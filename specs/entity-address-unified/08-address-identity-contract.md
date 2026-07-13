@@ -49,7 +49,7 @@ Rules:
 - A full base rebuild is required when `archive_identity_version` changes.
 - `ptg_address` must be rerun after a base rebuild because better canonical
   matches can change PTG address attachments.
-- The dashboard/import-control health view should show stale archive identity
+- The operator health view should show stale archive identity
   versions as a blocker, not as a warning.
 
 ## Merge Resolution
@@ -207,5 +207,5 @@ A publish must fail if:
 - any bridge row references a `location_key` outside the same staged publish;
 - base and PTG overlay rows report different archive identity versions.
 
-This validation belongs in both staged build checks and dashboard/import-control
+This validation belongs in both staged build checks and operator
 health checks.

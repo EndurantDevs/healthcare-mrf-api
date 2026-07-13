@@ -191,7 +191,7 @@ For a disposable database on local Postgres:
 ```bash
 env HLTHPRT_DB_HOST=127.0.0.1 \
     HLTHPRT_DB_PORT=5440 \
-    HLTHPRT_DB_DATABASE=healthporta_address_canon_test \
+    HLTHPRT_DB_DATABASE=mrf_address_canon_test \
     HLTHPRT_DB_SCHEMA=mrf \
     HLTHPRT_DB_USER=nick \
     HLTHPRT_DB_PASSWORD= \
@@ -216,9 +216,9 @@ SELECT EXISTS (
 Local verification snapshot from 2026-06-11:
 
 - Disposable Postgres on `127.0.0.1:5440`, database
-  `healthporta_address_canon_test`, reached Alembic head
+  `mrf_address_canon_test`, reached Alembic head
   `20260611130000_reapply_address_canonical_functions`.
-- Dev `healthporta` read-only baseline is captured in
+- Dev `mrf_dev` read-only baseline is captured in
   `reports/address_canonical_baseline_2026-06-11.md`, including exact
   full-table unit-conflict numbers for the available `npi_address` and
   `address_archive` tables. Rerun it in the target production snapshot before
@@ -231,13 +231,13 @@ Local verification snapshot from 2026-06-11:
 - Full local suite passed: `942 passed`.
 - Live local healthcare-mrf-api smoke on `127.0.0.1:8085` returned `200` for
   healthcheck, `npi/all`, `npi/id`, and pricing score against an unmigrated
-  `healthporta` DB.
+  `mrf_dev` DB.
 - Disposable-DB post-suite schema checks confirmed `address_archive_v2`,
   `address_checksum_map`, and
   `addr_key_v1(text,text,text,text,text,text)` remained installed. The local
-  main `healthporta` DB is intentionally still on the legacy archive schema
+  main `mrf_dev` DB is intentionally still on the legacy archive schema
   until Phase 3 cutover.
-- PostGIS matrix passed in `healthporta_address_canon_postgis_test` with
+- PostGIS matrix passed in `mrf_address_canon_postgis_test` with
   PostGIS `3.6.1`; downgrade/upgrade recreated
   `address_archive_v2_geo_idx`.
 - Phase 3.1 review-fix real-copy smoke passed in the disposable DB using

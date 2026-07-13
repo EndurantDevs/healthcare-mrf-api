@@ -30,6 +30,11 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:PTGNormal", "process.PTGNormal", ("ptg",)),
     WorkerSpec("arq:PTGLarge", "process.PTGLarge", ("ptg",)),
     WorkerSpec("arq:PTGHuge", "process.PTGHuge", ("ptg",)),
+    WorkerSpec(
+        "arq:PTGCandidateAudit",
+        "process.PTGCandidateAudit",
+        ("ptg-candidate-audit",),
+    ),
     WorkerSpec("arq:MRF", "process.MRF", ("mrf",)),
     WorkerSpec("arq:NPI", "process.NPI", ("npi",)),
     WorkerSpec("arq:NUCC", "process.NUCC", ("nucc",)),

@@ -379,17 +379,25 @@ def logical_artifact_identity(
     raw_byte_count: int | None = None,
     allow_deferred: bool = False,
 ) -> PTG2LogicalArtifact:
-    """Return the logical content identity of an artifact, optionally deferred."""
+    """Return a logical identity, or a marked raw-container identity when deferred."""
     raw_path_obj = Path(raw_path)
     compression, member_name = _compression_for_path(raw_path_obj)
     threshold = _env_int(PTG2_DEFER_LOGICAL_HASH_BYTES_ENV, 1024 * 1024 * 1024)
-    if allow_deferred and raw_sha256 and raw_byte_count and threshold > 0 and raw_byte_count >= threshold:
+    if (
+        allow_deferred
+        and compression is not None
+        and raw_sha256
+        and raw_byte_count
+        and threshold > 0
+        and raw_byte_count >= threshold
+    ):
         return PTG2LogicalArtifact(
             str(raw_path_obj),
             raw_sha256,
             raw_byte_count,
             compression=compression,
             member_name=member_name,
+            logical_hash_deferred=True,
         )
     with open_json_artifact_stream(raw_path_obj) as src:
         digest, total = _stream_hash(src)

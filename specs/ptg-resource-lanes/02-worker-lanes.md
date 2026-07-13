@@ -16,7 +16,7 @@ while rollout is in progress.
 
 MRF chunked work remains on `arq:MRF` in this phase. Resource metrics are still
 recorded so future deployment can split MRF into chunk classes without changing
-the import-control API again.
+the authenticated operator API again.
 
 ## Runtime Guards
 

@@ -4,10 +4,15 @@ import ast
 import re
 from pathlib import Path
 
+import yaml
+
 HTTP_METHODS = {"get", "post", "put", "delete", "patch", "options", "head"}
 ENDPOINT_DIR = Path("api/endpoint")
 OPENAPI_PATH = Path("doc/openapi.yaml")
 HIDDEN_RUNTIME_ALIASES = {
+    # Control-authenticated candidate validation is intentionally excluded
+    # from the public OpenAPI contract.
+    ("get", "/pricing/providers/audit-search-by-procedure"),
     ("get", "/pricing/physicians"),
     ("get", "/pricing/physicians/{npi}"),
     ("get", "/pricing/physicians/{npi}/score"),
@@ -270,3 +275,37 @@ def test_openapi_operation_ids_are_present_and_unique():
     assert len(operation_ids) == len(spec_routes)
     assert len(operation_ids) == len(set(operation_ids))
     assert not (HIDDEN_RUNTIME_ALIASES & spec_routes)
+
+
+def test_openapi_strict_ptg_pagination_exposes_exact_page_continuation():
+    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    schemas = spec["components"]["schemas"]
+    pagination_properties = schemas["PaginationMeta"]["properties"]
+
+    assert {"has_more", "total_is_exact", "total_lower_bound"} <= set(
+        pagination_properties
+    )
+    assert pagination_properties["has_more"]["type"] == "boolean"
+    assert pagination_properties["total_is_exact"]["type"] == "boolean"
+    assert pagination_properties["total_lower_bound"] == {
+        "type": "integer",
+        "minimum": 0,
+        "description": (
+            "Optional proven lower bound when an exact total would require "
+            "exhaustive expansion."
+        ),
+    }
+
+    strict_pagination = schemas["PtgPricingPaginationMeta"]["allOf"]
+    assert strict_pagination[0] == {
+        "$ref": "#/components/schemas/PaginationMeta"
+    }
+    required = set(strict_pagination[1]["required"])
+    assert required == {"total", "limit", "offset", "has_more"}
+    assert {"total_is_exact", "total_lower_bound"}.isdisjoint(required)
+    assert (
+        schemas["PricingProcedureProviderListResponse"]["properties"][
+            "pagination"
+        ]["$ref"]
+        == "#/components/schemas/PtgPricingPaginationMeta"
+    )

@@ -101,8 +101,8 @@ def decode_price_memberships(encoded_payload: bytes | bytearray | memoryview) ->
         if atom_end > len(encoded_payload):
             raise ValueError("PTG2 v3 price-membership atom keys are truncated")
         atom_keys = decode_dense_keys(encoded_payload[cursor:atom_end], header.atom_key_bits)
-        if any(left_key >= right_key for left_key, right_key in zip(atom_keys, atom_keys[1:])):
-            raise ValueError("price membership atom keys are not strictly ordered")
+        if any(left_key > right_key for left_key, right_key in zip(atom_keys, atom_keys[1:])):
+            raise ValueError("price membership atom keys are not ordered")
         memberships_by_price_key[price_key] = atom_keys
         cursor = atom_end
         previous_price_key = price_key
@@ -235,8 +235,8 @@ def _price_memberships_for_checkpoint(
             raise ValueError("PTG2 v3 price-membership atom keys are truncated")
         if price_key in requested_keys:
             atom_keys = decode_dense_keys(encoded_payload[cursor:atom_end], header.atom_key_bits)
-            if any(left_key >= right_key for left_key, right_key in zip(atom_keys, atom_keys[1:])):
-                raise ValueError("price membership atom keys are not strictly ordered")
+            if any(left_key > right_key for left_key, right_key in zip(atom_keys, atom_keys[1:])):
+                raise ValueError("price membership atom keys are not ordered")
             memberships_by_price_key[price_key] = atom_keys
         cursor = atom_end
         previous_price_key = price_key
@@ -272,8 +272,8 @@ def _validate_memberships(
             raise ValueError("price membership cannot be empty")
         if any(atom_key < 0 or atom_key > maximum_atom_key for atom_key in atom_keys):
             raise ValueError("dense atom key does not fit in its encoded width")
-        if any(left_key >= right_key for left_key, right_key in zip(atom_keys, atom_keys[1:])):
-            raise ValueError("price membership atom keys must be strictly ordered")
+        if any(left_key > right_key for left_key, right_key in zip(atom_keys, atom_keys[1:])):
+            raise ValueError("price membership atom keys must be ordered")
         previous_price_key = price_key
 
 
@@ -476,4 +476,3 @@ def _skip_optional_text(payload: bytes | bytearray | memoryview, offset: int) ->
     if text_end > len(payload):
         raise ValueError("PTG2 v3 price-atom text is truncated")
     return text_end
-

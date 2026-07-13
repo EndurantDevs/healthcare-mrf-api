@@ -32,6 +32,34 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthcheckResponse'
+  /healthcheck/live:
+    get:
+      operationId: getLiveness
+      summary: Process liveness probe
+      responses:
+        '200':
+          description: The API process is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LivenessResponse'
+  /healthcheck/ready:
+    get:
+      operationId: getReadiness
+      summary: PostgreSQL and strict PTG V3 readiness probe
+      responses:
+        '200':
+          description: PostgreSQL and the strict PTG V3 schema are ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+        '503':
+          description: PostgreSQL or the strict PTG V3 schema is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
   /coverage/statistics:
     get:
       operationId: getCoverageStatistics
@@ -2467,6 +2495,12 @@ paths:
           required: true
           schema:
             type: integer
+        - name: address_key
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Restrict the returned address list and evidence to one canonical address UUID
         - name: force_address_update
           in: query
           schema:
@@ -2644,7 +2678,7 @@ paths:
       description: |
         Resolves the published PTG2 serving snapshot for a group plan by EIN
         `plan_id` and `market_type`, then enumerates the snapshot provider
-        membership table as keyset-paginated 10-digit NPI values.
+        scope in strict shared V3 storage as keyset-paginated 10-digit NPI values.
       parameters:
         - name: plan_id
           in: query
@@ -2727,12 +2761,6 @@ paths:
             application/json:
               schema:
                 type: object
-        '501':
-          description: Snapshot does not expose provider membership storage
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
   /pricing/statistics:
     get:
       operationId: getPricingStatistics
@@ -2744,6 +2772,79 @@ paths:
             application/json:
               schema:
                 type: object
+  /pricing/providers/audit-occurrences:
+    get:
+      operationId: getPricingProviderAuditOccurrences
+      summary: Read a persisted strict-V3 source-verification sample
+      description: |
+        Returns a deterministic page from the bounded occurrence sample sealed
+        with a PostgreSQL-backed PTG snapshot. The route is intended for release
+        verification against the original machine-readable source and requires
+        an explicit plan and immutable snapshot.
+      parameters:
+        - name: plan_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: snapshot_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: mode
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [exact_source]
+        - name: order_by
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [occurrence_id]
+        - name: order
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [asc]
+        - name: limit
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - name: offset
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+        - name: plan_market_type
+          in: query
+          schema:
+            type: string
+        - name: source_key
+          in: query
+          schema:
+            type: string
+          description: Optional logical source key that must match the pinned snapshot.
+      responses:
+        '200':
+          description: Persisted audit occurrence page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PtgAuditOccurrenceResponse'
+        '400':
+          description: Invalid query or mismatched plan and snapshot scope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /pricing/providers:
     get:
       operationId: getPricingProviders
@@ -3867,12 +3968,7 @@ paths:
         inspect `result_state`, `pricing_scope`, `resolved_snapshot_id`, and
         `query.ignored_params` to distinguish matched rows from no snapshot,
         no local match in the requested radius, or no matching rates.
-        If `include_allowed_amounts` is true or omitted, a plan-scoped lookup
-        with no in-network negotiated row may return historical allowed-amount
-        evidence. CMS TiC allowed-amounts files are out-of-network by schema;
-        other source metadata may mark the evidence `network_status=in_network`.
-        Allowed amounts are historical payment evidence and must not be
-        presented as negotiated rates.
+        Strict V3 serves in-network negotiated rates only.
       parameters:
         - name: year
           in: query
@@ -4020,9 +4116,10 @@ paths:
           schema: { type: boolean }
         - name: include_allowed_amounts
           in: query
-          schema: { type: boolean, default: true }
+          schema: { type: boolean, default: false, enum: [false] }
           description: |
-            When true or omitted for plan-scoped PTG/TiC requests, may return historical allowed-amount evidence if no in-network negotiated price row is available for the requested code. CMS TiC allowed-amounts files are out-of-network by schema; other source metadata may mark the evidence `network_status=in_network`. Allowed amounts are historical payment evidence and must not be presented as negotiated rates.
+            Retired compatibility parameter. Only false is accepted; true is
+            rejected before the strict PTG search runs.
         - name: include_details
           in: query
           schema: { type: boolean }
@@ -4284,9 +4381,11 @@ paths:
           in: query
           schema:
             type: boolean
-            default: true
+            default: false
+            enum: [false]
           description: |
-            When true or omitted for plan-scoped PTG/TiC requests, may return historical allowed-amount evidence if no in-network negotiated price row is available for the requested code. CMS TiC allowed-amounts files are out-of-network by schema; other source metadata may mark the evidence `network_status=in_network`. Allowed amounts are historical payment evidence and must not be presented as negotiated rates.
+            Retired compatibility parameter. Only false is accepted; true is
+            rejected before the strict PTG search runs.
         - name: include_details
           in: query
           schema:
@@ -4918,6 +5017,213 @@ components:
         details:
           type: string
       additionalProperties: true
+    PtgAuditOccurrenceResponse:
+      type: object
+      required:
+        - result_state
+        - pricing_scope
+        - resolved_snapshot_id
+        - items
+        - pagination
+        - provenance
+        - audit_sample
+      properties:
+        result_state:
+          type: string
+          enum: [matched, no_matching_rates]
+        pricing_scope:
+          type: string
+          enum: [plan_scoped_ptg]
+        resolved_snapshot_id:
+          type: string
+        items:
+          type: array
+          items:
+            type: object
+            required:
+              - occurrence_id
+              - source_artifact_key
+              - source_type
+              - identity_kind
+              - identity_sha256
+              - raw_container_sha256
+              - logical_hash_deferred
+              - source_trace_set_hash
+              - source_trace
+              - tuple
+            properties:
+              occurrence_id:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+              source_artifact_key:
+                type: integer
+                minimum: 0
+              source_key:
+                type: string
+                nullable: true
+              source_type:
+                type: string
+                enum: [in_network]
+              identity_kind:
+                type: string
+                enum: [raw_container_sha256_v1, logical_json_sha256_v1]
+              identity_sha256:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+              raw_container_sha256:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+              logical_json_sha256:
+                type: string
+                nullable: true
+                pattern: '^[0-9a-f]{64}$'
+              logical_hash_deferred:
+                type: boolean
+              source_trace_set_hash:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+              source_trace:
+                type: array
+                minItems: 1
+                items:
+                  type: object
+                  required: [source_file_version_id]
+                  additionalProperties: true
+              tuple:
+                type: object
+                required:
+                  - code_system
+                  - code
+                  - npi
+                  - negotiated_rate
+                  - service_code
+                  - billing_code_modifier
+                properties:
+                  code_system:
+                    type: string
+                  code:
+                    type: string
+                  npi:
+                    type: integer
+                    minimum: 1000000000
+                    maximum: 9999999999
+                  negotiation_arrangement:
+                    type: string
+                    nullable: true
+                  negotiated_type:
+                    type: string
+                    nullable: true
+                  negotiated_rate:
+                    type: number
+                  expiration_date:
+                    type: string
+                    nullable: true
+                  service_code:
+                    type: array
+                    items:
+                      type: string
+                  billing_class:
+                    type: string
+                    nullable: true
+                  setting:
+                    type: string
+                    nullable: true
+                  billing_code_modifier:
+                    type: array
+                    items:
+                      type: string
+                  additional_information:
+                    type: string
+                    nullable: true
+        pagination:
+          type: object
+          required: [total, limit, offset, has_more]
+          properties:
+            total:
+              type: integer
+              minimum: 0
+            limit:
+              type: integer
+              minimum: 1
+              maximum: 100
+            offset:
+              type: integer
+              minimum: 0
+            has_more:
+              type: boolean
+        query:
+          type: object
+          additionalProperties: true
+        provenance:
+          type: object
+          required:
+            - arch_version
+            - storage_generation
+            - database_backend
+            - plan_id
+            - snapshot_id
+            - mode
+            - pricing_scope
+          properties:
+            arch_version:
+              type: string
+              enum: [postgres_binary_v3]
+            storage_generation:
+              type: string
+              enum: [shared_blocks_v3]
+            database_backend:
+              type: string
+              enum: [postgresql]
+            plan_id:
+              type: string
+            snapshot_id:
+              type: string
+            source_key:
+              type: string
+              nullable: true
+            mode:
+              type: string
+              enum: [exact_source]
+            pricing_scope:
+              type: string
+              enum: [plan_scoped_ptg]
+        audit_sample:
+          type: object
+          required:
+            - contract
+            - format_version
+            - method
+            - sample_count
+            - maximum_rows
+            - sample_digest
+            - complete_population
+            - serving_multiplicity_semantics
+          properties:
+            contract:
+              type: string
+              enum: [persisted_served_occurrence_sample_v2]
+            format_version:
+              type: integer
+              enum: [2]
+            method:
+              type: string
+              enum: [publish_time_stratified_v1]
+            sample_count:
+              type: integer
+              minimum: 0
+              maximum: 2560
+            maximum_rows:
+              type: integer
+              enum: [2560]
+            sample_digest:
+              type: string
+              pattern: '^[0-9a-f]{64}$'
+            complete_population:
+              type: boolean
+              enum: [false]
+            serving_multiplicity_semantics:
+              type: string
+              enum: [source_multiset_v1]
     CountResponse:
       type: object
       properties:
@@ -4944,12 +5250,35 @@ components:
       properties:
         total:
           type: integer
+          minimum: 0
         limit:
           type: integer
+          minimum: 1
         offset:
           type: integer
+          minimum: 0
         page:
           type: integer
+          minimum: 1
+        has_more:
+          type: boolean
+          description: Exact indicator that another page exists after the returned window.
+        total_is_exact:
+          type: boolean
+          description: Optional completeness marker for a progressively selected result total.
+        total_lower_bound:
+          type: integer
+          minimum: 0
+          description: Optional proven lower bound when an exact total would require exhaustive expansion.
+    PtgPricingPaginationMeta:
+      allOf:
+        - $ref: '#/components/schemas/PaginationMeta'
+        - type: object
+          required: [total, limit, offset, has_more]
+          description: |
+            Strict PTG pricing pagination. `has_more` is exact even when
+            `total_is_exact` is false and `total` is only the proven
+            `total_lower_bound` from progressive provider selection.
     ClinicalConcept:
       type: object
       properties:
@@ -6356,12 +6685,12 @@ components:
           type: string
           nullable: true
           description: Machine-readable outcome for plan-scoped PTG/TiC pricing lookups.
-          enum: [matched, no_match_in_radius, no_matching_rates, no_snapshot_for_plan, allowed_amounts_found]
+          enum: [matched, no_match_in_radius, no_matching_rates, no_snapshot_for_plan]
         pricing_scope:
           type: string
           nullable: true
           description: Indicates the pricing backend scope when the response came from plan-scoped PTG/TiC data.
-          enum: [plan_scoped_ptg, plan_scoped_allowed_amounts]
+          enum: [plan_scoped_ptg]
         resolved_snapshot_id:
           type: string
           nullable: true
@@ -6371,7 +6700,7 @@ components:
           items:
             $ref: '#/components/schemas/PricingProcedureProviderRecord'
         pagination:
-          $ref: '#/components/schemas/PaginationMeta'
+          $ref: '#/components/schemas/PtgPricingPaginationMeta'
         query:
           type: object
           properties:
@@ -6856,6 +7185,46 @@ components:
             details:
               type: string
           additionalProperties: true
+    LivenessResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [OK]
+        release:
+          type: string
+          nullable: true
+    ReadinessResponse:
+      type: object
+      required: [status, database, ptg_v3_schema]
+      properties:
+        status:
+          type: string
+          enum: [OK, Fail]
+        release:
+          type: string
+          nullable: true
+        database:
+          type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [OK, Fail]
+            details:
+              type: string
+          additionalProperties: false
+        ptg_v3_schema:
+          type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [OK, Fail]
+            details:
+              type: string
+          additionalProperties: false
     PlanIndexStatus:
       type: object
       properties:

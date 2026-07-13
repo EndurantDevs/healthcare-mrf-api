@@ -1,8 +1,6 @@
 # healthcare-mrf-api
 
-[![HealthPorta](https://app.healthporta.com/brand/healthporta-logo-2x.png)](https://app.healthporta.com/docs)
-
-`healthcare-mrf-api` is HealthPorta's data ingestion and API platform for public U.S. healthcare pricing, provider, plan, pharmacy, and Medicare-derived benchmarking data.
+`healthcare-mrf-api` is an open data-ingestion and API platform for public U.S. healthcare pricing, provider, plan, pharmacy, and Medicare-derived benchmarking data.
 
 It combines multiple public programs into one operational service so applications can query provider directories, plan data, procedure pricing, pharmacy activity, quality benchmarks, and enrollment-derived enrichment from a consistent API layer.
 
@@ -212,20 +210,8 @@ python main.py server start --host 0.0.0.0 --port 8080
 
 The API becomes useful after at least one importer has been run successfully.
 
-## Commercial Usage
+## API Consumers
 
-For managed production access, hosted documentation, and commercial integration support, see [HealthPorta Docs](https://app.healthporta.com/docs).
-
-HealthPorta supports:
-
-- hosted API access for healthcare pricing, provider, plan, and pharmacy data
-- integration into internal company systems and client-facing products
-- MCP-based connectivity for AI agents and workflow automation
-
-For AI-agent integration details, see [HealthPorta MCP](https://app.healthporta.com/mcp).
-
-## Related Projects
-
-- [HealthPorta](https://www.healthporta.com/about-us)
-- [HealthPorta Docs](https://app.healthporta.com/docs)
-- [Pharmacy Near Me](https://pharmacy-near-me.com/)
+The HTTP APIs are intentionally client-neutral. Self-hosted applications,
+external gateways, and automation clients can use the same documented public
+contracts without depending on a deployment-specific control service.

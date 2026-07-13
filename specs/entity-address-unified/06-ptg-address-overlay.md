@@ -19,7 +19,7 @@ The fast refresh requirement still applies:
 - base NPI/MRF/address rows can stay untouched;
 - only `ptg_address` and the PTG overlay partition/view need to refresh after a
   PTG-only import;
-- import-control can show node ownership even when all nodes write to the same
+- an external orchestrator can show node ownership even when all nodes write to the same
   database.
 
 Future multi-node deployment can split PTG ownership by node without changing
@@ -202,7 +202,7 @@ If `ptg-address` fails:
 
 - keep existing `ptg_address` live;
 - do not refresh the PTG overlay;
-- mark PTG overlay stale in import-control;
+- mark PTG overlay stale through the operator API;
 - allow retry after source/base/archive issue is fixed.
 
 The existing non-PTG base searches should continue to work.

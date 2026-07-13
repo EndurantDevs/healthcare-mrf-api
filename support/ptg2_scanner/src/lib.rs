@@ -11,6 +11,8 @@ pub mod manifest;
 pub mod normalize;
 pub mod output;
 pub mod progress;
+pub mod shared_graph;
+pub mod v3_runs;
 
 #[cfg(feature = "python")]
 mod python_api {

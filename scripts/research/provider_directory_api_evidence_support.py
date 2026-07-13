@@ -99,7 +99,7 @@ def _validated_api_base_url(base_url: str | None) -> str | None:
 
 
 class ProviderDirectoryApiClient:
-    """Credential-safe api-layer JSON client with explicit request timeouts."""
+    """Credential-safe consumer API client with explicit request timeouts."""
 
     def __init__(
         self, config: ApiConfig, opener: Callable[..., Any] = urllib.request.urlopen
@@ -113,7 +113,7 @@ class ProviderDirectoryApiClient:
             raise ValueError("API key header is invalid")
 
     def get_json(self, path: str, params: Mapping[str, str]) -> HttpResult:
-        """Request one api-layer object without retaining response text on errors."""
+        """Request one API object without retaining response text on errors."""
         if not self.config.is_enabled or not self.base_url:
             raise RuntimeError("API client is disabled")
         request = urllib.request.Request(
@@ -170,7 +170,7 @@ def _envelope_rows(payload: Mapping[str, Any] | None, field: str) -> list[Any]:
 
 
 def has_row_source_provenance(row: Any, source_id: str) -> bool:
-    """Return whether one api-layer row exposes the requested FHIR source."""
+    """Return whether one API row exposes the requested FHIR source."""
     return bool(matching_source_summary_maps(row, source_id))
 
 
@@ -434,7 +434,7 @@ def evaluate_source(
     witnesses: list[MappedEvidenceWitness] | None = None,
     completion_proofs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Verify bounded api-layer detail and phone evidence for one manifest source."""
+    """Verify bounded API detail and phone evidence for one manifest source."""
     witnesses = witnesses or []
     source_result = _base_source_result(selection, samples)
     witness_checks: list[dict[str, Any]] = []

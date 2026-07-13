@@ -1,15 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Garbage collect non-current PTG2 source snapshot tables.
 
-This helper is intentionally narrower than the legacy PTG2 cleanup: it only
-targets terminal manifest-backed source snapshots that are not referenced by
-any current pointer table. Active building snapshots are never candidates.
+This helper targets terminal snapshots and abandoned building snapshots that
+are not referenced by any current pointer table. A building snapshot remains
+protected while its import run is active and heartbeating.
 """
 
 from __future__ import annotations
 
-import argparse
-import asyncio
 import json
 import os
 from dataclasses import dataclass
@@ -18,12 +16,16 @@ from typing import Any, Iterable
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
-from process.ptg_parts.snapshot_cleanup import _snapshot_manifest_table_names
-from process.ptg_parts.source_pointers import PTG2_SOURCE_POINTER_GC_LOCK_KEY
+from process.ptg_parts.ptg2_lifecycle_lock import PTG2_SOURCE_POINTER_GC_LOCK_KEY
+from process.ptg_parts.ptg2_shared_gc import release_unbound_ptg2_shared_layouts
+from process.ptg_parts.snapshot_cleanup import (
+    is_strict_ptg2_v3_shared_blocks_manifest,
+)
 
 
 _GC_CANDIDATE_STATUSES = frozenset({"published", "failed"})
-_GC_CANDIDATE_STORAGE = "manifest_snapshot"
+_STALE_BUILD_SECONDS_ENV = "HLTHPRT_PTG2_STALE_BUILD_SECONDS"
+_STALE_BUILD_SECONDS_DEFAULT = 21_600
 
 
 @dataclass(frozen=True)
@@ -35,15 +37,29 @@ class PTG2SnapshotGCTable:
 
 
 @dataclass(frozen=True)
+class _PTG2SnapshotGCCandidate:
+    snapshot_id: str
+    source_key: str
+    table_names: tuple[str, ...]
+    is_shared: bool
+    reason: str
+
+
+@dataclass(frozen=True)
 class PTG2SourceSnapshotGCPlan:
     current_snapshot_ids: tuple[str, ...]
     candidate_snapshot_ids: tuple[str, ...]
     tables: tuple[PTG2SnapshotGCTable, ...]
+    candidate_reasons: tuple[tuple[str, str], ...] = ()
+    shared_snapshot_ids: tuple[str, ...] = ()
+    shared_layout_count: int = 0
+    shared_candidate_hash_count: int = 0
+    shared_stored_bytes: int = 0
 
     @property
     def total_bytes(self) -> int:
         """Return the aggregate size of tables selected for garbage collection."""
-        return sum(table.bytes for table in self.tables)
+        return sum(table.bytes for table in self.tables) + self.shared_stored_bytes
 
     @property
     def table_count(self) -> int:
@@ -53,7 +69,12 @@ class PTG2SourceSnapshotGCPlan:
     @property
     def has_actions(self) -> bool:
         """Return whether the garbage-collection plan selects snapshots or tables."""
-        return bool(self.candidate_snapshot_ids or self.tables)
+        return bool(
+            self.candidate_snapshot_ids
+            or self.tables
+            or self.shared_layout_count
+            or self.shared_candidate_hash_count
+        )
 
 
 def _row_mapping(row: Any) -> dict[str, Any]:
@@ -62,6 +83,18 @@ def _row_mapping(row: Any) -> dict[str, Any]:
     if isinstance(row, dict):
         return row
     return dict(getattr(row, "_mapping", row))
+
+
+def _stale_build_seconds(value: int | None) -> int:
+    raw_value: Any = (
+        value
+        if value is not None
+        else os.getenv(_STALE_BUILD_SECONDS_ENV, _STALE_BUILD_SECONDS_DEFAULT)
+    )
+    try:
+        return max(int(raw_value), 0)
+    except (TypeError, ValueError):
+        return _STALE_BUILD_SECONDS_DEFAULT
 
 
 def _manifest_dict(value: Any) -> dict[str, Any]:
@@ -113,8 +146,12 @@ async def build_ptg2_source_snapshot_gc_plan(
     schema_name: str | None = None,
     executor: Any | None = None,
     retain_current_lineage: int = 4,
+    stale_build_seconds: int | None = None,
+    max_snapshots: int | None = None,
+    max_tables: int | None = None,
+    max_bytes: int | None = None,
 ) -> PTG2SourceSnapshotGCPlan:
-    """Build a plan while retaining recent lineage behind every current pointer."""
+    """Build a bounded plan while retaining lineage behind every current pointer."""
 
     schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     executor = executor or db
@@ -138,17 +175,37 @@ async def build_ptg2_source_snapshot_gc_plan(
         """
     )
     current_snapshot_ids = tuple(str(_row_mapping(row).get("snapshot_id")) for row in current_rows)
+    stale_seconds = _stale_build_seconds(stale_build_seconds)
     snapshot_rows = await executor.all(
         f"""
-        SELECT snapshot_id,
-               status,
-               previous_snapshot_id,
-               manifest,
-               manifest->'serving_index' AS serving_index,
-               manifest->'serving_index'->>'source_key' AS source_key
-          FROM {_quote_ident(schema_name)}.ptg2_snapshot
-         ORDER BY snapshot_id
-        """
+        SELECT snapshot.snapshot_id,
+               snapshot.status,
+               snapshot.previous_snapshot_id,
+               snapshot.manifest,
+               snapshot.manifest->'serving_index' AS serving_index,
+               snapshot.manifest->'serving_index'->>'source_key' AS source_key,
+               (
+                   snapshot.status = 'building'
+                   AND snapshot.created_at
+                       < timezone('UTC', transaction_timestamp())
+                         - (:stale_build_seconds * INTERVAL '1 second')
+                   AND (
+                       import_run.import_run_id IS NULL
+                       OR import_run.status NOT IN ('pending', 'running', 'building')
+                       OR COALESCE(
+                           import_run.heartbeat_at,
+                           import_run.started_at,
+                           '-infinity'::timestamp
+                       ) < timezone('UTC', transaction_timestamp())
+                           - (:stale_build_seconds * INTERVAL '1 second')
+                   )
+               ) AS stale_building
+          FROM {_quote_ident(schema_name)}.ptg2_snapshot AS snapshot
+          LEFT JOIN {_quote_ident(schema_name)}.ptg2_import_run AS import_run
+            ON import_run.import_run_id = snapshot.import_run_id
+         ORDER BY snapshot.created_at, snapshot.snapshot_id
+        """,
+        stale_build_seconds=stale_seconds,
     )
     retained_table_refs: set[str] = set()
     protected_snapshot_ids = _protected_snapshot_lineage_ids(
@@ -156,27 +213,61 @@ async def build_ptg2_source_snapshot_gc_plan(
         current_snapshot_ids,
         retain_current_lineage,
     )
-    candidate_table_rows: list[tuple[str, str, str]] = []
-    candidate_snapshot_ids: list[str] = []
+    candidates: list[_PTG2SnapshotGCCandidate] = []
     for raw_row in snapshot_rows:
         row = _row_mapping(raw_row)
         snapshot_id = str(row.get("snapshot_id") or "")
         serving_index = _serving_index(row)
-        table_names = _snapshot_manifest_table_names(serving_index)
-        is_gc_candidate = (
+        is_strict_v3 = is_strict_ptg2_v3_shared_blocks_manifest(serving_index)
+        # Strict V3 snapshot state is owned by shared-block tables; no manifest
+        # may authorize per-snapshot table cleanup.
+        table_names: tuple[str, ...] = ()
+        terminal_candidate = (
             bool(snapshot_id)
+            and is_strict_v3
             and str(row.get("status") or "") in _GC_CANDIDATE_STATUSES
-            and str(serving_index.get("storage") or "") == _GC_CANDIDATE_STORAGE
             and snapshot_id not in protected_snapshot_ids
         )
+        stale_building_candidate = (
+            bool(snapshot_id)
+            and is_strict_v3
+            and bool(row.get("stale_building"))
+            and snapshot_id not in protected_snapshot_ids
+        )
+        is_gc_candidate = terminal_candidate or stale_building_candidate
         if not is_gc_candidate:
             retained_table_refs.update(table_names)
             continue
-        candidate_snapshot_ids.append(snapshot_id)
         source_key = str(row.get("source_key") or serving_index.get("source_key") or "")
-        candidate_table_rows.extend((snapshot_id, source_key, table_name) for table_name in table_names)
+        candidates.append(
+            _PTG2SnapshotGCCandidate(
+                snapshot_id=snapshot_id,
+                source_key=source_key,
+                table_names=table_names,
+                is_shared=True,
+                reason="stale_building" if stale_building_candidate else "terminal",
+            )
+        )
+
+    snapshot_limit = (
+        len(candidates)
+        if max_snapshots is None
+        else min(max(int(max_snapshots), 0), len(candidates))
+    )
+    table_limit = None if max_tables is None else max(int(max_tables), 0)
+    byte_limit = None if max_bytes is None else max(int(max_bytes), 0)
+    last_candidate_index_by_table: dict[str, int] = {}
+    for candidate_index, candidate in enumerate(candidates):
+        for table_name in candidate.table_names:
+            last_candidate_index_by_table[table_name] = candidate_index
     candidate_table_names = sorted(
-        {table_name for _, _, table_name in candidate_table_rows} - retained_table_refs
+        {
+            table_name
+            for candidate in candidates[:snapshot_limit]
+            for table_name in candidate.table_names
+            if table_name not in retained_table_refs
+            and last_candidate_index_by_table[table_name] < snapshot_limit
+        }
     )
     size_by_table: dict[str, int] = {}
     if candidate_table_names:
@@ -198,21 +289,68 @@ async def build_ptg2_source_snapshot_gc_plan(
             str(_row_mapping(row).get("table_name")): int(_row_mapping(row).get("bytes") or 0)
             for row in size_rows
         }
-    tables = tuple(
-        PTG2SnapshotGCTable(
-            snapshot_id=snapshot_id,
-            source_key=source_key,
-            table_name=table_name,
-            bytes=size_by_table[table_name],
+
+    async def _plan_for_candidate_count(candidate_count: int) -> PTG2SourceSnapshotGCPlan:
+        selected_candidates = candidates[:candidate_count]
+        selected_tables: list[PTG2SnapshotGCTable] = []
+        selected_table_names: set[str] = set()
+        for candidate in selected_candidates:
+            for table_name in candidate.table_names:
+                if (
+                    table_name in selected_table_names
+                    or table_name not in size_by_table
+                    or table_name in retained_table_refs
+                    or last_candidate_index_by_table[table_name] >= candidate_count
+                ):
+                    continue
+                selected_table_names.add(table_name)
+                selected_tables.append(
+                    PTG2SnapshotGCTable(
+                        snapshot_id=candidate.snapshot_id,
+                        source_key=candidate.source_key,
+                        table_name=table_name,
+                        bytes=size_by_table[table_name],
+                    )
+                )
+        tables = tuple(selected_tables)
+        shared_snapshot_ids = tuple(
+            candidate.snapshot_id for candidate in selected_candidates if candidate.is_shared
         )
-        for snapshot_id, source_key, table_name in candidate_table_rows
-        if table_name in size_by_table and table_name not in retained_table_refs
-    )
-    return PTG2SourceSnapshotGCPlan(
-        current_snapshot_ids=current_snapshot_ids,
-        candidate_snapshot_ids=tuple(dict.fromkeys(candidate_snapshot_ids)),
-        tables=tables,
-    )
+        return PTG2SourceSnapshotGCPlan(
+            current_snapshot_ids=current_snapshot_ids,
+            candidate_snapshot_ids=tuple(
+                candidate.snapshot_id for candidate in selected_candidates
+            ),
+            tables=tables,
+            candidate_reasons=tuple(
+                (candidate.snapshot_id, candidate.reason)
+                for candidate in selected_candidates
+            ),
+            shared_snapshot_ids=shared_snapshot_ids,
+            shared_layout_count=0,
+            shared_candidate_hash_count=0,
+            shared_stored_bytes=0,
+        )
+
+    if table_limit is None and byte_limit is None:
+        return await _plan_for_candidate_count(snapshot_limit)
+
+    selected_plan = await _plan_for_candidate_count(0)
+    lower_bound = 1
+    upper_bound = snapshot_limit
+    while lower_bound <= upper_bound:
+        candidate_count = (lower_bound + upper_bound) // 2
+        candidate_plan = await _plan_for_candidate_count(candidate_count)
+        is_within_table_limit = (
+            table_limit is None or candidate_plan.table_count <= table_limit
+        )
+        is_within_byte_limit = byte_limit is None or candidate_plan.total_bytes <= byte_limit
+        if is_within_table_limit and is_within_byte_limit:
+            selected_plan = candidate_plan
+            lower_bound = candidate_count + 1
+        else:
+            upper_bound = candidate_count - 1
+    return selected_plan
 
 
 def validate_ptg2_source_snapshot_gc_plan(
@@ -267,6 +405,7 @@ async def execute_ptg2_source_snapshot_gc_plan(
     max_bytes: int = 80 * 1024 * 1024 * 1024,
     lock_timeout: str = "5s",
     retain_current_lineage: int = 4,
+    stale_build_seconds: int | None = None,
 ) -> PTG2SourceSnapshotGCPlan:
     """Recompute and execute a bounded cleanup plan in one transaction."""
 
@@ -279,6 +418,10 @@ async def execute_ptg2_source_snapshot_gc_plan(
             schema_name=schema_name,
             executor=connection,
             retain_current_lineage=retain_current_lineage,
+            stale_build_seconds=stale_build_seconds,
+            max_snapshots=max_snapshots,
+            max_tables=max_tables,
+            max_bytes=max_bytes,
         )
         validate_ptg2_source_snapshot_gc_plan(
             plan,
@@ -291,6 +434,20 @@ async def execute_ptg2_source_snapshot_gc_plan(
                 f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)}"
             )
         if plan.candidate_snapshot_ids:
+            await connection.status(
+                f"""
+                DELETE FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope
+                 WHERE snapshot_id = ANY(:snapshot_ids)
+                """,
+                snapshot_ids=list(plan.candidate_snapshot_ids),
+            )
+            deleted_binding_count = await connection.status(
+                f"""
+                DELETE FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_binding
+                 WHERE snapshot_id = ANY(:snapshot_ids)
+                """,
+                snapshot_ids=list(plan.candidate_snapshot_ids),
+            )
             await connection.status(
                 f"""
                 DELETE FROM {_quote_ident(schema_name)}.ptg2_artifact_blob_chunk
@@ -313,75 +470,24 @@ async def execute_ptg2_source_snapshot_gc_plan(
                 f"""
                 DELETE FROM {_quote_ident(schema_name)}.ptg2_snapshot
                  WHERE snapshot_id = ANY(:snapshot_ids)
-                   AND status IN ('published', 'failed')
+                   AND status IN ('published', 'failed', 'building')
+                   AND lower(COALESCE(manifest->'serving_index'->>'arch_version', ''))
+                       = 'postgres_binary_v3'
+                   AND lower(COALESCE(manifest->'serving_index'->>'storage_generation', ''))
+                       = 'shared_blocks_v3'
                 """,
                 snapshot_ids=list(plan.candidate_snapshot_ids),
             )
+            if int(deleted_binding_count or 0) > 0:
+                await release_unbound_ptg2_shared_layouts(
+                    schema_name=schema_name,
+                    executor=connection,
+                    require_shared=True,
+                )
         return plan
 
 
-def _bytes_to_gib(value: int) -> float:
-    return value / (1024 ** 3)
-
-
-def _print_plan(plan: PTG2SourceSnapshotGCPlan) -> None:
-    print(f"current_snapshot_refs={len(plan.current_snapshot_ids)}")
-    print(f"candidate_snapshots={len(plan.candidate_snapshot_ids)}")
-    print(f"candidate_tables={plan.table_count}")
-    print(f"candidate_bytes={plan.total_bytes}")
-    print(f"candidate_gib={_bytes_to_gib(plan.total_bytes):.2f}")
-    families: dict[str, tuple[int, int]] = {}
-    for table in plan.tables:
-        family = table.table_name.rsplit("_", 1)[0] + "_*"
-        count, bytes_value = families.get(family, (0, 0))
-        families[family] = (count + 1, bytes_value + table.bytes)
-    for family, (count, bytes_value) in sorted(families.items(), key=lambda item: item[1][1], reverse=True):
-        print(f"family={family} tables={count} bytes={bytes_value} gib={_bytes_to_gib(bytes_value):.2f}")
-
-
-def _positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("value must be non-negative")
-    return parsed
-
-
-async def _amain(argv: Iterable[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Clean non-current PTG2 manifest source snapshots.")
-    parser.add_argument("--schema", default=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
-    parser.add_argument("--execute", action="store_true", help="Apply cleanup. Default is dry-run.")
-    parser.add_argument("--max-snapshots", type=_positive_int, default=400)
-    parser.add_argument("--max-tables", type=_positive_int, default=2000)
-    parser.add_argument("--max-bytes-gb", type=_positive_int, default=80)
-    parser.add_argument("--lock-timeout", default="5s")
-    parser.add_argument("--retain-current-lineage", type=_positive_int, default=4)
-    args = parser.parse_args(list(argv) if argv is not None else None)
-    max_bytes = args.max_bytes_gb * 1024 * 1024 * 1024
-    if args.execute:
-        plan = await execute_ptg2_source_snapshot_gc_plan(
-            schema_name=args.schema,
-            max_snapshots=args.max_snapshots,
-            max_tables=args.max_tables,
-            max_bytes=max_bytes,
-            lock_timeout=args.lock_timeout,
-            retain_current_lineage=args.retain_current_lineage,
-        )
-        _print_plan(plan)
-        print("cleanup_executed=true")
-    else:
-        plan = await build_ptg2_source_snapshot_gc_plan(
-            schema_name=args.schema,
-            retain_current_lineage=args.retain_current_lineage,
-        )
-        validate_ptg2_source_snapshot_gc_plan(
-            plan,
-            max_snapshots=args.max_snapshots,
-            max_tables=args.max_tables,
-            max_bytes=max_bytes,
-        )
-        _print_plan(plan)
-        print("cleanup_executed=false")
-
-
 if __name__ == "__main__":
-    asyncio.run(_amain())
+    from process.ptg_parts.ptg2_source_snapshot_gc_cli import main
+
+    main()

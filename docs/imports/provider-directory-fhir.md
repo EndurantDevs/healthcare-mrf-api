@@ -84,12 +84,12 @@ Use this sequence for a campaign or documentation review:
 
 2. Run the acquisition harness in its default GET-only mode for inspection.
    Add `--apply` only when the selected campaign should create or resume live
-   import-control runs. Keep the report at the manifest's configured path, or
+   operator-managed runs. Keep the report at the manifest's configured path, or
    pass an explicit `--report` path:
 
    ```bash
    ./venv314/bin/python scripts/research/provider_directory_endpoint_acquisition_cli.py \
-     --control-url "$HLTHPRT_IMPORT_CONTROL_URL" \
+     --control-url "$OPERATOR_API_URL" \
      --apply \
      --report reports/provider-directory-endpoint-acquisition/report.json
    ```
@@ -101,7 +101,7 @@ Use this sequence for a campaign or documentation review:
    ```bash
    ./venv314/bin/python scripts/update_provider_directory_verification.py \
      --report reports/provider-directory-endpoint-acquisition/report.json \
-     --environment healthporta-dev
+     --environment mrf-dev
    ```
 
    The updater rejects stale reports, campaign or manifest mismatches, and
@@ -307,7 +307,7 @@ historical alias copies are intentionally not deleted by this change; their
 cleanup is a separate migration.
 
 Checkpointed acquisitions retain the candidate `dataset_id`. Candidate identity
-uses `provider_directory_pagination_root_run_id` when import-control supplies
+uses `provider_directory_pagination_root_run_id` when an external orchestrator supplies
 it, so pagination and partition/reverse-lookup retries across multiple hops
 continue the same non-current dataset. Partition checkpoints are scoped to that
 root lineage and a stable search-strategy version; changing strategy cannot
@@ -324,7 +324,7 @@ predecessor's row within the same root and candidate; a guarded fresh root gets
 an independent row while failed-root evidence remains available for audit.
 Failed-root checkpoint retention is intentionally conservative: cleanup must
 first prove that the endpoint candidate is neither current nor
-active/incomplete and that no import-control run in the root lineage is live.
+active/incomplete and that no orchestrated run in the root lineage is live.
 Deployments that manage this database with `manage sync-structure` apply the
 same root-key change through an idempotent, advisory-locked reconciler. It
 accepts only the known legacy or current primary-key shape and fails closed on
@@ -332,7 +332,7 @@ unresolved lineage. Do not run `alembic upgrade head` merely to apply this
 change when the deployment's `mrf.alembic_version` intentionally trails its
 sync-managed schema.
 
-When an operator resumes a failed acquisition directly through import-control,
+When an operator resumes a failed acquisition through the authenticated operator API,
 the campaign harness can attach that existing lineage tip with
 `--adopt-run ENTRY=RUN_ID --apply`. Adoption is GET-only: it requires an exact
 manifest parameter match, validates the acquisition root, rejects a run that
@@ -349,11 +349,10 @@ mutable owner/retry lineage, a lease, row count, lifecycle timestamps, state,
 and error. Output rows store an encrypted URL capability and immutable hash plus
 attempt, row-count, completion, timestamp, and error state for every selected
 manifest output. Encryption derives a domain-separated Fernet key from
-`HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY`, falling back to an existing
-control/import-control token. Decryption also tries the fallback tokens and the
+`HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY`. Decryption also supports the
 comma-separated or JSON-array
 `HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_PREVIOUS_KEYS` key ring, allowing a
-dedicated key or control token to rotate while an accepted export is active.
+dedicated key to rotate while an accepted export is active.
 Missing/wrong key configuration fails closed but remains retryable and does not
 erase encrypted capabilities. Terminal completion or data-level failure clears
 capability ciphertext while retaining hashes and audit data. A retry can adopt
@@ -730,11 +729,11 @@ or `publish_artifacts=false`; otherwise a bounded test can spend most of its
 runtime rebuilding global address artifacts that are unrelated to the smoke.
 
 Long-running imports report source-probe, resource-import, and artifact-publish
-progress back to import-control when the running worker image includes progress
+progress back to an external orchestrator when the running worker image includes progress
 callbacks. Older active workers still show generic `process_data running`
 progress until they complete.
 
-The import-control default schedule plan runs the Provider Directory chain
+The recommended external schedule runs the Provider Directory chain
 monthly: full `provider-directory-fhir` resource import, latest-run
 Provider Directory partial `entity-address-unified` refresh, then the optional
 table-backed PTG corroboration publish once the unified-address dependency is
@@ -768,7 +767,7 @@ files, not inline secret values. In dev Kubernetes the worker config points
 `HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_FILE` at:
 
 ```text
-/var/run/healthporta/provider-directory/credentials.json
+/var/run/healthcare-mrf-api/provider-directory/credentials.json
 ```
 
 Create or update the optional `provider-directory-credentials` secret with a
@@ -1012,7 +1011,7 @@ parameters, and drops the schema:
   --sql-typing \
   --db-host 127.0.0.1 \
   --db-port 5440 \
-  --db-database healthporta_test \
+  --db-database mrf_test \
   --db-user nick
 ```
 
@@ -1022,7 +1021,7 @@ Run a bounded local DB-backed CLI case:
 HLTHPRT_DB_HOST=127.0.0.1 \
 HLTHPRT_DB_PORT=5440 \
 HLTHPRT_DB_USER=nick \
-HLTHPRT_DB_DATABASE=healthporta \
+HLTHPRT_DB_DATABASE=mrf_dev \
 HLTHPRT_TEST_DATABASE_SUFFIX=_test \
 ./venv314/bin/python scripts/research/provider_directory_fhir_harness.py \
   --local-cli \
@@ -1045,12 +1044,12 @@ the importer's `--test` flag, while the explicit limits keep the run bounded.
 `HLTHPRT_DB_*` target after the import:
 
 ```bash
-createdb -h 127.0.0.1 -p 5440 -U nick hp_pd_harness_monthly
+createdb -h 127.0.0.1 -p 5440 -U nick mrf_pd_harness_monthly
 
 HLTHPRT_DB_HOST=127.0.0.1 \
 HLTHPRT_DB_PORT=5440 \
 HLTHPRT_DB_USER=nick \
-HLTHPRT_DB_DATABASE=hp_pd_harness_monthly \
+HLTHPRT_DB_DATABASE=mrf_pd_harness_monthly \
 ./venv314/bin/python scripts/research/provider_directory_fhir_harness.py \
   --local-cli \
   --coverage-audit \
@@ -1072,7 +1071,7 @@ HLTHPRT_DB_DATABASE=hp_pd_harness_monthly \
   --source-concurrency 1 \
   --retest-results-url https://raw.githubusercontent.com/hltiunn/provider-directory-db/main/data/retest_results.json
 
-dropdb -h 127.0.0.1 -p 5440 -U nick hp_pd_harness_monthly
+dropdb -h 127.0.0.1 -p 5440 -U nick mrf_pd_harness_monthly
 ```
 
 When validating a completed artifact-publishing run rather than a bounded
@@ -1086,7 +1085,7 @@ resource smoke, replace the pod-safe audit with the serving-readiness gate:
   --coverage-audit-fast-serving-readiness \
   --db-host 127.0.0.1 \
   --db-port 5440 \
-  --db-database healthporta \
+  --db-database mrf_dev \
   --db-user nick
 ```
 
@@ -1117,7 +1116,7 @@ network refs:
 ./venv314/bin/python scripts/research/provider_directory_coverage_audit.py \
   --host 127.0.0.1 \
   --port 5440 \
-  --database healthporta \
+  --database mrf_dev \
   --schema mrf \
   --retest-results-path /tmp/retest_results.json \
   --format markdown
@@ -1189,7 +1188,7 @@ schedule check instead of only reporting readiness:
 ./venv314/bin/python scripts/research/provider_directory_coverage_audit.py \
   --host 127.0.0.1 \
   --port 5440 \
-  --database healthporta \
+  --database mrf_dev \
   --schema mrf \
   --format markdown \
   --require-serving-ready
@@ -1208,7 +1207,7 @@ the heavier unified-address, PTG, and network-resolution sections disabled in
 the API pod; run the full audit from the dev host or a dedicated worker context.
 
 ```bash
-sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
+sudo k3s kubectl -n mrf-dev exec -i deploy/healthcare-mrf-api -- \
   venv/bin/python - --schema mrf --format markdown \
   --pod-safe \
   --statement-timeout-ms 30000 \
@@ -1219,7 +1218,7 @@ Generate the non-secret credential onboarding artifact from the same deployed
 environment:
 
 ```bash
-sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
+sudo k3s kubectl -n mrf-dev exec -i deploy/healthcare-mrf-api -- \
   venv/bin/python - --schema mrf --format credential-backlog-json \
   --pod-safe \
   --statement-timeout-ms 30000 \
@@ -1230,7 +1229,7 @@ sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
 Generate a fill-in credential config template from the same backlog:
 
 ```bash
-sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
+sudo k3s kubectl -n mrf-dev exec -i deploy/healthcare-mrf-api -- \
   venv/bin/python - --schema mrf --format credential-config-template-json \
   --pod-safe \
   --statement-timeout-ms 30000 \
@@ -1241,7 +1240,7 @@ sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
 Generate a prioritized host-level onboarding list:
 
 ```bash
-sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
+sudo k3s kubectl -n mrf-dev exec -i deploy/healthcare-mrf-api -- \
   venv/bin/python - --schema mrf --format credential-priority-json \
   --pod-safe \
   --statement-timeout-ms 30000 \
@@ -1253,7 +1252,7 @@ Validate a candidate credential config file without changing the deployed
 worker environment:
 
 ```bash
-sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
+sudo k3s kubectl -n mrf-dev exec -i deploy/healthcare-mrf-api -- \
   venv/bin/python - --schema mrf --format markdown \
   --pod-safe \
   --credential-config-file /path/in/pod/provider-directory-credentials.candidate.json \
@@ -1312,8 +1311,7 @@ signals:
 
 ## Schedule
 
-`import-control` defines `default-provider-directory-fhir-monthly` at
-`20 1 5 * *` America/Chicago. The default parameters probe the full seed
+A typical monthly schedule runs at `20 1 5 * *` America/Chicago. The default parameters probe the full seed
 catalog, include the upstream `provider-directory-db` retest snapshot
 supplement, include credentialed/auth-required sources when credentials are
 configured, run a full resource refresh (`resource_limit=0`,
@@ -1342,7 +1340,7 @@ vendor provides a byte-for-byte usable cursor, documented stable offset
 contract, or complete Bulk/file export. Future source-specific caps can also be carried
 in source `metadata_json.provider_directory_resource_page_count_caps` without
 changing the monthly schedule.
-`import-control` also schedules a follow-up artifact-only Provider Directory
+The external scheduler also runs a follow-up artifact-only Provider Directory
 run after the monthly `entity-address-unified` Provider Directory partial
 projection. That run uses `publish_artifacts_only=true` and
 `publish_corroboration=true`, and requires both the full FHIR refresh and the
@@ -1365,9 +1363,8 @@ address archive publishing uses the same seen-stage/current-run scope when
 building its temporary stage table, so the monthly run avoids broad
 `provider_directory_location` publish scans for unchanged rows.
 
-`import-control` also defines
-`default-provider-directory-entity-address-unified-monthly` at `20 2 5 * *`
-America/Chicago. It runs `entity-address-unified` with
+A typical dependent schedule runs `entity-address-unified` at `20 2 5 * *`
+America/Chicago with
 `refresh_mode=provider-directory-partial`,
 `provider_directory_partial_scope=latest-run`,
 `serving_only_refresh=true`, and `publish=true` so Provider Directory FHIR rows

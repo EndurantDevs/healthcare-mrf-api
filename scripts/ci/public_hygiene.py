@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Public repository hygiene checks.
 
-The check is intentionally based on tracked files only so local scratch files do
-not make CI nondeterministic. It blocks private agent/operator guidance paths and
-obvious secret material from entering the public repository.
+CI checks tracked files. Release preparation can additionally scan untracked,
+non-ignored files with ``--include-untracked``.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import re
 import subprocess
@@ -46,7 +46,7 @@ CONTENT_PATTERNS = {
     ),
 }
 
-PRIVATE_TEXT_FINGERPRINTS = {
+PRIVATE_EXAMPLE_FINGERPRINTS = {
     "0d7f9b704b0669e301fce51d326b99648420899282f8591f7f2c25f0139f390d",
     "12e76d8f8d8c492db3d8694b37965678f1f44502a3f99a04a95b2443e54103e9",
     "172590cb4afd42e31874eb15a27f5950aa3ec2585d718addf1fa0e707e030b1a",
@@ -64,23 +64,53 @@ PRIVATE_TEXT_FINGERPRINTS = {
     "ea48bd692cc5bb613a2c7aae310aa00cf65eadc93ea1b0c036c07717d1eaca4a",
     "f035af007b46c4de201dfbfd377719b1b0d56ae340b7087797b27a220a2bee49",
 }
+
+# Fingerprints of normalized private integration names. Keeping only hashes here
+# lets the public gate reject separator variants without publishing
+# the names it protects against.
+PRIVATE_INTEGRATION_FINGERPRINTS = {
+    "216c6d1b6b239d96e8c9a75575e4c94392bce811945aee5d1fae7882344aa39e",
+    "2ae795d6a6ea0ce8c620243a10273674e034e9f7afe0a9cc368b201e931151f7",
+    "47ded72d07eccdc65a1017e29809be824913399e264f3daa156b39ee598614d8",
+    "7b714bcacf92d474089f5cf2c0e3c03a403ffc729174b0f3106ca1367f3f72e9",
+    "d8205bea56fce6d160026dffc89bbd8a0655c34296a5ff31886d6e5785270b6b",
+    "e3ddb5be56a2a9333debc2676dec9a472954b4c9742424ba849fc5fb466ae141",
+    "f3d92f97909c326ce25386f309cae51ed94f7ee1d4c20d1ed1d99f35737fdb39",
+}
+PRIVATE_TEXT_FINGERPRINTS = (
+    PRIVATE_EXAMPLE_FINGERPRINTS | PRIVATE_INTEGRATION_FINGERPRINTS
+)
 TEXT_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 PRIVATE_TEXT_WINDOW_MAX = 3
+INTEGRATION_IDENTIFIER_SEPARATOR_RE = re.compile(r"[-_./:\\]+")
 
-SELF_PATHS = {
+PATTERN_EXEMPT_PATHS = {
     "scripts/ci/public_hygiene.py",
-    ".github/workflows/ci.yml",
 }
 
 
-def tracked_files() -> list[Path]:
+def repository_files(*, include_untracked: bool = False) -> list[Path]:
+    command = ["git", "ls-files", "-z", "--cached"]
+    if include_untracked:
+        command.extend(["--others", "--exclude-standard"])
     result = subprocess.run(
-        ["git", "ls-files"],
+        command,
         check=True,
-        text=True,
         stdout=subprocess.PIPE,
     )
-    return [Path(line) for line in result.stdout.splitlines() if line]
+    return sorted(
+        {
+            Path(item.decode("utf-8", errors="surrogateescape"))
+            for item in result.stdout.split(b"\0")
+            if item
+        }
+    )
+
+
+def existing_files(paths: list[Path]) -> list[Path]:
+    """Ignore tracked paths deleted by the candidate change being checked."""
+
+    return [path for path in paths if path.is_file()]
 
 
 def is_binary(path: Path) -> bool:
@@ -99,22 +129,38 @@ def check_paths(paths: list[Path]) -> list[str]:
             errors.append(f"forbidden path component: {path}")
         if path.name in FORBIDDEN_BASENAMES:
             errors.append(f"forbidden instruction file: {path}")
+        if has_private_text_fingerprint(path.as_posix()):
+            errors.append(f"private-path-fingerprint: {path}")
     return errors
 
 
 def has_private_text_fingerprint(text: str) -> bool:
     """Match private examples without publishing their plaintext in this repository."""
 
-    tokens = [token.lower() for token in TEXT_TOKEN_RE.findall(text)]
+    tokens = list(TEXT_TOKEN_RE.finditer(text))
     for start in range(len(tokens)):
         normalized_window = ""
+        integration_identifier = True
         for width in range(PRIVATE_TEXT_WINDOW_MAX):
             token_index = start + width
             if token_index >= len(tokens):
                 break
-            normalized_window += tokens[token_index]
+            if width:
+                separator = text[
+                    tokens[token_index - 1].end() : tokens[token_index].start()
+                ]
+                integration_identifier = bool(
+                    integration_identifier
+                    and INTEGRATION_IDENTIFIER_SEPARATOR_RE.fullmatch(separator)
+                )
+            normalized_window += tokens[token_index].group(0).lower()
             fingerprint = hashlib.sha256(normalized_window.encode("utf-8")).hexdigest()
-            if fingerprint in PRIVATE_TEXT_FINGERPRINTS:
+            if fingerprint in PRIVATE_EXAMPLE_FINGERPRINTS:
+                return True
+            if (
+                integration_identifier
+                and fingerprint in PRIVATE_INTEGRATION_FINGERPRINTS
+            ):
                 return True
     return False
 
@@ -123,29 +169,42 @@ def check_content(paths: list[Path]) -> list[str]:
     errors: list[str] = []
     for path in paths:
         path_str = path.as_posix()
-        if path_str in SELF_PATHS or is_binary(path):
+        if is_binary(path):
             continue
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        for label, pattern in CONTENT_PATTERNS.items():
-            if pattern.search(text):
-                errors.append(f"{label}: {path}")
+        if path_str not in PATTERN_EXEMPT_PATHS:
+            for label, pattern in CONTENT_PATTERNS.items():
+                if pattern.search(text):
+                    errors.append(f"{label}: {path}")
         if has_private_text_fingerprint(text):
             errors.append(f"private-example-fingerprint: {path}")
     return errors
 
 
-def main() -> int:
-    paths = tracked_files()
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--include-untracked",
+        action="store_true",
+        help="also scan non-ignored untracked files for a local release check",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    paths = existing_files(repository_files(include_untracked=args.include_untracked))
     errors = check_paths(paths) + check_content(paths)
     if errors:
         print("Public hygiene check failed:")
         for error in errors:
             print(f"- {error}")
         return 1
-    print(f"Public hygiene check passed for {len(paths)} tracked files.")
+    scope = "tracked and untracked" if args.include_untracked else "tracked"
+    print(f"Public hygiene check passed for {len(paths)} {scope} files.")
     return 0
 
 

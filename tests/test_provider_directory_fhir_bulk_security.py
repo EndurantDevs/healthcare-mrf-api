@@ -41,7 +41,6 @@ def test_bulk_checkpoint_encryption_fails_closed_without_any_configured_key(monk
         "HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY",
         "HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_PREVIOUS_KEYS",
         "HLTHPRT_CONTROL_API_TOKEN",
-        "HLTHPRT_IMPORT_CONTROL_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -71,7 +70,6 @@ def test_bulk_checkpoint_decryption_survives_key_rotation(monkeypatch):
         "HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_PREVIOUS_KEYS",
         raising=False,
     )
-    monkeypatch.delenv("HLTHPRT_IMPORT_CONTROL_TOKEN", raising=False)
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "old-control-secret")
     ciphertext = importer._encrypt_bulk_capability("https://status.example/job/1")
 

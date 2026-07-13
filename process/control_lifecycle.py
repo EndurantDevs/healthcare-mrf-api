@@ -109,7 +109,7 @@ async def control_single_job_start(
             status="failed",
             phase_detail=f"{target_function} failed",
             progress_message="failed",
-            error={"code": "import_failed", "message": str(exc).strip() or type(exc).__name__}, metrics=_terminal_metrics_from_context(ctx.get("context")),
+            error=_control_failure_error(exc), metrics=_terminal_metrics_from_context(ctx.get("context")),
         )
         await _flush_terminal_status_events()
         raise
@@ -162,7 +162,7 @@ async def _live_progress_heartbeat(run_id: str, importer: str, target_function: 
             pct=0,
             message="running",
             started_at=started_at,
-            source="import-control-heartbeat",
+            source="engine-heartbeat",
             confidence="heartbeat",
         )
 
@@ -494,3 +494,16 @@ def _isolated_control_job_context(ctx: dict[str, Any], run_id: str) -> dict[str,
         job_context_map.pop("control_run_id", None)
     isolated_context_map["context"] = job_context_map
     return isolated_context_map
+
+
+def _control_failure_error(exc: Exception) -> dict[str, Any]:
+    """Preserve stable retry semantics exposed by importer-specific errors."""
+
+    error = {
+        "code": str(getattr(exc, "control_error_code", "import_failed")),
+        "message": str(exc).strip() or type(exc).__name__,
+    }
+    retryable = getattr(exc, "retryable", None)
+    if isinstance(retryable, bool):
+        error["retryable"] = retryable
+    return error

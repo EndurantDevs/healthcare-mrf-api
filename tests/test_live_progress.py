@@ -5,7 +5,7 @@ from process import live_progress
 
 def test_heartbeat_preserves_old_importer_progress():
     merged = {
-        "source": "import-control-heartbeat",
+        "source": "engine-heartbeat",
         "unit": "run",
         "done": 0,
         "total": 1,

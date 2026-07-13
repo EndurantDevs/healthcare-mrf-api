@@ -98,15 +98,11 @@ Verified directly: the pricing files themselves contain **no postal addresses**.
   `content_addressed_path` — artifact file addressing, not postal.
   `ptg_parts/allowed_amounts.py`, `ptg_parts/source_download.py`,
   `ptg_control.py`, `ms_drg.py`: zero postal-address handling.
-- Addresses enter PTG2 only at serving time, by joining pricing NPIs to
-  upstream address tables in priority order
-  (`process/ptg_parts/serving_maintenance.py:236-309`):
-  priority 1 `doctor_clinician_address`, priority 2 `entity_address_unified`,
-  priority 3 `npi_address` — then one best row per NPI becomes
-  `ptg2_provider_location` with
-  `location_hash = md5(npi|source|zip5|city_norm|state)` (`:325`) and a
-  denormalized `address_payload` JSON. Note the hash is deliberately
-  city/zip-grained (no street component).
+- Addresses enter strict PTG serving only at request time. The pricing reader
+  joins the snapshot's NPIs to the current `entity_address_unified` projection
+  and falls back to `npi_address` when the unified row is incomplete
+  (`api/ptg2_serving.py`). No snapshot-local provider-location table or
+  denormalized address payload is published.
 - Therefore PTG2 **inherits** address quality from upstream for most rows, but
   the `ptg_address` projection also stages its source address text into the
   canonical archive before publishing (`source_bit=128, priority=8`). The

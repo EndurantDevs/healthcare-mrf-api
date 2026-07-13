@@ -4,7 +4,7 @@
 
 PTG and large MRF imports have highly variable memory profiles. A small PTG
 file can finish quickly with a few GiB, while a UHC-style file can exceed 50
-GiB during compact serving. The import-control plane must schedule these jobs
+GiB during compact serving. The external orchestration layer must schedule these jobs
 by expected memory and worker profile, not by a single global PTG slot.
 
 ## Decisions

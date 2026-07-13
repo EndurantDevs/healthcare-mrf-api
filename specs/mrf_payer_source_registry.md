@@ -11,7 +11,7 @@ configuration or active repository references.
 
 There is no federal master index of payer Transparency in Coverage MRF URLs. CMS defines the rule
 and schema, while payers, issuers, employers, TPAs, and platform vendors publish their own entry
-points. The durable HealthPorta layer is therefore a curated source list plus periodic metadata
+points. The durable catalog layer is therefore a curated source list plus periodic metadata
 recrawls.
 
 Key consequences:
@@ -90,7 +90,7 @@ The importer writes these local catalog tables:
 4. Optionally `HEAD` source URLs with SSRF protections.
 5. Optionally resolve platform URLs and crawl TOC/index metadata.
 6. Upsert plan/file rows and URL observations.
-7. Optionally sync public source seeds and discovered plans to `import-control`.
+7. Optionally expose public source seeds and discovered plans to an external catalog.
 8. Use `--probe-files` for metadata-only body-file `HEAD` checks.
 
 ## Maintenance
@@ -99,7 +99,7 @@ The importer writes these local catalog tables:
 - Do not add temporary signed body-file URLs. Store stable TOC, index, lookup, or landing URLs.
 - Use one-time external research to refresh the master list, then remove provider-specific scripts,
   URLs, and docs references from runtime code.
-- Configure cadence in `import-control`, not cron or Python defaults.
+- Configure cadence in an external scheduler, not Python defaults.
 - Keep `docs/data-sources.md`, `docs/imports/mrf-source-discovery.md`, and this spec in sync when
   source-discovery behavior changes.
 

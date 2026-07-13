@@ -11,19 +11,41 @@ from typing import Any
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
+from process.ptg_parts.ptg2_shared_gc import release_unbound_ptg2_shared_layouts
 from process.ptg_parts.snapshot_cleanup import (
-    _all_snapshot_manifest_rows,
-    _drop_ptg2_snapshot_table_names,
-    _exclusively_owned_snapshot_table_names,
     _is_ptg2_snapshot_in_flight,
-    _missing_snapshot_serving_resources,
-    _snapshot_manifest_table_names,
+    is_strict_ptg2_v3_shared_blocks_manifest,
 )
-from process.ptg_parts.source_pointers import PTG2_SOURCE_POINTER_GC_LOCK_KEY, _source_plan_rows
+from process.ptg_parts.source_pointers import (
+    PTG2_SOURCE_POINTER_GC_LOCK_KEY,
+    PTG2SourcePointerConflict,
+    activate_ptg2_source_candidate,
+)
 
 
 class SourceSnapshotConflict(ValueError):
     """Raised when a source snapshot pointer changed between plan and execute."""
+
+
+class _TransactionExecutor:
+    """Expose the current SQLAlchemy transaction through the shared-GC interface."""
+
+    def __init__(self, session: Any):
+        self._session = session
+
+    async def all(self, statement: Any, **params: Any) -> list[Any]:
+        result = await self._session.execute(
+            _text(statement) if isinstance(statement, str) else statement,
+            params,
+        )
+        return result.all()
+
+    async def status(self, statement: Any, **params: Any) -> int | None:
+        result = await self._session.execute(
+            _text(statement) if isinstance(statement, str) else statement,
+            params,
+        )
+        return getattr(result, "rowcount", None)
 
 
 def _schema_name() -> str:
@@ -48,14 +70,6 @@ def _manifest_dict(value: Any) -> dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
-
-
-def _date_value(value: Any) -> datetime.date:
-    if isinstance(value, datetime.date):
-        return value
-    if isinstance(value, str) and value:
-        return datetime.date.fromisoformat(value[:10])
-    return datetime.date.today()
 
 
 def _snapshot_remove_reasons(
@@ -103,6 +117,10 @@ def _retirement_manifest_source_key(
         else {}
     )
     manifest_source_key = str(serving_index_map.get("source_key") or "").strip() or None
+    if not is_strict_ptg2_v3_shared_blocks_manifest(serving_index_map):
+        raise ValueError(
+            "only postgres_binary_v3/shared_blocks_v3 snapshots can be retired"
+        )
     snapshot_status = str(snapshot.get("status") or "").strip().lower()
     if _is_ptg2_snapshot_in_flight(snapshot_status):
         raise ValueError(f"snapshot is in-flight (status: {snapshot_status})")
@@ -117,103 +135,21 @@ async def promote_ptg2_source_snapshot(
     snapshot_id: str,
     expected_current_snapshot_id: str | None = None,
 ) -> dict[str, Any]:
-    """Atomically point a source and its plan rows at a published snapshot."""
-    source_key = str(source_key or "").strip()
+    """Activate one audited strict-V3 candidate and all of its live pointers."""
+    source_key = str(source_key or "").strip().lower()
     snapshot_id = str(snapshot_id or "").strip()
     if not source_key or not snapshot_id:
         raise ValueError("source_key and snapshot_id are required")
-    schema = _schema_name()
-    async with db.transaction() as session:
-        await _lock_source_pointer_gc(session)
-        snapshot = await _snapshot_row(schema, snapshot_id)
-        if not snapshot:
-            raise ValueError("snapshot not found")
-        if str(snapshot.get("status") or "").strip().lower() != "published":
-            raise ValueError("snapshot is not published")
-        manifest = _manifest_dict(snapshot.get("manifest"))
-        serving_index = manifest.get("serving_index") if isinstance(manifest.get("serving_index"), dict) else {}
-        manifest_source_key = str(serving_index.get("source_key") or "").strip()
-        if manifest_source_key and manifest_source_key != source_key:
-            raise ValueError("snapshot source_key does not match requested source_key")
-        missing_tables, missing_artifacts = await _missing_snapshot_serving_resources(
-            schema,
-            snapshot_id,
-            serving_index,
-        )
-        if missing_tables:
-            raise ValueError(f"snapshot serving tables are missing: {', '.join(missing_tables)}")
-        if missing_artifacts:
-            raise ValueError(f"snapshot serving artifacts are missing: {', '.join(missing_artifacts)}")
-        current_snapshot_id, rollback_snapshot_id = await _current_source_snapshot_state(schema, source_key)
-        if expected_current_snapshot_id is not None and str(expected_current_snapshot_id or "") != str(
-            current_snapshot_id or ""
-        ):
-            raise SourceSnapshotConflict("current source snapshot changed")
-        previous_snapshot_id = rollback_snapshot_id if current_snapshot_id == snapshot_id else current_snapshot_id
-        import_month = _date_value(snapshot.get("import_month"))
-        updated_at = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-        plan_rows = await _source_plan_rows(
-            snapshot_id=snapshot_id,
+    try:
+        result = await activate_ptg2_source_candidate(
             source_key=source_key,
-            import_month=import_month,
-            previous_snapshot_id=previous_snapshot_id,
-            updated_at=updated_at,
-            serving_index=serving_index,
+            snapshot_id=snapshot_id,
+            expected_current_snapshot_id=expected_current_snapshot_id,
         )
-        if not plan_rows:
-            raise ValueError("snapshot has no plan source rows")
-        await session.execute(
-            _text(
-                f"""
-                INSERT INTO {_quote_ident(schema)}.ptg2_current_source_snapshot
-                    (source_key, snapshot_id, previous_snapshot_id, import_month, updated_at)
-                VALUES (:source_key, :snapshot_id, :previous_snapshot_id, :import_month, :updated_at)
-                ON CONFLICT (source_key) DO UPDATE SET
-                    snapshot_id = EXCLUDED.snapshot_id,
-                    previous_snapshot_id = EXCLUDED.previous_snapshot_id,
-                    import_month = EXCLUDED.import_month,
-                    updated_at = EXCLUDED.updated_at
-                """
-            ),
-            {
-                "source_key": source_key,
-                "snapshot_id": snapshot_id,
-                "previous_snapshot_id": previous_snapshot_id,
-                "import_month": import_month,
-                "updated_at": updated_at,
-            },
-        )
-        await session.execute(
-            _text(f"DELETE FROM {_quote_ident(schema)}.ptg2_current_plan_source WHERE source_key = :source_key"),
-            {"source_key": source_key},
-        )
-        for row in plan_rows:
-            await session.execute(
-                _text(
-                    f"""
-                    INSERT INTO {_quote_ident(schema)}.ptg2_current_plan_source
-                        (plan_source_key, plan_id, plan_market_type, import_month, source_key, snapshot_id, previous_snapshot_id, updated_at)
-                    VALUES
-                        (:plan_source_key, :plan_id, :plan_market_type, :import_month, :source_key, :snapshot_id, :previous_snapshot_id, :updated_at)
-                    ON CONFLICT (plan_source_key) DO UPDATE SET
-                        plan_id = EXCLUDED.plan_id,
-                        plan_market_type = EXCLUDED.plan_market_type,
-                        import_month = EXCLUDED.import_month,
-                        source_key = EXCLUDED.source_key,
-                        snapshot_id = EXCLUDED.snapshot_id,
-                        previous_snapshot_id = EXCLUDED.previous_snapshot_id,
-                        updated_at = EXCLUDED.updated_at
-                    """
-                ),
-                row,
-            )
+    except PTG2SourcePointerConflict as exc:
+        raise SourceSnapshotConflict(str(exc)) from exc
     _clear_ptg2_snapshot_cache()
-    return {
-        "source_key": source_key,
-        "snapshot_id": snapshot_id,
-        "previous_snapshot_id": previous_snapshot_id,
-        "plan_source_count": len(plan_rows),
-    }
+    return result
 
 
 async def build_ptg2_source_snapshot_remove_plan(
@@ -241,15 +177,22 @@ async def build_ptg2_source_snapshot_remove_plan(
         }
     manifest = _manifest_dict(snapshot.get("manifest"))
     serving_index = manifest.get("serving_index") if isinstance(manifest.get("serving_index"), dict) else {}
+    if not is_strict_ptg2_v3_shared_blocks_manifest(serving_index):
+        return {
+            "snapshot_id": snapshot_id,
+            "source_key": source_key,
+            "exists": True,
+            "removable": False,
+            "reason": "only postgres_binary_v3/shared_blocks_v3 snapshots can be removed",
+            "metadata_only": True,
+            "tables": [],
+            "artifact_manifest_ids": [],
+            "current_references": {},
+            "status": snapshot.get("status"),
+            "import_month": str(snapshot.get("import_month") or ""),
+        }
     manifest_source_key = str(serving_index.get("source_key") or "").strip() or None
     references = await _current_references(schema, snapshot_id)
-    manifest_tables = _snapshot_manifest_table_names(serving_index)
-    all_snapshot_rows = await _all_snapshot_manifest_rows(db, schema_name=schema)
-    tables = _exclusively_owned_snapshot_table_names(
-        snapshot_id,
-        manifest_tables,
-        all_snapshot_rows,
-    )
     artifact_ids = await _artifact_manifest_ids(schema, snapshot_id)
     snapshot_status = str(snapshot.get("status") or "").strip().lower()
     reasons = _snapshot_remove_reasons(
@@ -265,7 +208,7 @@ async def build_ptg2_source_snapshot_remove_plan(
         "removable": not reasons,
         "reason": "; ".join(reasons) if reasons else None,
         "metadata_only": False,
-        "tables": tables,
+        "tables": [],
         "artifact_manifest_ids": artifact_ids,
         "current_references": references,
         "status": snapshot.get("status"),
@@ -290,11 +233,21 @@ async def remove_ptg2_source_snapshot(
                 **plan,
                 "executed": True,
                 "deleted_tables": 0,
+                "deleted_v3_snapshot_scopes": 0,
+                "deleted_v3_snapshot_bindings": 0,
                 "deleted_artifact_manifests": 0,
                 "deleted_snapshots": 0,
+                "released_shared_layouts": 0,
             }
-        tables = [str(value) for value in plan.get("tables") or []]
-        await _drop_ptg2_snapshot_table_names(tables)
+        tables: list[str] = []
+        deleted_v3_snapshot_scopes = await db.status(
+            f"DELETE FROM {_quote_ident(schema)}.ptg2_v3_snapshot_scope WHERE snapshot_id = :snapshot_id",
+            snapshot_id=snapshot_id,
+        )
+        deleted_v3_snapshot_bindings = await db.status(
+            f"DELETE FROM {_quote_ident(schema)}.ptg2_v3_snapshot_binding WHERE snapshot_id = :snapshot_id",
+            snapshot_id=snapshot_id,
+        )
         artifact_ids = [str(value) for value in plan.get("artifact_manifest_ids") or []]
         deleted_artifact_chunks = 0
         if artifact_ids:
@@ -311,13 +264,25 @@ async def remove_ptg2_source_snapshot(
             f"DELETE FROM {_quote_ident(schema)}.ptg2_snapshot WHERE snapshot_id = :snapshot_id",
             snapshot_id=snapshot_id,
         )
+        shared_layout_release = None
+        if int(deleted_v3_snapshot_bindings or 0) > 0:
+            shared_layout_release = await release_unbound_ptg2_shared_layouts(
+                schema_name=schema,
+                executor=_TransactionExecutor(session),
+                require_shared=True,
+            )
     return {
         **plan,
         "executed": True,
         "deleted_tables": len(tables),
+        "deleted_v3_snapshot_scopes": int(deleted_v3_snapshot_scopes or 0),
+        "deleted_v3_snapshot_bindings": int(deleted_v3_snapshot_bindings or 0),
         "deleted_artifact_chunks": int(deleted_artifact_chunks or 0),
         "deleted_artifact_manifests": int(deleted_artifacts or 0),
         "deleted_snapshots": int(deleted_snapshots or 0),
+        "released_shared_layouts": int(
+            getattr(shared_layout_release, "logical_layout_count", 0) or 0
+        ),
     }
 
 

@@ -50,6 +50,7 @@ from process.nucc import process_data as process_nucc_data
 from process.nucc import shutdown as nucc_shutdown
 from process.nucc import startup as nucc_startup
 from process.ptg import main as initiate_ptg
+from process.ptg_candidate_audit import main as initiate_ptg_candidate_audit
 from process.ptg_control import ptg_control_start
 from process.claims_pricing import (claims_pricing_finalize,
                                     claims_pricing_process_chunk,
@@ -258,6 +259,31 @@ class PTGHuge:
     functions = _ptg_control_functions(job_timeout)
     burst = True
     queue_name = "arq:PTGHuge"
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class PTGCandidateAudit:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = max(
+        _worker_int_env("HLTHPRT_MAX_PTG_CANDIDATE_AUDIT_JOBS", 1),
+        1,
+    )
+    queue_read_limit = max(
+        _worker_int_env(
+            "HLTHPRT_PTG_CANDIDATE_AUDIT_QUEUE_READ_LIMIT",
+            max_jobs,
+        ),
+        1,
+    )
+    queue_name = "arq:PTGCandidateAudit"
+    job_timeout = _worker_int_env(
+        "HLTHPRT_PTG_CANDIDATE_AUDIT_JOB_TIMEOUT",
+        172800,
+    )
+    burst = True
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job
@@ -1001,6 +1027,30 @@ def ptg(
     )
 
 
+@click.command(help="Audit and activate one validated strict-V3 PTG candidate")
+@click.option(
+    "--candidate-run-id",
+    required=True,
+    help="Public PTG candidate import run id.",
+)
+@click.option("--snapshot-id", help="Optional snapshot id corroboration.")
+@click.option("--import-id", help="Optional PTG import id corroboration.")
+def ptg_candidate_audit(
+    candidate_run_id: str,
+    snapshot_id: str | None,
+    import_id: str | None,
+):
+    """Run the release audit that can activate one strict V3 candidate."""
+
+    _run(
+        initiate_ptg_candidate_audit(
+            candidate_run_id=candidate_run_id,
+            snapshot_id=snapshot_id,
+            import_id=import_id,
+        )
+    )
+
+
 @click.command(help="Run NUCC Taxonomy Import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def nucc(test: bool):
@@ -1611,8 +1661,6 @@ def address_archive_v2_migrate(
 @click.option("--file-probe-types", help="Comma-separated file types to probe. Defaults to in-network,allowed-amounts.")
 @click.option("--file-probe-entity-types", help="Comma-separated payer entity types to probe, for example tpa or network/tpa.")
 @click.option("--file-probe-payer-query", help="Case-insensitive payer-name substring for file probes.")
-@click.option("--sync-import-control", is_flag=True, help="Push discovered source seeds to the configured import-control service.")
-@click.option("--sync-import-control-catalog", is_flag=True, help="Also publish discovered sources into the import-control searchable catalog.")
 @click.option("--max-toc-bytes", type=int, help="Maximum TOC/index response bytes to fetch during discovery.")
 @click.option("--concurrency", type=int, default=None, help="Maximum concurrent URL checks/TOC fetches. Defaults to 10.")
 @click.option("--crawl-target-limit", type=int, help="Maximum resolved TOC targets to crawl after platform expansion.")
@@ -1630,8 +1678,6 @@ def mrf_source_discovery_command(
     file_probe_types: str | None,
     file_probe_entity_types: str | None,
     file_probe_payer_query: str | None,
-    sync_import_control: bool,
-    sync_import_control_catalog: bool,
     max_toc_bytes: int | None,
     concurrency: int | None,
     crawl_target_limit: int | None,
@@ -1653,8 +1699,6 @@ def mrf_source_discovery_command(
             file_probe_types=file_probe_types,
             file_probe_entity_types=file_probe_entity_types,
             file_probe_payer_query=file_probe_payer_query,
-            sync_import_control=sync_import_control,
-            sync_import_control_catalog=sync_import_control_catalog,
             max_toc_bytes=max_toc_bytes or None,
             concurrency=concurrency or None,
             crawl_target_limit=crawl_target_limit or None,
@@ -1707,6 +1751,7 @@ process_group_end.add_command(pharmacy_license_end, "pharmacy-license")
 process_group.add_command(plan_attributes)
 process_group.add_command(npi)
 process_group.add_command(ptg)
+process_group.add_command(ptg_candidate_audit, name="ptg-candidate-audit")
 process_group.add_command(claims_pricing, name="claims-pricing")
 process_group.add_command(claims_procedures, name="claims-procedures")
 process_group.add_command(drug_claims, name="drug-claims")

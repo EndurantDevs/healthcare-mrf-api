@@ -8,7 +8,7 @@ Run `ms-drg` as a reference import after CMS MS-DRG releases change, or at least
 python main.py start ms-drg
 ```
 
-For import-control, configure importer `ms-drg` with default parameters:
+For an external scheduler, configure importer `ms-drg` with default parameters:
 
 ```json
 {

@@ -1,8 +1,8 @@
 //! PTG2 manifest identity and sidecar primitives.
 //!
-//! The active v2 scanner writes text hash keys directly into PostgreSQL COPY
-//! rows. Manifest keeps stable global content identities, then maps them to
-//! deterministic snapshot-local dense ids for the hot serving tables.
+//! The strict V3 scanner writes canonical hash keys directly into PostgreSQL
+//! COPY rows. Manifest keeps stable global content identities and emits the
+//! membership artifacts consumed by the shared graph converter.
 
 use crate::hashing::{canonical_json, update_hash_optional_str, update_hash_string_list};
 use serde_json::Value;
@@ -96,24 +96,30 @@ pub fn procedure_global_id(procedure_payload: &Value) -> GlobalId128 {
     GlobalId128::from_domain_payload("procedure_manifest", procedure_payload)
 }
 
-pub fn provider_set_global_id_from_group_hashes(provider_group_hashes: &[i64]) -> GlobalId128 {
+pub fn provider_set_global_id_from_group_hashes_and_network_names(
+    provider_group_hashes: &[i64],
+    network_names: &[String],
+) -> GlobalId128 {
     let mut sorted_group_hashes = provider_group_hashes.to_vec();
     sorted_group_hashes.sort_unstable();
     sorted_group_hashes.dedup();
+    let mut sorted_network_names = network_names.to_vec();
+    sorted_network_names.sort_unstable();
+    sorted_network_names.dedup();
 
     let mut hasher = Xxh3::new();
-    hasher.update(b"provider_set_manifest");
+    hasher.update(b"provider_set_network_manifest_v1");
     for provider_group_hash in sorted_group_hashes {
-        hasher.update(b"\x1f");
+        hasher.update(b"\x1fgroup:");
         hasher.update(&provider_group_hash.to_le_bytes());
     }
+    update_hash_string_list(&mut hasher, &sorted_network_names);
     GlobalId128(hasher.digest128().to_le_bytes())
 }
 
 pub fn price_set_global_id_from_atom_ids(price_atom_ids: &[GlobalId128]) -> GlobalId128 {
     let mut sorted_atom_ids = price_atom_ids.to_vec();
     sorted_atom_ids.sort_unstable();
-    sorted_atom_ids.dedup();
 
     let mut hasher = Xxh3::new();
     hasher.update(b"price_set_manifest");
@@ -300,26 +306,46 @@ mod tests {
     }
 
     #[test]
-    fn provider_set_global_id_sorts_and_dedupes_members() {
-        let first = provider_set_global_id_from_group_hashes(&[1, 2, 3]);
-        let second = provider_set_global_id_from_group_hashes(&[3, 2, 1, 3]);
-        let different_members = provider_set_global_id_from_group_hashes(&[1, 2, 4]);
+    fn provider_set_global_id_sorts_and_dedupes_members_and_network_names() {
+        let first = provider_set_global_id_from_group_hashes_and_network_names(
+            &[1, 2, 3],
+            &["Network A".to_string(), "Network B".to_string()],
+        );
+        let second = provider_set_global_id_from_group_hashes_and_network_names(
+            &[3, 2, 1, 3],
+            &[
+                "Network B".to_string(),
+                "Network A".to_string(),
+                "Network A".to_string(),
+            ],
+        );
+        let different_members = provider_set_global_id_from_group_hashes_and_network_names(
+            &[1, 2, 4],
+            &["Network A".to_string(), "Network B".to_string()],
+        );
+        let different_network = provider_set_global_id_from_group_hashes_and_network_names(
+            &[1, 2, 3],
+            &["Network C".to_string()],
+        );
 
         assert_eq!(first, second);
         assert_eq!(first.to_hex().len(), 32);
         assert_ne!(first, different_members);
+        assert_ne!(first, different_network);
     }
 
     #[test]
-    fn price_set_global_id_sorts_and_dedupes_atom_ids() {
+    fn price_set_global_id_sorts_atom_ids_and_preserves_multiplicity() {
         let high = GlobalId128([9; GLOBAL_ID_BYTES]);
         let low = GlobalId128([1; GLOBAL_ID_BYTES]);
 
         let first = price_set_global_id_from_atom_ids(&[high, low, high]);
-        let second = price_set_global_id_from_atom_ids(&[low, high]);
+        let reordered = price_set_global_id_from_atom_ids(&[high, high, low]);
+        let deduplicated = price_set_global_id_from_atom_ids(&[low, high]);
         let different = price_set_global_id_from_atom_ids(&[low]);
 
-        assert_eq!(first, second);
+        assert_eq!(first, reordered);
+        assert_ne!(first, deduplicated);
         assert_ne!(first, different);
     }
 

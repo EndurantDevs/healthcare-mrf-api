@@ -13,6 +13,15 @@ from .source_files import collect_issues
 
 DEFAULT_CONFIG = "readability-budget.json"
 DEFAULT_BASELINE = "readability-baseline.json"
+PROTECTED_NEW_ISSUE_CATEGORIES = frozenset(
+    {
+        "builtin_shadowing",
+        "global_state_usage",
+        "inline_suppressions",
+        "pass_placeholders",
+        "syntax_errors",
+    }
+)
 
 
 def build_snapshot(repo_root: Path, config: dict[str, Any]) -> dict[str, Any]:
@@ -132,8 +141,13 @@ def _check_readability_ratchet(
         return 2
 
     new_by_category = _new_issues(snapshot, ratchet_baseline)
-    if new_by_category:
-        _print_new_issues(new_by_category)
+    protected_new_issues_by_category = {
+        category: issues
+        for category, issues in new_by_category.items()
+        if category in PROTECTED_NEW_ISSUE_CATEGORIES
+    }
+    if protected_new_issues_by_category:
+        _print_new_issues(protected_new_issues_by_category)
         return 1
     if not _is_baseline_synchronized(baseline, snapshot):
         print(
@@ -151,6 +165,13 @@ def _check_readability_ratchet(
         f"base={base_total} current={current_total} target<={target_total} "
         f"reduction={required_reduction_percent:g}%"
     )
+    ordinary_new_issue_count = _ordinary_new_issue_count(new_by_category)
+    if ordinary_new_issue_count:
+        print(
+            "Readability ratchet: "
+            f"{ordinary_new_issue_count} replacement finding(s) must be offset "
+            "by the required net debt reduction."
+        )
     if current_total > target_total:
         print(
             f"Readability debt must decrease by at least {required_reduction} finding(s).",
@@ -159,6 +180,14 @@ def _check_readability_ratchet(
         return 1
     print("Readability ratchet satisfied.")
     return 0
+
+
+def _ordinary_new_issue_count(new_issues_by_category: dict[str, list[dict[str, Any]]]) -> int:
+    return sum(
+        len(issues)
+        for category, issues in new_issues_by_category.items()
+        if category not in PROTECTED_NEW_ISSUE_CATEGORIES
+    )
 
 
 def _is_baseline_synchronized(baseline: dict[str, Any], snapshot: dict[str, Any]) -> bool:

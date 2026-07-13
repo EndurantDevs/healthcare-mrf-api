@@ -7,6 +7,10 @@ import pytest
 from process import ptg_control
 
 
+async def _allow_active_run(_run_id):
+    return None
+
+
 @pytest.mark.asyncio
 async def test_ptg_control_start_maps_payload_to_ptg_main(monkeypatch):
     calls = []
@@ -20,6 +24,7 @@ async def test_ptg_control_start_maps_payload_to_ptg_main(monkeypatch):
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
     monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
     result = await ptg_control.ptg_control_start(
         {},
@@ -64,6 +69,7 @@ async def test_ptg_control_start_marks_failed_and_reraises_cancelled_ptg_main(mo
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
     monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
     monkeypatch.setattr(ptg_control, "_flush_terminal_status_events", fake_flush_terminal_status_events)
+    monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
     with pytest.raises(asyncio.CancelledError):
         await ptg_control.ptg_control_start(
@@ -106,6 +112,7 @@ async def test_ptg_control_start_records_ptg2_terminal_identity(monkeypatch):
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
     monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
     result = await ptg_control.ptg_control_start(
         {},
@@ -144,6 +151,7 @@ async def test_ptg_control_start_runs_live_progress_heartbeat(monkeypatch):
     monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
     monkeypatch.setattr(ptg_control, "_live_progress_heartbeat", fake_heartbeat)
     monkeypatch.setattr(ptg_control, "_stop_live_progress_heartbeat", fake_stop)
+    monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
     await ptg_control.ptg_control_start(
         {},
@@ -200,7 +208,7 @@ async def test_ptg_control_start_skips_stale_terminal_run(monkeypatch):
         raise AssertionError("stale PTG job should not mark run running")
 
     async def fake_db_first(*_args, **_kwargs):
-        return ("run_current", "planned", "canceled")
+        return ("canceled",)
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
     monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
@@ -218,43 +226,18 @@ async def test_ptg_control_start_skips_stale_terminal_run(monkeypatch):
     assert result == {
         "status": "skipped",
         "run_id": "run_old",
-        "source_file_import_id": "source_import_1",
-        "current_engine_run_id": "run_current",
         "reason": "run_canceled",
     }
 
 
 @pytest.mark.asyncio
-async def test_ptg_control_start_skips_superseded_source_import_run(monkeypatch):
-    async def fake_ptg_main(**_kwargs):
-        raise AssertionError("superseded PTG job should not start scanner")
-
-    async def fake_mark_control_run(*_args, **_kwargs):
-        raise AssertionError("superseded PTG job should not mark run running")
-
+async def test_ptg_stale_job_check_allows_nonterminal_local_run(monkeypatch):
     async def fake_db_first(*_args, **_kwargs):
-        return ("run_new", "queued", "queued")
+        return ("queued",)
 
-    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
-    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
     monkeypatch.setattr(ptg_control.db, "first", fake_db_first)
 
-    result = await ptg_control.ptg_control_start(
-        {},
-        {
-            "run_id": "run_old",
-            "source_file_import_id": "source_import_1",
-            "params": {"test_mode": True, "source_key": "demo_source"},
-        },
-    )
-
-    assert result == {
-        "status": "skipped",
-        "run_id": "run_old",
-        "source_file_import_id": "source_import_1",
-        "current_engine_run_id": "run_new",
-        "reason": "superseded_source_import_run",
-    }
+    assert await ptg_control._stale_ptg_job_result("run_old") is None
 
 
 @pytest.mark.asyncio
@@ -300,6 +283,7 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_CLASS", "process.PTGSmall")
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
     monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
     await ptg_control.ptg_control_start(
         {},
@@ -354,6 +338,7 @@ async def test_ptg_control_start_rejects_wrong_lane(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_QUEUE", "arq:PTGLarge")
     monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_CLASS", "process.PTGLarge")
     monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
     with pytest.raises(RuntimeError, match="expected arq:PTGSmall"):
         await ptg_control.ptg_control_start(

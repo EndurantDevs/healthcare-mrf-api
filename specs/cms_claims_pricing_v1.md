@@ -1,10 +1,10 @@
-# CMS Claims Pricing v1 (HealthPorta-style)
+# CMS Claims Pricing v1
 
 ## Scope
 
 This spec documents the first working pricing API for `healthcare-mrf-api` based on CMS claims data imports.
 
-- API surface: HealthPorta-style read-only v1 endpoints only.
+- API surface: public read-only v1 endpoints only.
 - Data source for v1: CMS claims datasets.
 - Ribbon API is used only as behavior reference; no Ribbon path or ID parity is implemented.
 

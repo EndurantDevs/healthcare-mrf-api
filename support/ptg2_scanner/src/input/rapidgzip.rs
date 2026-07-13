@@ -1,6 +1,6 @@
 //! Optional external rapidgzip reader used by the full scanner pass.
 
-use super::{is_gzip, lossy_utf8_reader, open_reader};
+use super::{is_gzip, open_reader, strict_utf8_reader};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
@@ -40,7 +40,10 @@ struct StderrCapture {
 
 impl StderrCapture {
     fn message(&self) -> String {
-        let mut message = String::from_utf8_lossy(&self.bytes).trim().to_owned();
+        let mut message = match std::str::from_utf8(&self.bytes) {
+            Ok(message) => message.trim().to_owned(),
+            Err(_) => "rapidgzip emitted non-UTF-8 stderr".to_owned(),
+        };
         if self.truncated {
             if !message.is_empty() {
                 message.push(' ');
@@ -385,7 +388,7 @@ pub fn open_full_scan_json_reader(
     compressed_bytes_read: Arc<AtomicU64>,
     rapidgzip: &RapidgzipConfig,
 ) -> io::Result<Box<dyn Read>> {
-    Ok(lossy_utf8_reader(open_full_scan_reader(
+    Ok(strict_utf8_reader(open_full_scan_reader(
         path,
         compressed_bytes_read,
         rapidgzip,

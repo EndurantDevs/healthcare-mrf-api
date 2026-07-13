@@ -81,7 +81,7 @@ other as described in 05.
       disposable Postgres database stamped at the prior revision; no-PostGIS
       path validated, checksum bridge PK fixed to `PRIMARY KEY(checksum)`.
       With-PostGIS matrix validated on
-      `healthporta_address_canon_postgis_test` with PostGIS `3.6.1`; upgrade
+      `mrf_address_canon_postgis_test` with PostGIS `3.6.1`; upgrade
       and downgrade/upgrade paths created `address_archive_v2_geo_idx`.
 - [x] **1.4 (M)** `stamp_address_keys` + `resolve_into_archive` helpers with
       advisory lock, `SET LOCAL work_mem`/`statement_timeout`, ResolveStats
@@ -118,7 +118,7 @@ other as described in 05.
       model deploy (staging-class cache).
       AC: documented in `docs/devops/`; control-plane restart hook if available.
       Status: documented in `docs/devops/address-canonical.md`; no worker
-      restart hook is currently exposed by the control plane.
+      restart hook is currently exposed through the authenticated operator API.
 
 ## Review findings R1–R17 (2026-06-11) — fix before production enablement
 
@@ -135,7 +135,7 @@ result was produced with the buggy identity).
       runs a hardcoded 7-file list; `test_address_canonical_unit.py`,
       `test_address_checksum_schema.py`, `test_address_canonical_db.py` are
       absent, and the DB suite silently skips (8 skipped) unless
-      `HLTHPRT_DB_DATABASE` contains "test" (conftest defaults `healthporta`).
+      `HLTHPRT_DB_DATABASE` contains "test" (conftest defaults `mrf_dev`).
       AC: unit + schema tests run in CI now; DB suite runs against a CI
       Postgres service (or a follow-up task with an explicit date); a failing
       golden-corpus case fails CI.
@@ -360,7 +360,7 @@ result was produced with the buggy identity).
 
 These are not blockers for correctness, but they must be fixed before claiming
 the Phase 2.4 NPPES wall-time AC. They were observed during a real local
-`npi` rebuild on `healthporta` with `HLTHPRT_ADDRESS_CANON_SOURCES=nppes`,
+`npi` rebuild on `mrf_dev` with `HLTHPRT_ADDRESS_CANON_SOURCES=nppes`,
 `HLTHPRT_ADDRESS_ARCHIVE_TABLE=address_archive_v2`, and
 `HLTHPRT_ADDRESS_ARCHIVE_CUTOVER=1`, and confirmed on the dev host during the
 ordered `nucc` -> `npi` full import.
@@ -445,7 +445,7 @@ ordered `nucc` -> `npi` full import.
       correct core rows but 0 `npi_phone_staffing` rows. A later ordered run
       without `HLTHPRT_ADDRESS_CANON_SOURCES` populated staffing but published
       0 `address_key` values. AC: full NPI runs either validate prerequisites
-      before starting or fail fast with an actionable message; import-control
+      before starting or fail fast with an actionable message; the external scheduler
       schedules `nucc` before `npi`; canonical validation requires
       `HLTHPRT_ADDRESS_CANON_SOURCES=nppes` and archive cutover flags when the
       address-canonical path is expected.
@@ -682,7 +682,7 @@ local suite `942 passed` against the disposable Postgres `5440` test database.
       gated by `raw_signature`).
 - [ ] **6.2 (L)** Merge machinery: `address_match_candidate` queue,
       `address_merge_log`, `merged_into` resolution in archive reads; admin
-      review endpoint in the control plane; PLUS the candidate-generation
+      review endpoint in the operator interface; PLUS the candidate-generation
       batch job (02 §queue-filling): blocked comparison (`zip5+house token` /
       `premise_key` / 25m GiST), component scoring with `pg_trgm` street
       similarity + geocode-distance buckets. Review-only — no auto-merge path

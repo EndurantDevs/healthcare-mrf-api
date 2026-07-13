@@ -2,165 +2,106 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
-import gc
 import hashlib
 import json
 import os
 import re
-import time
-from collections import OrderedDict, defaultdict
-from contextlib import contextmanager
+from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
-from string import Template
-from typing import Any, Iterable, Mapping
+from decimal import Decimal, InvalidOperation
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
-from sqlalchemy import bindparam, text
+from sqlalchemy import text
 
+from db.connection import db as sa_db
+
+from api.ptg2_address_policy import (
+    PTG2_LEGACY_ADDRESS_COLUMNS as _PTG2_LEGACY_ADDRESS_COLUMNS,
+    PTG2_UNIFIED_ADDRESS_COLUMNS as _PTG2_UNIFIED_ADDRESS_COLUMNS,
+    PTG_CONTACT_DETAIL_FIELDS,
+    PTG_NO_DISPLAY_ADDRESS_FIELDS,
+    PTG_NO_DISPLAY_VERIFICATION_FIELDS,
+)
 from api.code_systems import EQUIVALENT_PROCEDURE_CODE_SYSTEMS, canonical_catalog_code, catalog_code_lookup_values
 from api.endpoint.pagination import PaginationParams
 from api.ptg2_code_filters import (
     INFERRED_PROVIDER_TAXONOMY_RULES,
     INTERNAL_PROCEDURE_CODE_SYSTEM,
-    PROCEDURE_CODE_SYSTEMS,
     InferredProviderTaxonomyRule,
-    _append_code_filter,
-    _append_resolved_code_filter,
-    _inferred_provider_taxonomy_sql,
-    _is_external_procedure_code_text,
-    _is_signed_int_text,
     _normalize_code,
     _normalize_code_system,
     _normalize_npi,
-    _normalize_taxonomy_code,
     _ptg2_code_query_fields,
-    _qualify_compact_filters,
-)
-from api.ptg2_index_cache import (
-    PTG2_ARTIFACT_KIND_SNAPSHOT_INDEX,
-    PTG2_INDEX_CACHE_TTL_SECONDS,
-    PTG2_RESPONSE_CACHE_MAX_KEYS,
-    PTG2_RESPONSE_CACHE_TTL_SECONDS,
-    _CACHE_MISS,
-    _PTG2_INDEX_CACHE,
-    _artifact_root,
-    _path_from_uri,
-    _ptg2_response_cache_get,
-    _ptg2_response_cache_key,
-    _ptg2_response_cache_set,
-    clear_ptg2_index_cache,
-    load_ptg2_index_from_path,
 )
 from api.ptg2_code_details import _enrich_ptg2_code_details
+from api.ptg2_candidate_audit import candidate_audit_access_from_args
 from api.ptg2_code_context import (
-    _query_ptg2_code_crosswalk_edges,
     _resolve_ptg2_code_search_context,
 )
 from api.ptg2_snapshot import (
-    current_snapshot_id,
-    current_source_snapshot_id_for_plan,
     current_source_snapshot_ids_for_plan,
-    load_current_ptg2_index,
     resolve_current_ptg2_snapshot_id,
-    snapshot_artifact_uri,
 )
 from api.ptg2_response import (
-    PTG2_ITEM_DIAGNOSTIC_FIELDS,
-    PTG2_ITEM_SOURCE_FIELDS,
-    PTG2_QUERY_DIAGNOSTIC_FIELDS,
-    PTG2_QUERY_SOURCE_FIELDS,
     _canonical_catalog_code,
-    _canonical_price_row,
     _catalog_key,
     _coerce_json_payload,
     _coerce_numeric_rate,
-    _include_ptg2_details,
     _include_ptg2_sources,
-    _normalize_catalog_code_system,
     _normalize_filter_string_list,
     _normalize_price_payload,
     _normalize_string_list,
     _optional_decimal,
     _optional_float,
-    _price_component,
     _price_response_fields,
     _price_row_key,
     _request_bool,
     _shape_ptg2_response,
-    _summarize_price_payload,
-)
-from api.ptg2_price_sql import (
-    _empty_price_array_sql,
-    _normalized_price_join_sql,
-    _normalized_price_json_sql,
-    _price_atom_payload_sql,
-    _scalar_price_json_sql,
-    _typed_price_json_sql,
 )
 from api.ptg2_tables import (
-    _gin_index_available_for_column,
-    _index_available,
-    _is_compact_serving_table,
-    _ordered_serving_table_candidates,
-    _safe_table_name,
-    _serving_table_candidates,
-    _serving_table_available,
-    _serving_table_name,
-    snapshot_serving_table,
+    PTG2_V3_ARCH_VERSION,
     snapshot_serving_tables,
 )
-from api.ptg2_types import PTG2ServingIndex, PTG2ServingTables
-from api.ptg2_manifest_artifacts import search_ptg2_manifest_serving_snapshot
+from api.ptg2_types import PTG2ServingTables
 from api.ptg2_db_sidecars import (
-    db_artifact_entry_available,
-    lookup_atoms_by_price_id,
-    lookup_atoms_by_price_key,
-    lookup_global_sidecar_members_from_db,
-    lookup_global_sidecar_members_many_from_db,
     lookup_serving_binary_by_code_from_db,
+    lookup_serving_binary_by_code_prefix_from_db,
     lookup_binary_code_batch_from_db,
     lookup_price_ids_from_db,
-    lookup_serving_binary_by_provider_set_from_db,
-    lookup_serving_binary_by_provider_set_patterns_from_db,
-    lookup_serving_binary_by_provider_sets_patterns_from_db,
     serving_binary_code_block_exists,
-    lookup_binary_price_atoms_from_db,
-    lookup_serving_by_code_sidecar_from_db,
-    lookup_serving_by_provider_set_patterns_from_db,
-    lookup_serving_by_provider_set_sidecar_from_db,
-)
-from api.ptg2_db_serving_v3 import (
-    lookup_price_atom_memberships_from_db,
-    lookup_price_atoms_from_db,
-    lookup_provider_code_keys_from_db,
+    has_shared_provider_pages_in_db,
+    lookup_shared_code_page_from_db,
+    lookup_shared_graph_members_from_db,
+    lookup_shared_price_atom_memberships_from_db,
+    lookup_shared_price_atoms_from_db,
+    lookup_shared_provider_code_keys_from_db,
+    lookup_shared_provider_pages_from_db,
 )
 from api.ptg2_db_serving_v3_pages import (
     PTG2_SERVING_BINARY_V3_PAGE_ROWS,
     PTG2V3PageRecord,
     PTG2V3ProviderPage,
-    has_provider_pages_in_db,
-    lookup_code_page_from_db,
-    lookup_provider_pages_from_db,
 )
+from api.ptg2_shared_blocks import (
+    PTG2SharedBlockError,
+    PTG2_V3_GRAPH_GROUP_TO_NPI,
+    PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
+    PTG2_V3_GRAPH_NPI_TO_GROUP,
+    PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
+    fetch_snapshot_source_provenance,
+)
+from process.ptg_parts.ptg2_shared_blocks import PTG2_V3_SHARED_GENERATION
 from process.ext.contact_canon import canonicalize_one
-from process.ptg_parts.ptg2_manifest_artifacts import (
-    PTG2ManifestArtifactError,
-    lookup_global_sidecar_members,
-    lookup_global_sidecar_members_many,
-    lookup_serving_by_code_sidecar,
-    lookup_serving_by_provider_set_patterns,
-    lookup_serving_by_provider_set_sidecar,
-)
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from api.ptg2_serving_utils import (
     _normalize_zip5,
     _price_filter_clauses,
-    _provider_payload,
     _row_mapping,
     _uuid_to_hex,
 )
 from api.provider_specialty_filters import (
-    ProviderSpecialtyFilter,
     provider_specialty_taxonomy_exists_sql,
     provider_specialty_taxonomy_semijoin_sql,
     resolve_provider_specialty_filter,
@@ -169,48 +110,37 @@ from api.provider_specialty_filters import (
 PTG2_MODE_EXACT_SOURCE = "exact_source"
 PTG2_MODE_PRODUCT_SEARCH = "product_search"
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
-PTG2_WARM_P95_MAX_MS = max(float(os.getenv("HLTHPRT_PTG2_WARM_P95_MAX_MS", "50")), 1.0)
-PTG2_JSON_FALLBACK_ENV = "HLTHPRT_PTG2_ENABLE_JSON_FALLBACK"
-PTG2_SERVING_TABLE_ENV = "HLTHPRT_PTG2_SERVING_TABLE"
-PTG2_FAST_COMPACT_COUNTS_ENV = "HLTHPRT_PTG2_FAST_COMPACT_COUNTS"
 ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
-ADDRESS_SERVING_SOURCE_LEGACY = "legacy"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
-_PTG2_MANIFEST_SIDECAR_CACHE: dict[tuple[str, str, str], tuple[str, ...]] = {}
-_PTG2_RATE_SCOPE_CACHE_MAX_KEYS = max(int(os.getenv("HLTHPRT_PTG2_RATE_SCOPE_CACHE_MAX_KEYS", "1024")), 0)
-_PTG2_RATE_SCOPE_CACHE_MAX_IDS = max(int(os.getenv("HLTHPRT_PTG2_RATE_SCOPE_CACHE_MAX_IDS", "3000000")), 0)
 _PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT = 25
-_PTG2_MANIFEST_LOCATION_JIT_DISABLED_ATTR = "_ptg2_manifest_location_jit_disabled"
-_PTG2_TAXONOMY_INT_CODE_CACHE: dict[tuple[str, ...], tuple[int, ...]] = {}
-_PTG2_TABLE_COLUMNS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
+_PTG2_MULTI_NETWORK_CONCURRENCY_ENV = "HLTHPRT_PTG2_MULTI_NETWORK_CONCURRENCY"
+_PTG2_MULTI_NETWORK_CONCURRENCY_DEFAULT = 8
 
 
-@dataclass(frozen=True)
-class _ManifestProviderLocationQuery:
-    serving_tables: PTG2ServingTables
-    provider_group_location_table: str
-    provider_group_rate_scope_table: str
-    npi_data_table: str
-    has_npi_data: bool
-    provider_name_sql: str
-    location_select_sql: str
-    location_order_sql: str
-    limited_location_order_sql: str
-    params: dict[str, Any]
-    state_value: str | None
-    city_value: str | None
-    zip_value: str | None
-    geo_lat: float | None
-    geo_long: float | None
-    geo_radius_miles: float | None
-    location_specialty_filter: Any
-    location_inferred_taxonomy_sql: str
-    location_array_taxonomy_codes: tuple[Any, ...]
-    location_array_taxonomy_int_codes: tuple[int, ...]
-    rate_provider_group_ids: tuple[str, ...]
-    has_component_rate_scope: bool
-    member_scope_cte: str
-    is_provider_group_location_scope_empty: bool
+def _safe_table_name(value: Any, *, default_schema: str = PTG2_SCHEMA) -> str | None:
+    """Validate an auxiliary PostgreSQL relation name before interpolation."""
+
+    if not value:
+        return None
+    parts = str(value).strip().split(".", 1)
+    schema_name, table_name = (default_schema, parts[0]) if len(parts) == 1 else parts
+    identifier = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+    if not identifier.fullmatch(schema_name) or not identifier.fullmatch(table_name):
+        return None
+    return f"{schema_name}.{table_name}"
+
+
+async def _relation_available(session: Any, table_name: str) -> bool:
+    """Probe optional reference-data relations, never snapshot serving layouts."""
+
+    try:
+        result = await session.execute(
+            text("SELECT to_regclass(:table_name)"),
+            {"table_name": table_name},
+        )
+    except Exception:
+        return False
+    return bool(result.scalar())
 
 
 @dataclass(frozen=True)
@@ -218,606 +148,6 @@ class _ManifestRateScope:
     group_ids: tuple[str, ...]
     group_id_bytes: frozenset[bytes]
     id_count: int
-    fallback_group_ids: frozenset[str] = frozenset()
-
-
-@dataclass
-class _RateScopeCacheBudget:
-    total_ids: int = 0
-
-_PTG2_RATE_SCOPE_CACHE: OrderedDict[tuple[str, ...], _ManifestRateScope] = OrderedDict()
-_PTG2_RATE_SCOPE_CACHE_BUDGET = _RateScopeCacheBudget()
-
-
-@dataclass(frozen=True)
-class _ManifestProviderLocationScope:
-    cte_sql: str
-    join_sql: str
-    group_filter_sql: str | None
-    is_empty: bool = False
-
-
-def _manifest_provider_set_component_table(serving_tables: PTG2ServingTables) -> str | None:
-    if serving_tables.uses_sidecar_provider_scope:
-        return None
-    return _safe_table_name(serving_tables.provider_set_component_table)
-
-
-def _manifest_provider_group_rate_scope_table(serving_tables: PTG2ServingTables) -> str | None:
-    if serving_tables.uses_sidecar_provider_scope:
-        return None
-    return _safe_table_name(serving_tables.provider_group_rate_scope_table)
-
-
-async def _set_local_jit_off_for_manifest_location(session) -> None:
-    if getattr(session, _PTG2_MANIFEST_LOCATION_JIT_DISABLED_ATTR, False):
-        return
-    await session.execute(text("SET LOCAL jit = off"))
-    setattr(session, _PTG2_MANIFEST_LOCATION_JIT_DISABLED_ATTR, True)
-
-
-_PROVIDER_GROUP_LOCATION_SQL = """
-            WITH
-            {location_rate_scope_cte}
-            {location_zip_scope_cte}
-            raw_location_rows AS (
-                SELECT DISTINCT ON (loc.provider_group_global_id_128, loc.npi)
-                    loc.provider_group_global_id_128,
-                    loc.npi,
-                    loc.address_key::text AS address_key,
-                    loc.premise_key::text AS premise_key,
-                    ('entity_address_unified:' || loc.npi::varchar || ':' || COALESCE(loc.address_type, '') || ':' || COALESCE(loc.address_checksum, ''))::varchar AS location_hash,
-                    loc.state_name AS state,
-                    loc.city_name AS city,
-                    LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) AS zip5,
-                    {group_location_select_sql},
-                    'entity_address_unified'::varchar AS location_source,
-                    'entity_address_unified'::varchar AS location_confidence_code,
-                    loc.first_line,
-                    loc.second_line,
-                    loc.postal_code,
-                    loc.country_code,
-                    loc.address_precision,
-                    loc.formatted_address,
-                    loc.lat,
-                    loc.long,
-                    loc.telephone_number,
-                    loc.fax_number,
-                    loc.phone_number,
-                    loc.phone_extension,
-                    loc.fax_number_digits,
-                    loc.fax_extension,
-                    loc.address_type,
-                    loc.address_checksum
-                {provider_group_location_from_sql}
-                {location_rate_scope_join}
-                WHERE {location_where_sql}
-                  AND loc.address_type = ANY(CAST(:address_types AS varchar[]))
-                ORDER BY loc.provider_group_global_id_128,
-                    loc.npi,
-                    {group_location_order_sql},
-                    CASE loc.address_type
-                        WHEN 'practice' THEN 0
-                        WHEN 'primary' THEN 1
-                        WHEN 'secondary' THEN 2
-                        ELSE 3
-                    END,
-                    loc.address_checksum
-            ),
-            location_npis AS MATERIALIZED (
-                SELECT *
-                FROM raw_location_rows
-                ORDER BY {limited_location_order_sql}
-                LIMIT :limit
-            ),
-            located_with_tax AS MATERIALIZED (
-                SELECT
-                    loc.*,
-                    jsonb_build_object(
-                        'first_line', loc.first_line,
-                        'second_line', loc.second_line,
-                        'city', loc.city,
-                        'state', loc.state,
-                        'postal_code', loc.postal_code,
-                        'country_code', loc.country_code,
-                        'zip5', loc.zip5,
-                        'address_key', loc.address_key::text,
-                        'address_checksum', loc.address_checksum,
-                        'address_precision', loc.address_precision,
-                        'formatted_address', loc.formatted_address,
-                        'lat', loc.lat,
-                        'long', loc.long,
-                        'telephone_number', loc.telephone_number,
-                        'fax_number', loc.fax_number,
-                        'phone_number', loc.phone_number,
-                        'phone_extension', loc.phone_extension,
-                        'fax_number_digits', loc.fax_number_digits,
-                        'fax_extension', loc.fax_extension
-                    )::text AS address_payload,
-                    {provider_name_sql} AS provider_name,
-                    tax.taxonomy_codes,
-                    tax.specialties,
-                    tax.classifications,
-                    tax.specializations,
-                    tax.primary_specialty,
-                    tax.primary_specialization
-                FROM location_npis loc
-                {provider_location_join}
-                {provider_taxonomy_summary_lateral_sql}
-            )
-            SELECT
-                provider_group_global_id_128,
-                npi,
-                address_key,
-                premise_key,
-                location_hash,
-                state,
-                city,
-                zip5,
-                distance_miles,
-                zip_match_type,
-                anchor_zip5,
-                zip_radius_miles,
-                location_source,
-                location_confidence_code,
-                address_payload,
-                telephone_number,
-                fax_number,
-                phone_number,
-                phone_extension,
-                fax_number_digits,
-                fax_extension,
-                COALESCE(taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
-                COALESCE(specialties, ARRAY[]::varchar[]) AS specialties,
-                COALESCE(classifications, ARRAY[]::varchar[]) AS classifications,
-                COALESCE(specializations, ARRAY[]::varchar[]) AS specializations,
-                primary_specialty,
-                primary_specialization,
-                provider_name
-            FROM located_with_tax
-            """
-
-
-def _ptg2_manifest_provider_location_scope(
-    query_context: _ManifestProviderLocationQuery,
-) -> _ManifestProviderLocationScope:
-    if query_context.rate_provider_group_ids:
-        group_filter_sql = (
-            "loc.provider_group_global_id_128 = ANY("
-            f"CAST(:location_rate_provider_group_ids AS {_ptg2_manifest_id_array_cast(query_context.serving_tables)}))"
-        )
-        return _ManifestProviderLocationScope("", "", group_filter_sql)
-    if query_context.has_component_rate_scope:
-        if query_context.provider_group_rate_scope_table:
-            plan_filter, _ = _code_plan_scope_sql(
-                query_context.params.get("location_plan_id"),
-                column="rpg_location.plan_id",
-                param_name="location_plan_id",
-            )
-            route_filters = [
-                "rpg_location.provider_group_global_id_128 = loc.provider_group_global_id_128",
-                plan_filter,
-                _reported_code_param_filter(
-                    "rpg_location.reported_code",
-                    "location_reported_code",
-                    query_context.params,
-                ),
-            ]
-            if "location_reported_code_system" in query_context.params:
-                route_filters.append("rpg_location.reported_code_system = :location_reported_code_system")
-            join_sql = f"""
-                JOIN {query_context.provider_group_rate_scope_table} rpg_location
-                  ON {" AND ".join(route_filters)}"""
-            return _ManifestProviderLocationScope("", join_sql, "TRUE")
-        join_sql = """
-                JOIN rate_provider_groups rpg_location
-                  ON rpg_location.provider_group_global_id_128 = loc.provider_group_global_id_128"""
-        return _ManifestProviderLocationScope(query_context.member_scope_cte, join_sql, "TRUE")
-    if query_context.is_provider_group_location_scope_empty:
-        return _ManifestProviderLocationScope("", "", None, is_empty=True)
-    return _ManifestProviderLocationScope("", "", None)
-
-
-async def _manifest_provider_group_rate_scope_available(
-    session,
-    provider_group_rate_scope_table: str,
-    *,
-    plan_id: str,
-    reported_code: str,
-    code_system: str | None,
-) -> bool:
-    if not provider_group_rate_scope_table or not plan_id or not reported_code:
-        return False
-    plan_filter, _ = _code_plan_scope_sql(plan_id)
-    filters = [plan_filter]
-    params: dict[str, Any] = {
-        "plan_id": plan_id,
-    }
-    _append_reported_code_value_filter(
-        filters,
-        params,
-        column="reported_code",
-        param_name="reported_code",
-        values=_ptg2_reported_code_lookup_values(code_system, reported_code),
-    )
-    if code_system:
-        filters.append("reported_code_system = :reported_code_system")
-        params["reported_code_system"] = code_system
-    try:
-        result = await session.execute(
-            text(
-                f"""
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM {provider_group_rate_scope_table}
-                    WHERE {" AND ".join(filters)}
-                    LIMIT 1
-                )
-                """
-            ),
-            params,
-        )
-        return bool(result.scalar())
-    except Exception:
-        await _rollback_optional_ptg2_query(session)
-        return False
-
-
-async def _taxonomy_int_codes_for_codes(
-    session,
-    taxonomy_codes: Iterable[Any],
-) -> tuple[int, ...]:
-    normalized_codes = tuple(
-        dict.fromkeys(
-            str(code or "").strip().upper()
-            for code in taxonomy_codes
-            if str(code or "").strip()
-        )
-    )
-    if not normalized_codes:
-        return ()
-    cached = _PTG2_TAXONOMY_INT_CODE_CACHE.get(normalized_codes)
-    if cached is not None:
-        return cached
-    try:
-        result = await session.execute(
-            text(
-                f"""
-                SELECT int_code
-                  FROM {PTG2_SCHEMA}.nucc_taxonomy
-                 WHERE code = ANY(CAST(:taxonomy_codes AS varchar[]))
-                   AND int_code IS NOT NULL
-                 ORDER BY int_code
-                """
-            ),
-            {"taxonomy_codes": list(normalized_codes)},
-        )
-    except Exception:
-        await _rollback_optional_ptg2_query(session)
-        return ()
-    int_codes = tuple(
-        sorted(
-            {
-                int(value)
-                for row in result
-                if (value := _row_mapping(row).get("int_code")) is not None
-            }
-        )
-    )
-    if int_codes:
-        _PTG2_TAXONOMY_INT_CODE_CACHE[normalized_codes] = int_codes
-    return int_codes
-
-
-def _literal_int_array_sql(values: Iterable[Any]) -> str:
-    int_values = sorted({int(value) for value in values})
-    if not int_values:
-        return "ARRAY[]::integer[]"
-    return "ARRAY[" + ",".join(str(value) for value in int_values) + "]::integer[]"
-
-
-def _literal_text_sql(value: Any) -> str:
-    if value is None:
-        return "NULL::text"
-    return "'" + str(value).replace("'", "''") + "'::text"
-
-
-def _literal_text_array_sql(values: Iterable[Any]) -> str:
-    text_values = [str(value) for value in values if value is not None]
-    if not text_values:
-        return "ARRAY[]::text[]"
-    return "ARRAY[" + ",".join(_literal_text_sql(value).removesuffix("::text") for value in text_values) + "]::text[]"
-
-
-def _manifest_location_geo_filters_for_alias(
-    query_context: _ManifestProviderLocationQuery,
-    alias: str,
-) -> list[str]:
-    geo_filter_clauses: list[str] = []
-    if (
-        query_context.geo_lat is not None
-        and query_context.geo_long is not None
-        and query_context.geo_radius_miles is not None
-    ):
-        geo_filter_clauses.append(f"{alias}.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
-        geo_filter_clauses.append(f"{alias}.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
-        geo_filter_clauses.append(
-            f"{_ptg2_geo_distance_miles_sql(f'{alias}.lat::float8', f'{alias}.long::float8')} "
-            "<= CAST(:geo_radius_miles AS double precision)"
-        )
-        geo_filter_clauses.append(f"COALESCE({alias}.address_precision, '') <> 'city_zip'")
-    return geo_filter_clauses
-
-
-def _manifest_location_geo_filters(query_context: _ManifestProviderLocationQuery) -> list[str]:
-    return _manifest_location_geo_filters_for_alias(query_context, "loc")
-
-
-def _manifest_location_zip_or_geo_sql(
-    query_context: _ManifestProviderLocationQuery,
-    *,
-    alias: str = "loc",
-) -> str | None:
-    geo_filter_clauses = _manifest_location_geo_filters_for_alias(query_context, alias)
-    zip_expr = f"LEFT(COALESCE({alias}.zip5, {alias}.postal_code, ''), 5) = :zip5"
-    if query_context.zip_value and geo_filter_clauses:
-        return f"({zip_expr} OR ({' AND '.join(geo_filter_clauses)}))"
-    if query_context.zip_value:
-        return zip_expr
-    if geo_filter_clauses:
-        return " AND ".join(geo_filter_clauses)
-    return None
-
-
-def _manifest_location_zip_radius_fast_path_enabled(query_context: _ManifestProviderLocationQuery) -> bool:
-    return bool(
-        query_context.zip_value
-        and query_context.geo_lat is not None
-        and query_context.geo_long is not None
-        and query_context.geo_radius_miles is not None
-        and query_context.location_array_taxonomy_int_codes
-        and not query_context.location_specialty_filter.active
-    )
-
-
-def _manifest_location_zip_scope_sql(query_context: _ManifestProviderLocationQuery) -> str:
-    if not _manifest_location_zip_radius_fast_path_enabled(query_context):
-        return ""
-    return f"""
-            location_zip_scope AS MATERIALIZED (
-                SELECT g.zip_code::text AS zip5
-                  FROM {PTG2_SCHEMA}.geo_zip_lookup anchor
-                  JOIN {PTG2_SCHEMA}.geo_zip_lookup g
-                    ON g.latitude IS NOT NULL
-                   AND g.longitude IS NOT NULL
-                 WHERE anchor.zip_code = :zip5
-                   AND 69.0 * sqrt(
-                        power(g.latitude - anchor.latitude, 2)
-                        + power(
-                            (g.longitude - anchor.longitude)
-                            * cos(radians((g.latitude + anchor.latitude) / 2.0)),
-                            2
-                        )
-                   ) <= CAST(:geo_radius_miles AS double precision)
-            ),"""
-
-
-def _manifest_location_from_sql(query_context: _ManifestProviderLocationQuery) -> str:
-    if not _manifest_location_zip_radius_fast_path_enabled(query_context):
-        return f"FROM {query_context.provider_group_location_table} loc"
-    taxonomy_filter_sql = _literal_int_array_sql(query_context.location_array_taxonomy_int_codes)
-    zip_or_geo_sql = _manifest_location_zip_or_geo_sql(query_context, alias="loc") or "TRUE"
-    return f"""
-                FROM location_zip_scope zip_scope
-                JOIN LATERAL (
-                    SELECT loc.*
-                      FROM {query_context.provider_group_location_table} loc
-                     WHERE loc.zip5 = zip_scope.zip5
-                       AND loc.npi IS NOT NULL
-                       AND loc.address_type = ANY(CAST(:address_types AS varchar[]))
-                       AND loc.taxonomy_array && {taxonomy_filter_sql}
-                       AND {zip_or_geo_sql}
-                     OFFSET 0
-                ) loc ON TRUE"""
-
-
-def _ptg2_manifest_provider_location_filters(
-    query_context: _ManifestProviderLocationQuery,
-    group_filter_sql: str,
-) -> list[str]:
-    """Build predicates for one manifest-backed provider-location query."""
-
-    location_filter_clauses = ["loc.npi IS NOT NULL", group_filter_sql]
-    if query_context.state_value:
-        location_filter_clauses.append("loc.state_name = :state_value")
-    if query_context.city_value:
-        location_filter_clauses.append("loc.city_name = :city_value")
-    geo_filter_clauses = _manifest_location_geo_filters(query_context)
-    if query_context.zip_value and geo_filter_clauses:
-        location_filter_clauses.append(
-            f"(LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) = :zip5 OR ({' AND '.join(geo_filter_clauses)}))"
-        )
-    elif query_context.zip_value:
-        location_filter_clauses.append("LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) = :zip5")
-    elif geo_filter_clauses:
-        location_filter_clauses.extend(geo_filter_clauses)
-    # Precise taxonomy predicates are uncorrelated `npi IN (SELECT ...)`
-    # semi-joins, not correlated EXISTS: the location scan covers a dense-metro
-    # zip radius of the (17M-row scale) group-location table, and a per-row
-    # probe (worse for classification filters, which join nucc per row) is what
-    # 502'd plan-scoped classification searches.
-    if query_context.location_specialty_filter.active:
-        location_filter_clauses.append(
-            "loc.npi IN ("
-            + provider_specialty_taxonomy_semijoin_sql(
-                query_context.params,
-                "manifest_location_table_specialty",
-                query_context.location_specialty_filter,
-                schema=PTG2_SCHEMA,
-            )
-            + ")"
-        )
-    array_taxonomy_filter = _taxonomy_array_overlap_sql(
-        "loc",
-        query_context.params,
-        "manifest_location_table",
-        query_context.location_array_taxonomy_codes,
-    )
-    if not array_taxonomy_filter:
-        # Classification-only filters resolve no taxonomy codes, so the
-        # code-driven overlap above is empty; derive the in-index prefilter
-        # from nucc classification instead. The precise semi-join above still
-        # decides membership (primary_only etc.).
-        array_taxonomy_filter = _classification_taxonomy_array_overlap_sql(
-            "loc",
-            query_context.params,
-            "manifest_location_table",
-            query_context.location_specialty_filter,
-        )
-    if array_taxonomy_filter:
-        location_filter_clauses.append(array_taxonomy_filter)
-    if query_context.location_inferred_taxonomy_sql and not (
-        array_taxonomy_filter and not query_context.location_specialty_filter.active
-    ):
-        location_filter_clauses.append(
-            f"loc.npi IN (SELECT nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy nt "
-            f"WHERE {query_context.location_inferred_taxonomy_sql})"
-        )
-    if query_context.location_inferred_taxonomy_sql:
-        location_filter_clauses.append(_ptg2_individual_npi_exists_sql("loc.npi"))
-    return location_filter_clauses
-
-
-def _manifest_group_location_sql(
-    query_context: _ManifestProviderLocationQuery,
-    rate_scope: _ManifestProviderLocationScope,
-    location_filter_clauses: list[str],
-) -> str:
-    provider_location_join = (
-        f"LEFT JOIN {query_context.npi_data_table} n ON n.npi = loc.npi"
-        if query_context.has_npi_data
-        else ""
-    )
-    return _PROVIDER_GROUP_LOCATION_SQL.format(
-        location_rate_scope_cte=rate_scope.cte_sql,
-        location_zip_scope_cte=_manifest_location_zip_scope_sql(query_context),
-        group_location_select_sql=query_context.location_select_sql.replace("addr.", "loc."),
-        provider_name_sql=query_context.provider_name_sql,
-        provider_group_location_from_sql=_manifest_location_from_sql(query_context),
-        provider_location_join=provider_location_join,
-        location_rate_scope_join=rate_scope.join_sql,
-        location_where_sql=" AND ".join(location_filter_clauses),
-        group_location_order_sql=query_context.location_order_sql.replace("addr.", "loc."),
-        limited_location_order_sql=query_context.limited_location_order_sql,
-        provider_taxonomy_summary_lateral_sql=_provider_taxonomy_summary_lateral_sql("loc.npi"),
-    )
-
-_PTG2_LEGACY_ADDRESS_COLUMNS = {
-    "npi",
-    "type",
-    "checksum",
-    "address_key",
-    "state_name",
-    "city_name",
-    "postal_code",
-    "country_code",
-    "lat",
-    "long",
-    "first_line",
-    "second_line",
-    "telephone_number",
-    "fax_number",
-    "phone_number",
-    "phone_extension",
-    "fax_number_digits",
-    "fax_extension",
-}
-_PTG2_UNIFIED_ADDRESS_COLUMNS = _PTG2_LEGACY_ADDRESS_COLUMNS | {
-    "address_precision",
-}
-PTG_CONTACT_DETAIL_FIELDS = (
-    "fax_number_digits",
-    "phone_extension",
-    "fax_extension",
-)
-PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW = (
-    f"{PTG2_SCHEMA}.provider_directory_address_corroboration"
-)
-PTG_NO_DISPLAY_ADDRESS_FIELDS = {
-    "address",
-    "formatted_address",
-    "address_key",
-    "city",
-    "state",
-    "zip5",
-    "zip_code",
-    "postal_code",
-    "lat",
-    "long",
-    "latitude",
-    "longitude",
-    "distance",
-    "distance_miles",
-    "zip_match_type",
-    "coordinates",
-    "google_maps_url",
-    "google_map_url",
-    "maps_url",
-    "phone",
-    "telephone",
-    "telephone_number",
-    "phone_number",
-    "fax",
-    "fax_number",
-    *PTG_CONTACT_DETAIL_FIELDS,
-    "location_hash",
-    "location_source",
-    "location_confidence_code",
-    "address_sources",
-    "address_precision",
-    "source_count",
-    "multi_source_confirmed",
-    "source_mask",
-    "address_source_mask",
-}
-PTG_NO_DISPLAY_VERIFICATION_FIELDS = {
-    "location_source",
-    "location_confidence_code",
-    "address_precision",
-    "address_sources",
-    "source_count",
-    "multi_source_confirmed",
-    "source_mask",
-    "address_source_mask",
-    "provider_directory_source_id",
-    "provider_directory_org_name",
-    "provider_directory_plan_name",
-    "provider_directory_location_resource_id",
-    "provider_directory_location_name",
-    "provider_directory_plan_context_matched",
-    "provider_directory_network_name_matched",
-    "provider_directory_network_context_present",
-    "provider_directory_network_refs",
-    "provider_directory_network_names",
-    "provider_directory_network_matches",
-    "provider_directory_insurance_plan_refs",
-    "provider_directory_insurance_plan_matches",
-    "provider_directory_match_type",
-    "address_verification_evidence",
-}
-PTG_DIRECT_PAYER_LOCATION_RECORD_KEYS = {
-    "source_record_id",
-    "source_record_key",
-    "source_provider_reference_id",
-    "provider_reference_id",
-    "provider_reference",
-    "provider_group_id",
-    "provider_group_global_id_128",
-    "provider_group_hash",
-    "provider_group_location_hash",
-    "raw_provider_location_key",
-    "json_pointer",
-}
 
 
 def _ptg2_geo_distance_miles_sql(lat_sql: str, long_sql: str) -> str:
@@ -1530,30 +860,10 @@ def _ptg2_individual_npi_exists_sql(npi_sql: str) -> str:
     )
 
 
-def _ptg2_individual_npi_scalar_sql(npi_sql: str) -> str:
-    # Scalar-subquery form of _ptg2_individual_npi_exists_sql. The EXISTS form
-    # gets pulled up into a semi-join, and against an unbounded outer (a whole
-    # network member table) the planner then seq-scans + hashes all ~7M npi
-    # rows. A scalar subquery is never pulled up, so it stays one PK probe per
-    # already-filtered candidate row. npi.npi is the primary key, so the
-    # subquery is guaranteed scalar.
-    return (
-        f"COALESCE((SELECT COALESCE(n_entity.entity_type_code, 0) = 1 "
-        f"FROM {PTG2_SCHEMA}.npi n_entity WHERE n_entity.npi = {npi_sql}), false)"
-    )
-
-
 async def _ptg2_table_columns(session, table_name: str) -> frozenset[str]:
     safe_table_name = _safe_table_name(table_name)
     if not safe_table_name:
         return frozenset()
-    cache_enabled = hasattr(session, "sync_session")
-    if cache_enabled:
-        cached = _PTG2_TABLE_COLUMNS_CACHE.get(safe_table_name)
-        if cached is not None:
-            cached_at, cached_columns = cached
-            if PTG2_INDEX_CACHE_TTL_SECONDS == 0 or (time.monotonic() - cached_at) <= PTG2_INDEX_CACHE_TTL_SECONDS:
-                return cached_columns
     schema_name, bare_table_name = safe_table_name.split(".", 1)
     try:
         column_result = await session.execute(
@@ -1576,10 +886,7 @@ async def _ptg2_table_columns(session, table_name: str) -> frozenset[str]:
                 column_name = column_row[0] if column_row else None
             if column_name:
                 column_names.add(str(column_name))
-        frozen_columns = frozenset(column_names)
-        if cache_enabled:
-            _PTG2_TABLE_COLUMNS_CACHE[safe_table_name] = (time.monotonic(), frozen_columns)
-        return frozen_columns
+        return frozenset(column_names)
     except Exception:
         await _rollback_optional_ptg2_query(session)
         return frozenset()
@@ -1615,8 +922,9 @@ def _ptg2_row_address_key(row: dict[str, Any]) -> str | None:
 
 
 async def _ptg2_provider_directory_corroboration_table(session) -> str | None:
-    if await _serving_table_available(session, PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW):
-        return PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
+    relation = f"{PTG2_SCHEMA}.provider_directory_address_corroboration"
+    if await _relation_available(session, relation):
+        return relation
     return None
 
 
@@ -1812,7 +1120,7 @@ async def _ptg2_address_serving_table(
         unified_table = f"{PTG2_SCHEMA}.entity_address_unified"
         if await _ptg2_table_has_columns(session, unified_table, required_columns):
             return unified_table
-    if require_legacy_available and not await _serving_table_available(session, legacy_table):
+    if require_legacy_available and not await _relation_available(session, legacy_table):
         return None
     return legacy_table
 
@@ -1820,7 +1128,7 @@ async def _ptg2_address_serving_table(
 def _inferred_provider_taxonomy_rule(args: dict[str, Any]) -> InferredProviderTaxonomyRule | None:
     requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
     requested_code = _normalize_code(args.get("code") or args.get("reported_code"))
-    # api-layer/OpenAPI compatibility paths can arrive with only a 5-digit CPT code.
+    # OpenAPI compatibility paths can arrive with only a 5-digit CPT code.
     # Keep the default narrow so short numeric revenue codes such as "450" do not
     # accidentally inherit CPT taxonomy inference.
     if not requested_system and requested_code and requested_code.isdigit() and len(requested_code) == 5:
@@ -1853,76 +1161,46 @@ def _inferred_provider_taxonomy_code_sql(
     return "(" + " OR ".join(clauses) + ")" if clauses else ""
 
 
-def _taxonomy_array_overlap_sql(
-    alias: str,
-    params: dict[str, Any],
-    param_prefix: str,
-    taxonomy_codes: Iterable[Any],
-) -> str:
-    code_placeholders: list[str] = []
-    seen: set[str] = set()
-    for idx, raw_code in enumerate(taxonomy_codes):
-        code = str(raw_code or "").strip().upper()
-        if not code or code in seen:
-            continue
-        seen.add(code)
-        key = f"{param_prefix}_taxonomy_array_code_{idx}"
-        params[key] = code
-        code_placeholders.append(f":{key}")
-    if not code_placeholders:
-        return ""
-    return (
-        f"{alias}.taxonomy_array && ("
-        f"SELECT ARRAY_AGG(int_code) FROM {PTG2_SCHEMA}.nucc_taxonomy "
-        f"WHERE code IN ({', '.join(code_placeholders)}))"
-    )
-
-
-def _classification_taxonomy_array_overlap_sql(
-    alias: str,
-    params: dict[str, Any],
-    param_prefix: str,
-    specialty_filter: ProviderSpecialtyFilter,
-) -> str:
-    # Classification-driven variant of _taxonomy_array_overlap_sql for filters
-    # that resolve no explicit taxonomy codes. Overlap against every nucc code
-    # in the classification family is a superset of the precise predicate
-    # (primary_only, per-row specialization) — callers must still apply that.
-    if not (
-        specialty_filter.active
-        and specialty_filter.classification
-        and specialty_filter.use_classification_predicate
-        and not specialty_filter.taxonomy_codes
-    ):
-        return ""
-    classification_key = f"{param_prefix}_array_classification"
-    params[classification_key] = specialty_filter.classification
-    specialization_clause = (
-        " AND NULLIF(BTRIM(COALESCE(specialization, '')), '') IS NULL"
-        if not specialty_filter.include_subspecialties
-        else ""
-    )
-    return (
-        f"{alias}.taxonomy_array && ("
-        f"SELECT ARRAY_AGG(int_code) FROM {PTG2_SCHEMA}.nucc_taxonomy "
-        f"WHERE LOWER(COALESCE(classification, '')) = LOWER(:{classification_key})"
-        f"{specialization_clause})"
-    )
-
-
-def _ptg2_manifest_storage_enabled(serving_tables: PTG2ServingTables) -> bool:
-    return (serving_tables.storage or "").strip().lower() == "manifest_snapshot"
-
-
-def _ptg2_manifest_uses_lean_provider_key_layout(serving_tables: PTG2ServingTables) -> bool:
-    return (serving_tables.serving_table_layout or "").strip().lower() == "lean_provider_key_v1"
-
-
-def _shape_ptg2_manifest_response(payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+def _shape_ptg2_manifest_response(
+    payload: dict[str, Any],
+    args: dict[str, Any],
+    *,
+    database_evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     manifest_payload = dict(payload)
     manifest_payload["query"] = {
         key: value for key, value in dict(payload.get("query") or {}).items() if key != "result_granularity"
     }
+    query_payload = manifest_payload["query"]
+    manifest_payload["provenance"] = {
+        "arch_version": PTG2_V3_ARCH_VERSION,
+        "storage_generation": PTG2_V3_SHARED_GENERATION,
+        "database_backend": "postgresql",
+        "plan_id": str(
+            query_payload.get("plan_id")
+            or args.get("plan_id")
+            or args.get("plan_external_id")
+            or ""
+        ).strip(),
+        "snapshot_id": str(
+            query_payload.get("snapshot_id")
+            or args.get("snapshot_id")
+            or ""
+        ).strip(),
+        "source_key": str(
+            query_payload.get("source_key")
+            or args.get("source_key")
+            or ""
+        ).strip(),
+        "mode": normalize_ptg2_mode(
+            query_payload.get("mode") or args.get("mode")
+        ),
+        "pricing_scope": "plan_scoped_ptg",
+    }
+    if isinstance(database_evidence, Mapping):
+        manifest_payload["provenance"]["database_evidence"] = dict(
+            database_evidence
+        )
     manifest_payload["items"] = []
     for item in payload.get("items", []):
         shaped_item = dict(item)
@@ -1931,10 +1209,6 @@ def _shape_ptg2_manifest_response(payload: dict[str, Any], args: dict[str, Any])
         shaped_item.pop("tic_prices", None)
         manifest_payload["items"].append(shaped_item)
     return _shape_ptg2_response(manifest_payload, args)
-
-
-def _ptg2_manifest_id_array_cast(serving_tables: PTG2ServingTables) -> str:
-    return "uuid[]" if serving_tables.uses_uuid_ids else "char(32)[]"
 
 
 def _ptg2_manifest_id(value: Any) -> str:
@@ -1953,47 +1227,6 @@ def _ptg2_manifest_id_bytes(value: Any) -> bytes:
 
 def _ptg2_manifest_ids(values: list[Any] | tuple[Any, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(hex_value for value in values if (hex_value := _ptg2_manifest_id(value))))
-
-
-def _code_plan_scope_sql(
-    requested_plan: str,
-    *,
-    column: str = "plan_id",
-    param_name: str = "plan_id",
-) -> tuple[str, str]:
-    """Prefer exact plan-scoped code rows, but allow source-level rows as fallback."""
-    plan_column = column.strip() or "plan_id"
-    plan_param = param_name.strip() or "plan_id"
-    if str(requested_plan or "").strip():
-        return (
-            f"({plan_column} = :{plan_param} OR COALESCE({plan_column}, '') = '')",
-            f"CASE WHEN {plan_column} = :{plan_param} THEN 0 WHEN COALESCE({plan_column}, '') = '' THEN 1 ELSE 2 END",
-        )
-    return f"COALESCE({plan_column}, '') = ''", f"{plan_column} NULLS FIRST"
-
-
-def _preferred_code_metadata_rows(
-    code_rows: Iterable[Mapping[str, Any]],
-    requested_plan: str,
-) -> list[Mapping[str, Any]]:
-    """Prefer plan rows independently for each compatible reported-code form."""
-
-    rows_by_code: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
-    for code_row in code_rows:
-        key = (
-            str(code_row.get("reported_code_system") or ""),
-            str(code_row.get("reported_code") or ""),
-        )
-        rows_by_code.setdefault(key, []).append(code_row)
-    preferred_rows: list[Mapping[str, Any]] = []
-    for compatible_rows in rows_by_code.values():
-        plan_rows = [
-            code_row
-            for code_row in compatible_rows
-            if str(code_row.get("plan_id") or "").strip() == requested_plan
-        ]
-        preferred_rows.extend(plan_rows or compatible_rows)
-    return preferred_rows
 
 
 def _ptg2_reported_code_lookup_values(code_system: Any, code: Any) -> tuple[str, ...]:
@@ -2023,17 +1256,6 @@ def _append_reported_code_value_filter(
         params[key] = value
         placeholders.append(f":{key}")
     filters.append(f"{column} IN ({', '.join(placeholders)})")
-
-
-def _reported_code_param_filter(column: str, param_name: str, params: Mapping[str, Any]) -> str:
-    placeholders = [f":{param_name}"]
-    idx = 1
-    while f"{param_name}_{idx}" in params:
-        placeholders.append(f":{param_name}_{idx}")
-        idx += 1
-    if len(placeholders) == 1:
-        return f"{column} = :{param_name}"
-    return f"{column} IN ({', '.join(placeholders)})"
 
 
 def _external_catalog_lookup_pairs(code_context: Mapping[str, Any] | None) -> set[tuple[str, str]]:
@@ -2082,210 +1304,104 @@ def _append_manifest_reported_code_filter(
     filters.append("(" + " OR ".join(clauses) + ")")
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def search_ptg2_index(
-    index: PTG2ServingIndex,
-    *,
-    plan_id: str | None = None,
-    plan_external_id: str | None = None,
-    code: str | None = None,
-    state: str | None = None,
-    city: str | None = None,
-    zip5: str | None = None,
-    npi: int | str | None = None,
-) -> dict[str, Any]:
-    """Search the legacy in-memory PTG2 index using exact request filters."""
-
-    requested_plan = str(plan_id or plan_external_id or "").strip()
-    requested_code = str(code or "").strip()
-    requested_state = str(state or "").strip().upper()
-    requested_city = str(city or "").strip().upper()
-    requested_zip = _normalize_zip5(zip5)
-    requested_npi = _normalize_npi(npi)
-    plan_rates = dict(index.rates.get(requested_plan) or {}) if requested_plan else {}
-    rate_rows = list(plan_rates.get(requested_code) or []) if requested_code else []
-    items: list[dict[str, Any]] = []
-    for rate in rate_rows:
-        provider = _provider_payload(index, rate.get("provider_ordinal"))
-        if requested_state and str(provider.get("state") or "").upper() != requested_state:
-            continue
-        if requested_city and str(provider.get("city") or "").upper() != requested_city:
-            continue
-        if requested_zip and _normalize_zip5(provider.get("zip5")) != requested_zip:
-            continue
-        if requested_npi is not None and _normalize_npi(provider.get("npi")) != requested_npi:
-            continue
-        procedure = dict(index.procedures.get(requested_code) or {})
-        prices = _normalize_price_payload(rate.get("prices") or [])
-        item = {
-            **provider,
-            "procedure_code": procedure.get("procedure_code") or procedure.get("code") or requested_code,
-            "service_code": procedure.get("billing_code") or requested_code,
-            "reported_code": procedure.get("billing_code") or requested_code,
-            "reported_code_system": procedure.get("billing_code_type"),
-            "billing_code": procedure.get("billing_code") or requested_code,
-            "billing_code_type": procedure.get("billing_code_type"),
-            "procedure_name": procedure.get("name") or procedure.get("procedure_name"),
-            "procedure_description": procedure.get("description") or procedure.get("procedure_description"),
-            **_price_response_fields(prices),
-            "source_trace": _coerce_json_payload(rate.get("source_trace"), []),
-            "network_names": _coerce_str_list_payload(rate.get("network_names")),
-            "confidence": rate.get("confidence") or {"network": "tic_rate_npi_tin"},
-        }
-        address_payload = _coerce_json_payload(
-            _first_payload_value(provider.get("address_payload"), provider.get("address")),
-            {},
+def _require_strict_shared_v3(serving_tables: PTG2ServingTables) -> None:
+    if not serving_tables.uses_shared_blocks:
+        raise PTG2ManifestArtifactError(
+            "only postgres_binary_v3 with the strict shared-block contract is supported; "
+            "reimport the snapshot"
         )
-        if not isinstance(address_payload, dict):
-            address_payload = {}
-        if address_payload and not isinstance(item.get("address"), dict):
-            item["address"] = address_payload
-        _add_location_phone_fields(item, provider, address_payload)
-        _promote_address_provenance_fields(item, address_payload)
-        item["address_verification"] = _address_verification_payload(item, provider, address_payload)
-        _strip_no_display_address_fields(item)
-        items.append(item)
-    return _shape_ptg2_response(
-        {
-            "items": items,
-            "pagination": {"total": len(items), "limit": len(items), "offset": 0, "page": 1},
-            "query": {
-                "plan_id": requested_plan or None,
-                "plan_external_id": plan_external_id or None,
-                "code": requested_code or None,
-                "state": state or None,
-                "city": city or None,
-                "zip5": zip5 or None,
-                "npi": requested_npi,
-                "snapshot_id": index.snapshot_id,
-                "source": "ptg2",
-            },
-        },
-        {"include_sources": "true", "include_details": "true"},
-    )
 
 
-def warm_cache_benchmark(index: PTG2ServingIndex, request_count: int = 100) -> dict[str, Any]:
-    """Measure warm repeated lookup latency for an in-memory PTG2 index."""
-
-    request_count = max(int(request_count or 1), 1)
-    plan_id = next(iter(index.rates.keys()), "")
-    code = next(iter(dict(index.rates.get(plan_id) or {}).keys()), "")
-    timings: list[float] = []
-    for _ in range(request_count):
-        started = time.perf_counter()
-        search_ptg2_index(index, plan_id=plan_id, code=code)
-        timings.append((time.perf_counter() - started) * 1000.0)
-    sorted_timings = sorted(timings)
-    p95_index = min(max(math.ceil(0.95 * len(sorted_timings)) - 1, 0), len(sorted_timings) - 1)
-    p95_ms = sorted_timings[p95_index]
-    return {"request_count": request_count, "p95_ms": p95_ms, "passed": p95_ms <= PTG2_WARM_P95_MAX_MS}
+def _required_shared_snapshot_key(serving_tables: PTG2ServingTables) -> int:
+    if not serving_tables.uses_shared_blocks or serving_tables.shared_snapshot_key is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot is missing the strict shared-block contract; reimport the snapshot"
+        )
+    return int(serving_tables.shared_snapshot_key)
 
 
-def _ptg2_manifest_artifact_entries(serving_tables: PTG2ServingTables, name: str) -> list[dict[str, Any]]:
-    artifacts = serving_tables.artifacts or {}
-    entries: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-
-    def add_entry(value: Any) -> None:
-        """Append a unique artifact descriptor to the candidate list."""
-
-        if not isinstance(value, dict):
-            return
-        path = str(value.get("path") or "").strip()
-        sha = str(value.get("sha256") or "").strip()
-        key = (path, sha)
-        if key in seen:
-            return
-        seen.add(key)
-        entries.append(dict(value))
-
-    value = artifacts.get(name)
-    add_entry(value)
-    for sidecar in artifacts.get("sidecars") or []:
-        if isinstance(sidecar, dict) and sidecar.get("name") == name:
-            add_entry(sidecar)
-    return entries
+def _required_source_count(serving_tables: PTG2ServingTables) -> int:
+    _require_strict_shared_v3(serving_tables)
+    if serving_tables.source_count is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot is missing source_count; reimport the snapshot"
+        )
+    return int(serving_tables.source_count)
 
 
-def _ptg2_manifest_artifact_entry(serving_tables: PTG2ServingTables, name: str) -> dict[str, Any] | None:
-    entries = _ptg2_manifest_artifact_entries(serving_tables, name)
-    return entries[0] if entries else None
+def _required_logical_snapshot_id(serving_tables: PTG2ServingTables) -> str:
+    snapshot_id = str(serving_tables.snapshot_id or "").strip()
+    if not snapshot_id:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot is missing its logical snapshot id; reimport the snapshot"
+        )
+    return snapshot_id
 
 
-def _ptg2_manifest_sidecar_metadata(entry: dict[str, Any], sidecar_path: Path, raw_path: str) -> dict[str, Any] | None:
-    return entry if sidecar_path == Path(raw_path) else None
+def _shared_v3_code_table() -> str:
+    return f"{PTG2_SCHEMA}.ptg2_v3_code"
 
 
-def _raise_missing_postgres_binary_table(serving_tables: PTG2ServingTables) -> None:
-    if serving_tables.effective_arch_version not in {
-        "postgres_binary_v1",
-        "postgres_binary_v2",
-        "postgres_binary_v3",
-    }:
-        return
-    raise PTG2ManifestArtifactError(
-        f"PTG2 {serving_tables.effective_arch_version} snapshot is missing serving_binary_table"
-    )
+def _shared_v3_snapshot_scope_table() -> str:
+    return f"{PTG2_SCHEMA}.ptg2_v3_snapshot_scope"
 
 
-def _raise_local_sidecar_disallowed(serving_tables: PTG2ServingTables, artifact_name: str) -> None:
-    if serving_tables.effective_arch_version not in {
-        "postgres_binary_v1",
-        "postgres_binary_v2",
-        "postgres_binary_v3",
-    }:
-        return
-    raise PTG2ManifestArtifactError(
-        f"PTG2 {serving_tables.effective_arch_version} snapshot requires PostgreSQL artifact storage "
-        f"for {artifact_name}"
-    )
+def _normalized_plan_market_type(value: Any) -> str:
+    return str(value or "").strip().lower()
 
 
-def _resolve_ptg2_manifest_sidecar_path(raw_path: str) -> Path:
-    path = Path(raw_path)
-    if path.exists():
-        return path
-    artifact_root = _artifact_root()
-    if not path.is_absolute():
-        candidate = artifact_root / path
-        return candidate if candidate.exists() else path
+def _shared_v3_code_scope_sql(
+    serving_tables: PTG2ServingTables,
+    *,
+    requested_plan: str = "",
+    plan_market_type: str = "",
+    code_alias: str = "code_metadata",
+    scope_alias: str = "logical_scope",
+) -> tuple[str, list[str], dict[str, Any], str]:
+    """Join physical code metadata to this snapshot's logical plan mappings."""
 
-    suffix_parts: tuple[str, ...] = ()
-    for marker in ("healthporta-ptg2-artifacts", "ptg2-artifacts"):
-        try:
-            marker_index = path.parts.index(marker)
-        except ValueError:
-            continue
-        suffix_parts = path.parts[marker_index + 1 :]
-        break
-    if not suffix_parts:
-        return path
-    candidate = artifact_root.joinpath(*suffix_parts)
-    if candidate.exists():
-        return candidate
+    params: dict[str, Any] = {
+        "logical_snapshot_id": _required_logical_snapshot_id(serving_tables),
+    }
+    join_sql = f"""
+        JOIN {_shared_v3_snapshot_scope_table()} {scope_alias}
+          ON {scope_alias}.snapshot_id = :logical_snapshot_id
+         AND {scope_alias}.coverage_scope_id = {code_alias}.coverage_scope_id
+    """
+    filters: list[str] = []
+    normalized_plan = str(requested_plan or "").strip()
+    normalized_market_type = _normalized_plan_market_type(plan_market_type)
+    if normalized_plan:
+        filters.append(f"{scope_alias}.plan_id = :plan_id")
+        params["plan_id"] = normalized_plan
+    if normalized_market_type:
+        filters.append(f"{scope_alias}.plan_market_type = :plan_market_type")
+        params["plan_market_type"] = normalized_market_type
+    order_sql = f"{scope_alias}.plan_id, {scope_alias}.plan_market_type"
+    return join_sql, filters, params, order_sql
 
-    if len(suffix_parts) >= 3 and suffix_parts[0] == "serving":
-        filename = suffix_parts[-1]
-        serving_root = artifact_root / "serving"
-        if serving_root.exists():
-            matches = [item for item in serving_root.glob(f"*/{filename}") if item.exists()]
-            if len(matches) == 1:
-                return matches[0]
-            prefix = filename.rsplit("_", 1)[0]
-            if prefix and prefix != filename:
-                prefix_matches = [
-                    item for item in serving_root.glob(f"*/{prefix}_*.ptg2sc") if item.exists()
-                ]
-                if len(prefix_matches) == 1:
-                    return prefix_matches[0]
-    return path
+
+def _shared_v3_provider_set_table() -> str:
+    return f"{PTG2_SCHEMA}.ptg2_v3_provider_set"
+
+
+def _shared_v3_provider_group_table() -> str:
+    return f"{PTG2_SCHEMA}.ptg2_v3_provider_group"
+
+
+def _shared_v3_price_attr_table() -> str:
+    return f"{PTG2_SCHEMA}.ptg2_v3_price_attr"
+
+
+def _append_shared_snapshot_filter(
+    serving_tables: PTG2ServingTables,
+    filters: list[str],
+    params: dict[str, Any],
+    *,
+    column: str = "snapshot_key",
+) -> None:
+    filters.append(f"{column} = :shared_snapshot_key")
+    params["shared_snapshot_key"] = _required_shared_snapshot_key(serving_tables)
 
 
 def _ptg2_manifest_serving_content_hash(
@@ -2302,19 +1418,24 @@ async def _ptg2_manifest_provider_set_ids_for_keys(
     serving_tables: PTG2ServingTables,
     provider_set_keys: Iterable[int],
 ) -> dict[int, str]:
-    provider_set_dictionary_table = _safe_table_name(serving_tables.provider_set_dictionary_table)
     keys = sorted({int(value) for value in provider_set_keys if value is not None})
-    if not provider_set_dictionary_table or not keys:
+    if not keys:
         return {}
+    _require_strict_shared_v3(serving_tables)
+    params = {
+        "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
+        "provider_set_keys": keys,
+    }
     result = await session.execute(
         text(
             f"""
             SELECT provider_set_key, provider_set_global_id_128
-            FROM {provider_set_dictionary_table}
-            WHERE provider_set_key = ANY(CAST(:provider_set_keys AS integer[]))
+            FROM {_shared_v3_provider_set_table()}
+            WHERE snapshot_key = :shared_snapshot_key
+              AND provider_set_key = ANY(CAST(:provider_set_keys AS integer[]))
             """
         ),
-        {"provider_set_keys": keys},
+        params,
     )
     return {
         int(data.get("provider_set_key")): _ptg2_manifest_id(data.get("provider_set_global_id_128"))
@@ -2323,24 +1444,81 @@ async def _ptg2_manifest_provider_set_ids_for_keys(
     }
 
 
+async def _hydrate_provider_set_network_names(
+    session,
+    serving_tables: PTG2ServingTables,
+    rows: Iterable[dict[str, Any]],
+) -> None:
+    row_list = list(rows)
+    provider_set_ids = sorted(
+        {
+            provider_set_id
+            for row in row_list
+            if (
+                provider_set_id := _ptg2_manifest_id(
+                    row.get("provider_set_global_id_128")
+                )
+            )
+        }
+    )
+    if not provider_set_ids:
+        return
+    result = await session.execute(
+        text(
+            f"""
+            SELECT encode(provider_set_global_id_128, 'hex') AS provider_set_id,
+                   network_names
+              FROM {_shared_v3_provider_set_table()}
+             WHERE snapshot_key = :shared_snapshot_key
+               AND provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS bytea[]))
+            """
+        ),
+        {
+            "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
+            "provider_set_ids": [bytes.fromhex(value) for value in provider_set_ids],
+        },
+    )
+    network_names_by_id = {
+        str(data.get("provider_set_id") or ""): _coerce_str_list_payload(
+            data.get("network_names")
+        )
+        for data in (_row_mapping(row) for row in result)
+    }
+    if set(network_names_by_id) != set(provider_set_ids):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider-set network metadata is incomplete"
+        )
+    for row in row_list:
+        provider_set_id = _ptg2_manifest_id(
+            row.get("provider_set_global_id_128")
+        )
+        if provider_set_id:
+            row["network_names"] = network_names_by_id[provider_set_id]
+
+
 async def _ptg2_manifest_provider_set_keys_for_ids(
     session,
     serving_tables: PTG2ServingTables,
     provider_set_ids: Iterable[str],
 ) -> dict[str, int]:
-    provider_set_dictionary_table = _safe_table_name(serving_tables.provider_set_dictionary_table)
     normalized_ids = list(_ptg2_manifest_ids(tuple(provider_set_ids)))
-    if not provider_set_dictionary_table or not normalized_ids:
+    if not normalized_ids:
         return {}
+    _require_strict_shared_v3(serving_tables)
+    params = {
+        "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
+        "provider_set_ids": [bytes.fromhex(provider_set_id) for provider_set_id in normalized_ids],
+    }
     result = await session.execute(
         text(
             f"""
             SELECT provider_set_key, provider_set_global_id_128
-            FROM {provider_set_dictionary_table}
-            WHERE provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))
+            FROM {_shared_v3_provider_set_table()}
+            WHERE snapshot_key = :shared_snapshot_key
+              AND provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS bytea[]))
             """
         ),
-        {"provider_set_ids": normalized_ids},
+        params,
     )
     return {
         _ptg2_manifest_id(data.get("provider_set_global_id_128")): int(data.get("provider_set_key"))
@@ -2356,24 +1534,24 @@ async def _version_three_provider_counts_for_keys(
 ) -> dict[int, int] | None:
     """Read sparse provider counts from existing v3 provider-page blocks."""
 
-    if (
-        serving_tables.effective_arch_version != "postgres_binary_v3"
-        or not serving_tables.serving_binary_table
-        or provider_set_keys is None
-    ):
+    _require_strict_shared_v3(serving_tables)
+    if provider_set_keys is None:
         return None
     normalized_keys = tuple(sorted({int(provider_set_key) for provider_set_key in provider_set_keys}))
     if not normalized_keys:
         return {}
-    if not await has_provider_pages_in_db(
+    if not await has_shared_provider_pages_in_db(
         session,
-        serving_tables.serving_binary_table,
+        _required_shared_snapshot_key(serving_tables),
+        schema_name=PTG2_SCHEMA,
     ):
         return None
-    provider_pages = await lookup_provider_pages_from_db(
+    provider_pages = await lookup_shared_provider_pages_from_db(
         session,
-        serving_tables.serving_binary_table,
+        _required_shared_snapshot_key(serving_tables),
         normalized_keys,
+        source_count=_required_source_count(serving_tables),
+        schema_name=PTG2_SCHEMA,
     )
     if provider_pages is None:
         return None
@@ -2383,7 +1561,7 @@ async def _version_three_provider_counts_for_keys(
     }
 
 
-async def _ptg2_manifest_lookup_serving_by_code_sidecar(
+async def _lookup_shared_forward_rows(
     session,
     serving_tables: PTG2ServingTables,
     code_key: int,
@@ -2391,191 +1569,68 @@ async def _ptg2_manifest_lookup_serving_by_code_sidecar(
     provider_set_keys: Iterable[int] | None = None,
     provider_counts_by_key: Mapping[int, int] | None = None,
 ):
+    _require_strict_shared_v3(serving_tables)
     sparse_count_kwargs = (
         {"provider_counts_by_key": provider_counts_by_key}
         if provider_counts_by_key is not None
         else {}
     )
-    if serving_tables.effective_arch_version == "postgres_binary_v3":
-        if serving_tables.serving_binary_table:
-            return await lookup_serving_binary_by_code_from_db(
-                session,
-                serving_tables.serving_binary_table,
-                int(code_key),
-                provider_set_keys=provider_set_keys,
-                **sparse_count_kwargs,
-                price_dictionary_item_count=serving_tables.price_dictionary_item_count,
-                price_dictionary_block_bytes=serving_tables.price_dictionary_block_bytes,
-                price_dictionary_compressed_records=(
-                    serving_tables.price_dictionary_compressed_records
-                ),
-            )
-        _raise_missing_postgres_binary_table(serving_tables)
-    if serving_tables.serving_binary_table:
-        return await lookup_serving_binary_by_code_from_db(
-            session,
-            serving_tables.serving_binary_table,
-            int(code_key),
-            provider_set_keys=provider_set_keys,
-            **sparse_count_kwargs,
-        )
-    _raise_missing_postgres_binary_table(serving_tables)
-    entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
-    if not entry:
-        return ()
-    if db_artifact_entry_available(entry):
-        return await lookup_serving_by_code_sidecar_from_db(
-            session,
-            entry,
-            int(code_key),
-            schema_name=PTG2_SCHEMA,
-            provider_set_keys=provider_set_keys,
-        )
-    raw_path = str(entry.get("path") or "").strip()
-    if not raw_path:
-        return ()
-    sidecar_path = _resolve_ptg2_manifest_sidecar_path(raw_path)
-    return lookup_serving_by_code_sidecar(
-        sidecar_path,
+    dictionary_hints = _version_three_page_price_lookup_hints(serving_tables)
+    return await lookup_serving_binary_by_code_from_db(
+        session,
         int(code_key),
+        shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
+        source_count=_required_source_count(serving_tables),
         provider_set_keys=provider_set_keys,
-        metadata=_ptg2_manifest_sidecar_metadata(entry, sidecar_path, raw_path),
+        **sparse_count_kwargs,
+        **dictionary_hints,
+        schema_name=PTG2_SCHEMA,
     )
 
 
-async def _ptg2_manifest_lookup_serving_by_provider_set_sidecar(
-    session,
-    serving_tables: PTG2ServingTables,
-    provider_set_key: int,
-    *,
-    code_keys: Iterable[int] | None = None,
-):
-    if serving_tables.serving_binary_table:
-        return await lookup_serving_binary_by_provider_set_from_db(
-            session,
-            serving_tables.serving_binary_table,
-            int(provider_set_key),
-            code_keys=code_keys,
-        )
-    _raise_missing_postgres_binary_table(serving_tables)
-    entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
-    if not entry:
-        return ()
-    if db_artifact_entry_available(entry):
-        return await lookup_serving_by_provider_set_sidecar_from_db(
-            session,
-            entry,
-            int(provider_set_key),
-            schema_name=PTG2_SCHEMA,
-            code_keys=code_keys,
-        )
-    raw_path = str(entry.get("path") or "").strip()
-    if not raw_path:
-        return ()
-    sidecar_path = _resolve_ptg2_manifest_sidecar_path(raw_path)
-    return lookup_serving_by_provider_set_sidecar(
-        sidecar_path,
-        int(provider_set_key),
-        code_keys=code_keys,
-        metadata=_ptg2_manifest_sidecar_metadata(entry, sidecar_path, raw_path),
-    )
-
-
-async def _ptg2_manifest_lookup_serving_by_provider_set_patterns(
-    session,
-    serving_tables: PTG2ServingTables,
-    provider_set_key: int,
-    *,
-    code_keys: Iterable[int] | None = None,
-):
-    if serving_tables.serving_binary_table:
-        return await lookup_serving_binary_by_provider_set_patterns_from_db(
-            session,
-            serving_tables.serving_binary_table,
-            int(provider_set_key),
-            code_keys=code_keys,
-        )
-    _raise_missing_postgres_binary_table(serving_tables)
-    entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
-    if not entry:
-        return ()
-    if db_artifact_entry_available(entry):
-        return await lookup_serving_by_provider_set_patterns_from_db(
-            session,
-            entry,
-            int(provider_set_key),
-            schema_name=PTG2_SCHEMA,
-            code_keys=code_keys,
-        )
-    raw_path = str(entry.get("path") or "").strip()
-    if not raw_path:
-        return ()
-    sidecar_path = _resolve_ptg2_manifest_sidecar_path(raw_path)
-    return lookup_serving_by_provider_set_patterns(
-        sidecar_path,
-        int(provider_set_key),
-        code_keys=code_keys,
-        metadata=_ptg2_manifest_sidecar_metadata(entry, sidecar_path, raw_path),
-    )
-
-
-async def _ptg2_manifest_lookup_serving_by_provider_sets_patterns(
-    session,
-    serving_tables: PTG2ServingTables,
-    provider_set_keys: Iterable[int],
-    *,
-    code_keys: Iterable[int] | None = None,
-) -> dict[int, tuple[Any, ...]]:
-    normalized_provider_set_keys = tuple(
-        sorted({int(provider_set_key) for provider_set_key in provider_set_keys})
-    )
-    if not normalized_provider_set_keys:
-        return {}
-    if serving_tables.serving_binary_table:
-        return await lookup_serving_binary_by_provider_sets_patterns_from_db(
-            session,
-            serving_tables.serving_binary_table,
-            normalized_provider_set_keys,
-            code_keys=code_keys,
-        )
-    patterns_by_provider_set: dict[int, tuple[Any, ...]] = {}
-    for provider_set_key in normalized_provider_set_keys:
-        patterns_by_provider_set[provider_set_key] = await _ptg2_manifest_lookup_serving_by_provider_set_patterns(
-            session,
-            serving_tables,
-            provider_set_key,
-            code_keys=code_keys,
-        )
-    return patterns_by_provider_set
-
-
-def _ptg2_serving_sidecar_window(
-    sidecar_rows: Iterable[Any],
+def _shared_forward_row_window(
+    forward_rows: Iterable[Any],
     provider_set_ids_by_key: Mapping[int, str],
     *,
     limit: int | None,
     offset: int,
+    descending: bool,
 ) -> list[Any]:
     """Return the requested ordered serving-row window before response materialization."""
-    ordered_sidecar_rows = sorted(
-        (row for row in sidecar_rows if provider_set_ids_by_key.get(row.provider_set_key)),
+    eligible_rows = [
+        row
+        for row in forward_rows
+        if provider_set_ids_by_key.get(row.provider_set_key)
+    ]
+    if any(row.price_key is None for row in eligible_rows):
+        raise PTG2ManifestArtifactError(
+            "PTG2 strict V3 forward row is missing its dense price key"
+        )
+    ordered_rows = sorted(
+        eligible_rows,
         key=lambda row: (
-            -int(row.provider_count or 0),
-            provider_set_ids_by_key.get(row.provider_set_key) or "",
-            _ptg2_manifest_id(row.price_set_global_id_128),
+            -int(row.price_key) if descending else int(row.price_key),
+            int(row.provider_set_key),
+            int(row.source_key),
+            int(row.provider_count or 0),
         ),
     )
     if limit is None:
-        return ordered_sidecar_rows
+        return ordered_rows
     start = max(int(offset), 0)
-    return ordered_sidecar_rows[start : start + max(int(limit), 0)]
+    return ordered_rows[start : start + max(int(limit), 0)]
 
 
 def _version_three_page_price_lookup_hints(serving_tables: PTG2ServingTables) -> dict[str, Any]:
+    item_count = serving_tables.price_dictionary_item_count
+    block_bytes = serving_tables.price_dictionary_block_bytes
+    if item_count is None or block_bytes is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 strict V3 price dictionary metadata is missing; reimport the snapshot"
+        )
     return {
-        "price_dictionary_item_count": serving_tables.price_dictionary_item_count,
-        "price_dictionary_block_bytes": serving_tables.price_dictionary_block_bytes,
-        "price_dictionary_compressed_records": serving_tables.price_dictionary_compressed_records,
+        "price_dictionary_item_count": int(item_count),
+        "price_dictionary_block_bytes": int(block_bytes),
     }
 
 
@@ -2599,15 +1654,24 @@ def _version_three_forward_page_payloads(
                 page_entry.provider_set_key,
                 price_ids_by_key[page_entry.price_key],
             ),
+            "code_key": page_entry.code_key,
             "plan_id": code_metadata.get("plan_id"),
+            "plan_market_type": code_metadata.get("plan_market_type"),
             "reported_code_system": code_metadata.get("reported_code_system"),
             "reported_code": code_metadata.get("reported_code"),
+            "negotiation_arrangement": code_metadata.get(
+                "negotiation_arrangement"
+            ),
+            "billing_code_type_version": code_metadata.get("billing_code_type_version"),
+            "source_procedure_name": code_metadata.get("source_name"),
+            "source_procedure_description": code_metadata.get("source_description"),
             "procedure_global_id_128": None,
             "provider_set_global_id_128": provider_ids_by_key[page_entry.provider_set_key],
+            "_ptg_provider_set_key": page_entry.provider_set_key,
             "provider_count": page_entry.provider_count,
             "price_set_global_id_128": price_ids_by_key[page_entry.price_key],
             "price_key": page_entry.price_key,
-            "source_trace_set_hash": source_trace_set_hash,
+            "source_key": page_entry.source_key,
             "network_names": network_names,
         }
         for page_entry in page_entries[start : start + max(int(limit), 0)]
@@ -2623,10 +1687,12 @@ async def _version_three_forward_page_rows(
     network_names: list[str],
     limit: int,
     offset: int,
+    descending: bool = False,
 ) -> list[dict[str, Any]] | None:
     """Materialize one bounded code page without scanning the full forward block."""
 
-    if not serving_tables.serving_binary_table:
+    _require_strict_shared_v3(serving_tables)
+    if descending:
         return None
     page_end = max(int(offset), 0) + max(int(limit), 0)
     if page_end > PTG2_SERVING_BINARY_V3_PAGE_ROWS:
@@ -2634,10 +1700,12 @@ async def _version_three_forward_page_rows(
     code_key = code_metadata.get("code_key")
     if code_key is None:
         return None
-    page_entries = await lookup_code_page_from_db(
+    page_entries = await lookup_shared_code_page_from_db(
         session,
-        serving_tables.serving_binary_table,
+        _required_shared_snapshot_key(serving_tables),
         int(code_key),
+        source_count=_required_source_count(serving_tables),
+        schema_name=PTG2_SCHEMA,
     )
     if page_entries is None:
         return None
@@ -2657,9 +1725,10 @@ async def _version_three_forward_page_rows(
     price_keys = {page_entry.price_key for page_entry in selected_entries}
     price_ids_by_key = await lookup_price_ids_from_db(
         session,
-        serving_tables.serving_binary_table,
         price_keys,
         **_version_three_page_price_lookup_hints(serving_tables),
+        shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
+        schema_name=PTG2_SCHEMA,
     )
     if set(price_ids_by_key) != price_keys:
         raise PTG2ManifestArtifactError("PTG2 v3 forward page references an unknown price set")
@@ -2675,7 +1744,7 @@ async def _version_three_forward_page_rows(
     )
 
 
-async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
+async def _shared_rows_for_code(
     session,
     serving_tables: PTG2ServingTables,
     *,
@@ -2685,16 +1754,14 @@ async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
     network_names: list[str],
     limit: int | None = None,
     offset: int = 0,
+    descending: bool = False,
 ) -> list[dict[str, Any]] | None:
-    """Read code serving rows from binary/sidecar storage and materialize only one page."""
+    """Read strict shared code rows and materialize only one page."""
     code_key = code_data.get("code_key")
     if code_key is None:
         return None
-    if (
-        serving_tables.effective_arch_version == "postgres_binary_v3"
-        and provider_set_keys is None
-        and limit is not None
-    ):
+    _require_strict_shared_v3(serving_tables)
+    if provider_set_keys is None and limit is not None:
         page_rows = await _version_three_forward_page_rows(
             session,
             serving_tables,
@@ -2703,10 +1770,48 @@ async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
             network_names=network_names,
             limit=limit,
             offset=offset,
+            descending=descending,
         )
         if page_rows is not None:
             return page_rows
-    return await _full_code_sidecar_rows(
+        prefix_end = max(int(offset), 0) + max(int(limit), 0)
+        if prefix_end > 0:
+            prefix_rows = await lookup_serving_binary_by_code_prefix_from_db(
+                session,
+                int(code_key),
+                limit=prefix_end,
+                descending=descending,
+                shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
+                source_count=_required_source_count(serving_tables),
+                **_version_three_page_price_lookup_hints(serving_tables),
+                schema_name=PTG2_SCHEMA,
+            )
+            if not prefix_rows:
+                await _raise_missing_v3_block(session, serving_tables, int(code_key))
+                return []
+            selected_rows = prefix_rows[max(int(offset), 0) : prefix_end]
+            provider_set_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
+                session,
+                serving_tables,
+                [row.provider_set_key for row in selected_rows],
+            )
+            if set(provider_set_ids_by_key) != {
+                row.provider_set_key for row in selected_rows
+            }:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 v3 provider-set dictionary is missing a prefix-referenced key"
+                )
+            return [
+                _shared_forward_response_row(
+                    row,
+                    provider_set_ids_by_key[row.provider_set_key],
+                    code_data,
+                    source_trace_set_hash,
+                    network_names,
+                )
+                for row in selected_rows
+            ]
+    return await _full_shared_code_rows(
         session,
         serving_tables,
         code_data=code_data,
@@ -2715,17 +1820,37 @@ async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
         network_names=network_names,
         limit=limit,
         offset=offset,
+        descending=descending,
     )
 
 
 def _manifest_response_row_order(row: Mapping[str, Any]) -> tuple[Any, ...]:
     return (
-        -int(row.get("provider_count") or 0),
-        _ptg2_manifest_id(row.get("provider_set_global_id_128")),
-        _ptg2_manifest_id(row.get("price_set_global_id_128")),
+        int(row.get("price_key") if row.get("price_key") is not None else 2**32),
+        int(
+            row.get("_ptg_provider_set_key")
+            if row.get("_ptg_provider_set_key") is not None
+            else 2**31
+        ),
+        int(row.get("source_key") or 0),
+        int(row.get("provider_count") or 0),
+        int(row.get("code_key") or 0),
         str(row.get("reported_code") or ""),
         str(row.get("serving_content_hash_128") or ""),
+        str(row.get("plan_id") or ""),
+        str(row.get("plan_market_type") or ""),
     )
+
+
+def _manifest_response_row_order_for_direction(
+    row: Mapping[str, Any],
+    *,
+    descending: bool,
+) -> tuple[Any, ...]:
+    order = _manifest_response_row_order(row)
+    if not descending:
+        return order
+    return (-int(order[0]), *order[1:])
 
 
 async def _merge_manifest_code_variant_rows(
@@ -2738,11 +1863,12 @@ async def _merge_manifest_code_variant_rows(
     network_names: list[str],
     limit: int | None,
     offset: int,
+    descending: bool = False,
 ) -> list[dict[str, Any]] | None:
     """Merge one ordered serving window across compatible persisted code forms."""
 
     if len(code_rows) == 1:
-        return await _ptg2_manifest_rows_from_serving_by_code_sidecar(
+        return await _shared_rows_for_code(
             session,
             serving_tables,
             code_data=code_rows[0],
@@ -2751,31 +1877,52 @@ async def _merge_manifest_code_variant_rows(
             network_names=network_names,
             limit=limit,
             offset=offset,
+            descending=descending,
         )
     start = max(int(offset), 0)
     per_code_limit = None if limit is None else start + max(int(limit), 0)
-    combined_rows: list[dict[str, Any]] = []
+    logical_rows_by_code_key: dict[int, list[Mapping[str, Any]]] = {}
     for code_row in code_rows:
-        variant_rows = await _ptg2_manifest_rows_from_serving_by_code_sidecar(
+        if code_row.get("code_key") is None:
+            continue
+        logical_rows_by_code_key.setdefault(int(code_row["code_key"]), []).append(code_row)
+    combined_rows: list[dict[str, Any]] = []
+    for logical_code_rows in logical_rows_by_code_key.values():
+        physical_code_row = logical_code_rows[0]
+        variant_rows = await _shared_rows_for_code(
             session,
             serving_tables,
-            code_data=code_row,
+            code_data=physical_code_row,
             provider_set_keys=provider_set_keys,
             source_trace_set_hash=source_trace_set_hash,
             network_names=network_names,
             limit=per_code_limit,
             offset=0,
+            descending=descending,
         )
         if variant_rows is None:
             return None
-        combined_rows.extend(variant_rows)
-    combined_rows.sort(key=_manifest_response_row_order)
+        for logical_code_row in logical_code_rows:
+            combined_rows.extend(
+                {
+                    **variant_row,
+                    "plan_id": logical_code_row.get("plan_id"),
+                    "plan_market_type": logical_code_row.get("plan_market_type"),
+                }
+                for variant_row in variant_rows
+            )
+    combined_rows.sort(
+        key=lambda row: _manifest_response_row_order_for_direction(
+            row,
+            descending=descending,
+        )
+    )
     if limit is None:
         return combined_rows[start:]
     return combined_rows[start : start + max(int(limit), 0)]
 
 
-async def _full_code_sidecar_rows(
+async def _full_shared_code_rows(
     session,
     serving_tables: PTG2ServingTables,
     *,
@@ -2785,46 +1932,47 @@ async def _full_code_sidecar_rows(
     network_names: list[str],
     limit: int | None,
     offset: int,
+    descending: bool,
 ) -> list[dict[str, Any]]:
     """Read and materialize an authoritative complete by-code block."""
 
     code_key = int(code_data["code_key"])
-    sidecar_rows = await _ptg2_manifest_lookup_serving_by_code_sidecar(
+    forward_rows = await _lookup_shared_forward_rows(
         session,
         serving_tables,
         code_key,
         provider_set_keys=provider_set_keys,
     )
-    if not sidecar_rows:
+    if not forward_rows:
         await _raise_missing_v3_block(session, serving_tables, code_key)
         return []
     provider_set_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
         session,
         serving_tables,
-        [sidecar_entry.provider_set_key for sidecar_entry in sidecar_rows],
+        [forward_entry.provider_set_key for forward_entry in forward_rows],
     )
     if (
-        serving_tables.effective_arch_version == "postgres_binary_v3"
-        and set(provider_set_ids_by_key)
-        != {sidecar_entry.provider_set_key for sidecar_entry in sidecar_rows}
+        set(provider_set_ids_by_key)
+        != {forward_entry.provider_set_key for forward_entry in forward_rows}
     ):
         raise PTG2ManifestArtifactError(
             "PTG2 v3 provider-set dictionary is missing a referenced key"
         )
-    ordered_sidecar_rows = _ptg2_serving_sidecar_window(
-        sidecar_rows,
+    ordered_rows = _shared_forward_row_window(
+        forward_rows,
         provider_set_ids_by_key,
         limit=limit,
         offset=offset,
+        descending=descending,
     )
     response_rows: list[dict[str, Any]] = []
-    for sidecar_row in ordered_sidecar_rows:
-        provider_set_id = provider_set_ids_by_key.get(sidecar_row.provider_set_key)
+    for forward_row in ordered_rows:
+        provider_set_id = provider_set_ids_by_key.get(forward_row.provider_set_key)
         if not provider_set_id:
             continue
         response_rows.append(
-            _ptg2_manifest_sidecar_response_row(
-                sidecar_row,
+            _shared_forward_response_row(
+                forward_row,
                 provider_set_id,
                 code_data,
                 source_trace_set_hash,
@@ -2834,30 +1982,37 @@ async def _full_code_sidecar_rows(
     return response_rows
 
 
-def _ptg2_manifest_sidecar_response_row(
-    sidecar_row: Any,
+def _shared_forward_response_row(
+    forward_row: Any,
     provider_set_id: str,
     code_data: Mapping[str, Any],
     source_trace_set_hash: str | None,
     network_names: list[str],
 ) -> dict[str, Any]:
-    """Shape one decoded sidecar row for the manifest serving response."""
+    """Shape one decoded shared forward row for the serving response."""
 
     return {
         "serving_content_hash_128": _ptg2_manifest_serving_content_hash(
-            sidecar_row.code_key,
-            sidecar_row.provider_set_key,
-            sidecar_row.price_set_global_id_128,
+            forward_row.code_key,
+            forward_row.provider_set_key,
+            forward_row.price_set_global_id_128,
         ),
+        "code_key": int(forward_row.code_key),
         "plan_id": code_data.get("plan_id"),
+        "plan_market_type": code_data.get("plan_market_type"),
         "reported_code_system": code_data.get("reported_code_system"),
         "reported_code": code_data.get("reported_code"),
+        "negotiation_arrangement": code_data.get("negotiation_arrangement"),
+        "billing_code_type_version": code_data.get("billing_code_type_version"),
+        "source_procedure_name": code_data.get("source_name"),
+        "source_procedure_description": code_data.get("source_description"),
         "procedure_global_id_128": None,
         "provider_set_global_id_128": provider_set_id,
-        "provider_count": sidecar_row.provider_count,
-        "price_set_global_id_128": sidecar_row.price_set_global_id_128,
-        "price_key": getattr(sidecar_row, "price_key", None),
-        "source_trace_set_hash": source_trace_set_hash,
+        "_ptg_provider_set_key": int(forward_row.provider_set_key),
+        "provider_count": forward_row.provider_count,
+        "price_set_global_id_128": forward_row.price_set_global_id_128,
+        "price_key": getattr(forward_row, "price_key", None),
+        "source_key": int(forward_row.source_key),
         "network_names": network_names,
     }
 
@@ -2869,14 +2024,12 @@ async def _raise_missing_v3_block(
 ) -> None:
     """Raise when a v3 code reference has no persisted forward artifact block."""
 
-    if (
-        serving_tables.effective_arch_version == "postgres_binary_v3"
-        and serving_tables.serving_binary_table
-        and not await serving_binary_code_block_exists(
-            session,
-            serving_tables.serving_binary_table,
-            code_key,
-        )
+    _require_strict_shared_v3(serving_tables)
+    if not await serving_binary_code_block_exists(
+        session,
+        code_key,
+        shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
+        schema_name=PTG2_SCHEMA,
     ):
         raise PTG2ManifestArtifactError(
             "PTG2 v3 forward artifact is missing a referenced code block"
@@ -2902,6 +2055,22 @@ def _append_provider_reverse_text_filter(
     params["q_like"] = f"%{q_text}%"
 
 
+@dataclass(frozen=True)
+class _VersionThreeReverseQuery:
+    provider_set_ids: Iterable[str]
+    requested_plan: str
+    code_value: str
+    code_system: Any
+    q_text: str
+    code_context: dict[str, Any] | None
+    source_trace_set_hash: str | None
+    network_names: list[str]
+    limit: int | None
+    offset: int
+    apply_window: bool
+    plan_market_type: str = ""
+
+
 async def _ptg2_manifest_code_rows_for_provider_reverse(
     session,
     serving_tables: PTG2ServingTables,
@@ -2914,24 +2083,23 @@ async def _ptg2_manifest_code_rows_for_provider_reverse(
     code_keys: Iterable[int] | None = None,
     limit_rows: int | None = None,
     offset_rows: int = 0,
+    plan_market_type: str = "",
 ) -> list[dict[str, Any]] | None:
-    code_count_table = _safe_table_name(serving_tables.code_count_table)
-    if not code_count_table:
-        return None
-    params: dict[str, Any] = {}
-    filters: list[str] = []
+    """Query strict V3 code metadata for a provider-reverse selection window."""
+    _require_strict_shared_v3(serving_tables)
+    scope_join_sql, filters, params, plan_order = _shared_v3_code_scope_sql(
+        serving_tables,
+        requested_plan=requested_plan,
+        plan_market_type=plan_market_type,
+    )
+    filters.append("code_metadata.snapshot_key = :shared_snapshot_key")
+    params["shared_snapshot_key"] = _required_shared_snapshot_key(serving_tables)
     normalized_code_keys = sorted(
         {int(code_key_value) for code_key_value in code_keys or () if code_key_value is not None}
     )
     if normalized_code_keys:
-        filters.append("code_key = ANY(CAST(:code_keys AS integer[]))")
+        filters.append("code_metadata.code_key = ANY(CAST(:code_keys AS integer[]))")
         params["code_keys"] = normalized_code_keys
-    if requested_plan:
-        plan_filter, plan_order = _code_plan_scope_sql(requested_plan, column="plan_id")
-        filters.append(plan_filter)
-        params["plan_id"] = requested_plan
-    else:
-        plan_order = "plan_id NULLS FIRST"
     _append_manifest_reported_code_filter(
         filters,
         params,
@@ -2949,10 +2117,24 @@ async def _ptg2_manifest_code_rows_for_provider_reverse(
     code_row_result = await session.execute(
         text(
             f"""
-            SELECT code_key, plan_id, reported_code_system, reported_code, rate_count
-            FROM {code_count_table}
+            SELECT code_metadata.code_key,
+                   logical_scope.plan_id,
+                   logical_scope.plan_market_type,
+                   code_metadata.reported_code_system,
+                   code_metadata.reported_code,
+                   code_metadata.negotiation_arrangement,
+                   code_metadata.billing_code_type_version,
+                   code_metadata.source_name,
+                   code_metadata.source_description,
+                   code_metadata.rate_count
+            FROM {_shared_v3_code_table()} code_metadata
+            {scope_join_sql}
             {where_sql}
-            ORDER BY {plan_order}, reported_code_system, reported_code, code_key
+            ORDER BY {plan_order},
+                     code_metadata.reported_code_system,
+                     code_metadata.reported_code,
+                     code_metadata.negotiation_arrangement,
+                     code_metadata.code_key
             {window_sql}
             """
         ),
@@ -2961,385 +2143,8 @@ async def _ptg2_manifest_code_rows_for_provider_reverse(
     return [_row_mapping(code_row) for code_row in code_row_result]
 
 
-async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
-    session,
-    serving_tables: PTG2ServingTables,
-    *,
-    provider_set_ids: Iterable[str],
-    requested_plan: str,
-    code_value: str,
-    code_system: Any,
-    q_text: str,
-    code_context: dict[str, Any] | None,
-    source_trace_set_hash: str | None,
-    network_names: list[str],
-    limit: int | None = None,
-    offset: int = 0,
-    apply_window: bool = False,
-) -> list[dict[str, Any]] | None:
-    """Resolve one provider's procedure rows from reverse binary artifacts."""
-
-    if not (
-        serving_tables.serving_binary_table
-        or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
-        or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
-    ):
-        return None
-    provider_set_keys_by_id = await _ptg2_manifest_provider_set_keys_for_ids(
-        session,
-        serving_tables,
-        provider_set_ids,
-    )
-    if not provider_set_keys_by_id:
-        return []
-    provider_set_ids_by_key = {value: key for key, value in provider_set_keys_by_id.items()}
-    broad_code_scan = not (
-        str(code_value or "").strip()
-        or code_system
-        or str(q_text or "").strip()
-        or code_context
-    )
-
-    def _sidecar_row_payload(
-        *,
-        code_by_key: Mapping[int, Mapping[str, Any]],
-        code_key: int,
-        provider_set_id: str | None,
-        provider_set_key: int,
-        provider_count: int,
-        price_set_global_id_128: str,
-    ) -> dict[str, Any]:
-        code_data = code_by_key.get(int(code_key))
-        if not code_data:
-            return {}
-        return {
-            "serving_content_hash_128": _ptg2_manifest_serving_content_hash(
-                int(code_key),
-                int(provider_set_key),
-                price_set_global_id_128,
-            ),
-            "plan_id": code_data.get("plan_id"),
-            "reported_code_system": code_data.get("reported_code_system"),
-            "reported_code": code_data.get("reported_code"),
-            "procedure_global_id_128": None,
-            "provider_set_global_id_128": provider_set_id or provider_set_ids_by_key.get(int(provider_set_key)),
-            "provider_count": provider_count,
-            "price_set_global_id_128": price_set_global_id_128,
-            "source_trace_set_hash": source_trace_set_hash,
-            "network_names": network_names,
-            "_code_key": int(code_key),
-        }
-
-    if apply_window:
-        prefer_provider_set_reverse = broad_code_scan and bool(
-            serving_tables.serving_binary_table
-            or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
-        )
-        if (
-            serving_tables.serving_binary_table
-            or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
-        ) and not prefer_provider_set_reverse:
-            page_limit = max(int(limit or 0), 0)
-            if page_limit <= 0:
-                return []
-            page_offset = max(int(offset or 0), 0)
-            requested_provider_set_keys = tuple(
-                sorted({int(value) for value in provider_set_keys_by_id.values()})
-            )
-            rows: list[dict[str, Any]] = []
-            skipped = 0
-            code_row_offset = 0
-            code_row_batch_size = 256 if broad_code_scan else None
-            while True:
-                code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
-                    session,
-                    serving_tables,
-                    requested_plan=requested_plan,
-                    code_value=code_value,
-                    code_system=code_system,
-                    q_text=q_text,
-                    code_context=code_context,
-                    limit_rows=code_row_batch_size,
-                    offset_rows=code_row_offset,
-                )
-                if code_rows is None:
-                    return None
-                if not code_rows:
-                    break
-                code_by_key = {
-                    int(row["code_key"]): row
-                    for row in code_rows
-                    if row.get("code_key") is not None
-                }
-                for code_key in code_by_key:
-                    sidecar_rows = await _ptg2_manifest_lookup_serving_by_code_sidecar(
-                        session,
-                        serving_tables,
-                        int(code_key),
-                        provider_set_keys=requested_provider_set_keys,
-                    )
-                    if not sidecar_rows:
-                        continue
-                    code_candidates: list[dict[str, Any]] = []
-                    for row in sidecar_rows:
-                        provider_set_id = provider_set_ids_by_key.get(int(row.provider_set_key))
-                        payload = _sidecar_row_payload(
-                            code_by_key=code_by_key,
-                            code_key=int(row.code_key),
-                            provider_set_id=provider_set_id,
-                            provider_set_key=int(row.provider_set_key),
-                            provider_count=int(row.provider_count),
-                            price_set_global_id_128=row.price_set_global_id_128,
-                        )
-                        if payload:
-                            code_candidates.append(payload)
-                    if not code_candidates:
-                        continue
-                    code_candidates.sort(
-                        key=lambda data: (
-                            -(int(data.get("provider_count") or 0)),
-                            _ptg2_manifest_id(data.get("provider_set_global_id_128")),
-                            _ptg2_manifest_id(data.get("price_set_global_id_128")),
-                        )
-                    )
-                    candidate_count = len(code_candidates)
-                    if skipped + candidate_count <= page_offset:
-                        skipped += candidate_count
-                        continue
-                    local_start = max(page_offset - skipped, 0)
-                    local_end = local_start + (page_limit - len(rows))
-                    rows.extend(code_candidates[local_start:local_end])
-                    skipped += candidate_count
-                    if len(rows) >= page_limit:
-                        break
-                if len(rows) >= page_limit or not broad_code_scan:
-                    break
-                code_row_offset += len(code_rows)
-                if code_row_batch_size is None or len(code_rows) < code_row_batch_size:
-                    break
-            for data in rows:
-                data.pop("_code_key", None)
-            return rows
-
-        page_limit = max(int(limit or 0), 0)
-        if page_limit <= 0:
-            return []
-        page_offset = max(int(offset or 0), 0)
-        entries_by_provider_code: list[tuple[str, int, dict[int, list[tuple[int, str]]]]] = []
-        code_by_key: dict[int, Mapping[str, Any]]
-        if broad_code_scan:
-            rows: list[dict[str, Any]] = []
-            skipped = 0
-            code_row_offset = 0
-            code_row_batch_size = max(page_limit + page_offset, 256)
-            while True:
-                code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
-                    session,
-                    serving_tables,
-                    requested_plan=requested_plan,
-                    code_value=code_value,
-                    code_system=code_system,
-                    q_text=q_text,
-                    code_context=code_context,
-                    limit_rows=code_row_batch_size,
-                    offset_rows=code_row_offset,
-                )
-                if code_rows is None:
-                    return None
-                if not code_rows:
-                    break
-                code_by_key = {int(row["code_key"]): row for row in code_rows if row.get("code_key") is not None}
-                if not code_by_key:
-                    break
-                entries_by_provider_code = []
-                patterns_by_provider_set = await _ptg2_manifest_lookup_serving_by_provider_sets_patterns(
-                    session,
-                    serving_tables,
-                    provider_set_keys_by_id.values(),
-                    code_keys=code_by_key.keys(),
-                )
-                for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
-                    patterns = patterns_by_provider_set.get(int(provider_set_key), ())
-                    entries_by_code: dict[int, list[tuple[int, str]]] = {}
-                    for pattern in patterns:
-                        for code_key in pattern.code_keys:
-                            if int(code_key) in code_by_key:
-                                entries_by_code.setdefault(int(code_key), []).extend(pattern.entries)
-                    if entries_by_code:
-                        entries_by_provider_code.append((provider_set_id, provider_set_key, entries_by_code))
-                for code_key in code_by_key:
-                    code_candidates: list[dict[str, Any]] = []
-                    for provider_set_id, provider_set_key, entries_by_code in entries_by_provider_code:
-                        for provider_count, price_set_id in entries_by_code.get(int(code_key), ()):
-                            payload = _sidecar_row_payload(
-                                code_by_key=code_by_key,
-                                code_key=int(code_key),
-                                provider_set_id=provider_set_id,
-                                provider_set_key=int(provider_set_key),
-                                provider_count=int(provider_count),
-                                price_set_global_id_128=price_set_id,
-                            )
-                            if payload:
-                                code_candidates.append(payload)
-                    code_candidates.sort(
-                        key=lambda data: (
-                            -(int(data.get("provider_count") or 0)),
-                            _ptg2_manifest_id(data.get("provider_set_global_id_128")),
-                            _ptg2_manifest_id(data.get("price_set_global_id_128")),
-                        )
-                    )
-                    candidate_count = len(code_candidates)
-                    if skipped + candidate_count <= page_offset:
-                        skipped += candidate_count
-                        continue
-                    local_start = max(page_offset - skipped, 0)
-                    local_end = local_start + (page_limit - len(rows))
-                    rows.extend(code_candidates[local_start:local_end])
-                    skipped += candidate_count
-                    if len(rows) >= page_limit:
-                        break
-                if len(rows) >= page_limit:
-                    break
-                code_row_offset += len(code_rows)
-                if len(code_rows) < code_row_batch_size:
-                    break
-            for data in rows:
-                data.pop("_code_key", None)
-            return rows
-        else:
-            code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
-                session,
-                serving_tables,
-                requested_plan=requested_plan,
-                code_value=code_value,
-                code_system=code_system,
-                q_text=q_text,
-                code_context=code_context,
-            )
-            if code_rows is None:
-                return None
-            if not code_rows:
-                return []
-            code_by_key = {int(row["code_key"]): row for row in code_rows if row.get("code_key") is not None}
-            patterns_by_provider_set = await _ptg2_manifest_lookup_serving_by_provider_sets_patterns(
-                session,
-                serving_tables,
-                provider_set_keys_by_id.values(),
-                code_keys=code_by_key.keys(),
-            )
-            for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
-                patterns = patterns_by_provider_set.get(int(provider_set_key), ())
-                entries_by_code: dict[int, list[tuple[int, str]]] = {}
-                for pattern in patterns:
-                    for code_key in pattern.code_keys:
-                        if int(code_key) in code_by_key:
-                            entries_by_code.setdefault(int(code_key), []).extend(pattern.entries)
-                if entries_by_code:
-                    entries_by_provider_code.append((provider_set_id, provider_set_key, entries_by_code))
-
-        rows: list[dict[str, Any]] = []
-        skipped = 0
-        for code_key in code_by_key:
-            code_candidates: list[dict[str, Any]] = []
-            for provider_set_id, provider_set_key, entries_by_code in entries_by_provider_code:
-                for provider_count, price_set_id in entries_by_code.get(int(code_key), ()):
-                    payload = _sidecar_row_payload(
-                        code_by_key=code_by_key,
-                        code_key=int(code_key),
-                        provider_set_id=provider_set_id,
-                        provider_set_key=int(provider_set_key),
-                        provider_count=int(provider_count),
-                        price_set_global_id_128=price_set_id,
-                    )
-                    if payload:
-                        code_candidates.append(payload)
-            code_candidates.sort(
-                key=lambda data: (
-                    -(int(data.get("provider_count") or 0)),
-                    _ptg2_manifest_id(data.get("provider_set_global_id_128")),
-                    _ptg2_manifest_id(data.get("price_set_global_id_128")),
-                )
-            )
-            candidate_count = len(code_candidates)
-            if skipped + candidate_count <= page_offset:
-                skipped += candidate_count
-                continue
-            local_start = max(page_offset - skipped, 0)
-            local_end = local_start + (page_limit - len(rows))
-            rows.extend(code_candidates[local_start:local_end])
-            skipped += candidate_count
-            if len(rows) >= page_limit:
-                break
-        for data in rows:
-            data.pop("_code_key", None)
-        return rows
-
-    code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
-        session,
-        serving_tables,
-        requested_plan=requested_plan,
-        code_value=code_value,
-        code_system=code_system,
-        q_text=q_text,
-        code_context=code_context,
-    )
-    if code_rows is None:
-        return None
-    if not code_rows:
-        return []
-    code_by_key = {int(row["code_key"]): row for row in code_rows if row.get("code_key") is not None}
-    rows: list[dict[str, Any]] = []
-    for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
-        sidecar_rows = await _ptg2_manifest_lookup_serving_by_provider_set_sidecar(
-            session,
-            serving_tables,
-            provider_set_key,
-            code_keys=code_by_key.keys(),
-        )
-        for row in sidecar_rows:
-            payload = _sidecar_row_payload(
-                code_by_key=code_by_key,
-                code_key=row.code_key,
-                provider_set_id=provider_set_id,
-                provider_set_key=row.provider_set_key,
-                provider_count=row.provider_count,
-                price_set_global_id_128=row.price_set_global_id_128,
-            )
-            if payload:
-                rows.append(payload)
-    code_order = {code_key: index for index, code_key in enumerate(code_by_key)}
-    rows.sort(
-        key=lambda data: (
-            code_order.get(int(data.get("_code_key") or 0), 0),
-            str(data.get("reported_code_system") or ""),
-            str(data.get("reported_code") or ""),
-            -(int(data.get("provider_count") or 0)),
-            _ptg2_manifest_id(data.get("provider_set_global_id_128")),
-            _ptg2_manifest_id(data.get("price_set_global_id_128")),
-        )
-    )
-    for data in rows:
-        data.pop("_code_key", None)
-    return rows
-
-
-@dataclass(frozen=True)
-class _VersionThreeReverseQuery:
-    provider_set_ids: Iterable[str]
-    requested_plan: str
-    code_value: str
-    code_system: Any
-    q_text: str
-    code_context: dict[str, Any] | None
-    source_trace_set_hash: str | None
-    network_names: list[str]
-    limit: int | None
-    offset: int
-    apply_window: bool
-
-
 def _version_three_candidate_rows(
-    code_metadata_by_key: Mapping[int, Mapping[str, Any]],
+    code_metadata_rows: Iterable[Mapping[str, Any]],
     forward_entries_by_code: Mapping[int, Iterable[Any]],
     provider_set_id_by_key: Mapping[int, str],
     source_trace_set_hash: str | None,
@@ -3348,7 +2153,10 @@ def _version_three_candidate_rows(
     """Build exactly ordered reverse candidates without collapsing duplicates."""
 
     candidate_row_groups: list[list[dict[str, Any]]] = []
-    for code_key, code_metadata in code_metadata_by_key.items():
+    for code_metadata in code_metadata_rows:
+        if code_metadata.get("code_key") is None:
+            continue
+        code_key = int(code_metadata["code_key"])
         code_candidates = [
             {
                 "serving_content_hash_128": _ptg2_manifest_serving_content_hash(
@@ -3357,14 +2165,21 @@ def _version_three_candidate_rows(
                     forward_entry.price_set_global_id_128,
                 ),
                 "plan_id": code_metadata.get("plan_id"),
+                "plan_market_type": code_metadata.get("plan_market_type"),
                 "reported_code_system": code_metadata.get("reported_code_system"),
                 "reported_code": code_metadata.get("reported_code"),
+                "negotiation_arrangement": code_metadata.get(
+                    "negotiation_arrangement"
+                ),
+                "billing_code_type_version": code_metadata.get("billing_code_type_version"),
+                "source_procedure_name": code_metadata.get("source_name"),
+                "source_procedure_description": code_metadata.get("source_description"),
                 "procedure_global_id_128": None,
                 "provider_set_global_id_128": provider_set_id_by_key.get(forward_entry.provider_set_key),
                 "provider_count": forward_entry.provider_count,
                 "price_set_global_id_128": forward_entry.price_set_global_id_128,
                 "price_key": forward_entry.price_key,
-                "source_trace_set_hash": source_trace_set_hash,
+                "source_key": int(forward_entry.source_key),
                 "network_names": network_names,
             }
             for forward_entry in forward_entries_by_code.get(code_key, ())
@@ -3375,6 +2190,7 @@ def _version_three_candidate_rows(
                 -(int(candidate.get("provider_count") or 0)),
                 _ptg2_manifest_id(candidate.get("provider_set_global_id_128")),
                 _ptg2_manifest_id(candidate.get("price_set_global_id_128")),
+                int(candidate.get("source_key") or 0),
             )
         )
         candidate_row_groups.append(code_candidates)
@@ -3408,6 +2224,7 @@ async def _version_three_exact_code_metadata(
         code_system=reverse_query.code_system,
         q_text=reverse_query.q_text,
         code_context=reverse_query.code_context,
+        plan_market_type=reverse_query.plan_market_type,
     )
     if code_metadata_rows is None:
         raise PTG2ManifestArtifactError("PTG2 v3 code dictionary is unavailable")
@@ -3419,6 +2236,7 @@ class _VersionThreeRowWindow:
     limit: int | None
     remaining_offset: int
     candidates: list[dict[str, Any]] = field(default_factory=list)
+    rows_seen: int = 0
 
     @property
     def is_full(self) -> bool:
@@ -3431,6 +2249,7 @@ class _VersionThreeRowWindow:
 
         if self.is_full:
             return
+        self.rows_seen += len(code_candidates)
         if self.remaining_offset >= len(code_candidates):
             self.remaining_offset -= len(code_candidates)
             return
@@ -3449,6 +2268,20 @@ def _version_three_row_window(reverse_query: _VersionThreeReverseQuery) -> _Vers
     return _VersionThreeRowWindow(limit=row_limit, remaining_offset=row_offset)
 
 
+@dataclass(frozen=True)
+class _VersionThreeReverseSelection:
+    """An exact ordered reverse prefix with honest cardinality metadata."""
+
+    rows: tuple[dict[str, Any], ...]
+    exhausted: bool
+    total_row_count: int | None = None
+
+    @property
+    def total_is_exact(self) -> bool:
+        """Return whether the reverse selection has an exact total row count."""
+        return self.total_row_count is not None
+
+
 async def _version_three_scope_code_keys(
     session,
     serving_tables: PTG2ServingTables,
@@ -3465,16 +2298,19 @@ async def _version_three_scope_code_keys(
         )
         return (
             tuple(
-                int(code_metadata["code_key"])
-                for code_metadata in exact_code_metadata_rows
-                if code_metadata.get("code_key") is not None
+                dict.fromkeys(
+                    int(code_metadata["code_key"])
+                    for code_metadata in exact_code_metadata_rows
+                    if code_metadata.get("code_key") is not None
+                )
             ),
             exact_code_metadata_rows,
         )
-    provider_set_code_keys = await lookup_provider_code_keys_from_db(
+    provider_set_code_keys = await lookup_shared_provider_code_keys_from_db(
         session,
-        serving_tables.serving_binary_table,
+        _required_shared_snapshot_key(serving_tables),
         provider_set_id_by_key,
+        schema_name=PTG2_SCHEMA,
     )
     missing_provider_code_keys = set(provider_set_id_by_key).difference(provider_set_code_keys)
     empty_provider_code_keys = {
@@ -3507,9 +2343,7 @@ async def _version_three_reverse_scope(
 ) -> _VersionThreeReverseScope | None:
     """Resolve provider keys and their candidate codes without forward reads."""
 
-    if not serving_tables.serving_binary_table:
-        _raise_missing_postgres_binary_table(serving_tables)
-        return None
+    _require_strict_shared_v3(serving_tables)
     provider_set_key_by_id = await _ptg2_manifest_provider_set_keys_for_ids(
         session,
         serving_tables,
@@ -3572,15 +2406,13 @@ async def _version_three_forward_entries_for_batch(
     )
     return await lookup_binary_code_batch_from_db(
         session,
-        serving_tables.serving_binary_table,
         code_metadata_by_key,
         provider_set_keys=provider_set_id_by_key,
         provider_counts_by_key=provider_counts_by_key,
-        price_dictionary_item_count=serving_tables.price_dictionary_item_count,
-        price_dictionary_block_bytes=serving_tables.price_dictionary_block_bytes,
-        price_dictionary_compressed_records=(
-            serving_tables.price_dictionary_compressed_records
-        ),
+        **_version_three_page_price_lookup_hints(serving_tables),
+        shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
+        source_count=_required_source_count(serving_tables),
+        schema_name=PTG2_SCHEMA,
     )
 
 
@@ -3610,6 +2442,7 @@ async def _version_three_candidate_batch(
             code_keys=reverse_scope.candidate_code_keys,
             limit_rows=metadata_batch_size,
             offset_rows=metadata_offset,
+            plan_market_type=reverse_query.plan_market_type,
         )
     if code_metadata_rows is None:
         return None
@@ -3627,7 +2460,7 @@ async def _version_three_candidate_batch(
         reverse_scope.provider_set_id_by_key,
     )
     candidate_row_groups = _version_three_candidate_rows(
-        code_metadata_by_key,
+        code_metadata_rows,
         forward_entries_by_code,
         reverse_scope.provider_set_id_by_key,
         reverse_query.source_trace_set_hash,
@@ -3653,32 +2486,20 @@ async def _has_single_plan_page_order(
     session,
     serving_tables: PTG2ServingTables,
     requested_plan: str,
+    plan_market_type: str = "",
 ) -> bool:
-    """Prove that dense code-key order matches the requested API plan order."""
+    """Allow projected pages only for one logical mapping and one physical scope."""
 
-    code_count_table = _safe_table_name(serving_tables.code_count_table)
-    if not code_count_table:
+    _require_strict_shared_v3(serving_tables)
+    normalized_plan = str(requested_plan or "").strip()
+    normalized_market_type = _normalized_plan_market_type(plan_market_type)
+    if normalized_plan and normalized_plan != str(serving_tables.plan_id or "").strip():
         return False
-    plan_order_result = await session.execute(
-        text(
-            f"""
-            SELECT CASE
-                WHEN :page_plan_id <> '' THEN COALESCE(
-                    BOOL_AND(COALESCE(plan_id = :page_plan_id, FALSE)),
-                    FALSE
-                )
-                ELSE COALESCE(BOOL_AND(plan_id IS NULL), FALSE)
-                  OR COALESCE(
-                        BOOL_AND(COALESCE(plan_id = '', FALSE)),
-                        FALSE
-                     )
-            END AS single_plan_scope
-            FROM {code_count_table}
-            """
-        ),
-        {"page_plan_id": str(requested_plan or "")},
-    )
-    return bool(plan_order_result.scalar())
+    if normalized_market_type and normalized_market_type != _normalized_plan_market_type(
+        serving_tables.plan_market_type or ""
+    ):
+        return False
+    return bool(serving_tables.coverage_scope_id)
 
 
 @dataclass(frozen=True)
@@ -3709,10 +2530,12 @@ async def _load_version_three_page_projection(
         provider_set_key: provider_set_id
         for provider_set_id, provider_set_key in provider_set_key_by_id.items()
     }
-    provider_pages_by_key = await lookup_provider_pages_from_db(
+    provider_pages_by_key = await lookup_shared_provider_pages_from_db(
         session,
-        serving_tables.serving_binary_table,
+        _required_shared_snapshot_key(serving_tables),
         provider_set_id_by_key,
+        source_count=_required_source_count(serving_tables),
+        schema_name=PTG2_SCHEMA,
     )
     if provider_pages_by_key is None:
         return None
@@ -3739,11 +2562,11 @@ async def _version_three_page_projection_scope(
 
     if not _is_version_three_reverse_page_eligible(reverse_query):
         return None
-    if not serving_tables.serving_binary_table:
-        return None
-    if not await has_provider_pages_in_db(
+    _require_strict_shared_v3(serving_tables)
+    if not await has_shared_provider_pages_in_db(
         session,
-        serving_tables.serving_binary_table,
+        _required_shared_snapshot_key(serving_tables),
+        schema_name=PTG2_SCHEMA,
     ):
         return None
     try:
@@ -3756,6 +2579,7 @@ async def _version_three_page_projection_scope(
         session,
         serving_tables,
         reverse_query.requested_plan,
+        reverse_query.plan_market_type,
     ):
         return None
     return await _load_version_three_page_projection(
@@ -3783,6 +2607,7 @@ def _version_three_ordered_page_entries(
                 -page_entry.provider_count,
                 page_entry.provider_set_key,
                 page_entry.price_key,
+                page_entry.source_key,
             )
         )
         ordered_entries.extend(code_entries)
@@ -3804,16 +2629,29 @@ def _version_three_reverse_page_candidates(
                 price_ids_by_key[page_entry.price_key],
             ),
             "plan_id": code_metadata_by_key[page_entry.code_key].get("plan_id"),
+            "plan_market_type": code_metadata_by_key[page_entry.code_key].get(
+                "plan_market_type"
+            ),
             "reported_code_system": code_metadata_by_key[page_entry.code_key].get(
                 "reported_code_system"
             ),
             "reported_code": code_metadata_by_key[page_entry.code_key].get("reported_code"),
+            "negotiation_arrangement": code_metadata_by_key[page_entry.code_key].get(
+                "negotiation_arrangement"
+            ),
+            "billing_code_type_version": code_metadata_by_key[page_entry.code_key].get(
+                "billing_code_type_version"
+            ),
+            "source_procedure_name": code_metadata_by_key[page_entry.code_key].get("source_name"),
+            "source_procedure_description": code_metadata_by_key[page_entry.code_key].get(
+                "source_description"
+            ),
             "procedure_global_id_128": None,
             "provider_set_global_id_128": provider_set_id_by_key[page_entry.provider_set_key],
             "provider_count": page_entry.provider_count,
             "price_set_global_id_128": price_ids_by_key[page_entry.price_key],
             "price_key": page_entry.price_key,
-            "source_trace_set_hash": reverse_query.source_trace_set_hash,
+            "source_key": page_entry.source_key,
             "network_names": reverse_query.network_names,
         }
         for page_entry in page_entries
@@ -3837,6 +2675,7 @@ async def _version_three_page_window(
         q_text="",
         code_context=None,
         code_keys=(page_entry.code_key for page_entry in page_scope.page_entries),
+        plan_market_type=reverse_query.plan_market_type,
     )
     if code_metadata_rows is None:
         return None
@@ -3863,12 +2702,12 @@ async def _version_three_page_window(
     return code_metadata_by_key, ordered_entries[start:requested_end]
 
 
-async def _version_three_reverse_page_rows(
+async def _version_three_reverse_page_selection(
     session,
     serving_tables: PTG2ServingTables,
     reverse_query: _VersionThreeReverseQuery,
-) -> list[dict[str, Any]] | None:
-    """Serve a shallow provider page without probing each full forward code block."""
+) -> _VersionThreeReverseSelection | None:
+    """Serve a shallow provider page with an exact projected row count."""
 
     page_scope = await _version_three_page_projection_scope(
         session,
@@ -3888,37 +2727,68 @@ async def _version_three_reverse_page_rows(
     code_metadata_by_key, selected_entries = page_window
     price_ids_by_key = await lookup_price_ids_from_db(
         session,
-        serving_tables.serving_binary_table,
         (page_entry.price_key for page_entry in selected_entries),
         **_version_three_page_price_lookup_hints(serving_tables),
+        shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
+        schema_name=PTG2_SCHEMA,
     )
     if set(price_ids_by_key) != {page_entry.price_key for page_entry in selected_entries}:
         raise PTG2ManifestArtifactError("PTG2 v3 reverse page references an unknown price set")
-    return _version_three_reverse_page_candidates(
-        code_metadata_by_key,
-        selected_entries,
-        page_scope.provider_set_id_by_key,
-        price_ids_by_key,
-        reverse_query,
+    rows = tuple(
+        _version_three_reverse_page_candidates(
+            code_metadata_by_key,
+            selected_entries,
+            page_scope.provider_set_id_by_key,
+            price_ids_by_key,
+            reverse_query,
+        )
+    )
+    total_row_count = sum(
+        provider_page.total_row_count
+        for provider_page in page_scope.provider_pages_by_key.values()
+    )
+    return _VersionThreeReverseSelection(
+        rows=rows,
+        exhausted=max(int(reverse_query.offset or 0), 0) + len(rows) >= total_row_count,
+        total_row_count=total_row_count,
     )
 
 
-async def _version_three_reverse_rows(
+async def _version_three_reverse_page_rows(
     session,
     serving_tables: PTG2ServingTables,
     reverse_query: _VersionThreeReverseQuery,
-) -> list[dict[str, Any]]:
-    """Serve reverse NPI queries from v3 code memberships and forward blocks."""
+) -> list[dict[str, Any]] | None:
+    """Compatibility helper returning only projected reverse rows."""
+
+    selection = await _version_three_reverse_page_selection(
+        session,
+        serving_tables,
+        reverse_query,
+    )
+    return None if selection is None else list(selection.rows)
+
+
+async def _version_three_reverse_selection(
+    session,
+    serving_tables: PTG2ServingTables,
+    reverse_query: _VersionThreeReverseQuery,
+) -> _VersionThreeReverseSelection:
+    """Serve an ordered reverse window without overstating its total count."""
 
     row_window = _version_three_row_window(reverse_query)
     if row_window.is_full:
-        return []
-    page_rows = await _version_three_reverse_page_rows(session, serving_tables, reverse_query)
-    if page_rows is not None:
-        return page_rows
+        return _VersionThreeReverseSelection(rows=(), exhausted=False)
+    page_selection = await _version_three_reverse_page_selection(
+        session,
+        serving_tables,
+        reverse_query,
+    )
+    if page_selection is not None:
+        return page_selection
     reverse_scope = await _version_three_reverse_scope(session, serving_tables, reverse_query)
     if reverse_scope is None:
-        return []
+        return _VersionThreeReverseSelection(rows=(), exhausted=True, total_row_count=0)
     metadata_batch_size = _version_three_code_batch_size(reverse_query)
     metadata_offset = 0
     while not row_window.is_full:
@@ -3931,312 +2801,317 @@ async def _version_three_reverse_rows(
             metadata_batch_size,
         )
         if candidate_batch is None:
-            return []
+            raise PTG2ManifestArtifactError("PTG2 v3 reverse metadata is unavailable")
         candidate_row_groups, code_metadata_count = candidate_batch
         if code_metadata_count == 0:
-            break
+            return _VersionThreeReverseSelection(
+                rows=tuple(row_window.candidates),
+                exhausted=True,
+                total_row_count=row_window.rows_seen,
+            )
         for code_candidates in candidate_row_groups:
             row_window.add_code_candidates(code_candidates)
             if row_window.is_full:
-                break
+                return _VersionThreeReverseSelection(
+                    rows=tuple(row_window.candidates),
+                    exhausted=False,
+                )
         if metadata_batch_size is None or code_metadata_count < metadata_batch_size:
-            break
+            return _VersionThreeReverseSelection(
+                rows=tuple(row_window.candidates),
+                exhausted=True,
+                total_row_count=row_window.rows_seen,
+            )
         metadata_offset += code_metadata_count
         metadata_batch_size = _next_version_three_code_batch_size(metadata_batch_size)
-    return row_window.candidates
+    return _VersionThreeReverseSelection(rows=tuple(row_window.candidates), exhausted=False)
 
 
-async def _ptg2_manifest_provider_procedure_rows_from_lean_table(
+async def _version_three_reverse_rows(
     session,
     serving_tables: PTG2ServingTables,
-    *,
-    provider_set_ids: Iterable[str],
-    requested_plan: str,
-    code_value: str,
-    code_system: Any,
-    q_text: str,
-    code_context: dict[str, Any] | None,
-    source_trace_set_hash: str | None,
-    network_names: list[str],
-    limit: int,
-    offset: int = 0,
-) -> list[dict[str, Any]] | None:
-    """Resolve one provider's procedure rows from the retained lean table."""
+    reverse_query: _VersionThreeReverseQuery,
+) -> list[dict[str, Any]]:
+    """Compatibility helper returning only reverse rows."""
 
-    table_name = _safe_table_name(serving_tables.serving_table)
-    if not table_name:
-        return None
-    code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
+    selection = await _version_three_reverse_selection(
         session,
         serving_tables,
-        requested_plan=requested_plan,
-        code_value=code_value,
-        code_system=code_system,
-        q_text=q_text,
-        code_context=code_context,
+        reverse_query,
     )
-    if code_rows is None:
-        return None
-    if not code_rows:
-        return []
-    provider_set_keys_by_id = await _ptg2_manifest_provider_set_keys_for_ids(
+    return list(selection.rows)
+
+
+@dataclass(frozen=True)
+class _VersionThreeFilteredReverseSelection:
+    """A filtered reverse prefix with prices retained for response shaping."""
+
+    rows: tuple[dict[str, Any], ...]
+    prices_by_price_set: Mapping[str, list[dict[str, Any]]]
+    exhausted: bool
+    matched_rows_seen: int
+    total_row_count: int | None = None
+
+
+async def _version_three_filtered_reverse_selection(
+    session,
+    serving_tables: PTG2ServingTables,
+    reverse_query: _VersionThreeReverseQuery,
+    args: Mapping[str, Any],
+    *,
+    offset: int,
+    limit: int,
+) -> _VersionThreeFilteredReverseSelection:
+    """Read ordered batches until a filtered page sentinel or exhaustion."""
+
+    reverse_scope = await _version_three_reverse_scope(session, serving_tables, reverse_query)
+    if reverse_scope is None:
+        return _VersionThreeFilteredReverseSelection(
+            rows=(),
+            prices_by_price_set={},
+            exhausted=True,
+            matched_rows_seen=0,
+            total_row_count=0,
+        )
+    requested_offset = max(int(offset), 0)
+    requested_limit = max(int(limit), 0)
+    filter_args = dict(args)
+    selected_rows: list[dict[str, Any]] = []
+    selected_prices: dict[str, list[dict[str, Any]]] = {}
+    matched_rows_seen = 0
+    metadata_offset = 0
+    metadata_batch_size = (
+        None
+        if reverse_scope.exact_code_metadata_rows is not None
+        else _PTG2_VERSION_THREE_REVERSE_CODE_BATCH_SIZE
+    )
+    while True:
+        candidate_batch = await _version_three_candidate_batch(
+            session,
+            serving_tables,
+            reverse_query,
+            reverse_scope,
+            metadata_offset,
+            metadata_batch_size,
+        )
+        if candidate_batch is None:
+            raise PTG2ManifestArtifactError("PTG2 v3 reverse metadata is unavailable")
+        candidate_row_groups, code_metadata_count = candidate_batch
+        if code_metadata_count == 0:
+            return _VersionThreeFilteredReverseSelection(
+                rows=tuple(selected_rows),
+                prices_by_price_set=selected_prices,
+                exhausted=True,
+                matched_rows_seen=matched_rows_seen,
+                total_row_count=matched_rows_seen,
+            )
+        candidate_rows = [row for row_group in candidate_row_groups for row in row_group]
+        price_key_by_set_id = {
+            _ptg2_manifest_id(row.get("price_set_global_id_128")): int(row["price_key"])
+            for row in candidate_rows
+            if row.get("price_key") is not None
+            and _ptg2_manifest_id(row.get("price_set_global_id_128"))
+        }
+        prices_by_price_set = await _ptg2_manifest_prices_for_price_sets(
+            session,
+            serving_tables,
+            tuple(price_key_by_set_id),
+            price_key_by_set_id=price_key_by_set_id,
+        )
+        for row in candidate_rows:
+            price_set_id = _ptg2_manifest_id(row.get("price_set_global_id_128"))
+            prices = _ptg2_manifest_filter_prices(
+                prices_by_price_set.get(price_set_id, []),
+                filter_args,
+            )
+            if not prices:
+                continue
+            matched_rows_seen += 1
+            if matched_rows_seen <= requested_offset:
+                continue
+            if len(selected_rows) < requested_limit:
+                selected_rows.append(row)
+                selected_prices[price_set_id] = prices
+            if len(selected_rows) >= requested_limit:
+                return _VersionThreeFilteredReverseSelection(
+                    rows=tuple(selected_rows),
+                    prices_by_price_set=selected_prices,
+                    exhausted=False,
+                    matched_rows_seen=matched_rows_seen,
+                )
+        if metadata_batch_size is None or code_metadata_count < metadata_batch_size:
+            return _VersionThreeFilteredReverseSelection(
+                rows=tuple(selected_rows),
+                prices_by_price_set=selected_prices,
+                exhausted=True,
+                matched_rows_seen=matched_rows_seen,
+                total_row_count=matched_rows_seen,
+            )
+        metadata_offset += code_metadata_count
+
+
+async def _shared_graph_members_by_id(
+    session,
+    serving_tables: PTG2ServingTables,
+    name: str,
+    owner_ids: list[str] | tuple[str, ...],
+    *,
+    max_members: int | None = None,
+) -> dict[str, tuple[str, ...]]:
+    """Resolve dense shared-graph members for normalized 128-bit owner IDs."""
+
+    _require_strict_shared_v3(serving_tables)
+    owner_id_list = list(_ptg2_manifest_ids(tuple(owner_ids)))
+    if not owner_id_list:
+        return {}
+    return await _shared_graph_members_many(
         session,
         serving_tables,
-        provider_set_ids,
+        name,
+        owner_id_list,
+        max_members=max_members,
     )
-    if not provider_set_keys_by_id:
-        return []
-    code_keys: list[int] = []
-    code_orders: list[int] = []
-    for index, row in enumerate(code_rows):
-        if row.get("code_key") is None:
-            continue
-        code_keys.append(int(row["code_key"]))
-        code_orders.append(index)
-    if not code_keys:
-        return []
-    provider_set_keys = [int(value) for value in provider_set_keys_by_id.values()]
-    if not provider_set_keys:
-        return []
-    code_count_table = _safe_table_name(serving_tables.code_count_table)
-    provider_set_dictionary_table = _safe_table_name(serving_tables.provider_set_dictionary_table)
-    if not code_count_table or not provider_set_dictionary_table:
-        return None
-    row_result = await session.execute(
+
+async def _shared_provider_group_ids_for_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_group_keys: Iterable[int],
+) -> dict[int, str]:
+    keys = tuple(sorted({int(provider_group_key) for provider_group_key in provider_group_keys}))
+    if not keys:
+        return {}
+    result = await session.execute(
         text(
             f"""
-            WITH requested_codes AS MATERIALIZED (
-                SELECT *
-                FROM unnest(CAST(:code_keys AS integer[]), CAST(:code_orders AS integer[]))
-                     AS requested(code_key, code_order)
-            )
-            SELECT
-                requested_codes.code_order,
-                serving.code_key,
-                serving.provider_set_key,
-                code_count.plan_id,
-                code_count.reported_code_system,
-                code_count.reported_code,
-                provider_sets.provider_set_global_id_128,
-                serving.provider_count,
-                serving.price_set_global_id_128
-            FROM {table_name} serving
-            JOIN requested_codes
-              ON requested_codes.code_key = serving.code_key
-            JOIN {code_count_table} code_count
-              ON code_count.code_key = serving.code_key
-            JOIN {provider_set_dictionary_table} provider_sets
-              ON provider_sets.provider_set_key = serving.provider_set_key
-            WHERE serving.provider_set_key = ANY(CAST(:provider_set_keys AS integer[]))
-            ORDER BY requested_codes.code_order,
-                     code_count.reported_code_system,
-                     code_count.reported_code,
-                     serving.provider_count DESC NULLS LAST,
-                     provider_sets.provider_set_global_id_128,
-                     serving.price_set_global_id_128
-            LIMIT :limit OFFSET :offset
+            SELECT provider_group_key, provider_group_global_id_128
+              FROM {_shared_v3_provider_group_table()}
+             WHERE snapshot_key = :shared_snapshot_key
+               AND provider_group_key = ANY(CAST(:provider_group_keys AS integer[]))
             """
         ),
         {
-            "code_keys": code_keys,
-            "code_orders": code_orders,
-            "provider_set_keys": provider_set_keys,
-            "limit": max(int(limit), 0),
-            "offset": max(int(offset), 0),
+            "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
+            "provider_group_keys": keys,
         },
     )
-    rows: list[dict[str, Any]] = []
-    for row in row_result:
-        data = _row_mapping(row)
-        code_key = int(data.get("code_key") or 0)
-        provider_set_key = int(data.get("provider_set_key") or 0)
-        price_set_id = _ptg2_manifest_id(data.get("price_set_global_id_128"))
-        rows.append(
-            {
-                "serving_content_hash_128": _ptg2_manifest_serving_content_hash(
-                    code_key,
-                    provider_set_key,
-                    price_set_id,
-                ),
-                "plan_id": data.get("plan_id"),
-                "reported_code_system": data.get("reported_code_system"),
-                "reported_code": data.get("reported_code"),
-                "procedure_global_id_128": None,
-                "provider_set_global_id_128": _ptg2_manifest_id(data.get("provider_set_global_id_128")),
-                "provider_count": data.get("provider_count"),
-                "price_set_global_id_128": price_set_id,
-                "source_trace_set_hash": source_trace_set_hash,
-                "network_names": network_names,
-            }
-        )
-    return rows
+    return {
+        int(row.get("provider_group_key")): _ptg2_manifest_id(row.get("provider_group_global_id_128"))
+        for row in (_row_mapping(raw_row) for raw_row in result)
+        if row.get("provider_group_key") is not None
+        and _ptg2_manifest_id(row.get("provider_group_global_id_128"))
+    }
 
 
-def _ptg2_manifest_sidecar_members(
-    serving_tables: PTG2ServingTables,
-    name: str,
-    owner_id: str,
-    *,
-    max_members: int | None = None,
-) -> tuple[str, ...]:
-    owner_id = _ptg2_manifest_id(owner_id)
-    if not owner_id:
-        return ()
-    members: set[str] = set()
-    for entry in _ptg2_manifest_artifact_entries(serving_tables, name):
-        path = str(entry.get("path") or "").strip()
-        if not path:
-            continue
-        _raise_local_sidecar_disallowed(serving_tables, name)
-        sidecar_path = _resolve_ptg2_manifest_sidecar_path(path)
-        sidecar_metadata = entry if sidecar_path == Path(path) else None
-        cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
-        cache_key = (str(sidecar_path), str(entry.get("sha256") or ""), cache_owner_id)
-        cached = _PTG2_MANIFEST_SIDECAR_CACHE.get(cache_key)
-        if cached is None:
-            cached = tuple(
-                member.hex()
-                for member in lookup_global_sidecar_members(
-                    sidecar_path,
-                    owner_id,
-                    metadata=sidecar_metadata,
-                    max_members=max_members,
-                )
-            )
-            _PTG2_MANIFEST_SIDECAR_CACHE[cache_key] = cached
-        members.update(cached)
-    return tuple(sorted(members))
-
-
-def _ptg2_manifest_sidecar_members_many(
-    serving_tables: PTG2ServingTables,
-    name: str,
-    owner_ids: list[str] | tuple[str, ...],
-    *,
-    max_members: int | None = None,
-) -> dict[str, tuple[str, ...]]:
-    owner_id_list = list(_ptg2_manifest_ids(tuple(owner_ids)))
-    result_sets: dict[str, set[str]] = {owner_id: set() for owner_id in owner_id_list}
-    for entry in _ptg2_manifest_artifact_entries(serving_tables, name):
-        path = str(entry.get("path") or "").strip()
-        if not path:
-            continue
-        _raise_local_sidecar_disallowed(serving_tables, name)
-        sidecar_path = _resolve_ptg2_manifest_sidecar_path(path)
-        sidecar_metadata = entry if sidecar_path == Path(path) else None
-        sha = str(entry.get("sha256") or "")
-        missing: list[str] = []
-        for owner_id in owner_id_list:
-            cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
-            cache_key = (str(sidecar_path), sha, cache_owner_id)
-            cached = _PTG2_MANIFEST_SIDECAR_CACHE.get(cache_key)
-            if cached is None:
-                missing.append(owner_id)
-            else:
-                result_sets[owner_id].update(cached)
-        if missing:
-            members_by_owner = lookup_global_sidecar_members_many(
-                sidecar_path,
-                missing,
-                metadata=sidecar_metadata,
-                max_members=max_members,
-            )
-            for owner_id in missing:
-                try:
-                    owner_bytes = bytes.fromhex(owner_id)
-                except ValueError:
-                    owner_bytes = b""
-                members = tuple(member.hex() for member in members_by_owner.get(owner_bytes, ()))
-                cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
-                _PTG2_MANIFEST_SIDECAR_CACHE[(str(sidecar_path), sha, cache_owner_id)] = members
-                result_sets[owner_id].update(members)
-    return {owner_id: tuple(sorted(members)) for owner_id, members in result_sets.items()}
-
-
-async def _ptg2_manifest_sidecar_members_many_async(
+async def _shared_provider_group_keys_for_ids(
     session,
     serving_tables: PTG2ServingTables,
-    name: str,
-    owner_ids: list[str] | tuple[str, ...],
-    *,
-    max_members: int | None = None,
-) -> dict[str, tuple[str, ...]]:
-    """Fetch sidecar memberships for many owner IDs from PostgreSQL artifacts."""
-
-    owner_id_list = list(_ptg2_manifest_ids(tuple(owner_ids)))
-    result_sets: dict[str, set[str]] = {owner_id: set() for owner_id in owner_id_list}
-    if not owner_id_list:
+    provider_group_ids: Iterable[str],
+) -> dict[str, int]:
+    ids = tuple(_ptg2_manifest_ids(tuple(provider_group_ids)))
+    if not ids:
         return {}
-    for entry in _ptg2_manifest_artifact_entries(serving_tables, name):
-        sha = str(entry.get("sha256") or "")
-        if db_artifact_entry_available(entry):
-            storage_uri = str(entry.get("storage_uri") or "")
-            missing: list[str] = []
-            for owner_id in owner_id_list:
-                cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
-                cache_key = (storage_uri, sha, cache_owner_id)
-                cached = _PTG2_MANIFEST_SIDECAR_CACHE.get(cache_key)
-                if cached is None:
-                    missing.append(owner_id)
-                else:
-                    result_sets[owner_id].update(cached)
-            if missing:
-                members_by_owner = await lookup_global_sidecar_members_many_from_db(
-                    session,
-                    entry,
-                    missing,
-                    schema_name=PTG2_SCHEMA,
-                    max_members=max_members,
-                    require_index_fences=(
-                        serving_tables.effective_arch_version == "postgres_binary_v3"
-                    ),
-                )
-                for owner_id in missing:
-                    try:
-                        owner_bytes = bytes.fromhex(owner_id)
-                    except ValueError:
-                        owner_bytes = b""
-                    members = tuple(member.hex() for member in members_by_owner.get(owner_bytes, ()))
-                    cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
-                    _PTG2_MANIFEST_SIDECAR_CACHE[(storage_uri, sha, cache_owner_id)] = members
-                    result_sets[owner_id].update(members)
-            continue
-
-        path = str(entry.get("path") or "").strip()
-        if not path:
-            continue
-        _raise_local_sidecar_disallowed(serving_tables, name)
-        sidecar_path = _resolve_ptg2_manifest_sidecar_path(path)
-        sidecar_metadata = entry if sidecar_path == Path(path) else None
-        missing = []
-        for owner_id in owner_id_list:
-            cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
-            cache_key = (str(sidecar_path), sha, cache_owner_id)
-            cached = _PTG2_MANIFEST_SIDECAR_CACHE.get(cache_key)
-            if cached is None:
-                missing.append(owner_id)
-            else:
-                result_sets[owner_id].update(cached)
-        if missing:
-            members_by_owner = lookup_global_sidecar_members_many(
-                sidecar_path,
-                missing,
-                metadata=sidecar_metadata,
-                max_members=max_members,
-            )
-            for owner_id in missing:
-                try:
-                    owner_bytes = bytes.fromhex(owner_id)
-                except ValueError:
-                    owner_bytes = b""
-                members = tuple(member.hex() for member in members_by_owner.get(owner_bytes, ()))
-                cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
-                _PTG2_MANIFEST_SIDECAR_CACHE[(str(sidecar_path), sha, cache_owner_id)] = members
-                result_sets[owner_id].update(members)
-    return {owner_id: tuple(sorted(members)) for owner_id, members in result_sets.items()}
+    result = await session.execute(
+        text(
+            f"""
+            SELECT provider_group_key, provider_group_global_id_128
+              FROM {_shared_v3_provider_group_table()}
+             WHERE snapshot_key = :shared_snapshot_key
+               AND provider_group_global_id_128 = ANY(CAST(:provider_group_ids AS bytea[]))
+            """
+        ),
+        {
+            "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
+            "provider_group_ids": [bytes.fromhex(provider_group_id) for provider_group_id in ids],
+        },
+    )
+    return {
+        _ptg2_manifest_id(row.get("provider_group_global_id_128")): int(row.get("provider_group_key"))
+        for row in (_row_mapping(raw_row) for raw_row in result)
+        if row.get("provider_group_key") is not None
+        and _ptg2_manifest_id(row.get("provider_group_global_id_128"))
+    }
 
 
-async def _ptg2_manifest_sidecar_members_async(
+async def _shared_graph_members_many(
+    session,
+    serving_tables: PTG2ServingTables,
+    name: str,
+    owner_ids: list[str],
+    *,
+    max_members: int | None,
+) -> dict[str, tuple[str, ...]]:
+    """Resolve shared-graph member IDs for each requested owner ID."""
+    direction_by_name = {
+        "provider_npi_group": PTG2_V3_GRAPH_NPI_TO_GROUP,
+        "provider_group_npi": PTG2_V3_GRAPH_GROUP_TO_NPI,
+        "provider_inverted": PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
+        "provider_forward": PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
+    }
+    direction = direction_by_name.get(name)
+    if direction is None:
+        raise PTG2ManifestArtifactError(f"unsupported PTG2 shared graph artifact: {name}")
+    if direction == PTG2_V3_GRAPH_NPI_TO_GROUP:
+        owner_key_by_id = {
+            owner_id: npi
+            for owner_id in owner_ids
+            if (npi := _ptg2_npi_from_member_id(owner_id)) is not None
+        }
+        if len(owner_key_by_id) != len(owner_ids):
+            raise PTG2ManifestArtifactError("PTG2 shared NPI graph owner is malformed")
+    elif direction == PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP:
+        owner_key_by_id = await _ptg2_manifest_provider_set_keys_for_ids(
+            session,
+            serving_tables,
+            owner_ids,
+        )
+    else:
+        owner_key_by_id = await _shared_provider_group_keys_for_ids(
+            session,
+            serving_tables,
+            owner_ids,
+        )
+    members_by_owner_key = await lookup_shared_graph_members_from_db(
+        session,
+        _required_shared_snapshot_key(serving_tables),
+        direction,
+        owner_key_by_id.values(),
+        schema_name=PTG2_SCHEMA,
+        max_members=max_members,
+    )
+    member_keys = {
+        member_key
+        for members in members_by_owner_key.values()
+        for member_key in members
+    }
+    if direction in {PTG2_V3_GRAPH_NPI_TO_GROUP, PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP}:
+        member_id_by_key = await _shared_provider_group_ids_for_keys(
+            session,
+            serving_tables,
+            member_keys,
+        )
+    elif direction == PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET:
+        member_id_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
+            session,
+            serving_tables,
+            member_keys,
+        )
+    else:
+        member_id_by_key = {
+            npi: _ptg2_npi_member_id(npi)
+            for npi in member_keys
+        }
+    if set(member_id_by_key) != member_keys:
+        raise PTG2ManifestArtifactError("PTG2 shared graph references a missing support dictionary key")
+    return {
+        owner_id: tuple(
+            member_id_by_key[member_key]
+            for member_key in members_by_owner_key.get(owner_key_by_id.get(owner_id, -1), ())
+        )
+        for owner_id in owner_ids
+    }
+
+
+async def _shared_graph_members_for_id(
     session,
     serving_tables: PTG2ServingTables,
     name: str,
@@ -4247,7 +3122,7 @@ async def _ptg2_manifest_sidecar_members_async(
     owner_id = _ptg2_manifest_id(owner_id)
     if not owner_id:
         return ()
-    members_by_owner = await _ptg2_manifest_sidecar_members_many_async(
+    members_by_owner = await _shared_graph_members_by_id(
         session,
         serving_tables,
         name,
@@ -4261,202 +3136,52 @@ async def _manifest_sets_by_group(
     session,
     serving_tables: PTG2ServingTables,
     group_ids: list[str] | tuple[str, ...],
-) -> dict[str, tuple[str, ...]] | None:
+) -> dict[str, tuple[str, ...]]:
     normalized_group_ids = _ptg2_manifest_ids(tuple(group_ids))
     if not normalized_group_ids:
         return {}
-
-    sidecar_available = bool(_ptg2_manifest_artifact_entry(serving_tables, "provider_inverted"))
-    component_table = _manifest_provider_set_component_table(serving_tables)
-    if component_table:
-        sets_by_group: dict[str, set[str]] = {group_id: set() for group_id in normalized_group_ids}
-        try:
-            component_rows = await session.execute(
-                text(
-                    f"""
-                    SELECT provider_group_global_id_128, provider_set_global_id_128
-                    FROM {component_table}
-                    WHERE provider_group_global_id_128 = ANY(
-                        CAST(:group_ids AS {_ptg2_manifest_id_array_cast(serving_tables)})
-                    )
-                    ORDER BY provider_group_global_id_128, provider_set_global_id_128
-                    """
-                ),
-                {"group_ids": list(normalized_group_ids)},
-            )
-        except Exception:
-            await _rollback_optional_ptg2_query(session)
-        else:
-            for component_row in component_rows:
-                component_mapping = _row_mapping(component_row)
-                group_id = _ptg2_manifest_id(component_mapping.get("provider_group_global_id_128"))
-                provider_set_id = _ptg2_manifest_id(component_mapping.get("provider_set_global_id_128"))
-                if group_id and provider_set_id:
-                    sets_by_group.setdefault(group_id, set()).add(provider_set_id)
-            missing_group_ids = tuple(
-                group_id for group_id, provider_set_ids in sets_by_group.items() if not provider_set_ids
-            )
-            if missing_group_ids and sidecar_available:
-                fallback_sets = await _ptg2_manifest_sidecar_members_many_async(
-                    session,
-                    serving_tables,
-                    "provider_inverted",
-                    missing_group_ids,
-                )
-                for group_id, provider_set_ids in fallback_sets.items():
-                    sets_by_group.setdefault(group_id, set()).update(provider_set_ids)
-            return {group_id: tuple(sorted(provider_set_ids)) for group_id, provider_set_ids in sets_by_group.items()}
-
-    if not sidecar_available:
-        return None
-    return await _ptg2_manifest_sidecar_members_many_async(
+    return await _shared_graph_members_by_id(
         session,
         serving_tables,
         "provider_inverted",
         normalized_group_ids,
     )
 
-
-def _ptg2_rate_scope_key(
-    serving_tables: PTG2ServingTables,
-    serving_table: str | None,
-    plan_id: str,
-    reported_code: str,
-    code_system: str | None,
-) -> tuple[str, ...]:
-    artifact_tokens: list[str] = []
-    if serving_tables.serving_binary_table:
-        artifact_tokens.extend(["serving_binary_table", str(serving_tables.serving_binary_table)])
-    for artifact_name in ("provider_forward", "serving_by_code"):
-        for artifact_entry in _ptg2_manifest_artifact_entries(serving_tables, artifact_name):
-            artifact_tokens.extend(
-                [
-                    artifact_name,
-                    str(artifact_entry.get("path") or ""),
-                    str(artifact_entry.get("storage_uri") or ""),
-                    str(artifact_entry.get("sha256") or ""),
-                    str(artifact_entry.get("artifact_id") or ""),
-                ]
-            )
-    return (
-        str(serving_tables.source_key or ""),
-        str(serving_tables.artifact_uri or ""),
-        str(serving_table or ""),
-        str(serving_tables.code_count_table or ""),
-        str(serving_tables.provider_set_dictionary_table or ""),
-        str(serving_tables.serving_table_layout or ""),
-        str(serving_tables.arch_version or ""),
-        str(serving_tables.id_storage or ""),
-        str(plan_id or ""),
-        str(reported_code or ""),
-        str(code_system or ""),
-        *artifact_tokens,
-    )
-
-
 def _ptg2_build_rate_scope(group_ids: tuple[str, ...]) -> _ManifestRateScope:
     normalized_group_ids = tuple(sorted(set(_ptg2_manifest_ids(group_ids))))
     sql_group_ids = normalized_group_ids if len(normalized_group_ids) <= _ptg2_sql_scope_limit() else ()
-    binary_group_ids: list[bytes] = []
-    fallback_group_ids: list[str] = []
-    for group_id in normalized_group_ids:
-        binary_group_id = _ptg2_manifest_id_bytes(group_id)
-        if binary_group_id:
-            binary_group_ids.append(binary_group_id)
-        else:
-            fallback_group_ids.append(group_id)
+    binary_group_ids = [_ptg2_manifest_id_bytes(group_id) for group_id in normalized_group_ids]
+    if any(not group_id for group_id in binary_group_ids):
+        raise PTG2ManifestArtifactError("PTG2 shared graph returned a malformed provider-group id")
     return _ManifestRateScope(
         group_ids=sql_group_ids,
         group_id_bytes=frozenset(binary_group_ids),
         id_count=len(normalized_group_ids),
-        fallback_group_ids=frozenset(fallback_group_ids),
     )
 
 
-def _is_rate_scope_cache_enabled() -> bool:
-    return _PTG2_RATE_SCOPE_CACHE_MAX_KEYS > 0 and _PTG2_RATE_SCOPE_CACHE_MAX_IDS > 0
-
-
-def _ptg2_rate_scope_cache_evict() -> None:
-    while _PTG2_RATE_SCOPE_CACHE and (
-        len(_PTG2_RATE_SCOPE_CACHE) > _PTG2_RATE_SCOPE_CACHE_MAX_KEYS
-        or _PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids > _PTG2_RATE_SCOPE_CACHE_MAX_IDS
-    ):
-        _, evicted_scope = _PTG2_RATE_SCOPE_CACHE.popitem(last=False)
-        _PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids = max(
-            _PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids - evicted_scope.id_count,
-            0,
-        )
-
-
-def _ptg2_rate_scope_get(cache_key: tuple[str, ...]) -> _ManifestRateScope | None:
-    if not _is_rate_scope_cache_enabled():
-        return None
-    rate_scope = _PTG2_RATE_SCOPE_CACHE.get(cache_key)
-    if rate_scope is not None:
-        _PTG2_RATE_SCOPE_CACHE.move_to_end(cache_key)
-    return rate_scope
-
-
-def _ptg2_rate_scope_set(cache_key: tuple[str, ...], group_ids: tuple[str, ...]) -> _ManifestRateScope:
-    rate_scope = _ptg2_build_rate_scope(group_ids)
-    previous_scope = _PTG2_RATE_SCOPE_CACHE.pop(cache_key, None)
-    if previous_scope is not None:
-        _PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids = max(
-            _PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids - previous_scope.id_count,
-            0,
-        )
-    if not _is_rate_scope_cache_enabled() or rate_scope.id_count > _PTG2_RATE_SCOPE_CACHE_MAX_IDS:
-        return rate_scope
-    _PTG2_RATE_SCOPE_CACHE[cache_key] = rate_scope
-    _PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids += rate_scope.id_count
-    _ptg2_rate_scope_cache_evict()
-    return rate_scope
-
-
-async def _manifest_rate_scope_from_sidecar(
+async def _shared_rate_scope(
     session,
     serving_tables: PTG2ServingTables,
     *,
-    serving_table: str | None,
     plan_id: str,
+    plan_market_type: str = "",
     reported_code: str,
     code_system: str | None,
     provider_set_keys: Iterable[int] | None = None,
 ) -> _ManifestRateScope:
-    cache_key = _ptg2_rate_scope_key(serving_tables, serving_table, plan_id, reported_code, code_system)
-    is_cache_enabled = hasattr(session, "sync_session") and provider_set_keys is None
-    if is_cache_enabled:
-        cached_scope = _ptg2_rate_scope_get(cache_key)
-        if cached_scope is not None:
-            return cached_scope
-    group_ids = await _manifest_rate_provider_groups_from_sidecar(
+    group_ids = await _shared_rate_provider_groups(
         session,
         serving_tables,
-        serving_table=serving_table,
         plan_id=plan_id,
+        plan_market_type=plan_market_type,
         reported_code=reported_code,
         code_system=code_system,
         provider_set_keys=provider_set_keys,
     )
-    if not is_cache_enabled:
-        return _ptg2_build_rate_scope(group_ids)
-    return _ptg2_rate_scope_set(cache_key, group_ids)
+    return _ptg2_build_rate_scope(group_ids)
 
-
-async def _is_manifest_component_table_populated(session, table_name: str | None) -> bool:
-    component_table = _safe_table_name(table_name)
-    if not component_table:
-        return False
-    try:
-        result = await session.execute(text(f"SELECT EXISTS (SELECT 1 FROM {component_table} LIMIT 1)"))
-        return bool(result.scalar())
-    except Exception:
-        await _rollback_optional_ptg2_query(session)
-        return False
-
-
-async def _manifest_sidecar_entries_for_code_rows(
+async def _shared_forward_entries_for_code_rows(
     session,
     serving_tables: PTG2ServingTables,
     code_rows: Iterable[Mapping[str, Any]],
@@ -4475,13 +3200,13 @@ async def _manifest_sidecar_entries_for_code_rows(
         serving_tables,
         normalized_provider_set_keys,
     )
-    sidecar_entries: list[Any] = []
+    forward_entries: list[Any] = []
     for code_row in code_rows:
         code_key = code_row.get("code_key")
         if code_key is None:
             continue
-        sidecar_entries.extend(
-            await _ptg2_manifest_lookup_serving_by_code_sidecar(
+        forward_entries.extend(
+            await _lookup_shared_forward_rows(
                 session,
                 serving_tables,
                 int(code_key),
@@ -4489,164 +3214,85 @@ async def _manifest_sidecar_entries_for_code_rows(
                 provider_counts_by_key=provider_counts_by_key,
             )
         )
-    return sidecar_entries
+    return forward_entries
 
 
-async def _manifest_rate_provider_groups_from_sidecar(
+async def _shared_rate_provider_groups(
     session,
     serving_tables: PTG2ServingTables,
     *,
-    serving_table: str | None,
     plan_id: str,
+    plan_market_type: str = "",
     reported_code: str,
     code_system: str | None,
     provider_set_keys: Iterable[int] | None = None,
 ) -> tuple[str, ...]:
-    """Resolve provider groups for one plan and reported code from artifacts."""
+    """Resolve the shared-graph groups that carry one plan/code rate."""
 
-    table_name = _safe_table_name(serving_table)
-    if (
-        not plan_id
-        or not reported_code
-        or not _ptg2_manifest_artifact_entry(serving_tables, "provider_forward")
-    ):
+    _require_strict_shared_v3(serving_tables)
+    if not plan_id or not reported_code:
         return ()
-    query_params_by_name: dict[str, Any] = {"plan_id": plan_id}
-    reported_code_values = _ptg2_reported_code_lookup_values(code_system, reported_code)
-    lean_provider_key_layout = _ptg2_manifest_uses_lean_provider_key_layout(serving_tables)
-    if lean_provider_key_layout:
-        code_count_table = _safe_table_name(serving_tables.code_count_table)
-        provider_set_dictionary_table = _safe_table_name(serving_tables.provider_set_dictionary_table)
-        if not code_count_table or not provider_set_dictionary_table:
-            return ()
-        plan_filter, plan_order = _code_plan_scope_sql(plan_id, column="code_count.plan_id")
-        rate_scope_filters = [plan_filter]
-        _append_reported_code_value_filter(
-            rate_scope_filters,
-            query_params_by_name,
-            column="code_count.reported_code",
-            param_name="reported_code",
-            values=reported_code_values,
-        )
-        if code_system:
-            rate_scope_filters.append("code_count.reported_code_system = :reported_code_system")
-            query_params_by_name["reported_code_system"] = code_system
-        if serving_tables.serving_binary_table or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code"):
-            code_result = await session.execute(
-                text(
-                    f"""
-                    SELECT
-                        code_count.code_key,
-                        code_count.plan_id,
-                        code_count.reported_code_system,
-                        code_count.reported_code
-                    FROM {code_count_table} code_count
-                    WHERE {" AND ".join(rate_scope_filters)}
-                    ORDER BY {plan_order}, code_count.reported_code, code_count.code_key
-                    """
-                ),
-                query_params_by_name,
-            )
-            code_rows = _preferred_code_metadata_rows(
-                (_row_mapping(code_row) for code_row in code_result),
-                plan_id,
-            )
-            if code_rows:
-                sidecar_rows = await _manifest_sidecar_entries_for_code_rows(
-                    session,
-                    serving_tables,
-                    code_rows,
-                    provider_set_keys=provider_set_keys,
-                )
-                provider_set_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
-                    session,
-                    serving_tables,
-                    [row.provider_set_key for row in sidecar_rows],
-                )
-                provider_set_ids = tuple(sorted(provider_set_ids_by_key.values()))
-                if not provider_set_ids:
-                    return ()
-                groups_by_set = await _ptg2_manifest_sidecar_members_many_async(
-                    session,
-                    serving_tables,
-                    "provider_forward",
-                    provider_set_ids,
-                )
-                return tuple(sorted({group_id for group_ids in groups_by_set.values() for group_id in group_ids}))
-        if not table_name:
-            return ()
-        provider_set_sql = f"""
-                SELECT provider_set_dictionary.provider_set_global_id_128
-                FROM {table_name} serving
-                JOIN {code_count_table} code_count
-                  ON code_count.code_key = serving.code_key
-                JOIN {provider_set_dictionary_table} provider_set_dictionary
-                  ON provider_set_dictionary.provider_set_key = serving.provider_set_key
-                WHERE {" AND ".join(rate_scope_filters)}
-                GROUP BY provider_set_dictionary.provider_set_global_id_128
-                ORDER BY MIN({plan_order}), provider_set_dictionary.provider_set_global_id_128
-                """
-    else:
-        if not table_name:
-            return ()
-        plan_filter, plan_order = _code_plan_scope_sql(plan_id)
-        rate_scope_filters = [plan_filter]
-        _append_reported_code_value_filter(
-            rate_scope_filters,
-            query_params_by_name,
-            column="reported_code",
-            param_name="reported_code",
-            values=reported_code_values,
-        )
-        if code_system:
-            rate_scope_filters.append("reported_code_system = :reported_code_system")
-            query_params_by_name["reported_code_system"] = code_system
-        provider_set_sql = f"""
-                SELECT provider_set_global_id_128
-                FROM {table_name}
-                WHERE {" AND ".join(rate_scope_filters)}
-                GROUP BY provider_set_global_id_128
-                ORDER BY MIN({plan_order}), provider_set_global_id_128
-                """
-    try:
-        provider_set_result = await session.execute(
-            text(provider_set_sql),
-            query_params_by_name,
-        )
-    except Exception:
-        await _rollback_optional_ptg2_query(session)
+    scope_join_sql, filters, params, plan_order = _shared_v3_code_scope_sql(
+        serving_tables,
+        requested_plan=plan_id,
+        plan_market_type=plan_market_type,
+    )
+    filters.append("code_metadata.snapshot_key = :shared_snapshot_key")
+    params["shared_snapshot_key"] = _required_shared_snapshot_key(serving_tables)
+    _append_reported_code_value_filter(
+        filters,
+        params,
+        column="code_metadata.reported_code",
+        param_name="reported_code",
+        values=_ptg2_reported_code_lookup_values(code_system, reported_code),
+    )
+    if code_system:
+        filters.append("code_metadata.reported_code_system = :reported_code_system")
+        params["reported_code_system"] = code_system
+    result = await session.execute(
+        text(
+            f"""
+            SELECT code_metadata.code_key,
+                   logical_scope.plan_id,
+                   logical_scope.plan_market_type,
+                   code_metadata.reported_code_system,
+                   code_metadata.reported_code
+              FROM {_shared_v3_code_table()} code_metadata
+              {scope_join_sql}
+             WHERE {" AND ".join(filters)}
+             ORDER BY {plan_order}, code_metadata.reported_code, code_metadata.code_key
+            """
+        ),
+        params,
+    )
+    code_rows = [_row_mapping(row) for row in result]
+    if not code_rows:
         return ()
-    provider_set_ids_list: list[str] = []
-    for provider_set_row in provider_set_result:
-        provider_set_id = _ptg2_manifest_id(_row_mapping(provider_set_row).get("provider_set_global_id_128"))
-        if provider_set_id:
-            provider_set_ids_list.append(provider_set_id)
-    provider_set_ids = tuple(provider_set_ids_list)
-    if not provider_set_ids:
-        return ()
-    groups_by_set = await _ptg2_manifest_sidecar_members_many_async(
+    forward_rows = await _shared_forward_entries_for_code_rows(
+        session,
+        serving_tables,
+        code_rows,
+        provider_set_keys=provider_set_keys,
+    )
+    provider_set_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
+        session,
+        serving_tables,
+        [row.provider_set_key for row in forward_rows],
+    )
+    expected_keys = {row.provider_set_key for row in forward_rows}
+    if set(provider_set_ids_by_key) != expected_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 shared provider-set dictionary is missing a rate-referenced key"
+        )
+    groups_by_set = await _shared_graph_members_by_id(
         session,
         serving_tables,
         "provider_forward",
-        provider_set_ids,
+        tuple(provider_set_ids_by_key.values()),
     )
-    return tuple(sorted({group_id for group_ids in groups_by_set.values() for group_id in group_ids}))
-
-
-async def _ptg2_manifest_provider_npis_for_provider_set(
-    session,
-    serving_tables: PTG2ServingTables,
-    provider_set_global_id: str,
-    *,
-    limit: int | None = None,
-) -> tuple[int, ...]:
-    npis_by_set = await _ptg2_manifest_provider_npis_for_provider_sets(
-        session,
-        serving_tables,
-        (provider_set_global_id,),
-        limit_per_set=limit,
+    return tuple(
+        sorted({group_id for group_ids in groups_by_set.values() for group_id in group_ids})
     )
-    return npis_by_set.get(_ptg2_manifest_id(provider_set_global_id), ())
 
 
 def _ptg2_npi_from_member_id(member_id: str) -> int | None:
@@ -4680,56 +3326,17 @@ async def _ptg2_manifest_provider_npis_for_provider_sets(
     )
     npis_by_set: dict[str, tuple[int, ...]] = {}
     for provider_set_id in provider_set_ids:
-        npis = [
-            npi
-            for member_id in member_ids_by_set.get(provider_set_id, ())
-            if (npi := _ptg2_npi_from_member_id(member_id)) is not None
-        ]
-        sorted_npis = tuple(sorted(set(npis)))
-        npis_by_set[provider_set_id] = sorted_npis[:limit_per_set] if limit_per_set is not None else sorted_npis
+        npis = tuple(
+            dict.fromkeys(
+                npi
+                for member_id in member_ids_by_set.get(provider_set_id, ())
+                if (npi := _ptg2_npi_from_member_id(member_id)) is not None
+            )
+        )
+        npis_by_set[provider_set_id] = (
+            npis[:limit_per_set] if limit_per_set is not None else npis
+        )
     return npis_by_set
-
-
-def _has_ptg2_artifact_reader(
-    serving_tables: PTG2ServingTables,
-    name: str,
-) -> bool:
-    """Return whether an artifact has a source the serving reader can use."""
-    for entry in _ptg2_manifest_artifact_entries(serving_tables, name):
-        if db_artifact_entry_available(entry):
-            return True
-        raw_path = str(entry.get("path") or "").strip()
-        if not raw_path or serving_tables.effective_arch_version in {
-            "postgres_binary_v1",
-            "postgres_binary_v2",
-            "postgres_binary_v3",
-        }:
-            continue
-        sidecar_path = _resolve_ptg2_manifest_sidecar_path(raw_path)
-        if sidecar_path.is_file() and os.access(sidecar_path, os.R_OK):
-            return True
-    return False
-
-
-def _has_authoritative_provider_membership(
-    serving_tables: PTG2ServingTables,
-) -> bool:
-    has_current_graph = bool(
-        _has_ptg2_artifact_reader(serving_tables, "provider_forward")
-        and _has_ptg2_artifact_reader(serving_tables, "provider_group_npi")
-    )
-    if serving_tables.effective_arch_version == "postgres_binary_v3":
-        return has_current_graph
-    return bool(_has_ptg2_artifact_reader(serving_tables, "provider_npi") or has_current_graph)
-
-
-def _uses_legacy_direct_provider_membership(serving_tables: PTG2ServingTables) -> bool:
-    """Return whether a pre-v3 snapshot may use its direct membership artifact."""
-
-    return (
-        serving_tables.effective_arch_version != "postgres_binary_v3"
-        and _has_ptg2_artifact_reader(serving_tables, "provider_npi")
-    )
 
 
 async def _provider_npi_member_ids_by_set(
@@ -4739,22 +3346,10 @@ async def _provider_npi_member_ids_by_set(
     *,
     limit_per_set: int | None,
 ) -> dict[str, tuple[str, ...]]:
-    """Resolve membership from the current graph or a pre-v3 direct artifact."""
-    if _uses_legacy_direct_provider_membership(serving_tables):
-        return await _ptg2_manifest_sidecar_members_many_async(
-            session,
-            serving_tables,
-            "provider_npi",
-            provider_set_ids,
-            max_members=limit_per_set,
-        )
-    if not _has_authoritative_provider_membership(serving_tables):
-        if serving_tables.effective_arch_version == "postgres_binary_v3":
-            raise PTG2ManifestArtifactError(
-                "postgres_binary_v3 provider membership graph is missing; reimport the snapshot"
-            )
-        return {}
-    groups_by_set = await _ptg2_manifest_sidecar_members_many_async(
+    """Resolve provider-set NPI membership through the dense shared graph."""
+
+    _require_strict_shared_v3(serving_tables)
+    groups_by_set = await _shared_graph_members_by_id(
         session,
         serving_tables,
         "provider_forward",
@@ -4774,7 +3369,7 @@ async def _provider_npi_member_ids_by_set(
             for group_id in groups_by_set.get(provider_set_id, ())
         )
     )
-    member_ids_by_group = await _ptg2_manifest_sidecar_members_many_async(
+    member_ids_by_group = await _shared_graph_members_by_id(
         session,
         serving_tables,
         "provider_group_npi",
@@ -4810,7 +3405,7 @@ async def _limited_graph_member_ids_by_set(
             provider_sets_by_group[group_id].append(provider_set_id)
     for batch_start in range(0, len(ordered_group_ids), 256):
         group_batch_ids = tuple(ordered_group_ids[batch_start : batch_start + 256])
-        member_ids_by_group = await _ptg2_manifest_sidecar_members_many_async(
+        member_ids_by_group = await _shared_graph_members_by_id(
             session,
             serving_tables,
             "provider_group_npi",
@@ -4927,136 +3522,6 @@ def _ptg2_price_atom_attr_specs() -> tuple[tuple[str, str, str, str], ...]:
     )
 
 
-def _build_ptg2_price_constant_sql(
-    attr_kind: str,
-    value_kind: str,
-    constant_values: dict[str, Any],
-) -> str | None:
-    """Return a literal SELECT expression for v2 constant price-atom attributes."""
-    if attr_kind not in constant_values:
-        return None
-    if value_kind == "array":
-        return f"{_literal_text_array_sql(constant_values.get(attr_kind) or [])} AS {attr_kind}"
-    return f"{_literal_text_sql(constant_values.get(attr_kind))} AS {attr_kind}"
-
-
-def _ptg2_price_atom_key_expr(column_name: str, constant_keys: dict[str, Any]) -> str:
-    """Resolve a dictionary key from metadata or the physical price-atom row."""
-    if column_name not in constant_keys:
-        return f"price_atom.{column_name}"
-    return str(int(constant_keys[column_name]))
-
-
-def _build_ptg2_price_join_sql(
-    price_atom_dictionary_table: str,
-    attr_kind: str,
-    key_column: str,
-    constant_keys: dict[str, Any],
-) -> str:
-    """Build one dictionary join for a non-constant lean price-atom attribute."""
-    return f"""
-            LEFT JOIN {price_atom_dictionary_table} {attr_kind}
-              ON {attr_kind}.attr_kind = '{attr_kind}'
-             AND {attr_kind}.attr_key = {_ptg2_price_atom_key_expr(key_column, constant_keys)}
-                    """
-
-
-def _build_ptg2_price_select_sql(
-    serving_tables: PTG2ServingTables,
-    price_atom_table: str,
-    price_atom_dictionary_table: str | None,
-    constant_values: dict[str, Any],
-) -> str:
-    """Build the SELECT for dictionary-backed lean price atoms."""
-    constant_keys = (
-        serving_tables.price_atom_constant_keys
-        if isinstance(serving_tables.price_atom_constant_keys, dict)
-        else {}
-    )
-    select_fields = ["price_atom.price_atom_global_id_128"]
-    join_parts: list[str] = []
-    output_by_attr: dict[str, str] = {"negotiated_rate": "price_atom.negotiated_rate"}
-    for attr_kind, key_column, value_kind, dictionary_select in _ptg2_price_atom_attr_specs():
-        constant_output_sql = _build_ptg2_price_constant_sql(attr_kind, value_kind, constant_values)
-        if constant_output_sql is not None:
-            output_by_attr[attr_kind] = constant_output_sql
-            continue
-        output_by_attr[attr_kind] = dictionary_select
-        if price_atom_dictionary_table:
-            join_parts.append(
-                    _build_ptg2_price_join_sql(
-                    price_atom_dictionary_table,
-                    attr_kind,
-                    key_column,
-                    constant_keys,
-                )
-            )
-    select_fields.extend(
-        [
-            output_by_attr["negotiated_type"],
-            output_by_attr["negotiated_rate"],
-            output_by_attr["expiration_date"],
-            output_by_attr["service_code"],
-            output_by_attr["billing_class"],
-            output_by_attr["setting"],
-            output_by_attr["billing_code_modifier"],
-            output_by_attr["additional_information"],
-        ]
-    )
-    return f"""
-            SELECT
-                {", ".join(select_fields)}
-            FROM {price_atom_table} price_atom
-            {" ".join(join_parts)}
-        """
-
-
-def _ptg2_manifest_price_atom_select_sql(serving_tables: PTG2ServingTables, price_atom_table: str) -> str:
-    """Return a price-atom SELECT that rehydrates v1/v2 lean dictionary layouts."""
-    price_atom_layout = (serving_tables.price_atom_table_layout or "").strip().lower()
-    price_atom_dictionary_table = _safe_table_name(serving_tables.price_atom_dictionary_table)
-    constant_values = (
-        serving_tables.price_atom_constant_values
-        if isinstance(serving_tables.price_atom_constant_values, dict)
-        else {}
-    )
-    if price_atom_layout in {"lean_dict_v1", "lean_dict_v2"} and (price_atom_dictionary_table or constant_values):
-        return _build_ptg2_price_select_sql(
-            serving_tables,
-            price_atom_table,
-            price_atom_dictionary_table,
-            constant_values,
-        )
-    return f"""
-            SELECT
-                price_atom_global_id_128,
-                negotiated_type,
-                negotiated_rate,
-                expiration_date,
-                service_code,
-                billing_class,
-                setting,
-                billing_code_modifier,
-                additional_information
-            FROM {price_atom_table}
-    """
-
-
-def _ptg2_manifest_price_payload(price_atom_row: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the API price payload for one hydrated price-atom row."""
-
-    return {
-        "negotiated_type": price_atom_row.get("negotiated_type"),
-        "negotiated_rate": price_atom_row.get("negotiated_rate"),
-        "expiration_date": price_atom_row.get("expiration_date"),
-        "service_code": price_atom_row.get("service_code") or [],
-        "billing_class": price_atom_row.get("billing_class"),
-        "setting": price_atom_row.get("setting"),
-        "billing_code_modifier": price_atom_row.get("billing_code_modifier") or [],
-        "additional_information": price_atom_row.get("additional_information"),
-    }
-
-
 def _version_three_atom_key_bits(serving_tables: PTG2ServingTables) -> int:
     """Return the manifest-declared dense atom width for a v3 snapshot."""
 
@@ -5094,32 +3559,39 @@ async def _version_three_dictionary_values(
                 required_keys.add((attr_kind, int(attr_key)))
     if not required_keys:
         return {}
-    dictionary_table = _safe_table_name(serving_tables.price_atom_dictionary_table)
-    if not dictionary_table:
-        raise PTG2ManifestArtifactError("PTG2 v3 snapshot is missing price_atom_dictionary_table")
+    _require_strict_shared_v3(serving_tables)
+    dictionary_table = _shared_v3_price_attr_table()
     dictionary_result = await session.execute(
         text(
             f"""
-            SELECT attr_kind, attr_key, text_value, text_array
+            SELECT attribute_kind, attribute_key, value
             FROM {dictionary_table}
-            WHERE attr_kind = ANY(CAST(:attr_kinds AS varchar[]))
-              AND attr_key = ANY(CAST(:attr_keys AS integer[]))
+            WHERE snapshot_key = :shared_snapshot_key
+              AND attribute_kind = ANY(CAST(:attr_kinds AS varchar[]))
+              AND attribute_key = ANY(CAST(:attr_keys AS integer[]))
             """
         ),
         {
+            "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
             "attr_kinds": sorted({attr_kind for attr_kind, _attr_key in required_keys}),
             "attr_keys": sorted({attr_key for _attr_kind, attr_key in required_keys}),
         },
     )
-    values_by_key = {
-        (str(dictionary_entry.get("attr_kind") or ""), int(dictionary_entry.get("attr_key"))): (
-            dictionary_entry.get("text_array")
-            if str(dictionary_entry.get("attr_kind") or "") in {"service_code", "billing_code_modifier"}
-            else dictionary_entry.get("text_value")
-        )
-        for dictionary_entry in (_row_mapping(dictionary_record) for dictionary_record in dictionary_result)
-        if dictionary_entry.get("attr_kind") is not None and dictionary_entry.get("attr_key") is not None
-    }
+    values_by_key: dict[tuple[str, int], Any] = {}
+    for dictionary_entry in (_row_mapping(dictionary_record) for dictionary_record in dictionary_result):
+        attr_kind = dictionary_entry.get("attribute_kind")
+        attr_key = dictionary_entry.get("attribute_key")
+        if attr_kind is None or attr_key is None:
+            continue
+        value = dictionary_entry.get("value")
+        if str(attr_kind) in {"service_code", "billing_code_modifier"}:
+            try:
+                value = json.loads(str(value or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise PTG2ManifestArtifactError("PTG2 v3 price atom array dictionary value is malformed") from exc
+            if not isinstance(value, list):
+                raise PTG2ManifestArtifactError("PTG2 v3 price atom array dictionary value is malformed")
+        values_by_key[(str(attr_kind), int(attr_key))] = value
     missing_keys = required_keys.difference(values_by_key)
     if missing_keys:
         raise PTG2ManifestArtifactError("PTG2 v3 price atom dictionary key is missing")
@@ -5156,19 +3628,18 @@ async def _version_three_prices_by_key(
 ) -> dict[int, list[dict[str, Any]]]:
     """Hydrate v3 price keys from compact memberships and dense atoms only."""
 
-    if not serving_tables.serving_binary_table:
-        _raise_missing_postgres_binary_table(serving_tables)
-        return {}
+    _require_strict_shared_v3(serving_tables)
     normalized_price_keys = tuple(sorted({int(price_key) for price_key in price_keys}))
     if not normalized_price_keys:
         return {}
     atom_key_bits = _version_three_atom_key_bits(serving_tables)
-    atom_keys_by_price_key = await lookup_price_atom_memberships_from_db(
+    atom_keys_by_price_key = await lookup_shared_price_atom_memberships_from_db(
         session,
-        serving_tables.serving_binary_table,
+        _required_shared_snapshot_key(serving_tables),
         normalized_price_keys,
         atom_key_bits=atom_key_bits,
         block_span=serving_tables.price_key_block_span,
+        schema_name=PTG2_SCHEMA,
     )
     _validate_version_three_price_memberships(normalized_price_keys, atom_keys_by_price_key)
     requested_atom_keys = tuple(
@@ -5178,12 +3649,13 @@ async def _version_three_prices_by_key(
             for atom_key in atom_keys_by_price_key.get(price_key, ())
         )
     )
-    price_atoms_by_key = await lookup_price_atoms_from_db(
+    price_atoms_by_key = await lookup_shared_price_atoms_from_db(
         session,
-        serving_tables.serving_binary_table,
+        _required_shared_snapshot_key(serving_tables),
         requested_atom_keys,
         atom_key_bits=atom_key_bits,
         block_span=serving_tables.atom_key_block_span,
+        schema_name=PTG2_SCHEMA,
     )
     missing_atom_keys = set(requested_atom_keys).difference(price_atoms_by_key)
     if missing_atom_keys:
@@ -5244,190 +3716,6 @@ def _version_three_price_rows(
     }
 
 
-async def _ptg2_price_rows_by_id(
-    session,
-    serving_tables: PTG2ServingTables,
-    price_atom_table: str,
-    atom_ids: tuple[str, ...],
-) -> dict[str, dict[str, Any]]:
-    """Fetch hydrated price-atom rows keyed by global atom id."""
-
-    atom_array_cast = _ptg2_manifest_id_array_cast(serving_tables)
-    price_atom_select_sql = _ptg2_manifest_price_atom_select_sql(serving_tables, price_atom_table)
-    stmt = text(
-        f"""
-            {price_atom_select_sql}
-            WHERE price_atom_global_id_128 = ANY(CAST(:atom_ids AS {atom_array_cast}))
-            """
-    )
-    price_atom_result = await session.execute(stmt, {"atom_ids": atom_ids})
-    return {
-        _ptg2_manifest_id(_row_mapping(price_atom_record).get("price_atom_global_id_128")): _row_mapping(
-            price_atom_record
-        )
-        for price_atom_record in price_atom_result
-    }
-
-
-async def _ptg2_manifest_prices_for_price_set(
-    session,
-    serving_tables: PTG2ServingTables,
-    price_set_global_id: str,
-) -> list[dict[str, Any]]:
-    price_atom_table = _safe_table_name(serving_tables.price_atom_table)
-    price_set_global_id = _ptg2_manifest_id(price_set_global_id)
-    if not price_atom_table or not price_set_global_id:
-        return []
-    price_members: tuple[str, ...] = ()
-    if serving_tables.serving_binary_table:
-        binary_members = await lookup_atoms_by_price_id(
-            session,
-            serving_tables.serving_binary_table,
-            (price_set_global_id,),
-        )
-        if price_set_global_id not in binary_members:
-            binary_members = await lookup_binary_price_atoms_from_db(
-                session,
-                serving_tables.serving_binary_table,
-                (price_set_global_id,),
-            )
-        price_members = binary_members.get(price_set_global_id, ())
-    if not price_members:
-        price_members = await _ptg2_manifest_sidecar_members_async(
-            session,
-            serving_tables,
-            "price_forward",
-            price_set_global_id,
-        )
-    if not price_members:
-        return []
-    atom_ids = list(price_members)
-    rows_by_id = await _ptg2_price_rows_by_id(
-        session,
-        serving_tables,
-        price_atom_table,
-        tuple(atom_ids),
-    )
-    prices: list[dict[str, Any]] = []
-    for atom_id in atom_ids:
-        price_atom_row = rows_by_id.get(atom_id)
-        if not price_atom_row:
-            continue
-        prices.append(_ptg2_manifest_price_payload(price_atom_row))
-    return prices
-
-
-def _ptg2_missing_price_set_ids(
-    price_set_ids: tuple[str, ...],
-    members_by_set: Mapping[str, tuple[str, ...]],
-) -> tuple[str, ...]:
-    """Return requested price-set ids not yet resolved to atom ids."""
-
-    return tuple(price_set_id for price_set_id in price_set_ids if price_set_id not in members_by_set)
-
-
-async def _ptg2_members_from_price_ids(
-    session,
-    serving_binary_table: str,
-    price_set_ids: tuple[str, ...],
-) -> dict[str, tuple[str, ...]]:
-    """Resolve binary price memberships directly by price-set id."""
-
-    members_by_set = await lookup_atoms_by_price_id(session, serving_binary_table, price_set_ids)
-    missing_price_set_ids = _ptg2_missing_price_set_ids(price_set_ids, members_by_set)
-    if missing_price_set_ids:
-        members_by_set.update(
-            await lookup_binary_price_atoms_from_db(
-                session,
-                serving_binary_table,
-                missing_price_set_ids,
-            )
-        )
-    return members_by_set
-
-
-async def _ptg2_members_from_price_keys(
-    session,
-    serving_binary_table: str,
-    price_set_ids: tuple[str, ...],
-    price_key_by_set_id: Mapping[str, int],
-) -> dict[str, tuple[str, ...]]:
-    """Resolve binary price memberships using request-local price keys first."""
-
-    requested_price_key_by_set_id = {
-        price_set_id: price_key_by_set_id[price_set_id]
-        for price_set_id in price_set_ids
-        if price_set_id in price_key_by_set_id
-    }
-    members_by_set = await lookup_atoms_by_price_key(session, serving_binary_table, requested_price_key_by_set_id)
-    missing_price_set_ids = _ptg2_missing_price_set_ids(price_set_ids, members_by_set)
-    if missing_price_set_ids:
-        members_by_set.update(
-            await _ptg2_members_from_price_ids(
-                session,
-                serving_binary_table,
-                missing_price_set_ids,
-            )
-        )
-    return members_by_set
-
-
-async def _ptg2_binary_price_members(
-    session,
-    serving_binary_table: str,
-    price_set_ids: tuple[str, ...],
-    price_key_by_set_id: Mapping[str, int] | None,
-) -> dict[str, tuple[str, ...]]:
-    """Resolve price-set atom memberships from PostgreSQL binary blocks."""
-
-    if price_key_by_set_id:
-        return await _ptg2_members_from_price_keys(
-            session,
-            serving_binary_table,
-            price_set_ids,
-            price_key_by_set_id,
-        )
-    return await _ptg2_members_from_price_ids(session, serving_binary_table, price_set_ids)
-
-
-async def _ptg2_price_members_by_set(
-    session,
-    serving_tables: PTG2ServingTables,
-    price_set_ids: tuple[str, ...],
-    *,
-    price_key_by_set_id: Mapping[str, int] | None = None,
-) -> dict[str, tuple[str, ...]]:
-    """Resolve price-set atom memberships from binary blocks, then legacy artifacts."""
-
-    members_by_set: dict[str, tuple[str, ...]] = {}
-    if serving_tables.serving_binary_table:
-        members_by_set.update(
-            await _ptg2_binary_price_members(
-                session,
-                serving_tables.serving_binary_table,
-                price_set_ids,
-                price_key_by_set_id,
-            )
-        )
-    missing_price_set_ids = _ptg2_missing_price_set_ids(price_set_ids, members_by_set)
-    if missing_price_set_ids:
-        members_by_set.update(
-            await _ptg2_manifest_sidecar_members_many_async(
-                session,
-                serving_tables,
-                "price_forward",
-                missing_price_set_ids,
-            )
-        )
-    return members_by_set
-
-
-def _ptg2_manifest_unique_atom_ids(members_by_set: Mapping[str, tuple[str, ...]]) -> tuple[str, ...]:
-    """Return unique atom ids while preserving first-seen membership order."""
-
-    return tuple(dict.fromkeys(atom_id for atom_ids in members_by_set.values() for atom_id in atom_ids))
-
-
 async def _ptg2_manifest_prices_for_price_sets(
     session,
     serving_tables: PTG2ServingTables,
@@ -5439,46 +3727,23 @@ async def _ptg2_manifest_prices_for_price_sets(
 
     price_set_ids = _ptg2_manifest_ids(tuple(price_set_global_ids))
     if not price_set_ids:
-        return {price_set_id: [] for price_set_id in price_set_ids}
-    if serving_tables.effective_arch_version == "postgres_binary_v3":
-        price_key_by_set_id = price_key_by_set_id or {}
-        missing_price_key_ids = set(price_set_ids).difference(price_key_by_set_id)
-        if missing_price_key_ids:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 forward row is missing a referenced price key"
-            )
-        prices_by_price_key = await _version_three_prices_by_key(
-            session,
-            serving_tables,
-            [price_key_by_set_id[price_set_id] for price_set_id in price_set_ids if price_set_id in price_key_by_set_id],
+        return {}
+    _require_strict_shared_v3(serving_tables)
+    price_key_by_set_id = price_key_by_set_id or {}
+    missing_price_key_ids = set(price_set_ids).difference(price_key_by_set_id)
+    if missing_price_key_ids:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 forward row is missing a referenced price key"
         )
-        return {
-            price_set_id: prices_by_price_key.get(price_key_by_set_id.get(price_set_id), [])
-            for price_set_id in price_set_ids
-        }
-    price_atom_table = _safe_table_name(serving_tables.price_atom_table)
-    if not price_atom_table:
-        return {price_set_id: [] for price_set_id in price_set_ids}
-    members_by_set = await _ptg2_price_members_by_set(
+    prices_by_price_key = await _version_three_prices_by_key(
         session,
         serving_tables,
-        price_set_ids,
-        price_key_by_set_id=price_key_by_set_id,
+        [price_key_by_set_id[price_set_id] for price_set_id in price_set_ids],
     )
-    atom_ids = _ptg2_manifest_unique_atom_ids(members_by_set)
-    if not atom_ids:
-        return {price_set_id: [] for price_set_id in price_set_ids}
-    rows_by_id = await _ptg2_price_rows_by_id(session, serving_tables, price_atom_table, atom_ids)
-    prices_by_set: dict[str, list[dict[str, Any]]] = {}
-    for price_set_id in price_set_ids:
-        prices: list[dict[str, Any]] = []
-        for atom_id in members_by_set.get(price_set_id, ()):
-            price_atom_row = rows_by_id.get(atom_id)
-            if not price_atom_row:
-                continue
-            prices.append(_ptg2_manifest_price_payload(price_atom_row))
-        prices_by_set[price_set_id] = prices
-    return prices_by_set
+    return {
+        price_set_id: prices_by_price_key.get(price_key_by_set_id[price_set_id], [])
+        for price_set_id in price_set_ids
+    }
 
 
 async def _ptg2_manifest_taxonomy_rows_for_npis(
@@ -5487,6 +3752,13 @@ async def _ptg2_manifest_taxonomy_rows_for_npis(
 ) -> dict[int, dict[str, Any]]:
     npis = tuple(sorted({int(npi) for npi in npis if int(npi) > 0}))
     if not npis:
+        return {}
+    taxonomy_table = f"{PTG2_SCHEMA}.npi_taxonomy"
+    vocabulary_table = f"{PTG2_SCHEMA}.nucc_taxonomy"
+    if not await _relation_available(
+        session,
+        taxonomy_table,
+    ) or not await _relation_available(session, vocabulary_table):
         return {}
     result = await session.execute(
         text(
@@ -5542,7 +3814,7 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
         _PTG2_LEGACY_ADDRESS_COLUMNS,
         require_legacy_available=True,
     )
-    if not await _serving_table_available(session, npi_data_table) or not npi_address_table:
+    if not await _relation_available(session, npi_data_table) or not npi_address_table:
         taxonomy_by_npi = await _ptg2_manifest_taxonomy_rows_for_npis(session, npis)
         return [
             {
@@ -5690,6 +3962,26 @@ def _ptg2_provider_taxonomy_filter_requested(args: dict[str, Any]) -> bool:
     return _inferred_provider_taxonomy_rule(args) is not None
 
 
+_PTG2_COST_ORDER_FIELDS = frozenset(
+    {
+        "total_allowed_amount",
+        "total_drug_cost",
+        "cost",
+        "price",
+        "rate",
+        "negotiated_rate",
+        "amount",
+    }
+)
+
+
+def _ptg2_cost_order_descending(args: Mapping[str, Any]) -> bool:
+    order_by = str(args.get("order_by") or "total_allowed_amount").strip().lower()
+    return order_by in _PTG2_COST_ORDER_FIELDS and str(
+        args.get("order") or "asc"
+    ).strip().lower() == "desc"
+
+
 def _ptg2_manifest_rate_candidate_limit(
     args: dict[str, Any],
     pagination,
@@ -5699,6 +3991,8 @@ def _ptg2_manifest_rate_candidate_limit(
 ) -> int:
     requested_limit = max(int(pagination.limit), 1)
     requested_offset = max(int(getattr(pagination, "offset", 0) or 0), 0)
+    if location_filter_requested and not expand_providers:
+        return requested_offset + requested_limit + 1
     if expand_providers and location_filter_requested:
         # Bound the nearby-candidate pool the location expansion materializes.
         # The downstream provider_group_member fan-out + per-row enrichment cost
@@ -5713,417 +4007,65 @@ def _ptg2_manifest_rate_candidate_limit(
                 _ptg2_manifest_location_candidate_overfetch_cap(),
             )
         candidate_floor = _ptg2_manifest_location_candidate_floor()
-        return min(
-            _ptg2_manifest_location_match_limit(),
-            max(
-                candidate_window,
-                requested_offset + requested_limit,
-                candidate_floor,
-            ),
+        return max(
+            candidate_window,
+            requested_offset + requested_limit + 1,
+            candidate_floor,
         )
     if expand_providers and not location_filter_requested and _ptg2_provider_taxonomy_filter_requested(args):
         return min(
             _PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT,
             max(requested_limit, requested_offset + requested_limit, requested_limit * 5, 5),
         )
+    if expand_providers:
+        return requested_offset + requested_limit
     return requested_limit
 
 
-_PTG2_ROUTE_ITEM_COLUMNS = {
-    "npi",
-    "location_hash",
-    "zip5",
-    "lat",
-    "long",
-    "address_precision",
-    "item_payload",
-    "min_rate",
-    "provider_name",
-}
-
-
-@contextmanager
-def _suspend_gc_for_route_item_payload():
-    was_enabled = gc.isenabled()
-    if was_enabled:
-        gc.disable()
-    try:
-        yield
-    finally:
-        if was_enabled:
-            gc.enable()
-
-
-def _ptg2_route_item_slug(value: Any, *, max_length: int = 32) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
-    return (slug or "none")[:max_length]
-
-
-def _route_item_candidates_for_codes(
-    serving_tables: PTG2ServingTables,
+def _ptg2_manifest_serving_row_limit(
+    args: Mapping[str, Any],
+    rate_candidate_limit: int,
     *,
-    plan_id: str,
-    code_system: str | None,
-    code_values: Iterable[str],
-) -> tuple[str, ...]:
-    serving_table = _safe_table_name(serving_tables.serving_table)
-    if not serving_table:
-        return ()
-    serving_name = serving_table.rsplit(".", 1)[-1]
-    serving_suffix = serving_name.removeprefix("ptg2_serving_")
-    if not serving_suffix or serving_suffix == serving_name:
-        return ()
-    plan_slug = _ptg2_route_item_slug(plan_id, max_length=24)
-    system_slug = _ptg2_route_item_slug(code_system or "code", max_length=12)
-    code_slugs = tuple(dict.fromkeys(_ptg2_route_item_slug(value, max_length=16) for value in code_values))
-    suffixes = tuple(dict.fromkeys((serving_suffix, serving_suffix[:5])))
-    return tuple(
-        f"{PTG2_SCHEMA}.ptg2_route_item_{suffix}_{plan_slug}_{system_slug}_{code_slug}"
-        for suffix in suffixes
-        for code_slug in code_slugs
-        if suffix
-    )
+    expand_providers: bool,
+) -> int | None:
+    """Return the safe pre-merge serving-row limit for a provider response."""
 
-
-def _ptg2_route_item_table_candidates(
-    serving_tables: PTG2ServingTables,
-    *,
-    plan_id: str,
-    code_system: str | None,
-    code: str,
-) -> tuple[str, ...]:
-    return _route_item_candidates_for_codes(
-        serving_tables,
-        plan_id=plan_id,
-        code_system=code_system,
-        code_values=_ptg2_reported_code_lookup_values(code_system, code),
-    )
-
-
-async def _ptg2_route_item_tables(
-    session,
-    serving_tables: PTG2ServingTables,
-    *,
-    plan_id: str,
-    code_system: str | None,
-    code: str,
-) -> tuple[str, ...]:
-    selected_tables: list[str] = []
-    for code_value in _ptg2_reported_code_lookup_values(code_system, code):
-        candidates = _route_item_candidates_for_codes(
-            serving_tables,
-            plan_id=plan_id,
-            code_system=code_system,
-            code_values=(code_value,),
-        )
-        for table_name in candidates:
-            if table_name in selected_tables:
-                break
-            if not await _serving_table_available(session, table_name):
-                continue
-            if await _ptg2_table_has_columns(session, table_name, _PTG2_ROUTE_ITEM_COLUMNS):
-                selected_tables.append(table_name)
-                break
-    return tuple(selected_tables)
-
-
-async def _ptg2_route_item_table(
-    session,
-    serving_tables: PTG2ServingTables,
-    *,
-    plan_id: str,
-    code_system: str | None,
-    code: str,
-) -> str | None:
-    route_tables = await _ptg2_route_item_tables(
-        session,
-        serving_tables,
-        plan_id=plan_id,
-        code_system=code_system,
-        code=code,
-    )
-    return route_tables[0] if route_tables else None
-
-
-def _ptg2_route_item_fast_path_allowed(args: dict[str, Any]) -> bool:
-    if not _request_bool(args.get("include_providers")):
-        return False
-    if _include_ptg2_sources(args):
-        return False
-    variant_payload_keys = (
-        "include_code_details",
-        "include_debug",
-        "include_details",
-        "include_unverified_addresses",
-    )
-    if any(args.get(key) not in (None, "", "null") for key in variant_payload_keys):
-        return False
-    if args.get("q") or args.get("service_name"):
-        return False
-    if args.get("state") or args.get("city"):
-        return False
-    if args.get("specialty") or args.get("classification"):
-        return False
-    unsupported_taxonomy_keys = (
-        "taxonomy_classification",
-        "taxonomy_specialization",
-        "taxonomy_section",
-    )
-    if any(args.get(key) not in (None, "", "null") for key in unsupported_taxonomy_keys):
-        return False
-    price_filter_params: dict[str, Any] = {}
-    price_filter_clauses, _ = _price_filter_clauses(args, price_filter_params)
-    if price_filter_clauses:
-        return False
-    return bool(
-        args.get("lat") not in (None, "", "null")
-        and args.get("long") not in (None, "", "null")
-        and args.get("radius_miles") not in (None, "", "null")
-    )
-
-
-def _route_item_taxonomy_sql(args: dict[str, Any], params: dict[str, Any]) -> str:
-    taxonomy_args_dict = dict(args)
-    if not taxonomy_args_dict.get("taxonomy_codes") and taxonomy_args_dict.get("taxonomy_code"):
-        taxonomy_args_dict["taxonomy_codes"] = taxonomy_args_dict.get("taxonomy_code")
-    specialty_filter = resolve_provider_specialty_filter(taxonomy_args_dict)
-    if not specialty_filter.active:
-        return ""
-    return (
-        "AND r.npi IN ("
-        + provider_specialty_taxonomy_semijoin_sql(
-            params,
-            "route_item_specialty",
-            specialty_filter,
-            schema=PTG2_SCHEMA,
-        )
-        + ")"
-    )
-
-
-async def _search_ptg2_manifest_route_item_table(
-    session,
-    snapshot_id: str,
-    args: dict[str, Any],
-    pagination,
-    serving_tables: PTG2ServingTables,
-    mode_value: str,
-    *,
-    requested_plan: str,
-    requested_system: str | None,
-    requested_code: str,
-) -> dict[str, Any] | None:
-    """Serve an eligible geo query through preprojected route-item tables."""
-
-    if not _ptg2_route_item_fast_path_allowed(args):
+    if expand_providers:
         return None
-    try:
-        geo_lat = float(args.get("lat"))
-        geo_long = float(args.get("long"))
-        geo_radius_miles = max(float(args.get("radius_miles")), 0.0)
-    except (TypeError, ValueError):
-        return None
-    zip_value = _normalize_zip5(args.get("zip5"))
-    route_tables = await _ptg2_route_item_tables(
-        session,
-        serving_tables,
-        plan_id=requested_plan,
-        code_system=requested_system,
-        code=requested_code,
-    )
-    if not route_tables:
-        return None
-    route_item_source_sql = "\nUNION ALL\n".join(
-        f"""
-        SELECT
-            item_payload,
-            zip5,
-            lat,
-            long,
-            address_precision,
-            min_rate,
-            provider_name,
-            npi,
-            location_hash,
-            {route_table_ordinal}::integer AS route_table_ordinal
-        FROM {table_name}
-        """
-        for route_table_ordinal, table_name in enumerate(route_tables)
-    )
+    return int(rate_candidate_limit)
 
-    params: dict[str, Any] = {
-        "zip5": zip_value,
-        "geo_lat": geo_lat,
-        "geo_long": geo_long,
-        "geo_radius_miles": geo_radius_miles,
-        "geo_min_lat": geo_lat - geo_radius_miles / 69.0,
-        "geo_max_lat": geo_lat + geo_radius_miles / 69.0,
-        "geo_min_long": geo_long - geo_radius_miles / 69.0,
-        "geo_max_long": geo_long + geo_radius_miles / 69.0,
-        "limit": int(pagination.limit),
-        "offset": int(pagination.offset),
-        "empty": "",
-        "city_zip": "city_zip",
-    }
-    npi_value = args.get("npi")
-    npi_filter_sql = ""
-    if npi_value not in (None, "", "null"):
-        try:
-            params["provider_npi"] = int(npi_value)
-        except (TypeError, ValueError):
-            return None
-        npi_filter_sql = "AND r.npi = :provider_npi"
-    taxonomy_filter_sql = _route_item_taxonomy_sql(args, params)
 
-    distance_sql = _ptg2_geo_distance_miles_sql("r.lat::float8", "r.long::float8")
-    order_by = str(args.get("order_by") or "").strip().lower()
-    order = str(args.get("order") or "").strip().lower()
-    descending = order == "desc"
-    cost_order_fields = {
-        "total_allowed_amount",
-        "total_drug_cost",
-        "cost",
-        "price",
-        "rate",
-        "negotiated_rate",
-        "amount",
-    }
-    distance_order_fields = {"", "distance", "distance_miles"}
-    if order_by in cost_order_fields:
-        direction = "DESC" if descending else "ASC"
-        distance_direction = "DESC" if descending else "ASC"
-        order_sql = (
-            f"min_rate {direction} NULLS LAST, "
-            f"distance_miles {distance_direction} NULLS LAST, "
-            "provider_name, npi, route_table_ordinal, location_hash NULLS LAST"
-        )
-    elif order_by in distance_order_fields:
-        direction = "DESC" if descending else "ASC"
-        zip_direction = "DESC" if descending else "ASC"
-        order_sql = (
-            f"zip_rank {zip_direction}, "
-            f"distance_miles {direction} NULLS LAST, "
-            "min_rate ASC NULLS LAST, provider_name, npi, "
-            "route_table_ordinal, location_hash NULLS LAST"
-        )
+def _ptg2_decimal_rate_sort_value(value: Any) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        decimal_rate = value
     else:
-        return None
-
-    await _set_local_jit_off_for_manifest_location(session)
-    try:
-        with _suspend_gc_for_route_item_payload():
-            result = await session.execute(
-                text(
-                    f"""
-            WITH route_items AS MATERIALIZED (
-                {route_item_source_sql}
-            ),
-            raw AS (
-                SELECT
-                    r.item_payload,
-                    CASE WHEN r.zip5 = :zip5 THEN 0.0 ELSE {distance_sql} END AS distance_miles,
-                    CASE WHEN r.zip5 = :zip5 THEN 0 ELSE 1 END AS zip_rank,
-                    r.min_rate,
-                    r.provider_name,
-                    r.npi,
-                    r.route_table_ordinal,
-                    r.location_hash
-                  FROM route_items r
-                 WHERE (
-                        r.zip5 = :zip5
-                        OR (
-                            r.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat
-                            AND r.long::float8 BETWEEN :geo_min_long AND :geo_max_long
-                            AND {distance_sql} <= CAST(:geo_radius_miles AS double precision)
-                            AND COALESCE(r.address_precision, :empty) <> :city_zip
-                        )
-                    )
-                    {npi_filter_sql}
-                    {taxonomy_filter_sql}
-            )
-            SELECT item_payload, distance_miles, zip_rank, COUNT(*) OVER () AS total_matches
-              FROM raw
-             ORDER BY {order_sql}
-             LIMIT :limit OFFSET :offset
-            """
-                ),
-                params,
-            )
-    except Exception:
-        await _rollback_optional_ptg2_query(session)
-        return None
-    items: list[dict[str, Any]] = []
-    total_matches: int | None = None
-    with _suspend_gc_for_route_item_payload():
-        for row in result:
-            data = _row_mapping(row)
-            if total_matches is None:
-                total_matches = _coerce_int_payload(data.get("total_matches"))
-            payload = _coerce_json_payload(data.get("item_payload"), {})
-            if not isinstance(payload, dict):
-                continue
-            item = dict(payload)
-            item["distance_miles"] = data.get("distance_miles")
-            item["zip_match_type"] = "same_zip" if int(data.get("zip_rank") or 0) == 0 else "radius"
-            item["anchor_zip5"] = zip_value
-            item["zip_radius_miles"] = geo_radius_miles
-            items.append(item)
-        if not items:
+        text = str(value).strip()
+        if not text:
             return None
-
-        returned_through = int(pagination.offset) + len(items)
-        return _shape_ptg2_manifest_response(
-            {
-                "items": items,
-                "pagination": {
-                    "total": total_matches if total_matches is not None else returned_through,
-                    "limit": pagination.limit,
-                    "offset": pagination.offset,
-                    "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
-                    "has_more": bool(total_matches is not None and returned_through < total_matches),
-                },
-                "query": {
-                    "plan_id": args.get("plan_id"),
-                    "plan_external_id": args.get("plan_external_id"),
-                    "plan_market_type": args.get("plan_market_type") or args.get("market_type") or None,
-                    "source_key": args.get("source_key") or None,
-                    "snapshot_id": snapshot_id,
-                    "mode": mode_value,
-                    "code": args.get("code") or None,
-                    "code_system": args.get("code_system") or None,
-                    "state": args.get("state") or None,
-                    "city": args.get("city") or None,
-                    "zip5": zip_value,
-                    "lat": args.get("lat") or None,
-                    "long": args.get("long") or None,
-                    "radius_miles": geo_radius_miles,
-                    "npi": args.get("npi") or None,
-                    "source": "ptg2_db",
-                    "serving_table": _safe_table_name(serving_tables.serving_table),
-                    "route_item_table": route_tables[0],
-                    "include_providers": True,
-                    "procedure_consolidation": "REPORTED_CODE",
-                },
-            },
-            args,
-        )
+        try:
+            decimal_rate = Decimal(text)
+        except (InvalidOperation, ValueError):
+            return None
+    return decimal_rate if decimal_rate.is_finite() else None
 
 
-def _ptg2_provider_price_sort_value(item: dict[str, Any]) -> float:
-    rates: list[float] = []
+def _ptg2_provider_price_sort_value(item: dict[str, Any]) -> Decimal:
+    rates: list[Decimal] = []
     for price in _coerce_json_payload(item.get("prices"), []):
         if not isinstance(price, dict):
             continue
-        rate = _coerce_numeric_rate(price.get("negotiated_rate"))
+        rate = _ptg2_decimal_rate_sort_value(price.get("negotiated_rate"))
         if rate is not None:
-            rates.append(float(rate))
+            rates.append(rate)
     for summary in _coerce_json_payload(item.get("price_summary"), []):
         if not isinstance(summary, dict):
             continue
-        rate = _coerce_numeric_rate(summary.get("rate"))
+        rate = _ptg2_decimal_rate_sort_value(summary.get("rate"))
         if rate is not None:
-            rates.append(float(rate))
-    return min(rates) if rates else math.inf
+            rates.append(rate)
+    return min(rates) if rates else Decimal("Infinity")
 
 
 def _ptg2_provider_distance_sort_value(item: dict[str, Any]) -> float:
@@ -6147,40 +4089,53 @@ def _sort_ptg2_manifest_provider_items(
     *,
     location_filter_requested: bool,
 ) -> list[dict[str, Any]]:
-    order_by = str(args.get("order_by") or "").strip().lower()
+    """Sort provider items by rank or the query's deterministic order."""
+    if items and all(item.get("_ptg_provider_rank") is not None for item in items):
+        return sorted(items, key=lambda item: int(item["_ptg_provider_rank"]))
+    requested_order = str(args.get("order_by") or "").strip().lower()
+    order_by = requested_order or ("distance" if location_filter_requested else "")
     order = str(args.get("order") or "").strip().lower()
     descending = order == "desc"
-    cost_order_fields = {
-        "total_allowed_amount",
-        "total_drug_cost",
-        "cost",
-        "price",
-        "rate",
-        "negotiated_rate",
-        "amount",
-    }
     distance_order_fields = {"distance", "distance_miles"}
-    if order_by in cost_order_fields:
+    if order_by in _PTG2_COST_ORDER_FIELDS:
         return sorted(
             items,
             key=lambda item: (
-                _ptg2_provider_price_sort_value(item),
+                (
+                    -_ptg2_provider_price_sort_value(item)
+                    if descending
+                    and _ptg2_provider_price_sort_value(item).is_finite()
+                    else _ptg2_provider_price_sort_value(item)
+                ),
+                int(
+                    item["_ptg_price_key"]
+                    if item.get("_ptg_price_key") is not None
+                    else 2**32
+                ),
                 _ptg2_provider_distance_sort_value(item),
                 str(item.get("provider_name") or ""),
-                str(item.get("npi") or ""),
+                int(item.get("npi") or 2**63 - 1),
             ),
-            reverse=descending,
         )
-    if order_by in distance_order_fields or (location_filter_requested and not order_by):
+    if order_by in distance_order_fields:
         return sorted(
             items,
             key=lambda item: (
-                _ptg2_provider_distance_sort_value(item),
+                (
+                    -_ptg2_provider_distance_sort_value(item)
+                    if descending
+                    and math.isfinite(_ptg2_provider_distance_sort_value(item))
+                    else _ptg2_provider_distance_sort_value(item)
+                ),
+                int(item.get("npi") or 2**63 - 1),
                 _ptg2_provider_price_sort_value(item),
                 str(item.get("provider_name") or ""),
-                str(item.get("npi") or ""),
+                int(
+                    item["_ptg_price_key"]
+                    if item.get("_ptg_price_key") is not None
+                    else 2**32
+                ),
             ),
-            reverse=descending,
         )
     return sorted(
         items,
@@ -6203,35 +4158,71 @@ def _ptg2_manifest_provider_procedure_item(
     provider_context: dict[str, Any] | None,
     args: dict[str, Any],
 ) -> dict[str, Any]:
+    """Shape one provider and negotiated-price match into an API result item."""
     reported_code = data.get("reported_code")
     reported_system = data.get("reported_code_system")
     provider_set_hash = _ptg2_manifest_id(data.get("provider_set_global_id_128"))
     price_set_hash = _ptg2_manifest_id(data.get("price_set_global_id_128"))
     rate_pack_hash = _ptg2_manifest_id(data.get("serving_content_hash_128"))
+    source_artifact_key = data.get("source_artifact_key")
+    if source_artifact_key is None:
+        source_artifact_key = data.get("source_key")
+    exact_source_mode = normalize_ptg2_mode(args.get("mode")) == PTG2_MODE_EXACT_SOURCE
+    source_procedure_name = data.get("source_procedure_name")
+    source_procedure_description = data.get("source_procedure_description")
     item_data = dict(provider_context or {})
     item_data.update(
         {
             "npi": npi,
+            "plan_id": data.get("plan_id"),
+            "plan_market_type": data.get("plan_market_type"),
             "provider_set_hash": provider_set_hash,
             "provider_count": data.get("provider_count") or 0,
             "provider_set_count": 1 if provider_set_hash else 0,
             "network_names": _coerce_str_list_payload(data.get("network_names")),
             "procedure_code": reported_code,
-            "procedure_name": procedure_detail.get("procedure_name"),
-            "procedure_description": procedure_detail.get("procedure_description"),
+            "billing_code_type_version": data.get("billing_code_type_version"),
+            "procedure_name": (
+                source_procedure_name
+                if exact_source_mode
+                else source_procedure_name or procedure_detail.get("procedure_name")
+            ),
+            "procedure_description": (
+                source_procedure_description
+                if exact_source_mode
+                else source_procedure_description
+                or procedure_detail.get("procedure_description")
+            ),
+            "source_procedure_name": source_procedure_name,
+            "source_procedure_description": source_procedure_description,
+            "catalog_procedure_name": procedure_detail.get("procedure_name"),
+            "catalog_procedure_description": procedure_detail.get("procedure_description"),
             "reported_code": reported_code,
             "reported_code_system": reported_system,
+            "negotiation_arrangement": data.get("negotiation_arrangement"),
             "billing_code": reported_code,
             "billing_code_type": reported_system,
             "prices": prices,
             "price_set_hash": price_set_hash,
             "rate_pack_hash": rate_pack_hash,
+            "source_key": data.get("logical_source_key") or args.get("source_key"),
+            "source_artifact_key": source_artifact_key,
+            "source_type": data.get("source_type"),
+            "identity_kind": data.get("identity_kind"),
+            "identity_sha256": data.get("identity_sha256"),
+            "raw_container_sha256": data.get("raw_container_sha256"),
+            "logical_json_sha256": data.get("logical_json_sha256"),
+            "logical_hash_deferred": data.get("logical_hash_deferred"),
+            "source_trace_set_hash": data.get("source_trace_set_hash"),
+            "source_trace": data.get("source_trace"),
         }
     )
     return _compact_item_from_row(item_data, args)
 
 
-def _ptg2_provider_rate_group_key(item: dict[str, Any]) -> tuple[str, str, str, str] | None:
+def _ptg2_provider_rate_group_key(
+    item: dict[str, Any],
+) -> tuple[str, str, str, str, str, str] | None:
     npi = item.get("npi")
     if npi in (None, ""):
         return None
@@ -6265,7 +4256,19 @@ def _ptg2_provider_rate_group_key(item: dict[str, Any]) -> tuple[str, str, str, 
         or item.get("billing_code")
         or ""
     )
-    return str(npi), str(location_key), str(reported_system), str(reported_code)
+    negotiation_arrangement = item.get("negotiation_arrangement") or ""
+    return (
+        str(npi),
+        str(location_key),
+        str(reported_system),
+        str(reported_code),
+        str(negotiation_arrangement),
+        str(
+            item.get("source_artifact_key")
+            if item.get("source_artifact_key") is not None
+            else ""
+        ),
+    )
 
 
 def _append_unique_value(values: list[Any], value: Any) -> None:
@@ -6307,8 +4310,8 @@ def _ensure_provider_rate_price_fields(item: dict[str, Any]) -> None:
 def _merge_ptg2_provider_rate_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse duplicate provider/location rows while preserving every rate option."""
     merged: list[dict[str, Any]] = []
-    grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-    price_dirty: set[tuple[str, str, str, str]] = set()
+    grouped: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
+    price_dirty: set[tuple[str, str, str, str, str, str]] = set()
     for item in items:
         group_key = _ptg2_provider_rate_group_key(item)
         if group_key is None:
@@ -6338,6 +4341,12 @@ def _merge_ptg2_provider_rate_items(items: list[dict[str, Any]]) -> list[dict[st
         existing["prices"] = combined_prices
         existing["tic_prices"] = combined_prices
         price_dirty.add(group_key)
+        existing_price_key = existing.get("_ptg_price_key")
+        item_price_key = item.get("_ptg_price_key")
+        if item_price_key is not None and (
+            existing_price_key is None or int(item_price_key) < int(existing_price_key)
+        ):
+            existing["_ptg_price_key"] = int(item_price_key)
         _append_unique_value(existing.setdefault("price_set_hashes", []), item.get("price_set_hash"))
         _append_unique_value(existing.setdefault("rate_pack_hashes", []), item.get("rate_pack_hash"))
         _append_unique_value(existing.setdefault("provider_set_hashes", []), item.get("provider_set_hash"))
@@ -6444,204 +4453,12 @@ def _ptg2_sql_scope_limit() -> int:
         return 10000
 
 
-def _ptg2_location_first_limit() -> int:
-    raw_value = os.getenv("HLTHPRT_PTG2_MANIFEST_LOCATION_FIRST_MAX_NPIS", "5000")
-    try:
-        return max(int(raw_value), 1)
-    except ValueError:
-        return 5000
-
-
-_LOCATION_FIRST_PROBE_SQL_TEMPLATE = Template(
-    """
-            WITH
-            $location_first_zip_scope
-            located_probe AS MATERIALIZED (
-                SELECT DISTINCT addr.npi
-                $location_first_from_sql
-                WHERE $location_first_filter_sql
-                ORDER BY addr.npi
-                LIMIT :location_first_probe_limit
-            )
-            SELECT npi
-            FROM located_probe
-            """
-)
-
-
-_LOCATION_FIRST_MEMBER_SQL_TEMPLATE = Template(
-    """
-            WITH
-            $location_first_zip_scope
-            located AS MATERIALIZED (
-                SELECT DISTINCT ON (addr.npi)
-                    addr.npi,
-                    addr.type,
-                    addr.checksum,
-                    addr.state_name,
-                    addr.city_name,
-                    addr.postal_code,
-                    addr.country_code,
-                    addr.address_key,
-                    $premise_key_select_sql
-                    $address_base_payload_sql AS base_address_payload,
-                    addr.lat,
-                    addr.long,
-                    addr.first_line,
-                    addr.second_line,
-                    addr.telephone_number,
-                    addr.fax_number,
-                    addr.phone_number,
-                    addr.phone_extension,
-                    addr.fax_number_digits,
-                    addr.fax_extension,
-                    $location_select_sql
-                $location_first_from_sql
-                WHERE $location_first_filter_sql
-                ORDER BY $location_order_sql,
-                    CASE addr.type
-                        WHEN 'practice' THEN 0
-                        WHEN 'primary' THEN 1
-                        WHEN 'secondary' THEN 2
-                        ELSE 3
-                    END,
-                    addr.checksum
-                LIMIT :location_first_max_npis
-            ),
-            location_npis AS MATERIALIZED (
-                SELECT *
-                FROM located
-                ORDER BY $limited_location_order_sql
-            )
-            $address_fallback_cte
-            , located_with_tax AS MATERIALIZED (
-                SELECT
-                    loc.*,
-                    tax.taxonomy_codes,
-                    tax.specialties,
-                    tax.classifications,
-                    tax.specializations,
-                    tax.primary_specialty,
-                    tax.primary_specialization
-                FROM location_npis loc
-                $provider_taxonomy_summary_lateral_sql
-            )
-            SELECT DISTINCT ON (pgm.provider_group_global_id_128, addr.npi)
-                pgm.provider_group_global_id_128,
-                addr.npi,
-                addr.address_key::text AS address_key,
-                addr.premise_key::text AS premise_key,
-                $address_location_hash_sql AS location_hash,
-                $eff_state_name AS state,
-                $eff_city_name AS city,
-                LEFT(COALESCE($eff_postal_code, ''), 5) AS zip5,
-                addr.distance_miles,
-                addr.zip_match_type,
-                addr.anchor_zip5,
-                addr.zip_radius_miles,
-                '$address_location_source' AS location_source,
-                '$address_location_source' AS location_confidence_code,
-                (
-                    COALESCE(addr.base_address_payload, '{}'::jsonb)
-                    - 'premise_key'
-                    || jsonb_build_object(
-                        'first_line', $eff_first_line,
-                        'second_line', $eff_second_line,
-                        'city', $eff_city_name,
-                        'state', $eff_state_name,
-                        'postal_code', $eff_postal_code,
-                        'country_code', $eff_country_code,
-                        'telephone_number', $eff_telephone_number,
-                        'fax_number', $eff_fax_number,
-                        'phone_number', $eff_phone_number,
-                        'phone_extension', $eff_phone_extension,
-                        'fax_number_digits', $eff_fax_number_digits,
-                        'fax_extension', $eff_fax_extension,
-                        'address_key', addr.address_key::text,
-                        'address_site_key', addr.premise_key::text,
-                        'lat', $eff_lat,
-                        'long', $eff_long
-                    )
-                )::text AS address_payload,
-                $eff_telephone_number AS telephone_number,
-                $eff_fax_number AS fax_number,
-                $eff_phone_number AS phone_number,
-                $eff_phone_extension AS phone_extension,
-                $eff_fax_number_digits AS fax_number_digits,
-                $eff_fax_extension AS fax_extension,
-                COALESCE(addr.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
-                COALESCE(addr.specialties, ARRAY[]::varchar[]) AS specialties,
-                COALESCE(addr.classifications, ARRAY[]::varchar[]) AS classifications,
-                COALESCE(addr.specializations, ARRAY[]::varchar[]) AS specializations,
-                addr.primary_specialty,
-                addr.primary_specialization,
-                $provider_name_sql AS provider_name
-            FROM located_with_tax addr
-            JOIN LATERAL (
-                SELECT pgm_inner.provider_group_global_id_128
-                  FROM $provider_group_member_table pgm_inner
-                 WHERE pgm_inner.npi = addr.npi
-                 OFFSET 0
-            ) pgm ON TRUE
-            $provider_join
-            $address_fallback_join
-            ORDER BY pgm.provider_group_global_id_128,
-                addr.npi,
-                CASE addr.type
-                    WHEN 'practice' THEN 0
-                    WHEN 'primary' THEN 1
-                    WHEN 'secondary' THEN 2
-                    ELSE 3
-                END,
-                addr.checksum
-            """
-)
-
-
-def _ptg2_filter_location_rows(
-    candidate_iterable: Iterable[Any],
-    rate_scope: _ManifestRateScope,
-    limit: int,
-) -> list[dict[str, Any]]:
-    scoped_location_matches: list[dict[str, Any]] = []
-    seen_location_matches: set[tuple[str, int]] = set()
-    for candidate_source in candidate_iterable:
-        candidate_mapping = _row_mapping(candidate_source)
-        group_id = _ptg2_manifest_id(candidate_mapping.get("provider_group_global_id_128"))
-        if not _has_rate_scope_group(rate_scope, group_id):
-            continue
-        try:
-            npi = int(candidate_mapping.get("npi"))
-        except (TypeError, ValueError):
-            continue
-        match_key = (group_id, npi)
-        if match_key in seen_location_matches:
-            continue
-        seen_location_matches.add(match_key)
-        scoped_location_matches.append(dict(candidate_mapping))
-        if len(scoped_location_matches) >= limit:
-            break
-    return scoped_location_matches
-
-
 def _has_rate_scope_group(rate_scope: _ManifestRateScope, value: Any) -> bool:
     group_id = _ptg2_manifest_id(value)
     if not group_id:
         return False
     binary_group_id = _ptg2_manifest_id_bytes(group_id)
-    if binary_group_id:
-        return binary_group_id in rate_scope.group_id_bytes
-    return group_id in rate_scope.fallback_group_ids
-
-
-def _has_membership_graph(serving_tables: PTG2ServingTables) -> bool:
-    return bool(
-        serving_tables.provider_npi_scope_table
-        and _ptg2_manifest_artifact_entry(serving_tables, "provider_forward")
-        and _ptg2_manifest_artifact_entry(serving_tables, "provider_group_npi")
-        and _ptg2_manifest_artifact_entry(serving_tables, "provider_npi_group")
-        and _ptg2_manifest_artifact_entry(serving_tables, "provider_inverted")
-    )
+    return bool(binary_group_id and binary_group_id in rate_scope.group_id_bytes)
 
 
 @dataclass(frozen=True)
@@ -6735,7 +4552,10 @@ WITH nearest_addresses AS MATERIALIZED (
              addr.npi,
              CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
              addr.checksum
-    LIMIT :probe_limit
+    LIMIT :raw_probe_limit
+), probe_stats AS MATERIALIZED (
+    SELECT COUNT(*)::bigint AS raw_probe_count
+    FROM nearest_addresses
 ), matched AS MATERIALIZED (
     SELECT
         addr.npi,
@@ -6777,8 +4597,10 @@ WITH nearest_addresses AS MATERIALIZED (
         ) AS address_rank
     FROM nearest_addresses addr
 )
-SELECT *
+SELECT matched.*,
+       (probe_stats.raw_probe_count < :raw_probe_limit) AS _ptg_source_exhausted
 FROM matched
+CROSS JOIN probe_stats
 WHERE address_rank = 1
 ORDER BY distance_miles ASC NULLS LAST, npi
 LIMIT :limit
@@ -6950,9 +4772,8 @@ async def _membership_location_query(
     offset: int = 0,
 ) -> _MembershipLocationQuery | None:
     """Build one bounded address lookup against immutable snapshot membership."""
-    provider_npi_scope_table = _safe_table_name(serving_tables.provider_npi_scope_table)
-    if not provider_npi_scope_table:
-        return None
+    _require_strict_shared_v3(serving_tables)
+    provider_npi_scope_table = f"{PTG2_SCHEMA}.ptg2_v3_npi_scope"
     has_geo_filter = args.get("lat") not in (None, "", "null") or args.get("long") not in (None, "", "null")
     address_table = await _ptg2_address_serving_table(
         session,
@@ -6987,6 +4808,8 @@ async def _membership_location_query(
     if filter_sql_parts is None:
         return None
     filter_sql, distance_sql = filter_sql_parts
+    parameter_map["shared_snapshot_key"] = _required_shared_snapshot_key(serving_tables)
+    filter_sql = f"npi_scope.snapshot_key = :shared_snapshot_key AND ({filter_sql})"
     return _MembershipLocationQuery(
         address_table=address_table,
         npi_scope_table=provider_npi_scope_table,
@@ -7059,7 +4882,8 @@ async def _membership_location_rows(
     location_hash_sql = _ptg2_address_location_hash_sql("addr", query_context.address_table)
     if query_context.knn_order_sql is not None and offset == 0:
         requested_limit = max(int(limit), 1)
-        query_context.parameter_map["probe_limit"] = requested_limit + max(requested_limit // 2, 64)
+        probe_limit = requested_limit + max(requested_limit // 2, 64)
+        query_context.parameter_map["raw_probe_limit"] = probe_limit + 1
         location_sql = _MEMBERSHIP_LOCATION_KNN_SQL.format(
             location_hash_sql=location_hash_sql,
             distance_sql=query_context.distance_sql,
@@ -7121,7 +4945,7 @@ async def _append_rate_matched_locations(
     prior_match_count = len(matched_location_rows)
     seen_candidate_npis.update(int(location["npi"]) for location in new_location_rows)
     owner_ids = tuple(_ptg2_npi_member_id(int(location["npi"])) for location in new_location_rows)
-    group_ids_by_owner = await _ptg2_manifest_sidecar_members_many_async(
+    group_ids_by_owner = await _shared_graph_members_by_id(
         session,
         serving_tables,
         "provider_npi_group",
@@ -7148,7 +4972,7 @@ async def _direct_group_ids_by_npi(
     """Expand a bounded rate group scope directly into its member NPIs."""
     if not rate_scope.group_ids or len(rate_scope.group_ids) > 1024:
         return None
-    member_ids_by_group = await _ptg2_manifest_sidecar_members_many_async(
+    member_ids_by_group = await _shared_graph_members_by_id(
         session,
         serving_tables,
         "provider_group_npi",
@@ -7293,8 +5117,18 @@ async def _paged_graph_candidates(
         )
         if has_enough_matches:
             return probe_state.result(taxonomy_filter_requested=taxonomy_filter_requested)
-        if probe_limit >= max_candidates:
+        source_exhausted = (
+            bool(candidate_location_rows[0].get("_ptg_source_exhausted"))
+            if candidate_location_rows
+            and "_ptg_source_exhausted" in candidate_location_rows[0]
+            else len(candidate_location_rows) < probe_limit
+        )
+        if source_exhausted:
             break
+        if probe_limit >= max_candidates:
+            raise PTG2ManifestArtifactError(
+                "PTG2 location traversal reached its configured exactness bound"
+            )
         probe_limit = _next_graph_location_probe_limit(
             probe_limit,
             batch_size=batch_size,
@@ -7323,11 +5157,15 @@ async def _graph_location_candidates(
         serving_tables,
         args,
         candidate_npis=tuple(direct_groups_by_npi),
-        limit=max(candidate_limit * 20, 1000),
+        limit=max(int(candidate_limit), 1),
     )
     if location_rows is None:
         return None
-    return _GraphLocationCandidates(location_rows, direct_groups_by_npi)
+    return _GraphLocationCandidates(
+        location_rows,
+        direct_groups_by_npi,
+        taxonomy_filtered=_ptg2_provider_taxonomy_filter_requested(args),
+    )
 
 
 async def _taxonomy_filtered_candidates(
@@ -7485,15 +5323,11 @@ async def _version_three_explicit_npi_graph_scope(
 ) -> _ExplicitNpiGraphScope | None:
     """Resolve one NPI to dense provider-set keys before reading a code block."""
 
-    if serving_tables.effective_arch_version != "postgres_binary_v3":
-        return None
+    _require_strict_shared_v3(serving_tables)
     requested_npi = _normalize_npi(args.get("npi"))
-    if requested_npi is None or not (
-        _has_ptg2_artifact_reader(serving_tables, "provider_npi_group")
-        and _has_ptg2_artifact_reader(serving_tables, "provider_inverted")
-    ):
+    if requested_npi is None:
         return None
-    group_ids = await _ptg2_manifest_sidecar_members_async(
+    group_ids = await _shared_graph_members_for_id(
         session,
         serving_tables,
         "provider_npi_group",
@@ -7563,7 +5397,7 @@ async def _graph_candidates_for_rate_scope(
         serving_tables,
         args,
         candidate_npis=(explicit_npi_scope.npi,),
-        limit=max(candidate_limit * 20, 1000),
+        limit=1,
     )
     if location_rows is None:
         return None
@@ -7582,6 +5416,7 @@ async def _graph_candidates_for_request(
     requested_system: str | None,
     plan_id: str,
     candidate_limit: int,
+    provider_set_keys: Iterable[int] | None = None,
 ) -> _GraphLocationCandidates | None:
     """Resolve a code scope, preferring exact-NPI traversal for v3 snapshots."""
 
@@ -7592,16 +5427,30 @@ async def _graph_candidates_for_request(
     )
     if explicit_npi_scope is not None and not explicit_npi_scope.provider_set_keys:
         return _GraphLocationCandidates([], {})
-    rate_scope = await _manifest_rate_scope_from_sidecar(
+    scoped_provider_set_keys = (
+        set(int(provider_set_key) for provider_set_key in provider_set_keys)
+        if provider_set_keys is not None
+        else None
+    )
+    if explicit_npi_scope is not None:
+        explicit_provider_set_keys = set(explicit_npi_scope.provider_set_keys)
+        scoped_provider_set_keys = (
+            explicit_provider_set_keys
+            if scoped_provider_set_keys is None
+            else scoped_provider_set_keys.intersection(explicit_provider_set_keys)
+        )
+    if scoped_provider_set_keys is not None and not scoped_provider_set_keys:
+        return _GraphLocationCandidates([], {})
+    rate_scope = await _shared_rate_scope(
         session,
         serving_tables,
-        serving_table=_safe_table_name(serving_tables.serving_table),
         plan_id=plan_id,
+        plan_market_type=args.get("plan_market_type") or args.get("market_type") or "",
         reported_code=requested_code,
         code_system=requested_system,
         provider_set_keys=(
-            explicit_npi_scope.provider_set_keys
-            if explicit_npi_scope is not None
+            tuple(sorted(scoped_provider_set_keys))
+            if scoped_provider_set_keys is not None
             else None
         ),
     )
@@ -7626,6 +5475,7 @@ async def _graph_location_matches(
     plan_id: str,
     snapshot_id: str | None = None,
     source_key: str | None = None,
+    provider_set_keys: Iterable[int] | None = None,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
     """Resolve geo-filtered provider sets through normalized membership artifacts."""
     requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
@@ -7644,6 +5494,7 @@ async def _graph_location_matches(
         requested_system=requested_system,
         plan_id=plan_id,
         candidate_limit=candidate_limit,
+        provider_set_keys=provider_set_keys,
     )
     if candidates is None:
         return None
@@ -7669,1143 +5520,54 @@ async def _ptg2_manifest_location_provider_matches(
     plan_id: str | None = None,
     snapshot_id: str | None = None,
     source_key: str | None = None,
+    provider_set_keys: Iterable[int] | None = None,
+    require_exhaustive: bool = False,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
-    """Resolve location-filtered provider sets and their matching rows."""
+    """Resolve location-filtered provider sets through the strict shared graph."""
 
-    if _has_membership_graph(serving_tables):
-        graph_candidate_limit = _ptg2_manifest_location_match_limit()
-        if candidate_limit is not None:
-            graph_candidate_limit = min(graph_candidate_limit, max(int(candidate_limit), 1))
-        graph_result = await _graph_location_matches(
-            session,
-            serving_tables,
-            args,
-            candidate_limit=graph_candidate_limit,
-            plan_id=str(plan_id or args.get("plan_id") or args.get("plan_external_id") or "").strip(),
-            snapshot_id=snapshot_id,
-            source_key=source_key,
-        )
-        if graph_result is not None:
-            return graph_result
-    provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
-    if (
-        not provider_group_member_table
-        or not (
-            _manifest_provider_set_component_table(serving_tables)
-            or _ptg2_manifest_artifact_entry(serving_tables, "provider_inverted")
-        )
-    ):
-        return None
-
-    state_value = str(args.get("state") or "").strip().upper()
-    city_value = str(args.get("city") or "").strip().lower()
-    zip_value = str(args.get("zip5") or args.get("zip") or "").strip()[:5]
-    geo_lat: float | None = None
-    geo_long: float | None = None
-    geo_radius_miles: float | None = None
-    if args.get("lat") not in (None, "", "null") or args.get("long") not in (None, "", "null"):
-        try:
-            radius_raw = args.get("radius_miles")
-            geo_lat = float(args.get("lat"))
-            geo_long = float(args.get("long"))
-            geo_radius_miles = max(float(radius_raw if radius_raw not in (None, "", "null") else 25.0), 0.0)
-        except (TypeError, ValueError):
-            return None
-    provider_npi = args.get("npi")
-    npi_address_table = await _ptg2_address_serving_table(
+    _require_strict_shared_v3(serving_tables)
+    configured_match_limit = _ptg2_manifest_location_match_limit()
+    graph_candidate_limit = configured_match_limit
+    if require_exhaustive:
+        graph_candidate_limit = configured_match_limit + 1
+    elif candidate_limit is not None:
+        requested_candidate_limit = max(int(candidate_limit), 1)
+        if requested_candidate_limit > configured_match_limit:
+            raise PTG2ManifestArtifactError(
+                "PTG2 location pagination exceeds its configured exactness bound"
+            )
+        graph_candidate_limit = requested_candidate_limit
+    matches = await _graph_location_matches(
         session,
-        _PTG2_UNIFIED_ADDRESS_COLUMNS if geo_lat is not None else _PTG2_LEGACY_ADDRESS_COLUMNS,
-        require_legacy_available=True,
-    )
-    npi_data_table = f"{PTG2_SCHEMA}.npi"
-    if not npi_address_table:
-        return None
-    using_unified_address_table = _is_unified_address_table(npi_address_table)
-    address_zip5_sql = _ptg2_address_zip5_sql("addr", unified=using_unified_address_table)
-
-    filters = ["addr.npi IS NOT NULL"]
-    configured_limit = _ptg2_manifest_location_match_limit()
-    if candidate_limit is not None:
-        configured_limit = min(configured_limit, max(int(candidate_limit), 1))
-    params: dict[str, Any] = {"limit": configured_limit}
-    if state_value:
-        filters.append("addr.state_name = :state_value")
-        params["state_value"] = state_value
-    if city_value:
-        filters.append("addr.city_name = :city_value")
-        params["city_value"] = city_value.upper()
-    if zip_value:
-        params["zip5"] = zip_value
-    geo_filters: list[str] = []
-    if geo_lat is not None and geo_long is not None and geo_radius_miles is not None:
-        params.update(
-            geo_lat=geo_lat,
-            geo_long=geo_long,
-            geo_radius_miles=geo_radius_miles,
-            geo_min_lat=geo_lat - geo_radius_miles / 69.0,
-            geo_max_lat=geo_lat + geo_radius_miles / 69.0,
-            geo_min_long=geo_long - geo_radius_miles / 69.0,
-            geo_max_long=geo_long + geo_radius_miles / 69.0,
-        )
-        if using_unified_address_table:
-            geo_filters.append("addr.lat IS NOT NULL")
-            geo_filters.append("addr.long IS NOT NULL")
-            geo_filters.append("addr.type IN ('primary', 'secondary', 'practice', 'site')")
-            geo_filters.append("COALESCE(addr.address_precision, '') <> 'city_zip'")
-            geo_filters.append(_ptg2_geo_dwithin_sql("addr.lat", "addr.long"))
-        else:
-            geo_filters.append("addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
-            geo_filters.append("addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
-            geo_filters.append(
-                f"{_ptg2_geo_distance_miles_sql('addr.lat::float8', 'addr.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
-            )
-    if zip_value and geo_filters:
-        filters.append(f"({address_zip5_sql} = :zip5 OR ({' AND '.join(geo_filters)}))")
-    elif zip_value:
-        filters.append(f"{address_zip5_sql} = :zip5")
-    elif geo_filters:
-        filters.extend(geo_filters)
-    if provider_npi is not None:
-        try:
-            params["provider_npi"] = int(provider_npi)
-            filters.append("addr.npi = :provider_npi")
-        except (TypeError, ValueError):
-            return None
-    if len(filters) == 1:
-        return None
-
-    # Scope location matches to providers that actually appear in this PTG snapshot
-    # before applying address/radius ordering. Limiting nearest NPIs globally first
-    # is both slow in dense metros and incorrect: the nearest global providers may
-    # not participate in the priced source, causing relevant in-network providers to
-    # be dropped before the provider_group_member join.
-    member_filters = ["pgm_scope.npi IS NOT NULL"]
-    # Also apply clinical specialty/taxonomy at the member scope, mirroring the
-    # non-location taxonomy filter (_ptg2_manifest_filter_npis_by_provider_taxonomy)
-    # and the compact provider filter. Taxonomy predicates are uncorrelated
-    # `npi IN (SELECT ...)` semi-joins rather than correlated EXISTS: a
-    # whole-network member table puts millions of rows in scope, and a
-    # correlated probe runs once per row (measured ~32M page reads / 24-45s
-    # cold -> upstream 502 on sparse behavioral codes), while the semi-join
-    # resolves the taxonomy NPI set once off the
-    # (healthcare_provider_taxonomy_code, npi) index (~0.8M page reads / 0.5s
-    # on the same snapshot).
-    location_specialty_filter = resolve_provider_specialty_filter(args)
-    if location_specialty_filter.active:
-        member_filters.append(
-            "pgm_scope.npi IN ("
-            + provider_specialty_taxonomy_semijoin_sql(
-                params,
-                "manifest_location_specialty",
-                location_specialty_filter,
-                schema=PTG2_SCHEMA,
-            )
-            + ")"
-        )
-    location_inferred_taxonomy_sql = _inferred_provider_taxonomy_code_sql(
+        serving_tables,
         args,
-        nt_alias="nt",
-        schema=PTG2_SCHEMA,
-        params=params,
-        param_prefix="manifest_location_inferred_taxonomy",
-    )
-    location_array_taxonomy_codes: list[str] = []
-    if location_specialty_filter.active:
-        location_array_taxonomy_codes.extend(location_specialty_filter.taxonomy_codes)
-    inferred_taxonomy_rule = _inferred_provider_taxonomy_rule(args)
-    if inferred_taxonomy_rule is not None:
-        location_array_taxonomy_codes.extend(inferred_taxonomy_rule.taxonomy_codes)
-    location_array_taxonomy_int_codes: tuple[int, ...] = ()
-    if zip_value and location_array_taxonomy_codes:
-        location_array_taxonomy_int_codes = await _taxonomy_int_codes_for_codes(
-            session,
-            location_array_taxonomy_codes,
-        )
-    member_entity_filter_sql = ""
-    if location_inferred_taxonomy_sql:
-        member_filters.append(
-            f"pgm_scope.npi IN (SELECT nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy nt "
-            f"WHERE {location_inferred_taxonomy_sql})"
-        )
-        # The individual-NPI check has no selective index to drive, so it runs
-        # as a scalar probe per candidate AFTER the member x taxonomy
-        # intersection (tens of thousands of rows) instead of inside it
-        # (millions).
-        member_entity_filter_sql = _ptg2_individual_npi_scalar_sql("scope_filter.npi")
-    member_taxonomy_scoped = location_specialty_filter.active or bool(location_inferred_taxonomy_sql)
-
-    member_scope_join = ""
-    final_member_scope_join = ""
-    final_member_filters: list[str] = []
-    member_scope_cte = ""
-    component_table = _manifest_provider_set_component_table(serving_tables)
-    serving_table = _safe_table_name(serving_tables.serving_table)
-    provider_group_location_table = _safe_table_name(serving_tables.provider_group_location_table)
-    provider_group_rate_scope_table = _manifest_provider_group_rate_scope_table(serving_tables)
-    active_provider_group_rate_scope_table = ""
-    has_serving_by_code_sidecar = bool(
-        serving_tables.serving_binary_table or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
-    )
-    rate_provider_group_ids: tuple[str, ...] = ()
-    rate_provider_group_count = 0
-    rate_provider_group_scope: _ManifestRateScope | None = None
-    sql_rate_provider_group_ids: tuple[str, ...] = ()
-    has_component_rate_scope = False
-    has_checked_rate_provider_group_sidecar = False
-    has_rate_provider_group_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "provider_forward"))
-    requested_plan_id = str(plan_id or args.get("plan_id") or args.get("plan_external_id") or "").strip()
-    requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
-    requested_code = (
-        canonical_catalog_code(requested_system, args.get("code") or args.get("reported_code"))
-        if requested_system
-        else str(args.get("code") or args.get("reported_code") or "").strip()
-    )
-    lean_provider_key_layout = _ptg2_manifest_uses_lean_provider_key_layout(serving_tables)
-    if (
-        component_table
-        and serving_table
-        and requested_plan_id
-        and requested_code
-        and await _is_manifest_component_table_populated(session, component_table)
-    ):
-        has_component_rate_scope = True
-        params["location_plan_id"] = requested_plan_id
-        plan_filter, _ = _code_plan_scope_sql(
-            requested_plan_id,
-            column="rate_scope.plan_id",
-            param_name="location_plan_id",
-        )
-        rate_scope_filters = [plan_filter]
-        _append_reported_code_value_filter(
-            rate_scope_filters,
-            params,
-            column="rate_scope.reported_code",
-            param_name="location_reported_code",
-            values=_ptg2_reported_code_lookup_values(requested_system, requested_code),
-        )
-        if requested_system:
-            rate_scope_filters.append("rate_scope.reported_code_system = :location_reported_code_system")
-            params["location_reported_code_system"] = requested_system
-        if provider_group_rate_scope_table:
-            has_route_scope = await _manifest_provider_group_rate_scope_available(
-                session,
-                provider_group_rate_scope_table,
-                plan_id=requested_plan_id,
-                reported_code=requested_code,
-                code_system=requested_system,
-            )
-            if has_route_scope:
-                active_provider_group_rate_scope_table = provider_group_rate_scope_table
-        if active_provider_group_rate_scope_table:
-            member_scope_cte = f"""
-            rate_provider_groups AS MATERIALIZED (
-                SELECT DISTINCT rate_scope.provider_group_global_id_128
-                FROM {active_provider_group_rate_scope_table} rate_scope
-                WHERE {" AND ".join(rate_scope_filters)}
-            ),"""
-        elif not lean_provider_key_layout:
-            member_scope_cte = f"""
-            rate_provider_groups AS MATERIALIZED (
-                SELECT DISTINCT psc.provider_group_global_id_128
-                FROM {serving_table} rate_scope
-                JOIN {component_table} psc
-                  ON psc.provider_set_global_id_128 = rate_scope.provider_set_global_id_128
-                WHERE {" AND ".join(rate_scope_filters)}
-            ),"""
-        else:
-            has_component_rate_scope = False
-        if has_component_rate_scope:
-            member_scope_join = """
-                JOIN rate_provider_groups rpg_scope
-                  ON rpg_scope.provider_group_global_id_128 = pgm_scope.provider_group_global_id_128"""
-            final_member_scope_join = """
-            JOIN rate_provider_groups rpg
-              ON rpg.provider_group_global_id_128 = pgm.provider_group_global_id_128"""
-    if not has_component_rate_scope and (serving_table or has_serving_by_code_sidecar) and requested_plan_id and requested_code:
-        rate_scope = await _manifest_rate_scope_from_sidecar(
-            session,
-            serving_tables,
-            serving_table=serving_table,
-            plan_id=requested_plan_id,
-            reported_code=requested_code,
-            code_system=requested_system,
-        )
-        has_checked_rate_provider_group_sidecar = True
-        rate_provider_group_ids = rate_scope.group_ids
-        rate_provider_group_count = rate_scope.id_count
-        rate_provider_group_scope = rate_scope
-        if rate_provider_group_ids:
-            if len(rate_provider_group_ids) <= _ptg2_sql_scope_limit():
-                sql_rate_provider_group_ids = rate_provider_group_ids
-                params["location_rate_provider_group_ids"] = list(sql_rate_provider_group_ids)
-                rate_group_filter = (
-                    "provider_group_global_id_128 = ANY("
-                    f"CAST(:location_rate_provider_group_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))"
-                )
-                member_filters.append(f"pgm_scope.{rate_group_filter}")
-                final_member_filters.append(f"pgm.{rate_group_filter}")
-    if (
-        provider_group_location_table
-        and rate_provider_group_count == 0
-        and not has_checked_rate_provider_group_sidecar
-        and not has_component_rate_scope
-        and (serving_table or has_serving_by_code_sidecar)
-        and requested_plan_id
-        and requested_code
-    ):
-        rate_scope = await _manifest_rate_scope_from_sidecar(
-            session,
-            serving_tables,
-            serving_table=serving_table,
-            plan_id=requested_plan_id,
-            reported_code=requested_code,
-            code_system=requested_system,
-        )
-        has_checked_rate_provider_group_sidecar = True
-        rate_provider_group_ids = rate_scope.group_ids
-        rate_provider_group_count = rate_scope.id_count
-        rate_provider_group_scope = rate_scope
-        if rate_provider_group_ids and len(rate_provider_group_ids) <= _ptg2_sql_scope_limit():
-            sql_rate_provider_group_ids = rate_provider_group_ids
-    if provider_group_location_table and sql_rate_provider_group_ids:
-        params.setdefault("location_rate_provider_group_ids", list(sql_rate_provider_group_ids))
-    is_provider_group_location_scope_empty = (
-        bool(provider_group_location_table)
-        and not has_component_rate_scope
-        and has_rate_provider_group_sidecar
-        and has_checked_rate_provider_group_sidecar
-        and rate_provider_group_count == 0
-    )
-
-    # With a taxonomy filter, resolve the member x taxonomy intersection ONCE in
-    # a MATERIALIZED CTE (small for sparse codes) and drive the address lookup
-    # from it: LATERAL + OFFSET 0 pins one (npi) index probe per scoped NPI. The
-    # zip filter compares an expression over postal_code, so any address-driven
-    # plan degrades to a full bitmap scan of the address table (~3M pages) --
-    # the planner picked exactly that for both the EXISTS and plain-JOIN forms.
-    # Without a taxonomy filter, membership stays a per-address-row EXISTS:
-    # materializing a whole unfiltered network (1M+ NPIs) costs more than it
-    # saves.
-    member_prefilter_cte = ""
-    if member_taxonomy_scoped:
-        scoped_member_cte_name = "scoped_taxonomy_member_npis" if member_entity_filter_sql else "scoped_member_npis"
-        member_entity_cte = (
-            f""",
-            scoped_member_npis AS MATERIALIZED (
-                SELECT scope_filter.npi
-                FROM scoped_taxonomy_member_npis scope_filter
-                WHERE {member_entity_filter_sql}
-            )"""
-            if member_entity_filter_sql
-            else ""
-        )
-        member_prefilter_cte = f"""
-            {scoped_member_cte_name} AS MATERIALIZED (
-                SELECT DISTINCT pgm_scope.npi
-                FROM {provider_group_member_table} pgm_scope
-                {member_scope_join}
-                WHERE {" AND ".join(member_filters)}
-            ){member_entity_cte},"""
-        location_address_from_sql = f"""FROM scoped_member_npis scope_npis
-                JOIN LATERAL (
-                    SELECT addr_probe.*
-                    FROM {npi_address_table} addr_probe
-                    WHERE addr_probe.npi = scope_npis.npi
-                    OFFSET 0
-                ) addr ON TRUE"""
-        member_match_predicate = "TRUE"
-    else:
-        location_address_from_sql = f"FROM {npi_address_table} addr"
-        member_match_predicate = f"""EXISTS (
-                      SELECT 1
-                      FROM {provider_group_member_table} pgm_scope
-                      {member_scope_join}
-                      WHERE pgm_scope.npi = addr.npi
-                        AND {" AND ".join(member_filters)}
-                  )"""
-
-    address_location_source = _ptg2_address_location_source(npi_address_table)
-    address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
-    address_base_payload_sql = "jsonb_build_object('type', addr.type, 'checksum', addr.checksum)"
-    has_npi_data = await _serving_table_available(session, npi_data_table)
-    provider_join = f"LEFT JOIN {npi_data_table} n ON n.npi = addr.npi" if has_npi_data else ""
-    provider_name_sql = (
-        _ptg2_provider_name_sql("n")
-        if has_npi_data
-        else "'TiC provider'"
-    )
-    distance_sql = ""
-    location_select_sql = (
-        "NULL::double precision AS distance_miles, "
-        "NULL::varchar AS zip_match_type, "
-        "NULL::varchar AS anchor_zip5, "
-        "NULL::double precision AS zip_radius_miles, "
-        "0 AS zip_rank"
-    )
-    location_order_sql = "addr.npi"
-    limited_location_order_sql = "npi"
-    if geo_lat is not None and geo_long is not None and geo_radius_miles is not None:
-        distance_sql = _ptg2_geo_distance_miles_sql("addr.lat::float8", "addr.long::float8")
-        if zip_value:
-            same_zip_sql = f"{address_zip5_sql} = :zip5"
-            location_select_sql = (
-                f"CASE WHEN {same_zip_sql} THEN 0.0 ELSE {distance_sql} END AS distance_miles, "
-                f"CASE WHEN {same_zip_sql} THEN 'same_zip' ELSE 'radius' END AS zip_match_type, "
-                ":zip5 AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles, "
-                f"CASE WHEN {same_zip_sql} THEN 0 ELSE 1 END AS zip_rank"
-            )
-        else:
-            location_select_sql = (
-                f"{distance_sql} AS distance_miles, "
-                "'radius' AS zip_match_type, "
-                "NULL::varchar AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles, "
-                "0 AS zip_rank"
-            )
-        location_order_sql = "addr.npi, zip_rank, distance_miles ASC NULLS LAST"
-        limited_location_order_sql = "zip_rank, distance_miles ASC NULLS LAST, npi"
-
-    # entity_address_unified can resolve a NPI to a city/zip-only row with no
-    # street (first_line). When that happens, fall back to the NPPES npi_address
-    # practice/primary row WHOLESALE (every field), so the displayed address stays
-    # internally consistent instead of mixing one source's street with another's
-    # city. Only applies when the unified table is the primary source.
-    if using_unified_address_table:
-        if hasattr(session, "sync_session"):
-            fallback_column_result = await session.execute(
-                text(
-                    """
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_schema = :schema_name
-                      AND table_name = 'npi_address'
-                    """
-                ),
-                {"schema_name": PTG2_SCHEMA},
-            )
-            fallback_columns = {
-                str(data.get("column_name"))
-                for data in (_row_mapping(row) for row in fallback_column_result)
-                if data.get("column_name")
-            }
-        else:
-            fallback_columns = {
-                "telephone_number",
-                "fax_number",
-                "phone_number",
-                "phone_extension",
-                "fax_number_digits",
-                "fax_extension",
-            }
-
-        def _fallback_column(column: str, sql_type: str = "varchar") -> str:
-            return f"na.{column}" if column in fallback_columns else f"NULL::{sql_type} AS {column}"
-
-        premise_key_select_sql = "addr.premise_key,"
-        address_fallback_cte = f"""
-            , fallback_addresses AS MATERIALIZED (
-                SELECT DISTINCT ON (na.npi)
-                       na.npi, na.first_line, na.second_line, na.city_name, na.state_name,
-                       na.postal_code, na.country_code,
-                       {_fallback_column('telephone_number')},
-                       {_fallback_column('fax_number')},
-                       {_fallback_column('phone_number')},
-                       {_fallback_column('phone_extension')},
-                       {_fallback_column('fax_number_digits')},
-                       {_fallback_column('fax_extension')},
-                       na.lat, na.long
-                  FROM {PTG2_SCHEMA}.npi_address na
-                  JOIN location_npis loc ON loc.npi = na.npi
-                 WHERE NULLIF(BTRIM(na.first_line), '') IS NOT NULL
-                 ORDER BY na.npi,
-                          CASE na.type WHEN 'primary' THEN 0 WHEN 'practice' THEN 1
-                                       WHEN 'secondary' THEN 2 ELSE 3 END,
-                          na.checksum
-            )"""
-        address_fallback_join = """
-            LEFT JOIN fallback_addresses na
-              ON na.npi = addr.npi
-             AND NULLIF(BTRIM(addr.first_line), '') IS NULL"""
-
-        def _eff(column: str) -> str:
-            cast_suffix = "::numeric" if column in {"lat", "long"} else ""
-            return (
-                "CASE WHEN NULLIF(BTRIM(addr.first_line), '') IS NULL "
-                f"AND na.first_line IS NOT NULL THEN na.{column}{cast_suffix} ELSE addr.{column}{cast_suffix} END"
-            )
-    else:
-        premise_key_select_sql = "NULL::uuid AS premise_key,"
-        address_fallback_cte = ""
-        address_fallback_join = ""
-
-        def _eff(column: str) -> str:
-            return f"addr.{column}"
-
-    async def _query_provider_group_location_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]] | None:
-        if not provider_group_location_table:
-            return None
-        query_context = _ManifestProviderLocationQuery(
-            serving_tables=serving_tables,
-            provider_group_location_table=provider_group_location_table,
-            provider_group_rate_scope_table=active_provider_group_rate_scope_table,
-            npi_data_table=npi_data_table,
-            has_npi_data=has_npi_data,
-            provider_name_sql=provider_name_sql,
-            location_select_sql=location_select_sql,
-            location_order_sql=location_order_sql,
-            limited_location_order_sql=limited_location_order_sql,
-            params=params,
-            state_value=state_value,
-            city_value=city_value,
-            zip_value=zip_value,
-            geo_lat=geo_lat,
-            geo_long=geo_long,
-            geo_radius_miles=geo_radius_miles,
-            location_specialty_filter=location_specialty_filter,
-            location_inferred_taxonomy_sql=location_inferred_taxonomy_sql,
-            location_array_taxonomy_codes=tuple(location_array_taxonomy_codes),
-            location_array_taxonomy_int_codes=location_array_taxonomy_int_codes,
-            rate_provider_group_ids=sql_rate_provider_group_ids,
-            has_component_rate_scope=has_component_rate_scope,
-            member_scope_cte=member_scope_cte,
-            is_provider_group_location_scope_empty=is_provider_group_location_scope_empty,
-        )
-        rate_scope = _ptg2_manifest_provider_location_scope(query_context)
-        if rate_scope.is_empty:
-            return []
-        if rate_scope.group_filter_sql is None:
-            return None
-        location_filter_clauses = _ptg2_manifest_provider_location_filters(
-            query_context,
-            rate_scope.group_filter_sql,
-        )
-        await _set_local_jit_off_for_manifest_location(session)
-        query_result = await session.execute(
-            text(
-                _manifest_group_location_sql(
-                    query_context,
-                    rate_scope,
-                    location_filter_clauses,
-                )
-            ),
-            {**params, "address_types": list(address_types)},
-        )
-        return [_row_mapping(location_row) for location_row in query_result]
-
-    def _location_first_zip_scope_cte() -> str:
-        if not (
-            zip_value
-            and geo_lat is not None
-            and geo_long is not None
-            and geo_radius_miles is not None
-        ):
-            return ""
-        return f"""
-            location_first_zip_scope AS MATERIALIZED (
-                SELECT g.zip_code::text AS zip5
-                  FROM {PTG2_SCHEMA}.geo_zip_lookup anchor
-                  JOIN {PTG2_SCHEMA}.geo_zip_lookup g
-                    ON g.latitude IS NOT NULL
-                   AND g.longitude IS NOT NULL
-                 WHERE anchor.zip_code = :zip5
-                   AND 69.0 * sqrt(
-                        power(g.latitude - anchor.latitude, 2)
-                        + power(
-                            (g.longitude - anchor.longitude)
-                            * cos(radians((g.latitude + anchor.latitude) / 2.0)),
-                            2
-                        )
-                   ) <= CAST(:geo_radius_miles AS double precision)
-            ),"""
-
-    def _location_first_from_sql(*, should_restrict_to_probe_npis: bool = False) -> str:
-        if not (
-            zip_value
-            and geo_lat is not None
-            and geo_long is not None
-            and geo_radius_miles is not None
-        ):
-            return f"FROM {npi_address_table} addr"
-        scoped_zip_sql = _ptg2_address_zip5_sql("addr_probe", unified=using_unified_address_table)
-        probe_npi_filter_sql = (
-            "AND addr_probe.npi = ANY(CAST(:location_first_probe_npis AS bigint[]))"
-            if should_restrict_to_probe_npis
-            else ""
-        )
-        return f"""
-                FROM location_first_zip_scope zip_scope
-                JOIN LATERAL (
-                    SELECT addr_probe.*
-                      FROM {npi_address_table} addr_probe
-                     WHERE {scoped_zip_sql} = zip_scope.zip5
-                       AND addr_probe.npi IS NOT NULL
-                       AND addr_probe.type = ANY(CAST(:address_types AS varchar[]))
-                       {f"AND addr_probe.taxonomy_array && CAST(:location_first_taxonomy_int_codes AS integer[])" if location_array_taxonomy_int_codes else ""}
-                       {probe_npi_filter_sql}
-                     OFFSET 0
-                ) addr ON TRUE"""
-
-    def _location_first_filters(
-        local_params: dict[str, Any],
-        *,
-        should_restrict_to_probe_npis: bool = False,
-    ) -> list[str]:
-        clauses = [*filters]
-        clauses.append("addr.type = ANY(CAST(:address_types AS varchar[]))")
-        if should_restrict_to_probe_npis:
-            clauses.append("addr.npi = ANY(CAST(:location_first_probe_npis AS bigint[]))")
-        if location_array_taxonomy_int_codes:
-            clauses.append("addr.taxonomy_array && CAST(:location_first_taxonomy_int_codes AS integer[])")
-        if location_specialty_filter.active:
-            clauses.append(
-                "addr.npi IN ("
-                + provider_specialty_taxonomy_semijoin_sql(
-                    local_params,
-                    "manifest_location_first_specialty",
-                    location_specialty_filter,
-                    schema=PTG2_SCHEMA,
-                )
-                + ")"
-            )
-        if location_inferred_taxonomy_sql:
-            clauses.append(
-                f"addr.npi IN (SELECT nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy nt "
-                f"WHERE {location_inferred_taxonomy_sql})"
-            )
-            clauses.append(_ptg2_individual_npi_scalar_sql("addr.npi"))
-        return clauses
-
-    def _location_first_sql_part_map(location_first_filter_sql: str, location_first_from_sql: str) -> dict[str, str]:
-        return {
-            "location_first_zip_scope": _location_first_zip_scope_cte(),
-            "location_first_from_sql": location_first_from_sql,
-            "location_first_filter_sql": location_first_filter_sql,
-            "premise_key_select_sql": premise_key_select_sql,
-            "location_select_sql": location_select_sql,
-            "location_order_sql": location_order_sql,
-            "limited_location_order_sql": limited_location_order_sql,
-            "address_fallback_cte": address_fallback_cte,
-            "provider_taxonomy_summary_lateral_sql": _provider_taxonomy_summary_lateral_sql("loc.npi"),
-            "address_location_hash_sql": address_location_hash_sql,
-            "address_location_source": address_location_source,
-            "address_base_payload_sql": address_base_payload_sql,
-            "provider_name_sql": provider_name_sql,
-            "provider_group_member_table": provider_group_member_table,
-            "provider_join": provider_join,
-            "address_fallback_join": address_fallback_join,
-            "eff_state_name": _eff("state_name"),
-            "eff_city_name": _eff("city_name"),
-            "eff_postal_code": _eff("postal_code"),
-            "eff_first_line": _eff("first_line"),
-            "eff_second_line": _eff("second_line"),
-            "eff_country_code": _eff("country_code"),
-            "eff_telephone_number": _eff("telephone_number"),
-            "eff_fax_number": _eff("fax_number"),
-            "eff_phone_number": _eff("phone_number"),
-            "eff_phone_extension": _eff("phone_extension"),
-            "eff_fax_number_digits": _eff("fax_number_digits"),
-            "eff_fax_extension": _eff("fax_extension"),
-            "eff_lat": _eff("lat"),
-            "eff_long": _eff("long"),
-        }
-
-    async def _query_location_first_probe_npis(location_first_param_map: dict[str, Any]) -> tuple[int, ...] | None:
-        probe_filter_sql = " AND ".join(_location_first_filters(location_first_param_map))
-        probe_sql_map = _location_first_sql_part_map(probe_filter_sql, _location_first_from_sql())
-        try:
-            await _set_local_jit_off_for_manifest_location(session)
-            probe_result_set = await session.execute(
-                text(_LOCATION_FIRST_PROBE_SQL_TEMPLATE.substitute(probe_sql_map)),
-                location_first_param_map,
-            )
-        except Exception:
-            await _rollback_optional_ptg2_query(session)
-            return None
-
-        probe_npis: list[int] = []
-        for probe_source in probe_result_set:
-            probe_npi = _row_mapping(probe_source).get("npi")
-            if probe_npi is not None:
-                try:
-                    probe_npis.append(int(probe_npi))
-                except (TypeError, ValueError):
-                    continue
-        return tuple(probe_npis)
-
-    async def _query_location_first_provider_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]] | None:
-        if not (
-            using_unified_address_table
-            and rate_provider_group_scope
-            and not sql_rate_provider_group_ids
-            and (member_taxonomy_scoped or provider_npi is not None)
-            and not has_component_rate_scope
-        ):
-            return None
-        location_first_max_npis = _ptg2_location_first_limit()
-        location_first_param_map = {
-            param_name: param_value
-            for param_name, param_value in params.items()
-            if param_name != "location_rate_provider_group_ids"
-        }
-        location_first_param_map.update(
-            {
-                "address_types": list(address_types),
-                "location_first_taxonomy_int_codes": list(location_array_taxonomy_int_codes),
-                "location_first_probe_limit": location_first_max_npis + 1,
-                "location_first_max_npis": location_first_max_npis,
-            }
-        )
-        probe_npis = await _query_location_first_probe_npis(location_first_param_map)
-        if probe_npis is None:
-            return None
-        if not probe_npis:
-            return []
-        if len(probe_npis) > location_first_max_npis:
-            return None
-        location_first_param_map["location_first_probe_npis"] = list(probe_npis)
-        member_filter_sql = " AND ".join(
-            _location_first_filters(
-                location_first_param_map,
-                should_restrict_to_probe_npis=True,
-            )
-        )
-        member_sql_map = _location_first_sql_part_map(
-            member_filter_sql,
-            _location_first_from_sql(should_restrict_to_probe_npis=True),
-        )
-
-        try:
-            member_result_set = await session.execute(
-                text(_LOCATION_FIRST_MEMBER_SQL_TEMPLATE.substitute(member_sql_map)),
-                location_first_param_map,
-            )
-        except Exception:
-            await _rollback_optional_ptg2_query(session)
-            return None
-
-        return _ptg2_filter_location_rows(member_result_set, rate_provider_group_scope, configured_limit)
-
-    async def _query_location_provider_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]]:
-        """Query matching provider locations for the requested address types."""
-
-        address_filters = [*filters]
-        address_params = {**params, "address_types": list(address_types)}
-        final_member_where_sql = f"WHERE {' AND '.join(final_member_filters)}" if final_member_filters else ""
-        result = await session.execute(
-            text(
-                f"""
-            WITH
-            {member_scope_cte}
-            {member_prefilter_cte}
-            raw_location_npis AS (
-                SELECT DISTINCT ON (addr.npi)
-                    addr.npi,
-                    addr.type,
-                    addr.checksum,
-                    addr.state_name,
-                    addr.city_name,
-                    addr.postal_code,
-                    addr.country_code,
-                    addr.address_key,
-                    {premise_key_select_sql}
-                    {address_base_payload_sql} AS base_address_payload,
-                    addr.lat,
-                    addr.long,
-                    addr.first_line,
-                    addr.second_line,
-                    addr.telephone_number,
-                    addr.fax_number,
-                    addr.phone_number,
-                    addr.phone_extension,
-                    addr.fax_number_digits,
-                    addr.fax_extension,
-                    {location_select_sql}
-                {location_address_from_sql}
-                WHERE {" AND ".join(address_filters)}
-                  AND addr.type = ANY(CAST(:address_types AS varchar[]))
-                  AND {member_match_predicate}
-                ORDER BY {location_order_sql},
-                    CASE addr.type
-                        WHEN 'practice' THEN 0
-                        WHEN 'primary' THEN 1
-                        WHEN 'secondary' THEN 2
-                        ELSE 3
-                    END,
-                    addr.checksum
-            ),
-            location_npis AS MATERIALIZED (
-                SELECT *
-                FROM raw_location_npis
-                ORDER BY {limited_location_order_sql}
-                LIMIT :limit
-            )
-            {address_fallback_cte}
-            -- Resolve each candidate's taxonomy/specialty summary ONCE per NPI,
-            -- before the provider_group_member fan-out below. Previously this
-            -- LATERAL hung off the final SELECT, so it was re-evaluated for every
-            -- (npi, provider_group) pair -- a provider in many groups paid the
-            -- taxonomy lookup dozens of times. In dense metros that fan-out is
-            -- what pushed the query past the request timeout. Computing it here,
-            -- over the already-bounded location_npis set, makes it O(candidates)
-            -- instead of O(candidates x groups).
-            , located_with_tax AS MATERIALIZED (
-                SELECT
-                    loc.*,
-                    tax.taxonomy_codes,
-                    tax.specialties,
-                    tax.classifications,
-                    tax.specializations,
-                    tax.primary_specialty,
-                    tax.primary_specialization
-                FROM location_npis loc
-                {_provider_taxonomy_summary_lateral_sql("loc.npi")}
-            )
-            SELECT DISTINCT ON (pgm.provider_group_global_id_128, addr.npi)
-                pgm.provider_group_global_id_128,
-                addr.npi,
-                addr.address_key::text AS address_key,
-                addr.premise_key::text AS premise_key,
-                {address_location_hash_sql} AS location_hash,
-                {_eff('state_name')} AS state,
-                {_eff('city_name')} AS city,
-                LEFT(COALESCE({_eff('postal_code')}, ''), 5) AS zip5,
-                addr.distance_miles,
-                addr.zip_match_type,
-                addr.anchor_zip5,
-                addr.zip_radius_miles,
-                '{address_location_source}' AS location_source,
-                '{address_location_source}' AS location_confidence_code,
-                (
-                    COALESCE(addr.base_address_payload, '{{}}'::jsonb)
-                    - 'premise_key'
-                    || jsonb_build_object(
-                        'first_line', {_eff('first_line')},
-                        'second_line', {_eff('second_line')},
-                        'city', {_eff('city_name')},
-                        'state', {_eff('state_name')},
-                        'postal_code', {_eff('postal_code')},
-                        'country_code', {_eff('country_code')},
-                        'telephone_number', {_eff('telephone_number')},
-                        'fax_number', {_eff('fax_number')},
-                        'phone_number', {_eff('phone_number')},
-                        'phone_extension', {_eff('phone_extension')},
-                        'fax_number_digits', {_eff('fax_number_digits')},
-                        'fax_extension', {_eff('fax_extension')},
-                        'address_key', addr.address_key::text,
-                        'address_site_key', addr.premise_key::text,
-                        'lat', {_eff('lat')},
-                        'long', {_eff('long')}
-                    )
-                )::text AS address_payload,
-                {_eff('telephone_number')} AS telephone_number,
-                {_eff('fax_number')} AS fax_number,
-                {_eff('phone_number')} AS phone_number,
-                {_eff('phone_extension')} AS phone_extension,
-                {_eff('fax_number_digits')} AS fax_number_digits,
-                {_eff('fax_extension')} AS fax_extension,
-                COALESCE(addr.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
-                COALESCE(addr.specialties, ARRAY[]::varchar[]) AS specialties,
-                COALESCE(addr.classifications, ARRAY[]::varchar[]) AS classifications,
-                COALESCE(addr.specializations, ARRAY[]::varchar[]) AS specializations,
-                addr.primary_specialty,
-                addr.primary_specialization,
-                {provider_name_sql} AS provider_name
-            FROM located_with_tax addr
-            JOIN {provider_group_member_table} pgm ON pgm.npi = addr.npi
-            {final_member_scope_join}
-            {provider_join}
-            {address_fallback_join}
-            {final_member_where_sql}
-            ORDER BY pgm.provider_group_global_id_128,
-                addr.npi,
-                CASE addr.type
-                    WHEN 'practice' THEN 0
-                    WHEN 'primary' THEN 1
-                    WHEN 'secondary' THEN 2
-                    ELSE 3
-                END,
-                addr.checksum
-            LIMIT :limit
-            """
-            ),
-            address_params,
-        )
-        return [_row_mapping(row) for row in result]
-
-    def _filter_large_scope_rows(location_rows: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
-        if location_rows is None:
-            return None
-        if not (rate_provider_group_scope and not sql_rate_provider_group_ids and not has_component_rate_scope):
-            return location_rows
-        return _ptg2_filter_location_rows(location_rows, rate_provider_group_scope, configured_limit)
-
-    async def _fill_location_phone_fallbacks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Fill missing unified-address phones from indexed fallback rows."""
-
-        if not using_unified_address_table:
-            return rows
-        missing_rows = [row for row in rows if not row.get("telephone_number") and not row.get("phone_number")]
-        if not missing_rows:
-            return rows
-        missing_npis: list[int] = []
-        for row in missing_rows:
-            try:
-                missing_npis.append(int(row.get("npi")))
-            except (TypeError, ValueError):
-                continue
-        missing_npis = sorted(set(missing_npis))
-        if not missing_npis:
-            return rows
-        address_keys = sorted({str(row.get("address_key")) for row in missing_rows if row.get("address_key")})
-        if not address_keys:
-            return rows
-        # Keep this fallback on the existing (address_key, npi) index. Premise
-        # matching can fan out to thousands of same-building rows and has no
-        # composite premise+npi index, so it does not belong on the hot pricing
-        # path.
-        fallback_result = await session.execute(
-            text(
-                f"""
-                SELECT npi,
-                       address_key::text AS address_key,
-                       premise_key::text AS premise_key,
-                       telephone_number,
-                       phone_number,
-                       phone_extension,
-                       fax_number,
-                       fax_number_digits,
-                       fax_extension,
-                       type,
-                       checksum
-                  FROM {npi_address_table}
-                 WHERE npi = ANY(CAST(:fallback_npis AS bigint[]))
-                   AND type = ANY(CAST(:fallback_address_types AS varchar[]))
-                   AND NULLIF(BTRIM(COALESCE(phone_number, telephone_number)), '') IS NOT NULL
-                   AND (
-                        address_key = ANY(CAST(:address_keys AS uuid[]))
-                   )
-                """
-            ),
-            {
-                "fallback_npis": missing_npis,
-                "fallback_address_types": ["practice", "primary", "secondary", "site"],
-                "address_keys": address_keys,
-            },
-        )
-        candidates = [_row_mapping(row) for row in fallback_result]
-        if not candidates:
-            return rows
-
-        candidates_by_address_key: dict[str, list[tuple[int, dict[str, Any]]]] = {}
-        candidates_by_premise_key: dict[str, list[tuple[int, dict[str, Any]]]] = {}
-        for idx, candidate in enumerate(candidates):
-            candidate_address_key = str(candidate.get("address_key") or "")
-            candidate_premise_key = str(candidate.get("premise_key") or "")
-            if candidate_address_key:
-                candidates_by_address_key.setdefault(candidate_address_key, []).append((idx, candidate))
-            if candidate_premise_key:
-                candidates_by_premise_key.setdefault(candidate_premise_key, []).append((idx, candidate))
-
-        def _fallback_rank(candidate: dict[str, Any], row: dict[str, Any]) -> tuple[int, int, int, str]:
-            type_rank = {"primary": 0, "practice": 1, "secondary": 2}.get(str(candidate.get("type") or ""), 3)
-            return (
-                0 if candidate.get("npi") == row.get("npi") else 1,
-                0 if str(candidate.get("address_key") or "") == str(row.get("address_key") or "") else 1,
-                type_rank,
-                str(candidate.get("checksum") or ""),
-            )
-
-        filled_rows: list[dict[str, Any]] = []
-        for row in rows:
-            if row.get("telephone_number") or row.get("phone_number"):
-                filled_rows.append(row)
-                continue
-            row_address_key = str(row.get("address_key") or "")
-            row_premise_key = str(row.get("premise_key") or "")
-            matches_by_idx: dict[int, dict[str, Any]] = {}
-            if row_address_key:
-                matches_by_idx.update(candidates_by_address_key.get(row_address_key, ()))
-            if row_premise_key:
-                matches_by_idx.update(candidates_by_premise_key.get(row_premise_key, ()))
-            matches = list(matches_by_idx.values())
-            if not matches:
-                filled_rows.append(row)
-                continue
-            same_npi_matches = [candidate for candidate in matches if candidate.get("npi") == row.get("npi")]
-            if same_npi_matches:
-                best = min(same_npi_matches, key=lambda candidate: _fallback_rank(candidate, row))
-            else:
-                distinct_phones = {
-                    str(candidate.get("phone_number") or "").strip()
-                    for candidate in matches
-                    if str(candidate.get("phone_number") or "").strip()
-                }
-                if len(distinct_phones) != 1:
-                    filled_rows.append(row)
-                    continue
-                best = min(matches, key=lambda candidate: _fallback_rank(candidate, row))
-            row = dict(row)
-            row["telephone_number"] = best.get("telephone_number") or best.get("phone_number")
-            row["phone_number"] = row.get("phone_number") or best.get("phone_number")
-            row["phone_extension"] = row.get("phone_extension") or best.get("phone_extension")
-            row["fax_number"] = row.get("fax_number") or best.get("fax_number")
-            row["fax_number_digits"] = row.get("fax_number_digits") or best.get("fax_number_digits")
-            row["fax_extension"] = row.get("fax_extension") or best.get("fax_extension")
-            address_payload = _coerce_json_payload(row.get("address_payload"), {})
-            if isinstance(address_payload, dict):
-                address_payload["telephone_number"] = row["telephone_number"]
-                if row.get("phone_number"):
-                    address_payload["phone_number"] = row["phone_number"]
-                if row.get("phone_extension"):
-                    address_payload["phone_extension"] = row["phone_extension"]
-                if row.get("fax_number"):
-                    address_payload["fax_number"] = row["fax_number"]
-                if row.get("fax_number_digits"):
-                    address_payload["fax_number_digits"] = row["fax_number_digits"]
-                if row.get("fax_extension"):
-                    address_payload["fax_extension"] = row["fax_extension"]
-                row["address_payload"] = address_payload
-            filled_rows.append(row)
-        return filled_rows
-
-    # Primary addresses map to the existing (type, state, city, npi) and
-    # (type, zip5) indexes. The broad primary+secondary form forces a large
-    # sort in dense cities, so use primary practice locations for the hot path
-    # and fall back to secondary only when primary has no candidates.
-    if using_unified_address_table:
-        primary_address_types = ("practice", "primary") if provider_npi is None else ("practice", "primary", "secondary")
-        fallback_address_types = ("secondary",)
-    else:
-        primary_address_types = ("primary",) if provider_npi is None else ("primary", "secondary")
-        fallback_address_types = ("secondary",)
-    rows = _filter_large_scope_rows(await _query_provider_group_location_rows(primary_address_types))
-    if rows is None:
-        rows = _filter_large_scope_rows(await _query_location_first_provider_rows(primary_address_types))
-    if rows is None:
-        rows = _filter_large_scope_rows(await _query_location_provider_rows(primary_address_types))
-    if not rows and provider_npi is None:
-        fallback_rows = _filter_large_scope_rows(await _query_provider_group_location_rows(fallback_address_types))
-        if fallback_rows is None:
-            fallback_rows = _filter_large_scope_rows(await _query_location_first_provider_rows(fallback_address_types))
-        rows = (
-            fallback_rows
-            if fallback_rows is not None
-            else _filter_large_scope_rows(await _query_location_provider_rows(fallback_address_types))
-        )
-    if not rows:
-        return set(), {}
-    rows = await _fill_location_phone_fallbacks(rows)
-    rows = await _overlay_provider_directory_corroboration(
-        session,
-        rows,
-        plan_id=plan_id,
+        candidate_limit=graph_candidate_limit,
+        plan_id=str(plan_id or args.get("plan_id") or args.get("plan_external_id") or "").strip(),
         snapshot_id=snapshot_id,
         source_key=source_key,
+        provider_set_keys=provider_set_keys,
     )
-    group_ids = tuple(
-        sorted({_ptg2_manifest_id(row.get("provider_group_global_id_128")) for row in rows if row.get("provider_group_global_id_128")})
-    )
-    if not group_ids:
-        return set(), {}
-    sets_by_group = await _manifest_sets_by_group(session, serving_tables, group_ids)
-    if sets_by_group is None:
-        return None
-    provider_set_ids: set[str] = set()
-    providers_by_set: dict[str, list[dict[str, Any]]] = {}
-    seen_provider_rows: dict[str, set[int]] = {}
-    for row in rows:
-        group_id = _ptg2_manifest_id(row.get("provider_group_global_id_128"))
-        npi = row.get("npi")
-        if not group_id or npi is None:
-            continue
-        provider_row = {
-            "npi": int(npi),
-            "provider_name": row.get("provider_name") or "TiC provider",
-            "state": row.get("state"),
-            "city": row.get("city"),
-            "zip5": row.get("zip5"),
-            "distance_miles": row.get("distance_miles"),
-            "zip_match_type": row.get("zip_match_type"),
-            "anchor_zip5": row.get("anchor_zip5"),
-            "zip_radius_miles": row.get("zip_radius_miles"),
-            "telephone_number": row.get("telephone_number"),
-            "fax_number": row.get("fax_number"),
-            "location_hash": row.get("location_hash"),
-            "location_source": row.get("location_source"),
-            "location_confidence_code": row.get("location_confidence_code"),
-            "address_payload": row.get("address_payload"),
-            "taxonomy_codes": row.get("taxonomy_codes") or [],
-            "specialties": row.get("specialties") or [],
-            "classifications": row.get("classifications") or [],
-            "specializations": row.get("specializations") or [],
-            "primary_specialty": row.get("primary_specialty"),
-            "primary_specialization": row.get("primary_specialization"),
-        }
-        for provider_set_id in sets_by_group.get(group_id, ()):
-            provider_set_ids.add(provider_set_id)
-            seen = seen_provider_rows.setdefault(provider_set_id, set())
-            provider_npi_value = int(npi)
-            if provider_npi_value in seen:
-                continue
-            seen.add(provider_npi_value)
-            providers_by_set.setdefault(provider_set_id, []).append(provider_row)
+    if matches is None or not require_exhaustive:
+        return matches
+    provider_set_ids, providers_by_set = matches
+    matched_npis = {
+        int(provider["npi"])
+        for providers in providers_by_set.values()
+        for provider in providers
+        if provider.get("npi") not in (None, "")
+    }
+    if len(matched_npis) > configured_match_limit:
+        raise PTG2ManifestArtifactError(
+            "PTG2 location traversal reached its configured exactness bound"
+        )
     return provider_set_ids, providers_by_set
-
-
-async def _ptg2_manifest_provider_rows_for_provider_set(
-    session,
-    serving_tables: PTG2ServingTables,
-    provider_set_global_id: str,
-    *,
-    limit: int,
-) -> list[dict[str, Any]] | None:
-    provider_set_global_id = _ptg2_manifest_id(provider_set_global_id)
-    if not provider_set_global_id:
-        return None
-    provider_npis = await _ptg2_manifest_provider_npis_for_provider_set(
-        session,
-        serving_tables,
-        provider_set_global_id,
-        limit=limit,
-    )
-    if provider_npis:
-        return await _ptg2_manifest_enriched_provider_rows_for_npis(session, npis=provider_npis, limit=limit)
-    if _has_authoritative_provider_membership(serving_tables):
-        return []
-
-    provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
-    if not provider_group_member_table:
-        return None
-    provider_groups = await _ptg2_manifest_sidecar_members_async(
-        session,
-        serving_tables,
-        "provider_forward",
-        provider_set_global_id,
-    )
-    if not provider_groups:
-        return None
-    group_ids = list(provider_groups)
-    group_array_cast = _ptg2_manifest_id_array_cast(serving_tables)
-    npi_stmt = text(
-        f"""
-        SELECT DISTINCT pgm.npi
-        FROM {provider_group_member_table} pgm
-        WHERE pgm.provider_group_global_id_128 = ANY(CAST(:group_ids AS {group_array_cast}))
-          AND pgm.npi > 0
-        ORDER BY pgm.npi
-        LIMIT :limit
-        """
-    )
-    npi_result = await session.execute(npi_stmt, {"group_ids": group_ids, "limit": limit})
-    npis = [int(_row_mapping(row).get("npi")) for row in npi_result if _row_mapping(row).get("npi") is not None]
-    return await _ptg2_manifest_enriched_provider_rows_for_npis(session, npis=npis, limit=limit)
-
 
 async def _ptg2_manifest_provider_rows_for_provider_sets(
     session,
     serving_tables: PTG2ServingTables,
     provider_set_global_ids: list[str] | tuple[str, ...],
     *,
-    limit_per_set: int,
+    limit_per_set: int | None,
     args: dict[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]] | None:
     """Resolve enriched provider rows for each requested provider set."""
@@ -8815,9 +5577,15 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
         return {}
     args = args or {}
     provider_taxonomy_filter_requested = _ptg2_provider_taxonomy_filter_requested(args)
-    candidate_limit_per_set = max(int(limit_per_set), 1)
+    candidate_limit_per_set = (
+        max(int(limit_per_set), 1) if limit_per_set is not None else None
+    )
     if provider_taxonomy_filter_requested:
-        candidate_limit_per_set = max(candidate_limit_per_set * 200, 1000)
+        candidate_limit_per_set = (
+            max(candidate_limit_per_set * 200, 1000)
+            if candidate_limit_per_set is not None
+            else None
+        )
 
     npis_by_set = await _ptg2_manifest_provider_npis_for_provider_sets(
         session,
@@ -8825,77 +5593,36 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
         provider_set_ids,
         limit_per_set=candidate_limit_per_set,
     )
-    has_authoritative_membership = _has_authoritative_provider_membership(
-        serving_tables
-    )
-    missing_provider_set_ids = (
-        []
-        if has_authoritative_membership
-        else [provider_set_id for provider_set_id in provider_set_ids if not npis_by_set.get(provider_set_id)]
-    )
-    if missing_provider_set_ids:
-        provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
-        if not provider_group_member_table:
-            return None
-        has_provider_forward_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "provider_forward"))
-        groups_by_set = await _ptg2_manifest_sidecar_members_many_async(
-            session,
-            serving_tables,
-            "provider_forward",
-            missing_provider_set_ids,
-        )
-        group_ids = tuple(dict.fromkeys(group_id for group_ids in groups_by_set.values() for group_id in group_ids))
-        if not group_ids:
-            if has_provider_forward_sidecar:
-                for provider_set_id in missing_provider_set_ids:
-                    npis_by_set.setdefault(provider_set_id, ())
-                group_ids = ()
-            else:
-                return None
-        if group_ids:
-            group_array_cast = _ptg2_manifest_id_array_cast(serving_tables)
-            npi_stmt = text(
-                f"""
-                    SELECT DISTINCT pgm.provider_group_global_id_128, pgm.npi
-                    FROM {provider_group_member_table} pgm
-                    WHERE pgm.provider_group_global_id_128 = ANY(CAST(:group_ids AS {group_array_cast}))
-                      AND pgm.npi > 0
-                    ORDER BY pgm.provider_group_global_id_128, pgm.npi
-                    """
-            )
-            npi_result = await session.execute(npi_stmt, {"group_ids": group_ids})
-            npis_by_group: dict[str, set[int]] = {}
-            for row in npi_result:
-                data = _row_mapping(row)
-                group_id = _ptg2_manifest_id(data.get("provider_group_global_id_128"))
-                npi = data.get("npi")
-                if group_id and npi is not None:
-                    npis_by_group.setdefault(group_id, set()).add(int(npi))
-            for provider_set_id in missing_provider_set_ids:
-                npis: set[int] = set()
-                for group_id in groups_by_set.get(provider_set_id, ()):
-                    npis.update(npis_by_group.get(group_id, set()))
-                npis_by_set[provider_set_id] = tuple(sorted(npis))
-        else:
-            for provider_set_id in missing_provider_set_ids:
-                npis_by_set.setdefault(provider_set_id, ())
-
     if provider_taxonomy_filter_requested:
         filtered_npis_by_set: dict[str, tuple[int, ...]] = {}
         for provider_set_id in provider_set_ids:
+            provider_npis = npis_by_set.get(provider_set_id, ())
             filtered_npis_by_set[provider_set_id] = await _ptg2_manifest_filter_npis_by_provider_taxonomy(
                 session,
                 args,
-                npis_by_set.get(provider_set_id, ()),
-                limit=max(int(limit_per_set), 1),
+                provider_npis,
+                limit=(
+                    max(int(limit_per_set), 1)
+                    if limit_per_set is not None
+                    else max(len(provider_npis), 1)
+                ),
             )
         npis_by_set = filtered_npis_by_set
+
+    def selected_npis(provider_set_id: str) -> tuple[int, ...]:
+        """Return provider-set NPIs capped by the optional per-set limit."""
+        provider_npis = npis_by_set.get(provider_set_id, ())
+        return (
+            provider_npis[: max(int(limit_per_set), 1)]
+            if limit_per_set is not None
+            else provider_npis
+        )
 
     all_npis = tuple(
         dict.fromkeys(
             npi
             for provider_set_id in provider_set_ids
-            for npi in npis_by_set.get(provider_set_id, ())[: max(int(limit_per_set), 1)]
+            for npi in selected_npis(provider_set_id)
         )
     )
     provider_rows = await _ptg2_manifest_enriched_provider_rows_for_npis(
@@ -8912,7 +5639,7 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
     return {
         provider_set_id: [
             providers_by_npi.get(npi) or {"npi": npi, "provider_name": "TiC provider"}
-            for npi in npis_by_set.get(provider_set_id, ())[: max(int(limit_per_set), 1)]
+            for npi in selected_npis(provider_set_id)
         ]
         for provider_set_id in provider_set_ids
     }
@@ -8922,62 +5649,18 @@ async def _ptg2_manifest_provider_sets_for_npi(
     session,
     serving_tables: PTG2ServingTables,
     npi: int,
-) -> tuple[str, ...] | None:
-    graph_provider_sets = await _provider_sets_from_membership_graph(session, serving_tables, npi)
-    if graph_provider_sets is not None:
-        return graph_provider_sets
-    if serving_tables.effective_arch_version == "postgres_binary_v3":
-        raise PTG2ManifestArtifactError(
-            "postgres_binary_v3 reverse provider graph is missing; reimport the snapshot"
-        )
-    provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
-    if (
-        not provider_group_member_table
-        or not (
-            _manifest_provider_set_component_table(serving_tables)
-            or _ptg2_manifest_artifact_entry(serving_tables, "provider_inverted")
-        )
-    ):
-        return None
-    group_result = await session.execute(
-        text(
-            f"""
-            SELECT DISTINCT provider_group_global_id_128
-            FROM {provider_group_member_table}
-            WHERE npi = :provider_npi
-            ORDER BY provider_group_global_id_128
-            """
-        ),
-        {"provider_npi": npi},
-    )
-    group_ids = [
-        _ptg2_manifest_id(_row_mapping(row).get("provider_group_global_id_128"))
-        for row in group_result
-        if _row_mapping(row).get("provider_group_global_id_128")
-    ]
-    if not group_ids:
-        return ()
-    sets_by_group = await _manifest_sets_by_group(session, serving_tables, tuple(group_ids))
-    if sets_by_group is None:
-        return None
-    provider_set_ids = tuple(
-        sorted({provider_set_id for provider_set_ids in sets_by_group.values() for provider_set_id in provider_set_ids})
-    )
-    return provider_set_ids
-
+) -> tuple[str, ...]:
+    return await _provider_sets_from_membership_graph(session, serving_tables, npi)
 
 async def _provider_sets_from_membership_graph(
     session,
     serving_tables: PTG2ServingTables,
     npi: int,
-) -> tuple[str, ...] | None:
-    """Resolve reverse NPI membership when a normalized graph is available."""
-    if not (
-        _has_ptg2_artifact_reader(serving_tables, "provider_npi_group")
-        and _has_ptg2_artifact_reader(serving_tables, "provider_inverted")
-    ):
-        return None
-    group_ids = await _ptg2_manifest_sidecar_members_async(
+) -> tuple[str, ...]:
+    """Resolve reverse NPI membership from the strict shared graph."""
+
+    _require_strict_shared_v3(serving_tables)
+    group_ids = await _shared_graph_members_for_id(
         session,
         serving_tables,
         "provider_npi_group",
@@ -8986,8 +5669,6 @@ async def _provider_sets_from_membership_graph(
     if not group_ids:
         return ()
     provider_sets_by_group = await _manifest_sets_by_group(session, serving_tables, group_ids)
-    if provider_sets_by_group is None:
-        return None
     return tuple(
         sorted(
             {
@@ -8996,6 +5677,343 @@ async def _provider_sets_from_membership_graph(
                 for provider_set_id in provider_set_ids
             }
         )
+    )
+
+
+_ProviderExpansionKey = tuple[str, str, str, str, str, str]
+
+
+@dataclass(frozen=True)
+class _ProviderExpansionSelection:
+    row_data: list[dict[str, Any]]
+    providers_by_set: dict[str, list[dict[str, Any]]]
+    rank_by_key: dict[_ProviderExpansionKey, int]
+    exhausted: bool
+
+    @property
+    def total_lower_bound(self) -> int:
+        """Return the number of distinct ranked provider expansion keys."""
+        return len(self.rank_by_key)
+
+
+def _provider_expansion_key(
+    data: Mapping[str, Any],
+    *,
+    npi: int | None,
+) -> _ProviderExpansionKey:
+    source_key = data.get("source_artifact_key")
+    if source_key is None:
+        source_key = data.get("source_key")
+    reported_system = str(
+        data.get("reported_code_system")
+        or data.get("service_code_system")
+        or data.get("billing_code_type")
+        or ""
+    )
+    reported_code = str(
+        data.get("reported_code")
+        or data.get("service_code")
+        or data.get("billing_code")
+        or ""
+    )
+    arrangement = str(data.get("negotiation_arrangement") or "")
+    if npi is not None:
+        return (
+            "npi",
+            str(int(npi)),
+            reported_system,
+            reported_code,
+            arrangement,
+            str(source_key if source_key is not None else ""),
+        )
+    occurrence_id = _ptg2_manifest_id(
+        data.get("serving_content_hash_128") or data.get("rate_pack_hash")
+    )
+    if not occurrence_id:
+        raise PTG2ManifestArtifactError(
+            "PTG2 strict V3 NPI-free rate is missing its occurrence identity"
+        )
+    return (
+        "rate",
+        occurrence_id,
+        reported_system,
+        reported_code,
+        arrangement,
+        str(source_key if source_key is not None else ""),
+    )
+
+
+def _rank_provider_expansion_prefix(
+    row_data: list[dict[str, Any]],
+    npis_by_set: Mapping[str, tuple[int, ...]],
+    *,
+    target_count: int,
+) -> tuple[
+    dict[_ProviderExpansionKey, int],
+    tuple[int, ...],
+    tuple[str, ...],
+]:
+    rank_by_key: dict[_ProviderExpansionKey, int] = {}
+    selected_npis: dict[int, None] = {}
+    selected_provider_set_ids: dict[str, None] = {}
+    for data in row_data:
+        provider_set_id = _ptg2_manifest_id(data.get("provider_set_global_id_128"))
+        if not provider_set_id:
+            raise PTG2ManifestArtifactError(
+                "PTG2 strict V3 rate is missing its provider-set identity"
+            )
+        provider_npis = npis_by_set.get(provider_set_id, ())
+        candidates: tuple[int | None, ...] = provider_npis or (None,)
+        for npi in candidates:
+            key = _provider_expansion_key(data, npi=npi)
+            if key in rank_by_key:
+                continue
+            rank_by_key[key] = len(rank_by_key)
+            selected_provider_set_ids[provider_set_id] = None
+            if npi is not None:
+                selected_npis[int(npi)] = None
+            if len(rank_by_key) >= target_count:
+                return (
+                    rank_by_key,
+                    tuple(selected_npis),
+                    tuple(selected_provider_set_ids),
+                )
+    return rank_by_key, tuple(selected_npis), tuple(selected_provider_set_ids)
+
+
+async def _provider_set_ids_for_selected_npis(
+    session,
+    serving_tables: PTG2ServingTables,
+    npis: tuple[int, ...],
+) -> dict[int, tuple[str, ...]]:
+    if not npis:
+        return {}
+    member_id_by_npi = {npi: _ptg2_npi_member_id(npi) for npi in npis}
+    groups_by_member = await _shared_graph_members_by_id(
+        session,
+        serving_tables,
+        "provider_npi_group",
+        tuple(member_id_by_npi.values()),
+    )
+    group_ids = tuple(
+        dict.fromkeys(
+            group_id
+            for member_id in member_id_by_npi.values()
+            for group_id in groups_by_member.get(member_id, ())
+        )
+    )
+    sets_by_group = await _manifest_sets_by_group(
+        session,
+        serving_tables,
+        group_ids,
+    )
+    return {
+        npi: tuple(
+            dict.fromkeys(
+                provider_set_id
+                for group_id in groups_by_member.get(member_id, ())
+                for provider_set_id in sets_by_group.get(group_id, ())
+            )
+        )
+        for npi, member_id in member_id_by_npi.items()
+    }
+
+
+async def _selected_provider_rows_by_set(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    npis: tuple[int, ...],
+    provider_set_ids_by_npi: Mapping[int, tuple[str, ...]],
+    args: Mapping[str, Any],
+    snapshot_id: str,
+) -> dict[str, list[dict[str, Any]]] | None:
+    provider_rows = await _ptg2_manifest_enriched_provider_rows_for_npis(
+        session,
+        npis=npis,
+        limit=max(len(npis), 1),
+        plan_id=str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
+        or None,
+        snapshot_id=snapshot_id,
+        source_key=serving_tables.source_key
+        or str(args.get("source_key") or "").strip()
+        or None,
+    )
+    if provider_rows is None:
+        return None
+    provider_by_npi = {
+        int(row["npi"]): row
+        for row in provider_rows
+        if row.get("npi") is not None
+    }
+    provider_set_ids = tuple(
+        dict.fromkeys(
+            provider_set_id
+            for npi in npis
+            for provider_set_id in provider_set_ids_by_npi.get(npi, ())
+        )
+    )
+    return {
+        provider_set_id: [
+            provider_by_npi.get(npi)
+            or {"npi": npi, "provider_name": "TiC provider"}
+            for npi in npis
+            if provider_set_id in provider_set_ids_by_npi.get(npi, ())
+        ]
+        for provider_set_id in provider_set_ids
+    }
+
+
+def _next_provider_expansion_rate_window(
+    current_window: int,
+    *,
+    target_count: int,
+    distinct_count: int,
+    declared_rate_count: int,
+) -> int:
+    projected = (
+        current_window * target_count + max(distinct_count, 1) - 1
+    ) // max(distinct_count, 1)
+    return min(
+        declared_rate_count,
+        max(current_window + PTG2_SERVING_BINARY_V3_PAGE_ROWS, current_window * 2, projected),
+    )
+
+
+async def _strict_cost_provider_expansion_selection(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    code_rows: list[Mapping[str, Any]],
+    args: Mapping[str, Any],
+    snapshot_id: str,
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+    target_count: int,
+    descending: bool,
+) -> _ProviderExpansionSelection | None:
+    """Expand cost-ordered rates until the requested provider prefix is complete."""
+    declared_rate_count = sum(max(int(row.get("rate_count") or 0), 0) for row in code_rows)
+    if declared_rate_count <= 0:
+        return _ProviderExpansionSelection([], {}, {}, True)
+    rate_window = min(
+        declared_rate_count,
+        max(PTG2_SERVING_BINARY_V3_PAGE_ROWS, max(int(target_count), 1)),
+    )
+    rank_by_key: dict[_ProviderExpansionKey, int] = {}
+    selected_npis: tuple[int, ...] = ()
+    selected_provider_set_ids: tuple[str, ...] = ()
+    exhausted = False
+    row_prefix: list[dict[str, Any]] = []
+    while True:
+        row_prefix = await _merge_manifest_code_variant_rows(
+            session,
+            serving_tables,
+            code_rows=code_rows,
+            provider_set_keys=None,
+            source_trace_set_hash=source_trace_set_hash,
+            network_names=network_names,
+            limit=rate_window,
+            offset=0,
+            descending=descending,
+        )
+        if row_prefix is None:
+            return None
+        provider_set_ids = tuple(
+            dict.fromkeys(
+                provider_set_id
+                for row in row_prefix
+                if (
+                    provider_set_id := _ptg2_manifest_id(
+                        row.get("provider_set_global_id_128")
+                    )
+                )
+            )
+        )
+        npis_by_set = await _ptg2_manifest_provider_npis_for_provider_sets(
+            session,
+            serving_tables,
+            provider_set_ids,
+            limit_per_set=max(int(target_count), 1),
+        )
+        rank_by_key, selected_npis, selected_provider_set_ids = (
+            _rank_provider_expansion_prefix(
+                row_prefix,
+                npis_by_set,
+                target_count=max(int(target_count), 1),
+            )
+        )
+        exhausted = rate_window >= declared_rate_count or len(row_prefix) < rate_window
+        if len(rank_by_key) >= target_count or exhausted:
+            break
+        next_window = _next_provider_expansion_rate_window(
+            rate_window,
+            target_count=target_count,
+            distinct_count=len(rank_by_key),
+            declared_rate_count=declared_rate_count,
+        )
+        if next_window <= rate_window:
+            raise PTG2ManifestArtifactError(
+                "PTG2 strict V3 provider expansion did not make progress"
+            )
+        rate_window = next_window
+
+    provider_set_ids_by_npi = await _provider_set_ids_for_selected_npis(
+        session,
+        serving_tables,
+        selected_npis,
+    )
+    completion_provider_set_ids = tuple(
+        dict.fromkeys(
+            (
+                provider_set_id
+                for npi in selected_npis
+                for provider_set_id in provider_set_ids_by_npi.get(npi, ())
+            )
+        )
+    )
+    completion_provider_set_ids = tuple(
+        dict.fromkeys((*completion_provider_set_ids, *selected_provider_set_ids))
+    )
+    provider_set_key_by_id = await _ptg2_manifest_provider_set_keys_for_ids(
+        session,
+        serving_tables,
+        completion_provider_set_ids,
+    )
+    if set(provider_set_key_by_id) != set(completion_provider_set_ids):
+        raise PTG2ManifestArtifactError(
+            "PTG2 strict V3 provider expansion references an unknown provider set"
+        )
+    completion_rows = await _merge_manifest_code_variant_rows(
+        session,
+        serving_tables,
+        code_rows=code_rows,
+        provider_set_keys=provider_set_key_by_id.values(),
+        source_trace_set_hash=source_trace_set_hash,
+        network_names=network_names,
+        limit=None,
+        offset=0,
+        descending=descending,
+    )
+    if completion_rows is None:
+        return None
+    providers_by_set = await _selected_provider_rows_by_set(
+        session,
+        serving_tables,
+        npis=selected_npis,
+        provider_set_ids_by_npi=provider_set_ids_by_npi,
+        args=args,
+        snapshot_id=snapshot_id,
+    )
+    if providers_by_set is None:
+        return None
+    for provider_set_id in selected_provider_set_ids:
+        providers_by_set.setdefault(provider_set_id, [])
+    return _ProviderExpansionSelection(
+        row_data=completion_rows,
+        providers_by_set=providers_by_set,
+        rank_by_key=rank_by_key,
+        exhausted=exhausted and len(rank_by_key) < target_count,
     )
 
 
@@ -9051,86 +6069,122 @@ async def _search_ptg2_manifest_db_serving_table(
     serving_tables: PTG2ServingTables,
     mode_value: str,
 ) -> dict[str, Any] | None:
-    """Serve the additive manifest skinny table for exact plan/code lookups.
+    """Serve one strict shared V3 snapshot through sparse PostgreSQL reads."""
 
-    Provider, geography, and text expansion still require manifest sidecar readers; keep
-    this path intentionally bounded until those readers are wired into the API.
-    """
-    table_name = _safe_table_name(serving_tables.serving_table)
-    has_serving_by_code_sidecar = bool(
-        serving_tables.serving_binary_table or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
-    )
-    table_available = bool(table_name and await _serving_table_available(session, table_name))
-    if not table_available and not has_serving_by_code_sidecar:
-        return None
+    _require_strict_shared_v3(serving_tables)
     requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
-    requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
+    requested_system = _normalize_code_system(
+        args.get("code_system") or args.get("reported_code_system")
+    )
     requested_code = (
-        canonical_catalog_code(requested_system, args.get("code") or args.get("reported_code"))
+        canonical_catalog_code(
+            requested_system,
+            args.get("code") or args.get("reported_code"),
+        )
         if requested_system
         else str(args.get("code") or args.get("reported_code") or "").strip()
     )
-    expand_providers = _request_bool(args.get("include_providers"))
-    location_filter_requested = bool(
-        args.get("state")
-        or args.get("city")
-        or args.get("zip5")
-        or args.get("zip")
-        or args.get("npi")
-        or args.get("lat") is not None
-        or args.get("long") is not None
-        or args.get("radius_miles") is not None
+    explicit_source_scope = bool(
+        str(args.get("source_key") or "").strip()
+        or str(args.get("snapshot_id") or "").strip()
     )
-    lean_provider_key_layout = _ptg2_manifest_uses_lean_provider_key_layout(serving_tables)
-    explicit_source_scope = bool(str(args.get("source_key") or "").strip() or str(args.get("snapshot_id") or "").strip())
-    unsupported_filters = args.get("q")
-    if unsupported_filters or not requested_code or (not requested_plan and not explicit_source_scope):
-        return None
-    has_provider_npi_sidecar = _has_authoritative_provider_membership(serving_tables)
-    if expand_providers and not serving_tables.provider_group_member_table and not has_provider_npi_sidecar:
+    if args.get("q") or not requested_code or (not requested_plan and not explicit_source_scope):
         return None
 
+    expand_providers = _request_bool(args.get("include_providers"))
+    location_filter_requested = _ptg2_location_filter_requested(args)
+    price_filter_requested = any(
+        args.get(field)
+        for field in (
+            "pos",
+            "place_of_service",
+            "service_code",
+            "modifier",
+            "modifiers",
+            "billing_code_modifier",
+            "rate",
+            "negotiated_rate",
+        )
+    )
+    requested_order = str(args.get("order_by") or "").strip().lower()
+    requested_direction = str(args.get("order") or "asc").strip().lower()
+    distance_order_fields = {"", "distance", "distance_miles"}
+    location_requires_exhaustive = bool(
+        location_filter_requested
+        and (
+            not expand_providers
+            or requested_order not in distance_order_fields
+            or requested_direction == "desc"
+        )
+    )
+    deferred_location_selection = bool(
+        location_filter_requested and price_filter_requested
+    )
     rate_candidate_limit = _ptg2_manifest_rate_candidate_limit(
         args,
         pagination,
         expand_providers=expand_providers,
         location_filter_requested=location_filter_requested,
     )
-    requested_code_values = _ptg2_reported_code_lookup_values(requested_system, requested_code)
-    plan_filter, plan_order = _code_plan_scope_sql(requested_plan)
-    filters = [plan_filter]
-    params: dict[str, Any] = {
-        "plan_id": requested_plan,
-        "limit": int(pagination.limit),
-        "rate_candidate_limit": rate_candidate_limit,
-        "rate_candidate_offset": 0 if expand_providers else int(pagination.offset),
-        "offset": int(pagination.offset),
-    }
-    _append_reported_code_value_filter(
-        filters,
-        params,
-        column="reported_code",
-        param_name="reported_code",
-        values=requested_code_values,
+    # One NPI can participate in more serving rows than the provider-page size.
+    # All matching rows must reach the merge so no price occurrence becomes
+    # unreachable behind a pre-merge candidate cap.
+    serving_row_limit = _ptg2_manifest_serving_row_limit(
+        args,
+        rate_candidate_limit,
+        expand_providers=expand_providers,
     )
-    if requested_system:
-        filters.append("reported_code_system = :reported_code_system")
-        params["reported_code_system"] = requested_system
-    location_providers_by_set: dict[str, list[dict[str, Any]]] = {}
-    if location_filter_requested:
-        route_item_payload = await _search_ptg2_manifest_route_item_table(
-            session,
-            snapshot_id,
+
+    def no_match_response() -> dict[str, Any]:
+        """Build the exact empty response for the current serving query."""
+        return _shape_ptg2_manifest_response(
+            {
+                "items": [],
+                "pagination": {
+                    "total": 0,
+                    "limit": pagination.limit,
+                    "offset": pagination.offset,
+                    "page": (pagination.offset // pagination.limit) + 1
+                    if pagination.limit
+                    else 1,
+                    "has_more": False,
+                    "total_is_exact": True,
+                    "total_lower_bound": 0,
+                },
+                "query": {
+                    "plan_id": args.get("plan_id"),
+                    "plan_external_id": args.get("plan_external_id"),
+                    "plan_market_type": args.get("plan_market_type")
+                    or args.get("market_type")
+                    or None,
+                    "source_key": args.get("source_key") or None,
+                    "snapshot_id": snapshot_id,
+                    "mode": mode_value,
+                    "code": args.get("code") or None,
+                    "code_system": args.get("code_system") or None,
+                    "state": args.get("state") or None,
+                    "city": args.get("city") or None,
+                    "zip5": args.get("zip5") or None,
+                    "lat": args.get("lat") or None,
+                    "long": args.get("long") or None,
+                    "radius_miles": args.get("radius_miles") or None,
+                    "npi": args.get("npi") or None,
+                    "source": "ptg2_db",
+                    "serving_table": None,
+                    "include_providers": expand_providers,
+                    "procedure_consolidation": "REPORTED_CODE",
+                    "status": "no_match",
+                },
+            },
             args,
-            pagination,
-            serving_tables,
-            mode_value,
-            requested_plan=requested_plan,
-            requested_system=requested_system,
-            requested_code=requested_code,
+            database_evidence=serving_tables.database_evidence,
         )
-        if route_item_payload is not None:
-            return route_item_payload
+
+    location_providers_by_set: dict[str, list[dict[str, Any]]] = {}
+    location_selection_exhausted = False
+    location_candidate_count = 0
+    provider_set_keys: list[int] | None = None
+    if location_filter_requested and not deferred_location_selection:
         location_matches = await _ptg2_manifest_location_provider_matches(
             session,
             serving_tables,
@@ -9139,301 +6193,160 @@ async def _search_ptg2_manifest_db_serving_table(
             plan_id=requested_plan,
             snapshot_id=snapshot_id,
             source_key=serving_tables.source_key or args.get("source_key"),
+            require_exhaustive=location_requires_exhaustive,
         )
         if location_matches is None:
             return None
         provider_set_ids, location_providers_by_set = location_matches
+        location_candidate_count = len(
+            {
+                int(provider["npi"])
+                for providers in location_providers_by_set.values()
+                for provider in providers
+                if provider.get("npi") not in (None, "")
+            }
+        )
+        location_selection_exhausted = (
+            location_requires_exhaustive
+            or location_candidate_count < rate_candidate_limit
+        )
         if not provider_set_ids:
-            return _shape_ptg2_manifest_response(
-                {
-                    "items": [],
-                    "pagination": {
-                        "total": 0,
-                        "limit": pagination.limit,
-                        "offset": pagination.offset,
-                        "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
-                    },
-                    "query": {
-                        "plan_id": args.get("plan_id"),
-                        "plan_external_id": args.get("plan_external_id"),
-                        "plan_market_type": args.get("plan_market_type") or args.get("market_type") or None,
-                        "source_key": args.get("source_key") or None,
-                        "snapshot_id": snapshot_id,
-                        "mode": mode_value,
-                        "code": args.get("code") or None,
-                        "code_system": args.get("code_system") or None,
-                        "state": args.get("state") or None,
-                        "city": args.get("city") or None,
-                        "zip5": args.get("zip5") or None,
-                        "lat": args.get("lat") or None,
-                        "long": args.get("long") or None,
-                        "radius_miles": args.get("radius_miles") or None,
-                        "npi": args.get("npi") or None,
-                        "source": "ptg2_db",
-                        "serving_table": table_name,
-                        "include_providers": expand_providers,
-                        "procedure_consolidation": "REPORTED_CODE",
-                        "status": "no_match",
-                    },
-                },
-                args,
+            return no_match_response()
+        provider_set_key_by_id = await _ptg2_manifest_provider_set_keys_for_ids(
+            session,
+            serving_tables,
+            sorted(provider_set_ids),
+        )
+        if set(provider_set_key_by_id) != set(provider_set_ids):
+            raise PTG2ManifestArtifactError(
+                "PTG2 shared graph references an unknown provider set"
             )
-        if not lean_provider_key_layout:
-            filters.append(
-                f"provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))"
-            )
-            params["provider_set_ids"] = sorted(provider_set_ids)
-    where_sql = " AND ".join(filters)
+        provider_set_keys = list(provider_set_key_by_id.values())
+        if not provider_set_keys:
+            return no_match_response()
+
+    requested_code_values = _ptg2_reported_code_lookup_values(
+        requested_system,
+        requested_code,
+    )
+    scope_join_sql, code_filters, code_params, code_plan_order = _shared_v3_code_scope_sql(
+        serving_tables,
+        requested_plan=requested_plan,
+        plan_market_type=args.get("plan_market_type") or args.get("market_type") or "",
+    )
+    code_filters.extend(
+        [
+            "code_metadata.reported_code_system IS NOT DISTINCT FROM :reported_code_system",
+            "code_metadata.snapshot_key = :shared_snapshot_key",
+        ]
+    )
+    code_params.update(
+        {
+            "reported_code_system": requested_system or None,
+            "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
+        }
+    )
+    _append_reported_code_value_filter(
+        code_filters,
+        code_params,
+        column="code_metadata.reported_code",
+        param_name="reported_code",
+        values=requested_code_values,
+    )
+    code_result = await session.execute(
+        text(
+            f"""
+            SELECT code_metadata.code_key,
+                   logical_scope.plan_id,
+                   logical_scope.plan_market_type,
+                   code_metadata.reported_code_system,
+                   code_metadata.reported_code,
+                   code_metadata.negotiation_arrangement,
+                   code_metadata.billing_code_type_version,
+                   code_metadata.source_name,
+                   code_metadata.source_description,
+                   code_metadata.rate_count
+              FROM {_shared_v3_code_table()} code_metadata
+              {scope_join_sql}
+             WHERE {" AND ".join(code_filters)}
+             ORDER BY {code_plan_order},
+                      CASE WHEN code_metadata.reported_code = :reported_code THEN 0 ELSE 1 END,
+                      code_metadata.code_key
+            """
+        ),
+        code_params,
+    )
+    code_rows = [_row_mapping(row) for row in code_result]
+    if not code_rows:
+        return None
+    if not all(code_row.get("code_key") is not None for code_row in code_rows):
+        raise PTG2ManifestArtifactError("PTG2 shared code dictionary contains an invalid key")
+
     total: int | None = None
-    code_count_table = _safe_table_name(serving_tables.code_count_table)
-    if lean_provider_key_layout:
-        provider_set_dictionary_table = _safe_table_name(serving_tables.provider_set_dictionary_table)
-        if not code_count_table or not provider_set_dictionary_table:
-            return None
-        code_plan_filter, code_plan_order = _code_plan_scope_sql(requested_plan)
-        code_count_filter_clauses = [
-            code_plan_filter,
-            "reported_code_system IS NOT DISTINCT FROM :reported_code_system",
-        ]
-        code_count_params_by_name: dict[str, Any] = {
-            "plan_id": requested_plan,
-            "reported_code_system": requested_system or None,
-        }
-        _append_reported_code_value_filter(
-            code_count_filter_clauses,
-            code_count_params_by_name,
-            column="reported_code",
-            param_name="reported_code",
-            values=requested_code_values,
-        )
-        code_result = await session.execute(
-            text(
-                f"""
-                SELECT code_key, plan_id, reported_code_system, reported_code, rate_count
-                FROM {code_count_table}
-                WHERE {" AND ".join(code_count_filter_clauses)}
-                ORDER BY {code_plan_order}, CASE WHEN reported_code = :reported_code THEN 0 ELSE 1 END, code_key
-                """
-            ),
-            code_count_params_by_name,
-        )
-        code_rows = _preferred_code_metadata_rows(
-            (_row_mapping(row) for row in code_result),
-            requested_plan,
-        )
-        if not code_rows:
-            return None
-        params["code_keys"] = [
-            int(code_row["code_key"])
-            for code_row in code_rows
-            if code_row.get("code_key") is not None
-        ]
-        if not params["code_keys"]:
-            return None
-        if not location_filter_requested:
-            total = sum(int(code_row.get("rate_count") or 0) for code_row in code_rows)
-            if total <= 0:
-                return None
-        lean_filters = ["serving.code_key = ANY(CAST(:code_keys AS integer[]))"]
-        if location_filter_requested:
-            provider_key_result = await session.execute(
-                text(
-                    f"""
-                    SELECT provider_set_key
-                    FROM {provider_set_dictionary_table}
-                    WHERE provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))
-                    """
-                ),
-                {"provider_set_ids": sorted(provider_set_ids)},
-            )
-            provider_set_keys = [
-                int(data.get("provider_set_key"))
-                for data in (_row_mapping(row) for row in provider_key_result)
-                if data.get("provider_set_key") is not None
-            ]
-            if not provider_set_keys:
-                return _shape_ptg2_manifest_response(
-                    {
-                        "items": [],
-                        "pagination": {
-                            "total": 0,
-                            "limit": pagination.limit,
-                            "offset": pagination.offset,
-                            "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
-                        },
-                        "query": {
-                            "plan_id": args.get("plan_id"),
-                            "plan_external_id": args.get("plan_external_id"),
-                            "plan_market_type": args.get("plan_market_type") or args.get("market_type") or None,
-                            "source_key": args.get("source_key") or None,
-                            "snapshot_id": snapshot_id,
-                            "mode": mode_value,
-                            "code": args.get("code") or None,
-                            "code_system": args.get("code_system") or None,
-                            "state": args.get("state") or None,
-                            "city": args.get("city") or None,
-                            "zip5": args.get("zip5") or None,
-                            "lat": args.get("lat") or None,
-                            "long": args.get("long") or None,
-                            "radius_miles": args.get("radius_miles") or None,
-                            "npi": args.get("npi") or None,
-                            "source": "ptg2_db",
-                            "serving_table": table_name,
-                            "include_providers": expand_providers,
-                            "procedure_consolidation": "REPORTED_CODE",
-                            "status": "no_match",
-                        },
-                    },
-                    args,
-                )
-            params["provider_set_keys"] = provider_set_keys
-            lean_filters.append("serving.provider_set_key = ANY(CAST(:provider_set_keys AS integer[]))")
-        source_trace_set_hash = serving_tables.source_trace_set_hash or None
-        network_names = serving_tables.network_names or []
-        serving_hash_sql = (
-            "md5(serving_page.code_key::text || ':' || serving_page.provider_set_key::text "
-            "|| ':' || serving_page.price_set_global_id_128::text)"
-        )
-        if serving_tables.uses_uuid_ids:
-            serving_hash_sql = f"{serving_hash_sql}::uuid"
-        manifest_id_sql_type = "uuid" if serving_tables.uses_uuid_ids else "char(32)"
-        sidecar_row_data = None
-        if has_serving_by_code_sidecar:
-            sidecar_start = 0 if expand_providers else int(params.get("rate_candidate_offset") or 0)
-            sidecar_limit = int(params.get("rate_candidate_limit") or pagination.limit)
-            sidecar_rows = await _merge_manifest_code_variant_rows(
-                session,
-                serving_tables,
-                code_rows=code_rows,
-                provider_set_keys=params.get("provider_set_keys") if location_filter_requested else None,
-                source_trace_set_hash=source_trace_set_hash,
-                network_names=network_names,
-                limit=sidecar_limit,
-                offset=sidecar_start,
-            )
-            if sidecar_rows is not None:
-                sidecar_row_data = sidecar_rows
-        if sidecar_row_data is not None:
-            row_data = sidecar_row_data
-        else:
-            if not table_available or not table_name:
-                return None
-            row_result = await session.execute(
-                text(
-                    f"""
-                    WITH serving_page AS MATERIALIZED (
-                        SELECT
-                            serving.code_key,
-                            serving.provider_set_key,
-                            serving.provider_count,
-                            serving.price_set_global_id_128,
-                            code_metadata.plan_id,
-                            code_metadata.reported_code_system,
-                            code_metadata.reported_code
-                        FROM {table_name} serving
-                        JOIN {code_count_table} code_metadata
-                          ON code_metadata.code_key = serving.code_key
-                        WHERE {" AND ".join(lean_filters)}
-                        ORDER BY serving.provider_count DESC NULLS LAST, serving.code_key
-                        LIMIT :rate_candidate_limit OFFSET :rate_candidate_offset
-                    )
-                    SELECT
-                        {serving_hash_sql} AS serving_content_hash_128,
-                        serving_page.plan_id,
-                        serving_page.reported_code_system,
-                        serving_page.reported_code,
-                        NULL::{manifest_id_sql_type} AS procedure_global_id_128,
-                        (
-                            SELECT provider_sets.provider_set_global_id_128
-                            FROM {provider_set_dictionary_table} provider_sets
-                            WHERE provider_sets.provider_set_key = serving_page.provider_set_key
-                        ) AS provider_set_global_id_128,
-                        serving_page.provider_count,
-                        serving_page.price_set_global_id_128,
-                        :lean_source_trace_set_hash AS source_trace_set_hash,
-                        CAST(:lean_network_names AS varchar[]) AS network_names
-                    FROM serving_page
-                    ORDER BY serving_page.provider_count DESC NULLS LAST
-                    """
-                ),
-                {
-                    **params,
-                    "lean_source_trace_set_hash": source_trace_set_hash,
-                    "lean_network_names": network_names,
-                },
-            )
-            row_data = [_row_mapping(row) for row in row_result]
-    elif code_count_table and requested_system and not location_filter_requested:
-        code_count_filter_clauses = [
-            plan_filter,
-            "reported_code_system IS NOT DISTINCT FROM :reported_code_system",
-        ]
-        code_count_params_by_name = {
-            "plan_id": requested_plan,
-            "reported_code_system": requested_system or None,
-        }
-        _append_reported_code_value_filter(
-            code_count_filter_clauses,
-            code_count_params_by_name,
-            column="reported_code",
-            param_name="reported_code",
-            values=requested_code_values,
-        )
-        count_result = await session.execute(
-            text(
-                f"""
-                SELECT COALESCE(SUM(rate_count), 0) AS rate_count
-                FROM {code_count_table}
-                WHERE {" AND ".join(code_count_filter_clauses)}
-                """
-            ),
-            code_count_params_by_name,
-        )
-        total = int(count_result.scalar() or 0)
-        if total <= 0:
-            return None
-    elif not location_filter_requested:
-        count_result = await session.execute(text(f"SELECT COUNT(*) FROM {table_name} WHERE {where_sql}"), params)
-        total = int(count_result.scalar() or 0)
+    if not location_filter_requested:
+        total = sum(int(code_row.get("rate_count") or 0) for code_row in code_rows)
         if total <= 0:
             return None
 
-    if not lean_provider_key_layout:
-        network_names_select_sql = (
-            "network_names"
-            if await _ptg2_table_has_columns(session, table_name, {"network_names"})
-            else "NULL::varchar[] AS network_names"
-        )
-        row_result = await session.execute(
-            text(
-                f"""
-                SELECT
-                    serving_content_hash_128,
-                    plan_id,
-                    reported_code_system,
-                    reported_code,
-                    procedure_global_id_128,
-                    provider_set_global_id_128,
-                    provider_count,
-                    price_set_global_id_128,
-                    source_trace_set_hash,
-                    {network_names_select_sql}
-                FROM {table_name}
-                WHERE {where_sql}
-                ORDER BY {plan_order}, provider_count DESC NULLS LAST, serving_content_hash_128
-                LIMIT :rate_candidate_limit OFFSET :rate_candidate_offset
-                """
+    network_names = serving_tables.network_names or []
+    exact_provider_selection: _ProviderExpansionSelection | None = None
+    strict_cost_provider_expansion = (
+        expand_providers
+        and not location_filter_requested
+        and not _ptg2_provider_taxonomy_filter_requested(args)
+        and not price_filter_requested
+        and str(args.get("order_by") or "total_allowed_amount").strip().lower()
+        in _PTG2_COST_ORDER_FIELDS
+    )
+    if strict_cost_provider_expansion:
+        exact_provider_selection = await _strict_cost_provider_expansion_selection(
+            session,
+            serving_tables,
+            code_rows=code_rows,
+            args=args,
+            snapshot_id=snapshot_id,
+            source_trace_set_hash=None,
+            network_names=network_names,
+            target_count=max(
+                int(pagination.offset) + int(pagination.limit) + 1,
+                1,
             ),
-            params,
+            descending=_ptg2_cost_order_descending(args),
         )
-        row_data = [_row_mapping(row) for row in row_result]
+        if exact_provider_selection is None:
+            return None
+        row_data = exact_provider_selection.row_data
+    else:
+        row_data = await _merge_manifest_code_variant_rows(
+            session,
+            serving_tables,
+            code_rows=code_rows,
+            provider_set_keys=provider_set_keys,
+            source_trace_set_hash=None,
+            network_names=network_names,
+            limit=None if price_filter_requested else serving_row_limit,
+            offset=(
+                0
+                if expand_providers or price_filter_requested or location_filter_requested
+                else int(pagination.offset)
+            ),
+            descending=_ptg2_cost_order_descending(args),
+        )
+    if row_data is None:
+        return None
+    serving_rows_exhausted = (
+        serving_row_limit is None or len(row_data) < int(serving_row_limit)
+    )
+
     items: list[dict[str, Any]] = []
     if not row_data:
         return None
-    source_traces_by_set = (
-        await _ptg2_source_traces_for_trace_sets(
+    await _hydrate_provider_set_network_names(session, serving_tables, row_data)
+    source_provenance_by_key = (
+        await _ptg2_source_provenance_for_rows(
             session,
-            [data.get("source_trace_set_hash") for data in row_data],
+            serving_tables,
+            row_data,
         )
         if _include_ptg2_sources(args)
         else {}
@@ -9449,9 +6362,77 @@ async def _search_ptg2_manifest_db_serving_table(
         [_ptg2_manifest_id(data.get("price_set_global_id_128")) for data in row_data],
         price_key_by_set_id=price_key_by_set_id,
     )
+    if price_filter_requested:
+        prices_by_price_set = {
+            price_set_id: _ptg2_manifest_filter_prices(prices, args)
+            for price_set_id, prices in prices_by_price_set.items()
+        }
+        matching_price_set_ids = {
+            price_set_id
+            for price_set_id, prices in prices_by_price_set.items()
+            if prices
+        }
+        row_data = [
+            data
+            for data in row_data
+            if _ptg2_manifest_id(data.get("price_set_global_id_128"))
+            in matching_price_set_ids
+        ]
+        if not row_data:
+            return no_match_response()
+    if deferred_location_selection:
+        filtered_provider_set_keys = {
+            int(data["_ptg_provider_set_key"])
+            for data in row_data
+            if data.get("_ptg_provider_set_key") is not None
+        }
+        if not filtered_provider_set_keys:
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 price-filtered location rows are missing provider-set keys"
+            )
+        location_matches = await _ptg2_manifest_location_provider_matches(
+            session,
+            serving_tables,
+            args,
+            candidate_limit=rate_candidate_limit,
+            plan_id=requested_plan,
+            snapshot_id=snapshot_id,
+            source_key=serving_tables.source_key or args.get("source_key"),
+            provider_set_keys=filtered_provider_set_keys,
+            require_exhaustive=location_requires_exhaustive,
+        )
+        if location_matches is None:
+            return None
+        provider_set_ids, location_providers_by_set = location_matches
+        if not provider_set_ids:
+            return no_match_response()
+        location_candidate_count = len(
+            {
+                int(provider["npi"])
+                for providers in location_providers_by_set.values()
+                for provider in providers
+                if provider.get("npi") not in (None, "")
+            }
+        )
+        location_selection_exhausted = (
+            location_requires_exhaustive
+            or location_candidate_count < rate_candidate_limit
+        )
+        row_data = [
+            data
+            for data in row_data
+            if _ptg2_manifest_id(data.get("provider_set_global_id_128"))
+            in provider_set_ids
+        ]
+        if not row_data:
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 location projection did not retain a matching serving row"
+            )
     providers_by_set: dict[str, list[dict[str, Any]]] = {}
     if expand_providers:
-        if location_filter_requested:
+        if exact_provider_selection is not None:
+            providers_by_set = exact_provider_selection.providers_by_set
+        elif location_filter_requested:
             providers_by_set = location_providers_by_set
         else:
             provider_set_ids = [_ptg2_manifest_id(data.get("provider_set_global_id_128")) for data in row_data]
@@ -9459,7 +6440,7 @@ async def _search_ptg2_manifest_db_serving_table(
                 session,
                 serving_tables,
                 provider_set_ids,
-                limit_per_set=max(int(pagination.limit), 1),
+                limit_per_set=None,
                 args={**args, "snapshot_id": snapshot_id, "source_key": serving_tables.source_key or args.get("source_key")},
             )
             if provider_rows_by_set is None:
@@ -9467,7 +6448,12 @@ async def _search_ptg2_manifest_db_serving_table(
             providers_by_set = provider_rows_by_set
     procedure_details = await _ptg2_manifest_procedure_details_for_rows(session, row_data)
     for data in row_data:
-        if not expand_providers and len(items) >= int(pagination.limit):
+        if (
+            not expand_providers
+            and not price_filter_requested
+            and not location_filter_requested
+            and len(items) >= int(pagination.limit)
+        ):
             break
         reported_code = data.get("reported_code")
         reported_system = data.get("reported_code_system")
@@ -9476,32 +6462,59 @@ async def _search_ptg2_manifest_db_serving_table(
         rate_pack_hash = _ptg2_manifest_id(data.get("serving_content_hash_128"))
         prices = prices_by_price_set.get(price_set_hash, [])
         procedure_detail = procedure_details.get(_catalog_key(reported_system, reported_code) or ("", ""), {})
+        source_procedure_name = data.get("source_procedure_name")
+        source_procedure_description = data.get("source_procedure_description")
+        exact_source_mode = mode_value == PTG2_MODE_EXACT_SOURCE
         base_item = {
+            "plan_id": data.get("plan_id"),
+            "plan_market_type": data.get("plan_market_type"),
             "provider_ordinal": provider_set_hash,
             "provider_set_hash": provider_set_hash,
             "provider_set_hashes": [provider_set_hash] if provider_set_hash else [],
             "provider_name": "TiC provider set",
-            "source_key": serving_tables.source_key or args.get("source_key"),
+            "source_key": _logical_source_key(serving_tables, args),
+            "source_artifact_key": int(data["source_key"]),
             "snapshot_id": snapshot_id,
             "network_names": _coerce_str_list_payload(data.get("network_names")),
             "provider_count": data.get("provider_count") or 0,
             "provider_set_count": 1 if provider_set_hash else 0,
             "procedure_code": reported_code,
             "hp_procedure_code": reported_code,
-            "procedure_name": procedure_detail.get("procedure_name"),
-            "procedure_description": procedure_detail.get("procedure_description"),
+            "billing_code_type_version": data.get("billing_code_type_version"),
+            "procedure_name": (
+                source_procedure_name
+                if exact_source_mode
+                else source_procedure_name or procedure_detail.get("procedure_name")
+            ),
+            "procedure_description": (
+                source_procedure_description
+                if exact_source_mode
+                else source_procedure_description
+                or procedure_detail.get("procedure_description")
+            ),
+            "source_procedure_name": source_procedure_name,
+            "source_procedure_description": source_procedure_description,
+            "catalog_procedure_name": procedure_detail.get("procedure_name"),
+            "catalog_procedure_description": procedure_detail.get("procedure_description"),
             "service_code": reported_code,
             "service_code_system": reported_system or requested_system or "CPT",
             "reported_code": reported_code,
             "reported_code_system": reported_system,
+            "negotiation_arrangement": data.get("negotiation_arrangement"),
             "billing_code": reported_code,
             "billing_code_type": reported_system,
             **_price_response_fields(prices),
             "price_set_hash": price_set_hash,
             "rate_pack_hash": rate_pack_hash,
-            "source_trace": source_traces_by_set.get(str(data.get("source_trace_set_hash") or ""), []),
+            "_ptg_price_key": (
+                int(data["price_key"]) if data.get("price_key") is not None else None
+            ),
+            "source_trace": [],
             "confidence": {"network": "tic_rate_npi_tin", "location": "nppes_practice_location"},
         }
+        source_provenance = source_provenance_by_key.get(int(data["source_key"]))
+        if source_provenance is not None:
+            base_item.update(_item_source_provenance(source_provenance))
         base_item["address_verification"] = _address_verification_payload(base_item, {}, {})
         _apply_address_display_policy(base_item, args)
         if not expand_providers:
@@ -9556,30 +6569,94 @@ async def _search_ptg2_manifest_db_serving_table(
         return None
     if expand_providers:
         items = _merge_ptg2_provider_rate_items(items)
+    if exact_provider_selection is not None:
+        selected_items: list[dict[str, Any]] = []
+        materialized_keys: set[_ProviderExpansionKey] = set()
+        for item in items:
+            item_key = _provider_expansion_key(
+                item,
+                npi=(
+                    int(item["npi"])
+                    if item.get("npi") not in (None, "")
+                    else None
+                ),
+            )
+            rank = exact_provider_selection.rank_by_key.get(item_key)
+            if rank is None:
+                continue
+            item["_ptg_provider_rank"] = rank
+            selected_items.append(item)
+            materialized_keys.add(item_key)
+        if materialized_keys != set(exact_provider_selection.rank_by_key):
+            raise PTG2ManifestArtifactError(
+                "PTG2 strict V3 provider expansion failed to materialize its selected page"
+            )
+        items = selected_items
     items = _sort_ptg2_manifest_provider_items(
         items,
         args,
         location_filter_requested=location_filter_requested and expand_providers,
     )
     total_items = len(items)
+    requested_page_end = max(int(pagination.offset), 0) + max(
+        int(pagination.limit),
+        0,
+    )
+    if (
+        location_filter_requested
+        and not (location_selection_exhausted and serving_rows_exhausted)
+        and total_items <= requested_page_end
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 location traversal could not prove the requested page boundary"
+        )
     has_more_page_rows = False
-    if expand_providers:
+    if expand_providers or price_filter_requested or location_filter_requested:
         start = max(int(pagination.offset), 0)
         end = start + max(int(pagination.limit), 0)
         items = items[start:end]
         has_more_page_rows = end < total_items
     elif total is not None:
         has_more_page_rows = (int(pagination.offset) + len(items)) < int(total)
+    _hide_source_artifact_key_unless_requested(items, args)
+    for item in items:
+        item.pop("_ptg_price_key", None)
+        item.pop("_ptg_provider_rank", None)
     return _shape_ptg2_manifest_response(
         {
             "items": items,
             "pagination": {
                 "total": (
                     total_items
-                    if expand_providers
+                    if expand_providers or price_filter_requested or location_filter_requested
                     else total
                     if total is not None
                     else int(pagination.offset) + len(items)
+                ),
+                **(
+                    {
+                        "total_is_exact": exact_provider_selection.exhausted,
+                        "total_lower_bound": exact_provider_selection.total_lower_bound,
+                    }
+                    if exact_provider_selection is not None
+                    else (
+                        {
+                            "total_is_exact": (
+                                location_selection_exhausted
+                                and serving_rows_exhausted
+                            ),
+                            "total_lower_bound": total_items,
+                        }
+                        if location_filter_requested
+                        else (
+                            {
+                                "total_is_exact": True,
+                                "total_lower_bound": total_items,
+                            }
+                            if expand_providers or price_filter_requested
+                            else {}
+                        )
+                    )
                 ),
                 "limit": pagination.limit,
                 "offset": pagination.offset,
@@ -9603,314 +6680,83 @@ async def _search_ptg2_manifest_db_serving_table(
                 "radius_miles": args.get("radius_miles") or None,
                 "npi": args.get("npi") or None,
                 "source": "ptg2_db",
-                "serving_table": table_name,
+                "serving_table": None,
                 "include_providers": expand_providers,
                 "procedure_consolidation": "REPORTED_CODE",
             },
         },
         args,
+        database_evidence=serving_tables.database_evidence,
     )
 
 
-def _compact_required_tables(serving_tables: PTG2ServingTables) -> bool:
-    return bool(
-        serving_tables.price_code_set_table
-        and serving_tables.price_atom_table
-        and serving_tables.price_set_entry_table
-        and serving_tables.procedure_table
-    )
+async def _ptg2_source_provenance_for_rows(
+    session: Any,
+    serving_tables: PTG2ServingTables,
+    rows: Iterable[Mapping[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    source_keys: set[int] = set()
+    for row in rows:
+        source_key = row.get("source_artifact_key")
+        if source_key is None:
+            source_key = row.get("source_key")
+        if isinstance(source_key, bool) or source_key is None:
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 serving row is missing exact source provenance"
+            )
+        try:
+            source_keys.add(int(source_key))
+        except (TypeError, ValueError) as exc:
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 serving row has an invalid source key"
+            ) from exc
+    try:
+        return await fetch_snapshot_source_provenance(
+            session,
+            schema_name=PTG2_SCHEMA,
+            logical_snapshot_id=_required_logical_snapshot_id(serving_tables),
+            source_keys=source_keys,
+            expected_source_count=_required_source_count(serving_tables),
+        )
+    except PTG2SharedBlockError as exc:
+        raise PTG2ManifestArtifactError(str(exc)) from exc
 
 
-def _compact_price_payload_sql(serving_tables: PTG2ServingTables, params: dict[str, Any], args: dict[str, Any]) -> str:
-    price_filters, _price_filter_payload = _price_filter_clauses(args, params)
-    filter_sql = ""
-    if price_filters:
-        filter_sql = "WHERE " + " AND ".join(price_filters)
-    return f"""
-        SELECT jsonb_agg(pa.payload ORDER BY pa.negotiated_rate NULLS LAST) AS prices
-        FROM {serving_tables.price_set_entry_table} pse
-        JOIN {serving_tables.price_atom_table} pa
-          ON pa.price_atom_hash = pse.price_atom_hash
-        LEFT JOIN {serving_tables.price_code_set_table} service_set
-          ON service_set.price_code_set_hash = pa.service_code_set_hash
-        LEFT JOIN {serving_tables.price_code_set_table} modifier_set
-          ON modifier_set.price_code_set_hash = pa.modifier_code_set_hash
-        {filter_sql}
-          {"AND" if filter_sql else "WHERE"} pse.price_set_hash = r.price_set_hash
-    """
+def _logical_source_key(
+    serving_tables: PTG2ServingTables,
+    args: Mapping[str, Any],
+) -> str | None:
+    source_key = serving_tables.source_key or args.get("source_key")
+    normalized = str(source_key or "").strip()
+    return normalized or None
 
 
-def _source_trace_payload_sql(row_alias: str = "r") -> str:
-    return f"""
-        COALESCE(
-            NULLIF({row_alias}.source_trace::jsonb, '[]'::jsonb),
-            source_trace_payload.source_trace,
-            '[]'::jsonb
-        ) AS source_trace
-    """
-
-
-def _source_trace_payload_lateral_sql(row_alias: str = "r") -> str:
-    return f"""
-        LEFT JOIN LATERAL (
-            SELECT jsonb_agg(
-                       jsonb_strip_nulls(
-                           jsonb_build_object(
-                               'source_file_version_id', st.source_file_version_id,
-                               'original_url', st.original_url,
-                               'canonical_url', st.canonical_url,
-                               'json_pointer', st.json_pointer,
-                               'line_number', st.line_number
-                           )
-                       )
-                       ORDER BY st.source_trace_hash
-                   ) AS source_trace
-            FROM {PTG2_SCHEMA}.ptg2_source_trace_set sts
-            JOIN {PTG2_SCHEMA}.ptg2_source_trace st
-              ON st.source_trace_hash = ANY(sts.source_trace_hashes)
-            WHERE sts.source_trace_set_hash = {row_alias}.source_trace_set_hash
-        ) source_trace_payload ON TRUE
-    """
-
-
-async def _ptg2_source_traces_for_trace_sets(
-    session,
-    source_trace_set_hashes: list[Any] | tuple[Any, ...] | set[Any],
-) -> dict[str, list[dict[str, Any]]]:
-    trace_set_hashes = sorted({str(value).strip() for value in source_trace_set_hashes if str(value or "").strip()})
-    if not trace_set_hashes:
-        return {}
-    result = await session.execute(
-        text(
-            f"""
-            SELECT
-                sts.source_trace_set_hash,
-                COALESCE(
-                    jsonb_agg(
-                        jsonb_strip_nulls(
-                            jsonb_build_object(
-                                'source_file_version_id', st.source_file_version_id,
-                                'original_url', st.original_url,
-                                'canonical_url', st.canonical_url,
-                                'json_pointer', st.json_pointer,
-                                'line_number', st.line_number
-                            )
-                        )
-                        ORDER BY st.source_trace_hash
-                    ),
-                    '[]'::jsonb
-                ) AS source_trace
-            FROM {PTG2_SCHEMA}.ptg2_source_trace_set sts
-            JOIN {PTG2_SCHEMA}.ptg2_source_trace st
-              ON st.source_trace_hash = ANY(sts.source_trace_hashes)
-            WHERE sts.source_trace_set_hash = ANY(CAST(:source_trace_set_hashes AS varchar[]))
-            GROUP BY sts.source_trace_set_hash
-            """
-        ),
-        {"source_trace_set_hashes": trace_set_hashes},
-    )
+def _item_source_provenance(
+    provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    source_key = provenance.get("source_key")
+    if isinstance(source_key, bool) or source_key is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 source provenance is missing its dense artifact key"
+        )
     return {
-        str(data.get("source_trace_set_hash")): _coerce_json_payload(data.get("source_trace"), [])
-        for data in (_row_mapping(row) for row in result)
-        if data.get("source_trace_set_hash")
+        **{
+            key: value
+            for key, value in provenance.items()
+            if key != "source_key"
+        },
+        "source_artifact_key": int(source_key),
     }
 
 
-def _compact_provider_filter_sql(
-    serving_tables: PTG2ServingTables,
-    args: dict[str, Any],
-    params: dict[str, Any],
-    *,
-    address_table: str | None = None,
-) -> tuple[str, bool]:
-    """Build the provider-filter CTE for a compact serving query."""
-
-    has_geo = bool(args.get("zip5") or args.get("zip") or args.get("city") or args.get("state") or args.get("lat") or args.get("long") or args.get("radius_miles"))
-    specialty_filter = resolve_provider_specialty_filter(args)
-    inferred_sql = _inferred_provider_taxonomy_code_sql(
-        args,
-        nt_alias="nt",
-        schema=PTG2_SCHEMA,
-        params=params,
-        param_prefix="inferred_taxonomy",
-    )
-    has_provider_filter = has_geo or specialty_filter.active or bool(inferred_sql)
-    if not has_provider_filter:
-        return "", False
-    if not serving_tables.provider_group_member_table:
-        return "", False
-    if args.get("zip5") or args.get("zip"):
-        params["zip5"] = _normalize_zip5(args.get("zip5") or args.get("zip"))
-    if args.get("city"):
-        params["city_exact"] = str(args.get("city") or "").strip().upper()
-    if args.get("state"):
-        params["state_exact"] = str(args.get("state") or "").strip().upper()
-    if args.get("lat") and args.get("long"):
-        lat = float(args.get("lat"))
-        lon = float(args.get("long"))
-        radius = float(args.get("radius_miles") or 25.0)
-        params.update(
-            geo_lat=lat,
-            geo_long=lon,
-            geo_radius_miles=radius,
-            geo_min_lat=lat - radius / 69.0,
-            geo_max_lat=lat + radius / 69.0,
-            geo_min_long=lon - radius / 69.0,
-            geo_max_long=lon + radius / 69.0,
-        )
-    if serving_tables.provider_group_location_table and has_geo:
-        params.setdefault("provider_match_limit", max(int(params.get("limit") or 25) * 8, 64))
-        params.setdefault("location_rate_candidate_limit", max(int(params.get("limit") or 25) * 200, 4096))
-        clauses = []
-        geo_clauses: list[str] = []
-        if params.get("geo_lat") is not None:
-            geo_clauses.append("loc.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
-            geo_clauses.append("loc.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
-            geo_clauses.append(
-                f"{_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
-            )
-            geo_clauses.append("COALESCE(loc.address_precision, '') <> 'city_zip'")
-        if params.get("zip5") and geo_clauses:
-            clauses.append(f"(LEFT(COALESCE(loc.zip5, ''), 5) = :zip5 OR ({' AND '.join(geo_clauses)}))")
-        elif params.get("zip5"):
-            clauses.append("LEFT(COALESCE(loc.zip5, ''), 5) = :zip5")
-        elif geo_clauses:
-            clauses.extend(geo_clauses)
-        if params.get("city_exact"):
-            clauses.append("UPPER(COALESCE(loc.city_name, '')) = :city_exact")
-        if params.get("state_exact"):
-            clauses.append("UPPER(COALESCE(loc.state_name, '')) = :state_exact")
-        # Taxonomy predicates are uncorrelated `npi IN (SELECT ...)` semi-joins,
-        # not correlated EXISTS: this scan covers every location row in the
-        # zip/geo set BEFORE the LIMIT, and a correlated probe re-descends
-        # npi_taxonomy once per row (the same pathology that 502'd the manifest
-        # location matcher). The semi-join resolves the taxonomy NPI set once
-        # off the (healthcare_provider_taxonomy_code, npi) index.
-        if inferred_sql:
-            clauses.append(
-                f"loc.npi IN (SELECT nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE {inferred_sql})"
-            )
-            clauses.append(_ptg2_individual_npi_exists_sql("loc.npi"))
-        if specialty_filter.active:
-            clauses.append(
-                "loc.npi IN ("
-                + provider_specialty_taxonomy_semijoin_sql(
-                    params,
-                    "provider_specialty_loc",
-                    specialty_filter,
-                    schema=PTG2_SCHEMA,
-                )
-                + ")"
-            )
-        where = " AND ".join(clauses) or "TRUE"
-        component_join = ""
-        provider_match_predicate = "FALSE"
-        component_table = _manifest_provider_set_component_table(serving_tables)
-        if component_table:
-            component_join = f"""
-                JOIN {component_table} psc_filter
-                  ON psc_filter.provider_set_hash = r.provider_set_hash"""
-            provider_match_predicate = "pgm_filter.provider_group_hash = psc_filter.provider_group_hash"
-        elif serving_tables.provider_group_member_table:
-            provider_match_predicate = "pgm_filter.provider_group_hash = r.provider_set_hash"
-        return (
-            f"""
-            , filtered_locations AS MATERIALIZED (
-                SELECT loc.*
-                FROM {serving_tables.provider_group_location_table} loc
-                WHERE {where}
-                LIMIT :location_rate_candidate_limit
-            )
-            , provider_filtered_rates AS MATERIALIZED (
-                SELECT DISTINCT r.*
-                FROM rate_candidates r
-                {component_join}
-                JOIN {serving_tables.provider_group_member_table} pgm_filter
-                  ON {provider_match_predicate}
-                JOIN filtered_locations loc ON loc.npi = pgm_filter.npi
-                WHERE loc.npi IS NOT NULL
-            )
-            """,
-            True,
-        )
-    clauses = []
-    joins = []
-    provider_set_predicate = ""
-    component_table = _manifest_provider_set_component_table(serving_tables)
-    if component_table:
-        joins.append(f"FROM {component_table} psc_filter")
-        joins.append(f"JOIN {serving_tables.provider_group_member_table} pgm_filter ON pgm_filter.provider_group_hash = psc_filter.provider_group_hash")
-        provider_set_predicate = "psc_filter.provider_set_hash = r.provider_set_hash"
-    elif serving_tables.provider_group_member_table:
-        joins.append(f"FROM {serving_tables.provider_group_member_table} pgm_filter")
-        provider_set_predicate = "pgm_filter.provider_group_hash = r.provider_set_hash"
-    else:
-        return "", False
-    if has_geo:
-        address_filter_is_unified = _is_unified_address_table(address_table)
-        address_filter_zip5_sql = _ptg2_address_zip5_sql("addr_filter", unified=address_filter_is_unified)
-        joins.append(f"JOIN {address_table or f'{PTG2_SCHEMA}.npi_address'} addr_filter ON addr_filter.npi = pgm_filter.npi")
-        geo_clauses = []
-        if params.get("geo_lat") is not None:
-            if address_filter_is_unified:
-                geo_clauses.append("addr_filter.lat IS NOT NULL")
-                geo_clauses.append("addr_filter.long IS NOT NULL")
-                geo_clauses.append("COALESCE(addr_filter.address_precision, '') <> 'city_zip'")
-                geo_clauses.append(_ptg2_geo_dwithin_sql("addr_filter.lat", "addr_filter.long"))
-            else:
-                geo_clauses.append("addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
-                geo_clauses.append("addr_filter.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
-                geo_clauses.append(
-                    f"{_ptg2_geo_distance_miles_sql('addr_filter.lat::float8', 'addr_filter.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
-                )
-        if address_filter_is_unified and (params.get("zip5") or geo_clauses):
-            clauses.append("addr_filter.type IN ('primary', 'secondary', 'practice', 'site')")
-        if params.get("zip5") and geo_clauses:
-            clauses.append(f"({address_filter_zip5_sql} = :zip5 OR ({' AND '.join(geo_clauses)}))")
-        elif params.get("zip5"):
-            clauses.append(f"{address_filter_zip5_sql} = :zip5")
-        elif geo_clauses:
-            clauses.extend(geo_clauses)
-        if params.get("city_exact"):
-            clauses.append("UPPER(COALESCE(addr_filter.city_name, '')) = :city_exact")
-        if params.get("state_exact"):
-            clauses.append("UPPER(COALESCE(addr_filter.state_name, '')) = :state_exact")
-    # Uncorrelated IN semi-joins here too: the enclosing EXISTS walks each rate
-    # candidate's provider set, which for group plans can be a whole network.
-    # The subquery result is resolved/hashed once and probed per member row
-    # instead of re-descending npi_taxonomy per row.
-    if specialty_filter.active:
-        clauses.append(
-            "pgm_filter.npi IN ("
-            + provider_specialty_taxonomy_semijoin_sql(
-                params,
-                "provider_specialty",
-                specialty_filter,
-                schema=PTG2_SCHEMA,
-            )
-            + ")"
-        )
-    if inferred_sql:
-        clauses.append(
-            f"pgm_filter.npi IN (SELECT nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE {inferred_sql})"
-        )
-        clauses.append(_ptg2_individual_npi_exists_sql("pgm_filter.npi"))
-    where = " AND ".join(clauses) or "TRUE"
-    return (
-        f"""
-        , provider_filtered_rates AS MATERIALIZED (
-            SELECT DISTINCT r.*
-            FROM rate_candidates r
-            WHERE EXISTS (
-                SELECT 1
-                {' '.join(joins)}
-                WHERE {provider_set_predicate}
-                  AND {where}
-            )
-        )
-        """,
-        True,
-    )
+def _hide_source_artifact_key_unless_requested(
+    items: Iterable[dict[str, Any]],
+    args: Mapping[str, Any],
+) -> None:
+    if _include_ptg2_sources(dict(args)):
+        return
+    for item in items:
+        item.pop("source_artifact_key", None)
 
 
 def _provider_taxonomy_summary_lateral_sql(npi_sql: str, alias: str = "tax") -> str:
@@ -9935,187 +6781,6 @@ def _provider_taxonomy_summary_lateral_sql(npi_sql: str, alias: str = "tax") -> 
     """
 
 
-def _compact_provider_expansion_sql(
-    serving_tables: PTG2ServingTables,
-    args: dict[str, Any],
-    params: dict[str, Any],
-    *,
-    address_table: str | None = None,
-    provider_name_table: str | None = None,
-) -> str:
-    """Build joins that expand compact rates into provider response rows."""
-
-    if not _request_bool(args.get("include_providers")):
-        return ""
-    resolved_address_table = address_table or f"{PTG2_SCHEMA}.npi_address"
-    address_location_hash_sql = _ptg2_address_location_hash_sql("addr", resolved_address_table)
-    params.setdefault("provider_match_limit", max(int(params.get("limit") or 25) * 8, 64))
-    member_predicates: list[str] = []
-    specialty_filter = resolve_provider_specialty_filter(args)
-    # Uncorrelated IN semi-joins (see _compact_provider_filter_sql): the member
-    # join fans out per (rate x provider-group) pair, so correlated taxonomy
-    # probes scale with whole-network member counts.
-    if specialty_filter.active:
-        member_predicates.append(
-            "pgm.npi IN ("
-            + provider_specialty_taxonomy_semijoin_sql(
-                params,
-                "provider_expansion_specialty",
-                specialty_filter,
-                schema=PTG2_SCHEMA,
-            )
-            + ")"
-        )
-    inferred_sql = _inferred_provider_taxonomy_code_sql(
-        args,
-        nt_alias="nt",
-        schema=PTG2_SCHEMA,
-        params=params,
-        param_prefix="provider_expansion_inferred_taxonomy",
-    )
-    if inferred_sql:
-        member_predicates.append(
-            f"pgm.npi IN (SELECT nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE {inferred_sql})"
-        )
-        member_predicates.append(_ptg2_individual_npi_exists_sql("pgm.npi"))
-    member_filter_sql = "".join(f"\n          AND {predicate}" for predicate in member_predicates)
-    component_join = ""
-    member_join = ""
-    component_table = _manifest_provider_set_component_table(serving_tables)
-    if component_table:
-        component_join = f"""
-        JOIN {component_table} psc
-          ON psc.provider_set_hash = r.provider_set_hash"""
-        member_join = f"""
-        JOIN {serving_tables.provider_group_member_table} pgm
-          ON pgm.provider_group_hash = psc.provider_group_hash{member_filter_sql}"""
-    elif serving_tables.provider_group_member_table:
-        member_join = f"""
-        JOIN {serving_tables.provider_group_member_table} pgm
-          ON pgm.provider_group_hash = r.provider_set_hash{member_filter_sql}"""
-    else:
-        return ""
-    if serving_tables.provider_group_location_table and (args.get("zip5") or args.get("zip") or args.get("city") or args.get("state") or args.get("lat") or args.get("long")):
-        location_order_sql = ""
-        if params.get("geo_lat") is not None:
-            zip_rank_sql = "0"
-            if params.get("zip5"):
-                zip_rank_sql = "CASE WHEN LEFT(COALESCE(loc.zip5, ''), 5) = :zip5 THEN 0 ELSE 1 END"
-            location_order_sql = f"""
-            ORDER BY {zip_rank_sql},
-                     {_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.long::float8')} ASC NULLS LAST,
-                     loc.npi,
-                     loc.address_checksum
-            """
-        return f"""
-        {component_join}
-        {member_join}
-        JOIN LATERAL (
-            SELECT
-                loc.npi,
-                ('entity_address_unified:' || loc.npi::varchar || ':' || COALESCE(loc.address_type, '') || ':' || COALESCE(loc.address_checksum, ''))::varchar AS location_hash,
-                loc.state_name AS state,
-                loc.city_name AS city,
-                loc.zip5,
-                'entity_address_unified'::varchar AS location_source,
-                'entity_address_unified'::varchar AS location_confidence_code,
-                jsonb_build_object(
-                    'first_line', loc.first_line,
-                    'second_line', loc.second_line,
-                    'city', loc.city_name,
-                    'state', loc.state_name,
-                    'postal_code', loc.postal_code,
-                    'country_code', loc.country_code,
-                    'zip5', loc.zip5,
-                    'address_key', loc.address_key::text,
-                    'address_site_key', loc.premise_key::text,
-                    'address_checksum', loc.address_checksum,
-                    'address_precision', loc.address_precision,
-                    'formatted_address', loc.formatted_address,
-                    'lat', loc.lat,
-                    'long', loc.long,
-                    'telephone_number', loc.telephone_number,
-                    'fax_number', loc.fax_number,
-                    'phone_number', loc.phone_number,
-                    'phone_extension', loc.phone_extension,
-                    'fax_number_digits', loc.fax_number_digits,
-                    'fax_extension', loc.fax_extension
-                ) AS address_payload,
-                ARRAY[]::varchar[] AS taxonomy_codes,
-                ARRAY[]::varchar[] AS specialties,
-                ARRAY[]::varchar[] AS classifications,
-                ARRAY[]::varchar[] AS specializations,
-                NULL::varchar AS primary_specialty,
-                NULL::varchar AS primary_specialization,
-                'TiC provider'::varchar AS provider_name,
-                loc.lat,
-                loc.long
-            FROM {serving_tables.provider_group_location_table} loc
-            WHERE loc.npi = pgm.npi
-              AND EXISTS (
-                  SELECT 1 FROM filtered_locations filtered
-                  WHERE filtered.npi = loc.npi
-              )
-            {location_order_sql}
-            OFFSET 0
-            LIMIT 1
-        ) loc ON TRUE
-        {_provider_taxonomy_summary_lateral_sql("pgm.npi")}
-        """
-    provider_name_join = f"LEFT JOIN {provider_name_table} n ON n.npi = pgm.npi" if provider_name_table else ""
-    address_distance_select_sql = (
-        "NULL::double precision AS distance_miles, "
-        "NULL::varchar AS zip_match_type, "
-        "NULL::varchar AS anchor_zip5, "
-        "NULL::double precision AS zip_radius_miles"
-    )
-    address_order_sql = """
-            ORDER BY (NULLIF(BTRIM(addr.first_line), '') IS NULL),
-                     (addr.type = 'primary') DESC, addr.type, addr.checksum
-    """
-    if params.get("geo_lat") is not None:
-        address_distance_sql = _ptg2_geo_distance_miles_sql("addr.lat::float8", "addr.long::float8")
-        if params.get("zip5"):
-            same_zip_sql = "LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5"
-            address_distance_select_sql = (
-                f"CASE WHEN {same_zip_sql} THEN 0.0 ELSE {address_distance_sql} END AS distance_miles, "
-                f"CASE WHEN {same_zip_sql} THEN 'same_zip' ELSE 'radius' END AS zip_match_type, "
-                ":zip5 AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles"
-            )
-            zip_rank_sql = f"CASE WHEN {same_zip_sql} THEN 0 ELSE 1 END"
-        else:
-            address_distance_select_sql = (
-                f"{address_distance_sql} AS distance_miles, "
-                "'radius' AS zip_match_type, "
-                "NULL::varchar AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles"
-            )
-            zip_rank_sql = "0"
-        address_order_sql = f"""
-            ORDER BY {zip_rank_sql},
-                     distance_miles ASC NULLS LAST,
-                     (NULLIF(BTRIM(addr.first_line), '') IS NULL),
-                     (addr.type = 'primary') DESC, addr.type, addr.checksum
-        """
-    return f"""
-        {component_join}
-        {member_join}
-        {provider_name_join}
-        LEFT JOIN LATERAL (
-            SELECT
-                addr.*,
-                {address_location_hash_sql} AS location_hash,
-                addr.state_name AS state,
-                addr.city_name AS city,
-                {address_distance_select_sql}
-            FROM {resolved_address_table} addr
-            WHERE addr.npi = pgm.npi
-            {address_order_sql}
-            LIMIT 1
-        ) addr ON TRUE
-        {_provider_taxonomy_summary_lateral_sql("pgm.npi")}
-    """
-
-
 def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     """Shape one compact database row into the public provider payload."""
 
@@ -10132,6 +6797,8 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
         "npi": data.get("npi") or args.get("npi"),
         "provider_ordinal": data.get("provider_ordinal") or data.get("npi") or provider_set_hash,
         "provider_name": data.get("provider_name"),
+        "plan_id": data.get("plan_id"),
+        "plan_market_type": data.get("plan_market_type"),
         "state": data.get("state"),
         "city": data.get("city"),
         "zip5": data.get("zip5"),
@@ -10149,12 +6816,22 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
         "specializations": specializations,
         "procedure_code": data.get("procedure_code"),
         "hp_procedure_code": data.get("procedure_code"),
-        "procedure_name": data.get("procedure_name") or data.get("procedure_display_name"),
+        "procedure_name": (
+            data.get("procedure_name")
+            if "procedure_name" in data
+            else data.get("procedure_display_name")
+        ),
         "procedure_description": data.get("procedure_description"),
+        "billing_code_type_version": data.get("billing_code_type_version"),
+        "source_procedure_name": data.get("source_procedure_name"),
+        "source_procedure_description": data.get("source_procedure_description"),
+        "catalog_procedure_name": data.get("catalog_procedure_name"),
+        "catalog_procedure_description": data.get("catalog_procedure_description"),
         "service_code": data.get("billing_code") or data.get("reported_code"),
         "service_code_system": data.get("billing_code_type") or data.get("reported_code_system"),
         "reported_code": data.get("reported_code"),
         "reported_code_system": data.get("reported_code_system"),
+        "negotiation_arrangement": data.get("negotiation_arrangement"),
         "billing_code": data.get("billing_code") or data.get("reported_code"),
         "billing_code_type": data.get("billing_code_type") or data.get("reported_code_system"),
         "provider_set_hash": provider_set_hash,
@@ -10164,6 +6841,14 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
         "price_set_hash": data.get("price_set_hash"),
         "rate_pack_hash": data.get("rate_pack_hash") or data.get("serving_rate_id"),
         "source_key": data.get("source_key") or args.get("source_key"),
+        "source_artifact_key": data.get("source_artifact_key"),
+        "source_type": data.get("source_type"),
+        "identity_kind": data.get("identity_kind"),
+        "identity_sha256": data.get("identity_sha256"),
+        "raw_container_sha256": data.get("raw_container_sha256"),
+        "logical_json_sha256": data.get("logical_json_sha256"),
+        "logical_hash_deferred": data.get("logical_hash_deferred"),
+        "source_trace_set_hash": data.get("source_trace_set_hash"),
         "snapshot_id": data.get("snapshot_id") or args.get("snapshot_id"),
         "network_names": _coerce_str_list_payload(data.get("network_names")),
         **_price_response_fields(prices),
@@ -10185,346 +6870,15 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
     _promote_address_provenance_fields(item, address_payload)
     item["address_verification"] = _address_verification_payload(item, data, address_payload)
     _apply_address_display_policy(item, args)
-    return {key: value for key, value in item.items() if value is not None}
-
-
-async def _search_compact_serving_table(
-    session,
-    table_name: str,
-    serving_tables: PTG2ServingTables,
-    snapshot_id: str,
-    args: dict[str, Any],
-    pagination,
-    filters: list[str],
-    params: dict[str, Any],
-    mode_value: str,
-) -> dict[str, Any] | None:
-    """Search one compact serving relation with resolved request filters."""
-
-    if not _compact_required_tables(serving_tables):
-        return None
-    params = dict(params)
-    params.setdefault("limit", int(pagination.limit))
-    params.setdefault("offset", int(pagination.offset))
-    price_filter_params: dict[str, Any] = {}
-    price_filter_clauses, price_filter_query = _price_filter_clauses(args, price_filter_params)
-    params.update(price_filter_params)
-    expand_providers = _request_bool(args.get("include_providers"))
-    has_geo_filter = bool(
-        args.get("zip5")
-        or args.get("zip")
-        or args.get("city")
-        or args.get("state")
-        or args.get("lat")
-        or args.get("long")
-        or args.get("radius_miles")
-    )
-    uses_location_table = bool(serving_tables.provider_group_location_table and has_geo_filter)
-    address_table_sql = None
-    if (has_geo_filter and not uses_location_table) or (expand_providers and not uses_location_table):
-        address_table_sql = await _ptg2_address_serving_table(
-            session,
-            _PTG2_UNIFIED_ADDRESS_COLUMNS if has_geo_filter else _PTG2_LEGACY_ADDRESS_COLUMNS,
-        )
-    provider_name_table = None
-    if expand_providers and not uses_location_table:
-        candidate_provider_name_table = f"{PTG2_SCHEMA}.npi"
-        if await _serving_table_available(session, candidate_provider_name_table):
-            provider_name_table = candidate_provider_name_table
-    provider_filter_sql, has_provider_filter = _compact_provider_filter_sql(
-        serving_tables,
-        args,
-        params,
-        address_table=address_table_sql,
-    )
-    if has_provider_filter:
-        public_limit = max(int(params.get("limit") or 25), 1)
-        public_offset = max(int(params.get("offset") or 0), 0)
-        params.setdefault(
-            "rate_candidate_limit",
-            max(
-                public_limit * 200,
-                public_offset + public_limit,
-                int(params.get("location_rate_candidate_limit") or 0),
-                4096,
-            ),
-        )
-    source_cte = "provider_filtered_rates" if has_provider_filter else "rate_candidates"
-    provider_expansion_sql = _compact_provider_expansion_sql(
-        serving_tables,
-        args,
-        params,
-        address_table=address_table_sql,
-        provider_name_table=provider_name_table,
-    )
-    provider_select_sql = ""
-    provider_distance_order_sql = ""
-    if expand_providers and serving_tables.provider_group_location_table and provider_expansion_sql:
-        provider_distance_select_sql = ""
-        if params.get("geo_lat") is not None:
-            loc_distance_sql = _ptg2_geo_distance_miles_sql("loc.lat::float8", "loc.long::float8")
-            if params.get("zip5"):
-                same_zip_sql = "LEFT(COALESCE(loc.zip5, ''), 5) = :zip5"
-                provider_distance_select_sql = (
-                    f"CASE WHEN {same_zip_sql} THEN 0.0 ELSE {loc_distance_sql} END AS distance_miles, "
-                    f"CASE WHEN {same_zip_sql} THEN 'same_zip' ELSE 'radius' END AS zip_match_type, "
-                    ":zip5 AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles, "
-                )
-            else:
-                provider_distance_select_sql = (
-                    f"{loc_distance_sql} AS distance_miles, "
-                    "'radius' AS zip_match_type, NULL::varchar AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles, "
-                )
-            provider_distance_order_sql = "ORDER BY distance_miles ASC NULLS LAST, r.reported_code_system, r.reported_code"
-        provider_select_sql = (
-            "loc.npi, loc.location_hash, loc.state, loc.city, loc.zip5, "
-            "loc.location_source, loc.location_confidence_code, loc.address_payload, "
-            "COALESCE(tax.taxonomy_codes, loc.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes, "
-            "COALESCE(tax.specialties, loc.specialties, ARRAY[]::varchar[]) AS specialties, "
-            "COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications, "
-            "COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations, "
-            "tax.primary_specialty, tax.primary_specialization, loc.provider_name,"
-            f"{provider_distance_select_sql}"
-        )
-    elif expand_providers:
-        address_location_source = _ptg2_address_location_source(address_table_sql)
-        provider_name_sql = (
-            f"{_ptg2_provider_name_sql('n')} AS provider_name,"
-            if provider_name_table
-            else "'TiC provider' AS provider_name,"
-        )
-        provider_select_sql = (
-            "pgm.npi, addr.location_hash, addr.state, addr.city, "
-            "LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5, "
-            f"'{address_location_source}' AS location_source, "
-            f"'{address_location_source}' AS location_confidence_code, "
-            "jsonb_build_object("
-            "'npi', pgm.npi, "
-            "'type', addr.type, "
-            "'checksum', addr.checksum, "
-            "'first_line', addr.first_line, "
-            "'second_line', addr.second_line, "
-            "'city_name', addr.city_name, "
-            "'state_name', addr.state_name, "
-            "'city', addr.city, "
-            "'state', addr.state, "
-            "'postal_code', addr.postal_code, "
-            "'country_code', addr.country_code, "
-            "'telephone_number', addr.telephone_number, "
-            "'fax_number', addr.fax_number, "
-            "'phone_number', addr.phone_number, "
-            "'phone_extension', addr.phone_extension, "
-            "'fax_number_digits', addr.fax_number_digits, "
-            "'fax_extension', addr.fax_extension, "
-            "'address_key', addr.address_key::text, "
-            "'address_site_key', addr.premise_key::text, "
-            "'lat', addr.lat, "
-            "'long', addr.long"
-            ") AS address_payload, "
-            "COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes, "
-            "COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties, "
-            "COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications, "
-            "COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations, "
-            "tax.primary_specialty, tax.primary_specialization, "
-            "addr.distance_miles, addr.zip_match_type, addr.anchor_zip5, addr.zip_radius_miles, "
-            f"{provider_name_sql}"
-        )
-        if params.get("geo_lat") is not None:
-            provider_distance_order_sql = "ORDER BY distance_miles ASC NULLS LAST, r.reported_code_system, r.reported_code"
-    price_exists_sql = ""
-    if price_filter_clauses:
-        price_exists_sql = f"""
-        AND EXISTS (
-            SELECT 1
-            FROM {serving_tables.price_set_entry_table} pse_filter
-            JOIN {serving_tables.price_atom_table} pa
-              ON pa.price_atom_hash = pse_filter.price_atom_hash
-            LEFT JOIN {serving_tables.price_code_set_table} service_set
-              ON service_set.price_code_set_hash = pa.service_code_set_hash
-            LEFT JOIN {serving_tables.price_code_set_table} modifier_set
-              ON modifier_set.price_code_set_hash = pa.modifier_code_set_hash
-            WHERE pse_filter.price_set_hash = r.price_set_hash
-              AND {' AND '.join(price_filter_clauses)}
-        )
-        """
-    rate_candidate_limit_sql = ":rate_candidate_limit" if has_provider_filter else ":limit"
-    rate_candidate_offset_sql = "" if has_provider_filter else "OFFSET :offset"
-    final_order_sql = provider_distance_order_sql
-    final_pagination_sql = ""
-    if has_provider_filter:
-        if not final_order_sql:
-            final_order_sql = "ORDER BY r.reported_code_system, r.reported_code, r.provider_count DESC NULLS LAST"
-        if not expand_providers:
-            final_pagination_sql = "LIMIT :limit OFFSET :offset"
-    row_stmt = text(
-        f"""
-        WITH rate_candidates AS MATERIALIZED (
-            SELECT r.*
-            FROM {table_name} r
-            WHERE {' AND '.join(filters)}
-              {price_exists_sql}
-            ORDER BY r.reported_code_system, r.reported_code, r.provider_count DESC NULLS LAST
-            LIMIT {rate_candidate_limit_sql} {rate_candidate_offset_sql}
-        )
-        {provider_filter_sql}
-        SELECT
-            {provider_select_sql}
-            r.serving_rate_id,
-            r.snapshot_id,
-            r.plan_id,
-            r.plan_name,
-            r.plan_id_type,
-            COALESCE(r.plan_market_type, NULL::varchar) AS plan_market_type,
-            r.issuer_name,
-            r.plan_sponsor_name,
-            r.procedure_code,
-            r.reported_code_system,
-            r.reported_code,
-            COALESCE(proc.billing_code, r.reported_code) AS billing_code,
-            COALESCE(proc.billing_code_type, r.reported_code_system) AS billing_code_type,
-            COALESCE(proc.display_name, proc.name) AS procedure_name,
-            proc.description AS procedure_description,
-            r.provider_set_hash,
-            r.provider_count,
-            COALESCE(r.provider_set_count, NULL::integer) AS provider_set_count,
-            r.price_set_hash,
-            price_payload.prices AS prices,
-            {_source_trace_payload_sql("r")}
-        FROM {source_cte} r
-        LEFT JOIN LATERAL (
-            SELECT *
-            FROM {serving_tables.procedure_table} proc
-            WHERE proc.procedure_code = r.procedure_code
-            LIMIT 1
-        ) proc ON TRUE
-        LEFT JOIN LATERAL (
-            {_compact_price_payload_sql(serving_tables, params, args)}
-        ) price_payload ON TRUE
-        {_source_trace_payload_lateral_sql("r")}
-        {provider_expansion_sql}
-        WHERE TRUE
-          {"AND price_payload.prices IS NOT NULL" if price_filter_clauses else ""}
-        {final_order_sql}
-        {final_pagination_sql}
-        """
-    )
-    result = await session.execute(row_stmt, params)
-    rows = [_row_mapping(row) for row in result]
-    if not rows:
-        return None
-    if expand_providers:
-        rows = await _overlay_provider_directory_corroboration(
-            session,
-            rows,
-            plan_id=str(args.get("plan_id") or args.get("plan_external_id") or "").strip() or None,
-            snapshot_id=snapshot_id,
-            source_key=serving_tables.source_key or args.get("source_key"),
-        )
-    items = [_compact_item_from_row(row, args) for row in rows]
-    total_items = int(pagination.offset) + len(items)
-    if expand_providers:
-        items = _merge_ptg2_provider_rate_items(items)
-        items = _sort_ptg2_manifest_provider_items(
-            items,
-            args,
-            location_filter_requested=has_geo_filter,
-        )
-        total_items = len(items)
-        start = max(int(pagination.offset), 0)
-        end = start + max(int(pagination.limit), 0)
-        items = items[start:end]
-    return _shape_ptg2_response(
-        {
-            "items": items,
-            "pagination": {
-                "total": total_items,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
-            },
-            "query": {
-                "plan_id": args.get("plan_id") or None,
-                "plan_external_id": args.get("plan_external_id") or None,
-                "plan_market_type": str(args.get("plan_market_type") or "").strip().lower() or None,
-                "source_key": args.get("source_key") or None,
-                "snapshot_id": snapshot_id,
-                "mode": mode_value,
-                "code": args.get("code") or args.get("reported_code") or None,
-                "code_system": args.get("code_system") or None,
-                "q": args.get("q") or args.get("service_name") or None,
-                "price_filter": price_filter_query or None,
-                "state": args.get("state") or None,
-                "city": args.get("city") or None,
-                "zip5": args.get("zip5") or args.get("zip") or None,
-                "zip_radius_miles": args.get("zip_radius_miles") or args.get("radius_miles") or None,
-                "source": "ptg2_db",
-                "serving_table": table_name,
-                "include_providers": expand_providers,
-                "result_granularity": "provider" if expand_providers else "provider_set",
-                "procedure_consolidation": "REPORTED_CODE",
-            },
-        },
-        args,
-    )
-
-
-async def _search_legacy_serving_table(
-    session,
-    table_name: str,
-    snapshot_id: str,
-    args: dict[str, Any],
-    pagination,
-    filters: list[str],
-    params: dict[str, Any],
-    mode_value: str,
-) -> dict[str, Any] | None:
-    count_result = await session.execute(text(f"SELECT COUNT(*) FROM {table_name} r WHERE {' AND '.join(filters)}"), params)
-    total = int(count_result.scalar() or 0)
-    if total <= 0:
-        return None
-    row_result = await session.execute(
-        text(
-            f"""
-            SELECT
-                r.*,
-                {_source_trace_payload_sql("r").replace(" AS source_trace", " AS hydrated_source_trace")}
-            FROM {table_name} r
-            {_source_trace_payload_lateral_sql("r")}
-            WHERE {' AND '.join(filters)}
-            ORDER BY r.provider_count DESC NULLS LAST, r.serving_rate_id
-            LIMIT :limit OFFSET :offset
-            """
-        ),
-        params,
-    )
-    items = [_compact_item_from_row(_row_mapping(row), args) for row in row_result]
-    if not items:
-        return None
-    return _shape_ptg2_response(
-        {
-            "items": items,
-            "pagination": {
-                "total": total,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
-            },
-            "query": {
-                "plan_id": args.get("plan_id") or None,
-                "plan_external_id": args.get("plan_external_id") or None,
-                "plan_market_type": str(args.get("plan_market_type") or "").strip().lower() or None,
-                "source_key": args.get("source_key") or None,
-                "snapshot_id": snapshot_id,
-                "mode": mode_value,
-                "code": args.get("code") or args.get("reported_code") or None,
-                "code_system": args.get("code_system") or None,
-                "source": "ptg2_db",
-                "serving_table": table_name,
-                "procedure_consolidation": "HP_PROCEDURE_CODE",
-            },
-        },
-        args,
-    )
+    compact_item = {key: value for key, value in item.items() if value is not None}
+    if normalize_ptg2_mode(args.get("mode")) == "exact_source":
+        for field_name in (
+            "billing_code_type_version",
+            "procedure_name",
+            "procedure_description",
+        ):
+            compact_item[field_name] = item[field_name]
+    return compact_item
 
 
 async def search_ptg2_serving_table(
@@ -10535,79 +6889,26 @@ async def search_ptg2_serving_table(
     *,
     serving_tables: PTG2ServingTables | None = None,
 ) -> dict[str, Any] | None:
-    """Dispatch a snapshot query to its explicit serving architecture."""
+    """Serve a published snapshot through the strict shared V3 architecture."""
 
     mode_value = normalize_ptg2_mode(args.get("mode"))
-    serving_tables = serving_tables or PTG2ServingTables()
-    table_name = _safe_table_name(serving_tables.serving_table)
-    if _ptg2_manifest_storage_enabled(serving_tables):
-        if serving_tables.serving_table:
-            return await _search_ptg2_manifest_db_serving_table(
-                session,
-                snapshot_id,
-                args,
-                pagination,
-                serving_tables,
-                mode_value,
-            )
-        payload = await search_ptg2_manifest_serving_snapshot(
-            snapshot_id,
-            args,
-            pagination,
-            serving_tables=serving_tables,
-            mode_value=mode_value,
-        )
-        if payload is None:
-            return None
-        return _shape_ptg2_manifest_response(payload, args)
-    code_context = await _resolve_ptg2_code_search_context(
+    tables = serving_tables or await snapshot_serving_tables(
         session,
-        code=args.get("code") or args.get("reported_code"),
-        code_system=args.get("code_system") or args.get("reported_code_system"),
+        snapshot_id,
+        candidate_audit_access=candidate_audit_access_from_args(args),
     )
-    if table_name and await _serving_table_available(session, table_name):
-        requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
-        filters = ["snapshot_id = :snapshot_id"]
-        params: dict[str, Any] = {
-            "snapshot_id": snapshot_id,
-            "limit": int(pagination.limit),
-            "offset": int(pagination.offset),
-        }
-        if requested_plan:
-            filters.append("plan_id = :plan_id")
-            params["plan_id"] = requested_plan
-        _append_resolved_code_filter(
-            filters,
-            params,
-            code=args.get("code") or args.get("reported_code"),
-            code_system=args.get("code_system") or args.get("reported_code_system"),
-            code_context=code_context,
-        )
-        filters = _qualify_compact_filters(filters)
-        if _is_compact_serving_table(table_name) or _compact_required_tables(serving_tables):
-            return await _search_compact_serving_table(
-                session,
-                table_name,
-                serving_tables,
-                snapshot_id,
-                args,
-                pagination,
-                filters,
-                params,
-                mode_value,
-            )
-        return await _search_legacy_serving_table(
-            session,
-            table_name,
-            snapshot_id,
-            args,
-            pagination,
-            filters,
-            params,
-            mode_value,
-        )
-    return None
-
+    _require_strict_shared_v3(tables)
+    resolved_args_by_name = dict(args)
+    if tables.source_key and not resolved_args_by_name.get("source_key"):
+        resolved_args_by_name["source_key"] = tables.source_key
+    return await _search_ptg2_manifest_db_serving_table(
+        session,
+        snapshot_id,
+        resolved_args_by_name,
+        pagination,
+        tables,
+        mode_value,
+    )
 
 async def _search_ptg2_manifest_provider_procedures(
     session,
@@ -10618,20 +6919,14 @@ async def _search_ptg2_manifest_provider_procedures(
     snapshot_id: str,
     serving_tables: PTG2ServingTables,
 ) -> dict[str, Any] | None:
-    """Search manifest-backed procedures and prices for one provider NPI."""
+    """Search strict shared V3 procedures and prices for one provider NPI."""
 
-    table_name = _safe_table_name(serving_tables.serving_table)
-    has_reverse_sidecar = bool(
-        serving_tables.serving_binary_table
-        or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
-        or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
+    _require_strict_shared_v3(serving_tables)
+    provider_set_ids = await _ptg2_manifest_provider_sets_for_npi(
+        session,
+        serving_tables,
+        npi,
     )
-    table_available = bool(table_name and await _serving_table_available(session, table_name))
-    if not table_available and not has_reverse_sidecar:
-        return None
-    provider_set_ids = await _ptg2_manifest_provider_sets_for_npi(session, serving_tables, npi)
-    if provider_set_ids is None:
-        return None
     if not provider_set_ids:
         return _shape_ptg2_response(
             {
@@ -10640,13 +6935,19 @@ async def _search_ptg2_manifest_provider_procedures(
                     "total": 0,
                     "limit": pagination.limit,
                     "offset": pagination.offset,
-                    "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+                    "page": (pagination.offset // pagination.limit) + 1
+                    if pagination.limit
+                    else 1,
+                    "has_more": False,
+                    "total_is_exact": True,
+                    "total_lower_bound": 0,
                 },
                 "query": {
                     "npi": npi,
                     "plan_id": args.get("plan_id") or None,
                     "plan_external_id": args.get("plan_external_id") or None,
-                    "plan_market_type": str(args.get("plan_market_type") or "").strip().lower() or None,
+                    "plan_market_type": str(args.get("plan_market_type") or "").strip().lower()
+                    or None,
                     "source_key": args.get("source_key") or None,
                     "snapshot_id": snapshot_id,
                     "mode": normalize_ptg2_mode(args.get("mode")),
@@ -10654,7 +6955,7 @@ async def _search_ptg2_manifest_provider_procedures(
                     "code_system": args.get("code_system") or None,
                     "q": args.get("q") or args.get("service_name") or None,
                     "source": "ptg2_db",
-                    "serving_table": table_name,
+                    "serving_table": None,
                     "provider_reverse_index": True,
                     "status": "no_match",
                 },
@@ -10666,153 +6967,75 @@ async def _search_ptg2_manifest_provider_procedures(
     code_value = str(args.get("code") or args.get("reported_code") or "").strip()
     q_text = str(args.get("q") or args.get("service_name") or "").strip().lower()
     market_type = str(args.get("plan_market_type") or "").strip().lower()
-    params: dict[str, Any] = {
-        "provider_set_ids": list(_ptg2_manifest_ids(tuple(provider_set_ids))),
-        "limit": int(pagination.limit),
-        "offset": int(pagination.offset),
-    }
     code_context = await _resolve_ptg2_code_search_context(
         session,
         code=code_value,
         code_system=args.get("code_system"),
     )
-    filters = [f"provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))"]
-    if requested_plan:
-        plan_filter, plan_order = _code_plan_scope_sql(requested_plan)
-        filters.append(plan_filter)
-        params["plan_id"] = requested_plan
-    else:
-        plan_order = "plan_id NULLS FIRST"
-    _append_manifest_reported_code_filter(
-        filters,
-        params,
-        code=code_value,
-        code_system=args.get("code_system"),
-        code_context=code_context,
-    )
-    if q_text:
-        filters.append(
-            """
-            (
-                LOWER(COALESCE(reported_code, '')) LIKE :q_like
-             OR LOWER(COALESCE(reported_code_system, '')) LIKE :q_like
-            )
-            """
-        )
-        params["q_like"] = f"%{q_text}%"
-
     price_filter_params: dict[str, Any] = {}
     _, price_filter_query = _price_filter_clauses(args, price_filter_params)
     has_price_filter = bool(price_filter_query)
-    if has_price_filter:
-        params["candidate_limit"] = max(int(getattr(pagination, "limit", 25) or 25) * 200, 500)
-        limit_sql = "LIMIT :candidate_limit"
-        offset_sql = ""
-    else:
-        limit_sql = "LIMIT :limit"
-        offset_sql = "OFFSET :offset"
-    where_sql = " AND ".join(filters)
-    row_data: list[dict[str, Any]] | None = None
-    if has_reverse_sidecar and _ptg2_manifest_uses_lean_provider_key_layout(serving_tables):
-        if serving_tables.effective_arch_version == "postgres_binary_v3":
-            reverse_query = _VersionThreeReverseQuery(
-                provider_set_ids=provider_set_ids,
-                requested_plan=requested_plan,
-                code_value=code_value,
-                code_system=args.get("code_system"),
-                q_text=q_text,
-                code_context=code_context,
-                source_trace_set_hash=serving_tables.source_trace_set_hash or None,
-                network_names=serving_tables.network_names or [],
-                limit=int(params["candidate_limit"]) if has_price_filter else int(pagination.limit),
-                offset=0 if has_price_filter else int(pagination.offset),
-                apply_window=not has_price_filter,
-            )
-            sidecar_rows = await _version_three_reverse_rows(
-                session,
-                serving_tables,
-                reverse_query,
-            )
-        else:
-            sidecar_rows = await _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
-                session,
-                serving_tables,
-                provider_set_ids=provider_set_ids,
-                requested_plan=requested_plan,
-                code_value=code_value,
-                code_system=args.get("code_system"),
-                q_text=q_text,
-                code_context=code_context,
-                source_trace_set_hash=serving_tables.source_trace_set_hash or None,
-                network_names=serving_tables.network_names or [],
-                limit=None if has_price_filter else int(pagination.limit),
-                offset=0 if has_price_filter else int(pagination.offset),
-                apply_window=not has_price_filter,
-            )
-        if sidecar_rows is not None:
-            if has_price_filter:
-                row_data = sidecar_rows[: int(params["candidate_limit"])]
-            else:
-                row_data = sidecar_rows
-    if row_data is None:
-        if table_available and _ptg2_manifest_uses_lean_provider_key_layout(serving_tables):
-            row_data = await _ptg2_manifest_provider_procedure_rows_from_lean_table(
-                session,
-                serving_tables,
-                provider_set_ids=provider_set_ids,
-                requested_plan=requested_plan,
-                code_value=code_value,
-                code_system=args.get("code_system"),
-                q_text=q_text,
-                code_context=code_context,
-                source_trace_set_hash=serving_tables.source_trace_set_hash or None,
-                network_names=serving_tables.network_names or [],
-                limit=int(params["candidate_limit"]) if has_price_filter else int(pagination.limit),
-                offset=0 if has_price_filter else int(pagination.offset),
-            )
-    if row_data is None:
-        if not table_available or not table_name:
-            return None
-        network_names_select_sql = (
-            "network_names"
-            if await _ptg2_table_has_columns(session, table_name, {"network_names"})
-            else "NULL::varchar[] AS network_names"
-        )
-        row_stmt = text(
-            f"""
-                SELECT
-                    serving_content_hash_128,
-                    plan_id,
-                    reported_code_system,
-                    reported_code,
-                    procedure_global_id_128,
-                    provider_set_global_id_128,
-                    provider_count,
-                    price_set_global_id_128,
-                    source_trace_set_hash,
-                    {network_names_select_sql}
-                FROM {table_name}
-                WHERE {where_sql}
-                ORDER BY {plan_order}, reported_code_system, reported_code, provider_count DESC NULLS LAST, serving_content_hash_128
-                {limit_sql} {offset_sql}
-                """
-        )
-        row_result = await session.execute(row_stmt, params)
-        row_data = [_row_mapping(row) for row in row_result]
-    source_traces_by_set = await _ptg2_source_traces_for_trace_sets(
-        session,
-        [data.get("source_trace_set_hash") for data in row_data],
+    requested_limit = max(int(getattr(pagination, "limit", 25) or 25), 1)
+    requested_offset = max(int(getattr(pagination, "offset", 0) or 0), 0)
+    sentinel_limit = requested_limit + 1
+    reverse_query = _VersionThreeReverseQuery(
+        provider_set_ids=provider_set_ids,
+        requested_plan=requested_plan,
+        code_value=code_value,
+        code_system=args.get("code_system"),
+        q_text=q_text,
+        code_context=code_context,
+        source_trace_set_hash=None,
+        network_names=serving_tables.network_names or [],
+        limit=None if has_price_filter else sentinel_limit,
+        offset=0 if has_price_filter else requested_offset,
+        apply_window=not has_price_filter,
+        plan_market_type=market_type,
     )
-    price_key_by_set_id = {
-        _ptg2_manifest_id(data.get("price_set_global_id_128")): int(data.get("price_key"))
-        for data in row_data
-        if data.get("price_key") is not None and _ptg2_manifest_id(data.get("price_set_global_id_128"))
-    }
-    prices_by_price_set = await _ptg2_manifest_prices_for_price_sets(
-        session,
-        serving_tables,
-        [_ptg2_manifest_id(data.get("price_set_global_id_128")) for data in row_data],
-        price_key_by_set_id=price_key_by_set_id,
+    if has_price_filter:
+        filtered_selection = await _version_three_filtered_reverse_selection(
+            session,
+            serving_tables,
+            reverse_query,
+            args,
+            offset=requested_offset,
+            limit=sentinel_limit,
+        )
+        row_data = list(filtered_selection.rows)
+        prices_by_price_set = dict(filtered_selection.prices_by_price_set)
+        exact_total = filtered_selection.total_row_count
+        observed_total_lower_bound = filtered_selection.matched_rows_seen
+    else:
+        reverse_selection = await _version_three_reverse_selection(
+            session,
+            serving_tables,
+            reverse_query,
+        )
+        row_data = list(reverse_selection.rows)
+        exact_total = reverse_selection.total_row_count
+        observed_total_lower_bound = requested_offset + len(row_data)
+        price_key_by_set_id = {
+            _ptg2_manifest_id(data.get("price_set_global_id_128")): int(data.get("price_key"))
+            for data in row_data
+            if data.get("price_key") is not None
+            and _ptg2_manifest_id(data.get("price_set_global_id_128"))
+        }
+        prices_by_price_set = await _ptg2_manifest_prices_for_price_sets(
+            session,
+            serving_tables,
+            [_ptg2_manifest_id(data.get("price_set_global_id_128")) for data in row_data],
+            price_key_by_set_id=price_key_by_set_id,
+        )
+    await _hydrate_provider_set_network_names(session, serving_tables, row_data)
+
+    source_provenance_by_key = (
+        await _ptg2_source_provenance_for_rows(
+            session,
+            serving_tables,
+            row_data,
+        )
+        if _include_ptg2_sources(args)
+        else {}
     )
     procedure_details = await _ptg2_manifest_procedure_details_for_rows(session, row_data)
     provider_context_rows = await _ptg2_manifest_enriched_provider_rows_for_npis(
@@ -10824,28 +7047,29 @@ async def _search_ptg2_manifest_provider_procedures(
         source_key=args.get("source_key") or None,
     )
     provider_context = provider_context_rows[0] if provider_context_rows else {"npi": npi}
-    item_args = {**args, "snapshot_id": snapshot_id}
+    item_args = {
+        **args,
+        "snapshot_id": snapshot_id,
+        "source_key": _logical_source_key(serving_tables, args),
+    }
 
     items: list[dict[str, Any]] = []
-    skipped_for_offset = 0
     for data in row_data:
-        prices = _ptg2_manifest_filter_prices(
-            prices_by_price_set.get(_ptg2_manifest_id(data.get("price_set_global_id_128")), []),
-            args,
+        prices = prices_by_price_set.get(
+            _ptg2_manifest_id(data.get("price_set_global_id_128")),
+            [],
         )
-        if has_price_filter and not prices:
-            continue
-        if has_price_filter and skipped_for_offset < int(pagination.offset):
-            skipped_for_offset += 1
-            continue
-        if len(items) >= int(pagination.limit):
-            break
         reported_code = data.get("reported_code")
         reported_system = data.get("reported_code_system")
         procedure_detail = procedure_details.get(_catalog_key(reported_system, reported_code) or ("", ""), {})
+        source_provenance = source_provenance_by_key.get(int(data["source_key"]))
         data_with_trace = {
             **data,
-            "source_trace": source_traces_by_set.get(str(data.get("source_trace_set_hash") or ""), []),
+            **(
+                _item_source_provenance(source_provenance)
+                if source_provenance is not None
+                else {"source_artifact_key": int(data["source_key"])}
+            ),
         }
         items.append(
             _ptg2_manifest_provider_procedure_item(
@@ -10857,9 +7081,17 @@ async def _search_ptg2_manifest_provider_procedures(
                 args=item_args,
             )
         )
-    total = int(pagination.offset) + len(items)
-    if not items:
-        total = 0 if not row_data else total
+    has_more = len(items) > requested_limit
+    items = items[:requested_limit]
+    total_is_exact = exact_total is not None
+    total_lower_bound = (
+        int(exact_total)
+        if total_is_exact
+        else max(observed_total_lower_bound, requested_offset + len(items))
+    )
+    total = int(exact_total) if total_is_exact else total_lower_bound
+
+    _hide_source_artifact_key_unless_requested(items, args)
 
     return _shape_ptg2_response(
         {
@@ -10869,6 +7101,9 @@ async def _search_ptg2_manifest_provider_procedures(
                 "limit": pagination.limit,
                 "offset": pagination.offset,
                 "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+                "has_more": has_more,
+                "total_is_exact": total_is_exact,
+                "total_lower_bound": total_lower_bound,
             },
             "query": {
                 "npi": npi,
@@ -10883,173 +7118,9 @@ async def _search_ptg2_manifest_provider_procedures(
                 "q": q_text or None,
                 "price_filter": price_filter_query or None,
                 "source": "ptg2_db",
-                "serving_table": table_name,
+                "serving_table": None,
                 "provider_reverse_index": True,
-                "status": None if items else "no_match",
-                **_ptg2_code_query_fields(code_context, args),
-            },
-        },
-        args,
-    )
-
-
-async def _search_compact_provider_procedures(
-    session,
-    npi: int,
-    args: dict[str, Any],
-    pagination,
-    *,
-    snapshot_id: str,
-    serving_tables: PTG2ServingTables,
-) -> dict[str, Any] | None:
-    """Search a compact serving relation for one provider's procedures."""
-
-    table_name = _safe_table_name(serving_tables.serving_table)
-    if not table_name or not await _serving_table_available(session, table_name):
-        return None
-    component_table = _manifest_provider_set_component_table(serving_tables)
-    if not component_table or not serving_tables.provider_group_member_table:
-        return None
-    params: dict[str, Any] = {
-        "npi": int(npi),
-        "snapshot_id": snapshot_id,
-        "limit": int(pagination.limit),
-        "offset": int(pagination.offset),
-    }
-    requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
-    market_type = str(args.get("plan_market_type") or "").strip().lower()
-    filters = ["r.snapshot_id = :snapshot_id"]
-    if requested_plan:
-        filters.append("r.plan_id = :plan_id")
-        params["plan_id"] = requested_plan
-    code_context = await _resolve_ptg2_code_search_context(
-        session,
-        code=args.get("code") or args.get("reported_code"),
-        code_system=args.get("code_system") or args.get("reported_code_system"),
-    )
-    code_filters: list[str] = []
-    _append_resolved_code_filter(
-        code_filters,
-        params,
-        code=args.get("code") or args.get("reported_code"),
-        code_system=args.get("code_system") or args.get("reported_code_system"),
-        code_context=code_context,
-    )
-    filters.extend(_qualify_compact_filters(code_filters))
-    price_filter_params: dict[str, Any] = {}
-    price_filter_clauses, price_filter_query = _price_filter_clauses(args, price_filter_params)
-    params.update(price_filter_params)
-    price_exists_sql = ""
-    if price_filter_clauses and _compact_required_tables(serving_tables):
-        price_exists_sql = f"""
-          AND EXISTS (
-              SELECT 1
-              FROM {serving_tables.price_set_entry_table} pse_filter
-              JOIN {serving_tables.price_atom_table} pa
-                ON pa.price_atom_hash = pse_filter.price_atom_hash
-              LEFT JOIN {serving_tables.price_code_set_table} service_set
-                ON service_set.price_code_set_hash = pa.service_code_set_hash
-              LEFT JOIN {serving_tables.price_code_set_table} modifier_set
-                ON modifier_set.price_code_set_hash = pa.modifier_code_set_hash
-              WHERE pse_filter.price_set_hash = r.price_set_hash
-                AND {' AND '.join(price_filter_clauses)}
-          )
-        """
-    row_stmt = text(
-        f"""
-        WITH provider_sets AS MATERIALIZED (
-            SELECT DISTINCT psc.provider_set_hash
-            FROM {component_table} psc
-            JOIN {serving_tables.provider_group_member_table} pgm
-              ON pgm.provider_group_hash = psc.provider_group_hash
-            WHERE pgm.npi = :npi
-        )
-        SELECT
-            r.serving_rate_id,
-            r.snapshot_id,
-            r.plan_id,
-            r.plan_name,
-            r.plan_id_type,
-            NULL::varchar AS plan_market_type,
-            r.issuer_name,
-            r.plan_sponsor_name,
-            r.procedure_code,
-            r.reported_code_system,
-            r.reported_code,
-            COALESCE(proc.billing_code, r.reported_code) AS billing_code,
-            COALESCE(proc.billing_code_type, r.reported_code_system) AS billing_code_type,
-            COALESCE(proc.display_name, proc.name) AS procedure_name,
-            proc.description AS procedure_description,
-            r.provider_set_hash,
-            r.provider_count,
-            NULL::integer AS provider_set_count,
-            r.price_set_hash,
-            price_payload.prices AS prices,
-            {_source_trace_payload_sql("r")}
-        FROM {table_name} r
-        JOIN provider_sets ps ON ps.provider_set_hash = r.provider_set_hash
-        LEFT JOIN {serving_tables.procedure_table or f'{PTG2_SCHEMA}.ptg2_procedure'} proc
-          ON proc.procedure_code = r.procedure_code
-        LEFT JOIN LATERAL (
-            {_compact_price_payload_sql(serving_tables, params, args) if _compact_required_tables(serving_tables) else 'SELECT r.prices AS prices'}
-        ) price_payload ON TRUE
-        {_source_trace_payload_lateral_sql("r")}
-        WHERE {' AND '.join(filters)}
-          {price_exists_sql}
-          {"AND price_payload.prices IS NOT NULL" if price_filter_clauses else ""}
-        ORDER BY r.reported_code_system, r.reported_code, r.provider_count DESC NULLS LAST
-        LIMIT :limit OFFSET :offset
-        """
-    )
-    row_result = await session.execute(row_stmt, params)
-    rows = [_row_mapping(row) for row in row_result]
-    items = []
-    for row in rows:
-        item = _compact_item_from_row(row, args)
-        item["npi"] = int(npi)
-        items.append(item)
-    if not items:
-        return _shape_ptg2_response(
-            {
-                "items": [],
-                "pagination": {"total": 0, "limit": pagination.limit, "offset": pagination.offset, "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1},
-                "query": {
-                    "npi": int(npi),
-                    "plan_id": requested_plan or None,
-                    "plan_external_id": args.get("plan_external_id") or None,
-                    "plan_market_type": market_type or None,
-                    "source_key": args.get("source_key") or None,
-                    "snapshot_id": snapshot_id,
-                    "mode": normalize_ptg2_mode(args.get("mode")),
-                    "code": args.get("code") or args.get("reported_code") or None,
-                    "code_system": args.get("code_system") or None,
-                    "price_filter": price_filter_query or None,
-                    "source": "ptg2_db",
-                    "serving_table": table_name,
-                    "provider_reverse_index": True,
-                    "status": "no_match",
-                },
-            },
-            args,
-        )
-    return _shape_ptg2_response(
-        {
-            "items": items,
-            "pagination": {"total": int(pagination.offset) + len(items), "limit": pagination.limit, "offset": pagination.offset, "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1},
-            "query": {
-                "npi": int(npi),
-                "plan_id": requested_plan or None,
-                "plan_external_id": args.get("plan_external_id") or None,
-                "plan_market_type": market_type or None,
-                "source_key": args.get("source_key") or None,
-                "snapshot_id": snapshot_id,
-                "mode": normalize_ptg2_mode(args.get("mode")),
-                "code": args.get("code") or args.get("reported_code") or None,
-                "code_system": args.get("code_system") or None,
-                "price_filter": price_filter_query or None,
-                "source": "ptg2_db",
-                "serving_table": table_name,
-                "provider_reverse_index": True,
+                "status": None if total else "no_match",
                 **_ptg2_code_query_fields(code_context, args),
             },
         },
@@ -11066,27 +7137,19 @@ async def _search_ptg2_provider_procedures_snapshot(
     snapshot_id: str,
 ) -> dict[str, Any] | None:
     """Search one explicitly selected snapshot for a provider's procedures."""
-    serving_tables = await snapshot_serving_tables(session, snapshot_id)
-    table_name = _safe_table_name(serving_tables.serving_table)
-    component_table = _manifest_provider_set_component_table(serving_tables)
-    if table_name and (
-        _is_compact_serving_table(table_name)
-        or (component_table and not _ptg2_manifest_storage_enabled(serving_tables))
-    ):
-        return await _search_compact_provider_procedures(
-            session,
-            npi,
-            args,
-            pagination,
-            snapshot_id=snapshot_id,
-            serving_tables=serving_tables,
-        )
-    if not _ptg2_manifest_storage_enabled(serving_tables):
-        return None
+    serving_tables = await snapshot_serving_tables(
+        session,
+        snapshot_id,
+        candidate_audit_access=candidate_audit_access_from_args(args),
+    )
+    _require_strict_shared_v3(serving_tables)
+    resolved_args_by_name = dict(args)
+    if serving_tables.source_key and not resolved_args_by_name.get("source_key"):
+        resolved_args_by_name["source_key"] = serving_tables.source_key
     return await _search_ptg2_manifest_provider_procedures(
         session,
         npi,
-        args,
+        resolved_args_by_name,
         pagination,
         snapshot_id=snapshot_id,
         serving_tables=serving_tables,
@@ -11105,33 +7168,83 @@ def _provider_procedure_sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
     )
 
 
-async def _search_multi_ptg2_provider_procedures(
-    session,
+def _ptg2_multi_network_concurrency() -> int:
+    try:
+        configured = int(
+            os.getenv(
+                _PTG2_MULTI_NETWORK_CONCURRENCY_ENV,
+                _PTG2_MULTI_NETWORK_CONCURRENCY_DEFAULT,
+            )
+        )
+    except (TypeError, ValueError):
+        configured = _PTG2_MULTI_NETWORK_CONCURRENCY_DEFAULT
+    return max(1, min(configured, 32))
+
+
+async def _gather_ptg2_network_reads(
+    network_snapshots: list[tuple[str, str]],
+    network_reader: Callable[[str, str], Awaitable[Any]],
+) -> list[Any]:
+    """Run immutable network reads concurrently without sharing a DB session."""
+    semaphore = asyncio.Semaphore(_ptg2_multi_network_concurrency())
+
+    async def run_bounded(source_key: str, snapshot_id: str):
+        """Run one reader after obtaining a bounded concurrency slot."""
+        async with semaphore:
+            return await network_reader(source_key, snapshot_id)
+
+    return list(
+        await asyncio.gather(
+            *(
+                run_bounded(source_key, snapshot_id)
+                for source_key, snapshot_id in network_snapshots
+            )
+        )
+    )
+
+
+async def _search_provider_procedures_network(
+    source_key: str,
+    snapshot_id: str,
     npi: int,
+    args: dict[str, Any],
+    pagination,
+) -> tuple[str, str, dict[str, Any] | None]:
+    async with sa_db.session() as network_session:
+        response = await _search_ptg2_provider_procedures_snapshot(
+            network_session,
+            npi,
+            args,
+            pagination,
+            snapshot_id=snapshot_id,
+        )
+    return source_key, snapshot_id, response
+
+
+def _shape_multi_provider_procedure_response(
+    network_responses: list[tuple[str, str, dict[str, Any] | None]],
     network_snapshots: list[tuple[str, str]],
     args: dict[str, Any],
     pagination,
 ) -> dict[str, Any] | None:
-    """Combine one provider's priced procedures across every plan network."""
-    fetch_count = max(1, int(pagination.offset) + int(pagination.limit))
-    sub_pagination = PaginationParams(page=1, limit=fetch_count, offset=0, source="page")
+    """Merge per-network procedure responses into one paginated API response."""
     combined_items: list[dict[str, Any]] = []
     matched_networks: list[dict[str, str]] = []
-    total = 0
+    total_lower_bound = 0
+    totals_are_exact = True
     base_query_by_field: dict[str, Any] | None = None
-    for source_key, snapshot_id in network_snapshots:
-        network_response_by_field = await _search_ptg2_provider_procedures_snapshot(
-            session,
-            npi,
-            args,
-            sub_pagination,
-            snapshot_id=snapshot_id,
-        )
+    for source_key, snapshot_id, network_response_by_field in network_responses:
         if not network_response_by_field:
             continue
         if base_query_by_field is None:
             base_query_by_field = dict(network_response_by_field.get("query") or {})
-        total += int((network_response_by_field.get("pagination") or {}).get("total") or 0)
+        network_pagination = network_response_by_field.get("pagination") or {}
+        total_lower_bound += int(
+            network_pagination.get("total_lower_bound")
+            if network_pagination.get("total_lower_bound") is not None
+            else network_pagination.get("total") or 0
+        )
+        totals_are_exact = totals_are_exact and network_pagination.get("total_is_exact") is True
         network_items = network_response_by_field.get("items") or []
         if network_items:
             matched_networks.append({"source_key": source_key, "snapshot_id": snapshot_id})
@@ -11145,7 +7258,11 @@ async def _search_multi_ptg2_provider_procedures(
     start = max(int(pagination.offset), 0)
     end = start + max(int(pagination.limit), 0)
     page_items = combined_items[start:end]
+    has_more = len(combined_items) > end
+    total_lower_bound = max(total_lower_bound, start + len(page_items) + int(has_more))
+    total = total_lower_bound
     base_query_by_field.update(
+        source_key=None,
         snapshot_id=None,
         snapshots=[snapshot_id for _, snapshot_id in network_snapshots],
         networks=matched_networks,
@@ -11159,11 +7276,46 @@ async def _search_multi_ptg2_provider_procedures(
                 "limit": pagination.limit,
                 "offset": pagination.offset,
                 "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
-                "has_more": int(pagination.offset) + len(page_items) < total,
+                "has_more": has_more,
+                "total_is_exact": totals_are_exact,
+                "total_lower_bound": total_lower_bound,
             },
             "query": base_query_by_field,
         },
         args,
+    )
+
+
+async def _search_multi_ptg2_provider_procedures(
+    session,
+    npi: int,
+    network_snapshots: list[tuple[str, str]],
+    args: dict[str, Any],
+    pagination,
+) -> dict[str, Any] | None:
+    """Combine one provider's priced procedures across every plan network."""
+    fetch_count = max(1, int(pagination.offset) + int(pagination.limit) + 1)
+    sub_pagination = PaginationParams(page=1, limit=fetch_count, offset=0, source="page")
+
+    async def read_network(source_key: str, snapshot_id: str):
+        """Read one network through an independent database session."""
+        return await _search_provider_procedures_network(
+            source_key,
+            snapshot_id,
+            npi,
+            args,
+            sub_pagination,
+        )
+
+    network_responses = await _gather_ptg2_network_reads(
+        network_snapshots,
+        read_network,
+    )
+    return _shape_multi_provider_procedure_response(
+        network_responses,
+        network_snapshots,
+        args,
+        pagination,
     )
 
 
@@ -11232,36 +7384,39 @@ def _ptg2_manifest_plan_code_values(args: dict[str, Any]) -> tuple[str, str | No
 
 async def _has_ptg2_table_plan_code(
     session,
-    table_name: str,
+    serving_tables: PTG2ServingTables,
     *,
     requested_plan: str,
     requested_system: str | None,
     requested_code: str,
+    plan_market_type: str = "",
 ) -> bool:
-    query_params_by_name: dict[str, Any] = {
-        "plan_id": requested_plan,
-    }
-    plan_filter_sql, _ = _code_plan_scope_sql(requested_plan)
-    code_filters = [plan_filter_sql]
+    _require_strict_shared_v3(serving_tables)
+    scope_join_sql, code_filters, query_params_by_name, _ = _shared_v3_code_scope_sql(
+        serving_tables,
+        requested_plan=requested_plan,
+        plan_market_type=plan_market_type,
+    )
+    code_filters.append("code_metadata.snapshot_key = :shared_snapshot_key")
+    query_params_by_name["shared_snapshot_key"] = _required_shared_snapshot_key(serving_tables)
     _append_reported_code_value_filter(
         code_filters,
         query_params_by_name,
-        column="reported_code",
+        column="code_metadata.reported_code",
         param_name="reported_code",
         values=_ptg2_reported_code_lookup_values(requested_system, requested_code),
     )
-    system_sql = ""
     if requested_system:
         query_params_by_name["reported_code_system"] = requested_system
-        system_sql = "AND reported_code_system = :reported_code_system"
+        code_filters.append("code_metadata.reported_code_system = :reported_code_system")
     exists_result = await session.execute(
         text(
             f"""
             SELECT EXISTS (
                 SELECT 1
-                FROM {table_name}
+                FROM {_shared_v3_code_table()} code_metadata
+                {scope_join_sql}
                 WHERE {" AND ".join(code_filters)}
-                  {system_sql}
                 LIMIT 1
             )
             """
@@ -11278,42 +7433,25 @@ async def _ptg2_manifest_snapshot_has_plan_code(
     *,
     serving_tables: PTG2ServingTables | None = None,
 ) -> bool:
-    """Cheaply rule out network snapshots that cannot price the requested route."""
-    # Unit-test fakes and non-SQLAlchemy call sites should retain the old
-    # fan-out behavior unless they explicitly patch this helper.
-    if not hasattr(session, "sync_session"):
-        return True
+    """Fail closed when a bound shared snapshot cannot prove a requested route."""
+
     requested = _ptg2_manifest_plan_code_values(args)
     if requested is None:
         return True
     requested_plan, requested_system, requested_code = requested
-    try:
-        serving_tables = serving_tables or await snapshot_serving_tables(session, snapshot_id)
-        table_name = _safe_table_name(serving_tables.serving_table)
-        if not table_name or not await _serving_table_available(session, table_name):
-            return True
-        if _ptg2_manifest_uses_lean_provider_key_layout(serving_tables):
-            code_count_table = _safe_table_name(serving_tables.code_count_table)
-            if not code_count_table or not await _serving_table_available(session, code_count_table):
-                return True
-            return await _has_ptg2_table_plan_code(
-                session,
-                code_count_table,
-                requested_plan=requested_plan,
-                requested_system=requested_system,
-                requested_code=requested_code,
-            )
-        return await _has_ptg2_table_plan_code(
-            session,
-            table_name,
-            requested_plan=requested_plan,
-            requested_system=requested_system,
-            requested_code=requested_code,
-        )
-    except Exception:
-        await _rollback_optional_ptg2_query(session)
-        return True
-
+    tables = serving_tables or await snapshot_serving_tables(
+        session,
+        snapshot_id,
+        candidate_audit_access=candidate_audit_access_from_args(args),
+    )
+    return await _has_ptg2_table_plan_code(
+        session,
+        tables,
+        requested_plan=requested_plan,
+        requested_system=requested_system,
+        requested_code=requested_code,
+        plan_market_type=args.get("plan_market_type") or args.get("market_type") or "",
+    )
 
 async def _search_one_ptg2_snapshot(
     session,
@@ -11323,11 +7461,11 @@ async def _search_one_ptg2_snapshot(
     *,
     serving_tables: PTG2ServingTables | None = None,
 ) -> dict[str, Any] | None:
-    cache_key = _ptg2_response_cache_key(snapshot_id, args, pagination)
-    cached_payload = _ptg2_response_cache_get(cache_key)
-    if cached_payload is not _CACHE_MISS:
-        return cached_payload
-    serving_tables = serving_tables or await snapshot_serving_tables(session, snapshot_id)
+    serving_tables = serving_tables or await snapshot_serving_tables(
+        session,
+        snapshot_id,
+        candidate_audit_access=candidate_audit_access_from_args(args),
+    )
     db_payload = await search_ptg2_serving_table(
         session,
         snapshot_id,
@@ -11337,8 +7475,33 @@ async def _search_one_ptg2_snapshot(
     )
     if db_payload is not None:
         db_payload = await _enrich_ptg2_code_details(session, db_payload, args)
-        return _ptg2_response_cache_set(cache_key, _shape_ptg2_response(db_payload, args))
-    return _ptg2_response_cache_set(cache_key, None)
+        return _shape_ptg2_response(db_payload, args)
+    return None
+
+
+async def _search_plan_network_snapshot(
+    source_key: str,
+    snapshot_id: str,
+    args: dict[str, Any],
+    pagination,
+) -> tuple[str, str, dict[str, Any] | None]:
+    async with sa_db.session() as network_session:
+        serving_tables = await snapshot_serving_tables(network_session, snapshot_id)
+        if not await _ptg2_manifest_snapshot_has_plan_code(
+            network_session,
+            snapshot_id,
+            args,
+            serving_tables=serving_tables,
+        ):
+            return source_key, snapshot_id, None
+        response = await _search_one_ptg2_snapshot(
+            network_session,
+            snapshot_id,
+            args,
+            pagination,
+            serving_tables=serving_tables,
+        )
+    return source_key, snapshot_id, response
 
 
 async def _search_multi_ptg2_snapshots(
@@ -11373,27 +7536,21 @@ async def _search_multi_ptg2_snapshots(
     total = 0
     base_query: dict[str, Any] | None = None
     matched_networks: list[dict[str, str]] = []
-    for source_key, snapshot_id in network_snapshots:
-        serving_tables: PTG2ServingTables | None = None
-        if hasattr(session, "sync_session"):
-            serving_tables = await snapshot_serving_tables(session, snapshot_id)
-            if not await _ptg2_manifest_snapshot_has_plan_code(
-                session,
-                snapshot_id,
-                args,
-                serving_tables=serving_tables,
-            ):
-                continue
-        if serving_tables is None:
-            payload = await _search_one_ptg2_snapshot(session, snapshot_id, args, sub_pagination)
-        else:
-            payload = await _search_one_ptg2_snapshot(
-                session,
-                snapshot_id,
-                args,
-                sub_pagination,
-                serving_tables=serving_tables,
-            )
+
+    async def read_network(source_key: str, snapshot_id: str):
+        """Read one network through an independent database session."""
+        return await _search_plan_network_snapshot(
+            source_key,
+            snapshot_id,
+            args,
+            sub_pagination,
+        )
+
+    network_responses = await _gather_ptg2_network_reads(
+        network_snapshots,
+        read_network,
+    )
+    for source_key, snapshot_id, payload in network_responses:
         if not payload:
             continue
         if base_query is None:
@@ -11408,15 +7565,13 @@ async def _search_multi_ptg2_snapshots(
         if items:
             matched_networks.append({"source_key": source_key, "snapshot_id": snapshot_id})
         for item in items:
-            # Copy before tagging -- payload items may come from the response
-            # cache and must not be mutated in place.
             tagged = dict(item)
             if source_key:
                 tagged.setdefault("network", source_key)
             combined.append(tagged)
 
     if base_query is None:
-        # No network produced a payload (e.g. none materialized) -- behave like
+        # No network produced a payload, so behave like
         # the single-snapshot path returning no match.
         return None
 
@@ -11430,6 +7585,7 @@ async def _search_multi_ptg2_snapshots(
     page_items = combined[start:end]
 
     query = dict(base_query)
+    query["source_key"] = None
     query["snapshot_id"] = None
     query["snapshots"] = [snapshot_id for _, snapshot_id in network_snapshots]
     query["networks"] = matched_networks

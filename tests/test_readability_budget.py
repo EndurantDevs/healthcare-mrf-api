@@ -328,6 +328,37 @@ def test_readability_ratchet_rejects_replacement_debt(tmp_path):
     ) == 1
 
 
+def test_readability_ratchet_allows_ordinary_replacement_with_net_reduction(tmp_path):
+    repo_root = tmp_path
+    package = repo_root / "pkg"
+    package.mkdir()
+    module = package / "module.py"
+    module.write_text(
+        "def first_long_function():\n"
+        + "    first_value = 1\n" * 65
+        + "\ndef second_long_function():\n"
+        + "    second_value = 2\n" * 65,
+        encoding="utf-8",
+    )
+    _write_config(repo_root)
+    assert readability_budget.main(["--repo-root", str(repo_root), "--write-baseline"]) == 0
+    base_baseline = repo_root / "readability-base.json"
+    base_baseline.write_text(
+        (repo_root / "readability-baseline.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    module.write_text(
+        "def replacement_long_function():\n" + "    replacement_value = 3\n" * 65,
+        encoding="utf-8",
+    )
+    assert readability_budget.main(["--repo-root", str(repo_root), "--write-baseline"]) == 0
+
+    assert readability_budget.main(
+        ["--repo-root", str(repo_root), "--ratchet-baseline", str(base_baseline)]
+    ) == 0
+
+
 def test_readability_ratchet_holds_at_zero(tmp_path):
     repo_root = tmp_path
     package = repo_root / "pkg"

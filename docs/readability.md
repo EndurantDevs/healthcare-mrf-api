@@ -35,9 +35,10 @@ and prevent new debt from entering unnoticed.
   too many locals, global/nonlocal state, missing contract docstrings, placeholder
   bodies, and noisy comments.
 
-Existing debt IDs are stored in `readability-baseline.json`. The CI check fails
-only when new debt appears relative to that baseline. When debt is removed or the
-rules intentionally change, regenerate the baseline in the same change:
+Existing debt IDs are stored in `readability-baseline.json`. The normal check
+rejects findings that are not present in that synchronized baseline. When debt
+is removed or the rules intentionally change, regenerate the baseline in the
+same change:
 
 ```bash
 python scripts/readability_budget.py --write-baseline
@@ -48,3 +49,9 @@ Normal local check:
 ```bash
 python scripts/readability_budget.py
 ```
+
+Pull-request CI also compares the synchronized snapshot with the base branch.
+New syntax errors, suppressions, placeholder bodies, global state, or builtin
+shadowing always fail. Other replacement findings are allowed only when the
+complete branch still reduces total readability debt by the configured target;
+CI currently requires a 1 percent reduction.

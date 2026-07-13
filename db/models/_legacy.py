@@ -2,11 +2,32 @@
 
 import os
 
-from sqlalchemy import (ARRAY, DATE, JSON, SMALLINT, TEXT, TIMESTAMP,
-                        BigInteger, Boolean, Column, DateTime, Enum, Float,
-                        Integer, LargeBinary, Numeric, PrimaryKeyConstraint,
-                        String, text)
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy import (
+    ARRAY,
+    DATE,
+    JSON,
+    SMALLINT,
+    TEXT,
+    TIMESTAMP,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKeyConstraint,
+    Identity,
+    Index,
+    Integer,
+    LargeBinary,
+    Numeric,
+    PrimaryKeyConstraint,
+    String,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import declared_attr
 
 from db.connection import Base, db
@@ -2025,6 +2046,828 @@ class PTG2ArtifactBlobChunk(Base, JSONOutputMixin):
     raw_byte_count = Column(Integer)
     byte_count = Column(Integer)
     created_at = Column(DateTime)
+
+
+class PTG2V3SnapshotLayout(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_snapshot_layout"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            name="ptg2_v3_snapshot_layout_pkey",
+        ),
+        CheckConstraint(
+            "state IN ('building', 'sealed')",
+            name="ptg2_v3_snapshot_layout_state_check",
+        ),
+        CheckConstraint(
+            "mapping_digest IS NULL OR octet_length(mapping_digest) = 32",
+            name="ptg2_v3_snapshot_layout_mapping_digest_check",
+        ),
+        CheckConstraint(
+            "support_digest IS NULL OR octet_length(support_digest) = 32",
+            name="ptg2_v3_snapshot_layout_support_digest_check",
+        ),
+        CheckConstraint(
+            "logical_byte_count >= 0",
+            name="ptg2_v3_snapshot_layout_logical_byte_count_check",
+        ),
+        Index(
+            "ptg2_v3_snapshot_layout_state_idx",
+            "state",
+            "lease_until",
+            "heartbeat_at",
+        ),
+        Index(
+            "ptg2_v3_snapshot_layout_sealed_mapping_idx",
+            "generation",
+            "mapping_digest",
+            "support_digest",
+            unique=True,
+            postgresql_where=text(
+                "state = 'sealed' AND mapping_digest IS NOT NULL "
+                "AND support_digest IS NOT NULL"
+            ),
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, Identity(), nullable=False)
+    storage_shard_id = Column(SMALLINT, nullable=False, server_default=text("0"))
+    build_token = Column(String(96), nullable=False)
+    generation = Column(String(32), nullable=False)
+    state = Column(String(16), nullable=False)
+    mapping_digest = Column(LargeBinary)
+    support_digest = Column(LargeBinary)
+    layout_manifest = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    logical_byte_count = Column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+    heartbeat_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+    lease_until = Column(DateTime(timezone=True))
+    published_at = Column(DateTime(timezone=True))
+
+
+class PTG2V3LayoutFingerprint(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_layout_fingerprint"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "semantic_fingerprint",
+            name="ptg2_v3_layout_fingerprint_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                "ptg2_v3_snapshot_layout.snapshot_key"
+            ],
+            name="ptg2_v3_layout_fingerprint_snapshot_key_fkey",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "octet_length(semantic_fingerprint) = 32",
+            name="ptg2_v3_layout_fingerprint_digest_check",
+        ),
+        Index(
+            "ptg2_v3_layout_fingerprint_snapshot_key_idx",
+            "snapshot_key",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    semantic_fingerprint = Column(LargeBinary, nullable=False)
+    snapshot_key = Column(BigInteger, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+
+class PTG2V3SnapshotBinding(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_snapshot_binding"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_id",
+            name="ptg2_v3_snapshot_binding_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_id"],
+            [f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}.ptg2_snapshot.snapshot_id"],
+            name="ptg2_v3_snapshot_binding_snapshot_id_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                "ptg2_v3_snapshot_layout.snapshot_key"
+            ],
+            name="ptg2_v3_snapshot_binding_snapshot_key_fkey",
+            ondelete="RESTRICT",
+        ),
+        Index(
+            "ptg2_v3_snapshot_binding_snapshot_key_idx",
+            "snapshot_key",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_id = Column(String(96), nullable=False)
+    snapshot_key = Column(BigInteger, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+
+class PTG2V3SnapshotScope(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_snapshot_scope"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_id",
+            name="ptg2_v3_snapshot_scope_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_id"],
+            [f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}.ptg2_snapshot.snapshot_id"],
+            name="ptg2_v3_snapshot_scope_snapshot_id_fkey",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "octet_length(coverage_scope_id) = 32",
+            name="ptg2_v3_snapshot_scope_coverage_scope_id_check",
+        ),
+        Index(
+            "ptg2_v3_snapshot_scope_lookup_idx",
+            "snapshot_id",
+            "coverage_scope_id",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_id = Column(String(96), nullable=False)
+    plan_id = Column(String(64), nullable=False)
+    plan_market_type = Column(
+        String(32),
+        nullable=False,
+        server_default=text("''"),
+    )
+    coverage_scope_id = Column(LargeBinary, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+
+class PTG2V3CandidateAuditAttestation(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_candidate_audit_attestation"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_id",
+            name="ptg2_v3_candidate_audit_attestation_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_id"],
+            [
+                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                "ptg2_v3_snapshot_scope.snapshot_id"
+            ],
+            name="ptg2_v3_candidate_audit_attestation_snapshot_id_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                "ptg2_v3_snapshot_layout.snapshot_key"
+            ],
+            name="ptg2_v3_candidate_audit_attestation_snapshot_key_fkey",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "octet_length(coverage_scope_id) = 32",
+            name="ptg2_v3_candidate_audit_attestation_scope_check",
+        ),
+        CheckConstraint(
+            "octet_length(source_set_digest) = 32",
+            name="ptg2_v3_candidate_audit_attestation_source_set_check",
+        ),
+        CheckConstraint(
+            "octet_length(audit_sample_digest) = 32",
+            name="ptg2_v3_candidate_audit_attestation_sample_check",
+        ),
+        CheckConstraint(
+            "octet_length(report_digest) = 32",
+            name="ptg2_v3_candidate_audit_attestation_report_check",
+        ),
+        CheckConstraint(
+            "expires_at > attested_at",
+            name="ptg2_v3_candidate_audit_attestation_expiry_check",
+        ),
+        Index(
+            "ptg2_v3_candidate_audit_attestation_snapshot_key_idx",
+            "snapshot_key",
+        ),
+        Index(
+            "ptg2_v3_candidate_audit_attestation_expiry_idx",
+            "expires_at",
+            "activated_at",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_id = Column(String(96), nullable=False)
+    snapshot_key = Column(BigInteger, nullable=False)
+    source_key = Column(String(96), nullable=False)
+    plan_id = Column(String(64), nullable=False)
+    plan_market_type = Column(String(32), nullable=False)
+    coverage_scope_id = Column(LargeBinary, nullable=False)
+    source_set_digest = Column(LargeBinary, nullable=False)
+    audit_sample_digest = Column(LargeBinary, nullable=False)
+    contract = Column(String(64), nullable=False)
+    tool_name = Column(String(64), nullable=False)
+    tool_version = Column(String(32), nullable=False)
+    report_digest = Column(LargeBinary, nullable=False)
+    report = Column(JSONB, nullable=False)
+    attested_at = Column(DateTime(timezone=True), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    activated_at = Column(DateTime(timezone=True))
+
+
+class PTG2V3SnapshotSource(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_snapshot_source"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_id",
+            "source_key",
+            name="ptg2_v3_snapshot_source_pkey",
+        ),
+        UniqueConstraint(
+            "snapshot_id",
+            "source_type",
+            "identity_kind",
+            "identity_sha256",
+            name="ptg2_v3_snapshot_source_identity_key",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_id"],
+            [
+                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                "ptg2_v3_snapshot_scope.snapshot_id"
+            ],
+            name="ptg2_v3_snapshot_source_snapshot_id_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["source_trace_set_hash"],
+            [
+                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                "ptg2_source_trace_set.source_trace_set_hash"
+            ],
+            name="ptg2_v3_snapshot_source_trace_set_hash_fkey",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "source_key >= 0",
+            name="ptg2_v3_snapshot_source_source_key_check",
+        ),
+        CheckConstraint(
+            "source_type <> ''",
+            name="ptg2_v3_snapshot_source_source_type_check",
+        ),
+        CheckConstraint(
+            "identity_kind <> ''",
+            name="ptg2_v3_snapshot_source_identity_kind_check",
+        ),
+        CheckConstraint(
+            "identity_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ptg2_v3_snapshot_source_identity_sha256_check",
+        ),
+        CheckConstraint(
+            "raw_container_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ptg2_v3_snapshot_source_raw_sha256_check",
+        ),
+        CheckConstraint(
+            "(logical_hash_deferred AND logical_json_sha256 IS NULL) OR "
+            "(NOT logical_hash_deferred AND "
+            "logical_json_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ptg2_v3_snapshot_source_logical_sha256_check",
+        ),
+        CheckConstraint(
+            "(identity_kind = 'logical_json_sha256_v1' AND "
+            "NOT logical_hash_deferred AND "
+            "logical_json_sha256 = identity_sha256) OR "
+            "(identity_kind = 'raw_container_sha256_v1' AND "
+            "logical_hash_deferred AND "
+            "raw_container_sha256 = identity_sha256)",
+            name="ptg2_v3_snapshot_source_identity_evidence_check",
+        ),
+        CheckConstraint(
+            "source_trace_set_hash ~ '^[0-9a-f]{64}$'",
+            name="ptg2_v3_snapshot_source_trace_set_hash_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_id = Column(String(96), nullable=False)
+    source_key = Column(Integer, nullable=False)
+    source_type = Column(String(32), nullable=False)
+    identity_kind = Column(String(64), nullable=False)
+    identity_sha256 = Column(String(64), nullable=False)
+    raw_container_sha256 = Column(String(64), nullable=False)
+    logical_json_sha256 = Column(String(64))
+    logical_hash_deferred = Column(Boolean, nullable=False)
+    source_trace_set_hash = Column(String(64), nullable=False)
+
+
+class PTG2V3Block(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_block"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("block_hash", name="ptg2_v3_block_pkey"),
+        CheckConstraint(
+            "octet_length(block_hash) = 32",
+            name="ptg2_v3_block_hash_check",
+        ),
+        CheckConstraint(
+            "format_version = 2",
+            name="ptg2_v3_block_format_version_check",
+        ),
+        CheckConstraint(
+            "codec IN ('none', 'zlib')",
+            name="ptg2_v3_block_codec_check",
+        ),
+        CheckConstraint(
+            "entry_count >= 0",
+            name="ptg2_v3_block_entry_count_check",
+        ),
+        CheckConstraint(
+            "raw_byte_count >= 0",
+            name="ptg2_v3_block_raw_byte_count_check",
+        ),
+        CheckConstraint(
+            "stored_byte_count >= 0",
+            name="ptg2_v3_block_stored_byte_count_check",
+        ),
+        CheckConstraint(
+            "octet_length(payload) = stored_byte_count",
+            name="ptg2_v3_block_payload_size_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "postgresql_partition_by": "HASH (block_hash)",
+        },
+    )
+
+    block_hash = Column(LargeBinary, nullable=False)
+    format_version = Column(SMALLINT, nullable=False)
+    object_kind = Column(String(64), nullable=False)
+    codec = Column(String(16), nullable=False)
+    entry_count = Column(BigInteger, nullable=False)
+    raw_byte_count = Column(BigInteger, nullable=False)
+    stored_byte_count = Column(BigInteger, nullable=False)
+    payload = Column(LargeBinary, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+
+class PTG2V3SnapshotBlock(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_snapshot_block"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "object_kind",
+            "block_key",
+            "fragment_no",
+            name="ptg2_v3_snapshot_block_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                "ptg2_v3_snapshot_layout.snapshot_key"
+            ],
+            name="ptg2_v3_snapshot_block_snapshot_key_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["block_hash"],
+            [
+                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                "ptg2_v3_block.block_hash"
+            ],
+            name="ptg2_v3_snapshot_block_block_hash_fkey",
+        ),
+        CheckConstraint(
+            "fragment_no >= 0",
+            name="ptg2_v3_snapshot_block_fragment_no_check",
+        ),
+        CheckConstraint(
+            "block_key >= 0",
+            name="ptg2_v3_snapshot_block_block_key_check",
+        ),
+        CheckConstraint(
+            "entry_count >= 0",
+            name="ptg2_v3_snapshot_block_entry_count_check",
+        ),
+        Index("ptg2_v3_snapshot_block_block_hash_idx", "block_hash"),
+        Index(
+            "ptg2_v3_snapshot_block_lookup_idx",
+            "snapshot_key",
+            "object_kind",
+            "block_key",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    object_kind = Column(String(64), nullable=False)
+    block_key = Column(BigInteger, nullable=False)
+    fragment_no = Column(Integer, nullable=False)
+    entry_count = Column(BigInteger, nullable=False)
+    block_hash = Column(LargeBinary, nullable=False)
+
+
+class PTG2V3GraphOwner(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_graph_owner"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "direction",
+            "owner_key",
+            name="ptg2_v3_graph_owner_pkey",
+        ),
+        CheckConstraint(
+            "direction BETWEEN 1 AND 4",
+            name="ptg2_v3_graph_owner_direction_check",
+        ),
+        CheckConstraint(
+            "first_chunk >= 0",
+            name="ptg2_v3_graph_owner_first_chunk_check",
+        ),
+        CheckConstraint(
+            "member_offset >= 0 AND member_offset < 65536",
+            name="ptg2_v3_graph_owner_member_offset_check",
+        ),
+        CheckConstraint(
+            "member_count >= 0",
+            name="ptg2_v3_graph_owner_member_count_check",
+        ),
+        Index(
+            "ptg2_v3_graph_owner_lookup_idx",
+            "snapshot_key",
+            "direction",
+            "owner_key",
+            postgresql_include=[
+                "first_chunk",
+                "member_offset",
+                "member_count",
+            ],
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    direction = Column(SMALLINT, nullable=False)
+    owner_key = Column(BigInteger, nullable=False)
+    first_chunk = Column(Integer, nullable=False)
+    member_offset = Column(Integer, nullable=False)
+    member_count = Column(BigInteger, nullable=False)
+
+
+class PTG2V3Code(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_code"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "code_key",
+            name="ptg2_v3_code_pkey",
+        ),
+        UniqueConstraint(
+            "snapshot_key",
+            "coverage_scope_id",
+            "reported_code_system",
+            "reported_code",
+            "negotiation_arrangement",
+            "billing_code_type_version",
+            "source_name",
+            "source_description",
+            name="ptg2_v3_code_identity_key",
+            postgresql_nulls_not_distinct=True,
+        ),
+        UniqueConstraint(
+            "snapshot_key",
+            "code_global_id_128",
+            name="ptg2_v3_code_global_id_key",
+        ),
+        CheckConstraint(
+            "octet_length(code_global_id_128) = 16",
+            name="ptg2_v3_code_global_id_check",
+        ),
+        CheckConstraint(
+            "octet_length(coverage_scope_id) = 32",
+            name="ptg2_v3_code_coverage_scope_id_check",
+        ),
+        CheckConstraint(
+            "rate_count >= 0",
+            name="ptg2_v3_code_rate_count_check",
+        ),
+        CheckConstraint(
+            "code_key >= 0",
+            name="ptg2_v3_code_code_key_check",
+        ),
+        Index(
+            "ptg2_v3_code_lookup_idx",
+            "snapshot_key",
+            "coverage_scope_id",
+            "reported_code_system",
+            "reported_code",
+            postgresql_include=["code_key", "negotiation_arrangement", "rate_count"],
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    code_key = Column(Integer, nullable=False)
+    code_global_id_128 = Column(LargeBinary, nullable=False)
+    coverage_scope_id = Column(LargeBinary, nullable=False)
+    reported_code_system = Column(TEXT)
+    reported_code = Column(TEXT)
+    negotiation_arrangement = Column(TEXT)
+    billing_code_type_version = Column(TEXT)
+    source_name = Column(TEXT)
+    source_description = Column(TEXT)
+    rate_count = Column(BigInteger, nullable=False)
+
+
+class PTG2V3ProviderSet(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_provider_set"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "provider_set_key",
+            name="ptg2_v3_provider_set_pkey",
+        ),
+        UniqueConstraint(
+            "snapshot_key",
+            "provider_set_global_id_128",
+            name="ptg2_v3_provider_set_global_id_key",
+        ),
+        CheckConstraint(
+            "octet_length(provider_set_global_id_128) = 16",
+            name="ptg2_v3_provider_set_global_id_check",
+        ),
+        CheckConstraint(
+            "provider_count >= 0",
+            name="ptg2_v3_provider_set_provider_count_check",
+        ),
+        CheckConstraint(
+            "provider_set_key >= 0",
+            name="ptg2_v3_provider_set_key_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    provider_set_key = Column(Integer, nullable=False)
+    provider_set_global_id_128 = Column(LargeBinary, nullable=False)
+    provider_count = Column(BigInteger, nullable=False)
+    network_names = Column(ARRAY(TEXT), nullable=False, server_default=text("ARRAY[]::text[]"))
+
+
+class PTG2V3ProviderGroup(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_provider_group"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "provider_group_key",
+            name="ptg2_v3_provider_group_pkey",
+        ),
+        UniqueConstraint(
+            "snapshot_key",
+            "provider_group_global_id_128",
+            name="ptg2_v3_provider_group_global_id_key",
+        ),
+        CheckConstraint(
+            "octet_length(provider_group_global_id_128) = 16",
+            name="ptg2_v3_provider_group_global_id_check",
+        ),
+        CheckConstraint(
+            "provider_group_key >= 0",
+            name="ptg2_v3_provider_group_key_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    provider_group_key = Column(Integer, nullable=False)
+    provider_group_global_id_128 = Column(LargeBinary, nullable=False)
+
+
+class PTG2V3PriceAttr(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_price_attr"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "attribute_kind",
+            "attribute_key",
+            name="ptg2_v3_price_attr_pkey",
+        ),
+        UniqueConstraint(
+            "snapshot_key",
+            "attribute_kind",
+            "value",
+            name="ptg2_v3_price_attr_value_key",
+            postgresql_nulls_not_distinct=True,
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    attribute_kind = Column(String(32), nullable=False)
+    attribute_key = Column(Integer, nullable=False)
+    value = Column(TEXT)
+
+
+class PTG2V3NPIScope(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_npi_scope"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "npi",
+            name="ptg2_v3_npi_scope_pkey",
+        ),
+        CheckConstraint(
+            "npi > 0",
+            name="ptg2_v3_npi_scope_npi_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "postgresql_partition_by": "HASH (snapshot_key)",
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    npi = Column(BigInteger, nullable=False)
+
+
+class PTG2V3AuditOccurrence(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_audit_occurrence"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "occurrence_id",
+            name="ptg2_v3_audit_occurrence_pkey",
+        ),
+        CheckConstraint(
+            "octet_length(occurrence_id) = 32",
+            name="ptg2_v3_audit_occurrence_id_check",
+        ),
+        CheckConstraint(
+            "code_key >= 0",
+            name="ptg2_v3_audit_occurrence_code_key_check",
+        ),
+        CheckConstraint(
+            "provider_set_key >= 0",
+            name="ptg2_v3_audit_occurrence_provider_set_key_check",
+        ),
+        CheckConstraint(
+            "price_key >= 0",
+            name="ptg2_v3_audit_occurrence_price_key_check",
+        ),
+        CheckConstraint(
+            "source_key >= 0",
+            name="ptg2_v3_audit_occurrence_source_key_check",
+        ),
+        CheckConstraint(
+            "npi BETWEEN 1000000000 AND 9999999999",
+            name="ptg2_v3_audit_occurrence_npi_check",
+        ),
+        CheckConstraint(
+            "atom_ordinal >= 0",
+            name="ptg2_v3_audit_occurrence_atom_ordinal_check",
+        ),
+        CheckConstraint(
+            "atom_key >= 0",
+            name="ptg2_v3_audit_occurrence_atom_key_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "postgresql_partition_by": "HASH (snapshot_key)",
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    occurrence_id = Column(LargeBinary(32), nullable=False)
+    code_key = Column(Integer, nullable=False)
+    provider_set_key = Column(Integer, nullable=False)
+    price_key = Column(BigInteger, nullable=False)
+    source_key = Column(Integer, nullable=False)
+    npi = Column(BigInteger, nullable=False)
+    atom_ordinal = Column(BigInteger, nullable=False)
+    atom_key = Column(BigInteger, nullable=False)
+
+
+class PTG2V3GCCandidate(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_gc_candidate"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "block_hash",
+            name="ptg2_v3_gc_candidate_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["block_hash"],
+            [
+                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                "ptg2_v3_block.block_hash"
+            ],
+            name="ptg2_v3_gc_candidate_block_hash_fkey",
+            ondelete="CASCADE",
+        ),
+        Index("ptg2_v3_gc_candidate_eligible_at_idx", "eligible_at"),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+
+    block_hash = Column(LargeBinary, nullable=False)
+    eligible_at = Column(DateTime(timezone=True), nullable=False)
+    queued_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
 
 
 class PTG2Plan(Base, JSONOutputMixin):

@@ -70,6 +70,8 @@ async def _latest_snapshot_date(session, table_exists: dict[str, bool]) -> str:
 
 @blueprint.get("/statistics", name="coverage.statistics")
 async def coverage_statistics(request):
+    """Summarize coverage availability across published datasets."""
+
     session = _get_session(request)
 
     tracked_tables = [

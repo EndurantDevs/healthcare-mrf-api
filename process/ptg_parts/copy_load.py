@@ -392,6 +392,8 @@ async def _copy_compact_serving_rate_source(source, *, target_table: str = "ptg2
 
 
 async def _copy_ptg2_dictionary_file(copy_path: Path, kind: str, *, target_table: str | None = None) -> None:
+    """Copy one non-empty PTG dictionary shard into its staging table."""
+
     if not copy_path.exists() or copy_path.stat().st_size <= 0:
         return
     specs = {

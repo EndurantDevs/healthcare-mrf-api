@@ -119,20 +119,6 @@
         "performance": false
       },
       "variants": ["raw_chunk_1m"]
-    },
-    {
-      "id": "ptg-pilot-import",
-      "kind": "import_control_pilot",
-      "variants": ["parse_in_workers"],
-      "params": {
-        "test_mode": true,
-        "max_files": 1,
-        "max_items": 1000,
-        "reuse_raw_artifacts": true,
-        "resource_class": "small",
-        "_expected_queue": "arq:PTGSmall",
-        "_expected_worker_class": "process.PTGSmall"
-      }
     }
   ]
 }

@@ -14,32 +14,37 @@ import pytest
 
 
 COPY_ENV_BY_KIND = {
-    "compact": "HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH",
-    "manifest_lean_serving": "HLTHPRT_PTG2_MANIFEST_LEAN_SERVING_COPY_PATH",
-    "manifest_price_atom": "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH",
-    "manifest_price_set_atom": "HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH",
-    "manifest_provider_group_member": "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH",
-    "manifest_code_count": "HLTHPRT_PTG2_MANIFEST_CODE_COUNT_COPY_PATH",
-    "manifest_provider_set_dictionary": "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COPY_PATH",
-    "procedure": "HLTHPRT_PTG2_PROCEDURE_COPY_PATH",
-    "price_code_set": "HLTHPRT_PTG2_PRICE_CODE_SET_COPY_PATH",
-    "price_atom": "HLTHPRT_PTG2_PRICE_ATOM_COPY_PATH",
-    "price_set_entry": "HLTHPRT_PTG2_PRICE_SET_ENTRY_COPY_PATH",
-    "provider_set": "HLTHPRT_PTG2_PROVIDER_SET_COPY_PATH",
-    "provider_set_component": "HLTHPRT_PTG2_PROVIDER_SET_COMPONENT_COPY_PATH",
-    "provider_set_entry": "HLTHPRT_PTG2_PROVIDER_SET_ENTRY_COPY_PATH",
-    "provider_entry_component": "HLTHPRT_PTG2_PROVIDER_ENTRY_COMPONENT_COPY_PATH",
-    "provider_group_member": "HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH",
+    "price_atom": "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH",
+    "price_set_atom": "HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH",
+    "provider_group_member": "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH",
 }
 
 SIDECAR_ENV_BY_KIND = {
     "provider_forward": "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH",
     "provider_inverted": "HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH",
-    "provider_npi": "HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_PATH",
-    "price_forward": "HLTHPRT_PTG2_MANIFEST_PRICE_FORWARD_SIDECAR_PATH",
 }
 
+LEGACY_OUTPUT_ENVS = (
+    "HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH",
+    "HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH",
+    "HLTHPRT_PTG2_MANIFEST_LEAN_SERVING_COPY_PATH",
+    "HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_PATH",
+    "HLTHPRT_PTG2_MANIFEST_PRICE_FORWARD_SIDECAR_PATH",
+    "HLTHPRT_PTG2_MANIFEST_CODE_COUNT_COPY_PATH",
+    "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COPY_PATH",
+    "HLTHPRT_PTG2_PROCEDURE_COPY_PATH",
+    "HLTHPRT_PTG2_PRICE_CODE_SET_COPY_PATH",
+    "HLTHPRT_PTG2_PRICE_ATOM_COPY_PATH",
+    "HLTHPRT_PTG2_PRICE_SET_ENTRY_COPY_PATH",
+    "HLTHPRT_PTG2_PROVIDER_SET_COPY_PATH",
+    "HLTHPRT_PTG2_PROVIDER_SET_COMPONENT_COPY_PATH",
+    "HLTHPRT_PTG2_PROVIDER_SET_ENTRY_COPY_PATH",
+    "HLTHPRT_PTG2_PROVIDER_ENTRY_COMPONENT_COPY_PATH",
+    "HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH",
+)
+
 HEX_ID_PATTERN = re.compile(rb"(?<![0-9a-f])[0-9a-f]{32,64}(?![0-9a-f])")
+SERVING_RUN_RECORD_BYTES = 52
 
 
 def _built_scanner_binary() -> Path:
@@ -139,13 +144,19 @@ def _canonical_rows_digest(rows: tuple[bytes, ...]) -> str:
     return hashlib.sha256(b"\n".join(rows)).hexdigest()
 
 
-def _scanner_environment(workers: int, queue_size: int | None) -> dict[str, str]:
-    return {
+def _scanner_environment(
+    workers: int, queue_size: int | None, serving_run_directory: Path
+) -> dict[str, str]:
+    env = {
         **os.environ,
-        "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "snapshot-parallelism-v2",
-        "HLTHPRT_PTG2_COMPACT_PLAN_ID": "plan-parallelism-v2",
-        "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "plan-month-parallelism-v2",
-        "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "trace-parallelism-v2",
+        "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v3",
+        "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID": (b"\xcc" * 32).hex(),
+        "HLTHPRT_PTG2_V3_SERVING_RUN_DIR": str(serving_run_directory),
+        "HLTHPRT_PTG2_V3_SERVING_RUN_PARTITIONS": "4",
+        "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "snapshot-parallelism-v3",
+        "HLTHPRT_PTG2_COMPACT_PLAN_ID": "plan-parallelism-v3",
+        "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "plan-month-parallelism-v3",
+        "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "trace-parallelism-v3",
         "HLTHPRT_PTG2_MANIFEST_ONLY": "false",
         "HLTHPRT_PTG2_RUST_WORKERS": str(workers),
         "HLTHPRT_PTG2_RUST_WORK_QUEUE": str(queue_size or max(workers * 2, 2)),
@@ -162,19 +173,43 @@ def _scanner_environment(workers: int, queue_size: int | None) -> dict[str, str]
         "HLTHPRT_PTG2_COMPACT_SERVING_COPY_ROTATE_BYTES": "0",
         "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS": "false",
     }
+    for env_name in (
+        *COPY_ENV_BY_KIND.values(),
+        *SIDECAR_ENV_BY_KIND.values(),
+        *LEGACY_OUTPUT_ENVS,
+    ):
+        env.pop(env_name, None)
+    return env
+
+
+def _serving_run_records(frames: list[tuple[str, dict]]) -> tuple[bytes, ...]:
+    records = []
+    for record_kind, payload in frames:
+        if record_kind != "v3_serving_run_partition_file":
+            continue
+        run_payload = Path(payload["path"]).read_bytes()
+        assert len(run_payload) % SERVING_RUN_RECORD_BYTES == 0
+        records.extend(
+            run_payload[offset : offset + SERVING_RUN_RECORD_BYTES]
+            for offset in range(0, len(run_payload), SERVING_RUN_RECORD_BYTES)
+        )
+    return tuple(sorted(records))
 
 
 def _scanner_run_result(
     frames: list[tuple[str, dict]],
     copy_path_by_kind: dict[str, Path],
     sidecar_path_by_kind: dict[str, Path],
+    run_dir: Path,
 ) -> dict:
     copy_rows_by_kind = {
         kind: _sorted_copy_rows(copy_path)
         for kind, copy_path in copy_path_by_kind.items()
     }
+    serving_records = _serving_run_records(frames)
     return {
         "frames": frames,
+        "run_dir": run_dir,
         "copy_rows": copy_rows_by_kind,
         "copy_digests": {
             kind: _canonical_rows_digest(copy_output_rows)
@@ -184,6 +219,8 @@ def _scanner_run_result(
             kind: hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
             for kind, sidecar_path in sidecar_path_by_kind.items()
         },
+        "serving_records": serving_records,
+        "serving_digest": hashlib.sha256(b"".join(serving_records)).hexdigest(),
         "ids": {
             global_id.decode("ascii")
             for copy_output_rows in copy_rows_by_kind.values()
@@ -205,10 +242,12 @@ def _run_parallel_scanner(
     env_overrides: dict[str, str] | None = None,
 ) -> dict:
     run_dir.mkdir()
-    selected_copy_kinds = copy_kinds or tuple(COPY_ENV_BY_KIND)
+    selected_copy_kinds = tuple(COPY_ENV_BY_KIND) if copy_kinds is None else copy_kinds
     copy_path_by_kind = {kind: run_dir / f"{kind}.copy" for kind in selected_copy_kinds}
     sidecar_path_by_kind = {kind: run_dir / f"{kind}.sidecar" for kind in sidecar_kinds}
-    scanner_env_map = _scanner_environment(workers, queue_size)
+    scanner_env_map = _scanner_environment(
+        workers, queue_size, run_dir / "serving-runs"
+    )
     scanner_env_map.update(
         {COPY_ENV_BY_KIND[kind]: str(copy_path) for kind, copy_path in copy_path_by_kind.items()}
     )
@@ -228,27 +267,9 @@ def _run_parallel_scanner(
         timeout=120,
     )
     frames = _parse_scanner_frames(completed.stdout)
-    return _scanner_run_result(frames, copy_path_by_kind, sidecar_path_by_kind)
-
-
-def _combine_scanner_output_groups(groups: list[dict]) -> dict:
-    copy_rows_by_kind = {
-        kind: output_rows
-        for group in groups
-        for kind, output_rows in group["copy_rows"].items()
-    }
-    return {
-        "frames": groups[0]["frames"],
-        "copy_rows": copy_rows_by_kind,
-        "copy_digests": {
-            kind: _canonical_rows_digest(output_rows)
-            for kind, output_rows in copy_rows_by_kind.items()
-        },
-        "sidecar_digests": {
-            kind: digest for group in groups for kind, digest in group["sidecar_digests"].items()
-        },
-        "ids": set().union(*(group["ids"] for group in groups)),
-    }
+    return _scanner_run_result(
+        frames, copy_path_by_kind, sidecar_path_by_kind, run_dir
+    )
 
 
 @pytest.fixture(scope="module")
@@ -257,23 +278,13 @@ def scanner_parallelism_runs(tmp_path_factory):
     base = tmp_path_factory.mktemp("ptg2-scanner-parallelism")
     artifact = base / "rates.json.gz"
     _write_gzip_json(artifact, _scanner_fixture_payload())
-    output_kind_groups = (
-        tuple(COPY_ENV_BY_KIND)[:8],
-        tuple(COPY_ENV_BY_KIND)[8:],
-    )
     return {
-        workers: _combine_scanner_output_groups(
-            [
-                _run_parallel_scanner(
-                    scanner_binary,
-                    artifact,
-                    base / f"workers-{workers}-group-{group_index}",
-                    workers=workers,
-                    copy_kinds=copy_kinds,
-                    sidecar_kinds=tuple(SIDECAR_ENV_BY_KIND) if group_index == 0 else (),
-                )
-                for group_index, copy_kinds in enumerate(output_kind_groups)
-            ]
+        workers: _run_parallel_scanner(
+            scanner_binary,
+            artifact,
+            base / f"workers-{workers}",
+            workers=workers,
+            sidecar_kinds=tuple(SIDECAR_ENV_BY_KIND),
         )
         for workers in (1, 8, 16)
     }
@@ -347,6 +358,8 @@ def test_scanner_outputs_are_identical_with_1_8_and_16_workers(scanner_paralleli
         assert candidate["copy_rows"] == baseline["copy_rows"]
         assert candidate["copy_digests"] == baseline["copy_digests"]
         assert candidate["sidecar_digests"] == baseline["sidecar_digests"]
+        assert candidate["serving_records"] == baseline["serving_records"]
+        assert candidate["serving_digest"] == baseline["serving_digest"]
         assert candidate["ids"] == baseline["ids"]
         assert _single_frame(candidate, "dedupe_summary") == baseline_dedupe
 
@@ -376,6 +389,8 @@ def test_scanner_metric_contract_exposes_dense_fixture_bottleneck_split(scanner_
     summary = _single_frame(scanner_parallelism_runs[8], "scanner_summary")
 
     assert config["scanner_metric_contract_version"] == 2
+    assert config["snapshot_arch"] == "postgres_binary_v3"
+    assert config["storage_generation"] == "shared_blocks_v3"
     assert config["execution_mode"] == "parallel_top_level_bytes"
     assert config["provider_reference_order"] == "before_in_network"
     assert config["top_level_byte_scan_selected"] is True

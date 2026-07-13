@@ -1,0 +1,105 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Address and contact fields removed when no verified location may be shown."""
+
+PTG_CONTACT_DETAIL_FIELDS = (
+    "fax_number_digits",
+    "phone_extension",
+    "fax_extension",
+)
+
+PTG2_LEGACY_ADDRESS_COLUMNS = {
+    "npi",
+    "type",
+    "checksum",
+    "address_key",
+    "state_name",
+    "city_name",
+    "postal_code",
+    "country_code",
+    "lat",
+    "long",
+    "first_line",
+    "second_line",
+    "telephone_number",
+    "fax_number",
+    "phone_number",
+    "phone_extension",
+    "fax_number_digits",
+    "fax_extension",
+}
+PTG2_UNIFIED_ADDRESS_COLUMNS = PTG2_LEGACY_ADDRESS_COLUMNS | {
+    "address_precision",
+}
+
+PTG_NO_DISPLAY_ADDRESS_FIELDS = {
+    "address",
+    "formatted_address",
+    "address_key",
+    "city",
+    "state",
+    "zip5",
+    "zip_code",
+    "postal_code",
+    "lat",
+    "long",
+    "latitude",
+    "longitude",
+    "distance",
+    "distance_miles",
+    "zip_match_type",
+    "coordinates",
+    "google_maps_url",
+    "google_map_url",
+    "maps_url",
+    "phone",
+    "telephone",
+    "telephone_number",
+    "phone_number",
+    "fax",
+    "fax_number",
+    *PTG_CONTACT_DETAIL_FIELDS,
+    "location_hash",
+    "location_source",
+    "location_confidence_code",
+    "address_sources",
+    "address_precision",
+    "source_count",
+    "multi_source_confirmed",
+    "source_mask",
+    "address_source_mask",
+}
+
+PTG_NO_DISPLAY_VERIFICATION_FIELDS = {
+    "location_source",
+    "location_confidence_code",
+    "address_precision",
+    "address_sources",
+    "source_count",
+    "multi_source_confirmed",
+    "source_mask",
+    "address_source_mask",
+    "provider_directory_source_id",
+    "provider_directory_org_name",
+    "provider_directory_plan_name",
+    "provider_directory_location_resource_id",
+    "provider_directory_location_name",
+    "provider_directory_plan_context_matched",
+    "provider_directory_network_name_matched",
+    "provider_directory_network_context_present",
+    "provider_directory_network_refs",
+    "provider_directory_network_names",
+    "provider_directory_network_matches",
+    "provider_directory_insurance_plan_refs",
+    "provider_directory_insurance_plan_matches",
+    "provider_directory_match_type",
+    "address_verification_evidence",
+}
+
+
+__all__ = [
+    "PTG2_LEGACY_ADDRESS_COLUMNS",
+    "PTG2_UNIFIED_ADDRESS_COLUMNS",
+    "PTG_CONTACT_DETAIL_FIELDS",
+    "PTG_NO_DISPLAY_ADDRESS_FIELDS",
+    "PTG_NO_DISPLAY_VERIFICATION_FIELDS",
+]

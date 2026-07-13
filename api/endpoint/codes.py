@@ -78,6 +78,8 @@ def _restricted_public_filter(column):
 
 @blueprint.get("/")
 async def list_codes(request):
+    """List normalized reference codes with bounded filtering and paging."""
+
     session = _get_session(request)
     args = request.args
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
@@ -164,6 +166,8 @@ async def list_codes(request):
 
 @blueprint.get("/<code_system>/<code>")
 async def get_code(request, code_system: str, code: str):
+    """Return one normalized code-system entry when it exists."""
+
     session = _get_session(request)
     normalized_system = _normalize_code_system(code_system)
     normalized_code = _canonical_code_for_system(normalized_system, code)
@@ -187,6 +191,8 @@ async def get_code(request, code_system: str, code: str):
 
 @blueprint.get("/<code_system>/<code>/related")
 async def get_related_codes(request, code_system: str, code: str):
+    """Return bounded crosswalk relationships for one reference code."""
+
     session = _get_session(request)
     normalized_system = _normalize_code_system(code_system)
     normalized_code = _canonical_code_for_system(normalized_system, code)

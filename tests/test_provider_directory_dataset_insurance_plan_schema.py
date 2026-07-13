@@ -92,9 +92,12 @@ def test_dataset_insurance_plan_migration_creates_and_backfills_projection(
         for table_item in recorded_table["items"]
         if isinstance(table_item, sa.Column)
     ]
-    assert recorded_columns == list(
-        ProviderDirectoryDatasetInsurancePlan.__table__.columns.keys()
-    )
+    assert recorded_columns == [
+        "dataset_id",
+        "resource_id",
+        "payload_hash",
+        "payload_json",
+    ]
     foreign_key = next(
         table_item
         for table_item in recorded_table["items"]

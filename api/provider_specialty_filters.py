@@ -261,6 +261,10 @@ def specialty_resolution_cache() -> SpecialtyResolutionCache:
     return _SPECIALTY_RESOLUTION_CACHE
 
 
+class DynamicSpecialtyResolutionError(RuntimeError):
+    """PostgreSQL could not resolve a PTG specialty request deterministically."""
+
+
 _NORMALIZED_SPECIALTY_CLASSIFICATION_ALIASES: dict[str, str] = {
     variant: classification
     for alias, classification in _SPECIALTY_CLASSIFICATION_ALIASES.items()
@@ -325,7 +329,27 @@ class ProviderSpecialtyFilter:
         return payload
 
 
-def resolve_provider_specialty_filter(args: Mapping[str, Any]) -> ProviderSpecialtyFilter:
+def _static_specialty_lookup(term: str, include_subspecialties: bool = True) -> tuple[str, ...]:
+    for variant in _specialty_key_variants(term):
+        codes = _SPECIALTY_TAXONOMY_CODE_ALIASES.get(variant)
+        if codes:
+            return codes
+    return ()
+
+
+def _static_specialty_suggestions(term: str, count: int = 3) -> tuple[str, ...]:
+    key = _normalize_specialty_key(term)
+    if not key:
+        return ()
+    return tuple(difflib.get_close_matches(key, _SPECIALTY_TAXONOMY_CODE_ALIASES.keys(), n=count, cutoff=0.75))
+
+
+def _resolve_provider_specialty_filter(
+    args: Mapping[str, Any],
+    *,
+    specialty_lookup,
+    specialty_suggestions,
+) -> ProviderSpecialtyFilter:
     specialty = str(args.get("specialty") or "").strip()
     classification = str(args.get("classification") or "").strip()
     taxonomy_codes = _normalize_taxonomy_codes(args.get("taxonomy_codes"))
@@ -336,9 +360,7 @@ def resolve_provider_specialty_filter(args: Mapping[str, Any]) -> ProviderSpecia
 
     key = _normalize_specialty_key(specialty)
     if not taxonomy_codes and specialty:
-        taxonomy_codes = _SPECIALTY_RESOLUTION_CACHE.lookup(
-            specialty, include_subspecialties=include_subspecialties
-        )
+        taxonomy_codes = specialty_lookup(specialty, include_subspecialties)
     if not classification and key in _NORMALIZED_SPECIALTY_CLASSIFICATION_ALIASES:
         classification = _NORMALIZED_SPECIALTY_CLASSIFICATION_ALIASES[key]
     unresolved_specialty: str | None = None
@@ -350,7 +372,7 @@ def resolve_provider_specialty_filter(args: Mapping[str, Any]) -> ProviderSpecia
         # unresolved_specialty and decide (guard: informative 400; list
         # endpoints: warn and skip the filter).
         unresolved_specialty = specialty
-        suggested_specialties = _SPECIALTY_RESOLUTION_CACHE.suggestions(specialty)
+        suggested_specialties = specialty_suggestions(specialty)
     use_classification_predicate = True
     classification_key = classification.lower()
     if (
@@ -371,6 +393,52 @@ def resolve_provider_specialty_filter(args: Mapping[str, Any]) -> ProviderSpecia
         use_classification_predicate=use_classification_predicate,
         unresolved_specialty=unresolved_specialty,
         suggested_specialties=suggested_specialties,
+    )
+
+
+def resolve_provider_specialty_filter(args: Mapping[str, Any]) -> ProviderSpecialtyFilter:
+    """Resolve a specialty using the legacy process-global cache.
+
+    Claims and NPI surfaces retain this compatibility path.  PTG handlers use
+    ``resolve_ptg_provider_specialty_filter`` so each dynamic alias is read
+    from PostgreSQL for that request.
+    """
+
+    return _resolve_provider_specialty_filter(
+        args,
+        specialty_lookup=_SPECIALTY_RESOLUTION_CACHE.lookup,
+        specialty_suggestions=_SPECIALTY_RESOLUTION_CACHE.suggestions,
+    )
+
+
+async def resolve_ptg_provider_specialty_filter(session, args: Mapping[str, Any]) -> ProviderSpecialtyFilter:
+    """Resolve a PTG specialty without filesystem or process-global state."""
+
+    resolved = _resolve_provider_specialty_filter(
+        args,
+        specialty_lookup=_static_specialty_lookup,
+        specialty_suggestions=_static_specialty_suggestions,
+    )
+    if resolved.active or not resolved.specialty or _normalize_taxonomy_codes(args.get("taxonomy_codes")):
+        return resolved
+
+    try:
+        from api.provider_specialty_cache_entries import load_dynamic_specialty_entry
+
+        entry = await load_dynamic_specialty_entry(session, _specialty_key_variants, resolved.specialty)
+    except Exception as exc:
+        raise DynamicSpecialtyResolutionError(
+            "Specialty resolution is unavailable; the request was not run without its specialty filter."
+        ) from exc
+    if entry is None:
+        return resolved
+
+    all_codes, base_codes = entry
+    selected_codes = all_codes if resolved.include_subspecialties else base_codes
+    return _resolve_provider_specialty_filter(
+        {**args, "taxonomy_codes": selected_codes},
+        specialty_lookup=_static_specialty_lookup,
+        specialty_suggestions=_static_specialty_suggestions,
     )
 
 

@@ -24,7 +24,7 @@
   MRF-source unified rebuild, and live NPI detail compatibility before the
   address migration is applied.
 - Added phase-based live progress events for canonical address stamping and
-  archive resolve; events reuse the existing async Redis/import-control progress
+  archive resolve; events reuse the existing async Redis/operator progress
   path and no-op when no controlled import context is active.
 - Added `HLTHPRT_ADDRESS_CANON_STAMP_SHARDS` as an ops override for canonical
   address stamp sharding, with focused unit coverage and runbook guidance.
@@ -59,11 +59,11 @@
   `addr_key_v1(text,text,text,text,text,text)` remain installed; `git diff
   --check` and `python -m compileall -q api process db alembic tests` passed.
   PostGIS migration matrix was validated in
-  `healthporta_address_canon_postgis_test` with PostGIS `3.6.1`, including a
+  `mrf_address_canon_postgis_test` with PostGIS `3.6.1`, including a
   downgrade/upgrade cycle and the conditional `address_archive_v2_geo_idx`.
   Current live local healthcare-mrf-api smoke on `127.0.0.1:8085` returned
   `200` for healthcheck, `npi/all`, `npi/id`, and pricing score against an
-  unmigrated `healthporta` DB, proving fallback readers.
+  pre-migration `mrf_dev` DB, proving fallback readers.
 - Current focused post-review verification: `tests/test_address_canonical_unit.py`
   plus `tests/test_address_checksum_schema.py` `40 passed`;
   `tests/test_address_canonical_db.py` `14 passed` against disposable Postgres
@@ -77,7 +77,7 @@
   `HLTHPRT_ADDRESS_ARCHIVE_TABLE=address_archive_v2`: geo, NUCC, CMS doctors,
   facility anchors, provider enrichment, NPPES, marketplace MRF, Part D,
   pharmacy license, archive migration, and `entity-address-unified` were run in
-  order on a wiped `healthporta` dev schema. Resulting source-key coverage:
+  order on a wiped `mrf_dev` schema. Resulting source-key coverage:
   CMS doctors `5000/5000`, facility anchors `501/501`, FFS addresses
   `1408/1408`, NPI addresses `2818/2818`, MRF addresses `376/376`, pharmacy
   license `10/10`, unified addresses `8688/10174`, archive rows `4169`, and

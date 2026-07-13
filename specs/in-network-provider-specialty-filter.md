@@ -1,10 +1,10 @@
 # In-Network Provider Specialty Filtering for Group Plans
 
 **Status:** Proposed · **Date:** 2026-06-24 · **Owner:** TBD
-**Scope:** healthcare-mrf-api (engine/serving + enumeration endpoint), api-layer (proxy routes), api-mcp (member tools)
-**Related:** `specs/import-control-plane/*`, the `group_plan_providers` enumeration endpoint (`api/endpoint/pricing.py`), the PTG2 serving search (`api/ptg2_serving.py`).
+**Scope:** healthcare-mrf-api engine, serving, and enumeration endpoints plus implementation-neutral API consumers
+**Related:** the `group_plan_providers` enumeration endpoint (`api/endpoint/pricing.py`) and the PTG2 serving search (`api/ptg2_serving.py`).
 
-This spec is self-contained: a coding agent can pick it up cold. Every "current behavior" claim cites code read in the working tree or a live result captured against api-dev/mcp-dev on 2026-06-23/24.
+This spec is self-contained: a coding agent can pick it up cold. Every "current behavior" claim cites public service code or a reproducible development result.
 
 ---
 
@@ -31,10 +31,10 @@ Transparency-in-Coverage (TiC) in-network files — the source of a group plan's
 ## 3. Current behavior (what's broken) — evidence
 
 1. **The serving-search `specialty` filter is a no-op for minimal-layout snapshots.** In `api/ptg2_serving.py` the specialty predicate (`nucc.display_name LIKE :specialty_like`, ~L1601–1610 and L1654–1658) is only emitted inside two branches: one gated on `serving_tables.provider_group_location_table` (~L1583) and one built `FROM {provider_set_component_table} … JOIN {provider_group_member_table}` (~L1633–1660). The affected layout has **neither** `provider_group_location_table` **nor** `provider_set_component_table` (only `provider_group_member_table`), so no specialty predicate is applied. A synthetic regression request for `plan_id=TESTPLAN001` must return a strict subset when `specialty=Family%20Medicine` is added.
-2. **`classification` is ignored by the serving search** — only `specialty` is read (`api/ptg2_serving.py` ~L1551). (`searchPricingProvidersByProcedure` advertises `classification`/`taxonomy_codes` at the api-layer edge, but the serving engine drops them.)
+2. **`classification` is ignored by the serving search** — only `specialty` is read (`api/ptg2_serving.py` ~L1551). External callers may send `classification`/`taxonomy_codes`, but the serving engine drops them.
 3. **The group-plan enumeration endpoint has no specialty filter at all** — `api/endpoint/pricing.py::group_plan_providers` enumerates every in-network NPI with no taxonomy constraint.
-4. **api-mcp `find_group_plan_providers` cannot scope by specialty** — no param.
-5. (Secondary) **api-mcp `call_operation` empties plan-scoped pricing results** — `searchPricingProvidersByProcedure` via `call_operation` returns `[]` while the native `search_providers_by_procedure` tool and a raw api-layer curl return data; `_normalize_claims_provider_specialty_aliases` mangles the plan-scoped query.
+4. **Some automation clients cannot scope provider enumeration by specialty** because they do not expose the parameter.
+5. (Secondary) Client wrappers must preserve plan-scoped pricing query parameters and return the same data as direct HTTP requests.
 
 ## 4. Goals / non-goals
 
@@ -55,7 +55,7 @@ Add a **single, layout-independent specialty predicate** that filters by joining
 - **A. Serving/pricing search** (`api/ptg2_serving.py`): when neither `provider_group_location_table` nor `provider_set_component_table` is available, filter on `provider_group_member.npi` directly via NPPES. When they *are* available, keep the existing (more selective) path but ensure it uses the same NUCC matching rules.
 - **B. Group-plan enumeration** (`api/endpoint/pricing.py::group_plan_providers`): add a taxonomy join + filter on the enumerated DISTINCT NPIs.
 
-Surface the params up through api-layer and api-mcp. Specialty resolution (free text/classification → NUCC code set) is shared logic (one helper) so all entry points agree.
+Expose the parameters through the public HTTP contract. Specialty resolution (free text/classification -> NUCC code set) is shared logic so all entry points agree.
 
 ## 6. Specialty resolution & PCP taxonomy set (the critical correctness detail)
 
@@ -103,14 +103,14 @@ Resolution rules:
   (keyset pagination preserved; `npi_taxonomy.npi` is indexed.)
 - Response unchanged except an echo of the resolved `taxonomy_code_set` for transparency.
 
-### 7.3 api-layer (`src/routes/claims_ratings.rs`)
+### 7.3 External gateways
 - Add `specialty`, `classification`, `taxonomy_codes`, `include_subspecialties` to the **allowed params** of `pricing_group_plan_providers` (the pricing-search route already forwards `specialty`/`classification`/`taxonomy_codes`; verify they reach the serving engine unchanged).
 
-### 7.4 api-mcp (`healthporta_mcp/mcp_server.py`)
-- `find_group_plan_providers`: add `specialty` / `classification` params; forward to the enumeration endpoint.
-- `search_providers_by_procedure`: ensure `specialty`/`classification`/`taxonomy_codes` forward (today it forwards plan params + `include_providers`; add the taxonomy params).
+### 7.4 Automation clients
+- Provider-enumeration clients should expose `specialty` / `classification` and forward them to the public endpoint.
+- Procedure-search clients should forward `specialty`/`classification`/`taxonomy_codes` together with plan parameters and `include_providers`.
 - Tool descriptions: for a member search, **default to specialty-scoped** — instruct the agent to pass the member's needed specialty (or `specialty=primary care`) so an off-specialty provider is never proposed.
-- (Secondary, separate ticket) Fix `_normalize_claims_provider_specialty_aliases` so plan-scoped `searchPricingProvidersByProcedure` via `call_operation` returns the same data as the native tool.
+- Add parity tests proving wrapped and direct calls return the same plan-scoped data.
 
 ## 8. Acceptance criteria
 
@@ -118,19 +118,19 @@ Resolution rules:
 2. `searchPricingProvidersByProcedure?plan_id=TESTPLAN001&market_type=group&code=99214&include_providers=true&specialty=Family%20Medicine` returns **only** family-medicine in-network providers near the location, each with the negotiated rate. The result set is a **strict subset** of the unfiltered call (proving the filter is applied, not ignored).
 3. `classification=Internal%20Medicine` (without `include_subspecialties=true`) returns general internists and **excludes** cardiologists (`207RC0000X`) and other IM subspecialists.
 4. Works for both synthetic minimal-layout and fuller-layout snapshots.
-5. api-mcp `find_group_plan_providers(org_name="Example Group Plan", specialty="primary care")` returns only PCPs.
+5. An automation-client call for `plan_id=TESTPLAN001` and `specialty="primary care"` returns only PCPs.
 
 ## 9. Testing
 
 - **Unit:** specialty resolver (§6) — `"family medicine"`/`"primary care"`/`classification=Internal Medicine` → expected code sets; assert cardiology code is excluded from the IM general set. (`healthcare-mrf-api/tests/`)
 - **Engine/integration:** seed a tiny snapshot with provider_group_member NPIs of mixed taxonomies; assert the specialty filter returns only matching NPIs in both minimal and location/set_component layouts. (`tests/test_npi_api*` / a new `tests/test_group_plan_provider_specialty.py`)
-- **api-mcp:** extend `support/verify_conversations.py` with a "covered PCP near member with negotiated price" scenario that asserts every returned NPI's taxonomy matches.
+- **API consumers:** add a "covered PCP near member with negotiated price" scenario that asserts every returned NPI's taxonomy matches.
 - **Regression:** a test that fails if a specialty filter is silently dropped (compare filtered vs unfiltered count and taxonomy of results).
 
 ## 10. Rollout & migration
 
 - No schema migration; uses existing `mrf.npi_taxonomy`. Confirm an index on `npi_taxonomy.npi` exists (it does — created by the NPI loader).
-- Deploy order: healthcare-mrf-api (engine + endpoint) → api-layer (param passthrough) → api-mcp (tool params). Each independently deployable; api-mcp degrades gracefully (omitting specialty = current behavior) until the engine ships.
+- Deploy order: public engine and endpoint first, then external gateway parameter passthrough and automation-client updates. Each component remains independently deployable.
 - Backward compatible: all new params optional; absent = today's behavior.
 
 ## 11. Risks & mitigations
@@ -143,4 +143,4 @@ Resolution rules:
 ## 12. Out of scope / future
 
 - Surfacing per-NPI negotiated rate for an arbitrary specialty-correct provider (today the rate is per provider-set; if a specialty-correct in-network provider isn't in a priced set, fall back to the plan's set-level negotiated rate for the code with a clear caveat).
-- A combined one-call orchestrator (`find_covered_providers(org, specialty, procedure, location)`) that returns specialty-correct, in-network, priced providers in a single MCP call — natural follow-up once the filter lands.
+- A combined one-call client operation (`find_covered_providers(plan, specialty, procedure, location)`) that returns specialty-correct, in-network, priced providers is a natural follow-up once the filter lands.

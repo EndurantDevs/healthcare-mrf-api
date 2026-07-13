@@ -4,8 +4,14 @@ import json
 import types
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+
+from api.ptg2_candidate_audit import (
+    PTG2_CANDIDATE_AUDIT_ACCESS_ARG,
+    PTG2_CANDIDATE_AUDIT_HEADER,
+)
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "api" / "endpoint" / "pricing.py"
 MODULE_SPEC = spec_from_file_location("pricing_endpoint_unit", MODULE_PATH)
@@ -79,31 +85,20 @@ def make_request(results, args=None):
     )
 
 
-FIXTURE_ALLOWED_TABLE_NAMES = (
-    "mrf.ptg_allowed_item_fixture_import",
-    "mrf.ptg_allowed_payment_fixture_import",
-    "mrf.ptg_allowed_provider_payment_fixture_import",
-)
-FIXTURE_ALLOWED_ROW_BY_FIELD = {
-    "npi": 1427166008,
-    "plan_id": "TESTPLAN001",
-    "billing_code_type": "CPT",
-    "billing_code": "99214",
-    "allowed_amount": 133.0,
-    "billed_charge": 155.0,
-    "tin_type": "ein",
-    "tin_value": "123456789",
-}
-FIXTURE_IMPORT_ROW_BY_FIELD = {
-    "source_file_import_id": "fixture_import",
-    "source_key": "ptg_fixture",
-    "snapshot_id": "ptg2:202607:smile",
-    "metrics": {"plan_count": 1},
-}
-
-
 async def fake_plan_snapshot_pairs(_session, _plan_fields):
     return [("ptg_test", "ptg2:test")]
+
+
+def strict_snapshot_tables(snapshot_id="ptg2:test"):
+    snapshot_keys = {
+        "ptg2:test": 17,
+        "ptg2:test:ndc": 41,
+        "ptg2:test:c2": 42,
+    }
+    return types.SimpleNamespace(
+        uses_shared_blocks=True,
+        shared_snapshot_key=snapshot_keys[snapshot_id],
+    )
 
 
 @pytest.mark.asyncio
@@ -158,7 +153,7 @@ async def test_group_plan_providers_filters_to_ten_digit_npis(monkeypatch):
         return "ptg2:test"
 
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
-        return types.SimpleNamespace(provider_group_member_table="mrf.ptg2_provider_group_member_test")
+        return strict_snapshot_tables(_snapshot_id)
 
     monkeypatch.setattr(
         pricing_module,
@@ -194,12 +189,9 @@ async def test_group_plan_providers_filters_to_ten_digit_npis(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_group_plan_providers_pages_v2_npi_scope(monkeypatch):
+async def test_group_plan_providers_pages_strict_v3_npi_scope(monkeypatch):
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
-        return types.SimpleNamespace(
-            provider_group_member_table=None,
-            provider_npi_scope_table="mrf.ptg2_provider_npi_scope_test",
-        )
+        return strict_snapshot_tables(_snapshot_id)
 
     monkeypatch.setattr(
         pricing_module,
@@ -217,7 +209,8 @@ async def test_group_plan_providers_pages_v2_npi_scope(monkeypatch):
 
     assert [pricing_item["npi"] for pricing_item in pricing_response["providers"]["items"]] == [1234567890]
     sql = str(request.ctx.sa_session.executions[0][0][0])
-    assert "FROM mrf.ptg2_provider_npi_scope_test gm" in sql
+    assert "FROM mrf.ptg2_v3_npi_scope" in sql
+    assert "snapshot_key = ANY(:snapshot_keys)" in sql
 
 
 @pytest.mark.asyncio
@@ -226,7 +219,7 @@ async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
         return "ptg2:test"
 
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
-        return types.SimpleNamespace(provider_group_member_table="mrf.ptg2_provider_group_member_test")
+        return strict_snapshot_tables(_snapshot_id)
 
     monkeypatch.setattr(
         pricing_module,
@@ -266,12 +259,95 @@ async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_group_plan_providers_does_not_refresh_legacy_specialty_cache(monkeypatch):
+    async def fail_if_called(_session):
+        raise AssertionError("PTG request must not use the process-global specialty cache")
+
+    async def fake_snapshot_serving_tables(_session, _snapshot_id):
+        return strict_snapshot_tables(_snapshot_id)
+
+    monkeypatch.setattr(
+        pricing_module,
+        "ensure_specialty_resolution_cache",
+        fail_if_called,
+        raising=False,
+    )
+    monkeypatch.setattr(pricing_module, "current_source_snapshot_ids_for_plan", fake_plan_snapshot_pairs)
+    monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
+    request = make_request(
+        [FakeResult(rows=[types.SimpleNamespace(npi=1234567890)])],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "specialty": "Family Medicine",
+            "limit": "10",
+        },
+    )
+
+    response = await group_plan_providers(request)
+
+    assert json.loads(response.body)["providers"]["items"] == [{"npi": 1234567890}]
+
+
+@pytest.mark.asyncio
+async def test_plan_scoped_search_resolves_dynamic_specialty_without_legacy_cache(monkeypatch):
+    seen_argument_map = {}
+
+    async def fail_if_called(_session):
+        raise AssertionError("PTG request must not use the process-global specialty cache")
+
+    async def fake_search(_session, args, pagination):
+        seen_argument_map.update(args)
+        return {
+            "items": [],
+            "pagination": {
+                "total": 0,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2", "plan_id": args["plan_id"]},
+        }
+
+    monkeypatch.setattr(
+        pricing_module,
+        "ensure_specialty_resolution_cache",
+        fail_if_called,
+        raising=False,
+    )
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request = make_request(
+        [
+            FakeResult(rows=[{
+                "target_system": "NUCC",
+                "target_code": "2085R0202X",
+                "metadata_json": None,
+            }]),
+        ],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "70551",
+            "specialty": "imaging specialist",
+            "limit": "10",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+
+    assert json.loads(response.body)["query"]["source"] == "ptg2"
+    assert seen_argument_map["taxonomy_codes"] == ("2085R0202X",)
+    assert len(request.ctx.sa_session.executions) == 1
+    assert "FROM mrf.terminology_synonym" in str(request.ctx.sa_session.executions[0][0][0])
+
+
+@pytest.mark.asyncio
 async def test_group_plan_providers_classification_internal_medicine_uses_base_taxonomy(monkeypatch):
     async def fake_snapshot_id(_session, _plan_fields):
         return "ptg2:test"
 
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
-        return types.SimpleNamespace(provider_group_member_table="mrf.ptg2_provider_group_member_test")
+        return strict_snapshot_tables(_snapshot_id)
 
     monkeypatch.setattr(
         pricing_module,
@@ -313,7 +389,7 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
         return "ptg2:test"
 
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
-        return types.SimpleNamespace(provider_group_member_table="mrf.ptg2_provider_group_member_test")
+        return strict_snapshot_tables(_snapshot_id)
 
     monkeypatch.setattr(
         pricing_module,
@@ -404,7 +480,7 @@ async def test_group_plan_providers_widens_zip_filter_to_radius_by_default(monke
     """zip5 should mean 'this ZIP plus zip_radius_miles' (default 10), not strict equality."""
 
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
-        return types.SimpleNamespace(provider_group_member_table="mrf.ptg2_provider_group_member_test")
+        return strict_snapshot_tables(_snapshot_id)
 
     async def fake_zip_radius_rows(_session, *, zip5, radius_miles, state_hint=None, **_kwargs):
         assert zip5 == "60601"
@@ -449,7 +525,7 @@ async def test_group_plan_providers_drives_from_local_specialty_candidates(monke
     not walk the member table probing per-NPI EXISTS."""
 
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
-        return types.SimpleNamespace(provider_group_member_table="mrf.ptg2_provider_group_member_test")
+        return strict_snapshot_tables(_snapshot_id)
 
     async def fake_zip_radius_rows(_session, *, zip5, radius_miles, state_hint=None, **_kwargs):
         return [{"zip5": "60601"}, {"zip5": "60602"}]
@@ -494,13 +570,8 @@ async def test_group_plan_providers_unions_all_published_network_snapshots(monke
     async def fake_network_snapshot_pairs(_session, _plan_fields):
         return [("ptg_ndc", "ptg2:test:ndc"), ("ptg_c2", "ptg2:test:c2")]
 
-    member_table_by_snapshot = {
-        "ptg2:test:ndc": "mrf.ptg2_provider_group_member_ndc",
-        "ptg2:test:c2": "mrf.ptg2_provider_group_member_c2",
-    }
-
     async def fake_snapshot_serving_tables(_session, snapshot_id):
-        return types.SimpleNamespace(provider_group_member_table=member_table_by_snapshot[snapshot_id])
+        return strict_snapshot_tables(snapshot_id)
 
     monkeypatch.setattr(pricing_module, "current_source_snapshot_ids_for_plan", fake_network_snapshot_pairs)
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
@@ -523,7 +594,8 @@ async def test_group_plan_providers_unions_all_published_network_snapshots(monke
         {"source_key": "ptg_c2", "snapshot_id": "ptg2:test:c2", "enumerated": True},
     ]
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
-    assert "SELECT npi FROM mrf.ptg2_provider_group_member_ndc UNION ALL SELECT npi FROM mrf.ptg2_provider_group_member_c2" in provider_sql
+    assert "SELECT npi FROM mrf.ptg2_v3_npi_scope" in provider_sql
+    assert "snapshot_key = ANY(:snapshot_keys)" in provider_sql
     assert "(SELECT npi FROM" in provider_sql
 
 
@@ -534,13 +606,8 @@ async def test_group_plan_providers_splits_multi_network_postal_scans(monkeypatc
     async def fake_network_snapshot_pairs(_session, _plan_fields):
         return [("ptg_ndc", "ptg2:test:ndc"), ("ptg_c2", "ptg2:test:c2")]
 
-    member_table_by_snapshot = {
-        "ptg2:test:ndc": "mrf.ptg2_provider_group_member_ndc",
-        "ptg2:test:c2": "mrf.ptg2_provider_group_member_c2",
-    }
-
     async def fake_snapshot_serving_tables(_session, snapshot_id):
-        return types.SimpleNamespace(provider_group_member_table=member_table_by_snapshot[snapshot_id])
+        return strict_snapshot_tables(snapshot_id)
 
     async def fake_postal_radius_rows(_session, **keyword_args):
         return [{"zip5": keyword_args["zip5"]}, {"zip5": "60602"}]
@@ -574,11 +641,12 @@ async def test_group_plan_providers_splits_multi_network_postal_scans(monkeypatc
     first_member_query_sql = str(request.ctx.sa_session.executions[0][0][0])
     second_member_query_sql = str(request.ctx.sa_session.executions[1][0][0])
     first_member_query_params = request.ctx.sa_session.executions[0][0][1]
-    assert "FROM mrf.ptg2_provider_group_member_ndc gm" in first_member_query_sql
-    assert "FROM mrf.ptg2_provider_group_member_c2 gm" in second_member_query_sql
+    assert "FROM mrf.ptg2_v3_npi_scope gm" in first_member_query_sql
+    assert "FROM mrf.ptg2_v3_npi_scope gm" in second_member_query_sql
     assert "UNION ALL" not in first_member_query_sql
     assert "UNION ALL" not in second_member_query_sql
     assert "EXISTS (" in first_member_query_sql
+    assert first_member_query_params["split_snapshot_key"] == 41
     assert first_member_query_params["limit"] == 10
     assert first_member_query_params["location_zips"] == ["60601", "60602"]
 
@@ -591,7 +659,7 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
         return "ptg2:test"
 
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
-        return types.SimpleNamespace(provider_group_member_table="mrf.ptg2_provider_group_member_test")
+        return strict_snapshot_tables(_snapshot_id)
 
     async def fake_group_plan_provider_address_source(_session):
         return "mrf.entity_address_unified", True, True, True
@@ -2254,6 +2322,94 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_public_procedure_route_cannot_escalate_to_candidate(monkeypatch):
+    seen_argument_map = {}
+
+    async def fake_search(_session, args, pagination):
+        seen_argument_map.update(args)
+        return {
+            "items": [],
+            "pagination": {
+                "total": 0,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2"},
+        }
+
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "operator-secret")
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request = make_request(
+        [FakeResult(scalar=1)],
+        args={
+            "plan_id": "12-3456789",
+            "plan_market_type": "group",
+            "source_key": "source_a",
+            "snapshot_id": "candidate-snapshot",
+            "code": "70551",
+        },
+    )
+    request.route = types.SimpleNamespace(
+        name="pricing.providers.search_by_procedure"
+    )
+    request.headers = {
+        PTG2_CANDIDATE_AUDIT_HEADER: "candidate-snapshot",
+        "Authorization": "Bearer operator-secret",
+    }
+
+    await list_providers_by_procedure(request)
+
+    assert PTG2_CANDIDATE_AUDIT_ACCESS_ARG not in seen_argument_map
+
+
+@pytest.mark.asyncio
+async def test_audit_procedure_route_attaches_exact_candidate_capability(monkeypatch):
+    seen_argument_map = {}
+
+    async def fake_search(_session, args, pagination):
+        seen_argument_map.update(args)
+        return {
+            "items": [],
+            "pagination": {
+                "total": 0,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2"},
+        }
+
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "operator-secret")
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request = make_request(
+        [FakeResult(scalar=1)],
+        args={
+            "plan_id": "12-3456789",
+            "plan_market_type": "group",
+            "source_key": "source_a",
+            "snapshot_id": "candidate-snapshot",
+            "code": "70551",
+        },
+    )
+    request.route = types.SimpleNamespace(
+        name="pricing.providers.audit_search_by_procedure"
+    )
+    request.headers = {
+        PTG2_CANDIDATE_AUDIT_HEADER: "candidate-snapshot",
+        "Authorization": "Bearer operator-secret",
+    }
+
+    await list_providers_by_procedure(request)
+
+    access = seen_argument_map[PTG2_CANDIDATE_AUDIT_ACCESS_ARG]
+    assert access.snapshot_id == "candidate-snapshot"
+    assert access.source_key == "source_a"
+    assert access.plan_id == "12-3456789"
+    assert access.plan_market_type == "group"
+
+
+@pytest.mark.asyncio
 async def test_list_providers_by_procedure_infers_ptg_code_system(monkeypatch):
     observed_search_args_by_name = {}
 
@@ -2284,32 +2440,11 @@ async def test_list_providers_by_procedure_infers_ptg_code_system(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_list_providers_by_procedure_falls_back_to_allowed_amount_evidence(monkeypatch):
-    async def fake_search(_session, _args, _pagination):
-        return None
-
-    async def fake_allowed(_session, args, pagination):
-        return {
-            "result_state": "allowed_amounts_found",
-            "pricing_scope": "plan_scoped_allowed_amounts",
-            "items": [
-                {
-                    "npi": 1427166008,
-                    "network_status": "out_of_network_or_not_confirmed_in_network",
-                    "prices": [{"source": "allowed_amounts", "allowed_amount": 133.0}],
-                }
-            ],
-            "pagination": {
-                "total": 1,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
-            "query": {"source": "ptg_allowed_amounts", "plan_id": args["plan_id"]},
-        }
-
-    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
-    monkeypatch.setattr(pricing_module, "_search_ptg_allowed_amount_evidence", fake_allowed)
+async def test_list_providers_by_procedure_rejects_allowed_amounts_before_ptg_search(
+    monkeypatch,
+):
+    strict_search = AsyncMock()
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", strict_search)
     request = make_request(
         [],
         args={
@@ -2318,239 +2453,54 @@ async def test_list_providers_by_procedure_falls_back_to_allowed_amount_evidence
             "code": "99203",
             "zip5": "60601",
             "year": "2023",
+            "include_allowed_amounts": "true",
         },
     )
 
-    response = await list_providers_by_procedure(request)
-    pricing_response = json.loads(response.body)
+    with pytest.raises(
+        pricing_module.InvalidUsage,
+        match="include_allowed_amounts.*not supported",
+    ):
+        await list_providers_by_procedure(request)
 
-    assert pricing_response["result_state"] == "allowed_amounts_found"
-    assert pricing_response["pricing_scope"] == "plan_scoped_allowed_amounts"
-    assert pricing_response["items"][0]["network_status"] == "out_of_network_or_not_confirmed_in_network"
-    assert pricing_response["items"][0]["prices"][0]["source"] == "allowed_amounts"
-    assert pricing_response["query"]["year_semantics"] == "ignored_for_plan_scoped_ptg_rates"
+    strict_search.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_allowed_amount_empty_ptg_fallback(monkeypatch):
-    async def fake_search(_session, _args, pagination):
-        return {
-            "items": [],
-            "pagination": {
-                "total": 0,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
-            "query": {"source": "ptg2", "status": "no_match"},
-        }
+async def test_plan_scoped_ptg_miss_does_not_query_allowed_amounts_by_default(
+    monkeypatch,
+):
+    strict_search = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        strict_search,
+    )
 
-    async def fake_allowed(_session, args, pagination):
-        return {
-            "result_state": "allowed_amounts_found",
-            "pricing_scope": "plan_scoped_allowed_amounts",
-            "items": [{"npi": 1427166008, "allowed_amount_min": 133.0}],
-            "pagination": {
-                "total": 1,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
-            "query": {"source": "ptg_allowed_amounts", "plan_id": args["plan_id"]},
-        }
-
-    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
-    monkeypatch.setattr(pricing_module, "_search_ptg_allowed_amount_evidence", fake_allowed)
     request = make_request(
         [],
-        args={"plan_id": "TESTPLAN001", "market_type": "group", "code": "99203", "zip5": "60601"},
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "99203",
+            "snapshot_id": "strict-v3-snapshot",
+        },
     )
-
     response = await list_providers_by_procedure(request)
-    pricing_response = json.loads(response.body)
+    payload = json.loads(response.body)
 
-    assert pricing_response["result_state"] == "allowed_amounts_found"
-    assert pricing_response["items"][0]["allowed_amount_min"] == 133.0
-    assert pricing_response["query"]["source"] == "ptg_allowed_amounts"
-
-
-@pytest.mark.asyncio
-async def test_allowed_amount_search_checks_tables_and_allows_single_plan_alias(monkeypatch):
-    """Allowed-amount fallback tolerates catalog-plan aliases for single-plan files."""
-    checked_tables = []
-
-    async def has_test_table(_session, table_name):
-        checked_tables.append(table_name)
-        return True
-
-    async def fake_import_rows(_session, _args, *, plan_id):
-        assert plan_id == "7862274fdc01bcc0"
-        return [FIXTURE_IMPORT_ROW_BY_FIELD]
-
-    plan_id_filters = []
-
-    async def fake_allowed_rows(_session, *, table_names, plan_id, code, code_system, npi, limit):
-        assert table_names == FIXTURE_ALLOWED_TABLE_NAMES
-        assert code == "99214"
-        assert code_system == "CPT"
-        assert npi is None
-        assert limit > 0
-        plan_id_filters.append(plan_id)
-        return [] if plan_id else [FIXTURE_ALLOWED_ROW_BY_FIELD]
-
-    async def fake_provider_rows(_session, *, npis, **_kwargs):
-        assert npis == (1427166008,)
-        return []
-
-    monkeypatch.setattr(pricing_module, "_table_exists", has_test_table)
-    monkeypatch.setattr(pricing_module, "_allowed_amount_import_rows_for_plan", fake_import_rows)
-    monkeypatch.setattr(pricing_module, "_allowed_amount_rows_from_tables", fake_allowed_rows)
-    monkeypatch.setattr(pricing_module, "_ptg2_manifest_enriched_provider_rows_for_npis", fake_provider_rows)
-
-    fallback_payload = await pricing_module._search_ptg_allowed_amount_evidence(
-        FakeSession(),
-        {"plan_id": "7862274fdc01bcc0", "market_type": "group", "code": "99214", "code_system": "CPT"},
-        types.SimpleNamespace(limit=3, offset=0, page=1),
-    )
-
-    assert fallback_payload["result_state"] == "allowed_amounts_found"
-    assert fallback_payload["pricing_scope"] == "plan_scoped_allowed_amounts"
-    assert fallback_payload["items"][0]["network_status"] == "out_of_network_or_not_confirmed_in_network"
-    assert fallback_payload["items"][0]["prices"][0]["allowed_amount"] == 133.0
-    assert plan_id_filters == ["7862274fdc01bcc0", ""]
-    assert checked_tables == ["hp_import_control.source_file_import", *FIXTURE_ALLOWED_TABLE_NAMES]
+    assert payload["pricing_scope"] == "plan_scoped_ptg"
+    assert payload["items"] == []
+    strict_search.assert_awaited_once()
+    assert request.ctx.sa_session.executions == []
 
 
 @pytest.mark.asyncio
-async def test_allowed_amount_import_rows_include_file_plan_candidates():
-    session = FakeSession(
-        [
-            FakeResult([]),
-            FakeResult(
-                [
-                    {
-                        "source_file_import_id": "candidate_import",
-                        "snapshot_id": "ptg2:202607:candidate",
-                        "source_key": "ptg_candidate",
-                        "import_month": "2026-07-01",
-                        "attempt_no": 1,
-                        "metrics": {"plan_count": 1},
-                    }
-                ]
-            ),
-        ]
-    )
-
-    rows = await pricing_module._allowed_amount_import_rows_for_plan(
-        session,
-        {"market_type": "group"},
-        plan_id="TESTPLAN001",
-    )
-
-    assert [row["source_file_import_id"] for row in rows] == ["candidate_import"]
-    assert len(session.executions) == 2
-
-
-@pytest.mark.asyncio
-async def test_allowed_amount_rows_cast_optional_npi_bind():
-    session = FakeSession([FakeResult([]), FakeResult([])])
-
-    await pricing_module._allowed_amount_rows_from_tables(
-        session,
-        table_names=FIXTURE_ALLOWED_TABLE_NAMES,
-        plan_id="TESTPLAN001",
-        code="99214",
-        code_system="CPT",
-        npi=None,
-        limit=1,
-    )
-
-    sql_text = str(session.executions[1][0][0])
-    assert "CAST(:npi AS bigint) IS NULL" in sql_text
-    assert "expanded.npi = CAST(:npi AS bigint)" in sql_text
-    assert "'out_of_network_or_not_confirmed_in_network'::text AS network_status" in sql_text
-
-
-@pytest.mark.asyncio
-async def test_allowed_amount_rows_select_network_columns_when_present():
-    session = FakeSession([
-        FakeResult([("network_status",), ("network_semantics",)]),
-        FakeResult([]),
-    ])
-
-    await pricing_module._allowed_amount_rows_from_tables(
-        session,
-        table_names=FIXTURE_ALLOWED_TABLE_NAMES,
-        plan_id="TESTPLAN001",
-        code="99214",
-        code_system="CPT",
-        npi=None,
-        limit=1,
-    )
-
-    sql_text = str(session.executions[1][0][0])
-    assert "ap.network_status AS network_status" in sql_text
-    assert "ap.network_semantics AS network_semantics" in sql_text
-
-
-@pytest.mark.asyncio
-async def test_allowed_amount_search_returns_in_network_allowed_amounts(monkeypatch):
-    async def has_allowed_amount_table(_session, _table_name):
-        return True
-
-    async def fake_import_rows(_session, _args, *, plan_id):
-        assert plan_id == "7862274fdc01bcc0"
-        return [FIXTURE_IMPORT_ROW_BY_FIELD]
-
-    async def fake_allowed_rows(_session, *, table_names, plan_id, code, code_system, npi, limit):
-        assert table_names == FIXTURE_ALLOWED_TABLE_NAMES
-        assert plan_id == "7862274fdc01bcc0"
-        assert code == "99214"
-        assert code_system == "CPT"
-        assert npi is None
-        assert limit > 0
-        return [
-            {
-                **FIXTURE_ALLOWED_ROW_BY_FIELD,
-                "network_status": "in_network",
-                "network_semantics": "in_network_historical_allowed_amounts",
-            }
-        ]
-
-    async def fake_provider_rows(_session, *, npis, **_kwargs):
-        assert npis == (1427166008,)
-        return [{"npi": 1427166008, "provider_name": "Confirmed Network Clinic"}]
-
-    monkeypatch.setattr(pricing_module, "_table_exists", has_allowed_amount_table)
-    monkeypatch.setattr(pricing_module, "_allowed_amount_import_rows_for_plan", fake_import_rows)
-    monkeypatch.setattr(pricing_module, "_allowed_amount_rows_from_tables", fake_allowed_rows)
-    monkeypatch.setattr(pricing_module, "_ptg2_manifest_enriched_provider_rows_for_npis", fake_provider_rows)
-
-    allowed_search_response = await pricing_module._search_ptg_allowed_amount_evidence(
-        FakeSession(),
-        {"plan_id": "7862274fdc01bcc0", "market_type": "group", "code": "99214", "code_system": "CPT"},
-        types.SimpleNamespace(limit=3, offset=0, page=1),
-    )
-
-    assert allowed_search_response is not None
-    assert allowed_search_response["query"]["network_semantics"] == "in_network_historical_allowed_amounts"
-    assert allowed_search_response["sources"][0]["network_status"] == "in_network"
-    assert allowed_search_response["warnings"][0]["code"] == "allowed_amounts_not_negotiated_rates"
-    assert allowed_search_response["items"][0]["network_status"] == "in_network"
-    assert allowed_search_response["items"][0]["price_summary"][0]["network_status"] == "in_network"
-    assert allowed_search_response["items"][0]["prices"][0]["network_semantics"] == "in_network_historical_allowed_amounts"
-
-
-@pytest.mark.asyncio
-async def test_list_providers_by_procedure_can_disable_allowed_amount_fallback(monkeypatch):
-    async def fake_search(_session, _args, _pagination):
-        return None
-
-    async def fail_allowed(*_args, **_kwargs):
-        raise AssertionError("allowed amount fallback should be disabled")
-
-    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
-    monkeypatch.setattr(pricing_module, "_search_ptg_allowed_amount_evidence", fail_allowed)
+async def test_plan_scoped_ptg_miss_does_not_query_allowed_amounts_when_false(
+    monkeypatch,
+):
+    strict_search = AsyncMock(return_value=None)
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", strict_search)
     request = make_request(
         [],
         args={
@@ -2567,6 +2517,8 @@ async def test_list_providers_by_procedure_can_disable_allowed_amount_fallback(m
     assert pricing_response["items"] == []
     assert pricing_response["result_state"] == "no_snapshot_for_plan"
     assert pricing_response["query"]["source"] == "ptg2"
+    strict_search.assert_awaited_once()
+    assert request.ctx.sa_session.executions == []
 
 
 @pytest.mark.asyncio

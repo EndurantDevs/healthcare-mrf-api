@@ -21,6 +21,8 @@ PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
 
 
 async def _enrich_ptg2_code_details(session, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    """Attach requested code-catalog details to a PTG pricing response."""
+
     if not _request_bool(args.get("include_code_details")):
         return payload
 

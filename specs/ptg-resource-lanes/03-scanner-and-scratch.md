@@ -6,8 +6,8 @@
 - Keep Rust panic unwind behavior; do not set `panic = "abort"`.
 - Keep `DISTINCT ON` publish dedupe as a correctness backstop during this rollout.
 - Use parse-in-workers where the lane profile enables it. Current dev enables it
-  for all PTG lanes and uses lane-specific worker/queue overrides from
-  import-control.
+  for all PTG lanes and uses lane-specific worker/queue overrides supplied by
+  the external orchestrator.
 - Continue splitting large negotiated-rate arrays with
   `HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES`.
 

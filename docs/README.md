@@ -1,7 +1,5 @@
 # healthcare-mrf-api Documentation
 
-[![HealthPorta](https://app.healthporta.com/brand/healthporta-logo-2x.png)](https://app.healthporta.com/docs)
-
 This directory is the public documentation tree for `healthcare-mrf-api`.
 It is intended for readers on GitHub who need to understand:
 
@@ -43,13 +41,9 @@ Useful starting points:
 - [`../specs/drug_claims_v1.md`](../specs/drug_claims_v1.md)
 - [`../specs/import_swap_backup_policy.md`](../specs/import_swap_backup_policy.md)
 
-## Commercial Usage
-If you need managed production access instead of running the repository yourself, use [HealthPorta Docs](https://app.healthporta.com/docs).
+## External Integration
 
-HealthPorta provides:
-
-- hosted API access for current healthcare pricing, provider, plan, pharmacy, and Medicare-derived datasets
-- MCP-based integration for AI agents and internal company tooling
-- a production-ready data interface for external client applications and internal operational systems
-
-MCP and agent integration details are available at [HealthPorta MCP](https://app.healthporta.com/mcp).
+The documented HTTP contracts are implementation-neutral. An external
+application, gateway, or automation client can authenticate and consume them
+without requiring knowledge of a particular operator dashboard or control
+service.

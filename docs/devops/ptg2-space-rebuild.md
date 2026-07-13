@@ -1,179 +1,108 @@
-# PTG2 Dev Space Rebuild Runbook
+# Strict PTG V3 Dev Reimport Runbook
 
-This runbook covers the dev-server workflow for replacing a large current
-legacy PTG2 source snapshot with the current lean storage layout, then removing
-only the verified old snapshot.
-
-Use this for current snapshots that are still referenced by
-`mrf.ptg2_current_source_snapshot` or `mrf.ptg2_current_plan_source`. Do not use
-the non-current GC runbook for these; current snapshots must be rebuilt,
-compared, repointed by the importer, and only then removed.
+Use this runbook to replace obsolete PTG snapshots with the only supported
+architecture: `postgres_binary_v3` and `shared_blocks_v3`.
 
 ## Safety Rules
 
-- Pause PTG dispatch before starting, or the scheduler can immediately consume
-  reclaimed space with unrelated planned imports.
-- Rebuild from stored `mrf.ptg2_import_run.options`; do not hand-copy payer URLs
-  into tickets or chat.
-- Compare old and new snapshots before removal.
-- Treat row samples and retained serving artifacts as required checks. For both
-  PostgreSQL binary architectures, retained serving and relationship artifacts
-  are PostgreSQL rows, not pod-local files.
-- Remove one old source snapshot at a time.
-- Keep the job output JSON and post-cleanup metrics in the incident/report
-  folder.
+- Pause new PTG dispatch and let active publication transactions finish.
+- Apply the strict V3 database migration before deploying the writer or reader.
+- Reimport through the normal external orchestration path from stored source
+  options; do not copy private source URLs into tickets or chat.
+- Keep original JSON or gzip inputs only as bounded validation scratch. Strict
+  serving is PostgreSQL-only.
+- Do not remove an old snapshot until the new snapshot passes direct source
+  exactness, API latency, storage, and pointer checks.
 
-## 1. Pause PTG Dispatch
+## 1. Capture Baseline
 
-Set the dev import-control PTG capacity to zero and confirm active slots drain:
+Record database size, import scratch usage, active PTG runs, and current source
+and plan pointers. Use `pg_total_relation_size` for PostgreSQL evidence; pod
+filesystem size is not a substitute.
 
-```bash
-curl -sS -X PATCH \
-  -H "Authorization: Bearer ${HP_IMPORT_CONTROL_API_TOKEN}" \
-  -H "Content-Type: application/json" \
-  --data '{"ptg_slot_capacity":0}' \
-  http://127.0.0.1:8095/v1/nodes/local_mrf
-```
+## 2. Deploy Migration And Writer First
 
-Keep it at zero while disk is tight.
+Run the healthcare MRF migration Job and verify one Alembic head. Update the
+worker Job image, but leave the currently serving API Deployment on its prior
+image while active plans are rebuilt. Strict V3 deliberately has no old-snapshot
+reader, so switching the API first would make any remaining old pointer
+unservable.
 
-## 2. Capture Baseline Metrics
+Confirm the worker's effective configuration reports:
 
-Capture filesystem and database size before rebuilding:
+- `HLTHPRT_PTG2_SNAPSHOT_ARCH=postgres_binary_v3`;
+- `storage_generation=shared_blocks_v3`;
+- PostgreSQL shared-block serving;
+- no filesystem or in-process serving cache.
 
-```bash
-df -h /data
-sudo du -xhd1 /data 2>/dev/null | sort -h | tail -30
-```
+## 3. Reimport Normally
 
-Inside an API environment with DB variables:
+Use the authenticated operator API to dispatch a fresh import. When rebuilding from an existing
+run, `scripts/devops/ptg2_rebuild_snapshot_from_options.py` loads stored options
+and invokes the current strict importer. Do not hand-edit a published snapshot.
 
-```sql
-SELECT pg_size_pretty(pg_database_size(current_database())) AS db_size;
-```
+Record scanner, staging, finalization, publication, and total wall time. A
+published state alone is not sufficient evidence.
 
-For candidate selection, prefer the largest current legacy source snapshots.
-Current references come from:
+## 4. Run Exact Source Audit
 
-- `mrf.ptg2_current_source_snapshot`
-- `mrf.ptg2_current_plan_source`
-
-## 3. Rebuild Snapshot
-
-Run the rebuild script inside the deployed API image or a Kubernetes Job using
-the same image and the `import-workdir` PVC:
+Before deleting validation scratch, run the independent audit against the
+pinned published snapshot:
 
 ```bash
-/opt/venv/bin/python /opt/scripts/devops/ptg2_rebuild_snapshot_from_options.py \
-  --snapshot-id ptg2:202606:old_snapshot_id \
-  --import-id space_rebuild_source_suffix_yyyymmddhhmmss
+/opt/venv/bin/python /opt/scripts/validation/ptg2_v3_source_api_audit.py \
+  /work/validation/source-01.json.gz \
+  --report /work/validation/strict-v3-audit.json \
+  --api-base-url http://healthcare-mrf-api:8080 \
+  --plan-id "${PLAN_ID}" \
+  --snapshot-id "${SNAPSHOT_ID}" \
+  --source-key "${SOURCE_KEY}" \
+  --profile release
 ```
 
-The script loads the old snapshot's stored import options from Postgres and
-runs `process.ptg.main` with the current code/storage layout. The output JSON
-includes the new snapshot id, file counts, and serving-rate count.
+Pass every release floor and require zero exactness, multiplicity, source
+attribution, unresolved-reference, invalid-value, and negative-query failures.
+The report must show at least 3,000 observed standard API HTTP requests and cold
+p95 below 40 ms for the configured release gate.
 
-## 4. Compare Old and New
+## 5. Verify Storage and Independence
 
-After the rebuild publishes the new snapshot, compare before any cleanup:
+Confirm the logical snapshot and plan bindings are independent. Physical layout
+reuse is allowed only when the complete physical input set and all semantic
+options match. Verify shared-reference counts before removing any binding.
 
-```bash
-/opt/venv/bin/python /opt/scripts/devops/ptg2_compare_snapshots.py \
-  --old-snapshot-id ptg2:202606:old_snapshot_id \
-  --new-snapshot-id ptg2:202606:new_snapshot_id \
-  --sample-limit 500 \
-  --sample-pct 0.1 \
-  --benchmark-cases 5 \
-  --benchmark-iterations 3 \
-  --benchmark-limit 5
-```
+Record the strict relation split, unique shared bytes, logical referenced bytes,
+and total PostgreSQL allocation. Confirm API requests create no local serving
+cache files.
 
-The compare must pass all of these checks:
+## 6. Cut Over The API
 
-- old and new snapshots are published
-- source key matches
-- serving-rate count matches
-- processed-file count matches
-- sampled serving rows have zero misses
-- sampled price atoms have zero misses
-- sampled provider membership has zero misses, using provider-group members for
-  v1 or graph edge/NPI-scope checks for v2
-- retained serving artifact counts and sha256 hashes match when both snapshots
-  use sidecar-backed layouts
-- PostgreSQL binary serving artifact rows exist and local materialized artifact
-  caches are absent for both PostgreSQL binary architectures
-- `postgres_binary_v2` publishes `provider_npi_scope`, omits
-  `provider_group_member`, and stores provider-forward, provider-inverted,
-  provider-group-NPI, and provider-NPI-group artifacts in PostgreSQL
+Pause PTG dispatch again and require all current source, plan, and global
+pointers to resolve to published snapshots bound to sealed
+`shared_blocks_v3` layouts. The cutover must fail if an import is still active
+or any current pointer remains on an old generation.
 
-The `--benchmark-*` options are non-gating. They add warm-cache,
-snapshot-scoped serving timings for sampled plan/code pairs so storage changes
-can be reviewed next to real query latency. For either PostgreSQL binary architecture, also
-include one forward lookup, one reverse NPI lookup, and one geo-filtered
-plan/code lookup so both binary relationship directions are exercised.
+Promote the already-tested writer image to the API Deployment. Require the
+readiness endpoint to return HTTP 200 with both PostgreSQL and strict-V3 schema
+status `OK`, then repeat representative pinned pricing requests. Do not rebuild
+a different image for this step.
 
-Do not remove the old snapshot if any check fails.
+## 7. Remove Obsolete Snapshots
 
-## 5. Remove Old Snapshot
+Dry-run `scripts/devops/ptg2_remove_source_snapshot.py`, review pointer and
+shared-layout reference checks, then execute one snapshot at a time. Cleanup may
+recognize old generation metadata solely to delete it safely.
 
-Dry-run first:
+The bulk legacy cleanup command fails closed while any current pointer still
+references an old snapshot. It must never delete current pointer rows to make a
+cleanup plan executable.
 
-```bash
-/opt/venv/bin/python /opt/scripts/devops/ptg2_remove_source_snapshot.py \
-  --snapshot-id ptg2:202606:old_snapshot_id \
-  --source-key ptg_source_key
-```
+After each removal, verify current source/plan pointers, shared-layout reference
+counts, garbage-collection eligibility, database size, and a pinned strict V3
+pricing request.
 
-Execute only after confirming `removable: true` and reviewing the table list:
+## 8. Resume Dispatch
 
-```bash
-/opt/venv/bin/python /opt/scripts/devops/ptg2_remove_source_snapshot.py \
-  --snapshot-id ptg2:202606:old_snapshot_id \
-  --source-key ptg_source_key \
-  --execute
-```
-
-The remove script refuses snapshots still referenced by global, source, or plan
-pointers. It drops only manifest-declared PTG2 snapshot tables and deletes the
-matching `ptg2_artifact_manifest` and `ptg2_snapshot` metadata.
-
-## 6. Verify After Cleanup
-
-Refresh storage metrics:
-
-```bash
-df -h /data
-sudo du -xhd1 /data 2>/dev/null | sort -h | tail -30
-```
-
-Check the old snapshot is gone and the new snapshot remains current:
-
-```sql
-SELECT snapshot_id, source_key
-FROM mrf.ptg2_current_source_snapshot
-WHERE source_key = 'ptg_source_key';
-
-SELECT snapshot_id, status
-FROM mrf.ptg2_snapshot
-WHERE snapshot_id IN ('ptg2:202606:old_snapshot_id', 'ptg2:202606:new_snapshot_id');
-```
-
-Run a pricing smoke with a real plan for the source:
-
-```bash
-curl -sS \
-  "http://127.0.0.1:8080/api/v1/pricing/group-plan-providers?plan_id=${PLAN_ID}&market_type=${MARKET_TYPE}&source_key=${SOURCE_KEY}&limit=1"
-```
-
-The response should resolve the rebuilt snapshot id.
-
-## 7. Resume Capacity
-
-Only restore PTG dispatch capacity after:
-
-- old snapshot cleanup completed
-- storage metrics are recorded
-- pricing smoke resolved the rebuilt snapshot
-- no unrelated planned backlog should start immediately
-
-When dev storage is still tight, leave `ptg_slot_capacity` at `0`.
+Restore capacity only after migration, import, exact audit, cold-latency,
+storage, removal, and GC checks pass. Keep evidence under ignored report paths
+with private identifiers redacted.

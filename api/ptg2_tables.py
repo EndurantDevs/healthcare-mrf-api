@@ -1,149 +1,71 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""PTG2 serving table discovery and validation helpers."""
+"""Strict shared-block PTG V3 snapshot metadata loading."""
 
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
-import time
 from typing import Any
 
 from sqlalchemy import text
 
-from process.ptg_parts.ptg2_artifact_blobs import hydrate_ptg2_artifact_entry_from_db
+from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
+from api.ptg2_serving_utils import ein_plan_id_variants
+from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from process.ptg_parts.ptg2_shared_blocks import (
+    PTG2_V3_COLD_LOOKUP_CONTRACT,
+    PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS,
+    PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
+    PTG2_V3_SHARED_GENERATION,
+)
+from process.ptg_parts.ptg2_shared_reuse import PTG2_V3_SOURCE_SET_CONTRACT
 
 from api.ptg2_types import PTG2ServingTables
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
-PTG2_SERVING_TABLE_ENV = "HLTHPRT_PTG2_SERVING_TABLE"
-PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ_ENV = "HLTHPRT_PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ"
-_PTG2_TABLE_CACHE_TTL_SECONDS = max(float(os.getenv("HLTHPRT_PTG2_TABLE_CACHE_TTL_SECONDS", "300")), 0.0)
-_PTG2_TABLE_AVAILABLE_CACHE: dict[str, tuple[float, bool]] = {}
-_PTG2_SNAPSHOT_TABLES_CACHE: dict[str, tuple[float, PTG2ServingTables]] = {}
-logger = logging.getLogger(__name__)
-
-
-def _metadata_cache_enabled(session: Any) -> bool:
-    return hasattr(session, "sync_session")
-
-
-async def _serving_table_available(session, table_name: str) -> bool:
-    cache_enabled = _metadata_cache_enabled(session)
-    if cache_enabled:
-        cached = _PTG2_TABLE_AVAILABLE_CACHE.get(table_name)
-        if cached is not None:
-            cached_at, value = cached
-            if _PTG2_TABLE_CACHE_TTL_SECONDS == 0 or (time.monotonic() - cached_at) <= _PTG2_TABLE_CACHE_TTL_SECONDS:
-                return value
-    try:
-        result = await session.execute(
-            text("SELECT to_regclass(:table_name)"),
-            {"table_name": table_name},
-        )
-        value = bool(result.scalar())
-        if cache_enabled:
-            _PTG2_TABLE_AVAILABLE_CACHE[table_name] = (time.monotonic(), value)
-        return value
-    except Exception:
-        return False
-
-
-async def _index_available(session, index_name: str) -> bool:
-    try:
-        result = await session.execute(
-            text("SELECT to_regclass(:index_name)"),
-            {"index_name": index_name},
-        )
-        return bool(result.scalar())
-    except Exception:
-        return False
-
-
-async def _gin_index_available_for_column(session, table_name: str, column_name: str) -> bool:
-    try:
-        result = await session.execute(
-            text(
-                """
-                SELECT EXISTS (
-                    SELECT 1
-                      FROM pg_index ix
-                      JOIN pg_class table_class ON table_class.oid = ix.indrelid
-                      JOIN pg_namespace table_schema ON table_schema.oid = table_class.relnamespace
-                      JOIN pg_class index_class ON index_class.oid = ix.indexrelid
-                      JOIN pg_am index_am ON index_am.oid = index_class.relam
-                      JOIN pg_attribute attr
-                        ON attr.attrelid = table_class.oid
-                       AND attr.attnum = ANY(ix.indkey)
-                     WHERE table_class.oid = to_regclass(:table_name)
-                       AND attr.attname = :column_name
-                       AND index_am.amname = 'gin'
-                       AND ix.indisvalid
-                       AND ix.indisready
-                )
-                """
-            ),
-            {"table_name": table_name, "column_name": column_name},
-        )
-        return bool(result.scalar())
-    except Exception:
-        return False
+PTG2_V3_ARCH_VERSION = "postgres_binary_v3"
+PTG2_V3_STORAGE_TYPE = "ptg2_shared_blocks_v3"
+PTG2_V3_SERVING_LAYOUT = "lean_provider_key_v1"
+PTG2_V3_SHARED_BLOCK_LAYOUT = "dense_shared_blocks_v3"
+PTG2_V3_AUDIT_CONTRACT = "persisted_served_occurrence_sample_v2"
+PTG2_V3_AUDIT_METHOD = "publish_time_stratified_v1"
+PTG2_V3_AUDIT_MAX_SAMPLE_ROWS = 2560
+PTG2_DATABASE_EVIDENCE_CONTRACT = "postgresql_session_v1"
+_COVERAGE_SCOPE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _safe_table_name(value: Any, *, default_schema: str = PTG2_SCHEMA) -> str | None:
+    """Validate a schema-qualified relation name without probing PostgreSQL."""
+
     if not value:
         return None
-    text_value = str(value).strip()
-    if not text_value:
-        return None
-    parts = text_value.split(".", 1)
-    if len(parts) == 1:
-        schema_name = default_schema
-        table_name = parts[0]
-    else:
-        schema_name, table_name = parts
-    ident_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
-    if not ident_re.fullmatch(schema_name) or not ident_re.fullmatch(table_name):
+    parts = str(value).strip().split(".", 1)
+    schema_name, table_name = (default_schema, parts[0]) if len(parts) == 1 else parts
+    identifier = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+    if not identifier.fullmatch(schema_name) or not identifier.fullmatch(table_name):
         return None
     return f"{schema_name}.{table_name}"
 
 
-def _serving_table_name(snapshot_id: str | None = None) -> str:
-    configured = _safe_table_name(os.getenv(PTG2_SERVING_TABLE_ENV))
-    if configured:
-        return configured
-    if snapshot_id:
-        suffix = re.sub(r"[^A-Za-z0-9_]", "_", str(snapshot_id)).strip("_")[:48]
-        if suffix:
-            return f"{PTG2_SCHEMA}.ptg2_serving_rate_{suffix}"
-    return f"{PTG2_SCHEMA}.ptg2_serving_rate"
-
-
-def _serving_table_candidates(snapshot_id: str | None = None) -> list[str]:
-    candidates = [_serving_table_name(snapshot_id)]
-    if f"{PTG2_SCHEMA}.ptg2_serving_rate" not in candidates:
-        candidates.append(f"{PTG2_SCHEMA}.ptg2_serving_rate")
-    return candidates
-
-
-def _ordered_serving_table_candidates(snapshot_id: str | None = None) -> list[str]:
-    return _serving_table_candidates(snapshot_id)
-
-
-def _is_compact_serving_table(table_name: str | None) -> bool:
-    return "compact" in str(table_name or "").lower()
-
-
-def _serving_index_arch_version(serving_index: dict[str, Any]) -> str:
-    return str(serving_index.get("arch_version") or "").strip().lower()
-
-
 def _optional_integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
     try:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _strict_coverage_scope_id(serving_index: dict[str, Any]) -> str:
+    value = serving_index.get("coverage_scope_id")
+    if not isinstance(value, str) or not _COVERAGE_SCOPE_ID_RE.fullmatch(value):
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot is missing a canonical 64-lowercase-hex "
+            "coverage_scope_id; reimport the snapshot"
+        )
+    return value
 
 
 def _serving_index_atom_key_bits(serving_index: dict[str, Any]) -> int | None:
@@ -153,15 +75,10 @@ def _serving_index_atom_key_bits(serving_index: dict[str, Any]) -> int | None:
     serving_binary = serving_index.get("serving_binary")
     if not isinstance(serving_binary, dict):
         return None
-    dense_atom_keys = serving_binary.get("dense_atom_keys")
-    if isinstance(dense_atom_keys, dict):
-        dense_bits = _optional_integer(dense_atom_keys.get("atom_key_bits"))
-        if dense_bits is not None:
-            return dense_bits
     price_atoms = serving_binary.get("price_atoms_v3")
-    if isinstance(price_atoms, dict):
-        return _optional_integer(price_atoms.get("atom_key_bits"))
-    return None
+    if not isinstance(price_atoms, dict):
+        return None
+    return _optional_integer(price_atoms.get("atom_key_bits"))
 
 
 def _serving_binary_section_integer(
@@ -172,195 +89,476 @@ def _serving_binary_section_integer(
     serving_binary = serving_index.get("serving_binary")
     if not isinstance(serving_binary, dict):
         return None
-    section_fields = serving_binary.get(section_name)
-    if not isinstance(section_fields, dict):
+    section = serving_binary.get(section_name)
+    if not isinstance(section, dict):
         return None
-    return _optional_integer(section_fields.get(field_name))
+    return _optional_integer(section.get(field_name))
 
 
-def _serving_binary_section_storage_integer(
+def _strict_v3_audit_sample(
     serving_index: dict[str, Any],
-    section_name: str,
-    field_name: str,
-) -> int | None:
-    serving_binary = serving_index.get("serving_binary")
-    if not isinstance(serving_binary, dict):
-        return None
-    section_fields = serving_binary.get(section_name)
-    if not isinstance(section_fields, dict):
-        return None
-    storage_fields = section_fields.get("storage")
-    if not isinstance(storage_fields, dict):
-        return None
-    return _optional_integer(storage_fields.get(field_name))
+    *,
+    source_count: int,
+) -> dict[str, Any]:
+    audit_sample = serving_index.get("audit_sample")
+    if not isinstance(audit_sample, dict):
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot is missing its persisted audit sample; "
+            "reimport the snapshot"
+        )
+    expected_fields = {
+        "contract": PTG2_V3_AUDIT_CONTRACT,
+        "method": PTG2_V3_AUDIT_METHOD,
+        "serving_multiplicity_semantics": PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
+    }
+    for field_name, expected_value in expected_fields.items():
+        if str(audit_sample.get(field_name) or "").strip().lower() != expected_value:
+            raise PTG2ManifestArtifactError(
+                f"PTG2 postgres_binary_v3 audit sample has invalid {field_name}; "
+                "reimport the snapshot"
+            )
+    sample_count = _optional_integer(audit_sample.get("sample_count"))
+    maximum_rows = _optional_integer(audit_sample.get("maximum_rows"))
+    if (
+        sample_count is None
+        or sample_count < 0
+        or maximum_rows != PTG2_V3_AUDIT_MAX_SAMPLE_ROWS
+        or sample_count > maximum_rows
+        or _optional_integer(audit_sample.get("format_version")) != 2
+        or _optional_integer(audit_sample.get("source_count")) != source_count
+        or str(audit_sample.get("occurrence_identity") or "").strip().lower()
+        != "sha256_candidate_ordinal_source_key_v2"
+        or audit_sample.get("complete_population") is not False
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 audit sample bounds are invalid; reimport the snapshot"
+        )
+    sample_digest = str(audit_sample.get("sample_digest") or "").strip().lower()
+    if not _COVERAGE_SCOPE_ID_RE.fullmatch(sample_digest):
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 audit sample digest is invalid; reimport the snapshot"
+        )
+    return dict(audit_sample)
 
 
-def _is_postgres_binary_serving_index(serving_index: dict[str, Any]) -> bool:
-    if _serving_index_arch_version(serving_index) in {
-        "postgres_binary_v1",
-        "postgres_binary_v2",
-        "postgres_binary_v3",
-    }:
-        return True
-    if _safe_table_name(serving_index.get("serving_binary_table")):
-        return True
+def _strict_v3_source_set(
+    serving_index: dict[str, Any],
+    *,
+    source_count: int,
+) -> dict[str, Any] | None:
+    """Validate a logical snapshot source-set seal when one is published."""
+
+    source_set = serving_index.get("source_set")
+    if source_set is None:
+        return None
+    if not isinstance(source_set, dict):
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot source_set is malformed; reimport the snapshot"
+        )
+    digest = str(source_set.get("raw_container_sha256_digest") or "").strip()
+    if (
+        set(source_set)
+        != {"contract", "source_count", "raw_container_sha256_digest"}
+        or str(source_set.get("contract") or "").strip().lower()
+        != PTG2_V3_SOURCE_SET_CONTRACT
+        or _optional_integer(source_set.get("source_count")) != source_count
+        or not _COVERAGE_SCOPE_ID_RE.fullmatch(digest)
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot source_set is invalid; reimport the snapshot"
+        )
+    return {
+        "contract": PTG2_V3_SOURCE_SET_CONTRACT,
+        "source_count": source_count,
+        "raw_container_sha256_digest": digest,
+    }
+
+
+def _database_execution_evidence(row_fields: Any) -> dict[str, Any]:
+    """Return non-sensitive evidence read from the active PostgreSQL session."""
+
+    server_version_num = _optional_integer(
+        row_fields.get("postgres_server_version_num")
+    )
+    evidence = {
+        "contract": PTG2_DATABASE_EVIDENCE_CONTRACT,
+        "server_version_num": server_version_num,
+        "database_selected": row_fields.get("database_selected"),
+        "backend_session_active": row_fields.get("backend_session_active"),
+        "transaction_snapshot_observed": row_fields.get(
+            "transaction_snapshot_observed"
+        ),
+    }
+    if (
+        server_version_num is None
+        or server_version_num < 10000
+        or evidence["database_selected"] is not True
+        or evidence["backend_session_active"] is not True
+        or evidence["transaction_snapshot_observed"] is not True
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 snapshot query did not return valid PostgreSQL execution evidence"
+        )
+    return evidence
+
+
+def _strict_v3_manifest_fields(
+    serving_index: dict[str, Any],
+) -> tuple[int | None, str | None, str | None, dict[str, Any]]:
+    """Validate the only serving contract accepted by the API."""
+
+    arch_version = str(serving_index.get("arch_version") or "").strip().lower()
+    storage_generation = (
+        str(serving_index.get("storage_generation") or "").strip().lower()
+    )
+    cold_lookup_contract = (
+        str(serving_index.get("cold_lookup_contract") or "").strip().lower()
+    )
+    price_membership_semantics = (
+        str(serving_index.get("price_membership_semantics") or "").strip().lower()
+    )
+    serving_multiplicity_semantics = (
+        str(serving_index.get("serving_multiplicity_semantics") or "").strip().lower()
+    )
+    shared_snapshot_key = _optional_integer(serving_index.get("shared_snapshot_key"))
+    source_count = _optional_integer(serving_index.get("source_count"))
+
+    if arch_version != PTG2_V3_ARCH_VERSION:
+        raise PTG2ManifestArtifactError(
+            "only postgres_binary_v3 snapshots are supported; reimport the snapshot"
+        )
+    if storage_generation != PTG2_V3_SHARED_GENERATION:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot is missing storage_generation=shared_blocks_v3; "
+            "reimport the snapshot"
+        )
+    if cold_lookup_contract != PTG2_V3_COLD_LOOKUP_CONTRACT:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot is missing cold_lookup_contract=ptg_v3_cold_v2; "
+            "reimport the snapshot"
+        )
+    if price_membership_semantics != PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot is missing "
+            "price_membership_semantics=multiset_v1; reimport the snapshot"
+        )
+    if serving_multiplicity_semantics != PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot is missing "
+            "serving_multiplicity_semantics=source_multiset_v1; reimport the snapshot"
+        )
+    if shared_snapshot_key is None or shared_snapshot_key <= 0:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot is missing a positive shared_snapshot_key; "
+            "reimport the snapshot"
+        )
+    if source_count is None or source_count <= 0 or source_count > 2**31:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot is missing a valid source_count; "
+            "reimport the snapshot"
+        )
+    _strict_coverage_scope_id(serving_index)
+
+    required_markers = {
+        "storage": "manifest_snapshot",
+        "type": PTG2_V3_STORAGE_TYPE,
+        "provider_scope_strategy": "postgres_shared_graph",
+        "id_storage": "binary128",
+        "serving_table_layout": PTG2_V3_SERVING_LAYOUT,
+        "shared_block_layout": PTG2_V3_SHARED_BLOCK_LAYOUT,
+    }
+    for field_name, expected_value in required_markers.items():
+        actual_value = str(serving_index.get(field_name) or "").strip().lower()
+        if actual_value != expected_value:
+            raise PTG2ManifestArtifactError(
+                f"PTG2 postgres_binary_v3 snapshot is missing {field_name}={expected_value}; "
+                "reimport the snapshot"
+            )
+    if serving_index.get("snapshot_scoped") is not True:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot must be snapshot_scoped; reimport the snapshot"
+        )
+
     materialized_tables = serving_index.get("materialized_tables")
-    return isinstance(materialized_tables, dict) and bool(_safe_table_name(materialized_tables.get("serving_binary")))
+    legacy_table_fields = (
+        "table",
+        "serving_binary_table",
+        "price_code_set_table",
+        "price_atom_table",
+        "price_atom_dictionary_table",
+        "price_set_entry_table",
+        "procedure_table",
+        "code_count_table",
+        "provider_set_table",
+        "provider_set_component_table",
+        "provider_set_entry_table",
+        "provider_entry_component_table",
+        "provider_group_member_table",
+        "provider_npi_scope_table",
+        "provider_group_location_table",
+        "provider_group_rate_scope_table",
+        "provider_set_dictionary_table",
+    )
+    if any(serving_index.get(field_name) for field_name in legacy_table_fields) or (
+        isinstance(materialized_tables, dict) and bool(materialized_tables)
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 manifests must not declare legacy materialized tables; "
+            "reimport the snapshot"
+        )
+    if (
+        serving_index.get("artifacts")
+        or serving_index.get("artifact_uri")
+        or serving_index.get("storage_uri")
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 manifests must not declare filesystem or sidecar artifacts; "
+            "reimport the snapshot"
+        )
 
+    serving_binary = serving_index.get("serving_binary")
+    required_sections = (
+        "price_dictionary",
+        "price_set_atom_memberships_v3",
+        "price_atoms_v3",
+    )
+    if not isinstance(serving_binary, dict) or any(
+        not isinstance(serving_binary.get(section_name), dict)
+        for section_name in required_sections
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot is missing strict serving_binary metadata; "
+            "reimport the snapshot"
+        )
+    if str(serving_binary.get("format") or "").strip().lower() != PTG2_V3_ARCH_VERSION:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot has an invalid serving_binary format; "
+            "reimport the snapshot"
+        )
 
-def _materialize_db_artifacts_on_read(serving_index: dict[str, Any]) -> bool:
-    if _is_postgres_binary_serving_index(serving_index):
-        return False
-    raw = os.getenv(PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ_ENV, "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    price_dictionary = serving_binary["price_dictionary"]
+    membership = serving_binary["price_set_atom_memberships_v3"]
+    price_atoms = serving_binary["price_atoms_v3"]
 
+    def required_integer(section: dict[str, Any], field_name: str) -> int:
+        """Read one required non-null integer from a manifest section."""
 
-async def _hydrate_snapshot_artifacts(session, artifacts: Any, serving_index: dict[str, Any]) -> dict[str, Any] | None:
-    if not isinstance(artifacts, dict):
-        return None
-    if not _materialize_db_artifacts_on_read(serving_index):
-        return dict(artifacts)
-
-    async def hydrate_entry(value: Any) -> Any:
-        if not isinstance(value, dict):
-            return value
-        try:
-            return await hydrate_ptg2_artifact_entry_from_db(session, value, schema_name=PTG2_SCHEMA)
-        except Exception as exc:
-            logger.warning("Failed to hydrate PTG2 artifact %s from PostgreSQL: %s", value.get("name"), exc)
-            return value
-
-    hydrated: dict[str, Any] = {}
-    for key, value in artifacts.items():
-        if key == "sidecars" and isinstance(value, list):
-            hydrated[key] = [await hydrate_entry(item) for item in value]
-        else:
-            hydrated[key] = await hydrate_entry(value)
-    return hydrated
-
-
-async def snapshot_serving_table(session, snapshot_id: str) -> str | None:
-    tables = await snapshot_serving_tables(session, snapshot_id)
-    if tables.serving_table:
-        return tables.serving_table
-    for table_name in _ordered_serving_table_candidates(snapshot_id):
-        if await _serving_table_available(session, table_name):
-            return table_name
-    return None
-
-
-async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTables:
-    cache_enabled = _metadata_cache_enabled(session)
-    if cache_enabled:
-        cached = _PTG2_SNAPSHOT_TABLES_CACHE.get(snapshot_id)
-        if cached is not None:
-            cached_at, tables = cached
-            if _PTG2_TABLE_CACHE_TTL_SECONDS == 0 or (time.monotonic() - cached_at) <= _PTG2_TABLE_CACHE_TTL_SECONDS:
-                return tables
-
-    def _cache(value: PTG2ServingTables) -> PTG2ServingTables:
-        if cache_enabled:
-            _PTG2_SNAPSHOT_TABLES_CACHE[snapshot_id] = (time.monotonic(), value)
+        value = _optional_integer(section.get(field_name))
+        if value is None:
+            raise PTG2ManifestArtifactError(
+                f"PTG2 postgres_binary_v3 snapshot is missing {field_name}; reimport the snapshot"
+            )
         return value
 
+    price_set_count = required_integer(price_dictionary, "price_set_count")
+    block_bytes = required_integer(price_dictionary, "block_bytes")
+    membership_span = required_integer(membership, "block_span")
+    atom_span = required_integer(price_atoms, "block_span")
+    atom_key_bits = _serving_index_atom_key_bits(serving_index)
+    if price_set_count < 0 or block_bytes < 16 or block_bytes % 16 != 0:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 price dictionary metadata is invalid; reimport the snapshot"
+        )
+    if membership_span <= 0 or atom_span <= 0 or atom_key_bits not in {24, 32}:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 sparse price metadata is invalid; reimport the snapshot"
+        )
+    if str(price_dictionary.get("artifact_kind") or "") != "by_code_price_dictionary":
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 price dictionary kind is invalid; reimport the snapshot"
+        )
+    return (
+        shared_snapshot_key,
+        storage_generation,
+        cold_lookup_contract,
+        _strict_v3_audit_sample(serving_index, source_count=source_count),
+    )
+
+
+async def snapshot_serving_tables(
+    session: Any,
+    snapshot_id: str,
+    *,
+    candidate_audit_access: PTG2CandidateAuditAccess | None = None,
+) -> PTG2ServingTables:
+    """Load one published snapshot through its sealed shared-layout binding."""
+
+    query_params_by_name: dict[str, Any] = {
+        "snapshot_id": str(snapshot_id),
+        "storage_generation": PTG2_V3_SHARED_GENERATION,
+    }
+    status_sql = "snapshot.status = 'published'"
+    candidate_scope_sql = ""
+    if candidate_audit_access is not None:
+        if candidate_audit_access.snapshot_id != str(snapshot_id):
+            raise PTG2ManifestArtifactError("PTG2 snapshot is unavailable")
+        query_params_by_name.update(
+            candidate_activation_contract=PTG2_CANDIDATE_ACTIVATION_CONTRACT,
+            candidate_source_key=candidate_audit_access.source_key,
+            candidate_plan_ids=ein_plan_id_variants(candidate_audit_access.plan_id),
+            candidate_plan_market_type=candidate_audit_access.plan_market_type,
+        )
+        status_sql = """
+            snapshot.status = 'validated'
+            AND snapshot.manifest->'activation'->>'contract'
+                = :candidate_activation_contract
+            AND snapshot.manifest->'activation'->>'state' = 'validated'
+            AND lower(btrim(COALESCE(
+                snapshot.manifest->'activation'->>'source_key', ''
+            ))) = :candidate_source_key
+        """
+        candidate_scope_sql = """
+            AND snapshot_scope.plan_id = ANY(CAST(:candidate_plan_ids AS text[]))
+            AND snapshot_scope.plan_market_type = :candidate_plan_market_type
+        """
     result = await session.execute(
         text(
             f"""
-            SELECT manifest
-              FROM {PTG2_SCHEMA}.ptg2_snapshot
-             WHERE snapshot_id = :snapshot_id
-               AND status = 'published'
+            SELECT snapshot.manifest,
+                   layout.layout_manifest->'serving_index'->'audit_sample'
+                       AS layout_audit_sample,
+                   layout.layout_manifest->'serving_index'->>'coverage_scope_id'
+                       AS layout_coverage_scope_id,
+                   layout.layout_manifest->'serving_index'->>'code_count'
+                       AS layout_code_count,
+                   snapshot_scope.plan_id AS snapshot_plan_id,
+                   snapshot_scope.plan_market_type AS snapshot_plan_market_type,
+                   encode(snapshot_scope.coverage_scope_id, 'hex')
+                       AS snapshot_coverage_scope_id,
+                   current_setting('server_version_num')::integer
+                       AS postgres_server_version_num,
+                   current_database() IS NOT NULL AS database_selected,
+                   pg_backend_pid() > 0 AS backend_session_active,
+                   txid_current_snapshot() IS NOT NULL
+                       AS transaction_snapshot_observed
+              FROM {PTG2_SCHEMA}.ptg2_snapshot snapshot
+              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_binding binding
+                ON binding.snapshot_id = snapshot.snapshot_id
+              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_layout layout
+                ON layout.snapshot_key = binding.snapshot_key
+              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_scope snapshot_scope
+                ON snapshot_scope.snapshot_id = snapshot.snapshot_id
+             WHERE snapshot.snapshot_id = :snapshot_id
+               AND {status_sql}
+               AND layout.state = 'sealed'
+               AND layout.generation = :storage_generation
+               {candidate_scope_sql}
+               AND binding.snapshot_key = CASE
+                   WHEN snapshot.manifest->'serving_index'->>'shared_snapshot_key' ~ '^[1-9][0-9]*$'
+                   THEN (snapshot.manifest->'serving_index'->>'shared_snapshot_key')::bigint
+                   ELSE NULL
+               END
              LIMIT 1
             """
         ),
-        {"snapshot_id": snapshot_id},
+        query_params_by_name,
     )
-    value = result.scalar()
-    if not value:
-        return PTG2ServingTables()
+    row = result.one_or_none()
+    if row is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 snapshot is not published and bound to a sealed shared V3 layout"
+        )
+    row_fields = row if isinstance(row, dict) else row._mapping
+    value = row_fields.get("manifest")
     if isinstance(value, str):
         try:
             value = json.loads(value)
-        except json.JSONDecodeError:
-            return PTG2ServingTables()
+        except json.JSONDecodeError as exc:
+            raise PTG2ManifestArtifactError(
+                "PTG2 snapshot manifest is malformed"
+            ) from exc
     if not isinstance(value, dict):
-        return PTG2ServingTables()
-    manifest = value
-    serving_index = manifest.get("serving_index")
+        raise PTG2ManifestArtifactError("PTG2 snapshot manifest is malformed")
+
+    serving_index = value.get("serving_index")
     if isinstance(serving_index, str):
         try:
             serving_index = json.loads(serving_index)
-        except json.JSONDecodeError:
-            serving_index = None
+        except json.JSONDecodeError as exc:
+            raise PTG2ManifestArtifactError(
+                "PTG2 serving_index manifest is malformed"
+            ) from exc
     if not isinstance(serving_index, dict):
-        serving_index = manifest
-    artifact_uri = (
-        serving_index.get("artifact_uri")
-        or serving_index.get("storage_uri")
-        or manifest.get("artifact_uri")
-        or manifest.get("storage_uri")
-    )
+        raise PTG2ManifestArtifactError(
+            "PTG2 snapshot is missing a strict serving_index; reimport the snapshot"
+        )
+
+    (
+        shared_snapshot_key,
+        storage_generation,
+        cold_lookup_contract,
+        audit_sample,
+    ) = _strict_v3_manifest_fields(serving_index)
+    coverage_scope_id = _strict_coverage_scope_id(serving_index)
+    layout_audit_sample = row_fields.get("layout_audit_sample")
+    if isinstance(layout_audit_sample, str):
+        try:
+            layout_audit_sample = json.loads(layout_audit_sample)
+        except json.JSONDecodeError as exc:
+            raise PTG2ManifestArtifactError(
+                "PTG2 sealed layout audit sample is malformed"
+            ) from exc
+    if not isinstance(layout_audit_sample, dict) or layout_audit_sample != audit_sample:
+        raise PTG2ManifestArtifactError(
+            "PTG2 sealed layout audit sample does not match its snapshot manifest"
+        )
+    if str(row_fields.get("layout_coverage_scope_id") or "") != coverage_scope_id:
+        raise PTG2ManifestArtifactError(
+            "PTG2 sealed layout coverage scope does not match its snapshot manifest"
+        )
+    if str(row_fields.get("snapshot_coverage_scope_id") or "") != coverage_scope_id:
+        raise PTG2ManifestArtifactError(
+            "PTG2 snapshot coverage scope binding does not match its manifest"
+        )
+    code_count = _optional_integer(serving_index.get("code_count"))
+    layout_code_count = _optional_integer(row_fields.get("layout_code_count"))
+    if code_count is None or code_count < 0 or layout_code_count != code_count:
+        raise PTG2ManifestArtifactError(
+            "PTG2 sealed layout code count does not match its snapshot manifest"
+        )
+    serving_rate_count = _optional_integer(serving_index.get("serving_rates"))
+    if code_count == 0 and serving_rate_count is not None and serving_rate_count > 0:
+        raise PTG2ManifestArtifactError(
+            "PTG2 shared layout is missing code metadata for a non-empty snapshot"
+        )
     network_names = serving_index.get("network_names")
-    artifacts = await _hydrate_snapshot_artifacts(session, serving_index.get("artifacts"), serving_index)
-    return _cache(PTG2ServingTables(
-        storage=str(serving_index.get("storage") or "").strip() or None,
-        type=str(serving_index.get("type") or "").strip() or None,
-        snapshot_scoped=bool(serving_index.get("snapshot_scoped")),
-        source_key=str(serving_index.get("source_key") or "").strip() or None,
-        artifact_uri=str(artifact_uri or "").strip() or None,
-        artifacts=artifacts,
-        arch_version=str(serving_index.get("arch_version") or "").strip() or None,
-        provider_scope_strategy=str(serving_index.get("provider_scope_strategy") or "").strip() or None,
-        materialized_tables=(
-            dict(serving_index.get("materialized_tables") or {})
-            if isinstance(serving_index.get("materialized_tables"), dict)
-            else None
+    source_count = _optional_integer(serving_index.get("source_count"))
+    return PTG2ServingTables(
+        snapshot_id=str(snapshot_id),
+        arch_version=PTG2_V3_ARCH_VERSION,
+        storage="manifest_snapshot",
+        shared_snapshot_key=shared_snapshot_key,
+        storage_generation=storage_generation,
+        cold_lookup_contract=cold_lookup_contract,
+        serving_table_layout=PTG2_V3_SERVING_LAYOUT,
+        shared_block_layout=PTG2_V3_SHARED_BLOCK_LAYOUT,
+        source_count=source_count,
+        code_count=code_count,
+        coverage_scope_id=coverage_scope_id,
+        plan_id=str(row_fields.get("snapshot_plan_id") or "").strip() or None,
+        plan_market_type=(
+            str(row_fields.get("snapshot_plan_market_type") or "").strip() or None
         ),
-        id_storage=str(serving_index.get("id_storage") or "hex").strip().lower() or "hex",
-        serving_table_layout=str(serving_index.get("serving_table_layout") or "").strip() or None,
-        source_trace_set_hash=str(serving_index.get("source_trace_set_hash") or "").strip() or None,
-        network_names=[str(value) for value in network_names] if isinstance(network_names, list) else None,
-        serving_table=_safe_table_name(serving_index.get("table")),
-        price_code_set_table=_safe_table_name(serving_index.get("price_code_set_table")),
-        price_atom_table=_safe_table_name(serving_index.get("price_atom_table")),
-        price_atom_table_layout=str(serving_index.get("price_atom_table_layout") or "").strip() or None,
-        price_atom_dictionary_table=_safe_table_name(serving_index.get("price_atom_dictionary_table")),
-        price_atom_constant_keys=(
-            dict(serving_index.get("price_atom_constant_keys") or {})
-            if isinstance(serving_index.get("price_atom_constant_keys"), dict)
+        source_key=str(serving_index.get("source_key") or "").strip() or None,
+        audit_sample=audit_sample,
+        source_set=_strict_v3_source_set(
+            serving_index,
+            source_count=int(source_count or 0),
+        ),
+        database_evidence=_database_execution_evidence(row_fields),
+        source_trace_set_hash=str(
+            serving_index.get("source_trace_set_hash") or ""
+        ).strip()
+        or None,
+        network_names=(
+            [str(item) for item in network_names]
+            if isinstance(network_names, list)
             else None
         ),
         price_atom_constant_values=(
             dict(serving_index.get("price_atom_constant_values") or {})
             if isinstance(serving_index.get("price_atom_constant_values"), dict)
             else None
-        ),
-        price_set_entry_table=_safe_table_name(serving_index.get("price_set_entry_table")),
-        procedure_table=_safe_table_name(serving_index.get("procedure_table")),
-        code_count_table=_safe_table_name(serving_index.get("code_count_table")),
-        provider_set_table=_safe_table_name(serving_index.get("provider_set_table")),
-        provider_set_component_table=_safe_table_name(serving_index.get("provider_set_component_table")),
-        provider_set_entry_table=_safe_table_name(serving_index.get("provider_set_entry_table")),
-        provider_entry_component_table=_safe_table_name(serving_index.get("provider_entry_component_table")),
-        provider_group_member_table=_safe_table_name(serving_index.get("provider_group_member_table")),
-        provider_npi_scope_table=_safe_table_name(
-            serving_index.get("provider_npi_scope_table")
-            or (
-                serving_index.get("materialized_tables", {}).get("provider_npi_scope")
-                if isinstance(serving_index.get("materialized_tables"), dict)
-                else None
-            )
-        ),
-        provider_group_location_table=_safe_table_name(serving_index.get("provider_group_location_table")),
-        provider_group_rate_scope_table=_safe_table_name(serving_index.get("provider_group_rate_scope_table")),
-        provider_set_dictionary_table=_safe_table_name(serving_index.get("provider_set_dictionary_table")),
-        serving_binary_table=_safe_table_name(
-            serving_index.get("serving_binary_table")
-            or (
-                serving_index.get("materialized_tables", {}).get("serving_binary")
-                if isinstance(serving_index.get("materialized_tables"), dict)
-                else None
-            )
         ),
         price_dictionary_item_count=_serving_binary_section_integer(
             serving_index,
@@ -371,11 +569,6 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
             serving_index,
             "price_dictionary",
             "block_bytes",
-        ),
-        price_dictionary_compressed_records=_serving_binary_section_storage_integer(
-            serving_index,
-            "price_dictionary",
-            "compressed_records",
         ),
         atom_key_bits=_serving_index_atom_key_bits(serving_index),
         price_key_block_span=_serving_binary_section_integer(
@@ -388,4 +581,4 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
             "price_atoms_v3",
             "block_span",
         ),
-    ))
+    )

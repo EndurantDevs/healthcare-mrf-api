@@ -26,8 +26,10 @@ jobs:
       - uses: actions/checkout@v7
       - name: Commit message policy
         run: python3 scripts/check_commit_messages.py --event "$GITHUB_EVENT_PATH"
+      - name: Test public repository hygiene gate
+        run: python3 tests/test_public_hygiene.py
       - name: Check public repository hygiene
-        run: python scripts/ci/public_hygiene.py
+        run: python3 scripts/ci/public_hygiene.py
 
   python-quality:
     name: python quality and focused tests
@@ -85,9 +87,6 @@ jobs:
           tests/test_provider_directory_fhir_bulk_security.py
           tests/test_provider_directory_fhir_completeness.py
           tests/test_provider_directory_fhir_completeness_schema.py
-          tests/test_provider_directory_endpoint_acquisition_harness.py
-          tests/test_provider_directory_endpoint_acquisition_harness_adoption.py
-          tests/test_provider_directory_endpoint_acquisition_harness_restart.py
           tests/test_provider_directory_coverage_audit.py
           tests/test_provider_directory_artifact_cutover.py
           tests/test_provider_directory_artifact_cutover_reconciliation.py
@@ -101,7 +100,6 @@ jobs:
           tests/test_generate_provider_directory_support_docs.py
           tests/test_provider_directory_publication_readiness.py
           tests/test_provider_directory_catalog_confirmation.py
-          tests/test_update_provider_directory_verification.py
           tests/test_address_canonical_unit.py
           tests/test_address_checksum_schema.py
           tests/test_mrf_source_discovery.py
@@ -119,27 +117,51 @@ jobs:
           tests/test_process_ptg_unit.py
           tests/test_ptg_publish_state_races.py
           tests/test_ptg2_artifact_blobs.py
-          tests/test_ptg2_db_sidecars.py
-          tests/test_ptg2_db_serving_binary.py
-          tests/test_ptg2_db_serving_v3.py
+          tests/test_ptg2_db_serving_v3_sparse.py
+          tests/test_ptg2_exact_numeric_response.py
           tests/test_ptg2_manifest_artifacts.py
-          tests/test_ptg2_manifest_cleanup.py
           tests/test_ptg2_postgres_binary_v3_api.py
+          tests/test_ptg2_postgres_binary_v3_cold_paths.py
+          tests/test_ptg2_postgres_binary_v3_hydration.py
+          tests/test_ptg2_postgres_binary_v3_pages_api.py
+          tests/test_ptg2_rust_shared_graph_bridge.py
           tests/test_ptg2_scanner_indexed_rapidgzip.py
           tests/test_ptg2_scanner_parallelism.py
+          tests/test_ptg2_scanner_v3_runs.py
           tests/test_ptg2_serving.py
           tests/test_ptg2_serving_binary_v3.py
-          tests/test_ptg2_serving_binary_v3_publish.py
-          tests/test_ptg2_serving_binary_v3_writer.py
-          tests/test_ptg2_serving_binary_writer.py
           tests/test_ptg2_source_snapshot_gc.py
+          tests/test_ptg_devops_scripts.py
+          tests/test_ptg2_shared_audit.py
+          tests/test_ptg2_shared_blocks.py
+          tests/test_ptg2_shared_finalize.py
+          tests/test_ptg2_shared_gc.py
+          tests/test_ptg2_shared_graph.py
+          tests/test_ptg2_shared_graph_postgres.py
+          tests/test_ptg2_shared_price.py
+          tests/test_ptg2_shared_publish.py
+          tests/test_ptg2_shared_reuse.py
+          tests/test_ptg2_shared_serving_api.py
+          tests/test_ptg2_shared_snapshot_publish_postgres.py
+          tests/test_ptg2_shared_source_publish.py
+          tests/test_ptg2_snapshot.py
+          tests/test_ptg2_source_snapshot_gc_backlog.py
+          tests/test_ptg2_strict_v3_import_scratch.py
+          tests/test_ptg2_strict_v3_snapshot_validation.py
+          tests/test_ptg2_v3_cross_plan_reuse.py
+          tests/test_ptg2_v3_audit_occurrences_api.py
+          tests/test_ptg2_v3_capacity_gate.py
+          tests/test_ptg2_v3_shared_schema.py
+          tests/test_ptg2_v3_source_api_audit.py
           tests/test_ptg_control_unit.py
           tests/test_ptg_snapshot_claim_race.py
           tests/test_ptg_snapshot_cleanup_race.py
           tests/test_ptg_snapshot_cleanup_safety.py
+          tests/test_ptg_strict_static_control_tables.py
           tests/test_ptg_source_snapshot_control.py
           tests/test_ptg_source_snapshot_control_race.py
           tests/test_ptg_source_snapshot_control_safety.py
+          tests/test_ptg_source_snapshot_removal_v3.py
 
   api-contract:
     name: openapi contract
@@ -282,11 +304,11 @@ jobs:
         image: postgis/postgis:18-3.6
         env:
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: healthporta_address_canon_test
+          POSTGRES_DB: ptg2_v3_lifecycle_test_ci_runner
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d healthporta_address_canon_test"
+          --health-cmd "pg_isready -U postgres -d ptg2_v3_lifecycle_test_ci_runner"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -296,7 +318,7 @@ jobs:
       HLTHPRT_DB_PORT: "5432"
       HLTHPRT_DB_USER: postgres
       HLTHPRT_DB_PASSWORD: postgres
-      HLTHPRT_DB_DATABASE: healthporta_address_canon_test
+      HLTHPRT_DB_DATABASE: ptg2_v3_lifecycle_test_ci_runner
       HLTHPRT_DB_SCHEMA: mrf
       DB_SCHEMA: mrf
       HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
@@ -333,8 +355,30 @@ jobs:
           PY
           alembic stamp 20260610143000_address_checksums_bigint
           alembic upgrade head
+      - name: Run fresh-migrated PTG2 v3 PostgreSQL lifecycle gate
+        env:
+          HLTHPRT_PTG2_V3_LIFECYCLE_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
+        run: python -m pytest -q tests/test_ptg2_v3_migrated_lifecycle_postgres.py
       - name: Build Rust scanner for parity tests
         run: cargo build --manifest-path support/ptg2_scanner/Cargo.toml
+      - name: Run strict shared PTG PostgreSQL publish, graph, and cold-read smoke
+        env:
+          HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST: "1"
+        run: >
+          python -m pytest -q
+          tests/test_ptg2_shared_graph_postgres.py
+          tests/test_ptg2_shared_snapshot_publish_postgres.py
+      - name: Run strict shared PTG PostgreSQL GC and removal tests
+        env:
+          HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST: "1"
+        run: >
+          python -m pytest -q
+          tests/test_ptg2_shared_gc.py
+          tests/test_ptg_source_snapshot_removal_v3.py
+      - name: Run strict shared PTG PostgreSQL cross-plan reuse tests
+        env:
+          HLTHPRT_PTG2_CROSS_PLAN_POSTGRES_TEST: "1"
+        run: python -m pytest -q tests/test_ptg2_v3_cross_plan_reuse.py
       - name: Run address canonical DB tests
         run: |
           python -m pytest -q tests/test_address_canonical_db.py

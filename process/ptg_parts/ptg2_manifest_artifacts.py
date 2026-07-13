@@ -33,6 +33,14 @@ PTG2_MANIFEST_MEMBERSHIP_ARTIFACT_TYPE = "ptg2_manifest_global_membership_sideca
 PTG2_MANIFEST_MEMBERSHIP_MAGIC = b"PTG2MNSC"
 PTG2_MANIFEST_OLD_MEMBERSHIP_MAGIC = bytes.fromhex("5054473256335343")
 PTG2_MANIFEST_MEMBERSHIP_FORMAT = "magic8:uint32_le_version:uint64_le_entry_count:index(owner16:uint64_le_offset:uint32_le_count):members16"
+
+
+@dataclass
+class _ProviderSetBlockWriteState:
+    """Track mutable output counters shared by nested block writers."""
+
+    body_offset: int = 0
+    pattern_count: int = 0
 PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC = b"PTG2MNDS"
 PTG2_MANIFEST_OLD_DENSE_MEMBERSHIP_MAGIC = bytes.fromhex("5054473256334453")
 PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT = (
@@ -495,14 +503,14 @@ def write_serving_by_provider_set_sidecar(
     code_keys_seen: set[int] = set()
     blocks: list[dict[str, int]] = []
     row_count = 0
-    body_offset = 0
-    pattern_count = 0
+    write_state = _ProviderSetBlockWriteState()
     current_provider_set: int | None = None
     current_code: int | None = None
     current_code_entries: list[tuple[int, int]] = []
     current_patterns: dict[tuple[tuple[int, int], ...], list[int]] = {}
 
     def price_key_for(value: Any) -> int:
+        """Intern a normalized price-set ID and return its dense integer key."""
         price_set_id = _normalize_128_id(value)
         price_set_key = price_set_to_key.get(price_set_id)
         if price_set_key is None:
@@ -512,22 +520,30 @@ def write_serving_by_provider_set_sidecar(
         return price_set_key
 
     def flush_code() -> None:
-        nonlocal current_code_entries
+        """Fold the current code vector into its provider-set pattern."""
+
         if current_code is None:
             return
         vector = tuple(current_code_entries)
         current_patterns.setdefault(vector, []).append(current_code)
-        current_code_entries = []
+        current_code_entries.clear()
 
     def write_provider_block(body: Any, provider_set_key: int) -> None:
-        nonlocal body_offset, pattern_count
+        """Encode one provider-set block and record its byte fence."""
+
         flush_code()
         ordered_patterns = sorted(
             current_patterns.items(),
             key=lambda item: (item[1][0] if item[1] else -1, item[0]),
         )
         block_count = 0
-        blocks.append({"key": provider_set_key, "offset": body_offset, "count": 0})
+        blocks.append(
+            {
+                "key": provider_set_key,
+                "offset": write_state.body_offset,
+                "count": 0,
+            }
+        )
         for entries, code_key_list in ordered_patterns:
             code_keys = tuple(sorted(code_key_list))
             before = body.tell()
@@ -540,9 +556,9 @@ def write_serving_by_provider_set_sidecar(
             for provider_count, price_set_key in entries:
                 _write_uvarint(body, provider_count)
                 _write_uvarint(body, price_set_key)
-            body_offset += body.tell() - before
+            write_state.body_offset += body.tell() - before
             block_count += 1
-            pattern_count += 1
+            write_state.pattern_count += 1
         blocks[-1]["count"] = block_count
         current_patterns.clear()
 
@@ -575,8 +591,8 @@ def write_serving_by_provider_set_sidecar(
         "provider_set_count": len(blocks),
         "code_count": len(code_keys_seen),
         "price_set_count": len(price_set_values),
-        "pattern_count": pattern_count,
-        "body_bytes": body_offset,
+        "pattern_count": write_state.pattern_count,
+        "body_bytes": write_state.body_offset,
         "price_dictionary_bytes": len(price_set_values) * 16,
         "block_index_bytes": len(blocks) * PTG2_SERVING_BLOCK_INDEX_RECORD_SIZE,
     }
@@ -610,6 +626,7 @@ async def write_serving_by_code_sidecar_async(
     name: str = "serving_by_code",
     expected_row_count: int | None = None,
 ) -> dict[str, Any]:
+    """Write or reuse a by-code sidecar and return its manifest entry."""
     sidecar_path = Path(path)
     sidecar_path.parent.mkdir(parents=True, exist_ok=True)
     existing = _existing_serving_sidecar_path_entry(
@@ -706,6 +723,7 @@ async def write_serving_by_provider_set_sidecar_async(
     name: str = "serving_by_provider_set",
     expected_row_count: int | None = None,
 ) -> dict[str, Any]:
+    """Write or reuse a by-provider-set sidecar and return its manifest entry."""
     sidecar_path = Path(path)
     sidecar_path.parent.mkdir(parents=True, exist_ok=True)
     existing = _existing_serving_sidecar_path_entry(
@@ -725,14 +743,14 @@ async def write_serving_by_provider_set_sidecar_async(
     code_keys_seen: set[int] = set()
     blocks: list[dict[str, int]] = []
     row_count = 0
-    body_offset = 0
-    pattern_count = 0
+    write_state = _ProviderSetBlockWriteState()
     current_provider_set: int | None = None
     current_code: int | None = None
     current_code_entries: list[tuple[int, int]] = []
     current_patterns: dict[tuple[tuple[int, int], ...], list[int]] = {}
 
     def price_key_for(value: Any) -> int:
+        """Intern a normalized price-set ID and return its dense integer key."""
         price_set_id = _normalize_128_id(value)
         price_set_key = price_set_to_key.get(price_set_id)
         if price_set_key is None:
@@ -742,16 +760,24 @@ async def write_serving_by_provider_set_sidecar_async(
         return price_set_key
 
     def flush_code() -> None:
-        nonlocal current_code_entries
+        """Fold the current code vector into its provider-set pattern."""
+
         if current_code is None:
             return
         current_patterns.setdefault(tuple(current_code_entries), []).append(current_code)
-        current_code_entries = []
+        current_code_entries.clear()
 
     def write_provider_block(body: Any, provider_set_key: int) -> None:
-        nonlocal body_offset, pattern_count
+        """Encode one provider-set block and record its byte fence."""
+
         flush_code()
-        blocks.append({"key": provider_set_key, "offset": body_offset, "count": 0})
+        blocks.append(
+            {
+                "key": provider_set_key,
+                "offset": write_state.body_offset,
+                "count": 0,
+            }
+        )
         block_count = 0
         for entries, code_key_list in sorted(
             current_patterns.items(),
@@ -768,9 +794,9 @@ async def write_serving_by_provider_set_sidecar_async(
             for provider_count, price_set_key in entries:
                 _write_uvarint(body, provider_count)
                 _write_uvarint(body, price_set_key)
-            body_offset += body.tell() - before
+            write_state.body_offset += body.tell() - before
             block_count += 1
-            pattern_count += 1
+            write_state.pattern_count += 1
         blocks[-1]["count"] = block_count
         current_patterns.clear()
 
@@ -803,8 +829,8 @@ async def write_serving_by_provider_set_sidecar_async(
         "provider_set_count": len(blocks),
         "code_count": len(code_keys_seen),
         "price_set_count": len(price_set_values),
-        "pattern_count": pattern_count,
-        "body_bytes": body_offset,
+        "pattern_count": write_state.pattern_count,
+        "body_bytes": write_state.body_offset,
         "price_dictionary_bytes": len(price_set_values) * 16,
         "block_index_bytes": len(blocks) * PTG2_SERVING_BLOCK_INDEX_RECORD_SIZE,
     }
@@ -1463,6 +1489,7 @@ def _read_dense_sidecar_entries(
     *,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[PTG2ManifestSidecarEntry, ...]:
+    """Validate and decode a dense membership sidecar into manifest entries."""
     if len(payload) < _DENSE_MEMBERSHIP_HEADER.size:
         raise PTG2ManifestArtifactError("dense global membership sidecar is missing its header")
     magic, version, entry_count, member_global_count = _DENSE_MEMBERSHIP_HEADER.unpack_from(payload, 0)

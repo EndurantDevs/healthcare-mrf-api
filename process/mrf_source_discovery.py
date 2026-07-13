@@ -19,6 +19,7 @@ import socket
 import ssl
 import zipfile
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
@@ -54,9 +55,6 @@ from process.ptg_parts.canonical import canonicalize_url, semantic_hash
 from process.ptg_parts.source_jobs import parse_toc_catalog_entries
 
 SOURCE_CONFIG_ENV = "HLTHPRT_MRF_DISCOVERY_SOURCE_CONFIG"
-PRIVATE_SEED_CONTEXT_PATHS_ENV = "HLTHPRT_MRF_DISCOVERY_PRIVATE_SEED_CONTEXT_PATHS"
-PRIVATE_QUERY_CONTEXT_PATHS_ENV = "HLTHPRT_MRF_DISCOVERY_PRIVATE_QUERY_CONTEXT_PATHS"
-PRIVATE_QUERY_CONTEXT_LIMIT_ENV = "HLTHPRT_MRF_DISCOVERY_PRIVATE_QUERY_CONTEXT_LIMIT"
 DEFAULT_SOURCE_CONFIG = Path("specs/mrf_source_discovery_sources.json")
 DISCOVERY_TABLES = (
     MRFPayer,
@@ -96,8 +94,6 @@ MRF_URL_OBSERVATION_NULLABLE_KEYS = (
     "error",
     "metadata_json",
 )
-_SOURCE_CONFIG_CACHE: dict[str, Any] | None = None
-_SSL_CONTEXT: ssl.SSLContext | None = None
 INCOMPLETE_TLS_CHAIN_HOSTS_ENV = "HLTHPRT_INCOMPLETE_TLS_CHAIN_HOSTS"
 DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS = frozenset({"api.midlandschoice.com"})
 DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS = (
@@ -111,7 +107,6 @@ DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "auxiant_wordpress",
     "payercompass_mrf",
 )
-DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT = 5000
 NON_IMPORTABLE_SOURCE_STATUSES = {
     "archived",
     "needs_review",
@@ -176,10 +171,8 @@ class DiscoveryResult:
     files_probed: int = 0
     file_probe_ok: int = 0
     crawl_run_id: str | None = None
-    import_control_synced: int = 0
-    import_control_sources_synced: int = 0
-    import_control_plans_synced: int = 0
     errors: list[dict[str, Any]] = field(default_factory=list)
+
     def as_dict(self) -> dict[str, Any]:
         """Serialize discovery counters, errors, and run identity."""
         return {
@@ -193,9 +186,6 @@ class DiscoveryResult:
             "files_probed": self.files_probed,
             "file_probe_ok": self.file_probe_ok,
             "crawl_run_id": self.crawl_run_id,
-            "import_control_synced": self.import_control_synced,
-            "import_control_sources_synced": self.import_control_sources_synced,
-            "import_control_plans_synced": self.import_control_plans_synced,
             "errors": self.errors,
         }
 
@@ -223,17 +213,14 @@ def _source_config_path() -> Path:
     return path if path.is_absolute() else _repo_root() / path
 
 
+@lru_cache(maxsize=1)
 def _default_ssl_context() -> ssl.SSLContext:
-    global _SSL_CONTEXT  # pylint: disable=global-statement
-    if _SSL_CONTEXT is not None:
-        return _SSL_CONTEXT
     try:
         import certifi  # pylint: disable=import-outside-toplevel
 
-        _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+        return ssl.create_default_context(cafile=certifi.where())
     except Exception:  # pylint: disable=broad-exception-caught
-        _SSL_CONTEXT = ssl.create_default_context()
-    return _SSL_CONTEXT
+        return ssl.create_default_context()
 
 
 def _tcp_connector(limit: int) -> aiohttp.TCPConnector:
@@ -264,22 +251,15 @@ def _request_ssl_kwargs(url: str | None) -> dict[str, Any]:
     return {}
 
 
+@lru_cache(maxsize=8)
+def _load_source_config(config_path: Path) -> dict[str, Any]:
+    return json.loads(config_path.read_text(encoding="utf-8"))
+
+
 def _source_config() -> dict[str, Any]:
-    global _SOURCE_CONFIG_CACHE  # pylint: disable=global-statement
-    if _SOURCE_CONFIG_CACHE is None:
-        _SOURCE_CONFIG_CACHE = json.loads(
-            _source_config_path().read_text(encoding="utf-8")
-        )
-    return _SOURCE_CONFIG_CACHE
+    return _load_source_config(_source_config_path())
 
 
-IMPORT_CONTROL_PREVIEW_BATCH_SIZE = max(
-    int(os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_BATCH_SIZE", "5000")), 1
-)
-IMPORT_CONTROL_PREVIEW_MAX_REQUEST_BYTES = max(
-    int(os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_MAX_REQUEST_BYTES", str(8 * 1024 * 1024))),
-    1024,
-)
 TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "mymedicalshopper_talon",
     "mymedicalshopper_talon_bounded",
@@ -360,378 +340,7 @@ def _load_seed_list_rows(name: str | None) -> list[dict[str, str]]:
             {key: str(value or "").strip() for key, value in row.items()}
             for row in reader
         ]
-    return _merge_private_seed_context_rows(name, rows)
-
-
-def _private_seed_context_paths() -> list[Path]:
-    raw = str(os.getenv(PRIVATE_SEED_CONTEXT_PATHS_ENV) or "").strip()
-    if not raw:
-        return []
-    paths = []
-    for value in raw.split(os.pathsep):
-        value = value.strip()
-        if not value:
-            continue
-        path = _resolve_config_path(os.path.expanduser(value))
-        if not path.exists():
-            raise ValueError(f"private seed context file does not exist: {path}")
-        paths.append(path)
-    return paths
-
-
-def _private_seed_context_rows(seed_list_name: str | None) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for path in _private_seed_context_paths():
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-            fieldnames = set(reader.fieldnames or ())
-            if "group_number" not in fieldnames:
-                raise ValueError(f"private seed context {path} missing group_number")
-            for row in reader:
-                item = {key: str(value or "").strip() for key, value in row.items()}
-                row_seed_list = (
-                    item.get("seed_list")
-                    or item.get("seed_list_name")
-                    or item.get("list_name")
-                    or ""
-                ).strip()
-                if row_seed_list and row_seed_list != str(seed_list_name or ""):
-                    continue
-                rows.append(item)
     return rows
-
-
-def _private_query_context_paths() -> list[Path]:
-    raw = str(os.getenv(PRIVATE_QUERY_CONTEXT_PATHS_ENV) or "").strip()
-    if not raw:
-        return []
-    paths = []
-    for value in raw.split(os.pathsep):
-        value = value.strip()
-        if not value:
-            continue
-        is_optional_path = False
-        if value.lower().startswith("optional="):
-            is_optional_path = True
-            value = value[len("optional=") :].strip()
-            if not value:
-                continue
-        path = _resolve_config_path(os.path.expanduser(value))
-        if not path.exists():
-            if is_optional_path:
-                logging.getLogger(__name__).warning(
-                    "private query context file not mounted: %s", path
-                )
-                continue
-            raise ValueError(f"private query context file does not exist: {path}")
-        paths.append(path)
-    return paths
-
-
-def _private_query_context_rows() -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for path in _private_query_context_paths():
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row in reader:
-                context_by_field = {
-                    key: str(value or "").strip() for key, value in row.items()
-                }
-                context_by_field["_query_context_scope"] = "private"
-                rows.append(context_by_field)
-    return rows
-
-
-def _row_value_ci(row: dict[str, str], *keys: str) -> str:
-    by_key = {str(key or "").strip().lower(): value for key, value in row.items()}
-    for key in keys:
-        value = str(by_key.get(str(key or "").strip().lower()) or "").strip()
-        if value:
-            return value
-    return ""
-
-
-def _split_private_query_carrier_cell(value: Any) -> list[str]:
-    text = str(value or "").strip()
-    if not text:
-        return []
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        parsed = None
-    if isinstance(parsed, list):
-        return [_clean_text(item) for item in parsed if _clean_text(item)]
-    return [
-        part.strip(" \t-*")
-        for part in re.split(r"\r?\n|;", text)
-        if part.strip(" \t-*")
-    ]
-
-
-def _private_query_context_list(row: dict[str, str], *keys: str) -> list[str]:
-    return _split_private_query_carrier_cell(_row_value_ci(row, *keys))
-
-
-def _private_query_context_value_at(values: list[str], index: int) -> str | None:
-    if not values:
-        return None
-    if index < len(values):
-        return values[index]
-    if len(values) == 1:
-        return values[0]
-    return None
-
-
-def _private_query_employer_metadata(
-    row: dict[str, str], query: str
-) -> dict[str, Any]:
-    metadata: dict[str, Any] = {
-        "private_context_employer_name": query,
-        "private_context_scope": _row_value_ci(row, "_query_context_scope")
-        or "private",
-    }
-    aliases = _private_query_context_list(
-        row, "employer_aliases", "aliases", "company_aliases"
-    )
-    optional_metadata_by_key = {
-        "private_context_employer_aliases": aliases,
-        "private_context_employer_ein": _row_value_ci(row, "ein", "employer_ein"),
-        "private_context_erisa_plan_number": _row_value_ci(
-            row, "erisa_plan_number", "plan_number"
-        ),
-        "private_context_evidence_plan_year": _row_value_ci(
-            row, "evidence_plan_year", "plan_year"
-        ),
-        "private_context_current_verification_status": _row_value_ci(
-            row, "current_verification_status", "verification_status"
-        ),
-    }
-    for key, metadata_value in optional_metadata_by_key.items():
-        if metadata_value not in (None, "", []):
-            metadata[key] = metadata_value
-    return metadata
-
-
-def _private_query_carrier_metadata(
-    context_by_field: dict[str, str], benefit_line: str, carrier_index: int
-) -> dict[str, str]:
-    policy_numbers = _private_query_context_list(
-        context_by_field,
-        f"{benefit_line}_policy_numbers",
-        f"{benefit_line}_policy_number",
-        f"{benefit_line}_contract_numbers",
-        f"{benefit_line}_contract_number",
-    )
-    regions = _private_query_context_list(
-        context_by_field,
-        f"{benefit_line}_carrier_regions",
-        f"{benefit_line}_regions",
-    )
-    lookup_types = _private_query_context_list(
-        context_by_field,
-        f"{benefit_line}_lookup_types",
-        f"{benefit_line}_lookup_type",
-    )
-    metadata_by_key = {
-        "private_context_carrier_policy_number": (
-            _private_query_context_value_at(policy_numbers, carrier_index)
-        ),
-        "private_context_carrier_region": (
-            _private_query_context_value_at(regions, carrier_index)
-        ),
-        "private_context_lookup_type": (
-            _private_query_context_value_at(lookup_types, carrier_index)
-        ),
-    }
-    return {
-        key: metadata_value
-        for key, metadata_value in metadata_by_key.items()
-        if metadata_value not in (None, "")
-    }
-
-
-_PRIVATE_QUERY_CONTEXT_LINE_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("medical", ("medical_carriers", "medical_carrier", "medical")),
-    ("dental", ("dental_carriers", "dental_carrier", "dental")),
-    ("vision", ("vision_carriers", "vision_carrier", "vision")),
-)
-
-
-def _private_query_context_entries() -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    for row in _private_query_context_rows():
-        query = _clean_text(
-            _row_value_ci(
-                row,
-                "target_payer_query",
-                "company_name",
-                "employer_name",
-                "client_name",
-                "alias",
-            )
-        )
-        if not query:
-            continue
-        employer_metadata = _private_query_employer_metadata(row, query)
-        for line, columns in _PRIVATE_QUERY_CONTEXT_LINE_COLUMNS:
-            carriers: list[str] = []
-            for column in columns:
-                carriers.extend(
-                    _split_private_query_carrier_cell(_row_value_ci(row, column))
-                )
-            for index, carrier in enumerate(carriers):
-                carrier_query = _clean_text(carrier)
-                if not carrier_query:
-                    continue
-                context_by_field: dict[str, Any] = {
-                    "target_payer_query": query,
-                    "carrier_query": carrier_query,
-                    "benefit_line": line,
-                    **employer_metadata,
-                }
-                context_by_field.update(
-                    _private_query_carrier_metadata(row, line, index)
-                )
-                entries.append(context_by_field)
-    return entries
-
-
-def _candidate_supports_benefit_line(
-    candidate: SourceCandidate, benefit_line: str
-) -> bool:
-    target = _clean_text(benefit_line).lower()
-    if not target:
-        return True
-    lines = _normalize_benefit_lines(candidate.benefit_lines)
-    if not lines:
-        return True
-    return target in lines or "mixed" in lines or "unknown" in lines
-
-
-def _candidate_private_query_context_key(
-    candidate: SourceCandidate, entry: dict[str, Any]
-) -> tuple[str, str | None, str, str, str]:
-    return (
-        _clean_text(candidate.payer_name).lower(),
-        _canonical_or_none(candidate.index_url or candidate.human_url),
-        _clean_text(entry.get("target_payer_query")).lower(),
-        _clean_text(entry.get("carrier_query")).lower(),
-        _clean_text(entry.get("benefit_line")).lower(),
-    )
-
-
-def _private_query_context_limit() -> int:
-    raw = str(os.getenv(PRIVATE_QUERY_CONTEXT_LIMIT_ENV) or "").strip()
-    if not raw:
-        return DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT
-
-
-def _private_context_candidate_match_cache_key(entry: dict[str, Any]) -> tuple[str, str]:
-    return (
-        _clean_text(entry.get("benefit_line")).lower(),
-        _clean_text(entry.get("carrier_query")).lower(),
-    )
-
-
-def _private_query_expanded_candidates(
-    candidates: list[SourceCandidate],
-) -> list[SourceCandidate]:
-    entries = _private_query_context_entries()
-    if not entries:
-        return []
-    limit = _private_query_context_limit()
-    expanded: list[SourceCandidate] = []
-    seen: set[tuple[str, str | None, str, str, str]] = set()
-    base_candidates = [
-        candidate
-        for candidate in candidates
-        if _candidate_is_importable_source(candidate)
-        and _candidate_supports_source_query_expansion(candidate)
-    ]
-    match_cache_by_context: dict[tuple[str, str], list[SourceCandidate]] = {}
-    for entry in entries:
-        match_key = _private_context_candidate_match_cache_key(entry)
-        if match_key not in match_cache_by_context:
-            match_cache_by_context[match_key] = [
-                candidate
-                for candidate in base_candidates
-                if _candidate_supports_benefit_line(
-                    candidate, entry["benefit_line"]
-                )
-                and _candidate_matches_text_filters(
-                    candidate,
-                    entity_types=(),
-                    payer_query=entry["carrier_query"],
-                )
-            ]
-        for candidate in match_cache_by_context[match_key]:
-            key = _candidate_private_query_context_key(candidate, entry)
-            if key in seen:
-                continue
-            seen.add(key)
-            expanded_candidate = _candidate_with_target_payer_query(
-                candidate, entry["target_payer_query"]
-            )
-            context_metadata_by_key = {
-                key: metadata_value
-                for key, metadata_value in entry.items()
-                if key not in {"target_payer_query", "carrier_query", "benefit_line"}
-            }
-            expanded.append(
-                replace(
-                    expanded_candidate,
-                    raw_payload={
-                        **dict(expanded_candidate.raw_payload or {}),
-                        **context_metadata_by_key,
-                        "private_query_context": True,
-                        "private_context_benefit_line": entry["benefit_line"],
-                        "private_context_carrier_query": entry["carrier_query"],
-                    },
-                )
-            )
-            if len(expanded) >= limit:
-                return expanded
-    return expanded
-
-
-def _merge_private_seed_context_rows(
-    seed_list_name: str | None, rows: list[dict[str, str]]
-) -> list[dict[str, str]]:
-    private_rows = _private_seed_context_rows(seed_list_name)
-    if not private_rows:
-        return rows
-    by_group = {
-        str(row.get("group_number") or "").strip(): dict(row)
-        for row in rows
-        if str(row.get("group_number") or "").strip()
-    }
-    ordered_groups = [
-        str(row.get("group_number") or "").strip()
-        for row in rows
-        if str(row.get("group_number") or "").strip()
-    ]
-    for private_row in private_rows:
-        group_number = str(private_row.get("group_number") or "").strip()
-        if not group_number:
-            continue
-        existing = by_group.get(group_number, {})
-        merged = dict(existing)
-        for key, value in private_row.items():
-            if key in {"seed_list", "seed_list_name", "list_name"}:
-                continue
-            if value:
-                merged[key] = value
-        if not merged.get("status"):
-            merged["status"] = "active"
-        merged["group_number"] = group_number
-        by_group[group_number] = merged
-        if group_number not in ordered_groups:
-            ordered_groups.append(group_number)
-    return [by_group[group_number] for group_number in ordered_groups]
 
 
 def _configured_provider_names(key: str) -> list[str]:
@@ -2655,9 +2264,7 @@ async def _load_candidates(
     if parser == "master-list":
         path = _resolve_config_path(str(config.get("path") or ""))
         candidates = parse_master_list(path.read_text(encoding="utf-8"))
-        private_expanded = _private_query_expanded_candidates(candidates)
-        public_candidates = candidates[:limit] if limit else candidates
-        return _dedupe_candidates(public_candidates + private_expanded)
+        return candidates[:limit] if limit else candidates
     if test_mode:
         return []
     raise ValueError(f"unsupported provider: {provider}")
@@ -3230,7 +2837,7 @@ def _healthsparq_rows_from_metadata(
                 "file_schema": _healthsparq_file_schema(file_item),
                 "last_updated_on": _healthsparq_last_updated_on(file_item),
                 "reporting_entity_name": _healthsparq_reporting_entity_name(file_item),
-                # Normalized to the import-control preview plan shape (snake_case keys).
+                # Keep a normalized per-file plan list with snake_case keys.
                 "plan_info": normalized_plan_info,
             },
             "first_seen_at": now,
@@ -3354,8 +2961,8 @@ def _toc_rows_from_content(
                     ),
                     "domain": entry.domain,
                     "reporting_entity_name": entry.reporting_entity_name,
-                    # Preserve the exact per-file plan list (with plan_id_type) so the
-                    # import-control snapshot can be rebuilt from stored rows.
+                    # Preserve the exact per-file plan list, including plan_id_type,
+                    # so catalog consumers can use the stored rows directly.
                     "plan_info": plan_info,
                 },
                 "first_seen_at": _utc_now(),
@@ -6005,8 +5612,8 @@ async def _resolve_anthem_s3_context_files(
     source_url: str,
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget] | None:
-    employer_ein = _source_private_context_text(
-        source_row, "private_context_employer_ein"
+    employer_ein = _source_query_context_text(
+        source_row, "query_context_employer_ein"
     )
     if not employer_ein:
         return None
@@ -9249,7 +8856,7 @@ def _point32_directory_urls_from_html(html_text: str, *, base_url: str) -> list[
     return urls
 
 
-def _source_private_context_text(source: dict[str, Any], key: str) -> str:
+def _source_query_context_text(source: dict[str, Any], key: str) -> str:
     metadata = dict((source or {}).get("metadata_json") or {})
     raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
     return _clean_text(metadata.get(key) or raw.get(key))
@@ -9270,6 +8877,38 @@ def _source_private_context_values(
     )
 
 
+def _source_query_context_metadata(source: dict[str, Any]) -> dict[str, Any]:
+    """Expose generic operator-supplied lookup context to source resolvers."""
+
+    metadata = dict((source or {}).get("metadata_json") or {})
+    raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
+    output_key_by_source_key = {
+        "target_payer_query": "target_payer_query",
+        "query_context_employer_name": "employer_name",
+        "query_context_employer_aliases": "employer_aliases",
+        "query_context_employer_ein": "ein",
+        "query_context_erisa_plan_number": "erisa_plan_number",
+        "query_context_carrier_policy_number": "carrier_policy_number",
+        "query_context_carrier_region": "region",
+        "query_context_lookup_type": "lookup_type",
+        "query_context_evidence_plan_year": "evidence_plan_year",
+        "query_context_verification_status": "verification_status",
+    }
+    context_by_key: dict[str, Any] = {}
+    for source_key, output_key in output_key_by_source_key.items():
+        context_value = metadata.get(source_key)
+        if context_value is None:
+            context_value = raw.get(source_key)
+        if isinstance(context_value, str):
+            context_value = _clean_text(context_value)
+        if context_value not in (None, ""):
+            context_by_key[output_key] = context_value
+    employer_aliases = context_by_key.get("employer_aliases")
+    if employer_aliases:
+        context_by_key["aliases"] = employer_aliases
+    return context_by_key
+
+
 def _anthem_s3_employer_file_type(section_name: str) -> str | None:
     normalized = _clean_text(section_name).lower()
     if "out-of-network" in normalized or "allowed amount" in normalized:
@@ -9282,7 +8921,7 @@ def _anthem_s3_employer_file_type(section_name: str) -> str | None:
 def _anthem_s3_employer_identity(
     source_row: dict[str, Any],
 ) -> tuple[dict[str, Any], str, str, list[dict[str, Any]]]:
-    context_by_key = _import_control_source_context_metadata(source_row)
+    context_by_key = _source_query_context_metadata(source_row)
     employer_name = _clean_text(
         context_by_key.get("employer_name")
         or _source_target_payer_query(source_row)
@@ -9290,8 +8929,8 @@ def _anthem_s3_employer_identity(
     )
     employer_ein = _clean_text(
         context_by_key.get("ein")
-        or _source_private_context_text(
-            source_row, "private_context_employer_ein"
+        or _source_query_context_text(
+            source_row, "query_context_employer_ein"
         )
     )
     plan_id = "".join(character for character in employer_ein if character.isdigit())
@@ -12757,7 +12396,7 @@ def _source_target_payer_queries(source_row: dict[str, Any]) -> tuple[str, ...]:
     canonical_query = _source_target_payer_query(source_row)
     if canonical_query:
         query_values.append(canonical_query)
-    employer_name = _source_private_context_text(
+    employer_name = _source_query_context_text(
         source_row, "private_context_employer_name"
     )
     if employer_name:
@@ -12771,7 +12410,7 @@ def _source_target_payer_queries(source_row: dict[str, Any]) -> tuple[str, ...]:
         "private_context_employer_ein",
         "private_context_carrier_policy_number",
     ):
-        identifier = _source_private_context_text(source_row, identifier_key)
+        identifier = _source_query_context_text(source_row, identifier_key)
         if not identifier:
             continue
         query_values.append(identifier)
@@ -13480,6 +13119,21 @@ def _candidate_is_importable_source(candidate: SourceCandidate) -> bool:
     return str(candidate.status or "").lower() not in NON_IMPORTABLE_SOURCE_STATUSES
 
 
+def _source_row_source_tier(row: dict[str, Any]) -> str:
+    metadata = row.get("metadata_json") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return _normalize_source_tier(row.get("source_tier") or metadata.get("source_tier"))
+
+
+def _source_row_is_importable(row: dict[str, Any]) -> bool:
+    status = str(row.get("status") or "active").strip().lower()
+    return (
+        _source_row_source_tier(row) == "mrf_importable"
+        and status not in NON_IMPORTABLE_SOURCE_STATUSES
+    )
+
+
 def _candidate_has_catalog_source(candidate: SourceCandidate) -> bool:
     if _candidate_is_importable_source(candidate):
         return True
@@ -14096,1859 +13750,6 @@ def _looks_signed(url: str | None) -> bool:
     )
 
 
-def _import_control_seed_item(
-    row: dict[str, Any],
-    *,
-    review_status: str | None = None,
-    promoted_source_id: str | None = None,
-) -> dict[str, Any] | None:
-    url = row.get("index_url") or row.get("human_url")
-    if not url:
-        return None
-    item = {
-        "seed_url": url,
-        "payer_name": row.get("display_name"),
-        "source_key": row.get("source_key"),
-        "provider": row.get("seed_provider"),
-        "license_status": row.get("license_status"),
-        "confidence": row.get("confidence"),
-        "review_status": review_status or row.get("review_status") or "pending",
-        "metadata": _import_control_seed_metadata(row),
-    }
-    if promoted_source_id:
-        item["promoted_source_id"] = promoted_source_id
-    if item["review_status"] == "promoted":
-        item["reviewed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-    return item
-
-
-def _import_control_seed_metadata(row: dict[str, Any]) -> dict[str, Any]:
-    metadata = row.get("metadata_json") or {}
-    return {
-        "hosting_platform": row.get("hosting_platform"),
-        "source_type": row.get("source_type"),
-        "source_tier": _source_row_source_tier(row),
-        "domain": row.get("domain"),
-        "healthcare_source_id": row.get("source_id"),
-        "target_payer_query": metadata.get("target_payer_query"),
-        "benefit_lines": list(dict.fromkeys(metadata.get("benefit_lines") or [])),
-        "aliases": list(dict.fromkeys(metadata.get("aliases") or [])),
-        "source_coverage": list(dict.fromkeys(metadata.get("source_coverage") or [])),
-        "vendor_names": list(dict.fromkeys(metadata.get("vendor_names") or [])),
-        "network_names": list(dict.fromkeys(metadata.get("network_names") or [])),
-        "plan_names": list(dict.fromkeys(metadata.get("plan_names") or [])),
-        **_import_control_source_context_metadata(row),
-    }
-
-
-def _import_control_source_context_metadata(
-    source_row: dict[str, Any]
-) -> dict[str, Any]:
-    metadata = source_row.get("metadata_json") or {}
-    raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
-    context_metadata_by_key: dict[str, Any] = {}
-    key_mapping = {
-        "target_payer_query": "target_payer_query",
-        "private_query_context": "private_query_context",
-        "private_context_benefit_line": "private_context_benefit_line",
-        "private_context_carrier_query": "private_context_carrier_query",
-        "private_context_employer_name": "employer_name",
-        "private_context_employer_aliases": "employer_aliases",
-        "private_context_employer_ein": "ein",
-        "private_context_erisa_plan_number": "erisa_plan_number",
-        "private_context_carrier_policy_number": "carrier_policy_number",
-        "private_context_carrier_region": "region",
-        "private_context_lookup_type": "lookup_type",
-        "private_context_evidence_plan_year": "evidence_plan_year",
-        "private_context_current_verification_status": (
-            "current_verification_status"
-        ),
-        "private_context_scope": "query_context_scope",
-    }
-    for source_key, output_key in key_mapping.items():
-        context_value = metadata.get(source_key)
-        if context_value is None:
-            context_value = raw.get(source_key)
-        if isinstance(context_value, str):
-            context_value = _clean_text(context_value)
-        if context_value not in (None, ""):
-            context_metadata_by_key[output_key] = context_value
-    employer_aliases = context_metadata_by_key.get("employer_aliases")
-    if employer_aliases:
-        context_metadata_by_key["aliases"] = employer_aliases
-    return context_metadata_by_key
-
-
-def _has_private_query_context_source_row(row: dict[str, Any]) -> bool:
-    context = _import_control_source_context_metadata(row)
-    if context.get("private_query_context"):
-        return True
-    metadata = row.get("metadata_json") or {}
-    raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
-    target_query = (
-        context.get("target_payer_query")
-        or metadata.get("target_payer_query")
-        or raw.get("target_payer_query")
-    )
-    return bool(target_query and raw.get("query_expansion_source"))
-
-
-def _should_sync_private_context_snapshots() -> bool:
-    return str(
-        os.getenv("HLTHPRT_MRF_PRIVATE_CONTEXT_SNAPSHOT_SYNC") or ""
-    ).strip().lower() in {"1", "true", "yes", "on"}
-
-
-async def _post_import_control_seed_batch(
-    session: aiohttp.ClientSession,
-    base_url: str,
-    batch: list[dict[str, Any]],
-) -> dict[str, Any]:
-    retry_attempts = _import_control_catalog_retry_attempts()
-    for attempt in range(1, retry_attempts + 1):
-        try:
-            async with session.post(
-                f"{base_url.rstrip('/')}/v1/catalog/seeds/import",
-                json={"seed_provider": "healthcare-mrf-api", "items": batch},
-            ) as resp:
-                if resp.status >= 400:
-                    text = await resp.text()
-                    raise RuntimeError(
-                        f"import-control seed sync failed: {resp.status} {text[:200]}"
-                    )
-                return await resp.json()
-        except Exception as exc:
-            should_retry = (
-                attempt < retry_attempts
-                and _should_retry_import_control_catalog_error({"message": str(exc)})
-            )
-            if not should_retry:
-                raise
-            await asyncio.sleep(_import_control_catalog_retry_delay(attempt))
-    return {}
-
-
-async def _sync_import_control_seeds(
-    source_rows: list[dict[str, Any]],
-    *,
-    limit: int | None = None,
-    progress_run_id: str | None = None,
-) -> int:
-    """Sync source seed rows into import-control and optionally emit batch progress."""
-    base_url = str(
-        os.getenv("HLTHPRT_IMPORT_CONTROL_URL")
-        or os.getenv("HP_IMPORT_CONTROL_BASE_URL")
-        or ""
-    ).strip()
-    token = str(
-        os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN")
-        or os.getenv("HLTHPRT_CONTROL_API_TOKEN")
-        or ""
-    ).strip()
-    if not base_url or not token:
-        logging.getLogger(__name__).warning(
-            "import-control seed sync skipped: HLTHPRT_IMPORT_CONTROL_URL and/or HLTHPRT_IMPORT_CONTROL_TOKEN not configured"
-        )
-        return 0
-    items = []
-    for row in source_rows[: limit or len(source_rows)]:
-        item = _import_control_seed_item(row)
-        if item:
-            items.append(item)
-    if not items:
-        return 0
-    total_items = len(items)
-    timeout = _import_control_sync_timeout()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    }
-    synced = 0
-    async with aiohttp.ClientSession(
-        headers=headers, timeout=timeout, trust_env=False
-    ) as session:
-        for batch in _chunked(items, _import_control_seed_batch_size()):
-            payload = await _post_import_control_seed_batch(session, base_url, batch)
-            synced += int(payload.get("count") or len(payload.get("items") or []))
-            if progress_run_id:
-                _emit_import_control_seed_progress(
-                    progress_run_id,
-                    done=min(synced, total_items),
-                    total=total_items,
-                )
-    return synced
-
-
-def _emit_import_control_seed_progress(
-    progress_run_id: str, *, done: int, total: int
-) -> None:
-    """Publish one import-control seed sync progress update for a control run."""
-    enqueue_live_progress(
-        run_id=progress_run_id,
-        importer="mrf-source-discovery",
-        status="running",
-        phase="syncing import-control seeds",
-        unit="sources",
-        done=done,
-        total=total,
-        message=f"synced source seed rows {done}/{total}",
-    )
-
-
-def _env_flag(name: str) -> bool:
-    return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _positive_env_float(name: str, default: float) -> float:
-    try:
-        value = float(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-    return value if value > 0 else default
-
-
-def _positive_env_int(name: str, default: int) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-    return value if value > 0 else default
-
-
-def _import_control_sync_timeout() -> aiohttp.ClientTimeout:
-    return aiohttp.ClientTimeout(
-        total=_positive_env_float(
-            "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_TOTAL_TIMEOUT_SECONDS", 1800.0
-        ),
-        connect=_positive_env_float(
-            "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_CONNECT_TIMEOUT_SECONDS", 30.0
-        ),
-        sock_read=_positive_env_float(
-            "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_READ_TIMEOUT_SECONDS", 600.0
-        ),
-    )
-
-
-def _import_control_seed_batch_size() -> int:
-    return _positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE", 500)
-
-
-def _import_control_catalog_concurrency(requested: int | None) -> int:
-    configured = os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_CATALOG_CONCURRENCY")
-    if configured:
-        return min(_positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_CATALOG_CONCURRENCY", 1), 32)
-    return min(max(1, int(requested or 1)), 4)
-
-
-def _import_control_catalog_retry_attempts() -> int:
-    return min(_positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_CATALOG_RETRY_ATTEMPTS", 4), 8)
-
-
-def _import_control_catalog_retry_delay(attempt: int) -> float:
-    return min(60.0, float(5 * (2 ** max(0, attempt - 1))))
-
-
-def _should_retry_import_control_catalog_error(error: dict[str, Any]) -> bool:
-    message = str(error.get("message") or "").strip().lower()
-    if not message:
-        return True
-    return any(
-        token in message
-        for token in (
-            "broken pipe",
-            "connection reset",
-            "connection timeout",
-            "no route to host",
-            "server disconnected",
-            "timeout",
-        )
-    )
-
-
-def _should_retry_import_control_catalog_errors(
-    errors: list[dict[str, Any]],
-) -> bool:
-    return bool(errors) and all(_should_retry_import_control_catalog_error(error) for error in errors)
-
-
-def _coerce_metadata(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str) and value.strip():
-        try:
-            parsed = json.loads(value)
-        except (TypeError, ValueError):
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
-def _source_row_source_tier(row: dict[str, Any]) -> str:
-    metadata = row.get("metadata_json") or {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-    return _normalize_source_tier(row.get("source_tier") or metadata.get("source_tier"))
-
-
-def _source_row_is_importable(row: dict[str, Any]) -> bool:
-    status = str(row.get("status") or "active").strip().lower()
-    return (
-        _source_row_source_tier(row) == "mrf_importable"
-        and status not in NON_IMPORTABLE_SOURCE_STATUSES
-    )
-
-
-def _eligible_for_public_promotion(row: dict[str, Any]) -> bool:
-    """Only free, direct MRF sources become public import-control sources. Paid/vendor
-    aggregator provenance rows stay in the seed review queue."""
-    access_model = str(row.get("access_model") or "").strip().lower()
-    source_type = str(row.get("source_type") or "").strip().lower()
-    return access_model == "free" and source_type != "vendor_aggregator"
-
-
-def _import_control_source_urls(row: dict[str, Any]) -> tuple[str | None, str | None]:
-    index_url = row.get("index_url") or row.get("human_url")
-    official_url = row.get("human_url") or row.get("index_url")
-    platform = str(row.get("hosting_platform") or "").strip()
-    resolver = _platform_resolver_config(platform)
-    if (
-        index_url
-        and str(resolver.get("type") or "").strip() == "healthsparq_public_mrf"
-        and resolver.get("metadata_url_template")
-    ):
-        try:
-            params = _healthsparq_public_params(str(index_url))
-            metadata_url = _healthsparq_direct_metadata_url(resolver, params)
-        except (TypeError, ValueError):
-            metadata_url = None
-        if metadata_url:
-            return metadata_url, str(official_url or index_url)
-    return (
-        str(index_url) if index_url else None,
-        str(official_url) if official_url else None,
-    )
-
-
-def _chunked(items: list[Any], size: int):
-    for start in range(0, len(items), max(1, size)):
-        yield items[start : start + size]
-
-
-def _split_preview_items(
-    items: list[dict[str, Any]], *, max_plan_info: int = 200
-) -> list[dict[str, Any]]:
-    """Split large per-file plan arrays into smaller preview items.
-
-    Some payers list thousands of plans against every file reference. import-control
-    upserts by stable source_file_id + discovered_plan_id, so sending the same file
-    URL with smaller plan_info slices is equivalent and avoids huge HTTP payloads.
-    """
-    split_items: list[dict[str, Any]] = []
-    for item in items:
-        plan_info = item.get("plan_info") or []
-        if not isinstance(plan_info, list) or len(plan_info) <= max_plan_info:
-            split_items.append(item)
-            continue
-        for plan_batch in _chunked(plan_info, max_plan_info):
-            next_item = dict(item)
-            next_item["plan_info"] = plan_batch
-            split_items.append(next_item)
-    return split_items
-
-
-def _preview_request_size_bytes(source_id: str, items: list[dict[str, Any]]) -> int:
-    payload = {"source_id": source_id, "items": items}
-    return len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-
-
-def _preview_item_size_bytes(preview_item_map: dict[str, Any]) -> int:
-    return len(
-        json.dumps(
-            preview_item_map,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-    )
-
-
-def _chunk_preview_items_for_request(
-    source_id: str,
-    preview_item_maps: list[dict[str, Any]],
-    *,
-    max_items: int | None = None,
-    max_bytes: int | None = None,
-):
-    """Yield preview item batches that fit both count and serialized request limits."""
-    resolved_max_items = max_items or IMPORT_CONTROL_PREVIEW_BATCH_SIZE
-    resolved_max_bytes = max_bytes or IMPORT_CONTROL_PREVIEW_MAX_REQUEST_BYTES
-    preview_batch_maps: list[dict[str, Any]] = []
-    preview_batch_size = _preview_request_size_bytes(source_id, [])
-    for preview_item_map in preview_item_maps:
-        preview_item_size = _preview_item_size_bytes(preview_item_map)
-        candidate_batch_size = (
-            preview_batch_size
-            + preview_item_size
-            + (1 if preview_batch_maps else 0)
-        )
-        if preview_batch_maps and (
-            len(preview_batch_maps) >= resolved_max_items
-            or candidate_batch_size > resolved_max_bytes
-        ):
-            yield preview_batch_maps
-            preview_batch_maps = [preview_item_map]
-            preview_batch_size = _preview_request_size_bytes(source_id, []) + preview_item_size
-            continue
-        preview_batch_maps.append(preview_item_map)
-        preview_batch_size = candidate_batch_size
-    if preview_batch_maps:
-        yield preview_batch_maps
-
-
-def _as_text_list(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item or "").strip()]
-    if isinstance(value, tuple):
-        return [str(item).strip() for item in value if str(item or "").strip()]
-    return []
-
-
-def _file_column_plan_info(
-    *,
-    source_id: str,
-    plan_ids: Any,
-    plan_names: Any,
-    market_types: Any,
-    plan_lookup: dict[tuple[str, str, str | None, str | None], dict[str, Any]],
-) -> list[dict[str, Any]]:
-    ids = _as_text_list(plan_ids)
-    names = _as_text_list(plan_names)
-    markets = _as_text_list(market_types)
-    if not ids:
-        return []
-    items: list[dict[str, Any]] = []
-    for index, plan_id in enumerate(ids):
-        plan_name = names[index] if index < len(names) else None
-        market_type = (
-            markets[index]
-            if index < len(markets)
-            else (markets[0] if len(markets) in {1} else None)
-        )
-        lookup = (
-            plan_lookup.get((source_id, plan_id, plan_name, market_type))
-            or plan_lookup.get((source_id, plan_id, plan_name, None))
-            or plan_lookup.get((source_id, plan_id, None, market_type))
-            or plan_lookup.get((source_id, plan_id, None, None))
-            or {}
-        )
-        items.append(
-            {
-                "plan_id": plan_id,
-                "plan_id_type": lookup.get("plan_id_type"),
-                "plan_market_type": market_type or lookup.get("market_type"),
-                "plan_name": plan_name or lookup.get("plan_name"),
-                "issuer_name": lookup.get("issuer_name"),
-                "plan_sponsor_name": lookup.get("plan_sponsor_name"),
-            }
-        )
-    return items
-
-
-def _import_control_plan_info_with_context_ids(
-    *,
-    source_id: str,
-    plan_info: list[dict[str, Any]],
-    from_index_url: Any,
-    canonical_url: Any,
-) -> list[dict[str, Any]]:
-    next_info: list[dict[str, Any]] = []
-    source_index_url = (
-        str(from_index_url or "").strip() or str(canonical_url or "").strip()
-    )
-    for plan in plan_info:
-        next_plan = dict(plan)
-        plan_id = str(next_plan.get("plan_id") or "").strip()
-        plan_name = str(
-            next_plan.get("plan_name")
-            or next_plan.get("plan_sponsor_name")
-            or next_plan.get("issuer_name")
-            or ""
-        ).strip()
-        market_type = str(next_plan.get("plan_market_type") or "").strip()
-        if not plan_id and plan_name and market_type:
-            next_plan["plan_id"] = semantic_hash(
-                {
-                    "source_id": source_id,
-                    "source_index_url": source_index_url,
-                    "plan_name": plan_name,
-                    "market_type": market_type,
-                },
-                domain="mrf_source_context_plan",
-            )[:32]
-            next_plan["plan_id_type"] = (
-                next_plan.get("plan_id_type") or "source_context_hash"
-            )
-        next_info.append(next_plan)
-    return next_info
-
-
-_GENERIC_IMPORT_CONTROL_PLAN_LABELS = {
-    "allowed amount",
-    "allowed amounts",
-    "allowed amount file",
-    "allowed amounts file",
-    "in network",
-    "in-network",
-    "in network file",
-    "in-network file",
-    "in network rates",
-    "in-network rates",
-    "local in-network negotiated rates file",
-    "local network",
-    "machine readable",
-    "machine readable file",
-    "machine readable files",
-    "mrf",
-    "mrfs",
-    "machinereadables",
-    "pricing transparency",
-    "transparency",
-    "transparency in coverage",
-}
-
-
-def _import_control_label_is_generic(value: Any) -> bool:
-    normalized = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
-    return not normalized or normalized in _GENERIC_IMPORT_CONTROL_PLAN_LABELS
-
-
-def _meaningful_import_control_label(*values: Any) -> str | None:
-    for value in values:
-        plan_name = _clean_text(value)
-        if not plan_name or _import_control_label_is_generic(plan_name):
-            continue
-        return plan_name
-    return None
-
-
-def _import_control_file_context_plan_info(
-    *,
-    source_id: str,
-    description: Any,
-    network_name: Any,
-    company_name: Any,
-    from_index_url: Any,
-    canonical_url: Any,
-    target_label: Any = None,
-) -> list[dict[str, Any]]:
-    for candidate in (description, network_name, target_label, company_name):
-        plan_name = _meaningful_import_control_label(candidate)
-        if not plan_name:
-            continue
-        plan_id = semantic_hash(
-            {
-                "source_id": source_id,
-                "source_index_url": str(from_index_url or "").strip(),
-                "canonical_url": str(canonical_url or "").strip(),
-                "plan_name": plan_name,
-                "market_type": "group",
-            },
-            domain="mrf_source_file_context_plan",
-        )[:32]
-        return [
-            {
-                "plan_id": plan_id,
-                "plan_id_type": "source_file_context_hash",
-                "plan_market_type": "group",
-                "plan_name": plan_name,
-            }
-        ]
-    return []
-
-
-def _plan_lookup_from_rows(
-    rows: list[Any],
-) -> dict[tuple[str, str, str | None, str | None], dict[str, Any]]:
-    lookup: dict[tuple[str, str, str | None, str | None], dict[str, Any]] = {}
-    for row in rows:
-        source_id = str(row[0] or "")
-        plan_id = str(row[1] or "").strip()
-        if not source_id or not plan_id:
-            continue
-        metadata = _coerce_metadata(row[6] if len(row) > 6 else None)
-        raw_plan = (
-            metadata.get("raw_plan")
-            if isinstance(metadata.get("raw_plan"), dict)
-            else {}
-        )
-        item = {
-            "plan_id_type": row[2],
-            "market_type": row[3],
-            "plan_name": row[4],
-            "reporting_entity_name": row[5],
-            "issuer_name": raw_plan.get("issuer_name") or raw_plan.get("issuerName"),
-            "plan_sponsor_name": (
-                raw_plan.get("plan_sponsor_name")
-                or raw_plan.get("plan_sponser_name")
-                or raw_plan.get("sponsor_name")
-                or raw_plan.get("company_name")
-            ),
-        }
-        plan_name = str(row[4] or "").strip() or None
-        market_type = str(row[3] or "").strip() or None
-        lookup.setdefault((source_id, plan_id, plan_name, market_type), item)
-        lookup.setdefault((source_id, plan_id, plan_name, None), item)
-        lookup.setdefault((source_id, plan_id, None, market_type), item)
-        lookup.setdefault((source_id, plan_id, None, None), item)
-    return lookup
-
-
-def _enrich_plan_info_from_lookup(
-    source_id: str,
-    plan_info: list[dict[str, Any]],
-    plan_lookup: dict[tuple[str, str, str | None, str | None], dict[str, Any]],
-) -> list[dict[str, Any]]:
-    enriched: list[dict[str, Any]] = []
-    for plan in plan_info:
-        if not isinstance(plan, dict):
-            continue
-        next_plan = dict(plan)
-        plan_id = str(next_plan.get("plan_id") or "").strip()
-        plan_name = str(next_plan.get("plan_name") or "").strip() or None
-        market_type = str(next_plan.get("plan_market_type") or "").strip() or None
-        lookup = (
-            plan_lookup.get((source_id, plan_id, plan_name, market_type))
-            or plan_lookup.get((source_id, plan_id, plan_name, None))
-            or plan_lookup.get((source_id, plan_id, None, market_type))
-            or plan_lookup.get((source_id, plan_id, None, None))
-            or {}
-        )
-        if not next_plan.get("issuer_name") and lookup.get("issuer_name"):
-            next_plan["issuer_name"] = lookup["issuer_name"]
-        if not (
-            next_plan.get("plan_sponsor_name") or next_plan.get("plan_sponser_name")
-        ) and lookup.get("plan_sponsor_name"):
-            next_plan["plan_sponsor_name"] = lookup["plan_sponsor_name"]
-        enriched.append(next_plan)
-    return enriched
-
-
-def _reporting_entity_from_plan_info(
-    source_id: str,
-    plan_info: list[dict[str, Any]],
-    plan_lookup: dict[tuple[str, str, str | None, str | None], dict[str, Any]],
-) -> str | None:
-    for plan in plan_info:
-        plan_id = str(plan.get("plan_id") or "").strip()
-        plan_name = str(plan.get("plan_name") or "").strip() or None
-        market_type = str(plan.get("plan_market_type") or "").strip() or None
-        lookup = (
-            plan_lookup.get((source_id, plan_id, plan_name, market_type))
-            or plan_lookup.get((source_id, plan_id, plan_name, None))
-            or plan_lookup.get((source_id, plan_id, None, market_type))
-            or plan_lookup.get((source_id, plan_id, None, None))
-            or {}
-        )
-        reporting_entity = str(lookup.get("reporting_entity_name") or "").strip()
-        if reporting_entity:
-            return reporting_entity
-    return None
-
-
-def _company_name_from_index_url(value: Any) -> str | None:
-    path = urlsplit(str(value or "")).path
-    name = Path(path).name
-    if not name:
-        return None
-    name = re.sub(r"\.(json|zip|gz)$", "", name, flags=re.IGNORECASE)
-    name = re.sub(r"_index$", "", name, flags=re.IGNORECASE)
-    name = re.sub(r"^\d{4}-\d{2}-\d{2}[_-]+", "", name)
-    name = name.replace("_", " ").replace("-", " ").strip()
-    if not name or name.lower() in {"index", "toc", "table of contents", "mrfdownload"}:
-        return None
-    name = re.sub(r"\s+", " ", name)
-    if _import_control_label_is_generic(name):
-        return None
-    return name
-
-
-def _import_control_company_name(
-    metadata: dict[str, Any], from_index_url: Any
-) -> str | None:
-    return _meaningful_import_control_label(
-        metadata.get("company_name"),
-        _company_name_from_index_url(from_index_url),
-    )
-
-
-def _apply_company_fallback(
-    plan_info: list[dict[str, Any]], company_name: str | None
-) -> list[dict[str, Any]]:
-    if not company_name:
-        return plan_info
-    next_info: list[dict[str, Any]] = []
-    for plan in plan_info:
-        next_plan = dict(plan)
-        if not (
-            next_plan.get("plan_sponsor_name")
-            or next_plan.get("plan_sponser_name")
-            or next_plan.get("sponsor_name")
-        ):
-            next_plan["plan_sponsor_name"] = company_name
-        next_info.append(next_plan)
-    return next_info
-
-
-_IMPORT_CONTROL_CATALOG_RATE_DOMAINS = frozenset(
-    {
-        "in_network",
-        "in_network_rates",
-        "allowed_amount",
-        "allowed_amounts",
-    }
-)
-
-
-def _import_control_supported_rate_domain(value: Any) -> bool:
-    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
-    return normalized in _IMPORT_CONTROL_CATALOG_RATE_DOMAINS
-
-
-def _mrf_schema_name() -> str:
-    schema = str(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf").strip() or "mrf"
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
-        return "mrf"
-    return schema
-
-
-def _mapping_value(row: Any, key: str) -> Any:
-    if isinstance(row, dict):
-        return row.get(key)
-    mapping = getattr(row, "_mapping", None)
-    if mapping is not None:
-        return mapping.get(key)
-    return getattr(row, key, None)
-
-
-def _stored_source_row_from_db_row(row: Any) -> dict[str, Any]:
-    return {
-        "source_id": _mapping_value(row, "source_id"),
-        "payer_id": _mapping_value(row, "payer_id"),
-        "source_key": _mapping_value(row, "source_key"),
-        "display_name": _mapping_value(row, "display_name"),
-        "source_type": _mapping_value(row, "source_type"),
-        "hosting_platform": _mapping_value(row, "hosting_platform"),
-        "access_model": _mapping_value(row, "access_model"),
-        "index_url": _mapping_value(row, "index_url"),
-        "human_url": _mapping_value(row, "human_url"),
-        "canonical_url": _mapping_value(row, "canonical_url"),
-        "domain": _mapping_value(row, "domain"),
-        "status": _mapping_value(row, "status"),
-        "schema_version": _mapping_value(row, "schema_version"),
-        "latest_index_date": _mapping_value(row, "latest_index_date"),
-        "num_plans": _mapping_value(row, "num_plans"),
-        "num_files": _mapping_value(row, "num_files"),
-        "num_indices": _mapping_value(row, "num_indices"),
-        "total_compressed_size": _mapping_value(row, "total_compressed_size"),
-        "provenance_url": _mapping_value(row, "provenance_url"),
-        "seed_provider": _mapping_value(row, "seed_provider"),
-        "confidence": _mapping_value(row, "confidence"),
-        "license_status": _mapping_value(row, "license_status"),
-        "review_status": _mapping_value(row, "review_status"),
-        "metadata_json": _coerce_metadata(_mapping_value(row, "metadata_json")),
-        "created_at": _mapping_value(row, "created_at"),
-        "updated_at": _mapping_value(row, "updated_at"),
-    }
-
-
-async def _stored_import_control_catalog_source_rows() -> list[dict[str, Any]]:
-    schema = _mrf_schema_name()
-    skipped_statuses = ", ".join(
-        f"'{status}'" for status in sorted(NON_IMPORTABLE_SOURCE_STATUSES)
-    )
-    supported_domains = ", ".join(
-        f"'{domain}'" for domain in sorted(_IMPORT_CONTROL_CATALOG_RATE_DOMAINS)
-    )
-    rows = await db.all(
-        f"""
-        select
-            s.source_id,
-            s.payer_id,
-            s.source_key,
-            s.display_name,
-            s.source_type,
-            s.hosting_platform,
-            s.access_model,
-            s.index_url,
-            s.human_url,
-            s.canonical_url,
-            s.domain,
-            s.status,
-            s.schema_version,
-            s.latest_index_date,
-            s.num_plans,
-            s.num_files,
-            s.num_indices,
-            s.total_compressed_size,
-            s.provenance_url,
-            s.seed_provider,
-            s.confidence,
-            s.license_status,
-            s.review_status,
-            s.metadata_json,
-            s.created_at,
-            s.updated_at
-        from {schema}.mrf_source s
-        where coalesce(s.status, 'active') not in ({skipped_statuses})
-          and (s.index_url is not null or s.human_url is not null)
-          and exists (
-            select 1
-            from {schema}.mrf_file f
-            where f.source_id = s.source_id
-              and f.url is not null
-              and json_typeof(f.metadata_json->'plan_info') = 'array'
-              and json_array_length(f.metadata_json->'plan_info') > 0
-              and regexp_replace(
-                    lower(coalesce(f.metadata_json->>'domain', f.file_type, '')),
-                    '[^a-z0-9]+',
-                    '_',
-                    'g'
-                  ) in ({supported_domains})
-          )
-        order by s.display_name, s.source_id
-        """
-    )
-    return [_stored_source_row_from_db_row(row) for row in rows]
-
-
-async def _import_control_catalog_source_rows(
-    source_rows: list[dict[str, Any]], *, limit: int | None = None
-) -> list[dict[str, Any]]:
-    if limit is not None:
-        return source_rows
-    merged = list(source_rows)
-    seen_source_ids = {str(row.get("source_id") or "") for row in source_rows}
-    try:
-        stored_rows = await _stored_import_control_catalog_source_rows()
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        logging.getLogger(__name__).warning(
-            "stored import-control catalog source supplement failed: %s", exc
-        )
-        return merged
-    for row in stored_rows:
-        source_id = str(row.get("source_id") or "")
-        if not source_id or source_id in seen_source_ids:
-            continue
-        merged.append(row)
-        seen_source_ids.add(source_id)
-    return merged
-
-
-def _import_control_snapshot_file_is_supported(
-    file_type: Any, metadata: dict[str, Any], from_index_url: Any
-) -> bool:
-    if str(metadata.get("source_format") or "").strip().lower() == "csv":
-        return False
-    return _import_control_supported_rate_domain(metadata.get("domain") or file_type)
-
-
-def _import_control_preview_context(
-    metadata: dict[str, Any], from_index_url: Any, canonical_url: Any
-) -> dict[str, str]:
-    context: dict[str, str] = {}
-    for key in (
-        "group_id",
-        "group_number",
-        "client_id",
-        "client_name",
-        "company_name",
-        "employer_id",
-        "employer_name",
-        "employer_slug",
-        "entity_slug",
-        "tpa_slug",
-        "tpa_name",
-        "ein",
-        "plan_id",
-        "plan_name",
-        "target_label",
-    ):
-        value = str(metadata.get(key) or "").strip()
-        if value and not (
-            key == "company_name" and _import_control_label_is_generic(value)
-        ):
-            context[key] = value
-    group_number = (
-        context.get("group_id")
-        or context.get("group_number")
-        or _asr_group_number_from_url(str(from_index_url or ""))
-        or _asr_group_number_from_url(str(canonical_url or ""))
-    )
-    if group_number:
-        context["group_id"] = group_number
-        context["group_number"] = group_number
-    return context
-
-
-async def _import_control_snapshot_items(
-    source_ids: list[str],
-) -> dict[str, list[dict[str, Any]]]:
-    """Read the currently-stored MRF file snapshot for the given sources and build
-    import-control preview items grouped by healthcare source_id. Prefer the exact
-    per-file plan list captured on MRFFile.metadata_json; for older resolver rows,
-    synthesize it from MRFFile plan columns and MRFPlan plan_id_type metadata."""
-    unique_ids = [sid for sid in dict.fromkeys(source_ids) if sid]
-    if not unique_ids:
-        return {}
-    stmt = (
-        select(
-            MRFFile.source_id,
-            MRFFile.url,
-            MRFFile.canonical_url,
-            MRFFile.file_type,
-            MRFFile.size_bytes,
-            MRFFile.metadata_json,
-            MRFFile.plan_ids,
-            MRFFile.plan_names,
-            MRFFile.market_types,
-            MRFFile.network_name,
-            MRFFile.description,
-            MRFFile.from_index_url,
-        )
-        .where(MRFFile.source_id.in_(unique_ids))
-        .where(MRFFile.url.is_not(None))
-    )
-    rows = await db.all(stmt)
-    supported_rows = []
-    plan_lookup_source_id_list = []
-    for row in rows:
-        metadata = _coerce_metadata(row[5])
-        file_domain = metadata.get("domain") or row[3]
-        if not _import_control_snapshot_file_is_supported(
-            file_domain, metadata, row[11]
-        ):
-            continue
-        supported_rows.append((row, metadata, file_domain))
-        if not metadata.get("plan_info") and row[0]:
-            plan_lookup_source_id_list.append(row[0])
-    plan_lookup = {}
-    if plan_lookup_source_id_list:
-        plan_source_ids = list(dict.fromkeys(plan_lookup_source_id_list))
-        plan_rows = await db.all(
-            select(
-                MRFPlan.source_id,
-                MRFPlan.plan_id,
-                MRFPlan.plan_id_type,
-                MRFPlan.market_type,
-                MRFPlan.plan_name,
-                MRFPlan.reporting_entity_name,
-                MRFPlan.metadata_json,
-            ).where(MRFPlan.source_id.in_(plan_source_ids))
-        )
-        plan_lookup = _plan_lookup_from_rows(plan_rows)
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row, metadata, file_domain in supported_rows:
-        plan_info = metadata.get("plan_info") or []
-        if not plan_info:
-            plan_info = _file_column_plan_info(
-                source_id=row[0],
-                plan_ids=row[6],
-                plan_names=row[7],
-                market_types=row[8],
-                plan_lookup=plan_lookup,
-            )
-        else:
-            plan_info = _enrich_plan_info_from_lookup(row[0], plan_info, plan_lookup)
-        company_name = _import_control_company_name(metadata, row[11])
-        plan_info = _apply_company_fallback(plan_info, company_name)
-        original_url = row[1] or row[2]
-        if not original_url:
-            continue
-        if not plan_info:
-            plan_info = _import_control_file_context_plan_info(
-                source_id=row[0],
-                description=row[10] or metadata.get("description"),
-                network_name=row[9],
-                company_name=company_name,
-                from_index_url=row[11],
-                canonical_url=row[2] or original_url,
-                target_label=metadata.get("target_label"),
-            )
-        if not plan_info:
-            continue
-        plan_info = _import_control_plan_info_with_context_ids(
-            source_id=row[0],
-            plan_info=plan_info,
-            from_index_url=row[11],
-            canonical_url=row[2] or original_url,
-        )
-        context = _import_control_preview_context(
-            metadata, row[11], row[2] or original_url
-        )
-        grouped.setdefault(row[0], []).append(
-            {
-                "original_url": original_url,
-                "canonical_url": row[2] or original_url,
-                "domain": file_domain,
-                "source_type": row[3],
-                "network_name": row[9],
-                "description": row[10] or metadata.get("description") or company_name,
-                "from_index_url": row[11],
-                "company_name": company_name,
-                "reporting_entity_name": metadata.get("reporting_entity_name")
-                or _reporting_entity_from_plan_info(row[0], plan_info, plan_lookup),
-                "content_length": row[4],
-                "plan_info": plan_info,
-                **context,
-            }
-        )
-    return grouped
-
-
-def _import_control_preview_item_matches_query(
-    item: dict[str, Any], target_query: str | None
-) -> bool:
-    values: list[Any] = [
-        item.get("original_url"),
-        item.get("canonical_url"),
-        item.get("domain"),
-        item.get("source_type"),
-        item.get("network_name"),
-        item.get("description"),
-        item.get("from_index_url"),
-        item.get("company_name"),
-        item.get("reporting_entity_name"),
-        item.get("group_id"),
-        item.get("group_number"),
-        item.get("client_id"),
-        item.get("client_name"),
-        item.get("employer_id"),
-        item.get("employer_name"),
-        item.get("employer_slug"),
-        item.get("entity_slug"),
-        item.get("target_label"),
-    ]
-    for plan in item.get("plan_info") or []:
-        if not isinstance(plan, dict):
-            continue
-        values.extend(
-            [
-                plan.get("plan_id"),
-                plan.get("plan_name"),
-                plan.get("planName"),
-                plan.get("plan_sponsor_name"),
-                plan.get("plan_sponser_name"),
-                plan.get("sponsor_name"),
-                plan.get("company_name"),
-            ]
-        )
-    return _search_values_match_query(values, target_query)
-
-
-def _import_control_preview_item_with_private_context(
-    item: dict[str, Any], target_query: str
-) -> dict[str, Any] | None:
-    if not _import_control_preview_item_matches_query(item, target_query):
-        return None
-    next_item = dict(item)
-    plan_info = _query_expanded_plan_info(next_item.get("plan_info") or [], target_query)
-    next_item["plan_info"] = _apply_company_fallback(plan_info, target_query)
-    next_item.setdefault("company_name", target_query)
-    return next_item
-
-
-def _source_row_url_match_values(row: dict[str, Any]) -> list[str]:
-    values: list[str] = []
-    for value in (
-        row.get("canonical_url"),
-        row.get("index_url"),
-        row.get("human_url"),
-        *_import_control_source_urls(row),
-    ):
-        text = str(value or "").strip()
-        if not text:
-            continue
-        values.append(text)
-        canonical = _canonical_or_none(text)
-        if canonical:
-            values.append(canonical)
-    return list(dict.fromkeys(values))
-
-
-async def _private_context_snapshot_source_ids(
-    row: dict[str, Any], *, limit: int = 8
-) -> list[str]:
-    """Find importable private-context source IDs related to a source row."""
-    source_id = str(row.get("source_id") or "")
-    url_values = _source_row_url_match_values(row)
-    if not source_id or not url_values:
-        return []
-    stmt = (
-        select(
-            MRFSource.source_id,
-            MRFSource.payer_id,
-            MRFSource.source_key,
-            MRFSource.display_name,
-            MRFSource.source_type,
-            MRFSource.hosting_platform,
-            MRFSource.access_model,
-            MRFSource.index_url,
-            MRFSource.human_url,
-            MRFSource.canonical_url,
-            MRFSource.domain,
-            MRFSource.status,
-            MRFSource.schema_version,
-            MRFSource.latest_index_date,
-            MRFSource.num_plans,
-            MRFSource.num_files,
-            MRFSource.num_indices,
-            MRFSource.total_compressed_size,
-            MRFSource.provenance_url,
-            MRFSource.seed_provider,
-            MRFSource.confidence,
-            MRFSource.license_status,
-            MRFSource.review_status,
-            MRFSource.metadata_json,
-            MRFSource.created_at,
-            MRFSource.updated_at,
-        )
-        .where(MRFSource.source_id != source_id)
-        .where(
-            or_(
-                MRFSource.canonical_url.in_(url_values),
-                MRFSource.index_url.in_(url_values),
-                MRFSource.human_url.in_(url_values),
-            )
-        )
-        .order_by(
-            MRFSource.num_files.desc().nullslast(),
-            MRFSource.num_plans.desc().nullslast(),
-            MRFSource.source_id,
-        )
-        .limit(limit * 3)
-    )
-    rows = await db.all(stmt)
-    source_ids: list[str] = []
-    for candidate_row in rows:
-        candidate = _stored_source_row_from_db_row(candidate_row)
-        candidate_id = str(candidate.get("source_id") or "")
-        if not candidate_id or candidate_id == source_id:
-            continue
-        if _has_private_query_context_source_row(candidate):
-            continue
-        if not _source_row_is_importable(candidate):
-            continue
-        source_ids.append(candidate_id)
-        if len(source_ids) >= limit:
-            break
-    return source_ids
-
-
-async def _private_context_snapshot_items(
-    row: dict[str, Any],
-) -> list[dict[str, Any]]:
-    if not _has_private_query_context_source_row(row):
-        return []
-    if not _should_sync_private_context_snapshots():
-        return []
-    target_query = _source_target_payer_query(row) or _clean_text(
-        _import_control_source_context_metadata(row).get("target_payer_query")
-    )
-    if not target_query:
-        return []
-    try:
-        sibling_source_ids = await _private_context_snapshot_source_ids(row)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        logging.getLogger(__name__).warning(
-            "private-context sibling snapshot lookup failed: %s", exc
-        )
-        return []
-    if not sibling_source_ids:
-        return []
-    sibling_snapshots = await _import_control_snapshot_items(sibling_source_ids)
-    items: list[dict[str, Any]] = []
-    seen_urls: set[str] = set()
-    for sibling_id in sibling_source_ids:
-        for item in sibling_snapshots.get(sibling_id) or []:
-            private_item = _import_control_preview_item_with_private_context(
-                item, target_query
-            )
-            if private_item is None:
-                continue
-            item_key = str(
-                private_item.get("canonical_url")
-                or private_item.get("original_url")
-                or ""
-            )
-            if item_key and item_key in seen_urls:
-                continue
-            if item_key:
-                seen_urls.add(item_key)
-            items.append(private_item)
-    return items
-
-
-_IMPORT_CONTROL_STAGED_VISIBILITY = "internal"
-_IMPORT_CONTROL_STAGED_STATUS = "needs_review"
-
-
-def _import_control_source_identity_key(row: dict[str, Any]) -> str:
-    index_url, official_url = _import_control_source_urls(row)
-    base_key = _canonical_or_none(index_url or official_url)
-    if not base_key:
-        return str(row.get("source_id") or row.get("source_key") or "")
-    context_metadata = _import_control_source_context_metadata(row)
-    if not context_metadata:
-        return base_key
-    context_parts = [
-        str(context_metadata[key]).strip()
-        for key in (
-            "target_payer_query",
-            "private_context_benefit_line",
-            "private_context_carrier_query",
-        )
-        if str(context_metadata.get(key) or "").strip()
-    ]
-    if not context_parts:
-        return base_key
-    return _id(
-        "import-control-source-identity",
-        {
-            "source_url": base_key,
-            "context": context_parts,
-        },
-    )
-
-
-def _import_control_source_promotion_rank(
-    row: dict[str, Any],
-    snapshot: dict[str, list[dict[str, Any]]],
-) -> tuple[int, int, int, int]:
-    status_rank = {
-        "active": 5,
-        "stale": 4,
-        "needs_review": 3,
-        "unsupported": 1,
-        "archived": 0,
-    }.get(str(row.get("status") or "").strip().lower(), 2)
-    metadata = row.get("metadata_json") or {}
-    aliases = metadata.get("aliases") or []
-    if not isinstance(aliases, list):
-        aliases = [aliases]
-    source_id = str(row.get("source_id") or "")
-    return (
-        1 if snapshot.get(source_id) else 0,
-        status_rank,
-        len([alias for alias in aliases if str(alias or "").strip()]),
-        1 if (row.get("index_url") or row.get("human_url")) else 0,
-    )
-
-
-def _dedupe_import_control_source_rows(
-    source_rows: list[dict[str, Any]],
-    snapshot: dict[str, list[dict[str, Any]]],
-) -> list[dict[str, Any]]:
-    by_key: dict[str, dict[str, Any]] = {}
-    for row in source_rows:
-        key = _import_control_source_identity_key(row)
-        previous = by_key.get(key)
-        if previous is None or _import_control_source_promotion_rank(
-            row, snapshot
-        ) > _import_control_source_promotion_rank(previous, snapshot):
-            by_key[key] = row
-    return list(by_key.values())
-
-
-def _duplicate_import_control_source_rows(
-    group_rows: list[dict[str, Any]], selected_rows: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Return same-identity rows not selected for catalog publication."""
-    selected_object_ids = {id(row) for row in selected_rows}
-    return [row for row in group_rows if id(row) not in selected_object_ids]
-
-
-async def _promote_import_control_source(
-    session: aiohttp.ClientSession,
-    base: str,
-    row: dict[str, Any],
-    *,
-    visibility: str = "public",
-    status: str = "active",
-    preserve_operator_state: bool = True,
-) -> str | None:
-    """Upsert a discovered source into import-control and return the import-control-derived
-    source_id (it derives ids from the canonical URL, ignoring ours). The catalog sync stages
-    sources as internal/needs_review and only flips them public after a full plan sync.
-    """
-    index_url, official_url = _import_control_source_urls(row)
-    payload = {
-        "index_url": index_url,
-        "official_url": official_url,
-        "source_key": row.get("source_key"),
-        "display_name": row.get("display_name"),
-        "payer_name": row.get("display_name"),
-        "source_type": row.get("source_type"),
-        "source_tier": _source_row_source_tier(row),
-        "domain": row.get("domain"),
-        "visibility": visibility,
-        "status": status,
-        "preserve_operator_state": preserve_operator_state,
-        "metadata": {
-            "hosting_platform": row.get("hosting_platform"),
-            "healthcare_source_id": row.get("source_id"),
-            "seed_provider": row.get("seed_provider"),
-            "access_model": row.get("access_model"),
-            "source_tier": _source_row_source_tier(row),
-            "aliases": list(
-                dict.fromkeys((row.get("metadata_json") or {}).get("aliases") or [])
-            ),
-            "benefit_lines": list(
-                dict.fromkeys(
-                    (row.get("metadata_json") or {}).get("benefit_lines") or []
-                )
-            ),
-            "source_coverage": list(
-                dict.fromkeys(
-                    (row.get("metadata_json") or {}).get("source_coverage") or []
-                )
-            ),
-            "vendor_names": list(
-                dict.fromkeys(
-                    (row.get("metadata_json") or {}).get("vendor_names") or []
-                )
-            ),
-            "network_names": list(
-                dict.fromkeys(
-                    (row.get("metadata_json") or {}).get("network_names") or []
-                )
-            ),
-            "plan_names": list(
-                dict.fromkeys(
-                    (row.get("metadata_json") or {}).get("plan_names") or []
-                )
-            ),
-            "supersedes_urls": list(
-                dict.fromkeys(
-                    (row.get("metadata_json") or {}).get("supersedes_urls") or []
-                )
-            ),
-            **_import_control_source_context_metadata(row),
-        },
-    }
-    async with session.post(f"{base}/v1/catalog/sources", json=payload) as resp:
-        if resp.status >= 400:
-            text = await resp.text()
-            raise RuntimeError(
-                f"import-control source promote failed: {resp.status} {text[:200]}"
-            )
-        data = await resp.json()
-    return str(data.get("source_id") or "") or None
-
-
-async def _fetch_import_control_source(
-    session: aiohttp.ClientSession, base: str, ic_source_id: str
-) -> dict[str, Any] | None:
-    """Read the stored import-control source (the upsert response echoes the request payload,
-    not the persisted operator-controlled visibility/status)."""
-    async with session.get(f"{base}/v1/catalog/sources/{ic_source_id}") as resp:
-        if resp.status == 404:
-            return None
-        if resp.status >= 400:
-            text = await resp.text()
-            raise RuntimeError(
-                f"import-control source fetch failed: {resp.status} {text[:200]}"
-            )
-        data = await resp.json()
-    return data if isinstance(data, dict) else None
-
-
-async def _find_import_control_sources_by_url(
-    session: aiohttp.ClientSession,
-    import_control_base_url: str,
-    source_index_url: str,
-) -> list[dict[str, Any]]:
-    """Return catalog sources whose stored canonical URL matches source_index_url."""
-    canonical_source_url = _canonical_or_none(source_index_url) or source_index_url
-    async with session.get(
-        f"{import_control_base_url}/v1/catalog/sources",
-        params={"q": source_index_url, "limit": "100"},
-    ) as resp:
-        if resp.status >= 400:
-            text = await resp.text()
-            raise RuntimeError(
-                f"import-control source search failed: {resp.status} {text[:200]}"
-            )
-        response_payload = await resp.json()
-    response_items = (
-        response_payload.get("items") if isinstance(response_payload, dict) else None
-    )
-    if not isinstance(response_items, list):
-        return []
-    matching_sources: list[dict[str, Any]] = []
-    for source_record in response_items:
-        if not isinstance(source_record, dict):
-            continue
-        catalog_source_urls = {
-            str(source_record.get("canonical_index_url") or "").strip(),
-            str(source_record.get("index_url") or "").strip(),
-            str(source_record.get("official_url") or "").strip(),
-        }
-        if (
-            canonical_source_url in catalog_source_urls
-            or source_index_url in catalog_source_urls
-        ):
-            matching_sources.append(source_record)
-    return matching_sources
-
-
-async def _patch_import_control_source_state(
-    session: aiohttp.ClientSession,
-    base: str,
-    source_id: str,
-    *,
-    visibility: str,
-    status: str,
-) -> None:
-    payload = {
-        "visibility": visibility,
-        "status": status,
-        "preserve_operator_state": False,
-    }
-    async with session.patch(
-        f"{base}/v1/catalog/sources/{source_id}", json=payload
-    ) as resp:
-        if resp.status >= 400:
-            text = await resp.text()
-            raise RuntimeError(
-                f"import-control source patch failed: {resp.status} {text[:200]}"
-            )
-        await resp.json()
-
-
-async def _ingest_import_control_preview(
-    session: aiohttp.ClientSession,
-    base: str,
-    ic_source_id: str,
-    items: list[dict[str, Any]],
-) -> int:
-    preview = {"source_id": ic_source_id, "items": items}
-    async with session.post(
-        f"{base}/v1/ptg/discover/ingest-preview", json=preview
-    ) as resp:
-        if resp.status >= 400:
-            text = await resp.text()
-            raise RuntimeError(
-                f"import-control plan ingest failed: {resp.status} {text[:200]}"
-            )
-        data = await resp.json()
-    counts = data.get("counts") or {}
-    return int(counts.get("plans") or 0)
-
-
-async def _mark_import_control_seed_promoted(
-    session: aiohttp.ClientSession,
-    base: str,
-    row: dict[str, Any],
-    promoted_source_id: str,
-) -> bool:
-    item = _import_control_seed_item(
-        row,
-        review_status="promoted",
-        promoted_source_id=promoted_source_id,
-    )
-    if not item:
-        return False
-    async with session.post(
-        f"{base}/v1/catalog/seeds/import",
-        json={"seed_provider": "healthcare-mrf-api", "items": [item]},
-    ) as resp:
-        if resp.status >= 400:
-            text = await resp.text()
-            raise RuntimeError(
-                f"import-control promoted seed sync failed: {resp.status} {text[:200]}"
-            )
-        await resp.json()
-    return True
-
-
-async def _supersede_import_control_replaced_urls(
-    session: aiohttp.ClientSession,
-    base: str,
-    source_row: dict[str, Any],
-) -> None:
-    """Hide catalog rows for explicitly replaced source URLs."""
-    metadata = source_row.get("metadata_json") or {}
-    for old_url in metadata.get("supersedes_urls") or []:
-        old_url_text = str(old_url or "").strip()
-        if not old_url_text:
-            continue
-        replaced_sources = await _find_import_control_sources_by_url(
-            session, base, old_url_text
-        )
-        for replaced_source in replaced_sources:
-            replaced_source_id = str(replaced_source.get("source_id") or "").strip()
-            if not replaced_source_id:
-                continue
-            await _patch_import_control_source_state(
-                session,
-                base,
-                replaced_source_id,
-                visibility=_IMPORT_CONTROL_STAGED_VISIBILITY,
-                status="superseded",
-            )
-        if replaced_sources:
-            continue
-        replacement_source_map = {
-            **source_row,
-            "index_url": old_url_text,
-            "human_url": old_url_text,
-            "canonical_url": _canonical_or_none(old_url_text),
-            "hosting_platform": classify_hosting_platform(old_url_text),
-        }
-        await _promote_import_control_source(
-            session,
-            base,
-            replacement_source_map,
-            visibility=_IMPORT_CONTROL_STAGED_VISIBILITY,
-            status="superseded",
-            preserve_operator_state=False,
-        )
-
-
-async def _push_import_control_catalog(
-    source_rows: list[dict[str, Any]],
-    *,
-    limit: int | None = None,
-    progress_run_id: str | None = None,
-    concurrency: int | None = None,
-) -> tuple[int, int, list[dict[str, Any]]]:
-    """Promote eligible discovered sources into import-control and push their discovered
-    plans (built from the stored MRF file snapshot). Returns
-    (sources_synced, plans_synced, per-source errors).
-
-    Publication is staged: each source is upserted as internal/needs_review first, its plans
-    are ingested and the seed marked promoted, and only then is the source flipped public.
-    A partial failure leaves the source non-public (needs_review) instead of exposing an
-    incomplete plan catalog, and the source does not count as synced.
-
-    Reuses import-control's non-destructive upsert (keyed on the stable discovered_plan_id),
-    so manual fetch-preview plans and bulk-discovered plans converge instead of duplicating.
-    """
-    base_url = str(
-        os.getenv("HLTHPRT_IMPORT_CONTROL_URL")
-        or os.getenv("HP_IMPORT_CONTROL_BASE_URL")
-        or ""
-    ).strip()
-    token = str(
-        os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN")
-        or os.getenv("HLTHPRT_CONTROL_API_TOKEN")
-        or ""
-    ).strip()
-    if not base_url or not token:
-        return (0, 0, [])
-    source_rows = await _import_control_catalog_source_rows(source_rows, limit=limit)
-    eligible = [
-        row
-        for row in source_rows
-        if _eligible_for_public_promotion(row)
-        and (row.get("index_url") or row.get("human_url"))
-    ]
-    eligible = eligible[: limit or len(eligible)]
-    if not eligible:
-        return (0, 0, [])
-    eligible_rows_by_identity: dict[str, list[dict[str, Any]]] = {}
-    for row in eligible:
-        eligible_rows_by_identity.setdefault(
-            _import_control_source_identity_key(row), []
-        ).append(row)
-    base = base_url.rstrip("/")
-    timeout = _import_control_sync_timeout()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    }
-    catalog_concurrency = _import_control_catalog_concurrency(concurrency)
-    sources_synced = 0
-    plans_synced = 0
-    errors: list[dict[str, Any]] = []
-    if catalog_concurrency > 1 and len(eligible_rows_by_identity) > 1:
-        progress_total = len(eligible)
-        progress_state_dict = {"done": 0}
-        progress_lock = asyncio.Lock()
-        semaphore = asyncio.Semaphore(catalog_concurrency)
-        retry_attempts = _import_control_catalog_retry_attempts()
-
-        async def sync_catalog_source_identity_group(
-            group_rows: list[dict[str, Any]],
-        ) -> tuple[int, int, list[dict[str, Any]]]:
-            """Sync one source identity group while sharing global run progress."""
-            async with semaphore:
-                group_sync_result = (0, 0, [])
-                for attempt in range(1, retry_attempts + 1):
-                    try:
-                        group_sync_result = await _push_import_control_catalog(
-                            group_rows,
-                            limit=len(group_rows),
-                            progress_run_id=None,
-                            concurrency=1,
-                        )
-                    except Exception as sync_error:
-                        source_id = (
-                            str(group_rows[0].get("source_id") or "") if group_rows else ""
-                        )
-                        group_sync_result = (
-                            0,
-                            0,
-                            [
-                                {
-                                    "source_id": source_id or None,
-                                    "import_control_source_id": None,
-                                    "message": str(sync_error),
-                                }
-                            ],
-                        )
-                    group_sources_synced, _group_plans_synced, group_errors = group_sync_result
-                    should_retry = (
-                        attempt < retry_attempts
-                        and group_sources_synced == 0
-                        and _should_retry_import_control_catalog_errors(group_errors)
-                    )
-                    if not should_retry:
-                        break
-                    await asyncio.sleep(_import_control_catalog_retry_delay(attempt))
-            async with progress_lock:
-                progress_state_dict["done"] += len(group_rows)
-                current_done = progress_state_dict["done"]
-            if progress_run_id:
-                enqueue_live_progress(
-                    run_id=progress_run_id,
-                    importer="mrf-source-discovery",
-                    status="running",
-                    phase="syncing import-control catalog",
-                    unit="sources",
-                    done=current_done,
-                    total=progress_total,
-                    message=f"synced catalog source {current_done}/{progress_total}",
-                )
-            return group_sync_result
-
-        sync_results = await asyncio.gather(
-            *(
-                sync_catalog_source_identity_group(group_rows)
-                for group_rows in eligible_rows_by_identity.values()
-            )
-        )
-        sources_synced = sum(item[0] for item in sync_results)
-        plans_synced = sum(item[1] for item in sync_results)
-        errors = [error for item in sync_results for error in item[2]]
-        if errors and not sources_synced:
-            raise RuntimeError(
-                f"import-control catalog sync failed for all {len(errors)} source(s): "
-                + "; ".join(str(item.get("message") or "") for item in errors)[:500]
-            )
-        return (sources_synced, plans_synced, errors)
-    async with aiohttp.ClientSession(
-        headers=headers, timeout=timeout, trust_env=False
-    ) as session:
-        # Snapshot rows can be very large for broad public carriers. Load only the
-        # current source identity group so private-context catalog syncs do not
-        # materialize every source file preview in one process.
-        progress_total = len(eligible)
-        progress_done = 0
-
-        def emit_catalog_sync_progress(message: str) -> None:
-            """Publish one import-control catalog sync progress event for this run."""
-            if progress_run_id:
-                enqueue_live_progress(
-                    run_id=progress_run_id,
-                    importer="mrf-source-discovery",
-                    status="running",
-                    phase="syncing import-control catalog",
-                    unit="sources",
-                    done=progress_done,
-                    total=progress_total,
-                    message=message,
-                )
-
-        for group_rows in eligible_rows_by_identity.values():
-            group_snapshot_source_ids = [
-                str(row.get("source_id") or "")
-                for row in group_rows
-                if _source_row_is_importable(row) and str(row.get("source_id") or "")
-                and (
-                    not _has_private_query_context_source_row(row)
-                    or _should_sync_private_context_snapshots()
-                )
-            ]
-            snapshots_by_source_id = (
-                await _import_control_snapshot_items(group_snapshot_source_ids)
-                if group_snapshot_source_ids
-                else {}
-            )
-            for row in group_rows:
-                source_id = str(row.get("source_id") or "")
-                if (
-                    source_id
-                    and not snapshots_by_source_id.get(source_id)
-                    and _has_private_query_context_source_row(row)
-                    and _should_sync_private_context_snapshots()
-                ):
-                    private_items = await _private_context_snapshot_items(row)
-                    if private_items:
-                        snapshots_by_source_id[source_id] = private_items
-            rows_to_sync = _dedupe_import_control_source_rows(
-                group_rows, snapshots_by_source_id
-            )
-            synced_identity_keys: set[str] = set()
-            for row in rows_to_sync:
-                source_id = str(row.get("source_id") or "")
-                items = snapshots_by_source_id.get(source_id) or []
-                source_status = str(row.get("status") or "active").strip() or "active"
-                evidence_only = not _source_row_is_importable(row)
-                identity_key = _import_control_source_identity_key(row)
-                ic_source_id: str | None = None
-                try:
-                    # Stage the source non-public first so a mid-sync failure never leaves a
-                    # public source with an incomplete plan catalog.
-                    ic_source_id = await _promote_import_control_source(
-                        session,
-                        base,
-                        row,
-                        visibility=_IMPORT_CONTROL_STAGED_VISIBILITY,
-                        status=_IMPORT_CONTROL_STAGED_STATUS,
-                    )
-                    if not ic_source_id:
-                        progress_done += 1
-                        emit_catalog_sync_progress(
-                            f"catalog source {progress_done}/{progress_total} skipped"
-                        )
-                        continue
-                    source_status_lower = source_status.lower()
-                    stored = await _fetch_import_control_source(session, base, ic_source_id)
-                    # Flip staged rows public after ingest. Also let an active registry row with
-                    # crawled files clear a stale state left by an older duplicate URL row.
-                    stored_visibility = str((stored or {}).get("visibility") or "")
-                    staged = stored is None or (
-                        stored_visibility == _IMPORT_CONTROL_STAGED_VISIBILITY
-                        and str(stored.get("status") or "") == _IMPORT_CONTROL_STAGED_STATUS
-                    )
-                    stored_status = str((stored or {}).get("status") or "").lower()
-                    needs_public_state_refresh = (
-                        source_status_lower == "active"
-                        and stored_status in {"stale", "superseded"}
-                        and (
-                            stored_visibility != "public"
-                            or stored_status != source_status_lower
-                        )
-                    )
-                    should_ingest_preview = bool(items and not evidence_only)
-                    if not items and source_status_lower == "active" and not evidence_only:
-                        # Existing public sources still need metadata-only refreshes
-                        # (aliases, benefit lines, source tier). Newly staged metadata-only
-                        # sources should become searchable even when the source snapshot has
-                        # not produced preview items yet.
-                        if staged or needs_public_state_refresh:
-                            await _promote_import_control_source(
-                                session,
-                                base,
-                                row,
-                                visibility="public",
-                                status=source_status,
-                                preserve_operator_state=False,
-                        )
-                        sources_synced += 1
-                        synced_identity_keys.add(identity_key)
-                        await _supersede_import_control_replaced_urls(
-                            session, base, row
-                        )
-                        progress_done += 1
-                        emit_catalog_sync_progress(
-                            f"synced catalog source {progress_done}/{progress_total}"
-                        )
-                        continue
-                    source_plans = 0
-                    if should_ingest_preview:
-                        for batch in _chunk_preview_items_for_request(
-                            ic_source_id, _split_preview_items(items)
-                        ):
-                            source_plans += await _ingest_import_control_preview(
-                                session, base, ic_source_id, batch
-                            )
-                        await _mark_import_control_seed_promoted(
-                            session, base, row, ic_source_id
-                        )
-                    elif evidence_only:
-                        await _mark_import_control_seed_promoted(
-                            session, base, row, ic_source_id
-                        )
-                    if (
-                        staged
-                        or source_status_lower != "active"
-                        or (items and stored_status == "stale")
-                        or needs_public_state_refresh
-                    ):
-                        await _promote_import_control_source(
-                            session,
-                            base,
-                            row,
-                            visibility="public",
-                            status=source_status,
-                            preserve_operator_state=False,
-                        )
-                    sources_synced += 1
-                    plans_synced += source_plans
-                    synced_identity_keys.add(identity_key)
-                    await _supersede_import_control_replaced_urls(session, base, row)
-                    progress_done += 1
-                    emit_catalog_sync_progress(
-                        f"synced catalog source {progress_done}/{progress_total}"
-                    )
-                except Exception as exc:  # pylint: disable=broad-exception-caught
-                    errors.append(
-                        {
-                            "source_id": source_id or None,
-                            "import_control_source_id": ic_source_id,
-                            "message": str(exc),
-                        }
-                    )
-                    progress_done += 1
-                    emit_catalog_sync_progress(
-                        f"catalog source {progress_done}/{progress_total} failed"
-                    )
-                    continue
-            for duplicate_row in _duplicate_import_control_source_rows(
-                group_rows, rows_to_sync
-            ):
-                duplicate_identity_key = _import_control_source_identity_key(duplicate_row)
-                if duplicate_identity_key not in synced_identity_keys:
-                    continue
-                try:
-                    await _promote_import_control_source(
-                        session,
-                        base,
-                        duplicate_row,
-                        visibility=_IMPORT_CONTROL_STAGED_VISIBILITY,
-                        status="superseded",
-                        preserve_operator_state=False,
-                    )
-                except Exception as exc:  # pylint: disable=broad-exception-caught
-                    errors.append(
-                        {
-                            "source_id": str(duplicate_row.get("source_id") or "")
-                            or None,
-                            "import_control_source_id": None,
-                            "message": f"duplicate cleanup failed: {exc}",
-                        }
-                    )
-    if errors and not sources_synced:
-        raise RuntimeError(
-            f"import-control catalog sync failed for all {len(errors)} source(s): "
-            + "; ".join(str(item.get("message") or "") for item in errors)[:500]
-        )
-    return (sources_synced, plans_synced, errors)
-
-
 def _discovery_run_params(
     *,
     test_mode: bool,
@@ -15963,8 +13764,6 @@ def _discovery_run_params(
     file_probe_types: tuple[str, ...],
     file_probe_entity_types: tuple[str, ...],
     file_probe_payer_query: str | None,
-    sync_import_control: bool,
-    sync_import_control_catalog: bool,
     max_toc_bytes: int,
     concurrency: int,
     crawl_target_limit: int | None,
@@ -15982,8 +13781,6 @@ def _discovery_run_params(
         "file_probe_types": list(file_probe_types),
         "file_probe_entity_types": list(file_probe_entity_types),
         "file_probe_payer_query": file_probe_payer_query,
-        "sync_import_control": sync_import_control,
-        "sync_import_control_catalog": sync_import_control_catalog,
         "max_toc_bytes": max_toc_bytes,
         "concurrency": concurrency,
         "crawl_target_limit": crawl_target_limit,
@@ -16015,9 +13812,6 @@ def _discovery_control_metrics(
         "files_probed": result.files_probed,
         "file_probe_ok": result.file_probe_ok,
         "bytes_streamed": bytes_streamed,
-        "import_control_synced": result.import_control_synced,
-        "import_control_sources_synced": result.import_control_sources_synced,
-        "import_control_plans_synced": result.import_control_plans_synced,
         "error_count": len(result.errors),
     }
 
@@ -16198,14 +13992,12 @@ async def main(
     file_probe_types: Any = None,
     file_probe_entity_types: Any = None,
     file_probe_payer_query: str | None = None,
-    sync_import_control: bool = False,
-    sync_import_control_catalog: bool = True,
     max_toc_bytes: int = MAX_TOC_BYTES_DEFAULT,
     concurrency: int = DEFAULT_CONCURRENCY,
     crawl_target_limit: int | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Run source discovery, optional crawling and probing, and synchronization."""
+    """Run source discovery with optional crawling and file probing."""
     max_toc_bytes = max_toc_bytes or MAX_TOC_BYTES_DEFAULT
     concurrency = max(1, int(concurrency or DEFAULT_CONCURRENCY))
     crawl_target_limit = max(1, int(crawl_target_limit)) if crawl_target_limit else None
@@ -16245,8 +14037,6 @@ async def main(
         file_probe_types=parsed_file_probe_types,
         file_probe_entity_types=parsed_file_probe_entity_types,
         file_probe_payer_query=parsed_file_probe_payer_query,
-        sync_import_control=sync_import_control,
-        sync_import_control_catalog=sync_import_control_catalog,
         max_toc_bytes=max_toc_bytes,
         concurrency=concurrency,
         crawl_target_limit=crawl_target_limit,
@@ -16290,9 +14080,7 @@ async def main(
             message="loading source providers",
         )
 
-    needs_source_load = bool(
-        dry_run or check_urls or crawl or sync_import_control or not probe_files
-    )
+    needs_source_load = bool(dry_run or check_urls or crawl or not probe_files)
     candidates: list[SourceCandidate] = []
     if needs_source_load:
         provider_load_limit = (
@@ -16464,68 +14252,6 @@ async def main(
         result.files_probed = len(probe_observations)
         result.file_probe_ok = ok_count
         result.urls_checked += len(probe_observations)
-    if sync_import_control:
-        try:
-            if control_run_id:
-                enqueue_live_progress(
-                    run_id=control_run_id,
-                    importer="mrf-source-discovery",
-                    status="running",
-                    phase="syncing import-control seeds",
-                    unit="sources",
-                    done=0,
-                    total=len(source_rows),
-                    message=f"syncing {len(source_rows)} source seed rows",
-                )
-            result.import_control_synced = await _sync_import_control_seeds(
-                source_rows,
-                limit=bounded_limit,
-                progress_run_id=control_run_id,
-            )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            result.errors.append({"provider": "import-control", "message": str(exc)})
-        if sync_import_control_catalog:
-            try:
-                if control_run_id:
-                    enqueue_live_progress(
-                        run_id=control_run_id,
-                        importer="mrf-source-discovery",
-                        status="running",
-                        phase="syncing import-control catalog",
-                        unit="sources",
-                        done=0,
-                        total=len(source_rows),
-                        message=f"syncing catalog plans for {len(source_rows)} source rows",
-                    )
-                sources_synced, plans_synced, catalog_errors = (
-                    await _push_import_control_catalog(
-                        source_rows,
-                        limit=bounded_limit,
-                        progress_run_id=control_run_id,
-                        concurrency=concurrency,
-                    )
-                )
-                result.import_control_sources_synced = sources_synced
-                result.import_control_plans_synced = plans_synced
-                for item in catalog_errors:
-                    result.errors.append({"provider": "import-control-catalog", **item})
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                result.errors.append(
-                    {"provider": "import-control-catalog", "message": str(exc)}
-                )
-        else:
-            if control_run_id:
-                enqueue_live_progress(
-                    run_id=control_run_id,
-                    importer="mrf-source-discovery",
-                    status="running",
-                    phase="skipping import-control catalog sync",
-                    unit="sources",
-                    done=len(source_rows),
-                    total=len(source_rows),
-                    message="skipped catalog plan sync",
-                )
-
     crawl_status = "succeeded" if not result.errors else "succeeded_with_errors"
     finished_at = _utc_now()
     bytes_streamed = sum(int(item.get("content_length") or 0) for item in observations)
@@ -16617,15 +14343,6 @@ async def process_data(
         file_probe_types=task.get("file_probe_types"),
         file_probe_entity_types=task.get("file_probe_entity_types"),
         file_probe_payer_query=task.get("file_probe_payer_query"),
-        sync_import_control=bool(
-            task.get(
-                "sync_import_control",
-                _env_flag("HLTHPRT_MRF_DISCOVERY_SYNC_IMPORT_CONTROL_DEFAULT"),
-            )
-        ),
-        sync_import_control_catalog=bool(
-            task.get("sync_import_control_catalog", True)
-        ),
         max_toc_bytes=int(task.get("max_toc_bytes") or MAX_TOC_BYTES_DEFAULT),
         concurrency=int(task.get("concurrency") or DEFAULT_CONCURRENCY),
         crawl_target_limit=_as_int(task.get("crawl_target_limit")),

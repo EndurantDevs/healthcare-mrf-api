@@ -6,8 +6,8 @@ pub const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
 pub const DEFAULT_PROGRESS_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_PROGRESS_OBJECTS: u64 = 2_000_000;
 pub const DEFAULT_SPLIT_NEGOTIATED_RATES: usize = 8192;
-pub const DEFAULT_COMPACT_RUST_WORKERS: usize = 8;
-pub const DEFAULT_COMPACT_RUST_WORK_QUEUE: usize = 16;
+pub const DEFAULT_COMPACT_RUST_WORKERS: usize = 16;
+pub const DEFAULT_COMPACT_RUST_WORK_QUEUE: usize = 32;
 pub const DEFAULT_COMPACT_COPY_ROTATE_BYTES: u64 = 128 * 1024 * 1024;
 pub const DEFAULT_RAW_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_PARSE_IN_WORKERS: bool = true;
@@ -129,6 +129,8 @@ mod tests {
 
     #[test]
     fn scanner_chunk_defaults_are_promoted_and_can_be_overridden() {
+        assert_eq!(DEFAULT_COMPACT_RUST_WORKERS, 16);
+        assert_eq!(DEFAULT_COMPACT_RUST_WORK_QUEUE, 32);
         assert_eq!(DEFAULT_SPLIT_NEGOTIATED_RATES, 8192);
         assert_eq!(DEFAULT_RAW_CHUNK_BYTES, 33_554_432);
         scoped_env(

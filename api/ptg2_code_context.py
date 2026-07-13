@@ -70,6 +70,8 @@ async def _resolve_ptg2_code_search_context(
     code: Any,
     code_system: Any,
 ) -> dict[str, Any] | None:
+    """Resolve a requested procedure code through bounded crosswalk traversal."""
+
     requested_system = _normalize_code_system(code_system)
     requested_code = _normalize_code(code)
     if requested_system:

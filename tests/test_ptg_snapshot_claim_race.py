@@ -125,6 +125,11 @@ def test_published_reconciliation_rejects_cleaned_resources_under_lock(monkeypat
         "_publish_ptg2_source_pointers",
         publish_source_pointers,
     )
+    monkeypatch.setattr(
+        process_ptg,
+        "_current_source_snapshot_id",
+        AsyncMock(return_value="snap_published"),
+    )
 
     with pytest.raises(RuntimeError, match="serving resources are missing"):
         asyncio.run(
