@@ -126,18 +126,24 @@ def test_role_evidence_sql_uses_indexed_catalog_lookup_and_active_resources():
         in sql
     )
     assert "regexp_replace(affiliation.participating_organization_ref" not in sql
-    assert "network_catalog.refs::jsonb" in sql
-    assert "catalog_ref.value->>'resource_type' = 'InsurancePlan'" in sql
-    assert "insurance_plan.source_id = plan_candidate.source_id" in sql
-    assert "insurance_plan.resource_id = plan_candidate.resource_id" in sql
+    assert "network_catalog.refs" not in sql
+    assert "jsonb_array_elements(network_catalog.refs" not in sql
+    assert "catalog_plan_candidates" not in sql
+    assert "COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)" in sql
+    assert "insurance_plan.source_id = role_network.source_id" in sql
+    assert "plan_network_ref.value = role_network.reference" in sql
+    assert "role_network.resource_id" in sql
     assert "FROM (SELECT DISTINCT source_id FROM valid_role_networks)" not in sql
-    assert "plan_network_ref" not in sql
     active_plan_sql = (
         "COALESCE(NULLIF(LOWER(BTRIM(insurance_plan.status)), ''), 'active') = 'active'"
     )
     assert sql.count(active_plan_sql) == 2
     assert "network_catalog.network_resource_id = role_network.resource_id" in sql
+    assert "network_catalog.provider_directory_network_name" in sql
     assert "catalog_status.catalog_complete" in sql
+    assert "FROM direct_plans AS direct_plan" in sql
+    assert "direct_plan.resource_id = insurance_plan.resource_id" in sql
+    assert "BOOL_OR(role_network.plan_provenance = 'network-derived')" in sql
 
 
 def test_role_plan_cap_prioritizes_direct_plans_and_reports_both_bounds():
@@ -233,6 +239,14 @@ def test_mapper_preserves_cap_and_global_truncation_metadata():
         "truncated": True,
         "catalog_complete": True,
     }
+    assert role_evidence["insurance_plans"] == [
+        {
+            "resource_type": "InsurancePlan",
+            "resource_id": "plan-1",
+            "identifier": "PLAN-1",
+            "provenance": "network-derived",
+        }
+    ]
     assert role_evidence["evidence_metadata"] == {
         "returned": 2,
         "total": 9000,

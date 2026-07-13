@@ -942,6 +942,45 @@ def _provider_directory_role_keys_from_addresses(
     return role_key_list
 
 
+def _directory_affiliation_keys_from_records(record_ids: Any) -> list[tuple[str, str]]:
+    candidates = record_ids if isinstance(record_ids, (list, tuple, set)) else [record_ids]
+    affiliation_key_list: list[tuple[str, str]] = []
+    seen_set: set[tuple[str, str]] = set()
+    for raw_record_id in candidates:
+        parts = str(raw_record_id or "").split(":")
+        if len(parts) < 5 or parts[:2] != [
+            "provider_directory_fhir",
+            "organization_affiliation",
+        ]:
+            continue
+        affiliation_key = (parts[2].strip(), parts[3].strip())
+        if not all(affiliation_key) or affiliation_key in seen_set:
+            continue
+        seen_set.add(affiliation_key)
+        affiliation_key_list.append(affiliation_key)
+    return affiliation_key_list
+
+
+def _provider_directory_affiliation_keys_from_addresses(
+    addresses: Sequence[Any],
+) -> list[tuple[str, str]]:
+    affiliation_key_list: list[tuple[str, str]] = []
+    seen_set: set[tuple[str, str]] = set()
+    for address in addresses or []:
+        if not isinstance(address, Mapping):
+            continue
+        for affiliation_key in _directory_affiliation_keys_from_records(
+            address.get("source_record_ids")
+        ):
+            if affiliation_key in seen_set:
+                continue
+            seen_set.add(affiliation_key)
+            affiliation_key_list.append(affiliation_key)
+            if len(affiliation_key_list) >= MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS:
+                return affiliation_key_list
+    return affiliation_key_list
+
+
 def _provider_directory_reference_resource_id_sql(reference: str, resource_type: str) -> str:
     return (
         "NULLIF(BTRIM(CASE "
@@ -950,6 +989,22 @@ def _provider_directory_reference_resource_id_sql(reference: str, resource_type:
         f"WHEN {reference} LIKE '{resource_type}/%' "
         f"THEN regexp_replace({reference}, '^{resource_type}/', '') "
         f"ELSE {reference} END), '')"
+    )
+
+
+def _provider_directory_plan_network_match_sql(
+    plan_network_reference: str,
+    network_resource_id: str,
+    network_reference: str,
+) -> str:
+    """Match a small InsurancePlan network list to a normalized network row."""
+    normalized_plan_network_id = _provider_directory_reference_resource_id_sql(
+        plan_network_reference,
+        "Organization",
+    )
+    return (
+        f"({plan_network_reference} = {network_reference} "
+        f"OR {normalized_plan_network_id} = {network_resource_id})"
     )
 
 
@@ -1113,17 +1168,10 @@ def _missing_catalog_plan_ctes_sql() -> str:
     """
 
 
-def _catalog_plan_lookup_ctes_sql(schema: str) -> str:
+def _role_catalog_status_cte_sql(schema: str) -> str:
+    """Require a catalog row for every role network before deriving plans."""
     return f"""
-    role_network_catalog AS MATERIALIZED (
-        SELECT role_network.source_id, role_network.role_id,
-               role_network.resource_id, role_network.plan_provenance,
-               network_catalog.refs::jsonb
-          FROM valid_role_networks AS role_network
-          JOIN {schema}.provider_directory_network_catalog AS network_catalog
-            ON network_catalog.source_id = role_network.source_id
-           AND network_catalog.network_resource_id = role_network.resource_id
-    ), role_catalog_status AS MATERIALIZED (
+    role_catalog_status AS MATERIALIZED (
         SELECT role.source_id, role.role_id,
                BOOL_AND(
                    role_network.source_id IS NULL OR network_catalog.source_id IS NOT NULL
@@ -1136,63 +1184,65 @@ def _catalog_plan_lookup_ctes_sql(schema: str) -> str:
             ON network_catalog.source_id = role_network.source_id
            AND network_catalog.network_resource_id = role_network.resource_id
       GROUP BY role.source_id, role.role_id
-    ), catalog_plan_candidates AS MATERIALIZED (
-        SELECT DISTINCT role_network.source_id, role_network.role_id,
-               NULLIF(BTRIM(catalog_ref.value->>'resource_id'), '')::varchar AS resource_id,
-               role_network.plan_provenance
-          FROM role_network_catalog AS role_network
-          JOIN role_catalog_status AS catalog_status
-            ON catalog_status.source_id = role_network.source_id
-           AND catalog_status.role_id = role_network.role_id
-           AND catalog_status.catalog_complete
-         CROSS JOIN LATERAL jsonb_array_elements(
-               COALESCE(role_network.refs, '[]'::jsonb)
-         ) AS catalog_ref(value)
-         WHERE catalog_ref.value->>'resource_type' = 'InsurancePlan'
     )
     """
 
 
-def _catalog_derived_plan_cte_sql(schema: str) -> str:
+def _network_derived_role_plans_cte_sql(schema: str) -> str:
+    """Derive role plans from current InsurancePlan network references."""
     insurance_plan_active = _insurance_plan_active_sql("insurance_plan")
+    network_match = _provider_directory_plan_network_match_sql(
+        "plan_network_ref.value",
+        "role_network.resource_id",
+        "role_network.reference",
+    )
     return f"""
     network_derived_plans AS MATERIALIZED (
-        SELECT plan_candidate.source_id, plan_candidate.role_id,
+        SELECT role_network.source_id, role_network.role_id,
                insurance_plan.resource_id,
                NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS identifier,
-               CASE WHEN BOOL_OR(plan_candidate.plan_provenance = 'network-derived')
+               CASE WHEN BOOL_OR(role_network.plan_provenance = 'network-derived')
                     THEN 'network-derived'::varchar
                     ELSE 'organization-affiliation-network-derived'::varchar
                 END AS provenance
-          FROM catalog_plan_candidates AS plan_candidate
+          FROM valid_role_networks AS role_network
+          JOIN role_catalog_status AS catalog_status
+            ON catalog_status.source_id = role_network.source_id
+           AND catalog_status.role_id = role_network.role_id
+           AND catalog_status.catalog_complete
           JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
-            ON insurance_plan.source_id = plan_candidate.source_id
-           AND insurance_plan.resource_id = plan_candidate.resource_id
+            ON insurance_plan.source_id = role_network.source_id
            AND {insurance_plan_active}
           {_provider_directory_current_resource_join_sql(
               "insurance_plan", "InsurancePlan", "current_insurance_plan"
           )}
-         WHERE plan_candidate.resource_id IS NOT NULL
+         WHERE EXISTS (
+               SELECT 1
+                 FROM jsonb_array_elements_text(
+                      COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)
+                 ) AS plan_network_ref(value)
+                WHERE {network_match}
+         )
            AND NOT EXISTS (
                SELECT 1
                  FROM direct_plans AS direct_plan
-                WHERE direct_plan.source_id = plan_candidate.source_id
-                  AND direct_plan.role_id = plan_candidate.role_id
-                  AND direct_plan.resource_id = plan_candidate.resource_id
+                WHERE direct_plan.source_id = role_network.source_id
+                  AND direct_plan.role_id = role_network.role_id
+                  AND direct_plan.resource_id = insurance_plan.resource_id
            )
-      GROUP BY plan_candidate.source_id, plan_candidate.role_id,
+      GROUP BY role_network.source_id, role_network.role_id,
                insurance_plan.resource_id, insurance_plan.plan_identifier
     )
     """
 
 
 def _provider_directory_catalog_plan_ctes_sql(schema: str, has_catalog: bool) -> str:
-    """Build fail-closed catalog reverse lookup CTEs for network-derived plans."""
+    """Build catalog-gated role plan CTEs without expanding catalog payloads."""
     if not has_catalog:
         return _missing_catalog_plan_ctes_sql()
     return f"""
-    {_catalog_plan_lookup_ctes_sql(schema)},
-    {_catalog_derived_plan_cte_sql(schema)}
+    {_role_catalog_status_cte_sql(schema)},
+    {_network_derived_role_plans_cte_sql(schema)}
     """
 
 
@@ -1590,6 +1640,294 @@ async def _fetch_provider_directory_role_evidence_map(
     return _map_provider_directory_role_evidence(evidence_result.all())
 
 
+def _provider_directory_requested_affiliation_ctes_sql(schema: str) -> str:
+    """Fence requested affiliations and their networks to current resources."""
+    network_id = _provider_directory_reference_resource_id_sql(
+        "network_ref.value",
+        "Organization",
+    )
+    return f"""
+    requested_affiliations AS (
+        SELECT source_id, affiliation_id
+          FROM unnest(
+               CAST(:source_ids AS varchar[]),
+               CAST(:affiliation_ids AS varchar[])
+          ) AS requested(source_id, affiliation_id)
+    ), affiliations AS MATERIALIZED (
+        SELECT affiliation.source_id,
+               affiliation.resource_id AS affiliation_id,
+               affiliation.network_refs::jsonb
+          FROM requested_affiliations AS requested
+          JOIN {schema}.provider_directory_organization_affiliation AS affiliation
+            ON affiliation.source_id = requested.source_id
+           AND affiliation.resource_id = requested.affiliation_id
+          {_provider_directory_current_resource_join_sql(
+              "affiliation", "OrganizationAffiliation", "visible_affiliation_resource"
+          )}
+         WHERE affiliation.active IS DISTINCT FROM false
+    ), affiliation_networks AS MATERIALIZED (
+        SELECT DISTINCT affiliation.source_id, affiliation.affiliation_id,
+               network_ref.value::varchar AS reference,
+               {network_id}::varchar AS resource_id
+          FROM affiliations AS affiliation
+         CROSS JOIN LATERAL jsonb_array_elements_text(
+               COALESCE(affiliation.network_refs, '[]'::jsonb)
+         ) AS network_ref(value)
+    ), valid_affiliation_networks AS MATERIALIZED (
+        SELECT affiliation_network.*
+          FROM affiliation_networks AS affiliation_network
+          JOIN {schema}.provider_directory_organization AS network_organization
+            ON network_organization.source_id = affiliation_network.source_id
+           AND network_organization.resource_id = affiliation_network.resource_id
+           AND network_organization.active IS DISTINCT FROM false
+          {_provider_directory_current_resource_join_sql(
+              "network_organization", "Organization", "current_network_organization_resource"
+          )}
+         WHERE affiliation_network.resource_id IS NOT NULL
+    )
+    """
+
+
+def _affiliation_plan_resolution_cte_sql(schema: str) -> str:
+    """Resolve current InsurancePlan rows referenced by affiliation networks."""
+    insurance_plan_active = _insurance_plan_active_sql("insurance_plan")
+    network_match = _provider_directory_plan_network_match_sql(
+        "plan_network_ref.value",
+        "affiliation_network.resource_id",
+        "affiliation_network.reference",
+    )
+    return f"""
+    affiliation_plans AS MATERIALIZED (
+        SELECT DISTINCT affiliation_network.source_id,
+               affiliation_network.affiliation_id,
+               insurance_plan.resource_id,
+               NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS identifier,
+               'organization-affiliation-network-derived'::varchar AS provenance
+          FROM valid_affiliation_networks AS affiliation_network
+          JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
+            ON insurance_plan.source_id = affiliation_network.source_id
+           AND {insurance_plan_active}
+          {_provider_directory_current_resource_join_sql(
+              "insurance_plan", "InsurancePlan", "current_insurance_plan"
+          )}
+         WHERE EXISTS (
+               SELECT 1
+                 FROM jsonb_array_elements_text(
+                      COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)
+                 ) AS plan_network_ref(value)
+                WHERE {network_match}
+         )
+    )
+    """
+
+
+def _affiliation_plan_cap_ctes_sql() -> str:
+    """Cap affiliation plans and retain completeness metadata."""
+    return f"""
+    ranked_plans AS MATERIALIZED (
+        SELECT affiliation_plan.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY source_id, affiliation_id
+                   ORDER BY resource_id, identifier NULLS LAST
+               ) AS plan_rank
+          FROM affiliation_plans AS affiliation_plan
+    ), returned_plans AS MATERIALIZED (
+        SELECT source_id, affiliation_id, resource_id, identifier, provenance
+          FROM ranked_plans
+         WHERE plan_rank <= {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE}
+    ), affiliation_plan_metadata AS MATERIALIZED (
+        SELECT affiliation.source_id, affiliation.affiliation_id,
+               LEAST(COUNT(affiliation_plan.resource_id), {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE})::bigint
+                   AS plan_returned,
+               COUNT(affiliation_plan.resource_id)::bigint AS plan_total,
+               COUNT(affiliation_plan.resource_id) > {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE}
+                   AS plan_truncated,
+               TRUE::boolean AS catalog_complete
+          FROM affiliations AS affiliation
+          LEFT JOIN affiliation_plans AS affiliation_plan
+            ON affiliation_plan.source_id = affiliation.source_id
+           AND affiliation_plan.affiliation_id = affiliation.affiliation_id
+      GROUP BY affiliation.source_id, affiliation.affiliation_id
+    )
+    """
+
+
+def _provider_directory_affiliation_evidence_union_sql(
+    schema: str,
+    has_catalog: bool,
+) -> str:
+    """Project affiliation, plan, and current network evidence rows."""
+    network_joins, network_name, _network_provenance = (
+        _provider_directory_network_resolution_sql(schema, has_catalog)
+    )
+    return f"""
+        SELECT affiliation.source_id, affiliation.affiliation_id,
+               'affiliation'::varchar AS evidence_type,
+               affiliation.affiliation_id::varchar AS resource_id,
+               NULL::varchar AS identifier, NULL::varchar AS name,
+               NULL::varchar AS reference,
+               'provider_directory_organization_affiliation'::varchar AS provenance,
+               plan_metadata.plan_returned, plan_metadata.plan_total,
+               plan_metadata.plan_truncated, plan_metadata.catalog_complete
+          FROM affiliations AS affiliation
+          JOIN affiliation_plan_metadata AS plan_metadata
+            ON plan_metadata.source_id = affiliation.source_id
+           AND plan_metadata.affiliation_id = affiliation.affiliation_id
+        UNION ALL
+        SELECT returned_plan.source_id, returned_plan.affiliation_id,
+               'insurance_plan'::varchar AS evidence_type,
+               returned_plan.resource_id, returned_plan.identifier,
+               NULL::varchar AS name, NULL::varchar AS reference,
+               returned_plan.provenance,
+               NULL::bigint, NULL::bigint, NULL::boolean, NULL::boolean
+          FROM returned_plans AS returned_plan
+        UNION ALL
+        SELECT network.source_id, network.affiliation_id,
+               'network'::varchar AS evidence_type,
+               network.resource_id, NULL::varchar AS identifier,
+               NULLIF(BTRIM({network_name}), '')::varchar AS name,
+               network.reference,
+               'provider_directory_organization_affiliation'::varchar AS provenance,
+               NULL::bigint, NULL::bigint, NULL::boolean, NULL::boolean
+          FROM valid_affiliation_networks AS network
+          {network_joins}
+         WHERE network.resource_id IS NOT NULL
+           AND NULLIF(BTRIM({network_name}), '') IS NOT NULL
+    """
+
+
+def _provider_directory_affiliation_evidence_sql(
+    schema: str,
+    has_catalog: bool,
+) -> str:
+    """Resolve exact affiliation network and plan evidence from current resources."""
+    current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(schema)
+    affiliation_ctes_sql = _provider_directory_requested_affiliation_ctes_sql(
+        schema
+    )
+    plan_resolution_cte_sql = (
+        _affiliation_plan_resolution_cte_sql(schema)
+    )
+    plan_cap_ctes_sql = _affiliation_plan_cap_ctes_sql()
+    evidence_union_sql = _provider_directory_affiliation_evidence_union_sql(
+        schema,
+        has_catalog,
+    )
+    return f"""
+    WITH {current_resource_ctes_sql}, {affiliation_ctes_sql},
+         {plan_resolution_cte_sql}, {plan_cap_ctes_sql}, evidence AS (
+        {evidence_union_sql}
+    )
+    SELECT source_id, affiliation_id, evidence_type, resource_id, identifier,
+           name, reference, provenance, plan_returned, plan_total,
+           plan_truncated, catalog_complete,
+           COUNT(*) OVER ()::bigint AS evidence_row_total
+      FROM evidence
+  ORDER BY CASE WHEN evidence_type = 'affiliation' THEN 0 ELSE 1 END,
+           source_id, affiliation_id, evidence_type, resource_id
+     LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS};
+    """
+
+
+def _map_provider_directory_affiliation_evidence(
+    evidence_rows: Sequence[Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    affiliation_evidence_map: dict[tuple[str, str], dict[str, Any]] = {}
+    plan_keys_by_affiliation: dict[tuple[str, str], set[tuple[Any, ...]]] = {}
+    network_keys_by_affiliation: dict[tuple[str, str], set[tuple[Any, ...]]] = {}
+    evidence_row_total: int | None = None
+    for evidence_row in evidence_rows:
+        mapping = getattr(evidence_row, "_mapping", evidence_row)
+        if mapping.get("evidence_row_total") is not None:
+            evidence_row_total = int(mapping["evidence_row_total"])
+        affiliation_key = (
+            str(mapping["source_id"]),
+            str(mapping["affiliation_id"]),
+        )
+        affiliation_evidence = affiliation_evidence_map.setdefault(
+            affiliation_key,
+            {"insurance_plans": [], "networks": []},
+        )
+        evidence_type = mapping["evidence_type"]
+        if evidence_type == "affiliation":
+            plan_metadata = _provider_directory_plan_metadata(mapping)
+            if plan_metadata is not None:
+                affiliation_evidence["insurance_plan_metadata"] = plan_metadata
+        elif evidence_type == "insurance_plan":
+            plan_keys = plan_keys_by_affiliation.setdefault(affiliation_key, set())
+            _append_provider_directory_plan_evidence(
+                mapping,
+                affiliation_evidence,
+                plan_keys,
+            )
+        elif evidence_type == "network":
+            network_keys = network_keys_by_affiliation.setdefault(affiliation_key, set())
+            _append_provider_directory_network_evidence(
+                mapping,
+                affiliation_evidence,
+                network_keys,
+            )
+    for affiliation_evidence in affiliation_evidence_map.values():
+        plan_metadata = affiliation_evidence.get("insurance_plan_metadata")
+        if isinstance(plan_metadata, dict) and evidence_row_total is not None:
+            plan_metadata["returned"] = len(affiliation_evidence["insurance_plans"])
+        if evidence_row_total is not None:
+            affiliation_evidence["evidence_metadata"] = {
+                "returned": len(evidence_rows),
+                "total": evidence_row_total,
+                "truncated": evidence_row_total > len(evidence_rows),
+            }
+    return affiliation_evidence_map
+
+
+async def _fetch_provider_directory_affiliation_evidence_map(
+    affiliation_key_list: Sequence[tuple[str, str]],
+    *,
+    session: Any = None,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    bounded_keys = list(dict.fromkeys(affiliation_key_list))[
+        :MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS
+    ]
+    if not bounded_keys:
+        return {}
+    if session is None:
+        async with db.session() as evidence_session:
+            return await _fetch_provider_directory_affiliation_evidence_map(
+                bounded_keys,
+                session=evidence_session,
+            )
+    required_tables = [
+        await _table_exists(table_name, session=session)
+        for table_name in (
+            *PROVIDER_DIRECTORY_VISIBILITY_TABLES,
+            "provider_directory_organization_affiliation",
+            "provider_directory_insurance_plan",
+            "provider_directory_organization",
+        )
+    ]
+    if not all(required_tables):
+        return {}
+    has_catalog = await _table_exists(
+        "provider_directory_network_catalog",
+        session=session,
+    )
+    schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    if not getattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, False):
+        await session.execute(text("SET LOCAL jit = off"))
+        setattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, True)
+    evidence_result = await _execute_stmt(
+        text(_provider_directory_affiliation_evidence_sql(schema, has_catalog)),
+        session=session,
+        params={
+            "source_ids": [source_id for source_id, _affiliation_id in bounded_keys],
+            "affiliation_ids": [
+                affiliation_id for _source_id, affiliation_id in bounded_keys
+            ],
+        },
+    )
+    return _map_provider_directory_affiliation_evidence(evidence_result.all())
+
+
 def _provider_directory_source_detail_statement(source_ids: Sequence[str]) -> Any:
     table = ProviderDirectorySource.__table__
     selected_endpoints = (
@@ -1705,6 +2043,8 @@ def _provider_directory_catalog_alias(source_detail: Mapping[str, Any]) -> dict[
 
 def _merge_provider_directory_role_evidence(
     matching_role_evidence_list: Sequence[tuple[tuple[str, str], Mapping[str, Any]]],
+    *,
+    evidence_id_field: str = "practitioner_role_id",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[Mapping[str, Any]]]:
     insurance_plan_list: list[dict[str, Any]] = []
     network_list: list[dict[str, Any]] = []
@@ -1732,7 +2072,7 @@ def _merge_provider_directory_role_evidence(
             role_plan_metadata_list.append(
                 {
                     "source_id": role_key[0],
-                    "practitioner_role_id": role_key[1],
+                    evidence_id_field: role_key[1],
                     **dict(plan_metadata),
                 }
             )
@@ -1797,13 +2137,96 @@ def _provider_directory_role_evidence_fields(
     return field_map
 
 
-def _provider_directory_endpoint_provenance(
+def _provider_directory_affiliation_evidence_fields(
+    source_ids: Sequence[str],
+    affiliation_keys: Sequence[tuple[str, str]],
+    detail_by_id: Mapping[str, Mapping[str, Any]],
+    endpoint_key: tuple[str, str],
+    affiliation_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return evidence limited to exact affiliation keys for one endpoint group."""
+    endpoint_source_ids = {
+        source_id
+        for source_id in source_ids
+        if (source_detail := detail_by_id.get(source_id))
+        and _provider_directory_endpoint_group_key(source_detail) == endpoint_key
+    }
+    matching_affiliation_evidence_list = []
+    seen_affiliation_keys: set[tuple[str, str]] = set()
+    for affiliation_key in affiliation_keys:
+        if (
+            affiliation_key in seen_affiliation_keys
+            or affiliation_key[0] not in endpoint_source_ids
+        ):
+            continue
+        seen_affiliation_keys.add(affiliation_key)
+        affiliation_evidence = affiliation_evidence_map.get(affiliation_key)
+        if affiliation_evidence is not None:
+            matching_affiliation_evidence_list.append(
+                (affiliation_key, affiliation_evidence)
+            )
+    if not matching_affiliation_evidence_list:
+        return {}
+    field_map: dict[str, Any] = {
+        "organization_affiliation_ids": sorted(
+            {
+                affiliation_key[1]
+                for affiliation_key, _affiliation_evidence in matching_affiliation_evidence_list
+            }
+        ),
+    }
+    plan_list, network_list, plan_metadata_list, evidence_metadata_list = (
+        _merge_provider_directory_role_evidence(
+            matching_affiliation_evidence_list,
+            evidence_id_field="organization_affiliation_id",
+        )
+    )
+    if plan_list:
+        field_map["insurance_plans"] = plan_list
+    if network_list:
+        field_map["networks"] = network_list
+    if len(plan_metadata_list) == 1:
+        field_map["insurance_plan_metadata"] = {
+            key: plan_metadata_list[0][key]
+            for key in ("returned", "total", "truncated", "catalog_complete")
+        }
+    elif plan_metadata_list:
+        field_map["insurance_plan_metadata_by_affiliation"] = plan_metadata_list
+    if evidence_metadata_list:
+        field_map["evidence_metadata"] = dict(evidence_metadata_list[0])
+    return field_map
+
+
+def _merge_provider_directory_affiliation_fields(
+    endpoint_provenance_map: dict[str, Any],
+    affiliation_field_map: Mapping[str, Any],
+) -> None:
+    for key in ("insurance_plans", "networks"):
+        merged_values = _merge_unique_list_values(
+            endpoint_provenance_map.get(key),
+            affiliation_field_map.get(key),
+        )
+        if merged_values:
+            endpoint_provenance_map[key] = merged_values
+    affiliation_ids = affiliation_field_map.get("organization_affiliation_ids")
+    if affiliation_ids:
+        endpoint_provenance_map["organization_affiliation_ids"] = list(
+            affiliation_ids
+        )
+    for key in (
+        "insurance_plan_metadata",
+        "insurance_plan_metadata_by_affiliation",
+        "evidence_metadata",
+    ):
+        if key in affiliation_field_map and key not in endpoint_provenance_map:
+            endpoint_provenance_map[key] = affiliation_field_map[key]
+
+
+def _provider_directory_selected_endpoint_keys(
     source_ids: Sequence[str],
     detail_by_id: Mapping[str, Mapping[str, Any]],
-    role_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
-    role_keys: Sequence[tuple[str, str]] = (),
-) -> list[dict[str, Any]]:
-    selected_endpoint_keys: list[tuple[str, str]] = []
+) -> list[tuple[str, str]]:
+    endpoint_keys: list[tuple[str, str]] = []
     seen_endpoint_keys: set[tuple[str, str]] = set()
     for source_id in source_ids:
         source_detail = detail_by_id.get(source_id)
@@ -1813,46 +2236,86 @@ def _provider_directory_endpoint_provenance(
         if endpoint_key in seen_endpoint_keys:
             continue
         seen_endpoint_keys.add(endpoint_key)
-        selected_endpoint_keys.append(endpoint_key)
+        endpoint_keys.append(endpoint_key)
+    return endpoint_keys
 
-    endpoint_provenance_items: list[dict[str, Any]] = []
-    for endpoint_key in selected_endpoint_keys:
-        endpoint_aliases = sorted(
-            (
-                source_detail
-                for source_detail in detail_by_id.values()
-                if _provider_directory_endpoint_group_key(source_detail) == endpoint_key
-            ),
-            key=lambda source_detail: str(source_detail.get("source_id") or ""),
+
+def _provider_directory_endpoint_provenance_item(
+    endpoint_key: tuple[str, str],
+    source_ids: Sequence[str],
+    detail_by_id: Mapping[str, Mapping[str, Any]],
+    role_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]],
+    role_keys: Sequence[tuple[str, str]],
+    affiliation_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]],
+    affiliation_keys: Sequence[tuple[str, str]],
+) -> dict[str, Any]:
+    """Build one endpoint item from exact role and affiliation evidence keys."""
+    endpoint_aliases = sorted(
+        (
+            source_detail
+            for source_detail in detail_by_id.values()
+            if _provider_directory_endpoint_group_key(source_detail) == endpoint_key
+        ),
+        key=lambda source_detail: str(source_detail.get("source_id") or ""),
+    )
+    endpoint_provenance_map: dict[str, Any] = {
+        "source": "provider_directory_fhir",
+        "source_ids": sorted(
+            source_id
+            for source_id in source_ids
+            if (source_detail := detail_by_id.get(source_id))
+            and _provider_directory_endpoint_group_key(source_detail) == endpoint_key
+        ),
+        "catalog_aliases_verified": False,
+        "catalog_aliases": [
+            _provider_directory_catalog_alias(source_detail)
+            for source_detail in endpoint_aliases
+        ],
+    }
+    if endpoint_key[0] == "endpoint_id":
+        endpoint_provenance_map["endpoint_id"] = endpoint_key[1]
+    endpoint_provenance_map.update(
+        _provider_directory_role_evidence_fields(
+            source_ids, role_keys, detail_by_id, endpoint_key, role_evidence_map
         )
-        # Verified plan/network fields require concrete PractitionerRole references.
-        endpoint_provenance_map: dict[str, Any] = {
-            "source": "provider_directory_fhir",
-            "source_ids": sorted(
-                source_id
-                for source_id in source_ids
-                if (source_detail := detail_by_id.get(source_id))
-                and _provider_directory_endpoint_group_key(source_detail) == endpoint_key
-            ),
-            "catalog_aliases_verified": False,
-            "catalog_aliases": [
-                _provider_directory_catalog_alias(source_detail)
-                for source_detail in endpoint_aliases
-            ],
-        }
-        if endpoint_key[0] == "endpoint_id":
-            endpoint_provenance_map["endpoint_id"] = endpoint_key[1]
-        endpoint_provenance_map.update(
-            _provider_directory_role_evidence_fields(
-                source_ids,
-                role_keys,
-                detail_by_id,
-                endpoint_key,
-                role_evidence_map or {},
-            )
+    )
+    _merge_provider_directory_affiliation_fields(
+        endpoint_provenance_map,
+        _provider_directory_affiliation_evidence_fields(
+            source_ids,
+            affiliation_keys,
+            detail_by_id,
+            endpoint_key,
+            affiliation_evidence_map,
+        ),
+    )
+    return endpoint_provenance_map
+
+
+def _provider_directory_endpoint_provenance(
+    source_ids: Sequence[str],
+    detail_by_id: Mapping[str, Mapping[str, Any]],
+    role_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+    role_keys: Sequence[tuple[str, str]] = (),
+    affiliation_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+    affiliation_keys: Sequence[tuple[str, str]] = (),
+) -> list[dict[str, Any]]:
+    """Group requested sources and exact evidence keys by endpoint identity."""
+    return [
+        _provider_directory_endpoint_provenance_item(
+            endpoint_key,
+            source_ids,
+            detail_by_id,
+            role_evidence_map or {},
+            role_keys,
+            affiliation_evidence_map or {},
+            affiliation_keys,
         )
-        endpoint_provenance_items.append(endpoint_provenance_map)
-    return endpoint_provenance_items
+        for endpoint_key in _provider_directory_selected_endpoint_keys(
+            source_ids,
+            detail_by_id,
+        )
+    ]
 
 
 async def _attach_provider_directory_source_details(
@@ -1868,11 +2331,21 @@ async def _attach_provider_directory_source_details(
     if not detail_by_id:
         return
     role_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]] = {}
+    affiliation_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]] = {}
     if include_role_evidence:
         role_key_list = _provider_directory_role_keys_from_addresses(addresses)
         role_evidence_map = await _fetch_provider_directory_role_evidence_map(
             role_key_list,
             session=session,
+        )
+        affiliation_key_list = _provider_directory_affiliation_keys_from_addresses(
+            addresses
+        )
+        affiliation_evidence_map = (
+            await _fetch_provider_directory_affiliation_evidence_map(
+                affiliation_key_list,
+                session=session,
+            )
         )
     for address in addresses:
         if not isinstance(address, dict):
@@ -1881,11 +2354,16 @@ async def _attach_provider_directory_source_details(
             address.get("source_record_ids")
         )
         address_role_keys = _directory_role_keys_from_records(address.get("source_record_ids"))
+        address_affiliation_keys = _directory_affiliation_keys_from_records(
+            address.get("source_record_ids")
+        )
         endpoint_provenance = _provider_directory_endpoint_provenance(
             address_source_ids,
             detail_by_id,
             role_evidence_map,
             address_role_keys,
+            affiliation_evidence_map,
+            address_affiliation_keys,
         )
         if endpoint_provenance:
             address[PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY] = endpoint_provenance

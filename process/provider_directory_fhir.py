@@ -23984,10 +23984,26 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
             loc.state_code::varchar AS state_code,
             loc.postal_code::varchar AS postal_code,
             {location_country_expr}::varchar AS country_code,
-            COALESCE(loc.telephone_number, organization_phone.telephone_number)::varchar AS telephone_number,
-            COALESCE(loc.fax_number, organization_fax.fax_number)::varchar AS fax_number,
-            COALESCE(loc.phone_number, {organization_phone_number_expr})::varchar AS phone_number,
-            COALESCE(loc.fax_number_digits, {organization_fax_number_expr})::varchar AS fax_number_digits,
+            COALESCE(
+                CASE WHEN loc.phone_number IS NOT NULL THEN loc.telephone_number END,
+                organization_phone.telephone_number,
+                affiliation_phone.telephone_number
+            )::varchar AS telephone_number,
+            COALESCE(
+                loc.fax_number,
+                organization_fax.fax_number,
+                affiliation_fax.fax_number
+            )::varchar AS fax_number,
+            COALESCE(
+                loc.phone_number,
+                {organization_phone_number_expr},
+                {affiliation_phone_number_expr}
+            )::varchar AS phone_number,
+            COALESCE(
+                loc.fax_number_digits,
+                {organization_fax_number_expr},
+                {affiliation_fax_number_expr}
+            )::varchar AS fax_number_digits,
             {location_lat_expr} AS lat,
             {location_long_expr} AS long,
             'street'::varchar AS address_precision,
@@ -24047,6 +24063,20 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
                  AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
                LIMIT 1
           ) AS organization_fax ON TRUE
+          LEFT JOIN LATERAL (
+              SELECT telecom.value->>'value' AS telephone_number
+                FROM jsonb_array_elements(COALESCE(affiliation.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+               WHERE telecom.value->>'system' = 'phone'
+                 AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+               LIMIT 1
+          ) AS affiliation_phone ON TRUE
+          LEFT JOIN LATERAL (
+              SELECT telecom.value->>'value' AS fax_number
+                FROM jsonb_array_elements(COALESCE(affiliation.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+               WHERE telecom.value->>'system' = 'fax'
+                 AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+               LIMIT 1
+          ) AS affiliation_fax ON TRUE
          WHERE organization.npi BETWEEN 1000000000 AND 9999999999
            AND organization.active IS DISTINCT FROM false
            AND affiliation.active IS DISTINCT FROM false
@@ -24113,6 +24143,12 @@ def _address_overlay_contact_sql_context(
             "organization",
             "organization_phone.telephone_number",
             "organization_fax.fax_number",
+            location_country_expr,
+        ),
+        (
+            "affiliation",
+            "affiliation_phone.telephone_number",
+            "affiliation_fax.fax_number",
             location_country_expr,
         ),
     )
@@ -24493,10 +24529,26 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 loc.state_code::varchar AS state_code,
                 loc.postal_code::varchar AS postal_code,
                 {location_country_expr}::varchar AS country_code,
-                COALESCE(loc.telephone_number, organization_phone.telephone_number)::varchar AS telephone_number,
-                COALESCE(loc.fax_number, organization_fax.fax_number)::varchar AS fax_number,
-                COALESCE(loc.phone_number, {organization_phone_number_expr})::varchar AS phone_number,
-                COALESCE(loc.fax_number_digits, {organization_fax_number_expr})::varchar AS fax_number_digits,
+                COALESCE(
+                    CASE WHEN loc.phone_number IS NOT NULL THEN loc.telephone_number END,
+                    organization_phone.telephone_number,
+                    affiliation_phone.telephone_number
+                )::varchar AS telephone_number,
+                COALESCE(
+                    loc.fax_number,
+                    organization_fax.fax_number,
+                    affiliation_fax.fax_number
+                )::varchar AS fax_number,
+                COALESCE(
+                    loc.phone_number,
+                    {organization_phone_number_expr},
+                    {affiliation_phone_number_expr}
+                )::varchar AS phone_number,
+                COALESCE(
+                    loc.fax_number_digits,
+                    {organization_fax_number_expr},
+                    {affiliation_fax_number_expr}
+                )::varchar AS fax_number_digits,
                 {location_lat_expr} AS lat,
                 {location_long_expr} AS long,
                 'street'::varchar AS address_precision,
@@ -24568,6 +24620,20 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                      AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
                    LIMIT 1
               ) AS organization_fax ON TRUE
+              LEFT JOIN LATERAL (
+                  SELECT telecom.value->>'value' AS telephone_number
+                    FROM jsonb_array_elements(COALESCE(affiliation.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                   WHERE telecom.value->>'system' = 'phone'
+                     AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                   LIMIT 1
+              ) AS affiliation_phone ON TRUE
+              LEFT JOIN LATERAL (
+                  SELECT telecom.value->>'value' AS fax_number
+                    FROM jsonb_array_elements(COALESCE(affiliation.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                   WHERE telecom.value->>'system' = 'fax'
+                     AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                   LIMIT 1
+              ) AS affiliation_fax ON TRUE
              WHERE organization.npi BETWEEN 1000000000 AND 9999999999
                AND organization.active IS DISTINCT FROM false
                AND affiliation.active IS DISTINCT FROM false

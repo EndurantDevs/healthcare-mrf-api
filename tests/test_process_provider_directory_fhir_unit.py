@@ -16624,7 +16624,7 @@ def test_address_overlay_sql_scope():
     assert "UNITEDSTATESOFAMERICA" in sql
     assert "THEN 'US'" in sql
     assert "role_phone.telephone_number," in sql
-    assert "loc.telephone_number," in sql
+    assert "WHEN loc.phone_number IS NOT NULL THEN loc.telephone_number" in sql
     assert "practitioner_phone.telephone_number" in sql
     assert "organization_phone.telephone_number" in sql
     assert "role.healthcare_service_refs" in sql
@@ -16753,7 +16753,7 @@ def test_practitioner_role_address_phone_prefers_usable_location_then_role(sql):
     )
 
 
-def test_address_overlay_affiliation_component_uses_org_phone_and_service_locations():
+def test_address_overlay_affiliation_component_uses_context_contact_fallbacks_and_service_locations():
     sql = importer._address_overlay_component_insert_sql(
         "mrf",
         "provider_directory_address_overlay_stage_test",
@@ -16761,17 +16761,67 @@ def test_address_overlay_affiliation_component_uses_org_phone_and_service_locati
         run_id="run_1",
         source_ids=["source_a"],
     )
+    compact_sql = " ".join(sql.split())
 
-    assert "COALESCE(loc.telephone_number, organization_phone.telephone_number)" in sql
-    assert "COALESCE(loc.fax_number, organization_fax.fax_number)" in sql
+    assert (
+        "COALESCE( CASE WHEN loc.phone_number IS NOT NULL THEN loc.telephone_number END, "
+        "organization_phone.telephone_number, affiliation_phone.telephone_number )::varchar "
+        "AS telephone_number"
+    ) in compact_sql
+    assert (
+        "COALESCE( loc.fax_number, organization_fax.fax_number, "
+        "affiliation_fax.fax_number )::varchar AS fax_number"
+    ) in compact_sql
     assert "AS organization_phone ON TRUE" in sql
     assert "AS organization_fax ON TRUE" in sql
+    assert "COALESCE(affiliation.telecom::jsonb, '[]'::jsonb)" in sql
+    assert "AS affiliation_phone ON TRUE" in sql
+    assert "AS affiliation_fax ON TRUE" in sql
     assert "affiliation.healthcare_service_refs" in sql
     assert 'JOIN "mrf"."provider_directory_healthcare_service" AS healthcare_service' in sql
     assert "healthcare_service.location_refs" in sql
     assert "WITH overlay_rows AS MATERIALIZED" in sql
     assert "FROM overlay_rows" in sql
     assert sql.count("addr_key_v1(") == 1
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        importer.provider_directory_address_overlay_insert_sql(
+            "mrf",
+            "provider_directory_address_overlay_stage_test",
+        ),
+        importer._address_overlay_component_insert_sql(
+            "mrf",
+            "provider_directory_address_overlay_stage_test",
+            component="organization_affiliation",
+        ),
+    ],
+)
+def test_contra_costa_affiliation_telecom_fallback_keeps_extensions_and_canonical_digits(sql):
+    phone = "(925) 313-6000 ext. 204"
+    fax = "(925) 313-6001 x9"
+    canonical = importer._location_contact_fields(phone, fax, "US")
+    compact_sql = " ".join(sql.split())
+    affiliation_sql = compact_sql.split(
+        "provider_directory_fhir:organization_affiliation:", 1
+    )[1]
+
+    assert "organization_phone.telephone_number, affiliation_phone.telephone_number" in compact_sql
+    assert "organization_fax.fax_number, affiliation_fax.fax_number" in compact_sql
+    assert "affiliation_phone.telephone_number" in affiliation_sql.split(
+        "AS phone_number", 1
+    )[0]
+    assert "affiliation_fax.fax_number" in affiliation_sql.split(
+        "AS fax_number_digits", 1
+    )[0]
+    assert canonical == {
+        "phone_number": "9253136000",
+        "fax_number_digits": "9253136001",
+        "phone_extension": "204",
+        "fax_extension": "9",
+    }
 
 
 def test_address_overlay_affiliation_keeps_location_lookup_correlated():
