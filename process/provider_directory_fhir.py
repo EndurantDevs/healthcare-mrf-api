@@ -817,6 +817,7 @@ SOURCE_QUOTA_EXHAUSTED_ERROR = "provider_directory_source_quota_exhausted"
 SOURCE_RETRY_NOT_BEFORE_METRIC = "provider_directory_retry_not_before"
 SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS = 300
 SOURCE_TRANSIENT_HTTP_STATUSES = frozenset({423, 429, 500, 502, 503, 504})
+REST_PAGINATION_COOLDOWN_RETRY_CAP = 2
 MOLINA_QUOTA_RESET_GRACE_SECONDS = 60
 MOLINA_QUOTA_DURATION_PATTERN = re.compile(
     r"\breplenished\s+in\s+(\d{1,3}):(\d{2}):(\d{2})\b",
@@ -953,6 +954,11 @@ class ResourceFetchResult:
     deadline_reached: bool = False
     retry_not_before: str | None = None
     fetch_diagnostic: dict[str, Any] | None = None
+    pagination_cooldown_retries: int = 0
+    pagination_cooldown_wait_seconds: float = 0.0
+    is_pagination_cooldown_recovered: bool = False
+    is_pagination_cooldown_exhausted: bool = False
+    is_pagination_cooldown_deadline_blocked: bool = False
 
     @property
     def bounded(self) -> bool:
@@ -962,6 +968,16 @@ class ResourceFetchResult:
             or self.hard_page_limit_reached
             or self.deadline_reached
         )
+
+
+@dataclass(frozen=True)
+class RestPaginationCooldownResult:
+    fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int]
+    retries: int = 0
+    wait_seconds: float = 0.0
+    recovered: bool = False
+    exhausted: bool = False
+    deadline_blocked: bool = False
 
 
 @dataclass(frozen=True)
@@ -13131,6 +13147,126 @@ async def _fetch_source_json(
     return fetch_result
 
 
+def _is_rest_pagination_cooldown_failure(
+    status_code: int | None,
+    fetch_error: str | None,
+) -> bool:
+    """Limit long in-worker cooldowns to locked pages and transport timeouts."""
+    if status_code == 423:
+        return True
+    if not fetch_error:
+        return False
+    normalized_error = fetch_error.lower()
+    return "timeout" in normalized_error or "timed out" in normalized_error
+
+
+def _rest_pagination_cooldown_delay_seconds(
+    fhir_payload: dict[str, Any] | None,
+) -> float:
+    retry_after_seconds = _source_retry_after_seconds(fhir_payload)
+    if retry_after_seconds is not None:
+        return retry_after_seconds
+    return float(SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS)
+
+
+async def _retry_rest_pagination_after_cooldown(
+    source_record: dict[str, Any],
+    request_url: str,
+    fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int],
+    *,
+    timeout: int,
+    deadline_at: float | None,
+) -> RestPaginationCooldownResult:
+    """Retry one unchanged checkpoint URL after terminal quick-retry failures."""
+    retries = 0
+    wait_seconds = 0.0
+    while retries < REST_PAGINATION_COOLDOWN_RETRY_CAP:
+        status_code, fhir_payload, fetch_error, _elapsed_ms = fetch_result
+        if not _is_rest_pagination_cooldown_failure(status_code, fetch_error):
+            break
+        delay_seconds = _rest_pagination_cooldown_delay_seconds(fhir_payload)
+        if deadline_at is not None and time.monotonic() + delay_seconds >= deadline_at:
+            return RestPaginationCooldownResult(
+                fetch_result=fetch_result,
+                retries=retries,
+                wait_seconds=wait_seconds,
+                deadline_blocked=True,
+            )
+        await asyncio.sleep(delay_seconds)
+        wait_seconds += delay_seconds
+        retries += 1
+        fetch_result, is_deadline_blocked = await _fetch_cooldown_checkpoint_page(
+            source_record,
+            request_url,
+            fetch_result,
+            timeout=timeout,
+            deadline_at=deadline_at,
+        )
+        if is_deadline_blocked:
+            return RestPaginationCooldownResult(
+                fetch_result=fetch_result,
+                retries=retries,
+                wait_seconds=wait_seconds,
+                deadline_blocked=True,
+            )
+    status_code, _fhir_payload, fetch_error, _elapsed_ms = fetch_result
+    is_failure_transient = _is_rest_pagination_cooldown_failure(
+        status_code,
+        fetch_error,
+    )
+    return RestPaginationCooldownResult(
+        fetch_result=fetch_result,
+        retries=retries,
+        wait_seconds=wait_seconds,
+        recovered=(
+            retries > 0 and fetch_result[0] == 200 and fetch_result[2] is None
+        ),
+        exhausted=(
+            is_failure_transient
+            and retries >= REST_PAGINATION_COOLDOWN_RETRY_CAP
+        ),
+    )
+
+
+async def _fetch_cooldown_checkpoint_page(
+    source_record: dict[str, Any],
+    request_url: str,
+    prior_fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int],
+    *,
+    timeout: int,
+    deadline_at: float | None,
+) -> tuple[
+    tuple[int | None, dict[str, Any] | None, str | None, int],
+    bool,
+]:
+    """Fetch one unchanged checkpoint page without overrunning its deadline."""
+    if deadline_at is None:
+        return await _fetch_source_json(
+            source_record,
+            request_url,
+            timeout=timeout,
+        ), False
+    remaining_seconds = deadline_at - time.monotonic()
+    if remaining_seconds <= 0:
+        return prior_fetch_result, True
+    try:
+        return await asyncio.wait_for(
+            _fetch_source_json(
+                source_record,
+                request_url,
+                timeout=min(timeout, max(1, math.ceil(remaining_seconds))),
+            ),
+            timeout=remaining_seconds,
+        ), False
+    except TimeoutError:
+        return (
+            None,
+            None,
+            "TimeoutError: resource deadline reached during cooldown retry",
+            0,
+        ), True
+
+
 RESOURCE_ACCESS_PROBE_ORDER = (
     "Practitioner",
     "PractitionerRole",
@@ -19795,6 +19931,11 @@ async def _fetch_resource_rows(
     error_message: str | None = None
     retry_not_before: str | None = None
     fetch_diagnostic: dict[str, Any] | None = None
+    pagination_cooldown_retries = 0
+    pagination_cooldown_wait_seconds = 0.0
+    is_pagination_cooldown_recovered = False
+    is_pagination_cooldown_exhausted = False
+    is_pagination_cooldown_deadline_blocked = False
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
     is_deadline_reached = False
     source_api_base = _canonical_base(
@@ -19876,11 +20017,36 @@ async def _fetch_resource_rows(
                 next_url_remaining = True
                 break
             seen_urls.add(request_identity)
-            status_code, payload, error, _elapsed = await _fetch_source_json(
+            page_fetch_result = await _fetch_source_json(
                 source,
                 url,
                 timeout=resource_timeout,
             )
+            if checkpoint_context and _is_rest_pagination_cooldown_failure(
+                page_fetch_result[0],
+                page_fetch_result[2],
+            ):
+                cooldown_result = await _retry_rest_pagination_after_cooldown(
+                    source,
+                    url,
+                    page_fetch_result,
+                    timeout=resource_timeout,
+                    deadline_at=deadline_at,
+                )
+                page_fetch_result = cooldown_result.fetch_result
+                pagination_cooldown_retries += cooldown_result.retries
+                pagination_cooldown_wait_seconds += cooldown_result.wait_seconds
+                is_pagination_cooldown_recovered = (
+                    is_pagination_cooldown_recovered or cooldown_result.recovered
+                )
+                is_pagination_cooldown_exhausted = (
+                    is_pagination_cooldown_exhausted or cooldown_result.exhausted
+                )
+                is_pagination_cooldown_deadline_blocked = (
+                    is_pagination_cooldown_deadline_blocked
+                    or cooldown_result.deadline_blocked
+                )
+            status_code, payload, error, _elapsed = page_fetch_result
             if status_code != 200 or error:
                 if (
                     checkpoint_context
@@ -20071,6 +20237,13 @@ async def _fetch_resource_rows(
         deadline_reached=is_deadline_reached,
         retry_not_before=retry_not_before,
         fetch_diagnostic=fetch_diagnostic,
+        pagination_cooldown_retries=pagination_cooldown_retries,
+        pagination_cooldown_wait_seconds=pagination_cooldown_wait_seconds,
+        is_pagination_cooldown_recovered=is_pagination_cooldown_recovered,
+        is_pagination_cooldown_exhausted=is_pagination_cooldown_exhausted,
+        is_pagination_cooldown_deadline_blocked=(
+            is_pagination_cooldown_deadline_blocked
+        ),
     )
 
 
@@ -21561,6 +21734,11 @@ def _empty_resource_stats() -> dict[str, Any]:
         "collection_complete_sources": 0,
         "pages_fetched": 0,
         "rows_fetched": 0,
+        "pagination_cooldown_retries": 0,
+        "pagination_cooldown_wait_seconds": 0.0,
+        "pagination_cooldown_recovered_sources": 0,
+        "pagination_cooldown_exhausted_sources": 0,
+        "pagination_cooldown_deadline_blocked_sources": 0,
     }
 
 
@@ -21606,6 +21784,25 @@ def _resource_fetch_metric_total(
     )
 
 
+def _record_pagination_cooldown_stats(
+    resource_stats: dict[str, Any],
+    fetch_result: ResourceFetchResult,
+) -> None:
+    """Accumulate the bounded REST cooldown outcome for one fetch."""
+    resource_stats[
+        "pagination_cooldown_retries"
+    ] += fetch_result.pagination_cooldown_retries
+    resource_stats[
+        "pagination_cooldown_wait_seconds"
+    ] += fetch_result.pagination_cooldown_wait_seconds
+    if fetch_result.is_pagination_cooldown_recovered:
+        resource_stats["pagination_cooldown_recovered_sources"] += 1
+    if fetch_result.is_pagination_cooldown_exhausted:
+        resource_stats["pagination_cooldown_exhausted_sources"] += 1
+    if fetch_result.is_pagination_cooldown_deadline_blocked:
+        resource_stats["pagination_cooldown_deadline_blocked_sources"] += 1
+
+
 def _record_resource_fetch_stats(
     resource_stats_by_type: dict[str, dict[str, Any]],
     resource_type: str,
@@ -21613,6 +21810,7 @@ def _record_resource_fetch_stats(
     *,
     bulk_export_selection: str | None = None,
 ) -> None:
+    """Accumulate one resource fetch's nonsecret operational metrics."""
     resource_stats = resource_stats_by_type.setdefault(
         resource_type,
         _empty_resource_stats(),
@@ -21620,6 +21818,7 @@ def _record_resource_fetch_stats(
     resource_stats["sources_attempted"] += 1
     resource_stats["pages_fetched"] += fetch_result.pages_fetched
     resource_stats["rows_fetched"] += fetch_result.rows_fetched
+    _record_pagination_cooldown_stats(resource_stats, fetch_result)
     if fetch_result.complete:
         resource_stats["sources_completed"] += 1
         resource_stats["collection_complete_sources"] += 1
@@ -21672,27 +21871,40 @@ def _record_resource_completion(
 
 
 def _resource_fetch_diagnostic(
-    result: ResourceFetchResult,
+    fetch_result: ResourceFetchResult,
     *,
     rows_written: int,
 ) -> dict[str, Any]:
     return {
-        "complete": result.complete,
-        "collection_complete": result.complete,
+        "complete": fetch_result.complete,
+        "collection_complete": fetch_result.complete,
         "plan_graph_complete": False,
-        "bounded": result.bounded,
-        "error": result.error,
-        "fetch_mode": result.fetch_mode,
-        "pages_fetched": result.pages_fetched,
-        "rows_fetched": result.rows_fetched,
+        "bounded": fetch_result.bounded,
+        "error": fetch_result.error,
+        "fetch_mode": fetch_result.fetch_mode,
+        "pages_fetched": fetch_result.pages_fetched,
+        "rows_fetched": fetch_result.rows_fetched,
         "rows_written": rows_written,
-        "row_limit_reached": result.row_limit_reached,
-        "page_limit_reached": result.page_limit_reached,
-        "hard_page_limit_reached": result.hard_page_limit_reached,
-        "deadline_reached": result.deadline_reached,
-        "next_url_remaining": result.next_url_remaining,
-        "retry_not_before": result.retry_not_before,
-        "source_fetch": result.fetch_diagnostic,
+        "row_limit_reached": fetch_result.row_limit_reached,
+        "page_limit_reached": fetch_result.page_limit_reached,
+        "hard_page_limit_reached": fetch_result.hard_page_limit_reached,
+        "deadline_reached": fetch_result.deadline_reached,
+        "next_url_remaining": fetch_result.next_url_remaining,
+        "retry_not_before": fetch_result.retry_not_before,
+        "source_fetch": fetch_result.fetch_diagnostic,
+        "pagination_cooldown_retries": fetch_result.pagination_cooldown_retries,
+        "pagination_cooldown_wait_seconds": (
+            fetch_result.pagination_cooldown_wait_seconds
+        ),
+        "pagination_cooldown_recovered": (
+            fetch_result.is_pagination_cooldown_recovered
+        ),
+        "pagination_cooldown_exhausted": (
+            fetch_result.is_pagination_cooldown_exhausted
+        ),
+        "pagination_cooldown_deadline_blocked": (
+            fetch_result.is_pagination_cooldown_deadline_blocked
+        ),
     }
 
 

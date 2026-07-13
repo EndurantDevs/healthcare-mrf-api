@@ -15771,6 +15771,231 @@ async def test_fetch_resource_rows_resumes_exact_checkpoint_url(monkeypatch):
     assert saved_checkpoints[0]["rows_processed"] == 701
 
 
+def _cooldown_checkpoint_callbacks(resume_url, responses):
+    requested_urls: list[str] = []
+    saved_checkpoints: list[dict[str, Any]] = []
+
+    async def load_checkpoint(_context, _resource_type, _start_url):
+        return importer.PaginationResumeState(
+            next_url=resume_url,
+            pages_processed=7,
+            rows_processed=700,
+            recent_url_hashes=(),
+            resumed=True,
+        )
+
+    async def fetch_source_json(_source, request_url, *, timeout):
+        assert timeout == 3
+        requested_urls.append(request_url)
+        return responses.pop(0)
+
+    async def save_checkpoint(_context, _resource_type, **checkpoint):
+        saved_checkpoints.append(checkpoint)
+
+    return (
+        requested_urls,
+        saved_checkpoints,
+        load_checkpoint,
+        fetch_source_json,
+        save_checkpoint,
+    )
+
+
+async def _fetch_checkpointed_cigna_practitioners():
+    return await importer._fetch_resource_rows(
+        _cigna_checkpoint_source(),
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=AsyncMock(return_value=1),
+        row_batch_size=1000,
+        retain_rows=False,
+        deadline_seconds=1000,
+        pagination_checkpoint=_cigna_checkpoint_context(
+            "run_retry",
+            "run_original",
+        ),
+    )
+
+
+def _assert_cooldown_recovery_observability(fetch_result):
+    diagnostic = importer._resource_fetch_diagnostic(fetch_result, rows_written=1)
+    assert diagnostic["pagination_cooldown_retries"] == 1
+    assert diagnostic["pagination_cooldown_wait_seconds"] == 4.0
+    assert diagnostic["pagination_cooldown_recovered"] is True
+    assert "locked-token" not in json.dumps(diagnostic)
+
+    stats_by_resource: dict[str, dict[str, Any]] = {}
+    importer._record_resource_fetch_stats(
+        stats_by_resource,
+        "Practitioner",
+        fetch_result,
+    )
+    assert stats_by_resource["Practitioner"]["pagination_cooldown_retries"] == 1
+    assert stats_by_resource["Practitioner"]["pagination_cooldown_wait_seconds"] == 4.0
+    assert (
+        stats_by_resource["Practitioner"]["pagination_cooldown_recovered_sources"]
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_page_423_cooldown_retries_exact_url_and_recovers(monkeypatch):
+    """A locked checkpoint page retries in place without resetting progress."""
+    resume_url = (
+        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_getpages=locked-token&_count=100"
+    )
+    responses = [
+        (
+            423,
+            {importer.SOURCE_RETRY_AFTER_FIELD: "4", "diagnostics": "private"},
+            None,
+            5,
+        ),
+        (200, _practitioner_search_bundle("prac-701"), None, 5),
+    ]
+    request_urls, saved_checkpoints, load_checkpoint, fetch_source_json, save_checkpoint = (
+        _cooldown_checkpoint_callbacks(resume_url, responses)
+    )
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        load_checkpoint,
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+
+    fetch_result = await _fetch_checkpointed_cigna_practitioners()
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.pages_fetched == 8
+    assert fetch_result.rows_fetched == 701
+    assert fetch_result.pagination_cooldown_retries == 1
+    assert fetch_result.pagination_cooldown_wait_seconds == 4.0
+    assert fetch_result.is_pagination_cooldown_recovered is True
+    assert request_urls == [resume_url, resume_url]
+    sleep_mock.assert_awaited_once_with(4.0)
+    assert len(saved_checkpoints) == 1
+    assert saved_checkpoints[0]["next_url"] is None
+    assert saved_checkpoints[0]["pages_processed"] == 8
+    assert saved_checkpoints[0]["rows_processed"] == 701
+    _assert_cooldown_recovery_observability(fetch_result)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_transport_timeout_uses_300_second_cooldown(monkeypatch):
+    checkpoint_url = "https://payer.example/fhir/Location?_getpages=timeout-token"
+    fetch_source_json = AsyncMock(
+        return_value=(200, {"resourceType": "Bundle", "entry": []}, None, 5)
+    )
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+
+    cooldown_result = await importer._retry_rest_pagination_after_cooldown(
+        {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+        checkpoint_url,
+        (None, None, "TimeoutError: timed out", 9),
+        timeout=3,
+        deadline_at=None,
+    )
+
+    assert cooldown_result.fetch_result[0] == 200
+    assert cooldown_result.retries == 1
+    assert cooldown_result.wait_seconds == 300.0
+    assert cooldown_result.recovered is True
+    sleep_mock.assert_awaited_once_with(300.0)
+    fetch_source_json.assert_awaited_once_with(
+        {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+        checkpoint_url,
+        timeout=3,
+    )
+
+
+def test_checkpoint_cooldown_excludes_other_transient_failures():
+    assert not importer._is_rest_pagination_cooldown_failure(503, None)
+    assert not importer._is_rest_pagination_cooldown_failure(
+        None,
+        "ConnectionResetError: connection reset by peer",
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_cooldown_stops_before_resource_deadline(monkeypatch):
+    fetch_source_json = AsyncMock()
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+
+    cooldown_result = await importer._retry_rest_pagination_after_cooldown(
+        {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+        "https://payer.example/fhir/Location?_getpages=deadline-token",
+        (423, {importer.SOURCE_RETRY_AFTER_FIELD: "300"}, None, 9),
+        timeout=3,
+        deadline_at=importer.time.monotonic() + 299,
+    )
+
+    assert cooldown_result.fetch_result[0] == 423
+    assert cooldown_result.retries == 0
+    assert cooldown_result.deadline_blocked is True
+    sleep_mock.assert_not_awaited()
+    fetch_source_json.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_423_cooldown_exhaustion_preserves_resume_checkpoint(
+    monkeypatch,
+):
+    """Exhausted cooldowns leave the durable resume checkpoint untouched."""
+    resume_url = (
+        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_getpages=locked-token&_count=100"
+    )
+    locked_response = (423, {importer.SOURCE_RETRY_AFTER_FIELD: "1"}, None, 5)
+    responses = [locked_response] * 3
+    request_urls, saved_checkpoints, load_checkpoint, fetch_source_json, save_checkpoint = (
+        _cooldown_checkpoint_callbacks(resume_url, responses)
+    )
+    clear_checkpoint = AsyncMock()
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        load_checkpoint,
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
+    monkeypatch.setattr(
+        importer,
+        "_clear_checkpoint_dataset_resource_type",
+        clear_checkpoint,
+    )
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+
+    fetch_result = await _fetch_checkpointed_cigna_practitioners()
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error == "http_423"
+    assert fetch_result.pages_fetched == 7
+    assert fetch_result.rows_fetched == 700
+    assert fetch_result.next_url_remaining is True
+    assert fetch_result.pagination_cooldown_retries == 2
+    assert fetch_result.pagination_cooldown_wait_seconds == 2.0
+    assert fetch_result.is_pagination_cooldown_exhausted is True
+    assert request_urls == [resume_url, resume_url, resume_url]
+    assert [call.args[0] for call in sleep_mock.await_args_list] == [1.0, 1.0]
+    assert saved_checkpoints == []
+    clear_checkpoint.assert_not_awaited()
+
+
 def _terminal_empty_offset_page_callbacks(api_base):
     terminal_url = (
         f"{api_base}/Organization?"
