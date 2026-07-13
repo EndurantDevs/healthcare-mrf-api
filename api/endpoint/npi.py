@@ -1432,38 +1432,6 @@ def _provider_directory_plan_cap_ctes_sql() -> str:
     """
 
 
-def _returned_plan_details_cte_sql(schema: str) -> str:
-    """Project current normalized plan details without changing the capped plan set."""
-    return f"""
-    returned_plan_details AS MATERIALIZED (
-        SELECT returned_plan.source_id, returned_plan.role_id,
-               returned_plan.resource_id,
-               insurance_plan.status AS plan_status,
-               insurance_plan.name AS plan_name,
-               insurance_plan.aliases::jsonb AS plan_aliases,
-               insurance_plan.type_codes::jsonb AS plan_type_codes,
-               insurance_plan.owned_by_ref AS plan_owned_by_ref,
-               insurance_plan.administered_by_ref AS plan_administered_by_ref,
-               insurance_plan.period_start AS plan_period_start,
-               insurance_plan.period_end AS plan_period_end,
-               insurance_plan.product_identifiers::jsonb AS plan_product_identifiers,
-               insurance_plan.plan_backbones::jsonb AS plan_backbones,
-               insurance_plan.coverage::jsonb AS plan_coverage,
-               insurance_plan.fhir_meta::jsonb AS plan_fhir_meta,
-               insurance_plan.fhir_self_url AS plan_fhir_self_url,
-               insurance_plan.fhir_fetch_url AS plan_fhir_fetch_url,
-               insurance_plan.fhir_fetch_mode AS plan_fhir_fetch_mode
-          FROM returned_plans AS returned_plan
-          JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
-            ON insurance_plan.source_id = returned_plan.source_id
-           AND insurance_plan.resource_id = returned_plan.resource_id
-          {_provider_directory_current_resource_join_sql(
-              "insurance_plan", "InsurancePlan", "returned_insurance_plan"
-          )}
-    )
-    """
-
-
 def _provider_directory_role_ctes_sql(
     schema: str,
     has_affiliations: bool,
@@ -1477,7 +1445,6 @@ def _provider_directory_role_ctes_sql(
         has_catalog,
     )
     plan_cap_ctes_sql = _provider_directory_plan_cap_ctes_sql()
-    returned_plan_details_cte_sql = _returned_plan_details_cte_sql(schema)
     evidence_network_id = _provider_directory_reference_resource_id_sql(
         "network_ref.reference",
         "Organization",
@@ -1486,7 +1453,6 @@ def _provider_directory_role_ctes_sql(
     {requested_role_ctes_sql},
     {network_plan_ctes_sql},
     {plan_cap_ctes_sql},
-    {returned_plan_details_cte_sql},
     network_references AS (
         SELECT role_network.source_id, role_network.role_id, role_network.reference,
                role_network.evidence_provenance
@@ -1568,22 +1534,33 @@ def _provider_directory_role_evidence_sql(
            role.role_not_available, role.role_availability_exceptions,
            role.role_new_patient_acceptance, role.role_telehealth, role.role_fhir_meta,
            role.role_fhir_self_url, role.role_fhir_fetch_url, role.role_fhir_fetch_mode,
-           plan.plan_status, plan.plan_name, plan.plan_aliases, plan.plan_type_codes,
-           plan.plan_owned_by_ref, plan.plan_administered_by_ref, plan.plan_period_start,
-           plan.plan_period_end, plan.plan_product_identifiers, plan.plan_backbones,
-           plan.plan_coverage, plan.plan_fhir_meta, plan.plan_fhir_self_url,
-           plan.plan_fhir_fetch_url, plan.plan_fhir_fetch_mode,
+           plan.status AS plan_status, plan.name AS plan_name,
+           plan.aliases::jsonb AS plan_aliases, plan.type_codes::jsonb AS plan_type_codes,
+           plan.owned_by_ref AS plan_owned_by_ref,
+           plan.administered_by_ref AS plan_administered_by_ref,
+           plan.period_start AS plan_period_start, plan.period_end AS plan_period_end,
+           plan.product_identifiers::jsonb AS plan_product_identifiers,
+           plan.plan_backbones::jsonb AS plan_backbones,
+           plan.coverage::jsonb AS plan_coverage,
+           plan.fhir_meta::jsonb AS plan_fhir_meta,
+           plan.fhir_self_url AS plan_fhir_self_url,
+           plan.fhir_fetch_url AS plan_fhir_fetch_url,
+           plan.fhir_fetch_mode AS plan_fhir_fetch_mode,
            COUNT(*) OVER ()::bigint AS evidence_row_total
       FROM evidence
  LEFT JOIN roles AS role
         ON evidence.evidence_type = 'role'
        AND role.source_id = evidence.source_id
        AND role.role_id = evidence.role_id
- LEFT JOIN returned_plan_details AS plan
+ LEFT JOIN current_resources AS current_plan_detail
         ON evidence.evidence_type = 'insurance_plan'
-       AND plan.source_id = evidence.source_id
-       AND plan.role_id = evidence.role_id
-       AND plan.resource_id = evidence.resource_id
+       AND current_plan_detail.source_id = evidence.source_id
+       AND current_plan_detail.resource_type = 'InsurancePlan'
+       AND current_plan_detail.resource_id = evidence.resource_id
+ LEFT JOIN {schema}.provider_directory_insurance_plan AS plan
+        ON plan.source_id = current_plan_detail.source_id
+       AND plan.resource_id = current_plan_detail.resource_id
+       AND plan.last_seen_run_id = current_plan_detail.run_id
   ORDER BY CASE WHEN evidence_type = 'role' THEN 0 ELSE 1 END,
            evidence.source_id, evidence.role_id, evidence.evidence_type, evidence.resource_id
      LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS};
@@ -2341,18 +2318,24 @@ def _merge_provider_directory_role_evidence(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[Mapping[str, Any]]]:
     insurance_plan_list: list[dict[str, Any]] = []
     network_list: list[dict[str, Any]] = []
-    plan_keys: set[tuple[Any, ...]] = set()
+    plan_indexes_by_key: dict[tuple[Any, ...], int] = {}
     network_keys: set[tuple[Any, ...]] = set()
     role_plan_metadata_list: list[dict[str, Any]] = []
     evidence_metadata_list: list[Mapping[str, Any]] = []
     for role_key, role_evidence in matching_role_evidence_list:
         for plan_detail in role_evidence.get("insurance_plans") or []:
-            plan_fields = tuple(plan_detail.get(key) for key in (
-                "resource_type", "resource_id", "identifier", "provenance"
-            ))
-            if plan_fields not in plan_keys:
-                plan_keys.add(plan_fields)
+            plan_key_parts = tuple(
+                plan_detail.get(key) for key in ("resource_type", "resource_id")
+            )
+            existing_plan_index = plan_indexes_by_key.get(plan_key_parts)
+            if existing_plan_index is None:
+                plan_indexes_by_key[plan_key_parts] = len(insurance_plan_list)
                 insurance_plan_list.append(dict(plan_detail))
+            elif (
+                insurance_plan_list[existing_plan_index].get("provenance")
+                and not plan_detail.get("provenance")
+            ):
+                insurance_plan_list[existing_plan_index] = dict(plan_detail)
         for network_detail in role_evidence.get("networks") or []:
             network_fields = tuple(network_detail.get(key) for key in (
                 "resource_type", "resource_id", "name", "reference", "provenance"

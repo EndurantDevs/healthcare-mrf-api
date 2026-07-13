@@ -95,15 +95,16 @@ def test_role_evidence_sql_projects_typed_details_without_catalog_refs():
         "role.available_time::jsonb AS role_available_time",
         "role.new_patient_acceptance::jsonb AS role_new_patient_acceptance",
         "role.telehealth AS role_telehealth",
-        "insurance_plan.product_identifiers::jsonb AS plan_product_identifiers",
-        "insurance_plan.plan_backbones::jsonb AS plan_backbones",
-        "insurance_plan.coverage::jsonb AS plan_coverage",
-        "returned_plan_details AS MATERIALIZED",
-        "LEFT JOIN returned_plan_details AS plan",
+        "plan.product_identifiers::jsonb AS plan_product_identifiers",
+        "plan.plan_backbones::jsonb AS plan_backbones",
+        "plan.coverage::jsonb AS plan_coverage",
+        "LEFT JOIN current_resources AS current_plan_detail",
+        "LEFT JOIN mrf.provider_directory_insurance_plan AS plan",
     ):
         assert column in sql
     assert "network_catalog.refs" not in sql
     assert "jsonb_array_elements(network_catalog.refs" not in sql
+    assert "returned_plan_details AS MATERIALIZED" not in sql
 
 
 def test_current_insurance_plan_ctes_start_from_requested_sources():
@@ -201,3 +202,33 @@ def test_endpoint_evidence_keeps_role_details_keyed_to_the_address_role():
     assert evidence["practitioner_roles"] == [
         role_evidence_map[(source_id, "role-a")]["practitioner_role"]
     ]
+
+
+def test_endpoint_evidence_deduplicates_same_plan_across_role_provenance():
+    plan_map = {
+        "resource_type": "InsurancePlan",
+        "resource_id": "plan-1",
+        "identifier": "product-1",
+        "name": "Example Choice",
+    }
+    role_evidence_list = [
+        (
+            ("source-a", "role-a"),
+            {
+                "insurance_plans": [
+                    {**plan_map, "provenance": "network-derived"}
+                ],
+                "networks": [],
+            },
+        ),
+        (
+            ("source-a", "role-b"),
+            {"insurance_plans": [plan_map], "networks": []},
+        ),
+    ]
+
+    plans, _networks, _metadata, _evidence = (
+        npi_module._merge_provider_directory_role_evidence(role_evidence_list)
+    )
+
+    assert plans == [plan_map]
