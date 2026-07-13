@@ -657,10 +657,46 @@ PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE = (
 PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE = (
     "provider_directory_dataset_insurance_plan"
 )
+PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_COLUMNS = (
+    "plan_active",
+    "plan_identifier",
+)
+PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_REQUIREMENTS = tuple(
+    (PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE, column_name)
+    for column_name in PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_COLUMNS
+)
 PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE = (
     "provider_directory_dataset_affiliation_organization"
 )
 PROVIDER_DIRECTORY_DATASET_RELATION_VERSION = "1"
+
+PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL = """
+    WITH requested_columns AS (
+        SELECT column_table_name, column_name
+          FROM unnest(
+               CAST(:column_table_names AS varchar[]),
+               CAST(:column_names AS varchar[])
+          ) AS requested(column_table_name, column_name)
+    )
+    SELECT requested.table_name,
+           to_regclass(:schema || '.' || requested.table_name)
+               IS NOT NULL AS is_available
+      FROM unnest(CAST(:table_names AS varchar[]))
+           AS requested(table_name)
+    UNION ALL
+    SELECT requested.column_table_name || '.' || requested.column_name,
+           EXISTS (
+               SELECT 1
+                 FROM pg_attribute
+                WHERE attrelid = to_regclass(
+                      :schema || '.' || requested.column_table_name
+                )
+                  AND attname = requested.column_name
+                  AND attnum > 0
+                  AND NOT attisdropped
+           ) AS is_available
+      FROM requested_columns AS requested
+"""
 
 
 # A handful of reference labs / large health systems carry 1k+ service locations.
@@ -1479,6 +1515,10 @@ def _missing_catalog_plan_ctes_sql() -> str:
                NULL::varchar AS identifier, NULL::varchar AS provenance
           FROM roles AS role
          WHERE false
+    ), network_derived_plan_keys AS MATERIALIZED (
+        SELECT role.source_id, role.role_id, NULL::varchar AS resource_id
+          FROM roles AS role
+         WHERE false
     )
     """
 
@@ -1562,11 +1602,23 @@ def _dataset_role_plan_candidates_sql(schema: str) -> str:
     """
 
 
+def _dataset_plan_scalar_sql(
+    identifier_sql: str,
+    active_sql: str,
+    has_scalar_columns: bool,
+) -> tuple[str, str]:
+    """Choose generated plan scalars only when both columns are available."""
+    if has_scalar_columns:
+        return "insurance_plan.plan_identifier", "insurance_plan.plan_active"
+    return identifier_sql, active_sql
+
+
 def _dataset_role_plan_resources_sql(
     schema: str,
     insurance_plan_identifier: str,
     insurance_plan_active: str,
     has_dataset_insurance_plan: bool,
+    has_dataset_insurance_plan_scalars: bool,
 ) -> str:
     """Load only active immutable plan payloads referenced by candidates."""
     resource_table = (
@@ -1577,20 +1629,25 @@ def _dataset_role_plan_resources_sql(
     resource_type_filter = (
         "" if has_dataset_insurance_plan else "AND insurance_plan.resource_type = 'InsurancePlan'"
     )
+    selected_identifier, active_filter = _dataset_plan_scalar_sql(
+        insurance_plan_identifier,
+        insurance_plan_active,
+        has_dataset_insurance_plan_scalars,
+    )
     return f"""
     dataset_network_plan_resource_keys AS MATERIALIZED (
         SELECT DISTINCT candidate.dataset_id, candidate.resource_id
           FROM dataset_network_plan_candidates AS candidate
     ), dataset_network_plan_resources AS MATERIALIZED (
         SELECT candidate.dataset_id, insurance_plan.resource_id,
-               NULLIF(BTRIM({insurance_plan_identifier}), '')::varchar AS identifier
+               NULLIF(BTRIM({selected_identifier}), '')::varchar AS identifier
           FROM dataset_network_plan_resource_keys AS candidate
           JOIN {schema}.{resource_table} AS insurance_plan
             ON insurance_plan.dataset_id = candidate.dataset_id
            AND insurance_plan.resource_id = candidate.resource_id
            {resource_type_filter}
-           AND {insurance_plan_active}
-    ), dataset_network_derived_plans AS MATERIALIZED (
+           AND {active_filter}
+    ), dataset_network_eligible_plan_candidates AS MATERIALIZED (
         SELECT candidate.source_id, candidate.role_id,
                insurance_plan.resource_id, insurance_plan.identifier,
                candidate.provenance
@@ -1598,6 +1655,22 @@ def _dataset_role_plan_resources_sql(
           JOIN dataset_network_plan_resources AS insurance_plan
             ON insurance_plan.dataset_id = candidate.dataset_id
            AND insurance_plan.resource_id = candidate.resource_id
+    ), dataset_network_derived_plan_keys AS MATERIALIZED (
+        SELECT source_id, role_id, resource_id
+          FROM dataset_network_eligible_plan_candidates
+    ), dataset_network_ranked_plan_candidates AS MATERIALIZED (
+        SELECT candidate.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY candidate.source_id, candidate.role_id
+                   ORDER BY candidate.resource_id,
+                            candidate.identifier NULLS LAST,
+                            candidate.provenance
+               ) AS plan_rank
+          FROM dataset_network_eligible_plan_candidates AS candidate
+    ), dataset_network_derived_plans AS MATERIALIZED (
+        SELECT source_id, role_id, resource_id, identifier, provenance
+          FROM dataset_network_ranked_plan_candidates
+         WHERE plan_rank <= {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE}
     )
     """
 
@@ -1605,6 +1678,7 @@ def _dataset_role_plan_resources_sql(
 def _dataset_role_plan_sql(
     schema: str,
     has_dataset_insurance_plan: bool,
+    has_dataset_insurance_plan_scalars: bool,
 ) -> str:
     """Build indexed immutable role-to-plan resolution CTEs."""
     insurance_plan_status = (
@@ -1623,6 +1697,7 @@ def _dataset_role_plan_sql(
         insurance_plan_identifier,
         insurance_plan_active,
         has_dataset_insurance_plan,
+        has_dataset_insurance_plan_scalars,
     )
     return f"""
     {candidate_sql}, {resource_sql}
@@ -1687,6 +1762,7 @@ def _network_derived_role_plans_cte_sql(
     schema: str,
     has_dataset_network_plan: bool,
     has_dataset_insurance_plan: bool,
+    has_dataset_insurance_plan_scalars: bool,
 ) -> str:
     """Derive role plans from dataset edges with a legacy JSON fallback."""
     scoped_plan_ctes_sql = _scoped_current_insurance_plan_ctes_sql(
@@ -1699,7 +1775,11 @@ def _network_derived_role_plans_cte_sql(
         ),
     )
     dataset_plan_cte_sql = (
-        _dataset_role_plan_sql(schema, has_dataset_insurance_plan)
+        _dataset_role_plan_sql(
+            schema,
+            has_dataset_insurance_plan,
+            has_dataset_insurance_plan_scalars,
+        )
         if has_dataset_network_plan
         else """
     dataset_network_derived_plans AS MATERIALIZED (
@@ -1708,13 +1788,24 @@ def _network_derived_role_plans_cte_sql(
                NULL::varchar AS provenance
           FROM valid_role_networks AS role_network
          WHERE false
+    ), dataset_network_derived_plan_keys AS MATERIALIZED (
+        SELECT role_network.source_id, role_network.role_id,
+               NULL::varchar AS resource_id
+          FROM valid_role_networks AS role_network
+         WHERE false
     )
         """
     )
     legacy_plan_cte_sql = _legacy_role_plan_sql(has_dataset_network_plan)
     return f"""
     {scoped_plan_ctes_sql}, {dataset_plan_cte_sql}, {legacy_plan_cte_sql},
-    network_derived_plans AS MATERIALIZED (
+    network_derived_plan_keys AS MATERIALIZED (
+        SELECT source_id, role_id, resource_id
+          FROM dataset_network_derived_plan_keys
+        UNION ALL
+        SELECT source_id, role_id, resource_id
+          FROM legacy_network_derived_plans
+    ), network_derived_plans AS MATERIALIZED (
         SELECT source_id, role_id, resource_id, identifier, provenance
           FROM dataset_network_derived_plans
         UNION ALL
@@ -1729,6 +1820,7 @@ def _provider_directory_catalog_plan_ctes_sql(
     has_catalog: bool,
     has_dataset_network_plan: bool,
     has_dataset_insurance_plan: bool,
+    has_dataset_insurance_plan_scalars: bool,
 ) -> str:
     """Build catalog-gated role plan CTEs without expanding catalog payloads."""
     if not has_catalog:
@@ -1739,6 +1831,7 @@ def _provider_directory_catalog_plan_ctes_sql(
         schema,
         has_dataset_network_plan,
         has_dataset_insurance_plan,
+        has_dataset_insurance_plan_scalars,
     )}
     """
 
@@ -1750,22 +1843,21 @@ def _provider_directory_network_plan_ctes_sql(
     has_dataset_network_plan: bool,
     has_dataset_affiliation_organization: bool,
     has_dataset_insurance_plan: bool,
+    has_dataset_insurance_plan_scalars: bool,
 ) -> str:
     """Build same-source network intersection CTEs for role plan evidence."""
     role_network_id = _provider_directory_reference_resource_id_sql(
-        "role_network_ref.value",
-        "Organization",
+        "role_network_ref.value", "Organization"
     )
     affiliation_ctes_sql = _provider_directory_affiliation_network_ctes_sql(
-        schema,
-        has_affiliations,
-        has_dataset_affiliation_organization,
+        schema, has_affiliations, has_dataset_affiliation_organization
     )
     plan_ctes_sql = _provider_directory_catalog_plan_ctes_sql(
         schema,
         has_catalog,
         has_dataset_network_plan,
         has_dataset_insurance_plan,
+        has_dataset_insurance_plan_scalars,
     )
     return f"""
     direct_role_networks AS MATERIALIZED (
@@ -1862,8 +1954,17 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
 
 
 def _provider_directory_plan_cap_ctes_sql() -> str:
+    """Cap returned payload keys while retaining exact active-plan totals."""
     return f"""
-    plan_candidates AS MATERIALIZED (
+    all_plan_keys AS MATERIALIZED (
+        SELECT direct_plan.source_id, direct_plan.role_id, direct_plan.resource_id
+          FROM direct_plans AS direct_plan
+        UNION ALL
+        SELECT derived_plan.source_id, derived_plan.role_id, derived_plan.resource_id
+          FROM network_derived_plan_keys AS derived_plan
+    ), unique_plan_keys AS MATERIALIZED (
+        SELECT DISTINCT source_id, role_id, resource_id FROM all_plan_keys
+    ), plan_candidates AS MATERIALIZED (
         SELECT direct_plan.source_id, direct_plan.role_id, direct_plan.resource_id,
                direct_plan.identifier,
                'provider_directory_insurance_plan'::varchar AS provenance
@@ -1894,21 +1995,21 @@ def _provider_directory_plan_cap_ctes_sql() -> str:
          WHERE plan_rank <= {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE}
     ), role_plan_metadata AS MATERIALIZED (
         SELECT role.source_id, role.role_id,
-               LEAST(COUNT(unique_plan.resource_id), {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE})::bigint
+               LEAST(COUNT(unique_plan_key.resource_id), {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE})::bigint
                    AS plan_returned,
                CASE WHEN catalog_status.catalog_complete
-                    THEN COUNT(unique_plan.resource_id)::bigint END AS plan_total,
+                    THEN COUNT(unique_plan_key.resource_id)::bigint END AS plan_total,
                CASE WHEN catalog_status.catalog_complete
-                    THEN COUNT(unique_plan.resource_id) > {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE}
+                    THEN COUNT(unique_plan_key.resource_id) > {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE}
                 END AS plan_truncated,
                catalog_status.catalog_complete
           FROM roles AS role
           JOIN role_catalog_status AS catalog_status
             ON catalog_status.source_id = role.source_id
            AND catalog_status.role_id = role.role_id
-          LEFT JOIN unique_plans AS unique_plan
-            ON unique_plan.source_id = role.source_id
-           AND unique_plan.role_id = role.role_id
+          LEFT JOIN unique_plan_keys AS unique_plan_key
+            ON unique_plan_key.source_id = role.source_id
+           AND unique_plan_key.role_id = role.role_id
       GROUP BY role.source_id, role.role_id, catalog_status.catalog_complete
     )
     """
@@ -1955,6 +2056,7 @@ def _provider_directory_role_ctes_sql(
     has_dataset_network_plan: bool,
     has_dataset_affiliation_organization: bool,
     has_dataset_insurance_plan: bool,
+    has_dataset_insurance_plan_scalars: bool,
 ) -> str:
     """Compose keyed role, network, capped-plan, and network-evidence CTEs."""
     requested_role_ctes_sql = _provider_directory_requested_role_ctes_sql(schema)
@@ -1965,6 +2067,7 @@ def _provider_directory_role_ctes_sql(
         has_dataset_network_plan,
         has_dataset_affiliation_organization,
         has_dataset_insurance_plan,
+        has_dataset_insurance_plan_scalars,
     )
     plan_cap_ctes_sql = _provider_directory_plan_cap_ctes_sql()
     evidence_network_id = _provider_directory_reference_resource_id_sql(
@@ -2089,6 +2192,7 @@ def _provider_directory_role_evidence_sql(
     has_dataset_network_plan: bool = False,
     has_dataset_affiliation_organization: bool = False,
     has_dataset_insurance_plan: bool = False,
+    has_dataset_insurance_plan_scalars: bool = False,
 ) -> str:
     """Build exact-key role evidence SQL with dataset-gated relation fallbacks."""
     return _PROVIDER_DIRECTORY_ROLE_EVIDENCE_SQL_TEMPLATE.format(
@@ -2104,6 +2208,7 @@ def _provider_directory_role_evidence_sql(
             has_dataset_network_plan,
             has_dataset_affiliation_organization,
             has_dataset_insurance_plan,
+            has_dataset_insurance_plan_scalars,
         ),
         evidence_union_sql=_provider_directory_evidence_union_sql(
             schema,
@@ -2478,6 +2583,9 @@ async def _fetch_provider_directory_role_evidence_map(
             PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE,
             PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
         ),
+        optional_columns=(
+            PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_REQUIREMENTS
+        ),
     )
     if table_flags is None:
         return {}
@@ -2492,6 +2600,7 @@ async def _fetch_provider_directory_role_evidence_map(
                 table_flags[PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE],
                 table_flags[PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE],
                 table_flags[PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE],
+                _has_provider_directory_plan_scalars(table_flags),
             )
         ),
         session=session,
@@ -2508,23 +2617,23 @@ async def _provider_directory_evidence_tables(
     *,
     required_names: Sequence[str],
     optional_names: Sequence[str],
+    optional_columns: Sequence[tuple[str, str]] = (),
 ) -> dict[str, bool] | None:
+    """Resolve required tables and optional table-column capabilities in one query."""
     table_names = list(dict.fromkeys((*required_names, *optional_names)))
     try:
         availability_result = await _execute_stmt(
-            text(
-                """
-                SELECT requested.table_name,
-                       to_regclass(:schema || '.' || requested.table_name)
-                           IS NOT NULL AS is_available
-                  FROM unnest(CAST(:table_names AS varchar[]))
-                       AS requested(table_name)
-                """
-            ),
+            text(PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL),
             session=session,
             params={
                 "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
                 "table_names": table_names,
+                "column_table_names": [
+                    table_name for table_name, _column_name in optional_columns
+                ],
+                "column_names": [
+                    column_name for _table_name, column_name in optional_columns
+                ],
             },
         )
     except Exception:
@@ -2537,10 +2646,27 @@ async def _provider_directory_evidence_tables(
     }
     if not all(availability_by_name.get(table_name, False) for table_name in required_names):
         return None
+    optional_capability_names = [
+        *optional_names,
+        *(f"{table_name}.{column_name}" for table_name, column_name in optional_columns),
+    ]
     return {
-        table_name: availability_by_name.get(table_name, False)
-        for table_name in optional_names
+        capability_name: availability_by_name.get(capability_name, False)
+        for capability_name in optional_capability_names
     }
+
+
+def _has_provider_directory_plan_scalars(
+    capability_flags: Mapping[str, bool],
+) -> bool:
+    """Require both generated plan fields before selecting the scalar path."""
+    return all(
+        capability_flags.get(
+            f"{PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE}.{column_name}",
+            False,
+        )
+        for column_name in PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_COLUMNS
+    )
 
 
 async def _disable_provider_directory_evidence_jit(session: Any) -> None:
@@ -2599,10 +2725,10 @@ def _provider_directory_requested_affiliation_ctes_sql(schema: str) -> str:
 def _dataset_affiliation_plan_sql(
     schema: str,
     has_dataset_insurance_plan: bool,
+    has_dataset_insurance_plan_scalars: bool,
 ) -> str:
-    insurance_plan_status = (
-        "insurance_plan.payload_json::jsonb ->> 'status'"
-    )
+    """Resolve affiliation plan edges through active immutable plan scalars."""
+    insurance_plan_status = "insurance_plan.payload_json::jsonb ->> 'status'"
     insurance_plan_identifier = (
         "insurance_plan.payload_json::jsonb ->> 'plan_identifier'"
     )
@@ -2617,6 +2743,11 @@ def _dataset_affiliation_plan_sql(
     )
     resource_type_filter = (
         "" if has_dataset_insurance_plan else "AND insurance_plan.resource_type = 'InsurancePlan'"
+    )
+    selected_identifier, active_filter = _dataset_plan_scalar_sql(
+        insurance_plan_identifier,
+        insurance_plan_active,
+        has_dataset_insurance_plan_scalars,
     )
     return f"""
     dataset_affiliation_plan_candidates AS MATERIALIZED (
@@ -2634,13 +2765,13 @@ def _dataset_affiliation_plan_sql(
           FROM dataset_affiliation_plan_candidates AS candidate
     ), dataset_affiliation_plan_resources AS MATERIALIZED (
         SELECT candidate.dataset_id, insurance_plan.resource_id,
-               NULLIF(BTRIM({insurance_plan_identifier}), '')::varchar AS identifier
+               NULLIF(BTRIM({selected_identifier}), '')::varchar AS identifier
           FROM dataset_affiliation_plan_resource_keys AS candidate
           JOIN {schema}.{resource_table} AS insurance_plan
             ON insurance_plan.dataset_id = candidate.dataset_id
            AND insurance_plan.resource_id = candidate.resource_id
            {resource_type_filter}
-           AND {insurance_plan_active}
+           AND {active_filter}
     ), dataset_affiliation_plans AS MATERIALIZED (
         SELECT candidate.source_id, candidate.affiliation_id,
                insurance_plan.resource_id, insurance_plan.identifier,
@@ -2694,6 +2825,7 @@ def _affiliation_plan_resolution_cte_sql(
     schema: str,
     has_dataset_network_plan: bool,
     has_dataset_insurance_plan: bool,
+    has_dataset_insurance_plan_scalars: bool,
 ) -> str:
     """Resolve affiliation plans from dataset edges with a legacy fallback."""
     scoped_plan_ctes_sql = _scoped_current_insurance_plan_ctes_sql(
@@ -2706,7 +2838,11 @@ def _affiliation_plan_resolution_cte_sql(
         ),
     )
     dataset_plan_cte_sql = (
-        _dataset_affiliation_plan_sql(schema, has_dataset_insurance_plan)
+        _dataset_affiliation_plan_sql(
+            schema,
+            has_dataset_insurance_plan,
+            has_dataset_insurance_plan_scalars,
+        )
         if has_dataset_network_plan
         else """
     dataset_affiliation_plans AS MATERIALIZED (
@@ -2814,6 +2950,7 @@ def _provider_directory_affiliation_evidence_sql(
     has_catalog: bool,
     has_dataset_network_plan: bool = False,
     has_dataset_insurance_plan: bool = False,
+    has_dataset_insurance_plan_scalars: bool = False,
 ) -> str:
     """Resolve exact affiliation network and plan evidence from current resources."""
     current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(
@@ -2827,6 +2964,7 @@ def _provider_directory_affiliation_evidence_sql(
         schema,
         has_dataset_network_plan,
         has_dataset_insurance_plan,
+        has_dataset_insurance_plan_scalars,
     )
     plan_cap_ctes_sql = _affiliation_plan_cap_ctes_sql()
     evidence_union_sql = _provider_directory_affiliation_evidence_union_sql(
@@ -2944,6 +3082,9 @@ async def _fetch_provider_directory_affiliation_evidence_map(
             PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE,
             PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
         ),
+        optional_columns=(
+            PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_REQUIREMENTS
+        ),
     )
     if table_flags is None:
         return {}
@@ -2956,6 +3097,7 @@ async def _fetch_provider_directory_affiliation_evidence_map(
                 table_flags["provider_directory_network_catalog"],
                 table_flags[PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE],
                 table_flags[PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE],
+                _has_provider_directory_plan_scalars(table_flags),
             )
         ),
         session=session,

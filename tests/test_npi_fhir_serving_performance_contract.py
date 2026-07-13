@@ -7,7 +7,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api.endpoint import npi as npi_module
-from db.models import ProviderDirectoryDatasetResource
+from db.models import (
+    ProviderDirectoryDatasetInsurancePlan,
+    ProviderDirectoryDatasetResource,
+)
 
 
 @pytest.mark.asyncio
@@ -100,12 +103,72 @@ def test_relation_evidence_deduplicates_before_payload_projection():
     assert "dataset_network_plan_resource_keys AS MATERIALIZED" in role_sql
     assert "SELECT DISTINCT candidate.dataset_id, candidate.resource_id" in role_sql
     assert "dataset_network_plan_resources AS MATERIALIZED" in role_sql
+    assert "dataset_network_eligible_plan_candidates AS MATERIALIZED" in role_sql
+    assert "dataset_network_derived_plan_keys AS MATERIALIZED" in role_sql
+    assert "dataset_network_ranked_plan_candidates AS MATERIALIZED" in role_sql
+    assert "network_derived_plan_keys AS MATERIALIZED" in role_sql
+    assert "unique_plan_keys AS MATERIALIZED" in role_sql
+    assert (
+        f"WHERE plan_rank <= {npi_module.MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE}"
+        in role_sql
+    )
     assert "dataset_affiliation_plan_candidates AS MATERIALIZED" in affiliation_sql
     assert "dataset_affiliation_plan_resource_keys AS MATERIALIZED" in affiliation_sql
     assert "dataset_affiliation_plan_resources AS MATERIALIZED" in affiliation_sql
     assert "insurance_plan.dataset_id = candidate.dataset_id" in role_sql
     assert "insurance_plan.dataset_id = candidate.dataset_id" in affiliation_sql
     assert npi_module.MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE == 100
+
+
+def test_dataset_plan_scalar_path_avoids_json_before_cap():
+    role_sql = npi_module._dataset_role_plan_resources_sql(
+        "mrf",
+        "insurance_plan.payload_json::jsonb ->> 'plan_identifier'",
+        "insurance_plan.payload_json::jsonb ->> 'status' = 'active'",
+        has_dataset_insurance_plan=True,
+        has_dataset_insurance_plan_scalars=True,
+    )
+    affiliation_sql = npi_module._dataset_affiliation_plan_sql(
+        "mrf",
+        has_dataset_insurance_plan=True,
+        has_dataset_insurance_plan_scalars=True,
+    )
+
+    for scalar_sql in (role_sql, affiliation_sql):
+        assert "insurance_plan.plan_identifier" in scalar_sql
+        assert "insurance_plan.plan_active" in scalar_sql
+        assert "insurance_plan.payload_json" not in scalar_sql
+
+
+def test_plan_scalar_columns_are_generated_and_migrated():
+    table = ProviderDirectoryDatasetInsurancePlan.__table__
+    assert table.c.plan_active.computed is not None
+    assert table.c.plan_identifier.computed is not None
+
+    migration_text = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "20260713237000_provider_directory_plan_scalars.py"
+    ).read_text()
+    assert "sa.Computed" in migration_text
+    assert "INCLUDE (plan_identifier)" in migration_text
+    assert "WHERE plan_active" in migration_text
+
+
+def test_plan_scalar_capability_requires_both_generated_columns():
+    table_name = npi_module.PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE
+    capability_by_name = {
+        f"{table_name}.plan_active": True,
+        f"{table_name}.plan_identifier": True,
+    }
+
+    assert npi_module._has_provider_directory_plan_scalars(
+        capability_by_name
+    )
+    assert not npi_module._has_provider_directory_plan_scalars(
+        {f"{table_name}.plan_active": True}
+    )
 
 
 def test_immutable_plan_lookup_index_matches_model_and_migration():

@@ -10,6 +10,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Column,
+    Computed,
     DateTime,
     ForeignKey,
     Integer,
@@ -497,6 +498,17 @@ class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):
         {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
     __my_index_elements__ = ["dataset_id", "resource_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": (
+                "dataset_id",
+                "resource_id",
+                "plan_identifier",
+            ),
+            "name": "provider_directory_dataset_insurance_plan_active_lookup_idx",
+            "where": "plan_active",
+        }
+    ]
 
     dataset_id = Column(
         String(96),
@@ -510,6 +522,21 @@ class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):
     resource_id = Column(String(256), nullable=False)
     payload_hash = Column(String(64), nullable=False)
     payload_json = Column(JSON, nullable=False)
+    plan_active = Column(
+        Boolean,
+        Computed(
+            "COALESCE(NULLIF(lower(btrim(payload_json ->> 'status')), ''), "
+            "'active') = 'active'",
+            persisted=True,
+        ),
+    )
+    plan_identifier = Column(
+        TEXT,
+        Computed(
+            "NULLIF(btrim(payload_json ->> 'plan_identifier'), '')",
+            persisted=True,
+        ),
+    )
 
 
 class ProviderDirectoryDatasetNetworkPlan(Base, JSONOutputMixin):
