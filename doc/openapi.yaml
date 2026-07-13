@@ -2491,7 +2491,13 @@ paths:
           in: query
           schema:
             type: boolean
-          description: Include detailed address evidence arrays and record identifiers for debugging
+          description: Include detailed address evidence and Provider Directory profile source evidence
+        - name: include_profile
+          in: query
+          schema:
+            type: boolean
+            default: true
+          description: Include the deduplicated insurer Provider Directory profile when available
         - name: extra_info
           in: query
           schema:
@@ -8091,6 +8097,90 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/NpiOtherName'
+        provider_directory_profile:
+          $ref: '#/components/schemas/ProviderDirectoryProfile'
+        provider_directory_profile_evidence:
+          allOf:
+            - $ref: '#/components/schemas/ProviderDirectoryProfile'
+          description: Per-fact source evidence, returned only when include_evidence is true
+      additionalProperties: true
+    ProviderDirectoryProfile:
+      type: object
+      properties:
+        schema_version:
+          type: integer
+        generation_id:
+          type: string
+          nullable: true
+        published_at:
+          type: string
+          format: date-time
+          nullable: true
+        source_count:
+          type: integer
+        independent_source_count:
+          type: integer
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderDirectoryProfileSource'
+        facts:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'
+      additionalProperties: true
+    ProviderDirectoryProfileSource:
+      type: object
+      properties:
+        source_id:
+          type: string
+        endpoint_id:
+          type: string
+        dataset_id:
+          type: string
+        api_base:
+          type: string
+          format: uri
+        org_name:
+          type: string
+        plan_name:
+          type: string
+      additionalProperties: true
+    ProviderDirectoryProfileFactCategory:
+      type: object
+      properties:
+        total:
+          type: integer
+        truncated:
+          type: boolean
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderDirectoryProfileFact'
+      additionalProperties: true
+    ProviderDirectoryProfileFact:
+      type: object
+      properties:
+        value:
+          type: object
+          additionalProperties: true
+        source_ids:
+          type: array
+          items:
+            type: string
+        source_count:
+          type: integer
+        independent_source_count:
+          type: integer
+        evidence_count:
+          type: integer
+        evidence_truncated:
+          type: boolean
+        evidence:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
       additionalProperties: true
     NpiTaxonomy:
       type: object
