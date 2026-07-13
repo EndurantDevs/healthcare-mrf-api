@@ -40,6 +40,7 @@ __all__ = (
     "ProviderDirectoryCapability",
     "ProviderDirectoryCanonicalResource",
     "ProviderDirectoryDatasetAffiliationOrganization",
+    "ProviderDirectoryDatasetInsurancePlan",
     "ProviderDirectoryDatasetNetworkPlan",
     "ProviderDirectoryDatasetResource",
     "ProviderDirectoryEndpoint",
@@ -108,6 +109,12 @@ class ImportRun(Base, JSONOutputMixin):
         {"index_elements": ("schedule_id",), "name": "import_run_schedule_idx"},
         {"index_elements": ("subscription_id",), "name": "import_run_subscription_idx"},
         {"index_elements": ("source_file_import_id",), "name": "import_run_source_file_import_idx"},
+        {
+            "index_elements": ("retry_of_run_id",),
+            "name": "import_run_provider_directory_retry_child_idx",
+            "unique": True,
+            "where": "importer = 'provider-directory-fhir' AND retry_of_run_id IS NOT NULL",
+        },
     ]
 
     run_id = Column(String(64), nullable=False)
@@ -477,6 +484,29 @@ class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
         nullable=False,
     )
     resource_type = Column(String(64), nullable=False)
+    resource_id = Column(String(256), nullable=False)
+    payload_hash = Column(String(64), nullable=False)
+    payload_json = Column(JSON, nullable=False)
+
+
+class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):
+    __tablename__ = "provider_directory_dataset_insurance_plan"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("dataset_id", "resource_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["dataset_id", "resource_id"]
+
+    dataset_id = Column(
+        String(96),
+        ForeignKey(
+            ProviderDirectoryEndpointDataset.dataset_id,
+            name="provider_directory_dataset_insurance_plan_dataset_id_fkey",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
     resource_id = Column(String(256), nullable=False)
     payload_hash = Column(String(64), nullable=False)
     payload_json = Column(JSON, nullable=False)

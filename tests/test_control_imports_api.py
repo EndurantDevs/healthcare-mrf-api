@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
 import importlib.util
 import io
 import json
@@ -989,6 +990,19 @@ def _load_import_run_migration():
     return module
 
 
+def _load_provider_directory_retry_child_migration():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "20260713235000_import_run_provider_directory_retry_child.py"
+    )
+    spec = importlib.util.spec_from_file_location("migration_provider_directory_retry_child", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class _OpRecorder:
     def __init__(self):
         self.tables = {}
@@ -1018,7 +1032,11 @@ def test_import_run_migration_mirrors_model(monkeypatch):
     table = recorder.tables["import_run"]
     assert table["schema"] == ImportRun.__table__.schema
     assert [column.name for column in table["columns"]] == list(ImportRun.__table__.columns.keys())
-    assert {name for name in recorder.indexes} == {spec["name"] for spec in ImportRun.__my_additional_indexes__}
+    assert {name for name in recorder.indexes} == {
+        spec["name"]
+        for spec in ImportRun.__my_additional_indexes__
+        if spec["name"] != "import_run_provider_directory_retry_child_idx"
+    }
     idempotency_idx = recorder.indexes["import_run_active_idempotency_idx"]
     assert idempotency_idx["table"] == "import_run"
     assert idempotency_idx["unique"] is True
@@ -1026,6 +1044,75 @@ def test_import_run_migration_mirrors_model(monkeypatch):
     assert str(idempotency_idx["postgresql_where"]) == (
         "status IN ('queued', 'starting', 'running', 'finalizing', 'canceling')"
     )
+
+
+class _MigrationRows:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return self.rows
+
+
+class _RetryChildMigrationRecorder:
+    def __init__(self, duplicate_rows):
+        self.duplicate_rows = duplicate_rows
+        self.statements = []
+        self.indexes = []
+
+    def get_bind(self):
+        return self
+
+    def execute(self, statement):
+        self.statements.append(statement)
+        return _MigrationRows(self.duplicate_rows)
+
+    def create_index(self, name, table_name, columns, **kwargs):
+        self.indexes.append((name, table_name, columns, kwargs))
+
+
+def test_provider_directory_retry_child_index_metadata_and_migration(monkeypatch):
+    module = _load_provider_directory_retry_child_migration()
+    recorder = _RetryChildMigrationRecorder([])
+    monkeypatch.setattr(module, "op", recorder)
+
+    module.upgrade()
+
+    model_index = next(
+        spec
+        for spec in ImportRun.__my_additional_indexes__
+        if spec["name"] == "import_run_provider_directory_retry_child_idx"
+    )
+    assert model_index == {
+        "index_elements": ("retry_of_run_id",),
+        "name": "import_run_provider_directory_retry_child_idx",
+        "unique": True,
+        "where": "importer = 'provider-directory-fhir' AND retry_of_run_id IS NOT NULL",
+    }
+    assert len(recorder.indexes) == 1
+    name, table_name, columns, options = recorder.indexes[0]
+    assert name == model_index["name"]
+    assert table_name == "import_run"
+    assert columns == ["retry_of_run_id"]
+    assert options["unique"] is True
+    assert str(options["postgresql_where"]) == model_index["where"]
+    assert "HAVING count(*) > 1" in str(recorder.statements[0])
+
+
+def test_provider_directory_retry_child_migration_fails_on_duplicates(monkeypatch):
+    module = _load_provider_directory_retry_child_migration()
+    recorder = _RetryChildMigrationRecorder(
+        [{"retry_of_run_id": "run_parent", "child_count": 2}]
+    )
+    monkeypatch.setattr(module, "op", recorder)
+
+    with pytest.raises(RuntimeError, match=r"run_parent \(2 children\).+no data was deleted"):
+        module.upgrade()
+
+    assert recorder.indexes == []
 
 
 def test_control_blueprint_registers_import_run_ensure_listener():
@@ -1456,9 +1543,10 @@ def _legacy_provider_directory_active_run(run_id, source_id, endpoint_scope):
 
 
 class _ProviderAdmissionDb:
-    def __init__(self):
+    def __init__(self, query_rows=None):
         self.events = []
         self.committed = False
+        self.query_rows = list(query_rows or [])
 
     @asynccontextmanager
     async def acquire(self):
@@ -1475,6 +1563,10 @@ class _ProviderAdmissionDb:
     async def status(self, statement):
         self.events.append(("status", statement))
         return 1
+
+    async def all(self, statement):
+        self.events.append(("all", statement))
+        return self.query_rows
 
     async def execute(self, statement):
         self.events.append(("execute", statement))
@@ -1626,6 +1718,128 @@ async def test_create_import_run_replays_provider_directory_idempotency_key(monk
     assert created is False
     assert replayed_run == active
     assert [event[0] for event in database.events] == ["acquire", "scalar", "commit"]
+
+
+@pytest.mark.asyncio
+async def test_create_import_run_replays_terminal_provider_directory_retry_child(monkeypatch):
+    terminal_child = {
+        "run_id": "run_child",
+        "status": "failed",
+        "importer": "provider-directory-fhir",
+        "retry_of_run_id": "run_parent",
+    }
+    database = _ProviderAdmissionDb([terminal_child])
+
+    async def fail_active_lookup(*_args):
+        raise AssertionError("retry-child replay must precede active-run admission checks")
+
+    async def fail_enqueue(_row):
+        raise AssertionError("an existing terminal retry child must not enqueue again")
+
+    monkeypatch.setattr(control_imports, "db", database)
+    monkeypatch.setattr(control_imports, "_active_idempotency_run", fail_active_lookup)
+    monkeypatch.setattr(control_imports, "_active_importer_runs", fail_active_lookup)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
+
+    replayed_run, created = await create_import_run(
+        {
+            "run_id": "run_second_child",
+            "importer": "provider-directory-fhir",
+            "retry_of_run_id": "run_parent",
+            "idempotency_key": "new-idempotency-key",
+        }
+    )
+
+    assert created is False
+    assert replayed_run == terminal_child
+    assert [event[0] for event in database.events] == ["acquire", "scalar", "all", "commit"]
+    retry_lookup = database.events[2][1].compile().params
+    assert retry_lookup["importer_1"] == "provider-directory-fhir"
+    assert retry_lookup["retry_of_run_id_1"] == "run_parent"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_provider_directory_retries_converge_on_one_child(monkeypatch):
+    class ConcurrentAdmissionDb(_ProviderAdmissionDb):
+        def __init__(self):
+            super().__init__()
+            self.admission_lock = asyncio.Lock()
+            self.retry_children = {}
+
+        @asynccontextmanager
+        async def acquire(self):
+            async with self.admission_lock:
+                self.events.append(("acquire",))
+                try:
+                    yield self
+                finally:
+                    self.events.append(("commit",))
+
+        async def status(self, statement):
+            row = dict(statement.compile().params)
+            self.retry_children[row["retry_of_run_id"]] = row
+            return await super().status(statement)
+
+    database = ConcurrentAdmissionDb()
+    enqueue_started = asyncio.Event()
+    finish_enqueue = asyncio.Event()
+    enqueue_count = 0
+
+    async def retry_child(connection, retry_of_run_id):
+        assert connection is database
+        return database.retry_children.get(retry_of_run_id)
+
+    async def no_idempotency_run(_connection, _idempotency_key):
+        return None
+
+    async def no_active_runs(_connection, _importer):
+        return []
+
+    async def fake_enqueue(row):
+        nonlocal enqueue_count
+        enqueue_count += 1
+        enqueue_started.set()
+        await finish_enqueue.wait()
+        return {
+            "status": "queued",
+            "phase_detail": "enqueued",
+            "heartbeat_at": row["heartbeat_at"],
+            "progress": {"message": "queued"},
+            "metrics": {"queue": "arq:ProviderDirectoryFHIR"},
+            "error": None,
+        }
+
+    monkeypatch.setattr(control_imports, "db", database)
+    monkeypatch.setattr(control_imports, "_provider_directory_retry_child", retry_child)
+    monkeypatch.setattr(control_imports, "_active_idempotency_run", no_idempotency_run)
+    monkeypatch.setattr(control_imports, "_active_importer_runs", no_active_runs)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", fake_enqueue)
+
+    first_task = asyncio.create_task(
+        create_import_run(
+            {
+                "run_id": "run_child_one",
+                "importer": "provider-directory-fhir",
+                "retry_of_run_id": "run_parent",
+            }
+        )
+    )
+    await enqueue_started.wait()
+    second_result = await create_import_run(
+        {
+            "run_id": "run_child_two",
+            "importer": "provider-directory-fhir",
+            "retry_of_run_id": "run_parent",
+        }
+    )
+    finish_enqueue.set()
+    first_result = await first_task
+
+    assert first_result[1] is True
+    assert second_result[1] is False
+    assert first_result[0]["run_id"] == second_result[0]["run_id"] == "run_child_one"
+    assert enqueue_count == 1
+    assert [event[0] for event in database.events].count("status") == 1
 
 
 @pytest.mark.asyncio

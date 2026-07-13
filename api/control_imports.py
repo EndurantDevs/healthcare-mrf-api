@@ -881,6 +881,17 @@ async def _active_idempotency_run(connection: Any, idempotency_key: str) -> dict
     return _normalize_connection_run(active_rows[0]) if active_rows else None
 
 
+async def _provider_directory_retry_child(connection: Any, retry_of_run_id: str) -> dict[str, Any] | None:
+    statement = (
+        select(ImportRun.__table__)
+        .where(ImportRun.importer == "provider-directory-fhir")
+        .where(ImportRun.retry_of_run_id == retry_of_run_id)
+        .limit(1)
+    )
+    child_rows = await connection.all(statement)
+    return _normalize_connection_run(child_rows[0]) if child_rows else None
+
+
 async def _active_importer_runs(connection: Any, importer: str) -> list[dict[str, Any]]:
     statement = (
         select(ImportRun.__table__)
@@ -1086,6 +1097,11 @@ async def _admit_provider_directory_run(import_row: dict[str, Any]) -> dict[str,
             text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
             lock_key=_PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY,
         )
+        retry_of_run_id = import_row.get("retry_of_run_id")
+        if retry_of_run_id:
+            retry_child = await _provider_directory_retry_child(connection, str(retry_of_run_id))
+            if retry_child:
+                return retry_child
         idempotency_key = import_row.get("idempotency_key")
         if idempotency_key:
             active_run = await _active_idempotency_run(connection, str(idempotency_key))
@@ -1122,6 +1138,7 @@ async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
 
     now = utc_now()
     run_id = str(payload.get("run_id") or "").strip() or _new_run_id()
+    retry_of_run_id = str(payload.get("retry_of_run_id") or "").strip() or None
     row = {
         "run_id": run_id,
         "engine": ENGINE_NAME,
@@ -1143,7 +1160,7 @@ async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
         "error": None,
         "snapshot_id": None,
         "import_id": payload.get("import_id"),
-        "retry_of_run_id": payload.get("retry_of_run_id"),
+        "retry_of_run_id": retry_of_run_id,
     }
     try:
         if importer == "provider-directory-fhir":
