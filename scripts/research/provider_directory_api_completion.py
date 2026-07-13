@@ -19,9 +19,7 @@ def _quote_identifier(identifier: str, *, label: str) -> str:
     return f'"{identifier}"'
 
 
-def current_dataset_completion_sql(schema: str) -> str:
-    """Return one current-dataset completion record per source/resource."""
-    quoted_schema = _quote_identifier(schema, label="database schema")
+def _current_dataset_completion_ctes_sql(quoted_schema: str) -> str:
     return f"""
         WITH requested_resources AS MATERIALIZED (
             SELECT source_id, resource_type
@@ -57,6 +55,11 @@ def current_dataset_completion_sql(schema: str) -> str:
                AND COALESCE(dataset.acquisition_root_run_id,
                             dataset.import_run_id) IS NOT NULL
         )
+    """
+
+
+def _current_dataset_completion_select_sql(quoted_schema: str) -> str:
+    return f"""
         SELECT requested.source_id, requested.resource_type,
                dataset.dataset_id, dataset.acquisition_root_run_id,
                dataset.terminal_run_id, dataset.publication_metadata_json,
@@ -91,6 +94,17 @@ def current_dataset_completion_sql(schema: str) -> str:
             ON terminal_run.run_id = dataset.terminal_run_id
       ORDER BY requested.source_id, requested.resource_type;
     """
+
+
+def current_dataset_completion_sql(schema: str) -> str:
+    """Return one current-dataset completion record per source/resource."""
+    quoted_schema = _quote_identifier(schema, label="database schema")
+    return "\n".join(
+        (
+            _current_dataset_completion_ctes_sql(quoted_schema),
+            _current_dataset_completion_select_sql(quoted_schema),
+        )
+    )
 
 
 async def fetch_current_dataset_completion_proofs(

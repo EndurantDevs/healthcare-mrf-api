@@ -1727,6 +1727,7 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
                role.organization_ref,
                role.insurance_plan_refs::jsonb, role.network_refs::jsonb,
                role.active AS role_active,
+               role.identifiers::jsonb AS role_identifiers,
                role.healthcare_service_refs::jsonb AS role_healthcare_service_refs,
                role.endpoint_refs::jsonb AS role_endpoint_refs,
                role.specialty_codes::jsonb AS role_specialty_codes,
@@ -1961,6 +1962,7 @@ _PROVIDER_DIRECTORY_ROLE_EVIDENCE_SQL_TEMPLATE = """
            role.role_active, role.organization_ref AS role_organization_ref,
            role.role_healthcare_service_refs, role.role_endpoint_refs,
            role.role_specialty_codes, role.role_code_codes, role.role_telecom,
+           role.role_identifiers,
            role.role_period_start, role.role_period_end, role.role_available_time,
            role.role_not_available, role.role_availability_exceptions,
            role.role_new_patient_acceptance, role.role_telehealth,
@@ -2201,6 +2203,7 @@ def _provider_directory_role_detail(mapping: Mapping[str, Any]) -> dict[str, Any
     }
     for field_name in (
         "active",
+        "identifiers",
         "organization_ref",
         "healthcare_service_refs",
         "endpoint_refs",
