@@ -1,6 +1,6 @@
 # address_archive_v2 efficiency snapshot - 2026-06-13
 
-Environment: `ns1033171` dev server, database `healthporta`, PostgreSQL 18.x, after the current MRF/NPI import optimization deploy.
+Environment: development server, database `mrf_dev`, PostgreSQL 18.x, after the current MRF/NPI import optimization deploy.
 
 ## Executive summary
 

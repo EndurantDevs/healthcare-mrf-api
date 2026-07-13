@@ -1,396 +1,357 @@
-# PTG2 Optimization Research Harness
+# Strict PTG V3 Optimization And Measurement
 
-This workflow keeps PTG2 optimization work on `research/ptg2-optimization-harness`
-until a measured subset is explicitly promoted to `main`.
+## Scope
 
-## Branch Rules
+This document defines the evidence required to optimize and release the only
+supported PTG architecture: `postgres_binary_v3` with
+`storage_generation=shared_blocks_v3`.
 
-- Create the branch from `origin/main`.
-- Keep generated benchmark evidence under `reports/ptg2-experiments/`; that path
-  is ignored by Git through `reports/*`.
-- Do not change default deployed PTG2 scanner behavior from this branch unless a
-  local fixture gate and a dev pilot gate pass.
-- Keep the PTG2 DB publish dedupe fallback enabled.
+Optimization work may change implementation details only when it preserves the
+published contract. Historical architecture comparisons and filesystem serving
+measurements are outside this scope.
 
-## Local Usage
+## Non-Negotiable Invariants
 
-List the configured cases:
+Every candidate must preserve all of the following:
+
+- PostgreSQL is the only serving store.
+- The API serves only sealed `shared_blocks_v3` layouts through an explicit
+  logical snapshot binding and logical plan scope.
+- PTG block, graph, dictionary, and price payloads are not materialized into a
+  runtime filesystem cache or retained in a process serving cache.
+- `source_multiset_v1` preserves duplicate source serving occurrences.
+- `multiset_v1` preserves duplicate price-atom memberships and ordinals.
+- One physical layout represents one complete distinct physical input set plus
+  the exact scanner/finalizer and semantic contracts.
+- Equal complete physical input sets may share a layout while plan, source,
+  snapshot, scope, and pointer state remain independent.
+- New physical publication is all-or-nothing, persists the audit sample, and
+  seals immutable mappings before logical cutover.
+- Scratch and unlogged PostgreSQL stages are disposable and removed on success
+  and failure.
+- Replacement creates a new immutable layout or a new logical binding; sealed
+  state is never rewritten in place.
+- GC cannot release a layout with a live binding or delete a block with a live
+  mapping.
+- Dense publication is fenced by a unique build token and a row lock, and
+  finalization validates a source-bound complete run partition contract.
+
+An optimization that relaxes one of these properties is an architecture
+change, not a performance candidate.
+
+## Current Implementation Shape
+
+The scanner emits partitioned serving runs, code dictionaries, and temporary
+provider-membership inputs. A Rust finalizer performs bounded-memory external
+sorting and emits dense block streams. Publication stores content-addressed
+payloads and fixed support rows in PostgreSQL, validates the complete mapping,
+persists the audit sample, and atomically changes the layout from `building` to
+`sealed`.
+
+The physical semantic fingerprint is order-independent and covers the complete
+artifact set and scanner/finalizer identity. Logical plan metadata is excluded
+from physical identity and stored in snapshot-specific scope rows. This allows
+cross-plan physical reuse without allowing one plan to observe another plan's
+logical scope.
+
+At request time the API resolves a logical snapshot, validates its strict
+manifest, follows the sealed physical binding, and fetches only addressed
+PostgreSQL fragments. Block readers validate stored hashes and metadata and do
+not retain payloads between requests.
+
+The authoritative by-code writer emits only `by_code_provider_shard_v1`.
+Provider-set keys are partitioned into 1,024-key shards, where
+`shard_id = provider_set_key // 1024` and
+`block_key = (code_key << 31) | shard_id`; every block's fragments are dense
+and contiguous from `0`. The separate `by_code_price_page_v4` projection holds
+at most 64 rows and exists only for fast qualifying first-page reads.
+
+Standard cost-ordered provider pagination uses progressive exact selection for
+pages that cannot be satisfied by the projection. It expands the forward
+prefix only until the requested window plus one row is proven, then performs
+sparse reverse completion for the selected NPIs and provider sets. Therefore
+`has_more` remains exact without forcing exhaustive expansion. Pagination may
+add optional `total_is_exact` and `total_lower_bound` fields when the complete
+total is not yet known; a false `total_is_exact` marks `total` and
+`total_lower_bound` as proven lower bounds.
+
+## Evidence Status
+
+| Gate | Status | Required evidence |
+| --- | --- | --- |
+| Strict architecture selection | Implemented in repository | Unsupported architecture values and incompatible manifests fail closed. |
+| Complete-set physical identity | Implemented in repository | Order independence, content sensitivity, scanner identity, and one-plan-per-snapshot tests. |
+| Independent logical binding | Implemented in repository | Two logical snapshots can share one layout while plan filtering and removal remain isolated. |
+| Temporary scratch cleanup | Implemented in repository | Scanner and graph/finalizer failure tests leave no serving scratch. |
+| Exact multiplicity | Implemented in repository | Duplicate source candidates and duplicate atom ordinals survive publication and audit. |
+| Persisted audit sample | Implemented in repository | Publish-time sample metadata, digest, row bound, and API readback tests. |
+| Independent release audit | Tooling implemented | A qualifying release report must meet the fixed sample and latency floors. |
+| Candidate attestation and atomic activation | Implemented in repository | Fresh report and sealed-sample binding, immutable validated row, exact predecessor CAS, wall-clock expiry, single-use receipt, and transaction rollback tests. |
+| Automatic candidate audit orchestration | Implemented in repository | The generic `ptg-candidate-audit` job resolves one validated candidate, leases and verifies retained inputs, runs the release audit, records the attestation, and atomically promotes the exact predecessor. |
+| Class-specific cold first-page p95 <= 40 ms | Pending release measurement | Fresh API processes, distinct keys, and complete first-page observations measured separately for matched-positive, negative, and deterministic-random requests. |
+| Unique large import in 10-15 minutes | Pending dev measurement | Complete fresh build, logged PostgreSQL publication, audit, seal, and resource report. |
+| 2,000 imports/month | Gate implemented; measurement pending | `ptg2_v3_capacity_gate.py` requires observed arrival shape, qualified reuse, retries, concurrent API load, GC, storage, scratch, and PostgreSQL headroom. |
+
+There is no accepted dev large-import proof for the strict architecture yet.
+Do not promote the target or a projection to a measured result.
+
+## Focused Repository Checks
+
+The following tests cover the highest-risk architecture boundaries:
 
 ```bash
-./venv314/bin/python scripts/research/ptg2_experiment.py list
+python -m pytest -q \
+  tests/test_ptg2_shared_reuse.py \
+  tests/test_ptg2_v3_cross_plan_reuse.py \
+  tests/test_ptg2_strict_v3_import_scratch.py \
+  tests/test_ptg2_shared_audit.py \
+  tests/test_ptg2_shared_gc.py \
+  tests/test_ptg2_candidate_attestation.py \
+  tests/test_ptg2_strict_v3_snapshot_validation.py \
+  tests/test_ptg2_v3_source_api_audit.py
 ```
 
-Run a dry-run plan:
+PostgreSQL-backed cases that are environment-gated must be run in a disposable
+test database before release. A skipped database case is not evidence that the
+database behavior passed.
+
+The independent audit tool documents its release invocation and privacy model
+in [the validation guide](../../scripts/validation/README.md). Inspect its
+arguments without recording target details:
 
 ```bash
-./venv314/bin/python scripts/research/ptg2_experiment.py run --dry-run
+python scripts/validation/ptg2_v3_source_api_audit.py --help
 ```
 
-Run fixture benchmarks after building the scanner:
+## Correctness Measurement
 
-```bash
-cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml
-./venv314/bin/python scripts/research/ptg2_experiment.py run \
-  --case large-in-network-fixture \
-  --case duplicate-serving-fixture
-```
+Correctness is occurrence-based, not set-based. The canonical comparison tuple
+contains code system, code, NPI, negotiation arrangement, negotiated type and
+rate, expiration date, service codes, billing class, setting, modifiers, and
+additional information. Counts must match for otherwise identical tuples.
 
-Compare default worker-side raw chunks with a memory-sensitive 1 MiB raw chunk
-cap on a bulky synthetic file:
+The release profile requires all of these floors:
 
-```bash
-cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml
-./venv314/bin/python scripts/research/ptg2_experiment.py run \
-  --case bulky-raw-chunk-fixture \
-  --variant parse_in_workers \
-  --variant raw_chunk_1m
-```
-
-Inspect `elapsed_seconds`, `peak_rss_kb`, `raw_chunk_count`,
-`raw_chunk_max_bytes`, and matching COPY output digests. This case intentionally
-skips the performance gate because smaller chunks can trade some throughput for
-lower peak memory and more predictable huge-file scheduling.
-
-Run the local DB-backed PTG smoke against PostgreSQL on `127.0.0.1:5440`.
-This serves a tiny TOC and in-network file from a temporary localhost HTTP
-server, enables `HLTHPRT_FETCH_ALLOW_LOCAL=true` only for the child process, and
-targets `healthporta_test` via `HLTHPRT_DB_DATABASE=healthporta` plus
-`HLTHPRT_TEST_DATABASE_SUFFIX=_test`:
-
-```bash
-HLTHPRT_DB_HOST=127.0.0.1 \
-HLTHPRT_DB_PORT=5440 \
-HLTHPRT_DB_USER=nick \
-HLTHPRT_DB_DATABASE=healthporta \
-HLTHPRT_TEST_DATABASE_SUFFIX=_test \
-./venv314/bin/python scripts/research/ptg2_experiment.py run \
-  --case local-db-smoke
-```
-
-Run a full-file local import and verify the published DB snapshot against the
-original generated source file. Unlike `local-db-smoke`, this does not pass
-`--max-items`; after `PTG2_IMPORT_DONE`, the harness reloads `rates.json.gz`,
-computes independent source counts and a sorted price-atom digest, then compares
-those values with the published serving, price atom, and provider-member tables:
-
-```bash
-HLTHPRT_DB_HOST=127.0.0.1 \
-HLTHPRT_DB_PORT=5440 \
-HLTHPRT_DB_USER=nick \
-HLTHPRT_DB_DATABASE=healthporta \
-HLTHPRT_TEST_DATABASE_SUFFIX=_test \
-./venv314/bin/python scripts/research/ptg2_experiment.py run \
-  --case local-full-file-verify
-```
-
-### Normalized Membership Graph A/B
-
-Run the PostgreSQL-only v1/v2 membership comparison with:
-
-```bash
-HLTHPRT_DB_HOST=127.0.0.1 \
-HLTHPRT_DB_PORT=5440 \
-HLTHPRT_DB_USER=nick \
-HLTHPRT_DB_DATABASE=healthporta \
-HLTHPRT_TEST_DATABASE_SUFFIX=_test \
-./venv314/bin/python scripts/research/ptg2_experiment.py run \
-  --suite docs/research/ptg2_membership_graph_local_suite.json
-```
-
-The 2026-07-10 64K-rate control run validated every source price and NPI in both
-architectures with API caches disabled:
-
-| Metric | `postgres_binary_v1` | `postgres_binary_v2` |
-| --- | ---: | ---: |
-| Snapshot bytes | 396,480 | 372,984 |
-| Import seconds | 0.80 | 0.66 |
-| Code lookup p95 | 14.08 ms | 12.66 ms |
-| NPI reverse p95 | 17.38 ms | 14.69 ms |
-| ZIP + 100-price-set response p95 | 51.17 ms | 55.22 ms |
-
-The small fixture has one NPI per provider set, so v2 is only about 6% smaller
-there. It intentionally does not model the expensive payer shape that motivated
-v2: many provider sets containing large shared groups. In that shape, v1 stores
-the provider-group membership table plus a direct set-to-NPI expansion; v2
-stores each group/NPI edge once in each direction and keeps only a distinct-NPI
-scope table. Use a real high-fan-out source comparison before estimating fleet
-storage savings from the control fixture.
-
-The suite also includes a TIN-only v2 case. It verifies that a valid rate file
-with zero NPIs still publishes all unique prices, creates an empty indexed NPI
-scope, returns no reverse-NPI items, and leaves no scope stage tables behind.
-
-### Real-scale dev findings
-
-A 2026-07-10 dev run measured a 13.80 GiB compressed dental source with
-513,262,462 unique serving rows. The source and plan names are intentionally
-omitted here; the persisted snapshot/report ids remain the operational source
-of truth.
-
-| Stage | Actual | Measured floor or current dependency floor | Interpretation |
-| --- | ---: | ---: | --- |
-| Raw file read, warm page cache | 6.19 s | 6.19 s | 2.23 GiB/s; storage was not the scanner constraint |
-| Clean single-core `gzip -dc` | 541.51 s | 541.51 s | 26.10 compressed MiB/s; hard floor for the current single gzip member |
-| Rust scanner | 876.70 s | 541.51 s | 1.62x the gzip floor; at most 335.19 s is removable without changing the container format |
-| Complete data phase | 931.58 s | 541.51 s | Includes about 54.88 s after scanner completion |
-| Parallel staging COPY | 85.76 s | Not isolated in this run | 650,988,716 rows, or 7.59M rows/s |
-| By-code binary stream | 452.89 s | Runs concurrently with reverse | 513.26M rows and 1.679 GB output |
-| Reverse binary stream | 566.51 s | 566.51 s pair wall floor | 513.26M rows and 2.656 GB output |
-| Price-set/atom stream | 746.28 s | Not isolated in this run | 29.12M price sets, 127.33M atom refs, and 2.521 GB payload |
-| Binary build | 1,312.92 s | 1,312.79 s with current dependencies | `max(452.89, 566.51) + 746.28`; wrapper overhead is only 0.13 s |
-| Remaining serving publish | 73.79 s | Stage-specific | Mostly the 66.27 s lean price-atom rewrite; artifact upload was 2.96 s |
-| Full PostgreSQL publish | 2,404.13 s | See scenario bounds below | 40m04.13s; this measured snapshot predated the logged-relation durability fix |
-
-The scanner captured 272.64 GiB of raw negotiated-rate JSON and sustained
-318.44 MiB/s across its workers. The producer was blocked on worker queues for
-175.32 s, exactly 20.0% of scanner time and 52.3% of the scanner headroom above
-clean gzip. Removing all observed queue blocking would still leave the scanner
-159.87 s above the gzip floor, so worker throughput and producer scanning both
-matter.
-
-The measured snapshot tables were later found to be `UNLOGGED`. PostgreSQL can
-truncate unlogged relations after an unclean restart, so the 40-minute run was
-PostgreSQL-resident but not a valid durability benchmark. New binary snapshots
-create retained relations as logged tables and verify every table in the
-published `materialized_tables` map before cutover. The first post-deploy import
-must therefore remeasure publish time and WAL cost rather than treating the old
-40-minute number as the logged baseline.
-
-The stage arithmetic gives useful scenario bounds:
-
-- Bringing only the scanner to the measured gzip floor changes 40m04s to about
-  34m29s. Scanner tuning cannot produce the largest remaining gain.
-- The new writer runs the price-set/atom work concurrently with the two serving
-  streams and moves its row encoding into bounded-memory Rust. Dependency
-  arithmetic lowers the uncontended binary-build bound from 21m53s to at most
-  12m26s, changing the old full-run arithmetic to about 30m38s. This remains a
-  projection until a logged production-scale publish measures PostgreSQL sort,
-  COPY, WAL, and table-extension contention.
-- Combining both optimistic changes gives about 25m02s. This is a scheduling
-  bound, not a benchmark promise; three ordered PostgreSQL streams may contend.
-- The bounded Rust atom encoder removes Python row iteration but cannot remove
-  PostgreSQL's ordered scan or sort.
-
-The writer persists per-kind staging input bytes and elapsed throughput, plus
-PostgreSQL source bytes, target bytes, time-to-first-byte, and completion time
-for each Rust stream. These counters let the next comparison separate database
-sort/export, Rust encoding, and target COPY instead of treating each stream as
-one opaque timer. It also records the final relation persistence so an unlogged
-snapshot cannot be mistaken for a durable result again.
-
-The real storage A/B also constrains the architecture claim:
-
-| Shape | Compatibility layout | Normalized v2 | Change |
-| --- | ---: | ---: | ---: |
-| 513M serving rows | 8.017 GiB | 7.783 GiB | 239.6 MiB smaller, 2.9% |
-| 520M serving rows | 7.989 GiB | 7.809 GiB | 183.8 MiB smaller, 2.2% |
-
-For both shapes, the 7.2 GiB serving binary and roughly 0.9 GiB price-atom
-table dominate; v2 changes provider membership, not those components. A
-different dense source exposed the opposite extreme: its two provider-set/group
-directions alone occupied 3.766 GiB stored because they represented about
-1.12B edges. Replacing one direction with a request-time inversion would save
-space but make one API direction scan the complete edge set. Any next storage
-version therefore needs compact bidirectional integer-key blocks and a shared
-price dictionary, not ordinary one-edge-per-row PostgreSQL tables.
-
-### Candidate 2-3 GB architecture
-
-The measured cardinalities support a separate, immutable
-`postgres_binary_v3` experiment rather than another in-place v2 rewrite. For
-the 513M-row source, only 952,060 code/provider groups have more than one price
-set. A v3 layout can therefore keep one sharded forward projection, replace the
-full reverse projection with provider/code bitmaps plus a sparse multiplicity
-stream, store the 29.12M price-set ids once, and encode 127.33M atom references
-with 24-bit dense atom keys. The key width must be snapshot-adaptive: use 24
-bits only below 16,777,216 unique atoms, switch automatically to 32 bits above
-that boundary, and record the selected width in every block header and manifest.
-Binary atom payloads can then replace the UUID-heavy relational atom heap and
-index without imposing a 24-bit limit on larger imports.
-
-The current measured estimate is 2.63-2.99 GB decimal, or 2.45-2.78 GiB:
-
-| Candidate v3 component | Estimated bytes |
+| Check | Floor or ceiling |
 | --- | ---: |
-| Sharded forward projection | 1.15-1.35 GB |
-| Shared price-set dictionary | 0.48-0.50 GB |
-| Reverse provider/code bitmap and overflow | 0.17-0.18 GB |
-| Dense price-set/atom membership | 0.40-0.43 GB |
-| Binary atom payloads | 0.14-0.18 GB |
-| Provider graph, NPI scope, support, and allowance | 0.29-0.36 GB |
+| Source-selected exact occurrences | default 2,500; minimum 2,500 |
+| Independently API-selected persisted occurrences | default 2,500; minimum 2,500 |
+| Deterministic pseudo-random complete pricing requests | default 2,500; minimum 2,500 |
+| Observed standard-API HTTP requests | minimum 3,000 |
+| Negative code/NPI recombinations | default 500; hard minimum 250 |
+| Cold first-page p95 per request class | at most 40 ms |
+| Resolved-rate fraction | exactly 1.0 |
+| Unresolved provider references | 0 |
+| Invalid prices | 0 |
+| Invalid NPIs | 0 |
+| Invalid field types | 0 |
 
-The v3 reader and Rust streaming writer now implement this shape. Price-set
-keys remain 32-bit, atom widths are selected from complete snapshot
-cardinality, provider/code pairs use bounded spill runs plus a streaming k-way
-merge, and missing referenced blocks fail closed. The full-scale pilot below
-validated the 2-3 GiB budget on a 513M-row snapshot.
+The source-selected sample is derived independently from original in-network
+files and includes the exact raw container SHA in occurrence identity. The
+API-selected sample comes from the persisted publish-time served
+occurrences and receives no source-selected query keys. Negative checks combine
+individually positive codes and NPIs that must not produce a false membership.
+TIN-only provider groups use the schema-defined `[0]` marker and never create
+a fake NPI. The audit reports them separately from NPI-addressable rates and
+the release profile fails if any are present until a TIN-addressed API audit is
+available.
 
-### Current v3 evidence (2026-07-11)
+The physical layout itself stores a deterministic, stratified publication
+sample of at most 2,560 occurrences. It is generated before sealing and includes
+source-candidate and atom ordinals, so `source_multiset_v1` and `multiset_v1`
+multiplicity can be checked. This sample supports the API-selected release
+floor but does not replace source-side validation.
 
-A cache-disabled local PostgreSQL run with 4,194,304 serving rates, 4,096 code
-keys, and 1,024 provider sets produced a complete 14,742,560-byte snapshot. The
-same fixture's previous v2 result was 35,935,248 bytes, so v3 was 2.44 times
-smaller. The v3 run completed in 9.8 seconds, including a 3.977-second binary
-build. With 20 measured requests after two warmups, code lookup p95 was
-34.435 ms and NPI reverse p95 was 39.850 ms; both passed the explicit 40 ms
-p95 gate with binary, dictionary, and sidecar caches disabled. The report is:
+## Latency Measurement
 
-```text
-/tmp/ptg2-v3-final-4m-report/run-20260710T194138Z/report.json
-```
+The release ceiling is cold first-page p95 <= 40 ms. For this contract, "cold"
+means the first observed traversal for each distinct sampled key from fresh API
+processes. It does not claim that PostgreSQL buffers, the operating-system page
+cache, or upstream network caches were evicted.
 
-A full-scale dev pilot published 513,262,462 serving rates as a durable,
-PostgreSQL-only v3 snapshot. Source, plan, and snapshot identifiers are omitted
-from this public report. The snapshot used 2,739,963,383 bytes (2.552 GiB),
-including its estimated share of compressed PostgreSQL artifact chunks. The
-historical v2 snapshot for the same logical source used 7.783 GiB, so v3 was
-3.05 times smaller. Adding bounded first-page projections increased the
-page-less v3 footprint by 30.15 MiB, or 1.17 percent.
+Measure and report separately:
 
-| Full-scale metric | Historical v2 | Page-enabled v3 | Result |
+- first-page first-observation latency for matched-positive, negative, and
+  deterministic-random requests, each with its own gate;
+- complete logical query latency across all pages, also split by request class;
+- immediate repeat latency for diagnosis only;
+- page count, tuple count, concurrency, and timeout/error counts; and
+- block kinds and PostgreSQL round trips used by each lookup class when
+  profiling is enabled.
+
+Warm measurements cannot satisfy the cold gate. Repeating one key cannot stand
+in for the distinct-key release distribution. Report p95 only when the release
+sample floor was completed without excluded errors.
+
+For plans backed by multiple published network snapshots, measure both every
+pinned snapshot and the unpinned merged-plan API. The merged path reads
+immutable snapshots through separate PostgreSQL sessions with bounded
+concurrency and must match the union of the individually audited snapshots
+without partial success.
+
+## Large Import Gate
+
+The target is 10 to 15 minutes end-to-end for one unique large physical build.
+The timer starts before source processing and ends only after durable
+PostgreSQL publication, persisted audit creation, sealing, logical binding, and
+pointer publication complete.
+
+A qualifying dev measurement must:
+
+1. Use the exact release scanner/finalizer and migrated schema intended for
+   deployment.
+2. Select a complete representative input set without diagnostic truncation.
+3. Force a fresh physical semantic fingerprint; record reuse-only logical
+   publication as a different workload.
+4. Use logged durable shared relations and the normal PostgreSQL transaction
+   path.
+5. Exercise bounded temporary scratch and prove cleanup after completion.
+6. Persist and validate the publish-time audit sample.
+7. Run the independent release audit at 2,500 source occurrences, 2,500 API
+   occurrences, 2,500 pseudo-random complete pricing requests, at least 3,000
+   observed standard-API HTTP requests, and 500 negative checks by default with
+   a hard minimum of 250.
+8. Submit the report while it is fresh, attest the exact sealed sample and
+   source set, and consume that receipt through exact-predecessor activation.
+9. Start fresh API processes and pass cold first-page p95 <= 40 ms separately
+   for matched-positive, negative, and deterministic-random requests.
+10. Record enough resource data to determine whether the result can coexist
+   with other imports and serving traffic.
+
+The report must separate at least these stages:
+
+- discovery and download;
+- scan and temporary run generation;
+- provider graph conversion;
+- finalizer sort/merge and block encoding;
+- PostgreSQL COPY and support-row publication;
+- price and graph publication;
+- persisted audit generation;
+- mapping validation and seal;
+- logical binding and pointer cutover; and
+- scratch cleanup.
+
+Also record peak process memory, peak temporary bytes, PostgreSQL relation and
+index bytes, WAL bytes, database CPU and I/O, connection usage, row/block
+counts, retry count, and GC candidates created. Redact source names, plan and
+snapshot identifiers, URLs, paths, target addresses, credentials, and exact
+client-specific source sizes from durable reports.
+
+Status: **pending**. Until a report satisfies this protocol, the 10-to-15-minute
+number is a target only.
+
+## Reclamation
+
+Logical snapshot cleanup removes bindings first. An hourly, non-overlapping
+shared-layout GC job reclaims unbound layouts and then unreferenced immutable
+blocks under explicit row, byte, and layout limits. Stale building snapshots
+are eligible only after their import run is absent, terminal, or has stopped
+heartbeating beyond the configured threshold. This recurring sweep is part of
+the 2,000-import/month capacity contract, not an operator-only maintenance
+step.
+
+## Reuse Measurement
+
+Measure fresh physical builds and logical reuse separately:
+
+- **Fresh build:** no matching semantic fingerprint exists. All scan,
+  finalization, publication, audit, and seal work runs.
+- **Preflight reuse:** an identical complete input set and scanner identity
+  resolve to an existing sealed layout. The import records provenance and
+  publishes independent logical scope, binding, and pointers without scanning.
+- **Seal-time deduplication:** independently started work converges on an
+  identical mapping and support digest; the already sealed layout wins and the
+  redundant building layout is released.
+
+A failed fresh build is abandoned immediately only when the row is still in
+the building state, has no logical binding, and carries the failing attempt's
+fencing token. Interrupted cleanup remains covered by the recurring stale-build
+sweep, but ordinary retries do not wait for that interval.
+
+For reuse evidence, verify that logical snapshots have different ids and plan
+scope rows, share the intended physical layout key, return only their own
+logical plan, and remain available when another binding is removed. A content,
+artifact-set, or scanner identity change must miss preflight reuse.
+
+## Capacity For 2,000 Imports Per Month
+
+Use a 30-day month for comparable arithmetic. With no reuse:
+
+| Unique-build time | Build hours/month | One-lane utilization | Theoretical one-lane maximum |
 | --- | ---: | ---: | ---: |
-| Total snapshot storage | 7.783 GiB | 2.552 GiB | 3.05x smaller |
-| End-to-end import | 2,404.13 s | 1,436.89 s | 1.67x faster |
-| Scanner/data phase | 931.58 s | 760.43 s | 18.4% faster |
-| Pre-COPY merge | Not isolated | 56.48 s | Measured |
-| Binary build | 1,312.92 s | 502.45 s | 2.61x faster |
-| Publish phase | 1,386.71 s | 560.55 s | 2.47x faster |
+| 10 minutes | 333.3 | 46.3% | 4,320/month |
+| 15 minutes | 500.0 | 69.4% | 2,880/month |
 
-The v2 timing came from the earlier unlogged pilot, while the v3 relations are
-logged. Treat the speed comparison as operational evidence, not a controlled
-WAL A/B. The v3 snapshot and shared artifact relation both reported
-`relpersistence='p'`; all five retained lineage snapshots remained present.
-Every API pod served directly from PostgreSQL with no PTG filesystem cache.
+These are steady-state compute bounds, not an operations plan. At the
+15-minute target, one lane has only 30.6 percent time headroom before accounting
+for burstiness, retries, deployment drains, database maintenance, audits, or
+GC. Queueing delay grows quickly as utilization approaches the theoretical
+limit.
 
-The bounded page projections were compared with the immediately preceding
-page-less v3 snapshot using 20 randomized codes, 20 randomized NPIs, and three
-rounds per lookup class. All 180 response pairs matched exactly.
-
-| Warm lookup | Page-less v3 p95 | Page-enabled v3 p95 |
-| --- | ---: | ---: |
-| Code forward | 855.69 ms | 16.07 ms |
-| NPI reverse | 2,120.57 ms | 22.90 ms |
-| NPI plus code | 153.45 ms | 24.09 ms |
-
-Geo lookup now uses a PostGIS GiST nearest-neighbor probe, applies taxonomy
-after the index-bounded location prefix, and restores request-local planner
-settings after the KNN statement. Ten fixed response hashes matched the prior
-deployment exactly. After all six API workers were warmed, identical-query p95
-was 0.837 ms. With the response cache bypassed by 100 unique radius values,
-p50 was 59.43 ms, p95 was 101.11 ms, and the maximum was 118.88 ms. The latter
-is the honest uncached geo contract; do not describe all geo requests as a
-40 ms path.
-
-A separate fresh-process run with zero warmups measured the first code request
-at 59.704 ms and the following NPI reverse request at 86.436 ms. The current
-validated contract is therefore warm p95 at or below 40 ms plus a 100 ms cold
-sample ceiling; do not describe v3 as a universal 40 ms path until snapshot
-prewarming or fewer PostgreSQL round trips closes that first-request gap. The
-cold report is:
+Let `U` be the observed fraction of logical imports that require a unique
+physical build. Approximate monthly build hours as:
 
 ```text
-/tmp/ptg2-v3-cold-4m-report/run-20260710T195429Z/report.json
+2,000 * U * measured_unique_build_minutes / 60
 ```
 
-A later full-scale fresh-pod sample exposed a different cold-path scale effect.
-After sparse provider-count reads removed the global count dictionary, a cold
-NPI-filtered forward request improved from roughly 2.0-2.1 seconds to
-141.59 ms. The cold NPI reverse request remained 483.64 ms because both graph
-hops still inflated large owner indexes from 8 MiB PostgreSQL chunks.
+Do not assume a reuse discount until production-like fingerprints demonstrate
+it. Track both logical-import throughput and unique-layout throughput.
 
-The next graph contract keeps the membership payload unchanged and adds sparse
-owner fences every 32,768 records. On the largest measured graph, direct
-NPI-to-group-to-set traversal changed from 166.43-180.59 ms without fences, to
-111.63-115.19 ms with fences over the old 8 MiB chunks, and to
-31.78-32.63 ms with independently compressed 1 MiB chunks. Recompressing all
-four graph directions at 1 MiB changed their combined payload by only 7,339
-bytes, about 0.01 percent. Fence metadata for that snapshot contains 99 owner
-ids across all four directions, only a few kilobytes in each authoritative
-manifest copy. End-to-end cold API latency must be remeasured after reimport;
-the direct graph probe is not an API latency claim.
+Capacity tests must include:
 
-The stronger contract also validates every owner id and member range while
-building fences. On the same four full-scale graph directions, that pass took
-8.98 ms, 68.34 ms, 67.46 ms, and 268.80 ms, about 414 ms total. Adding real
-binary-header validation to each cold lookup kept the direct two-hop samples at
-31.08-37.77 ms.
+- peak and sustained arrival rates, not only monthly averages;
+- the measured physical-reuse hit rate and reuse lookup overhead;
+- retry and failed-build rates;
+- scratch capacity per concurrent unique build;
+- PostgreSQL COPY, WAL, checkpoint, storage, vacuum, I/O, and connection
+  headroom under concurrent imports and API traffic;
+- release-audit API load and duration;
+- shared-block growth after content-addressed deduplication; and
+- layout release plus bounded block-sweep throughput.
 
-One production-scale sample was roughly 14.8 GB compressed and 293 GB expanded.
-On a high-resource dev lane, verified decode-to-stdout took 124 seconds with four
-rapidgzip threads and 111 seconds with eight, versus the 523-second GNU gzip
-floor. Four threads are the initial integrated-scanner choice because parsing
-workers need the remaining CPU; the full scanner and publish phases still need
-the real import measurement.
+Adding worker lanes is acceptable only while PostgreSQL and scratch stay within
+measured limits and the API keeps the cold first-page gate. A scheduler should
+cap concurrent unique builds independently from fast logical reuse jobs.
 
-A synthetic reversed-order fixture with 960,000 negotiated rates and about
-179 MB of expanded JSON took 48.845 seconds through the checked serial fallback
-and 7.332 seconds through the indexed 16-worker path, a 6.66x wall-time
-improvement. Both produced the same 168 unique COPY rows and SHA-256 after
-deduplication. The temporary `gztool` index was 102,915 bytes; the default
-`indexed_gzip` format was about 46x larger on the same input.
+## GC And Replacement Experiments
 
-Reader-first deployment, side-by-side immutable snapshots, logical parity,
-storage, latency, durability, and no-disk-cache checks are complete for the dev
-pilot. Keep those gates for every wider environment promotion.
+Optimization experiments must preserve immutable replacement:
 
-After taxonomy filtering was moved ahead of the v2 location candidate limit,
-the warmed PostgreSQL-only API p95 values were 20.48 ms for code-to-provider,
-8.94 ms for one NPI/code, 36.94 ms for all prices of one NPI, and 22.66 ms for
-radius geo. Reverse result digests matched v1 exactly. Geo-forward returns more
-providers because v1 applies another limit after provider-group fan-out, which
-can discard already selected NPIs; do not force v2 to reproduce that
-under-coverage.
+1. Build and seal a new layout or reuse an existing exact physical match.
+2. Publish a new logical snapshot and scope.
+3. Move pointers only after correctness and serving validation.
+4. Retain the prior binding for the required rollback window.
+5. Remove obsolete logical snapshots through the normal snapshot-removal path.
+6. Release only layouts with no remaining binding and expired leases.
+7. Queue mapped block hashes with a grace period, then sweep only unreferenced
+   hashes in row- and byte-bounded batches.
 
-Reports are written to:
+GC measurement must report dry-run and executed layout counts, candidate and
+deleted hashes, stored bytes, grace timing, batch limits, and final reference
+rechecks. Demonstrate that a concurrent new binding prevents layout release and
+that a concurrent mapping prevents block deletion.
 
-```text
-reports/ptg2-experiments/run-<timestamp>/report.json
-reports/ptg2-experiments/run-<timestamp>/report.md
-```
-
-## Dev Pilot
-
-The pilot case is skipped unless a control URL and token are supplied. Use the
-engine control API URL in dev, or the equivalent import-control proxy if that is
-the selected entry point:
+Run the metadata-only plan first:
 
 ```bash
-HLTHPRT_CONTROL_URL=http://127.0.0.1:8080/control/v1 \
-HLTHPRT_CONTROL_API_TOKEN=<token> \
-./venv314/bin/python scripts/research/ptg2_experiment.py run \
-  --case ptg-pilot-import \
-  --variant parse_in_workers
+python -m process.ptg_parts.ptg2_shared_gc
 ```
 
-The pilot payload uses existing PTG lane fields:
-
-- `_expected_queue`
-- `_expected_worker_class`
-- `_scanner_rust_workers`
-- `_scanner_parse_in_workers`
-- `_scanner_work_queue`
-- `_scanner_event_queue`
-
-## Gates
-
-- Correctness: sorted COPY row counts and SHA-256 digests must match baseline.
-- Dedupe: negotiated-rate and serving-rate dedupe counters must match expected
-  baseline behavior.
-- Performance: candidate elapsed time must improve by at least 15 percent.
-- Memory: candidate peak RSS must not grow more than 20 percent unless the
-  report assigns it to a larger PTG resource lane.
-
-Unknown memory is non-fatal for local macOS runs because `/proc` is unavailable;
-dev-server runs should use pod/cgroup evidence before promotion.
-
-## Dev Deploy Shape
-
-When gates pass, build a research image:
+Execution is a separate reviewed action:
 
 ```bash
-TAG=ghcr.io/endurantdevs/healthcare-mrf-api:research-ptg2-$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)
+python -m process.ptg_parts.ptg2_shared_gc --execute
 ```
 
-Load or publish that tag for `ns1033171`, update the dev deploy branch image
-pins, reconcile Flux, and run the pilot import again. Roll back by restoring the
-previous image pin in `healthporta-deploy`.
+## Promotion Decision
+
+Promote a PTG optimization only when the same candidate passes focused tests,
+PostgreSQL-backed isolation tests, exact source-to-API release audit, cold
+latency, unique large-import timing, scratch cleanup, durability, and capacity
+headroom. A smaller fixture can reject a candidate but cannot prove the large
+import or 2,000-import monthly gates.
+
+The promotion record should contain only redacted digests, aggregate counts,
+timings, resource metrics, and pass/fail reasons. It must not contain company,
+client, plan, network, source, environment, path, host, or credential details.

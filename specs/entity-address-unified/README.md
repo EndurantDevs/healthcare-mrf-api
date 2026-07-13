@@ -13,7 +13,7 @@ context, not a standalone postal-address cache.
 ## Purpose
 
 `entity_address_unified` becomes the authoritative provider/pharmacy address
-serving table for HealthPorta APIs. It is a derived search model rebuilt from
+serving table for the public APIs. It is a derived search model rebuilt from
 published import tables, not a raw source table.
 
 The current `entity_address_unified` table is not a client-facing contract. The

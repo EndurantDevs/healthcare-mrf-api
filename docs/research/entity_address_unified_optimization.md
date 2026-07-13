@@ -2,7 +2,7 @@
 
 This workflow reuses the PTG2 experiment harness for entity-address-unified
 pilots. It keeps the evidence under ignored `reports/` paths and captures the
-final import-control run, progress samples, elapsed time, and published metrics
+final orchestrated run, progress samples, elapsed time, and published metrics
 from the importer.
 
 ## Dev Pilot Usage
@@ -15,11 +15,10 @@ Run a dry-run plan:
   --dry-run
 ```
 
-Run the 1k-per-source bounded dev smoke through import-control:
+Run the 1k-per-source bounded dev smoke through the deployment's authenticated
+operator API:
 
 ```bash
-HLTHPRT_IMPORT_CONTROL_URL=http://127.0.0.1:8095 \
-HLTHPRT_IMPORT_CONTROL_API_TOKEN=<token> \
 ./venv314/bin/python scripts/research/ptg2_experiment.py run \
   --suite docs/research/entity_address_unified_benchmark_suite.example.json \
   --case dev-bounded-smoke-1k
@@ -33,8 +32,6 @@ Run the full dev pilot only when PTG/openaddress jobs are not competing for the
 same database CPU and temp I/O:
 
 ```bash
-HLTHPRT_IMPORT_CONTROL_URL=http://127.0.0.1:8095 \
-HLTHPRT_IMPORT_CONTROL_API_TOKEN=<token> \
 ./venv314/bin/python scripts/research/ptg2_experiment.py run \
   --suite docs/research/entity_address_unified_benchmark_suite.example.json \
   --case dev-full-run
@@ -71,7 +68,7 @@ post_publish_index_concurrency = 1
 
 ## Local Harness Proof
 
-The 2026-06-27 local self-harness run used `healthporta_test` on
+The 2026-06-27 local self-harness run used `mrf_test` on
 `127.0.0.1:5440`, full-mode source discovery, and `HLTHPRT_IMPORT_ID_OVERRIDE`
 `codexeauserve16`. It staged 45,369 rows in 2.824 seconds with 514 source
 selects, 32 aggregate shards, `inline_source_evidence=true`,
@@ -160,7 +157,7 @@ for missing or invalid live indexes instead of the only place they are created.
 
 Use `metrics.published_elapsed_seconds` for the publish-time SLA when
 post-publish index warmup is enabled; total worker wall time can still include
-warmup. Import-control waiters can observe terminal status immediately after
+warmup. External orchestrator waiters can observe terminal status immediately after
 publish with `metrics.post_publish_index_pending=true`, a nonzero
 `metrics.post_publish_index_total`, and
 `metrics.post_publish_index_completed=0`; if the proof also needs warmup
@@ -204,7 +201,7 @@ concurrency 32 as an accepted aggregation-local improvement that still needs a
 clean full-run confirmation.
 
 Post-publish success updates now preserve the `finished_at` recorded when the
-row-complete table is published. This makes import-control duration match
+row-complete table is published. This makes orchestrator duration match
 `metrics.published_elapsed_seconds` for publish-first refreshes while still
 recording deferred validation and index warmup metrics afterward. Validation
 failure remains terminal and updates the run to failed. A follow-up proof
@@ -219,7 +216,7 @@ latitude band and execute in 616 ms. The accepted `(lat, long)` candidate built
 in 13.4s and executed the same query in 46 ms while avoiding a sequential scan.
 Both checks rolled back, leaving only the live `geo_idx` index in dev.
 
-Local smoke on `healthporta_test` (PostgreSQL 5440) with the serving profile
+Local smoke on `mrf_test` (PostgreSQL 5440) with the serving profile
 staged 3,504 rows in 0.47s, published nothing, and left no proof artifacts.
 With `HLTHPRT_ENTITY_ADDRESS_UNIFIED_FINAL_SUMMARY_COUNTS=false`, staged rows
 came from the aggregate INSERT rowcount (`aggregating.rows=3504`) and no final

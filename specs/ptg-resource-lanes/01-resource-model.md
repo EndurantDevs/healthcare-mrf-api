@@ -9,7 +9,7 @@
 | `large` | 40 GiB | 64 GiB | Large payer files with many rates or provider groups |
 | `huge` | 64 GiB | 96 GiB | Known high-memory PTG compact-serving jobs |
 
-The scheduler budget is the capacity reservation used by import-control when
+The scheduler budget is the capacity reservation used by an external orchestrator when
 choosing whether a node has headroom. The Kubernetes worker limit is the pod
 cgroup ceiling. Keep the worker limit higher than the scheduler budget so the
 scanner can survive transient publish/merge peaks without letting the scheduler
@@ -59,5 +59,5 @@ Each run should store `metrics.ptg_resource` or `metrics.mrf_resource`:
 }
 ```
 
-The import-control admin UI should display class, queue, worker class, memory
+An operator UI should display class, queue, worker class, memory
 budget, and latest actual memory when present.

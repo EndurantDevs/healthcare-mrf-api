@@ -8,14 +8,15 @@ plan, and file rows without downloading full in-network or allowed-amount rate b
 
 ```bash
 python main.py start mrf-source-discovery --test
-python main.py start mrf-source-discovery --provider all --limit 25 --check-urls --crawl --crawl-target-limit 5 --concurrency 10 --sync-import-control
+python main.py start mrf-source-discovery --provider all --limit 25 --check-urls --crawl --crawl-target-limit 5 --concurrency 10
 python main.py start mrf-source-discovery --provider master-list --source-entity-types tpa --check-urls --crawl --concurrency 10
 python main.py start mrf-source-discovery --probe-files --file-probe-limit 500 --concurrency 25
 python main.py start mrf-source-discovery --probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10
 ```
 
-The importer is also exposed through `/control/v1/importers` as `mrf-source-discovery`, so
-`import-control` and `api-app` can schedule it, run it now, retry it, and show status/progress.
+The importer is also exposed through the authenticated operator API as
+`mrf-source-discovery`, so an external orchestrator can schedule it, retry it,
+and observe status and progress.
 The operational runbook is [MRF source discovery DevOps](../devops/mrf-source-discovery.md).
 
 Source URLs are curated in `specs/mrf_payer_master_list.md`, not in Python code. The JSON registry
@@ -43,7 +44,7 @@ Platform resolvers are also configured in that file. The importer currently reso
   EINs captured as group plan metadata for BRMS and Lucent delegated sources.
 - HTML TPA pages that include both direct MRF links and Healthcare Bluebook delegations, including
   BRMS and Lucent landing pages. Direct CSV links are cataloged for visibility but excluded from
-  import-control preview promotion.
+  automated catalog promotion.
 - ASR Health Benefits group-number MRF pages into deterministic TOC URLs using the named
   `asr_health_benefits_groups` seed list and active rows from
   `specs/mrf_seed_lists/asr_health_benefits_groups.csv`.
@@ -100,7 +101,6 @@ large compressed rate files dominate runtime.
 - `--file-probe-payer-query`: case-insensitive payer-name substring for focused probes, for example `Collective`.
 - `--concurrency`: maximum concurrent URL checks/TOC fetches; defaults to 10.
 - `--crawl-target-limit`: cap resolved TOC targets after platform expansion; use it for smoke runs and omit it for full metadata recrawls.
-- `--sync-import-control`: push discovered source seeds to `import-control` when configured.
 - `--test`: use the configured test providers and skip external URL checks.
 
 Useful environment knobs for full crawls:
@@ -110,15 +110,6 @@ Useful environment knobs for full crawls:
 - `HLTHPRT_MRF_DISCOVERY_WRITE_BATCH_SIZE`: parsed-row upsert batch size; defaults to 2000 rows.
 - `HLTHPRT_MRF_CRAWL_ROW_WRITE_TIMEOUT_SECONDS`: optional per-batch database write timeout;
   defaults to `0`, which lets full-catalog crawls finish slow write batches instead of aborting.
-- `HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_BATCH_SIZE`: split preview items sent per
-  import-control catalog ingest request; defaults to 5000.
-- `HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE`: split import-control seed sync
-  rows per request; defaults to 100.
-- `HLTHPRT_MRF_IMPORT_CONTROL_SYNC_TOTAL_TIMEOUT_SECONDS`,
-  `HLTHPRT_MRF_IMPORT_CONTROL_SYNC_CONNECT_TIMEOUT_SECONDS`, and
-  `HLTHPRT_MRF_IMPORT_CONTROL_SYNC_READ_TIMEOUT_SECONDS`: HTTP timeouts for
-  internal import-control seed/catalog publication; default to 300, 10, and
-  180 seconds.
 - `HLTHPRT_MRF_DISCOVERY_MAX_TOC_BYTES`: generic TOC/metadata fetch limit; defaults to 25 MB.
   Resolver-specific caps in `specs/mrf_source_discovery_sources.json` can raise this for known
   larger index files without changing the global default.
@@ -143,21 +134,13 @@ The importer writes local MRF catalog tables:
 - `mrf_crawl_run`: discovery run summaries and errors.
 - `mrf_payer_scorecard`: optional scorecard enrichment.
 
-## Import-Control Sync
+## External Catalog Integration
 
-When `--sync-import-control` is enabled, the importer promotes eligible free/non-vendor sources into
-the central import-control catalog and pushes discovered plan/file relationships through
-`/v1/ptg/discover/ingest-preview`.
-
-The sync builder prefers exact per-file `metadata_json.plan_info` captured during TOC parsing. For
-older rows or resolver paths that only populated `mrf_file.plan_ids`, `plan_names`, and
-`market_types`, it synthesizes import-control `plan_info` from those structured columns and uses
-`mrf_plan` as the plan-id-type/reporting-entity lookup.
-
-Some payer indexes attach thousands of plans to each file reference. Before posting to
-import-control, the importer splits large `plan_info` arrays into smaller preview slices while
-preserving the same file URL. This keeps HTTP payloads bounded and is equivalent because
-import-control upserts by stable plan and source-file identities.
+The local catalog tables are the public integration boundary. An external
+orchestrator may read eligible source, plan, and file records through an
+authenticated operator API and mirror them into its own catalog. Integrations
+must preserve stable plan and source-file identities and keep large
+`plan_info` payloads bounded.
 
 ## Safety Rules
 
@@ -178,10 +161,11 @@ import-control upserts by stable plan and source-file identities.
 Recommended schedules:
 
 - Daily: `--check-urls --provider master-list`
-- Weekly: `--provider master-list --limit 500 --check-urls --concurrency 10 --sync-import-control`
+- Weekly: `--provider master-list --limit 500 --check-urls --concurrency 10`
 - Smoke: `--provider master-list --limit 15 --check-urls --crawl --crawl-target-limit 2 --concurrency 5`
-- Monthly: `--provider master-list --limit 500 --check-urls --crawl --concurrency 10 --sync-import-control`
+- Monthly: `--provider master-list --limit 500 --check-urls --crawl --concurrency 10`
 - TPA freshness smoke: `--probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10`
 
-Configure these in `import-control` so admins can change cadence, run now, disable, retry, and view
-status from `api-app`.
+Configure these in an external scheduler so operators can change cadence,
+disable or retry runs, and inspect status through the authenticated operator
+API.

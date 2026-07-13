@@ -1,100 +1,84 @@
 # Repository Review Readiness
 
-This note records the checks used before sharing the repository for external review. It intentionally focuses on reproducible commands and known caveats rather than marketing claims.
+This note records reproducible checks used before external review. It avoids
+production identifiers and treats live measurements as release evidence, not
+as permanent benchmark claims.
 
-## PTG2 Serving Storage Evidence
+## PTG Architecture
 
-This section is historical local evidence for the first manifest-backed storage
-reduction work. Current storage reviews should prefer live snapshot manifests
-and deployment smoke output. PostgreSQL binary snapshots can use either the v1
-direct provider-membership layout or the v2 normalized membership graph.
+The only supported PTG snapshot architecture is `postgres_binary_v3` with
+`storage_generation=shared_blocks_v3`. Older snapshots must be reimported.
+Runtime readers do not infer an architecture from table presence and do not
+materialize PostgreSQL artifacts into a filesystem or process cache.
 
-Measured on the local PostgreSQL instance at `127.0.0.1:5440`, database
-`healthporta`, schema `mrf`.
+Old generation names may appear only in cleanup code and rejection tests. They
+exist so obsolete physical state can be deleted safely; they are not serving or
+import compatibility paths.
 
-Current source snapshots:
-
-| Source | Snapshot | Serving table total | Support tables total |
-| --- | --- | ---: | ---: |
-| `example_source_a` | `ptg2:202605:2e95465b2025` | 41 GB | ~4.5 GB |
-| `example_source_b` | `ptg2:202605:79060d12dfcf` | 41 GB | ~4.5 GB |
-
-Support tables in this historical evidence are `price_atom`,
-`provider_group_member`, and `code_count`. This was the hot database footprint
-for the earlier manifest layout. For `postgres_binary_v2`, expect `price_atom`,
-`code_count`, `provider_npi_scope`, the provider-set dictionary, and the binary
-serving table. Review PostgreSQL artifact chunks for all four membership graph
-directions and confirm that pod-local materialized artifact caches are absent.
-
-Import timing records available locally:
-
-| Import run | Status | Serving rows | Duration |
-| --- | --- | ---: | ---: |
-| `ptg2:example_source_a_202605_full_thin2` | `validated` | 301,445,112 | 14,631.8 s |
-| Source B manifest-backed import | `validated` | 149,971,480 | 10,231.8 s |
-
-The `example_source_a` manifest-backed run was validated from salvaged artifacts, so its recorded duration is not useful for throughput comparison.
-
-## Artifact Hygiene
-
-Legacy retained sidecar directories can contain stale files from interrupted or
-superseded imports. Use the manifest-driven dry-run before deleting anything:
-
-```bash
-HLTHPRT_DB_HOST=127.0.0.1 \
-HLTHPRT_DB_PORT=5440 \
-HLTHPRT_DB_DATABASE=healthporta \
-HLTHPRT_DB_USER=nick \
-HLTHPRT_DB_SCHEMA=mrf \
-HLTHPRT_PTG2_ARTIFACT_DIR=/Volumes/Data/data \
-  ./venv314/bin/python -m process.ptg_parts.ptg2_artifact_cleanup --schema mrf
-```
-
-Historical dry-run result:
-
-- referenced sidecars: 36.2 GB
-- unreferenced sidecars: 61.1 GB
-- missing manifest-referenced files: 0
-
-Only add `--execute` after reviewing the dry-run output. The cleanup tool does not touch raw payer downloads.
-
-## Verification Commands
+## Required Gates
 
 ```bash
 ./venv314/bin/python -m pytest -q
-./venv314/bin/python -m py_compile \
-  process/ptg_parts/ptg2_artifact_cleanup.py \
-  process/ptg_parts/ptg2_legacy_cleanup.py \
-  api/ptg2_serving.py \
-  api/ptg2_serving_utils.py \
-  process/ptg.py
+cargo fmt --check --manifest-path support/ptg2_scanner/Cargo.toml
+cargo check --all-targets --manifest-path support/ptg2_scanner/Cargo.toml
+cargo clippy --all-targets --manifest-path support/ptg2_scanner/Cargo.toml -- -D warnings
+cargo test --manifest-path support/ptg2_scanner/Cargo.toml
 git diff --check
 ```
 
-Last local results:
+The PostgreSQL integration job must also exercise migration upgrade, strict
+shared publication, cross-plan physical reuse, cold reads, snapshot removal,
+and shared-block garbage collection.
 
-- `743 passed in 21.26s`
-- compile checks passed
-- `git diff --check` passed
-- guarded Source B UUID smoke import passed in `healthporta_test`: 2,641,583 serving rows, `id_storage=uuid`, 51.34 seconds
-- guarded `postgres_binary_v2` full-file smoke passed in `healthporta_test`:
-  65,536 serving rows and all original price/provider counts matched; forward
-  p95 was 12.66 ms and reverse NPI p95 was 14.69 ms with in-process binary and
-  sidecar caches disabled
+## Dev Deployment Gate
+
+Every application deployment to dev must start from GitHub Actions for the
+exact commit on `main`, after that commit's `CI` workflow succeeds. The
+post-CI workflow may queue the node-side image build and GitOps update; a
+manually dispatched reader promotion must verify the same successful CI run.
+Do not deploy by invoking node build scripts, changing live Kubernetes objects,
+editing images or environment variables in a pod, pushing desired-state
+manifests by hand, or forcing Flux reconciliation as a substitute for CI.
+
+Direct cluster commands are permitted for read-only diagnosis and smoke
+verification after the CI deployment. Any durable correction must be made in
+the owning repository and pass through the same CI path.
+
+## Release Evidence
+
+A representative dev import is required before broad deployment. Record:
+
+- start-to-published wall time and phase timings;
+- `pg_total_relation_size` split by strict V3 relation;
+- cold and warm latency distributions for forward, reverse-NPI, all-prices for
+  one NPI, and geo-filtered requests;
+- no pod-local serving cache files before or after requests;
+- exact source/API audit results from the original JSON or gzip inputs.
+
+The release audit is `scripts/validation/ptg2_v3_source_api_audit.py`. In its
+release profile it enforces at least 2,500 source-selected occurrences, 2,500
+independently API-selected occurrences, 2,500 deterministic random pricing
+requests, 3,000 observed standard API HTTP requests, and 250 negative checks.
+It compares exact fields, duplicate multiplicity, and raw-container SHA-256
+source attribution. The report must be freshly attested against the sealed
+sample/source-set digests, and activation must consume that receipt through an
+exact-predecessor transaction before the run counts as published evidence.
+
+Do not claim the 10-15 minute import target or a cold p95 below 40 ms until the
+representative dev run satisfies those gates.
 
 ## Security Hygiene
 
-The tracked `specs/example_coding.txt` transcript was removed because it was unrelated to this repository and contained credential-like literal examples. A follow-up secret-pattern sweep should remain part of review preparation:
+Do not put customer, employer-plan, or production source names in fixtures,
+reports, commit messages, or public documentation. Validation reports must use
+bounded redacted examples and must not contain source URLs or credentials.
 
-```bash
-rg -n "consumer_secret|api_key=|Bearer [A-Za-z0-9._~+/=-]{12,}|PRIVATE KEY|AWS_SECRET|SECRET_KEY\\s*=|password\\s*=\\s*['\\\"][^'\\\"]+" \
-  . -S --glob '!venv*/**' --glob '!restore/**' --glob '!data/**' --glob '!reports/**' --glob '!docs/review-readiness.md'
-```
+The public repository must not name or depend on deployment-specific
+dashboards, gateways, automation products, subscription services, proprietary
+orchestrators, or their database schemas. Those systems may consume the
+generic public and authenticated operator APIs only. Run a repository-wide
+dependency/name scan as part of the public-release gate.
 
-The current matches are code variables or request parameters, not hardcoded credentials.
-
-## Known Caveats
-
-- `pylint` is not installed in `venv314`, so the pylint baseline could not be captured from this environment.
-- Local untracked data/report artifacts remain in the working tree and should not be committed unless explicitly reviewed.
-- Existing internal module names may still include historical implementation labels; public docs and API response labels should avoid exposing those labels.
+Run the repository secret-pattern and public-name hygiene checks before review.
+Generated reports, downloaded MRF files, and local database artifacts remain
+untracked unless separately approved.

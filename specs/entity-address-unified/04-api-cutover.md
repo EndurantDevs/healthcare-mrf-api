@@ -180,19 +180,19 @@ item count range
 required fields
 geo sorting/distance when applicable
 filter behavior
-authorization/bundle behavior through api-layer
+authorization behavior through an external API gateway
 ```
 
-## API-Layer And MCP Impact
+## External Client Impact
 
-`api-layer` and `api-mcp` should not need large contract changes if upstream
-response shape is preserved.
+External gateways and automation clients should not need large contract changes
+if the upstream response shape is preserved.
 
 Expected dependent work:
 
 - update e2e expectations if optional source/confidence fields are added
 - add smoke tests for ACA vs PTG/group vs no-insurance searches
-- ensure MCP provider/pharmacy/pricing tools can benefit from richer coverage
+- ensure provider, pharmacy, and pricing clients can benefit from richer coverage
   without changing required arguments
 
 ## Legacy Table Reads

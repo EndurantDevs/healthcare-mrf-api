@@ -225,8 +225,8 @@ CREATE TABLE mrf.address_merge_log (
 
 - `entity_address_unified` — table, PK, builder, and its three readers
   (`api/endpoint/pricing.py:2407-2440`,
-  `process/ptg_parts/serving_maintenance.py:261-283`, cohort SQL) stay as they
-  are through the whole rollout; it later *consumes* `address_key` behind a
-  flag (see 05).
+  `api/ptg2_serving.py`, cohort SQL) stay as they are through the whole
+  rollout; the pricing readers consume the current unified projection without
+  copying it into snapshot-local PTG tables (see 05).
 - PTG2 tables — consumers only; they inherit better dedup upstream for free.
 - API payload shapes — `address_key` is internal until we decide to expose it.

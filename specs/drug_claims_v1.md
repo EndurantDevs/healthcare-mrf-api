@@ -1,4 +1,4 @@
-# CMS Drug Claims v1 (HealthPorta-style)
+# CMS Drug Claims v1
 
 ## Scope
 

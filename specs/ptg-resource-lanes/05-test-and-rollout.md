@@ -10,13 +10,12 @@
 
 ## Dev-Server Tests
 
-1. Deploy import-control, healthcare-mrf-api, and api-app changes.
-2. Reconcile Flux and wait for app health.
-3. Run one small PTG source-file import through admin/import-control.
+1. Deploy the public service and deployment-repository changes through CI.
+2. Reconcile the deployment controller and wait for service health.
+3. Run one small PTG source-file import through the authenticated operator API.
 4. Run one normal or large PTG source-file import if capacity is available.
 5. Run one MRF chunked smoke/full-safe import.
-6. Restart import-control and api-app; verify latest completed runs remain visible.
-7. Verify `mrf-3` is the active coderoam lane for this workstream.
+6. Restart the service and external orchestrator; verify latest completed runs remain visible.
 
 ## Acceptance Criteria
 

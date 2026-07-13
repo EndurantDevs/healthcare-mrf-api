@@ -13,7 +13,7 @@ python main.py worker process.EntityAddressUnified --burst
 ```
 
 PTG/TiC price files do not carry authoritative provider locations. Source
-snapshot promotions can optionally trigger this importer through import-control,
+snapshot promotions can optionally trigger this importer through an external orchestrator,
 but that runs a normal unified-address refresh from address-bearing sources
 rather than rebuilding a PTG-specific address cache.
 
@@ -66,7 +66,7 @@ python main.py worker process.EntityAddressUnified --burst
 ```
 
 Test mode is stage-only by default and does not replace the live serving tables
-unless `--publish` or import-control `publish=true` is supplied.
+unless `--publish` or an equivalent authenticated operator request is supplied.
 
 ## Publication Safety
 
@@ -121,7 +121,7 @@ NPI-ordered scan.
 When post-publish index warmup is enabled, use
 `metrics.published_elapsed_seconds` as the publish-time measurement. Successful
 post-publish validation and warmup updates preserve the original publish
-`finished_at`, so import-control duration also reflects the row-complete publish
+`finished_at`, so orchestrator duration also reflects the row-complete publish
 time while metrics retain the post-publish tail timings. A post-publish
 validation failure still marks the run failed at the failure time. Total worker
 wall time can still include live index warmup after the row-complete table has
@@ -149,7 +149,7 @@ runs independent archive, coordinate, practice, and fallback checks in parallel.
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_CODE_BRIDGES` (default `true`; set `false` for serving-focused rebuilds that do not need procedure/medication support bridge refresh)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_FACILITY_CANDIDATES` (default `true`; set `false` for serving-focused rebuilds that do not need facility-anchor candidate refresh)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY` (default `false`; for full refreshes, publish only the denormalized serving table and leave existing support/provenance tables unchanged)
-- `serving_only_refresh` import-control param / `--serving-only-refresh` CLI option (task-level override for `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY`; used by the daily Provider Directory serving projection)
+- `serving_only_refresh` operator parameter / `--serving-only-refresh` CLI option (task-level override for `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY`; used by the daily Provider Directory serving projection)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_STAGE` (default `false`; dev-speed option that builds the main stage without WAL; every published stage is converted to `LOGGED` before cutover)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_SOURCE_RECORD_IDS` (default `true`; set `false` for compacted serving refreshes to skip the expensive `source_record_ids` aggregation when final rows intentionally keep this array empty)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_FINAL_SUMMARY_COUNTS` (default `true`; set `false` for full serving refreshes to use the exact aggregate INSERT rowcount for staged rows and skip the final detailed count scan)
@@ -168,11 +168,11 @@ runs independent archive, coordinate, practice, and fallback checks in parallel.
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SYNCHRONOUS_COMMIT`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_JIT`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_MAX_PARALLEL_WORKERS_PER_GATHER`
-- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_LIMIT_PER_SOURCE` (bounded pilots only; import-control can also pass `limit_per_source`)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_LIMIT_PER_SOURCE` (bounded pilots only; an authenticated operator request can also pass `limit_per_source`)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH` (overrides publish decision; by default test mode skips publish and full mode publishes)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH`
-- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REFRESH_MODE` (`full` or `provider-directory-partial`; import-control can also pass `refresh_mode`)
-- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE` (default `3`; import-control can also pass `provider_directory_source_batch_size`, and the CLI exposes `--provider-directory-source-batch-size`; set `0` only for deliberate unbatched Provider Directory partial runs)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REFRESH_MODE` (`full` or `provider-directory-partial`; an authenticated operator request can also pass `refresh_mode`)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE` (default `3`; an authenticated operator request can also pass `provider_directory_source_batch_size`, and the CLI exposes `--provider-directory-source-batch-size`; set `0` only for deliberate unbatched Provider Directory partial runs)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_ARCHIVE_COORDINATES` (default `false`; when `true`, publish fails if archive rows still lack coordinates)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_INFERENCE` (default `false`; enables automatic NPI inference updates; review candidates are still populated when this is off)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NAME_FALLBACK_INFERENCE` (default `false`; enables expensive broad name+ZIP+street automatic inference after deterministic facility-anchor matches)
@@ -193,5 +193,5 @@ Entity-address pilots reuse the PTG research harness reporting flow:
   --dry-run
 ```
 
-See `docs/research/entity_address_unified_optimization.md` for dev import-control
+See `docs/research/entity_address_unified_optimization.md` for dev orchestrated
 pilot commands.

@@ -2,7 +2,7 @@
 
 `terminology-synonyms` materializes a fast search/resolve table for provider types, procedure names, and medication names.
 
-The import is intentionally derived from data HealthPorta already imports:
+The import is intentionally derived from data the service already imports:
 
 - NUCC taxonomy rows from `nucc`
 - CMS/provider-service rows from `claims-pricing`

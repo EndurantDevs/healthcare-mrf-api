@@ -32,7 +32,7 @@ PTG imports publish current snapshots
 ptg-address rebuilds and swaps ptg_address
         |
         v
-import-control marks address unified dirty or PTG-overlay dirty
+external orchestrator marks address unified dirty or PTG-overlay dirty
         |
         v
 entity-address-unified waits for active dependencies
@@ -273,7 +273,7 @@ rollback/debug.
 14. Analyze stage tables.
 15. Run validation gates.
 16. Swap live serving and bridge tables.
-17. Update active publish metadata in import-control.
+17. Update active publish metadata through the operator API.
 
 ### `entity-address-unified` PTG-fast refresh steps
 

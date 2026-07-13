@@ -167,7 +167,7 @@ See [08 Address Identity Contract](08-address-identity-contract.md).
 
 ## Observability
 
-Import-control should display:
+The operator interface should display:
 
 - current live version/run ID;
 - current archive identity version;
@@ -242,8 +242,8 @@ Manual rollback:
 5. Compare against current `npi_address`-backed behavior with quantified
    dual-read gates.
 6. Run focused healthcare-mrf-api tests.
-7. Run api-layer e2e smoke against dev.
-8. Run dashboard/import-control rebuild flow.
+7. Run external-gateway end-to-end smoke against dev.
+8. Run the authenticated operator rebuild flow.
 9. Review query plans and row counts with the team.
 
 ## Production Rollout
@@ -305,7 +305,7 @@ Manual rollback:
 - PTG/group-plan provider search;
 - PTG/group-plan search after PTG-only overlay refresh;
 - no-insurance provider search;
-- authorization/bundle behavior through api-layer.
+- authorization behavior through an external API gateway.
 
 ### E2E tests
 
@@ -349,7 +349,7 @@ Manual rollback:
 - wire importer lifecycle;
 - add dependency wait logic;
 - add dirty markers;
-- add import-control status output;
+- add operator status output;
 - add manual rebuild support.
 
 ### Phase 3: source coverage

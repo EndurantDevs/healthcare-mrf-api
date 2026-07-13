@@ -1,27 +1,44 @@
 # PTG2 Source Snapshot GC DevOps
 
-This runbook covers cleanup of old source-scoped PTG2 serving snapshots. It is
-for retained `manifest_snapshot` rows in `mrf.ptg2_snapshot` whose physical
-tables are no longer referenced by the current PTG2 pointer tables.
+This runbook covers cleanup of old strict-V3 source snapshots. It applies to
+`postgres_binary_v3` / `shared_blocks_v3` rows in `mrf.ptg2_snapshot` that are
+no longer referenced by the current PTG pointer tables.
 
 ## What It Cleans
 
-The maintenance command targets only snapshots that satisfy all of these
-conditions:
+The maintenance command targets only snapshots outside every protected pointer
+lineage that are in one of these bounded lifecycle classes:
 
-- `mrf.ptg2_snapshot.status IN ('published', 'failed')`; active `building` snapshots are excluded
-- `manifest->'serving_index'->>'storage' = 'manifest_snapshot'`
-- the snapshot id is outside the protected lineage rooted at all current pointer tables:
+- terminal `published` or `failed` manifest snapshots;
+- abandoned `building` snapshots whose import run is absent, terminal, or no
+  longer heartbeating.
+
+Strict-V3 `validated` candidates are deliberately excluded. Until the audit
+runner has a durable lease and heartbeat, age alone cannot distinguish an
+abandoned candidate from a long-running release audit. Remove an abandoned
+candidate explicitly through the authenticated source-snapshot control flow.
+
+The protected lineage is rooted at all current pointer tables:
+
   - `mrf.ptg2_current_snapshot`
   - `mrf.ptg2_current_source_snapshot`
   - `mrf.ptg2_current_plan_source`
 
 By default the current snapshot and its three predecessors are protected for
 each pointer (`--retain-current-lineage 4`). For snapshots outside that lineage
-the command drops only manifest-declared PTG2 tables with known
-snapshot-table prefixes, then deletes matching `ptg2_artifact_manifest` and
-`ptg2_snapshot` metadata rows. It does not remove raw payer downloads or
-sidecar artifact files.
+the command deletes strict-V3 scope, binding, artifact, and logical snapshot
+metadata. Strict V3 has no per-snapshot serving tables to drop. When at least
+one physical binding is deleted, the same transaction runs bounded
+shared-layout release through the same database connection. That release sees
+the uncommitted binding deletion, removes layouts whose final binding
+disappeared, and queues their block hashes for reclamation. A later bounded
+block sweep deletes only hashes whose grace period has elapsed and that remain
+unreferenced.
+
+Source-GC byte limits cover only the logical snapshot plan. Shared-layout
+release and block sweeping retain their independent row, byte, lease, and
+grace-period bounds, so source cleanup cannot consume an unrelated physical
+backlog without limit.
 
 ## Command
 
@@ -56,28 +73,20 @@ history depth.
 
 The execute path acquires the same advisory lock used by source publication,
 locks snapshot status and all pointer tables against concurrent updates, and
-recomputes the candidate set inside that database transaction before dropping
-tables. A snapshot promoted after a dry-run, or a failed snapshot reclaimed as
+recomputes the candidate set inside that database transaction before deleting
+state. A snapshot promoted after a dry-run, or a failed snapshot reclaimed as
 `building`, is therefore protected by the execute-time plan. The command
 refuses to run if the recomputed snapshot count, table count, or byte total
 exceeds the supplied bounds.
 
-## Dev-Server Access Pattern
+## Deployment Access Pattern
 
-On the current dev server, PostgreSQL is host-level PostgreSQL on port `5440`;
-the Kubernetes service points to `postgres-host:5440`.
-
-From a deployed API pod, run the command with the normal app environment. From
-the host, connect as the `postgres` system user for ad hoc verification:
-
-```bash
-ssh ubuntu@<dev-node-host>
-sudo -u postgres psql -p 5440 -d healthporta
-```
-
-Do not paste database credentials into tickets, PRs, or chat. Prefer running
-the maintenance command inside an environment that already has the app DB
-variables.
+Run maintenance through the deployment's normal CI-controlled job or scheduler
+with the same database configuration and control identity as the application.
+Do not patch a running pod, inject an ad hoc image, or publish database
+credentials in tickets, pull requests, logs, or chat. Dry-run output is safe to
+review only when it contains aggregate identifiers and counts rather than
+customer or source metadata.
 
 ## Verification Queries
 
@@ -166,11 +175,11 @@ Track disk and database size before and after:
 
 ```bash
 df -hT /data
-sudo du -sh /data/healthporta/postgres /data/healthporta-rwx /data/healthporta/k3s 2>/dev/null
+sudo du -sh /data/mrf-api/postgres /data/mrf-api-rwx /data/mrf-api/k3s 2>/dev/null
 ```
 
 ```sql
-SELECT pg_size_pretty(pg_database_size('healthporta')) AS db_size;
+SELECT pg_size_pretty(pg_database_size('mrf_dev')) AS db_size;
 ```
 
 ## Known Follow-Up

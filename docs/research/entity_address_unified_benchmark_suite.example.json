@@ -1,7 +1,7 @@
 {
   "version": 1,
   "title": "Entity Address Unified Experiment Report",
-  "description": "Import-control pilots for entity-address-unified. These cases reuse the PTG experiment harness reporting path while targeting bounded and full unified-address materialization runs.",
+  "description": "Orchestrated pilots for entity-address-unified. These cases reuse the PTG experiment harness reporting path while targeting bounded and full unified-address materialization runs.",
   "gates": {
     "min_improvement_pct": 15.0,
     "max_memory_growth_pct": 20.0
@@ -15,7 +15,7 @@
   "cases": [
     {
       "id": "dev-bounded-smoke-1k",
-      "kind": "import_control_run",
+      "kind": "orchestrated_run",
       "importer": "entity-address-unified",
       "triggered_by": "entity-address-unified-research",
       "actor": "codex",
@@ -36,7 +36,7 @@
     },
     {
       "id": "dev-bounded-smoke-20k",
-      "kind": "import_control_run",
+      "kind": "orchestrated_run",
       "importer": "entity-address-unified",
       "triggered_by": "entity-address-unified-research",
       "actor": "codex",
@@ -57,7 +57,7 @@
     },
     {
       "id": "dev-full-run",
-      "kind": "import_control_run",
+      "kind": "orchestrated_run",
       "importer": "entity-address-unified",
       "triggered_by": "entity-address-unified-research",
       "actor": "codex",

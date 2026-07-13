@@ -2,7 +2,7 @@
 
 ## Problem
 
-HealthPorta currently has multiple address-bearing source tables:
+The service currently has multiple address-bearing source tables:
 
 - NPPES provider addresses in `npi_address`
 - ACA/MRF provider-network addresses in `mrf_address`
@@ -92,7 +92,7 @@ This gives:
 - deterministic rebuilds
 - atomic publish
 - simple rollback to the previous version
-- clear dependency handling in import-control
+- clear dependency handling in the external orchestrator
 - simpler debugging when a source import is wrong
 
 ## PTG Rule

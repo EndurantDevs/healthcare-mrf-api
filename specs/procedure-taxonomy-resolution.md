@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-06-26
-**Scope:** `healthcare-mrf-api`, `api-layer`, `api-mcp`
+**Scope:** `healthcare-mrf-api` and implementation-neutral API consumers
 **Related:** `specs/in-network-provider-specialty-filter.md`, `specs/cms_claims_pricing_v1.md`, `docs/imports/clinical-reference.md`
 
 ## Problem
@@ -27,9 +27,8 @@ Current hardcoded logic exists in several places:
   sets for plan provider filters.
 - `api/ptg2_code_filters.py` maps broad CPT numeric ranges to inferred
   provider taxonomies for some PTG2 serving paths.
-- `api-mcp/healthporta_mcp/mcp_server.py` keeps small hand-written specialty
-  and care-intent mappings, including a client-side instruction to enrich each
-  NPI and filter after pricing.
+- Some API consumers keep small hand-written specialty and care-intent mappings,
+  including client-side logic to enrich each NPI and filter after pricing.
 
 Those lists should become fallbacks only. The durable solution is a derived,
 auditable procedure-to-taxonomy evidence layer with explicit safety gates. The
@@ -131,8 +130,8 @@ Add a derived resolver owned by `healthcare-mrf-api`:
 4. Publish a resolver API that returns both a recommended provider-filter mode
    and ranked evidence. The mode decides whether taxonomy is a hard filter, a
    ranking boost, or validation-only.
-5. Move `api-mcp` care-intent logic to call this resolver instead of carrying
-   a private taxonomy list.
+5. Let API consumers call this resolver instead of carrying private taxonomy
+   lists.
 
 This should be an additional finalize step of `claims-pricing` or a small
 dependent importer named `procedure-taxonomy`. It should not re-download the
@@ -419,7 +418,8 @@ often specialty-agnostic. Treat broad `363L00000X` / `363A00000X` carefully:
 
 ## API Surface
 
-Add these endpoints to `healthcare-mrf-api` and proxy them through `api-layer`.
+Add these endpoints to `healthcare-mrf-api`; external gateways may proxy them
+without changing the contract.
 
 ### `GET /api/v1/pricing/procedure-taxonomy/resolve`
 
@@ -516,13 +516,13 @@ admin review, debugging, and explaining why a filter was chosen.
 
 ### `POST /api/v1/pricing/procedure-taxonomy/resolve-batch`
 
-Accepts a list of codes and returns the same resolution payload per code. MCP
-should use this when `resolve_care_codes` returns office visit plus lab/test
-codes.
+Accepts a list of codes and returns the same resolution payload per code.
+Automation clients should use this when a care-intent resolver returns office
+visit plus lab/test codes.
 
-## MCP Changes
+## API Consumer Changes
 
-`api-mcp` should stop carrying the normal runtime mapping.
+API consumers should stop carrying the normal runtime mapping.
 
 1. Add a tool:
 
@@ -555,9 +555,9 @@ codes.
    - unit tests,
    - explicit fallback when the resolver returns unavailable.
 
-## API-Layer Changes
+## External Gateway Changes
 
-`api-layer` already forwards explicit taxonomy parameters for:
+External gateways should forward explicit taxonomy parameters for:
 
 - `/api/v1/pricing/group-plan-providers`
 - `/api/v1/pricing/providers/search-by-procedure`
@@ -571,10 +571,10 @@ Add proxy routes for:
 
 Implementation requirements:
 
-- register each route explicitly in `api-layer/src/main.rs`;
-- add `provider_services_claims` gating in `api-layer/src/auth.rs::bundle_for_path`
-  for `/api/v1/pricing/procedure-taxonomy`;
-- mirror the same path mapping in `api-mcp/healthporta_mcp/mcp_server.py::_bundle_for_path`;
+- register each route explicitly in the gateway configuration;
+- require the appropriate authorization scope for
+  `/api/v1/pricing/procedure-taxonomy`;
+- keep the same path and authorization mapping in automation clients;
 - add entitlement tests beside the existing provider-specialty/group-plan tests;
 - expose these in OpenAPI with examples that show ambiguous office visit
   behavior and `soft_boost` behavior.
@@ -617,7 +617,7 @@ For member-facing plan search:
    - Use idempotent `ON CONFLICT`/swap semantics, advisory locks for publish,
      row-count floors, row-count-delta abort guards, and diagnostics for
      taxonomy coverage, null taxonomy rate, and representativeness buckets.
-   - Keep the build cancellable through the import-control conventions used by
+   - Keep the build cancellable through the operator conventions used by
      other long-running importers.
 2. Run against the current local/test claims import to validate table shape.
 3. Run against a full dev claims-pricing year and inspect:
@@ -629,10 +629,10 @@ For member-facing plan search:
    - PT/OT codes,
    - dental/CDT unavailable/curated behavior.
 4. Add resolver endpoints in `healthcare-mrf-api`.
-5. Add api-layer proxy routes, auth bundle mapping, OpenAPI, and entitlement
+5. Add external-gateway proxy routes, authorization mapping, OpenAPI, and entitlement
    tests.
-6. Add api-mcp resolver tool, entitlement mirror mapping, and update
-   `resolve_care_codes` guidance.
+6. Update automation clients to call the resolver and follow the published
+   authorization mapping.
 7. Replace or demote `api/ptg2_code_filters.py` inferred rules to overrides.
 
 ## Acceptance Criteria
@@ -657,11 +657,11 @@ For member-facing plan search:
 6. `search_providers_by_procedure` uses taxonomy as a hard plan-scoped filter
    only when `recommended_mode=hard_filter`; otherwise it broad-searches,
    ranks/boosts, and validates.
-7. `api-mcp` no longer needs a private hardcoded list to decide the correct
+7. API consumers no longer need a private hardcoded list to decide the correct
    doctor taxonomy for a code in normal runtime.
 8. Every resolved response includes enough evidence to audit why the taxonomy
    mode and taxonomy candidates were chosen.
-9. The new api-layer and api-mcp paths are gated by `provider_services_claims`
+9. The new public paths are gated by the documented authorization scope
    and covered by entitlement tests.
 10. Materialization fails closed on row-count floor/delta, taxonomy coverage, or
     representativeness diagnostics that fall outside configured bounds.

@@ -10,7 +10,7 @@ full in-network or allowed-amount rate bodies.
 - Track source freshness through `HEAD` checks, ETag, Last-Modified, and content-length metadata.
 - Parse TOC/index metadata into local `mrf_payer`, `mrf_source`, `mrf_plan`, `mrf_file`,
   `mrf_url_observation`, and `mrf_crawl_run` tables.
-- Push discovered seeds to `import-control` when `--sync-import-control` is configured.
+- Make discovered rows available to authenticated external catalog consumers.
 
 The source registry is data-driven:
 
@@ -25,7 +25,7 @@ master list.
 
 ## Required Workers
 
-Start the ARQ worker class when running through queues/import-control:
+Start the ARQ worker class when running through queues or an external orchestrator:
 
 ```bash
 python main.py worker MRFSourceDiscovery
@@ -39,15 +39,15 @@ python main.py start mrf-source-discovery --test
 
 ## Recommended Schedules
 
-Configure these in `import-control`, not hard-coded cron:
+Configure these in an external scheduler rather than hard-coded cron:
 
 | Cadence | Params | Purpose |
 | --- | --- | --- |
 | Daily | `--provider master-list --check-urls --concurrency 10` | catch broken/stale curated sources |
-| Weekly | `--provider master-list --check-urls --concurrency 10 --sync-import-control --sync-import-control-catalog` | refresh source health and publish the full stored searchable source, plan, and file catalog |
+| Weekly | `--provider master-list --check-urls --concurrency 10` | refresh source health and the full stored searchable source, plan, and file catalog |
 | Weekly TPA | `--provider master-list --source-entity-types tpa --check-urls --crawl --concurrency 10` | keep TPA-hosted metadata and file references current |
 | Weekly TPA probe | `--probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10` | sample TPA body-file freshness without full PTG import |
-| Monthly | `--provider master-list --limit 500 --check-urls --crawl --concurrency 10 --sync-import-control --sync-import-control-catalog` | full metadata refresh within bounded source universe |
+| Monthly | `--provider master-list --limit 500 --check-urls --crawl --concurrency 10` | full metadata refresh within bounded source universe |
 
 Use `--crawl-target-limit` for production smoke/canary runs before unbounded monthly crawls.
 
@@ -68,14 +68,14 @@ Local dev uses `.env`; in the shared dev setup this points PostgreSQL at `127.0.
 ./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query BRMS --check-urls --crawl --concurrency 3
 ./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Lucent --check-urls --crawl --concurrency 3
 ./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Cigna --crawl --concurrency 3
-./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Varipro --check-urls --crawl --concurrency 3 --sync-import-control
+./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Varipro --check-urls --crawl --concurrency 3
 ./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query "ASR Health Benefits" --crawl --concurrency 3
 ```
 
 Meritain, BRMS, and Lucent should create `mrf_plan` rows from client/group metadata during crawl.
 BRMS and Lucent Healthcare Bluebook links should remain stable `mrf.healthcarebluebook.com/...`
 URLs in `mrf_file`; do not store signed blob redirect URLs as canonical catalog rows. BRMS direct
-CSV links are cataloged only and are intentionally excluded from import-control ingest previews.
+CSV links are cataloged only and are intentionally excluded from automated ingest previews.
 
 One-time ASR group discovery:
 
