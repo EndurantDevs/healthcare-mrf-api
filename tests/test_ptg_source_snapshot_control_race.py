@@ -117,43 +117,80 @@ class _InterleavingDB:
     def acquire(self):
         return _CleanupAcquire(self.cleanup_connection)
 
+    @staticmethod
+    def text(statement):
+        return statement
+
 
 def _install_control_fakes(monkeypatch, state):
     fake_db = _InterleavingDB(state)
-    monkeypatch.setattr(source_snapshot_control, "db", fake_db)
+    monkeypatch.setattr(source_pointers, "db", fake_db)
     monkeypatch.setattr(snapshot_cleanup, "db", fake_db)
     monkeypatch.setattr(
-        source_snapshot_control,
-        "_snapshot_row",
+        source_pointers,
+        "_locked_candidate_activation_row",
         AsyncMock(
             return_value={
                 "snapshot_id": "snap_new",
-                "status": "published",
-                "import_month": "2026-07-01",
-                "manifest": {"serving_index": {"source_key": "source_a"}},
+                "import_run_id": "run_new",
+                "status": "validated",
+                "import_month": datetime.date(2026, 7, 1),
+                "created_at": datetime.datetime(2026, 7, 1),
+                "validated_at": datetime.datetime(2026, 7, 1, 0, 1),
+                "published_at": None,
+                "previous_snapshot_id": "snap_old",
+                "snapshot_key": 17,
+                "plan_id": "P1",
+                "plan_market_type": "group",
+                "coverage_scope_id": b"c" * 32,
+                "manifest": {
+                    "activation": {
+                        "contract": "ptg2_candidate_activation_v1",
+                        "state": "validated",
+                        "source_key": "source_a",
+                        "expected_previous_snapshot_id": "snap_old",
+                    },
+                    "serving_index": {"source_key": "source_a"},
+                },
             }
         ),
     )
     monkeypatch.setattr(
-        source_snapshot_control,
-        "_current_source_snapshot_state",
-        AsyncMock(return_value=("snap_old", None)),
+        source_pointers,
+        "_database_utc_timestamp",
+        AsyncMock(return_value=datetime.datetime(2026, 7, 1, 0, 2)),
     )
-    monkeypatch.setattr(source_snapshot_control, "_source_plan_rows", AsyncMock(return_value=[_plan_pointer_row()]))
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def verify(*_args, **_kwargs):
+        state.events.append("audit_verified")
+        return b"r" * 32
+
+    async def compare_and_swap(*_args, **params):
+        await state.cleanup_waiting.wait()
+        state.current_snapshot_id = params["snapshot_id"]
+        state.events.append("promotion_repointed")
+
+    async def consume(*_args, **_kwargs):
+        state.events.append("audit_consumed")
+
+    monkeypatch.setattr(
+        source_pointers,
+        "verify_candidate_audit_attestation_in_transaction",
+        verify,
+    )
+    monkeypatch.setattr(source_pointers, "_compare_and_swap_source_pointer", compare_and_swap)
+    monkeypatch.setattr(source_pointers, "_publish_snapshot_in_pointer_transaction", noop)
+    monkeypatch.setattr(source_pointers, "_reconcile_global_snapshot_pointer", noop)
+    monkeypatch.setattr(source_pointers, "_replace_source_plan_pointers", noop)
+    monkeypatch.setattr(
+        source_pointers,
+        "consume_candidate_audit_attestation_in_transaction",
+        consume,
+    )
     monkeypatch.setattr(source_snapshot_control, "_clear_ptg2_snapshot_cache", lambda: None)
-
-
-def _plan_pointer_row():
-    return {
-        "plan_source_key": "ps_1",
-        "plan_id": "P1",
-        "plan_market_type": "group",
-        "import_month": datetime.date(2026, 7, 1),
-        "source_key": "source_a",
-        "snapshot_id": "snap_new",
-        "previous_snapshot_id": "snap_old",
-        "updated_at": datetime.datetime(2026, 7, 1),
-    }
 
 
 async def _run_interleaving(state):
@@ -185,10 +222,11 @@ def test_cleanup_waits_for_manual_promotion_and_preserves_promoted_snapshot(monk
 
     assert state.events == [
         "promotion_locked",
+        "audit_verified",
         "cleanup_waiting",
         "promotion_repointed",
+        "audit_consumed",
         "promotion_committed",
         "cleanup_locked",
         "cleanup_read_current",
-        'DROP TABLE IF EXISTS "mrf"."ptg2_serving_old";',
     ]

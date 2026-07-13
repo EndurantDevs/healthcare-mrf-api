@@ -120,7 +120,6 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "crawl_target_limit" and param["type"] == "integer" for param in items["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "source_entity_types" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "source_payer_query" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "sync_import_control_catalog" and param["is_flag"] for param in items["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "probe_files" and param["is_flag"] for param in items["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "file_probe_limit" and param["type"] == "integer" for param in items["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "file_probe_types" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
@@ -1187,7 +1186,7 @@ async def test_import_run_ensure_is_memoized_and_uses_advisory_lock(monkeypatch)
         async def connect(self):
             calls.append(("connect",))
 
-    monkeypatch.setattr(control_imports, "_IMPORT_RUN_ENSURED", False)
+    monkeypatch.setattr(control_imports._IMPORT_RUN_ENSURE_STATE, "ensured", False)
     monkeypatch.setattr(control_imports, "db", FakeDb())
 
     await control_imports.ensure_import_run_table()
@@ -2484,6 +2483,47 @@ async def test_control_ptg_parse_toc_preview_endpoint(monkeypatch):
 
     assert payload["status"] == "parsed"
     assert to_thread_calls == [control.parse_ptg_toc_preview]
+
+
+@pytest.mark.asyncio
+async def test_control_ptg_source_snapshot_attest_endpoint(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    calls = []
+
+    async def fake_attest(**kwargs):
+        calls.append(kwargs)
+        return {
+            "status": "attested",
+            "snapshot_id": kwargs["snapshot_id"],
+            "report_digest": "a" * 64,
+        }
+
+    monkeypatch.setattr(control, "record_candidate_audit_attestation", fake_attest)
+    report = {"schema_version": 2, "status": "pass"}
+    response = await control.control_ptg_source_snapshot_attest(
+        authed_request(
+            json={
+                "snapshot_id": "snap_new",
+                "source_key": "source_a",
+                "plan_id": "12-3456789",
+                "plan_market_type": "group",
+                "report": report,
+            }
+        )
+    )
+    payload = json.loads(response.body)
+
+    assert response.status == 200
+    assert payload["status"] == "attested"
+    assert calls == [
+        {
+            "snapshot_id": "snap_new",
+            "source_key": "source_a",
+            "plan_id": "12-3456789",
+            "plan_market_type": "group",
+            "report": report,
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,8 @@ from db.connection import db
 
 
 def init_api(api):
+    """Register public API blueprints on the Sanic application."""
+
     db.init_app(api)
     api.blueprint(control_blueprint)
     api.blueprint(metrics_blueprint)

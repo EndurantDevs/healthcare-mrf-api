@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts" / "devops"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_script(module_name: str):
@@ -17,58 +18,107 @@ def _load_script(module_name: str):
     return module
 
 
-def test_ptg_compare_sql_helper_returns_text_clause():
-    module = _load_script("ptg2_compare_snapshots")
-
-    clause = module._sql_text("SELECT 1")
-
-    assert str(clause) == "SELECT 1"
-
-
-def test_ptg_compare_parser_accepts_latency_benchmark_options():
-    module = _load_script("ptg2_compare_snapshots")
-
-    args = module._build_parser().parse_args(
-        [
-            "--old-snapshot-id",
-            "ptg2:old",
-            "--new-snapshot-id",
-            "ptg2:new",
-            "--benchmark-cases",
-            "5",
-            "--benchmark-iterations",
-            "3",
-            "--benchmark-limit",
-            "7",
-        ]
-    )
-
-    assert args.benchmark_cases == 5
-    assert args.benchmark_iterations == 3
-    assert args.benchmark_limit == 7
-
-
-def test_ptg_compare_summarize_ms_reports_percentile():
-    module = _load_script("ptg2_compare_snapshot_checks")
-
-    summary = module._summarize_ms([10.0, 20.0, 30.0])
-
-    assert summary == {
-        "count": 3,
-        "min_ms": 10.0,
-        "avg_ms": 20.0,
-        "p95_ms": 30.0,
-        "max_ms": 30.0,
-    }
-
-
 def test_ptg_devops_scripts_import_without_database_connection():
     for module_name in (
-        "ptg2_compare_snapshots",
         "ptg2_rebuild_snapshot_from_options",
         "ptg2_remove_source_snapshot",
+        "ptg2_strict_v3_cutover_ready",
     ):
         assert _load_script(module_name).__name__ == module_name
+
+
+def test_dev_deploy_workflow_requires_successful_ci_for_exact_main_sha():
+    workflow = (REPOSITORY_ROOT / ".github/workflows/deploy-dev.yml").read_text()
+
+    assert 'workflows: ["CI"]' in workflow
+    assert "github.event.workflow_run.conclusion == 'success'" in workflow
+    assert "Authorize exact tested source SHA" in workflow
+    assert "context.ref !== 'refs/heads/main'" in workflow
+    assert "workflow_id: 'ci.yml'" in workflow
+    assert "head_sha: deploySha" in workflow
+    assert "run.head_sha === deploySha" in workflow
+    assert "run.event === 'push'" in workflow
+    assert "run.head_repository?.full_name === expectedRepository" in workflow
+    assert "deploySha !== mainSha" in workflow
+    assert "Reader promotion requires the exact staged deploy_sha" in workflow
+    assert "!['auto', 'reader'].includes(phase)" in workflow
+    assert "--detach" not in workflow
+    assert "timeout-minutes: 90" in workflow
+    assert "run.conclusion === 'success'" in workflow
+
+
+def test_ptg_strict_v3_cutover_readiness_requires_all_pointers_and_idle_imports():
+    module = _load_script("ptg2_strict_v3_cutover_ready")
+
+    class Executor:
+        async def all(self, statement):
+            if "WITH pointers AS" in statement:
+                return [
+                    {
+                        "pointer_count": 7,
+                        "missing_snapshot_count": 0,
+                        "unpublished_snapshot_count": 0,
+                        "invalid_arch_count": 0,
+                        "invalid_manifest_generation_count": 0,
+                        "unsealed_source_set_count": 0,
+                        "unsealed_audit_sample_count": 0,
+                        "missing_binding_count": 0,
+                        "unsealed_layout_count": 0,
+                        "invalid_layout_generation_count": 0,
+                        "mismatched_binding_count": 0,
+                    }
+                ]
+            return [
+                {
+                    "active_import_run_count": 0,
+                    "building_snapshot_count": 0,
+                }
+            ]
+
+    result = asyncio.run(
+        module.collect_cutover_readiness(Executor(), schema_name="mrf")
+    )
+
+    assert result["ready"] is True
+    assert result["pointer_count"] == 7
+    assert not any(result["failure_counts"].values())
+
+
+def test_ptg_strict_v3_cutover_readiness_fails_for_legacy_pointer_or_active_run():
+    module = _load_script("ptg2_strict_v3_cutover_ready")
+
+    class Executor:
+        async def all(self, statement):
+            if "WITH pointers AS" in statement:
+                return [
+                    {
+                        "pointer_count": 3,
+                        "missing_snapshot_count": 0,
+                        "unpublished_snapshot_count": 0,
+                        "invalid_arch_count": 1,
+                        "invalid_manifest_generation_count": 1,
+                        "unsealed_source_set_count": 1,
+                        "unsealed_audit_sample_count": 1,
+                        "missing_binding_count": 1,
+                        "unsealed_layout_count": 1,
+                        "invalid_layout_generation_count": 1,
+                        "mismatched_binding_count": 1,
+                    }
+                ]
+            return [
+                {
+                    "active_import_run_count": 1,
+                    "building_snapshot_count": 1,
+                }
+            ]
+
+    result = asyncio.run(
+        module.collect_cutover_readiness(Executor(), schema_name="mrf")
+    )
+
+    assert result["ready"] is False
+    assert result["active_import_run_count"] == 1
+    assert result["failure_counts"]["invalid_arch_count"] == 1
 
 
 def test_ptg_rebuild_expands_uhc_toc_url_candidates():

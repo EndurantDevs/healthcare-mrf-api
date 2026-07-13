@@ -5,7 +5,158 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import ptg2_serving
+from api import ptg2_db_sidecars
 from api.ptg2_db_sidecars import PTG2ServingBinaryRow
+
+
+def _uvarint(value):
+    encoded = bytearray()
+    remaining = int(value)
+    while remaining >= 0x80:
+        encoded.append((remaining & 0x7F) | 0x80)
+        remaining >>= 7
+    encoded.append(remaining)
+    return bytes(encoded)
+
+
+def _source_vector(source_keys, source_count):
+    source_bits = 0 if source_count == 1 else (source_count - 1).bit_length()
+    encoded = bytearray((len(source_keys) * source_bits + 7) // 8)
+    bit_offset = 0
+    for source_key in source_keys:
+        for source_bit in range(source_bits):
+            if source_key & (1 << source_bit):
+                encoded[bit_offset // 8] |= 1 << (bit_offset % 8)
+            bit_offset += 1
+    return source_bits, bytes(encoded)
+
+
+def _provider_shard_payload(source_count, price_keys, source_keys, *, source_bits=None):
+    expected_bits, encoded_sources = _source_vector(source_keys, source_count)
+    return b"".join(
+        [
+            b"\x02",
+            _uvarint(source_count),
+            bytes([expected_bits if source_bits is None else source_bits]),
+            _uvarint(3),
+            _uvarint(len(price_keys)),
+            *(_uvarint(price_key) for price_key in price_keys),
+            encoded_sources,
+        ]
+    )
+
+
+def _decode_provider_shard(payload, *, source_count, entry_count=1):
+    return ptg2_db_sidecars._decode_serving_binary_code_records(
+        [
+            {
+                "block_no": 0,
+                "entry_count": entry_count,
+                "_decoded_payload": payload,
+            }
+        ],
+        provider_set_keys=None,
+        expected_source_count=source_count,
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_count", "source_keys"),
+    [(1, [0]), (2, [0, 1]), (256, [0, 255]), (257, [0, 256])],
+)
+def test_v3_provider_shard_decodes_exact_source_bit_width_boundaries(
+    source_count,
+    source_keys,
+):
+    price_keys = list(range(10, 10 + len(source_keys)))
+    decoded = _decode_provider_shard(
+        _provider_shard_payload(source_count, price_keys, source_keys),
+        source_count=source_count,
+    )
+
+    assert decoded == [
+        (3, price_key, source_key)
+        for price_key, source_key in zip(price_keys, source_keys)
+    ]
+
+
+def test_v3_provider_shard_preserves_cross_source_duplicates_and_multiplicity():
+    assert _decode_provider_shard(
+        _provider_shard_payload(2, [10, 10, 10], [0, 0, 1]),
+        source_count=2,
+    ) == [(3, 10, 0), (3, 10, 0), (3, 10, 1)]
+
+
+@pytest.mark.asyncio
+async def test_forward_batch_decoder_receives_and_enforces_source_count(monkeypatch):
+    block_key = 7 << 31
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_discover_forward_shard_keys",
+        AsyncMock(return_value={7: (block_key,)}),
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        AsyncMock(
+            return_value=[
+                {
+                    "block_key": block_key,
+                    "block_no": 0,
+                    "entry_count": 1,
+                    "_decoded_payload": _provider_shard_payload(2, [0], [1]),
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_provider_counts_for_decoded_keys",
+        AsyncMock(return_value={3: 4}),
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_serving_binary_dictionary_values_for_keys",
+        AsyncMock(return_value={0: "0" * 31 + "a"}),
+    )
+
+    decoded = await ptg2_db_sidecars.lookup_binary_code_batch_from_db(
+        object(),
+        [7],
+        shared_snapshot_key=41,
+        source_count=2,
+        price_dictionary_item_count=1,
+        price_dictionary_block_bytes=64,
+    )
+
+    assert decoded[7][0].source_key == 1
+    with pytest.raises(
+        ptg2_db_sidecars.PTG2ManifestArtifactError,
+        match="corrupt",
+    ):
+        await ptg2_db_sidecars.lookup_binary_code_batch_from_db(
+            object(),
+            [7],
+            shared_snapshot_key=41,
+            source_count=3,
+            price_dictionary_item_count=1,
+            price_dictionary_block_bytes=64,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _provider_shard_payload(2, [10], [0], source_bits=8),
+        _provider_shard_payload(2, [10], [0]) + b"\x00",
+        _provider_shard_payload(2, [11, 10], [0, 1]),
+        _provider_shard_payload(3, [10], [3]),
+        _provider_shard_payload(2, [10], [0])[:-1] + b"\x80",
+    ],
+)
+def test_v3_provider_shard_rejects_corrupt_source_vectors_and_trailing_bytes(payload):
+    with pytest.raises(ptg2_db_sidecars.PTG2ManifestArtifactError, match="corrupt|ordered|trailing"):
+        _decode_provider_shard(payload, source_count=2 if payload[1] == 2 else 3)
 
 
 class FakeResult:
@@ -30,13 +181,17 @@ def _version_three_tables(**table_overrides_by_key):
     table_kwargs_by_key = {
         "arch_version": "postgres_binary_v3",
         "storage": "manifest_snapshot",
-        "serving_binary_table": "mrf.ptg2_serving_binary_v3",
+        "shared_snapshot_key": 41,
+        "storage_generation": "shared_blocks_v3",
+        "cold_lookup_contract": "ptg_v3_cold_v2",
         "serving_table_layout": "lean_provider_key_v1",
-        "code_count_table": "mrf.ptg2_code_count_v3",
-        "provider_set_dictionary_table": "mrf.ptg2_provider_set_dictionary_v3",
+        "shared_block_layout": "dense_shared_blocks_v3",
+        "source_count": 2,
         "atom_key_bits": 24,
         "price_key_block_span": 512,
         "atom_key_block_span": 512,
+        "price_dictionary_item_count": 8192,
+        "price_dictionary_block_bytes": 65536,
     }
     table_kwargs_by_key.update(table_overrides_by_key)
     return ptg2_serving.PTG2ServingTables(**table_kwargs_by_key)
@@ -44,19 +199,18 @@ def _version_three_tables(**table_overrides_by_key):
 
 @pytest.mark.asyncio
 async def test_v3_forward_uses_existing_forward_rows_and_keeps_price_key(monkeypatch):
-    async def forward_rows(
-        _session, table_name, code_key, *, provider_set_keys=None, **dictionary_hints
-    ):
-        assert table_name == "mrf.ptg2_serving_binary_v3"
+    async def forward_rows(_session, code_key, *, provider_set_keys=None, **dictionary_hints):
         assert code_key == 7
         assert provider_set_keys is None
-        assert dictionary_hints["price_dictionary_item_count"] is None
+        assert dictionary_hints["price_dictionary_item_count"] == 8192
+        assert dictionary_hints["shared_snapshot_key"] == 41
         return (
             PTG2ServingBinaryRow(
                 code_key=7,
                 provider_set_key=3,
                 provider_count=4,
                 price_set_global_id_128="00000000000000000000000000000011",
+                source_key=1,
                 price_key=19,
             ),
         )
@@ -67,13 +221,8 @@ async def test_v3_forward_uses_existing_forward_rows_and_keeps_price_key(monkeyp
 
     monkeypatch.setattr(ptg2_serving, "lookup_serving_binary_by_code_from_db", forward_rows)
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_set_ids_for_keys", provider_sets)
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_resolve_ptg2_manifest_sidecar_path",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("v3 must not resolve local sidecars")),
-    )
 
-    serving_rows = await ptg2_serving._ptg2_manifest_rows_from_serving_by_code_sidecar(
+    serving_rows = await ptg2_serving._shared_rows_for_code(
         object(),
         _version_three_tables(),
         code_data={"code_key": 7, "plan_id": "plan", "reported_code_system": "CPT", "reported_code": "99213"},
@@ -83,23 +232,24 @@ async def test_v3_forward_uses_existing_forward_rows_and_keeps_price_key(monkeyp
     )
 
     assert serving_rows and serving_rows[0]["price_key"] == 19
+    assert serving_rows[0]["source_key"] == 1
 
 
 @pytest.mark.asyncio
 async def test_v3_forward_raises_when_referenced_code_block_is_missing(monkeypatch):
     async def missing_forward_rows(
-        _session, _table_name, _code_key, *, provider_set_keys=None, **_dictionary_hints
+        _session, _code_key, *, provider_set_keys=None, **_dictionary_hints
     ):
         return ()
 
-    async def has_referenced_code_block(_session, _table_name, _code_key):
+    async def has_referenced_code_block(_session, _code_key, **_kwargs):
         return False
 
     monkeypatch.setattr(ptg2_serving, "lookup_serving_binary_by_code_from_db", missing_forward_rows)
     monkeypatch.setattr(ptg2_serving, "serving_binary_code_block_exists", has_referenced_code_block)
 
     with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="referenced code block"):
-        await ptg2_serving._ptg2_manifest_rows_from_serving_by_code_sidecar(
+        await ptg2_serving._shared_rows_for_code(
             object(),
             _version_three_tables(),
             code_data={"code_key": 7},
@@ -112,7 +262,7 @@ async def test_v3_forward_raises_when_referenced_code_block_is_missing(monkeypat
 @pytest.mark.asyncio
 async def test_v3_forward_raises_when_provider_dictionary_key_is_missing(monkeypatch):
     async def forward_rows(
-        _session, _table_name, _code_key, *, provider_set_keys=None, **_dictionary_hints
+        _session, _code_key, *, provider_set_keys=None, **_dictionary_hints
     ):
         return (
             PTG2ServingBinaryRow(
@@ -120,6 +270,7 @@ async def test_v3_forward_raises_when_provider_dictionary_key_is_missing(monkeyp
                 provider_set_key=3,
                 provider_count=1,
                 price_set_global_id_128="00000000000000000000000000000011",
+                source_key=0,
                 price_key=19,
             ),
         )
@@ -131,7 +282,7 @@ async def test_v3_forward_raises_when_provider_dictionary_key_is_missing(monkeyp
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_set_ids_for_keys", missing_provider_set)
 
     with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="provider-set dictionary"):
-        await ptg2_serving._ptg2_manifest_rows_from_serving_by_code_sidecar(
+        await ptg2_serving._shared_rows_for_code(
             object(),
             _version_three_tables(),
             code_data={"code_key": 7},
@@ -152,8 +303,9 @@ async def _stub_reverse_provider_keys(_session, _tables, provider_set_ids):
     return {_REVERSE_PROVIDER_SET_IDS[0]: 3, _REVERSE_PROVIDER_SET_IDS[1]: 4}
 
 
-async def _stub_reverse_provider_codes(_session, table_name, provider_set_keys):
-    assert table_name == "mrf.ptg2_serving_binary_v3"
+async def _stub_reverse_provider_codes(_session, snapshot_key, provider_set_keys, *, schema_name=None):
+    assert snapshot_key == 41
+    assert schema_name == "mrf"
     assert tuple(provider_set_keys) == (3, 4)
     return {3: (7, 8), 4: (7,)}
 
@@ -167,29 +319,31 @@ async def _stub_reverse_code_metadata(_session, _tables, **kwargs):
 
 
 async def _stub_reverse_forward_entries(
-    _session, table_name, code_keys, *, provider_set_keys=None, **_dictionary_hints
+    _session, code_keys, *, provider_set_keys=None, **_dictionary_hints
 ):
-    assert table_name == "mrf.ptg2_serving_binary_v3"
+    assert _dictionary_hints["shared_snapshot_key"] == 41
     assert tuple(code_keys) == (7, 8)
     assert tuple(provider_set_keys) == (3, 4)
     return {
         7: (
-            PTG2ServingBinaryRow(code_key=7, provider_set_key=3, provider_count=2, price_set_global_id_128="00000000000000000000000000000011", price_key=10),
-            PTG2ServingBinaryRow(code_key=7, provider_set_key=4, provider_count=7, price_set_global_id_128="00000000000000000000000000000012", price_key=11),
-            PTG2ServingBinaryRow(code_key=7, provider_set_key=4, provider_count=7, price_set_global_id_128="00000000000000000000000000000012", price_key=11),
+            PTG2ServingBinaryRow(7, 3, 2, "00000000000000000000000000000011", 0, 10),
+            PTG2ServingBinaryRow(7, 4, 7, "00000000000000000000000000000012", 0, 11),
+            PTG2ServingBinaryRow(7, 4, 7, "00000000000000000000000000000012", 1, 11),
         ),
-        8: (PTG2ServingBinaryRow(code_key=8, provider_set_key=3, provider_count=5, price_set_global_id_128="00000000000000000000000000000013", price_key=12),),
+        8: (
+            PTG2ServingBinaryRow(8, 3, 5, "00000000000000000000000000000013", 0, 12),
+        ),
     }
 
 
 def _configure_version_three_reverse(monkeypatch):
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_set_keys_for_ids", _stub_reverse_provider_keys)
-    monkeypatch.setattr(ptg2_serving, "lookup_provider_code_keys_from_db", _stub_reverse_provider_codes)
+    monkeypatch.setattr(ptg2_serving, "lookup_shared_provider_code_keys_from_db", _stub_reverse_provider_codes)
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_code_rows_for_provider_reverse", _stub_reverse_code_metadata)
     monkeypatch.setattr(ptg2_serving, "lookup_binary_code_batch_from_db", _stub_reverse_forward_entries)
     monkeypatch.setattr(
         ptg2_serving,
-        "has_provider_pages_in_db",
+        "has_shared_provider_pages_in_db",
         AsyncMock(return_value=False),
     )
     monkeypatch.setattr(
@@ -199,7 +353,7 @@ def _configure_version_three_reverse(monkeypatch):
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "lookup_provider_pages_from_db",
+        "lookup_shared_provider_pages_from_db",
         AsyncMock(return_value=None),
     )
 
@@ -236,12 +390,12 @@ async def test_v3_reverse_raises_when_provider_code_membership_is_missing(monkey
         _stub_reverse_provider_keys,
     )
 
-    async def incomplete_provider_codes(_session, _table_name, _provider_set_keys):
+    async def incomplete_provider_codes(_session, _snapshot_key, _provider_set_keys, **_kwargs):
         return {3: (7,)}
 
     monkeypatch.setattr(
         ptg2_serving,
-        "lookup_provider_code_keys_from_db",
+        "lookup_shared_provider_code_keys_from_db",
         incomplete_provider_codes,
     )
 
@@ -274,7 +428,7 @@ class VersionThreeBatchHarness:
     async def provider_keys(self, _session, _tables, _provider_set_ids):
         return {_REVERSE_PROVIDER_SET_IDS[0]: 3}
 
-    async def provider_codes(self, _session, _table_name, _provider_set_keys):
+    async def provider_codes(self, _session, _snapshot_key, _provider_set_keys, **_kwargs):
         return {3: self.candidate_code_keys}
 
     async def code_metadata(self, _session, _tables, **query_kwargs):
@@ -308,12 +462,13 @@ class VersionThreeBatchHarness:
             provider_set_key=3,
             provider_count=(code_key % 7) + 1,
             price_set_global_id_128=price_set_id,
+            source_key=code_key % 2,
             price_key=code_key,
         )
         return (forward_entry, forward_entry) if code_key % 10 == 0 else (forward_entry,)
 
     async def forward_entries(
-        self, _session, _table_name, code_keys, *, provider_set_keys=None, **_dictionary_hints
+        self, _session, code_keys, *, provider_set_keys=None, **_dictionary_hints
     ):
         assert tuple(provider_set_keys) == (3,)
         batch_code_keys = tuple(code_keys)
@@ -345,12 +500,12 @@ class VersionThreeBatchHarness:
 
     def install(self, monkeypatch):
         monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_set_keys_for_ids", self.provider_keys)
-        monkeypatch.setattr(ptg2_serving, "lookup_provider_code_keys_from_db", self.provider_codes)
+        monkeypatch.setattr(ptg2_serving, "lookup_shared_provider_code_keys_from_db", self.provider_codes)
         monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_code_rows_for_provider_reverse", self.code_metadata)
         monkeypatch.setattr(ptg2_serving, "lookup_binary_code_batch_from_db", self.forward_entries)
         monkeypatch.setattr(
             ptg2_serving,
-            "has_provider_pages_in_db",
+            "has_shared_provider_pages_in_db",
             AsyncMock(return_value=False),
         )
         monkeypatch.setattr(
@@ -360,7 +515,7 @@ class VersionThreeBatchHarness:
         )
         monkeypatch.setattr(
             ptg2_serving,
-            "lookup_provider_pages_from_db",
+            "lookup_shared_provider_pages_from_db",
             AsyncMock(return_value=None),
         )
 
@@ -465,7 +620,7 @@ async def test_v3_exact_code_skips_reverse_membership_expansion(monkeypatch):
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "lookup_provider_code_keys_from_db",
+        "lookup_shared_provider_code_keys_from_db",
         reverse_memberships,
     )
 

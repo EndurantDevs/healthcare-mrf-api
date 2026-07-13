@@ -8,19 +8,41 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+import orjson
+
 from api.code_systems import canonical_catalog_code, normalize_code_system
 
 NUMERIC_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
+ORJSON_INTEGER_MIN = -(1 << 63)
+ORJSON_INTEGER_MAX = (1 << 64) - 1
+
+
+class _ExactNumericText(str):
+    """Canonical numeric text awaiting final JSON response shaping."""
+
 
 PTG2_ITEM_SOURCE_FIELDS = {
+    "identity_kind",
+    "identity_sha256",
+    "logical_hash_deferred",
+    "logical_json_sha256",
     "snapshot_id",
+    "source_artifact_key",
     "source_key",
+    "source_trace_set_hash",
+    "source_type",
     "source_trace",
+    "raw_container_sha256",
     "network_names",
+    "billing_code_type_version",
+    "source_procedure_name",
+    "source_procedure_description",
 }
 PTG2_ITEM_DIAGNOSTIC_FIELDS = {
     "billing_code",
     "billing_code_type",
+    "catalog_procedure_name",
+    "catalog_procedure_description",
     "confidence",
     "hp_procedure_code",
     "location_confidence_code",
@@ -92,7 +114,7 @@ def _include_ptg2_sources(args: dict[str, Any]) -> bool:
 def _shape_ptg2_response(payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     """Keep app-facing PTG responses lean unless callers opt into provenance/debug fields."""
     if _include_ptg2_details(args):
-        return payload
+        return _fragment_exact_numbers(payload)
 
     include_sources = _include_ptg2_sources(args)
     hidden_item_fields = set(PTG2_ITEM_DIAGNOSTIC_FIELDS)
@@ -110,7 +132,19 @@ def _shape_ptg2_response(payload: dict[str, Any], args: dict[str, Any]) -> dict[
     shaped["query"] = {
         key: value for key, value in dict(payload.get("query") or {}).items() if key not in hidden_query_fields
     }
-    return shaped
+    return _fragment_exact_numbers(shaped)
+
+
+def _fragment_exact_numbers(value: Any) -> Any:
+    if isinstance(value, _ExactNumericText):
+        return orjson.Fragment(value.encode("ascii"))
+    if isinstance(value, dict):
+        return {key: _fragment_exact_numbers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_fragment_exact_numbers(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_fragment_exact_numbers(item) for item in value)
+    return value
 
 
 def _normalize_catalog_code_system(raw_system: Any) -> str:
@@ -166,11 +200,13 @@ def _coerce_json_payload(value: Any, default: Any) -> Any:
 def _coerce_numeric_rate(value: Any) -> Any:
     if value is None or isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
+    if isinstance(value, float):
         return value
     if isinstance(value, Decimal):
-        return int(value) if value == value.to_integral_value() else float(value)
-    if isinstance(value, str):
+        decimal_value = value
+    elif isinstance(value, int):
+        decimal_value = Decimal(value)
+    elif isinstance(value, str):
         text_value = value.strip()
         if not text_value or not NUMERIC_PATTERN.fullmatch(text_value):
             return value
@@ -178,8 +214,29 @@ def _coerce_numeric_rate(value: Any) -> Any:
             decimal_value = Decimal(text_value)
         except InvalidOperation:
             return value
-        return int(decimal_value) if decimal_value == decimal_value.to_integral_value() else float(decimal_value)
-    return value
+    else:
+        return value
+
+    if not decimal_value.is_finite():
+        return value
+    expanded = format(decimal_value, "f")
+    if decimal_value.is_zero():
+        expanded = "0"
+    elif "." in expanded:
+        expanded = expanded.rstrip("0").rstrip(".")
+
+    # Retain ordinary native numbers when orjson emits the exact same token.
+    # Precision-sensitive decimals and integers outside orjson's range remain
+    # validated text until final response shaping turns them into fragments.
+    if "." not in expanded:
+        if ORJSON_INTEGER_MIN <= decimal_value <= ORJSON_INTEGER_MAX:
+            return int(decimal_value)
+    else:
+        float_value = float(expanded)
+        if orjson.dumps(float_value).decode("ascii") == expanded:
+            return float_value
+
+    return _ExactNumericText(expanded)
 
 
 def _normalize_string_list(value: Any) -> list[str]:
@@ -217,17 +274,12 @@ def _price_row_key(row: dict[str, Any]) -> str:
 def _normalize_price_payload(prices: Any) -> list[dict[str, Any]]:
     payload = _coerce_json_payload(prices, [])
     normalized: list[dict[str, Any]] = []
-    seen: set[str] = set()
     if not isinstance(payload, list):
         return normalized
     for row in payload:
         if not isinstance(row, dict):
             continue
         normalized_row = _canonical_price_row(row)
-        key = _price_row_key(normalized_row)
-        if key in seen:
-            continue
-        seen.add(key)
         normalized.append(normalized_row)
     return normalized
 

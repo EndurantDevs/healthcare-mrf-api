@@ -315,7 +315,7 @@ async def test_required_missing_evidence_fails_but_probe_only_missing_evidence_s
 
 
 @pytest.mark.asyncio
-async def test_api_layer_routes_envelopes_and_typed_source_variants(
+async def test_consumer_api_routes_envelopes_and_typed_source_variants(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(harness, "load_manifest", lambda _path: _manifest())

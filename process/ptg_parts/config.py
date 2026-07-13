@@ -61,9 +61,10 @@ PTG2_UNLOGGED_FINAL_ENV = "HLTHPRT_PTG2_UNLOGGED_FINAL"
 PTG2_BINARY_IDS_ENV = "HLTHPRT_PTG2_BINARY_IDS"
 PTG2_MANIFEST_PRECOPY_MERGE_ENV = "HLTHPRT_PTG2_MANIFEST_PRECOPY_MERGE"
 PTG2_MANIFEST_STREAM_MERGE_COPY_ENV = "HLTHPRT_PTG2_MANIFEST_STREAM_MERGE_COPY"
-PTG2_MANIFEST_DIRECT_COPY_FILES_ENV = "HLTHPRT_PTG2_MANIFEST_DIRECT_COPY_FILES"
 PTG2_MANIFEST_DIRECT_COPY_TASKS_ENV = "HLTHPRT_PTG2_MANIFEST_DIRECT_COPY_TASKS"
 PTG2_FILE_PROCESS_CONCURRENCY_ENV = "HLTHPRT_PTG2_FILE_PROCESS_CONCURRENCY"
+PTG2_SOURCE_IMPORT_LOCK_ENABLED_ENV = "HLTHPRT_PTG2_SOURCE_IMPORT_LOCK_ENABLED"
+PTG2_AUTO_ACTIVATE_CANDIDATES_ENV = "HLTHPRT_PTG2_AUTO_ACTIVATE_CANDIDATES"
 PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV = "HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED"
 PTG2_MANIFEST_PUBLISH_DB_DEDUPE_FALLBACK_ENV = "HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK"
 PTG2_DEDUPE_SERVING_STAGE_MERGE_ENV = "HLTHPRT_PTG2_DEDUPE_SERVING_STAGE_MERGE"
@@ -110,26 +111,13 @@ PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES_ENV = "HLTHPRT_PTG2_RUST_PROVIDER_REF_RAW
 PTG2_MANIFEST_MERGE_CHUNK_BYTES_ENV = "HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES"
 PTG2_MANIFEST_MERGE_SORT_WORKERS_ENV = "HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS"
 PTG2_SNAPSHOT_ARCH_ENV = "HLTHPRT_PTG2_SNAPSHOT_ARCH"
-PTG2_SNAPSHOT_ARCH_VARIANT_ENV = "HLTHPRT_PTG2_SNAPSHOT_ARCH_VARIANT"
 
-PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1 = "materialized_v1"
-PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1 = "sidecar_scope_v1"
-PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1 = "postgres_binary_v1"
-PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2 = "postgres_binary_v2"
 PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3 = "postgres_binary_v3"
-PTG2_SNAPSHOT_ARCH_LEGACY_MIXED_V1 = "legacy_mixed_v1"
 PTG2_POSTGRES_BINARY_SNAPSHOT_ARCHES = frozenset(
-    {
-        PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
-        PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
-        PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3,
-    }
+    {PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3}
 )
 PTG2_POSTGRES_BINARY_PROVIDER_MEMBERSHIP_ARCHES = frozenset(
-    {
-        PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
-        PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3,
-    }
+    {PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3}
 )
 PTG2_PROVIDER_SCOPE_STRATEGY_MATERIALIZED_RATE_SCOPE = "materialized_rate_scope"
 PTG2_PROVIDER_SCOPE_STRATEGY_COMPONENT_TABLE = "component_table"
@@ -138,10 +126,11 @@ PTG2_PROVIDER_SCOPE_STRATEGY_SIDECAR = "sidecar_provider_scope"
 PTG2_DEFAULT_COMPACT_COPY_TASKS = 4
 PTG2_DEFAULT_COMPACT_COPY_KIND_TASKS = 1
 PTG2_DEFAULT_COMPACT_SERVING_COPY_TASKS = 1
-PTG2_DEFAULT_RUST_WORKERS = 8
-PTG2_DEFAULT_RUST_WORK_QUEUE = 16
-PTG2_DEFAULT_RUST_EVENT_QUEUE = 32
+PTG2_DEFAULT_RUST_WORKERS = 16
+PTG2_DEFAULT_RUST_WORK_QUEUE = 32
+PTG2_DEFAULT_RUST_EVENT_QUEUE = 128
 PTG2_DEFAULT_RUST_SPLIT_NEGOTIATED_RATES = 8192
+PTG2_DEFAULT_MANIFEST_DIRECT_COPY_TASKS = 16
 PTG2_DEFAULT_DOWNLOAD_TASKS = 4
 PTG2_DEFAULT_RANGE_DOWNLOAD_TASKS = 4
 PTG2_DEFAULT_RANGE_DOWNLOAD_CHUNK_BYTES = 128 * 1024 * 1024
@@ -179,44 +168,29 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _ptg2_snapshot_arch_from_env() -> str | None:
+def _ptg2_auto_activate_candidates() -> bool:
+    """Return whether a validated strict-V3 candidate should become live."""
+
+    if _env_bool(PTG2_AUTO_ACTIVATE_CANDIDATES_ENV, False):
+        raise ValueError(
+            f"{PTG2_AUTO_ACTIVATE_CANDIDATES_ENV}=true is unsupported; "
+            "strict V3 candidates require an audited control-plane activation"
+        )
+    return False
+
+
+def _ptg2_snapshot_arch_from_env() -> str:
     raw = os.getenv(PTG2_SNAPSHOT_ARCH_ENV)
     if raw is None or not str(raw).strip():
-        return PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2
-    normalized = str(raw).strip().lower().replace("-", "_")
-    arch_alias_map = {
-        "materialized": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
-        "materialized_v1": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
-        "legacy": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
-        "legacy_materialized": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
-        "legacy_materialized_v1": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
-        "sidecar": PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
-        "sidecar_only": PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
-        "sidecar_scope": PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
-        "sidecar_scope_v1": PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
-        "postgres_binary": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
-        "postgres_binary_v1": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
-        "postgres_binary_v2": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
-        "postgres_binary_v3": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3,
-        "db_binary": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
-        "db_binary_v1": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
-        "db_binary_v2": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
-        "db_binary_v3": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3,
-        "binary": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
-        "binary_v1": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
-        "binary_v2": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
-        "binary_v3": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3,
-    }
-    if normalized not in arch_alias_map:
+        return PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3
+    normalized = str(raw).strip().lower()
+    if normalized != PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3:
         raise ValueError(
             f"Unsupported {PTG2_SNAPSHOT_ARCH_ENV}={raw!r}; "
-            f"expected {PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1!r}, "
-            f"{PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1!r}, "
-            f"{PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1!r}, "
-            f"{PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2!r}, "
-            f"or {PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3!r}"
+            f"only {PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3!r} is supported; "
+            "reimport legacy snapshots"
         )
-    return arch_alias_map[normalized]
+    return PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3
 
 
 def _is_postgres_binary_snapshot_arch(arch_version: str | None) -> bool:
@@ -232,16 +206,6 @@ _is_postgres_binary_v3_snapshot_arch = _is_postgres_binary_v3_arch
 
 def _uses_postgres_binary_provider_membership_graph(arch_version: str | None) -> bool:
     return arch_version in PTG2_POSTGRES_BINARY_PROVIDER_MEMBERSHIP_ARCHES
-
-
-def _ptg2_snapshot_arch_variant(arch_version: str | None = None) -> str | None:
-    raw = os.getenv(PTG2_SNAPSHOT_ARCH_VARIANT_ENV)
-    if raw is None and os.getenv(PTG2_SNAPSHOT_ARCH_ENV) is not None:
-        raw = arch_version or _ptg2_snapshot_arch_from_env()
-    if raw is None or not str(raw).strip():
-        return None
-    normalized = "".join(ch if ch.isalnum() else "_" for ch in str(raw).strip().lower()).strip("_")
-    return normalized or None
 
 
 def _ptg2_stage_copy_dedupe_enabled(kind: str) -> bool:

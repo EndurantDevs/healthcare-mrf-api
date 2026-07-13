@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Asynchronous best-effort status events for import-control."""
+"""Asynchronous best-effort events for an optional operator-provided sink."""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 def isoformat_utc(value: Any) -> Any:
     """Serialize a naive-UTC datetime (or ISO string) as timezone-aware UTC ISO-8601.
 
-    DB columns store naive UTC; consumers (the import-control brain and the UI)
-    need an explicit offset, so attach UTC at the serialization boundary.
+    DB columns store naive UTC. Attach UTC at the serialization boundary so
+    generic event consumers do not have to infer the storage convention.
     """
     if isinstance(value, str):
         raw = value.strip()
@@ -45,7 +45,7 @@ _last_sent_by_run: dict[str, tuple[float, str, str]] = {}
 
 def enqueue_status_event(payload: dict[str, Any]) -> None:
     """Queue a status event without blocking the importer."""
-    if not _import_control_url():
+    if not _status_event_url():
         return
     run_id = str(payload.get("run_id") or "").strip()
     if not run_id:
@@ -126,12 +126,12 @@ async def _publisher_worker(queue: asyncio.Queue[dict[str, Any]]) -> None:
 
 
 def _post_event(event: dict[str, Any]) -> None:
-    base_url = _import_control_url()
-    if not base_url:
+    event_url = _status_event_url()
+    if not event_url:
         return
     body = json.dumps(event, default=str).encode("utf-8")
     request = urllib.request.Request(
-        f"{base_url.rstrip('/')}/v1/runs/events",
+        event_url,
         data=body,
         method="POST",
         headers={"content-type": "application/json", **_auth_headers()},
@@ -141,12 +141,12 @@ def _post_event(event: dict[str, Any]) -> None:
 
 
 def _auth_headers() -> dict[str, str]:
-    token = str(os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN") or os.getenv("HLTHPRT_CONTROL_API_TOKEN") or "").strip()
+    token = str(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_TOKEN") or "").strip()
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-def _import_control_url() -> str:
-    return str(os.getenv("HLTHPRT_IMPORT_CONTROL_URL") or os.getenv("HP_IMPORT_CONTROL_BASE_URL") or "").strip()
+def _status_event_url() -> str:
+    return str(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_URL") or "").strip()
 
 
 def _timeout_seconds() -> float:

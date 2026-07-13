@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Verify current Provider Directory evidence through the client-facing api-layer contract."""
+"""Verify current Provider Directory evidence through a consumer API contract."""
 
 from __future__ import annotations
 

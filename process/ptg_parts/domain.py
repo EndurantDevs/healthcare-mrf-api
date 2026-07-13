@@ -20,6 +20,7 @@ PTG2_STATUS_VALIDATED = "validated"
 PTG2_STATUS_PUBLISHED = "published"
 PTG2_STATUS_FAILED = "failed"
 PTG2_STATUS_DEAD_LETTER = "dead_letter"
+PTG2_CANDIDATE_ACTIVATION_CONTRACT = "ptg2_candidate_activation_v1"
 
 PTG2_ARTIFACT_RAW = "raw"
 PTG2_ARTIFACT_LOGICAL_JSON = "logical_json"
@@ -140,6 +141,7 @@ class PTG2SourceVersion:
     raw_storage_uri: str | None = None
     raw_sha256: str | None = None
     logical_sha256: str | None = None
+    logical_hash_deferred: bool = False
     content_length: int | None = None
     etag: str | None = None
     last_modified: str | None = None
@@ -256,6 +258,7 @@ class PTG2LogicalArtifact:
     byte_count: int
     compression: str | None = None
     member_name: str | None = None
+    logical_hash_deferred: bool = False
 
 
 @dataclass(frozen=True)

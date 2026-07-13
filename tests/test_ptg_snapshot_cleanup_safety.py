@@ -70,7 +70,7 @@ def _dropped_table_statements(connection):
     return [statement for statement, _params in connection.status_calls if "DROP TABLE" in statement]
 
 
-def test_rollback_cleanup_retains_displaced_snapshot(monkeypatch):
+def test_rollback_cleanup_ignores_legacy_layouts(monkeypatch):
     snapshot_rows = [
         _snapshot_row("snap_a", "published", "ptg2_serving_a"),
         _snapshot_row("snap_b", "published", "ptg2_serving_b", "snap_a"),
@@ -89,12 +89,10 @@ def test_rollback_cleanup_retains_displaced_snapshot(monkeypatch):
     )
 
     assert connection.pointer_sql.count("previous_snapshot_id AS snapshot_id") == 3
-    assert _dropped_table_statements(connection) == [
-        'DROP TABLE IF EXISTS "mrf"."ptg2_serving_old";'
-    ]
+    assert _dropped_table_statements(connection) == []
 
 
-def test_locked_cleanup_skips_rebuilding_snapshot(monkeypatch):
+def test_locked_cleanup_never_drops_legacy_tables(monkeypatch):
     snapshot_rows = [
         _snapshot_row("snap_current", "published", "ptg2_serving_current"),
         _snapshot_row("snap_retry", "building", "ptg2_serving_retry"),
@@ -113,56 +111,4 @@ def test_locked_cleanup_skips_rebuilding_snapshot(monkeypatch):
     )
 
     assert "status" in connection.manifest_sql
-    assert _dropped_table_statements(connection) == [
-        'DROP TABLE IF EXISTS "mrf"."ptg2_serving_old";'
-    ]
-
-
-def test_old_v3_graph_contract_cannot_be_repromoted(monkeypatch):
-    monkeypatch.setattr(snapshot_cleanup, "_required_snapshot_table_names", lambda _index: set())
-    monkeypatch.setattr(snapshot_cleanup, "_snapshot_artifact_references", lambda _index: (set(), set()))
-
-    missing_tables, missing_artifacts = asyncio.run(
-        snapshot_cleanup._missing_snapshot_serving_resources(
-            "mrf",
-            "snapshot-old-v3",
-            {
-                "arch_version": "postgres_binary_v3",
-                "provider_membership_graph": {
-                    "artifact_version": "provider_membership_graph_v2",
-                },
-            },
-        )
-    )
-
-    assert missing_tables == []
-    assert missing_artifacts == ["provider_membership_graph_v3"]
-
-
-def test_current_v3_version_label_without_graph_entries_cannot_be_promoted(monkeypatch):
-    monkeypatch.setattr(snapshot_cleanup, "_required_snapshot_table_names", lambda _index: set())
-    monkeypatch.setattr(snapshot_cleanup, "_snapshot_artifact_references", lambda _index: (set(), set()))
-
-    missing_tables, missing_artifacts = asyncio.run(
-        snapshot_cleanup._missing_snapshot_serving_resources(
-            "mrf",
-            "snapshot-graphless-v3",
-            {
-                "arch_version": "postgres_binary_v3",
-                "provider_membership_graph": {
-                    "artifact_version": "provider_membership_graph_v3",
-                    "artifact_names": [
-                        "provider_forward",
-                        "provider_group_npi",
-                        "provider_inverted",
-                        "provider_npi_group",
-                    ],
-                    "storage": "postgresql_chunks_v1",
-                },
-                "artifacts": {},
-            },
-        )
-    )
-
-    assert missing_tables == []
-    assert missing_artifacts == ["provider_membership_graph_v3"]
+    assert _dropped_table_statements(connection) == []

@@ -13,7 +13,8 @@ SNAPSHOT_ROWS = [
         "manifest": {
             "serving_index": {
                 "source_key": "source_a",
-                "table": "mrf.ptg2_serving_b",
+                "arch_version": "postgres_binary_v3",
+                "storage_generation": "shared_blocks_v3",
             }
         },
     },
@@ -23,7 +24,8 @@ SNAPSHOT_ROWS = [
         "manifest": {
             "serving_index": {
                 "source_key": "source_a",
-                "table": "mrf.ptg2_serving_a",
+                "arch_version": "postgres_binary_v3",
+                "storage_generation": "shared_blocks_v3",
             }
         },
     },
@@ -33,7 +35,8 @@ SNAPSHOT_ROWS = [
         "manifest": {
             "serving_index": {
                 "source_key": "source_a",
-                "table": "mrf.ptg2_serving_previous_1",
+                "arch_version": "postgres_binary_v3",
+                "storage_generation": "shared_blocks_v3",
             }
         },
     },
@@ -43,7 +46,8 @@ SNAPSHOT_ROWS = [
         "manifest": {
             "serving_index": {
                 "source_key": "source_a",
-                "table": "mrf.ptg2_serving_previous_2",
+                "arch_version": "postgres_binary_v3",
+                "storage_generation": "shared_blocks_v3",
             }
         },
     },
@@ -53,7 +57,8 @@ SNAPSHOT_ROWS = [
         "manifest": {
             "serving_index": {
                 "source_key": "source_a",
-                "table": "mrf.ptg2_serving_old",
+                "arch_version": "postgres_binary_v3",
+                "storage_generation": "shared_blocks_v3",
             }
         },
     },
@@ -137,6 +142,18 @@ async def _run_interleaving(monkeypatch) -> list[str]:
     state = _InterleavingState()
     connection = _InterleavingConnection(state)
     monkeypatch.setattr(snapshot_cleanup, "db", _FakeDB(connection))
+
+    async def release_unbound(*, schema_name, executor, require_shared):
+        assert schema_name == "mrf"
+        assert executor is connection
+        assert require_shared is True
+        state.events.append("a_cleanup_released_unbound_layouts")
+
+    monkeypatch.setattr(
+        snapshot_cleanup,
+        "release_unbound_ptg2_shared_layouts",
+        release_unbound,
+    )
     publish_task = asyncio.create_task(_publish_b(state))
     await state.b_has_publish_lock.wait()
     cleanup_task = asyncio.create_task(
@@ -164,5 +181,5 @@ def test_stale_post_publish_cleanup_replans_after_newer_promotion(monkeypatch):
         "a_cleanup_acquired_publish_lock",
         "a_cleanup_replanned_current_pointer",
         "a_cleanup_loaded_lineage",
-        'DROP TABLE IF EXISTS "mrf"."ptg2_serving_old";',
+        "a_cleanup_released_unbound_layouts",
     ]

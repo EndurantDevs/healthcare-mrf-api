@@ -4,17 +4,73 @@
 from __future__ import annotations
 
 import datetime
+import fcntl
 import hashlib
 import json
 import os
 import re
 import tempfile
+import threading
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from process.ptg_parts.canonical import semantic_hash
 from process.ptg_parts.domain import PTG2_ARTIFACT_RAW, PTG2HeadMetadata
+
+
+_PROCESS_LOCKS_GUARD = threading.Lock()
+_PROCESS_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _process_lock(path: Path) -> threading.Lock:
+    key = str(path.resolve())
+    with _PROCESS_LOCKS_GUARD:
+        return _PROCESS_LOCKS.setdefault(key, threading.Lock())
+
+
+class _PTG2FileLock:
+    """Serialize store mutations across threads, processes, and worker pods."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._thread_lock = _process_lock(path)
+        self._fd: int | None = None
+
+    def acquire(self) -> None:
+        self._thread_lock.acquire()
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with suppress(OSError):
+                self.path.parent.chmod(0o777)
+            self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o666)
+            with suppress(OSError):
+                os.chmod(self.path, 0o666)
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        except BaseException:
+            if self._fd is not None:
+                os.close(self._fd)
+                self._fd = None
+            self._thread_lock.release()
+            raise
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None
+            self._thread_lock.release()
+
+    def __enter__(self) -> "_PTG2FileLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.release()
 
 
 def _utcnow() -> datetime.datetime:
@@ -119,6 +175,8 @@ class PTG2ArtifactStore:
         self.tmp_dir = self.root / "tmp"
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_path = self.root / "manifest.jsonl"
+        self.leases_dir = self.root / "leases"
+        self.locks_dir = self.root / ".locks"
 
     def artifact_path(self, digest: str, kind: str = PTG2_ARTIFACT_RAW, suffix: str = "") -> Path:
         """Return this store's content-addressed path for an artifact."""
@@ -142,27 +200,92 @@ class PTG2ArtifactStore:
             return Path(unquote(urlsplit(uri).path))
         return Path(uri)
 
-    def find_candidates(self, canonical_url: str) -> list[dict[str, Any]]:
-        """Return retained raw-artifact manifest entries for a canonical URL."""
+    @contextmanager
+    def retention_lock(self):
+        """Hold the store-wide lease, manifest, and collection lock."""
+
+        with _PTG2FileLock(self.root / ".retention.lock"):
+            yield
+
+    def named_lock(self, namespace: str, key: str) -> _PTG2FileLock:
+        """Return a per-artifact lock without creating another artifact copy."""
+
+        safe_namespace = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(namespace))[:64] or "artifact"
+        safe_key = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(key))[:160] or "default"
+        return _PTG2FileLock(self.locks_dir / safe_namespace / f"{safe_key}.lock")
+
+    def _manifest_entries(self) -> list[dict[str, Any]]:
         if not self.manifest_path.exists():
             return []
-        candidates: list[dict[str, Any]] = []
-        with open(self.manifest_path, "r", encoding="utf-8") as fp:
-            for line in fp:
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if payload.get("canonical_url") == canonical_url and payload.get("artifact_kind") == PTG2_ARTIFACT_RAW:
-                    candidates.append(payload)
-        return candidates
+        entries: list[dict[str, Any]] = []
+        try:
+            with open(self.manifest_path, "r", encoding="utf-8") as fp:
+                for line in fp:
+                    try:
+                        payload = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if isinstance(payload, dict):
+                        entries.append(payload)
+        except FileNotFoundError:
+            return []
+        return entries
+
+    def find_candidates(self, canonical_url: str) -> list[dict[str, Any]]:
+        """Return retained raw-artifact manifest entries for a canonical URL."""
+        latest_by_artifact: dict[tuple[str, str], dict[str, Any]] = {}
+        for payload in self._manifest_entries():
+            if (
+                payload.get("canonical_url") != canonical_url
+                or payload.get("artifact_kind") != PTG2_ARTIFACT_RAW
+            ):
+                continue
+            uri = str(payload.get("raw_storage_uri") or payload.get("storage_uri") or "")
+            digest = str(payload.get("raw_sha256") or "")
+            latest_by_artifact[(uri, digest)] = payload
+        return [
+            payload
+            for payload in latest_by_artifact.values()
+            if payload.get("status") in (None, "", "available")
+        ]
+
+    def find_logical_candidates(self, raw_sha256: str) -> list[dict[str, Any]]:
+        """Return retained logical JSON records for one raw container digest."""
+
+        return [
+            payload
+            for payload in self._manifest_entries()
+            if payload.get("artifact_kind") == "logical_json"
+            and payload.get("raw_sha256") == raw_sha256
+            and payload.get("status") in (None, "", "available")
+        ]
 
     def record_manifest(self, payload: dict[str, Any]) -> None:
         """Append a timestamped artifact record to this store's manifest."""
         payload = dict(payload)
         payload.setdefault("recorded_at", _utcnow().isoformat())
-        with open(self.manifest_path, "a", encoding="utf-8") as fp:
-            fp.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+        encoded = (json.dumps(payload, sort_keys=True, default=str) + "\n").encode("utf-8")
+        with self.retention_lock():
+            fd = os.open(
+                self.manifest_path,
+                os.O_RDWR | os.O_CREAT | os.O_APPEND,
+                0o666,
+            )
+            try:
+                end_offset = os.lseek(fd, 0, os.SEEK_END)
+                if end_offset > 0 and os.pread(fd, 1, end_offset - 1) != b"\n":
+                    # Isolate a crash-torn tail so this complete record remains
+                    # independently readable and recoverable.
+                    os.write(fd, b"\n")
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("short write while appending PTG artifact manifest")
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
 
 def _is_strong_etag(etag: str | None) -> bool:

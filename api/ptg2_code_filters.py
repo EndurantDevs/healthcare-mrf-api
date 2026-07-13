@@ -28,6 +28,8 @@ class InferredProviderTaxonomyRule:
     display_terms: tuple[str, ...]
 
     def matches(self, code_value: int) -> bool:
+        """Return whether a numeric procedure code falls in this rule."""
+
         return any(start <= code_value <= end for start, end in self.ranges)
 
 

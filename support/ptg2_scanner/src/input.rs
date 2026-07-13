@@ -38,7 +38,7 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
-struct LossyUtf8Reader<R: Read> {
+struct StrictUtf8Reader<R: Read> {
     inner: R,
     pending: Vec<u8>,
     output: Vec<u8>,
@@ -47,7 +47,7 @@ struct LossyUtf8Reader<R: Read> {
     checked_bom: bool,
 }
 
-impl<R: Read> LossyUtf8Reader<R> {
+impl<R: Read> StrictUtf8Reader<R> {
     fn new(inner: R) -> Self {
         Self {
             inner,
@@ -59,52 +59,50 @@ impl<R: Read> LossyUtf8Reader<R> {
         }
     }
 
-    fn append_initial_bytes(&mut self, bytes: &[u8], eof: bool) {
-        self.checked_bom = true;
-        let json_bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-        self.append_valid_utf8_lossy(json_bytes, eof);
+    fn preserving_bom(inner: R) -> Self {
+        Self {
+            inner,
+            pending: Vec::with_capacity(4),
+            output: Vec::new(),
+            output_pos: 0,
+            eof: false,
+            checked_bom: true,
+        }
     }
 
-    fn append_valid_utf8_lossy(&mut self, bytes: &[u8], eof: bool) {
-        let mut pos = 0usize;
-        while pos < bytes.len() {
-            match std::str::from_utf8(&bytes[pos..]) {
-                Ok(valid) => {
-                    self.output.extend_from_slice(valid.as_bytes());
-                    self.pending.clear();
-                    return;
+    fn append_initial_bytes(&mut self, bytes: &[u8], eof: bool) -> io::Result<()> {
+        self.checked_bom = true;
+        let json_bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+        self.append_valid_utf8(json_bytes, eof)
+    }
+
+    fn append_valid_utf8(&mut self, bytes: &[u8], eof: bool) -> io::Result<()> {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                self.output.extend_from_slice(valid.as_bytes());
+                self.pending.clear();
+                Ok(())
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                self.output.extend_from_slice(&bytes[..valid_up_to]);
+                if error.error_len().is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "PTG JSON contains invalid UTF-8",
+                    ));
                 }
-                Err(error) => {
-                    let valid_up_to = error.valid_up_to();
-                    if valid_up_to > 0 {
-                        self.output
-                            .extend_from_slice(&bytes[pos..pos + valid_up_to]);
-                        pos += valid_up_to;
-                    }
-                    match error.error_len() {
-                        Some(error_len) => {
-                            self.output.extend_from_slice(
-                                char::REPLACEMENT_CHARACTER
-                                    .encode_utf8(&mut [0; 4])
-                                    .as_bytes(),
-                            );
-                            pos += error_len;
-                        }
-                        None => {
-                            self.pending.clear();
-                            if eof {
-                                let text = String::from_utf8_lossy(&bytes[pos..]);
-                                self.output.extend_from_slice(text.as_bytes());
-                            } else {
-                                self.pending.extend_from_slice(&bytes[pos..]);
-                            }
-                            return;
-                        }
-                    }
+                self.pending.clear();
+                if eof {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "PTG JSON ends with incomplete UTF-8",
+                    ));
                 }
+                self.pending.extend_from_slice(&bytes[valid_up_to..]);
+                Ok(())
             }
         }
-        self.pending.clear();
     }
 
     fn fill_output(&mut self) -> io::Result<bool> {
@@ -118,9 +116,9 @@ impl<R: Read> LossyUtf8Reader<R> {
                 if !self.pending.is_empty() {
                     let pending = std::mem::take(&mut self.pending);
                     if self.checked_bom {
-                        self.append_valid_utf8_lossy(&pending, true);
+                        self.append_valid_utf8(&pending, true)?;
                     } else {
-                        self.append_initial_bytes(&pending, true);
+                        self.append_initial_bytes(&pending, true)?;
                     }
                 }
                 break;
@@ -132,23 +130,23 @@ impl<R: Read> LossyUtf8Reader<R> {
                     self.pending = initial_bytes;
                     continue;
                 }
-                self.append_initial_bytes(&initial_bytes, false);
+                self.append_initial_bytes(&initial_bytes, false)?;
                 continue;
             }
             if self.pending.is_empty() {
-                self.append_valid_utf8_lossy(&raw[..read], false);
+                self.append_valid_utf8(&raw[..read], false)?;
             } else {
                 let mut bytes = Vec::with_capacity(self.pending.len() + read);
                 bytes.extend_from_slice(&self.pending);
                 bytes.extend_from_slice(&raw[..read]);
-                self.append_valid_utf8_lossy(&bytes, false);
+                self.append_valid_utf8(&bytes, false)?;
             }
         }
         Ok(!self.output.is_empty())
     }
 }
 
-impl<R: Read> Read for LossyUtf8Reader<R> {
+impl<R: Read> Read for StrictUtf8Reader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -202,11 +200,18 @@ pub fn open_json_reader(
     path: &Path,
     compressed_bytes_read: Arc<AtomicU64>,
 ) -> io::Result<Box<dyn Read>> {
-    Ok(lossy_utf8_reader(open_reader(path, compressed_bytes_read)?))
+    Ok(strict_utf8_reader(open_reader(
+        path,
+        compressed_bytes_read,
+    )?))
 }
 
-pub fn lossy_utf8_reader<R: Read + 'static>(inner: R) -> Box<dyn Read> {
-    Box::new(LossyUtf8Reader::new(inner))
+pub fn strict_utf8_reader<R: Read + 'static>(inner: R) -> Box<dyn Read> {
+    Box::new(StrictUtf8Reader::new(inner))
+}
+
+pub fn strict_utf8_reader_preserving_bom<R: Read + 'static>(inner: R) -> Box<dyn Read> {
+    Box::new(StrictUtf8Reader::preserving_bom(inner))
 }
 
 #[cfg(test)]
@@ -259,15 +264,15 @@ mod tests {
     }
 
     #[test]
-    fn open_json_reader_replaces_invalid_utf8_without_loading_file() {
+    fn open_json_reader_rejects_invalid_utf8_without_loading_file() {
         let path = temp_path("invalid_utf8.json");
         std::fs::write(&path, b"{\"name\":\"A\xffB\"}").expect("write invalid utf8 test file");
         let bytes_read = Arc::new(AtomicU64::new(0));
         let mut reader =
             open_json_reader(&path, Arc::clone(&bytes_read)).expect("open json reader");
         let mut text = String::new();
-        reader.read_to_string(&mut text).expect("read json file");
-        assert_eq!(text, "{\"name\":\"A\u{FFFD}B\"}");
+        let error = reader.read_to_string(&mut text).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(bytes_read.load(Ordering::Relaxed), 14);
         std::fs::remove_file(path).ok();
     }
@@ -287,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn lossy_utf8_reader_strips_bom_split_across_reads() {
+    fn strict_utf8_reader_strips_bom_split_across_reads() {
         struct OneByteReader(Cursor<Vec<u8>>);
 
         impl Read for OneByteReader {
@@ -305,14 +310,14 @@ mod tests {
         }
 
         let payload = b"\xEF\xBB\xBF{\"ok\":true}".to_vec();
-        let mut reader = lossy_utf8_reader(OneByteReader(Cursor::new(payload)));
+        let mut reader = strict_utf8_reader(OneByteReader(Cursor::new(payload)));
         let mut text = String::new();
         reader.read_to_string(&mut text).expect("read split bom");
         assert_eq!(text, "{\"ok\":true}");
     }
 
     #[test]
-    fn lossy_utf8_reader_preserves_multibyte_sequences_across_reads() {
+    fn strict_utf8_reader_preserves_multibyte_sequences_across_reads() {
         struct OneByteReader(Cursor<Vec<u8>>);
 
         impl Read for OneByteReader {
@@ -330,11 +335,36 @@ mod tests {
         }
 
         let mut reader =
-            LossyUtf8Reader::new(OneByteReader(Cursor::new("AéB".as_bytes().to_vec())));
+            StrictUtf8Reader::new(OneByteReader(Cursor::new("AéB".as_bytes().to_vec())));
         let mut text = String::new();
         reader
             .read_to_string(&mut text)
-            .expect("read lossy utf8 stream");
+            .expect("read strict utf8 stream");
         assert_eq!(text, "AéB");
+    }
+
+    #[test]
+    fn strict_utf8_reader_rejects_invalid_sequences() {
+        let mut reader = strict_utf8_reader(Cursor::new(vec![b'A', 0xff, b'B']));
+        let mut text = String::new();
+        let error = reader.read_to_string(&mut text).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn strict_utf8_reader_rejects_incomplete_sequences_at_eof() {
+        let mut reader = strict_utf8_reader(Cursor::new(vec![b'A', 0xc3]));
+        let mut text = String::new();
+        let error = reader.read_to_string(&mut text).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn strict_utf8_reader_can_preserve_bom_for_offset_sensitive_scans() {
+        let payload = b"\xEF\xBB\xBF{\"ok\":true}".to_vec();
+        let mut reader = strict_utf8_reader_preserving_bom(Cursor::new(payload.clone()));
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).expect("read valid UTF-8");
+        assert_eq!(output, payload);
     }
 }

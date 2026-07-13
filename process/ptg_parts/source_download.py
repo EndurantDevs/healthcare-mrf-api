@@ -18,7 +18,7 @@ import time
 import zipfile
 import zlib
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -38,7 +38,7 @@ from process.ptg_parts.artifacts import (
     ptg2_temp_parent,
     sha256_file,
 )
-from process.ptg_parts.canonical import canonicalize_url
+from process.ptg_parts.canonical import canonicalize_url, semantic_hash
 from process.ptg_parts.config import (
     PTG2_DEFAULT_DOWNLOAD_TASKS,
     PTG2_DOWNLOAD_TASKS_ENV,
@@ -65,6 +65,15 @@ from process.ptg_parts.live_progress import (
     reset_live_progress_context,
     set_live_progress_context,
     write_live_progress,
+)
+from process.ptg_parts.input_artifact_retention import (
+    async_named_artifact_lock,
+    bind_artifact_lease,
+    current_artifact_lease_id,
+    protect_artifact_path,
+    protect_artifact_prefix,
+    protect_existing_artifact,
+    publish_artifact_file,
 )
 from process.ptg_parts.progress import _scale_stage_progress_pct
 from process.ptg_parts.screen import _emit_screen_line
@@ -794,18 +803,65 @@ async def download_raw_artifact(
     max_bytes: int | None = None,
     keep_partial_artifacts: bool | None = None,
 ) -> PTG2RawArtifact:
-    """Download or reuse a verified raw artifact and record its manifest entry."""
+    """Download or reuse one raw artifact under a URL-scoped cross-process lock."""
+
     store = store or PTG2ArtifactStore()
     await assert_safe_url(url)
-    keep_partials = _env_bool(PTG2_KEEP_PARTIAL_ENV, True) if keep_partial_artifacts is None else keep_partial_artifacts
     canonical_url = canonicalize_url(url)
+    download_key = semantic_hash(canonical_url, domain="ptg2_retained_download_lock")
+    async with async_named_artifact_lock(store, "download", download_key):
+        return await _download_raw_artifact_locked(
+            url,
+            store=store,
+            canonical_url=canonical_url,
+            reuse_raw_artifacts=reuse_raw_artifacts,
+            max_bytes=max_bytes,
+            keep_partial_artifacts=keep_partial_artifacts,
+        )
+
+
+async def _download_raw_artifact_locked(
+    url: str,
+    *,
+    store: PTG2ArtifactStore,
+    canonical_url: str,
+    reuse_raw_artifacts: bool,
+    max_bytes: int | None,
+    keep_partial_artifacts: bool | None,
+) -> PTG2RawArtifact:
+    """Run one raw download after this canonical URL has been serialized."""
+
+    keep_partials = _env_bool(PTG2_KEEP_PARTIAL_ENV, True) if keep_partial_artifacts is None else keep_partial_artifacts
     head = await fetch_head_metadata(url)
     progress_started_at = time.monotonic()
     progress_interval_bytes = _download_progress_interval_bytes()
     next_progress_bytes = progress_interval_bytes
     validate_downloaded_gzip = _env_bool(_GZIP_VALIDATE_FRESH_ENV, False)
     if reuse_raw_artifacts:
-        candidate, mode = choose_reusable_raw_artifact(store.find_candidates(canonical_url), head, store=store)
+        candidates = store.find_candidates(canonical_url)
+        for reuse_candidate in candidates:
+            reuse_uri = reuse_candidate.get("raw_storage_uri") or reuse_candidate.get("storage_uri")
+            if not reuse_uri:
+                continue
+            reuse_path = store.path_from_uri(str(reuse_uri))
+            try:
+                protect_existing_artifact(store, reuse_path)
+            except ValueError:
+                # A migrated external path is outside this collector's authority.
+                continue
+        candidate, mode = choose_reusable_raw_artifact(candidates, head, store=store)
+        if candidate is not None and mode is not None:
+            candidate_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
+            candidate_path = store.path_from_uri(candidate_uri)
+            try:
+                protected = protect_existing_artifact(store, candidate_path)
+            except ValueError:
+                # Older manifests can point outside the current managed root. The
+                # collector cannot delete those paths, so normal reuse remains safe.
+                protected = candidate_path.exists()
+            if not protected:
+                candidate = None
+                mode = None
         if candidate is not None and mode is not None:
             raw_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
             raw_path = store.path_from_uri(raw_uri)
@@ -864,6 +920,9 @@ async def download_raw_artifact(
 
     partial_path = store.partial_path(canonical_url, suffix=_safe_url_suffix(url))
     tmp_path = partial_path if keep_partials else store.tmp_dir / f"ptg2-{os.getpid()}-{datetime.datetime.utcnow().timestamp()}.part"
+    if keep_partials:
+        protect_artifact_path(store, partial_path)
+        protect_artifact_path(store, _range_sidecar_path(partial_path))
     digest = hashlib.sha256()
     byte_count = 0
     download_etag = head.etag
@@ -954,12 +1013,16 @@ async def download_raw_artifact(
                     started_at=progress_started_at,
                 )
         raw_sha = digest.hexdigest()
-        final_path = store.artifact_path(raw_sha, kind=PTG2_ARTIFACT_RAW, suffix=_safe_url_suffix(url))
-        final_path.parent.mkdir(parents=True, exist_ok=True)
-        if final_path.exists():
-            tmp_path.unlink(missing_ok=True)
-        else:
-            os.replace(tmp_path, final_path)
+        # The digest is the complete physical identity. Omitting URL-derived
+        # suffixes lets different source URLs with identical bytes share one
+        # retained raw container.
+        final_path = store.artifact_path(raw_sha, kind=PTG2_ARTIFACT_RAW)
+        publish_artifact_file(
+            store,
+            tmp_path,
+            final_path,
+            expected_sha256=raw_sha,
+        )
         actual_sha, actual_size = sha256_file(final_path)
         if actual_sha != raw_sha:
             raise RuntimeError(f"Checksum verification failed for {final_path}")
@@ -982,7 +1045,9 @@ async def download_raw_artifact(
                     "error": gzip_error,
                 }
             )
-            final_path.unlink(missing_ok=True)
+            # This digest path may already be leased by another URL/import.
+            # The failed observation is non-reusable; reference-aware GC owns
+            # physical deletion after every valid lease has ended.
             raise RuntimeError(gzip_error)
         _emit_download_progress(
             url=url,
@@ -1091,6 +1156,86 @@ def _retained_logical_artifact_dir(store: PTG2ArtifactStore, raw_artifact: PTG2R
     return path
 
 
+async def _retained_logical_artifact(
+    store: PTG2ArtifactStore,
+    raw_artifact: PTG2RawArtifact,
+) -> PTG2LogicalArtifact:
+    logical_dir = _retained_logical_artifact_dir(store, raw_artifact)
+    protect_artifact_prefix(store, logical_dir)
+    async with async_named_artifact_lock(
+        store,
+        "logical",
+        raw_artifact.raw_sha256,
+    ):
+        for candidate in reversed(store.find_logical_candidates(raw_artifact.raw_sha256)):
+            logical_uri = candidate.get("logical_storage_uri") or candidate.get("storage_uri")
+            logical_sha256 = str(candidate.get("logical_sha256") or "")
+            if not logical_uri or re.fullmatch(r"[0-9a-f]{64}", logical_sha256) is None:
+                continue
+            logical_path = store.path_from_uri(str(logical_uri))
+            try:
+                expected_size = int(candidate.get("byte_count"))
+                size_matches = logical_path.stat().st_size == expected_size
+            except (OSError, TypeError, ValueError):
+                size_matches = False
+            try:
+                protected = size_matches and protect_existing_artifact(store, logical_path)
+            except ValueError:
+                # Ignore migrated logical records outside this managed store.
+                protected = False
+            if protected:
+                actual_sha256, _actual_size = sha256_file(logical_path)
+                if actual_sha256 != logical_sha256:
+                    store.record_manifest(
+                        {
+                            "artifact_kind": "logical_json",
+                            "raw_sha256": raw_artifact.raw_sha256,
+                            "logical_sha256": logical_sha256,
+                            "logical_storage_uri": store.storage_uri(logical_path),
+                            "status": "corrupt",
+                            "actual_sha256": actual_sha256,
+                        }
+                    )
+                    continue
+                return PTG2LogicalArtifact(
+                    logical_path=str(logical_path),
+                    logical_sha256=logical_sha256,
+                    byte_count=expected_size,
+                    compression=candidate.get("compression"),
+                    member_name=candidate.get("member_name"),
+                )
+
+        with tempfile.TemporaryDirectory(
+            prefix=f"logical-{raw_artifact.raw_sha256[:12]}-",
+            dir=store.tmp_dir,
+        ) as temporary_dir:
+            staged = stream_logical_artifact(
+                raw_artifact.raw_path,
+                output_dir=temporary_dir,
+            )
+            final_path = logical_dir / f"{staged.logical_sha256}.json"
+            publish_artifact_file(
+                store,
+                staged.logical_path,
+                final_path,
+                expected_sha256=staged.logical_sha256,
+            )
+        retained = replace(staged, logical_path=str(final_path))
+        store.record_manifest(
+            {
+                "artifact_kind": "logical_json",
+                "raw_sha256": raw_artifact.raw_sha256,
+                "logical_sha256": retained.logical_sha256,
+                "logical_storage_uri": store.storage_uri(final_path),
+                "byte_count": retained.byte_count,
+                "compression": retained.compression,
+                "member_name": retained.member_name,
+                "status": "available",
+            }
+        )
+        return retained
+
+
 def _materialize_json_source_from_facade():
     ptg_module = sys.modules.get("process.ptg")
     return getattr(ptg_module, "materialize_json_source", materialize_json_source)
@@ -1098,15 +1243,17 @@ def _materialize_json_source_from_facade():
 
 def _download_ptg_job_artifact_sync_from_facade(job: dict[str, object], **kwargs) -> PTG2DownloadedJob:
     live_progress_context = kwargs.pop("live_progress_context", None)
+    artifact_lease_id = kwargs.pop("artifact_lease_id", None)
     ptg_module = sys.modules.get("process.ptg")
     downloader = getattr(ptg_module, "_download_ptg_job_artifact_sync", _download_ptg_job_artifact_sync)
-    if isinstance(live_progress_context, dict) and live_progress_context:
-        token = set_live_progress_context(**live_progress_context)
-        try:
-            return downloader(job, **kwargs)
-        finally:
-            reset_live_progress_context(token)
-    return downloader(job, **kwargs)
+    with bind_artifact_lease(str(artifact_lease_id) if artifact_lease_id else None):
+        if isinstance(live_progress_context, dict) and live_progress_context:
+            token = set_live_progress_context(**live_progress_context)
+            try:
+                return downloader(job, **kwargs)
+            finally:
+                reset_live_progress_context(token)
+        return downloader(job, **kwargs)
 
 
 async def _download_ptg_job_artifact(
@@ -1126,10 +1273,7 @@ async def _download_ptg_job_artifact(
             keep_partial_artifacts=keep_partial_artifacts,
         )
         logical_artifact = (
-            stream_logical_artifact(
-                raw_artifact.raw_path,
-                output_dir=_retained_logical_artifact_dir(store, raw_artifact),
-            )
+            await _retained_logical_artifact(store, raw_artifact)
             if _should_materialize_logical_artifact(raw_artifact.raw_path)
             else logical_artifact_identity(
                 raw_artifact.raw_path,
@@ -1175,6 +1319,7 @@ async def _iter_downloaded_ptg_jobs(
     pending: set[asyncio.Future[PTG2DownloadedJob]] = set()
     job_iter = iter(jobs)
     base_live_progress_context = current_live_progress_context()
+    artifact_lease_id = current_artifact_lease_id()
     job_count = max(len(jobs), 1)
 
     def schedule_more() -> None:
@@ -1202,6 +1347,7 @@ async def _iter_downloaded_ptg_jobs(
                         max_bytes=max_bytes,
                         keep_partial_artifacts=keep_partial_artifacts,
                         live_progress_context=live_progress_context,
+                        artifact_lease_id=artifact_lease_id,
                     )
                 )
             )
@@ -1218,4 +1364,11 @@ async def _iter_downloaded_ptg_jobs(
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        executor.shutdown(wait=False, cancel_futures=True)
+        # Running thread-pool calls cannot be cancelled by their asyncio
+        # wrappers. Wait for them before the import-level artifact lease is
+        # released, otherwise GC could reclaim a file a worker still uses.
+        await asyncio.to_thread(
+            executor.shutdown,
+            wait=True,
+            cancel_futures=True,
+        )

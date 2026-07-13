@@ -55,6 +55,7 @@ class CarrierCoverageStats:
     distinct_unmatched: int = 0
 
     def to_dict(self) -> dict[str, Any]:
+        """Return these coverage counters as a JSON-ready mapping."""
         return {
             "line": self.line,
             "column": self.column,
@@ -118,14 +119,17 @@ def split_carrier_cell(value: str | None) -> list[str]:
 
 
 def normalize_carrier(value: str) -> str:
+    """Normalize a carrier label for case-insensitive matching."""
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
 def is_placeholder_carrier(value: str) -> bool:
+    """Return whether a carrier label is a placeholder value."""
     return bool(PLACEHOLDER_RE.match(normalize_carrier(value)))
 
 
 def discovery_candidate_matches(candidate: Any, carrier: str) -> bool:
+    """Return whether discovery's payer text filter matches the carrier label."""
     return discovery._candidate_matches_text_filters(
         candidate,
         entity_types=(),
@@ -134,6 +138,7 @@ def discovery_candidate_matches(candidate: Any, carrier: str) -> bool:
 
 
 def candidate_supports_benefit_line(candidate: Any, line: str) -> bool:
+    """Return whether a candidate can cover the requested benefit line."""
     benefit_lines = getattr(candidate, "benefit_lines", None)
     if not benefit_lines:
         return True
@@ -240,6 +245,7 @@ def audit_carrier_rows(
     line_columns: Sequence[tuple[str, str]] = DEFAULT_LINE_COLUMNS,
     matcher: Matcher = discovery_candidate_matches,
 ) -> tuple[list[CarrierCoverageStats], dict[str, list[tuple[str, int]]]]:
+    """Classify carrier mentions by benefit line and return unmatched counts."""
     stats_by_line: list[CarrierCoverageStats] = []
     unmatched_by_line: dict[str, list[tuple[str, int]]] = {}
     csv_rows = list(client_rows)
@@ -402,6 +408,7 @@ def audit_non_importable_reason_summary(
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
+    """Read a UTF-8 CSV file into carrier-row mappings."""
     with path.open(newline="", encoding="utf-8-sig") as handle:
         return list(csv.DictReader(handle))
 
@@ -410,6 +417,7 @@ async def load_discovery_candidates(
     provider: str,
     limit: int,
 ) -> tuple[list[Any], list[Any]]:
+    """Load catalog-backed discovery candidates and their importable subset."""
     candidates = await discovery._load_candidates(provider, test_mode=True, limit=limit)
     catalog_candidates = [
         candidate
@@ -425,6 +433,7 @@ async def load_discovery_candidates(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for the carrier coverage audit."""
     parser = argparse.ArgumentParser(
         description="Audit private client carrier coverage against PTG source discovery."
     )
@@ -549,6 +558,7 @@ def _print_human_report(
 
 
 async def async_main(argv: Sequence[str] | None = None) -> int:
+    """Run the audit command and emit its selected report format."""
     args = build_arg_parser().parse_args(argv)
     rows = read_csv_rows(args.csv_path)
     all_candidates, importable_candidates = await load_discovery_candidates(
@@ -596,6 +606,7 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
 
 
 def main() -> int:
+    """Run the asynchronous carrier audit and return its exit code."""
     return asyncio.run(async_main())
 
 

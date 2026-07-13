@@ -47,3 +47,40 @@ async def test_control_job_persists_failure_audit_metrics(monkeypatch):
             "pagination_resume_required": ["pdfhir_molina:Location"],
         }
     }
+
+
+@pytest.mark.asyncio
+async def test_control_job_preserves_importer_retry_contract(monkeypatch):
+    run_marks = []
+
+    class DeterministicFailure(RuntimeError):
+        control_error_code = "deterministic_failure"
+        retryable = False
+
+    async def fake_mark(run_id, **kwargs):
+        run_marks.append((run_id, kwargs))
+
+    async def fake_target(_ctx, _task):
+        raise DeterministicFailure("evidence mismatch")
+
+    class FakeModule:
+        process_data = staticmethod(fake_target)
+
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
+    monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: FakeModule)
+
+    with pytest.raises(DeterministicFailure):
+        await control_single_job_start(
+            {},
+            {
+                "run_id": "run_deterministic_failure",
+                "target_module": "fake.module",
+                "target_function": "process_data",
+            },
+        )
+
+    assert run_marks[-1][1]["error"] == {
+        "code": "deterministic_failure",
+        "message": "evidence mismatch",
+        "retryable": False,
+    }

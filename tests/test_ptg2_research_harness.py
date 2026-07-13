@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.research import ptg2_experiment as harness
 
 
@@ -108,21 +110,33 @@ def test_suite_validation_and_env_expansion(tmp_path):
     assert env["HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES"] == "2"
 
 
-def test_postgres_binary_final_suite_uses_fast_tableless_config():
-    suite = harness.load_suite("docs/research/ptg2_postgres_binary_local_suite.json")
-    variants = harness.variant_map(suite)
-    final_env = variants["postgres_binary_final"]["env"]
+def test_suite_runner_rejects_nonlocal_case_kind(tmp_path):
+    suite_path = tmp_path / "suite.json"
+    suite_path.write_text(
+        json.dumps(
+            {
+                "variants": [{"id": "baseline"}],
+                "cases": [{"id": "remote-case", "kind": "remote_job"}],
+            }
+        ),
+        encoding="utf-8",
+    )
 
-    assert final_env["HLTHPRT_PTG2_SNAPSHOT_ARCH"] == "postgres_binary_v1"
-    assert final_env["HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN"] == "true"
-    assert final_env["HLTHPRT_PTG2_RUST_WORKERS"] == "16"
-    assert final_env["HLTHPRT_PTG2_RUST_WORK_QUEUE"] == "32"
-    assert final_env["HLTHPRT_PTG2_RUST_EVENT_QUEUE"] == "128"
-    assert final_env["HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION"] == "zlib"
-    assert final_env["HLTHPRT_PTG2_SERVING_BINARY_SOURCE_COPY_FORMAT"] == "binary"
-    assert final_env["HLTHPRT_PTG2_SERVING_BINARY_TARGET_COPY_FORMAT"] == "binary"
-    assert final_env["HLTHPRT_PTG2_MANIFEST_DIRECT_COPY_TASKS"] == "16"
-    assert final_env["HLTHPRT_PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS"] == "true"
+    suite = harness.load_suite(suite_path)
+
+    with pytest.raises(ValueError, match="unsupported nonlocal kinds"):
+        harness.run_suite(suite, report_dir=tmp_path, dry_run=True)
+
+
+def test_default_suite_never_overrides_the_strict_snapshot_architecture():
+    suite = harness.load_suite("docs/research/ptg2_benchmark_suite.example.json")
+    variants = harness.variant_map(suite)
+
+    assert variants
+    for variant in variants.values():
+        assert variant.get("env", {}).get(
+            "HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3"
+        ) == "postgres_binary_v3"
 
 
 def test_copy_output_gate_detects_digest_mismatch():
@@ -1072,90 +1086,6 @@ def test_local_ptg_cli_full_file_dry_run_omits_max_items(tmp_path, monkeypatch):
     assert (fixture_dir / "rates.json.gz").exists()
 
 
-def test_import_control_run_dry_run_builds_generic_import_payload(tmp_path, monkeypatch):
-    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
-    suite = {
-        "title": "Entity Address Unified Experiment Report",
-        "variants": [{"id": "current"}],
-        "cases": [
-            {
-                "id": "dev-bounded-smoke-1k",
-                "kind": "import_control_run",
-                "importer": "entity-address-unified",
-                "actor": "codex",
-                "params": {"test": True, "publish": False, "limit_per_source": 1000},
-                "variants": ["current"],
-            }
-        ],
-    }
-
-    report = harness.run_suite(suite, report_dir=tmp_path, dry_run=True)
-    result = report["results"][0]
-    request_payload = result["import_run"]["request_payload"]
-
-    assert report["suite"]["title"] == "Entity Address Unified Experiment Report"
-    assert result["status"] == "dry_run"
-    assert result["kind"] == "import_control_run"
-    assert result["command"][1] == "http://import-control.test/v1/runs"
-    assert request_payload["importer"] == "entity-address-unified"
-    assert request_payload["params"] == {"test": True, "publish": False, "limit_per_source": 1000}
-    assert request_payload["actor"] == "codex"
-
-
-def test_import_control_run_polls_until_terminal(tmp_path, monkeypatch):
-    calls = []
-
-    def fake_post_json(url, payload, *, token):
-        calls.append(("post", url, payload, token))
-        return {
-            "run_id": "run_entity",
-            "status": "running",
-            "progress": {"pct": 5, "phase": "queued"},
-        }
-
-    def fake_get_json(url, *, token):
-        calls.append(("get", url, token))
-        return {
-            "run_id": "run_entity",
-            "status": "succeeded",
-            "phase_detail": "entity-address-unified published",
-            "progress": {"pct": 100, "phase": "entity-address-unified published"},
-            "metrics": {"rows": 123, "phase_timings": {"materializing": {"seconds": 1.2}}},
-        }
-
-    monkeypatch.setattr(harness, "post_json", fake_post_json)
-    monkeypatch.setattr(harness, "get_json", fake_get_json)
-    monkeypatch.setattr(harness.time, "sleep", lambda _seconds: None)
-    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
-    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_API_TOKEN", "secret")
-    suite = {
-        "variants": [{"id": "current"}],
-        "cases": [
-            {
-                "id": "dev-bounded-smoke-1k",
-                "kind": "import_control_run",
-                "importer": "entity-address-unified",
-                "poll_seconds": 0,
-                "timeout_seconds": 10,
-                "params": {"test": True, "publish": False, "limit_per_source": 1000},
-                "variants": ["current"],
-            }
-        ],
-    }
-
-    report = harness.run_suite(suite, report_dir=tmp_path)
-    result = report["results"][0]
-
-    assert result["status"] == "succeeded"
-    assert result["import_run"]["final_run"]["metrics"]["rows"] == 123
-    assert result["progress"] == [
-        {"pct": 5, "phase": "queued"},
-        {"pct": 100, "phase": "entity-address-unified published"},
-    ]
-    assert calls[0][0] == "post"
-    assert calls[1] == ("get", "http://import-control.test/v1/runs/run_entity", "secret")
-
-
 def test_markdown_report_includes_scanner_and_import_summary():
     report = {
         "generated_at": "20260620T000000Z",
@@ -1248,33 +1178,3 @@ def test_markdown_report_includes_serving_arch_summary():
     assert "serving_binary_writer=rust_stream" in markdown
     assert "serving_binary_kinds=by_code_grouped,price_set_atoms" in markdown
     assert "serving_sidecar_artifacts=false" in markdown
-
-
-def test_markdown_report_includes_generic_import_control_summary():
-    report = {
-        "generated_at": "20260621T000000Z",
-        "suite": {"title": "Entity Address Unified Experiment Report"},
-        "gates": {"overall": "passed"},
-        "results": [
-            {
-                "case_id": "dev",
-                "variant_id": "current",
-                "kind": "import_control_run",
-                "status": "succeeded",
-                "elapsed_seconds": 1.0,
-                "import_run": {
-                    "final_run": {
-                        "status": "succeeded",
-                        "phase_detail": "entity-address-unified published",
-                        "progress": {"pct": 100},
-                        "metrics": {"rows": 123},
-                    }
-                },
-            }
-        ],
-    }
-
-    markdown = harness.render_markdown_report(report)
-
-    assert "# Entity Address Unified Experiment Report" in markdown
-    assert "succeeded<br>entity-address-unified published<br>pct=100<br>rows=123" in markdown

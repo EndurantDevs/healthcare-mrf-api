@@ -17005,7 +17005,6 @@ def _bulk_checkpoint_primary_secret() -> str:
     master_secret = _clean_text(
         os.getenv("HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY")
         or os.getenv("HLTHPRT_CONTROL_API_TOKEN")
-        or os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN")
     )
     if not master_secret:
         raise RuntimeError("bulk_export_checkpoint_encryption_key_missing")
@@ -17039,13 +17038,11 @@ def _bulk_checkpoint_decryption_secrets() -> tuple[str, ...]:
     primary_secret = _clean_text(
         os.getenv("HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY")
         or os.getenv("HLTHPRT_CONTROL_API_TOKEN")
-        or os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN")
     )
     secret_candidates = (
         primary_secret,
         *_bulk_checkpoint_previous_secrets(),
         _clean_text(os.getenv("HLTHPRT_CONTROL_API_TOKEN")),
-        _clean_text(os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN")),
     )
     decryption_secrets = tuple(
         dict.fromkeys(

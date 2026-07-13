@@ -6,8 +6,22 @@ on:
     branches: [main]
     types: [completed]
   workflow_dispatch:
+    inputs:
+      ptg_v3_phase:
+        description: "Strict V3 deployment phase; reader promotes the staged audited image"
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - reader
+      deploy_sha:
+        description: "Exact tested main SHA; required for reader promotion"
+        required: false
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -17,10 +31,118 @@ concurrency:
 jobs:
   queue:
     name: Queue dev-node build
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository
+        )
+      }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 90
     steps:
+      - name: Authorize exact tested source SHA
+        id: authorize
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const expectedRepository = `${owner}/${repo}`
+            const expectedWorkflowPath = '.github/workflows/ci.yml'
+            const main = await github.rest.repos.getBranch({owner, repo, branch: 'main'})
+            const mainSha = main.data.commit.sha
+            let deploySha
+            let phase = 'auto'
+
+            if (context.eventName === 'workflow_run') {
+              const run = context.payload.workflow_run
+              const trusted =
+                run.conclusion === 'success' &&
+                run.event === 'push' &&
+                run.path === expectedWorkflowPath &&
+                run.head_branch === 'main' &&
+                run.head_repository?.full_name === expectedRepository &&
+                run.repository?.full_name === expectedRepository
+              if (!trusted) {
+                core.setFailed('Refusing an untrusted upstream workflow run')
+                return
+              }
+              deploySha = run.head_sha
+              if (deploySha !== mainSha) {
+                core.setFailed(`Refusing stale main SHA ${deploySha}; current main is ${mainSha}`)
+                return
+              }
+            } else {
+              if (context.ref !== 'refs/heads/main') {
+                core.setFailed(`Dev deploys are restricted to main, got ${context.ref}`)
+                return
+              }
+              phase = String(context.payload.inputs?.ptg_v3_phase || 'auto')
+              if (!['auto', 'reader'].includes(phase)) {
+                core.setFailed(`Unsupported strict V3 deployment phase ${phase}`)
+                return
+              }
+              deploySha = String(context.payload.inputs?.deploy_sha || '').trim()
+              if (phase === 'reader' && !deploySha) {
+                core.setFailed('Reader promotion requires the exact staged deploy_sha')
+                return
+              }
+              deploySha ||= context.sha
+              if (!/^[0-9a-f]{40}$/.test(deploySha)) {
+                core.setFailed('deploy_sha must be a lowercase 40-character commit SHA')
+                return
+              }
+              if (phase !== 'reader' && deploySha !== mainSha) {
+                core.setFailed(`Automatic deployment requires current main ${mainSha}`)
+                return
+              }
+
+              if (phase === 'reader' && deploySha !== mainSha) {
+                const comparison = await github.rest.repos.compareCommitsWithBasehead({
+                  owner,
+                  repo,
+                  basehead: `${deploySha}...${mainSha}`,
+                })
+                if (!['ahead', 'identical'].includes(comparison.data.status) ||
+                    comparison.data.merge_base_commit.sha !== deploySha) {
+                  core.setFailed(`${deploySha} is not an ancestor of current main ${mainSha}`)
+                  return
+                }
+              }
+
+              const {data} = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: 'ci.yml',
+                head_sha: deploySha,
+                branch: 'main',
+                event: 'push',
+                status: 'completed',
+                per_page: 100,
+              })
+              const passed = data.workflow_runs.some((run) =>
+                run.path === expectedWorkflowPath &&
+                run.head_branch === 'main' &&
+                run.head_sha === deploySha &&
+                run.event === 'push' &&
+                run.repository?.full_name === expectedRepository &&
+                run.conclusion === 'success'
+              )
+              if (!passed) {
+                core.setFailed(`No successful ci.yml push run exists for ${deploySha}`)
+                return
+              }
+            }
+
+            core.setOutput('deploy_sha', deploySha)
+            core.setOutput('deploy_branch', 'main')
+            core.setOutput('ptg_v3_phase', phase)
+
       - name: Install SSH key
         env:
           DEV_DEPLOY_SSH_KEY: ${{ secrets.DEV_DEPLOY_SSH_KEY }}
@@ -40,20 +162,22 @@ jobs:
       - name: Queue build on dev node
         env:
           DEV_DEPLOY_HOST: ${{ secrets.DEV_DEPLOY_HOST }}
-          DEPLOY_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
-          DEPLOY_BRANCH: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
+          DEPLOY_SHA: ${{ steps.authorize.outputs.deploy_sha }}
+          DEPLOY_BRANCH: ${{ steps.authorize.outputs.deploy_branch }}
+          PTG_V3_PHASE: ${{ steps.authorize.outputs.ptg_v3_phase }}
         run: |
           if [ -z "${DEV_DEPLOY_HOST}" ]; then
             echo "::error::DEV_DEPLOY_HOST is not configured"
             exit 1
           fi
+          deploy_args="${DEPLOY_SHA} ${DEPLOY_BRANCH} --ptg-v3-phase=${PTG_V3_PHASE}"
           if ! ssh -i ~/.ssh/dev-deploy \
             -o IdentitiesOnly=yes \
             -o BatchMode=yes \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile=~/.ssh/known_hosts \
             "ubuntu@${DEV_DEPLOY_HOST}" \
-            "${DEPLOY_SHA} ${DEPLOY_BRANCH} --detach" >/tmp/dev-deploy.out 2>/tmp/dev-deploy.err; then
+            "${deploy_args}" >/tmp/dev-deploy.out 2>/tmp/dev-deploy.err; then
             echo "::error::Failed to queue dev deploy"
             exit 1
           fi

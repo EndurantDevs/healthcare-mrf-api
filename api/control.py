@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import hmac
 
 from sanic import Blueprint, response
-from sanic.exceptions import BadRequest, Forbidden, NotFound, SanicException
+from sanic.exceptions import BadRequest, NotFound, SanicException
 
 from api.control_imports import (
     create_import_run,
@@ -22,6 +20,10 @@ from api.control_imports import (
     retry_import_run,
 )
 from api.control_workers import ensure_worker, worker_registry
+from api.control_auth import require_control_auth as _require_control_auth
+from process.ptg_parts.ptg2_candidate_attestation import (
+    record_candidate_audit_attestation,
+)
 from process.ptg_parts.source_snapshot_control import (
     SourceSnapshotConflict,
     build_ptg2_source_snapshot_remove_plan,
@@ -48,21 +50,6 @@ async def control_error(request, exc: SanicException):
     """Render control-plane exceptions with the stable JSON error contract."""
 
     return response.json(_error_payload(request, exc), status=getattr(exc, "status_code", 500))
-
-
-def _require_control_auth(request) -> None:
-    expected = str(os.getenv("HLTHPRT_CONTROL_API_TOKEN") or "").strip()
-    if not expected:
-        raise Forbidden("control API token is required")
-    headers = getattr(request, "headers", {}) or {}
-    auth_header = str(headers.get("Authorization", ""))
-    bearer = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
-    explicit = str(headers.get("X-HealthPorta-Control-Token", "")).strip()
-    if not (
-        hmac.compare_digest(bearer, expected)
-        or hmac.compare_digest(explicit, expected)
-    ):
-        raise Forbidden("control API token is invalid")
 
 
 @blueprint.get("/importers")
@@ -159,6 +146,28 @@ async def control_ptg_source_snapshot_promote(request):
             raise BadRequest(str(exc)) from exc
         result = dict(result)
         result["address_refresh"] = {"run": refresh_run, "created": created}
+    return response.json(result, default=str)
+
+
+@blueprint.post("/ptg/source-snapshots/attest")
+async def control_ptg_source_snapshot_attest(request):
+    """Bind one passing release audit report to an exact validated candidate."""
+
+    _require_control_auth(request)
+    payload = request.json if isinstance(request.json, dict) else {}
+    report = payload.get("report")
+    if not isinstance(report, dict):
+        raise BadRequest("report must be an object")
+    try:
+        result = await record_candidate_audit_attestation(
+            snapshot_id=str(payload.get("snapshot_id") or ""),
+            source_key=str(payload.get("source_key") or ""),
+            plan_id=str(payload.get("plan_id") or ""),
+            plan_market_type=str(payload.get("plan_market_type") or ""),
+            report=report,
+        )
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
     return response.json(result, default=str)
 
 

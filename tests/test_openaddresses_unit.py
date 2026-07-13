@@ -933,7 +933,7 @@ async def test_openaddresses_load_file_stops_when_control_run_cancelled(tmp_path
         )
 
 
-def test_openaddresses_import_control_registration():
+def test_openaddresses_operator_registration():
     adapter = control_imports._SINGLE_JOB_ADAPTERS["openaddresses"]
 
     assert adapter["queue"] == "arq:OpenAddresses"

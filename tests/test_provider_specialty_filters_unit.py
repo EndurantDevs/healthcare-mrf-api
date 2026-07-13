@@ -4,9 +4,11 @@ import pytest
 
 from api import provider_specialty_filters as psf
 from api.provider_specialty_filters import (
+    DynamicSpecialtyResolutionError,
     SpecialtyResolutionCache,
     _normalize_specialty_key,
     _specialty_key_variants,
+    resolve_ptg_provider_specialty_filter,
     resolve_provider_specialty_filter,
 )
 
@@ -185,6 +187,54 @@ async def test_resolver_uses_loaded_shared_cache(monkeypatch):
     assert resolved.active
     assert resolved.taxonomy_codes == ("2084P0800X",)
     assert resolved.unresolved_specialty is None
+
+
+@pytest.mark.asyncio
+async def test_ptg_dynamic_resolution_uses_current_database_rows_not_global_cache(monkeypatch):
+    class _CurrentAliasSession:
+        def __init__(self):
+            self.statements = []
+
+        async def execute(self, statement):
+            self.statements.append(statement)
+            if "terminology_synonym" in str(statement):
+                return _FakeResult([
+                    {
+                        "target_system": "NUCC",
+                        "target_code": "2085R0202X",
+                        "metadata_json": None,
+                    }
+                ])
+            raise AssertionError("the indexed synonym match should not need a NUCC lookup")
+
+    stale_cache = SpecialtyResolutionCache()
+    stale_cache._alias_codes["imaging specialist"] = (("999999999X",), ("999999999X",))
+    monkeypatch.setattr(psf, "_SPECIALTY_RESOLUTION_CACHE", stale_cache)
+    session = _CurrentAliasSession()
+
+    resolved = await resolve_ptg_provider_specialty_filter(
+        session,
+        {"specialty": "imaging specialist"},
+    )
+
+    assert resolved.taxonomy_codes == ("2085R0202X",)
+    assert len(session.statements) == 1
+    statement = str(session.statements[0])
+    assert "FROM mrf.terminology_synonym" in statement
+    assert "terminology_synonym.term_key IN" in statement
+
+
+@pytest.mark.asyncio
+async def test_ptg_dynamic_resolution_fails_closed_when_database_lookup_fails():
+    class _BrokenSession:
+        async def execute(self, statement):
+            raise RuntimeError("database unavailable")
+
+    with pytest.raises(DynamicSpecialtyResolutionError, match="not run without its specialty filter"):
+        await resolve_ptg_provider_specialty_filter(
+            _BrokenSession(),
+            {"specialty": "imaging specialist"},
+        )
 
 
 def test_seed_rows_mirror_static_alias_dict():

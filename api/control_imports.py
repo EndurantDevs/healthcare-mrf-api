@@ -9,7 +9,7 @@ import json
 import os
 import shutil
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -32,8 +32,15 @@ CANCEL_FLAG_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_IMPORT_RUN_LIST_LIMIT = 200
 MAX_TRIGGERED_BY_LENGTH = 32
 _IMPORT_RUN_ENSURE_LOCK = asyncio.Lock()
-_IMPORT_RUN_ENSURED = False
 _IMPORT_RUN_ADVISORY_LOCK_KEY = 44_706_101_200_001
+
+
+@dataclass
+class _ImportRunEnsureState:
+    ensured: bool = False
+
+
+_IMPORT_RUN_ENSURE_STATE = _ImportRunEnsureState()
 
 _IMPORTER_DEPENDENCIES: dict[str, list[str]] = {
     "npi": ["nucc"],
@@ -42,6 +49,14 @@ _IMPORTER_DEPENDENCIES: dict[str, list[str]] = {
 
 _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
     "ptg": {"queue": "arq:PTG", "function": "ptg_control_start", "payload": "ptg_control", "job_prefix": "ptg_start"},
+    "ptg-candidate-audit": {
+        "queue": "arq:PTGCandidateAudit",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped_kwargs",
+        "target_module": "process.ptg_candidate_audit",
+        "target_function": "main",
+        "job_prefix": "ptg_candidate_audit",
+    },
     "mrf": {"queue": "arq:MRF", "function": "init_file", "payload": "test_mode"},
     "npi": {
         "queue": "arq:NPI",
@@ -226,6 +241,8 @@ _FINISH_IMPORTERS = {
 
 
 def utc_now() -> dt.datetime:
+    """Return a naive UTC timestamp for persisted control-plane records."""
+
     return dt.datetime.now(dt.UTC).replace(tzinfo=None)
 
 
@@ -268,6 +285,8 @@ def _json_safe_default(value: Any) -> Any:
 
 
 def importer_registry() -> list[dict[str, Any]]:
+    """Describe the importer commands exposed by the public control API."""
+
     from process import process_group, process_group_end
 
     finish_commands = set(process_group_end.commands)
@@ -293,11 +312,13 @@ def importer_registry() -> list[dict[str, Any]]:
 
 
 def importer_names() -> set[str]:
+    """Return every importer name accepted by the control API."""
+
     return {entry["name"] for entry in importer_registry()}
 
 
 def _importer_family(importer: str) -> str:
-    if importer in {"ptg", "mrf", "mrf-source-discovery"}:
+    if importer in {"ptg", "ptg-candidate-audit", "mrf", "mrf-source-discovery"}:
         return "mrf"
     if importer in {"claims-pricing", "claims-procedures", "drug-claims"}:
         return "claims"
@@ -326,6 +347,8 @@ def _new_run_id() -> str:
 
 
 async def node_health() -> dict[str, Any]:
+    """Collect bounded database, Redis, worker, disk, and memory health."""
+
     artifact_root = Path(os.getenv("HLTHPRT_PTG2_ARTIFACT_ROOT") or os.getenv("HLTHPRT_PTG2_ARTIFACT_DIR") or "/tmp")
     try:
         usage = shutil.disk_usage(artifact_root)
@@ -384,7 +407,7 @@ def _ram_status() -> dict[str, int | None]:
             total = values.get("MemTotal")
             available = values.get("MemAvailable")
     except OSError:
-        pass
+        values.clear()
     if total is None and hasattr(os, "sysconf"):
         try:
             total = int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
@@ -455,14 +478,15 @@ def _redis_client() -> redis.Redis:
 
 
 async def ensure_import_run_table() -> None:
-    global _IMPORT_RUN_ENSURED
-    if _IMPORT_RUN_ENSURED:
+    """Create the public import-run control table once per process."""
+
+    if _IMPORT_RUN_ENSURE_STATE.ensured:
         return
     async with _IMPORT_RUN_ENSURE_LOCK:
-        if _IMPORT_RUN_ENSURED:
+        if _IMPORT_RUN_ENSURE_STATE.ensured:
             return
         await _ensure_import_run_table_once()
-        _IMPORT_RUN_ENSURED = True
+        _IMPORT_RUN_ENSURE_STATE.ensured = True
 
 
 async def _ensure_import_run_table_once() -> None:

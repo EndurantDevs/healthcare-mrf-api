@@ -35,22 +35,28 @@ async def _record_source_version(
     import_run_id: str | None = None,
 ) -> PTG2SourceVersion:
     source_identity_hash = _source_identity_hash(source_type, raw_artifact.canonical_url)
+    logical_hash_deferred = bool(logical_artifact.logical_hash_deferred)
+    content_identity_kind = (
+        "raw_container_sha256_v1"
+        if logical_hash_deferred
+        else "logical_json_sha256_v1"
+    )
     version_payload = {
         "source_identity_hash": source_identity_hash,
         "raw_sha256": raw_artifact.raw_sha256,
         "logical_sha256": logical_artifact.logical_sha256,
+        "content_identity_kind": content_identity_kind,
         "etag": raw_artifact.head.etag if raw_artifact.head else None,
         "content_length": raw_artifact.head.content_length if raw_artifact.head else raw_artifact.byte_count,
         "last_modified": raw_artifact.head.last_modified if raw_artifact.head else None,
     }
-    logical_hash_deferred = (
-        bool(logical_artifact.compression)
-        and logical_artifact.logical_sha256 == raw_artifact.raw_sha256
-        and logical_artifact.byte_count == raw_artifact.byte_count
-    )
     source_file_version_id = semantic_hash(version_payload, domain="source_file_version")[:32]
     content_hash = semantic_hash(
-        {"domain": domain, "logical_sha256": logical_artifact.logical_sha256},
+        {
+            "domain": domain,
+            "identity_kind": content_identity_kind,
+            "sha256": logical_artifact.logical_sha256,
+        },
         domain="content_identity",
     )
     now = _utcnow()
@@ -87,6 +93,7 @@ async def _record_source_version(
                     "compression": logical_artifact.compression,
                     "member_name": logical_artifact.member_name,
                     "logical_hash_deferred": logical_hash_deferred,
+                    "identity_kind": content_identity_kind,
                 },
                 "created_at": now,
             }
@@ -155,10 +162,10 @@ async def _record_source_version(
         raw_storage_uri=raw_artifact.raw_storage_uri,
         raw_sha256=raw_artifact.raw_sha256,
         logical_sha256=logical_artifact.logical_sha256,
+        logical_hash_deferred=logical_hash_deferred,
         content_length=raw_artifact.head.content_length if raw_artifact.head else raw_artifact.byte_count,
         etag=raw_artifact.head.etag if raw_artifact.head else None,
         last_modified=raw_artifact.head.last_modified if raw_artifact.head else None,
         verification_mode=raw_artifact.verification_mode,
         reused_from_source_file_version_id=raw_artifact.reused_from_source_file_version_id,
     )
-

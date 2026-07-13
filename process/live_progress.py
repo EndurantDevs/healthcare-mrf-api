@@ -32,7 +32,7 @@ IMPORT_LIVE_PROGRESS_STALE_SECONDS = int(
 
 _context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("import_live_progress_context", default={})
 _redis_client: redis.Redis | None = None
-_HEARTBEAT_SOURCE = "import-control-heartbeat"
+_HEARTBEAT_SOURCE = "engine-heartbeat"
 _PROGRESS_FIELDS = (
     "unit",
     "done",

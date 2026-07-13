@@ -95,6 +95,71 @@ pub fn npi_list(value: Option<&Value>) -> Vec<i64> {
     out
 }
 
+pub fn strict_integer_text(value: &Value, field_name: &str) -> io::Result<String> {
+    let Value::Number(number) = value else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field_name} must be a JSON integer"),
+        ));
+    };
+    let canonical = canonical_decimal_text(&number.to_string()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field_name} must be a JSON integer"),
+        )
+    })?;
+    if canonical.contains('.') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field_name} must be a JSON integer"),
+        ));
+    }
+    Ok(canonical)
+}
+
+pub fn strict_integer(value: &Value, field_name: &str) -> io::Result<i64> {
+    strict_integer_text(value, field_name)?
+        .parse()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{field_name} is outside the supported integer range"),
+            )
+        })
+}
+
+pub fn strict_npi_list(value: Option<&Value>) -> io::Result<Vec<i64>> {
+    let Some(Value::Array(items)) = value else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider group npi must be an array of JSON integers",
+        ));
+    };
+    if items.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider group npi must contain at least one JSON integer",
+        ));
+    }
+    if items.len() == 1 && strict_integer(&items[0], "provider group npi element")? == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let npi = strict_integer(item, "provider group npi element")?;
+        if !is_valid_npi(npi) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("provider group npi element is outside the 10-digit range: {npi}"),
+            ));
+        }
+        out.push(npi);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
 pub fn normalize_money_text(text: String) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -240,6 +305,51 @@ pub fn normalized_money_from_reader<R: Read>(
     Ok(normalized_scalar_from_reader(json_reader)?.and_then(normalize_money_text))
 }
 
+pub fn strict_money_number_from_reader<R: Read>(
+    json_reader: &mut JsonStreamReader<R>,
+) -> io::Result<Option<String>> {
+    match json_reader.peek().map_err(to_io_error)? {
+        ValueType::Number => {
+            let text = json_reader.next_number_as_string().map_err(to_io_error)?;
+            canonical_decimal_text(&text).map(Some).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "negotiated_rate cannot be represented by the canonical decimal contract",
+                )
+            })
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiated_rate must be a JSON number",
+        )),
+    }
+}
+
+pub fn strict_string_array_from_reader<R: Read>(
+    json_reader: &mut JsonStreamReader<R>,
+    field_name: &str,
+) -> io::Result<Vec<String>> {
+    if json_reader.peek().map_err(to_io_error)? != ValueType::Array {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field_name} must be an array of strings"),
+        ));
+    }
+    let mut out = Vec::new();
+    json_reader.begin_array().map_err(to_io_error)?;
+    while json_reader.has_next().map_err(to_io_error)? {
+        if json_reader.peek().map_err(to_io_error)? != ValueType::String {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{field_name} elements must be strings"),
+            ));
+        }
+        out.push(json_reader.next_string().map_err(to_io_error)?);
+    }
+    json_reader.end_array().map_err(to_io_error)?;
+    Ok(out)
+}
+
 pub fn normalized_string_list_from_reader<R: Read>(
     json_reader: &mut JsonStreamReader<R>,
 ) -> io::Result<Vec<String>> {
@@ -291,6 +401,8 @@ mod tests {
         canonical_text_list, int_list, normalize_code, normalize_money_text, normalize_string,
         normalize_tin_type, normalize_tin_value, normalized_money_from_reader,
         normalized_scalar_from_reader, normalized_string_list_from_reader, npi_list,
+        strict_integer, strict_integer_text, strict_money_number_from_reader, strict_npi_list,
+        strict_string_array_from_reader,
     };
     use serde_json::json;
     use struson::reader::JsonStreamReader;
@@ -332,6 +444,71 @@ mod tests {
             ]))),
             vec![1_234_567_890, 9_999_999_999]
         );
+    }
+
+    #[test]
+    fn strict_provider_identifiers_reject_coercion_and_invalid_npis() {
+        assert_eq!(strict_integer(&json!(7), "id").unwrap(), 7);
+        assert_eq!(strict_integer(&json!(7.0), "id").unwrap(), 7);
+        assert_eq!(
+            strict_integer_text(&json!(121591448686103182592848195376305442061u128), "id").unwrap(),
+            "121591448686103182592848195376305442061"
+        );
+        for invalid in [json!("7"), json!(true), json!({}), json!([]), json!(7.5)] {
+            assert!(strict_integer(&invalid, "id").is_err());
+        }
+
+        assert_eq!(
+            strict_npi_list(Some(&json!([1234567890, 1234567890.0]))).unwrap(),
+            vec![1234567890]
+        );
+        assert_eq!(
+            strict_npi_list(Some(&json!([0]))).unwrap(),
+            Vec::<i64>::new()
+        );
+        for invalid in [
+            json!(1234567890_i64),
+            json!([]),
+            json!(["1234567890"]),
+            json!([true]),
+            json!([{}]),
+            json!([[]]),
+            json!([123456789]),
+            json!([0, 1234567890]),
+            json!([1234567890, 0]),
+            json!([0, 0]),
+        ] {
+            assert!(strict_npi_list(Some(&invalid)).is_err());
+        }
+        assert!(strict_npi_list(None).is_err());
+    }
+
+    #[test]
+    fn strict_money_reader_accepts_only_canonicalizable_numbers() {
+        for (raw, expected) in [("12.3400", "12.34"), ("1.2e2", "120")] {
+            let mut reader = JsonStreamReader::new(raw.as_bytes());
+            assert_eq!(
+                strict_money_number_from_reader(&mut reader).unwrap(),
+                Some(expected.to_string())
+            );
+        }
+        for raw in [r#""12.34""#, "true", "{}", "[]", "null", "1e999999999"] {
+            let mut reader = JsonStreamReader::new(raw.as_bytes());
+            assert!(strict_money_number_from_reader(&mut reader).is_err());
+        }
+    }
+
+    #[test]
+    fn strict_string_array_reader_rejects_scalars_and_non_string_elements() {
+        let mut reader = JsonStreamReader::new(br#"["11", " 22 "]"#.as_slice());
+        assert_eq!(
+            strict_string_array_from_reader(&mut reader, "service_code").unwrap(),
+            vec!["11".to_string(), " 22 ".to_string()]
+        );
+        for raw in [r#""11""#, "true", "12", "{}", "null", r#"["11", 22]"#] {
+            let mut reader = JsonStreamReader::new(raw.as_bytes());
+            assert!(strict_string_array_from_reader(&mut reader, "service_code").is_err());
+        }
     }
 
     #[test]

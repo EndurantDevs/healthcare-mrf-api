@@ -1,10 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import os
+from pathlib import Path
 
 import pytest
 
 TEST_ENV_DEFAULTS = {
+    "HLTHPRT_LOG_CFG": str(Path(__file__).resolve().parents[1] / "logging.yaml"),
     "HLTHPRT_DB_DRIVER": "asyncpg",
     "HLTHPRT_DB_HOST": "127.0.0.1",
     "HLTHPRT_DB_PORT": "5432",
@@ -16,6 +18,7 @@ TEST_ENV_DEFAULTS = {
     "HLTHPRT_DB_POOL_MAX_SIZE": "5",
     "HLTHPRT_DB_ECHO": "False",
     "HLTHPRT_REDIS_ADDRESS": "redis://127.0.0.1:6379",
+    "HLTHPRT_PTG2_SOURCE_IMPORT_LOCK_ENABLED": "false",
 }
 
 for key, value in TEST_ENV_DEFAULTS.items():

@@ -1,31 +1,18 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""PostgreSQL readers for the PTG2 v3 serving-binary blocks.
-
-V3 keeps the v2 forward serving blocks and moves only reverse code membership
-and dense price atoms to explicit PostgreSQL artifact kinds.  A physical row
-may hold one fragment of a logical block, so readers always concatenate an
-ordered block before decoding it.
-"""
+"""Decoder primitives for strict shared-block PTG V3 PostgreSQL reads."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from api.ptg2_db_sidecars import (
-    _decode_serving_binary_payload,
-    _safe_qualified_table_name,
-    _serving_binary_payload_rows_for_keys,
-)
+from api.ptg2_db_sidecars import _decode_serving_binary_payload
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts.ptg2_serving_binary_v3 import (
     PTG2_V3_ATOM_KEY_24_BITS,
     PTG2_V3_ATOM_KEY_32_BITS,
-    PTG2V3PriceAtomRecord,
-    decode_price_atoms_for_offsets,
     decode_price_memberships_for_keys,
     decode_provider_code_set,
-    price_atom_entry_count,
     price_membership_entry_count,
     read_uvarint,
 )
@@ -38,9 +25,6 @@ PTG2_SERVING_BINARY_V3_ATOM_PAYLOAD_KIND = "price_atoms_v3"
 PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN = 1024
 PTG2_SERVING_BINARY_V3_PRICE_KEY_BLOCK_SPAN = 512
 PTG2_SERVING_BINARY_V3_ATOM_KEY_BLOCK_SPAN = 512
-# Kept as a compatibility alias for early v3 reader callers.  Provider-code
-# payloads are not block-addressed; provider-set keys are.
-PTG2_SERVING_BINARY_V3_CODE_KEY_BLOCK_SPAN = PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN
 
 
 def _requested_keys(source_keys: Iterable[int]) -> tuple[int, ...]:
@@ -68,48 +52,6 @@ def _effective_block_span(block_span: int | None, default_span: int) -> int:
     if normalized_span <= 0 or normalized_span > 1 << 24:
         raise PTG2ManifestArtifactError("PTG2 v3 manifest block span is invalid")
     return normalized_span
-
-
-async def _logical_blocks_by_key(
-    session: Any,
-    table_name: str,
-    *,
-    artifact_kind: str,
-    block_keys: Iterable[int],
-) -> dict[int, tuple[bytes, int]]:
-    """Fetch requested blocks and return one decoded payload per logical block."""
-
-    requested_block_keys = tuple(sorted({int(block_key) for block_key in block_keys}))
-    if not requested_block_keys:
-        return {}
-    binary_block_rows = await _serving_binary_payload_rows_for_keys(
-        session,
-        table_name,
-        artifact_kind=artifact_kind,
-        block_keys=requested_block_keys,
-    )
-    fragment_rows_by_block_key: dict[int, dict[int, Mapping[str, Any]]] = {
-        block_key: {} for block_key in requested_block_keys
-    }
-    for binary_block_row in binary_block_rows:
-        block_key = int(binary_block_row.get("block_key") or 0)
-        block_number = int(binary_block_row.get("block_no") or 0)
-        if block_key not in fragment_rows_by_block_key or block_number < 0:
-            raise PTG2ManifestArtifactError("PTG2 v3 query returned an invalid block fragment")
-        if block_number in fragment_rows_by_block_key[block_key]:
-            raise PTG2ManifestArtifactError(f"PTG2 v3 {artifact_kind} has duplicate block fragments")
-        fragment_rows_by_block_key[block_key][block_number] = binary_block_row
-
-    logical_blocks_by_key: dict[int, tuple[bytes, int]] = {}
-    for block_key, fragment_rows_by_number in fragment_rows_by_block_key.items():
-        if not fragment_rows_by_number:
-            continue
-        logical_blocks_by_key[block_key] = _logical_block_bytes(
-            fragment_rows_by_number,
-            artifact_kind=artifact_kind,
-            block_key=block_key,
-        )
-    return logical_blocks_by_key
 
 
 def _logical_block_bytes(
@@ -153,21 +95,6 @@ def _is_key_in_block(key: int, block_key: int, block_span: int) -> bool:
     return block_start <= key < block_start + block_span
 
 
-def _store_requested_value(
-    values_by_key: dict[int, Any],
-    *,
-    key: int,
-    value: Any,
-    requested_key_set: set[int],
-    artifact_kind: str,
-) -> None:
-    if key not in requested_key_set:
-        return
-    if key in values_by_key:
-        raise PTG2ManifestArtifactError(f"PTG2 v3 {artifact_kind} contains a duplicate key: {key}")
-    values_by_key[key] = value
-
-
 def _decode_provider_code_block(
     block_bytes: bytes,
     *,
@@ -206,43 +133,6 @@ def _decode_provider_code_block(
         return code_keys_by_provider_set
     except Exception as exc:
         raise PTG2ManifestArtifactError(f"PTG2 v3 provider-set code block {block_key} is corrupt") from exc
-
-
-async def lookup_provider_code_keys_from_db(
-    session: Any,
-    table_name: str,
-    provider_set_keys: Iterable[int],
-) -> dict[int, tuple[int, ...]]:
-    """Return requested provider-set keys mapped to their immutable code keys."""
-
-    _safe_qualified_table_name(table_name)
-    requested_key_values = _requested_keys(provider_set_keys)
-    logical_blocks = await _logical_blocks_by_key(
-        session,
-        table_name,
-        artifact_kind=PTG2_SERVING_BINARY_V3_PROVIDER_SET_CODES_KIND,
-        block_keys=_block_keys_for(
-            requested_key_values,
-            PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN,
-        ),
-    )
-    requested_key_set = set(requested_key_values)
-    code_keys_by_provider_set: dict[int, tuple[int, ...]] = {}
-    for block_key, (block_bytes, entry_count) in logical_blocks.items():
-        for provider_set_key, code_keys in _decode_provider_code_block(
-            block_bytes,
-            block_key=block_key,
-            entry_count=entry_count,
-            requested_provider_set_keys=requested_key_set,
-        ).items():
-            _store_requested_value(
-                code_keys_by_provider_set,
-                key=provider_set_key,
-                value=code_keys,
-                requested_key_set=requested_key_set,
-                artifact_kind=PTG2_SERVING_BINARY_V3_PROVIDER_SET_CODES_KIND,
-            )
-    return code_keys_by_provider_set
 
 
 def _membership_atom_key_bits(block_bytes: bytes) -> int:
@@ -287,103 +177,3 @@ def _decode_price_membership_block(
         return memberships_by_price_key
     except Exception as exc:
         raise PTG2ManifestArtifactError(f"PTG2 v3 price-membership block {block_key} is corrupt") from exc
-
-
-async def lookup_price_atom_memberships_from_db(
-    session: Any,
-    table_name: str,
-    price_keys: Iterable[int],
-    *,
-    atom_key_bits: int | None = None,
-    block_span: int | None = None,
-) -> dict[int, tuple[int, ...]]:
-    """Return requested price keys mapped to dense price-atom memberships."""
-
-    _safe_qualified_table_name(table_name)
-    expected_atom_key_bits = _expected_atom_key_bits(atom_key_bits)
-    effective_block_span = _effective_block_span(
-        block_span,
-        PTG2_SERVING_BINARY_V3_PRICE_KEY_BLOCK_SPAN,
-    )
-    requested_key_values = _requested_keys(price_keys)
-    logical_blocks = await _logical_blocks_by_key(
-        session,
-        table_name,
-        artifact_kind=PTG2_SERVING_BINARY_V3_PRICE_MEMBERSHIPS_KIND,
-        block_keys=_block_keys_for(requested_key_values, effective_block_span),
-    )
-    requested_key_set = set(requested_key_values)
-    atom_keys_by_price_key: dict[int, tuple[int, ...]] = {}
-    for block_key, (block_bytes, entry_count) in logical_blocks.items():
-        for price_key, atom_keys in _decode_price_membership_block(
-            block_bytes,
-            block_key=block_key,
-            entry_count=entry_count,
-            atom_key_bits=expected_atom_key_bits,
-            block_span=effective_block_span,
-            requested_price_keys=requested_key_set,
-        ).items():
-            _store_requested_value(
-                atom_keys_by_price_key,
-                key=price_key,
-                value=atom_keys,
-                requested_key_set=requested_key_set,
-                artifact_kind=PTG2_SERVING_BINARY_V3_PRICE_MEMBERSHIPS_KIND,
-            )
-    return atom_keys_by_price_key
-
-
-async def lookup_price_atoms_from_db(
-    session: Any,
-    table_name: str,
-    atom_keys: Iterable[int],
-    *,
-    atom_key_bits: int | None = None,
-    block_span: int | None = None,
-) -> dict[int, PTG2V3PriceAtomRecord]:
-    """Return requested dense atom keys mapped to compact price-atom records."""
-
-    _safe_qualified_table_name(table_name)
-    expected_atom_key_bits = _expected_atom_key_bits(atom_key_bits)
-    effective_block_span = _effective_block_span(
-        block_span,
-        PTG2_SERVING_BINARY_V3_ATOM_KEY_BLOCK_SPAN,
-    )
-    requested_key_values = _requested_keys(atom_keys)
-    if expected_atom_key_bits is not None and requested_key_values and requested_key_values[-1] >= 1 << expected_atom_key_bits:
-        raise PTG2ManifestArtifactError("PTG2 v3 atom key exceeds the manifest atom-key width")
-    logical_blocks = await _logical_blocks_by_key(
-        session,
-        table_name,
-        artifact_kind=PTG2_SERVING_BINARY_V3_ATOM_PAYLOAD_KIND,
-        block_keys=_block_keys_for(requested_key_values, effective_block_span),
-    )
-    requested_key_set = set(requested_key_values)
-    price_atoms_by_key: dict[int, PTG2V3PriceAtomRecord] = {}
-    for block_key, (block_bytes, entry_count) in logical_blocks.items():
-        try:
-            encoded_atom_count = price_atom_entry_count(block_bytes)
-        except Exception as exc:
-            raise PTG2ManifestArtifactError(f"PTG2 v3 price-atom block {block_key} is corrupt") from exc
-        if encoded_atom_count != entry_count or encoded_atom_count > effective_block_span:
-            raise PTG2ManifestArtifactError("PTG2 v3 price-atom count does not match its block row")
-        first_atom_key = block_key * effective_block_span
-        requested_offsets = {
-            atom_key - first_atom_key
-            for atom_key in requested_key_set
-            if _is_key_in_block(atom_key, block_key, effective_block_span)
-        }
-        try:
-            price_atoms_by_offset = decode_price_atoms_for_offsets(block_bytes, requested_offsets)
-        except Exception as exc:
-            raise PTG2ManifestArtifactError(f"PTG2 v3 price-atom block {block_key} is corrupt") from exc
-        for atom_offset, price_atom in price_atoms_by_offset.items():
-            atom_key = first_atom_key + atom_offset
-            _store_requested_value(
-                price_atoms_by_key,
-                key=atom_key,
-                value=price_atom,
-                requested_key_set=requested_key_set,
-                artifact_kind=PTG2_SERVING_BINARY_V3_ATOM_PAYLOAD_KIND,
-            )
-    return price_atoms_by_key

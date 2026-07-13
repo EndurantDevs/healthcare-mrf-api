@@ -9,19 +9,24 @@ import logging
 import multiprocessing
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping, Sequence
 
 import ijson
+from sqlalchemy import cast, func, literal
+from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import db
-from db.models import (ImportLog, PTG2CurrentPlanSource, PTG2CurrentSnapshot,
+from db.models import (ImportLog, PTG2CurrentPlanSource,
                        PTG2CurrentSourceSnapshot, PTG2FactChunk,
                        PTG2GCCandidate, PTG2ImportJob, PTG2ImportRun,
                        PTG2LocationSet, PTG2LocationSetMember, PTG2Plan,
@@ -38,8 +43,6 @@ from db.models import (ImportLog, PTG2CurrentPlanSource, PTG2CurrentSnapshot,
 from process.ext.utils import (ensure_database, flush_error_log,
                                get_import_schema, log_error, make_class,
                                push_objects, return_checksum)
-from process.ptg_parts.allowed_amounts import (_parse_allowed_amounts,
-                                               _process_allowed_amounts_file)
 from process.ptg_parts.artifact_streams import (load_json_artifact,
                                                 logical_artifact_identity,
                                                 open_json_artifact_stream,
@@ -64,94 +67,30 @@ from process.ptg_parts.canonical import (_canonical_key, _canonical_sort_key,
                                          normalize_money,
                                          normalize_tic_source_url,
                                          semantic_hash, sha256_bytes)
-from process.ptg_parts.compact_bulk import (_flush_in_network_rows,
-                                            prepare_ptg2_compact_bulk_load)
-from process.ptg_parts.compact_indexes import (
-    _PTG2_COMPACT_MODEL_BY_KIND, _index_snapshot_compact_table_entries,
-    _index_snapshot_compact_tables, _ptg2_compact_dictionary_index_mode,
-    _ptg2_compact_serving_index_mode,
-    _ptg2_compact_serving_reported_index_statement, _ptg2_index_timestamp,
-    _ptg2_model_index_statements_for_table, _ptg2_model_snapshot_index_role,
-    _run_ptg2_index_statement)
-from process.ptg_parts.compact_state import (_compact_add_unique,
-                                             _compact_state,
-                                             _compact_streaming_dedupe_tables,
-                                             _ptg2_price_atom_payload,
-                                             _ptg2_source_trace_payload)
-from process.ptg_parts.compact_writes import (_drain_compact_writes,
-                                              _existing_price_set_hashes,
-                                              _flush_compact_rate_pack_groups,
-                                              _flush_compact_rows,
-                                              _schedule_compact_write)
 from process.ptg_parts.config import (
-    PTG2_ASYNC_WRITE_TASKS_ENV, PTG2_BILLING_BATCH_ROWS_ENV,
-    PTG2_COMPACT_BATCH_ROWS_ENV, PTG2_COMPACT_BULK_DROP_INDEXES_ENV,
-    PTG2_COMPACT_COPY_KIND_TASKS_ENV, PTG2_COMPACT_COPY_TASKS_ENV,
-    PTG2_COMPACT_IMPORT_ENV, PTG2_COMPACT_SERVING_COPY_TASKS_ENV,
-    PTG2_COMPACT_SERVING_TABLE_ENV, PTG2_COPY_UPSERT_ROWS_ENV,
-    PTG2_DEDUPE_SERVING_STAGE_MERGE_ENV, PTG2_DEFAULT_COMPACT_COPY_KIND_TASKS,
-    PTG2_DEFAULT_COMPACT_COPY_TASKS, PTG2_DEFAULT_COMPACT_SERVING_COPY_TASKS,
-    PTG2_DEFAULT_DOWNLOAD_TASKS, PTG2_DEFAULT_RANGE_DOWNLOAD_CHUNK_BYTES,
-    PTG2_DEFAULT_RANGE_DOWNLOAD_MIN_BYTES, PTG2_DEFAULT_RANGE_DOWNLOAD_TASKS,
-    PTG2_DEFAULT_RUST_WORKERS, PTG2_DEFER_PROVIDER_LOCATIONS_ENV,
-    PTG2_DIRECT_COPY_SERVING_RATE_ENV, PTG2_DOWNLOAD_PROGRESS_BYTES_ENV,
-    PTG2_DOWNLOAD_RETRIES_ENV, PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV,
-    PTG2_DOWNLOAD_TASKS_ENV, PTG2_EXPECTED_IN_NETWORK_ITEMS_ENV,
-    PTG2_FAST_FINAL_REBUILD_ENV, PTG2_FAST_OBJECT_ITERATOR_ENV,
-    PTG2_FAST_PROVIDER_AGGREGATION_ENV, PTG2_FAST_PROVIDER_UNION_ENV,
-    PTG2_FILE_PROCESS_CONCURRENCY_ENV, PTG2_HASH_MODE_ENV,
-    PTG2_ITEM_BATCH_ROWS_ENV, PTG2_JSON_DECODER_ITERATOR_ENV,
-    PTG2_KEEP_PARTIAL_ENV, PTG2_KEEP_PRICE_SET_STAGE_ENV,
-    PTG2_KEEP_SERVING_RATE_STAGE_ENV, PTG2_MANIFEST_DIRECT_COPY_FILES_ENV,
-    PTG2_MANIFEST_DIRECT_COPY_TASKS_ENV, PTG2_MANIFEST_PRECOPY_MERGE_ENV,
-    PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV,
-    PTG2_MANIFEST_STREAM_MERGE_COPY_ENV,
-    PTG2_PRICE_BATCH_ROWS_ENV,
-    PTG2_PROGRESS_INTERVAL_SECONDS_ENV, PTG2_PROVIDER_BUCKET_COUNT_ENV,
-    PTG2_PROVIDER_CACHE_BACKEND_ENV, PTG2_PROVIDER_CACHE_MEMORY_REFS_ENV,
-    PTG2_PROVIDER_COMBO_CACHE_REFS_ENV, PTG2_PROVIDER_REF_BATCH_ROWS_ENV,
-    PTG2_PROVIDER_SET_INLINE_NPI_LIMIT_ENV,
-    PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV, PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV,
-    PTG2_RANGE_DOWNLOAD_TASKS_ENV, PTG2_RANGE_DOWNLOADS_ENV,
-    PTG2_RATE_BATCH_ROWS_ENV, PTG2_RATE_GROUP_FLUSH_ITEMS_ENV,
-    PTG2_RAW_WORKER_OBJECTS_ENV, PTG2_RUST_COMPACT_SERVING_ENV,
-    PTG2_RUST_EVENT_QUEUE_ENV, PTG2_RUST_PARSE_IN_WORKERS_ENV, PTG2_RUST_SCANNER_BIN_ENV,
-    PTG2_RUST_SCANNER_ENV, PTG2_RUST_WORKERS_ENV, PTG2_SERVING_ONLY_IMPORT_ENV,
-    PTG2_SERVING_WORKERS_ENV, PTG2_SKIP_BULK_INDEX_ENSURE_ENV,
-    PTG2_SKIP_COMPACT_SERVING_INDEX_ENSURE_ENV,
-    PTG2_SKIP_EXISTING_PRICE_SETS_ENV, PTG2_SLIM_SERVING_ROWS_ENV,
-    PTG2_STAGE_COPY_DEDUPE_DEFAULT_KINDS, PTG2_STAGE_COPY_DEDUPE_ENV,
-    PTG2_STAGE_INDEXES_ENV, PTG2_STAGE_PRICE_SETS_ENV,
-    PTG2_STAGE_SERVING_AS_FINAL_ENV, PTG2_STAGE_SERVING_RATES_ENV,
-    PTG2_STREAMING_DEDUPE_ENV, PTG2_UNLOGGED_FINAL_ENV,
-    PTG2_UNLOGGED_STAGE_ENV, PTG2_WORKER_CHUNK_BYTES_ENV,
-    PTG2_WORKER_CHUNK_ITEMS_ENV, PTG2_WORKER_MAX_PENDING_BATCHES_ENV,
-    PTG2_WORKER_MAX_PENDING_BYTES_ENV, PTG2_WORKER_RESULT_FILES_ENV,
-    TEST_ALLOWED_ITEMS, TEST_IN_NETWORK_ITEMS, TEST_NEGOTIATED_PRICES,
-    TEST_PROVIDER_GROUPS, TEST_TOC_FILES, TEST_TOC_JOBS, _env_bool, _env_int,
-    _is_postgres_binary_snapshot_arch, _is_postgres_binary_v3_arch,
-    _ptg2_snapshot_arch_from_env, _ptg2_snapshot_arch_variant,
-    _ptg2_stage_copy_dedupe_enabled, _use_compact_serving_table,
-    _uses_postgres_binary_provider_membership_graph,
-    _use_rust_compact_serving, _use_serving_only_import,
-    _use_stage_serving_as_final)
-from process.ptg_parts.copy_load import (_copy_compact_serving_rate_file,
-                                         _copy_compact_serving_rate_rows,
-                                         _copy_compact_serving_rate_source,
-                                         _copy_ignore_ptg2_objects,
+    PTG2_COPY_UPSERT_ROWS_ENV, PTG2_DEFAULT_MANIFEST_DIRECT_COPY_TASKS,
+    PTG2_DEFAULT_RUST_EVENT_QUEUE, PTG2_DEFAULT_RUST_WORKERS,
+    PTG2_DIRECT_COPY_SERVING_RATE_ENV, PTG2_DOWNLOAD_RETRIES_ENV,
+    PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV, PTG2_DOWNLOAD_TASKS_ENV,
+    PTG2_FAST_PROVIDER_UNION_ENV, PTG2_FILE_PROCESS_CONCURRENCY_ENV,
+    PTG2_KEEP_PARTIAL_ENV, PTG2_MANIFEST_DIRECT_COPY_TASKS_ENV,
+    PTG2_PROVIDER_BUCKET_COUNT_ENV, PTG2_PROVIDER_CACHE_MEMORY_REFS_ENV,
+    PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV,
+    PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV, PTG2_RANGE_DOWNLOAD_TASKS_ENV,
+    PTG2_RANGE_DOWNLOADS_ENV, PTG2_RUST_EVENT_QUEUE_ENV,
+    PTG2_RUST_SCANNER_BIN_ENV, PTG2_RUST_WORKERS_ENV,
+    PTG2_SOURCE_IMPORT_LOCK_ENABLED_ENV, PTG2_STREAMING_DEDUPE_ENV,
+    TEST_TOC_FILES, TEST_TOC_JOBS, _env_bool, _env_int,
+    _is_postgres_binary_v3_arch, _ptg2_snapshot_arch_from_env)
+from process.ptg_parts.config import _ptg2_auto_activate_candidates
+from process.ptg_parts.copy_load import (_copy_ignore_ptg2_objects,
                                          _copy_insert_ptg2_objects,
-                                         _copy_ptg2_dictionary_file,
-                                         _copy_stage_price_set_rows,
-                                         _copy_stage_serving_rate_rows,
-                                         _copy_upsert_ptg2_objects,
-                                         _json_default,
-                                         _primary_key_column_names,
-                                         _ptg2_conflict_targets,
-                                         _ptg2_copy_record, _ptg2_json_columns)
+                                         _copy_upsert_ptg2_objects)
 from process.ptg_parts.db_tables import (_estimated_table_rows,
                                          _exact_table_rows, _quote_ident,
                                          _table_exists, _table_has_rows)
 from process.ptg_parts.domain import (PTG2_ARTIFACT_RAW,
+                                      PTG2_CANDIDATE_ACTIVATION_CONTRACT,
                                       PTG2_CONFIDENCE_NPPES_MAILING_LOCATION,
                                       PTG2_CONFIDENCE_NPPES_PRACTICE_LOCATION,
                                       PTG2_CONFIDENCE_PAYER_DIRECTORY,
@@ -193,6 +132,11 @@ from process.ptg_parts.live_progress import (current_live_progress_context,
                                              reset_live_progress_context,
                                              set_live_progress_context,
                                              write_live_progress)
+from process.ptg_parts.input_artifact_retention import (
+    artifact_lease_context,
+    guard_artifact_lease,
+    release_current_artifact_lease,
+)
 from process.ptg_parts.progress import (_artifact_progress_position,
                                         _format_duration,
                                         _maybe_log_artifact_progress,
@@ -208,28 +152,36 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT, PTG2_MANIFEST_MEMBERSHIP_FORMAT)
 from process.ptg_parts.ptg2_manifest_publish import (
     PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
-    _copy_lean_manifest_serving_file,
     _copy_price_atom_member_file,
-    _copy_ptg2_manifest_code_count_file,
     _copy_ptg2_manifest_price_atom_file,
-    _copy_ptg2_manifest_provider_group_member_file,
-    _copy_provider_npi_scope_file,
-    _copy_ptg2_manifest_provider_set_dictionary_file,
-    _copy_ptg2_manifest_serving_file,
     _create_ptg2_manifest_serving_stage_table,
-    _ptg2_id_storage,
-    _ptg2_manifest_drop_serving_table_after_sidecars,
-    _ptg2_manifest_postgres_binary_natural_lean_stream_enabled,
-    _ptg2_manifest_price_atom_layout,
-    _ptg2_manifest_provider_group_location_enabled,
-    _ptg2_manifest_provider_group_rate_scope_enabled,
-    _ptg2_manifest_provider_set_component_enabled,
-    _use_direct_lean_manifest_copy,
-    _ptg2_manifest_serving_layout,
-    _ptg2_manifest_serving_sidecars_enabled,
     _ptg2_manifest_stage_table_name,
-    _ptg2_manifest_support_stage_table,
-    _publish_ptg2_manifest_serving_snapshot)
+    _ptg2_manifest_support_stage_table)
+from process.ptg_parts.ptg2_shared_blocks import (
+    PTG2_V3_COLD_LOOKUP_CONTRACT,
+    PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS,
+    PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
+    PTG2_V3_SHARED_GENERATION,
+    is_shared_layout_build_abandoned,
+    reserve_shared_layout,
+)
+from process.ptg_parts.ptg2_shared_finalize import attach_v3_source_run_contract
+from process.ptg_parts.ptg2_shared_reuse import (
+    SharedPhysicalArtifactIdentity,
+    normalized_physical_artifact_identity,
+    same_downloaded_physical_input,
+    shared_logical_artifact_metadata,
+    shared_physical_artifact_identity,
+    shared_physical_input_identity,
+    shared_snapshot_source_assignments,
+    shared_source_set_metadata,
+)
+from process.ptg_parts.ptg2_shared_snapshot_publish import (
+    delete_unpublished_shared_v3_snapshot_sources,
+    publish_shared_v3_snapshot_sources,
+    publish_strict_shared_v3_layout,
+    validate_reused_shared_v3_snapshot_sources,
+)
 from process.ptg_parts.row_helpers import (_as_int_list, _as_list,
                                            _coerce_date, _make_checksum,
                                            _normalize_code_component,
@@ -238,50 +190,10 @@ from process.ptg_parts.row_helpers import (_as_int_list, _as_list,
                                            _normalized_npi_list,
                                            _provider_group_hash_prefix,
                                            _provider_group_identity_hash)
-from process.ptg_parts.rust_publish import (
-    _ptg2_publish_timestamp, _ptg2_serving_child_table_name,
-    _publish_renamed_rust_dictionary_table,
-    _publish_rust_compact_snapshot_tables, _publish_rust_serving_stage_tables)
 from process.ptg_parts.rust_scanner import (
     _aiter_compact_serving_records_rust, _iter_compact_serving_records_rust,
     _iter_top_level_object_bytes_rust, _ptg2_rust_scanner_binary)
-from process.ptg_parts.rust_stage import (_RUST_COPY_TABLE_SPECS,
-                                          PTG2_SERVING_STAGE_LANE_PREFIX,
-                                          _create_rust_copy_stage_tables,
-                                          _merge_rust_copy_stage_tables,
-                                          _ptg2_dictionary_select_columns,
-                                          _rust_copy_stage_table_name,
-                                          _serving_stage_lane_key,
-                                          _serving_stage_table_for_copy,
-                                          _serving_stage_tables)
 from process.ptg_parts.screen import _emit_screen_line
-from process.ptg_parts.serving_index import (
-    _ptg2_table_available, build_ptg2_compact_serving_index,
-    build_ptg2_db_serving_index, build_ptg2_stage_serving_index,
-    finalize_ptg2_incremental_serving_index)
-from process.ptg_parts.serving_maintenance import (
-    _build_ptg2_provider_locations, _copy_simple_rows,
-    _count_compact_serving_rate_rows, _merge_staged_price_sets,
-    _merge_staged_serving_rates)
-from process.ptg_parts.serving_only import (
-    _iter_worker_result_rows, _normalize_serving_price_payload,
-    _ptg2_worker_capacity_wait_needed, _serving_only_hash_int_sets,
-    _serving_only_hash_price_key, _serving_only_hash_text,
-    _serving_only_key_list, _serving_only_key_value,
-    _serving_only_merge_worker_result, _serving_only_price_payload,
-    _serving_only_price_payload_and_key, _serving_only_rows_for_payload)
-from process.ptg_parts.serving_only import \
-    _serving_only_worker_process_chunk_to_files as \
-    _serving_only_worker_process_chunk_to_files_impl
-from process.ptg_parts.serving_only import _worker_payload_size
-from process.ptg_parts.serving_rows import (_provider_group_member_rows,
-                                            _provider_set_component_rows,
-                                            _ptg2_compact_serving_rate_row,
-                                            _ptg2_hp_procedure_code,
-                                            _ptg2_serving_rate_row)
-from process.ptg_parts.snapshot_artifacts import (
-    _row_mapping, build_ptg2_compact_snapshot_index_artifact,
-    build_ptg2_snapshot_index_artifact)
 from process.ptg_parts.snapshot_cleanup import (
     _cleanup_old_ptg2_source_tables, _drop_ptg2_snapshot_table_names,
     _drop_ptg2_snapshot_tables_for_manifest,
@@ -320,14 +232,14 @@ from process.ptg_parts.source_jobs import (_dedupe_preserve, _dedupe_ptg_jobs,
                                            parse_toc_catalog_entries)
 from process.ptg_parts.source_pointers import (_current_source_snapshot_id,
                                                _acquire_source_pointer_gc_lock,
+                                               _stage_ptg2_source_candidate,
+                                               activated_snapshot_attributes,
                                                _ptg2_plan_source_key,
-                                               _publish_ptg2_global_snapshot_pointer,
                                                _publish_ptg2_source_pointers,
                                                _source_plan_rows)
 from process.ptg_parts.source_versions import _record_source_version
 from process.ptg_parts.table_setup import (
-    PTG2_MODEL_CLASSES, PTG_ALLOWED_AMOUNT_TABLE_CLASS_NAMES,
-    PTG_CONTROL_TABLE_CLASS_NAMES, PTG_IN_NETWORK_DENSE_TABLE_CLASS_NAMES,
+    PTG2_MODEL_CLASSES, PTG_CONTROL_TABLE_CLASS_NAMES,
     PTG_PROVIDER_REFERENCE_TABLE_CLASS_NAMES, _drop_ptg2_columns,
     _ensure_indexes, _ensure_ptg_dynamic_tables,
     _ensure_ptg2_price_atom_columns, _ensure_ptg2_price_set_columns,
@@ -347,12 +259,22 @@ from process.ptg_parts.values import (_catalog_entry_id, build_fact_chunk,
 from process.url_security import fetch_max_bytes
 
 logger = logging.getLogger(__name__)
+_ptg2_monotonic = time.monotonic
 
 PTG2_SOURCE_SCOPED_TEST_ENV = "HLTHPRT_PTG2_SOURCE_SCOPED_TEST"
 PTG2_AUTO_ADDRESS_REFRESH_ENV = "HLTHPRT_PTG2_AUTO_ADDRESS_REFRESH"
 PTG2_AUTO_ADDRESS_REFRESH_TEST_ENV = "HLTHPRT_PTG2_AUTO_ADDRESS_REFRESH_TEST"
 PTG2_AUTO_ADDRESS_REFRESH_LIMIT_ENV = "HLTHPRT_PTG2_AUTO_ADDRESS_REFRESH_LIMIT_PER_SOURCE"
 PTG2_AUTO_ADDRESS_REFRESH_PUBLISH_ENV = "HLTHPRT_PTG2_AUTO_ADDRESS_REFRESH_PUBLISH"
+
+
+def _row_mapping(row: Any) -> dict[str, Any]:
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return dict(mapping)
+    if isinstance(row, dict):
+        return dict(row)
+    return dict(row)
 
 
 def _ptg2_auto_address_refresh_enabled(*, test_mode: bool) -> tuple[bool, str | None]:
@@ -448,16 +370,44 @@ class PTG2SnapshotInProgressConflict(RuntimeError):
     """Raised when another delivery owns a deterministic snapshot build."""
 
 
-async def _push_ptg2_snapshot_preserving_publication(
-    snapshot_attributes: dict[str, Any],
+def _ptg2_snapshot_conflict_update_values(
+    statement: Any,
+    table: Any,
+    *,
+    incoming_status: str | None,
 ) -> dict[str, Any]:
-    table = PTG2Snapshot.__table__
-    statement = db.insert(table).values(snapshot_attributes)
+    """Build snapshot upsert values while preserving a failed candidate manifest."""
+
     update_values_by_column = {
         column.name: getattr(statement.excluded, column.name)
         for column in table.c
         if column.name != "snapshot_id"
     }
+    if incoming_status != PTG2_STATUS_FAILED:
+        return update_values_by_column
+    empty_jsonb = cast(literal("{}"), JSONB)
+    existing_manifest = func.coalesce(cast(table.c.manifest, JSONB), empty_jsonb)
+    failure_manifest = func.coalesce(
+        cast(statement.excluded.manifest, JSONB),
+        empty_jsonb,
+    )
+    update_values_by_column["manifest"] = cast(
+        existing_manifest.op("||")(failure_manifest),
+        table.c.manifest.type,
+    )
+    return update_values_by_column
+
+
+async def _push_ptg2_snapshot_preserving_publication(
+    snapshot_attributes: dict[str, Any],
+) -> dict[str, Any]:
+    table = PTG2Snapshot.__table__
+    statement = db.insert(table).values(snapshot_attributes)
+    update_values_by_column = _ptg2_snapshot_conflict_update_values(
+        statement,
+        table,
+        incoming_status=snapshot_attributes.get("status"),
+    )
     is_snapshot_claim = snapshot_attributes.get("status") == PTG2_STATUS_BUILDING
     conflict_where = (
         table.c.status == PTG2_STATUS_FAILED
@@ -529,57 +479,6 @@ async def _push_ptg2_objects(
             raise
         await push_objects(object_entries, cls, rewrite=rewrite)
 
-_PTG2_WORKER_PROVIDER_MAP = None
-_PTG2_WORKER_PLAN_FIELDS: dict[str, Any] | None = None
-_PTG2_WORKER_SNAPSHOT_ID: str | None = None
-_PTG2_WORKER_PLAN_MONTH_ID: str | None = None
-_PTG2_WORKER_SOURCE_TRACE: list[dict[str, Any]] | None = None
-_PTG2_WORKER_SOURCE_TRACE_SET_HASH: str | None = None
-_PTG2_WORKER_SLIM_SERVING_ROWS = False
-_PTG2_WORKER_COMPACT_SERVING = False
-
-
-def _serving_only_worker_process(payload_or_raw: dict[str, Any] | bytes) -> dict[str, list[dict[str, Any]]]:
-    if (
-        _PTG2_WORKER_PROVIDER_MAP is None
-        or _PTG2_WORKER_PLAN_FIELDS is None
-        or _PTG2_WORKER_SNAPSHOT_ID is None
-        or _PTG2_WORKER_PLAN_MONTH_ID is None
-        or _PTG2_WORKER_SOURCE_TRACE is None
-    ):
-        raise RuntimeError("PTG2 serving worker was not initialized")
-    payload = _json_loads(payload_or_raw) if isinstance(payload_or_raw, (bytes, bytearray)) else payload_or_raw
-    return _serving_only_rows_for_payload(
-        payload,
-        provider_map=_PTG2_WORKER_PROVIDER_MAP,
-        plan_fields=_PTG2_WORKER_PLAN_FIELDS,
-        snapshot_id=_PTG2_WORKER_SNAPSHOT_ID,
-        plan_month_id=_PTG2_WORKER_PLAN_MONTH_ID,
-        source_trace_payload=_PTG2_WORKER_SOURCE_TRACE,
-        slim_serving_rows=_PTG2_WORKER_SLIM_SERVING_ROWS,
-        compact_serving=_PTG2_WORKER_COMPACT_SERVING,
-        source_trace_set_hash=_PTG2_WORKER_SOURCE_TRACE_SET_HASH,
-        include_price_set_rows=True,
-    )
-
-
-def _serving_only_worker_process_chunk(
-    payloads_or_raw: list[dict[str, Any] | bytes | bytearray],
-) -> dict[str, list[dict[str, Any]]]:
-    merged: dict[str, list[dict[str, Any]]] = {}
-    for payload_or_raw in payloads_or_raw:
-        result = _serving_only_worker_process(payload_or_raw)
-        _serving_only_merge_worker_result(merged, result)
-    merged.pop("__seen__", None)
-    return merged
-
-
-def _serving_only_worker_process_chunk_to_files(
-    payloads_or_raw: list[dict[str, Any] | bytes | bytearray],
-) -> dict[str, Any]:
-    return _serving_only_worker_process_chunk_to_files_impl(payloads_or_raw, _serving_only_worker_process)
-
-
 def _ptg2_copy_file_row_count(path: Path) -> int:
     if not path.exists() or path.stat().st_size <= 0:
         return 0
@@ -615,22 +514,6 @@ def _collect_ptg2_manifest_sidecar_artifacts(
 
 def _ptg2_existing_manifest_copy_paths(input_paths: list[Path]) -> list[Path]:
     return [path for path in input_paths if path.exists() and path.stat().st_size > 0]
-
-
-def _ptg2_manifest_copy_merge_command(kind: str, output_path: Path, input_paths: list[Path]) -> list[str]:
-    binary = _ptg2_rust_scanner_binary()
-    if binary is None:
-        raise RuntimeError(
-            "PTG2 manifest pre-COPY merge requires the Rust scanner binary; "
-            "build it with `cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml`"
-        )
-    return [
-        str(binary),
-        "--merge-manifest-copy",
-        kind,
-        str(output_path),
-        *[str(path) for path in input_paths],
-    ]
 
 
 def _ptg2_provider_membership_sidecar_command(
@@ -687,33 +570,6 @@ async def _build_ptg2_provider_membership_sidecars(
         raise RuntimeError("PTG2 provider membership sidecar builder returned invalid output") from exc
 
 
-def _manifest_merge_summary_from_stdout(
-    stdout: bytes,
-    *,
-    kind: str,
-    input_paths: list[Path],
-    output_path: Path,
-) -> dict[str, Any]:
-    try:
-        header, rest = stdout.split(b"\n", 1)
-        record_kind, length_bytes = header.split(b"\t", 1)
-        payload_len = int(length_bytes)
-        payload = rest[:payload_len]
-        if record_kind == b"manifest_copy_merge_summary":
-            return json.loads(payload.decode("utf-8"))
-    except Exception as exc:
-        logger.debug("failed to parse PTG2 manifest pre-COPY merge summary: %s", exc)
-    output_rows = _ptg2_copy_file_row_count(output_path)
-    input_rows = sum(_ptg2_copy_file_row_count(path) for path in input_paths)
-    return {
-        "kind": kind,
-        "input_files": len(input_paths),
-        "input_rows": input_rows,
-        "output_rows": output_rows,
-        "dropped_rows": max(input_rows - output_rows, 0),
-    }
-
-
 def _emit_ptg2_publish_progress(
     publish_step: str,
     *,
@@ -749,148 +605,6 @@ def _emit_ptg2_publish_progress(
         logger.debug("Failed to write PTG2 publish live progress", exc_info=True)
 
 
-def _run_ptg2_manifest_copy_merge_sync(kind: str, output_path: Path, input_paths: list[Path]) -> dict[str, Any]:
-    existing_paths = _ptg2_existing_manifest_copy_paths(input_paths)
-    if not existing_paths:
-        output_path.touch()
-        return {"kind": kind, "input_files": 0, "input_rows": 0, "output_rows": 0, "dropped_rows": 0}
-    process = subprocess.run(
-        _ptg2_manifest_copy_merge_command(kind, output_path, existing_paths),
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=False,
-    )
-    if process.returncode != 0:
-        stderr = process.stderr.decode("utf-8", errors="replace")
-        raise RuntimeError(f"PTG2 manifest pre-COPY merge failed for {kind}: {stderr[-1000:]}")
-    return _manifest_merge_summary_from_stdout(
-        process.stdout,
-        kind=kind,
-        input_paths=existing_paths,
-        output_path=output_path,
-    )
-
-
-async def _run_ptg2_manifest_copy_merge(kind: str, output_path: Path, input_paths: list[Path]) -> dict[str, Any]:
-    return await asyncio.to_thread(_run_ptg2_manifest_copy_merge_sync, kind, output_path, input_paths)
-
-
-def _manifest_stream_fifo_path(kind: str) -> Path:
-    fd, raw_fifo_path = tempfile.mkstemp(prefix=f"ptg2_{kind}_stream_", suffix=".copy", dir=ptg2_temp_parent())
-    os.close(fd)
-    fifo_path = Path(raw_fifo_path)
-    fifo_path.unlink(missing_ok=True)
-    os.mkfifo(fifo_path)
-    return fifo_path
-
-
-def _close_manifest_fifo_fd(file_descriptor: int) -> None:
-    try:
-        os.close(file_descriptor)
-    except OSError as exc:
-        logger.debug("failed to close PTG2 manifest FIFO descriptor %s: %s", file_descriptor, exc)
-
-
-def _start_manifest_fifo_closer(process: subprocess.Popen[bytes], file_descriptor: int) -> threading.Thread:
-    def wait_for_process_and_close_fifo() -> None:
-        """Close the dummy FIFO writer after the Rust merge process exits."""
-        process.wait()
-        _close_manifest_fifo_fd(file_descriptor)
-
-    closer_thread = threading.Thread(target=wait_for_process_and_close_fifo, daemon=True)
-    closer_thread.start()
-    return closer_thread
-
-
-async def _terminate_manifest_merge_process(process: subprocess.Popen[bytes], kind: str) -> None:
-    if process.poll() is None:
-        process.terminate()
-    _stdout, stderr = await asyncio.to_thread(process.communicate)
-    if process.returncode:
-        logger.warning(
-            "PTG2 manifest streaming pre-COPY merge failed during COPY for %s: %s",
-            kind,
-            stderr.decode("utf-8", errors="replace")[-1000:],
-        )
-
-
-async def _copy_manifest_fifo_and_collect_stdout(
-    *,
-    kind: str,
-    fifo_path: Path,
-    target_table: str,
-    copy_func,
-    process: subprocess.Popen[bytes],
-) -> bytes:
-    try:
-        await copy_func(fifo_path, target_table=target_table)
-    except Exception:
-        await _terminate_manifest_merge_process(process, kind)
-        raise
-    stdout, stderr = await asyncio.to_thread(process.communicate)
-    if process.returncode != 0:
-        stderr_text = stderr.decode("utf-8", errors="replace")
-        raise RuntimeError(f"PTG2 manifest streaming pre-COPY merge failed for {kind}: {stderr_text[-1000:]}")
-    return stdout
-
-
-async def _stream_ptg2_manifest_copy_merge(
-    kind: str,
-    *,
-    target_table: str,
-    input_paths: list[Path],
-    copy_func,
-) -> dict[str, Any]:
-    """Run the Rust merge producer directly into a PostgreSQL COPY reader."""
-    existing_paths = _ptg2_existing_manifest_copy_paths(input_paths)
-    if not existing_paths:
-        return {"kind": kind, "input_files": 0, "input_rows": 0, "output_rows": 0, "dropped_rows": 0}
-    if not hasattr(os, "mkfifo"):
-        raise RuntimeError("PTG2 manifest streaming pre-COPY merge requires POSIX named pipes")
-
-    fifo_path = _manifest_stream_fifo_path(kind)
-    dummy_fd = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
-    closer_thread: threading.Thread | None = None
-
-    try:
-        process = subprocess.Popen(
-            _ptg2_manifest_copy_merge_command(kind, fifo_path, existing_paths),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        closer_thread = _start_manifest_fifo_closer(process, dummy_fd)
-        dummy_fd = -1
-        stdout = await _copy_manifest_fifo_and_collect_stdout(
-            kind=kind,
-            fifo_path=fifo_path,
-            target_table=target_table,
-            copy_func=copy_func,
-            process=process,
-        )
-        summary = _manifest_merge_summary_from_stdout(
-            stdout,
-            kind=kind,
-            input_paths=existing_paths,
-            output_path=fifo_path,
-        )
-        summary["streamed_to_copy"] = True
-        return summary
-    finally:
-        if dummy_fd >= 0:
-            _close_manifest_fifo_fd(dummy_fd)
-        if closer_thread is not None:
-            closer_thread.join(timeout=1)
-        fifo_path.unlink(missing_ok=True)
-
-
-def _manifest_serving_copy_settings():
-    use_direct_lean_copy = _use_direct_lean_manifest_copy()
-    if use_direct_lean_copy:
-        return "manifest_lean_serving", _copy_lean_manifest_serving_file, True
-    return "manifest_serving", _copy_ptg2_manifest_serving_file, False
-
-
 def _copy_file_row_count(copy_file_entry: dict[str, Any]) -> int:
     try:
         return int(copy_file_entry.get("row_count") or 0)
@@ -922,51 +636,32 @@ def _collect_manifest_copy_files(
     return copy_files_by_kind, emitted_rows_by_kind
 
 
-async def _stream_manifest_copy_kind_with_progress(
-    kind: str,
-    *,
-    target_table: str,
-    input_paths: list[Path],
-    copy_func,
-    completed_steps_before_copy: int,
-    total_steps: int,
-    emitted_rows: int | None,
-) -> dict[str, Any]:
-    _emit_ptg2_publish_progress(
-        f"copying {kind}",
-        completed_steps=completed_steps_before_copy,
-        total_steps=total_steps,
-        stage_start_pct=92.0,
-        stage_end_pct=95.0,
-        message_text=f"streaming {kind} merge into {target_table}",
-        copy_kind=kind,
-        target_table=target_table,
-        input_files=len(_ptg2_existing_manifest_copy_paths(input_paths)),
-        emitted_rows=emitted_rows,
-        streamed_to_copy=True,
-    )
-    copy_metrics = await _stream_ptg2_manifest_copy_merge(
-        kind,
-        target_table=target_table,
-        input_paths=input_paths,
-        copy_func=copy_func,
-    )
-    _emit_ptg2_publish_progress(
-        f"copied {kind}",
-        completed_steps=completed_steps_before_copy + 1,
-        total_steps=total_steps,
-        stage_start_pct=92.0,
-        stage_end_pct=95.0,
-        message_text=f"copied {int(copy_metrics.get('output_rows') or 0)} {kind} row(s) into {target_table}",
-        copy_kind=kind,
-        target_table=target_table,
-        input_files=copy_metrics.get("input_files"),
-        input_rows=copy_metrics.get("input_rows"),
-        output_rows=copy_metrics.get("output_rows"),
-        dropped_rows=copy_metrics.get("dropped_rows"),
-        streamed_to_copy=True,
-    )
-    return copy_metrics
+def _collect_manifest_copy_entries(
+    successful_files: list[dict[str, Any]],
+    copy_kinds: Sequence[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Collect metadata-bearing deferred files without opening their payloads."""
+
+    entries_by_kind: dict[str, list[dict[str, Any]]] = {
+        kind: [] for kind in copy_kinds
+    }
+    seen_paths_by_kind: dict[str, set[str]] = {kind: set() for kind in copy_kinds}
+    for file_summary in successful_files:
+        summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
+        manifest_payload = summary_payload.get("manifest") if isinstance(summary_payload, dict) else None
+        copy_files = manifest_payload.get("copy_files") if isinstance(manifest_payload, dict) else None
+        if not isinstance(copy_files, dict):
+            continue
+        for kind in copy_kinds:
+            for raw_entry in copy_files.get(kind) or ():
+                if not isinstance(raw_entry, dict):
+                    continue
+                path = str(raw_entry.get("path") or "").strip()
+                if not path or path in seen_paths_by_kind[kind]:
+                    continue
+                seen_paths_by_kind[kind].add(path)
+                entries_by_kind[kind].append(dict(raw_entry))
+    return entries_by_kind
 
 
 async def _copy_manifest_files_direct_with_progress(
@@ -979,10 +674,16 @@ async def _copy_manifest_files_direct_with_progress(
     total_steps: int,
     emitted_rows: int | None,
 ) -> dict[str, Any]:
-    """Copy manifest worker files directly while reporting publish progress."""
+    """Copy manifest worker files, emit progress, and return throughput metrics."""
     existing_paths = _ptg2_existing_manifest_copy_paths(input_paths)
     input_bytes = sum(input_path.stat().st_size for input_path in existing_paths)
-    copy_tasks = max(_env_int(PTG2_MANIFEST_DIRECT_COPY_TASKS_ENV, 8), 1)
+    copy_tasks = max(
+        _env_int(
+            PTG2_MANIFEST_DIRECT_COPY_TASKS_ENV,
+            PTG2_DEFAULT_MANIFEST_DIRECT_COPY_TASKS,
+        ),
+        1,
+    )
     _emit_ptg2_publish_progress(
         f"copying {kind}",
         completed_steps=completed_steps_before_copy,
@@ -1005,7 +706,7 @@ async def _copy_manifest_files_direct_with_progress(
         semaphore = asyncio.Semaphore(copy_tasks)
 
         async def copy_one(input_path: Path) -> None:
-            """Copy one manifest worker file under the shared concurrency limit."""
+            """Run one copy operation under the shared concurrency limit."""
             async with semaphore:
                 await copy_func(input_path, target_table=target_table)
 
@@ -1045,75 +746,6 @@ async def _copy_manifest_files_direct_with_progress(
     }
 
 
-async def _merge_manifest_copy_kind_with_progress(
-    kind: str,
-    output_path: Path,
-    input_paths: list[Path],
-    *,
-    completed_steps_before_merge: int,
-    total_steps: int,
-    emitted_rows: int | None,
-) -> dict[str, Any]:
-    _emit_ptg2_publish_progress(
-        f"merging {kind}",
-        completed_steps=completed_steps_before_merge,
-        total_steps=total_steps,
-        stage_start_pct=92.0,
-        stage_end_pct=95.0,
-        message_text=f"merging {kind} copy files",
-        copy_kind=kind,
-        input_files=len(_ptg2_existing_manifest_copy_paths(input_paths)),
-        emitted_rows=emitted_rows,
-    )
-    merge_metrics = await _run_ptg2_manifest_copy_merge(kind, output_path, input_paths)
-    _emit_ptg2_publish_progress(
-        f"merged {kind}",
-        completed_steps=completed_steps_before_merge + 1,
-        total_steps=total_steps,
-        stage_start_pct=92.0,
-        stage_end_pct=95.0,
-        message_text=f"merged {int(merge_metrics.get('output_rows') or 0)} {kind} row(s)",
-        copy_kind=kind,
-        input_files=merge_metrics.get("input_files"),
-        input_rows=merge_metrics.get("input_rows"),
-        output_rows=merge_metrics.get("output_rows"),
-        dropped_rows=merge_metrics.get("dropped_rows"),
-    )
-    return merge_metrics
-
-
-async def _copy_merged_manifest_kind_with_progress(
-    kind: str,
-    copy_path: Path,
-    *,
-    target_table: str,
-    copy_func,
-    completed_steps_before_copy: int,
-    total_steps: int,
-) -> None:
-    _emit_ptg2_publish_progress(
-        f"copying {kind}",
-        completed_steps=completed_steps_before_copy,
-        total_steps=total_steps,
-        stage_start_pct=92.0,
-        stage_end_pct=95.0,
-        message_text=f"copying merged {kind} rows into {target_table}",
-        copy_kind=kind,
-        target_table=target_table,
-    )
-    await copy_func(copy_path, target_table=target_table)
-    _emit_ptg2_publish_progress(
-        f"copied {kind}",
-        completed_steps=completed_steps_before_copy + 1,
-        total_steps=total_steps,
-        stage_start_pct=92.0,
-        stage_end_pct=95.0,
-        message_text=f"copied merged {kind} rows into {target_table}",
-        copy_kind=kind,
-        target_table=target_table,
-    )
-
-
 def _cleanup_manifest_copy_paths(copy_files_by_kind: dict[str, list[Path]]) -> None:
     for copy_file_paths in copy_files_by_kind.values():
         for copy_file_path in copy_file_paths:
@@ -1123,6 +755,113 @@ def _cleanup_manifest_copy_paths(copy_files_by_kind: dict[str, list[Path]]) -> N
             except Exception:
                 logger.debug("Failed to remove PTG2 manifest merge file %s", copy_file_path, exc_info=True)
             _cleanup_empty_manifest_copy_siblings(base_copy_path)
+
+
+def _cleanup_manifest_copy_entries(
+    copy_entries_by_kind: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> None:
+    paths_by_kind = {
+        str(kind): [
+            Path(str(entry.get("path")))
+            for entry in entries
+            if entry.get("path")
+        ]
+        for kind, entries in copy_entries_by_kind.items()
+    }
+    run_directories = {
+        path.parent
+        for paths in paths_by_kind.values()
+        for path in paths
+        if path.parent.name.startswith("ptg2-v3-runs-")
+    }
+    _cleanup_manifest_copy_paths(paths_by_kind)
+    for run_directory in run_directories:
+        shutil.rmtree(run_directory, ignore_errors=True)
+
+
+def _cleanup_strict_v3_graph_artifacts(artifacts: Mapping[str, Any]) -> None:
+    """Remove import-only graph files after they are durable in PostgreSQL."""
+
+    artifact_root = (resolve_ptg2_artifact_dir() / "serving").resolve()
+    parent_directories: set[Path] = set()
+    for entry in artifacts.get("sidecars") or ():
+        if not isinstance(entry, Mapping):
+            continue
+        raw_path = str(entry.get("path") or "").strip()
+        if not raw_path or "://" in raw_path:
+            continue
+        path = Path(raw_path).resolve()
+        try:
+            path.relative_to(artifact_root)
+        except ValueError:
+            logger.warning("Refusing to remove PTG graph artifact outside %s: %s", artifact_root, path)
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove imported PTG graph artifact %s", path, exc_info=True)
+            continue
+        parent_directories.add(path.parent)
+    for directory in sorted(parent_directories, key=lambda value: len(value.parts), reverse=True):
+        current = directory
+        while current != artifact_root:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
+
+
+async def _cancel_and_wait_tasks(tasks: set[asyncio.Task[Any]]) -> None:
+    """Cancel child work and wait until it can no longer use import inputs."""
+
+    remaining = tuple(tasks)
+    for task in remaining:
+        task.cancel()
+    if remaining:
+        await asyncio.gather(*remaining, return_exceptions=True)
+    tasks.clear()
+
+
+@asynccontextmanager
+async def _ptg2_source_import_lock(source_key: str):
+    """Serialize full imports for one source without holding a SQL transaction."""
+
+    if not _env_bool(PTG2_SOURCE_IMPORT_LOCK_ENABLED_ENV, True):
+        yield
+        return
+    if db.engine is None:
+        await db.connect()
+    assert db.engine is not None
+    lock_name = f"ptg2_source_import_v1:{source_key}"
+    async with db.engine.connect() as connection:
+        while True:
+            lock_query_result = await connection.execute(
+                db.text(
+                    "SELECT pg_try_advisory_lock(hashtextextended(:lock_name, 0))"
+                ),
+                {"lock_name": lock_name},
+            )
+            acquired = bool(lock_query_result.scalar())
+            await connection.commit()
+            if acquired:
+                break
+            write_live_progress(
+                phase="waiting for source import",
+                pct=1,
+                message="waiting for another import of this source to finish",
+            )
+            await asyncio.sleep(5)
+        try:
+            yield
+        finally:
+            await connection.execute(
+                db.text(
+                    "SELECT pg_advisory_unlock(hashtextextended(:lock_name, 0))"
+                ),
+                {"lock_name": lock_name},
+            )
+            await connection.commit()
 
 
 def _manifest_copy_base_path(copy_file_path: Path) -> Path:
@@ -1157,322 +896,110 @@ async def _merge_and_copy_ptg2_manifest_files(
     successful_files: list[dict[str, Any]],
     manifest_stage_table: str,
 ) -> dict[str, Any]:
-    """Merge deferred PTG2 manifest shards and copy them into stage tables."""
-    manifest_serving_copy_kind, manifest_serving_copy_func, use_direct_lean_copy = _manifest_serving_copy_settings()
-    copy_kinds = [
-        manifest_serving_copy_kind,
-        "price_atom",
-        "price_set_atom",
-        "provider_group_member",
-        "provider_npi_scope",
-        "code_count",
-        "provider_set_dictionary",
-    ]
-    copy_files_by_kind, emitted_rows_by_kind = _collect_manifest_copy_files(successful_files, copy_kinds)
-    if not any(copy_files_by_kind.values()):
-        return {"enabled": False, "reason": "no_deferred_copy_files"}
-
-    def _new_merge_path(prefix: str) -> Path:
-        fd, name = tempfile.mkstemp(prefix=prefix, suffix=".copy", dir=ptg2_temp_parent())
-        os.close(fd)
-        path = Path(name)
-        path.unlink(missing_ok=True)
-        return path
-
-    price_atom_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_atom")
-    price_set_atom_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_set_atom")
-    provider_group_member_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_group_member")
-    provider_npi_scope_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_npi_scope")
-    code_count_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "code_count")
-    provider_set_dictionary_table = _ptg2_manifest_support_stage_table(
-        manifest_stage_table,
-        "provider_set_dictionary",
-    )
-    has_price_set_atom_files = bool(copy_files_by_kind.get("price_set_atom"))
-    binary_snapshot_arch = _is_postgres_binary_snapshot_arch(_ptg2_snapshot_arch_from_env())
-    direct_copy_default = binary_snapshot_arch
-    use_provider_membership_graph = _uses_postgres_binary_provider_membership_graph(
-        _ptg2_snapshot_arch_from_env()
-    )
-    if use_provider_membership_graph or _env_bool(PTG2_MANIFEST_DIRECT_COPY_FILES_ENV, direct_copy_default):
-        merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
-        progress_total = 6 if has_price_set_atom_files else 5
-        try:
-            serving_metrics = await _copy_manifest_files_direct_with_progress(
-                manifest_serving_copy_kind,
-                target_table=manifest_stage_table,
-                input_paths=copy_files_by_kind[manifest_serving_copy_kind],
-                copy_func=manifest_serving_copy_func,
-                completed_steps_before_copy=0,
-                total_steps=progress_total,
-                emitted_rows=emitted_rows_by_kind.get(manifest_serving_copy_kind),
-            )
-            price_atom_metrics = await _copy_manifest_files_direct_with_progress(
+    if _is_postgres_binary_v3_arch(_ptg2_snapshot_arch_from_env()):
+        copy_kinds = ("price_atom", "price_set_atom")
+        copy_files_by_kind, emitted_rows_by_kind = _collect_manifest_copy_files(
+            successful_files,
+            list(copy_kinds),
+        )
+        if not any(copy_files_by_kind.values()):
+            return {"enabled": False, "reason": "no_strict_v3_price_copy_files"}
+        target_by_kind = {
+            "price_atom": _ptg2_manifest_support_stage_table(
+                manifest_stage_table,
                 "price_atom",
-                target_table=price_atom_table,
-                input_paths=copy_files_by_kind["price_atom"],
-                copy_func=_copy_ptg2_manifest_price_atom_file,
-                completed_steps_before_copy=1,
-                total_steps=progress_total,
-                emitted_rows=emitted_rows_by_kind.get("price_atom"),
-            )
-            price_set_atom_metrics = None
-            if has_price_set_atom_files:
-                price_set_atom_metrics = await _copy_manifest_files_direct_with_progress(
-                    "price_set_atom",
-                    target_table=price_set_atom_table,
-                    input_paths=copy_files_by_kind["price_set_atom"],
-                    copy_func=_copy_price_atom_member_file,
-                    completed_steps_before_copy=2,
-                    total_steps=progress_total,
-                    emitted_rows=emitted_rows_by_kind.get("price_set_atom"),
-                )
-            if use_provider_membership_graph:
-                provider_group_member_metrics_map = {"skipped": "postgres_binary_v2_membership_graph"}
-                provider_scope_metrics_map = await _copy_manifest_files_direct_with_progress(
-                    "provider_npi_scope",
-                    target_table=provider_npi_scope_table,
-                    input_paths=copy_files_by_kind["provider_npi_scope"],
-                    copy_func=_copy_provider_npi_scope_file,
-                    completed_steps_before_copy=3 if has_price_set_atom_files else 2,
-                    total_steps=progress_total,
-                    emitted_rows=emitted_rows_by_kind.get("provider_npi_scope"),
-                )
-            else:
-                provider_group_member_metrics_map = await _copy_manifest_files_direct_with_progress(
-                    "provider_group_member",
-                    target_table=provider_group_member_table,
-                    input_paths=copy_files_by_kind["provider_group_member"],
-                    copy_func=_copy_ptg2_manifest_provider_group_member_file,
-                    completed_steps_before_copy=3 if has_price_set_atom_files else 2,
-                    total_steps=progress_total,
-                    emitted_rows=emitted_rows_by_kind.get("provider_group_member"),
-                )
-                provider_scope_metrics_map = None
-            code_count_metrics = await _copy_manifest_files_direct_with_progress(
-                "code_count",
-                target_table=code_count_table,
-                input_paths=copy_files_by_kind["code_count"],
-                copy_func=_copy_ptg2_manifest_code_count_file,
-                completed_steps_before_copy=4 if has_price_set_atom_files else 3,
-                total_steps=progress_total,
-                emitted_rows=emitted_rows_by_kind.get("code_count"),
-            )
-            provider_set_dictionary_metrics = await _copy_manifest_files_direct_with_progress(
-                "provider_set_dictionary",
-                target_table=provider_set_dictionary_table,
-                input_paths=copy_files_by_kind["provider_set_dictionary"],
-                copy_func=_copy_ptg2_manifest_provider_set_dictionary_file,
-                completed_steps_before_copy=5 if has_price_set_atom_files else 4,
-                total_steps=progress_total,
-                emitted_rows=emitted_rows_by_kind.get("provider_set_dictionary"),
-            )
-            merge_metrics["kinds"] = {
-                manifest_serving_copy_kind: serving_metrics,
-                "price_atom": price_atom_metrics,
-                "provider_group_member": provider_group_member_metrics_map,
-                "code_count": code_count_metrics,
-                "provider_set_dictionary": provider_set_dictionary_metrics,
-            }
-            if provider_scope_metrics_map is not None:
-                merge_metrics["kinds"]["provider_npi_scope"] = provider_scope_metrics_map
-            if price_set_atom_metrics is not None:
-                merge_metrics["kinds"]["price_set_atom"] = price_set_atom_metrics
-            merge_metrics["serving_rows"] = int(serving_metrics.get("output_rows") or 0)
-            merge_metrics["direct_to_copy"] = True
-            _emit_screen_line(f"PTG2_MANIFEST_PRECOPY_MERGE\t{json.dumps(merge_metrics, sort_keys=True)}")
-            return merge_metrics
-        finally:
-            _cleanup_manifest_copy_paths(copy_files_by_kind)
-
-    stream_merge_default = binary_snapshot_arch
-    if _env_bool(PTG2_MANIFEST_STREAM_MERGE_COPY_ENV, stream_merge_default):
-        merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
-        progress_total = 4 if has_price_set_atom_files else 3
-
-        try:
-            serving_metrics = await _stream_manifest_copy_kind_with_progress(
-                manifest_serving_copy_kind,
-                target_table=manifest_stage_table,
-                input_paths=copy_files_by_kind[manifest_serving_copy_kind],
-                copy_func=manifest_serving_copy_func,
-                completed_steps_before_copy=0,
-                total_steps=progress_total,
-                emitted_rows=emitted_rows_by_kind.get(manifest_serving_copy_kind),
-            )
-            price_atom_metrics = await _stream_manifest_copy_kind_with_progress(
-                "price_atom",
-                target_table=price_atom_table,
-                input_paths=copy_files_by_kind["price_atom"],
-                copy_func=_copy_ptg2_manifest_price_atom_file,
-                completed_steps_before_copy=1,
-                total_steps=progress_total,
-                emitted_rows=emitted_rows_by_kind.get("price_atom"),
-            )
-            price_set_atom_metrics = None
-            if has_price_set_atom_files:
-                price_set_atom_metrics = await _stream_manifest_copy_kind_with_progress(
-                    "price_set_atom",
-                    target_table=price_set_atom_table,
-                    input_paths=copy_files_by_kind["price_set_atom"],
-                    copy_func=_copy_price_atom_member_file,
-                    completed_steps_before_copy=2,
-                    total_steps=progress_total,
-                    emitted_rows=emitted_rows_by_kind.get("price_set_atom"),
-                )
-            provider_group_member_metrics = await _stream_manifest_copy_kind_with_progress(
-                "provider_group_member",
-                target_table=provider_group_member_table,
-                input_paths=copy_files_by_kind["provider_group_member"],
-                copy_func=_copy_ptg2_manifest_provider_group_member_file,
-                completed_steps_before_copy=3 if has_price_set_atom_files else 2,
-                total_steps=progress_total,
-                emitted_rows=emitted_rows_by_kind.get("provider_group_member"),
-            )
-            merge_metrics["kinds"] = {
-                manifest_serving_copy_kind: serving_metrics,
-                "price_atom": price_atom_metrics,
-                "provider_group_member": provider_group_member_metrics,
-            }
-            if price_set_atom_metrics is not None:
-                merge_metrics["kinds"]["price_set_atom"] = price_set_atom_metrics
-            merge_metrics["serving_rows"] = int(serving_metrics.get("output_rows") or 0)
-            merge_metrics["streamed_to_copy"] = True
-            _emit_screen_line(f"PTG2_MANIFEST_PRECOPY_MERGE\t{json.dumps(merge_metrics, sort_keys=True)}")
-            return merge_metrics
-        finally:
-            _cleanup_manifest_copy_paths(copy_files_by_kind)
-
-    serving_merge_prefix = (
-        "ptg2_manifest_lean_serving_merged_" if use_direct_lean_copy else "ptg2_manifest_serving_merged_"
-    )
-    merged_serving = _new_merge_path(serving_merge_prefix)
-    merged_price_atom = _new_merge_path("ptg2_manifest_price_atom_merged_")
-    merged_price_set_atom = _new_merge_path("ptg2_manifest_price_set_atom_merged_") if has_price_set_atom_files else None
-    merged_provider_group_member = _new_merge_path("ptg2_manifest_provider_group_member_merged_")
-    merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
-    progress_total = 8 if has_price_set_atom_files else 6
-
-    try:
-        serving_metrics = await _merge_manifest_copy_kind_with_progress(
-            manifest_serving_copy_kind,
-            merged_serving,
-            copy_files_by_kind[manifest_serving_copy_kind],
-            completed_steps_before_merge=0,
-            total_steps=progress_total,
-            emitted_rows=emitted_rows_by_kind.get(manifest_serving_copy_kind),
-        )
-        price_atom_metrics = await _merge_manifest_copy_kind_with_progress(
-            "price_atom",
-            merged_price_atom,
-            copy_files_by_kind["price_atom"],
-            completed_steps_before_merge=1,
-            total_steps=progress_total,
-            emitted_rows=emitted_rows_by_kind.get("price_atom"),
-        )
-        price_set_atom_metrics = None
-        if merged_price_set_atom is not None:
-            price_set_atom_metrics = await _merge_manifest_copy_kind_with_progress(
+            ),
+            "price_set_atom": _ptg2_manifest_support_stage_table(
+                manifest_stage_table,
                 "price_set_atom",
-                merged_price_set_atom,
-                copy_files_by_kind["price_set_atom"],
-                completed_steps_before_merge=2,
-                total_steps=progress_total,
-                emitted_rows=emitted_rows_by_kind.get("price_set_atom"),
-            )
-        provider_group_member_metrics = await _merge_manifest_copy_kind_with_progress(
-            "provider_group_member",
-            merged_provider_group_member,
-            copy_files_by_kind["provider_group_member"],
-            completed_steps_before_merge=3 if has_price_set_atom_files else 2,
-            total_steps=progress_total,
-            emitted_rows=emitted_rows_by_kind.get("provider_group_member"),
-        )
-        await _copy_merged_manifest_kind_with_progress(
-            manifest_serving_copy_kind,
-            merged_serving,
-            target_table=manifest_stage_table,
-            copy_func=manifest_serving_copy_func,
-            completed_steps_before_copy=4 if has_price_set_atom_files else 3,
-            total_steps=progress_total,
-        )
-        await _copy_merged_manifest_kind_with_progress(
-            "price_atom",
-            merged_price_atom,
-            target_table=price_atom_table,
-            copy_func=_copy_ptg2_manifest_price_atom_file,
-            completed_steps_before_copy=5 if has_price_set_atom_files else 4,
-            total_steps=progress_total,
-        )
-        if merged_price_set_atom is not None:
-            await _copy_merged_manifest_kind_with_progress(
-                "price_set_atom",
-                merged_price_set_atom,
-                target_table=price_set_atom_table,
-                copy_func=_copy_price_atom_member_file,
-                completed_steps_before_copy=6,
-                total_steps=progress_total,
-            )
-        await _copy_merged_manifest_kind_with_progress(
-            "provider_group_member",
-            merged_provider_group_member,
-            target_table=provider_group_member_table,
-            copy_func=_copy_ptg2_manifest_provider_group_member_file,
-            completed_steps_before_copy=7 if has_price_set_atom_files else 5,
-            total_steps=progress_total,
-        )
-        merge_metrics["kinds"] = {
-            manifest_serving_copy_kind: serving_metrics,
-            "price_atom": price_atom_metrics,
-            "provider_group_member": provider_group_member_metrics,
+            ),
         }
-        if price_set_atom_metrics is not None:
-            merge_metrics["kinds"]["price_set_atom"] = price_set_atom_metrics
-        merge_metrics["serving_rows"] = int(serving_metrics.get("output_rows") or 0)
-        _emit_screen_line(f"PTG2_MANIFEST_PRECOPY_MERGE\t{json.dumps(merge_metrics, sort_keys=True)}")
-        return merge_metrics
-    finally:
-        for path in (merged_serving, merged_price_atom, merged_price_set_atom, merged_provider_group_member):
-            if path is None:
-                continue
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to remove PTG2 manifest merge file %s", path, exc_info=True)
-        _cleanup_manifest_copy_paths(copy_files_by_kind)
+        copy_func_by_kind = {
+            "price_atom": _copy_ptg2_manifest_price_atom_file,
+            "price_set_atom": _copy_price_atom_member_file,
+        }
+        copy_report_map: dict[str, Any] = {
+            "enabled": True,
+            "strict_v3_price_only": True,
+            "kinds": {},
+            "emitted_rows": emitted_rows_by_kind,
+        }
+        active_kinds = [kind for kind in copy_kinds if copy_files_by_kind[kind]]
+        try:
+            for completed_steps, kind in enumerate(active_kinds):
+                copy_report_map["kinds"][kind] = await _copy_manifest_files_direct_with_progress(
+                    kind,
+                    target_table=target_by_kind[kind],
+                    input_paths=copy_files_by_kind[kind],
+                    copy_func=copy_func_by_kind[kind],
+                    completed_steps_before_copy=completed_steps,
+                    total_steps=max(len(active_kinds), 1),
+                    emitted_rows=emitted_rows_by_kind.get(kind),
+                )
+            copy_report_map["direct_to_copy"] = True
+            _emit_screen_line(
+                "PTG2_STRICT_V3_PRICE_COPY\t"
+                f"{json.dumps(copy_report_map, sort_keys=True)}"
+            )
+            return copy_report_map
+        finally:
+            _cleanup_manifest_copy_paths(copy_files_by_kind)
 
 
-async def _parse_in_network_file_serving_only(
+def _record_v3_scanner_summary(
+    scanner_summary_by_name: Mapping[str, Any],
+    deferred_copy_entries_by_kind: dict[str, list[dict[str, Any]]],
+    row_counts_by_name: dict[str, int],
+) -> None:
+    copy_file_field_by_kind = {
+        "serving_run": "serving_run_partition_files",
+        "serving_code_dictionary": "serving_run_code_dictionary_files",
+    }
+    for copy_kind, field_name in copy_file_field_by_kind.items():
+        candidate_entries = scanner_summary_by_name.get(field_name)
+        if not isinstance(candidate_entries, list):
+            continue
+        deferred_copy_entries_by_kind[copy_kind].extend(
+            dict(copy_entry)
+            for copy_entry in candidate_entries
+            if isinstance(copy_entry, dict)
+        )
+    row_counts_by_name["serving"] = int(
+        scanner_summary_by_name.get("serving_run_rows") or 0
+    )
+
+
+async def _parse_strict_v3_file(
     file_path: str,
     file_id: int,
     meta: dict[str, Any],
     plan_info: list[dict[str, Any]] | None,
-    provider_map,
     test_mode: bool,
     import_log_cls,
     source_url: str,
     source_version: PTG2SourceVersion | None,
     snapshot_id: str,
+    coverage_scope_id: str,
     import_month: datetime.date,
     max_items: int | None = None,
-    rust_stage_tables: dict[str, str] | None = None,
     ptg2_manifest_stage_table: str | None = None,
     source_network_names: list[str] | str | None = None,
 ) -> dict[str, Any]:
-    """Parse one in-network file into manifest-backed serving artifacts."""
+    """Scan one file into strict V3 COPY artifacts and clean incomplete scratch state."""
+
     if not ptg2_manifest_stage_table:
         raise RuntimeError("PTG imports require manifest serving stage tables")
-    if rust_stage_tables:
-        raise RuntimeError("Legacy PTG Rust stage tables are no longer supported")
     if max_items is not None:
         logger.info("Ignoring max_items=%s for manifest-backed Rust PTG import", max_items)
 
     plan_fields = _derive_plan_fields(meta, plan_info)
     source_network_name_values = _normalize_source_network_names(source_network_names)
     arch_version = _ptg2_snapshot_arch_from_env()
-    use_postgres_binary_arch = _is_postgres_binary_snapshot_arch(arch_version)
+    if not _is_postgres_binary_v3_arch(arch_version):
+        raise RuntimeError("only postgres_binary_v3 PTG imports are supported")
     plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(plan_fields, snapshot_id, import_month)
     _source_trace_row, _source_trace_set_row = _ptg2_source_trace_rows(source_version, source_url)
+    source_trace_hash = _source_trace_row["source_trace_hash"]
     source_trace_set_hash = _source_trace_set_row["source_trace_set_hash"]
 
     await _push_ptg2_objects([plan_row], PTG2Plan, rewrite=True)
@@ -1481,37 +1008,24 @@ async def _parse_in_network_file_serving_only(
     await _push_ptg2_objects([plan_month_row], PTG2PlanMonth, rewrite=True)
 
     copy_tmp_dir = ptg2_temp_parent()
-    manifest_stage_table = ptg2_manifest_stage_table
     manifest_copy_row_counter_by_name = {"serving": 0}
     rust_records = 0
-    rust_dedupe_summary: dict[str, Any] = {}
-    rust_scanner_config: dict[str, Any] = {}
-    rust_scanner_summary: dict[str, Any] = {}
+    rust_dedupe_summary_by_field: dict[str, Any] = {}
+    rust_scanner_config_by_name: dict[str, Any] = {}
+    rust_scanner_summary_by_name: dict[str, Any] = {}
     procedure_hashes: set[str] = set()
-    use_provider_membership_graph = _uses_postgres_binary_provider_membership_graph(arch_version)
-    defer_manifest_copy = _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True) or use_provider_membership_graph
-    use_direct_lean_copy = _use_direct_lean_manifest_copy()
-    manifest_serving_copy_kind = "manifest_lean_serving" if use_direct_lean_copy else "manifest_serving"
-    manifest_serving_record_kind = (
-        "manifest_lean_serving_copy_file" if use_direct_lean_copy else "manifest_serving_copy_file"
-    )
-    manifest_serving_copy_func = (
-        _copy_lean_manifest_serving_file if use_direct_lean_copy else _copy_ptg2_manifest_serving_file
-    )
-    deferred_copy_files: dict[str, list[dict[str, Any]]] = {
-        manifest_serving_copy_kind: [],
+    deferred_copy_entries_by_kind: dict[str, list[dict[str, Any]]] = {
+        "serving_run": [],
+        "serving_code_dictionary": [],
         "price_atom": [],
         "price_set_atom": [],
         "provider_group_member": [],
-        "provider_npi_scope": [],
-        "code_count": [],
-        "provider_set_dictionary": [],
+        "provider_set_metadata": [],
     }
-    deferred_copy_file_paths_by_kind: dict[str, set[str]] = {kind: set() for kind in deferred_copy_files}
-    compact_copy_tasks: set[asyncio.Task] = set()
-    compact_copy_task_limit = max(_env_int(PTG2_COMPACT_COPY_TASKS_ENV, PTG2_DEFAULT_COMPACT_COPY_TASKS), 1)
-    compact_copy_semaphore = asyncio.Semaphore(compact_copy_task_limit)
-    copy_completed = False
+    deferred_copy_file_paths_by_kind: dict[str, set[str]] = {
+        kind: set() for kind in deferred_copy_entries_by_kind
+    }
+    is_scan_complete = False
 
     def _new_copy_path(prefix: str) -> Path:
         fd, name = tempfile.mkstemp(prefix=prefix, suffix=".copy", dir=copy_tmp_dir)
@@ -1530,7 +1044,9 @@ async def _parse_in_network_file_serving_only(
         if path_key in seen_paths:
             return 0
         seen_paths.add(path_key)
-        deferred_copy_files[kind].append({"path": str(copy_file), "row_count": row_count})
+        deferred_copy_entries_by_kind[kind].append(
+            {"path": str(copy_file), "row_count": row_count}
+        )
         return row_count
 
     def _manifest_copy_candidates(copy_path: Path) -> list[Path]:
@@ -1549,88 +1065,56 @@ async def _parse_in_network_file_serving_only(
             candidate_paths.append(worker_copy_path)
         return candidate_paths
 
-    manifest_serving_copy_path = _new_copy_path(
-        "ptg2_manifest_lean_serving_" if use_direct_lean_copy else "ptg2_manifest_serving_"
-    )
     manifest_price_atom_copy_path = _new_copy_path("ptg2_manifest_price_atom_")
     manifest_price_set_atom_copy_path = _new_copy_path("ptg2_manifest_price_set_atom_")
     manifest_provider_group_member_copy_path = _new_copy_path("ptg2_manifest_provider_group_member_")
-    manifest_code_count_copy_path = _new_copy_path("ptg2_manifest_code_count_")
-    manifest_provider_set_dictionary_copy_path = _new_copy_path("ptg2_manifest_provider_set_dictionary_")
+    manifest_provider_set_metadata_copy_path = _new_copy_path(
+        "ptg2_v3_provider_set_metadata_"
+    )
+    v3_serving_run_directory = Path(
+        tempfile.mkdtemp(prefix="ptg2-v3-runs-", dir=copy_tmp_dir)
+    )
     manifest_artifact_dir = resolve_ptg2_artifact_dir() / "serving" / _ptg2_snapshot_table_token(
         str(plan_fields.get("plan_id") or "plan"),
         snapshot_id,
     )
     manifest_artifact_dir.mkdir(parents=True, exist_ok=True)
     manifest_file_token = hashlib.sha256(str(Path(file_path).resolve()).encode("utf-8")).hexdigest()[:16]
-    provider_npi_sidecar_enabled = (
-        not use_provider_membership_graph
-        and _env_bool(PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV, True)
-    )
-    manifest_sidecar_paths = {
-        "provider_forward": manifest_artifact_dir / f"provider_forward_{manifest_file_token}.ptg2sc",
-        "provider_inverted": manifest_artifact_dir / f"provider_inverted_{manifest_file_token}.ptg2sc",
-        "provider_npi": (
-            manifest_artifact_dir / f"provider_npi_{manifest_file_token}.ptg2sc"
-            if provider_npi_sidecar_enabled
-            else None
-        ),
-        "provider_group_npi": (
-            manifest_artifact_dir / f"provider_group_npi_{manifest_file_token}.ptg2sc"
-            if use_provider_membership_graph
-            else None
-        ),
-        "provider_npi_group": (
-            manifest_artifact_dir / f"provider_npi_group_{manifest_file_token}.ptg2sc"
-            if use_provider_membership_graph
-            else None
-        ),
-        "price_forward": (
-            None
-            if use_postgres_binary_arch
-            else manifest_artifact_dir / f"price_forward_{manifest_file_token}.ptg2sc"
-        ),
+    manifest_sidecar_paths_by_kind = {
+        "provider_forward": manifest_artifact_dir
+        / f"provider_forward_{manifest_file_token}.ptg2sc",
+        "provider_inverted": manifest_artifact_dir
+        / f"provider_inverted_{manifest_file_token}.ptg2sc",
+        "provider_group_npi": manifest_artifact_dir
+        / f"provider_group_npi_{manifest_file_token}.ptg2sc",
+        "provider_npi_group": manifest_artifact_dir
+        / f"provider_npi_group_{manifest_file_token}.ptg2sc",
     }
 
-    def emit_copy_status(status: str, *, kind: str, copy_file: Path, rows: int, target_table: str | None, started_at: float | None = None) -> None:
-        """Emit structured status for one manifest shard copy."""
-        payload: dict[str, Any] = {
-            "event": f"PTG2_COPY_SHARD_{status}",
-            "kind": kind,
-            "path": str(copy_file),
-            "rows": rows,
-            "target_table": target_table,
-        }
-        if started_at is not None:
-            payload["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
-        _emit_screen_line(json.dumps(payload, sort_keys=True))
+    def discard_file_scratch() -> None:
+        """Remove all file-local COPY, run, and sidecar scratch artifacts."""
 
-    async def copy_ready_manifest_serving_file(copy_row: dict[str, Any]) -> None:
-        """Copy or defer one ready manifest serving shard."""
-        raw_copy_path = str(copy_row.get("path") or "").strip()
-        if not raw_copy_path:
-            return
-        copied_rows = int(copy_row.get("row_count") or 0)
-        copy_file = Path(raw_copy_path)
-        if defer_manifest_copy:
-            if copied_rows <= 0:
-                copied_rows = _ptg2_copy_file_row_count(copy_file)
-            manifest_copy_row_counter_by_name["serving"] += _record_deferred_copy_file_once(
-                manifest_serving_copy_kind,
-                copy_file,
-                copied_rows,
-            )
-            return
-        async with compact_copy_semaphore:
-            started_at = time.monotonic()
-            emit_copy_status("START", kind=manifest_serving_copy_kind, copy_file=copy_file, rows=copied_rows, target_table=manifest_stage_table)
-            await manifest_serving_copy_func(copy_file, target_table=manifest_stage_table)
-            emit_copy_status("DONE", kind=manifest_serving_copy_kind, copy_file=copy_file, rows=copied_rows, target_table=manifest_stage_table, started_at=started_at)
-        manifest_copy_row_counter_by_name["serving"] += copied_rows
-        copy_file.unlink(missing_ok=True)
+        _cleanup_manifest_copy_entries(deferred_copy_entries_by_kind)
+        for copy_path in (
+            manifest_price_atom_copy_path,
+            manifest_price_set_atom_copy_path,
+            manifest_provider_group_member_copy_path,
+            manifest_provider_set_metadata_copy_path,
+        ):
+            _cleanup_manifest_copy_family(copy_path)
+        shutil.rmtree(v3_serving_run_directory, ignore_errors=True)
+        shutil.rmtree(manifest_artifact_dir, ignore_errors=True)
 
-    async def copy_ready_manifest_dictionary_file(kind: str, copy_row: dict[str, Any]) -> None:
-        """Copy or defer one ready manifest dictionary shard."""
+    def record_ready_manifest_file(kind: str, copy_row: dict[str, Any]) -> None:
+        """Record one nonempty deferred COPY file exactly once for publication."""
+
+        if kind not in {
+            "price_atom",
+            "price_set_atom",
+            "provider_group_member",
+            "provider_set_metadata",
+        }:
+            return
         raw_copy_path = str(copy_row.get("path") or "").strip()
         if not raw_copy_path:
             return
@@ -1638,137 +1122,79 @@ async def _parse_in_network_file_serving_only(
         copied_rows = int(copy_row.get("row_count") or 0)
         if copied_rows <= 0:
             copied_rows = _ptg2_copy_file_row_count(copy_file)
-        if kind == "price_atom":
-            target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_atom")
-            copy_func = _copy_ptg2_manifest_price_atom_file
-        elif kind == "price_set_atom":
-            target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_set_atom")
-            copy_func = _copy_price_atom_member_file
-        elif kind == "provider_group_member":
-            target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_group_member")
-            copy_func = _copy_ptg2_manifest_provider_group_member_file
-        elif kind == "code_count":
-            target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "code_count")
-            copy_func = _copy_ptg2_manifest_code_count_file
-        elif kind == "provider_set_dictionary":
-            target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_set_dictionary")
-            copy_func = _copy_ptg2_manifest_provider_set_dictionary_file
-        else:
-            return
-        if defer_manifest_copy:
-            _record_deferred_copy_file_once(kind, copy_file, copied_rows)
-            return
-        async with compact_copy_semaphore:
-            started_at = time.monotonic()
-            emit_copy_status("START", kind=f"manifest_{kind}", copy_file=copy_file, rows=copied_rows, target_table=target_table)
-            await copy_func(copy_file, target_table=target_table)
-            emit_copy_status("DONE", kind=f"manifest_{kind}", copy_file=copy_file, rows=copied_rows, target_table=target_table, started_at=started_at)
-        copy_file.unlink(missing_ok=True)
-
-    async def wait_for_some_copy_tasks(force: bool = False) -> None:
-        """Drain ready manifest copy tasks when the task window fills."""
-        if not compact_copy_tasks:
-            return
-        if force:
-            done, _pending_tasks = await asyncio.wait(compact_copy_tasks, return_when=asyncio.ALL_COMPLETED)
-            compact_copy_tasks.clear()
-        elif len(compact_copy_tasks) < compact_copy_task_limit * 2:
-            return
-        else:
-            done, pending_tasks = await asyncio.wait(compact_copy_tasks, return_when=asyncio.FIRST_COMPLETED)
-            compact_copy_tasks.intersection_update(pending_tasks)
-        for task in done:
-            task.result()
+        _record_deferred_copy_file_once(kind, copy_file, copied_rows)
 
     try:
         async for record_kind, record_row in _aiter_compact_serving_records_rust(
             file_path,
             snapshot_id=snapshot_id,
             plan_id=str(plan_fields.get("plan_id") or ""),
+            coverage_scope_id=coverage_scope_id,
             plan_month_id=str(plan_month_row["plan_month_id"]),
             source_trace_set_hash=source_trace_set_hash,
-            manifest_serving_copy_path=None if use_direct_lean_copy else manifest_serving_copy_path,
-            manifest_lean_serving_copy_path=manifest_serving_copy_path if use_direct_lean_copy else None,
-            manifest_provider_forward_sidecar_path=manifest_sidecar_paths.get("provider_forward"),
-            manifest_provider_inverted_sidecar_path=manifest_sidecar_paths.get("provider_inverted"),
-            manifest_provider_npi_sidecar_path=manifest_sidecar_paths.get("provider_npi"),
-            manifest_price_forward_sidecar_path=manifest_sidecar_paths.get("price_forward"),
+            manifest_serving_copy_path=None,
+            manifest_lean_serving_copy_path=None,
+            v3_serving_run_directory=v3_serving_run_directory,
+            manifest_provider_forward_sidecar_path=manifest_sidecar_paths_by_kind[
+                "provider_forward"
+            ],
+            manifest_provider_inverted_sidecar_path=manifest_sidecar_paths_by_kind[
+                "provider_inverted"
+            ],
+            manifest_provider_npi_sidecar_path=None,
+            manifest_price_forward_sidecar_path=None,
             manifest_price_atom_copy_path=manifest_price_atom_copy_path,
-            manifest_price_set_atom_copy_path=manifest_price_set_atom_copy_path if use_postgres_binary_arch else None,
+            manifest_price_set_atom_copy_path=manifest_price_set_atom_copy_path,
             manifest_provider_group_member_copy_path=manifest_provider_group_member_copy_path,
-            manifest_code_count_copy_path=manifest_code_count_copy_path if use_postgres_binary_arch else None,
-            manifest_provider_set_dictionary_copy_path=(
-                manifest_provider_set_dictionary_copy_path if use_postgres_binary_arch else None
-            ),
+            manifest_code_count_copy_path=None,
+            manifest_provider_set_dictionary_copy_path=manifest_provider_set_metadata_copy_path,
             source_network_names=source_network_name_values,
             manifest_only=True,
         ):
             if record_kind == "dedupe_summary":
-                rust_dedupe_summary = dict(record_row or {})
+                rust_dedupe_summary_by_field = dict(record_row or {})
                 continue
             if record_kind == "scanner_config":
-                rust_scanner_config = dict(record_row or {})
+                rust_scanner_config_by_name = dict(record_row or {})
                 continue
             if record_kind == "scanner_summary":
-                rust_scanner_summary = dict(record_row or {})
+                rust_scanner_summary_by_name = dict(record_row or {})
+                _record_v3_scanner_summary(
+                    rust_scanner_summary_by_name,
+                    deferred_copy_entries_by_kind,
+                    manifest_copy_row_counter_by_name,
+                )
                 continue
             rust_records += 1
-            if record_kind == manifest_serving_record_kind:
-                compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_serving_file(record_row)))
-                await wait_for_some_copy_tasks()
-            elif record_kind == "manifest_price_atom_copy_file":
-                compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_dictionary_file("price_atom", record_row)))
-                await wait_for_some_copy_tasks()
-            elif record_kind == "manifest_price_set_atom_copy_file":
-                compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_dictionary_file("price_set_atom", record_row)))
-                await wait_for_some_copy_tasks()
-            elif record_kind == "manifest_provider_group_member_copy_file":
-                compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_dictionary_file("provider_group_member", record_row)))
-                await wait_for_some_copy_tasks()
-            elif record_kind == "manifest_code_count_copy_file":
-                compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_dictionary_file("code_count", record_row)))
-                await wait_for_some_copy_tasks()
-            elif record_kind == "manifest_provider_set_dictionary_copy_file":
-                compact_copy_tasks.add(
-                    asyncio.create_task(copy_ready_manifest_dictionary_file("provider_set_dictionary", record_row))
-                )
-                await wait_for_some_copy_tasks()
-            elif record_kind in {"procedure", "serving_rate_compact"} and record_row.get("procedure_hash"):
+            if record_kind == "manifest_price_atom_copy_file":
+                record_ready_manifest_file("price_atom", record_row)
+            if record_kind == "manifest_price_set_atom_copy_file":
+                record_ready_manifest_file("price_set_atom", record_row)
+            if record_kind == "manifest_provider_group_member_copy_file":
+                record_ready_manifest_file("provider_group_member", record_row)
+            if record_kind == "manifest_provider_set_dictionary_copy_file":
+                record_ready_manifest_file("provider_set_metadata", record_row)
+            if record_kind in {"procedure", "serving_rate_compact"} and record_row.get("procedure_hash"):
                 procedure_hashes.add(str(record_row.get("procedure_hash")))
-        await wait_for_some_copy_tasks(force=True)
-        for copy_path, copy_func in (
-            (manifest_serving_copy_path, copy_ready_manifest_serving_file),
-            (manifest_price_atom_copy_path, lambda row: copy_ready_manifest_dictionary_file("price_atom", row)),
-            (
-                manifest_price_set_atom_copy_path,
-                lambda row: copy_ready_manifest_dictionary_file("price_set_atom", row),
-            ),
-            (manifest_provider_group_member_copy_path, lambda row: copy_ready_manifest_dictionary_file("provider_group_member", row)),
-            (manifest_code_count_copy_path, lambda row: copy_ready_manifest_dictionary_file("code_count", row)),
-            (
-                manifest_provider_set_dictionary_copy_path,
-                lambda row: copy_ready_manifest_dictionary_file("provider_set_dictionary", row),
-            ),
+        for copy_path, kind in (
+            (manifest_price_atom_copy_path, "price_atom"),
+            (manifest_price_set_atom_copy_path, "price_set_atom"),
+            (manifest_provider_group_member_copy_path, "provider_group_member"),
+            (manifest_provider_set_metadata_copy_path, "provider_set_metadata"),
         ):
             for candidate_copy_path in _manifest_copy_candidates(copy_path):
                 if candidate_copy_path.exists() and candidate_copy_path.stat().st_size > 0:
-                    await copy_func({"path": str(candidate_copy_path), "row_count": 0})
-        if manifest_copy_row_counter_by_name["serving"] == 0 and not defer_manifest_copy:
-            manifest_copy_row_counter_by_name["serving"] = await _estimated_table_rows(
-                os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
-                manifest_stage_table,
-            )
-        copy_completed = True
+                    record_ready_manifest_file(
+                        kind,
+                        {"path": str(candidate_copy_path), "row_count": 0},
+                    )
+        is_scan_complete = True
     finally:
-        for task in compact_copy_tasks:
-            task.cancel()
         manifest_copy_paths = (
-            manifest_serving_copy_path,
             manifest_price_atom_copy_path,
             manifest_price_set_atom_copy_path,
             manifest_provider_group_member_copy_path,
-            manifest_code_count_copy_path,
-            manifest_provider_set_dictionary_copy_path,
+            manifest_provider_set_metadata_copy_path,
         )
         for copy_path in manifest_copy_paths:
             try:
@@ -1777,37 +1203,52 @@ async def _parse_in_network_file_serving_only(
             except Exception:
                 logger.debug("Failed to remove empty PTG2 manifest copy file %s", copy_path, exc_info=True)
             _cleanup_empty_manifest_copy_siblings(copy_path)
-        remove_copy_families = (copy_completed and not defer_manifest_copy) or (
-            not copy_completed and not _env_bool(PTG2_KEEP_PARTIAL_ENV, False)
-        )
-        if remove_copy_families:
+        if not is_scan_complete:
             for copy_path in manifest_copy_paths:
                 _cleanup_manifest_copy_family(copy_path)
+            discard_file_scratch()
 
     membership_graph_metrics_map: dict[str, Any] = {}
-    if use_provider_membership_graph:
-        provider_npi_scope_copy_path = _new_copy_path("ptg2_manifest_provider_npi_scope_")
-        provider_group_member_paths = [
-            Path(copy_metadata["path"])
-            for copy_metadata in deferred_copy_files["provider_group_member"]
-            if copy_metadata.get("path")
-        ]
+    provider_npi_scope_copy_path = _new_copy_path("ptg2_manifest_provider_npi_scope_")
+    provider_group_member_paths = [
+        Path(copy_metadata["path"])
+        for copy_metadata in deferred_copy_entries_by_kind["provider_group_member"]
+        if copy_metadata.get("path")
+    ]
+    try:
         membership_graph_metrics_map = await _build_ptg2_provider_membership_sidecars(
-            provider_group_npi_path=manifest_sidecar_paths["provider_group_npi"],
-            provider_npi_group_path=manifest_sidecar_paths["provider_npi_group"],
+            provider_group_npi_path=manifest_sidecar_paths_by_kind[
+                "provider_group_npi"
+            ],
+            provider_npi_group_path=manifest_sidecar_paths_by_kind[
+                "provider_npi_group"
+            ],
             provider_npi_scope_copy_path=provider_npi_scope_copy_path,
             input_paths=provider_group_member_paths,
         )
-        deferred_copy_files["provider_npi_scope"].append(
-            {
-                "path": str(provider_npi_scope_copy_path),
-                "row_count": int(membership_graph_metrics_map.get("npi_scope_count") or 0),
-            }
-        )
+    except BaseException:
+        provider_npi_scope_copy_path.unlink(missing_ok=True)
+        discard_file_scratch()
+        raise
+    provider_npi_scope_copy_path.unlink(missing_ok=True)
+    _cleanup_manifest_copy_entries(
+        {
+            "provider_group_member": deferred_copy_entries_by_kind[
+                "provider_group_member"
+            ]
+        }
+    )
+    deferred_copy_entries_by_kind["provider_group_member"] = []
 
-    await flush_error_log(import_log_cls)
-    manifest_artifacts = _collect_ptg2_manifest_sidecar_artifacts(manifest_sidecar_paths)
-    summary = {
+    try:
+        await flush_error_log(import_log_cls)
+    except BaseException:
+        discard_file_scratch()
+        raise
+    manifest_artifacts = _collect_ptg2_manifest_sidecar_artifacts(
+        manifest_sidecar_paths_by_kind
+    )
+    import_summary_by_field = {
         "provider_refs": 0,
         "in_network_items": len(procedure_hashes),
         "serving_rates": manifest_copy_row_counter_by_name["serving"],
@@ -1818,29 +1259,33 @@ async def _parse_in_network_file_serving_only(
         "rust_records": rust_records,
         "manifest": {
             "serving_rows": manifest_copy_row_counter_by_name["serving"],
+            "source_trace_hash": source_trace_hash,
             "source_trace_set_hash": source_trace_set_hash,
             "network_names": source_network_name_values,
             "sidecars": manifest_artifacts,
             "sidecar_paths": {
                 name: str(path)
-                for name, path in manifest_sidecar_paths.items()
+                for name, path in manifest_sidecar_paths_by_kind.items()
                 if path is not None
             },
-            "copy_files": deferred_copy_files if defer_manifest_copy else {},
-            "precopy_merge_deferred": defer_manifest_copy,
+            "copy_files": deferred_copy_entries_by_kind,
+            "precopy_merge_deferred": True,
             "membership_graph": membership_graph_metrics_map,
         },
     }
-    if rust_dedupe_summary:
-        summary["dedupe"] = rust_dedupe_summary
-    if rust_scanner_config or rust_scanner_summary:
-        summary["scanner"] = {
-            "config": rust_scanner_config,
-            "summary": rust_scanner_summary,
+    if rust_dedupe_summary_by_field:
+        import_summary_by_field["dedupe"] = rust_dedupe_summary_by_field
+    if rust_scanner_config_by_name or rust_scanner_summary_by_name:
+        import_summary_by_field["scanner"] = {
+            "config": rust_scanner_config_by_name,
+            "summary": rust_scanner_summary_by_name,
         }
-    _emit_screen_line(f"PTG2 serving-only import summary: {summary}")
-    logger.info("PTG2 serving-only import summary: %s", summary)
-    return summary
+    _emit_screen_line(f"PTG2 serving-only import summary: {import_summary_by_field}")
+    logger.info("PTG2 serving-only import summary: %s", import_summary_by_field)
+    return import_summary_by_field
+
+
+_parse_in_network_file_strict_v3 = _parse_strict_v3_file
 
 
 @dataclass
@@ -1850,867 +1295,15 @@ class _StageTimer:
 
     def mark(self, stage_name: str) -> None:
         """Record elapsed time and advance the stage boundary."""
-        now_monotonic = time.monotonic()
+        now_monotonic = _ptg2_monotonic()
         self.durations_by_stage[stage_name] = now_monotonic - self.started_monotonic
         self.started_monotonic = now_monotonic
 
 
-async def _parse_in_network_items(
-    file_path: str,
-    file_id: int,
-    meta: dict[str, Any],
-    plan_info: list[dict[str, Any]] | None,
-    provider_map,
-    classes: dict[str, type],
-    test_mode: bool,
-    import_log_cls,
-    source_url: str,
-    max_items: int | None = None,
-) -> None:
-    """Parse legacy in-network items into normalized staging rows."""
-    provider_cls = classes["PTGProviderGroup"]
-    item_cls = classes["PTGInNetworkItem"]
-    billing_cls = classes["PTGBillingCode"]
-    rate_cls = classes["PTGNegotiatedRate"]
-    price_cls = classes["PTGNegotiatedPrice"]
-
-    item_rows: list[dict[str, Any]] = []
-    billing_rows: list[dict[str, Any]] = []
-    rate_rows: list[dict[str, Any]] = []
-    price_rows: list[dict[str, Any]] = []
-    provider_rows: list[dict[str, Any]] = []
-    provider_hash_seen: set[int] = _provider_cache_hashes(provider_map)
-    rate_hash_seen: set[int] = set()
-    price_hash_seen: set[int] = set()
-    item_batch_rows = max(_env_int(PTG2_ITEM_BATCH_ROWS_ENV, 1000), 1)
-    billing_batch_rows = max(_env_int(PTG2_BILLING_BATCH_ROWS_ENV, 5000), 1)
-    rate_batch_rows = max(_env_int(PTG2_RATE_BATCH_ROWS_ENV, 5000), 1)
-    price_batch_rows = max(_env_int(PTG2_PRICE_BATCH_ROWS_ENV, 10000), 1)
-
-    plan_fields = _derive_plan_fields(meta, plan_info)
-
-    with open_json_artifact_stream(file_path) as afp:
-        count = 0
-        for in_item in ijson.items(afp, "in_network.item", use_float=True):
-            count += 1
-            item_hash = _make_checksum(
-                file_id,
-                in_item.get("billing_code_type"),
-                in_item.get("billing_code"),
-                in_item.get("negotiation_arrangement"),
-                in_item.get("name"),
-                )
-            item_rows.append(
-                {
-                    "item_hash": item_hash,
-                    "file_id": file_id,
-                    "negotiation_arrangement": in_item.get("negotiation_arrangement"),
-                    "name": in_item.get("name"),
-                    "billing_code_type": in_item.get("billing_code_type"),
-                    "billing_code_type_version": in_item.get("billing_code_type_version"),
-                    "billing_code": in_item.get("billing_code"),
-                    "description": in_item.get("description"),
-                    "severity_of_illness": in_item.get("severity_of_illness"),
-                    "plan_name": plan_fields.get("plan_name"),
-                    "plan_id_type": plan_fields.get("plan_id_type"),
-                    "plan_id": plan_fields.get("plan_id"),
-                    "plan_market_type": plan_fields.get("plan_market_type"),
-                    "issuer_name": plan_fields.get("issuer_name"),
-                    "plan_sponsor_name": plan_fields.get("plan_sponsor_name"),
-                }
-                )
-            for code in in_item.get("bundled_codes", []):
-                billing_rows.append(
-                    {
-                        "code_hash": _make_checksum(item_hash, "bundle", code.get("billing_code")),
-                        "item_hash": item_hash,
-                        "code_role": "bundle",
-                        "billing_code_type": code.get("billing_code_type"),
-                        "billing_code_type_version": code.get("billing_code_type_version"),
-                        "billing_code": code.get("billing_code"),
-                        "description": code.get("description"),
-                    }
-                )
-            for code in in_item.get("covered_services", []):
-                billing_rows.append(
-                    {
-                        "code_hash": _make_checksum(item_hash, "covered", code.get("billing_code")),
-                        "item_hash": item_hash,
-                        "code_role": "covered",
-                        "billing_code_type": code.get("billing_code_type"),
-                        "billing_code_type_version": code.get("billing_code_type_version"),
-                        "billing_code": code.get("billing_code"),
-                        "description": code.get("description"),
-                    }
-                )
-
-            for negotiated_rate in in_item.get("negotiated_rates", []):
-                provider_refs = negotiated_rate.get("provider_references") or []
-                provider_groups_inline = negotiated_rate.get("provider_groups") or []
-                groups_to_use: list[dict[str, Any]] = []
-                for provider_ref in provider_refs:
-                    provider_key = _normalize_provider_ref(provider_ref)
-                    groups = _provider_cache_get(provider_map, provider_key) or _provider_cache_get(provider_map, provider_ref)
-                    if not groups:
-                        await log_error(
-                            "err",
-                            f"Provider reference {provider_ref} not found for file {source_url}",
-                            [0],
-                            source_url,
-                            "ptg-in-network",
-                            "json",
-                            import_log_cls,
-                        )
-                        continue
-                    groups_to_use.extend(groups)
-                if provider_groups_inline:
-                    inline_ref = (
-                        _normalize_provider_ref(provider_groups_inline[0].get("provider_group_id"))
-                        if len(provider_groups_inline) == 1
-                        else None
-                    )
-                    inline_entry, inline_row = _build_provider_set_entry(
-                        file_id=file_id,
-                        provider_group_ref=inline_ref,
-                        provider_groups=provider_groups_inline,
-                        network_names=negotiated_rate.get("network_name") or [],
-                    )
-                    if inline_entry is not None and inline_row is not None:
-                        inline_hash = inline_entry["__hash__"]
-                        if inline_hash not in provider_hash_seen:
-                            provider_hash_seen.add(inline_hash)
-                            provider_rows.append(inline_row)
-                        groups_to_use.append(inline_entry)
-                combined_entry, combined_row = _combine_provider_set_entries(
-                    file_id=file_id,
-                    entries=groups_to_use,
-                    network_names=negotiated_rate.get("network_name") or [],
-                )
-                if combined_entry is not None and combined_row is not None:
-                    combined_hash = combined_entry["__hash__"]
-                    if combined_hash not in provider_hash_seen:
-                        provider_hash_seen.add(combined_hash)
-                        provider_rows.append(combined_row)
-                    groups_to_use = [combined_entry]
-                else:
-                    groups_to_use = []
-                for group in groups_to_use:
-                    rate_hash = _make_checksum(item_hash, group.get("__hash__") or "")
-                    if rate_hash not in rate_hash_seen:
-                        rate_hash_seen.add(rate_hash)
-                        rate_rows.append(
-                            {
-                                "rate_hash": rate_hash,
-                                "item_hash": item_hash,
-                                "provider_group_ref": group.get("provider_group_id"),
-                                "provider_group_hash": group.get("__hash__"),
-                            }
-                        )
-                    for negotiated_price in negotiated_rate.get("negotiated_prices", []):
-                        price_hash = _make_checksum(
-                            rate_hash,
-                            negotiated_price.get("negotiated_type"),
-                            negotiated_price.get("negotiated_rate"),
-                            negotiated_price.get("expiration_date") or "",
-                            negotiated_price.get("billing_class"),
-                            negotiated_price.get("setting"),
-                            "|".join(_as_list(negotiated_price.get("service_code"))),
-                            "|".join(_as_list(negotiated_price.get("billing_code_modifier"))),
-                        )
-                        if price_hash in price_hash_seen:
-                            continue
-                        price_hash_seen.add(price_hash)
-                        price_rows.append(
-                            {
-                                "price_hash": price_hash,
-                                "rate_hash": rate_hash,
-                                "negotiated_type": negotiated_price.get("negotiated_type"),
-                                "negotiated_rate": negotiated_price.get("negotiated_rate"),
-                                "expiration_date": _coerce_date(negotiated_price.get("expiration_date")),
-                                "service_code": _as_list(negotiated_price.get("service_code")),
-                                "billing_class": negotiated_price.get("billing_class"),
-                                "setting": negotiated_price.get("setting"),
-                                "billing_code_modifier": _as_list(negotiated_price.get("billing_code_modifier")),
-                                "additional_information": negotiated_price.get("additional_information"),
-                            }
-                        )
-                        if test_mode and len(price_rows) >= TEST_NEGOTIATED_PRICES:
-                            break
-                if test_mode and len(price_rows) >= TEST_NEGOTIATED_PRICES:
-                    break
-
-            if len(item_rows) >= item_batch_rows:
-                await push_objects(_dedupe_rows_by(item_rows, "item_hash"), item_cls)
-                item_rows = []
-            if len(billing_rows) >= billing_batch_rows:
-                await push_objects(_dedupe_rows_by(billing_rows, "code_hash"), billing_cls)
-                billing_rows = []
-            if len(rate_rows) >= rate_batch_rows:
-                await push_objects(_dedupe_rows_by(rate_rows, "rate_hash"), rate_cls)
-                rate_rows = []
-            if len(price_rows) >= price_batch_rows:
-                await push_objects(_dedupe_rows_by(price_rows, "price_hash"), price_cls)
-                price_rows = []
-
-            if max_items is not None and count >= max_items:
-                break
-            if test_mode and count >= TEST_IN_NETWORK_ITEMS:
-                break
-
-    if item_rows:
-        await push_objects(_dedupe_rows_by(item_rows, "item_hash"), item_cls)
-    if billing_rows:
-        await push_objects(_dedupe_rows_by(billing_rows, "code_hash"), billing_cls)
-    if rate_rows:
-        await push_objects(_dedupe_rows_by(rate_rows, "rate_hash"), rate_cls)
-    if price_rows:
-        await push_objects(_dedupe_rows_by(price_rows, "price_hash"), price_cls)
-    if provider_rows:
-        await push_objects(_dedupe_rows_by(provider_rows, "provider_group_hash"), provider_cls)
-    await flush_error_log(import_log_cls)
-
-
-async def _parse_in_network_file_single_pass(
-    file_path: str,
-    file_id: int,
-    meta: dict[str, Any],
-    plan_info: list[dict[str, Any]] | None,
-    provider_map,
-    classes: dict[str, type],
-    test_mode: bool,
-    import_log_cls,
-    source_url: str,
-    max_items: int | None = None,
-) -> None:
-    """
-    Parse provider_references and in_network arrays in one physical pass.
-
-    Large UHC files are gzip streams, so a second parser pass means repeating
-    all decompression. The spec places provider_references before in_network;
-    when that is true this keeps provider reference storage bounded without
-    replaying the gzip.
-    """
-    provider_cls = classes["PTGProviderGroup"]
-    item_cls = classes["PTGInNetworkItem"]
-    billing_cls = classes["PTGBillingCode"]
-    rate_cls = classes["PTGNegotiatedRate"]
-    price_cls = classes["PTGNegotiatedPrice"]
-
-    provider_ref_batch_rows = max(_env_int(PTG2_PROVIDER_REF_BATCH_ROWS_ENV, 5000), 1)
-    item_batch_rows = max(_env_int(PTG2_ITEM_BATCH_ROWS_ENV, 1000), 1)
-    billing_batch_rows = max(_env_int(PTG2_BILLING_BATCH_ROWS_ENV, 5000), 1)
-    rate_batch_rows = max(_env_int(PTG2_RATE_BATCH_ROWS_ENV, 5000), 1)
-    price_batch_rows = max(_env_int(PTG2_PRICE_BATCH_ROWS_ENV, 10000), 1)
-
-    plan_fields = _derive_plan_fields(meta, plan_info)
-    provider_rows: list[dict[str, Any]] = []
-    item_rows: list[dict[str, Any]] = []
-    billing_rows: list[dict[str, Any]] = []
-    rate_rows: list[dict[str, Any]] = []
-    price_rows: list[dict[str, Any]] = []
-    provider_ref_hash_seen: set[int] = set()
-    provider_hash_seen: set[int] = _provider_cache_hashes(provider_map)
-    item_hash_seen: set[int] = set()
-    billing_hash_seen: set[int] = set()
-    rate_hash_seen: set[int] = set()
-    price_hash_seen: set[int] = set()
-    ref_count = 0
-    item_count = 0
-    progress_state: dict[str, Any] = {}
-
-    with open_json_artifact_stream(file_path) as afp:
-        def progress_callback() -> None:
-            """Report progress while scanning one in-network artifact."""
-            _maybe_log_artifact_progress(
-                file_path,
-                afp,
-                progress_state,
-                "in-network import",
-                ref_count=ref_count,
-                item_count=item_count,
-            )
-
-        iterator_fn = (
-            _iter_top_level_objects_fast
-            if _env_bool(PTG2_FAST_OBJECT_ITERATOR_ENV, True)
-            else _iter_top_level_objects
-        )
-        for object_name, payload in iterator_fn(
-            afp,
-            {
-                "provider_reference": "provider_references.item",
-                "in_network": "in_network.item",
-            },
-            use_float=True,
-            progress_callback=progress_callback,
-        ):
-            if object_name == "provider_reference":
-                ref_count += 1
-                if test_mode and ref_count > TEST_PROVIDER_GROUPS:
-                    continue
-                provider_group_id = _normalize_provider_ref(payload.get("provider_group_id"))
-                network_names = payload.get("network_name") or payload.get("network_names") or []
-                provider_entry, provider_row = _build_provider_set_entry(
-                    file_id=file_id,
-                    provider_group_ref=provider_group_id,
-                    provider_groups=payload.get("provider_groups", []),
-                    network_names=network_names,
-                )
-                if provider_entry is None or provider_row is None:
-                    continue
-                provider_hash = provider_entry["__hash__"]
-                if provider_hash not in provider_ref_hash_seen:
-                    provider_ref_hash_seen.add(provider_hash)
-                    provider_hash_seen.add(provider_hash)
-                    provider_rows.append(provider_row)
-                _provider_cache_put(provider_map, provider_group_id, [provider_entry])
-                if len(provider_rows) >= provider_ref_batch_rows:
-                    await push_objects(_dedupe_rows_by(provider_rows, "provider_group_hash"), provider_cls)
-                    provider_rows = []
-                    if isinstance(provider_map, PTG2ProviderReferenceCache):
-                        provider_map.commit()
-                continue
-
-            if object_name != "in_network":
-                continue
-            item_count += 1
-            item_hash = _make_checksum(
-                file_id,
-                payload.get("billing_code_type"),
-                payload.get("billing_code"),
-                payload.get("negotiation_arrangement"),
-                payload.get("name"),
-            )
-            if item_hash not in item_hash_seen:
-                item_hash_seen.add(item_hash)
-                item_rows.append(
-                    {
-                        "item_hash": item_hash,
-                        "file_id": file_id,
-                        "negotiation_arrangement": payload.get("negotiation_arrangement"),
-                        "name": payload.get("name"),
-                        "billing_code_type": payload.get("billing_code_type"),
-                        "billing_code_type_version": payload.get("billing_code_type_version"),
-                        "billing_code": payload.get("billing_code"),
-                        "description": payload.get("description"),
-                        "severity_of_illness": payload.get("severity_of_illness"),
-                        "plan_name": plan_fields.get("plan_name"),
-                        "plan_id_type": plan_fields.get("plan_id_type"),
-                        "plan_id": plan_fields.get("plan_id"),
-                        "plan_market_type": plan_fields.get("plan_market_type"),
-                        "issuer_name": plan_fields.get("issuer_name"),
-                        "plan_sponsor_name": plan_fields.get("plan_sponsor_name"),
-                    }
-                )
-            for code in payload.get("bundled_codes", []):
-                code_hash = _make_checksum(item_hash, "bundle", code.get("billing_code"))
-                if code_hash in billing_hash_seen:
-                    continue
-                billing_hash_seen.add(code_hash)
-                billing_rows.append(
-                    {
-                        "code_hash": code_hash,
-                        "item_hash": item_hash,
-                        "code_role": "bundle",
-                        "billing_code_type": code.get("billing_code_type"),
-                        "billing_code_type_version": code.get("billing_code_type_version"),
-                        "billing_code": code.get("billing_code"),
-                        "description": code.get("description"),
-                    }
-                )
-            for code in payload.get("covered_services", []):
-                code_hash = _make_checksum(item_hash, "covered", code.get("billing_code"))
-                if code_hash in billing_hash_seen:
-                    continue
-                billing_hash_seen.add(code_hash)
-                billing_rows.append(
-                    {
-                        "code_hash": code_hash,
-                        "item_hash": item_hash,
-                        "code_role": "covered",
-                        "billing_code_type": code.get("billing_code_type"),
-                        "billing_code_type_version": code.get("billing_code_type_version"),
-                        "billing_code": code.get("billing_code"),
-                        "description": code.get("description"),
-                    }
-                )
-
-            for negotiated_rate in payload.get("negotiated_rates", []):
-                provider_refs = negotiated_rate.get("provider_references") or []
-                provider_groups_inline = negotiated_rate.get("provider_groups") or []
-                groups_to_use: list[dict[str, Any]] = []
-                for provider_ref in provider_refs:
-                    provider_key = _normalize_provider_ref(provider_ref)
-                    groups = _provider_cache_get(provider_map, provider_key) or _provider_cache_get(provider_map, provider_ref)
-                    if not groups:
-                        await log_error(
-                            "err",
-                            f"Provider reference {provider_ref} not found for file {source_url}",
-                            [0],
-                            source_url,
-                            "ptg-in-network",
-                            "json",
-                            import_log_cls,
-                        )
-                        continue
-                    groups_to_use.extend(groups)
-                if provider_groups_inline:
-                    inline_ref = (
-                        _normalize_provider_ref(provider_groups_inline[0].get("provider_group_id"))
-                        if len(provider_groups_inline) == 1
-                        else None
-                    )
-                    inline_entry, inline_row = _build_provider_set_entry(
-                        file_id=file_id,
-                        provider_group_ref=inline_ref,
-                        provider_groups=provider_groups_inline,
-                        network_names=negotiated_rate.get("network_name") or [],
-                    )
-                    if inline_entry is not None and inline_row is not None:
-                        inline_hash = inline_entry["__hash__"]
-                        if inline_hash not in provider_hash_seen:
-                            provider_hash_seen.add(inline_hash)
-                            provider_rows.append(inline_row)
-                        groups_to_use.append(inline_entry)
-                combined_entry, combined_row = _combine_provider_set_entries(
-                    file_id=file_id,
-                    entries=groups_to_use,
-                    network_names=negotiated_rate.get("network_name") or [],
-                )
-                if combined_entry is not None and combined_row is not None:
-                    combined_hash = combined_entry["__hash__"]
-                    if combined_hash not in provider_hash_seen:
-                        provider_hash_seen.add(combined_hash)
-                        provider_rows.append(combined_row)
-                    groups_to_use = [combined_entry]
-                else:
-                    groups_to_use = []
-                for group in groups_to_use:
-                    rate_hash = _make_checksum(item_hash, group.get("__hash__") or "")
-                    if rate_hash not in rate_hash_seen:
-                        rate_hash_seen.add(rate_hash)
-                        rate_rows.append(
-                            {
-                                "rate_hash": rate_hash,
-                                "item_hash": item_hash,
-                                "provider_group_ref": group.get("provider_group_id"),
-                                "provider_group_hash": group.get("__hash__"),
-                            }
-                        )
-                    for negotiated_price in negotiated_rate.get("negotiated_prices", []):
-                        price_hash = _make_checksum(
-                            rate_hash,
-                            negotiated_price.get("negotiated_type"),
-                            negotiated_price.get("negotiated_rate"),
-                            negotiated_price.get("expiration_date") or "",
-                            negotiated_price.get("billing_class"),
-                            negotiated_price.get("setting"),
-                            "|".join(_as_list(negotiated_price.get("service_code"))),
-                            "|".join(_as_list(negotiated_price.get("billing_code_modifier"))),
-                        )
-                        if price_hash in price_hash_seen:
-                            continue
-                        price_hash_seen.add(price_hash)
-                        price_rows.append(
-                            {
-                                "price_hash": price_hash,
-                                "rate_hash": rate_hash,
-                                "negotiated_type": negotiated_price.get("negotiated_type"),
-                                "negotiated_rate": negotiated_price.get("negotiated_rate"),
-                                "expiration_date": _coerce_date(negotiated_price.get("expiration_date")),
-                                "service_code": _as_list(negotiated_price.get("service_code")),
-                                "billing_class": negotiated_price.get("billing_class"),
-                                "setting": negotiated_price.get("setting"),
-                                "billing_code_modifier": _as_list(negotiated_price.get("billing_code_modifier")),
-                                "additional_information": negotiated_price.get("additional_information"),
-                            }
-                        )
-                        if test_mode and len(price_rows) >= TEST_NEGOTIATED_PRICES:
-                            break
-                if test_mode and len(price_rows) >= TEST_NEGOTIATED_PRICES:
-                    break
-
-            if provider_rows and len(provider_rows) >= provider_ref_batch_rows:
-                await push_objects(_dedupe_rows_by(provider_rows, "provider_group_hash"), provider_cls)
-                provider_rows = []
-            item_rows, billing_rows, rate_rows, price_rows = await _flush_in_network_rows(
-                item_rows,
-                billing_rows,
-                rate_rows,
-                price_rows,
-                item_cls,
-                billing_cls,
-                rate_cls,
-                price_cls,
-                item_batch_rows=item_batch_rows,
-                billing_batch_rows=billing_batch_rows,
-                rate_batch_rows=rate_batch_rows,
-                price_batch_rows=price_batch_rows,
-            )
-            if isinstance(provider_map, PTG2ProviderReferenceCache):
-                provider_map.commit()
-
-            if max_items is not None and item_count >= max_items:
-                break
-            if test_mode and item_count >= TEST_IN_NETWORK_ITEMS:
-                break
-
-    if progress_state:
-        progress_state["last_log"] = 0
-        _maybe_log_artifact_progress(
-            file_path,
-            afp if "afp" in locals() else None,
-            progress_state,
-            "in-network import",
-            ref_count=ref_count,
-            item_count=item_count,
-        )
-    if isinstance(provider_map, PTG2ProviderReferenceCache):
-        provider_map.commit()
-    if provider_rows:
-        await push_objects(_dedupe_rows_by(provider_rows, "provider_group_hash"), provider_cls)
-    await _flush_in_network_rows(
-        item_rows,
-        billing_rows,
-        rate_rows,
-        price_rows,
-        item_cls,
-        billing_cls,
-        rate_cls,
-        price_cls,
-        force=True,
-        item_batch_rows=item_batch_rows,
-        billing_batch_rows=billing_batch_rows,
-        rate_batch_rows=rate_batch_rows,
-        price_batch_rows=price_batch_rows,
-    )
-    await flush_error_log(import_log_cls)
-
-
-async def _parse_in_network_file_compact(
-    file_path: str,
-    file_id: int,
-    meta: dict[str, Any],
-    plan_info: list[dict[str, Any]] | None,
-    provider_map,
-    test_mode: bool,
-    import_log_cls,
-    source_url: str,
-    source_version: PTG2SourceVersion | None,
-    snapshot_id: str,
-    import_month: datetime.date,
-    max_items: int | None = None,
-) -> dict[str, Any]:
-    """Parse one in-network file into compact PTG2 rows."""
-    plan_fields = _derive_plan_fields(meta, plan_info)
-    plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(plan_fields, snapshot_id, import_month)
-    context_row = _ptg2_context_row(plan_fields, import_month, source_version)
-    source_trace_row, source_trace_set_row = _ptg2_source_trace_rows(source_version, source_url)
-    await _push_ptg2_objects([plan_row], PTG2Plan, rewrite=True)
-    if alias_rows:
-        await _push_ptg2_objects(alias_rows, PTG2PlanAlias, rewrite=True)
-    await _push_ptg2_objects([plan_month_row], PTG2PlanMonth, rewrite=True)
-    await _push_ptg2_objects([context_row], PTG2RateSetContext, rewrite=True)
-
-    state = _compact_state()
-    state["snapshot_id"] = snapshot_id
-    state["plan_fields"] = plan_fields
-    state["source_trace_payload"] = _ptg2_source_trace_payload(source_trace_row)
-    _compact_add_unique(state, "source_trace", "source_trace_hash", source_trace_row)
-    _compact_add_unique(state, "source_trace_set", "source_trace_set_hash", source_trace_set_row)
-    source_trace_set_hash = source_trace_set_row["source_trace_set_hash"]
-    context_hash = context_row["context_hash"]
-    provider_ref_count = 0
-    item_count = 0
-    progress_state: dict[str, Any] = {}
-    rate_group_flush_items = max(_env_int(PTG2_RATE_GROUP_FLUSH_ITEMS_ENV, 1000), 0)
-    provider_combo_cache_limit = max(_env_int(PTG2_PROVIDER_COMBO_CACHE_REFS_ENV, 32768), 0)
-    fast_provider_aggregation = _env_bool(
-        PTG2_FAST_PROVIDER_AGGREGATION_ENV,
-        _env_bool(PTG2_FAST_PROVIDER_UNION_ENV, False),
-    )
-    provider_combo_cache: OrderedDict[tuple[str, ...], dict[str, Any]] = OrderedDict()
-    provider_combo_stats = {
-        "provider_combo_cache_gets": 0,
-        "provider_combo_cache_hits": 0,
-        "provider_combo_cache_misses": 0,
-        "provider_combo_cache_size": 0,
-        "provider_combo_cache_limit": provider_combo_cache_limit,
-    }
-
-    with open_json_artifact_stream(file_path) as afp:
-        def progress_callback() -> None:
-            """Report progress while scanning one compact artifact."""
-            _maybe_log_artifact_progress(
-                file_path,
-                afp,
-                progress_state,
-                "compact in-network import",
-                ref_count=provider_ref_count,
-                item_count=item_count,
-            )
-
-        for object_name, payload in _iter_top_level_objects(
-            afp,
-            {
-                "provider_reference": "provider_references.item",
-                "in_network": "in_network.item",
-            },
-            use_float=True,
-            progress_callback=progress_callback,
-        ):
-            if object_name == "provider_reference":
-                provider_ref_count += 1
-                if test_mode and provider_ref_count > TEST_PROVIDER_GROUPS:
-                    continue
-                provider_group_id = _normalize_provider_ref(payload.get("provider_group_id"))
-                network_names = payload.get("network_name") or payload.get("network_names") or []
-                for provider_group_row in _ptg2_provider_group_rows(
-                    provider_groups=payload.get("provider_groups", []),
-                ):
-                    if _compact_add_unique(state, "provider_group", "provider_group_hash", provider_group_row):
-                        state["counts"]["provider_groups"] += 1
-                provider_entry, _provider_row = _build_provider_set_entry(
-                    file_id=file_id,
-                    provider_group_ref=provider_group_id,
-                    provider_groups=payload.get("provider_groups", []),
-                    network_names=network_names,
-                )
-                if provider_entry is None:
-                    continue
-                _provider_cache_put(provider_map, provider_group_id, [provider_entry])
-                continue
-
-            if object_name != "in_network":
-                continue
-            item_count += 1
-            procedure_row = _ptg2_procedure_row(payload)
-            procedure_hash = procedure_row["procedure_hash"]
-            state["procedure_payloads"][procedure_hash] = {
-                "billing_code_type": procedure_row.get("billing_code_type"),
-                "billing_code": procedure_row.get("billing_code"),
-                "name": procedure_row.get("name"),
-                "description": procedure_row.get("description"),
-            }
-            if _compact_add_unique(state, "procedure", "procedure_hash", procedure_row):
-                state["counts"]["procedures"] += 1
-
-            item_price_groups: dict[str, dict[str, Any]] = {}
-            for negotiated_rate in payload.get("negotiated_rates", []):
-                provider_groups_inline = negotiated_rate.get("provider_groups") or []
-                provider_refs = negotiated_rate.get("provider_references") or []
-                combined_entry = None
-                if provider_refs and not provider_groups_inline:
-                    combo_key = _provider_combo_cache_key(provider_refs)
-                    combined_entry = _provider_combo_cache_get(provider_combo_cache, combo_key, provider_combo_stats)
-                else:
-                    combo_key = ()
-                if combined_entry is None:
-                    groups_to_use: list[dict[str, Any]] = []
-                    if fast_provider_aggregation and provider_refs and not provider_groups_inline:
-                        combined_entry, missing_refs = _fast_provider_entry_from_provider_refs(provider_map, provider_refs)
-                        for provider_ref in missing_refs:
-                            await log_error(
-                                "err",
-                                f"Provider reference {provider_ref} not found for file {source_url}",
-                                [0],
-                                source_url,
-                                "ptg-in-network-compact",
-                                "json",
-                                import_log_cls,
-                            )
-                    else:
-                        for provider_ref in provider_refs:
-                            provider_key = _normalize_provider_ref(provider_ref)
-                            groups = _provider_cache_get(provider_map, provider_key) or _provider_cache_get(provider_map, provider_ref)
-                            if not groups:
-                                await log_error(
-                                    "err",
-                                    f"Provider reference {provider_ref} not found for file {source_url}",
-                                    [0],
-                                    source_url,
-                                    "ptg-in-network-compact",
-                                    "json",
-                                    import_log_cls,
-                                )
-                                continue
-                            groups_to_use.extend(groups)
-                    if provider_groups_inline:
-                        for provider_group_row in _ptg2_provider_group_rows(provider_groups=provider_groups_inline):
-                            if _compact_add_unique(state, "provider_group", "provider_group_hash", provider_group_row):
-                                state["counts"]["provider_groups"] += 1
-                        inline_ref = (
-                            _normalize_provider_ref(provider_groups_inline[0].get("provider_group_id"))
-                            if len(provider_groups_inline) == 1
-                            else None
-                        )
-                        inline_entry, _inline_row = _build_provider_set_entry(
-                            file_id=file_id,
-                            provider_group_ref=inline_ref,
-                            provider_groups=provider_groups_inline,
-                            network_names=negotiated_rate.get("network_name") or [],
-                        )
-                        if inline_entry is not None:
-                            groups_to_use.append(inline_entry)
-                    if combined_entry is None:
-                        combined_entry, _combined_row = _combine_provider_set_entries(
-                            file_id=file_id,
-                            entries=groups_to_use,
-                            network_names=negotiated_rate.get("network_name") or [],
-                        )
-                    if combined_entry is not None and combo_key:
-                        _provider_combo_cache_put(
-                            provider_combo_cache,
-                            combo_key,
-                            combined_entry,
-                            provider_combo_stats,
-                            provider_combo_cache_limit,
-                        )
-                if combined_entry is None:
-                    continue
-                price_atom_hashes: list[str] = []
-                price_payload: list[dict[str, Any]] = []
-                for negotiated_price in negotiated_rate.get("negotiated_prices", []):
-                    price_atom_row = _ptg2_price_atom_row(negotiated_price)
-                    if _compact_add_unique(state, "price_atom", "price_atom_hash", price_atom_row):
-                        state["counts"]["price_atoms"] += 1
-                    price_atom_hashes.append(price_atom_row["price_atom_hash"])
-                    price_payload.append(_ptg2_price_atom_payload(price_atom_row))
-                if not price_atom_hashes:
-                    continue
-                price_set = build_price_set(price_atom_hashes)
-                price_set_row = {
-                    **price_set,
-                    "created_at": _utcnow(),
-                }
-                if _compact_add_unique(state, "price_set", "price_set_hash", price_set_row):
-                    state["counts"]["price_sets"] += 1
-                state["price_payloads"][price_set_row["price_set_hash"]] = price_payload
-
-                item_group = item_price_groups.setdefault(
-                    price_set_row["price_set_hash"],
-                    {
-                        "price_set_hash": price_set_row["price_set_hash"],
-                        "provider_entries": [],
-                        "provider_entry_hashes": set(),
-                        "provider_group_hashes": set(),
-                        "provider_count": 0,
-                        "network_names": set(),
-                    },
-                )
-                if fast_provider_aggregation:
-                    entry_hash = int(combined_entry["__hash__"])
-                    if entry_hash not in item_group["provider_entry_hashes"]:
-                        item_group["provider_entry_hashes"].add(entry_hash)
-                        item_group["provider_group_hashes"].update(
-                            int(value) for value in combined_entry.get("provider_group_hashes") or [entry_hash]
-                        )
-                        item_group["provider_count"] += int(
-                            combined_entry.get("provider_count") or len(_as_int_list(combined_entry.get("npi")))
-                        )
-                        item_group["network_names"].update(
-                            str(value) for value in _as_list(combined_entry.get("network_name")) if value
-                        )
-                else:
-                    item_group["provider_entries"].append(combined_entry)
-
-            for item_group in item_price_groups.values():
-                if fast_provider_aggregation:
-                    super_entry = _fast_provider_entry_from_parts(
-                        entry_hashes=item_group["provider_entry_hashes"],
-                        provider_group_hashes=item_group["provider_group_hashes"],
-                        provider_count=item_group["provider_count"],
-                        network_names=item_group["network_names"],
-                    )
-                else:
-                    super_entry, _super_row = _combine_provider_set_entries(
-                        file_id=file_id,
-                        entries=item_group["provider_entries"],
-                        network_names=[],
-                    )
-                if super_entry is None:
-                    continue
-                provider_set_row = _ptg2_provider_set_row(super_entry)
-                state["provider_set_counts"][provider_set_row["provider_set_hash"]] = provider_set_row["provider_count"]
-                state["provider_set_network_names"][provider_set_row["provider_set_hash"]] = sorted(
-                    {
-                        str(value)
-                        for value in _as_list(super_entry.get("network_name"))
-                        if str(value or "").strip()
-                    }
-                )
-                if _compact_add_unique(state, "provider_set", "provider_set_hash", provider_set_row):
-                    state["counts"]["provider_sets"] += 1
-                provider_set_hash = provider_set_row["provider_set_hash"]
-                group_key = (procedure_hash, item_group["price_set_hash"], source_trace_set_hash)
-                state["rate_pack_groups"].setdefault(group_key, set()).add(provider_set_hash)
-            await _flush_compact_rows(state)
-            if rate_group_flush_items and item_count % rate_group_flush_items == 0:
-                await _flush_compact_rate_pack_groups(state, context_hash)
-
-            if max_items is not None and item_count >= max_items:
-                break
-            if test_mode and item_count >= TEST_IN_NETWORK_ITEMS:
-                break
-
-    await _flush_compact_rows(state, force=True)
-    await _flush_compact_rate_pack_groups(state, context_hash)
-    await _drain_compact_writes(state)
-    if _env_bool(PTG2_STAGE_SERVING_RATES_ENV, True) and not _use_stage_serving_as_final():
-        await _merge_staged_serving_rates(snapshot_id)
-    if _env_bool(PTG2_STAGE_PRICE_SETS_ENV, True):
-        await _merge_staged_price_sets(snapshot_id)
-    chunk_rows: list[dict[str, Any]] = []
-    chunk_hashes: list[str] = []
-    for (procedure_hash, provider_bucket), rate_pack_hashes in state["chunk_rate_packs"].items():
-        chunk = build_fact_chunk(
-            context_hash,
-            PTG2_DOMAIN_IN_NETWORK,
-            procedure_hash,
-            provider_bucket,
-            list(rate_pack_hashes),
-        )
-        chunk_rows.append({**chunk, "created_at": _utcnow()})
-        chunk_hashes.append(chunk["fact_chunk_hash"])
-    if chunk_rows:
-        await _push_ptg2_objects(chunk_rows, PTG2FactChunk, rewrite=True)
-    rate_set = build_rate_set(context_hash, chunk_hashes)
-    rate_set_row = {**rate_set, "created_at": _utcnow()}
-    await _push_ptg2_objects([rate_set_row], PTG2RateSet, rewrite=True)
-    await _push_ptg2_objects(
-        [
-            {
-                "plan_rate_set_id": semantic_hash(
-                    {
-                        "plan_month_id": plan_month_row["plan_month_id"],
-                        "rate_set_hash": rate_set_row["rate_set_hash"],
-                        "domain": PTG2_DOMAIN_IN_NETWORK,
-                    },
-                    domain="plan_rate_set",
-                )[:32],
-                "plan_month_id": plan_month_row["plan_month_id"],
-                "rate_set_hash": rate_set_row["rate_set_hash"],
-                "domain": PTG2_DOMAIN_IN_NETWORK,
-                "created_at": _utcnow(),
-            }
-        ],
-        PTG2PlanRateSet,
-        rewrite=True,
-    )
-    await flush_error_log(import_log_cls)
-    summary = {
-        **state["counts"],
-        "provider_refs": provider_ref_count,
-        "in_network_items": item_count,
-        "fact_chunks": len(chunk_rows),
-        "rate_set_hash": rate_set_row["rate_set_hash"],
-    }
-    if hasattr(provider_map, "stats"):
-        summary.update(provider_map.stats())
-    summary.update(provider_combo_stats)
-    _emit_screen_line(f"PTG2 compact import summary: {summary}")
-    logger.info("PTG2 compact import summary: %s", summary)
-    return summary
+@dataclass
+class _PendingStrictV3State:
+    copy_entries_by_kind: dict[str, list[dict[str, Any]]]
+    graph_artifacts_map: dict[str, Any]
 
 
 def _toc_file_url_match_tokens(file_url_contains: list[str] | None) -> list[str]:
@@ -2750,7 +1343,7 @@ async def _process_table_of_contents(
     keep_partial_artifacts: bool | None = None,
     raise_on_error: bool = False,
 ) -> list[dict[str, Any]]:
-    """Download a TOC and build filtered in-network file jobs."""
+    """Download and filter one table of contents, persist files, and return jobs."""
     file_cls = classes["PTGFile"]
     import_log_cls = classes["ImportLog"]
     jobs: list[dict[str, Any]] = []
@@ -2796,6 +1389,8 @@ async def _process_table_of_contents(
     if import_run_id and not targeted_file_import:
         catalog_rows = []
         for entry in parsed_catalog_entries:
+            if entry.domain != PTG2_DOMAIN_IN_NETWORK:
+                continue
             first_plan = entry.plan_info[0] if len(entry.plan_info) == 1 else {}
             catalog_rows.append(
                 {
@@ -2846,9 +1441,6 @@ async def _process_table_of_contents(
             if catalog_entry.domain == PTG2_DOMAIN_IN_NETWORK:
                 job_type = "in_network"
                 file_type = "in-network"
-            elif catalog_entry.domain == PTG2_DOMAIN_ALLOWED_AMOUNT:
-                job_type = "allowed_amounts"
-                file_type = "allowed-amounts"
             else:
                 continue
             location = normalize_tic_source_url(catalog_entry.original_url)
@@ -2897,15 +1489,6 @@ async def _process_table_of_contents(
         in_network_files = [
             item for item in _as_list(structure.get("in_network_files")) if isinstance(item, dict)
         ]
-        allowed_amount_files = [
-            item
-            for item in (
-                _as_list(structure.get("allowed_amount_file"))
-                + _as_list(structure.get("allowed_amount_files"))
-            )
-            if isinstance(item, dict)
-        ]
-
         for entry in in_network_files:
             location = entry.get("location")
             if not _looks_like_toc_body_file_location(location):
@@ -2933,32 +1516,6 @@ async def _process_table_of_contents(
             if _has_reached_toc_file_limit(jobs, max_files):
                 break
 
-        for allowed_amount_file in allowed_amount_files:
-            if _has_reached_toc_file_limit(jobs, max_files):
-                break
-            location = allowed_amount_file.get("location")
-            if not _looks_like_toc_body_file_location(location):
-                continue
-            location = normalize_tic_source_url(location)
-            if not _is_requested_toc_body_file_url(location, file_url_match_tokens):
-                continue
-            meta = dict(toc_meta)
-            file_row = _build_file_row(
-                location, "allowed-amounts", meta, plans, allowed_amount_file.get("description"), toc_url
-            )
-            if file_row["file_id"] not in seen_files:
-                file_rows.append(file_row)
-                seen_files.add(file_row["file_id"])
-            jobs.append(
-                {
-                    "type": "allowed_amounts",
-                    "url": location,
-                    "description": allowed_amount_file.get("description"),
-                    "plan_info": plans,
-                    "from_index_url": toc_url,
-                    "meta": meta,
-                }
-            )
         if test_mode and len(jobs) >= TEST_TOC_JOBS:
             break
 
@@ -3024,33 +1581,81 @@ def _load_table_of_contents_artifact(path: str | Path) -> dict[str, Any]:
     return toc
 
 
+async def _record_in_network_file_provenance(
+    job: dict[str, Any],
+    classes: Mapping[str, type],
+    *,
+    raw_artifact: PTG2RawArtifact,
+    logical_artifact: PTG2LogicalArtifact,
+    import_run_id: str | None,
+) -> dict[str, Any]:
+    """Persist logical file/source metadata independently from scanner dedupe."""
+
+    provided_meta = job.get("meta") if isinstance(job.get("meta"), dict) else {}
+    meta = provided_meta or await _extract_metadata_fields(logical_artifact.logical_path)
+    plan_info = job.get("plan_info") if isinstance(job.get("plan_info"), list) else None
+    file_row = _build_file_row(
+        str(job.get("url") or raw_artifact.original_url),
+        "in-network",
+        meta,
+        plan_info,
+        job.get("description"),
+        job.get("from_index_url"),
+    )
+    await _push_ptg2_objects([file_row], classes["PTGFile"], rewrite=True)
+    source_version = await _record_source_version(
+        source_type="in-network",
+        domain=PTG2_DOMAIN_IN_NETWORK,
+        raw_artifact=raw_artifact,
+        logical_artifact=logical_artifact,
+        import_run_id=import_run_id,
+    )
+    source_trace_row, source_trace_set_row = _ptg2_source_trace_rows(
+        source_version,
+        str(job.get("url") or raw_artifact.original_url),
+    )
+    await _push_ptg2_objects([source_trace_row], PTG2SourceTrace, rewrite=True)
+    await _push_ptg2_objects(
+        [source_trace_set_row],
+        PTG2SourceTraceSet,
+        rewrite=True,
+    )
+    return {
+        "file_row": file_row,
+        "meta": meta,
+        "source_version": source_version,
+        "source_trace_hash": source_trace_row["source_trace_hash"],
+        "source_trace_set_hash": source_trace_set_row["source_trace_set_hash"],
+        "network_names": _normalize_source_network_names(
+            job.get("source_network_names") or []
+        ),
+    }
+
+
 async def _process_in_network_file(
     job: dict[str, Any],
     classes: dict[str, type],
-    provider_ref_cache: dict[int, list[dict[str, Any]]],
     test_mode: bool,
     reuse_raw_artifacts: bool = True,
     max_bytes: int | None = None,
     max_items: int | None = None,
     import_run_id: str | None = None,
     keep_partial_artifacts: bool | None = None,
-    compact_import: bool = False,
     snapshot_id: str | None = None,
+    coverage_scope_id: str | None = None,
     import_month: datetime.date | None = None,
-    rust_stage_tables: dict[str, str] | None = None,
     ptg2_manifest_stage_table: str | None = None,
     source_network_names: list[str] | str | None = None,
     raw_artifact: PTG2RawArtifact | None = None,
     logical_artifact: PTG2LogicalArtifact | None = None,
+    recorded_provenance: Mapping[str, Any] | None = None,
 ) -> PTG2FileProcessResult:
-    """Download and process one in-network file job."""
+    """Scan one in-network job into strict V3 staging and return its result."""
     url = job["url"]
-    description = job.get("description")
     plan_info = job.get("plan_info")
-    from_index_url = job.get("from_index_url")
-    provided_meta = job.get("meta") or {}
+    if not coverage_scope_id or not re.fullmatch(r"[0-9a-f]{64}", coverage_scope_id):
+        raise ValueError("strict V3 file processing requires a 32-byte coverage scope id")
 
-    file_cls = classes["PTGFile"]
     import_log_cls = classes["ImportLog"]
 
     with tempfile.TemporaryDirectory(dir=ptg2_temp_parent()) as tmpdir:
@@ -3068,55 +1673,36 @@ async def _process_in_network_file(
                 logger.warning("Failed to download in-network file from %s: %s", url, exc)
                 return PTG2FileProcessResult("in_network", url, False, error=str(exc))
         extracted = logical_artifact.logical_path
-        meta = provided_meta or await _extract_metadata_fields(extracted)
-        file_row = _build_file_row(url, "in-network", meta, plan_info, description, from_index_url)
-        await _push_ptg2_objects([file_row], file_cls, rewrite=True)
-        source_version = await _record_source_version(
-            source_type="in-network",
-            domain=PTG2_DOMAIN_IN_NETWORK,
-            raw_artifact=raw_artifact,
-            logical_artifact=logical_artifact,
-            import_run_id=import_run_id,
-        )
-        provider_cache_backend = os.getenv(PTG2_PROVIDER_CACHE_BACKEND_ENV, "sqlite").strip().lower()
-        if provider_cache_backend in {"memory", "in-memory", "ram"}:
-            provider_cache = PTG2InMemoryProviderReferenceCache(provider_ref_cache)
-        else:
-            provider_cache = PTG2ProviderReferenceCache(Path(tmpdir) / "provider_refs.sqlite", provider_ref_cache)
-        parse_summary: dict[str, Any] | None = None
+        provenance_map = dict(recorded_provenance or {})
+        if not provenance_map:
+            provenance_map = await _record_in_network_file_provenance(
+                job,
+                classes,
+                raw_artifact=raw_artifact,
+                logical_artifact=logical_artifact,
+                import_run_id=import_run_id,
+            )
+        source_metadata_map = dict(provenance_map["meta"])
+        file_record_map = dict(provenance_map["file_row"])
+        source_version = provenance_map["source_version"]
         source_network_name_values = _normalize_source_network_names(source_network_names or job.get("source_network_names"))
-        try:
-            if compact_import:
-                parse_summary = await _parse_in_network_file_serving_only(
-                    extracted,
-                    file_row["file_id"],
-                    meta,
-                    plan_info,
-                    provider_cache,
-                    test_mode,
-                    import_log_cls,
-                    url,
-                    source_version,
-                    snapshot_id or "ptg2:unknown",
-                    import_month or normalize_import_month(None),
-                    max_items=max_items,
-                    rust_stage_tables=rust_stage_tables,
-                    ptg2_manifest_stage_table=ptg2_manifest_stage_table,
-                    source_network_names=source_network_name_values,
-                )
-            else:
-                parse_summary = await _parse_in_network_file_single_pass(
-                    extracted, file_row["file_id"], meta, plan_info, provider_cache, classes, test_mode, import_log_cls, url,
-                    max_items=max_items,
-                )
-        finally:
-            provider_cache.close()
-    if (
-        compact_import
-        and _use_serving_only_import()
-        and not test_mode
-        and int((parse_summary or {}).get("serving_rates") or 0) <= 0
-    ):
+        parse_summary = await _parse_in_network_file_strict_v3(
+            extracted,
+            file_record_map["file_id"],
+            source_metadata_map,
+            plan_info,
+            test_mode,
+            import_log_cls,
+            url,
+            source_version,
+            snapshot_id or "ptg2:unknown",
+            coverage_scope_id,
+            import_month or normalize_import_month(None),
+            max_items=max_items,
+            ptg2_manifest_stage_table=ptg2_manifest_stage_table,
+            source_network_names=source_network_name_values,
+        )
+    if not test_mode and int((parse_summary or {}).get("serving_rates") or 0) <= 0:
         no_data_summary = dict(parse_summary or {})
         no_data_summary["skipped_reason"] = "parsed zero serving rates"
         no_data_summary.update(_source_version_summary(source_version))
@@ -3124,13 +1710,134 @@ async def _process_in_network_file(
             "in_network",
             url,
             True,
-            file_id=file_row["file_id"],
+            file_id=file_record_map["file_id"],
             summary=no_data_summary,
             skipped=True,
         )
     summary_payload = dict(parse_summary or {})
     summary_payload.update(_source_version_summary(source_version))
-    return PTG2FileProcessResult("in_network", url, True, file_id=file_row["file_id"], summary=summary_payload)
+    return PTG2FileProcessResult(
+        "in_network",
+        url,
+        True,
+        file_id=file_record_map["file_id"],
+        summary=summary_payload,
+    )
+
+
+async def _persist_completed_ptg2_import_run(
+    *,
+    import_run_id: str,
+    import_month: datetime.date,
+    started_at: datetime.datetime,
+    options: Mapping[str, Any],
+    report_payload: dict[str, Any],
+    timing_payload: dict[str, Any],
+    import_started_monotonic: float,
+    post_publish_started_monotonic: float,
+    post_publish_stage_timer: _StageTimer,
+) -> datetime.datetime:
+    """Persist completion only after every required import stage has finished."""
+
+    provisional_finished_at = _utcnow()
+    provisional_report = {
+        **report_payload,
+        "timings": dict(timing_payload),
+        "timing_contract": {
+            "version": 2,
+            "completion_metrics_pending": True,
+        },
+    }
+    await _push_ptg2_objects(
+        [
+            {
+                "import_run_id": import_run_id,
+                "import_month": import_month,
+                "status": PTG2_STATUS_VALIDATED,
+                "started_at": started_at,
+                "finished_at": provisional_finished_at,
+                "heartbeat_at": provisional_finished_at,
+                "options": dict(options),
+                "report": provisional_report,
+                "error": None,
+            }
+        ],
+        PTG2ImportRun,
+        rewrite=True,
+    )
+    post_publish_stage_timer.mark("run_state_persistence")
+
+    completed_monotonic = _ptg2_monotonic()
+    for key, value in post_publish_stage_timer.durations_by_stage.items():
+        timing_payload[f"post_publish_{key}_seconds"] = value
+    timing_payload["post_publish_seconds"] = (
+        completed_monotonic - post_publish_started_monotonic
+    )
+    timing_payload["total_seconds"] = completed_monotonic - import_started_monotonic
+    report_payload["timings"] = timing_payload
+    report_payload["timing_contract"] = {
+        "version": 2,
+        "total_boundary": "after_required_run_state_persistence",
+        "completion_metrics_write_excluded": True,
+    }
+
+    completed_at = _utcnow()
+    await _push_ptg2_objects(
+        [
+            {
+                "import_run_id": import_run_id,
+                "import_month": import_month,
+                "status": PTG2_STATUS_VALIDATED,
+                "started_at": started_at,
+                "finished_at": completed_at,
+                "heartbeat_at": completed_at,
+                "options": dict(options),
+                "report": report_payload,
+                "error": None,
+            }
+        ],
+        PTG2ImportRun,
+        rewrite=True,
+    )
+    return completed_at
+
+
+async def _heartbeat_ptg2_import_run(import_run_id: str) -> None:
+    """Keep the internal PTG run lease current while a long import is active."""
+
+    interval = max(
+        float(os.getenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "15")),
+        1.0,
+    )
+    schema = _quote_ident(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await db.status(
+                f"""
+                UPDATE {schema}.ptg2_import_run
+                   SET heartbeat_at = timezone('UTC', statement_timestamp())
+                 WHERE import_run_id = :import_run_id
+                   AND status IN ('pending', 'running', 'building')
+                """,
+                import_run_id=import_run_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to persist PTG2 import heartbeat for %s",
+                import_run_id,
+                exc_info=True,
+            )
+
+
+async def _stop_ptg2_import_heartbeat(task: asyncio.Task[Any] | None) -> None:
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        return
 
 
 async def _mark_ptg2_import_failed(
@@ -3143,11 +1850,18 @@ async def _mark_ptg2_import_failed(
     options: dict[str, Any] | None = None,
     *,
     should_preserve_published_snapshot: bool = False,
-) -> None:
+    import_started_monotonic: float | None = None,
+    failure_handling_started_monotonic: float | None = None,
+) -> dict[str, Any] | None:
+    """Persist failed import state and return its report, or None on persistence failure."""
     finished = _utcnow()
     error_text = str(error)
     report_payload = dict(report or {})
     report_payload.setdefault("snapshot_id", snapshot_id)
+    timing_payload = dict(report_payload.get("timings") or {})
+    timing_payload.pop("total_seconds", None)
+    report_payload["timings"] = timing_payload
+    persistence_started_monotonic = _ptg2_monotonic()
     try:
         if not should_preserve_published_snapshot:
             await _push_ptg2_objects(
@@ -3161,7 +1875,10 @@ async def _mark_ptg2_import_failed(
                         "validated_at": None,
                         "published_at": None,
                         "previous_snapshot_id": None,
-                        "manifest": {**report_payload, "error": error_text},
+                        "manifest": {
+                            **report_payload,
+                            "error": error_text,
+                        },
                     }
                 ],
                 PTG2Snapshot,
@@ -3177,15 +1894,122 @@ async def _mark_ptg2_import_failed(
                     "finished_at": finished,
                     "heartbeat_at": finished,
                     "options": dict(options or {}),
-                    "report": report_payload,
+                    "report": {
+                        **report_payload,
+                        "timing_contract": {
+                            "version": 2,
+                            "completion_metrics_pending": True,
+                        },
+                    },
                     "error": error_text,
                 }
             ],
             PTG2ImportRun,
             rewrite=True,
         )
+        persisted_monotonic = _ptg2_monotonic()
+        if import_started_monotonic is not None:
+            timing_payload["failure_state_persistence_seconds"] = (
+                persisted_monotonic - persistence_started_monotonic
+            )
+            if failure_handling_started_monotonic is not None:
+                timing_payload["failure_handling_seconds"] = (
+                    persisted_monotonic - failure_handling_started_monotonic
+                )
+            timing_payload["total_seconds"] = (
+                persisted_monotonic - import_started_monotonic
+            )
+            report_payload["timings"] = timing_payload
+            report_payload["timing_contract"] = {
+                "version": 2,
+                "total_boundary": "after_required_failure_state_persistence",
+                "completion_metrics_write_excluded": True,
+            }
+            finished = _utcnow()
+            await _push_ptg2_objects(
+                [
+                    {
+                        "import_run_id": import_run_id,
+                        "import_month": import_month,
+                        "status": PTG2_STATUS_FAILED,
+                        "started_at": started_at,
+                        "finished_at": finished,
+                        "heartbeat_at": finished,
+                        "options": dict(options or {}),
+                        "report": report_payload,
+                        "error": error_text,
+                    }
+                ],
+                PTG2ImportRun,
+                rewrite=True,
+            )
+        return report_payload
     except Exception as mark_exc:
         logger.error("Failed to mark PTG2 import %s as failed: %s", import_run_id, mark_exc)
+        return None
+
+
+async def _is_failed_shared_layout_abandoned(
+    shared_layout_reservation: Any,
+    *,
+    build_token: str,
+) -> bool | None:
+    """Abandon an owned unpublished layout, or defer interrupted cleanup to GC."""
+    if shared_layout_reservation is None or shared_layout_reservation.reused:
+        return None
+    for attempt in range(3):
+        try:
+            async with db.transaction() as session:
+                return await is_shared_layout_build_abandoned(
+                    session,
+                    schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+                    snapshot_key=shared_layout_reservation.snapshot_key,
+                    build_token=build_token,
+                )
+        except Exception:
+            if attempt == 2:
+                logger.warning(
+                    "Failed to abandon unpublished shared PTG layout after retries; "
+                    "recurring GC will retry",
+                    exc_info=True,
+                )
+                return None
+            await asyncio.sleep(0.1 * (2**attempt))
+    return None
+
+
+async def _cleanup_failed_ptg2_source_state(
+    *,
+    serving_index: dict[str, Any] | None,
+    manifest_stage_table: str | None,
+    snapshot_id: str,
+) -> None:
+    """Remove unpublished relational, artifact, and source-dictionary state."""
+    try:
+        await _drop_ptg2_snapshot_tables_for_manifest(serving_index)
+        if manifest_stage_table:
+            await _drop_ptg2_snapshot_table_names(
+                _ptg2_manifest_stage_table_names(manifest_stage_table)
+            )
+    except Exception:
+        logger.debug(
+            "Failed to clean PTG2 source-scoped tables for failed import",
+            exc_info=True,
+        )
+    try:
+        await delete_ptg2_artifacts_for_snapshot(snapshot_id)
+    except Exception:
+        logger.debug("Failed to clean PTG2 artifacts for failed import", exc_info=True)
+    try:
+        await delete_unpublished_shared_v3_snapshot_sources(
+            schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            snapshot_id=snapshot_id,
+        )
+    except Exception:
+        logger.debug(
+            "Failed to clean PTG2 shared source metadata for failed import",
+            exc_info=True,
+        )
 
 
 def _source_version_summary(source_version: PTG2SourceVersion | None) -> dict[str, Any]:
@@ -3197,6 +2021,7 @@ def _source_version_summary(source_version: PTG2SourceVersion | None) -> dict[st
         "canonical_url": source_version.canonical_url,
         "raw_sha256": source_version.raw_sha256,
         "logical_sha256": source_version.logical_sha256,
+        "logical_hash_deferred": source_version.logical_hash_deferred,
         "content_length": source_version.content_length,
         "etag": source_version.etag,
         "last_modified": source_version.last_modified,
@@ -3206,8 +2031,12 @@ def _source_version_summary(source_version: PTG2SourceVersion | None) -> dict[st
 def _ptg2_source_file_versions_from_results(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     versions: list[dict[str, Any]] = []
     seen: set[tuple[str | None, str | None]] = set()
-    for item in files:
-        summary = item.get("summary") if isinstance(item.get("summary"), dict) else {}
+    for file_result in files:
+        summary = (
+            file_result.get("summary")
+            if isinstance(file_result.get("summary"), dict)
+            else {}
+        )
         version_id = summary.get("engine_source_file_version_id") or summary.get("source_file_version_id")
         identity_hash = summary.get("engine_source_identity_hash") or summary.get("source_identity_hash")
         if not version_id and not identity_hash:
@@ -3218,48 +2047,21 @@ def _ptg2_source_file_versions_from_results(files: list[dict[str, Any]]) -> list
         seen.add(key)
         versions.append(
             {
-                "source_type": item.get("source_type"),
-                "url": item.get("url"),
-                "file_id": item.get("file_id"),
+                "source_type": file_result.get("source_type"),
+                "url": file_result.get("url"),
+                "file_id": file_result.get("file_id"),
                 "engine_source_identity_hash": identity_hash,
                 "engine_source_file_version_id": version_id,
-                "canonical_url": summary.get("canonical_url") or item.get("url"),
+                "canonical_url": summary.get("canonical_url") or file_result.get("url"),
                 "raw_sha256": summary.get("raw_sha256"),
                 "logical_sha256": summary.get("logical_sha256"),
+                "logical_hash_deferred": bool(summary.get("logical_hash_deferred")),
                 "content_length": summary.get("content_length"),
                 "etag": summary.get("etag"),
                 "last_modified": summary.get("last_modified"),
             }
         )
     return versions
-
-
-_ALLOWED_AMOUNT_METRIC_KEYS = (
-    "allowed_amount_items",
-    "allowed_amount_blocks",
-    "allowed_amount_payments",
-    "allowed_amount_provider_payments",
-    "allowed_amount_npi_references",
-    "allowed_amount_unique_tins",
-)
-
-
-def _allowed_amount_metrics_from_results(files: list[dict[str, Any]]) -> dict[str, int | bool]:
-    metrics_by_name: dict[str, int | bool] = {key: 0 for key in _ALLOWED_AMOUNT_METRIC_KEYS}
-    for file_result in files:
-        if file_result.get("source_type") != "allowed_amounts":
-            continue
-        summary = file_result.get("summary") if isinstance(file_result.get("summary"), dict) else {}
-        for key in _ALLOWED_AMOUNT_METRIC_KEYS:
-            try:
-                metrics_by_name[key] = int(metrics_by_name.get(key) or 0) + max(0, int(summary.get(key) or 0))
-            except (TypeError, ValueError):
-                continue
-    metrics_by_name["allowed_amount_evidence"] = bool(
-        int(metrics_by_name.get("allowed_amount_provider_payments") or 0) > 0
-        or int(metrics_by_name.get("allowed_amount_payments") or 0) > 0
-    )
-    return metrics_by_name
 
 
 def _normalize_source_network_names(value: Any) -> list[str]:
@@ -3286,57 +2088,14 @@ _PTG2_SNAPSHOT_CONTENT_OPTION_KEYS = (
     "toc_list",
     "in_network_url",
     "allowed_url",
-    "provider_ref_url",
     "source_key",
     *_PTG2_SNAPSHOT_SET_OPTION_KEYS,
     "source_network_names",
     "max_files",
-    "max_items",
-    "compact_import",
-    "serving_only_import",
-    "source_scoped_compact",
-    "serving_storage",
     "snapshot_arch",
-    "snapshot_arch_variant",
+    "storage_generation",
     "test_mode",
-    "allow_partial_import",
-    "hash_mode",
-    "provider_bucket_count",
-    "provider_set_inline_npi_limit",
-    "id_storage",
-    "manifest_serving_layout",
-    "manifest_price_atom_layout",
-    "manifest_provider_group_location",
-    "manifest_provider_set_component",
-    "manifest_provider_group_rate_scope",
-    "manifest_serving_sidecars",
-    "manifest_drop_serving_table",
-    "manifest_postgres_binary_natural_lean_stream",
-    "manifest_provider_npi_sidecar",
 )
-
-_PTG2_POSTGRES_BINARY_V3_FORMAT_GENERATION = "membership_fences_v1"
-
-
-def _ptg2_snapshot_arch_identity_variant(
-    arch_version: str,
-    arch_variant: str | None,
-) -> str | None:
-    """Include incompatible storage generations in deterministic snapshot identity."""
-
-    if not _is_postgres_binary_v3_arch(arch_version):
-        return arch_variant
-    base_variant = arch_variant or arch_version
-    return f"{base_variant}:{_PTG2_POSTGRES_BINARY_V3_FORMAT_GENERATION}"
-
-
-def _ptg2_effective_hash_mode() -> str:
-    raw_mode = str(os.getenv(PTG2_HASH_MODE_ENV, "checksum64")).strip().lower()
-    if raw_mode == "sha256":
-        return "sha256"
-    if raw_mode in {"blake2", "blake2b", "blake2_128"}:
-        return "blake2_128"
-    return "checksum64"
 
 
 def _ptg2_snapshot_content_options(option_by_name: dict[str, Any]) -> dict[str, Any]:
@@ -3358,10 +2117,6 @@ def _ptg2_snapshot_content_options(option_by_name: dict[str, Any]) -> dict[str, 
     content_option_by_name["source_network_names"] = sorted(
         set(_normalize_source_network_names(option_by_name.get("source_network_names"))),
         key=str.casefold,
-    )
-    content_option_by_name["snapshot_arch_variant"] = (
-        option_by_name.get("snapshot_arch_variant")
-        or option_by_name.get("snapshot_arch")
     )
     return content_option_by_name
 
@@ -3416,6 +2171,19 @@ async def _reconcile_already_published_snapshot(
     if serving_index.get("storage") != "manifest_snapshot":
         return {"status": "not_applicable", "reason": "snapshot has no source-scoped serving tables"}
     previous_snapshot_id = snapshot_attributes.get("previous_snapshot_id")
+    current_snapshot_id = await _current_source_snapshot_id(source_key)
+    allowed_current_ids = {
+        snapshot_id,
+        str(previous_snapshot_id) if previous_snapshot_id else None,
+        None,
+    }
+    if current_snapshot_id not in allowed_current_ids:
+        return {
+            "status": "superseded",
+            "source_key": source_key,
+            "snapshot_id": snapshot_id,
+            "current_snapshot_id": current_snapshot_id,
+        }
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     async with db.transaction() as session:
         await _acquire_source_pointer_gc_lock(session)
@@ -3436,33 +2204,98 @@ async def _reconcile_already_published_snapshot(
             previous_snapshot_id=str(previous_snapshot_id) if previous_snapshot_id else None,
             import_month=import_month,
             updated_at=_utcnow(),
-            serving_index=serving_index,
             snapshot_attributes=snapshot_attributes,
         )
 
 
-_PTG2_CANDIDATE_TABLE_KINDS = (
-    "serving",
-    "serving_binary",
-    "price_atom",
-    "price_set_atom",
-    "provider_group_member",
-    "provider_npi_scope",
-    "provider_group_location",
-    "provider_set_component",
-    "provider_group_rate_scope",
-    "provider_set_dict",
-    "price_atom_dict",
-    "code_count",
-)
+async def _resume_validated_candidate(
+    *,
+    snapshot_attributes: dict[str, Any],
+    snapshot_id: str,
+    source_key: str,
+    import_month: datetime.date,
+    auto_activate: bool,
+) -> dict[str, Any]:
+    """Return or atomically activate an idempotently redelivered candidate."""
+
+    manifest = _published_snapshot_manifest(snapshot_attributes)
+    activation = manifest.get("activation")
+    if (
+        not isinstance(activation, dict)
+        or activation.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT
+        or activation.get("state") != "validated"
+    ):
+        raise RuntimeError(
+            f"PTG snapshot {snapshot_id} is validated without the strict V3 candidate contract"
+        )
+    if str(activation.get("source_key") or "") != source_key:
+        raise RuntimeError(
+            f"PTG snapshot {snapshot_id} candidate source does not match {source_key}"
+        )
+    serving_index = manifest.get("serving_index")
+    if not isinstance(serving_index, dict):
+        raise RuntimeError(f"PTG snapshot {snapshot_id} candidate has no serving index")
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    missing_tables, missing_artifacts = await _missing_snapshot_serving_resources(
+        schema_name,
+        snapshot_id,
+        serving_index,
+    )
+    if missing_tables or missing_artifacts:
+        raise RuntimeError(
+            f"PTG snapshot {snapshot_id} candidate resources are missing: "
+            + ", ".join([*missing_tables, *missing_artifacts])
+        )
+
+    previous_snapshot_id = activation.get("expected_previous_snapshot_id")
+    pointer_result: dict[str, Any] | None = None
+    if auto_activate:
+        activated_at = _utcnow()
+        pointer_result = await _publish_ptg2_source_pointers(
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=(
+                str(previous_snapshot_id) if previous_snapshot_id else None
+            ),
+            import_month=import_month,
+            updated_at=activated_at,
+            snapshot_attributes=activated_snapshot_attributes(
+                snapshot_attributes,
+                activated_at=activated_at,
+                activation_mode="automatic_redelivery",
+            ),
+        )
+    rate_count = manifest.get(
+        "serving_rates",
+        manifest.get(
+            "rate_count",
+            serving_index.get("serving_rates", serving_index.get("rate_count")),
+        ),
+    )
+    return {
+        "status": "succeeded",
+        "publish_status": (
+            "candidate_activated" if auto_activate else "candidate_validated"
+        ),
+        "activation_status": "activated" if auto_activate else "deferred",
+        "snapshot_status": (
+            PTG2_STATUS_PUBLISHED if auto_activate else PTG2_STATUS_VALIDATED
+        ),
+        "already_published": False,
+        "candidate_reused": True,
+        "import_run_id": str(snapshot_attributes.get("import_run_id") or ""),
+        "snapshot_id": snapshot_id,
+        "source_key": source_key,
+        "import_month": import_month.isoformat(),
+        "serving_rates": rate_count,
+        "rate_count": rate_count,
+        "pointer_reconciliation": pointer_result,
+    }
+
 
 _PTG2_MANIFEST_STAGE_SUPPORT_KINDS = (
     "price_atom",
     "price_set_atom",
-    "provider_group_member",
-    "provider_npi_scope",
-    "code_count",
-    "provider_set_dictionary",
 )
 
 
@@ -3474,35 +2307,6 @@ def _ptg2_manifest_stage_table_names(serving_stage_table: str) -> list[str]:
             for kind in _PTG2_MANIFEST_STAGE_SUPPORT_KINDS
         ),
     ]
-
-
-def _ptg2_candidate_serving_index(
-    *,
-    source_key: str,
-    snapshot_id: str,
-) -> dict[str, Any]:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    table_by_kind = {
-        kind: f"{schema_name}.{_ptg2_snapshot_table_name(kind, source_key, snapshot_id)}"
-        for kind in _PTG2_CANDIDATE_TABLE_KINDS
-    }
-    return {
-        "storage": "manifest_snapshot",
-        "type": "ptg2_serving_candidate",
-        "source_key": source_key,
-        "table": table_by_kind["serving"],
-        "serving_binary_table": table_by_kind["serving_binary"],
-        "price_atom_table": table_by_kind["price_atom"],
-        "provider_group_member_table": table_by_kind["provider_group_member"],
-        "provider_npi_scope_table": table_by_kind["provider_npi_scope"],
-        "provider_group_location_table": table_by_kind["provider_group_location"],
-        "provider_set_component_table": table_by_kind["provider_set_component"],
-        "provider_group_rate_scope_table": table_by_kind["provider_group_rate_scope"],
-        "provider_set_dictionary_table": table_by_kind["provider_set_dict"],
-        "price_atom_dictionary_table": table_by_kind["price_atom_dict"],
-        "code_count_table": table_by_kind["code_count"],
-        "materialized_tables": table_by_kind,
-    }
 
 
 def _already_published_result(
@@ -3537,7 +2341,567 @@ def _already_published_result(
     }
 
 
-async def main(
+_SHARED_V3_PHYSICAL_SERVING_INDEX_KEYS = frozenset(
+    {
+        "storage",
+        "type",
+        "snapshot_scoped",
+        "arch_version",
+        "storage_generation",
+        "cold_lookup_contract",
+        "price_membership_semantics",
+        "serving_multiplicity_semantics",
+        "shared_snapshot_key",
+        "provider_scope_strategy",
+        "id_storage",
+        "serving_table_layout",
+        "shared_block_layout",
+        "source_count",
+        "code_count",
+        "serving_rates",
+        "rate_count",
+        "atom_key_bits",
+        "price_atom_constant_keys",
+        "price_atom_constant_values",
+        "price_stage",
+        "serving_binary",
+        "provider_graph",
+        "storage_bytes",
+        "timings",
+        "audit_sample",
+    }
+)
+
+
+def _reused_shared_v3_serving_index(
+    layout_manifest: Mapping[str, Any] | None,
+    *,
+    source_key: str,
+    shared_snapshot_key: int,
+) -> dict[str, Any]:
+    """Bind source-scoped metadata to one already sealed physical layout."""
+
+    layout_manifest_map = dict(layout_manifest or {})
+    raw_serving_index = layout_manifest_map.get("serving_index", layout_manifest_map)
+    if not isinstance(raw_serving_index, Mapping):
+        raise RuntimeError("reusable strict V3 layout is missing its serving manifest")
+    serving_index = {
+        key: raw_serving_index[key]
+        for key in _SHARED_V3_PHYSICAL_SERVING_INDEX_KEYS
+        if key in raw_serving_index
+    }
+    if str(serving_index.get("arch_version") or "").strip().lower() != "postgres_binary_v3":
+        raise RuntimeError("reusable strict V3 layout has an incompatible architecture")
+    if (
+        str(serving_index.get("storage_generation") or "").strip().lower()
+        != PTG2_V3_SHARED_GENERATION
+        or str(serving_index.get("cold_lookup_contract") or "").strip().lower()
+        != PTG2_V3_COLD_LOOKUP_CONTRACT
+        or str(serving_index.get("price_membership_semantics") or "").strip().lower()
+        != PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS
+        or str(serving_index.get("serving_multiplicity_semantics") or "").strip().lower()
+        != PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS
+        or str(serving_index.get("shared_block_layout") or "").strip().lower()
+        != "dense_shared_blocks_v3"
+    ):
+        raise RuntimeError("reusable strict V3 layout is missing the shared cold-read contract")
+    try:
+        source_count = int(serving_index.get("source_count"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("reusable strict V3 layout is missing source_count") from exc
+    if source_count <= 0:
+        raise RuntimeError("reusable strict V3 layout has an invalid source_count")
+    try:
+        code_count = int(serving_index.get("code_count"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("reusable strict V3 layout is missing code_count") from exc
+    if code_count < 0:
+        raise RuntimeError("reusable strict V3 layout has an invalid code_count")
+    serving_index.update(
+        {
+            "source_key": source_key,
+            "shared_snapshot_key": int(shared_snapshot_key),
+            "storage_generation": PTG2_V3_SHARED_GENERATION,
+            "cold_lookup_contract": PTG2_V3_COLD_LOOKUP_CONTRACT,
+            "price_membership_semantics": PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS,
+            "serving_multiplicity_semantics": PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
+            "serving_binary_table": None,
+            "table": None,
+            "materialized_tables": {},
+        }
+    )
+    return serving_index
+
+
+def _annotate_v3_result_identity(
+    file_result: PTG2FileProcessResult,
+    identity: SharedPhysicalArtifactIdentity,
+    artifact_metadata: Mapping[str, Any],
+) -> PTG2FileProcessResult:
+    """Attach post-scan physical identity without changing scanner scheduling."""
+
+    if not file_result.success or not isinstance(file_result.summary, dict):
+        return file_result
+    manifest = file_result.summary.get("manifest")
+    if not isinstance(manifest, dict):
+        raise RuntimeError("strict V3 successful file result is missing its manifest")
+    identity_payload = identity.as_dict()
+    manifest["physical_artifact_identity"] = identity_payload
+    manifest["logical_artifact_provenance"] = dict(artifact_metadata)
+    copy_files = manifest.get("copy_files")
+    if not isinstance(copy_files, dict):
+        if file_result.skipped:
+            return file_result
+        raise RuntimeError("strict V3 successful scan is missing deferred COPY files")
+    serving_entries = copy_files.get("serving_run") or []
+    if not isinstance(serving_entries, list):
+        raise RuntimeError("strict V3 serving-run metadata must be a list")
+    for entry in serving_entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError("strict V3 serving-run metadata must contain objects")
+        for field_name, identity_value in identity_payload.items():
+            previous = entry.setdefault(field_name, identity_value)
+            if previous != identity_value:
+                raise RuntimeError(
+                    "strict V3 serving-run entry has conflicting physical identity"
+                )
+    scanner = file_result.summary.get("scanner")
+    scanner_summary = scanner.get("summary") if isinstance(scanner, Mapping) else None
+    scanner_config = scanner.get("config") if isinstance(scanner, Mapping) else None
+    if not isinstance(scanner_summary, Mapping) or not isinstance(
+        scanner_config, Mapping
+    ):
+        # Synthetic callers may annotate before scanner metadata is assembled. The
+        # strict finalizer still rejects these entries because they lack a contract.
+        return file_result
+    copy_files["serving_run"] = attach_v3_source_run_contract(
+        serving_entries,
+        source_identity=identity,
+        scanner_summary=scanner_summary,
+        scanner_config=scanner_config,
+    )
+    return file_result
+
+
+_annotate_v3_file_result_source_identity = _annotate_v3_result_identity
+
+
+def _shared_v3_identity_traces(
+    file_results: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    pairs: list[dict[str, Any]] = []
+    for file_result in file_results:
+        summary = file_result.get("summary")
+        manifest = summary.get("manifest") if isinstance(summary, Mapping) else None
+        if not isinstance(manifest, Mapping):
+            continue
+        identity_payload = manifest.get("physical_artifact_identity")
+        artifact_metadata = manifest.get("logical_artifact_provenance")
+        source_trace_hash = str(manifest.get("source_trace_hash") or "").strip()
+        if (
+            not isinstance(identity_payload, Mapping)
+            or not isinstance(artifact_metadata, Mapping)
+            or not source_trace_hash
+        ):
+            raise RuntimeError(
+                "strict V3 logical source result is missing identity/trace metadata"
+            )
+        pairs.append(
+            {
+                **normalized_physical_artifact_identity(identity_payload).as_dict(),
+                **dict(artifact_metadata),
+                "source_trace_hash": source_trace_hash,
+            }
+        )
+    return pairs
+
+
+_shared_v3_identity_trace_pairs_from_results = _shared_v3_identity_traces
+
+
+def _shared_v3_source_set_metadata(
+    identity_trace_pairs: Iterable[Mapping[str, Any]],
+    *,
+    expected_source_count: int,
+) -> dict[str, Any]:
+    """Seal the distinct raw containers from the complete publication input."""
+
+    raw_hashes = {
+        str(pair.get("raw_container_sha256") or "").strip().lower()
+        for pair in identity_trace_pairs
+    }
+    metadata = shared_source_set_metadata(raw_hashes)
+    if int(metadata["source_count"]) != int(expected_source_count):
+        raise RuntimeError(
+            "strict V3 source-set seal does not match the complete physical input"
+        )
+    return metadata
+
+
+async def _publish_shared_v3_source_dictionary(
+    *,
+    shared_input_identity: Any,
+    identity_trace_pairs: Iterable[Mapping[str, Any]],
+    snapshot_id: str,
+) -> tuple[Any, ...]:
+    assignments, trace_set_rows = shared_snapshot_source_assignments(
+        identity_trace_pairs,
+        expected_identities=shared_input_identity.source_identities,
+    )
+    now = _utcnow()
+    await _push_ptg2_objects(
+        [{**row, "created_at": now} for row in trace_set_rows],
+        PTG2SourceTraceSet,
+        rewrite=True,
+    )
+    await publish_shared_v3_snapshot_sources(
+        schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+        snapshot_id=snapshot_id,
+        plan_id=shared_input_identity.logical_plan.plan_id,
+        plan_market_type=shared_input_identity.logical_plan.plan_market_type,
+        coverage_scope_id=shared_input_identity.coverage_scope_id,
+        assignments=assignments,
+    )
+    return assignments
+
+
+def _is_shared_v3_preflight_eligible(
+    downloaded_jobs: Sequence[PTG2DownloadedJob],
+) -> bool:
+    """Return whether downloads carry enough metadata for a scan-free rebind."""
+
+    if not downloaded_jobs:
+        return False
+    for downloaded in downloaded_jobs:
+        if (
+            downloaded.error
+            or downloaded.raw_artifact is None
+            or downloaded.logical_artifact is None
+            or str(downloaded.job.get("type") or "").strip().lower() != "in_network"
+        ):
+            return False
+        job = downloaded.job
+        meta = job.get("meta") if isinstance(job.get("meta"), dict) else {}
+        plan_info = job.get("plan_info") if isinstance(job.get("plan_info"), list) else None
+        if not str(_derive_plan_fields(meta, plan_info).get("plan_id") or "").strip():
+            return False
+    return True
+
+
+_shared_v3_preflight_eligible = _is_shared_v3_preflight_eligible
+
+
+def _shared_v3_scanner_identity() -> dict[str, Any]:
+    """Bind reuse to the exact scanner/finalizer executable that defines output."""
+
+    binary = _ptg2_rust_scanner_binary()
+    if binary is None:
+        raise RuntimeError("strict shared V3 requires the PTG2 Rust scanner binary")
+    digest, byte_count = sha256_file(binary)
+    source_root = Path(__file__).resolve().parent
+    publisher_sources = (
+        source_root / "ptg.py",
+        source_root / "ptg_parts" / "rust_scanner.py",
+        source_root / "ptg_parts" / "ptg2_manifest_publish.py",
+        source_root / "ptg_parts" / "ptg2_serving_binary_v3.py",
+        source_root / "ptg_parts" / "ptg2_serving_binary_v3_code_sets.py",
+        source_root / "ptg_parts" / "ptg2_serving_binary_v3_primitives.py",
+        source_root / "ptg_parts" / "ptg2_serving_binary_v3_types.py",
+        source_root / "ptg_parts" / "ptg2_shared_audit.py",
+        source_root / "ptg_parts" / "ptg2_shared_blocks.py",
+        source_root / "ptg_parts" / "ptg2_shared_finalize.py",
+        source_root / "ptg_parts" / "ptg2_shared_graph.py",
+        source_root / "ptg_parts" / "ptg2_shared_price.py",
+        source_root / "ptg_parts" / "ptg2_shared_publish.py",
+        source_root / "ptg_parts" / "ptg2_shared_snapshot_publish.py",
+    )
+    publisher_digest = hashlib.sha256()
+    publisher_byte_count = 0
+    for source_path in publisher_sources:
+        source_bytes = source_path.read_bytes()
+        relative_name = source_path.relative_to(source_root).as_posix().encode("utf-8")
+        publisher_digest.update(len(relative_name).to_bytes(4, "big"))
+        publisher_digest.update(relative_name)
+        publisher_digest.update(len(source_bytes).to_bytes(8, "big"))
+        publisher_digest.update(source_bytes)
+        publisher_byte_count += len(source_bytes)
+    return {
+        "contract_version": 2,
+        "scanner_binary_sha256": digest,
+        "scanner_binary_bytes": int(byte_count),
+        "publisher_source_sha256": publisher_digest.hexdigest(),
+        "publisher_source_bytes": publisher_byte_count,
+    }
+
+
+async def _publish_reused_shared_v3_snapshot(
+    *,
+    downloaded_jobs: Sequence[PTG2DownloadedJob],
+    shared_input_identity: Any,
+    classes: Mapping[str, type],
+    layout_manifest: Mapping[str, Any] | None,
+    shared_snapshot_key: int,
+    semantic_fingerprint: bytes,
+    coverage_scope_id: bytes,
+    coverage_plan_id: str,
+    coverage_plan_market_type: str,
+    snapshot_id: str,
+    import_run_id: str,
+    source_key: str,
+    import_month: datetime.date,
+    previous_snapshot_id: str | None,
+    started_at: datetime.datetime,
+    options: Mapping[str, Any],
+    manifest_stage_table: str | None,
+    test_mode: bool,
+    import_started_monotonic: float,
+    candidate_stage_state: dict[str, bool] | None = None,
+) -> dict[str, Any]:
+    """Publish a logical snapshot binding without rescanning identical content."""
+
+    source_file_versions: list[dict[str, Any]] = []
+    observed_plans: set[tuple[str, str]] = set()
+    source_trace_hashes: set[str] = set()
+    network_names: set[str] = set()
+    source_provenance_entries: list[dict[str, Any]] = []
+    for downloaded in downloaded_jobs:
+        if downloaded.error or downloaded.raw_artifact is None or downloaded.logical_artifact is None:
+            raise RuntimeError("reusable strict V3 input contains an incomplete download")
+        job = downloaded.job
+        if str(job.get("type") or "").strip().lower() != "in_network":
+            raise RuntimeError("strict V3 fast reuse currently requires in-network-only inputs")
+        provenance = await _record_in_network_file_provenance(
+            job,
+            classes,
+            raw_artifact=downloaded.raw_artifact,
+            logical_artifact=downloaded.logical_artifact,
+            import_run_id=import_run_id,
+        )
+        source_metadata_map = dict(provenance["meta"])
+        plan_info = job.get("plan_info") if isinstance(job.get("plan_info"), list) else None
+        plan_fields = _derive_plan_fields(source_metadata_map, plan_info)
+        plan_id = str(plan_fields.get("plan_id") or "").strip()
+        if not plan_id:
+            raise RuntimeError("strict V3 fast reuse requires source plan identity metadata")
+        plan_market_type = str(plan_fields.get("plan_market_type") or "").strip().lower()
+        if (plan_id, plan_market_type) != (
+            str(coverage_plan_id).strip(),
+            str(coverage_plan_market_type).strip().lower(),
+        ):
+            raise RuntimeError(
+                "strict V3 reusable input plan metadata changed after physical identity planning"
+            )
+        if (plan_id, plan_market_type) not in observed_plans:
+            plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(
+                plan_fields,
+                snapshot_id,
+                import_month,
+            )
+            await _push_ptg2_objects([plan_row], PTG2Plan, rewrite=True)
+            if alias_rows:
+                await _push_ptg2_objects(alias_rows, PTG2PlanAlias, rewrite=True)
+            await _push_ptg2_objects([plan_month_row], PTG2PlanMonth, rewrite=True)
+            observed_plans.add((plan_id, plan_market_type))
+        file_row = provenance["file_row"]
+        source_version = provenance["source_version"]
+        source_trace_hashes.add(str(provenance["source_trace_hash"]))
+        source_provenance_entries.append(
+            {
+                **shared_physical_artifact_identity(downloaded).as_dict(),
+                **shared_logical_artifact_metadata(downloaded),
+                "source_trace_hash": str(provenance["source_trace_hash"]),
+            }
+        )
+        network_names.update(provenance["network_names"])
+        source_file_versions.append(
+            {
+                "source_type": "in_network",
+                "url": str(job.get("url") or ""),
+                "file_id": file_row.get("file_id"),
+                **_source_version_summary(source_version),
+            }
+        )
+
+    serving_index = _reused_shared_v3_serving_index(
+        layout_manifest,
+        source_key=source_key,
+        shared_snapshot_key=shared_snapshot_key,
+    )
+    serving_index["coverage_scope_id"] = bytes(coverage_scope_id).hex()
+    serving_index["source_trace_set_hash"] = build_source_trace_set(
+        sorted(source_trace_hashes)
+    )["source_trace_set_hash"]
+    serving_index["network_names"] = sorted(network_names, key=str.casefold)
+    if int(serving_index["source_count"]) != int(shared_input_identity.source_count):
+        raise RuntimeError(
+            "reusable strict V3 layout source_count does not match the complete physical input"
+        )
+    source_set = _shared_v3_source_set_metadata(
+        source_provenance_entries,
+        expected_source_count=shared_input_identity.source_count,
+    )
+    await _publish_shared_v3_source_dictionary(
+        shared_input_identity=shared_input_identity,
+        identity_trace_pairs=source_provenance_entries,
+        snapshot_id=snapshot_id,
+    )
+    serving_index["source_set"] = source_set
+    await validate_reused_shared_v3_snapshot_sources(
+        schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+        snapshot_key=int(shared_snapshot_key),
+        logical_snapshot_id=snapshot_id,
+    )
+    post_publish_started_monotonic = _ptg2_monotonic()
+    post_publish_stage_timings: dict[str, float] = {}
+    post_publish_stage_timer = _StageTimer(
+        post_publish_stage_timings,
+        post_publish_started_monotonic,
+    )
+    validated_at = _utcnow()
+    rate_count = int(serving_index.get("serving_rates", serving_index.get("rate_count")) or 0)
+    timings_by_phase = {
+        "data_seconds": 0.0,
+        "publish_seconds": 0.0,
+        "shared_layout_reuse_seconds": (
+            post_publish_started_monotonic - import_started_monotonic
+        ),
+    }
+    publish_report_map = {
+        "snapshot_id": snapshot_id,
+        "serving_index": serving_index,
+        "serving_rates": rate_count,
+        "rate_count": rate_count,
+        "source_file_versions": source_file_versions,
+        "shared_layout_reused": True,
+        "shared_snapshot_key": int(shared_snapshot_key),
+        "shared_semantic_fingerprint": bytes(semantic_fingerprint).hex(),
+        "coverage_scope_id": bytes(coverage_scope_id).hex(),
+        "timings": timings_by_phase,
+    }
+    snapshot_values_by_field = {
+        "snapshot_id": snapshot_id,
+        "import_run_id": import_run_id,
+        "import_month": import_month,
+        "status": PTG2_STATUS_VALIDATED,
+        "created_at": started_at,
+        "validated_at": validated_at,
+        "published_at": None,
+        "previous_snapshot_id": previous_snapshot_id,
+        "manifest": {
+            **publish_report_map,
+            "timings": dict(timings_by_phase),
+        },
+    }
+    candidate_result = await _stage_ptg2_source_candidate(
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        previous_snapshot_id=previous_snapshot_id,
+        import_month=import_month,
+        updated_at=validated_at,
+        snapshot_attributes=snapshot_values_by_field,
+        shared_snapshot_key=int(shared_snapshot_key),
+        coverage_scope_id=bytes(coverage_scope_id),
+        coverage_plan_id=coverage_plan_id,
+        coverage_plan_market_type=coverage_plan_market_type,
+    )
+    if candidate_stage_state is not None:
+        candidate_stage_state["staged"] = True
+    candidate_attributes = dict(candidate_result["candidate_attributes"])
+    auto_activate = bool(options.get("auto_activate_candidates", False))
+    if auto_activate:
+        activated_at = _utcnow()
+        await _publish_ptg2_source_pointers(
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=previous_snapshot_id,
+            import_month=import_month,
+            updated_at=activated_at,
+            snapshot_attributes=activated_snapshot_attributes(
+                candidate_attributes,
+                activated_at=activated_at,
+                activation_mode="automatic",
+            ),
+        )
+        activation_status = "activated"
+    else:
+        activation_status = "deferred"
+    release_current_artifact_lease()
+    post_publish_stage_timer.mark("logical_candidate_and_optional_pointer_cutover")
+    if manifest_stage_table:
+        await _drop_ptg2_snapshot_table_names(
+            _ptg2_manifest_stage_table_names(manifest_stage_table)
+        )
+    post_publish_stage_timer.mark("scratch_cleanup")
+    if auto_activate:
+        await _cleanup_old_ptg2_source_tables(
+            source_key,
+            {snapshot_id},
+            lock_pointer_state=True,
+        )
+    post_publish_stage_timer.mark("old_state_cleanup")
+    address_refresh = (
+        await _enqueue_ptg2_auto_address_refresh_after_import(
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            import_run_id=import_run_id,
+            has_serving_files=True,
+            source_scoped_compact=True,
+            test_mode=test_mode,
+        )
+        if auto_activate
+        else {"status": "skipped", "reason": "candidate-activation-deferred"}
+    )
+    post_publish_stage_timer.mark("address_refresh")
+    publish_report_map["address_refresh"] = address_refresh
+    publish_report_map["activation_status"] = activation_status
+    await _persist_completed_ptg2_import_run(
+        import_run_id=import_run_id,
+        import_month=import_month,
+        started_at=started_at,
+        options=options,
+        report_payload=publish_report_map,
+        timing_payload=timings_by_phase,
+        import_started_monotonic=import_started_monotonic,
+        post_publish_started_monotonic=post_publish_started_monotonic,
+        post_publish_stage_timer=post_publish_stage_timer,
+    )
+    write_live_progress(
+        status="succeeded",
+        phase="succeeded",
+        unit="files",
+        done=len(downloaded_jobs),
+        total=len(downloaded_jobs),
+        pct=100,
+        eta_seconds=0,
+        message="PTG import reused an identical PostgreSQL layout",
+    )
+    return {
+        "status": "succeeded",
+        "publish_status": "shared_layout_reused",
+        "already_published": False,
+        "shared_layout_reused": True,
+        "activation_status": activation_status,
+        "snapshot_status": (
+            PTG2_STATUS_PUBLISHED if auto_activate else PTG2_STATUS_VALIDATED
+        ),
+        "shared_snapshot_key": int(shared_snapshot_key),
+        "import_run_id": import_run_id,
+        "snapshot_id": snapshot_id,
+        "source_key": source_key,
+        "import_month": import_month.isoformat(),
+        "files_attempted": len(downloaded_jobs),
+        "files_processed": 0,
+        "files_reused": len(downloaded_jobs),
+        "files_failed": 0,
+        "serving_rates": rate_count,
+        "rate_count": rate_count,
+        "source_file_versions": source_file_versions,
+        "address_refresh": address_refresh,
+        "timings": timings_by_phase,
+    }
+
+
+async def _main_with_artifact_lease(
     test_mode: bool = False,
     toc_urls: list[str] | None = None,
     toc_list: str | None = None,
@@ -3561,15 +2925,20 @@ async def main(
     """
     PTG2 entry point for the Transparency in Coverage importer.
     """
-    import_started_monotonic = time.monotonic()
+    import_started_monotonic = _ptg2_monotonic()
     import_month_value = normalize_import_month(import_month)
     source_key_val = _normalize_source_key(source_key or os.getenv("HLTHPRT_PTG2_SOURCE_KEY"))
     snapshot_arch_version = _ptg2_snapshot_arch_from_env()
-    snapshot_arch_variant = _ptg2_snapshot_arch_variant(snapshot_arch_version)
-    snapshot_arch_identity_variant = _ptg2_snapshot_arch_identity_variant(
-        snapshot_arch_version,
-        snapshot_arch_variant,
-    )
+    if provider_ref_url:
+        raise ValueError(
+            "provider_ref_url is not supported by strict V3; provider references "
+            "must come from each in-network source"
+        )
+    if allowed_url:
+        raise ValueError(
+            "allowed_url is not supported by strict V3; only in-network rate files "
+            "participate in a serving snapshot"
+        )
     import_id_val = _normalize_import_id(
         import_id
         or _default_ptg2_import_id(
@@ -3580,12 +2949,10 @@ async def main(
             in_network_url=in_network_url,
             allowed_url=allowed_url,
             provider_ref_url=provider_ref_url,
-            arch_variant=snapshot_arch_identity_variant or snapshot_arch_version,
+            arch_variant=PTG2_V3_SHARED_GENERATION,
         )
     )
     import_run_id = f"ptg2:{import_id_val}"
-    compact_import = True
-    source_scoped_compact = True
     if source_key_val is None:
         if test_mode:
             source_key_val = _normalize_source_key(import_id_val)
@@ -3596,12 +2963,12 @@ async def main(
         _normalize_source_network_names(source_network_names),
         key=str.casefold,
     )
+    auto_activate_candidates = _ptg2_auto_activate_candidates()
     options_payload = {
         "toc_urls": toc_urls or [],
         "toc_list": toc_list,
         "in_network_url": in_network_url,
         "allowed_url": allowed_url,
-        "provider_ref_url": provider_ref_url,
         "source_key": source_key_val,
         "plan_ids": plan_ids or [],
         "plan_name_contains": plan_name_contains or [],
@@ -3609,39 +2976,32 @@ async def main(
         "file_url_contains": file_url_contains or [],
         "source_network_names": source_network_name_values,
         "max_files": max_files,
-        "max_items": max_items,
         "reuse_raw_artifacts": reuse_raw_artifacts,
         "keep_partial_artifacts": _env_bool(PTG2_KEEP_PARTIAL_ENV, True)
         if keep_partial_artifacts is None else keep_partial_artifacts,
-        "compact_import": compact_import,
-        "async_write_tasks": max(_env_int(PTG2_ASYNC_WRITE_TASKS_ENV, 1), 1),
-        "fast_provider_union": _env_bool(PTG2_FAST_PROVIDER_UNION_ENV, False),
-        "serving_only_import": _use_serving_only_import(),
-        "source_scoped_compact": source_scoped_compact,
-        "stage_serving_as_final": False,
-        "serving_storage": "manifest_snapshot",
         "snapshot_arch": snapshot_arch_version,
-        "snapshot_arch_variant": snapshot_arch_identity_variant,
+        "storage_generation": PTG2_V3_SHARED_GENERATION,
         "test_mode": test_mode,
-        "allow_partial_import": _env_bool("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", False),
-        "hash_mode": _ptg2_effective_hash_mode(),
-        "provider_bucket_count": ptg2_provider_bucket_count(),
-        "provider_set_inline_npi_limit": max(_env_int(PTG2_PROVIDER_SET_INLINE_NPI_LIMIT_ENV, 0), 0),
-        "id_storage": _ptg2_id_storage(),
-        "manifest_serving_layout": _ptg2_manifest_serving_layout(),
-        "manifest_price_atom_layout": _ptg2_manifest_price_atom_layout(),
-        "manifest_provider_group_location": _ptg2_manifest_provider_group_location_enabled(),
-        "manifest_provider_set_component": _ptg2_manifest_provider_set_component_enabled(),
-        "manifest_provider_group_rate_scope": _ptg2_manifest_provider_group_rate_scope_enabled(),
-        "manifest_serving_sidecars": _ptg2_manifest_serving_sidecars_enabled(),
-        "manifest_drop_serving_table": _ptg2_manifest_drop_serving_table_after_sidecars(),
-        "manifest_postgres_binary_natural_lean_stream": (
-            _ptg2_manifest_postgres_binary_natural_lean_stream_enabled()
+        "scanner_workers": max(
+            _env_int(PTG2_RUST_WORKERS_ENV, PTG2_DEFAULT_RUST_WORKERS),
+            1,
         ),
-        "manifest_provider_npi_sidecar": _env_bool(
-            PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV,
-            True,
+        "scanner_event_queue": max(
+            _env_int(PTG2_RUST_EVENT_QUEUE_ENV, PTG2_DEFAULT_RUST_EVENT_QUEUE),
+            1,
         ),
+        "file_process_concurrency": max(
+            _env_int(PTG2_FILE_PROCESS_CONCURRENCY_ENV, 1),
+            1,
+        ),
+        "price_copy_tasks": max(
+            _env_int(
+                PTG2_MANIFEST_DIRECT_COPY_TASKS_ENV,
+                PTG2_DEFAULT_MANIFEST_DIRECT_COPY_TASKS,
+            ),
+            1,
+        ),
+        "auto_activate_candidates": auto_activate_candidates,
     }
     snapshot_id = _ptg2_deterministic_snapshot_id(
         import_month=import_month_value,
@@ -3657,6 +3017,7 @@ async def main(
     )
     setup_stage_timings: dict[str, float] = {}
     setup_stage_timer = _StageTimer(setup_stage_timings, import_started_monotonic)
+    pending_strict_v3 = _PendingStrictV3State({}, {})
 
     # Enforce a streaming size cap on every caller-supplied URL (never None for
     # control-triggered runs) so a malicious/huge target cannot OOM or fill the node.
@@ -3673,26 +3034,42 @@ async def main(
     setup_stage_timer.mark("ensure_database")
     await ensure_ptg2_tables()
     setup_stage_timer.mark("ensure_ptg2_tables")
+    source_import_lock = _ptg2_source_import_lock(source_key_val)
+    has_source_import_lock = False
+    try:
+        await source_import_lock.__aenter__()
+        has_source_import_lock = True
+        setup_stage_timer.mark("source_import_lock")
+        observed_source_snapshot_id = await _current_source_snapshot_id(source_key_val)
+        setup_stage_timer.mark("source_snapshot_lookup")
+    except BaseException:
+        if has_source_import_lock:
+            await source_import_lock.__aexit__(None, None, None)
+        reset_live_progress_context(live_token)
+        raise
     now = _utcnow()
-    observed_source_snapshot_id = await _current_source_snapshot_id(source_key_val)
-    setup_stage_timer.mark("source_snapshot_lookup")
-    snapshot_state = await _push_ptg2_objects(
-        [
-            {
-                "snapshot_id": snapshot_id,
-                "import_run_id": import_run_id,
-                "import_month": import_month_value,
-                "status": PTG2_STATUS_BUILDING,
-                "created_at": now,
-                "validated_at": None,
-                "published_at": None,
-                "previous_snapshot_id": None,
-                "manifest": {},
-            }
-        ],
-        PTG2Snapshot,
-        rewrite=True,
-    )
+    try:
+        snapshot_state = await _push_ptg2_objects(
+            [
+                {
+                    "snapshot_id": snapshot_id,
+                    "import_run_id": import_run_id,
+                    "import_month": import_month_value,
+                    "status": PTG2_STATUS_BUILDING,
+                    "created_at": now,
+                    "validated_at": None,
+                    "published_at": None,
+                    "previous_snapshot_id": None,
+                    "manifest": {},
+                }
+            ],
+            PTG2Snapshot,
+            rewrite=True,
+        )
+    except BaseException:
+        await source_import_lock.__aexit__(None, None, None)
+        reset_live_progress_context(live_token)
+        raise
     if snapshot_state and snapshot_state.get("status") == PTG2_STATUS_PUBLISHED:
         try:
             pointer_reconciliation = await _reconcile_already_published_snapshot(
@@ -3718,8 +3095,56 @@ async def main(
             )
             return already_published_result
         finally:
+            await source_import_lock.__aexit__(None, None, None)
+            reset_live_progress_context(live_token)
+    if snapshot_state and snapshot_state.get("status") == PTG2_STATUS_VALIDATED:
+        try:
+            candidate_result = await _resume_validated_candidate(
+                snapshot_attributes=snapshot_state,
+                snapshot_id=snapshot_id,
+                source_key=source_key_val,
+                import_month=import_month_value,
+                auto_activate=auto_activate_candidates,
+            )
+            if auto_activate_candidates:
+                try:
+                    await _cleanup_old_ptg2_source_tables(
+                        source_key_val,
+                        {snapshot_id},
+                        lock_pointer_state=True,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Validated PTG candidate activated, but old-state cleanup failed",
+                        exc_info=True,
+                    )
+                candidate_result["address_refresh"] = (
+                    await _enqueue_ptg2_auto_address_refresh_after_import(
+                        source_key=source_key_val,
+                        snapshot_id=snapshot_id,
+                        import_run_id=import_run_id,
+                        has_serving_files=True,
+                        source_scoped_compact=True,
+                        test_mode=test_mode,
+                    )
+                )
+            write_live_progress(
+                status="succeeded",
+                phase="succeeded",
+                pct=100,
+                eta_seconds=0,
+                message=(
+                    "PTG candidate activated"
+                    if auto_activate_candidates
+                    else "PTG candidate already validated; live pointers unchanged"
+                ),
+            )
+            return candidate_result
+        finally:
+            await source_import_lock.__aexit__(None, None, None)
             reset_live_progress_context(live_token)
     if snapshot_state and snapshot_state.get("snapshot_claim_status") == "existing":
+        await source_import_lock.__aexit__(None, None, None)
         reset_live_progress_context(live_token)
         existing_status = snapshot_state.get("status") or "<unknown>"
         if existing_status == PTG2_STATUS_BUILDING:
@@ -3733,30 +3158,31 @@ async def main(
         )
     failure_report: dict[str, Any] = {"snapshot_id": snapshot_id, "legacy_table_suffix": import_id_val}
     ptg2_manifest_stage_table: str | None = None
+    ptg2_import_heartbeat_task: asyncio.Task[Any] | None = None
+    shared_layout_reservation = None
+    shared_input_identity = None
+    shared_layout_build_token = uuid.uuid4().hex
     previous_snapshot_id = (
         str(observed_source_snapshot_id) if observed_source_snapshot_id else None
     )
     current_pointer_published = False
+    candidate_stage_state = {"staged": False}
 
     async def mark_import_failed(error: BaseException | str, *, progress_message: str | None = None) -> None:
         """Persist import failure state and drop unpublished source-scoped staging tables."""
+        failure_handling_started_monotonic = _ptg2_monotonic()
         error_text = str(error) or "worker task was cancelled"
         write_live_progress(
-            status="failed",
-            phase="failed",
-            pct=100,
-            eta_seconds=0,
-            message=progress_message or f"PTG import failed: {error_text}",
+            phase="failing",
+            pct=99,
+            message="persisting PTG import failure state",
         )
         serving_index = failure_report.get("serving_index")
         is_snapshot_known_published = current_pointer_published
-        should_preserve_candidate_tables = current_pointer_published
-        if (
-            source_scoped_compact
-            and not should_preserve_candidate_tables
-            and isinstance(serving_index, dict)
-            and source_key_val
-        ):
+        should_preserve_candidate_tables = (
+            current_pointer_published or candidate_stage_state["staged"]
+        )
+        if not should_preserve_candidate_tables and isinstance(serving_index, dict):
             try:
                 is_snapshot_known_published = (
                     await _current_source_snapshot_id(source_key_val) == snapshot_id
@@ -3769,19 +3195,25 @@ async def main(
                     "preserving candidate tables to avoid deleting live data",
                     exc_info=True,
                 )
-        if source_scoped_compact and not should_preserve_candidate_tables:
-            try:
-                await _drop_ptg2_snapshot_tables_for_manifest(serving_index if isinstance(serving_index, dict) else None)
-                if ptg2_manifest_stage_table:
-                    await _drop_ptg2_snapshot_table_names(
-                        _ptg2_manifest_stage_table_names(ptg2_manifest_stage_table)
-                    )
-            except Exception:
-                logger.debug("Failed to clean PTG2 source-scoped tables for failed import", exc_info=True)
-            try:
-                await delete_ptg2_artifacts_for_snapshot(snapshot_id)
-            except Exception:
-                logger.debug("Failed to clean PTG2 artifacts for failed import", exc_info=True)
+        if not should_preserve_candidate_tables:
+            await _cleanup_failed_ptg2_source_state(
+                serving_index=(serving_index if isinstance(serving_index, dict) else None),
+                manifest_stage_table=ptg2_manifest_stage_table,
+                snapshot_id=snapshot_id,
+            )
+            abandoned_layout = await _is_failed_shared_layout_abandoned(
+                shared_layout_reservation,
+                build_token=shared_layout_build_token,
+            )
+            if abandoned_layout is not None:
+                failure_report["shared_layout_abandoned"] = abandoned_layout
+            elif shared_layout_reservation is not None and not shared_layout_reservation.reused:
+                failure_report["shared_layout_abandoned"] = False
+                failure_report["shared_layout_abandonment_deferred"] = True
+        _cleanup_manifest_copy_entries(pending_strict_v3.copy_entries_by_kind)
+        _cleanup_strict_v3_graph_artifacts(pending_strict_v3.graph_artifacts_map)
+        pending_strict_v3.copy_entries_by_kind = {}
+        pending_strict_v3.graph_artifacts_map = {}
         await _mark_ptg2_import_failed(
             import_run_id,
             snapshot_id,
@@ -3790,7 +3222,18 @@ async def main(
             error_text,
             report=failure_report,
             options=options_payload,
-            should_preserve_published_snapshot=is_snapshot_known_published,
+            should_preserve_published_snapshot=(
+                is_snapshot_known_published or candidate_stage_state["staged"]
+            ),
+            import_started_monotonic=import_started_monotonic,
+            failure_handling_started_monotonic=failure_handling_started_monotonic,
+        )
+        write_live_progress(
+            status="failed",
+            phase="failed",
+            pct=100,
+            eta_seconds=0,
+            message=progress_message or "PTG import failed; inspect worker logs",
         )
 
     try:
@@ -3811,6 +3254,10 @@ async def main(
             PTG2ImportRun,
             rewrite=True,
         )
+        ptg2_import_heartbeat_task = asyncio.create_task(
+            _heartbeat_ptg2_import_run(import_run_id),
+            name=f"ptg2-import-heartbeat:{import_run_id}",
+        )
         setup_stage_timer.mark("initial_status_rows")
         assert source_key_val is not None
         write_live_progress(phase="planning", pct=3, message="planning PTG files")
@@ -3818,31 +3265,15 @@ async def main(
         ptg2_manifest_stage_table = _ptg2_manifest_stage_table_name(stage_token)
         ptg2_manifest_stage_table = await _create_ptg2_manifest_serving_stage_table(stage_token)
         setup_stage_timer.mark("manifest_stage_table")
-        initial_dynamic_table_names: set[str] | None = None
-        if _is_postgres_binary_snapshot_arch(snapshot_arch_version) and compact_import:
-            initial_dynamic_table_names = set(PTG_CONTROL_TABLE_CLASS_NAMES)
         classes = await _prepare_ptg_tables(
             import_id_val,
             test_mode,
-            initial_table_class_names=initial_dynamic_table_names,
+            initial_table_class_names=set(PTG_CONTROL_TABLE_CLASS_NAMES),
         )
-        if initial_dynamic_table_names is None:
-            prepared_dynamic_table_names = set(classes)
-        else:
-            prepared_dynamic_table_names = set(initial_dynamic_table_names)
-        setup_stage_timer.mark("legacy_dynamic_tables")
+        setup_stage_timer.mark("control_tables")
 
-        async def ensure_dynamic_tables(class_names: set[str] | frozenset[str]) -> None:
-            """Create dynamic PTG tables required by the current import path."""
-            missing_names = set(class_names) - prepared_dynamic_table_names
-            if not missing_names:
-                return
-            await _ensure_ptg_dynamic_tables(classes, missing_names, test_mode=test_mode)
-            prepared_dynamic_table_names.update(missing_names)
-
-        provider_ref_cache: dict[int, list[dict[str, Any]]] = {}
         jobs: list[dict[str, Any]] = []
-        data_started_monotonic = time.monotonic()
+        data_started_monotonic = _ptg2_monotonic()
 
         toc_candidates: list[str] = []
         if toc_urls:
@@ -3876,27 +3307,11 @@ async def main(
                 continue
             jobs.extend(toc_jobs)
 
-        if provider_ref_url:
-            await ensure_dynamic_tables(PTG_PROVIDER_REFERENCE_TABLE_CLASS_NAMES)
-            provider_ref_cache.update(
-                await _process_provider_reference_file(
-                    provider_ref_url,
-                    classes,
-                    test_mode,
-                    reuse_raw_artifacts=reuse_raw_artifacts,
-                    max_bytes=max_bytes,
-                    import_run_id=import_run_id,
-                    keep_partial_artifacts=keep_partial_artifacts,
-                )
-            )
-
         if in_network_url:
             job: dict[str, Any] = {"type": "in_network", "url": in_network_url}
             if source_network_name_values:
                 job["source_network_names"] = source_network_name_values
             jobs.append(job)
-        if allowed_url:
-            jobs.append({"type": "allowed_amounts", "url": allowed_url})
         jobs = _filter_jobs_by_url_contains(jobs, file_url_contains)
         if source_network_name_values:
             for job in jobs:
@@ -3913,7 +3328,7 @@ async def main(
                 f"\tunique_jobs={len(jobs)}"
                 f"\tduplicates_skipped={duplicate_jobs_skipped}"
             )
-        if toc_failures and not _env_bool("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", False):
+        if toc_failures:
             failure_report = {
                 "toc_urls": toc_candidates,
                 "toc_failures": toc_failures,
@@ -3928,9 +3343,9 @@ async def main(
             }
             raise RuntimeError(
                 f"PTG2 import failed {len(toc_failures)} table-of-contents file(s); "
-                "set HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT=true to continue with other discovered jobs"
+                "strict V3 never publishes partial source coverage"
             )
-        if toc_candidates and not jobs and not in_network_url and not allowed_url:
+        if toc_candidates and not jobs and not in_network_url:
             failure_report = {
                 "toc_urls": toc_candidates,
                 "toc_failures": toc_failures,
@@ -3952,12 +3367,12 @@ async def main(
             seen_jobs.add(job_key)
             if max_files is not None and len(selected_jobs) >= max_files:
                 break
-            if job.get("type") in {"in_network", "allowed_amounts"}:
+            if job.get("type") == "in_network":
                 selected_jobs.append(job)
-        if any(job.get("type") == "allowed_amounts" for job in selected_jobs):
-            await ensure_dynamic_tables(PTG_ALLOWED_AMOUNT_TABLE_CLASS_NAMES)
-        if any(job.get("type") == "in_network" for job in selected_jobs) and not compact_import:
-            await ensure_dynamic_tables(PTG_IN_NETWORK_DENSE_TABLE_CLASS_NAMES)
+        if not selected_jobs:
+            raise RuntimeError(
+                "strict V3 import discovered no supported in-network rate files"
+            )
         processed_file_count_map = {"done": 0}
         attempted_files = len(selected_jobs)
         for progress_index, job in enumerate(selected_jobs):
@@ -3974,11 +3389,14 @@ async def main(
         failed_files: list[dict[str, Any]] = []
         skipped_files: list[dict[str, Any]] = []
         successful_files: list[dict[str, Any]] = []
-        seen_raw_artifact_hashes: set[str] = set()
+        downloads_by_logical_hash: dict[str, list[PTG2DownloadedJob]] = {}
         duplicate_raw_files_skipped = 0
         file_process_concurrency = 1
-        if compact_import and _use_serving_only_import() and not test_mode:
-            file_process_concurrency = max(_env_int(PTG2_FILE_PROCESS_CONCURRENCY_ENV, 1), 1)
+        if not test_mode:
+            file_process_concurrency = max(
+                _env_int(PTG2_FILE_PROCESS_CONCURRENCY_ENV, 1),
+                1,
+            )
         if file_process_concurrency > 1:
             _emit_screen_line(
                 "PTG2_FILE_PROCESS_CONCURRENCY"
@@ -3988,7 +3406,7 @@ async def main(
         processing_tasks: set[asyncio.Task[PTG2FileProcessResult | None]] = set()
 
         async def record_file_result(result: PTG2FileProcessResult | None) -> None:
-            """Record one completed file result and update live progress."""
+            """Classify a file result and update completion progress."""
             if result is None:
                 return
             if result.success:
@@ -4010,7 +3428,7 @@ async def main(
                 failed_files.append(asdict(result))
 
         async def drain_processing_tasks(*, force: bool = False) -> None:
-            """Drain completed file-processing tasks at the concurrency boundary."""
+            """Drain queued processing tasks as capacity requires and record results."""
             if not processing_tasks:
                 return
             if force:
@@ -4025,7 +3443,7 @@ async def main(
                 await record_file_result(task.result())
 
         def file_progress_context(job: dict[str, Any], *, start_pct: float, end_pct: float) -> dict[str, Any]:
-            """Map one file job onto its share of overall progress."""
+            """Map one job's index onto its allocated overall progress interval."""
             try:
                 job_index = max(int(job.get("_ptg_progress_index") or 0), 0)
             except (TypeError, ValueError):
@@ -4041,54 +3459,169 @@ async def main(
             }
 
         async def process_downloaded_job(downloaded) -> PTG2FileProcessResult | None:
-            """Process one downloaded artifact with scoped live progress."""
+            """Process a downloaded in-network artifact under its progress context."""
             job = downloaded.job
             token = set_live_progress_context(**file_progress_context(job, start_pct=20.0, end_pct=90.0))
             try:
                 if job.get("type") == "in_network":
-                    return await _process_in_network_file(
+                    if shared_input_identity is None:
+                        raise RuntimeError("strict V3 physical input identity was not established")
+                    file_result = await _process_in_network_file(
                         job,
                         classes,
-                        provider_ref_cache,
                         test_mode,
                         reuse_raw_artifacts=reuse_raw_artifacts,
                         max_bytes=max_bytes,
                         max_items=max_items,
                         import_run_id=import_run_id,
                         keep_partial_artifacts=keep_partial_artifacts,
-                        compact_import=compact_import,
                         snapshot_id=snapshot_id,
+                        coverage_scope_id=shared_input_identity.coverage_scope_hex,
                         import_month=import_month_value,
-                        rust_stage_tables=None,
                         ptg2_manifest_stage_table=ptg2_manifest_stage_table,
                         source_network_names=job.get("source_network_names"),
                         raw_artifact=downloaded.raw_artifact,
                         logical_artifact=downloaded.logical_artifact,
                     )
-                if job.get("type") == "allowed_amounts":
-                    return await _process_allowed_amounts_file(
-                        job,
-                        classes,
-                        test_mode,
-                        reuse_raw_artifacts=reuse_raw_artifacts,
-                        max_bytes=max_bytes,
-                        max_items=max_items,
-                        import_run_id=import_run_id,
-                        keep_partial_artifacts=keep_partial_artifacts,
-                        raw_artifact=downloaded.raw_artifact,
-                        logical_artifact=downloaded.logical_artifact,
+                    return _annotate_v3_file_result_source_identity(
+                        file_result,
+                        shared_physical_artifact_identity(downloaded),
+                        shared_logical_artifact_metadata(downloaded),
                     )
                 return None
             finally:
                 reset_live_progress_context(token)
 
         try:
+            buffered_downloads: list[PTG2DownloadedJob] = []
             async for downloaded in _iter_downloaded_ptg_jobs(
                 selected_jobs,
                 reuse_raw_artifacts=reuse_raw_artifacts,
                 max_bytes=max_bytes,
                 keep_partial_artifacts=keep_partial_artifacts,
             ):
+                buffered_downloads.append(downloaded)
+            download_failures: list[PTG2FileProcessResult] = []
+            for downloaded in buffered_downloads:
+                if downloaded.error:
+                    download_failures.append(
+                        PTG2FileProcessResult(
+                            str(downloaded.job.get("type") or "unknown"),
+                            str(downloaded.job.get("url") or ""),
+                            False,
+                            error=downloaded.error,
+                        )
+                    )
+                elif (
+                    downloaded.raw_artifact is None
+                    or downloaded.logical_artifact is None
+                ):
+                    download_failures.append(
+                        PTG2FileProcessResult(
+                            str(downloaded.job.get("type") or "unknown"),
+                            str(downloaded.job.get("url") or ""),
+                            False,
+                            error="download did not produce both raw and logical artifacts",
+                        )
+                    )
+            if download_failures:
+                failed_files.extend(asdict(result) for result in download_failures)
+                failure_report.update(
+                    {
+                        "files_attempted": attempted_files,
+                        "files_processed": 0,
+                        "files_failed": len(download_failures),
+                        "failed_files": list(failed_files),
+                    }
+                )
+                raise RuntimeError(
+                    f"PTG2 import failed {len(download_failures)} of {attempted_files} "
+                    "download(s); strict V3 never publishes partial source coverage"
+                )
+            if not _shared_v3_preflight_eligible(buffered_downloads):
+                raise RuntimeError(
+                    "strict V3 requires successful in-network downloads with one logical plan scope"
+                )
+            write_live_progress(
+                phase="planning",
+                unit="files",
+                done=len(buffered_downloads),
+                total=len(buffered_downloads),
+                pct=20,
+                message="checking for an identical shared PostgreSQL layout",
+            )
+            shared_input_identity = shared_physical_input_identity(
+                buffered_downloads,
+                options=options_payload,
+                scanner_canon_version=_shared_v3_scanner_identity(),
+            )
+            canonical_plan_values_by_field = {
+                key: value
+                for key, value in shared_input_identity.logical_plan_fields.items()
+                if value is not None and str(value).strip()
+            }
+            for downloaded in buffered_downloads:
+                job_meta = (
+                    dict(downloaded.job.get("meta"))
+                    if isinstance(downloaded.job.get("meta"), dict)
+                    else {}
+                )
+                downloaded.job["meta"] = {
+                    **job_meta,
+                    **canonical_plan_values_by_field,
+                }
+            async with db.transaction() as session:
+                shared_layout_reservation = await reserve_shared_layout(
+                    session,
+                    schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+                    semantic_fingerprint=shared_input_identity.semantic_fingerprint,
+                    build_token=shared_layout_build_token,
+                )
+            failure_report.update(
+                {
+                    "shared_snapshot_key": shared_layout_reservation.snapshot_key,
+                    "shared_semantic_fingerprint": (
+                        shared_input_identity.semantic_fingerprint.hex()
+                    ),
+                    "coverage_scope_id": shared_input_identity.coverage_scope_hex,
+                    "shared_layout_reused": shared_layout_reservation.reused,
+                }
+            )
+            if shared_layout_reservation.reused:
+                return await _publish_reused_shared_v3_snapshot(
+                    downloaded_jobs=buffered_downloads,
+                    shared_input_identity=shared_input_identity,
+                    classes=classes,
+                    layout_manifest=shared_layout_reservation.layout_manifest,
+                    shared_snapshot_key=shared_layout_reservation.snapshot_key,
+                    semantic_fingerprint=shared_input_identity.semantic_fingerprint,
+                    coverage_scope_id=shared_input_identity.coverage_scope_id,
+                    coverage_plan_id=shared_input_identity.logical_plan.plan_id,
+                    coverage_plan_market_type=(
+                        shared_input_identity.logical_plan.plan_market_type
+                    ),
+                    snapshot_id=snapshot_id,
+                    import_run_id=import_run_id,
+                    source_key=source_key_val,
+                    import_month=import_month_value,
+                    previous_snapshot_id=previous_snapshot_id,
+                    started_at=now,
+                    options=options_payload,
+                    manifest_stage_table=ptg2_manifest_stage_table,
+                    test_mode=test_mode,
+                    import_started_monotonic=import_started_monotonic,
+                    candidate_stage_state=candidate_stage_state,
+                )
+
+            async def iter_downloaded_jobs():
+                """Yield the fully validated download batch in discovery order."""
+
+                for buffered_download in buffered_downloads:
+                    yield buffered_download
+
+            downloaded_jobs = iter_downloaded_jobs()
+
+            async for downloaded in downloaded_jobs:
                 job = downloaded.job
                 result: PTG2FileProcessResult | None = None
                 if downloaded.error:
@@ -4106,28 +3639,58 @@ async def main(
                         False,
                         error="download did not produce an artifact",
                     )
-                elif downloaded.raw_artifact.raw_sha256 in seen_raw_artifact_hashes:
+                elif any(
+                    same_downloaded_physical_input(previous, downloaded)
+                    for previous in downloads_by_logical_hash.get(
+                        downloaded.logical_artifact.logical_sha256,
+                        (),
+                    )
+                ):
                     duplicate_raw_files_skipped += 1
+                    provenance = await _record_in_network_file_provenance(
+                        job,
+                        classes,
+                        raw_artifact=downloaded.raw_artifact,
+                        logical_artifact=downloaded.logical_artifact,
+                        import_run_id=import_run_id,
+                    )
                     _emit_screen_line(
                         "PTG2_RAW_JOB_DEDUPE"
                         f"\ttype={job.get('type')}"
                         f"\turl={job.get('url')}"
                         f"\traw_sha256={downloaded.raw_artifact.raw_sha256}"
-                        "\treason=duplicate_raw_artifact"
+                        f"\tlogical_sha256={downloaded.logical_artifact.logical_sha256}"
+                        "\treason=duplicate_logical_artifact"
                     )
                     result = PTG2FileProcessResult(
                         str(job.get("type") or "unknown"),
                         str(job.get("url") or ""),
                         True,
+                        file_id=int(provenance["file_row"]["file_id"]),
                         summary={
-                            "raw_sha256": downloaded.raw_artifact.raw_sha256,
+                            **_source_version_summary(provenance["source_version"]),
                             "raw_storage_uri": downloaded.raw_artifact.raw_storage_uri,
-                            "reason": "duplicate_raw_artifact",
+                            "reason": "duplicate_logical_artifact",
+                            "manifest": {
+                                "source_trace_hash": provenance["source_trace_hash"],
+                                "source_trace_set_hash": provenance[
+                                    "source_trace_set_hash"
+                                ],
+                                "network_names": provenance["network_names"],
+                            },
                         },
                         skipped=True,
                     )
-                elif downloaded.raw_artifact.raw_sha256:
-                    seen_raw_artifact_hashes.add(downloaded.raw_artifact.raw_sha256)
+                    result = _annotate_v3_file_result_source_identity(
+                        result,
+                        shared_physical_artifact_identity(downloaded),
+                        shared_logical_artifact_metadata(downloaded),
+                    )
+                elif downloaded.logical_artifact.logical_sha256:
+                    downloads_by_logical_hash.setdefault(
+                        downloaded.logical_artifact.logical_sha256,
+                        [],
+                    ).append(downloaded)
                 if result is not None:
                     await record_file_result(result)
                     continue
@@ -4136,8 +3699,7 @@ async def main(
                 await drain_processing_tasks()
             await drain_processing_tasks(force=True)
         finally:
-            for task in processing_tasks:
-                task.cancel()
+            await _cancel_and_wait_tasks(processing_tasks)
 
         failure_report = {
             "jobs_discovered": jobs_discovered_before_dedupe,
@@ -4155,19 +3717,59 @@ async def main(
             "snapshot_id": snapshot_id,
             "legacy_table_suffix": import_id_val,
         }
-        if failed_files and not _env_bool("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", False):
+        if shared_layout_reservation is not None:
+            failure_report.update(
+                {
+                    "shared_snapshot_key": shared_layout_reservation.snapshot_key,
+                    "shared_semantic_fingerprint": (
+                        shared_input_identity.semantic_fingerprint.hex()
+                        if shared_input_identity is not None
+                        else None
+                    ),
+                    "coverage_scope_id": (
+                        shared_input_identity.coverage_scope_hex
+                        if shared_input_identity is not None
+                        else None
+                    ),
+                    "shared_layout_reused": shared_layout_reservation.reused,
+                }
+            )
+        pending_strict_v3.copy_entries_by_kind = _collect_manifest_copy_entries(
+            successful_files,
+            (
+                "serving_run",
+                "serving_code_dictionary",
+                "provider_set_metadata",
+            ),
+        )
+        if failed_files:
             raise RuntimeError(
-                f"PTG2 import failed {len(failed_files)} of {attempted_files} attempted file(s); "
-                "set HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT=true to publish a partial snapshot"
+                f"PTG2 import failed {len(failed_files)} of {attempted_files} attempted "
+                "file(s); strict V3 never publishes partial source coverage"
             )
         if jobs and processed_file_count_map["done"] == 0:
             raise RuntimeError(
                 f"PTG2 import discovered {len(jobs)} job(s) but processed zero files successfully"
             )
 
+        if shared_input_identity is None:
+            raise RuntimeError("strict V3 source publication is missing physical input identity")
+        source_identity_traces = _shared_v3_identity_trace_pairs_from_results(
+            successful_files + skipped_files
+        )
+        source_set = _shared_v3_source_set_metadata(
+            source_identity_traces,
+            expected_source_count=shared_input_identity.source_count,
+        )
+        await _publish_shared_v3_source_dictionary(
+            shared_input_identity=shared_input_identity,
+            identity_trace_pairs=source_identity_traces,
+            snapshot_id=snapshot_id,
+        )
+
         await flush_error_log(classes["ImportLog"])
-        data_seconds = time.monotonic() - data_started_monotonic
-        publish_started_monotonic = time.monotonic()
+        data_seconds = _ptg2_monotonic() - data_started_monotonic
+        publish_started_monotonic = _ptg2_monotonic()
         write_live_progress(phase="publishing", pct=92, message="publishing PTG snapshot")
         publish_progress_total = 8
         _emit_ptg2_publish_progress(
@@ -4182,20 +3784,26 @@ async def main(
             file_summary.get("source_type") == "in_network" and not file_summary.get("skipped")
             for file_summary in successful_files
         )
-        allowed_amount_metrics = _allowed_amount_metrics_from_results(successful_files)
-        if has_serving_files and _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True):
+        if not has_serving_files:
+            raise RuntimeError(
+                "strict V3 import produced no publishable in-network source files"
+            )
+        strict_v3_copy_entries = pending_strict_v3.copy_entries_by_kind
+        if has_serving_files:
             _emit_ptg2_publish_progress(
                 "pre-copy merge",
                 completed_steps=0,
                 total_steps=publish_progress_total,
                 message_text="merging manifest copy files before publish",
             )
-            manifest_precopy_merge_started_monotonic = time.monotonic()
+            manifest_precopy_merge_started_monotonic = _ptg2_monotonic()
             manifest_merge_metrics = await _merge_and_copy_ptg2_manifest_files(
                 successful_files=successful_files,
                 manifest_stage_table=ptg2_manifest_stage_table,
             )
-            manifest_precopy_merge_seconds = time.monotonic() - manifest_precopy_merge_started_monotonic
+            manifest_precopy_merge_seconds = (
+                _ptg2_monotonic() - manifest_precopy_merge_started_monotonic
+            )
             manifest_merge_metrics["elapsed_seconds"] = manifest_precopy_merge_seconds
             _emit_ptg2_publish_progress(
                 "pre-copy merge complete",
@@ -4210,29 +3818,10 @@ async def main(
                 manifest_payload = summary_payload.get("manifest") if isinstance(summary_payload, dict) else None
                 if isinstance(manifest_payload, dict):
                     manifest_payload.pop("copy_files", None)
-        else:
-            _emit_ptg2_publish_progress(
-                "pre-copy merge skipped",
-                completed_steps=4,
-                total_steps=publish_progress_total,
-                message_text="manifest pre-copy merge skipped",
-                has_serving_files=has_serving_files,
-            )
-        manifest_artifacts = _collect_manifest_artifacts(successful_files)
-        serving_successful_files = [
-            file_summary
-            for file_summary in successful_files
-            if file_summary.get("source_type") == "in_network" and not file_summary.get("skipped")
-        ]
-        scanner_dedupe_guarded = (
-            len(serving_successful_files) == 1
-            and _is_postgres_binary_snapshot_arch(_ptg2_snapshot_arch_from_env())
+        manifest_artifacts = _collect_manifest_artifacts(
+            successful_files + skipped_files
         )
-        expected_price_set_count = (
-            _single_scanner_dedupe_count(serving_successful_files, "price_set_unique")
-            if scanner_dedupe_guarded
-            else None
-        )
+        pending_strict_v3.graph_artifacts_map = manifest_artifacts
         assert source_key_val is not None
         if has_serving_files:
             if not ptg2_manifest_stage_table:
@@ -4243,29 +3832,66 @@ async def main(
                 total_steps=publish_progress_total,
                 message_text="publishing PTG manifest snapshot tables",
             )
-            failure_report["serving_index"] = _ptg2_candidate_serving_index(
-                source_key=source_key_val,
-                snapshot_id=snapshot_id,
+            if shared_layout_reservation is None or shared_input_identity is None:
+                raise RuntimeError("strict V3 publish is missing its physical input reservation")
+            run_entries = strict_v3_copy_entries.get("serving_run") or []
+            code_dictionary_entries = strict_v3_copy_entries.get(
+                "serving_code_dictionary"
+            ) or []
+            provider_set_metadata_entries = strict_v3_copy_entries.get(
+                "provider_set_metadata"
+            ) or []
+            try:
+                shared_publication = await publish_strict_shared_v3_layout(
+                    schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+                    manifest_stage_table=ptg2_manifest_stage_table,
+                    reserved_snapshot_key=shared_layout_reservation.snapshot_key,
+                    build_token=shared_layout_build_token,
+                    expected_coverage_scope_id=(
+                        shared_input_identity.coverage_scope_id
+                    ),
+                    logical_snapshot_id=snapshot_id,
+                    expected_source_identities=(
+                        shared_input_identity.source_identities
+                    ),
+                    serving_run_entries=run_entries,
+                    code_dictionary_entries=code_dictionary_entries,
+                    provider_set_metadata_entries=provider_set_metadata_entries,
+                    graph_artifact_entries=list(manifest_artifacts.get("sidecars") or []),
+                    scratch_parent=ptg2_temp_parent(),
+                )
+            finally:
+                _cleanup_manifest_copy_entries(strict_v3_copy_entries)
+                _cleanup_strict_v3_graph_artifacts(manifest_artifacts)
+                pending_strict_v3.copy_entries_by_kind = {}
+                pending_strict_v3.graph_artifacts_map = {}
+            serving_index = {
+                **dict(shared_publication.serving_index),
+                "source_key": source_key_val,
+                "coverage_scope_id": shared_input_identity.coverage_scope_hex,
+                "source_set": source_set,
+                "source_trace_set_hash": manifest_artifacts.get(
+                    "source_trace_set_hash"
+                ),
+                "network_names": list(manifest_artifacts.get("network_names") or []),
+            }
+            manifest_merge_metrics["serving_rows"] = serving_index.get(
+                "serving_rates"
             )
-            serving_index = await _publish_ptg2_manifest_serving_snapshot(
-                ptg2_manifest_stage_table,
-                snapshot_id=snapshot_id,
-                source_key=source_key_val,
-                artifacts=manifest_artifacts,
-                # Pre-copy merge removes exact duplicate rows in the artifact stream,
-                # but live payer files can still produce duplicate serving identities.
-                # Keep the DB DISTINCT pass as the final publish-time guard unless
-                # one Rust scanner handled the whole source file and already emitted
-                # deduped manifest support rows.
-                db_dedupe_fallback=not scanner_dedupe_guarded,
-                scanner_dedupe_guarded=scanner_dedupe_guarded,
-                known_counts={
-                    "serving_rows": manifest_merge_metrics.get("serving_rows"),
-                    "price_sets": expected_price_set_count,
-                },
+            failure_report.update(
+                {
+                    "shared_snapshot_key": shared_publication.snapshot_key,
+                    "shared_layout_reused_at_seal": (
+                        shared_publication.layout_reused_at_seal
+                    ),
+                    "shared_stored_byte_count": shared_publication.stored_byte_count,
+                }
             )
-            failure_report["serving_index"] = serving_index
+            await _drop_ptg2_snapshot_table_names(
+                _ptg2_manifest_stage_table_names(ptg2_manifest_stage_table)
+            )
             ptg2_manifest_stage_table = None
+            failure_report["serving_index"] = serving_index
             _emit_ptg2_publish_progress(
                 "snapshot tables published",
                 completed_steps=6,
@@ -4274,65 +3900,25 @@ async def main(
                 serving_rates=serving_index.get("serving_rates") if isinstance(serving_index, dict) else None,
                 rate_count=serving_index.get("rate_count") if isinstance(serving_index, dict) else None,
             )
-        else:
-            if ptg2_manifest_stage_table:
-                _emit_ptg2_publish_progress(
-                    "dropping empty staging tables",
-                    completed_steps=5,
-                    total_steps=publish_progress_total,
-                    message_text="dropping PTG staging tables without serving files",
-                )
-                await _drop_ptg2_snapshot_table_names(
-                    _ptg2_manifest_stage_table_names(ptg2_manifest_stage_table)
-                )
-                ptg2_manifest_stage_table = None
-            serving_index = {
-                "type": "allowed_amounts_evidence" if allowed_amount_metrics.get("allowed_amount_evidence") else "allowed_amounts_only",
-                "storage": "legacy_dynamic_tables" if allowed_amount_metrics.get("allowed_amount_evidence") else "metadata_only",
-                "source_key": source_key_val,
-                "serving_rates": 0,
-                "rate_count": 0,
-                "legacy_table_suffix": import_id_val,
-                **allowed_amount_metrics,
-            }
-        publish_seconds = time.monotonic() - publish_started_monotonic
-        post_publish_prepare_started_monotonic = time.monotonic()
+        publish_seconds = _ptg2_monotonic() - publish_started_monotonic
+        post_publish_started_monotonic = _ptg2_monotonic()
         post_publish_stage_timings: dict[str, float] = {}
         post_publish_stage_timer = _StageTimer(
             post_publish_stage_timings,
-            post_publish_prepare_started_monotonic,
+            post_publish_started_monotonic,
         )
 
-        finished = _utcnow()
-        global_previous_snapshot_id = None
-        try:
-            row = await (
-                db.select(PTG2CurrentSnapshot.__table__.c.snapshot_id)
-                .where(PTG2CurrentSnapshot.__table__.c.slot == "current")
-                .first()
-            )
-            if row is not None:
-                global_previous_snapshot_id = row[0]
-        except Exception as exc:
-            logger.debug("No PTG2 current snapshot found before publish: %s", exc)
-        post_publish_stage_timer.mark("current_snapshot_lookup")
-        if not (source_scoped_compact and source_key_val):
-            previous_snapshot_id = global_previous_snapshot_id
+        validated_at = _utcnow()
         serving_timings = serving_index.get("timings", {}) if isinstance(serving_index, dict) else {}
         setup_seconds = data_started_monotonic - import_started_monotonic
-        post_publish_prepare_seconds = time.monotonic() - post_publish_prepare_started_monotonic
         timing_payload = {
-            "total_seconds": time.monotonic() - import_started_monotonic,
             "setup_seconds": setup_seconds,
             "data_seconds": data_seconds,
             "publish_seconds": publish_seconds,
             "manifest_precopy_merge_seconds": manifest_precopy_merge_seconds,
-            "post_publish_prepare_seconds": post_publish_prepare_seconds,
         }
         for key, value in setup_stage_timings.items():
             timing_payload[f"setup_{key}_seconds"] = value
-        for key, value in post_publish_stage_timings.items():
-            timing_payload[f"post_publish_{key}_seconds"] = value
         if isinstance(serving_timings, dict):
             for key, value in serving_timings.items():
                 try:
@@ -4345,7 +3931,6 @@ async def main(
             "serving_index": serving_index,
             "timings": timing_payload,
             "manifest_precopy_merge": manifest_merge_metrics,
-            **allowed_amount_metrics,
         }
         if isinstance(serving_index, dict):
             authoritative_rate_count = serving_index.get("serving_rates", serving_index.get("rate_count"))
@@ -4356,70 +3941,121 @@ async def main(
             "snapshot_id": snapshot_id,
             "import_run_id": import_run_id,
             "import_month": import_month_value,
-            "status": PTG2_STATUS_PUBLISHED,
+            "status": PTG2_STATUS_VALIDATED,
             "created_at": now,
-            "validated_at": finished,
-            "published_at": finished,
+            "validated_at": validated_at,
+            "published_at": None,
             "previous_snapshot_id": previous_snapshot_id,
-            "manifest": report_payload,
+            "manifest": {
+                **report_payload,
+                "timings": dict(timing_payload),
+            },
         }
-        source_pointer_published = bool(
-            has_serving_files and source_scoped_compact and source_key_val
+        if not isinstance(serving_index, dict) or serving_index.get("shared_snapshot_key") is None:
+            raise RuntimeError("strict V3 publish did not return a shared snapshot key")
+        published_shared_snapshot_key = int(serving_index["shared_snapshot_key"])
+        _emit_ptg2_publish_progress(
+            "staging validated candidate",
+            completed_steps=6,
+            total_steps=publish_progress_total,
+            message_text="binding validated PTG candidate without changing live pointers",
         )
-        if source_pointer_published:
-            _emit_ptg2_publish_progress(
-                "updating source pointer",
-                completed_steps=6,
-                total_steps=publish_progress_total,
-                message_text="updating PTG source snapshot pointer",
-            )
+        candidate_result = await _stage_ptg2_source_candidate(
+            source_key=source_key_val,
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=previous_snapshot_id,
+            import_month=import_month_value,
+            updated_at=validated_at,
+            snapshot_attributes=snapshot_publish_by_field,
+            shared_snapshot_key=published_shared_snapshot_key,
+            coverage_scope_id=shared_input_identity.coverage_scope_id,
+            coverage_plan_id=shared_input_identity.logical_plan.plan_id,
+            coverage_plan_market_type=(
+                shared_input_identity.logical_plan.plan_market_type
+            ),
+        )
+        candidate_stage_state["staged"] = True
+        candidate_attributes = dict(candidate_result["candidate_attributes"])
+        if auto_activate_candidates:
+            activated_at = _utcnow()
             await _publish_ptg2_source_pointers(
                 source_key=source_key_val,
                 snapshot_id=snapshot_id,
                 previous_snapshot_id=previous_snapshot_id,
                 import_month=import_month_value,
-                updated_at=finished,
-                serving_index=serving_index,
-                snapshot_attributes=snapshot_publish_by_field,
+                updated_at=activated_at,
+                snapshot_attributes=activated_snapshot_attributes(
+                    candidate_attributes,
+                    activated_at=activated_at,
+                    activation_mode="automatic",
+                ),
             )
             current_pointer_published = True
-        elif has_serving_files:
-            await _publish_ptg2_global_snapshot_pointer(
-                snapshot_attributes=snapshot_publish_by_field,
-                updated_at=finished,
-            )
-            current_pointer_published = True
+            activation_status = "activated"
+            snapshot_status = PTG2_STATUS_PUBLISHED
         else:
-            await _push_ptg2_objects(
-                [snapshot_publish_by_field],
-                PTG2Snapshot,
-                rewrite=True,
-            )
-        if source_pointer_published:
-            _emit_ptg2_publish_progress(
-                "cleaning old source tables",
-                completed_steps=7,
-                total_steps=publish_progress_total,
-                message_text="cleaning old PTG source tables",
-            )
+            activation_status = "deferred"
+            snapshot_status = PTG2_STATUS_VALIDATED
+        release_current_artifact_lease()
+        post_publish_stage_timer.mark(
+            "logical_candidate_and_optional_pointer_cutover"
+        )
+        _emit_ptg2_publish_progress(
+            "cleaning old source tables",
+            completed_steps=7,
+            total_steps=publish_progress_total,
+            message_text="cleaning old PTG source tables",
+        )
+        if auto_activate_candidates:
             await _cleanup_old_ptg2_source_tables(
                 source_key_val,
                 {snapshot_id},
                 lock_pointer_state=True,
             )
+        post_publish_stage_timer.mark("old_state_cleanup")
         _emit_ptg2_publish_progress(
             "address refresh",
             completed_steps=7,
             total_steps=publish_progress_total,
             message_text="checking PTG address-refresh follow-up",
         )
-        address_refresh_result = await _enqueue_ptg2_auto_address_refresh_after_import(
-            source_key=source_key_val,
-            snapshot_id=snapshot_id,
+        address_refresh_result = (
+            await _enqueue_ptg2_auto_address_refresh_after_import(
+                source_key=source_key_val,
+                snapshot_id=snapshot_id,
+                import_run_id=import_run_id,
+                has_serving_files=True,
+                source_scoped_compact=True,
+                test_mode=test_mode,
+            )
+            if auto_activate_candidates
+            else {"status": "skipped", "reason": "candidate-activation-deferred"}
+        )
+        post_publish_stage_timer.mark("address_refresh")
+        _cleanup_manifest_copy_entries(pending_strict_v3.copy_entries_by_kind)
+        _cleanup_strict_v3_graph_artifacts(pending_strict_v3.graph_artifacts_map)
+        pending_strict_v3.copy_entries_by_kind = {}
+        pending_strict_v3.graph_artifacts_map = {}
+        post_publish_stage_timer.mark("scratch_cleanup")
+        _emit_ptg2_publish_progress(
+            "persisting completion",
+            completed_steps=7,
+            total_steps=publish_progress_total,
+            message_text="persisting final PTG import state",
+            address_refresh_status=address_refresh_result.get("status") if isinstance(address_refresh_result, dict) else None,
+        )
+        report_payload["address_refresh"] = address_refresh_result
+        report_payload["activation_status"] = activation_status
+        await _persist_completed_ptg2_import_run(
             import_run_id=import_run_id,
-            has_serving_files=has_serving_files,
-            source_scoped_compact=source_scoped_compact,
-            test_mode=test_mode,
+            import_month=import_month_value,
+            started_at=now,
+            options=options_payload,
+            report_payload=report_payload,
+            timing_payload=timing_payload,
+            import_started_monotonic=import_started_monotonic,
+            post_publish_started_monotonic=post_publish_started_monotonic,
+            post_publish_stage_timer=post_publish_stage_timer,
         )
         _emit_ptg2_publish_progress(
             "validated",
@@ -4428,29 +4064,12 @@ async def main(
             message_text="PTG publish validation complete",
             address_refresh_status=address_refresh_result.get("status") if isinstance(address_refresh_result, dict) else None,
         )
-        report_payload["address_refresh"] = address_refresh_result
-        await _push_ptg2_objects(
-            [
-                {
-                    "import_run_id": import_run_id,
-                    "import_month": import_month_value,
-                    "status": PTG2_STATUS_VALIDATED,
-                    "started_at": now,
-                    "finished_at": finished,
-                    "heartbeat_at": finished,
-                    "options": options_payload,
-                    "report": report_payload,
-                    "error": None,
-                }
-            ],
-            PTG2ImportRun,
-            rewrite=True,
-        )
         done_line = (
             "PTG2_IMPORT_DONE"
             f"\timport_run_id={import_run_id}"
             f"\tsnapshot_id={snapshot_id}"
-            f"\tstatus={PTG2_STATUS_VALIDATED}"
+            f"\tstatus={snapshot_status}"
+            f"\tactivation_status={activation_status}"
             f"\tfiles_processed={processed_file_count_map['done']}"
             f"\tfiles_failed={len(failed_files)}"
             f"\tserving_rates={report_payload.get('serving_rates', 'unknown')}"
@@ -4458,7 +4077,7 @@ async def main(
             f"\tsetup_seconds={timing_payload['setup_seconds']:.2f}"
             f"\tdata_seconds={timing_payload['data_seconds']:.2f}"
             f"\tpublish_seconds={timing_payload['publish_seconds']:.2f}"
-            f"\tpost_publish_prepare_seconds={timing_payload['post_publish_prepare_seconds']:.2f}"
+            f"\tpost_publish_seconds={timing_payload['post_publish_seconds']:.2f}"
             f"\tindex_seconds={float(timing_payload.get('index_seconds', 0.0)):.2f}"
             f"\tanalyze_seconds={float(timing_payload.get('analyze_seconds', 0.0)):.2f}"
         )
@@ -4472,10 +4091,16 @@ async def main(
             total=attempted_files,
             pct=100,
             eta_seconds=0,
-            message="PTG import succeeded",
+            message=(
+                "PTG import succeeded"
+                if auto_activate_candidates
+                else "PTG candidate validated; live pointers unchanged"
+            ),
         )
         return {
             "status": "succeeded",
+            "activation_status": activation_status,
+            "snapshot_status": snapshot_status,
             "import_run_id": import_run_id,
             "snapshot_id": snapshot_id,
             "source_key": source_key_val,
@@ -4490,9 +4115,9 @@ async def main(
             "files_skipped": len(skipped_files),
             "serving_rates": report_payload.get("serving_rates"),
             "rate_count": report_payload.get("rate_count"),
-            **allowed_amount_metrics,
             "source_file_versions": _ptg2_source_file_versions_from_results(successful_files + skipped_files),
             "address_refresh": address_refresh_result,
+            "timings": timing_payload,
         }
     except asyncio.CancelledError:
         await mark_import_failed(
@@ -4504,7 +4129,70 @@ async def main(
         await mark_import_failed(exc)
         raise
     finally:
+        await _stop_ptg2_import_heartbeat(ptg2_import_heartbeat_task)
+        _cleanup_manifest_copy_entries(pending_strict_v3.copy_entries_by_kind)
+        _cleanup_strict_v3_graph_artifacts(pending_strict_v3.graph_artifacts_map)
+        try:
+            await source_import_lock.__aexit__(None, None, None)
+        except Exception:
+            logger.warning("Failed to release PTG2 source import lock", exc_info=True)
         reset_live_progress_context(live_token)
+
+
+async def main(
+    test_mode: bool = False,
+    toc_urls: list[str] | None = None,
+    toc_list: str | None = None,
+    in_network_url: str | None = None,
+    allowed_url: str | None = None,
+    provider_ref_url: str | None = None,
+    import_id: str | None = None,
+    source_key: str | None = None,
+    import_month: str | datetime.date | None = None,
+    max_files: int | None = None,
+    max_items: int | None = None,
+    plan_ids: list[str] | None = None,
+    plan_name_contains: list[str] | None = None,
+    plan_market_types: list[str] | None = None,
+    file_url_contains: list[str] | None = None,
+    source_network_names: list[str] | str | None = None,
+    reuse_raw_artifacts: bool = True,
+    keep_partial_artifacts: bool | None = None,
+    control_run_id: str | None = None,
+) -> dict[str, Any]:
+    """Run one PTG import while retaining shared inputs through a live lease."""
+
+    lease_owner = str(
+        control_run_id
+        or import_id
+        or source_key
+        or f"standalone-{uuid.uuid4().hex}"
+    )
+    with artifact_lease_context(owner=f"ptg:{lease_owner}") as lease:
+        return await guard_artifact_lease(
+            lease,
+            _main_with_artifact_lease(
+                test_mode=test_mode,
+                toc_urls=toc_urls,
+                toc_list=toc_list,
+                in_network_url=in_network_url,
+                allowed_url=allowed_url,
+                provider_ref_url=provider_ref_url,
+                import_id=import_id,
+                source_key=source_key,
+                import_month=import_month,
+                max_files=max_files,
+                max_items=max_items,
+                plan_ids=plan_ids,
+                plan_name_contains=plan_name_contains,
+                plan_market_types=plan_market_types,
+                file_url_contains=file_url_contains,
+                source_network_names=source_network_names,
+                reuse_raw_artifacts=reuse_raw_artifacts,
+                keep_partial_artifacts=keep_partial_artifacts,
+                control_run_id=control_run_id,
+            ),
+        )
 
 
 def _default_ptg2_import_id(
@@ -4567,15 +4255,10 @@ __all__ = [
     "build_procedure_collection",
     "build_provider_set",
     "build_provider_set_collection",
-    "build_ptg2_db_serving_index",
-    "build_ptg2_compact_snapshot_index_artifact",
-    "build_ptg2_compact_serving_index",
-    "build_ptg2_stage_serving_index",
     "build_rate_pack",
     "build_rate_pack_group",
     "build_rate_pack_procedure_group",
     "build_rate_set",
-    "build_ptg2_snapshot_index_artifact",
     "build_source_trace_set",
     "canonical_json_dumps",
     "canonicalize_url",
@@ -4584,7 +4267,6 @@ __all__ = [
     "download_raw_artifact",
     "ensure_ptg2_tables",
     "fetch_head_metadata",
-    "finalize_ptg2_incremental_serving_index",
     "hash_prefix",
     "logical_artifact_identity",
     "main",
@@ -4614,12 +4296,32 @@ def _manifest_sidecars_list(manifest_payload: dict[str, Any]) -> list[dict[str, 
     return []
 
 
+def _manifest_source_shard_id(
+    file_summary: Mapping[str, Any],
+    summary_payload: Mapping[str, Any],
+    file_index: int,
+) -> str:
+    file_id = file_summary.get("file_id")
+    if file_id is not None:
+        return f"file:{file_id}"
+    fallback_shard_id = (
+        summary_payload.get("logical_sha256")
+        or summary_payload.get("raw_sha256")
+        or summary_payload.get("engine_source_identity_hash")
+        or file_index
+    )
+    return f"manifest:{fallback_shard_id}"
+
+
 def _collect_manifest_artifacts(
     successful_files: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    """Aggregate manifest sidecars, trace identity, and network names by source shard."""
+
     sidecar_entries: list[dict[str, Any]] = []
-    source_trace_set_hashes: set[str] = set()
-    network_name_sets: set[tuple[str, ...]] = set()
+    source_trace_hashes: set[str] = set()
+    fallback_source_trace_set_hashes: set[str] = set()
+    network_names: set[str] = set()
     for file_index, file_summary in enumerate(successful_files):
         summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
         if not isinstance(summary_payload, dict):
@@ -4627,25 +4329,19 @@ def _collect_manifest_artifacts(
         manifest_payload = summary_payload.get("manifest")
         if not isinstance(manifest_payload, dict):
             continue
-        source_trace_set_hash = str(manifest_payload.get("source_trace_set_hash") or "").strip()
-        if source_trace_set_hash:
-            source_trace_set_hashes.add(source_trace_set_hash)
-        network_names = tuple(
+        source_trace_hash = str(manifest_payload.get("source_trace_hash") or "").strip()
+        if source_trace_hash:
+            source_trace_hashes.add(source_trace_hash)
+        else:
+            source_trace_set_hash = str(
+                manifest_payload.get("source_trace_set_hash") or ""
+            ).strip()
+            if source_trace_set_hash:
+                fallback_source_trace_set_hashes.add(source_trace_set_hash)
+        network_names.update(
             _normalize_source_network_names(manifest_payload.get("network_names") or [])
         )
-        if network_names:
-            network_name_sets.add(network_names)
-        file_id = file_summary.get("file_id")
-        if file_id is not None:
-            source_shard_id = f"file:{file_id}"
-        else:
-            fallback_shard_id = (
-                summary_payload.get("logical_sha256")
-                or summary_payload.get("raw_sha256")
-                or summary_payload.get("engine_source_identity_hash")
-                or file_index
-            )
-            source_shard_id = f"manifest:{fallback_shard_id}"
+        source_shard_id = _manifest_source_shard_id(file_summary, summary_payload, file_index)
         existing_sidecars = _manifest_sidecars_list(manifest_payload)
         if existing_sidecars:
             for sidecar in existing_sidecars:
@@ -4665,26 +4361,14 @@ def _collect_manifest_artifacts(
             sidecar_map["source_shard_id"] = source_shard_id
             sidecar_entries.append(sidecar_map)
     artifacts: dict[str, Any] = {"sidecars": sidecar_entries} if sidecar_entries else {}
-    if len(source_trace_set_hashes) == 1:
-        artifacts["source_trace_set_hash"] = next(iter(source_trace_set_hashes))
-    if len(network_name_sets) == 1:
-        artifacts["network_names"] = list(next(iter(network_name_sets)))
+    if source_trace_hashes:
+        artifacts["source_trace_set_hash"] = build_source_trace_set(
+            sorted(source_trace_hashes)
+        )["source_trace_set_hash"]
+    elif len(fallback_source_trace_set_hashes) == 1:
+        artifacts["source_trace_set_hash"] = next(
+            iter(fallback_source_trace_set_hashes)
+        )
+    if network_names:
+        artifacts["network_names"] = sorted(network_names, key=str.casefold)
     return artifacts
-
-
-def _single_scanner_dedupe_count(
-    serving_files: list[dict[str, Any]], metric_name: str
-) -> int | None:
-    """Return an exact scanner count only when one scanner owned the source."""
-    if len(serving_files) != 1:
-        return None
-    file_summary = serving_files[0]
-    summary = file_summary.get("summary") if isinstance(file_summary, dict) else None
-    dedupe = summary.get("dedupe") if isinstance(summary, dict) else None
-    if not isinstance(dedupe, dict):
-        return None
-    try:
-        metric_value = int(dedupe.get(metric_name) or 0)
-    except (TypeError, ValueError):
-        return None
-    return metric_value if metric_value > 0 else None

@@ -1,8 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Shared SSRF / local-file / unbounded-fetch guards for control-plane fetches.
 
-Adapted for the engine's HTTP stacks (aiohttp for PTG, urllib for MS-DRG) from the
-import-control brain's ``import_control.security`` implementation: scheme allowlisting,
+The engine's HTTP stacks (aiohttp for PTG, urllib for MS-DRG) share scheme allowlisting,
 resolved-IP blocklisting (rejecting any non-global address), per-redirect-hop
 re-validation, and a streaming size cap counted on bytes actually read.
 """

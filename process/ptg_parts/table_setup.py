@@ -501,10 +501,11 @@ async def _ensure_ptg_dynamic_tables(
         if cls.__name__ not in requested:
             continue
         obj = classes[cls.__name__]
-        try:
-            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__tablename__};")
-        except Exception as exc:
-            logger.debug("PTG drop table %s failed: %s", obj.__tablename__, exc)
+        if cls.__name__ not in PTG_CONTROL_TABLE_CLASS_NAMES:
+            try:
+                await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__tablename__};")
+            except Exception as exc:
+                logger.debug("PTG drop table %s failed: %s", obj.__tablename__, exc)
         try:
             await db.create_table(obj.__table__, checkfirst=True)
         except Exception as exc:
@@ -526,7 +527,11 @@ async def _prepare_ptg_tables(
         db_schema = "public"
     dynamic: dict[str, type] = {}
     for cls in PTG_DYNAMIC_TABLE_CLASSES:
-        dynamic[cls.__name__] = make_class(cls, import_id, schema_override=db_schema)
+        dynamic[cls.__name__] = (
+            cls
+            if cls.__name__ in PTG_CONTROL_TABLE_CLASS_NAMES
+            else make_class(cls, import_id, schema_override=db_schema)
+        )
     requested = set(initial_table_class_names) if initial_table_class_names is not None else {
         cls.__name__ for cls in PTG_DYNAMIC_TABLE_CLASSES
     }

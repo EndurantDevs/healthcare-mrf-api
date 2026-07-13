@@ -41,7 +41,7 @@ class MappedEvidenceWitness:
 def matching_source_summary_maps(
     provider_row: Any, source_id: str
 ) -> list[Mapping[str, Any]]:
-    """Return exact FHIR source summaries from one api-layer provider row."""
+    """Return exact FHIR source summaries from one consumer API provider row."""
     if not isinstance(provider_row, Mapping):
         return []
     raw_summary_list = provider_row.get("provider_directory_sources")
