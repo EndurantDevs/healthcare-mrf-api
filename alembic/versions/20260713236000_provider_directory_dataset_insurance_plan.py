@@ -31,31 +31,41 @@ def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
 
 
+def _table_exists(bind, schema: str) -> bool:
+    return bool(
+        bind.execute(
+            sa.text("SELECT to_regclass(:name)"),
+            {"name": f"{schema}.provider_directory_dataset_insurance_plan"},
+        ).scalar()
+    )
+
+
 def upgrade():
     schema = _schema()
-    op.create_table(
-        "provider_directory_dataset_insurance_plan",
-        sa.Column("dataset_id", sa.String(length=96), nullable=False),
-        sa.Column("resource_id", sa.String(length=256), nullable=False),
-        sa.Column("payload_hash", sa.String(length=64), nullable=False),
-        sa.Column(
-            "payload_json",
-            postgresql.JSONB(astext_type=sa.Text()),
-            nullable=False,
-        ),
-        sa.ForeignKeyConstraint(
-            ["dataset_id"],
-            [f"{schema}.provider_directory_endpoint_dataset.dataset_id"],
-            name="provider_directory_dataset_insurance_plan_dataset_id_fkey",
-            ondelete="CASCADE",
-        ),
-        sa.PrimaryKeyConstraint(
-            "dataset_id",
-            "resource_id",
-            name="provider_directory_dataset_insurance_plan_pkey",
-        ),
-        schema=schema,
-    )
+    if not _table_exists(op.get_bind(), schema):
+        op.create_table(
+            "provider_directory_dataset_insurance_plan",
+            sa.Column("dataset_id", sa.String(length=96), nullable=False),
+            sa.Column("resource_id", sa.String(length=256), nullable=False),
+            sa.Column("payload_hash", sa.String(length=64), nullable=False),
+            sa.Column(
+                "payload_json",
+                postgresql.JSONB(astext_type=sa.Text()),
+                nullable=False,
+            ),
+            sa.ForeignKeyConstraint(
+                ["dataset_id"],
+                [f"{schema}.provider_directory_endpoint_dataset.dataset_id"],
+                name="provider_directory_dataset_insurance_plan_dataset_id_fkey",
+                ondelete="CASCADE",
+            ),
+            sa.PrimaryKeyConstraint(
+                "dataset_id",
+                "resource_id",
+                name="provider_directory_dataset_insurance_plan_pkey",
+            ),
+            schema=schema,
+        )
     projection_ref = _qt(schema, "provider_directory_dataset_insurance_plan")
     resource_ref = _qt(schema, "provider_directory_dataset_resource")
     op.execute(
@@ -72,7 +82,10 @@ def upgrade():
                    payload_hash,
                    payload_json
               FROM {resource_ref}
-             WHERE resource_type = 'InsurancePlan';
+             WHERE resource_type = 'InsurancePlan'
+            ON CONFLICT (dataset_id, resource_id) DO UPDATE
+                    SET payload_hash = EXCLUDED.payload_hash,
+                        payload_json = EXCLUDED.payload_json;
             """
         )
     )

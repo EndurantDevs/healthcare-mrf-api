@@ -85,16 +85,29 @@ def _evidence_row(evidence_type, resource_id, provenance, **fields):
 
 
 class _EvidenceResult:
+    def __init__(self, evidence_rows=()):
+        self.evidence_rows = list(evidence_rows)
+
     def all(self):
-        return []
+        return self.evidence_rows
 
 
 class _EvidenceSession:
-    def __init__(self):
+    def __init__(self, unavailable_table_names=()):
         self.statements = []
+        self.unavailable_table_names = set(unavailable_table_names)
+        self.requested_table_names = []
 
-    async def execute(self, statement, _params=None):
+    async def execute(self, statement, params=None):
         self.statements.append(str(statement))
+        if "to_regclass" in str(statement) and params:
+            self.requested_table_names = list(params["table_names"])
+            return _EvidenceResult(
+                [
+                    {"table_name": table_name, "is_available": table_name not in self.unavailable_table_names}
+                    for table_name in self.requested_table_names
+                ]
+            )
         return _EvidenceResult()
 
 
@@ -278,36 +291,25 @@ def test_high_cardinality_mapping_is_linear_and_stable(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_role_evidence_disables_jit_once_per_request_session(monkeypatch):
+async def test_role_evidence_disables_jit_once_per_request_session():
     evidence_session = _EvidenceSession()
-    monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=True))
-
     for _attempt in range(2):
         await npi_module._fetch_provider_directory_role_evidence_map(
             [("pdfhir_example", "role-100")],
             session=evidence_session,
         )
-
     assert evidence_session.statements.count("SET LOCAL jit = off") == 1
     assert sum("requested_roles AS" in statement for statement in evidence_session.statements) == 2
 
 
 @pytest.mark.asyncio
-async def test_missing_affiliation_and_catalog_tables_keep_direct_path(monkeypatch):
-    evidence_session = _EvidenceSession()
-    checked_table_names = []
-
-    async def is_table_available(table_name, *, session=None):
-        assert session is evidence_session
-        checked_table_names.append(table_name)
-        return table_name not in {
-            "provider_directory_organization_affiliation",
-            "provider_directory_network_catalog",
-            "provider_directory_dataset_network_plan",
-            "provider_directory_dataset_affiliation_organization",
-        }
-
-    monkeypatch.setattr(npi_module, "_table_exists", is_table_available)
+async def test_missing_affiliation_and_catalog_tables_keep_direct_path():
+    evidence_session = _EvidenceSession({
+        "provider_directory_organization_affiliation",
+        "provider_directory_network_catalog",
+        "provider_directory_dataset_network_plan",
+        "provider_directory_dataset_affiliation_organization",
+    })
 
     evidence_map = await npi_module._fetch_provider_directory_role_evidence_map(
         [("pdfhir_example", "role-100")],
@@ -321,7 +323,7 @@ async def test_missing_affiliation_and_catalog_tables_keep_direct_path(monkeypat
     assert "provider_directory_organization_affiliation AS affiliation" not in query_sql
     assert "provider_directory_network_catalog" not in query_sql
     assert "FROM direct_plans AS direct_plan" in query_sql
-    assert checked_table_names == [
+    assert evidence_session.requested_table_names == [
         "provider_directory_source",
         "provider_directory_endpoint_dataset",
         "provider_directory_dataset_resource",

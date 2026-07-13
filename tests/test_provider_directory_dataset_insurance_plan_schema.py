@@ -38,6 +38,9 @@ class _OpRecorder:
     def create_table(self, name, *items, schema=None):
         self.tables[name] = {"items": items, "schema": schema}
 
+    def get_bind(self):
+        return self
+
     def execute(self, statement):
         self.executed.append(statement)
 
@@ -71,6 +74,7 @@ def test_dataset_insurance_plan_migration_creates_and_backfills_projection(
     operation_recorder = _OpRecorder()
     monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
     monkeypatch.setattr(migration, "op", operation_recorder)
+    monkeypatch.setattr(migration, "_table_exists", lambda *_args: False)
 
     migration.upgrade()
 
@@ -106,3 +110,17 @@ def test_dataset_insurance_plan_migration_creates_and_backfills_projection(
     assert "resource_type = 'InsurancePlan'" in backfill_sql
     assert "payload_hash" in backfill_sql
     assert "payload_json" in backfill_sql
+    assert "ON CONFLICT (dataset_id, resource_id) DO UPDATE" in backfill_sql
+
+
+def test_dataset_insurance_plan_migration_backfills_existing_model_table(monkeypatch):
+    migration = _load_migration()
+    operation_recorder = _OpRecorder()
+    monkeypatch.setattr(migration, "op", operation_recorder)
+    monkeypatch.setattr(migration, "_table_exists", lambda *_args: True)
+
+    migration.upgrade()
+
+    assert operation_recorder.tables == {}
+    assert len(operation_recorder.executed) == 1
+    assert "ON CONFLICT" in str(operation_recorder.executed[0])

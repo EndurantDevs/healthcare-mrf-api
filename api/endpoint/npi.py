@@ -2509,14 +2509,36 @@ async def _provider_directory_evidence_tables(
     required_names: Sequence[str],
     optional_names: Sequence[str],
 ) -> dict[str, bool] | None:
-    required_flags = [
-        await _table_exists(table_name, session=session)
-        for table_name in required_names
-    ]
-    if not all(required_flags):
+    table_names = list(dict.fromkeys((*required_names, *optional_names)))
+    try:
+        availability_result = await _execute_stmt(
+            text(
+                """
+                SELECT requested.table_name,
+                       to_regclass(:schema || '.' || requested.table_name)
+                           IS NOT NULL AS is_available
+                  FROM unnest(CAST(:table_names AS varchar[]))
+                       AS requested(table_name)
+                """
+            ),
+            session=session,
+            params={
+                "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+                "table_names": table_names,
+            },
+        )
+    except Exception:
+        return None
+    availability_by_name = {
+        str(getattr(table_row, "_mapping", table_row)["table_name"]): bool(
+            getattr(table_row, "_mapping", table_row)["is_available"]
+        )
+        for table_row in availability_result.all()
+    }
+    if not all(availability_by_name.get(table_name, False) for table_name in required_names):
         return None
     return {
-        table_name: await _table_exists(table_name, session=session)
+        table_name: availability_by_name.get(table_name, False)
         for table_name in optional_names
     }
 
