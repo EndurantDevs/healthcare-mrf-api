@@ -16,6 +16,13 @@ def _typed_role_evidence_map():
         "reference": None,
         "provenance": "provider_directory_practitioner_role",
         "role_active": True,
+        "role_identifiers": [
+            {
+                "system": "https://example.test/role-id",
+                "value": "role-license-100",
+                "period_start": "2026-01-01",
+            }
+        ],
         "role_organization_ref": "Organization/org-1",
         "role_healthcare_service_refs": ["HealthcareService/service-1"],
         "role_endpoint_refs": ["Endpoint/endpoint-1"],
@@ -95,6 +102,7 @@ def test_role_evidence_sql_projects_typed_details_without_catalog_refs():
 
     for column in (
         "role.available_time::jsonb AS role_available_time",
+        "role.identifiers::jsonb AS role_identifiers",
         "role.new_patient_acceptance::jsonb AS role_new_patient_acceptance",
         "role.telehealth AS role_telehealth",
         "plan.payload_json::jsonb - ARRAY[",
@@ -162,6 +170,13 @@ def test_role_evidence_mapper_emits_availability_and_name_only_plan_details():
     plan_detail = role_evidence["insurance_plans"][0]
 
     assert role_detail["available_time"][0]["availableStartTime"] == "09:00"
+    assert role_detail["identifiers"] == [
+        {
+            "system": "https://example.test/role-id",
+            "value": "role-license-100",
+            "period_start": "2026-01-01",
+        }
+    ]
     assert role_detail["new_patient_acceptance"] == {"code": "accepting"}
     assert role_detail["telehealth"] is True
     assert role_detail["period"] == {"start": "2026-01-01", "end": "2026-12-31"}

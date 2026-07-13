@@ -2230,30 +2230,78 @@ def _canonical_base(api_base: str | None) -> str | None:
     return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
 
 
+FHIR_URL_IDENTITY_MAX_LENGTH = 2048
+FHIR_URL_IDENTITY_INPUT_MAX_LENGTH = 65536
+FHIR_SENSITIVE_PATH_KEYS = frozenset(
+    {
+        "access-token",
+        "access_token",
+        "api-key",
+        "api_key",
+        "apikey",
+        "authorization",
+        "client-secret",
+        "client_secret",
+        "credential",
+        "key",
+        "password",
+        "secret",
+        "subscription-key",
+        "subscription_key",
+        "token",
+    }
+)
+
+
+def _sanitized_fhir_url_path(path: str) -> str:
+    """Remove matrix parameters and named credential path segments."""
+
+    sanitized_segments: list[str] = []
+    should_skip_credential_value = False
+    for raw_segment in path.split("/"):
+        segment = raw_segment.split(";", 1)[0]
+        if should_skip_credential_value:
+            should_skip_credential_value = False
+            continue
+        decoded = urllib.parse.unquote(segment).strip().lower()
+        key, separator, _value = decoded.partition("=")
+        if key in FHIR_SENSITIVE_PATH_KEYS:
+            should_skip_credential_value = not separator
+            continue
+        sanitized_segments.append(segment)
+    return "/".join(sanitized_segments)
+
+
 def _sanitized_fhir_url_identity(url: str | None) -> str | None:
     """Return a persistence-safe URL identity without credentials or query values."""
 
     text = _clean_text(url)
-    if not text:
+    if not text or len(text) > FHIR_URL_IDENTITY_INPUT_MAX_LENGTH:
         return None
     try:
         parsed = urllib.parse.urlsplit(text)
         port = parsed.port
     except ValueError:
         return None
+    sanitized_path = _sanitized_fhir_url_path(parsed.path)
     if parsed.scheme and not parsed.hostname:
-        return urllib.parse.urlunsplit(
-            (parsed.scheme.lower(), "", parsed.path, "", "")
+        sanitized = urllib.parse.urlunsplit(
+            (parsed.scheme.lower(), "", sanitized_path, "", "")
         )
+        return _profile_text(sanitized, max_length=FHIR_URL_IDENTITY_MAX_LENGTH)
     if not parsed.scheme or not parsed.hostname:
-        return parsed.path or None
+        return _profile_text(
+            sanitized_path,
+            max_length=FHIR_URL_IDENTITY_MAX_LENGTH,
+        )
     hostname = parsed.hostname.lower()
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"
     netloc = f"{hostname}:{port}" if port is not None else hostname
-    return urllib.parse.urlunsplit(
-        (parsed.scheme.lower(), netloc, parsed.path, "", "")
+    sanitized = urllib.parse.urlunsplit(
+        (parsed.scheme.lower(), netloc, sanitized_path, "", "")
     )
+    return _profile_text(sanitized, max_length=FHIR_URL_IDENTITY_MAX_LENGTH)
 
 
 def _sanitized_fhir_meta_codings(value: Any) -> list[dict[str, Any]]:
@@ -5374,6 +5422,11 @@ def _normalized_identifier(identifier: Any) -> dict[str, Any] | None:
         "period_start": _clean_text(period.get("start")),
         "period_end": _clean_text(period.get("end")),
         "assigner_ref": _first_reference(identifier.get("assigner")),
+        "assigner_display": _clean_text(
+            identifier.get("assigner", {}).get("display")
+            if isinstance(identifier.get("assigner"), dict)
+            else None
+        ),
     }
     return {
         key: value
@@ -6412,6 +6465,7 @@ def parse_fhir_resource(
             **base,
             "npi": _npi(resource),
             "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
+            "identifiers": _normalized_identifiers(resource.get("identifier")),
             "practitioner_ref": _first_reference(resource.get("practitioner")),
             "organization_ref": _first_reference(resource.get("organization")),
             "location_refs": _references(resource.get("location")),
@@ -6434,6 +6488,7 @@ def parse_fhir_resource(
             "accepting_patients": _plan_net_accepting_patients(resource),
             "npi": _npi(resource),
             "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
+            "identifiers": _normalized_identifiers(resource.get("identifier")),
             "name": _clean_text(resource.get("name")),
             "type_codes": _codings(resource.get("type")),
             "category_codes": _codings(resource.get("category")),
@@ -6469,6 +6524,7 @@ def parse_fhir_resource(
                 resource.get("availabilityExceptions")
             ),
             "extra_details": _profile_text(resource.get("extraDetails")),
+            "comment": _profile_text(resource.get("comment")),
             "photos": _normalized_photo_metadata(resource.get("photo")),
         }
         return ProviderDirectoryHealthcareService, row
@@ -6477,6 +6533,7 @@ def parse_fhir_resource(
         row = {
             **base,
             "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
+            "identifiers": _normalized_identifiers(resource.get("identifier")),
             "organization_ref": _first_reference(resource.get("organization")),
             "participating_organization_ref": _first_reference(resource.get("participatingOrganization")),
             "network_refs": _references(resource.get("network")),
@@ -6645,10 +6702,15 @@ def _append_alohr_parsed_resource(
     *,
     run_id: str | None,
 ) -> None:
+    resource_type = _clean_text(resource.get("resourceType")) or "Resource"
+    resource_id = _resource_id(resource)
     parsed = parse_fhir_resource(
         source_id,
         resource,
-        resource_url=f"{ALOHR_GRAPHQL_URL}#{resource.get('resourceType')}/{resource.get('id')}",
+        resource_url=(
+            "urn:healthporta:provider-directory:alohr:"
+            f"{resource_type}:{resource_id}"
+        ),
         acquisition=FHIRAcquisitionContext(
             fetch_url=ALOHR_GRAPHQL_URL,
             fetch_mode="graphql",

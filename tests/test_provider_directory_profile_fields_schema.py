@@ -10,6 +10,7 @@ from db.models import (
     ProviderDirectoryHealthcareService,
     ProviderDirectoryLocation,
     ProviderDirectoryOrganization,
+    ProviderDirectoryOrganizationAffiliation,
     ProviderDirectoryPractitioner,
     ProviderDirectoryPractitionerRole,
 )
@@ -99,6 +100,14 @@ PROFILE_COLUMN_NAMES = {
         BASE_PROFILE_COLUMN_NAMES[ProviderDirectoryPractitioner]
         | DERIVED_PRACTITIONER_COLUMN_NAMES
     ),
+}
+RESOURCE_IDENTIFIER_COLUMN_NAMES = {
+    ProviderDirectoryPractitionerRole.__tablename__: {"identifiers"},
+    ProviderDirectoryHealthcareService.__tablename__: {
+        "identifiers",
+        "comment",
+    },
+    ProviderDirectoryOrganizationAffiliation.__tablename__: {"identifiers"},
 }
 
 
@@ -254,3 +263,66 @@ def test_role_accepting_medicaid_migration_matches_model(monkeypatch):
             {"schema": "mrf"},
         )
     ]
+
+
+def test_resource_identifier_migration_matches_models(monkeypatch):
+    """Keep the additive migration aligned with the three typed resources."""
+    migration = _load_migration(
+        "20260713233000_provider_directory_resource_identifiers.py"
+    )
+    recorder = _OpRecorder()
+    monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
+    monkeypatch.setattr(migration, "op", recorder)
+
+    migration.upgrade()
+
+    assert migration.revision == (
+        "20260713233000_provider_directory_resource_identifiers"
+    )
+    assert migration.down_revision == (
+        "20260713230000_provider_directory_role_accepting_medicaid"
+    )
+    added_column_names_by_table = {
+        table_name: {
+            column.name
+            for recorded_table, column, _kwargs in recorder.added_columns
+            if recorded_table == table_name
+        }
+        for table_name in RESOURCE_IDENTIFIER_COLUMN_NAMES
+    }
+    assert added_column_names_by_table == RESOURCE_IDENTIFIER_COLUMN_NAMES
+    assert all(
+        kwargs["schema"] == "mrf" and column.nullable is True
+        for _table_name, column, kwargs in recorder.added_columns
+    )
+
+    migration.downgrade()
+
+    assert {
+        (table_name, column_name)
+        for table_name, column_name, _kwargs in recorder.dropped_columns
+    } == {
+        (table_name, column_name)
+        for table_name, column_names in RESOURCE_IDENTIFIER_COLUMN_NAMES.items()
+        for column_name in column_names
+    }
+
+
+def test_resource_identifier_models_use_expected_types():
+    """Expose identifier JSON and service comments through typed models."""
+    assert isinstance(
+        ProviderDirectoryPractitionerRole.__table__.c.identifiers.type,
+        SQLAlchemyJSON,
+    )
+    assert isinstance(
+        ProviderDirectoryHealthcareService.__table__.c.identifiers.type,
+        SQLAlchemyJSON,
+    )
+    assert isinstance(
+        ProviderDirectoryHealthcareService.__table__.c.comment.type,
+        sa.Text,
+    )
+    assert isinstance(
+        ProviderDirectoryOrganizationAffiliation.__table__.c.identifiers.type,
+        SQLAlchemyJSON,
+    )

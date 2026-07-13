@@ -121,6 +121,27 @@ PRACTITIONER_ROLE_COMPLETENESS_RESOURCE = {
         {"url": "https://unreviewed.example/arbitrary", "valueString": "discard"},
     ],
 }
+CANONICAL_ROLE_RESOURCE = {
+    "resourceType": "PractitionerRole",
+    "id": "role-1",
+    "meta": {"versionId": "2"},
+    "availableTime": [{"allDay": True}],
+    "specialty": [
+        {
+            "coding": [{"code": "207Q00000X"}],
+            "text": "Family medicine",
+        }
+    ],
+    "extension": [
+        {
+            "url": (
+                "https://healthporta.com/fhir/provider-directory/"
+                "accepting-medicaid"
+            ),
+            "valueBoolean": True,
+        }
+    ],
+}
 
 
 @pytest.mark.parametrize(
@@ -226,14 +247,10 @@ def test_practitioner_role_separates_availability_new_patients_and_telehealth():
 
 
 def test_canonical_and_dataset_payloads_inherit_completeness_and_provenance():
+    """Carry reviewed role fields and safe provenance into both artifacts."""
     parsed_model, role_row = importer.parse_fhir_resource(
         "source-a",
-        {
-            "resourceType": "PractitionerRole",
-            "id": "role-1",
-            "meta": {"versionId": "2"},
-            "availableTime": [{"allDay": True}],
-        },
+        CANONICAL_ROLE_RESOURCE,
         acquisition=importer.FHIRAcquisitionContext(
             self_url="https://payer.example/fhir/PractitionerRole/role-1",
             fetch_url="https://payer.example/fhir/PractitionerRole?_count=100",
@@ -259,8 +276,18 @@ def test_canonical_and_dataset_payloads_inherit_completeness_and_provenance():
     assert canonical_row["fhir_fetch_url"].endswith("/PractitionerRole")
     assert canonical_row["fhir_fetch_mode"] == "rest_bundle"
     assert canonical_row["payload_json"]["available_time"] == [{"allDay": True}]
+    assert canonical_row["payload_json"]["accepting_medicaid"] is True
+    assert canonical_row["payload_json"]["specialty_codes"] == [
+        {
+            "system": None,
+            "code": "207Q00000X",
+            "display": None,
+            "text": "Family medicine",
+        }
+    ]
     assert dataset_row["payload_json"] == importer._canonical_resource_payload(role_row)
     assert dataset_row["payload_json"]["fhir_meta"] == {"versionId": "2"}
+    assert dataset_row["payload_json"]["accepting_medicaid"] is True
 
 
 def test_canonical_backfill_syncs_provenance_columns_and_payload():
@@ -436,7 +463,10 @@ def test_graphql_call_site_records_graphql_mode_without_fhir_self_url():
     )
 
     practitioner_row = rows_by_model[ProviderDirectoryPractitioner][0]
-    assert practitioner_row["resource_url"].startswith(importer.ALOHR_GRAPHQL_URL)
+    assert practitioner_row["resource_url"] == (
+        "urn:healthporta:provider-directory:alohr:"
+        "Practitioner:practitioner-1"
+    )
     assert practitioner_row["fhir_self_url"] is None
     assert practitioner_row["fhir_fetch_url"] == importer.ALOHR_GRAPHQL_URL
     assert practitioner_row["fhir_fetch_mode"] == "graphql"

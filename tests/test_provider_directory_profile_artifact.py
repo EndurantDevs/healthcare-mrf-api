@@ -106,6 +106,7 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
         "new_patient_acceptance",
         "telehealth",
         "accepting_medicaid",
+        "role_identifier",
         "organization",
         "service",
     ):
@@ -113,6 +114,9 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
     assert "practitioner.birth_date" not in sql
     assert "practitioner.birthDate" not in sql
     assert "basis_start_date" in sql
+    assert "'identifiers', role.identifiers::jsonb" in sql
+    assert "'identifiers', service.identifiers::jsonb" in sql
+    assert "'comment', service.comment" in sql
     assert "ON CONFLICT (evidence_key) DO NOTHING" in sql
 
 

@@ -460,6 +460,11 @@ class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
             "index_elements": ("resource_type", "resource_id"),
             "name": "provider_directory_dataset_resource_type_id_idx",
         },
+        {
+            "index_elements": ("dataset_id", "resource_id"),
+            "name": "provider_directory_dataset_resource_plan_lookup_idx",
+            "where": "resource_type = 'InsurancePlan'",
+        },
         {"index_elements": ("payload_hash",), "name": "provider_directory_dataset_resource_hash_idx"},
     ]
 

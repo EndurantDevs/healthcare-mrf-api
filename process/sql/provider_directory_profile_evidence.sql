@@ -102,6 +102,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    role_rows.source_plan_name,
                    role_rows.resource_id AS role_resource_id,
                    service.resource_id, service.active, service.name,
+                   service.identifiers,
                    service.type_codes, service.category_codes,
                    service.specialty_codes, service.program_codes,
                    service.characteristic_codes,
@@ -111,6 +112,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    service.appointment_required, service.telecom,
                    service.available_time, service.not_available,
                    service.availability_exceptions, service.extra_details,
+                   service.comment,
                    service.updated_at
               FROM role_rows
               CROSS JOIN LATERAL jsonb_array_elements_text(
@@ -129,6 +131,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    source_context.plan_name AS source_plan_name,
                    NULL::varchar AS role_resource_id,
                    service.resource_id, service.active, service.name,
+                   service.identifiers,
                    service.type_codes, service.category_codes,
                    service.specialty_codes, service.program_codes,
                    service.characteristic_codes,
@@ -138,6 +141,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    service.appointment_required, service.telecom,
                    service.available_time, service.not_available,
                    service.availability_exceptions, service.extra_details,
+                   service.comment,
                    service.updated_at
               FROM {{SERVICE_REF}} AS service
               JOIN source_context
@@ -371,6 +375,20 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               ) AS role_code(value)
 
             UNION ALL
+            SELECT role.resolved_npi, 'role_identifier',
+                   md5(lower(role_identifier.value::text)),
+                   role_identifier.value,
+                   role.source_id, role.endpoint_id, role.dataset_id,
+                   role.canonical_api_base, role.source_org_name,
+                   role.source_plan_name, 'PractitionerRole', role.resource_id,
+                   role.resource_id, role.active, role.period_start,
+                   role.period_end, role.updated_at
+              FROM role_rows AS role
+              CROSS JOIN LATERAL jsonb_array_elements(
+                   COALESCE(role.identifiers::jsonb, '[]'::jsonb)
+              ) AS role_identifier(value)
+
+            UNION ALL
             SELECT role.resolved_npi, 'role_context',
                    md5(concat_ws('|', role.source_id, role.resource_id)),
                    jsonb_strip_nulls(
@@ -380,6 +398,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                            'healthcare_service_refs', role.healthcare_service_refs::jsonb,
                            'network_refs', role.network_refs::jsonb,
                            'insurance_plan_refs', role.insurance_plan_refs::jsonb,
+                           'identifiers', role.identifiers::jsonb,
                            'specialty_codes', role.specialty_codes::jsonb,
                            'role_codes', role.code_codes::jsonb,
                            'telecom', role.telecom::jsonb,
@@ -466,6 +485,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                        jsonb_strip_nulls(
                            jsonb_build_object(
                                'name', service.name,
+                               'identifiers', service.identifiers::jsonb,
                                'type_codes', service.type_codes::jsonb,
                                'category_codes', service.category_codes::jsonb,
                                'specialty_codes', service.specialty_codes::jsonb,
@@ -480,13 +500,15 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                                'available_time', service.available_time::jsonb,
                                'not_available', service.not_available::jsonb,
                                'availability_exceptions', service.availability_exceptions,
-                               'extra_details', service.extra_details
+                               'extra_details', service.extra_details,
+                               'comment', service.comment
                            )
                        )::text
                    ),
                    jsonb_strip_nulls(
                        jsonb_build_object(
                            'name', service.name,
+                           'identifiers', service.identifiers::jsonb,
                            'type_codes', service.type_codes::jsonb,
                            'category_codes', service.category_codes::jsonb,
                            'specialty_codes', service.specialty_codes::jsonb,
@@ -501,7 +523,8 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                            'available_time', service.available_time::jsonb,
                            'not_available', service.not_available::jsonb,
                            'availability_exceptions', service.availability_exceptions,
-                           'extra_details', service.extra_details
+                           'extra_details', service.extra_details,
+                           'comment', service.comment
                        )
                    ),
                    service.source_id, service.endpoint_id, service.dataset_id,

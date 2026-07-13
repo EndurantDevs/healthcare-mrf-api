@@ -14,7 +14,10 @@ def test_fhir_meta_and_resource_url_are_bounded_replay_safe_projections():
         "meta": {
             "versionId": "7",
             "lastUpdated": "2026-07-13T10:00:00Z",
-            "source": "https://user:pass@payer.example/source?token=secret#fragment",
+            "source": (
+                "https://user:pass@payer.example/source/token/path-secret/"
+                "PractitionerRole?token=secret#fragment"
+            ),
             "profile": [
                 "https://payer.example/Profile/provider-directory?api_key=secret"
             ],
@@ -45,7 +48,7 @@ def test_fhir_meta_and_resource_url_are_bounded_replay_safe_projections():
     assert role_row["fhir_meta"] == {
         "versionId": "7",
         "lastUpdated": "2026-07-13T10:00:00Z",
-        "source": "https://payer.example/source",
+        "source": "https://payer.example/source/PractitionerRole",
         "profile": ["https://payer.example/Profile/provider-directory"],
         "security": [
             {
@@ -60,6 +63,50 @@ def test_fhir_meta_and_resource_url_are_bounded_replay_safe_projections():
     assert "secret" not in serialized_role_row
     assert "resource-pass" not in serialized_role_row
     assert "must-not-persist" not in serialized_role_row
+    assert "path-secret" not in serialized_role_row
+
+
+def test_fhir_meta_url_collections_and_values_are_strictly_bounded():
+    oversized_url = "https://payer.example/" + ("x" * 70000)
+    profiles = [
+        f"https://payer.example/Profile/{index}/" + ("y" * 3000)
+        for index in range(40)
+    ]
+
+    sanitized_meta = importer._sanitized_fhir_meta(
+        {
+            "source": oversized_url,
+            "profile": profiles,
+            "security": [
+                {
+                    "system": (
+                        f"https://payer.example/security/{index}/"
+                        + ("z" * 3000)
+                    ),
+                    "display": "d" * 3000,
+                }
+                for index in range(40)
+            ],
+        }
+    )
+
+    assert sanitized_meta is not None
+    assert "source" not in sanitized_meta
+    assert len(sanitized_meta["profile"]) == 32
+    assert len(sanitized_meta["security"]) == 32
+    assert max(map(len, sanitized_meta["profile"])) == (
+        importer.FHIR_URL_IDENTITY_MAX_LENGTH
+    )
+    assert max(
+        len(security_coding["system"])
+        for security_coding in sanitized_meta["security"]
+    ) == (
+        importer.FHIR_URL_IDENTITY_MAX_LENGTH
+    )
+    assert max(
+        len(security_coding["display"])
+        for security_coding in sanitized_meta["security"]
+    ) == 2048
 
 
 def test_codings_preserve_each_codeable_concept_text():

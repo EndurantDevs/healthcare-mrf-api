@@ -616,7 +616,7 @@ def _primary_total_cache_set(value: int) -> int:
 
 
 MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS = 256
-MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE = 512
+MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE = 100
 MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS = 8192
 MAX_PROVIDER_DIRECTORY_FHIR_PROVENANCE_VALUES = 32
 MAX_PROVIDER_DIRECTORY_FHIR_PROVENANCE_TEXT_LENGTH = 2048
@@ -1487,17 +1487,8 @@ def _scoped_current_insurance_plan_ctes_sql(
     """
 
 
-def _dataset_role_plan_sql(schema: str) -> str:
-    insurance_plan_status = (
-        "insurance_plan.payload_json::jsonb ->> 'status'"
-    )
-    insurance_plan_identifier = (
-        "insurance_plan.payload_json::jsonb ->> 'plan_identifier'"
-    )
-    insurance_plan_active = (
-        "COALESCE(NULLIF(LOWER(BTRIM("
-        f"{insurance_plan_status})), ''), 'active') = 'active'"
-    )
+def _dataset_role_plan_candidates_sql(schema: str) -> str:
+    """Resolve role/network edges into distinct immutable plan candidates."""
     return f"""
     dataset_network_plan_candidates AS MATERIALIZED (
         SELECT role_network.dataset_id, role_network.source_id,
@@ -1529,18 +1520,61 @@ def _dataset_role_plan_sql(schema: str) -> str:
       GROUP BY role_network.dataset_id, role_network.source_id,
                role_network.role_id,
                network_plan.insurance_plan_resource_id
-    ), dataset_network_derived_plans AS MATERIALIZED (
-        SELECT candidate.source_id, candidate.role_id,
-               insurance_plan.resource_id,
-               NULLIF(BTRIM({insurance_plan_identifier}), '')::varchar AS identifier,
-               candidate.provenance
+    )
+    """
+
+
+def _dataset_role_plan_resources_sql(
+    schema: str,
+    insurance_plan_identifier: str,
+    insurance_plan_active: str,
+) -> str:
+    """Load only active immutable plan payloads referenced by candidates."""
+    return f"""
+    dataset_network_plan_resource_keys AS MATERIALIZED (
+        SELECT DISTINCT candidate.dataset_id, candidate.resource_id
           FROM dataset_network_plan_candidates AS candidate
+    ), dataset_network_plan_resources AS MATERIALIZED (
+        SELECT candidate.dataset_id, insurance_plan.resource_id,
+               NULLIF(BTRIM({insurance_plan_identifier}), '')::varchar AS identifier
+          FROM dataset_network_plan_resource_keys AS candidate
           JOIN {schema}.provider_directory_dataset_resource AS insurance_plan
             ON insurance_plan.dataset_id = candidate.dataset_id
            AND insurance_plan.resource_type = 'InsurancePlan'
            AND insurance_plan.resource_id = candidate.resource_id
            AND {insurance_plan_active}
+    ), dataset_network_derived_plans AS MATERIALIZED (
+        SELECT candidate.source_id, candidate.role_id,
+               insurance_plan.resource_id, insurance_plan.identifier,
+               candidate.provenance
+          FROM dataset_network_plan_candidates AS candidate
+          JOIN dataset_network_plan_resources AS insurance_plan
+            ON insurance_plan.dataset_id = candidate.dataset_id
+           AND insurance_plan.resource_id = candidate.resource_id
     )
+    """
+
+
+def _dataset_role_plan_sql(schema: str) -> str:
+    """Build indexed immutable role-to-plan resolution CTEs."""
+    insurance_plan_status = (
+        "insurance_plan.payload_json::jsonb ->> 'status'"
+    )
+    insurance_plan_identifier = (
+        "insurance_plan.payload_json::jsonb ->> 'plan_identifier'"
+    )
+    insurance_plan_active = (
+        "COALESCE(NULLIF(LOWER(BTRIM("
+        f"{insurance_plan_status})), ''), 'active') = 'active'"
+    )
+    candidate_sql = _dataset_role_plan_candidates_sql(schema)
+    resource_sql = _dataset_role_plan_resources_sql(
+        schema,
+        insurance_plan_identifier,
+        insurance_plan_active,
+    )
+    return f"""
+    {candidate_sql}, {resource_sql}
     """
 
 
@@ -2479,17 +2513,26 @@ def _dataset_affiliation_plan_sql(schema: str) -> str:
             ON network_plan.dataset_id = affiliation_network.dataset_id
            AND network_plan.network_resource_id = affiliation_network.resource_id
          WHERE affiliation_network.dataset_network_plan_complete
-    ), dataset_affiliation_plans AS MATERIALIZED (
-        SELECT candidate.source_id, candidate.affiliation_id,
-               insurance_plan.resource_id,
-               NULLIF(BTRIM({insurance_plan_identifier}), '')::varchar AS identifier,
-               'organization-affiliation-network-derived'::varchar AS provenance
+    ), dataset_affiliation_plan_resource_keys AS MATERIALIZED (
+        SELECT DISTINCT candidate.dataset_id, candidate.resource_id
           FROM dataset_affiliation_plan_candidates AS candidate
+    ), dataset_affiliation_plan_resources AS MATERIALIZED (
+        SELECT candidate.dataset_id, insurance_plan.resource_id,
+               NULLIF(BTRIM({insurance_plan_identifier}), '')::varchar AS identifier
+          FROM dataset_affiliation_plan_resource_keys AS candidate
           JOIN {schema}.provider_directory_dataset_resource AS insurance_plan
             ON insurance_plan.dataset_id = candidate.dataset_id
            AND insurance_plan.resource_type = 'InsurancePlan'
            AND insurance_plan.resource_id = candidate.resource_id
            AND {insurance_plan_active}
+    ), dataset_affiliation_plans AS MATERIALIZED (
+        SELECT candidate.source_id, candidate.affiliation_id,
+               insurance_plan.resource_id, insurance_plan.identifier,
+               'organization-affiliation-network-derived'::varchar AS provenance
+          FROM dataset_affiliation_plan_candidates AS candidate
+          JOIN dataset_affiliation_plan_resources AS insurance_plan
+            ON insurance_plan.dataset_id = candidate.dataset_id
+           AND insurance_plan.resource_id = candidate.resource_id
     )
     """
 

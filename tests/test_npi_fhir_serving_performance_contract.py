@@ -1,11 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import types
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
 from api.endpoint import npi as npi_module
+from db.models import ProviderDirectoryDatasetResource
 
 
 @pytest.mark.asyncio
@@ -88,6 +90,32 @@ def test_relation_evidence_deduplicates_before_payload_projection():
         assert "plan.payload_json::jsonb - ARRAY[" in evidence_sql
         assert "LEFT JOIN current_resources AS plan" in evidence_sql
     assert "dataset_network_plan_candidates AS MATERIALIZED" in role_sql
+    assert "dataset_network_plan_resource_keys AS MATERIALIZED" in role_sql
+    assert "SELECT DISTINCT candidate.dataset_id, candidate.resource_id" in role_sql
+    assert "dataset_network_plan_resources AS MATERIALIZED" in role_sql
     assert "dataset_affiliation_plan_candidates AS MATERIALIZED" in affiliation_sql
+    assert "dataset_affiliation_plan_resource_keys AS MATERIALIZED" in affiliation_sql
+    assert "dataset_affiliation_plan_resources AS MATERIALIZED" in affiliation_sql
     assert "insurance_plan.dataset_id = candidate.dataset_id" in role_sql
     assert "insurance_plan.dataset_id = candidate.dataset_id" in affiliation_sql
+    assert npi_module.MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE == 100
+
+
+def test_immutable_plan_lookup_index_matches_model_and_migration():
+    index_spec = next(
+        item
+        for item in ProviderDirectoryDatasetResource.__my_additional_indexes__
+        if item["name"]
+        == "provider_directory_dataset_resource_plan_lookup_idx"
+    )
+    assert index_spec["index_elements"] == ("dataset_id", "resource_id")
+    assert index_spec["where"] == "resource_type = 'InsurancePlan'"
+
+    migration_text = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "20260713234000_provider_directory_plan_lookup_index.py"
+    ).read_text()
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in migration_text
+    assert "20260713233000_provider_directory_resource_identifiers" in migration_text

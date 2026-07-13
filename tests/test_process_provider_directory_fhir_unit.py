@@ -2398,6 +2398,16 @@ def test_alohr_provider_rows_emit_practitioner_location_and_role():
     assert role["location_refs"] == [f"Location/{location['resource_id']}"]
     assert role["telehealth"] == [{"supported": False}]
     assert role["accepting_medicaid"] is True
+    assert practitioner["resource_url"] == (
+        "urn:healthporta:provider-directory:alohr:"
+        "Practitioner:prac-1234567893"
+    )
+    assert location["resource_url"].startswith(
+        "urn:healthporta:provider-directory:alohr:Location:"
+    )
+    assert role["resource_url"].startswith(
+        "urn:healthporta:provider-directory:alohr:PractitionerRole:"
+    )
 
 
 @pytest.mark.parametrize(

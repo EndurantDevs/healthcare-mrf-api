@@ -392,8 +392,10 @@ Each returned `PractitionerRole` preserves the normalized operational fields
 when supplied by the directory: `available_time`, `not_available`,
 `availability_exceptions`, `new_patient_acceptance`, and `telehealth`, along
 with reviewed `accepting_medicaid` evidence when a source explicitly supplies
-that boolean, plus identity, active status, organization/service/endpoint references,
-specialty and code codings, telecom, and period. Each returned
+that boolean, plus all normalized role identifiers, active status,
+organization/service/endpoint references, specialty and code codings, telecom,
+and period. Identifier evidence retains use, type codings and text, system,
+value, validity period, and assigner reference/display when supplied. Each returned
 `InsurancePlan` preserves its product-level identifiers in
 `product_identifiers`, plan backbone structures in `plan_backbones`, and
 `coverage`, in addition to the existing plan identity, status, names, type,
@@ -401,11 +403,21 @@ owner/administrator references, and period. A plan can be useful even when it
 has no identifier, so consumers must not discard a typed plan solely because
 `identifier` is null.
 
+The immutable dataset also retains normalized identifiers on
+`HealthcareService` and `OrganizationAffiliation`. Healthcare services retain
+their source `comment` separately from `extra_details`; both fields can become
+source-backed doctor-profile service evidence. The profile's
+`years_of_practice` fact is an estimate derived from the earliest plausible
+qualification start date. Its value always travels with the derivation basis,
+basis start date, and as-of date; it is not a claim about the provider's age or
+an independently verified employment start date.
+
 Both resource shapes can include `fhir_provenance`. This is a bounded,
 sanitized projection for debugging and traceability, not the source FHIR
 resource: it may contain selected `meta` values, `self_url`, `fetch_url`, and
-`fetch_mode`. URL values are reduced to an identity form without credentials,
-query parameters, or fragments. Repeated metadata collections are capped at
+`fetch_mode`. URL values are reduced to an identity form without userinfo,
+query parameters, fragments, matrix parameters, or named credential path
+segments. Repeated metadata collections are capped at
 32 values and exposed text is capped at 2,048 characters; malformed or empty
 values are omitted. Treat this as diagnostic provenance, not as a URL to
 replay or an authorization artifact.
@@ -414,7 +426,9 @@ ALOHR roles are retained even when the public GraphQL row has no address.
 Missing telehealth or Medicaid-acceptance values remain unknown rather than
 being converted to `false`. ALOHR organization rows do not synthesize a
 self-referential `OrganizationAffiliation`; affiliations require explicit
-relationship evidence from a source.
+relationship evidence from a source. Synthetic ALOHR resource identities use
+non-replayable `urn:healthporta:provider-directory:alohr:...` values while the
+GraphQL endpoint remains the separately sanitized fetch provenance.
 
 Plan resolution is source-scoped and current-dataset scoped. For a requested
 role or affiliation, the resolver first restricts `InsurancePlan` candidates
@@ -422,6 +436,11 @@ to the same source IDs, then uses only resources in that source's current,
 published endpoint dataset. Direct plan references and Plan-Net/network-derived
 plans therefore cannot pull a historical plan row or a plan belonging to a
 different source alias into the evidence response.
+
+Inline evidence returns at most 100 plans per role. Exact `returned`, `total`,
+and `truncated` metadata tells consumers when the complete plan set must be
+queried through the catalog/search API instead of expanding it into every
+provider-detail response.
 
 Provider, plan, network, and location references are retained as raw FHIR
 references first. Address canonical linkage can be filled later through
