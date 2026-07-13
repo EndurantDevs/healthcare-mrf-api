@@ -133,6 +133,37 @@ class FakeResponse:
         return False
 
 
+class AddressAwareClient:
+    """Return mapped evidence only for an unbounded or exact-address request."""
+
+    def __init__(self, source_id, address_key):
+        self.source_id = source_id
+        self.address_key = address_key
+        self.request_list = []
+
+    def get_json(self, path, params):
+        self.request_list.append((path, dict(params)))
+        if path == "providers/1234567890":
+            payload = (
+                _detail_payload(self.source_id)
+                if params.get("address_limit") == "all"
+                else {"data": {"npi": {"address_list": []}}}
+            )
+        else:
+            payload = (
+                {
+                    "data": {
+                        "items": _detail_payload(self.source_id)["data"]["npi"][
+                            "address_list"
+                        ]
+                    }
+                }
+                if params.get("address_key") == self.address_key
+                else {"data": {"items": []}}
+            )
+        return support.HttpResult(200, 1.0, payload)
+
+
 def _api_config(base_url="https://api.example.test/api/v1", **overrides):
     return support.ApiConfig(
         base_url=base_url,
@@ -206,6 +237,35 @@ def test_overlay_query_is_current_deterministic_and_has_no_role_scan():
     assert "LIMIT $2" in sql
     assert "provider_directory_dataset_resource" not in sql
     assert "provider_directory_practitioner_role" not in sql
+
+
+def test_mapped_witness_query_retains_exact_address_key():
+    sql = evidence_db.mapped_evidence_candidate_sql("mrf")
+
+    assert "sampled.address_key" in sql
+    assert "overlay.address_key::text AS address_key" in sql
+    assert evidence_db._mapped_candidate_map(
+        [
+            {
+                "source_id": SOURCE_A,
+                "resource_type": "PractitionerRole",
+                "resource_id": "role-1",
+                "npi": 1234567890,
+                "address_key": "00000000-0000-0000-0000-000000000001",
+            }
+        ],
+        {SOURCE_A},
+    ) == {
+        SOURCE_A: {
+            "PractitionerRole": [
+                (
+                    1234567890,
+                    "role-1",
+                    "00000000-0000-0000-0000-000000000001",
+                )
+            ]
+        }
+    }
 
 
 @pytest.mark.asyncio
@@ -305,6 +365,43 @@ async def test_api_layer_routes_envelopes_and_typed_source_variants(
     )
     assert "very-secret-token" not in json.dumps(report)
     assert "5550101234" not in json.dumps(report)
+
+
+def test_mapped_witness_checks_exact_address_beyond_default_page():
+    """Exact mapped evidence must not depend on the default address page."""
+    address_key = "00000000-0000-0000-0000-000000000001"
+    witness = support.MappedEvidenceWitness(
+        SOURCE_A,
+        1234567890,
+        "PractitionerRole",
+        "role-1",
+        address_key=address_key,
+    )
+
+    client = AddressAwareClient(SOURCE_A, address_key)
+    witness_check = support._evaluate_witness(witness, client, 40.0)
+
+    assert witness_check["detail_evidence_present"] is True
+    assert witness_check["provider_search_evidence_present"] is True
+    assert client.request_list == [
+        (
+            "providers/1234567890",
+            {
+                "include_sources": "true",
+                "include_evidence": "true",
+                "address_limit": "all",
+            },
+        ),
+        (
+            "providers",
+            {
+                "npi": "1234567890",
+                "include_sources": "true",
+                "include_evidence": "true",
+                "address_key": address_key,
+            },
+        ),
+    ]
 
 
 @pytest.mark.parametrize(

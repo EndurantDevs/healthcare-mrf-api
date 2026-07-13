@@ -273,14 +273,17 @@ def _evaluate_witness(
 ) -> dict[str, Any]:
     detail_result = api_client.get_json(
         f"providers/{witness.npi}",
-        {"include_sources": "true", "include_evidence": "true"},
+        {
+            "include_sources": "true", "include_evidence": "true",
+            "address_limit": "all",
+        },
     )
     search_result = api_client.get_json(
         "providers",
         {
-            "npi": str(witness.npi),
-            "include_sources": "true",
+            "npi": str(witness.npi), "include_sources": "true",
             "include_evidence": "true",
+            **({"address_key": witness.address_key} if witness.address_key else {}),
         },
     )
     return {

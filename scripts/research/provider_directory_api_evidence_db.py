@@ -21,6 +21,7 @@ from scripts.research.provider_directory_api_evidence_support import (
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 MAPPED_RESOURCE_TYPES = ("PractitionerRole", "OrganizationAffiliation")
 MAX_EXPECTED_EVIDENCE_ITEMS = 20
+MappedEvidenceCandidate = tuple[int, str, str]
 
 
 def _quote_identifier(identifier: str, *, label: str) -> str:
@@ -106,13 +107,14 @@ def mapped_evidence_candidate_sql(schema: str) -> str:
                    ) IS NOT NULL
         )
         SELECT requested.source_id, requested.resource_type,
-               sampled.resource_id, sampled.npi
+               sampled.resource_id, sampled.npi, sampled.address_key
           FROM requested_resources AS requested
           JOIN current_sources AS current_source
             ON current_source.source_id = requested.source_id
          CROSS JOIN LATERAL (
               SELECT DISTINCT ON (overlay.resource_id)
-                     overlay.resource_id, overlay.npi
+                     overlay.resource_id, overlay.npi,
+                     overlay.address_key::text AS address_key
                 FROM {quoted_schema}.provider_directory_address_overlay AS overlay
                 JOIN {quoted_schema}.provider_directory_dataset_resource AS resource
                   ON resource.dataset_id = current_source.dataset_id
@@ -198,25 +200,29 @@ async def fetch_mapped_evidence_witnesses(
 
 def _mapped_candidate_map(
     candidate_row_list: Iterable[Any], allowed_source_ids: set[str]
-) -> dict[str, dict[str, list[tuple[int, str]]]]:
-    candidate_by_source: dict[str, dict[str, list[tuple[int, str]]]] = {}
+) -> dict[str, dict[str, list[MappedEvidenceCandidate]]]:
+    candidate_by_source: dict[
+        str, dict[str, list[MappedEvidenceCandidate]]
+    ] = {}
     for candidate_row in candidate_row_list:
         row_map = getattr(candidate_row, "_mapping", candidate_row)
         source_id = str(row_map.get("source_id") or "")
         resource_type = str(row_map.get("resource_type") or "")
         resource_id = str(row_map.get("resource_id") or "")
+        address_key = str(row_map.get("address_key") or "")
         npi_value = row_map.get("npi")
         if (
             source_id not in allowed_source_ids
             or resource_type not in MAPPED_RESOURCE_TYPES
             or not resource_id
+            or not address_key
             or npi_value is None
         ):
             continue
         resource_candidate_list = candidate_by_source.setdefault(
             source_id, {}
         ).setdefault(resource_type, [])
-        candidate = (int(npi_value), resource_id)
+        candidate = (int(npi_value), resource_id, address_key)
         if candidate not in resource_candidate_list:
             resource_candidate_list.append(candidate)
     return candidate_by_source
@@ -226,7 +232,7 @@ async def _fetch_source_witness_list(
     conn: Any,
     schema: str,
     selection: SourceSelection,
-    candidate_by_resource: Mapping[str, list[tuple[int, str]]],
+    candidate_by_resource: Mapping[str, list[MappedEvidenceCandidate]],
 ) -> list[MappedEvidenceWitness]:
     witness_list = []
     role_candidate_list = candidate_by_resource.get("PractitionerRole", [])
@@ -237,7 +243,10 @@ async def _fetch_source_witness_list(
                 has_affiliations="OrganizationAffiliation" in selection.resources,
             ),
             [selection.source_id] * len(role_candidate_list),
-            [resource_id for _npi, resource_id in role_candidate_list],
+            [
+                resource_id
+                for _npi, resource_id, _address_key in role_candidate_list
+            ],
         )
         witness_list.extend(
             _mapped_witnesses(role_candidate_list, role_row_list, "PractitionerRole")
@@ -249,7 +258,10 @@ async def _fetch_source_witness_list(
         affiliation_row_list = await conn.fetch(
             _asyncpg_affiliation_evidence_sql(schema),
             [selection.source_id] * len(affiliation_candidate_list),
-            [resource_id for _npi, resource_id in affiliation_candidate_list],
+            [
+                resource_id
+                for _npi, resource_id, _address_key in affiliation_candidate_list
+            ],
         )
         witness_list.extend(
             _mapped_witnesses(
@@ -262,7 +274,7 @@ async def _fetch_source_witness_list(
 
 
 def _mapped_witnesses(
-    candidate_list: list[tuple[int, str]],
+    candidate_list: list[MappedEvidenceCandidate],
     evidence_row_list: Iterable[Any],
     resource_type: str,
 ) -> list[MappedEvidenceWitness]:
@@ -279,7 +291,7 @@ def _mapped_witnesses(
             rows_by_id.setdefault(evidence_id, []).append(row_map)
 
     witness_list = []
-    for npi, resource_id in candidate_list:
+    for npi, resource_id, address_key in candidate_list:
         evidence_map_list = rows_by_id.get(resource_id, [])
         if not any(
             evidence_map.get("evidence_type") == base_evidence_type
@@ -306,6 +318,7 @@ def _mapped_witnesses(
                 resource_id,
                 tuple(plan_id_list),
                 network_list,
+                address_key,
             )
         )
     return witness_list

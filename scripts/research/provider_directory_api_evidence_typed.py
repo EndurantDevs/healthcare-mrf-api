@@ -25,6 +25,7 @@ class MappedEvidenceWitness:
     resource_id: str
     insurance_plan_ids: tuple[str, ...] = ()
     networks: tuple[NetworkWitness, ...] = ()
+    address_key: str | None = None
 
     @property
     def supports_completion(self) -> bool:
