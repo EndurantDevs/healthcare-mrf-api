@@ -18,19 +18,15 @@ importer = importlib.import_module("process.provider_directory_fhir")
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_PROFILE_ENTRY_IDS = {
-    "amerihealth-caritas-carrier",
-    "alohr",
-    "cigna",
-    "contra-costa",
-    "hap",
-    "health-partners-plans",
-    "iehp",
-    "texas-tmhp",
+PROFILE_SOURCE_CLASSIFICATIONS = {
+    "acquisition",
+    "bulk_acquisition",
+    "external",
 }
 
 
-def test_profile_source_spec_matches_the_eight_reviewed_manifest_entries():
+def test_profile_source_spec_matches_all_reviewed_acquisition_entries():
+    """Require every importable source and exclude every probe-only source."""
     source_spec = profile.load_profile_source_spec()
     manifest = json.loads(
         (
@@ -41,18 +37,23 @@ def test_profile_source_spec_matches_the_eight_reviewed_manifest_entries():
     entries_by_id = {
         entry["entry_id"]: entry for entry in manifest["entries"]
     }
+    expected_profile_entry_ids = {
+        entry_id
+        for entry_id, entry in entries_by_id.items()
+        if entry["classification"] in PROFILE_SOURCE_CLASSIFICATIONS
+    }
     expected_source_ids = {
         source_id
-        for entry_id in EXPECTED_PROFILE_ENTRY_IDS
+        for entry_id in expected_profile_entry_ids
         for source_id in entries_by_id[entry_id]["source_ids"]
     }
 
-    assert set(source_spec["entry_ids"]) == EXPECTED_PROFILE_ENTRY_IDS
+    assert set(source_spec["entry_ids"]) == expected_profile_entry_ids
     assert set(source_spec["source_ids"]) == expected_source_ids
     assert all(
         entries_by_id[entry_id]["classification"]
-        in {"acquisition", "external"}
-        for entry_id in EXPECTED_PROFILE_ENTRY_IDS
+        in PROFILE_SOURCE_CLASSIFICATIONS
+        for entry_id in source_spec["entry_ids"]
     )
 
 
