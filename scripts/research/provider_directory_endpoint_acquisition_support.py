@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,6 +37,7 @@ LAST_UPDATED_PROOF_METRIC_NAMES = (
     "last_updated_ranged_root_post",
     "last_updated_unfiltered_post",
 )
+CONTROL_GET_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0, 5.0, 5.0)
 
 
 def _is_import_param_match(
@@ -155,7 +157,34 @@ class ImportControlHttpClient:
         self.token_env = token_env
         self.timeout_seconds = timeout_seconds
 
-    def _request_json(self, path: str, method: str = "GET", body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _open_json_request(
+        self,
+        request: urllib.request.Request,
+        retry_delays: tuple[float, ...],
+    ) -> Any:
+        for retry_delay in (*retry_delays, None):
+            try:
+                with urllib.request.urlopen(  # nosec B310
+                    request,
+                    timeout=self.timeout_seconds,
+                ) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                raise RuntimeError(
+                    f"import-control returned HTTP {exc.code}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                if retry_delay is None:
+                    raise RuntimeError("import-control request failed") from exc
+                time.sleep(retry_delay)
+        raise RuntimeError("import-control request failed")
+
+    def _request_json(
+        self,
+        path: str,
+        method: str = "GET",
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         headers_by_name = {"Accept": "application/json"}
         token = os.getenv(self.token_env, "").strip()
         if token:
@@ -164,14 +193,16 @@ class ImportControlHttpClient:
         if body is not None:
             headers_by_name["Content-Type"] = "application/json"
             encoded_body = json.dumps(body).encode("utf-8")
-        request = urllib.request.Request(self.base_url + path, data=encoded_body, headers=headers_by_name, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:  # nosec B310
-                decoded_dict = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"import-control returned HTTP {exc.code}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError("import-control request failed") from exc
+        request = urllib.request.Request(
+            self.base_url + path,
+            data=encoded_body,
+            headers=headers_by_name,
+            method=method,
+        )
+        retry_delays = (
+            CONTROL_GET_RETRY_DELAYS_SECONDS if method.upper() == "GET" else ()
+        )
+        decoded_dict = self._open_json_request(request, retry_delays)
         if not isinstance(decoded_dict, dict):
             raise RuntimeError("import-control returned a non-object response")
         return decoded_dict
