@@ -18625,6 +18625,7 @@ async def _fetch_last_updated_partition_count(
     *,
     timeout: int,
 ) -> LastUpdatedCountFetch:
+    """Fetch one exact, non-paginated partition count observation."""
     status_code, response_payload, error, _elapsed = await _fetch_source_json(
         source_record,
         request_url,
@@ -18660,22 +18661,14 @@ async def _fetch_last_updated_partition_count(
             ),
             error="non_searchset_count_bundle",
         )
-    if response_payload.get("entry"):
+    count_shape_error = _last_updated_count_bundle_shape_error(
+        response_payload
+    )
+    if count_shape_error is not None:
+        error_code, error_message = count_shape_error
         return LastUpdatedCountFetch(
-            CountObservation.unknown(
-                "count response contained resource entries"
-            ),
-            error="count_bundle_contains_entries",
-        )
-    if any(
-        isinstance(link, dict) and link.get("relation") == "next"
-        for link in response_payload.get("link") or []
-    ):
-        return LastUpdatedCountFetch(
-            CountObservation.unknown(
-                "count response contained a next-page link"
-            ),
-            error="count_bundle_has_next_link",
+            CountObservation.unknown(error_message),
+            error=error_code,
         )
     total = response_payload.get("total")
     if isinstance(total, bool) or not isinstance(total, int) or total < 0:
@@ -18686,6 +18679,26 @@ async def _fetch_last_updated_partition_count(
             error="count_total_not_exact",
         )
     return LastUpdatedCountFetch(CountObservation.exact(total))
+
+
+def _last_updated_count_bundle_shape_error(
+    response_payload: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Reject servers that paginate or populate a summary-count Bundle."""
+    if response_payload.get("entry"):
+        return (
+            "count_bundle_contains_entries",
+            "count response contained resource entries",
+        )
+    if any(
+        isinstance(link, dict) and link.get("relation") == "next"
+        for link in response_payload.get("link") or []
+    ):
+        return (
+            "count_bundle_has_next_link",
+            "count response contained a next-page link",
+        )
+    return None
 
 
 def _last_updated_partition_resource_window_error(

@@ -3623,16 +3623,16 @@ async def test_upsert_resource_rows_writes_canonical_resource_and_source_edges(m
 
 
 @pytest.mark.asyncio
-async def test_dataset_backed_upsert_keeps_payload_only_in_endpoint_dataset(monkeypatch):
+async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(monkeypatch):
     upsert_calls = []
 
-    async def fake_upsert(model, rows, **kwargs):
-        upsert_calls.append((model, rows, kwargs))
-        return len(rows)
+    async def fake_upsert(model, resource_rows, **kwargs):
+        upsert_calls.append((model, resource_rows, kwargs))
+        return len(resource_rows)
 
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    rows = [
+    resource_rows = [
         {
             "source_id": "source_a",
             "resource_id": "role-1",
@@ -3644,7 +3644,7 @@ async def test_dataset_backed_upsert_keeps_payload_only_in_endpoint_dataset(monk
 
     written = await importer._upsert_resource_rows(
         ProviderDirectoryPractitionerRole,
-        rows,
+        resource_rows,
         run_id="run_1",
         track_seen=False,
         canonical_api_base="https://payer.example/fhir",
@@ -18408,7 +18408,7 @@ async def test_last_updated_partition_rejects_paginated_count_bundles(
     expected_error,
 ):
     directory_source = _last_updated_partition_test_source()
-    count_bundle = {
+    count_bundle_dict = {
         "resourceType": "Bundle",
         "type": "searchset",
         "total": 1,
@@ -18417,7 +18417,7 @@ async def test_last_updated_partition_rejects_paginated_count_bundles(
     monkeypatch.setattr(
         importer,
         "_fetch_source_json",
-        AsyncMock(return_value=(200, count_bundle, None, 1)),
+        AsyncMock(return_value=(200, count_bundle_dict, None, 1)),
     )
 
     count_fetch = await importer._fetch_last_updated_partition_count(
