@@ -347,7 +347,7 @@ def test_freshness_validation_accepts_current_reviews():
         ("horizon-nj", "approved Provider Directory API-product subscription"),
         ("missouri", "Practitioner response exceeds the 20 MiB cap"),
         ("scan", "1,000-result search ceiling"),
-        ("centene", "return CloudFront HTTP 403 before FHIR processing"),
+        ("centene", "Location requires at least one resource search parameter"),
         ("contra-costa", "Seven public collections follow opaque next-link pagination"),
         ("alohr", "FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr"),
     ],
