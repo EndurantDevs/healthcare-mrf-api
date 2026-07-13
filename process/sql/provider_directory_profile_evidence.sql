@@ -388,6 +388,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                            'availability_exceptions', role.availability_exceptions,
                            'new_patient_acceptance', role.new_patient_acceptance::jsonb,
                            'telehealth', role.telehealth::jsonb,
+                           'accepting_medicaid', role.accepting_medicaid,
                            'period_start', role.period_start,
                            'period_end', role.period_end
                        )
@@ -424,6 +425,18 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               CROSS JOIN LATERAL jsonb_array_elements(
                    COALESCE(role.telehealth::jsonb, '[]'::jsonb)
               ) AS telehealth(value)
+
+            UNION ALL
+            SELECT role.resolved_npi, 'accepting_medicaid',
+                   md5(role.accepting_medicaid::text),
+                   jsonb_build_object('accepted', role.accepting_medicaid),
+                   role.source_id, role.endpoint_id, role.dataset_id,
+                   role.canonical_api_base, role.source_org_name,
+                   role.source_plan_name, 'PractitionerRole', role.resource_id,
+                   role.resource_id, role.active, role.period_start,
+                   role.period_end, role.updated_at
+              FROM role_rows AS role
+             WHERE role.accepting_medicaid IS NOT NULL
 
             UNION ALL
             SELECT role.resolved_npi, 'organization',

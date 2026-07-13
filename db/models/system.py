@@ -891,6 +891,7 @@ class ProviderDirectoryPractitionerRole(Base, JSONOutputMixin):
     availability_exceptions = Column(TEXT)
     new_patient_acceptance = Column(JSON)
     telehealth = Column(JSON)
+    accepting_medicaid = Column(Boolean)
     period_start = Column(String(64))
     period_end = Column(String(64))
     last_seen_run_id = Column(String(64))

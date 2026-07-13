@@ -391,7 +391,8 @@ for every candidate. Fetch the selected provider detail with
 Each returned `PractitionerRole` preserves the normalized operational fields
 when supplied by the directory: `available_time`, `not_available`,
 `availability_exceptions`, `new_patient_acceptance`, and `telehealth`, along
-with identity, active status, organization/service/endpoint references,
+with reviewed `accepting_medicaid` evidence when a source explicitly supplies
+that boolean, plus identity, active status, organization/service/endpoint references,
 specialty and code codings, telecom, and period. Each returned
 `InsurancePlan` preserves its product-level identifiers in
 `product_identifiers`, plan backbone structures in `plan_backbones`, and
@@ -408,6 +409,12 @@ query parameters, or fragments. Repeated metadata collections are capped at
 32 values and exposed text is capped at 2,048 characters; malformed or empty
 values are omitted. Treat this as diagnostic provenance, not as a URL to
 replay or an authorization artifact.
+
+ALOHR roles are retained even when the public GraphQL row has no address.
+Missing telehealth or Medicaid-acceptance values remain unknown rather than
+being converted to `false`. ALOHR organization rows do not synthesize a
+self-referential `OrganizationAffiliation`; affiliations require explicit
+relationship evidence from a source.
 
 Plan resolution is source-scoped and current-dataset scoped. For a requested
 role or affiliation, the resolver first restricts `InsurancePlan` candidates

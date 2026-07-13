@@ -2376,6 +2376,8 @@ def test_alohr_provider_rows_emit_practitioner_location_and_role():
             "phone": "+12055550123",
             "specialty": "207Q00000X",
             "specialtyDescription": "Family Medicine Physician",
+            "telehealth": False,
+            "acceptingMedicaid": True,
             "addresses": [
                 {"type": "work", "street1": "100 Main St", "city": "Birmingham", "state": "AL", "zip": "35203"}
             ],
@@ -2394,6 +2396,71 @@ def test_alohr_provider_rows_emit_practitioner_location_and_role():
     assert location["zip5"] == "35203"
     assert role["practitioner_ref"] == "Practitioner/prac-1234567893"
     assert role["location_refs"] == [f"Location/{location['resource_id']}"]
+    assert role["telehealth"] == [{"supported": False}]
+    assert role["accepting_medicaid"] is True
+
+
+@pytest.mark.parametrize(
+    ("provider_fields", "expected_telehealth", "expected_accepting_medicaid"),
+    [
+        ({}, [], None),
+        ({"telehealth": None, "acceptingMedicaid": None}, [], None),
+        ({"telehealth": True, "acceptingMedicaid": False}, [{"supported": True}], False),
+    ],
+)
+def test_alohr_addressless_provider_keeps_role_without_inventing_booleans(
+    provider_fields,
+    expected_telehealth,
+    expected_accepting_medicaid,
+):
+    rows_by_model: dict[type, list[dict[str, Any]]] = {}
+
+    importer._append_alohr_provider_rows(
+        rows_by_model,
+        "source_alohr",
+        {
+            "providerId": "provider-without-address",
+            "firstName": "Ada",
+            "lastName": "Lovelace",
+            "npi": "1234567893",
+            "specialty": "207Q00000X",
+            **provider_fields,
+        },
+        run_id="run_1",
+    )
+
+    assert ProviderDirectoryLocation not in rows_by_model
+    role = rows_by_model[ProviderDirectoryPractitionerRole][0]
+    assert role["location_refs"] == []
+    assert role["specialty_codes"][0]["code"] == "207Q00000X"
+    assert role["telehealth"] == expected_telehealth
+    assert role["accepting_medicaid"] is expected_accepting_medicaid
+
+
+def test_alohr_organization_does_not_invent_self_affiliation():
+    rows_by_model: dict[type, list[dict[str, Any]]] = {}
+
+    importer._append_alohr_organization_rows(
+        rows_by_model,
+        "source_alohr",
+        {
+            "orgId": "org-1",
+            "name": "Example Clinic",
+            "addresses": [
+                {
+                    "street1": "100 Main St",
+                    "city": "Birmingham",
+                    "state": "AL",
+                    "zip": "35203",
+                }
+            ],
+        },
+        run_id="run_1",
+    )
+
+    assert len(rows_by_model[ProviderDirectoryOrganization]) == 1
+    assert len(rows_by_model[ProviderDirectoryLocation]) == 1
+    assert ProviderDirectoryOrganizationAffiliation not in rows_by_model
 
 
 def test_fhir_address_normalizes_numeric_state_fips():
@@ -3735,7 +3802,8 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
     assert counts["Location"] == 2
     assert counts["PractitionerRole"] == 1
     assert counts["Organization"] == 1
-    assert counts["OrganizationAffiliation"] == 1
+    assert counts["OrganizationAffiliation"] == 0
+    assert ProviderDirectoryOrganizationAffiliation not in upserts
     assert upserts[ProviderDirectoryOrganization][0]["npi"] == 1992793046
     assert diagnostics["Practitioner"]["complete"] is True
     assert diagnostics["Organization"]["rows_written"] == 1

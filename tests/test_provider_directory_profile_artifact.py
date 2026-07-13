@@ -105,6 +105,7 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
         "specialty",
         "new_patient_acceptance",
         "telehealth",
+        "accepting_medicaid",
         "organization",
         "service",
     ):

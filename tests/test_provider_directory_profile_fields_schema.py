@@ -11,6 +11,7 @@ from db.models import (
     ProviderDirectoryLocation,
     ProviderDirectoryOrganization,
     ProviderDirectoryPractitioner,
+    ProviderDirectoryPractitionerRole,
 )
 
 
@@ -214,3 +215,42 @@ def test_practitioner_derived_profile_migration_matches_models(monkeypatch):
     assert {
         column_name for _, column_name, _ in recorder.dropped_columns
     } == DERIVED_PRACTITIONER_COLUMN_NAMES
+
+
+def test_role_accepting_medicaid_migration_matches_model(monkeypatch):
+    migration = _load_migration(
+        "20260713230000_provider_directory_role_accepting_medicaid.py"
+    )
+    recorder = _OpRecorder()
+    monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
+    monkeypatch.setattr(migration, "op", recorder)
+
+    migration.upgrade()
+
+    assert migration.revision == (
+        "20260713230000_provider_directory_role_accepting_medicaid"
+    )
+    assert migration.down_revision == (
+        "20260713220000_provider_directory_practitioner_derived_profile"
+    )
+    assert len(recorder.added_columns) == 1
+    table_name, column, kwargs = recorder.added_columns[0]
+    assert table_name == ProviderDirectoryPractitionerRole.__tablename__
+    assert column.name == "accepting_medicaid"
+    assert isinstance(column.type, sa.Boolean)
+    assert column.nullable is True
+    assert kwargs["schema"] == "mrf"
+    assert isinstance(
+        ProviderDirectoryPractitionerRole.__table__.c.accepting_medicaid.type,
+        sa.Boolean,
+    )
+
+    migration.downgrade()
+
+    assert recorder.dropped_columns == [
+        (
+            ProviderDirectoryPractitionerRole.__tablename__,
+            "accepting_medicaid",
+            {"schema": "mrf"},
+        )
+    ]

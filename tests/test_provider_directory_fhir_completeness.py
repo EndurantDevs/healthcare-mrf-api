@@ -96,6 +96,13 @@ PRACTITIONER_ROLE_COMPLETENESS_RESOURCE = {
         },
         {
             "url": (
+                "https://healthporta.com/fhir/provider-directory/"
+                "accepting-medicaid"
+            ),
+            "valueBoolean": True,
+        },
+        {
+            "url": (
                 "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
                 "StructureDefinition/delivery-method"
             ),
@@ -212,6 +219,7 @@ def test_practitioner_role_separates_availability_new_patients_and_telehealth():
     assert role_row["accepting_patients"] == expected_new_patients
     assert role_row["telehealth"][0] == {"supported": False}
     assert role_row["telehealth"][1]["virtual_modalities"][0]["code"] == "video"
+    assert role_row["accepting_medicaid"] is True
     serialized_row = json.dumps(role_row, default=str)
     assert "unreviewed" not in serialized_row
     assert "arbitrary" not in serialized_row
@@ -279,7 +287,10 @@ def test_rest_bundle_provenance_redacts_fetch_query():
             "resourceType": "Bundle",
             "entry": [
                 {
-                    "fullUrl": "https://payer.example/fhir/PractitionerRole/role-1",
+                    "fullUrl": (
+                        "https://user:pass@payer.example/fhir/PractitionerRole/role-1"
+                        "?access_token=secret#history"
+                    ),
                     "resource": {"resourceType": "PractitionerRole", "id": "role-1"},
                 }
             ],
@@ -292,6 +303,8 @@ def test_rest_bundle_provenance_redacts_fetch_query():
     assert role_rows[0]["fhir_self_url"].endswith("/PractitionerRole/role-1")
     assert role_rows[0]["fhir_fetch_url"] == "https://payer.example/fhir/PractitionerRole"
     assert role_rows[0]["fhir_fetch_mode"] == "rest_bundle"
+    assert "secret" not in json.dumps(role_rows[0], default=str)
+    assert "pass" not in role_rows[0]["resource_url"]
 
 
 def test_bundle_urn_self_identity_is_preserved_without_query_data():

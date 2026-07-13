@@ -1739,6 +1739,7 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
                role.availability_exceptions AS role_availability_exceptions,
                role.new_patient_acceptance::jsonb AS role_new_patient_acceptance,
                role.telehealth AS role_telehealth,
+               role.accepting_medicaid AS role_accepting_medicaid,
                role.fhir_meta::jsonb AS role_fhir_meta,
                role.fhir_self_url AS role_fhir_self_url,
                role.fhir_fetch_url AS role_fhir_fetch_url,
@@ -1962,7 +1963,8 @@ _PROVIDER_DIRECTORY_ROLE_EVIDENCE_SQL_TEMPLATE = """
            role.role_specialty_codes, role.role_code_codes, role.role_telecom,
            role.role_period_start, role.role_period_end, role.role_available_time,
            role.role_not_available, role.role_availability_exceptions,
-           role.role_new_patient_acceptance, role.role_telehealth, role.role_fhir_meta,
+           role.role_new_patient_acceptance, role.role_telehealth,
+           role.role_accepting_medicaid, role.role_fhir_meta,
            role.role_fhir_self_url, role.role_fhir_fetch_url, role.role_fhir_fetch_mode,
            {plan_payload_sql} AS plan_payload_json,
            evidence_count.evidence_row_total
@@ -2210,6 +2212,7 @@ def _provider_directory_role_detail(mapping: Mapping[str, Any]) -> dict[str, Any
         "availability_exceptions",
         "new_patient_acceptance",
         "telehealth",
+        "accepting_medicaid",
     ):
         field_value = mapping.get(f"role_{field_name}")
         if field_value is not None:

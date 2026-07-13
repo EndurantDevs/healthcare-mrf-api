@@ -170,6 +170,11 @@ REVIEWED_TELEHEALTH_EXTENSION_URLS = frozenset(
         "https://healthporta.com/fhir/provider-directory/telehealth",
     }
 )
+REVIEWED_ACCEPTING_MEDICAID_EXTENSION_URLS = frozenset(
+    {
+        "https://healthporta.com/fhir/provider-directory/accepting-medicaid",
+    }
+)
 FHIR_FETCH_MODES = frozenset(
     {"rest_bundle", "rest_read", "bulk_ndjson", "graphql"}
 )
@@ -2251,13 +2256,73 @@ def _sanitized_fhir_url_identity(url: str | None) -> str | None:
     )
 
 
+def _sanitized_fhir_meta_codings(value: Any) -> list[dict[str, Any]]:
+    """Keep a bounded, replay-safe projection of FHIR Meta codings."""
+
+    coding_values = [value] if isinstance(value, dict) else value
+    if not isinstance(coding_values, list):
+        return []
+    codings: list[dict[str, Any]] = []
+    for coding in coding_values[:32]:
+        if not isinstance(coding, dict):
+            continue
+        coding_by_field = {
+            "system": _sanitized_fhir_url_identity(coding.get("system")),
+            "version": _profile_text(coding.get("version"), max_length=256),
+            "code": _profile_text(coding.get("code"), max_length=256),
+            "display": _profile_text(coding.get("display")),
+            "userSelected": (
+                coding.get("userSelected")
+                if isinstance(coding.get("userSelected"), bool)
+                else None
+            ),
+        }
+        cleaned_coding_by_field = {
+            key: field_value
+            for key, field_value in coding_by_field.items()
+            if field_value is not None
+        }
+        if cleaned_coding_by_field:
+            codings.append(cleaned_coding_by_field)
+    return codings
+
+
+def _sanitized_fhir_meta(value: Any) -> dict[str, Any] | None:
+    """Return the reviewed subset of FHIR Meta without replayable URLs."""
+
+    if not isinstance(value, dict):
+        return None
+    profile_values = value.get("profile")
+    if isinstance(profile_values, str):
+        profile_values = [profile_values]
+    profiles = []
+    if isinstance(profile_values, list):
+        for profile in profile_values[:32]:
+            sanitized = _sanitized_fhir_url_identity(profile)
+            if sanitized:
+                profiles.append(sanitized)
+    meta_by_field = {
+        "versionId": _profile_text(value.get("versionId"), max_length=256),
+        "lastUpdated": _profile_text(value.get("lastUpdated"), max_length=64),
+        "source": _sanitized_fhir_url_identity(value.get("source")),
+        "profile": profiles or None,
+        "security": _sanitized_fhir_meta_codings(value.get("security")) or None,
+        "tag": _sanitized_fhir_meta_codings(value.get("tag")) or None,
+    }
+    cleaned_meta_by_field = {
+        key: field_value
+        for key, field_value in meta_by_field.items()
+        if field_value is not None
+    }
+    return cleaned_meta_by_field or None
+
+
 def _fhir_acquisition_fields(
     resource: dict[str, Any],
     acquisition: FHIRAcquisitionContext | None,
 ) -> dict[str, Any]:
-    metadata = resource.get("meta")
     return {
-        "fhir_meta": metadata if isinstance(metadata, dict) else None,
+        "fhir_meta": _sanitized_fhir_meta(resource.get("meta")),
         "fhir_self_url": _sanitized_fhir_url_identity(
             acquisition.self_url if acquisition else None
         ),
@@ -5150,6 +5215,7 @@ def _codings(values: Any) -> list[dict[str, Any]]:
     for value in values:
         if not isinstance(value, dict):
             continue
+        concept_items: list[dict[str, Any]] = []
         for coding in value.get("coding") or []:
             if not isinstance(coding, dict):
                 continue
@@ -5159,10 +5225,14 @@ def _codings(values: Any) -> list[dict[str, Any]]:
                 "display": _clean_text(coding.get("display")),
             }
             if any(item.values()):
-                result.append(item)
+                concept_items.append(item)
         text = _clean_text(value.get("text"))
-        if text and not result:
-            result.append({"text": text})
+        if text:
+            if concept_items:
+                concept_items[0]["text"] = text
+            else:
+                concept_items.append({"text": text})
+        result.extend(concept_items)
     return result
 
 
@@ -5441,6 +5511,20 @@ def _reviewed_telehealth(resource: dict[str, Any]) -> list[dict[str, Any]]:
     return telehealth_entries
 
 
+def _reviewed_boolean_extension(
+    resource: dict[str, Any],
+    extension_urls: frozenset[str],
+) -> bool | None:
+    values = {
+        extension["valueBoolean"]
+        for extension in resource.get("extension") or []
+        if isinstance(extension, dict)
+        and _extension_url(extension) in extension_urls
+        and isinstance(extension.get("valueBoolean"), bool)
+    }
+    return next(iter(values)) if len(values) == 1 else None
+
+
 def _practitioner_role_completeness_fields(
     resource: dict[str, Any],
 ) -> dict[str, Any]:
@@ -5462,6 +5546,10 @@ def _practitioner_role_completeness_fields(
         ),
         "new_patient_acceptance": new_patient_entries,
         "telehealth": _reviewed_telehealth(resource),
+        "accepting_medicaid": _reviewed_boolean_extension(
+            resource,
+            REVIEWED_ACCEPTING_MEDICAID_EXTENSION_URLS,
+        ),
     }
 
 
@@ -6175,7 +6263,7 @@ def _fhir_resource_base_fields(
     return {
         "source_id": source_id,
         "resource_id": _resource_id(resource),
-        "resource_url": resource_url,
+        "resource_url": _sanitized_fhir_url_identity(resource_url),
         **_fhir_acquisition_fields(resource, acquisition),
         "last_seen_run_id": run_id,
         "observed_at": observed_at,
@@ -6573,6 +6661,54 @@ def _append_alohr_parsed_resource(
         rows_by_model.setdefault(model, []).append(row)
 
 
+def _alohr_reviewed_boolean_extensions(
+    provider: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Map only explicit ALOHR booleans into reviewed local extensions."""
+
+    extensions = []
+    for extension_url, value in (
+        (
+            "https://healthporta.com/fhir/provider-directory/telehealth",
+            provider.get("telehealth"),
+        ),
+        (
+            "https://healthporta.com/fhir/provider-directory/accepting-medicaid",
+            provider.get("acceptingMedicaid"),
+        ),
+    ):
+        if isinstance(value, bool):
+            extensions.append(
+                {"url": extension_url, "valueBoolean": value}
+            )
+    return extensions
+
+
+def _alohr_provider_role_resource(
+    provider: dict[str, Any],
+    provider_id: str,
+    location_refs: list[dict[str, str]],
+    specialty: list[dict[str, Any]],
+    telecom: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build one role without requiring an address-backed Location."""
+
+    return {
+        "resourceType": "PractitionerRole",
+        "id": _alohr_resource_id(
+            "role",
+            provider_id,
+            ",".join(ref["reference"] for ref in location_refs),
+        ),
+        "active": True,
+        "practitioner": {"reference": f"Practitioner/{provider_id}"},
+        "location": location_refs,
+        "specialty": [{"coding": specialty}] if specialty else [],
+        "telecom": telecom,
+        "extension": _alohr_reviewed_boolean_extensions(provider),
+    }
+
+
 def _append_alohr_provider_rows(
     rows_by_model: dict[type, list[dict[str, Any]]],
     source_id: str,
@@ -6580,6 +6716,8 @@ def _append_alohr_provider_rows(
     *,
     run_id: str | None,
 ) -> None:
+    """Append normalized Practitioner, Location, and role rows for ALOHR."""
+
     provider_id = _clean_text(provider.get("providerId")) or _alohr_resource_id("prac", provider.get("npi"), provider.get("firstName"), provider.get("lastName"))
     full_name = " ".join(value for value in (_clean_text(provider.get("firstName")), _clean_text(provider.get("lastName"))) if value)
     telecom = _alohr_telecom(provider.get("phone"), provider.get("email"))
@@ -6609,21 +6747,14 @@ def _append_alohr_provider_rows(
         location = _alohr_location_resource(provider_id, full_name or provider_id, address, telecom)
         _append_alohr_parsed_resource(rows_by_model, source_id, location, run_id=run_id)
         location_refs.append({"reference": f"Location/{location['id']}"})
-    if location_refs:
-        role = {
-            "resourceType": "PractitionerRole",
-            "id": _alohr_resource_id("role", provider_id, ",".join(ref["reference"] for ref in location_refs)),
-            "active": True,
-            "practitioner": {"reference": f"Practitioner/{provider_id}"},
-            "location": location_refs,
-            "specialty": [{"coding": specialty}] if specialty else [],
-            "telecom": telecom,
-            "extension": [
-                {"url": "https://healthporta.com/fhir/provider-directory/telehealth", "valueBoolean": bool(provider.get("telehealth"))},
-                {"url": "https://healthporta.com/fhir/provider-directory/accepting-medicaid", "valueBoolean": bool(provider.get("acceptingMedicaid"))},
-            ],
-        }
-        _append_alohr_parsed_resource(rows_by_model, source_id, role, run_id=run_id)
+    role = _alohr_provider_role_resource(
+        provider,
+        provider_id,
+        location_refs,
+        specialty,
+        telecom,
+    )
+    _append_alohr_parsed_resource(rows_by_model, source_id, role, run_id=run_id)
 
 
 def _append_alohr_organization_rows(
@@ -6655,22 +6786,9 @@ def _append_alohr_organization_rows(
         "address": _alohr_address_items(organization),
     }
     _append_alohr_parsed_resource(rows_by_model, source_id, org_resource, run_id=run_id)
-    location_refs: list[dict[str, str]] = []
     for address in _alohr_address_items(organization):
         location = _alohr_location_resource(org_id, _clean_text(organization.get("name")) or org_id, address, telecom)
         _append_alohr_parsed_resource(rows_by_model, source_id, location, run_id=run_id)
-        location_refs.append({"reference": f"Location/{location['id']}"})
-    if location_refs:
-        affiliation = {
-            "resourceType": "OrganizationAffiliation",
-            "id": _alohr_resource_id("affiliation", org_id, ",".join(ref["reference"] for ref in location_refs)),
-            "active": True,
-            "organization": {"reference": f"Organization/{org_id}"},
-            "participatingOrganization": {"reference": f"Organization/{org_id}"},
-            "location": location_refs,
-            "specialty": [{"coding": specialty}] if specialty else [],
-        }
-        _append_alohr_parsed_resource(rows_by_model, source_id, affiliation, run_id=run_id)
 
 
 def provider_directory_address_corroboration_sql(
