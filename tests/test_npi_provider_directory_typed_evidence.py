@@ -108,15 +108,15 @@ def test_role_evidence_sql_projects_typed_details_without_catalog_refs():
     assert "returned_plan_details AS MATERIALIZED" not in sql
 
 
-def test_current_insurance_plan_ctes_start_from_requested_sources():
+def test_legacy_insurance_plan_ctes_start_from_incomplete_requested_sources():
     role_sql = npi_module._provider_directory_role_evidence_sql("mrf", has_catalog=True)
     affiliation_sql = npi_module._provider_directory_affiliation_evidence_sql(
         "mrf", has_catalog=True
     )
 
     for sql, source_cte, scope_name in (
-        (role_sql, "roles", "current_role_insurance_plans"),
-        (affiliation_sql, "affiliations", "current_affiliation_insurance_plans"),
+        (role_sql, "roles", "legacy_role_insurance_plans"),
+        (affiliation_sql, "affiliations", "legacy_affiliation_insurance_plans"),
     ):
         assert f"{scope_name}_sources AS MATERIALIZED" in sql
         assert f"FROM {source_cte}" in sql

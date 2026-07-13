@@ -1469,12 +1469,14 @@ def _role_catalog_status_cte_sql(schema: str) -> str:
 def _scoped_current_insurance_plan_ctes_sql(
     source_cte_name: str,
     scope_name: str,
+    source_filter_sql: str = "",
 ) -> str:
     """Fence current InsurancePlan rows to the requested evidence sources first."""
     return f"""
     {scope_name}_sources AS MATERIALIZED (
         SELECT DISTINCT dataset_id, source_id
           FROM {source_cte_name}
+          {source_filter_sql}
     ), {scope_name} AS MATERIALIZED (
         SELECT current_plan.*
           FROM {scope_name}_sources AS requested_source
@@ -1505,7 +1507,7 @@ def _dataset_role_plan_sql(schema: str) -> str:
           JOIN {schema}.{PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE} AS network_plan
             ON network_plan.dataset_id = role_network.dataset_id
            AND network_plan.network_resource_id = role_network.resource_id
-          JOIN current_role_insurance_plans AS insurance_plan
+          JOIN current_insurance_plans AS insurance_plan
             ON insurance_plan.dataset_id = network_plan.dataset_id
            AND insurance_plan.source_id = role_network.source_id
            AND insurance_plan.resource_id = network_plan.insurance_plan_resource_id
@@ -1552,7 +1554,7 @@ def _legacy_role_plan_sql(has_dataset_network_plan: bool) -> str:
            AND catalog_status.source_id = role_network.source_id
            AND catalog_status.role_id = role_network.role_id
            AND catalog_status.catalog_complete
-          JOIN current_role_insurance_plans AS insurance_plan
+          JOIN legacy_role_insurance_plans AS insurance_plan
             ON insurance_plan.dataset_id = role_network.dataset_id
            AND insurance_plan.source_id = role_network.source_id
            AND {insurance_plan_active}
@@ -1586,7 +1588,12 @@ def _network_derived_role_plans_cte_sql(
     """Derive role plans from dataset edges with a legacy JSON fallback."""
     scoped_plan_ctes_sql = _scoped_current_insurance_plan_ctes_sql(
         "roles",
-        "current_role_insurance_plans",
+        "legacy_role_insurance_plans",
+        (
+            "WHERE NOT dataset_network_plan_complete"
+            if has_dataset_network_plan
+            else ""
+        ),
     )
     dataset_plan_cte_sql = (
         _dataset_role_plan_sql(schema)
@@ -2377,7 +2384,7 @@ def _dataset_affiliation_plan_sql(schema: str) -> str:
           JOIN {schema}.{PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE} AS network_plan
             ON network_plan.dataset_id = affiliation_network.dataset_id
            AND network_plan.network_resource_id = affiliation_network.resource_id
-          JOIN current_affiliation_insurance_plans AS insurance_plan
+          JOIN current_insurance_plans AS insurance_plan
             ON insurance_plan.dataset_id = network_plan.dataset_id
            AND insurance_plan.source_id = affiliation_network.source_id
            AND insurance_plan.resource_id = network_plan.insurance_plan_resource_id
@@ -2407,7 +2414,7 @@ def _legacy_affiliation_plan_sql(has_dataset_network_plan: bool) -> str:
                NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS identifier,
                'organization-affiliation-network-derived'::varchar AS provenance
           FROM valid_affiliation_networks AS affiliation_network
-          JOIN current_affiliation_insurance_plans AS insurance_plan
+          JOIN legacy_affiliation_insurance_plans AS insurance_plan
             ON insurance_plan.dataset_id = affiliation_network.dataset_id
            AND insurance_plan.source_id = affiliation_network.source_id
            AND {insurance_plan_active}
@@ -2431,7 +2438,12 @@ def _affiliation_plan_resolution_cte_sql(
     """Resolve affiliation plans from dataset edges with a legacy fallback."""
     scoped_plan_ctes_sql = _scoped_current_insurance_plan_ctes_sql(
         "affiliations",
-        "current_affiliation_insurance_plans",
+        "legacy_affiliation_insurance_plans",
+        (
+            "WHERE NOT dataset_network_plan_complete"
+            if has_dataset_network_plan
+            else ""
+        ),
     )
     dataset_plan_cte_sql = (
         _dataset_affiliation_plan_sql(schema)

@@ -88,7 +88,9 @@ def test_affiliation_evidence_sql_fences_current_networks_and_resolved_plans():
     assert "JOIN current_affiliations AS affiliation" in sql
     assert "provider_directory_organization_affiliation AS affiliation" not in sql
     assert "JOIN current_organizations AS network_organization" in sql
-    assert "JOIN current_affiliation_insurance_plans AS insurance_plan" in sql
+    assert "JOIN current_insurance_plans AS insurance_plan" in sql
+    assert "JOIN legacy_affiliation_insurance_plans AS insurance_plan" in sql
+    assert "legacy_affiliation_insurance_plans_sources AS MATERIALIZED" in sql
     assert "provider_directory_dataset_network_plan AS network_plan" in sql
     assert "network_plan.dataset_id = affiliation_network.dataset_id" in sql
     assert "network_plan.network_resource_id = affiliation_network.resource_id" in sql
