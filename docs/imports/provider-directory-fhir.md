@@ -1209,13 +1209,13 @@ supplement, include credentialed/auth-required sources when credentials are
 configured, run a full resource refresh (`resource_limit=0`,
 `resource_deadline_seconds=21600`, `linked_resource_limit=0`,
 `linked_resource_deadline_seconds=1800`, `page_limit=0`, `page_count=100`,
-`stream_batch_size=5000`, `bulk_export=false`, `source_concurrency=1`). The
+`stream_batch_size=5000`, `bulk_export=true`, `source_concurrency=1`). The
 acquisition schedule also sets `stale_cleanup=false`,
 `publish_artifacts=false`, `publish_after_acquisition=false`, and
 `publish_corroboration=false`. This keeps remote acquisition resumable and
 separate from the later projection and artifact-publication schedules. The
-documented schedule currently leaves `bulk_export=false`; setting it to true on
-this acquisition shape enables durable unbounded Aetna Commercial Bulk Data.
+acquisition schedule enables durable unbounded Aetna Commercial Bulk Data when
+the credentialed endpoint advertises a supported export operation.
 The importer will not enable unbounded Aetna Bulk if stale deletion or artifact
 publication is folded back into the acquisition run. Paged fallback remains
 available before a Bulk job is accepted, and accepted jobs must resume from the
