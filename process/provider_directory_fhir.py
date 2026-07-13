@@ -4109,11 +4109,49 @@ def _molina_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] |
     }
 
 
-def _uhc_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
-    api_base = _canonical_base(row.get("api_base"))
-    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
-    source_url = (_clean_text(row.get("source_url")) or "").lower()
-    org_name = (_clean_text(row.get("org_name")) or "").lower()
+def _uhc_provider_directory_override_metadata(
+    source_row: dict[str, Any],
+) -> dict[str, Any]:
+    """Build fail-closed metadata for the public Optum FLEX endpoint."""
+    return {
+        "provider_directory_override": "uhc_flex_optum_fhirpublic_r4",
+        "provider_directory_override_reason": (
+            "UnitedHealthcare publishes Provider Directory Core metadata under the Optum FLEX "
+            "public R4 FHIR base; seed rows can point at the UHC interoperability landing page."
+        ),
+        "provider_directory_previous_api_base": _clean_text(
+            source_row.get("api_base")
+        ),
+        "provider_directory_confirmed_base": UHC_PROVIDER_DIRECTORY_BASE,
+        "provider_directory_confirmed_catalog_url": UHC_INTEROPERABILITY_APIS_URL,
+        "provider_directory_confirmed_metadata_url": UHC_PROVIDER_DIRECTORY_METADATA_URL,
+        "provider_directory_resource_page_count_caps": {"InsurancePlan": 1},
+        "provider_directory_supported_resources": list(UHC_SUPPORTED_RESOURCES),
+        "provider_directory_fully_enumerable_resources": [],
+        "provider_directory_coverage_mode": "probe_only",
+        "provider_directory_acquisition_enabled": False,
+        "provider_directory_blocked_reason": (
+            PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
+        ),
+        "provider_directory_acquisition_blocked_reason": (
+            "The public Optum FLEX endpoint caps core collections at 10,000 rows, "
+            "does not expose a complete residual partition, and cannot prove a "
+            "complete product-scoped provider directory."
+        ),
+        "provider_directory_expected_nonempty_resources": sorted(
+            STATE_EXPECTED_NONEMPTY_RESOURCES
+        ),
+    }
+
+
+def _uhc_provider_directory_override(
+    source_row: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Normalize UHC portal and stale hosts to the probe-only FLEX base."""
+    api_base = _canonical_base(source_row.get("api_base"))
+    portal_url = (_clean_text(source_row.get("portal_url")) or "").lower()
+    source_url = (_clean_text(source_row.get("source_url")) or "").lower()
+    org_name = (_clean_text(source_row.get("org_name")) or "").lower()
     parsed_api_base = urllib.parse.urlsplit(api_base or "")
     api_host = parsed_api_base.netloc.lower()
     api_path = parsed_api_base.path.lower()
@@ -4140,35 +4178,7 @@ def _uhc_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | No
         "auth_type": "none",
         "last_validated_status": "valid",
         "endpoints": _source_override_endpoint_fields(UHC_PROVIDER_DIRECTORY_BASE),
-        "metadata": {
-            "provider_directory_override": "uhc_flex_optum_fhirpublic_r4",
-            "provider_directory_override_reason": (
-                "UnitedHealthcare publishes Provider Directory Core metadata under the Optum FLEX "
-                "public R4 FHIR base; seed rows can point at the UHC interoperability landing page."
-            ),
-            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
-            "provider_directory_confirmed_base": UHC_PROVIDER_DIRECTORY_BASE,
-            "provider_directory_confirmed_catalog_url": UHC_INTEROPERABILITY_APIS_URL,
-            "provider_directory_confirmed_metadata_url": UHC_PROVIDER_DIRECTORY_METADATA_URL,
-            "provider_directory_resource_page_count_caps": {
-                "InsurancePlan": 1,
-            },
-            "provider_directory_supported_resources": list(UHC_SUPPORTED_RESOURCES),
-            "provider_directory_fully_enumerable_resources": [],
-            "provider_directory_coverage_mode": "probe_only",
-            "provider_directory_acquisition_enabled": False,
-            "provider_directory_blocked_reason": (
-                PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
-            ),
-            "provider_directory_acquisition_blocked_reason": (
-                "The public Optum FLEX endpoint caps core collections at 10,000 rows, "
-                "does not expose a complete residual partition, and cannot prove a "
-                "complete product-scoped provider directory."
-            ),
-            "provider_directory_expected_nonempty_resources": sorted(
-                STATE_EXPECTED_NONEMPTY_RESOURCES
-            ),
-        },
+        "metadata": _uhc_provider_directory_override_metadata(source_row),
     }
 
 
@@ -22459,8 +22469,8 @@ async def _import_resources(
     require_complete_resources: bool = False,
 ) -> dict[str, int]:
     counts: dict[str, int] = {resource: 0 for resource in resources}
-    for source in sources:
-        _assert_resource_acquisition_allowed(source)
+    for source_record in sources:
+        _assert_resource_acquisition_allowed(source_record)
     semaphore = asyncio.Semaphore(max(1, source_concurrency))
     _validate_provider_directory_endpoint_scope(
         sources,

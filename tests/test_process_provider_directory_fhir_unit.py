@@ -385,7 +385,7 @@ def test_source_row_from_seed_overrides_cigna_availity_non_fhir_base():
 
 
 def test_source_row_from_seed_overrides_centene_partner_portal_base():
-    row = importer._source_row_from_seed(
+    source_row = importer._source_row_from_seed(
         {
             "id": "centene-1",
             "org_name": "Centene Corporation",
@@ -396,24 +396,24 @@ def test_source_row_from_seed_overrides_centene_partner_portal_base():
         }
     )
 
-    assert row["api_base"] == importer.CENTENE_PROVIDER_DIRECTORY_BASE
-    assert row["canonical_api_base"] == importer.CENTENE_PROVIDER_DIRECTORY_BASE
-    assert row["requires_registration"] is False
-    assert row["auth_type"] == "none"
-    assert row["metadata_json"]["provider_directory_override"] == "centene_iopc_pd_providerdirectory"
-    assert row["metadata_json"]["provider_directory_previous_api_base"] == "https://partners.centene.com/apis"
-    assert row["metadata_json"]["provider_directory_confirmed_catalog_url"] == importer.CENTENE_PARTNER_PORTAL_APIS_URL
-    assert row["metadata_json"]["provider_directory_replaces_stale_generic_api_bases"] == [
+    assert source_row["api_base"] == importer.CENTENE_PROVIDER_DIRECTORY_BASE
+    assert source_row["canonical_api_base"] == importer.CENTENE_PROVIDER_DIRECTORY_BASE
+    assert source_row["requires_registration"] is False
+    assert source_row["auth_type"] == "none"
+    assert source_row["metadata_json"]["provider_directory_override"] == "centene_iopc_pd_providerdirectory"
+    assert source_row["metadata_json"]["provider_directory_previous_api_base"] == "https://partners.centene.com/apis"
+    assert source_row["metadata_json"]["provider_directory_confirmed_catalog_url"] == importer.CENTENE_PARTNER_PORTAL_APIS_URL
+    assert source_row["metadata_json"]["provider_directory_replaces_stale_generic_api_bases"] == [
         importer.CENTENE_STALE_GENERIC_BASE
     ]
     assert (
-        row["metadata_json"]["provider_directory_special_case_california_base"]
+        source_row["metadata_json"]["provider_directory_special_case_california_base"]
         == importer.CENTENE_PROVIDER_DIRECTORY_CALIFORNIA_BASE
     )
-    assert row["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
-    assert row["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
+    assert source_row["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
+    assert source_row["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
     assert (
-        row["metadata_json"]["provider_directory_blocked_reason"]
+        source_row["metadata_json"]["provider_directory_blocked_reason"]
         == importer.PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
     )
 
@@ -1017,7 +1017,7 @@ def test_source_row_from_seed_overrides_molina_dead_fhir_host():
 
 
 def test_source_row_from_seed_overrides_uhc_interoperability_landing_page():
-    row = importer._source_row_from_seed(
+    source_row = importer._source_row_from_seed(
         {
             "id": "uhc-1",
             "org_name": "UnitedHealthcare",
@@ -1029,29 +1029,29 @@ def test_source_row_from_seed_overrides_uhc_interoperability_landing_page():
         }
     )
 
-    assert row["api_base"] == importer.UHC_PROVIDER_DIRECTORY_BASE
-    assert row["canonical_api_base"] == importer.UHC_PROVIDER_DIRECTORY_BASE
-    assert row["requires_registration"] is False
-    assert row["auth_type"] == "none"
-    assert row["last_validated_status"] == "valid"
-    assert row["metadata_json"]["provider_directory_override"] == "uhc_flex_optum_fhirpublic_r4"
-    assert row["metadata_json"]["provider_directory_previous_api_base"] == importer.UHC_INTEROPERABILITY_APIS_URL
-    assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == importer.UHC_PROVIDER_DIRECTORY_METADATA_URL
-    assert row["metadata_json"]["provider_directory_resource_page_count_caps"] == {
+    assert source_row["api_base"] == importer.UHC_PROVIDER_DIRECTORY_BASE
+    assert source_row["canonical_api_base"] == importer.UHC_PROVIDER_DIRECTORY_BASE
+    assert source_row["requires_registration"] is False
+    assert source_row["auth_type"] == "none"
+    assert source_row["last_validated_status"] == "valid"
+    assert source_row["metadata_json"]["provider_directory_override"] == "uhc_flex_optum_fhirpublic_r4"
+    assert source_row["metadata_json"]["provider_directory_previous_api_base"] == importer.UHC_INTEROPERABILITY_APIS_URL
+    assert source_row["metadata_json"]["provider_directory_confirmed_metadata_url"] == importer.UHC_PROVIDER_DIRECTORY_METADATA_URL
+    assert source_row["metadata_json"]["provider_directory_resource_page_count_caps"] == {
         "InsurancePlan": 1,
     }
-    assert row["metadata_json"]["provider_directory_supported_resources"] == list(
+    assert source_row["metadata_json"]["provider_directory_supported_resources"] == list(
         importer.UHC_SUPPORTED_RESOURCES
     )
-    assert row["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
-    assert row["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
-    assert row["metadata_json"]["provider_directory_acquisition_enabled"] is False
+    assert source_row["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
+    assert source_row["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
+    assert source_row["metadata_json"]["provider_directory_acquisition_enabled"] is False
     assert (
-        importer._resource_acquisition_blocked_reason(row)
+        importer._resource_acquisition_blocked_reason(source_row)
         == importer.PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
     )
-    assert importer._resource_start_url(row, "HealthcareService", page_count=100) is None
-    assert importer._resource_start_url(row, "Endpoint", page_count=100) is None
+    assert importer._resource_start_url(source_row, "HealthcareService", page_count=100) is None
+    assert importer._resource_start_url(source_row, "Endpoint", page_count=100) is None
 
 
 def test_source_row_from_seed_overrides_uhc_dead_fhir_host():
