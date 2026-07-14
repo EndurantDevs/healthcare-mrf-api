@@ -58,7 +58,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--required-reduction-percent",
         type=float,
         default=1.0,
-        help="Minimum total debt reduction required by the ratchet (default: 1)",
+        help="Minimum total debt reduction required by the ratchet (default: 1; 0 prevents net growth)",
     )
     return parser.parse_args(argv)
 
@@ -127,8 +127,8 @@ def _check_readability_ratchet(
     required_reduction_percent: float,
 ) -> int:
     """Require a synchronized snapshot with less debt than the base branch."""
-    if not 0 < required_reduction_percent <= 100:
-        print("Readability reduction percent must be greater than 0 and at most 100.", file=sys.stderr)
+    if not 0 <= required_reduction_percent <= 100:
+        print("Readability reduction percent must be between 0 and 100.", file=sys.stderr)
         return 2
     if not ratchet_baseline_path.exists():
         print(f"Ratchet baseline is missing: {ratchet_baseline_path}", file=sys.stderr)

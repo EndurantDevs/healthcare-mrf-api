@@ -53,5 +53,5 @@ python scripts/readability_budget.py
 Pull-request CI also compares the synchronized snapshot with the base branch.
 New syntax errors, suppressions, placeholder bodies, global state, or builtin
 shadowing always fail. Other replacement findings are allowed only when the
-complete branch still reduces total readability debt by the configured target;
-CI currently requires a 1 percent reduction.
+complete branch does not increase total readability debt. Dedicated cleanup
+changes can still pass a positive `--required-reduction-percent` target.
