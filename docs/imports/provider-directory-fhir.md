@@ -343,6 +343,9 @@ source-edge rows through the normal upsert path and commits its checkpoint in
 the same transaction. Interrupted runs resume from the committed resource ID;
 a completed run proves exact membership and does no writes.
 
+The checkpoint migration adopts a relation created by runtime schema sync only
+after validating its columns, primary key, foreign keys, and supporting indexes.
+
 ```bash
 python main.py start provider-directory-fhir \
   --run-id "$REHYDRATE_RUN_ID" \
