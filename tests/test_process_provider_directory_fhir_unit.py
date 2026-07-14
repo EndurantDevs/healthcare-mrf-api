@@ -1966,6 +1966,126 @@ def test_source_row_from_seed_overrides_alohr_public_app_base():
     assert row["metadata_json"]["provider_directory_graphql_tenant_id"] == importer.ALOHR_TENANT_ID
 
 
+def _alohr_source_row_for_identity_test() -> dict[str, Any]:
+    return importer._source_row_from_seed(
+        {
+            "id": "alohr-identity",
+            "org_name": "State of Alabama",
+            "plan_name": "Medicaid",
+            "portal_url": importer.ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE,
+            "api_base": importer.ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE,
+            "auth_type": "none",
+            "source": "provider-directory-db",
+        }
+    )
+
+
+def test_alohr_endpoint_identity_records_graphql_acquisition_contract():
+    source_row = _alohr_source_row_for_identity_test()
+    endpoint_row = importer._provider_directory_api_endpoint_row(source_row)
+
+    assert endpoint_row is not None
+    contract = endpoint_row["metadata_json"]["connector_acquisition_contract"]
+    assert endpoint_row["metadata_json"]["identity_version"] == "resource-import-group-v2"
+    assert contract == {
+        "transport": "graphql",
+        "url": importer.ALOHR_GRAPHQL_URL,
+        "tenant_header": "tenantId",
+        "tenant_id": "alohr",
+        "streams": [
+            {
+                "root": "providers",
+                "item_root": "providers",
+                "query_sha256": hashlib.sha256(
+                    importer.ALOHR_PROVIDER_QUERY.encode("utf-8")
+                ).hexdigest(),
+            },
+            {
+                "root": "providerOrgs",
+                "item_root": "providerOrganizations",
+                "query_sha256": hashlib.sha256(
+                    importer.ALOHR_ORGANIZATION_QUERY.encode("utf-8")
+                ).hexdigest(),
+            },
+        ],
+    }
+    assert json.loads(
+        endpoint_row["endpoint_signature_json"]["connector_acquisition_contract"]
+    ) == contract
+
+
+@pytest.mark.parametrize(
+    ("contract_attribute", "replacement"),
+    [
+        ("ALOHR_GRAPHQL_URL", "https://replacement.example/graphql"),
+        ("ALOHR_TENANT_ID", "replacement-tenant"),
+        ("ALOHR_PROVIDER_GRAPHQL_ROOT", "replacementProviders"),
+        ("ALOHR_PROVIDER_GRAPHQL_ITEM_ROOT", "replacementProviderItems"),
+        ("ALOHR_ORGANIZATION_GRAPHQL_ROOT", "replacementOrganizations"),
+        (
+            "ALOHR_ORGANIZATION_GRAPHQL_ITEM_ROOT",
+            "replacementOrganizationItems",
+        ),
+        (
+            "ALOHR_PROVIDER_QUERY",
+            "query Replacement { providers(criteria: {}) { nextToken } }",
+        ),
+    ],
+)
+def test_alohr_endpoint_identity_hashes_every_graphql_contract_field(
+    monkeypatch,
+    contract_attribute,
+    replacement,
+):
+    original_source = _alohr_source_row_for_identity_test()
+    original_endpoint = importer._provider_directory_api_endpoint_row(original_source)
+    assert original_endpoint is not None
+
+    monkeypatch.setattr(importer, contract_attribute, replacement)
+    changed_source = _alohr_source_row_for_identity_test()
+    changed_endpoint = importer._provider_directory_api_endpoint_row(changed_source)
+
+    assert changed_endpoint is not None
+    assert changed_source["source_id"] == original_source["source_id"]
+    assert changed_endpoint["endpoint_id"] != original_endpoint["endpoint_id"]
+
+
+def test_alohr_graphql_endpoint_change_forces_a_fresh_four_resource_dataset(
+    monkeypatch,
+):
+    original_source = _alohr_source_row_for_identity_test()
+    original_endpoint = importer._provider_directory_api_endpoint_row(original_source)
+    assert original_endpoint is not None
+
+    monkeypatch.setattr(importer, "ALOHR_TENANT_ID", "replacement-tenant")
+    changed_source = _alohr_source_row_for_identity_test()
+    changed_endpoint = importer._provider_directory_api_endpoint_row(changed_source)
+    assert changed_endpoint is not None
+
+    selected_resources = importer._endpoint_dataset_expected_resources(
+        [changed_source]
+    )
+    original_dataset_id = importer._endpoint_dataset_candidate_id(
+        original_endpoint["endpoint_id"],
+        selected_resources,
+        "acquisition-root",
+    )
+    changed_dataset_id = importer._endpoint_dataset_candidate_id(
+        changed_endpoint["endpoint_id"],
+        selected_resources,
+        "acquisition-root",
+    )
+
+    assert changed_source["source_id"] == original_source["source_id"]
+    assert selected_resources == (
+        "Location",
+        "Organization",
+        "Practitioner",
+        "PractitionerRole",
+    )
+    assert changed_dataset_id != original_dataset_id
+
+
 def test_source_row_from_seed_preserves_known_confirmed_importable_bases():
     """Verify this provider-directory regression contract."""
     cases = [

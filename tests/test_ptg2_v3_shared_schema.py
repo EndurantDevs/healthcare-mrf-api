@@ -172,12 +172,12 @@ def test_v3_followup_migration_repairs_attestation_snapshot_index(monkeypatch):
     ]
 
 
-def test_repository_has_the_expected_single_alembic_head():
+def test_v3_followup_is_the_single_alembic_head():
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260714161000_alohr_contract_profile"
+        "20260714150000_provider_directory_pagination_census"
     ]
 
 

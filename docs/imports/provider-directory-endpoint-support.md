@@ -6,7 +6,7 @@ The live catalog and curated support matrix are distinct: the catalog inventory 
 
 `None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.
 
-A canonical base identifies the maintained source endpoint; its source IDs retain product or plan provenance. A documented mixed-mode connector may use a separate acquisition transport without changing that source identity. Shared endpoint aliases must not be collapsed into one published product result merely because they share a transport base. Access configuration, current published dataset state, terminal acquisition proof, derived artifact state, and unified/API readiness are separate claims.
+A canonical base identifies the maintained source endpoint; its source IDs retain product or plan provenance. Endpoint identity describes the complete acquisition contract, including connector-specific transport fields when acquisition does not use that canonical base. Shared endpoint aliases must not be collapsed into one published product result merely because they share a transport base. Access configuration, current published dataset state, terminal acquisition proof, derived artifact state, and unified/API readiness are separate claims.
 
 Freshness policy: catalog confirmation expires after `45` days, source reviews after `45` days, and current terminal proof after `45` days. CI rejects expired evidence.
 
@@ -111,7 +111,7 @@ Audit as of `2026-07-14`. A current published dataset is distinct from configure
 | SCAN (`scan`) | Probe-only | - | Not applicable | Live completeness proof is not yet recorded. |
 | Centene (`centene`) | Probe-only | - | Not applicable | Stable exhaustive pagination remains unverified. |
 | Contra Costa (`contra-costa`) | Current published (`pdds_6653e89e2f6f...`) | 950,535 | Snapshot-ready | A current dataset exists and a replacement acquisition is active. |
-| ALOHR (`alohr`) | Current published (`pdds_085b7d2da6de...`) | 319,384 | Snapshot-ready | The current dataset contains exactly the four source-backed ALOHR GraphQL resource types; the guarded metadata repair removes the stale OrganizationAffiliation contract claim without changing resources, provenance, or endpoint identity. |
+| ALOHR (`alohr`) | Current published (`pdds_085b7d2da6de...`) | 319,384 | Contract/live mismatch | The published dataset predates GraphQL-bound endpoint identity and its immutable metadata still claims OrganizationAffiliation. A fresh four-resource acquisition, validation, artifact promotion, unified refresh, and API proof are required before readiness can be asserted. |
 | Chorus Community Health Plans | Not importable | - | Not applicable | The documented service is unreachable. |
 | First Medical Health Plan, Inc. | Not importable | - | Not applicable | A user token and production approval are required. |
 | Puerto Rico Medicaid FFS | Not importable | - | Not applicable | No production Provider Directory is published. |

@@ -613,6 +613,10 @@ ALOHR_GRAPHQL_URL = "https://api.esante.us/graphql"
 ALOHR_TENANT_ID = "alohr"
 ALOHR_PROVIDER_CHECKPOINT_RESOURCE = "ALOHRGraphQLProvider"
 ALOHR_ORGANIZATION_CHECKPOINT_RESOURCE = "ALOHRGraphQLOrganization"
+ALOHR_PROVIDER_GRAPHQL_ROOT = "providers"
+ALOHR_PROVIDER_GRAPHQL_ITEM_ROOT = "providers"
+ALOHR_ORGANIZATION_GRAPHQL_ROOT = "providerOrgs"
+ALOHR_ORGANIZATION_GRAPHQL_ITEM_ROOT = "providerOrganizations"
 ALOHR_GRAPHQL_RESOURCE_TYPES = (
     "Location",
     "Organization",
@@ -26557,10 +26561,57 @@ def _limit_allows_more(current: int, limit: int) -> bool:
     return limit <= 0 or current < limit
 
 
+def _stable_identity_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_default,
+    )
+
+
+def _alohr_graphql_acquisition_contract(
+    source: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not _alohr_source_uses_graphql_connector(source):
+        return None
+    return {
+        "transport": "graphql",
+        "url": ALOHR_GRAPHQL_URL,
+        "tenant_header": "tenantId",
+        "tenant_id": ALOHR_TENANT_ID,
+        "streams": [
+            {
+                "root": ALOHR_PROVIDER_GRAPHQL_ROOT,
+                "item_root": ALOHR_PROVIDER_GRAPHQL_ITEM_ROOT,
+                "query_sha256": hashlib.sha256(
+                    ALOHR_PROVIDER_QUERY.encode("utf-8")
+                ).hexdigest(),
+            },
+            {
+                "root": ALOHR_ORGANIZATION_GRAPHQL_ROOT,
+                "item_root": ALOHR_ORGANIZATION_GRAPHQL_ITEM_ROOT,
+                "query_sha256": hashlib.sha256(
+                    ALOHR_ORGANIZATION_QUERY.encode("utf-8")
+                ).hexdigest(),
+            },
+        ],
+    }
+
+
 def _resource_endpoint_signature(source: dict[str, Any]) -> tuple[tuple[str, str], ...]:
-    return tuple(
+    signature_items = tuple(
         (field, _clean_text(source.get(field)) or "")
         for field in sorted(RESOURCE_ENDPOINT_FIELDS.values())
+    )
+    connector_contract = _alohr_graphql_acquisition_contract(source)
+    if connector_contract is None:
+        return signature_items
+    return signature_items + (
+        (
+            "connector_acquisition_contract",
+            _stable_identity_json(connector_contract),
+        ),
     )
 
 
@@ -26573,15 +26624,6 @@ def _resource_import_group_key(source: dict[str, Any]) -> tuple[str, str, tuple[
         api_base,
         json.dumps(credential_descriptor or {}, sort_keys=True, default=str),
         _resource_endpoint_signature(source),
-    )
-
-
-def _stable_identity_json(value: Any) -> str:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=_json_default,
     )
 
 
@@ -26609,6 +26651,25 @@ def _provider_directory_api_endpoint_row(
         "endpoint_signature": endpoint_signature_map,
     }
     now = observed_at or _now()
+    connector_contract_json = endpoint_signature_map.get(
+        "connector_acquisition_contract"
+    )
+    connector_contract = (
+        json.loads(connector_contract_json)
+        if connector_contract_json
+        else None
+    )
+    endpoint_metadata_by_field = {
+        "identity_version": (
+            "resource-import-group-v2"
+            if connector_contract is not None
+            else "resource-import-group-v1"
+        )
+    }
+    if connector_contract is not None:
+        endpoint_metadata_by_field["connector_acquisition_contract"] = (
+            connector_contract
+        )
     return {
         "endpoint_id": _identity_hash(identity_payload_map),
         "canonical_api_base": api_base,
@@ -26618,7 +26679,7 @@ def _provider_directory_api_endpoint_row(
         "endpoint_signature_json": endpoint_signature_map,
         "first_seen_at": now,
         "last_seen_at": now,
-        "metadata_json": {"identity_version": "resource-import-group-v1"},
+        "metadata_json": endpoint_metadata_by_field,
         "created_at": now,
         "updated_at": now,
     }
@@ -29058,16 +29119,16 @@ async def _import_alohr_graphql_source_group(
     stream_specs = (
         AlohrGraphQLStreamSpec(
             ALOHR_PROVIDER_QUERY,
-            "providers",
-            "providers",
+            ALOHR_PROVIDER_GRAPHQL_ROOT,
+            ALOHR_PROVIDER_GRAPHQL_ITEM_ROOT,
             append_provider,
             ("Practitioner", "Location", "PractitionerRole"),
             ALOHR_PROVIDER_CHECKPOINT_RESOURCE,
         ),
         AlohrGraphQLStreamSpec(
             ALOHR_ORGANIZATION_QUERY,
-            "providerOrgs",
-            "providerOrganizations",
+            ALOHR_ORGANIZATION_GRAPHQL_ROOT,
+            ALOHR_ORGANIZATION_GRAPHQL_ITEM_ROOT,
             append_organization,
             ("Organization", "Location"),
             ALOHR_ORGANIZATION_CHECKPOINT_RESOURCE,
