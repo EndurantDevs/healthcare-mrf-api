@@ -63,6 +63,7 @@ async def test_discover_sources_returns_registered_and_unmapped(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_discover_sources_includes_latest_ffs_resource_bundle(monkeypatch):
+    """Verify discover sources includes latest ffs resource bundle."""
     catalog = {
         "dataset": [
             {

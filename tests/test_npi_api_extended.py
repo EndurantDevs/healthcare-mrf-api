@@ -610,6 +610,7 @@ def _make_v2_archive_row(
 
 @pytest.mark.asyncio
 async def test_get_npi_geocode_mapbox(monkeypatch):
+    """Verify get npi geocode mapbox."""
     async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
@@ -699,6 +700,7 @@ async def test_get_npi_geocode_mapbox(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_geocode_omits_null_address_parts(monkeypatch):
+    """Verify get npi geocode omits null address parts."""
     async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
@@ -777,6 +779,7 @@ async def test_get_npi_geocode_omits_null_address_parts(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_geocode_google(monkeypatch):
+    """Verify get npi geocode google."""
     async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
@@ -872,6 +875,7 @@ async def test_get_npi_geocode_google(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_geocode_openaddresses_before_paid_providers(monkeypatch):
+    """Verify get npi geocode openaddresses before paid providers."""
     async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
@@ -1552,6 +1556,7 @@ async def test_build_npi_details_empty(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_address_geocode_paths(monkeypatch):
+    """Verify get npi address geocode paths."""
     details = {
         'npi': 123,
         'do_business_as': ['Existing DBA'],
@@ -1686,6 +1691,7 @@ async def test_get_npi_not_found(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_update_addr_coordinates_row_missing(monkeypatch):
+    """Verify get npi update addr coordinates row missing."""
     address_entry = {
         'npi': 1518379601,
         'type': 'primary',
@@ -1773,6 +1779,7 @@ async def test_get_npi_update_addr_coordinates_row_missing(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_update_addr_coordinates_handles_exception(monkeypatch):
+    """Verify get npi update addr coordinates handles exception."""
     address_entry = {
         'npi': 1518379601,
         'type': 'primary',
@@ -1976,6 +1983,7 @@ async def test_get_npi_v2_archive_is_disabled_without_cutover_flag(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_v2_archive_cutover_reads_geocodes_for_concurrent_addresses(monkeypatch):
+    """Verify get npi v2 archive cutover reads geocodes for concurrent addresses."""
     monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", "1")
     monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2")
     addresses = [
@@ -2072,6 +2080,7 @@ async def test_get_npi_v2_archive_cutover_reads_geocodes_for_concurrent_addresse
 
 @pytest.mark.asyncio
 async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypatch):
+    """Verify get npi v2 archive geocodeless row falls back to legacy."""
     monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", "true")
     address_entry = {
         'npi': 1518379601,
@@ -2138,6 +2147,7 @@ async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypat
 
 @pytest.mark.asyncio
 async def test_get_npi_v2_archive_geocode_write_uses_deduped_address_key_upsert(monkeypatch):
+    """Verify get npi v2 archive geocode write uses deduped address key upsert."""
     monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", "1")
     address_entry = {
         'npi': 1518379601,
@@ -2334,6 +2344,7 @@ async def test_get_npi_debug_flags_include_sources_and_evidence(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_hides_provider_directory_source_details_by_default(monkeypatch):
+    """Verify get npi hides provider directory source details by default."""
     async def fake_build(_npi, **_kwargs):
         return {
             'npi': _npi,
@@ -2402,6 +2413,7 @@ async def test_get_npi_hides_provider_directory_source_details_by_default(monkey
 
 @pytest.mark.asyncio
 async def test_get_npi_include_sources_enriches_provider_directory_source_summary(monkeypatch):
+    """Verify get npi include sources enriches provider directory source summary."""
     async def fake_build(_npi, **_kwargs):
         return {
             'npi': _npi,

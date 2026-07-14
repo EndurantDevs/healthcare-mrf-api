@@ -802,6 +802,7 @@ async def test_openaddresses_task_import_id_controls_stage_suffix():
 
 @pytest.mark.asyncio
 async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(monkeypatch):
+    """Verify openaddresses shutdown uses job import id from shared context."""
     seen = {}
 
     async def fake_ensure_database(_test_mode):

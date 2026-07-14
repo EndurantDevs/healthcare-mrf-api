@@ -2844,10 +2844,17 @@ def test_ptg2_ensure_tables_uses_existing_db_create_table(monkeypatch):
     async def fake_status(_statement):
         return None
 
+    async def fake_all(_statement, **params):
+        return [
+            {"table_name": table_name}
+            for table_name in params["table_names"]
+        ]
+
     async def fake_create_table(table, **_kwargs):
         created.append(table.name)
 
     monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "all", fake_all)
     monkeypatch.setattr(process_ptg.db, "create_table", fake_create_table)
 
     asyncio.run(process_ptg.ensure_ptg2_tables())
@@ -2859,15 +2866,61 @@ def test_ptg2_ensure_tables_uses_existing_db_create_table(monkeypatch):
     assert expected.issubset(set(created))
 
 
+def test_ptg2_runtime_table_setup_does_not_own_v3_migration_tables():
+    runtime_owned = {
+        model.__table__.name for model in process_ptg.PTG2_MODEL_CLASSES
+    }
+
+    assert not {
+        table_name for table_name in runtime_owned if table_name.startswith("ptg2_v3_")
+    }
+
+
+def test_ptg2_ensure_tables_requires_v3_migration_before_runtime_ddl(monkeypatch):
+    created = []
+
+    async def fake_status(_statement):
+        return None
+
+    async def fake_all(_statement, **params):
+        return [
+            {"table_name": table_name}
+            for table_name in params["table_names"]
+            if table_name != "ptg2_v3_candidate_audit_attestation"
+        ]
+
+    async def fake_create_table(table, **_kwargs):
+        created.append(table.name)
+
+    monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "all", fake_all)
+    monkeypatch.setattr(process_ptg.db, "create_table", fake_create_table)
+
+    with pytest.raises(
+        RuntimeError,
+        match="ptg2_v3_candidate_audit_attestation.*alembic upgrade head",
+    ):
+        asyncio.run(process_ptg.ensure_ptg2_tables())
+
+    assert created == []
+
+
 def test_ptg2_ensure_tables_fails_fast_on_create_error(monkeypatch):
     async def fake_status(_statement):
         return None
+
+    async def fake_all(_statement, **params):
+        return [
+            {"table_name": table_name}
+            for table_name in params["table_names"]
+        ]
 
     async def fake_create_table(table, **_kwargs):
         if table.name == "ptg2_snapshot":
             raise RuntimeError("no permission")
 
     monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "all", fake_all)
     monkeypatch.setattr(process_ptg.db, "create_table", fake_create_table)
 
     with pytest.raises(RuntimeError, match="ptg2_snapshot"):
@@ -4643,6 +4696,7 @@ def test_manifest_copy_entry_cleanup_removes_registered_v3_runs(tmp_path):
 
 
 def test_source_import_lock_serializes_different_snapshots_for_one_source(monkeypatch):
+    """Verify source import lock serializes different snapshots for one source."""
     lock_state = {"held": False}
     real_sleep = asyncio.sleep
 
@@ -4780,6 +4834,7 @@ def _build_published_snapshot_fields(import_month, updated_at):
 
 
 def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkeypatch):
+    """Verify ptg2 candidate stage binds layout without mutating live pointers."""
     executed = []
     updated_at = process_ptg._utcnow()
     import_month = process_ptg.normalize_import_month("2026-04")
@@ -4874,7 +4929,10 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
 
     class FakeSession:
         async def execute(self, statement, params=None):
-            executed.append((str(statement), params or {}))
+            sql = str(statement)
+            executed.append((sql, params or {}))
+            if "FOR UPDATE OF snapshot" in sql:
+                return SimpleNamespace(first=lambda: snapshot_by_field)
 
     class FakeTransaction:
         async def __aenter__(self):
@@ -4906,7 +4964,8 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
     assert "incumbent.published_at >=" in joined
     assert "DELETE FROM \"mrf\".ptg2_current_plan_source WHERE source_key = :source_key" in joined
     assert "INSERT INTO \"mrf\".ptg2_current_plan_source" in joined
-    assert len(executed) == 6
+    assert len(executed) == 7
+    assert "FOR UPDATE OF snapshot" in executed[1][0]
 
 
 def test_ptg2_source_pointer_publish_does_not_advance_source_when_plan_resolution_fails(monkeypatch):
@@ -4920,7 +4979,16 @@ def test_ptg2_source_pointer_publish_does_not_advance_source_when_plan_resolutio
 
     class FakeSession:
         async def execute(self, statement, params=None):
-            executed_statements.append((str(statement), params or {}))
+            sql = str(statement)
+            executed_statements.append((sql, params or {}))
+            if "FOR UPDATE OF snapshot" in sql:
+                return SimpleNamespace(
+                    first=lambda: {
+                        "snapshot_id": "snap",
+                        "status": "published",
+                        "manifest": {},
+                    }
+                )
 
     class FakeTransaction:
         async def __aenter__(self):
@@ -4945,7 +5013,7 @@ def test_ptg2_source_pointer_publish_does_not_advance_source_when_plan_resolutio
         )
 
     assert transaction_started_map["value"] is True
-    assert len(executed_statements) == 1
+    assert len(executed_statements) == 2
     assert "pg_advisory_xact_lock" in executed_statements[0][0]
     assert executed_statements[0][1] == {
         "publish_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
@@ -4962,7 +5030,10 @@ def test_ptg2_global_publish_is_atomic(monkeypatch):
 
     class FakeSession:
         async def execute(self, statement, params=None):
-            executed_statements.append((str(statement), params or {}))
+            sql = str(statement)
+            executed_statements.append((sql, params or {}))
+            if "FOR UPDATE OF snapshot" in sql:
+                return SimpleNamespace(first=lambda: snapshot_attributes)
 
     class FakeTransaction:
         async def __aenter__(self):
@@ -4985,10 +5056,11 @@ def test_ptg2_global_publish_is_atomic(monkeypatch):
         "snapshot_id": "snap",
         "global_pointer": "reconciled",
     }
-    assert len(executed_statements) == 3
+    assert len(executed_statements) == 4
     assert "pg_advisory_xact_lock" in executed_statements[0][0]
-    assert "UPDATE \"mrf\".ptg2_snapshot" in executed_statements[1][0]
-    assert "INSERT INTO \"mrf\".ptg2_current_snapshot" in executed_statements[2][0]
+    assert "FOR UPDATE OF snapshot" in executed_statements[1][0]
+    assert "UPDATE \"mrf\".ptg2_snapshot" in executed_statements[2][0]
+    assert "INSERT INTO \"mrf\".ptg2_current_snapshot" in executed_statements[3][0]
     assert executed_statements[0][1] == {
         "publish_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
     }
@@ -4999,7 +5071,16 @@ def test_ptg2_global_snapshot_pointer_rejects_unpublished_snapshot_after_lock(mo
 
     class FakeSession:
         async def execute(self, statement, params=None):
-            executed_statements.append((str(statement), params or {}))
+            sql = str(statement)
+            executed_statements.append((sql, params or {}))
+            if "FOR UPDATE OF snapshot" in sql:
+                return SimpleNamespace(
+                    first=lambda: {
+                        "snapshot_id": "snap",
+                        "status": "validated",
+                        "manifest": {},
+                    }
+                )
 
     class FakeTransaction:
         async def __aenter__(self):
@@ -5018,8 +5099,9 @@ def test_ptg2_global_snapshot_pointer_rejects_unpublished_snapshot_after_lock(mo
             )
         )
 
-    assert len(executed_statements) == 1
+    assert len(executed_statements) == 2
     assert "pg_advisory_xact_lock" in executed_statements[0][0]
+    assert "FOR UPDATE OF snapshot" in executed_statements[1][0]
 
 
 def test_ptg2_snapshot_manifest_table_names_allowlists_location_and_rejects_unsafe_names():
@@ -5257,6 +5339,7 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
 
 
 def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
+    """Verify ptg2 import defers live pointer mutation by default."""
     pushed = []
     publish_source_pointers = AsyncMock()
     cleanup_old_source_tables = AsyncMock()
@@ -5355,6 +5438,7 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
 
 
 def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
+    """Verify ptg2 completion timing ends after post publish work."""
     clock = {"seconds": 0.0}
     pushed: list[tuple[str, dict]] = []
     completion_events: list[tuple[str, float]] = []
@@ -5637,6 +5721,7 @@ def test_failed_shared_layout_abandonment_retries_transient_database_errors(monk
 
 
 def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
+    """Verify ptg2 test mode uses manifest source scoped import."""
     pushed = []
 
     async def fake_push(rows, cls, **_kwargs):

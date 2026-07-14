@@ -146,6 +146,7 @@ async def test_get_coverage_returns_items(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_pharmacy_license_by_npi_returns_summary_and_history(monkeypatch):
+    """Verify get pharmacy license by npi returns summary and history."""
     async def fake_table_exists(_session, _table_name, schema="mrf"):
         del schema
         return True

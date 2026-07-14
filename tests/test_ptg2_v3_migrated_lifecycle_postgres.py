@@ -194,6 +194,7 @@ def _configure_disposable_database(monkeypatch: pytest.MonkeyPatch, dsn: str) ->
 
 
 async def _assert_migrated_empty_target(database_name: str) -> None:
+    """Support the assert migrated empty target test fixture."""
     selected_database = await db.scalar("SELECT current_database()")
     assert selected_database == database_name
 
@@ -225,6 +226,39 @@ async def _assert_migrated_empty_target(database_name: str) -> None:
         "the migrated disposable schema is missing production tables: "
         f"{sorted(REQUIRED_TABLES - observed_tables)}"
     )
+    assert await db.scalar(
+        """
+        SELECT EXISTS (
+            SELECT 1
+              FROM pg_indexes
+             WHERE schemaname = :schema_name
+               AND tablename = 'ptg2_v3_candidate_audit_attestation'
+               AND indexname =
+                   'ptg2_v3_candidate_audit_attestation_snapshot_key_idx'
+        )
+        """,
+        schema_name=SCHEMA_NAME,
+    )
+    jsonb_columns = {
+        (str(row[0]), str(row[1]))
+        for row in await db.all(
+            """
+            SELECT table_name, column_name
+              FROM information_schema.columns
+             WHERE table_schema = :schema_name
+               AND data_type = 'jsonb'
+               AND (table_name, column_name) IN (
+                    ('ptg2_v3_snapshot_layout', 'layout_manifest'),
+                    ('ptg2_v3_candidate_audit_attestation', 'report')
+               )
+            """,
+            schema_name=SCHEMA_NAME,
+        )
+    }
+    assert jsonb_columns == {
+        ("ptg2_v3_snapshot_layout", "layout_manifest"),
+        ("ptg2_v3_candidate_audit_attestation", "report"),
+    }
     for table_name in EMPTY_BEFORE_WRITE_TABLES:
         assert await _count(table_name) == 0, (
             f"refusing to use non-empty disposable table {SCHEMA_NAME}.{table_name}"

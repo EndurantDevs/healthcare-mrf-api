@@ -242,6 +242,7 @@ async def test_ptg_stale_job_check_allows_nonterminal_local_run(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
+    """Verify ptg control start applies lane scanner env."""
     observed = {}
 
     async def fake_ptg_main(**_kwargs):

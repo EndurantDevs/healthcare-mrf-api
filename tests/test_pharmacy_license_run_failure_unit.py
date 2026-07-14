@@ -21,6 +21,7 @@ class _Recorder:
 
 
 async def test_canonical_resolve_failure_marks_run_failed(monkeypatch):
+    """Verify canonical resolve failure marks run failed."""
     run_statuses = []
     control_statuses = []
     snapshot_statuses = []

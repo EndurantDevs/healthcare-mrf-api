@@ -53,6 +53,7 @@ def _run_source_import():
 
 
 def test_deterministic_rerun_returns_already_published_without_table_work(monkeypatch):
+    """Verify deterministic rerun returns already published without table work."""
     calls = []
     create_stage = AsyncMock()
     cleanup = AsyncMock()
@@ -187,8 +188,14 @@ def test_source_pointer_compare_and_swap_rejects_stale_candidate(monkeypatch):
         async def execute(self, statement, params=None):
             sql = str(statement)
             executed_statements.append((sql, params or {}))
-            if "status = 'published'" in sql:
-                return _Result(("snap_stale",))
+            if "FROM \"mrf\".ptg2_snapshot AS snapshot" in sql:
+                return _Result(
+                    {
+                        "snapshot_id": "snap_stale",
+                        "status": "published",
+                        "manifest": {},
+                    }
+                )
             return _Result(None)
 
     transaction = _Transaction(ConflictSession())
@@ -215,6 +222,7 @@ def test_source_pointer_compare_and_swap_rejects_stale_candidate(monkeypatch):
     assert executed_statements[0][1] == {
         "publish_lock_key": source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
     }
-    assert "status = 'published'" in executed_statements[1][0]
+    assert "FOR UPDATE OF snapshot" in executed_statements[1][0]
+    assert executed_statements[1][1] == {"snapshot_id": "snap_stale"}
     assert "IS NOT DISTINCT FROM :previous_snapshot_id" in executed_statements[2][0]
     assert "DELETE FROM" not in executed_statements[2][0]

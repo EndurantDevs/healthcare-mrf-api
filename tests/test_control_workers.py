@@ -169,6 +169,7 @@ def test_ensure_worker_rejects_mismatched_explicit_ptg_lane():
 
 
 def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
+    """Verify ensure worker can create kubernetes job."""
     calls: list[tuple[str, str, dict[str, object] | None]] = []
 
     def fake_request(method, path, body=None):

@@ -215,6 +215,7 @@ def test_mrf_flush_rows_are_configurable(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
+    """Verify process json index dedupes provider url jobs."""
     class FakeRedis:
         def __init__(self):
             self.calls = []
@@ -304,6 +305,7 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_process_json_index_test_limit_counts_unique_registered_jobs(monkeypatch):
+    """Verify process json index test limit counts unique registered jobs."""
     class FakeRedis:
         def __init__(self):
             self.calls = []
@@ -673,6 +675,7 @@ async def test_mrf_shutdown_fails_after_unrecoverable_work_wait(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(monkeypatch):
+    """Verify mrf shutdown cleans stale finalize jobs when already finalized."""
     class FakeRedis:
         def __init__(self):
             self.zrem_calls = []
@@ -1027,6 +1030,7 @@ async def test_plan_summary_dependencies_ready(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_refresh_plan_drug_statistics_upserts_concurrent_refreshes(monkeypatch):
+    """Verify refresh plan drug statistics upserts concurrent refreshes."""
     from sqlalchemy import Boolean, Column, DateTime, Integer, MetaData, String, Table
 
     metadata = MetaData()
@@ -1624,6 +1628,7 @@ def test_build_mrf_address_rows_creates_address_and_evidence():
 
 
 def test_build_mrf_address_rows_batches_contact_normalization(monkeypatch):
+    """Verify build mrf address rows batches contact normalization."""
     seen_batches = []
 
     def fake_canonicalize_contact_batch(rows):

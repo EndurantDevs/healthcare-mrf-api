@@ -2161,6 +2161,7 @@ async def test_process_data_acquires_only_neutral_0900_without_alias_fanout(
     assert audit_metrics["source_import_duplicate_sources_collapsed"] == 0
     assert "amerihealth_shared_backend_preflight" not in audit_metrics
 def test_seed_rows_from_retest_results_filters_to_provider_like_rows(tmp_path):
+    """Verify seed rows from retest results filters to provider like rows."""
     retest_path = tmp_path / "retest_results.json"
     retest_path.write_text(
         json.dumps(
@@ -5618,6 +5619,7 @@ async def test_probe_sources_persists_resolved_api_base_for_repaired_catalog_url
 
 
 def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint():
+    """Verify parse fhir resource maps plan practitioner location role and endpoint."""
     plan_model, plan_row = importer.parse_fhir_resource(
         "source_a",
         {
@@ -9590,6 +9592,7 @@ async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_import_resources_retries_suspicious_zero_practitioner_role(monkeypatch):
+    """Verify import resources retries suspicious zero practitioner role."""
     metadata_calls: list[dict[str, Any]] = []
 
     async def fake_update_metadata(_source_ids, **kwargs):
@@ -9598,6 +9601,7 @@ async def test_import_resources_retries_suspicious_zero_practitioner_role(monkey
     fetch_calls: list[str] = []
 
     async def fake_fetch_resource_rows(source, resource_type, **_kwargs):
+        """Support the fake fetch resource rows test fixture."""
         fetch_calls.append(resource_type)
         if resource_type == "PractitionerRole" and fetch_calls.count("PractitionerRole") == 1:
             return importer.ResourceFetchResult(
@@ -10082,6 +10086,7 @@ async def test_process_data_merges_supplemental_retest_sources(monkeypatch, tmp_
 
 @pytest.mark.asyncio
 async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp_path):
+    """Verify process data merges supplemental catalog sources."""
     amerihealth_catalog_path = tmp_path / "amerihealth.html"
     amerihealth_catalog_path.write_text(
         """
@@ -13487,6 +13492,7 @@ async def test_non_role_uhc_residual_partition_retains_checkpoints(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_continues_after_scan_partition_error(monkeypatch):
+    """Verify fetch resource rows continues after scan partition error."""
     calls: list[str] = []
 
     async def fake_fetch_json(_source, url, *, timeout):
@@ -13998,6 +14004,7 @@ async def test_postal_partition_resume_marks_existing_roles_seen(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_import_resources_fetches_scan_practitioner_roles_after_practitioners(monkeypatch):
+    """Verify import resources fetches scan practitioner roles after practitioners."""
     _stub_resource_import_metadata(monkeypatch)
 
     async def fake_fetch_resource_rows(source, resource_type, **_kwargs):
@@ -17816,6 +17823,7 @@ async def test_process_data_contact_backfill_only_skips_seed_resolution(monkeypa
 
 @pytest.mark.asyncio
 async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeypatch):
+    """Verify process data publish artifacts only skips seed resolution."""
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_mark_provider_directory_progress", AsyncMock())

@@ -22,6 +22,7 @@ def _requires_test_database():
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(monkeypatch):
+    """Verify refresh mrf address summary materializes grouped evidence rows."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     suffix = f"summary_fixture_{uuid.uuid4().hex[:8]}"

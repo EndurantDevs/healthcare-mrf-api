@@ -588,6 +588,7 @@ async def test_startup_honors_import_id_override(monkeypatch, npi_module):
 @pytest.mark.asyncio
 async def test_shutdown_handles_rotation(monkeypatch, npi_module):
 
+    """Verify shutdown handles rotation."""
     monkeypatch.setenv("DB_SCHEMA", "testschema")
     monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_SOURCES", "nppes")
     monkeypatch.setattr(npi_module, "make_class", _fake_make_class_factory("testschema"))

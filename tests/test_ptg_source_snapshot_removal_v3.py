@@ -36,6 +36,7 @@ class _RecordingTransaction:
 
 @pytest.mark.asyncio
 async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(monkeypatch):
+    """Verify remove v3 snapshot releases layout in the removal transaction."""
     transaction = _RecordingTransaction()
     events = []
 
@@ -100,6 +101,7 @@ async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(mon
 
 
 async def _create_production_shaped_schema(database, schema_name):
+    """Support the create production shaped schema test fixture."""
     schema = f'"{schema_name}"'
     async with database.acquire() as connection:
         await connection.status(f"CREATE SCHEMA {schema}")
@@ -181,7 +183,8 @@ async def _create_production_shaped_schema(database, schema_name):
         await connection.status(
             f"""
             CREATE TABLE {schema}.ptg2_v3_snapshot_binding (
-                snapshot_id varchar(96) PRIMARY KEY,
+                snapshot_id varchar(96) PRIMARY KEY REFERENCES
+                    {schema}.ptg2_snapshot(snapshot_id) ON DELETE CASCADE,
                 snapshot_key bigint NOT NULL REFERENCES
                     {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE RESTRICT,
                 created_at timestamptz NOT NULL DEFAULT now()
@@ -191,7 +194,8 @@ async def _create_production_shaped_schema(database, schema_name):
         await connection.status(
             f"""
             CREATE TABLE {schema}.ptg2_v3_snapshot_scope (
-                snapshot_id varchar(96) PRIMARY KEY,
+                snapshot_id varchar(96) PRIMARY KEY REFERENCES
+                    {schema}.ptg2_snapshot(snapshot_id) ON DELETE CASCADE,
                 plan_id varchar(64) NOT NULL,
                 plan_market_type varchar(32) NOT NULL DEFAULT '',
                 coverage_scope_id bytea NOT NULL CHECK (octet_length(coverage_scope_id) = 32),
@@ -288,6 +292,7 @@ async def _create_production_shaped_schema(database, schema_name):
 
 
 async def _insert_shared_snapshots(database, schema_name):
+    """Support the insert shared snapshots test fixture."""
     schema = f'"{schema_name}"'
     manifests = {
         snapshot_id: json.dumps(
@@ -343,6 +348,28 @@ async def _insert_shared_snapshots(database, schema_name):
                 plan_id=f"plan-{source_key}",
                 coverage_scope_id=bytes([1 if source_key == "source_a" else 2]) * 32,
             )
+            await connection.status(
+                f"""
+                INSERT INTO {schema}.ptg2_v3_candidate_audit_attestation
+                    (snapshot_id, snapshot_key, source_key, plan_id,
+                     plan_market_type, coverage_scope_id, source_set_digest,
+                     audit_sample_digest, contract, tool_name, tool_version,
+                     report_digest, report, attested_at, expires_at, activated_at)
+                VALUES
+                    (:snapshot_id, 10, :source_key, :plan_id, 'group',
+                     :coverage_scope_id, :source_set_digest, :audit_sample_digest,
+                     'source_to_api_v1', 'fixture-auditor', '1.0',
+                     :report_digest, '{{}}'::jsonb, now(),
+                     now() + INTERVAL '1 hour', NULL)
+                """,
+                snapshot_id=snapshot_id,
+                source_key=source_key,
+                plan_id=f"plan-{source_key}",
+                coverage_scope_id=bytes([1 if source_key == "source_a" else 2]) * 32,
+                source_set_digest=bytes([3 if source_key == "source_a" else 4]) * 32,
+                audit_sample_digest=bytes([5 if source_key == "source_a" else 6]) * 32,
+                report_digest=bytes([7 if source_key == "source_a" else 8]) * 32,
+            )
 
 
 async def _count(database, schema_name, table_name, *, snapshot_id=None):
@@ -362,7 +389,7 @@ async def _count(database, schema_name, table_name, *, snapshot_id=None):
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_remove_v3_snapshot_matches_production_no_cascade_ddl(monkeypatch):
+async def test_real_postgres_remove_v3_snapshot_matches_production_fk_ddl(monkeypatch):
     if os.getenv("HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST") != "1":
         pytest.skip("set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 for the isolated PostgreSQL test")
 
@@ -387,8 +414,10 @@ async def test_real_postgres_remove_v3_snapshot_matches_production_no_cascade_dd
         assert await _count(database, schema_name, "ptg2_snapshot", snapshot_id="shared-a") == 0
         assert await _count(database, schema_name, "ptg2_v3_snapshot_scope", snapshot_id="shared-a") == 0
         assert await _count(database, schema_name, "ptg2_v3_snapshot_binding", snapshot_id="shared-a") == 0
+        assert await _count(database, schema_name, "ptg2_v3_candidate_audit_attestation", snapshot_id="shared-a") == 0
         assert await _count(database, schema_name, "ptg2_v3_snapshot_layout") == 1
         assert await _count(database, schema_name, "ptg2_v3_snapshot_binding", snapshot_id="shared-b") == 1
+        assert await _count(database, schema_name, "ptg2_v3_candidate_audit_attestation", snapshot_id="shared-b") == 1
 
         second = await source_snapshot_control.remove_ptg2_source_snapshot(
             snapshot_id="shared-b",
@@ -401,6 +430,7 @@ async def test_real_postgres_remove_v3_snapshot_matches_production_no_cascade_dd
         assert await _count(database, schema_name, "ptg2_snapshot") == 0
         assert await _count(database, schema_name, "ptg2_v3_snapshot_scope") == 0
         assert await _count(database, schema_name, "ptg2_v3_snapshot_binding") == 0
+        assert await _count(database, schema_name, "ptg2_v3_candidate_audit_attestation") == 0
         assert await _count(database, schema_name, "ptg2_v3_snapshot_layout") == 0
     finally:
         try:

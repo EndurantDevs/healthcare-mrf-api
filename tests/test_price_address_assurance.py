@@ -281,6 +281,7 @@ def test_price_address_assurance_rejects_malformed_provider_directory_network_ma
 
 
 def test_price_address_assurance_rejects_malformed_provider_directory_network_keys():
+    """Verify price address assurance rejects malformed provider directory network keys."""
     base_match = {
         "ptg_network_name": "C2",
         "provider_directory_network_name": "C2",
@@ -1195,6 +1196,7 @@ def test_price_address_assurance_rejects_mismatched_network_bound_address():
 
 
 def test_price_address_assurance_rejects_payer_confirmed_when_traced_raw_lacks_address(tmp_path):
+    """Verify price address assurance rejects payer confirmed when traced raw lacks address."""
     raw_artifact = tmp_path / "rates.json"
     _write_json(
         raw_artifact,
@@ -1318,6 +1320,7 @@ def test_price_address_assurance_accepts_payer_confirmed_when_traced_raw_has_add
 
 
 def test_price_address_assurance_rejects_payer_confirmed_when_source_trace_unresolved(tmp_path):
+    """Verify price address assurance rejects payer confirmed when source trace unresolved."""
     raw_artifact = tmp_path / "rates.json"
     _write_json(
         raw_artifact,
@@ -1659,6 +1662,7 @@ def test_price_address_assurance_cli_can_require_resolved_raw_artifacts():
 
 
 def test_price_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch, tmp_path):
+    """Verify price address assurance cli resolves raw artifacts from db."""
     script = _load_cli_module()
     raw_artifact = tmp_path / "raw-rates.json.gz"
     raw_artifact.write_text("{}", encoding="utf-8")
@@ -1754,6 +1758,7 @@ def test_price_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch,
 
 
 def test_price_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypatch, tmp_path, capsys):
+    """Verify price address assurance cli main verifies traced raw artifact."""
     script = _load_cli_module()
     raw_artifact = tmp_path / "raw-rates.json"
     api_payload = tmp_path / "api-payload.json"

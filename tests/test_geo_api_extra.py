@@ -419,6 +419,7 @@ async def test_geo_by_zip_tiger_fallback():
 
 @pytest.mark.asyncio
 async def test_geo_by_zip_with_census_profile():
+    """Verify geo by zip with census profile."""
     census_row = MappingRow(
         total_population=23890,
         median_household_income=147357,

@@ -41,6 +41,7 @@ def authed_request(**kwargs):
 
 
 def test_importer_registry_exposes_ptg_and_finish_lifecycle():
+    """Verify importer registry exposes ptg and finish lifecycle."""
     items = {entry["name"]: entry for entry in importer_registry()}
 
     assert "ptg" in items
@@ -2566,6 +2567,7 @@ async def test_control_ptg_source_snapshot_promote_endpoint(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_control_ptg_source_snapshot_promote_endpoint_can_enqueue_address_refresh(monkeypatch):
+    """Verify control ptg source snapshot promote endpoint can enqueue address refresh."""
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
     promote_calls = []
     import_calls = []

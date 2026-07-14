@@ -127,6 +127,7 @@ async def test_control_single_job_start_ignores_arq_metadata_kwargs(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
+    """Verify control single job start can run module shutdown."""
     marks = []
     calls = []
 

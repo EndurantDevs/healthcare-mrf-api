@@ -207,6 +207,7 @@ def _fixture_payload(
     duplicate_first_price: bool = False,
     repeated_rate_occurrences: bool = False,
 ) -> dict:
+    """Support the fixture payload test fixture."""
     provider_references = [
         {
             "provider_group_id": 1,
@@ -342,6 +343,7 @@ def _run_scanner(
     duplicate_first_price: bool = False,
     repeated_rate_occurrences: bool = False,
 ) -> dict:
+    """Support the run scanner test fixture."""
     run_directory = tmp_path / label
     run_directory.mkdir()
     artifact = run_directory / "input.json"
@@ -466,6 +468,7 @@ def _run_scanner(
 
 
 def test_v3_all_scanner_paths_emit_identical_fixed_width_records(tmp_path):
+    """Verify v3 all scanner paths emit identical fixed width records."""
     scanner_binary = _built_scanner_binary()
     runs = {
         "worker_ungrouped": _run_scanner(
@@ -673,6 +676,7 @@ def test_scanner_requires_explicit_v3_run_directory_without_legacy_derivation(
 
 
 def test_python_bridge_collects_partition_paths_in_scanner_summary(tmp_path, monkeypatch):
+    """Verify python bridge collects partition paths in scanner summary."""
     scanner_binary = _built_scanner_binary()
     artifact = tmp_path / "bridge-input.json"
     artifact.write_text(
@@ -747,6 +751,7 @@ def test_python_bridge_collects_partition_paths_in_scanner_summary(tmp_path, mon
 
 
 def test_direct_v3_finalizer_cli_emits_shared_block_staging_copy(tmp_path):
+    """Verify direct v3 finalizer cli emits shared block staging copy."""
     scanner_binary = _built_scanner_binary()
     scan = _run_scanner(
         scanner_binary,
