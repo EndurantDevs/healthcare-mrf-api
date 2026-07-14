@@ -60,10 +60,15 @@ def test_profile_source_spec_matches_all_reviewed_acquisition_entries():
 
 
 def test_profile_tables_and_indexes_are_bounded_and_npi_indexed():
-    profile_sql = profile.profile_table_sql("mrf", "profile_stage")
+    profile_sql = profile.profile_table_sql(
+        "mrf",
+        "profile_stage",
+        logged=True,
+    )
     evidence_sql = profile.profile_evidence_table_sql(
         "mrf",
         "evidence_stage",
+        logged=True,
     )
     profile_indexes = profile.profile_index_statements(
         "mrf",
@@ -76,10 +81,12 @@ def test_profile_tables_and_indexes_are_bounded_and_npi_indexed():
         evidence=True,
     )
 
-    assert "CREATE UNLOGGED TABLE" in profile_sql
+    assert 'CREATE TABLE "mrf"."profile_stage"' in profile_sql
+    assert "UNLOGGED" not in profile_sql
     assert "npi bigint PRIMARY KEY" in profile_sql
     assert "evidence_json jsonb NOT NULL" in profile_sql
-    assert "CREATE UNLOGGED TABLE" in evidence_sql
+    assert 'CREATE TABLE "mrf"."evidence_stage"' in evidence_sql
+    assert "UNLOGGED" not in evidence_sql
     assert "evidence_key char(32) PRIMARY KEY" in evidence_sql
     assert any("(generation_id)" in statement for statement in profile_indexes)
     assert any("(npi, fact_type, fact_key)" in statement for statement in evidence_indexes)
@@ -298,6 +305,58 @@ async def test_profile_scope_filters_to_current_immutable_dataset_fence(
     assert "endpoint_id" in captured_by_name["sql"]
 
 
+@pytest.mark.asyncio
+async def test_profile_stage_build_creates_logged_tables_without_rewrite(
+    monkeypatch,
+):
+    status = AsyncMock()
+    scalar_queries = []
+
+    async def scalar(sql, **_params):
+        scalar_queries.append(sql)
+        return "p" if "cls.relpersistence" in sql else 0
+
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(importer.db, "scalar", scalar)
+    monkeypatch.setattr(
+        importer,
+        "_table_exists",
+        AsyncMock(return_value=False),
+    )
+    build = importer._ProviderDirectoryProfileBuild(
+        schema="mrf",
+        generation_id="generation",
+        source_ids=("source_a",),
+        dataset_ids=("dataset_a",),
+        evidence_stage="evidence_stage",
+        profile_stage="profile_stage",
+    )
+    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+
+    _metrics, stages = await importer._build_provider_directory_profile_stages(
+        build,
+        fence,
+        fence,
+    )
+
+    statements = [call.args[0] for call in status.await_args_list]
+    assert any(
+        'CREATE TABLE "mrf"."evidence_stage"' in statement
+        for statement in statements
+    )
+    assert any(
+        'CREATE TABLE "mrf"."profile_stage"' in statement
+        for statement in statements
+    )
+    assert not any("CREATE UNLOGGED TABLE" in statement for statement in statements)
+    assert not any("SET LOGGED" in statement for statement in statements)
+    assert sum("cls.relpersistence" in query for query in scalar_queries) == 2
+    assert [stage.stage_table for stage in stages] == [
+        "evidence_stage",
+        "profile_stage",
+    ]
+
+
 def test_artifact_bundle_collects_profile_and_evidence_stages_together():
     async def rename_indexes(_schema, _stage):
         return None
@@ -325,6 +384,61 @@ def test_artifact_bundle_collects_profile_and_evidence_stages_together():
 
     assert metrics == {"profile_rows": 1}
     assert bundle.stages == list(stages)
+
+
+@pytest.mark.asyncio
+async def test_profile_stages_are_logged_at_creation_without_set_logged(
+    monkeypatch,
+):
+    build = importer._ProviderDirectoryProfileBuild(
+        schema="mrf",
+        generation_id="generation_1",
+        source_ids=("source_a",),
+        dataset_ids=("dataset_a",),
+        evidence_stage="evidence_stage",
+        profile_stage="profile_stage",
+    )
+    build_fence = importer.ProviderDirectoryArtifactBuildFence(
+        target_oid=None
+    )
+    status = AsyncMock()
+    assert_logged = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        importer,
+        "_has_provider_directory_profile_artifacts",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_assert_provider_directory_logged_relation",
+        assert_logged,
+    )
+
+    _metrics, stages = await importer._build_provider_directory_profile_stages(
+        build,
+        build_fence,
+        build_fence,
+    )
+
+    joined_sql = "\n".join(
+        str(awaited.args[0]) for awaited in status.await_args_list
+    )
+    assert 'CREATE TABLE "mrf"."evidence_stage"' in joined_sql
+    assert 'CREATE TABLE "mrf"."profile_stage"' in joined_sql
+    assert "CREATE UNLOGGED TABLE" not in joined_sql
+    assert "SET LOGGED" not in joined_sql
+    assert [
+        awaited.args for awaited in assert_logged.await_args_list
+    ] == [
+        ("mrf", "evidence_stage"),
+        ("mrf", "profile_stage"),
+    ]
+    assert [stage.target_relation for stage in stages] == [
+        profile.PROFILE_EVIDENCE_TABLE,
+        profile.PROFILE_TABLE,
+    ]
 
 
 @pytest.mark.asyncio
