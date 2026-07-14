@@ -8,13 +8,14 @@ on:
   workflow_dispatch:
     inputs:
       ptg_v3_phase:
-        description: "Strict V3 deployment phase; reader promotes the staged audited image"
+        description: "Strict V3 phase; recovery-writer replaces only a failed staged writer"
         required: true
         default: auto
         type: choice
         options:
           - auto
           - reader
+          - recovery-writer
       deploy_sha:
         description: "Exact tested main SHA; required for reader promotion"
         required: false
@@ -83,7 +84,7 @@ jobs:
                 return
               }
               phase = String(context.payload.inputs?.ptg_v3_phase || 'auto')
-              if (!['auto', 'reader'].includes(phase)) {
+              if (!['auto', 'reader', 'recovery-writer'].includes(phase)) {
                 core.setFailed(`Unsupported strict V3 deployment phase ${phase}`)
                 return
               }
@@ -98,7 +99,7 @@ jobs:
                 return
               }
               if (phase !== 'reader' && deploySha !== mainSha) {
-                core.setFailed(`Automatic deployment requires current main ${mainSha}`)
+                core.setFailed(`${phase} deployment requires current main ${mainSha}`)
                 return
               }
 

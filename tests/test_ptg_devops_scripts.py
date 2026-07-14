@@ -41,7 +41,11 @@ def test_dev_deploy_workflow_requires_successful_ci_for_exact_main_sha():
     assert "run.head_repository?.full_name === expectedRepository" in workflow
     assert "deploySha !== mainSha" in workflow
     assert "Reader promotion requires the exact staged deploy_sha" in workflow
-    assert "!['auto', 'reader'].includes(phase)" in workflow
+    assert "!['auto', 'reader', 'recovery-writer'].includes(phase)" in workflow
+    assert "${phase} deployment requires current main ${mainSha}" in workflow
+    assert workflow.count("phase = 'auto'") == 1
+    assert "workflow_dispatch:" in workflow
+    assert "- recovery-writer" in workflow
     assert "--detach" not in workflow
     assert "timeout-minutes: 90" in workflow
     assert "run.conclusion === 'success'" in workflow
