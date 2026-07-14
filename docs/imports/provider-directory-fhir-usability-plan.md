@@ -6,9 +6,10 @@ data usable in search and PTG evidence now.
 
 ## Defer For Future Full Coverage
 
-- Credential onboarding remains the main coverage gap. The live dev audit on
-  2026-07-02 showed 796 Provider Directory sources, with 668 still requiring
-  auth or registration and 32 responding with non-FHIR content.
+- **Historical snapshot, not current coverage:** the dev audit on 2026-07-02
+  recorded 796 Provider Directory sources, with 668 still requiring auth or
+  registration and 32 responding with non-FHIR content. Refresh the current
+  endpoint audit before using these counts for prioritization.
 - Non-Aetna credentialed payers should be onboarded in priority order from the
   coverage audit credential backlog exports. Each rule must be host/API-base
   scoped, secret-backed, and verified by a probe plus at least one resource
@@ -33,6 +34,11 @@ data usable in search and PTG evidence now.
 - The default recurring chain is monthly: full Provider Directory import,
   Provider Directory partial unified-address projection, then Provider
   Directory corroboration publish.
+- The consumer-API evidence gate is the source-by-source A/P/G/F/V matrix in
+  `scripts/research/provider_directory_api_evidence_harness.py`. It must prove
+  address-key, phone, geo, profile-fact, and exact current FHIR provenance for
+  each source in `specs/provider_directory_profile_sources.json`; it reports
+  missing current overlay data as a failure rather than treating it as a pass.
 
 ## Aetna Exception
 

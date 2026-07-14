@@ -29,6 +29,7 @@ class HarnessConfig:
     candidate_limit: int
     api_latency_slo_ms: float
     require_mapped_evidence: bool = False
+    profile_sources_path: Path | None = None
 
 
 def _normalized_ids(identifiers: Iterable[str]) -> tuple[str, ...]:

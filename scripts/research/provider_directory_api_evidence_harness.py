@@ -33,6 +33,12 @@ from scripts.research.provider_directory_api_evidence_db import (
     fetch_current_dataset_completion_proofs,
     fetch_mapped_evidence_witnesses,
     fetch_overlay_samples,
+    fetch_current_source_provenance,
+)
+from scripts.research.provider_directory_api_evidence_matrix import (
+    DEFAULT_PROFILE_SOURCE_SPEC,
+    load_matrix_source_spec,
+    resolve_matrix_source_selection,
 )
 from scripts.research.provider_directory_api_evidence_report import (
     database_failure_result,
@@ -64,9 +70,11 @@ class CurrentEvidenceProbe:
     completion_proofs_by_source: Mapping[
         str, Mapping[str, Mapping[str, Any]]
     ]
+    provenance_by_source: Mapping[str, Any]
     database_error: str | None = None
     witness_probe_error: str | None = None
     completion_probe_error: str | None = None
+    provenance_probe_error: str | None = None
 
 
 def _utc_now() -> str:
@@ -88,6 +96,7 @@ async def _current_samples(
     empty_witnesses_by_source = {
         selection.source_id: [] for selection in selections
     }
+    empty_provenance_by_source: dict[str, Any] = {}
     try:
         samples_by_source = await fetch_overlay_samples(
             conn,
@@ -100,6 +109,7 @@ async def _current_samples(
             empty_samples_by_source,
             empty_witnesses_by_source,
             {},
+            empty_provenance_by_source,
             database_error=type(exc).__name__,
         )
     try:
@@ -114,28 +124,53 @@ async def _current_samples(
             samples_by_source,
             empty_witnesses_by_source,
             {},
+            empty_provenance_by_source,
             witness_probe_error=type(exc).__name__,
         )
-    if not config.require_mapped_evidence:
-        return CurrentEvidenceProbe(samples_by_source, witnesses_by_source, {})
+    provenance_by_source, provenance_probe_error = await _current_provenance(
+        config, conn, selections
+    )
+    completion_proofs, completion_probe_error = await _completion_proofs(
+        config, conn, selections
+    )
+    return CurrentEvidenceProbe(
+        samples_by_source,
+        witnesses_by_source,
+        completion_proofs,
+        provenance_by_source,
+        completion_probe_error=completion_probe_error,
+        provenance_probe_error=provenance_probe_error,
+    )
+
+
+async def _current_provenance(
+    config: HarnessConfig, conn: Any, selections: list[SourceSelection]
+) -> tuple[Mapping[str, Any], str | None]:
     try:
-        completion_proofs_by_source = await fetch_current_dataset_completion_proofs(
-            conn,
-            schema=config.schema,
-            selections=selections,
-        )
-        return CurrentEvidenceProbe(
-            samples_by_source,
-            witnesses_by_source,
-            completion_proofs_by_source,
+        return (
+            await fetch_current_source_provenance(
+                conn, schema=config.schema, selections=selections
+            ),
+            None,
         )
     except Exception as exc:
-        return CurrentEvidenceProbe(
-            samples_by_source,
-            witnesses_by_source,
-            {},
-            completion_probe_error=type(exc).__name__,
+        return {}, type(exc).__name__
+
+
+async def _completion_proofs(
+    config: HarnessConfig, conn: Any, selections: list[SourceSelection]
+) -> tuple[Mapping[str, Mapping[str, Mapping[str, Any]]], str | None]:
+    if not config.require_mapped_evidence:
+        return {}, None
+    try:
+        return (
+            await fetch_current_dataset_completion_proofs(
+                conn, schema=config.schema, selections=selections
+            ),
+            None,
         )
+    except Exception as exc:
+        return {}, type(exc).__name__
 
 
 def _active_api_client(
@@ -181,6 +216,9 @@ def _source_results(
             completion_proofs=current_probe.completion_proofs_by_source.get(
                 selection.source_id
             ),
+            expected_provenance=current_probe.provenance_by_source.get(
+                selection.source_id
+            ),
         )
         for selection in selections
     ]
@@ -193,6 +231,7 @@ def _report_payload(
     current_probe: CurrentEvidenceProbe,
     api_client: ProviderDirectoryApiClient | None,
 ) -> dict[str, Any]:
+    """Compose a redaction-ready report from bounded source outcomes."""
     required_failures = sum(
         source_result["status"] == "fail" and source_result["required"]
         for source_result in source_results
@@ -214,30 +253,54 @@ def _report_payload(
             if api_client is not None and not current_probe.database_error
             else "data_only"
         ),
-        "selection": {
-            "entry_ids": list(config.entry_ids),
-            "source_ids": list(config.source_ids),
-            "selected_source_count": len(selections),
-            "max_sources": config.max_sources,
-            "samples_per_source": config.samples_per_source,
-            "phone_candidate_limit": config.candidate_limit,
-            "api_latency_slo_ms": config.api_latency_slo_ms,
-            "require_mapped_evidence": config.require_mapped_evidence,
-        },
-        "summary": {
-            "pass": sum(
-                source_result["status"] == "pass" for source_result in source_results
-            ),
-            "fail": sum(
-                source_result["status"] == "fail" for source_result in source_results
-            ),
-            "skip": sum(
-                source_result["status"] == "skip" for source_result in source_results
-            ),
-            "required_sources_failed": required_failures,
-            **mapped_summary,
-        },
+        "selection": _selection_summary(config, selections),
+        "summary": _outcome_summary(
+            source_results,
+            required_failures,
+            current_probe.provenance_probe_error,
+            mapped_summary,
+        ),
         "sources": source_results,
+    }
+
+
+def _selection_summary(
+    config: HarnessConfig, selections: list[SourceSelection]
+) -> dict[str, Any]:
+    return {
+        "entry_ids": list(config.entry_ids),
+        "source_ids": list(config.source_ids),
+        "selected_source_count": len(selections),
+        "max_sources": config.max_sources,
+        "samples_per_source": config.samples_per_source,
+        "phone_candidate_limit": config.candidate_limit,
+        "api_latency_slo_ms": config.api_latency_slo_ms,
+        "require_mapped_evidence": config.require_mapped_evidence,
+        "profile_sources": str(config.profile_sources_path or DEFAULT_PROFILE_SOURCE_SPEC),
+    }
+
+
+def _outcome_summary(
+    source_results: list[dict[str, Any]],
+    required_failures: int,
+    provenance_probe_error: str | None,
+    mapped_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        status: sum(result["status"] == status for result in source_results)
+        for status in ("pass", "fail", "skip")
+    } | {
+        "required_sources_failed": required_failures,
+        "matrix_checks": {
+            check_code: sum(
+                matrix_check.get(check_code, {}).get("state") == "pass"
+                for source_result in source_results
+                for matrix_check in source_result.get("verification_matrix", [])
+            )
+            for check_code in ("A", "P", "G", "F", "V")
+        },
+        "matrix_probe_failed": bool(provenance_probe_error),
+        **mapped_summary,
     }
 
 
@@ -250,8 +313,12 @@ async def build_report(
     """Build a credential-safe report, failing required sources without evidence."""
     _validate_harness_config(config)
     manifest = load_manifest(config.manifest_path)
-    selections = resolve_source_selection(
+    profile_spec = load_matrix_source_spec(
+        config.profile_sources_path or DEFAULT_PROFILE_SOURCE_SPEC
+    )
+    selections = resolve_matrix_source_selection(
         manifest,
+        profile_spec,
         requested_entry_ids=config.entry_ids,
         requested_source_ids=config.source_ids,
         max_sources=config.max_sources,
@@ -302,6 +369,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse explicit database/API settings without printing secret values."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--profile-sources", type=Path, default=DEFAULT_PROFILE_SOURCE_SPEC
+    )
     parser.add_argument("--entry-id", action="append", default=[])
     parser.add_argument("--source-id", action="append", default=[])
     parser.add_argument("--max-sources", type=int, default=100)
@@ -354,6 +424,7 @@ def _harness_config(args: argparse.Namespace) -> HarnessConfig:
         candidate_limit=args.phone_candidate_limit,
         api_latency_slo_ms=args.api_latency_slo_ms,
         require_mapped_evidence=args.require_mapped_evidence,
+        profile_sources_path=args.profile_sources,
     )
 
 

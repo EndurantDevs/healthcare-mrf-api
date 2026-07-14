@@ -14,8 +14,10 @@ from scripts.research.provider_directory_api_evidence_support import (
     MappedEvidenceWitness,
     NetworkWitness,
     OverlaySample,
+    SourceProvenance,
     SourceSelection,
 )
+from scripts.research.provider_directory_api_evidence_models import normalized_coordinate
 
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -54,10 +56,14 @@ def overlay_sample_sql(schema: str, *, phone_required: bool = True) -> str:
                AND dataset.superseded_at IS NULL
                AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
         )
-        SELECT current_source.source_id, sampled.npi, sampled.phone_number
+        SELECT current_source.source_id, sampled.npi, sampled.phone_number,
+               sampled.address_key, sampled.latitude, sampled.longitude
           FROM current_sources AS current_source
           CROSS JOIN LATERAL (
-              SELECT overlay.npi, overlay.phone_number
+              SELECT overlay.npi, overlay.phone_number,
+                     overlay.address_key::text AS address_key,
+                     NULLIF(BTRIM(overlay.latitude), '')::double precision AS latitude,
+                     NULLIF(BTRIM(overlay.longitude), '')::double precision AS longitude
                 FROM {quoted_schema}.provider_directory_address_overlay AS overlay
                WHERE overlay.source_id = current_source.source_id
                  AND overlay.last_seen_run_id = current_source.run_id
@@ -130,6 +136,83 @@ def mapped_evidence_candidate_sql(schema: str) -> str:
       ORDER BY requested.source_id, requested.resource_type,
                sampled.resource_id, sampled.npi;
     """
+
+
+def current_source_provenance_sql(schema: str) -> str:
+    """Return public current-dataset provenance for each selected source."""
+    quoted_schema = _quote_identifier(schema, label="database schema")
+    return f"""
+        WITH requested_sources AS MATERIALIZED (
+            SELECT DISTINCT source_id
+              FROM unnest($1::varchar[]) AS requested(source_id)
+        ), current_endpoint_counts AS MATERIALIZED (
+            SELECT requested.source_id, source.endpoint_id
+              FROM requested_sources AS requested
+              JOIN {quoted_schema}.provider_directory_source AS source
+                ON source.source_id = requested.source_id
+              JOIN {quoted_schema}.provider_directory_endpoint_dataset AS dataset
+                ON dataset.endpoint_id = source.endpoint_id
+             WHERE dataset.is_current IS TRUE
+          GROUP BY requested.source_id, source.endpoint_id
+            HAVING COUNT(*) = 1
+        ), current_sources AS MATERIALIZED (
+            SELECT current_endpoint.source_id, source.endpoint_id, dataset.dataset_id,
+                   COALESCE(
+                       endpoint.canonical_api_base, source.canonical_api_base,
+                       source.api_base
+                   ) AS api_base,
+                   source.org_name, source.plan_name
+              FROM current_endpoint_counts AS current_endpoint
+              JOIN {quoted_schema}.provider_directory_source AS source
+                ON source.source_id = current_endpoint.source_id
+              JOIN {quoted_schema}.provider_directory_endpoint_dataset AS dataset
+                ON dataset.endpoint_id = current_endpoint.endpoint_id
+              JOIN {quoted_schema}.provider_directory_api_endpoint AS endpoint
+                ON endpoint.endpoint_id = current_endpoint.endpoint_id
+             WHERE dataset.is_current IS TRUE
+               AND dataset.status = 'published'
+               AND dataset.published_at IS NOT NULL
+               AND dataset.superseded_at IS NULL
+        )
+        SELECT source_id, endpoint_id, dataset_id, api_base, org_name, plan_name
+          FROM current_sources
+         WHERE endpoint_id IS NOT NULL
+           AND dataset_id IS NOT NULL
+           AND NULLIF(BTRIM(api_base), '') IS NOT NULL
+      ORDER BY source_id;
+    """
+
+
+async def fetch_current_source_provenance(
+    conn: Any,
+    *,
+    schema: str,
+    selections: Iterable[SourceSelection],
+) -> dict[str, SourceProvenance]:
+    """Fetch one current published non-secret provenance tuple per source."""
+    source_ids = [selection.source_id for selection in selections]
+    if not source_ids:
+        return {}
+    provenance_by_source: dict[str, SourceProvenance] = {}
+    for provenance_row in await conn.fetch(
+        current_source_provenance_sql(schema), source_ids
+    ):
+        row_map = getattr(provenance_row, "_mapping", provenance_row)
+        source_id = str(row_map.get("source_id") or "")
+        endpoint_id = str(row_map.get("endpoint_id") or "")
+        dataset_id = str(row_map.get("dataset_id") or "")
+        api_base = str(row_map.get("api_base") or "")
+        if not all((source_id, endpoint_id, dataset_id, api_base)):
+            continue
+        provenance_by_source[source_id] = SourceProvenance(
+            source_id,
+            endpoint_id,
+            dataset_id,
+            api_base,
+            str(row_map.get("org_name") or "") or None,
+            str(row_map.get("plan_name") or "") or None,
+        )
+    return provenance_by_source
 
 
 def _asyncpg_role_evidence_sql(schema: str, *, has_affiliations: bool) -> str:
@@ -399,6 +482,9 @@ def _append_overlay_samples(
                 source_id,
                 npi,
                 _normalized_phone(row_map.get("phone_number")),
+                str(row_map.get("address_key") or "") or None,
+                normalized_coordinate(row_map.get("latitude")),
+                normalized_coordinate(row_map.get("longitude")),
             )
         )
 

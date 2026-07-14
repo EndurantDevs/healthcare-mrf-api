@@ -419,6 +419,50 @@ qualification start date. Its value always travels with the derivation basis,
 basis start date, and as-of date; it is not a claim about the provider's age or
 an independently verified employment start date.
 
+## Provider Profile API Verification Matrix
+
+`scripts/research/provider_directory_api_evidence_harness.py` is the
+credential-safe consumer-API verification harness for every reviewed profile
+source. Its source-of-truth is
+`specs/provider_directory_profile_sources.json`, which selects the 17
+acquisition, bulk-acquisition, or externally supported profile sources and
+defines the resource profile applicable to each source. It is deliberately not
+a replacement for an importer completeness run.
+
+Each current source must prove all five matrix checks with a bounded current
+overlay sample:
+
+| Check | Consumer surface | Required proof |
+| --- | --- | --- |
+| `A` | provider detail with `address_key` | The exact current address-key request returns the source-backed address. |
+| `P` | provider match candidates by phone | The normalized phone lookup returns the sampled NPI with exact FHIR source provenance. |
+| `G` | provider match candidates by coordinates | A bounded `lat`/`long` radius lookup returns the sampled NPI with exact FHIR source provenance. |
+| `F` | provider detail profile evidence | At least one source-backed profile fact exposes an allowed FHIR resource type and resource id. |
+| `V` | provider detail profile/profile-evidence sources | The API source tuple exactly matches the current `source_id`, `endpoint_id`, `dataset_id`, credential-free API base, organization, and plan values. |
+
+The harness obtains the expected `endpoint_id`, `dataset_id`, canonical API
+base, organization, and plan from one current published endpoint dataset per
+source. It does not trust a historical row or infer membership from catalog
+aliases. Profile-fact evidence additionally requires a source-backed FHIR
+`resource_type` and `resource_id`; role, plan, and network resource ids remain
+verified through the existing typed witness checks when those resources are
+applicable.
+
+Resource applicability is data-driven. The profile specification maps each
+source to its FHIR resource profile, so a source that does not support
+`OrganizationAffiliation` is reported as not applicable rather than treated as
+missing. ALOHR is explicitly modeled as the private `alohr` tenant GraphQL
+connector contract with `Practitioner`, `Organization`, `Location`, and
+`PractitionerRole`; it does not publish or synthesize
+`OrganizationAffiliation` resources.
+
+Run the harness against an authenticated consumer API with a credential-free
+base URL and either a bearer token or API key. `--data-only` remains useful for
+database fencing checks, but cannot pass the API matrix. The JSON report masks
+phone values, reports only presence of address keys and coordinates, and emits
+only credential-free provenance fields. It never serializes request headers,
+tokens, API keys, passwords, or response bodies.
+
 Both resource shapes can include `fhir_provenance`. This is a bounded,
 sanitized projection for debugging and traceability, not the source FHIR
 resource: it may contain selected `meta` values, `self_url`, `fetch_url`, and
