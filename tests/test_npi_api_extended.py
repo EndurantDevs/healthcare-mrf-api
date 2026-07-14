@@ -127,41 +127,41 @@ async def test_fast_has_insurance_count_city_uses_distinct(monkeypatch):
 
 
 def _build_result_row(npi_value: int) -> list:
-    row = [npi_value]
+    result_values = [npi_value]
     for column in NPIData.__table__.columns:
         if column.key == "npi":
-            row.append(npi_value)
+            result_values.append(npi_value)
         elif column.key == "do_business_as":
-            row.append(['DBA'])
+            result_values.append(['DBA'])
         else:
-            row.append(f"data_{column.key}")
+            result_values.append(f"data_{column.key}")
     for column in NPIAddress.__table__.columns:
         if column.key == "npi":
-            row.append(npi_value)
+            result_values.append(npi_value)
         elif column.key == "checksum":
-            row.append(1)
+            result_values.append(1)
         else:
-            row.append(f"addr_{column.key}")
+            result_values.append(f"addr_{column.key}")
     for column in NPIDataTaxonomy.__table__.columns:
         if column.key in {"npi", "checksum"}:
-            row.append(None)
+            result_values.append(None)
         else:
-            row.append(f"tax_{column.key}")
-    return row
+            result_values.append(f"tax_{column.key}")
+    return result_values
 
 
-def _set_result_address_column(row: list, key: str, value):
+def _set_result_address_column(result_values: list, key: str, value):
     for idx, column in enumerate(NPIAddress.__table__.columns):
         if column.key == key:
-            row[1 + len(NPIData.__table__.columns) + idx] = value
+            result_values[1 + len(NPIData.__table__.columns) + idx] = value
             return
     raise AssertionError(f"Unknown NPIAddress column: {key}")
 
 
-def _set_near_address_column(row: list, key: str, value):
+def _set_near_address_column(near_values: list, key: str, value):
     for idx, column in enumerate(NPIAddress.__table__.columns):
         if column.key == key:
-            row[2 + idx] = value
+            near_values[2 + idx] = value
             return
     raise AssertionError(f"Unknown NPIAddress column: {key}")
 
@@ -243,38 +243,38 @@ async def test_get_all_returns_rows(monkeypatch):
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_all(request)
-    payload = json.loads(response.body)
-    assert payload["total"] == 2
-    assert payload["rows"][0]["taxonomy_list"]
-    assert payload["rows"][0]["do_business_as"] == ['DBA']
-    assert payload["rows"][0]["address_key"] == "addr_address_key"
-    assert payload["rows"][0]["phone_number"] == "3125551212"
-    assert payload["rows"][0]["phone_extension"] == "44"
-    assert payload["rows"][0]["fax_number_digits"] == "3125550199"
+    response_body = json.loads(response.body)
+    assert response_body["total"] == 2
+    assert response_body["rows"][0]["taxonomy_list"]
+    assert response_body["rows"][0]["do_business_as"] == ['DBA']
+    assert response_body["rows"][0]["address_key"] == "addr_address_key"
+    assert response_body["rows"][0]["phone_number"] == "3125551212"
+    assert response_body["rows"][0]["phone_extension"] == "44"
+    assert response_body["rows"][0]["fax_number_digits"] == "3125550199"
 
 
 def _build_near_row(npi_value: int) -> list:
-    row = [npi_value, 0.5]
+    near_values = [npi_value, 0.5]
     for column in NPIAddress.__table__.columns:
         if column.key == "npi":
-            row.append(npi_value)
+            near_values.append(npi_value)
         elif column.key == "checksum":
-            row.append(1)
+            near_values.append(1)
         else:
-            row.append(f"addr_{column.key}")
+            near_values.append(f"addr_{column.key}")
     for column in NPIData.__table__.columns:
         if column.key == "npi":
-            row.append(npi_value)
+            near_values.append(npi_value)
         elif column.key == "do_business_as":
-            row.append(['DBA'])
+            near_values.append(['DBA'])
         else:
-            row.append(f"data_{column.key}")
+            near_values.append(f"data_{column.key}")
     for column in NPIDataTaxonomy.__table__.columns:
         if column.key in {"npi", "checksum"}:
-            row.append(None)
+            near_values.append(None)
         else:
-            row.append(f"tax_{column.key}")
-    return row
+            near_values.append(f"tax_{column.key}")
+    return near_values
 
 
 @pytest.mark.asyncio
@@ -299,21 +299,21 @@ async def test_get_near_npi(monkeypatch):
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_near_npi(request)
-    payload = json.loads(response.body)
-    assert len(payload) == 1
-    assert payload[0]["distance"] == 0.5
-    assert payload[0]["taxonomy_list"]
-    assert payload[0]["do_business_as"] == ['DBA']
-    assert payload[0]["phone_number"] == "2175550100"
+    response_body = json.loads(response.body)
+    assert len(response_body) == 1
+    assert response_body[0]["distance"] == 0.5
+    assert response_body[0]["taxonomy_list"]
+    assert response_body[0]["do_business_as"] == ['DBA']
+    assert response_body[0]["phone_number"] == "2175550100"
 
 
 @pytest.mark.asyncio
 async def test_get_near_npi_with_lat_long_includes_bbox_params(monkeypatch):
-    captured = {}
+    captured_query_map = {}
 
     class RecordingConnection:
         async def all(self, _sql, **params):
-            captured.update(params)
+            captured_query_map.update(params)
             return [_build_near_row(1112223334)]
 
         async def first(self, *_args, **_kwargs):
@@ -330,17 +330,17 @@ async def test_get_near_npi_with_lat_long_includes_bbox_params(monkeypatch):
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_near_npi(request)
-    payload = json.loads(response.body)
-    assert len(payload) == 1
-    assert "min_lat" in captured
-    assert "max_lat" in captured
-    assert "min_long" in captured
-    assert "max_long" in captured
+    response_body = json.loads(response.body)
+    assert len(response_body) == 1
+    assert "min_lat" in captured_query_map
+    assert "max_lat" in captured_query_map
+    assert "min_long" in captured_query_map
+    assert "max_long" in captured_query_map
 
 
 @pytest.mark.asyncio
 async def test_get_near_npi_uses_unified_address_table_when_compatible(monkeypatch):
-    captured = {}
+    captured_query_map = {}
 
     async def fake_table_columns(table_name, *, session=None):
         assert session is None
@@ -350,8 +350,8 @@ async def test_get_near_npi_uses_unified_address_table_when_compatible(monkeypat
 
     class RecordingConnection:
         async def all(self, sql, **params):
-            captured["sql"] = str(sql)
-            captured["params"] = params
+            captured_query_map["sql"] = str(sql)
+            captured_query_map["params"] = params
             return []
 
         async def first(self, *_args, **_kwargs):
@@ -371,10 +371,10 @@ async def test_get_near_npi_uses_unified_address_table_when_compatible(monkeypat
     )
     response = await npi_module.get_near_npi(request)
     assert json.loads(response.body) == []
-    assert "FROM mrf.entity_address_unified AS a" in captured["sql"]
-    assert "FROM mrf.npi_address AS a" not in captured["sql"]
-    assert "COALESCE(a.address_precision, '') <> 'city_zip'" in captured["sql"]
-    assert "min_lat" in captured["params"]
+    assert "FROM mrf.entity_address_unified AS a" in captured_query_map["sql"]
+    assert "FROM mrf.npi_address AS a" not in captured_query_map["sql"]
+    assert "COALESCE(a.address_precision, '') <> 'city_zip'" in captured_query_map["sql"]
+    assert "min_lat" in captured_query_map["params"]
 
 
 @pytest.mark.asyncio
@@ -420,8 +420,8 @@ async def test_get_full_taxonomy_list(monkeypatch):
 
     monkeypatch.setattr(npi_module, "db", FakeDB())
     response = await npi_module.get_full_taxonomy_list(types.SimpleNamespace(), "123")
-    payload = json.loads(response.body)
-    assert payload[0]["nucc_taxonomy"]["code"] == "123"
+    response_body = json.loads(response.body)
+    assert response_body[0]["nucc_taxonomy"]["code"] == "123"
 
 
 @pytest.mark.asyncio
@@ -448,12 +448,12 @@ async def test_get_plans_by_npi(monkeypatch):
         types.SimpleNamespace(select=lambda *_args, **_kwargs: FakeQuery([(plan_entry, issuer_entry)])),
     )
     response = await npi_module.get_plans_by_npi(types.SimpleNamespace(), "123")
-    payload = json.loads(response.body)
-    assert payload["npi_data"][0]["issuer_info"]["issuer"] == 2
+    response_body = json.loads(response.body)
+    assert response_body["npi_data"][0]["issuer_info"]["issuer"] == 2
 
 
 def test_public_nested_taxonomy_rows_hide_internal_identity_and_dedupe():
-    rows = [
+    taxonomy_input_rows = [
         {
             "npi": 1194956268,
             "checksum": -1,
@@ -474,9 +474,9 @@ def test_public_nested_taxonomy_rows_hide_internal_identity_and_dedupe():
         },
     ]
 
-    payload = npi_module._public_nested_taxonomy_rows(rows)
+    taxonomy_output_rows = npi_module._public_nested_taxonomy_rows(taxonomy_input_rows)
 
-    assert payload == [
+    assert taxonomy_output_rows == [
         {
             "healthcare_provider_taxonomy_code": "261QM1200X",
             "healthcare_provider_primary_taxonomy_switch": "Y",
@@ -486,7 +486,10 @@ def test_public_nested_taxonomy_rows_hide_internal_identity_and_dedupe():
             "healthcare_provider_primary_taxonomy_switch": "N",
         },
     ]
-    assert all("npi" not in row and "checksum" not in row for row in payload)
+    assert all(
+        "npi" not in taxonomy_record_map and "checksum" not in taxonomy_record_map
+        for taxonomy_record_map in taxonomy_output_rows
+    )
 
 
 @pytest.mark.asyncio
@@ -525,12 +528,12 @@ async def test_build_npi_details(monkeypatch):
             return FakeSelect(row_values)
 
     monkeypatch.setattr(npi_module, "db", FakeDB())
-    payload = await npi_module._build_npi_details(1234567890)
-    assert payload["taxonomy_list"]
-    assert payload["taxonomy_list"] == [{"taxonomy": 1}]
-    assert payload["taxonomy_group_list"]
-    assert payload["taxonomy_group_list"] == [{"group": 2}]
-    assert payload["address_list"]
+    response_body = await npi_module._build_npi_details(1234567890)
+    assert response_body["taxonomy_list"]
+    assert response_body["taxonomy_list"] == [{"taxonomy": 1}]
+    assert response_body["taxonomy_group_list"]
+    assert response_body["taxonomy_group_list"] == [{"group": 2}]
+    assert response_body["address_list"]
 
 
 @pytest.mark.asyncio
@@ -565,7 +568,7 @@ class FakeUpdate:
 
 class FakeInsert:
     def values(self, obj):
-        self.payload = obj
+        self.response_body = obj
         return self
 
     def on_conflict_do_update(self, **_kwargs):
@@ -691,11 +694,11 @@ async def test_get_npi_geocode_mapbox(monkeypatch):
         app=FakeApp(),
     )
     response = await npi_module.get_npi(request, "1518379601")
-    payload = json.loads(response.body)
-    assert payload["address_list"][0]["lat"] == 41.1
-    assert payload["address_list"][0]["geo_source"] == "mapbox"
+    response_body = json.loads(response.body)
+    assert response_body["address_list"][0]["lat"] == 41.1
+    assert response_body["address_list"][0]["geo_source"] == "mapbox"
     await tasks[0]
-    assert hasattr(insert, "payload")
+    assert hasattr(insert, "response_body")
 
 
 @pytest.mark.asyncio
@@ -769,9 +772,9 @@ async def test_get_npi_geocode_omits_null_address_parts(monkeypatch):
 
     request = types.SimpleNamespace(args={"force_address_update": "1"}, app=FakeApp())
     response = await npi_module.get_npi(request, "1518379601")
-    payload = json.loads(response.body)
+    response_body = json.loads(response.body)
 
-    assert payload["address_list"][0]["lat"] == 41.1
+    assert response_body["address_list"][0]["lat"] == 41.1
     assert requested_urls
     assert "None" not in requested_urls[0]
     assert "Chicago" in requested_urls[0]
@@ -866,11 +869,11 @@ async def test_get_npi_geocode_google(monkeypatch):
         app=FakeApp(),
     )
     response = await npi_module.get_npi(request, "1518379601")
-    payload = json.loads(response.body)
-    assert payload["address_list"][0]["lat"] == 41.2
-    assert payload["address_list"][0]["geo_source"] == "google"
+    response_body = json.loads(response.body)
+    assert response_body["address_list"][0]["lat"] == 41.2
+    assert response_body["address_list"][0]["geo_source"] == "google"
     await tasks[0]
-    assert hasattr(insert, "payload")
+    assert hasattr(insert, "response_body")
 
 
 @pytest.mark.asyncio
@@ -960,8 +963,8 @@ async def test_get_npi_geocode_openaddresses_before_paid_providers(monkeypatch):
         app=FakeApp(),
     )
     response = await npi_module.get_npi(request, "1518379601")
-    payload = json.loads(response.body)
-    address = payload["address_list"][0]
+    response_body = json.loads(response.body)
+    address = response_body["address_list"][0]
     assert address["lat"] == 41.3
     assert address["geo_source"] == "openaddresses"
     assert address["geocode_source"] == "openaddresses_exact"
@@ -987,8 +990,8 @@ async def test_get_all_full_taxonomy(monkeypatch):
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_all(request)
-    payload = json.loads(response.body)
-    assert payload["rows"] == {"1234": 7}
+    response_body = json.loads(response.body)
+    assert response_body["rows"] == {"1234": 7}
 
 
 @pytest.mark.asyncio
@@ -1009,8 +1012,8 @@ async def test_get_all_response_format_default(monkeypatch):
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_all(request)
-    payload = json.loads(response.body)
-    assert payload["rows"] == {"Pharmacist": 3}
+    response_body = json.loads(response.body)
+    assert response_body["rows"] == {"Pharmacist": 3}
 
 
 @pytest.mark.asyncio
@@ -1040,8 +1043,8 @@ async def test_get_near_npi_with_filters(monkeypatch):
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_near_npi(request)
-    payload = json.loads(response.body)
-    assert payload[0]["npi"] == 5556667778
+    response_body = json.loads(response.body)
+    assert response_body[0]["npi"] == 5556667778
 
 
 @pytest.mark.asyncio
@@ -1056,12 +1059,12 @@ async def test_get_near_npi_rejects_name_like_legacy_alias():
 
 @pytest.mark.asyncio
 async def test_get_near_npi_applies_procedure_and_medication_filters(monkeypatch):
-    captured = {}
+    captured_query_map = {}
 
     class RecordingConnection:
         async def all(self, sql, **params):
-            captured["sql"] = str(sql)
-            captured["params"] = dict(params)
+            captured_query_map["sql"] = str(sql)
+            captured_query_map["params"] = dict(params)
             return [_build_near_row(1112223334)]
 
         async def first(self, *_args, **_kwargs):
@@ -1097,18 +1100,18 @@ async def test_get_near_npi_applies_procedure_and_medication_filters(monkeypatch
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_near_npi(request)
-    payload = json.loads(response.body)
+    response_body = json.loads(response.body)
 
-    assert len(payload) == 1
-    assert "a.procedures_array @> ARRAY[:procedure_code_0]::INTEGER[]" in captured["sql"]
-    assert "a.procedures_array @> ARRAY[:procedure_code_1]::INTEGER[]" in captured["sql"]
-    assert "a.medications_array @> ARRAY[:medication_code_0]::INTEGER[]" in captured["sql"]
-    assert "a.medications_array @> ARRAY[:medication_code_1]::INTEGER[]" in captured["sql"]
-    assert captured["params"]["procedure_code_0"] == 1001
-    assert captured["params"]["procedure_code_1"] == 1002
-    assert captured["params"]["medication_code_0"] == 2001
-    assert captured["params"]["medication_code_1"] == 2002
-    assert captured["params"]["filter_year"] == 2023
+    assert len(response_body) == 1
+    assert "a.procedures_array @> ARRAY[:procedure_code_0]::INTEGER[]" in captured_query_map["sql"]
+    assert "a.procedures_array @> ARRAY[:procedure_code_1]::INTEGER[]" in captured_query_map["sql"]
+    assert "a.medications_array @> ARRAY[:medication_code_0]::INTEGER[]" in captured_query_map["sql"]
+    assert "a.medications_array @> ARRAY[:medication_code_1]::INTEGER[]" in captured_query_map["sql"]
+    assert captured_query_map["params"]["procedure_code_0"] == 1001
+    assert captured_query_map["params"]["procedure_code_1"] == 1002
+    assert captured_query_map["params"]["medication_code_0"] == 2001
+    assert captured_query_map["params"]["medication_code_1"] == 2002
+    assert captured_query_map["params"]["filter_year"] == 2023
 
 
 @pytest.mark.asyncio
@@ -1138,10 +1141,10 @@ async def test_get_near_npi_does_not_crash_on_short_positional_rows(monkeypatch)
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_near_npi(request)
-    payload = json.loads(response.body)
-    assert isinstance(payload, list)
-    assert len(payload) == 1
-    assert payload[0]["npi"] == 1112223334
+    response_body = json.loads(response.body)
+    assert isinstance(response_body, list)
+    assert len(response_body) == 1
+    assert response_body[0]["npi"] == 1112223334
 
 
 @pytest.mark.asyncio
@@ -1181,8 +1184,8 @@ async def test_get_npi_uses_cached_address(monkeypatch):
         app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": False})
     )
     response = await npi_module.get_npi(request, "1518379601")
-    payload = json.loads(response.body)
-    assert payload["address_list"][0]["lat"] == 40.0
+    response_body = json.loads(response.body)
+    assert response_body["address_list"][0]["lat"] == 40.0
 
 
 @pytest.mark.asyncio
@@ -1236,18 +1239,18 @@ async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latle
     first = await npi_module.get_npi(request, "1518379601")
     second = await npi_module.get_npi(request, "1518379601")
 
-    payload = json.loads(first.body)
-    assert payload["address_list"][0]["lat"] is None
+    response_body = json.loads(first.body)
+    assert response_body["address_list"][0]["lat"] is None
     assert first.body == second.body
     assert len(build_calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_get_npi_query_flags_disable_stored_and_live_geocode(monkeypatch):
-    captured_kwargs = {}
+    captured_keyword_map = {}
 
     async def fake_build(_npi, **kwargs):
-        captured_kwargs.update(kwargs)
+        captured_keyword_map.update(kwargs)
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -1293,10 +1296,10 @@ async def test_get_npi_query_flags_disable_stored_and_live_geocode(monkeypatch):
         app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": True}),
     )
     response = await npi_module.get_npi(request, "1518379601")
-    payload = json.loads(response.body)
+    response_body = json.loads(response.body)
 
-    assert payload["address_list"][0]["lat"] is None
-    assert captured_kwargs["include_address_total"] is False
+    assert response_body["address_list"][0]["lat"] is None
+    assert captured_keyword_map["include_address_total"] is False
 
 
 @pytest.mark.asyncio
@@ -1410,18 +1413,18 @@ async def test_get_all_count_only_filters(monkeypatch):
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_all(request)
-    payload = json.loads(response.body)
-    assert payload["rows"] == 5
+    response_body = json.loads(response.body)
+    assert response_body["rows"] == 5
 
 
 @pytest.mark.asyncio
 async def test_get_all_format_full_taxonomy(monkeypatch):
-    calls = {}
+    query_call_map = {}
 
     class RecordingConnection:
         async def all(self, sql, **params):
-            calls['sql'] = sql
-            calls['params'] = params
+            query_call_map['sql'] = sql
+            query_call_map['params'] = params
             return [("123", 4)]
 
         async def first(self, *_args, **_kwargs):
@@ -1430,19 +1433,19 @@ async def test_get_all_format_full_taxonomy(monkeypatch):
     monkeypatch.setattr(npi_module.db, 'acquire', lambda: FakeAcquire(RecordingConnection()))
     request = types.SimpleNamespace(args={'count_only': '1', 'format': 'full_taxonomy'}, app=types.SimpleNamespace())
     response = await npi_module.get_all(request)
-    payload = json.loads(response.body)
-    assert payload == {'rows': {'123': 4}}
-    assert 'ARRAY[int_code]' in str(calls['sql'])
+    response_body = json.loads(response.body)
+    assert response_body == {'rows': {'123': 4}}
+    assert 'ARRAY[int_code]' in str(query_call_map['sql'])
 
 
 @pytest.mark.asyncio
 async def test_get_all_format_classification(monkeypatch):
-    calls = {}
+    query_call_map = {}
 
     class RecordingConnection:
         async def all(self, sql, **params):
-            calls['sql'] = sql
-            calls['params'] = params
+            query_call_map['sql'] = sql
+            query_call_map['params'] = params
             return [("Spec", 7)]
 
         async def first(self, *_args, **_kwargs):
@@ -1451,19 +1454,19 @@ async def test_get_all_format_classification(monkeypatch):
     monkeypatch.setattr(npi_module.db, 'acquire', lambda: FakeAcquire(RecordingConnection()))
     request = types.SimpleNamespace(args={'count_only': '1', 'format': 'classification'}, app=types.SimpleNamespace())
     response = await npi_module.get_all(request)
-    payload = json.loads(response.body)
-    assert payload == {'rows': {'Spec': 7}}
-    assert 'classification' in str(calls['sql'])
+    response_body = json.loads(response.body)
+    assert response_body == {'rows': {'Spec': 7}}
+    assert 'classification' in str(query_call_map['sql'])
 
 
 @pytest.mark.asyncio
 async def test_get_all_format_all_returns_classification_map(monkeypatch):
-    calls = {}
+    query_call_map = {}
 
     class RecordingConnection:
         async def all(self, sql, **params):
-            calls['sql'] = sql
-            calls['params'] = params
+            query_call_map['sql'] = sql
+            query_call_map['params'] = params
             return [("Pharmacy", 12), ("Pharmacist", 33)]
 
         async def first(self, *_args, **_kwargs):
@@ -1475,10 +1478,10 @@ async def test_get_all_format_all_returns_classification_map(monkeypatch):
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_all(request)
-    payload = json.loads(response.body)
-    assert payload == {'rows': {'Pharmacy': 12, 'Pharmacist': 33}}
-    assert 'GROUP BY q.classification' in str(calls['sql'])
-    assert calls['params']['state'] == 'NE'
+    response_body = json.loads(response.body)
+    assert response_body == {'rows': {'Pharmacy': 12, 'Pharmacist': 33}}
+    assert 'GROUP BY q.classification' in str(query_call_map['sql'])
+    assert query_call_map['params']['state'] == 'NE'
 
 
 @pytest.mark.asyncio
@@ -1495,9 +1498,9 @@ async def test_get_all_deduplicates_rows(monkeypatch):
     monkeypatch.setattr(npi_module, 'db', FakeDB())
     request = types.SimpleNamespace(args={'limit': '1'}, app=types.SimpleNamespace())
     response = await npi_module.get_all(request)
-    payload = json.loads(response.body)
-    assert payload['total'] == 1
-    assert len(payload['rows']) == 1
+    response_body = json.loads(response.body)
+    assert response_body['total'] == 1
+    assert len(response_body['rows']) == 1
 
 
 @pytest.mark.asyncio
@@ -1550,14 +1553,14 @@ async def test_build_npi_details_empty(monkeypatch):
     monkeypatch.setattr(npi_module.random, 'choice', lambda seq: seq[0])
     # Keep SQLAlchemy select objects for the NPI-first optimization barrier.
 
-    result = await npi_module._build_npi_details(123)
-    assert result == {}
+    detail_result = await npi_module._build_npi_details(123)
+    assert detail_result == {}
 
 
 @pytest.mark.asyncio
 async def test_get_npi_address_geocode_paths(monkeypatch):
     """Verify get npi address geocode paths."""
-    details = {
+    address_details_map = {
         'npi': 123,
         'do_business_as': ['Existing DBA'],
         'taxonomy_list': [],
@@ -1644,7 +1647,7 @@ async def test_get_npi_address_geocode_paths(monkeypatch):
         async def scalar(self, *_args, **_kwargs):
             return await fake_scalar()
 
-    monkeypatch.setattr(npi_module, '_build_npi_details', AsyncMock(return_value=details))
+    monkeypatch.setattr(npi_module, '_build_npi_details', AsyncMock(return_value=address_details_map))
     monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(side_effect=fake_fetch_other_names))
     monkeypatch.setattr(npi_module, 'download_it', AsyncMock(side_effect=fake_download))
 
@@ -1672,9 +1675,9 @@ async def test_get_npi_address_geocode_paths(monkeypatch):
 
     request = types.SimpleNamespace(args={'force_address_update': '1'}, app=App())
     response = await npi_module.get_npi(request, '123')
-    payload = json.loads(response.body)
-    assert payload['do_business_as'] == ['Existing DBA']
-    assert payload['address_list'][0]['formatted_address'] == 'Match Address'
+    response_body = json.loads(response.body)
+    assert response_body['do_business_as'] == ['Existing DBA']
+    assert response_body['address_list'][0]['formatted_address'] == 'Match Address'
 
 
 @pytest.mark.asyncio
@@ -1692,7 +1695,7 @@ async def test_get_npi_not_found(monkeypatch):
 @pytest.mark.asyncio
 async def test_get_npi_update_addr_coordinates_row_missing(monkeypatch):
     """Verify get npi update addr coordinates row missing."""
-    address_entry = {
+    address_entry_map = {
         'npi': 1518379601,
         'type': 'primary',
         'checksum': 1,
@@ -1709,14 +1712,14 @@ async def test_get_npi_update_addr_coordinates_row_missing(monkeypatch):
     }
 
     async def fake_build(_npi, **_kwargs):
-        payload = {
+        build_response_map = {
             'npi': _npi,
             'do_business_as': [],
             'taxonomy_list': [],
             'taxonomy_group_list': [],
-            'address_list': [dict(address_entry)],
+            'address_list': [dict(address_entry_map)],
         }
-        return payload
+        return build_response_map
 
     monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
     monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
@@ -1771,8 +1774,8 @@ async def test_get_npi_update_addr_coordinates_row_missing(monkeypatch):
 
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379601')
-    payload = json.loads(response.body)
-    assert payload['address_list'][0]['lat'] == 41.0
+    response_body = json.loads(response.body)
+    assert response_body['address_list'][0]['lat'] == 41.0
     assert tasks, 'expected geocode update task'
     await tasks[0]
 
@@ -1780,7 +1783,7 @@ async def test_get_npi_update_addr_coordinates_row_missing(monkeypatch):
 @pytest.mark.asyncio
 async def test_get_npi_update_addr_coordinates_handles_exception(monkeypatch):
     """Verify get npi update addr coordinates handles exception."""
-    address_entry = {
+    address_entry_map = {
         'npi': 1518379601,
         'type': 'primary',
         'checksum': 2,
@@ -1802,7 +1805,7 @@ async def test_get_npi_update_addr_coordinates_handles_exception(monkeypatch):
             'do_business_as': [],
             'taxonomy_list': [],
             'taxonomy_group_list': [],
-            'address_list': [dict(address_entry)],
+            'address_list': [dict(address_entry_map)],
         }
 
     monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
@@ -1857,8 +1860,8 @@ async def test_get_npi_update_addr_coordinates_handles_exception(monkeypatch):
 
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379601')
-    payload = json.loads(response.body)
-    assert payload['address_list'][0]['lat'] == 41.0
+    response_body = json.loads(response.body)
+    assert response_body['address_list'][0]['lat'] == 41.0
     assert tasks
     # The task should swallow the insert exception
     await tasks[0]
@@ -1866,7 +1869,7 @@ async def test_get_npi_update_addr_coordinates_handles_exception(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_skip_update_when_lat_present(monkeypatch):
-    address_entry = {
+    address_entry_map = {
         'npi': 1518379601,
         'type': 'primary',
         'checksum': 3,
@@ -1888,7 +1891,7 @@ async def test_get_npi_skip_update_when_lat_present(monkeypatch):
             'do_business_as': [],
             'taxonomy_list': [],
             'taxonomy_group_list': [],
-            'address_list': [dict(address_entry)],
+            'address_list': [dict(address_entry_map)],
         }
 
     monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
@@ -1919,15 +1922,15 @@ async def test_get_npi_skip_update_when_lat_present(monkeypatch):
 
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379601')
-    payload = json.loads(response.body)
-    assert payload['address_list'][0]['lat'] == 40.0
+    response_body = json.loads(response.body)
+    assert response_body['address_list'][0]['lat'] == 40.0
     assert tasks == []
 
 
 @pytest.mark.asyncio
 async def test_get_npi_v2_archive_is_disabled_without_cutover_flag(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", raising=False)
-    address_entry = {
+    address_entry_map = {
         'npi': 1518379601,
         'type': 'primary',
         'checksum': 4,
@@ -1949,7 +1952,7 @@ async def test_get_npi_v2_archive_is_disabled_without_cutover_flag(monkeypatch):
             'do_business_as': [],
             'taxonomy_list': [],
             'taxonomy_group_list': [],
-            'address_list': [dict(address_entry)],
+            'address_list': [dict(address_entry_map)],
         }
 
     monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
@@ -1977,8 +1980,8 @@ async def test_get_npi_v2_archive_is_disabled_without_cutover_flag(monkeypatch):
 
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379601')
-    payload = json.loads(response.body)
-    assert payload['address_list'][0]['lat'] == 41.0
+    response_body = json.loads(response.body)
+    assert response_body['address_list'][0]['lat'] == 41.0
 
 
 @pytest.mark.asyncio
@@ -2071,9 +2074,9 @@ async def test_get_npi_v2_archive_cutover_reads_geocodes_for_concurrent_addresse
 
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379601')
-    payload = json.loads(response.body)
+    response_body = json.loads(response.body)
 
-    assert [address['lat'] for address in payload['address_list']] == [43.0, 44.0]
+    assert [address['lat'] for address in response_body['address_list']] == [43.0, 44.0]
     assert fake_db.first_calls == 2
     assert fake_db.catalog_calls == 4
 
@@ -2082,7 +2085,7 @@ async def test_get_npi_v2_archive_cutover_reads_geocodes_for_concurrent_addresse
 async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypatch):
     """Verify get npi v2 archive geocodeless row falls back to legacy."""
     monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", "true")
-    address_entry = {
+    address_entry_map = {
         'npi': 1518379601,
         'type': 'primary',
         'checksum': 12,
@@ -2105,7 +2108,7 @@ async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypat
             'do_business_as': [],
             'taxonomy_list': [],
             'taxonomy_group_list': [],
-            'address_list': [dict(address_entry)],
+            'address_list': [dict(address_entry_map)],
         }
 
     monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
@@ -2141,15 +2144,15 @@ async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypat
 
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379601')
-    payload = json.loads(response.body)
-    assert payload['address_list'][0]['lat'] == 41.0
+    response_body = json.loads(response.body)
+    assert response_body['address_list'][0]['lat'] == 41.0
 
 
 @pytest.mark.asyncio
-async def test_get_npi_v2_archive_geocode_write_uses_deduped_address_key_upsert(monkeypatch):
+async def test_get_npi_v2_archive_geocode_write_uses_deduped_key_upsert(monkeypatch):
     """Verify get npi v2 archive geocode write uses deduped address key upsert."""
     monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", "1")
-    address_entry = {
+    address_entry_map = {
         'npi': 1518379601,
         'type': 'primary',
         'checksum': 13,
@@ -2172,7 +2175,7 @@ async def test_get_npi_v2_archive_geocode_write_uses_deduped_address_key_upsert(
             'do_business_as': [],
             'taxonomy_list': [],
             'taxonomy_group_list': [],
-            'address_list': [dict(address_entry)],
+            'address_list': [dict(address_entry_map)],
         }
 
     monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
@@ -2226,8 +2229,8 @@ async def test_get_npi_v2_archive_geocode_write_uses_deduped_address_key_upsert(
 
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379601')
-    payload = json.loads(response.body)
-    assert payload['address_list'][0]['lat'] == 45.0
+    response_body = json.loads(response.body)
+    assert response_body['address_list'][0]['lat'] == 45.0
     assert tasks
     await tasks[0]
 
@@ -2278,19 +2281,19 @@ async def test_get_npi_exposes_address_key_and_hides_premise_key(monkeypatch):
 
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379601')
-    payload = json.loads(response.body)
-    assert payload['address_list'][0]['address_key'] == '00000000-0000-0000-0000-000000000001'
-    assert payload['address_list'][0]['address_site_key'] == '00000000-0000-0000-0000-000000000002'
-    assert 'premise_key' not in payload['address_list'][0]
-    assert 'premise_key' not in json.dumps(payload)
+    response_body = json.loads(response.body)
+    assert response_body['address_list'][0]['address_key'] == '00000000-0000-0000-0000-000000000001'
+    assert response_body['address_list'][0]['address_site_key'] == '00000000-0000-0000-0000-000000000002'
+    assert 'premise_key' not in response_body['address_list'][0]
+    assert 'premise_key' not in json.dumps(response_body)
 
 
 @pytest.mark.asyncio
 async def test_get_npi_debug_flags_include_sources_and_evidence(monkeypatch):
-    captured_kwargs = {}
+    captured_keyword_map = {}
 
     async def fake_build(_npi, **kwargs):
-        captured_kwargs.update(kwargs)
+        captured_keyword_map.update(kwargs)
         return {
             'npi': _npi,
             'do_business_as': [],
@@ -2329,11 +2332,11 @@ async def test_get_npi_debug_flags_include_sources_and_evidence(monkeypatch):
         app=FakeApp(),
     )
     response = await npi_module.get_npi(request, '1518379601')
-    payload = json.loads(response.body)
-    address = payload['address_list'][0]
+    response_body = json.loads(response.body)
+    address = response_body['address_list'][0]
 
-    assert captured_kwargs['include_sources'] is True
-    assert captured_kwargs['include_evidence'] is True
+    assert captured_keyword_map['include_sources'] is True
+    assert captured_keyword_map['include_evidence'] is True
     assert address['address_sources'] == ['npi', 'mrf']
     assert address['source_record_ids'] == ['npi:1518379601', 'mrf:row-1']
     assert address['source_count'] == 2
@@ -2344,7 +2347,7 @@ async def test_get_npi_debug_flags_include_sources_and_evidence(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_hides_provider_directory_source_details_by_default(monkeypatch):
-    """Verify get npi hides provider directory source details by default."""
+    """Verify get npi hides provider directory source address_details_map by default."""
     async def fake_build(_npi, **_kwargs):
         return {
             'npi': _npi,
@@ -2402,8 +2405,8 @@ async def test_get_npi_hides_provider_directory_source_details_by_default(monkey
 
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379602')
-    payload = json.loads(response.body)
-    address = payload['address_list'][0]
+    response_body = json.loads(response.body)
+    address = response_body['address_list'][0]
 
     fetch_details.assert_not_awaited()
     assert 'provider_directory_sources' not in address
@@ -2446,7 +2449,7 @@ async def test_get_npi_include_sources_enriches_provider_directory_source_summar
             ],
         }
 
-    source_detail = {
+    source_detail_map = {
         'source': 'provider_directory_fhir',
         'source_id': 'pdfhir_cigna',
         'endpoint_id': 'pd_endpoint_cigna',
@@ -2462,7 +2465,7 @@ async def test_get_npi_include_sources_enriches_provider_directory_source_summar
         'token': 'secret-token',
         'last_validated_status': 'valid',
     }
-    fetch_details = AsyncMock(return_value={'pdfhir_cigna': source_detail})
+    fetch_details = AsyncMock(return_value={'pdfhir_cigna': source_detail_map})
 
     monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
     monkeypatch.setattr(npi_module, '_fetch_provider_directory_source_detail_map', fetch_details)
@@ -2476,8 +2479,8 @@ async def test_get_npi_include_sources_enriches_provider_directory_source_summar
 
     request = types.SimpleNamespace(args={'include_sources': 'true'}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379602')
-    payload = json.loads(response.body)
-    address = payload['address_list'][0]
+    response_body = json.loads(response.body)
+    address = response_body['address_list'][0]
 
     fetch_details.assert_awaited_once_with(['pdfhir_cigna'], session=None)
     assert address['provider_directory_sources'] == [
@@ -2536,8 +2539,8 @@ async def test_get_npi_address_list_clears_empty_entries(monkeypatch):
 
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379601')
-    payload = json.loads(response.body)
-    assert payload['address_list'] == []
+    response_body = json.loads(response.body)
+    assert response_body['address_list'] == []
 
 
 def test_dedupe_addresses_merges_nondiscriminating_site_key_with_fhir_overlay():

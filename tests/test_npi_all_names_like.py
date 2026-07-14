@@ -71,11 +71,11 @@ async def test_get_all_include_total_false_skips_count_query(monkeypatch):
         }
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
     assert conn.calls == 1
-    assert data["total"] == 10
-    assert data["total_source"] == "estimated_page_floor"
+    assert response_body["total"] == 10
+    assert response_body["total_source"] == "estimated_page_floor"
 
 
 @pytest.mark.asyncio
@@ -91,11 +91,11 @@ async def test_get_all_locator_defaults_to_no_total_query(monkeypatch):
         }
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
     assert conn.calls == 1
-    assert data["total"] == 10
-    assert data["total_source"] == "estimated_page_floor"
+    assert response_body["total"] == 10
+    assert response_body["total_source"] == "estimated_page_floor"
 
 
 @pytest.mark.asyncio
@@ -171,9 +171,9 @@ async def test_get_all_sitemap_mode_allows_20000_limit(monkeypatch):
         }
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
-    assert data["limit"] == 20000
+    assert response_body["limit"] == 20000
     assert conn.calls == 1
     assert len(conn.last_params["page_npis"]) == 20000
 
@@ -194,11 +194,11 @@ async def test_get_all_q_filter(monkeypatch):
         }
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
-    assert data["total"] == 5  # count from first call
-    assert data["page"] == 1
-    assert data["limit"] == 50
-    assert data["offset"] == 0
+    response_body = json.loads(resp.body)
+    assert response_body["total"] == 5  # count from first call
+    assert response_body["page"] == 1
+    assert response_body["limit"] == 50
+    assert response_body["offset"] == 0
     assert "b.npi" in conn.last_sql and "name_like_0" in conn.last_params
     assert conn.last_params["limit"] > 0  # limit expanded from 0
 
@@ -219,9 +219,9 @@ async def test_get_all_count_only_supports_response_format_alias(monkeypatch):
         args={"count_only": "1", "response_format": "full_taxonomy"}
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
-    assert data["rows"]["taxonomy_a"] == 3
-    assert data["rows"]["taxonomy_b"] == 7
+    response_body = json.loads(resp.body)
+    assert response_body["rows"]["taxonomy_a"] == 3
+    assert response_body["rows"]["taxonomy_b"] == 7
 
 
 @pytest.mark.asyncio
@@ -238,8 +238,8 @@ async def test_get_all_q_alias_matches_provider_name(monkeypatch):
         }
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
-    assert data["total"] == 5
+    response_body = json.loads(resp.body)
+    assert response_body["total"] == 5
     assert "name_like_0" in conn.last_params
     assert conn.last_params["name_like_0"] == "%ryan james pasiewicz%"
     assert (
@@ -255,11 +255,11 @@ async def test_get_all_accepts_name_like_legacy_alias(monkeypatch):
 
     request = types.SimpleNamespace(args={"name_like": "clinic", "limit": "5", "start": "0"})
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
     assert conn.calls == 1
-    assert data["total"] == 0
-    assert data["total_source"] == "estimated_timeout_floor"
+    assert response_body["total"] == 0
+    assert response_body["total_source"] == "estimated_timeout_floor"
     assert "name_like_0" in conn.last_params
     assert conn.last_params["name_like_0"] == "%clinic%"
 
@@ -288,11 +288,11 @@ async def test_get_all_deduplicates_repeated_name_like_values_from_multidict(mon
 
     request = types.SimpleNamespace(args=FakeArgs())
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
     assert conn.calls == 1
-    assert data["total"] == 0
-    assert data["total_source"] == "estimated_timeout_floor"
+    assert response_body["total"] == 0
+    assert response_body["total_source"] == "estimated_timeout_floor"
     assert "name_like_0" in conn.last_params
     assert "name_like_1" not in conn.last_params
     assert conn.last_params["name_like_0"] == "%cvs%"
@@ -308,11 +308,11 @@ async def test_get_all_deduplicates_q_and_legacy_name_like(monkeypatch):
         args={"q": "clinic", "name_like": "CLINIC", "limit": "5", "start": "0"}
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
     assert conn.calls == 1
-    assert data["total"] == 0
-    assert data["total_source"] == "estimated_timeout_floor"
+    assert response_body["total"] == 0
+    assert response_body["total_source"] == "estimated_timeout_floor"
     assert "name_like_0" in conn.last_params
     assert "name_like_1" not in conn.last_params
     assert conn.last_params["name_like_0"] == "%clinic%"
@@ -327,11 +327,11 @@ async def test_get_all_broad_q_explicit_include_total_still_skips_slow_count(mon
         args={"q": "silver", "limit": "5", "start": "0", "include_total": "true"}
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
     assert conn.calls == 1
-    assert data["total"] == 0
-    assert data["total_source"] == "estimated_timeout_floor"
+    assert response_body["total"] == 0
+    assert response_body["total_source"] == "estimated_timeout_floor"
     assert "name_like_0" in conn.last_params
     assert conn.last_params["name_like_0"] == "%silver%"
 
@@ -398,7 +398,7 @@ def test_provider_list_address_type_clause_keeps_normal_lists_primary_only():
     assert clause == "c.type = 'primary'"
 
 
-def test_provider_list_address_type_clause_allows_service_locations_for_exact_unified_lookup():
+def test_provider_list_address_type_clause_allows_exact_service_locations():
     clause = npi_module._provider_list_address_type_clause(
         "c",
         "mrf.entity_address_unified",
@@ -507,9 +507,9 @@ async def test_get_all_unified_phone_facet_counts_include_service_locations(monk
         }
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
-    assert data["rows"] == {"Pharmacy": 1}
+    assert response_body["rows"] == {"Pharmacy": 1}
     assert conn.last_params["phone_digits"] == "3125551212"
     assert conn.last_params["candidate_limit"] == 500
     assert "FROM mrf.entity_address_unified AS c" in conn.last_sql
@@ -594,20 +594,20 @@ async def test_get_all_unified_phone_lookup_returns_provider_directory_only_row(
         }
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
-    assert data["total"] == 1
-    assert data["total_source"] == "estimated_page_floor"
-    assert len(data["rows"]) == 1
-    row = data["rows"][0]
-    assert row["npi"] == 1033213624
-    assert row["provider_organization_name"] == "MARY S HARPER GERIATRIC PSY CTR"
-    assert row["entity_type_code"] == 1
-    assert row["phone_number"] == "2053663010"
-    assert row["address_key"] == "e4cd3105-5ce1-efd3-3f31-d48bfa864a13"
-    assert row["address_sources"] == ["provider_directory_fhir"]
-    assert row["taxonomy_list"] == []
-    assert "source_record_ids" not in row
+    assert response_body["total"] == 1
+    assert response_body["total_source"] == "estimated_page_floor"
+    assert len(response_body["rows"]) == 1
+    provider_record_map = response_body["rows"][0]
+    assert provider_record_map["npi"] == 1033213624
+    assert provider_record_map["provider_organization_name"] == "MARY S HARPER GERIATRIC PSY CTR"
+    assert provider_record_map["entity_type_code"] == 1
+    assert provider_record_map["phone_number"] == "2053663010"
+    assert provider_record_map["address_key"] == "e4cd3105-5ce1-efd3-3f31-d48bfa864a13"
+    assert provider_record_map["address_sources"] == ["provider_directory_fhir"]
+    assert provider_record_map["taxonomy_list"] == []
+    assert "source_record_ids" not in provider_record_map
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
     assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in page_sql
     assert "provider_directory_address_overlay AS overlay" in page_sql
@@ -628,7 +628,7 @@ def test_provider_list_phone_candidate_limit_covers_page_window_and_stays_bounde
 
 
 @pytest.mark.asyncio
-async def test_get_all_unified_address_site_key_lookup_returns_provider_directory_only_row(monkeypatch):
+async def test_get_all_unified_site_key_returns_provider_directory_row(monkeypatch):
     """Verify get all unified address site key lookup returns provider directory only row."""
     address_site_key = "00000000-0000-0000-0000-000000000002"
 
@@ -706,16 +706,16 @@ async def test_get_all_unified_address_site_key_lookup_returns_provider_director
         }
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
-    assert data["total"] == 1
-    assert data["total_source"] == "estimated_page_floor"
-    assert len(data["rows"]) == 1
-    row = data["rows"][0]
-    assert row["npi"] == 1033213624
-    assert row["address_key"] == "00000000-0000-0000-0000-000000000001"
-    assert row["address_site_key"] == address_site_key
-    assert "premise_key" not in row
+    assert response_body["total"] == 1
+    assert response_body["total_source"] == "estimated_page_floor"
+    assert len(response_body["rows"]) == 1
+    provider_record_map = response_body["rows"][0]
+    assert provider_record_map["npi"] == 1033213624
+    assert provider_record_map["address_key"] == "00000000-0000-0000-0000-000000000001"
+    assert provider_record_map["address_site_key"] == address_site_key
+    assert "premise_key" not in provider_record_map
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
     fallback_sql = next(sql for sql, _params in conn.sql_calls if "SELECT c.*" in sql)
     assert "FROM mrf.entity_address_unified as c" in page_sql
@@ -801,15 +801,15 @@ async def test_get_all_unified_exact_npi_lookup_returns_provider_directory_only_
         }
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
-    assert data["total"] == 1
-    assert len(data["rows"]) == 1
-    row = data["rows"][0]
-    assert row["npi"] == 1033213624
-    assert row["provider_organization_name"] == "MARY S HARPER GERIATRIC PSY CTR"
-    assert row["address_sources"] == ["provider_directory_fhir"]
-    assert "source_record_ids" not in row
+    assert response_body["total"] == 1
+    assert len(response_body["rows"]) == 1
+    provider_record_map = response_body["rows"][0]
+    assert provider_record_map["npi"] == 1033213624
+    assert provider_record_map["provider_organization_name"] == "MARY S HARPER GERIATRIC PSY CTR"
+    assert provider_record_map["address_sources"] == ["provider_directory_fhir"]
+    assert "source_record_ids" not in provider_record_map
 
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
     assert "COALESCE(c.npi, c.inferred_npi) = :npi_filter" in page_sql
@@ -912,9 +912,9 @@ async def test_get_all_unified_exact_lookup_can_include_provider_directory_sourc
         }
     )
     resp = await get_all(request)
-    row = json.loads(resp.body)["rows"][0]
+    provider_record_map = json.loads(resp.body)["rows"][0]
 
-    assert row["provider_directory_sources"] == [
+    assert provider_record_map["provider_directory_sources"] == [
             {
                 "source": "provider_directory_fhir",
                 "source_ids": ["pdfhir_alohr"],
@@ -929,7 +929,7 @@ async def test_get_all_unified_exact_lookup_can_include_provider_directory_sourc
             ],
         }
     ]
-    assert "source_record_ids" not in row
+    assert "source_record_ids" not in provider_record_map
 
 
 @pytest.mark.asyncio
@@ -985,9 +985,9 @@ async def test_get_all_applies_procedure_and_medication_all_match_filters(monkey
         }
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
-    assert data["total"] == 5
+    assert response_body["total"] == 5
     assert "c.procedures_array @> ARRAY[:procedure_code_0]::INTEGER[]" in conn.last_sql
     assert "c.procedures_array @> ARRAY[:procedure_code_1]::INTEGER[]" in conn.last_sql
     assert "c.medications_array @> ARRAY[:medication_code_0]::INTEGER[]" in conn.last_sql
@@ -1116,13 +1116,13 @@ async def test_get_all_handles_sparse_positional_rows_without_crashing(monkeypat
         args={"name_like": "cvs", "classification": "Pharmacy", "state": "RI", "limit": "3"}
     )
     resp = await get_all(request)
-    data = json.loads(resp.body)
+    response_body = json.loads(resp.body)
 
-    assert data["total"] == 1
-    assert isinstance(data["rows"], list)
-    assert len(data["rows"]) == 1
-    assert data["rows"][0]["npi"] == 1234567890
-    assert isinstance(data["rows"][0].get("taxonomy_list"), list)
+    assert response_body["total"] == 1
+    assert isinstance(response_body["rows"], list)
+    assert len(response_body["rows"]) == 1
+    assert response_body["rows"][0]["npi"] == 1234567890
+    assert isinstance(response_body["rows"][0].get("taxonomy_list"), list)
 
 
 class _MappedProviderDirectoryRow:
