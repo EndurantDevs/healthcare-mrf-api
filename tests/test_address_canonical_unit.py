@@ -3519,8 +3519,12 @@ def test_provider_directory_partial_post_build_mutations_only_touch_scoped_stage
     assert "JOIN mrf.address_archive_v2 AS a" in same_key_sql
     assert "JOIN mrf.entity_address_unified_20260614_pd_live_locations AS scope" in inherited_sql
     assert "scope.location_key = target.location_key" in inherited_sql
-    assert "source_row.location_key" in same_provider_sql
-    assert "scope.location_key = source_row.location_key" in same_provider_sql
+    source_rows_sql, scoped_targets_sql = same_provider_sql.split(
+        "scoped_targets AS MATERIALIZED", maxsplit=1
+    )
+    assert "FROM mrf.entity_address_unified_20260614" in source_rows_sql
+    assert scope_table not in source_rows_sql
+    assert f"mrf.{scope_table} AS scope" in scoped_targets_sql
     assert "scoped_targets AS MATERIALIZED" in same_provider_sql
     assert "target_row.ctid = scoped_targets.target_row_id" in same_provider_sql
     assert "t.location_key = scope.location_key" in clear_invalid_sql

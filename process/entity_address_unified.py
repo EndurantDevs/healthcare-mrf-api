@@ -5158,50 +5158,25 @@ def _same_provider_update_needed_sql(target_coordinate_missing: str) -> str:
 def _same_provider_source_rows_sql(
     db_schema: str,
     table_name: str,
-    *,
-    coordinate_scope_table: str | None = None,
 ) -> str:
-    if not coordinate_scope_table:
-        return f"""
-        source_rows AS MATERIALIZED (
-            SELECT
-                location_key,
-                {_entity_address_provider_npi_expr()} AS provider_npi,
-                address_key,
-                telephone_number,
-                phone_number,
-                phone_extension,
-                fax_number,
-                fax_number_digits,
-                fax_extension,
-                lat,
-                long,
-                source_count,
-                updated_at
-              FROM {db_schema}.{table_name}
-             WHERE address_key IS NOT NULL
-        )
-        """
     return f"""
     source_rows AS MATERIALIZED (
         SELECT
-            source_row.location_key,
-            {_entity_address_provider_npi_expr("source_row")} AS provider_npi,
-            source_row.address_key,
-            source_row.telephone_number,
-            source_row.phone_number,
-            source_row.phone_extension,
-            source_row.fax_number,
-            source_row.fax_number_digits,
-            source_row.fax_extension,
-            source_row.lat,
-            source_row.long,
-            source_row.source_count,
-            source_row.updated_at
-          FROM {db_schema}.{table_name} AS source_row
-          JOIN {db_schema}.{coordinate_scope_table} AS scope
-            ON scope.location_key = source_row.location_key
-         WHERE source_row.address_key IS NOT NULL
+            location_key,
+            {_entity_address_provider_npi_expr()} AS provider_npi,
+            address_key,
+            telephone_number,
+            phone_number,
+            phone_extension,
+            fax_number,
+            fax_number_digits,
+            fax_extension,
+            lat,
+            long,
+            source_count,
+            updated_at
+          FROM {db_schema}.{table_name}
+         WHERE address_key IS NOT NULL
     )
     """
 
@@ -5270,7 +5245,6 @@ def _backfill_same_provider_address_fields_sql(
     WITH {_same_provider_source_rows_sql(
         db_schema,
         table_name,
-        coordinate_scope_table=coordinate_scope_table,
     )},
     {_same_provider_grouped_fields_sql()}{scoped_targets_sql}
     UPDATE {db_schema}.{table_name} AS target_row
