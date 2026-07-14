@@ -427,6 +427,12 @@ PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES = {
 PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_TYPES = frozenset().union(
     *PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES.values()
 )
+PROVIDER_DIRECTORY_AFFILIATION_REFERENCE_FALLBACK_METADATA_KEY = (
+    "provider_directory_affiliation_reference_fallback"
+)
+PROVIDER_DIRECTORY_AFFILIATION_REFERENCE_FALLBACK_ORGANIZATION = (
+    "organization_ref"
+)
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT = 128
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY = 6
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_STAGE_PREFIX = "provider_directory_location_archive_stage"
@@ -10784,6 +10790,10 @@ def _dataset_affiliation_organization_aggregate_proof(
         "affiliation_resource_count",
         "affiliation_with_participating_organization_count",
         "empty_participating_organization_reference_count",
+        "fallback_candidate_count",
+        "fallback_resolved_count",
+        "fallback_unresolved_count",
+        "unresolved_reference_count",
         "malformed_reference_payload_count",
         "valid_reference_count",
         "invalid_reference_count",
@@ -14756,6 +14766,9 @@ def _contra_costa_seed_row(
                 STATE_EXPECTED_NONEMPTY_RESOURCES
             ),
             "provider_directory_pagination_mode": "opaque_next_link_token",
+            PROVIDER_DIRECTORY_AFFILIATION_REFERENCE_FALLBACK_METADATA_KEY: (
+                PROVIDER_DIRECTORY_AFFILIATION_REFERENCE_FALLBACK_ORGANIZATION
+            ),
         },
     }
 
@@ -29492,6 +29505,7 @@ def _assert_serving_relation_complete(
     *,
     actual_edge_count: int | None = None,
 ) -> int:
+    """Reject malformed or incomplete serving relations."""
     malformed_count = _dataset_network_plan_count(
         proof_by_field,
         malformed_field,
@@ -29759,41 +29773,64 @@ async def _build_provider_directory_dataset_network_plan(
     )
 
 
-def _affiliation_org_source_ctes(
-    dataset_ref: str,
-    resource_ref: str,
-    root_filter: str,
-) -> str:
-    return f"""
+_AFFILIATION_ORG_SOURCE_CTES_TEMPLATE = f"""
         WITH target_dataset AS MATERIALIZED (
-            SELECT dataset_id,
-                   COALESCE(acquisition_root_run_id, import_run_id)
-                       AS acquisition_root_run_id
-              FROM {dataset_ref}
-             WHERE dataset_id = :dataset_id
-               {root_filter}
+            SELECT dataset.dataset_id,
+                   COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)
+                       AS acquisition_root_run_id,
+                   COALESCE(
+                       BOOL_OR(
+                           (
+                               source.metadata_json::jsonb ->>
+                               '{PROVIDER_DIRECTORY_AFFILIATION_REFERENCE_FALLBACK_METADATA_KEY}'
+                               = '{PROVIDER_DIRECTORY_AFFILIATION_REFERENCE_FALLBACK_ORGANIZATION}'
+                               OR source.canonical_api_base =
+                                  '{CONTRA_COSTA_PROVIDER_DIRECTORY_BASE}'
+                           )
+                       ),
+                       false
+                   ) AS allow_organization_reference_fallback
+              FROM %s AS dataset
+              LEFT JOIN %s AS source
+                ON source.endpoint_id = dataset.endpoint_id
+             WHERE dataset.dataset_id = :dataset_id
+               %s
+             GROUP BY dataset.dataset_id,
+                      dataset.acquisition_root_run_id,
+                      dataset.import_run_id
         ), affiliations AS MATERIALIZED (
             SELECT resource.resource_id AS affiliation_resource_id,
-                   resource.payload_json::jsonb
-                       -> 'participating_organization_ref' AS reference_json
-              FROM {resource_ref} AS resource
+                   resource.payload_json::jsonb -> 'participating_organization_ref'
+                       AS participating_reference_json,
+                   resource.payload_json::jsonb -> 'organization_ref'
+                       AS organization_reference_json,
+                   dataset.allow_organization_reference_fallback
+              FROM %s AS resource
               JOIN target_dataset AS dataset
                 ON dataset.dataset_id = resource.dataset_id
              WHERE resource.resource_type = 'OrganizationAffiliation'
         ), normalized_affiliations AS MATERIALIZED (
             SELECT affiliation_resource_id,
+                   participating_reference_json,
+                   organization_reference_json,
+                   allow_organization_reference_fallback,
                    CASE
-                       WHEN jsonb_typeof(reference_json) = 'string'
-                       THEN NULLIF(BTRIM(reference_json #>> '{{}}'), '')
+                       WHEN jsonb_typeof(participating_reference_json) = 'string'
+                       THEN NULLIF(BTRIM(participating_reference_json #>> '{{}}'), '')
                        ELSE NULL
-                   END AS reference_text,
+                   END AS participating_reference_text,
                    CASE
-                       WHEN reference_json IS NULL
-                         OR reference_json = 'null'::jsonb
+                       WHEN jsonb_typeof(organization_reference_json) = 'string'
+                       THEN NULLIF(BTRIM(organization_reference_json #>> '{{}}'), '')
+                       ELSE NULL
+                   END AS organization_reference_text,
+                   CASE
+                       WHEN participating_reference_json IS NULL
+                         OR participating_reference_json = 'null'::jsonb
                          OR (
-                            jsonb_typeof(reference_json) = 'string'
+                            jsonb_typeof(participating_reference_json) = 'string'
                             AND NULLIF(
-                                BTRIM(reference_json #>> '{{}}'),
+                                BTRIM(participating_reference_json #>> '{{}}'),
                                 ''
                             ) IS NULL
                          )
@@ -29801,9 +29838,27 @@ def _affiliation_org_source_ctes(
                        ELSE false
                    END AS empty_reference,
                    CASE
-                       WHEN reference_json IS NOT NULL
-                        AND reference_json <> 'null'::jsonb
-                        AND jsonb_typeof(reference_json) <> 'string'
+                       WHEN (
+                           participating_reference_json IS NOT NULL
+                           AND participating_reference_json <> 'null'::jsonb
+                           AND jsonb_typeof(participating_reference_json) <> 'string'
+                       ) OR (
+                           (
+                               participating_reference_json IS NULL
+                               OR participating_reference_json = 'null'::jsonb
+                               OR (
+                                   jsonb_typeof(participating_reference_json) = 'string'
+                                   AND NULLIF(
+                                       BTRIM(participating_reference_json #>> '{{}}'),
+                                       ''
+                                   ) IS NULL
+                               )
+                           )
+                           AND allow_organization_reference_fallback
+                           AND organization_reference_json IS NOT NULL
+                           AND organization_reference_json <> 'null'::jsonb
+                           AND jsonb_typeof(organization_reference_json) <> 'string'
+                       )
                        THEN true
                        ELSE false
                    END AS malformed_reference
@@ -29812,35 +29867,99 @@ def _affiliation_org_source_ctes(
     """
 
 
-def _affiliation_org_edge_ctes(
-    organization_reference_pattern: str,
+def _affiliation_org_source_ctes(
+    dataset_ref: str,
+    resource_ref: str,
+    source_ref: str,
+    root_filter: str,
 ) -> str:
-    return f"""
-        , resolved_affiliations AS MATERIALIZED (
+    """
+    Build dataset and normalized affiliation CTEs.
+
+    The source metadata and canonical-base check are intentionally evaluated
+    inside the target-dataset CTE so aliases cannot widen resource scope.
+    """
+    return _AFFILIATION_ORG_SOURCE_CTES_TEMPLATE % (
+        dataset_ref,
+        source_ref,
+        root_filter,
+        resource_ref,
+    )
+
+_AFFILIATION_ORG_EDGE_CTES_TEMPLATE = """
+        , selected_affiliations AS MATERIALIZED (
             SELECT affiliation_resource_id,
-                   reference_text,
+                   participating_reference_text,
                    empty_reference,
                    malformed_reference,
                    CASE
-                       WHEN reference_text ~ '^[A-Za-z0-9.-]{{1,64}}$'
+                       WHEN participating_reference_text IS NOT NULL
+                       THEN participating_reference_text
+                       WHEN empty_reference
+                        AND allow_organization_reference_fallback
+                       THEN organization_reference_text
+                       ELSE NULL
+                   END AS reference_text,
+                   (
+                       participating_reference_text IS NULL
+                       AND empty_reference
+                       AND allow_organization_reference_fallback
+                   ) AS fallback_candidate
+              FROM normalized_affiliations
+        ), resolved_affiliations AS MATERIALIZED (
+            SELECT affiliation_resource_id,
+                   participating_reference_text,
+                   reference_text,
+                   empty_reference,
+                   malformed_reference,
+                   fallback_candidate,
+                   CASE
+                       WHEN reference_text ~ '^[A-Za-z0-9.-]{1,64}$'
                        THEN reference_text
                        ELSE substring(
                            reference_text
-                           FROM '{organization_reference_pattern}'
+                           FROM '%s'
                        )
-                   END AS participating_organization_resource_id
-              FROM normalized_affiliations
+                   END AS organization_resource_id
+              FROM selected_affiliations
+        ), organizations AS MATERIALIZED (
+            SELECT DISTINCT resource.resource_id AS organization_resource_id
+              FROM %s AS resource
+              JOIN target_dataset AS dataset
+                ON dataset.dataset_id = resource.dataset_id
+             WHERE resource.resource_type = 'Organization'
+        ), resolved_affiliations_status AS MATERIALIZED (
+            SELECT resolved.*,
+                   organizations.organization_resource_id IS NOT NULL
+                       AS organization_exists
+              FROM resolved_affiliations AS resolved
+              LEFT JOIN organizations
+                ON organizations.organization_resource_id =
+                   resolved.organization_resource_id
         ), expected_edges AS MATERIALIZED (
-            SELECT DISTINCT affiliation_resource_id,
-                   participating_organization_resource_id
-              FROM resolved_affiliations
-             WHERE participating_organization_resource_id IS NOT NULL
+            SELECT DISTINCT resolved.affiliation_resource_id,
+                   resolved.organization_resource_id
+              FROM resolved_affiliations_status AS resolved
+             WHERE resolved.organization_resource_id IS NOT NULL
+               AND (
+                   NOT resolved.fallback_candidate
+                   OR resolved.organization_exists
+               )
         )
-    """
+"""
 
 
-def _affiliation_org_proof_select() -> str:
-    return """
+def _affiliation_org_edge_ctes(
+    resource_ref: str,
+    organization_reference_pattern: str,
+) -> str:
+    """Build reference-resolution and expected-edge CTEs."""
+    return _AFFILIATION_ORG_EDGE_CTES_TEMPLATE % (
+        organization_reference_pattern,
+        resource_ref,
+    )
+
+_AFFILIATION_ORG_PROOF_SELECT = """
         SELECT
             (SELECT COUNT(*) FROM target_dataset)::bigint
                 AS target_dataset_count,
@@ -29848,26 +29967,50 @@ def _affiliation_org_proof_select() -> str:
                 AS acquisition_root_run_id,
             (SELECT COUNT(*) FROM affiliations)::bigint
                 AS affiliation_resource_count,
-            (SELECT COUNT(*) FROM resolved_affiliations
-              WHERE reference_text IS NOT NULL)::bigint
+            (SELECT COUNT(*) FILTER (
+                WHERE participating_reference_text IS NOT NULL
+            ) FROM resolved_affiliations_status)::bigint
                 AS affiliation_with_participating_organization_count,
-            (SELECT COUNT(*) FROM resolved_affiliations
-              WHERE empty_reference)::bigint
+            (SELECT COUNT(*) FILTER (WHERE empty_reference)
+               FROM resolved_affiliations_status)::bigint
                 AS empty_participating_organization_reference_count,
-            (SELECT COUNT(*) FROM resolved_affiliations
-              WHERE malformed_reference)::bigint
+            (SELECT COUNT(*) FILTER (WHERE fallback_candidate)
+               FROM resolved_affiliations_status)::bigint
+                AS fallback_candidate_count,
+            (SELECT COUNT(*) FILTER (
+                WHERE fallback_candidate AND organization_exists
+            ) FROM resolved_affiliations_status)::bigint
+                AS fallback_resolved_count,
+            (SELECT COUNT(*) FILTER (
+                WHERE fallback_candidate
+                  AND NOT organization_exists
+            ) FROM resolved_affiliations_status)::bigint
+                AS fallback_unresolved_count,
+            (SELECT COUNT(*) FILTER (
+                WHERE (reference_text IS NOT NULL OR fallback_candidate)
+                  AND organization_resource_id IS NOT NULL
+                  AND NOT organization_exists
+            ) FROM resolved_affiliations_status)::bigint
+                AS unresolved_reference_count,
+            (SELECT COUNT(*) FILTER (WHERE malformed_reference)
+               FROM resolved_affiliations_status)::bigint
                 AS malformed_reference_payload_count,
-            (SELECT COUNT(*) FROM resolved_affiliations
-              WHERE participating_organization_resource_id IS NOT NULL)::bigint
+            (SELECT COUNT(*) FILTER (WHERE organization_exists)
+               FROM resolved_affiliations_status)::bigint
                 AS valid_reference_count,
-            (SELECT COUNT(*) FROM resolved_affiliations
-              WHERE reference_text IS NOT NULL
-                AND participating_organization_resource_id IS NULL)::bigint
+            (SELECT COUNT(*) FILTER (
+                WHERE reference_text IS NOT NULL
+                  AND organization_resource_id IS NULL
+            ) FROM resolved_affiliations_status)::bigint
                 AS invalid_reference_count,
             (SELECT COUNT(*) FROM expected_edges)::bigint
                 AS expected_edge_count;
-    """
+"""
 
+
+def _affiliation_org_proof_select() -> str:
+    """Build affiliation relation proof counters."""
+    return _AFFILIATION_ORG_PROOF_SELECT
 
 def _dataset_affiliation_organization_proof_sql(
     *,
@@ -29890,9 +30033,11 @@ def _dataset_affiliation_organization_proof_sql(
             _affiliation_org_source_ctes(
                 _qt(schema, ProviderDirectoryEndpointDataset.__tablename__),
                 _qt(schema, ProviderDirectoryDatasetResource.__tablename__),
+                _qt(schema, ProviderDirectorySource.__tablename__),
                 root_filter,
             ),
             _affiliation_org_edge_ctes(
+                _qt(schema, ProviderDirectoryDatasetResource.__tablename__),
                 organization_reference_pattern,
             ),
             _affiliation_org_proof_select(),
@@ -29924,9 +30069,13 @@ def _dataset_affiliation_organization_edge_insert_sql(
             _affiliation_org_source_ctes(
                 _qt(schema, ProviderDirectoryEndpointDataset.__tablename__),
                 _qt(schema, ProviderDirectoryDatasetResource.__tablename__),
+                _qt(schema, ProviderDirectorySource.__tablename__),
                 root_filter,
             ),
-            _affiliation_org_edge_ctes(organization_reference_pattern),
+            _affiliation_org_edge_ctes(
+                _qt(schema, ProviderDirectoryDatasetResource.__tablename__),
+                organization_reference_pattern,
+            ),
             f"""
             INSERT INTO {edge_ref} (
                 dataset_id,
@@ -29934,13 +30083,58 @@ def _dataset_affiliation_organization_edge_insert_sql(
                 affiliation_resource_id
             )
             SELECT dataset.dataset_id,
-                   edge.participating_organization_resource_id,
+                   edge.organization_resource_id,
                    edge.affiliation_resource_id
               FROM expected_edges AS edge
              CROSS JOIN target_dataset AS dataset;
             """,
         )
     )
+
+
+def _validate_affiliation_fallback_partition(
+    proof_by_field: dict[str, Any],
+    dataset_id: str,
+    error_prefix: str,
+) -> tuple[int, int]:
+    """Require exhaustive fallback metrics and one resolvable candidate."""
+    fallback_candidate_count = _dataset_network_plan_count(
+        proof_by_field,
+        "fallback_candidate_count",
+    )
+    fallback_resolved_count = _dataset_network_plan_count(
+        proof_by_field,
+        "fallback_resolved_count",
+    )
+    fallback_unresolved_count = _dataset_network_plan_count(
+        proof_by_field,
+        "fallback_unresolved_count",
+    )
+    if fallback_candidate_count != (
+        fallback_resolved_count + fallback_unresolved_count
+    ):
+        raise RuntimeError(
+            f"{error_prefix}_fallback_partition_mismatch:{dataset_id}:"
+            f"candidates={fallback_candidate_count}:"
+            f"resolved={fallback_resolved_count}:"
+            f"unresolved={fallback_unresolved_count}"
+        )
+    return fallback_candidate_count, fallback_resolved_count
+
+
+AFFILIATION_ORGANIZATION_PROOF_COUNT_FIELDS = (
+    "affiliation_resource_count",
+    "affiliation_with_participating_organization_count",
+    "empty_participating_organization_reference_count",
+    "fallback_candidate_count",
+    "fallback_resolved_count",
+    "fallback_unresolved_count",
+    "unresolved_reference_count",
+    "malformed_reference_payload_count",
+    "valid_reference_count",
+    "invalid_reference_count",
+    "expected_edge_count",
+)
 
 
 def _validated_dataset_affiliation_organization_proof(
@@ -29952,12 +30146,20 @@ def _validated_dataset_affiliation_organization_proof(
     inserted_edge_count: int,
     expected_acquisition_root_run_id: str | None | object,
 ) -> dict[str, Any]:
+    """Validate and serialize one dataset affiliation relation proof."""
     error_prefix = "provider_directory_dataset_affiliation_organization"
     root_run_id = _validated_serving_relation_root(
         proof_by_field,
         dataset_id,
         expected_acquisition_root_run_id,
         error_prefix,
+    )
+    fallback_candidate_count, fallback_resolved_count = (
+        _validate_affiliation_fallback_partition(
+            proof_by_field,
+            dataset_id,
+            error_prefix,
+        )
     )
     _assert_serving_relation_complete(
         proof_by_field,
@@ -29967,15 +30169,10 @@ def _validated_dataset_affiliation_organization_proof(
         error_prefix,
         actual_edge_count=inserted_edge_count,
     )
-    count_fields = (
-        "affiliation_resource_count",
-        "affiliation_with_participating_organization_count",
-        "empty_participating_organization_reference_count",
-        "malformed_reference_payload_count",
-        "valid_reference_count",
-        "invalid_reference_count",
-        "expected_edge_count",
-    )
+    if fallback_candidate_count and not fallback_resolved_count:
+        raise RuntimeError(
+            f"{error_prefix}_fallback_no_resolved_edges:{dataset_id}"
+        )
     return {
         "complete": True,
         "version": (
@@ -29986,7 +30183,7 @@ def _validated_dataset_affiliation_organization_proof(
         "build_run_id": build_run_id,
         **{
             field_name: _dataset_network_plan_count(proof_by_field, field_name)
-            for field_name in count_fields
+            for field_name in AFFILIATION_ORGANIZATION_PROOF_COUNT_FIELDS
         },
         "edge_count": inserted_edge_count,
         "replaced_edge_count": replaced_edge_count,

@@ -580,6 +580,24 @@ organizations (`name`, `aliases`, `resource_id`, `ref`). The public API
 serving emits only reconstructed PTG-to-directory matches that contain both
 `ptg_network_name` and `provider_directory_network_name`.
 
+### OrganizationAffiliation provider resolution
+
+The dataset-scoped `dataset_affiliation_organization` build resolves the
+standard FHIR `participating_organization_ref` first and joins the extracted
+resource id to an `Organization` in the same immutable endpoint dataset.
+`organization_ref` is never a general substitute. It is enabled only by the
+explicit `provider_directory_affiliation_reference_fallback=organization_ref`
+source metadata emitted for the Contra Costa endpoint shape, and only when the
+participating reference is absent. Existing rows are also recognized by the
+stable Contra Costa canonical API base, so an artifact-only rebuild does not
+require a source-row mutation. Fallback candidates, resolved candidates,
+unresolved candidates, and unresolved references are retained in the build
+proof. Unresolved references do not become relation edges; resolvable edges
+still publish when the fallback partition is exhaustive and at least one
+fallback candidate resolves. A fallback population with no resolved edge,
+malformed reference shapes, or inconsistent proof counts fails closed, avoiding
+a published zero-edge relation that hides missing provider evidence.
+
 ## Usage
 
 Seed the source catalog without network probes:

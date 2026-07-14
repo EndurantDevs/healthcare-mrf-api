@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-
 from contextlib import asynccontextmanager
 import asyncio
 import hashlib
@@ -11,7 +10,6 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -28,9 +26,11 @@ async def _require_disposable_postgres(database: Database) -> None:
 
 
 async def _create_tables(database: Database, schema: str) -> None:
+    await database.status(f"CREATE TABLE {schema}.provider_directory_source (source_id varchar(64) PRIMARY KEY, org_name varchar(256) NOT NULL, endpoint_id varchar(64), canonical_api_base text, metadata_json jsonb);")
     await database.status(
         f"CREATE TABLE {schema}.provider_directory_endpoint_dataset ("
         "dataset_id varchar(96) PRIMARY KEY, "
+        "endpoint_id varchar(64) NOT NULL, "
         "acquisition_root_run_id varchar(64), "
         "import_run_id varchar(64) NOT NULL"
         ");"
@@ -72,7 +72,6 @@ async def _create_tables(database: Database, schema: str) -> None:
         ");"
     )
 
-
 async def _insert_resource(
     database: Database,
     schema: str,
@@ -94,20 +93,23 @@ async def _insert_resource(
         payload_json=payload_json,
     )
 
-
 async def _insert_endpoint_dataset_fixtures(
     database: Database,
     schema: str,
 ) -> None:
     await database.status(
-        f"INSERT INTO {schema}.provider_directory_endpoint_dataset "
-        "(dataset_id, acquisition_root_run_id, import_run_id) VALUES "
-        "('dataset-a', 'root-a', 'import-a'), "
-        "('dataset-b', 'root-b', 'import-b'), "
-        "('dataset-zero', 'root-zero', 'import-zero'), "
-        "('dataset-legacy', NULL, 'legacy-import');"
+        f"INSERT INTO {schema}.provider_directory_source "
+        "(source_id, org_name, endpoint_id, canonical_api_base, metadata_json) VALUES "
+        "('source-a', 'Standard', 'endpoint-a', 'https://standard.test', '{}'::jsonb);"
     )
-
+    await database.status(
+        f"INSERT INTO {schema}.provider_directory_endpoint_dataset "
+        "(dataset_id, endpoint_id, acquisition_root_run_id, import_run_id) VALUES "
+        "('dataset-a', 'endpoint-a', 'root-a', 'import-a'), "
+        "('dataset-b', 'endpoint-b', 'root-b', 'import-b'), "
+        "('dataset-zero', 'endpoint-zero', 'root-zero', 'import-zero'), "
+        "('dataset-legacy', 'endpoint-legacy', NULL, 'legacy-import');"
+    )
 
 async def _insert_plan_fixtures(database: Database, schema: str) -> None:
     plan_payload_by_id = {
@@ -140,16 +142,13 @@ async def _insert_plan_fixtures(database: Database, schema: str) -> None:
         {"network_refs": ["Organization/legacy-network"]},
     )
 
-
 async def _insert_affiliation_fixtures(
     database: Database,
     schema: str,
 ) -> None:
     affiliation_reference_by_id = {
         "affiliation-a": "Organization/org-a",
-        "affiliation-b": (
-            "https://payer.test/fhir/Organization/org-a"
-        ),
+        "affiliation-b": "https://payer.test/fhir/Organization/org-a",
         "affiliation-c": "org-b",
         "affiliation-d": "",
         "affiliation-e": None,
@@ -157,15 +156,13 @@ async def _insert_affiliation_fixtures(
     for resource_id, affiliation_reference in (
         affiliation_reference_by_id.items()
     ):
+        payload = {"participating_organization_ref": affiliation_reference}
+        if resource_id in {"affiliation-a", "affiliation-b"}:
+            payload["organization_ref"] = "Organization/org-b"
         await _insert_resource(
-            database,
-            schema,
-            "dataset-a",
-            "OrganizationAffiliation",
-            resource_id,
-            {"participating_organization_ref": affiliation_reference},
+            database, schema, "dataset-a", "OrganizationAffiliation",
+            resource_id, payload,
         )
-
 
 async def _insert_zero_edge_fixtures(database: Database, schema: str) -> None:
     for plan_number in range(4):
@@ -200,10 +197,14 @@ async def _insert_sentinel_relation_fixtures(
 async def _insert_fixtures(database: Database, schema: str) -> None:
     await _insert_endpoint_dataset_fixtures(database, schema)
     await _insert_plan_fixtures(database, schema)
+    for resource_id in ("org-a", "org-b"):
+        await _insert_resource(
+            database, schema, "dataset-a", "Organization", resource_id,
+            {"name": resource_id},
+        )
     await _insert_affiliation_fixtures(database, schema)
     await _insert_zero_edge_fixtures(database, schema)
     await _insert_sentinel_relation_fixtures(database, schema)
-
 
 @asynccontextmanager
 async def _dataset_database(monkeypatch):
@@ -228,7 +229,6 @@ async def _dataset_database(monkeypatch):
             await database.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
         await database.disconnect()
 
-
 async def _build_dataset_a_relations(database: Database):
     async with database.acquire() as connection:
         network_proof = (
@@ -249,7 +249,6 @@ async def _build_dataset_a_relations(database: Database):
             )
         )
     return network_proof, affiliation_proof
-
 
 async def _dataset_a_relation_rows(database: Database, schema: str):
     network_edge_rows = await database.all(
@@ -322,6 +321,7 @@ async def test_real_postgres_builds_normalized_relations_and_preserves_other_dat
         _assert_network_edges(network_proof, network_edge_rows)
         _assert_affiliation_edges(affiliation_proof, affiliation_edge_rows)
         await _assert_dataset_b_sentinels(database, schema)
+
 
 
 async def _build_baseline_dataset_a_relations(database: Database, schema: str):
