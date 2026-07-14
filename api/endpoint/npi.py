@@ -6926,6 +6926,15 @@ def _replace_stale_geo_provider_directory_evidence(
             )
             if str(address_source).strip().lower() != "provider_directory_fhir"
         ]
+        _sync_match_candidate_source_counts(candidate_row)
+
+
+def _sync_match_candidate_source_counts(candidate_row: dict[str, Any]) -> None:
+    """Keep candidate corroboration counts aligned with filtered sources."""
+    source_count = len(_json_array_value(candidate_row.get("address_sources")))
+    candidate_row["source_count"] = source_count
+    candidate_row["independent_source_count"] = source_count
+    candidate_row["multi_source_confirmed"] = source_count > 1
 
 
 async def _attach_geo_candidate_record_ids(
@@ -6972,6 +6981,7 @@ async def _attach_geo_candidate_record_ids(
                 candidate_row.get("address_sources"),
                 "provider_directory_fhir",
             )
+            _sync_match_candidate_source_counts(candidate_row)
 
 
 async def _attach_candidate_sources_bounded(
