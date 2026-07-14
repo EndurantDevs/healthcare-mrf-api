@@ -2750,7 +2750,9 @@ def test_master_list_aliases_are_stored_on_source_and_payer_rows():
     )
 
     payer_row, source_row = discovery._candidate_to_rows(
-        candidate, discovery._utc_now()
+        candidate,
+        discovery._utc_now(),
+        discovery_run_id="run_example",
     )
 
     assert payer_row["aliases"] == ["Surest", "UHC", "UMR", "United Healthcare"]
@@ -2761,7 +2763,9 @@ def test_master_list_aliases_are_stored_on_source_and_payer_rows():
         "United Healthcare",
     ]
     assert payer_row["metadata_json"]["benefit_lines"] == ["medical"]
+    assert "discovery_run_id" not in payer_row["metadata_json"]
     assert source_row is not None
+    assert source_row["metadata_json"]["discovery_run_id"] == "run_example"
     assert source_row["metadata_json"]["aliases"] == [
         "Surest",
         "UHC",
@@ -13770,7 +13774,8 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
     async def fake_push_objects(row_dicts, model, *, rewrite, use_copy):
         persisted_batches.append((model, row_dicts, rewrite, use_copy))
 
-    async def fake_store_candidates(_candidates):
+    async def fake_store_candidates(_candidates, *, discovery_run_id):
+        assert discovery_run_id.startswith("mrfcrawl_")
         return (
             [{"payer_id": "payer_1"}],
             [{"source_id": "source_1", "index_url": "https://example.com/index.json"}],

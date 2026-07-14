@@ -37,6 +37,7 @@ from process.provider_quality_parts.sql_helpers import (
 
 
 def _cohort_sql_phase_1_build_features(ctx: dict[str, Any]) -> str:
+    """Build phase-one provider feature SQL."""
     schema = ctx["schema"]
     feature_table = ctx["feature_table"]
     feature_insert_cols_sql = ctx["feature_insert_cols_sql"]
@@ -340,6 +341,7 @@ def _cohort_sql_phase_1_build_features(ctx: dict[str, Any]) -> str:
 
 
 def _cohort_sql_phase_2_build_lsh_shard(ctx: dict[str, Any]) -> str:
+    """Build phase-two LSH shard SQL."""
     schema = ctx["schema"]
     lsh_table = ctx["lsh_table"]
     lsh_insert_cols_sql = ctx["lsh_insert_cols_sql"]
@@ -446,6 +448,7 @@ def _cohort_sql_phase_3_update_procedure_bucket(ctx: dict[str, Any]) -> str | No
 
 
 def _cohort_sql_phase_4_build_peer_targets(ctx: dict[str, Any]) -> str:
+    """Build phase-four peer-target SQL."""
     schema = ctx["schema"]
     qpp_table = ctx["qpp_table"]
     svi_table = ctx["svi_table"]
@@ -619,6 +622,7 @@ def _cohort_sql_phase_4_build_peer_targets(ctx: dict[str, Any]) -> str:
 
 
 def _cohort_sql_phase_5_build_measure_shard(ctx: dict[str, Any]) -> str:
+    """Build phase-five measure shard SQL."""
     schema = ctx["schema"]
     qpp_table = ctx["qpp_table"]
     svi_table = ctx["svi_table"]
@@ -1048,6 +1052,7 @@ def _cohort_sql_phase_6_build_domain_shard(ctx: dict[str, Any]) -> str:
 
 
 def _cohort_sql_phase_7_build_score_shard(ctx: dict[str, Any]) -> str:
+    """Build phase-seven score shard SQL."""
     schema = ctx["schema"]
     cohort_meta_cte = ""
     cohort_meta_join_scored = ""

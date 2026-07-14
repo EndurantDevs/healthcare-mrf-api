@@ -90,6 +90,7 @@ PATTERN_EXEMPT_PATHS = {
 
 
 def repository_files(*, include_untracked: bool = False) -> list[Path]:
+    """List tracked repository files included in hygiene checks."""
     command = ["git", "ls-files", "-z", "--cached"]
     if include_untracked:
         command.extend(["--others", "--exclude-standard"])
@@ -114,6 +115,7 @@ def existing_files(paths: list[Path]) -> list[Path]:
 
 
 def is_binary(path: Path) -> bool:
+    """Return whether file content appears binary."""
     try:
         chunk = path.read_bytes()[:4096]
     except OSError:
@@ -122,6 +124,7 @@ def is_binary(path: Path) -> bool:
 
 
 def check_paths(paths: list[Path]) -> list[str]:
+    """Check tracked paths for prohibited public data."""
     errors: list[str] = []
     for path in paths:
         parts = set(path.parts)
@@ -166,6 +169,7 @@ def has_private_text_fingerprint(text: str) -> bool:
 
 
 def check_content(paths: list[Path]) -> list[str]:
+    """Check tracked text content for prohibited public data."""
     errors: list[str] = []
     for path in paths:
         path_str = path.as_posix()
@@ -185,6 +189,7 @@ def check_content(paths: list[Path]) -> list[str]:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse public-hygiene command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--include-untracked",
@@ -195,6 +200,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the public repository hygiene checks."""
     args = parse_args(argv)
     paths = existing_files(repository_files(include_untracked=args.include_untracked))
     errors = check_paths(paths) + check_content(paths)

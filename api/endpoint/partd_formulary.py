@@ -164,6 +164,7 @@ async def _fetch_state_license_summary(session, npi: int, as_of: datetime.date) 
 
 @blueprint.get("/import/status")
 async def get_partd_import_status(request):
+    """Return Part D import status."""
     session = _get_session(request)
     run_id = request.args.get("run_id")
 
@@ -210,6 +211,7 @@ async def get_partd_import_status(request):
 
 @blueprint.get("/snapshots")
 async def list_partd_snapshots(request):
+    """List Part D snapshots."""
     session = _get_session(request)
     args = request.args
     args.get("page")
@@ -283,6 +285,7 @@ async def list_partd_snapshots(request):
 
 @blueprint.get("/pharmacies/<npi>/activity")
 async def get_pharmacy_partd_activity(request, npi):
+    """Return pharmacy Part D activity."""
     session = _get_session(request)
     parsed_npi = _parse_npi(npi)
     as_of = _parse_date_param(request.args.get("as_of"), "as_of") or datetime.date.today()
@@ -397,6 +400,7 @@ async def get_pharmacy_partd_activity(request, npi):
 
 @blueprint.get("/pharmacies/<npi>/medications/<code_system>/<code>/costs")
 async def get_pharmacy_medication_costs(request, npi, code_system, code):
+    """Return pharmacy medication costs."""
     session = _get_session(request)
     parsed_npi = _parse_npi(npi)
     normalized_system, normalized_code = _normalize_code(code_system, code)

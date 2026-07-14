@@ -162,6 +162,7 @@ async def _flush_places_rows(
 
 
 async def process_data(ctx, task=None):  # pragma: no cover
+    """Process one queued places-to-ZCTA import task."""
     task = task or {}
     await raise_if_cancelled(ctx, task)
     ctx.setdefault("context", {})
@@ -236,6 +237,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
 
 
 async def startup(ctx):  # pragma: no cover
+    """Initialize resources required by the places worker."""
     await my_init_db(db)
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()
@@ -273,6 +275,7 @@ async def _table_exists(schema: str, table_name: str) -> bool:
 
 
 async def shutdown(ctx):  # pragma: no cover
+    """Finalize the places run and publish its archive indexes."""
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
 
@@ -306,6 +309,7 @@ async def shutdown(ctx):  # pragma: no cover
         )
 
     async def archive_index(index_name: str) -> str:
+        """Build the places archive lookup index."""
         archived_name = _archived_identifier(index_name)
         await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_name};")
         await db.status(
@@ -358,6 +362,7 @@ async def shutdown(ctx):  # pragma: no cover
 
 
 async def main(test_mode: bool = False):  # pragma: no cover
+    """Run the places-to-ZCTA import entry point."""
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,

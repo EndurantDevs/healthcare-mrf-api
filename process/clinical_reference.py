@@ -327,6 +327,7 @@ def _build_clinical_area_rows(
     concepts: dict[tuple[str, str], dict[str, Any]],
     relationships: dict[tuple[str, str, str, str, str], dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build clinical area rows."""
     mesh_tree_by_code: dict[str, set[str]] = {}
     mesh_code_by_tree: dict[str, str] = {}
     for row in relationships.values():
@@ -664,6 +665,7 @@ async def _load_medrt_from_rxclass(test_mode: bool) -> tuple[list[dict], list[di
     completed = 0
 
     async def lookup(rxcui: str) -> tuple[str, list[dict[str, Any]]]:
+        """Fetch RxClass relationships for one RxCUI."""
         async with semaphore:
             try:
                 return rxcui, await asyncio.to_thread(_rxclass_for_rxcui, rxcui)
@@ -853,6 +855,7 @@ async def import_clinical_reference(
     force_download: bool = False,
     run_id: str | None = None,
 ) -> dict[str, Any]:
+    """Load and persist clinical reference relationships."""
     await ensure_database(test_mode)
     schema = _schema()
     import_suffix = _normalize_import_id(import_id)
@@ -1002,6 +1005,7 @@ async def main(
     force_download: bool = False,
     run_id: str | None = None,
 ) -> dict[str, Any]:
+    """Run the clinical reference import entry point."""
     await init_db(db)
     try:
         return await import_clinical_reference(

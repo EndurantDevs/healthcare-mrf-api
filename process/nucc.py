@@ -30,10 +30,12 @@ NUCC_QUEUE_NAME = "arq:NUCC"
 
 
 def is_test_mode(ctx: dict) -> bool:
+    """Return whether the worker is running in test mode."""
     return bool(ctx.get("context", {}).get("test_mode"))
 
 
 async def process_data(ctx, task=None):
+    """Process one queued NUCC taxonomy import task."""
     task = task or {}
     await raise_if_cancelled(ctx, task)
     import_date = ctx['import_date']
@@ -151,6 +153,7 @@ async def process_data(ctx, task=None):
 
 
 async def startup(ctx):
+    """Initialize resources required by the NUCC worker."""
     loop = asyncio.get_event_loop()
     ctx['context'] = {}
     ctx['context']['start'] = datetime.datetime.utcnow()
@@ -178,6 +181,7 @@ async def startup(ctx):
 
 
 async def shutdown(ctx):
+    """Finalize the NUCC run and release worker resources."""
     import_date = ctx['import_date']
     context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
@@ -223,6 +227,7 @@ async def shutdown(ctx):
 
 
 async def main(test_mode: bool = False):
+    """Run the NUCC taxonomy import entry point."""
     redis = await create_pool(build_redis_settings(),
                               job_serializer=serialize_job,
                               job_deserializer=deserialize_job)

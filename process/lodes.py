@@ -373,6 +373,7 @@ async def _process_lodes_state(
 
 
 async def process_data(ctx, task=None):
+    """Process one queued LODES import task."""
     task = task or {}
     ctx.setdefault("context", {})
 
@@ -445,6 +446,7 @@ async def process_data(ctx, task=None):
 
 
 async def startup(ctx):
+    """Initialize resources required by the LODES worker."""
     await my_init_db(db)
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()
@@ -474,6 +476,7 @@ async def startup(ctx):
 
 
 async def shutdown(ctx):
+    """Finalize the LODES run and release worker resources."""
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
@@ -598,6 +601,7 @@ async def shutdown(ctx):
 
 
 async def main(test_mode: bool = False):
+    """Run the LODES import entry point."""
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,
