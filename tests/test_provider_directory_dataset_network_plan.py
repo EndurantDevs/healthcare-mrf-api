@@ -34,6 +34,10 @@ def _affiliation_proof_by_field(**overrides):
         "affiliation_resource_count": 5,
         "affiliation_with_participating_organization_count": 3,
         "empty_participating_organization_reference_count": 2,
+        "fallback_candidate_count": 0,
+        "fallback_resolved_count": 0,
+        "fallback_unresolved_count": 0,
+        "unresolved_reference_count": 0,
         "malformed_reference_payload_count": 0,
         "valid_reference_count": 3,
         "invalid_reference_count": 0,
@@ -253,7 +257,7 @@ def test_affiliation_proof_sql_is_dataset_scoped_and_normalizes_org():
     assert "resource.resource_type = 'OrganizationAffiliation'" in sql
     assert "participating_organization_ref" in sql
     assert "Organization/([A-Za-z0-9.-]{1,64})" in sql
-    assert "reference_text ~ '^[A-Za-z0-9.-]{1,64}$'" in sql
+    assert "~ '^[A-Za-z0-9.-]{1,64}$'" in sql
     assert "InsurancePlan" not in sql
     assert "COALESCE(acquisition_root_run_id, import_run_id)" in sql
     assert "AS edge_count" not in sql
