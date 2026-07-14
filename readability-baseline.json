@@ -1,7 +1,7 @@
 {
   "issue_counts": {
     "ambiguous_function_names": 41,
-    "ambiguous_variable_names": 1603,
+    "ambiguous_variable_names": 1575,
     "boolean_name_mismatch": 462,
     "builtin_shadowing": 2,
     "class_name_shape": 2,
