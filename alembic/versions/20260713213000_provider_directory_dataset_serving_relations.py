@@ -11,6 +11,9 @@ import os
 from alembic import op
 import sqlalchemy as sa
 
+from db.migration_adoption import create_table_or_validate
+from db.migration_index_adoption import IndexDefinition, create_index_if_missing
+
 
 revision = "20260713213000_provider_directory_dataset_serving_relations"
 down_revision = "20260713210000_provider_directory_profile_fields"
@@ -35,7 +38,8 @@ def _dataset_foreign_key(
 
 
 def _create_network_plan_table(schema: str) -> None:
-    op.create_table(
+    create_table_or_validate(
+        op,
         "provider_directory_dataset_network_plan",
         sa.Column("dataset_id", sa.String(length=96), nullable=False),
         sa.Column("network_resource_id", sa.String(length=256), nullable=False),
@@ -56,18 +60,25 @@ def _create_network_plan_table(schema: str) -> None:
         ),
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_dataset_network_plan_reverse_lookup_idx",
         "provider_directory_dataset_network_plan",
         ["dataset_id", "insurance_plan_resource_id"],
         unique=False,
         schema=schema,
+        legacy_shapes=(
+            IndexDefinition(
+                key_columns=("dataset_id", "insurance_plan_resource_id"),
+            ),
+        ),
         postgresql_include=["network_resource_id"],
     )
 
 
 def _create_affiliation_organization_table(schema: str) -> None:
-    op.create_table(
+    create_table_or_validate(
+        op,
         "provider_directory_dataset_affiliation_organization",
         sa.Column("dataset_id", sa.String(length=96), nullable=False),
         sa.Column(

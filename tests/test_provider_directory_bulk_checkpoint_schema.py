@@ -124,6 +124,12 @@ def test_bulk_checkpoint_migration_matches_parent_and_root_columns(monkeypatch):
         }
     ]
     assert len(recorder.executed_statements) == 2
+    pagination_backfill_sql = str(
+        recorder.executed_statements[1].compile(
+            dialect=postgresql.dialect(),
+        )
+    )
+    assert "acquisition_root_run_id IS NULL" in pagination_backfill_sql
 
 
 def test_bulk_checkpoint_migration_matches_models(monkeypatch):

@@ -12,6 +12,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from db.migration_adoption import create_table_or_validate
+
 
 revision = "20260713236000_provider_directory_dataset_insurance_plan"
 down_revision = "20260713235000_import_run_provider_directory_retry_child"
@@ -31,41 +33,32 @@ def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
 
 
-def _table_exists(bind, schema: str) -> bool:
-    return bool(
-        bind.execute(
-            sa.text("SELECT to_regclass(:name)"),
-            {"name": f"{schema}.provider_directory_dataset_insurance_plan"},
-        ).scalar()
-    )
-
-
 def upgrade():
     schema = _schema()
-    if not _table_exists(op.get_bind(), schema):
-        op.create_table(
-            "provider_directory_dataset_insurance_plan",
-            sa.Column("dataset_id", sa.String(length=96), nullable=False),
-            sa.Column("resource_id", sa.String(length=256), nullable=False),
-            sa.Column("payload_hash", sa.String(length=64), nullable=False),
-            sa.Column(
-                "payload_json",
-                postgresql.JSONB(astext_type=sa.Text()),
-                nullable=False,
-            ),
-            sa.ForeignKeyConstraint(
-                ["dataset_id"],
-                [f"{schema}.provider_directory_endpoint_dataset.dataset_id"],
-                name="provider_directory_dataset_insurance_plan_dataset_id_fkey",
-                ondelete="CASCADE",
-            ),
-            sa.PrimaryKeyConstraint(
-                "dataset_id",
-                "resource_id",
-                name="provider_directory_dataset_insurance_plan_pkey",
-            ),
-            schema=schema,
-        )
+    create_table_or_validate(
+        op,
+        "provider_directory_dataset_insurance_plan",
+        sa.Column("dataset_id", sa.String(length=96), nullable=False),
+        sa.Column("resource_id", sa.String(length=256), nullable=False),
+        sa.Column("payload_hash", sa.String(length=64), nullable=False),
+        sa.Column(
+            "payload_json",
+            postgresql.JSONB(astext_type=sa.Text()),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["dataset_id"],
+            [f"{schema}.provider_directory_endpoint_dataset.dataset_id"],
+            name="provider_directory_dataset_insurance_plan_dataset_id_fkey",
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint(
+            "dataset_id",
+            "resource_id",
+            name="provider_directory_dataset_insurance_plan_pkey",
+        ),
+        schema=schema,
+    )
     projection_ref = _qt(schema, "provider_directory_dataset_insurance_plan")
     resource_ref = _qt(schema, "provider_directory_dataset_resource")
     op.execute(

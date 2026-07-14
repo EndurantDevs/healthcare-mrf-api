@@ -355,6 +355,10 @@ jobs:
           PY
           alembic stamp 20260610143000_address_checksums_bigint
           alembic upgrade head
+      - name: Run Provider Directory migration adoption and repair cycle
+        env:
+          HLTHPRT_PROVIDER_DIRECTORY_MIGRATION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
+        run: python -m pytest -q tests/test_provider_directory_migration_adoption_postgres.py
       - name: Run fresh-migrated PTG2 v3 PostgreSQL lifecycle gate
         env:
           HLTHPRT_PTG2_V3_LIFECYCLE_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"

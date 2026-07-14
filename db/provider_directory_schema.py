@@ -91,8 +91,11 @@ def _checkpoint_root_mismatch_count(
               LEFT JOIN {dataset_ref} AS dataset
                 ON dataset.dataset_id = checkpoint.dataset_id
              WHERE checkpoint.acquisition_root_run_id IS NULL
-                OR checkpoint.acquisition_root_run_id IS DISTINCT FROM
-                   dataset.acquisition_root_run_id;
+                OR (
+                    checkpoint.dataset_id IS NOT NULL
+                    AND checkpoint.acquisition_root_run_id IS DISTINCT FROM
+                        dataset.acquisition_root_run_id
+                );
             """
         )
     )

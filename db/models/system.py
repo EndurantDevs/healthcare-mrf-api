@@ -503,8 +503,8 @@ class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):
             "index_elements": (
                 "dataset_id",
                 "resource_id",
-                "plan_identifier",
             ),
+            "include": ("plan_identifier",),
             "name": "provider_directory_dataset_insurance_plan_active_lookup_idx",
             "where": "plan_active",
         }

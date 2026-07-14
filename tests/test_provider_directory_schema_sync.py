@@ -108,6 +108,7 @@ def test_sync_accepts_current_identity_without_rekeying(monkeypatch):
 
     executed_sql = "\n".join(statement for statement, _params in connection.executed)
     assert "SELECT count(*)" in executed_sql
+    assert "checkpoint.dataset_id IS NOT NULL" in executed_sql
     assert "ALTER TABLE" not in executed_sql
     assert results == _results()
 

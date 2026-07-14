@@ -11,6 +11,8 @@ import os
 from alembic import op
 import sqlalchemy as sa
 
+from db.migration_adoption import add_column_if_missing
+
 
 revision = "20260713220000_provider_directory_practitioner_derived_profile"
 down_revision = "20260713213000_provider_directory_dataset_serving_relations"
@@ -39,7 +41,8 @@ DERIVED_COLUMNS = (
 def upgrade():
     schema = _schema()
     for column in DERIVED_COLUMNS:
-        op.add_column(
+        add_column_if_missing(
+            op,
             "provider_directory_practitioner",
             column,
             schema=schema,

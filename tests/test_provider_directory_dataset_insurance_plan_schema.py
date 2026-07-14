@@ -74,7 +74,6 @@ def test_dataset_insurance_plan_migration_creates_and_backfills_projection(
     operation_recorder = _OpRecorder()
     monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
     monkeypatch.setattr(migration, "op", operation_recorder)
-    monkeypatch.setattr(migration, "_table_exists", lambda *_args: False)
 
     migration.upgrade()
 
@@ -120,7 +119,11 @@ def test_dataset_insurance_plan_migration_backfills_existing_model_table(monkeyp
     migration = _load_migration()
     operation_recorder = _OpRecorder()
     monkeypatch.setattr(migration, "op", operation_recorder)
-    monkeypatch.setattr(migration, "_table_exists", lambda *_args: True)
+    monkeypatch.setattr(
+        migration,
+        "create_table_or_validate",
+        lambda *_args, **_kwargs: False,
+    )
 
     migration.upgrade()
 

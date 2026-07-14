@@ -11,6 +11,9 @@ import os
 from alembic import op
 import sqlalchemy as sa
 
+from db.migration_adoption import add_column_if_missing
+from db.migration_index_adoption import IndexDefinition, create_index_if_missing
+
 
 revision = "20260713237000_provider_directory_plan_scalars"
 down_revision = "20260713236000_provider_directory_dataset_insurance_plan"
@@ -26,68 +29,49 @@ def _schema() -> str:
     return os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
 
 
-def _column_exists(column_name: str) -> bool:
-    bind = op.get_bind()
-    return bool(
-        bind.execute(
-            sa.text(
-                """
-                SELECT EXISTS (
-                    SELECT 1
-                      FROM pg_attribute
-                     WHERE attrelid = to_regclass(:table_name)
-                       AND attname = :column_name
-                       AND attnum > 0
-                       AND NOT attisdropped
-                )
-                """
-            ),
-            {
-                "table_name": f"{_schema()}.{PLAN_TABLE}",
-                "column_name": column_name,
-            },
-        ).scalar()
-    )
-
-
 def upgrade():
     schema = _schema()
-    if not _column_exists("plan_active"):
-        op.add_column(
-            PLAN_TABLE,
-            sa.Column(
-                "plan_active",
-                sa.Boolean(),
-                sa.Computed(
-                    "COALESCE(NULLIF(lower(btrim(payload_json ->> 'status')), ''), "
-                    "'active') = 'active'",
-                    persisted=True,
-                ),
+    add_column_if_missing(
+        op,
+        PLAN_TABLE,
+        sa.Column(
+            "plan_active",
+            sa.Boolean(),
+            sa.Computed(
+                "COALESCE(NULLIF(lower(btrim(payload_json ->> 'status')), ''), "
+                "'active') = 'active'",
+                persisted=True,
             ),
-            schema=schema,
-        )
-    if not _column_exists("plan_identifier"):
-        op.add_column(
-            PLAN_TABLE,
-            sa.Column(
-                "plan_identifier",
-                sa.Text(),
-                sa.Computed(
-                    "NULLIF(btrim(payload_json ->> 'plan_identifier'), '')",
-                    persisted=True,
-                ),
+        ),
+        schema=schema,
+    )
+    add_column_if_missing(
+        op,
+        PLAN_TABLE,
+        sa.Column(
+            "plan_identifier",
+            sa.Text(),
+            sa.Computed(
+                "NULLIF(btrim(payload_json ->> 'plan_identifier'), '')",
+                persisted=True,
             ),
-            schema=schema,
-        )
-    op.execute(
-        sa.text(
-            f"""
-            CREATE INDEX IF NOT EXISTS {ACTIVE_INDEX}
-                ON {schema}.{PLAN_TABLE} (dataset_id, resource_id)
-                INCLUDE (plan_identifier)
-             WHERE plan_active;
-            """
-        )
+        ),
+        schema=schema,
+    )
+    create_index_if_missing(
+        op,
+        ACTIVE_INDEX,
+        PLAN_TABLE,
+        ("dataset_id", "resource_id"),
+        schema=schema,
+        legacy_shapes=(
+            IndexDefinition(
+                key_columns=("dataset_id", "resource_id", "plan_identifier"),
+                predicate="plan_active",
+            ),
+        ),
+        postgresql_include=("plan_identifier",),
+        postgresql_where=sa.text("plan_active"),
     )
 
 

@@ -11,6 +11,8 @@ import os
 from alembic import op
 from sqlalchemy import text
 
+from db.migration_index_adoption import has_matching_index
+
 
 revision = "20260713234000_provider_directory_plan_lookup_index"
 down_revision = "20260713233000_provider_directory_resource_identifiers"
@@ -43,10 +45,40 @@ def _table_exists(bind, schema: str, table: str) -> bool:
     )
 
 
+def _offline_context():
+    get_context = getattr(op, "get_context", None)
+    if get_context is None:
+        return None
+    migration_context = get_context()
+    return migration_context if migration_context.as_sql else None
+
+
 def upgrade():
-    bind = op.get_bind()
     schema = _schema()
+    offline_context = _offline_context()
+    if offline_context is not None:
+        with offline_context.autocommit_block():
+            op.create_index(
+                INDEX_NAME,
+                TABLE_NAME,
+                ["dataset_id", "resource_id"],
+                schema=schema,
+                if_not_exists=True,
+                postgresql_concurrently=True,
+                postgresql_where=text("resource_type = 'InsurancePlan'"),
+            )
+        return
+    bind = op.get_bind()
     if not _table_exists(bind, schema, TABLE_NAME):
+        return
+    if has_matching_index(
+        op,
+        INDEX_NAME,
+        TABLE_NAME,
+        ("dataset_id", "resource_id"),
+        schema=schema,
+        postgresql_where=text("resource_type = 'InsurancePlan'"),
+    ):
         return
     with op.get_context().autocommit_block():
         bind.exec_driver_sql(
@@ -56,10 +88,30 @@ def upgrade():
             WHERE resource_type = 'InsurancePlan';
             """
         )
+    if not has_matching_index(
+        op,
+        INDEX_NAME,
+        TABLE_NAME,
+        ("dataset_id", "resource_id"),
+        schema=schema,
+        postgresql_where=text("resource_type = 'InsurancePlan'"),
+    ):
+        raise RuntimeError(f"required_index_missing:{schema}.{INDEX_NAME}")
 
 
 def downgrade():
     schema = _schema()
+    offline_context = _offline_context()
+    if offline_context is not None:
+        with offline_context.autocommit_block():
+            op.drop_index(
+                INDEX_NAME,
+                table_name=TABLE_NAME,
+                schema=schema,
+                if_exists=True,
+                postgresql_concurrently=True,
+            )
+        return
     with op.get_context().autocommit_block():
         op.get_bind().exec_driver_sql(
             f"DROP INDEX CONCURRENTLY IF EXISTS {_q(schema)}.{_q(INDEX_NAME)};"

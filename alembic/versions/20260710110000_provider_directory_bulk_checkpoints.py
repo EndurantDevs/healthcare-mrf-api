@@ -12,6 +12,13 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from db.migration_adoption import (
+    add_column_if_missing,
+    column_is_nullable,
+    create_table_or_validate,
+)
+from db.migration_index_adoption import create_index_if_missing
+
 
 revision = "20260710110000_provider_directory_bulk_checkpoints"
 down_revision = "20260710010000_provider_directory_pagination_checkpoint"
@@ -25,7 +32,8 @@ def _schema() -> str:
 
 def upgrade():
     schema = _schema()
-    op.add_column(
+    add_column_if_missing(
+        op,
         "provider_directory_endpoint_dataset",
         sa.Column("acquisition_root_run_id", sa.String(length=64), nullable=True),
         schema=schema,
@@ -42,7 +50,8 @@ def upgrade():
         .where(endpoint_dataset.c.import_run_id.is_not(None))
         .values(acquisition_root_run_id=endpoint_dataset.c.import_run_id)
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_endpoint_dataset_acquisition_root_idx",
         "provider_directory_endpoint_dataset",
         ["endpoint_id", "acquisition_root_run_id"],
@@ -51,10 +60,12 @@ def upgrade():
         postgresql_where=sa.text("acquisition_root_run_id IS NOT NULL"),
     )
 
-    op.add_column(
+    add_column_if_missing(
+        op,
         "provider_directory_pagination_checkpoint",
         sa.Column("acquisition_root_run_id", sa.String(length=64), nullable=True),
         schema=schema,
+        accepted_nullabilities=(True, False),
     )
     pagination_checkpoint = sa.table(
         "provider_directory_pagination_checkpoint",
@@ -63,19 +74,26 @@ def upgrade():
         schema=schema,
     )
     op.execute(
-        pagination_checkpoint.update().values(
-            acquisition_root_run_id=pagination_checkpoint.c.owner_run_id
-        )
+        pagination_checkpoint.update()
+        .where(pagination_checkpoint.c.acquisition_root_run_id.is_(None))
+        .values(acquisition_root_run_id=pagination_checkpoint.c.owner_run_id)
     )
-    op.alter_column(
+    if column_is_nullable(
+        op,
         "provider_directory_pagination_checkpoint",
         "acquisition_root_run_id",
-        existing_type=sa.String(length=64),
-        nullable=False,
         schema=schema,
-    )
+    ) is not False:
+        op.alter_column(
+            "provider_directory_pagination_checkpoint",
+            "acquisition_root_run_id",
+            existing_type=sa.String(length=64),
+            nullable=False,
+            schema=schema,
+        )
 
-    op.create_table(
+    create_table_or_validate(
+        op,
         "provider_directory_bulk_acquisition_checkpoint",
         sa.Column("checkpoint_id", sa.String(length=64), nullable=False),
         sa.Column("canonical_api_base", sa.Text(), nullable=False),
@@ -134,32 +152,37 @@ def upgrade():
         ),
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_bulk_acquisition_dataset_idx",
         "provider_directory_bulk_acquisition_checkpoint",
         ["dataset_id"],
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_bulk_acquisition_owner_idx",
         "provider_directory_bulk_acquisition_checkpoint",
         ["owner_run_id"],
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_bulk_acquisition_root_idx",
         "provider_directory_bulk_acquisition_checkpoint",
         ["acquisition_root_run_id"],
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_bulk_acquisition_state_updated_idx",
         "provider_directory_bulk_acquisition_checkpoint",
         ["state", "updated_at"],
         schema=schema,
     )
 
-    op.create_table(
+    create_table_or_validate(
+        op,
         "provider_directory_bulk_output_checkpoint",
         sa.Column("checkpoint_id", sa.String(length=64), nullable=False),
         sa.Column("output_id", sa.String(length=64), nullable=False),
@@ -203,7 +226,8 @@ def upgrade():
         ),
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_bulk_output_state_updated_idx",
         "provider_directory_bulk_output_checkpoint",
         ["state", "updated_at"],
