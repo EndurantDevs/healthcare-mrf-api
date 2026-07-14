@@ -11,11 +11,27 @@ import os
 from alembic import op
 import sqlalchemy as sa
 
+from db.migration_adoption import (
+    column_is_nullable,
+    primary_key_columns,
+)
+from db.migration_index_adoption import create_index_if_missing
+
 
 revision = "20260710143000_provider_directory_pagination_root_identity"
 down_revision = "20260710110000_provider_directory_bulk_checkpoints"
 branch_labels = None
 depends_on = None
+
+
+LEGACY_PRIMARY_KEY_COLUMNS = (
+    "canonical_api_base",
+    "resource_type",
+    "source_scope_hash",
+)
+ROOT_PRIMARY_KEY_COLUMNS = LEGACY_PRIMARY_KEY_COLUMNS + (
+    "acquisition_root_run_id",
+)
 
 
 def _schema() -> str:
@@ -88,8 +104,11 @@ def upgrade():
                       LEFT JOIN {schema}.provider_directory_endpoint_dataset AS dataset
                         ON dataset.dataset_id = checkpoint.dataset_id
                      WHERE checkpoint.acquisition_root_run_id IS NULL
-                        OR checkpoint.acquisition_root_run_id IS DISTINCT FROM
-                           dataset.acquisition_root_run_id
+                        OR (
+                            checkpoint.dataset_id IS NOT NULL
+                            AND checkpoint.acquisition_root_run_id IS DISTINCT FROM
+                                dataset.acquisition_root_run_id
+                        )
                 ) THEN
                     RAISE EXCEPTION
                         'provider_directory_pagination_checkpoint_root_backfill_failed';
@@ -99,31 +118,48 @@ def upgrade():
             """
         )
     )
-    op.alter_column(
+    if column_is_nullable(
+        op,
         "provider_directory_pagination_checkpoint",
         "acquisition_root_run_id",
-        existing_type=sa.String(length=64),
-        nullable=False,
         schema=schema,
-    )
-    op.drop_constraint(
-        "provider_directory_pagination_checkpoint_pkey",
-        "provider_directory_pagination_checkpoint",
-        type_="primary",
-        schema=schema,
-    )
-    op.create_primary_key(
-        "provider_directory_pagination_checkpoint_pkey",
-        "provider_directory_pagination_checkpoint",
-        [
-            "canonical_api_base",
-            "resource_type",
-            "source_scope_hash",
+    ) is not False:
+        op.alter_column(
+            "provider_directory_pagination_checkpoint",
             "acquisition_root_run_id",
-        ],
+            existing_type=sa.String(length=64),
+            nullable=False,
+            schema=schema,
+        )
+    existing_primary_key = primary_key_columns(
+        op,
+        "provider_directory_pagination_checkpoint",
         schema=schema,
     )
-    op.create_index(
+    if existing_primary_key not in (
+        None,
+        LEGACY_PRIMARY_KEY_COLUMNS,
+        ROOT_PRIMARY_KEY_COLUMNS,
+    ):
+        raise RuntimeError(
+            "provider_directory_pagination_checkpoint_primary_key_unknown:"
+            + ",".join(existing_primary_key)
+        )
+    if existing_primary_key != ROOT_PRIMARY_KEY_COLUMNS:
+        op.drop_constraint(
+            "provider_directory_pagination_checkpoint_pkey",
+            "provider_directory_pagination_checkpoint",
+            type_="primary",
+            schema=schema,
+        )
+        op.create_primary_key(
+            "provider_directory_pagination_checkpoint_pkey",
+            "provider_directory_pagination_checkpoint",
+            list(ROOT_PRIMARY_KEY_COLUMNS),
+            schema=schema,
+        )
+    create_index_if_missing(
+        op,
         "provider_directory_pagination_checkpoint_root_updated_idx",
         "provider_directory_pagination_checkpoint",
         ["acquisition_root_run_id", "updated_at"],

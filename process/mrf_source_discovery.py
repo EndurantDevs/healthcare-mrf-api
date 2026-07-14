@@ -6622,7 +6622,7 @@ def _json_mrf_directory_targets_from_payload(
     resolver_type: str,
 ) -> list[CrawlTarget]:
     """Walk a JSON directory payload and build unique crawl targets."""
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     seen: set[str] = set()
 
     def visit(value: Any) -> None:
@@ -6664,7 +6664,7 @@ def _json_mrf_directory_targets_from_payload(
                 "directory_url": directory_url,
                 "plan_info": plan_info,
             }
-            targets.append(
+            crawl_targets.append(
                 CrawlTarget(
                     source=source,
                     url=file_url,
@@ -6679,7 +6679,7 @@ def _json_mrf_directory_targets_from_payload(
             )
 
     visit(payload)
-    return targets
+    return crawl_targets
 
 
 async def _resolve_json_mrf_directory_links(
@@ -6698,28 +6698,28 @@ async def _resolve_json_mrf_directory_links(
         )
         directory_urls = _json_mrf_directory_links_from_html(html_text, base_url=url)
     max_directories = _as_int(resolver.get("max_directories")) or 20
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     for directory_url in directory_urls[:max_directories]:
-        payload = await _fetch_json(
+        directory_payload = await _fetch_json(
             directory_url,
             max_bytes=int(resolver.get("directory_max_bytes") or 20 * 1024 * 1024),
             session=session,
         )
-        targets.extend(
+        crawl_targets.extend(
             _json_mrf_directory_targets_from_payload(
                 source,
-                payload,
+                directory_payload,
                 directory_url=directory_url,
                 resolver_type="json_mrf_directory_links",
             )
         )
-    targets = _dedupe_crawl_targets_by_url(targets)
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no JSON directory MRF targets found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _humana_pct_payload_rows(payload: dict[str, Any]) -> list[Any]:
@@ -6787,18 +6787,18 @@ def _humana_pct_targets_from_payload(
     max_targets: int | None = None,
 ) -> list[CrawlTarget]:
     base_url = f"{urlsplit(api_url).scheme}://{urlsplit(api_url).netloc}/"
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     seen: set[str] = set()
-    for row in _humana_pct_payload_rows(payload):
-        file_name = _humana_pct_file_name_from_row(row)
+    for file_row in _humana_pct_payload_rows(payload):
+        file_name = _humana_pct_file_name_from_row(file_row)
         if not file_name:
             continue
-        file_type = _mrf_file_type_from_text(file_name, _humana_pct_row_text(row))
+        file_type = _mrf_file_type_from_text(file_name, _humana_pct_row_text(file_row))
         target_kind: str | None = None
         if file_type == "table-of-contents":
             target_kind = "toc_json"
         elif include_body_files:
-            file_type = _mrf_body_file_type_from_text(file_name, _humana_pct_row_text(row))
+            file_type = _mrf_body_file_type_from_text(file_name, _humana_pct_row_text(file_row))
             target_kind = "file_reference" if file_type else None
         if not target_kind or not file_type:
             continue
@@ -6818,22 +6818,22 @@ def _humana_pct_targets_from_payload(
                 _plan_info_from_label(file_name) if target_kind == "file_reference" else []
             ),
         }
-        targets.append(
+        crawl_targets.append(
             CrawlTarget(
                 source=source,
                 url=url,
                 label=_mrf_file_plan_label(file_name) or file_name,
                 resolved_from_url=api_url,
                 metadata={
-                    key: value
-                    for key, value in metadata.items()
-                    if value not in (None, "", [])
+                    key: metadata_value
+                    for key, metadata_value in metadata.items()
+                    if metadata_value not in (None, "", [])
                 },
             )
         )
-        if max_targets and len(targets) >= max_targets:
+        if max_targets and len(crawl_targets) >= max_targets:
             break
-    return targets
+    return crawl_targets
 
 
 async def _resolve_humana_pct_file_list(
@@ -6849,15 +6849,15 @@ async def _resolve_humana_pct_file_list(
         or urljoin(url, "/syntheticdata/Resource/GetData")
     )
     file_types = [
-        str(item).strip()
-        for item in (resolver.get("file_types") or ["innetwork"])
-        if str(item).strip()
+        str(file_type_value).strip()
+        for file_type_value in (resolver.get("file_types") or ["innetwork"])
+        if str(file_type_value).strip()
     ]
     page_size = _as_int(resolver.get("page_size")) or 100
     max_pages = _as_int(resolver.get("max_pages")) or 25
     max_targets = _as_int(resolver.get("max_targets")) or 1000
     include_body_files = bool(resolver.get("include_body_files"))
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     for file_type in file_types:
         for page in range(max_pages):
             start = page * page_size
@@ -6869,21 +6869,21 @@ async def _resolve_humana_pct_file_list(
                     "sEcho": page + 1,
                 }
             )
-            payload = await _fetch_json(
+            page_payload = await _fetch_json(
                 page_url,
                 max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
                 session=session,
             )
-            rows = _humana_pct_payload_rows(payload)
-            if not rows:
+            page_rows = _humana_pct_payload_rows(page_payload)
+            if not page_rows:
                 break
-            remaining = max_targets - len(targets)
+            remaining = max_targets - len(crawl_targets)
             if remaining <= 0:
                 break
-            targets.extend(
+            crawl_targets.extend(
                 _humana_pct_targets_from_payload(
                     source,
-                    payload,
+                    page_payload,
                     api_url=page_url,
                     resolver=resolver,
                     resolver_type=resolver_type,
@@ -6891,17 +6891,17 @@ async def _resolve_humana_pct_file_list(
                     max_targets=remaining,
                 )
             )
-            total = _humana_pct_total_records(payload)
-            if total is not None and start + len(rows) >= total:
+            total = _humana_pct_total_records(page_payload)
+            if total is not None and start + len(page_rows) >= total:
                 break
-            if len(rows) < page_size:
+            if len(page_rows) < page_size:
                 break
-        if len(targets) >= max_targets:
+        if len(crawl_targets) >= max_targets:
             break
-    targets = _dedupe_crawl_targets_by_url(targets)
-    if not targets:
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
+    if not crawl_targets:
         raise ValueError(f"no Humana PCT MRF targets found for {url}")
-    return targets[:max_targets]
+    return crawl_targets[:max_targets]
 
 
 def _html_looks_cloudflare_challenge(html_text: str) -> bool:
@@ -6937,13 +6937,13 @@ def _fchn_targets_from_detail_html(
     detail_url: str,
     resolver_type: str,
 ) -> list[CrawlTarget]:
-    targets = _crawl_targets_from_html_mrf_links(
+    crawl_targets = _crawl_targets_from_html_mrf_links(
         source,
         html_text,
         base_url=detail_url,
         resolver=resolver_type,
     )
-    enriched: list[CrawlTarget] = []
+    enriched_targets: list[CrawlTarget] = []
     detail_id = next(
         (
             part
@@ -6952,23 +6952,23 @@ def _fchn_targets_from_detail_html(
         ),
         None,
     )
-    for target in targets:
+    for crawl_target in crawl_targets:
         metadata = {
-            **dict(target.metadata or {}),
+            **dict(crawl_target.metadata or {}),
             "resolver": resolver_type,
             "fchn_detail_url": detail_url,
             "fchn_payor_detail_id": detail_id,
         }
-        enriched.append(
+        enriched_targets.append(
             CrawlTarget(
                 source=source,
-                url=target.url,
-                label=target.label,
-                resolved_from_url=target.resolved_from_url or detail_url,
-                metadata={key: value for key, value in metadata.items() if value},
+                url=crawl_target.url,
+                label=crawl_target.label,
+                resolved_from_url=crawl_target.resolved_from_url or detail_url,
+                metadata={key: metadata_value for key, metadata_value in metadata.items() if metadata_value},
             )
         )
-    return enriched
+    return enriched_targets
 
 
 async def _resolve_fchn_payor_search(
@@ -6985,7 +6985,7 @@ async def _resolve_fchn_payor_search(
     )
     if _html_looks_cloudflare_challenge(html_text):
         raise ValueError(f"cloudflare_challenge blocks FCHN MRF discovery for {url}")
-    targets = _fchn_targets_from_detail_html(
+    crawl_targets = _fchn_targets_from_detail_html(
         source, html_text, detail_url=url, resolver_type=resolver_type
     )
     max_details = _as_int(resolver.get("max_details")) or 100
@@ -6997,7 +6997,7 @@ async def _resolve_fchn_payor_search(
         or 5 * 1024 * 1024
     )
     for detail_url in detail_urls[:max_details]:
-        if len(targets) >= max_targets:
+        if len(crawl_targets) >= max_targets:
             break
         try:
             detail_html = await _fetch_text(
@@ -7009,7 +7009,7 @@ async def _resolve_fchn_payor_search(
             continue
         if _html_looks_cloudflare_challenge(detail_html):
             continue
-        targets.extend(
+        crawl_targets.extend(
             _fchn_targets_from_detail_html(
                 source,
                 detail_html,
@@ -7017,11 +7017,11 @@ async def _resolve_fchn_payor_search(
                 resolver_type=resolver_type,
             )
         )
-        targets = _dedupe_crawl_targets_by_url(targets)
-    targets = _dedupe_crawl_targets_by_url(targets)
-    if not targets:
+        crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
+    if not crawl_targets:
         raise ValueError(f"no FCHN MRF links found for {url}")
-    return targets[:max_targets]
+    return crawl_targets[:max_targets]
 
 
 def _payercompass_file_type(frame: dict[str, Any], label: str | None = None) -> str:
@@ -7123,7 +7123,7 @@ def _payercompass_target_for_file(
         label=_mrf_file_plan_label(file_name) or file_name,
         resolved_from_url=base_url,
         metadata={
-            key: value for key, value in metadata.items() if value not in (None, "", [])
+            key: metadata_value for key, metadata_value in metadata.items() if metadata_value not in (None, "", [])
         },
     )
 
@@ -7330,22 +7330,22 @@ async def _enrich_payercompass_targets_with_index_plan_info(
         or max_bytes
     )
     plan_info_by_key: dict[str, list[dict[str, Any]]] = {}
-    toc_metadata: dict[str, str | None] = {}
-    for target in targets:
-        if not _payercompass_is_index_target(target):
+    toc_metadata_by_field: dict[str, str | None] = {}
+    for crawl_target in targets:
+        if not _payercompass_is_index_target(crawl_target):
             continue
-        size_bytes = _parse_size_bytes((target.metadata or {}).get("size_bytes"))
+        size_bytes = _parse_size_bytes((crawl_target.metadata or {}).get("size_bytes"))
         if size_bytes and size_bytes > index_fetch_max_bytes:
             continue
         try:
             toc_values = await _fetch_zip_json_values(
-                target.url,
+                crawl_target.url,
                 max_bytes=index_fetch_max_bytes,
                 session=session,
             )
         except Exception as exc:  # pylint: disable=broad-exception-caught
             logging.getLogger(__name__).debug(
-                "failed to fetch PayerCompass index %s: %s", target.url, exc
+                "failed to fetch PayerCompass index %s: %s", crawl_target.url, exc
             )
             continue
         for _member_name, toc in toc_values:
@@ -7355,30 +7355,30 @@ async def _enrich_payercompass_targets_with_index_plan_info(
             for key, plans in member_index.items():
                 _payercompass_add_plan_info(plan_info_by_key, key, plans)
             for metadata_key, metadata_value in member_metadata.items():
-                if metadata_value and not toc_metadata.get(metadata_key):
-                    toc_metadata[metadata_key] = metadata_value
+                if metadata_value and not toc_metadata_by_field.get(metadata_key):
+                    toc_metadata_by_field[metadata_key] = metadata_value
     if not plan_info_by_key:
         return targets
-    for target in targets:
-        metadata = target.metadata or {}
+    for crawl_target in targets:
+        metadata = crawl_target.metadata or {}
         if metadata.get("target_file_type") != "in-network":
             continue
         if metadata.get("plan_info"):
             continue
-        plan_info: list[dict[str, Any]] = []
+        matched_plans: list[dict[str, Any]] = []
         seen_plan_keys: set[tuple[str, str, str, str, str]] = set()
-        for key in _payercompass_target_match_keys(target):
+        for key in _payercompass_target_match_keys(crawl_target):
             for plan in plan_info_by_key.get(key) or []:
                 plan_key = _payercompass_plan_key(plan)
                 if plan_key in seen_plan_keys:
                     continue
-                plan_info.append(plan)
+                matched_plans.append(plan)
                 seen_plan_keys.add(plan_key)
-        if not plan_info:
+        if not matched_plans:
             continue
-        metadata["plan_info"] = plan_info
+        metadata["plan_info"] = matched_plans
         metadata["payercompass_plan_info_source"] = "index_toc"
-        for metadata_key, metadata_value in toc_metadata.items():
+        for metadata_key, metadata_value in toc_metadata_by_field.items():
             if metadata_value and not metadata.get(metadata_key):
                 metadata[metadata_key] = metadata_value
     return targets
@@ -7398,7 +7398,7 @@ def _payercompass_targets_from_structure(
     )
     if not isinstance(frames, list):
         return []
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     max_timeframes = _as_int(resolver.get("max_timeframes")) or len(frames)
     for frame in frames[:max_timeframes]:
         if not isinstance(frame, dict):
@@ -7406,28 +7406,28 @@ def _payercompass_targets_from_structure(
         timeframe_id = str(frame.get("id") or "").strip()
         if not timeframe_id:
             continue
-        listing = file_lists.get(timeframe_id) or []
-        if not listing and (_as_int(frame.get("fileCount")) or 0) in {1}:
-            listing = [
+        file_entries = file_lists.get(timeframe_id) or []
+        if not file_entries and (_as_int(frame.get("fileCount")) or 0) in {1}:
+            file_entries = [
                 {"id": timeframe_id, "name": str(frame.get("name") or timeframe_id)}
             ]
-        for file_item in listing:
+        for file_item in file_entries:
             if not isinstance(file_item, dict):
                 continue
-            target = _payercompass_target_for_file(
+            crawl_target = _payercompass_target_for_file(
                 source,
                 base_url=base_url,
                 resolver=resolver,
                 frame=frame,
                 file_item=file_item,
             )
-            if target:
-                targets.append(target)
-    targets = _dedupe_crawl_targets_by_url(targets)
+            if crawl_target:
+                crawl_targets.append(crawl_target)
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    return targets
+        crawl_targets = crawl_targets[:max_targets]
+    return crawl_targets
 
 
 async def _resolve_payercompass_mrf(
@@ -7451,36 +7451,36 @@ async def _resolve_payercompass_mrf(
     if not isinstance(frames, list):
         frames = []
     max_timeframes = _as_int(resolver.get("max_timeframes")) or len(frames)
-    file_lists: dict[str, list[dict[str, Any]]] = {}
+    files_by_timeframe: dict[str, list[dict[str, Any]]] = {}
     for frame in frames[:max_timeframes]:
         if not isinstance(frame, dict):
             continue
         timeframe_id = str(frame.get("id") or "").strip()
         if not timeframe_id:
             continue
-        payload = await _post_json_value(
+        file_list_payload = await _post_json_value(
             file_list_url,
             {"timeFrameId": timeframe_id},
             max_bytes=max_bytes,
             session=session,
         )
-        file_lists[timeframe_id] = _payercompass_file_list_items(payload)
-    targets = _payercompass_targets_from_structure(
+        files_by_timeframe[timeframe_id] = _payercompass_file_list_items(file_list_payload)
+    crawl_targets = _payercompass_targets_from_structure(
         source,
         base_url=url,
         resolver=resolver,
         structure=structure,
-        file_lists=file_lists,
+        file_lists=files_by_timeframe,
     )
-    targets = await _enrich_payercompass_targets_with_index_plan_info(
-        targets,
+    crawl_targets = await _enrich_payercompass_targets_with_index_plan_info(
+        crawl_targets,
         resolver=resolver,
         max_bytes=max_bytes,
         session=session,
     )
-    if not targets:
+    if not crawl_targets:
         raise ValueError(f"no PayerCompass MRF files found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _webtpa_api_base_url(url: str) -> str:
@@ -7583,7 +7583,7 @@ async def _resolve_webtpa_mrf_api(
     if not isinstance(plans, list):
         raise ValueError(f"WebTPA plans endpoint did not return a list: {plans_url}")
     max_plans = _as_int(resolver.get("max_plans")) or len(plans)
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     endpoint_specs = (
         (
             "in-network",
@@ -7605,60 +7605,60 @@ async def _resolve_webtpa_mrf_api(
             "",
         ),
     )
-    for plan in [item for item in plans if isinstance(item, dict)][:max_plans]:
+    for plan in [api_entry for api_entry in plans if isinstance(api_entry, dict)][:max_plans]:
         plan_id = _webtpa_plan_id(plan)
         if not plan_id:
             continue
         for file_type, list_template, location_template in endpoint_specs:
             list_url = urljoin(base_url, list_template.format(plan_id=quote(plan_id)))
-            records = await _fetch_json_value(
+            file_records = await _fetch_json_value(
                 list_url,
                 max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
                 session=session,
             )
-            if not isinstance(records, list):
+            if not isinstance(file_records, list):
                 continue
-            for record in [item for item in records if isinstance(item, dict)]:
-                file_url = _webtpa_record_location(record)
-                file_id = _webtpa_file_id(record, file_type)
+            for file_record in [api_entry for api_entry in file_records if isinstance(api_entry, dict)]:
+                file_url = _webtpa_record_location(file_record)
+                file_id = _webtpa_file_id(file_record, file_type)
                 resolved_from_url = list_url
                 if not file_url and file_type == "in-network" and file_id:
                     location_url = urljoin(
                         base_url, location_template.format(file_id=quote(file_id))
                     )
                     try:
-                        location_payload = await _fetch_json(
+                        location_by_field = await _fetch_json(
                             location_url,
                             max_bytes=1024 * 1024,
                             session=session,
                         )
                     except Exception:  # pylint: disable=broad-exception-caught
-                        location_payload = {}
-                    if isinstance(location_payload, dict):
-                        file_url = _webtpa_record_location(location_payload)
+                        location_by_field = {}
+                    if isinstance(location_by_field, dict):
+                        file_url = _webtpa_record_location(location_by_field)
                         resolved_from_url = location_url
                 if not file_url:
                     continue
-                target = _webtpa_record_target(
+                crawl_target = _webtpa_record_target(
                     source,
                     plan=plan,
-                    record=record,
+                    record=file_record,
                     file_type=file_type,
                     file_url=file_url,
                     resolved_from_url=resolved_from_url,
                 )
-                if target:
-                    targets.append(target)
+                if crawl_target:
+                    crawl_targets.append(crawl_target)
                 max_targets = _as_int(resolver.get("max_targets"))
-                if max_targets and len(targets) >= max_targets:
-                    return _dedupe_crawl_targets_by_url(targets)[:max_targets]
-    targets = _dedupe_crawl_targets_by_url(targets)
+                if max_targets and len(crawl_targets) >= max_targets:
+                    return _dedupe_crawl_targets_by_url(crawl_targets)[:max_targets]
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no WebTPA MRF file targets found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _cmstic_brand_from_url(url: str) -> str | None:
@@ -7785,24 +7785,24 @@ async def _resolve_cmstic_keyed_toc_redirect(
             "content_length": resp.headers.get("Content-Length"),
             "content_type": resp.headers.get("Content-Type"),
         }
-    target = _cmstic_keyed_toc_crawl_target(
+    crawl_target = _cmstic_keyed_toc_crawl_target(
         source,
         url,
         final_url=final_url,
         resolver=resolver,
         resolver_type=str(resolver.get("type") or "cmstic_keyed_toc_redirect"),
     )
-    if not target:
+    if not crawl_target:
         raise ValueError(f"CMSTIC keyed TOC redirect did not resolve to a TOC: {url}")
     return [
         CrawlTarget(
-            source=target.source,
-            url=target.url,
-            label=target.label,
-            resolved_from_url=target.resolved_from_url,
+            source=crawl_target.source,
+            url=crawl_target.url,
+            label=crawl_target.label,
+            resolved_from_url=crawl_target.resolved_from_url,
             metadata={
-                **target.metadata,
-                **{key: value for key, value in metadata.items() if value},
+                **crawl_target.metadata,
+                **{key: metadata_value for key, metadata_value in metadata.items() if metadata_value},
             },
         )
     ]
@@ -7985,31 +7985,31 @@ async def _resolve_github_repo_mrf(
         raise ValueError(
             f"GitHub MRF tree response did not include file list for {owner}/{repo}"
         )
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     prefix = (path_prefix or "").strip("/")
-    for item in tree:
-        if not isinstance(item, dict):
+    for tree_entry in tree:
+        if not isinstance(tree_entry, dict):
             continue
-        path = str(item.get("path") or "")
+        path = str(tree_entry.get("path") or "")
         if prefix and path != prefix and not path.startswith(f"{prefix}/"):
             continue
-        target = _github_tree_mrf_target(
+        crawl_target = _github_tree_mrf_target(
             source,
             owner=owner,
             repo=repo,
             branch=branch,
-            item=item,
+            item=tree_entry,
             tree_url=tree_url,
             resolver_type=resolver_type,
         )
-        if target:
-            targets.append(target)
+        if crawl_target:
+            crawl_targets.append(crawl_target)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no GitHub MRF files found for {owner}/{repo}")
-    return targets
+    return crawl_targets
 
 
 def _strip_html_tags(value: str) -> str:
@@ -8164,18 +8164,18 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
             ):
                 continue
             candidates.append({"attr": "text", "value": url, "label": label})
-    normalized: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for item in candidates:
-        raw = html.unescape(str(item.get("value") or "")).strip()
+    normalized_candidates: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for link_candidate in candidates:
+        raw = html.unescape(str(link_candidate.get("value") or "")).strip()
         if not raw or raw.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
             continue
         url = urljoin(base_url, raw)
-        key = (str(item.get("attr") or "").lower(), _canonical_or_none(url) or url)
-        if key in seen:
+        key = (str(link_candidate.get("attr") or "").lower(), _canonical_or_none(url) or url)
+        if key in seen_keys:
             continue
-        seen.add(key)
-        label = item.get("label") or Path(urlsplit(url).path).name
+        seen_keys.add(key)
+        label = link_candidate.get("label") or Path(urlsplit(url).path).name
         if key[0] != "href" and _clean_text(label).lower() in {
             "download",
             "view",
@@ -8184,17 +8184,17 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
             "here",
         }:
             label = Path(urlsplit(url).path).name
-        row = {
+        candidate_by_field = {
             "attr": key[0],
             "url": url,
             "label": label,
         }
-        if isinstance(item.get("html_start"), int):
-            row["html_start"] = item.get("html_start")
-        if isinstance(item.get("html_end"), int):
-            row["html_end"] = item.get("html_end")
-        normalized.append(row)
-    return normalized
+        if isinstance(link_candidate.get("html_start"), int):
+            candidate_by_field["html_start"] = link_candidate.get("html_start")
+        if isinstance(link_candidate.get("html_end"), int):
+            candidate_by_field["html_end"] = link_candidate.get("html_end")
+        normalized_candidates.append(candidate_by_field)
+    return normalized_candidates
 
 
 class _MidlandsChoiceMrfParser(HTMLParser):
@@ -8249,7 +8249,7 @@ def _parse_midlandschoice_mrf_rows(
     parser = _MidlandsChoiceMrfParser()
     parser.feed(html_text or "")
     parser.close()
-    rows: list[dict[str, str]] = []
+    file_rows: list[dict[str, str]] = []
     for cells in parser.rows:
         if len(cells) < 5:
             continue
@@ -8269,7 +8269,7 @@ def _parse_midlandschoice_mrf_rows(
         )
         if target_file_type not in {"in-network", "allowed-amounts"}:
             continue
-        rows.append(
+        file_rows.append(
             {
                 "network_code": network_code,
                 "network_name": network_name,
@@ -8279,7 +8279,7 @@ def _parse_midlandschoice_mrf_rows(
                 "url": file_url,
             }
         )
-    return rows
+    return file_rows
 
 
 async def _resolve_midlandschoice_mrf(
@@ -8293,43 +8293,43 @@ async def _resolve_midlandschoice_mrf(
         max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
         session=session,
     )
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     resolver_type = str(resolver.get("type") or "midlandschoice_mrf")
-    for row in _parse_midlandschoice_mrf_rows(html_text, base_url=url):
-        label = row.get("network_name") or row.get("file_name") or row["network_code"]
-        targets.append(
+    for file_row in _parse_midlandschoice_mrf_rows(html_text, base_url=url):
+        label = file_row.get("network_name") or file_row.get("file_name") or file_row["network_code"]
+        crawl_targets.append(
             CrawlTarget(
                 source=source,
-                url=row["url"],
+                url=file_row["url"],
                 label=label,
                 resolved_from_url=url,
                 metadata={
                     "resolver": resolver_type,
                     "target_kind": "file_reference",
-                    "target_file_type": row["target_file_type"],
-                    "container_format": _container_format(row["url"]),
-                    "network_code": row["network_code"],
-                    "network_name": row.get("network_name"),
-                    "file_name": row.get("file_name"),
-                    "midlandschoice_file_type": row.get("file_type"),
+                    "target_file_type": file_row["target_file_type"],
+                    "container_format": _container_format(file_row["url"]),
+                    "network_code": file_row["network_code"],
+                    "network_name": file_row.get("network_name"),
+                    "file_name": file_row.get("file_name"),
+                    "midlandschoice_file_type": file_row.get("file_type"),
                     "reporting_entity_name": source.get("display_name")
                     or "Midlands Choice",
                     "reporting_entity_type": "third_party_administrator",
                     "plan_info": _plan_info_from_label(
                         label,
-                        plan_id=row["network_code"],
+                        plan_id=file_row["network_code"],
                         plan_id_type="network_code",
                     ),
                 },
             )
         )
-    targets = _dedupe_crawl_targets_by_url(targets)
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no Midlands Choice MRF download rows found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _embedded_http_urls(value: str | None) -> list[str]:
@@ -10394,7 +10394,7 @@ def _socrata_target_from_dataset(
         label=title,
         resolved_from_url=catalog_url,
         metadata={
-            key: value for key, value in metadata.items() if value not in (None, "", [])
+            key: metadata_value for key, metadata_value in metadata.items() if metadata_value not in (None, "", [])
         },
     )
 
@@ -10406,49 +10406,49 @@ async def _resolve_socrata_data_json_mrf_catalog(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     resolver_type = str(resolver.get("type") or "socrata_data_json_mrf_catalog")
-    payload = await _fetch_json(
+    catalog_payload = await _fetch_json(
         url,
         max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
         session=session,
     )
     datasets = [
-        item
-        for item in (payload.get("dataset") or [])
-        if isinstance(item, dict) and _socrata_dataset_matches(item, resolver)
+        dataset_entry
+        for dataset_entry in (catalog_payload.get("dataset") or [])
+        if isinstance(dataset_entry, dict) and _socrata_dataset_matches(dataset_entry, resolver)
     ]
     if resolver.get("latest_coverage_month_only"):
         coverage_months = [
             month
             for month in (
-                _socrata_coverage_month(_clean_text(item.get("title")))
-                for item in datasets
+                _socrata_coverage_month(_clean_text(dataset_entry.get("title")))
+                for dataset_entry in datasets
             )
             if month
         ]
         if coverage_months:
             latest_month = max(coverage_months)
             datasets = [
-                item
-                for item in datasets
-                if _socrata_coverage_month(_clean_text(item.get("title")))
+                dataset_entry
+                for dataset_entry in datasets
+                if _socrata_coverage_month(_clean_text(dataset_entry.get("title")))
                 == latest_month
             ]
-    targets: list[CrawlTarget] = []
-    for dataset in sorted(datasets, key=lambda item: _clean_text(item.get("title"))):
-        target = _socrata_target_from_dataset(
+    crawl_targets: list[CrawlTarget] = []
+    for dataset in sorted(datasets, key=lambda dataset_entry: _clean_text(dataset_entry.get("title"))):
+        crawl_target = _socrata_target_from_dataset(
             source,
             dataset,
             catalog_url=url,
             resolver_type=resolver_type,
         )
-        if target:
-            targets.append(target)
+        if crawl_target:
+            crawl_targets.append(crawl_target)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no Socrata MRF catalog files found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _cigna_lookup_urls_from_html(
@@ -10615,9 +10615,9 @@ def _parse_cigna_lookup_targets(
                 label=file_name or str(source.get("display_name") or "Cigna MRF index"),
                 resolved_from_url=lookup_url,
                 metadata={
-                    key: value
-                    for key, value in metadata.items()
-                    if value not in (None, "")
+                    key: metadata_value
+                    for key, metadata_value in metadata.items()
+                    if metadata_value not in (None, "")
                 },
             )
     return list(targets_by_url.values())
@@ -10636,11 +10636,11 @@ def _parse_bcbs_asomrf_filelist_targets(
         _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
     )
     targets_by_url: dict[str, CrawlTarget] = {}
-    for item in payload:
-        if not isinstance(item, dict):
+    for file_entry in payload:
+        if not isinstance(file_entry, dict):
             continue
-        file_url = str(item.get("url") or "").strip()
-        file_name = _clean_text(item.get("name")) or Path(urlsplit(file_url).path).name
+        file_url = str(file_entry.get("url") or "").strip()
+        file_name = _clean_text(file_entry.get("name")) or Path(urlsplit(file_url).path).name
         if (
             not file_url
             or _mrf_file_type_from_text(file_url, file_name) != "table-of-contents"
@@ -10653,9 +10653,9 @@ def _parse_bcbs_asomrf_filelist_targets(
             "target_max_bytes": toc_max_bytes,
             "filelist_url": filelist_url,
             "file_name": file_name,
-            "state": _clean_text(item.get("state")),
-            "ein": _clean_text(item.get("ein")),
-            "last_update_date": _clean_text(item.get("last_update_date")),
+            "state": _clean_text(file_entry.get("state")),
+            "ein": _clean_text(file_entry.get("ein")),
+            "last_update_date": _clean_text(file_entry.get("last_update_date")),
         }
         key = _canonical_or_none(file_url) or file_url
         targets_by_url[key] = CrawlTarget(
@@ -10664,12 +10664,12 @@ def _parse_bcbs_asomrf_filelist_targets(
             label=file_name or str(source.get("display_name") or "BCBS ASO MRF index"),
             resolved_from_url=filelist_url,
             metadata={
-                key: value for key, value in metadata.items() if value not in (None, "")
+                key: metadata_value for key, metadata_value in metadata.items() if metadata_value not in (None, "")
             },
         )
-    targets = list(targets_by_url.values())
+    crawl_targets = list(targets_by_url.values())
     return _limit_crawl_targets_round_robin(
-        targets, "state", _as_int(resolver.get("max_targets"))
+        crawl_targets, "state", _as_int(resolver.get("max_targets"))
     )
 
 
@@ -10775,7 +10775,7 @@ async def _resolve_bcbs_global_solutions_mrf(
     )
     page_urls = [url]
     seen_pages: set[str] = set()
-    toc_links: dict[str, dict[str, str]] = {}
+    toc_links_by_url: dict[str, dict[str, str]] = {}
     while page_urls and len(seen_pages) < max_pages:
         page_url = page_urls.pop(0)
         page_key = _canonical_or_none(page_url) or page_url
@@ -10793,7 +10793,7 @@ async def _resolve_bcbs_global_solutions_mrf(
             link_url = str(link.get("url") or "")
             link_key = _canonical_or_none(link_url) or link_url
             if link_key:
-                toc_links[link_key] = link
+                toc_links_by_url[link_key] = link
         for landing_url in _bcbs_global_solutions_landing_links_from_html(
             html_text, base_url=page_url
         ):
@@ -10801,25 +10801,25 @@ async def _resolve_bcbs_global_solutions_mrf(
             if landing_key not in seen_pages and landing_url not in page_urls:
                 page_urls.append(landing_url)
 
-    targets: list[CrawlTarget] = []
-    for link in toc_links.values():
+    crawl_targets: list[CrawlTarget] = []
+    for link in toc_links_by_url.values():
         toc_url = str(link.get("url") or "").strip()
         if not toc_url:
             continue
         try:
-            payload = await _fetch_json_value(
+            toc_payload = await _fetch_json_value(
                 toc_url,
                 max_bytes=toc_max_bytes,
                 session=session,
             )
         except Exception:  # pylint: disable=broad-exception-caught
             continue
-        if not _bcbs_global_solutions_toc_has_in_network(payload):
+        if not _bcbs_global_solutions_toc_has_in_network(toc_payload):
             continue
         plan_type = _clean_text(link.get("plan_type"))
-        plan_name = _bcbs_global_solutions_first_plan_name(payload)
+        plan_name = _bcbs_global_solutions_first_plan_name(toc_payload)
         label = _clean_text(link.get("label")) or plan_name or plan_type
-        targets.append(
+        crawl_targets.append(
             CrawlTarget(
                 source=source,
                 url=toc_url,
@@ -10832,20 +10832,20 @@ async def _resolve_bcbs_global_solutions_mrf(
                     "target_max_bytes": toc_max_bytes,
                     "plan_type": plan_type,
                     "reporting_entity_name": _clean_text(
-                        payload.get("reporting_entity_name")
+                        toc_payload.get("reporting_entity_name")
                     ),
                     "reporting_entity_type": _clean_text(
-                        payload.get("reporting_entity_type")
+                        toc_payload.get("reporting_entity_type")
                     ),
                     "reporting_plan_name": plan_name,
                 },
             )
         )
-        if max_targets and len(targets) >= max_targets:
+        if max_targets and len(crawl_targets) >= max_targets:
             break
-    if not targets:
+    if not crawl_targets:
         raise ValueError(f"no BCBS Global Solutions TOCs found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _bcbs_asomrf_filelist_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
@@ -10915,9 +10915,9 @@ def _bcbsma_monthly_toc_targets(
     if not base_url:
         raise ValueError("BCBSMA resolver requires base_url or source URL")
     suffixes = [
-        str(item).strip()
-        for item in (resolver.get("toc_suffixes") or ())
-        if str(item).strip()
+        str(suffix_value).strip()
+        for suffix_value in (resolver.get("toc_suffixes") or ())
+        if str(suffix_value).strip()
     ]
     if not suffixes:
         raise ValueError("BCBSMA resolver requires toc_suffixes")
@@ -10925,8 +10925,8 @@ def _bcbsma_monthly_toc_targets(
     if not isinstance(month_offsets, list) or not month_offsets:
         month_offsets = [0]
     current = now or _utc_now()
-    targets: list[CrawlTarget] = []
-    seen: set[str] = set()
+    crawl_targets: list[CrawlTarget] = []
+    seen_urls: set[str] = set()
     for raw_offset in month_offsets:
         offset = _as_int(raw_offset)
         if offset is None:
@@ -10938,10 +10938,10 @@ def _bcbsma_monthly_toc_targets(
             file_name = f"{month_prefix}{suffix}"
             target_url = urljoin(base_url.rstrip("/") + "/", file_name)
             key = _canonical_or_none(target_url) or target_url
-            if key in seen:
+            if key in seen_urls:
                 continue
-            seen.add(key)
-            targets.append(
+            seen_urls.add(key)
+            crawl_targets.append(
                 CrawlTarget(
                     source=source,
                     url=target_url,
@@ -10959,7 +10959,7 @@ def _bcbsma_monthly_toc_targets(
                     },
                 )
             )
-    return targets
+    return crawl_targets
 
 
 def _monthly_toc_targets(
@@ -10974,9 +10974,9 @@ def _monthly_toc_targets(
     if not base_url:
         raise ValueError("monthly TOC resolver requires base_url or source URL")
     templates = [
-        str(item).strip()
-        for item in (resolver.get("file_templates") or ())
-        if str(item).strip()
+        str(template_value).strip()
+        for template_value in (resolver.get("file_templates") or ())
+        if str(template_value).strip()
     ]
     if not templates:
         raise ValueError("monthly TOC resolver requires file_templates")
@@ -10985,14 +10985,14 @@ def _monthly_toc_targets(
         month_offsets = [0]
     target_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
     current = now or _utc_now()
-    targets: list[CrawlTarget] = []
-    seen: set[str] = set()
+    crawl_targets: list[CrawlTarget] = []
+    seen_urls: set[str] = set()
     for raw_offset in month_offsets:
         offset = _as_int(raw_offset)
         if offset is None:
             continue
         month_date = _add_months(current, offset)
-        values = {
+        month_values_by_field = {
             "year": month_date.strftime("%Y"),
             "month": month_date.strftime("%m"),
             "month_start": month_date.strftime("%Y-%m-01"),
@@ -11001,7 +11001,7 @@ def _monthly_toc_targets(
             "yyyymm": month_date.strftime("%Y%m"),
         }
         for template in templates:
-            file_path = template.format(**values)
+            file_path = template.format(**month_values_by_field)
             file_name = Path(urlsplit(file_path).path).name or file_path
             target_url = (
                 file_path
@@ -11009,10 +11009,10 @@ def _monthly_toc_targets(
                 else urljoin(base_url.rstrip("/") + "/", file_path.lstrip("/"))
             )
             key = _canonical_or_none(target_url) or target_url
-            if key in seen:
+            if key in seen_urls:
                 continue
-            seen.add(key)
-            targets.append(
+            seen_urls.add(key)
+            crawl_targets.append(
                 CrawlTarget(
                     source=source,
                     url=target_url,
@@ -11022,13 +11022,13 @@ def _monthly_toc_targets(
                         "resolver": str(resolver.get("type") or "monthly_toc"),
                         "target_kind": "toc_json",
                         "target_file_type": "table-of-contents",
-                        "month_start": values["month_start"],
+                        "month_start": month_values_by_field["month_start"],
                         "file_name": file_name,
                         "target_max_bytes": target_max_bytes,
                     },
                 )
             )
-    return targets
+    return crawl_targets
 
 
 def _azure_mrf_listing_targets_from_xml(
@@ -11042,8 +11042,8 @@ def _azure_mrf_listing_targets_from_xml(
     container_url = _clean_text(root.attrib.get("ContainerName"))
     target_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
     resolver_type = str(resolver.get("type") or "azure_mrf_listing")
-    targets: list[CrawlTarget] = []
-    seen: set[str] = set()
+    crawl_targets: list[CrawlTarget] = []
+    seen_urls: set[str] = set()
     for blob in root.findall(".//Blob"):
         name = _clean_text(blob.findtext("Name"))
         file_url = _clean_text(blob.findtext("Url"))
@@ -11063,10 +11063,10 @@ def _azure_mrf_listing_targets_from_xml(
         if resolver.get("skip_toc_targets") and target_kind == "toc_json":
             continue
         key = _canonical_or_none(file_url) or file_url
-        if key in seen:
+        if key in seen_urls:
             continue
-        seen.add(key)
-        targets.append(
+        seen_urls.add(key)
+        crawl_targets.append(
             CrawlTarget(
                 source=source,
                 url=file_url,
@@ -11088,8 +11088,8 @@ def _azure_mrf_listing_targets_from_xml(
                 },
             )
         )
-    targets.sort(key=_crawl_target_priority_key)
-    return targets
+    crawl_targets.sort(key=_crawl_target_priority_key)
+    return crawl_targets
 
 
 def _crawl_target_priority_key(target: CrawlTarget) -> tuple[int, str]:
@@ -11114,29 +11114,29 @@ async def _resolve_azure_mrf_listing(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     listing_urls = [
-        str(item).strip()
-        for item in (resolver.get("listing_urls") or [url])
-        if str(item).strip()
+        str(listing_url_value).strip()
+        for listing_url_value in (resolver.get("listing_urls") or [url])
+        if str(listing_url_value).strip()
     ]
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     for listing_url in listing_urls:
         xml_text = await _fetch_text(
             listing_url,
             max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
             session=session,
         )
-        targets.extend(
+        crawl_targets.extend(
             _azure_mrf_listing_targets_from_xml(
                 source, xml_text, listing_url=listing_url, resolver=resolver
             )
         )
-    targets = _dedupe_crawl_targets_by_url(targets)
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no Azure MRF listing targets found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _url_with_query_params(url: str, params: dict[str, Any]) -> str:
@@ -11188,44 +11188,44 @@ def _triples_mtt_targets_from_payload(
     if not isinstance(payload, dict):
         return []
     resolver_type = str(resolver.get("type") or "triples_mtt_api")
-    items = [item for item in payload.get("list") or () if isinstance(item, dict)]
+    file_entries = [file_entry for file_entry in payload.get("list") or () if isinstance(file_entry, dict)]
     if resolver.get("latest_month_only", True):
         latest = max(
             (
-                (str(item.get("year") or ""), str(item.get("month") or ""))
-                for item in items
-                if item.get("url")
+                (str(file_entry.get("year") or ""), str(file_entry.get("month") or ""))
+                for file_entry in file_entries
+                if file_entry.get("url")
             ),
             default=None,
         )
         if latest:
-            items = [
-                item
-                for item in items
-                if (str(item.get("year") or ""), str(item.get("month") or ""))
+            file_entries = [
+                file_entry
+                for file_entry in file_entries
+                if (str(file_entry.get("year") or ""), str(file_entry.get("month") or ""))
                 == latest
             ]
-    targets: list[CrawlTarget] = []
-    seen: set[str] = set()
-    for item in items:
-        file_url = _clean_text(item.get("url"))
-        label = _clean_text(item.get("marketing")) or Path(urlsplit(file_url).path).name
+    crawl_targets: list[CrawlTarget] = []
+    seen_urls: set[str] = set()
+    for file_entry in file_entries:
+        file_url = _clean_text(file_entry.get("url"))
+        label = _clean_text(file_entry.get("marketing")) or Path(urlsplit(file_url).path).name
         file_type = _mrf_file_type_from_text(file_url, label)
         if not file_url or not file_type:
             continue
         key = _canonical_or_none(file_url) or file_url
-        if key in seen:
+        if key in seen_urls:
             continue
-        seen.add(key)
+        seen_urls.add(key)
         plan_name = " - ".join(
             part
             for part in (
-                _clean_text(item.get("plan")),
-                _clean_text(item.get("marketing")),
+                _clean_text(file_entry.get("plan")),
+                _clean_text(file_entry.get("marketing")),
             )
             if part
         )
-        targets.append(
+        crawl_targets.append(
             CrawlTarget(
                 source=source,
                 url=file_url,
@@ -11240,12 +11240,12 @@ def _triples_mtt_targets_from_payload(
                     ),
                     "target_file_type": file_type,
                     "container_format": _container_format(file_url),
-                    "triples_id": item.get("id"),
-                    "network": item.get("network"),
-                    "plan": item.get("plan"),
-                    "year": item.get("year"),
-                    "month": item.get("month"),
-                    "marketing": item.get("marketing"),
+                    "triples_id": file_entry.get("id"),
+                    "network": file_entry.get("network"),
+                    "plan": file_entry.get("plan"),
+                    "year": file_entry.get("year"),
+                    "month": file_entry.get("month"),
+                    "marketing": file_entry.get("marketing"),
                     "plan_info": [
                         {
                             "plan_id": None,
@@ -11259,8 +11259,8 @@ def _triples_mtt_targets_from_payload(
         )
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    return targets
+        crawl_targets = crawl_targets[:max_targets]
+    return crawl_targets
 
 
 async def _resolve_triples_mtt_api(
@@ -11270,21 +11270,21 @@ async def _resolve_triples_mtt_api(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     api_url = str(resolver.get("api_url") or url).strip()
-    params = {
+    query_by_field = {
         "network": resolver.get("network") or "",
         "month": "",
         "year": "",
         "plan": resolver.get("plan") or "",
     }
-    initial_url = _url_with_query_params(api_url, params)
-    payload = await _fetch_json_value(
+    initial_url = _url_with_query_params(api_url, query_by_field)
+    api_payload = await _fetch_json_value(
         initial_url,
         max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
         session=session,
     )
     resolved_from_url = initial_url
     if resolver.get("latest_month_only", True):
-        year, month = _triples_mtt_latest_year_month(payload)
+        year, month = _triples_mtt_latest_year_month(api_payload)
         if year and month:
             latest_url = _url_with_query_params(
                 api_url,
@@ -11295,18 +11295,18 @@ async def _resolve_triples_mtt_api(
                     "plan": resolver.get("plan") or "",
                 },
             )
-            payload = await _fetch_json_value(
+            api_payload = await _fetch_json_value(
                 latest_url,
                 max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
                 session=session,
             )
             resolved_from_url = latest_url
-    targets = _triples_mtt_targets_from_payload(
-        source, payload, resolved_from_url=resolved_from_url, resolver=resolver
+    crawl_targets = _triples_mtt_targets_from_payload(
+        source, api_payload, resolved_from_url=resolved_from_url, resolver=resolver
     )
-    if not targets:
+    if not crawl_targets:
         raise ValueError(f"no Triple-S MTT targets found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _xml_child_text(element: ElementTree.Element, child_name: str) -> str:
@@ -11357,14 +11357,14 @@ def _healthspace_mrf_targets_from_soap(
     """Parse HealthSpace SOAP metadata into crawl targets."""
     root = ElementTree.fromstring((soap_text or "").lstrip("\ufeff"))
     resolver_type = str(resolver.get("type") or "healthspace_machine_readable_files")
-    targets: list[CrawlTarget] = []
-    seen: set[str] = set()
-    for item in root.iter():
-        if item.tag.rsplit("}", 1)[-1] != "MachineReadableFile":
+    crawl_targets: list[CrawlTarget] = []
+    seen_urls: set[str] = set()
+    for file_element in root.iter():
+        if file_element.tag.rsplit("}", 1)[-1] != "MachineReadableFile":
             continue
-        url = _clean_text(item.attrib.get("FilePathURL"))
+        url = _clean_text(file_element.attrib.get("FilePathURL"))
         file_name = (
-            _clean_text(item.attrib.get("FileName")) or Path(urlsplit(url).path).name
+            _clean_text(file_element.attrib.get("FileName")) or Path(urlsplit(url).path).name
         )
         if not url:
             continue
@@ -11379,11 +11379,11 @@ def _healthspace_mrf_targets_from_soap(
             and urlsplit(url).path.lower().endswith((".json", ".json.gz"))
             else "file_reference"
         )
-        company_id = _clean_text(item.attrib.get("CompanyId"))
-        company_name = _clean_text(item.attrib.get("CompanyName"))
-        plan_info = []
+        company_id = _clean_text(file_element.attrib.get("CompanyId"))
+        company_name = _clean_text(file_element.attrib.get("CompanyName"))
+        plan_entries = []
         if company_name:
-            plan_info.append(
+            plan_entries.append(
                 {
                     "plan_id": company_name,
                     "plan_id_type": "healthspace_company_name",
@@ -11392,10 +11392,10 @@ def _healthspace_mrf_targets_from_soap(
                 }
             )
         key = _canonical_or_none(url) or url
-        if key in seen:
+        if key in seen_urls:
             continue
-        seen.add(key)
-        targets.append(
+        seen_urls.add(key)
+        crawl_targets.append(
             CrawlTarget(
                 source=source,
                 url=url,
@@ -11409,11 +11409,11 @@ def _healthspace_mrf_targets_from_soap(
                     "company_id": company_id,
                     "company_name": company_name,
                     "file_name": file_name,
-                    "plan_info": plan_info,
+                    "plan_info": plan_entries,
                 },
             )
         )
-    return targets
+    return crawl_targets
 
 
 async def _resolve_healthspace_machine_readable_files(
@@ -11450,16 +11450,16 @@ async def _resolve_healthspace_machine_readable_files(
         max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
         session=session,
     )
-    targets = _healthspace_mrf_targets_from_soap(
+    crawl_targets = _healthspace_mrf_targets_from_soap(
         source, soap_text, resolved_from_url=service_url, resolver=resolver
     )
-    targets = _dedupe_crawl_targets_by_url(targets)
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no Healthspace MRF targets found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _healthez_outbound_file_type(url: str | None, label: str | None = None) -> str | None:
@@ -11514,8 +11514,8 @@ def _healthez_targets_from_html(
     base_url: str,
     resolver_type: str,
 ) -> list[CrawlTarget]:
-    targets: list[CrawlTarget] = []
-    seen: set[str] = set()
+    crawl_targets: list[CrawlTarget] = []
+    seen_urls: set[str] = set()
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         url = _healthez_normalized_outbound_url(str(candidate.get("url") or ""))
         if not url:
@@ -11524,11 +11524,11 @@ def _healthez_targets_from_html(
         if file_type not in {"in-network", "allowed-amounts"}:
             continue
         key = _canonical_or_none(url) or url
-        if key in seen:
+        if key in seen_urls:
             continue
-        seen.add(key)
+        seen_urls.add(key)
         label = _healthez_plan_label(url, str(candidate.get("label") or ""))
-        targets.append(
+        crawl_targets.append(
             CrawlTarget(
                 source=source,
                 url=url,
@@ -11543,7 +11543,7 @@ def _healthez_targets_from_html(
                 },
             )
         )
-    return targets
+    return crawl_targets
 
 
 async def _resolve_healthez_benefits_mrf(
@@ -11581,21 +11581,21 @@ def _s3_xml_listing_targets_from_xml(
     resolver_type = str(resolver.get("type") or "s3_xml_listing")
     public_base_url = str(resolver.get("public_base_url") or listing_url).rstrip("/")
     include_prefixes = tuple(
-        str(item).strip()
-        for item in (resolver.get("include_prefixes") or ())
-        if str(item).strip()
+        str(object_element).strip()
+        for object_element in (resolver.get("include_prefixes") or ())
+        if str(object_element).strip()
     )
     exclude_prefixes = tuple(
-        str(item).strip()
-        for item in (resolver.get("exclude_prefixes") or ())
-        if str(item).strip()
+        str(object_element).strip()
+        for object_element in (resolver.get("exclude_prefixes") or ())
+        if str(object_element).strip()
     )
-    targets: list[CrawlTarget] = []
-    seen: set[str] = set()
-    for item in root.iter():
-        if item.tag.rsplit("}", 1)[-1] != "Contents":
+    crawl_targets: list[CrawlTarget] = []
+    seen_urls: set[str] = set()
+    for object_element in root.iter():
+        if object_element.tag.rsplit("}", 1)[-1] != "Contents":
             continue
-        object_key = _xml_child_text(item, "Key")
+        object_key = _xml_child_text(object_element, "Key")
         if not object_key or object_key.endswith("/"):
             continue
         if include_prefixes and not object_key.startswith(include_prefixes):
@@ -11608,10 +11608,10 @@ def _s3_xml_listing_targets_from_xml(
         if not file_type:
             continue
         key = _canonical_or_none(file_url) or file_url
-        if key in seen:
+        if key in seen_urls:
             continue
-        seen.add(key)
-        targets.append(
+        seen_urls.add(key)
+        crawl_targets.append(
             CrawlTarget(
                 source=source,
                 url=file_url,
@@ -11623,13 +11623,13 @@ def _s3_xml_listing_targets_from_xml(
                     "target_file_type": file_type,
                     "container_format": _container_format(file_url),
                     "object_key": object_key,
-                    "content_length": _xml_child_text(item, "Size"),
-                    "etag": _xml_child_text(item, "ETag").strip('"'),
-                    "last_modified": _xml_child_text(item, "LastModified"),
+                    "content_length": _xml_child_text(object_element, "Size"),
+                    "etag": _xml_child_text(object_element, "ETag").strip('"'),
+                    "last_modified": _xml_child_text(object_element, "LastModified"),
                 },
             )
         )
-    return targets
+    return crawl_targets
 
 
 async def _resolve_s3_xml_listing(
@@ -11639,33 +11639,33 @@ async def _resolve_s3_xml_listing(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     listing_urls = [
-        str(item).strip()
-        for item in (resolver.get("listing_urls") or [url])
-        if str(item).strip()
+        str(listing_url_value).strip()
+        for listing_url_value in (resolver.get("listing_urls") or [url])
+        if str(listing_url_value).strip()
     ]
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     for listing_url in listing_urls:
         xml_text = await _fetch_text(
             listing_url,
             max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
             session=session,
         )
-        targets.extend(
+        crawl_targets.extend(
             _s3_xml_listing_targets_from_xml(
                 source, xml_text, listing_url=listing_url, resolver=resolver
             )
         )
-    targets = _dedupe_crawl_targets_by_url(targets)
-    targets.sort(
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
+    crawl_targets.sort(
         key=lambda target: str((target.metadata or {}).get("last_modified") or ""),
         reverse=True,
     )
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no S3 XML MRF listing targets found for {url}")
-    return targets
+    return crawl_targets
 
 
 async def _resolve_cigna_static_mrf_lookup(
@@ -11685,59 +11685,59 @@ async def _resolve_cigna_static_mrf_lookup(
     if not lookup_urls:
         raise ValueError(f"no Cigna MRF lookup URLs found in {url}")
     lookup_max_bytes = int(resolver.get("lookup_max_bytes") or 2 * 1024 * 1024)
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     for lookup_url in lookup_urls:
-        payload = await _fetch_json(
+        lookup_payload = await _fetch_json(
             lookup_url, max_bytes=lookup_max_bytes, session=session
         )
-        targets.extend(
+        crawl_targets.extend(
             _parse_cigna_lookup_targets(
-                payload, lookup_url=lookup_url, source=source, resolver=resolver
+                lookup_payload, lookup_url=lookup_url, source=source, resolver=resolver
             )
         )
-    if not targets:
+    if not crawl_targets:
         raise ValueError(f"no Cigna MRF index URLs found from {url}")
-    return targets
+    return crawl_targets
 
 
 def _healthsparq_public_params(url: str) -> dict[str, str]:
     raw = html.unescape(str(url or ""))
     parsed = urlsplit(raw)
-    params: dict[str, str] = {}
+    params_by_key: dict[str, str] = {}
     fragment = parsed.fragment
     match = re.search(r"^/?(?:one|public)/(?P<params>[^/?#]+)(?P<tail>.*)$", fragment)
     if match:
         route_params = match.group("params").split("/", 1)[0]
-        params.update(
+        params_by_key.update(
             {
-                key: value
-                for key, value in parse_qsl(route_params, keep_blank_values=False)
-                if key and value
+                key: param_value
+                for key, param_value in parse_qsl(route_params, keep_blank_values=False)
+                if key and param_value
             }
         )
         tail = match.group("tail") or ""
         if "?" in tail:
             query_text = tail.split("?", 1)[1]
-            params.update(
+            params_by_key.update(
                 {
-                    key: value
-                    for key, value in parse_qsl(query_text, keep_blank_values=False)
-                    if key and value
+                    key: param_value
+                    for key, param_value in parse_qsl(query_text, keep_blank_values=False)
+                    if key and param_value
                 }
             )
-    if not params:
-        params.update(
+    if not params_by_key:
+        params_by_key.update(
             {
-                key: value
-                for key, value in parse_qsl(parsed.query, keep_blank_values=False)
-                if key and value
+                key: param_value
+                for key, param_value in parse_qsl(parsed.query, keep_blank_values=False)
+                if key and param_value
             }
         )
-    if "insurerCode" not in params or "brandCode" not in params:
+    if "insurerCode" not in params_by_key or "brandCode" not in params_by_key:
         raise ValueError(
             "HealthSparq public URL must include insurerCode and brandCode"
         )
-    return params
+    return params_by_key
 
 
 def _url_origin(url: str) -> str:
@@ -12140,35 +12140,35 @@ async def _resolve_healthsparq_public_mrf(
     if metadata_url:
         try:
             await _assert_fetch_url_allowed(metadata_url)
-            payload = await _fetch_json(
+            api_payload_by_field = await _fetch_json(
                 metadata_url,
                 max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
                 session=session,
             )
         except Exception:
             return [_healthsparq_target(source, metadata_url, url, params)]
-        targets = _healthsparq_targets_from_metadata(
+        crawl_targets = _healthsparq_targets_from_metadata(
             source,
             metadata_url,
-            payload,
+            api_payload_by_field,
             resolved_from_url=url,
             params=params,
         )
-        if targets:
+        if crawl_targets:
             max_targets = _as_int(resolver.get("max_targets"))
-            return targets[:max_targets] if max_targets else targets
+            return crawl_targets[:max_targets] if max_targets else crawl_targets
         return [_healthsparq_target(source, metadata_url, url, params)]
     login_url = _healthsparq_service_url(url, resolver, "login_path")
-    login_query = {"_": str(int(_utc_now().timestamp() * 1000)), **params}
+    login_query_by_key = {"_": str(int(_utc_now().timestamp() * 1000)), **params}
     await _fetch_json(
-        f"{login_url}?{urlencode(login_query)}",
+        f"{login_url}?{urlencode(login_query_by_key)}",
         max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
         session=session,
     )
     mrf_all_url = _healthsparq_service_url(url, resolver, "mrf_all_path")
-    payload = {
-        key: value
-        for key, value in params.items()
+    api_payload_by_field = {
+        key: param_value
+        for key, param_value in params.items()
         if key
         in {
             "brandCode",
@@ -12177,15 +12177,15 @@ async def _resolve_healthsparq_public_mrf(
             "searchTerm",
             "productCode",
         }
-        and value
+        and param_value
     }
-    payload = await _post_json(
+    api_payload_by_field = await _post_json(
         mrf_all_url,
-        payload,
+        api_payload_by_field,
         max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
         session=session,
     )
-    metadata_url = str(payload.get("url") or "").strip()
+    metadata_url = str(api_payload_by_field.get("url") or "").strip()
     if not metadata_url:
         raise ValueError("HealthSparq public MRF API did not return a metadata URL")
     try:
@@ -12196,16 +12196,16 @@ async def _resolve_healthsparq_public_mrf(
         )
     except Exception:
         return [_healthsparq_target(source, metadata_url, mrf_all_url, params)]
-    targets = _healthsparq_targets_from_metadata(
+    crawl_targets = _healthsparq_targets_from_metadata(
         source,
         metadata_url,
         metadata_payload,
         resolved_from_url=mrf_all_url,
         params=params,
     )
-    if targets:
+    if crawl_targets:
         max_targets = _as_int(resolver.get("max_targets"))
-        return targets[:max_targets] if max_targets else targets
+        return crawl_targets[:max_targets] if max_targets else crawl_targets
     return [_healthsparq_target(source, metadata_url, mrf_all_url, params)]
 
 
@@ -12243,16 +12243,16 @@ def _providence_toc_targets_from_payload(
     api_url: str,
     resolver_type: str,
 ) -> list[CrawlTarget]:
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     for group in payload.get("groups") or []:
         if not isinstance(group, dict):
             continue
         group_id = _clean_text(group.get("group-id"))
         group_name = _clean_text(group.get("group-name"))
-        for item in group.get("tocs") or []:
-            if not isinstance(item, dict):
+        for toc_entry in group.get("tocs") or []:
+            if not isinstance(toc_entry, dict):
                 continue
-            toc_url = _clean_text(item.get("TOC_URL"))
+            toc_url = _clean_text(toc_entry.get("TOC_URL"))
             if not _looks_html_mrf_toc_url(toc_url, Path(urlsplit(toc_url).path).name):
                 continue
             metadata = {
@@ -12271,20 +12271,20 @@ def _providence_toc_targets_from_payload(
                     }
                 ],
             }
-            targets.append(
+            crawl_targets.append(
                 CrawlTarget(
                     source=source,
                     url=toc_url,
                     label=Path(urlsplit(toc_url).path).name or group_name,
                     resolved_from_url=api_url,
                     metadata={
-                        key: value
-                        for key, value in metadata.items()
-                        if value not in (None, "", [])
+                        key: metadata_value
+                        for key, metadata_value in metadata.items()
+                        if metadata_value not in (None, "", [])
                     },
                 )
             )
-    return targets
+    return crawl_targets
 
 
 async def _resolve_providence_mrf_api(
@@ -12305,18 +12305,18 @@ async def _resolve_providence_mrf_api(
     if not api_endpoint or not api_key:
         raise ValueError("Providence MRF config did not include API endpoint/key")
     max_bytes = int(resolver.get("max_bytes") or 10 * 1024 * 1024)
-    headers = {"X-API-Key": api_key}
+    headers_by_name = {"X-API-Key": api_key}
     group_queries = [
-        str(item).strip()
-        for item in (resolver.get("group_queries") or ["Individual and Family Plans"])
-        if str(item).strip()
+        str(query_value).strip()
+        for query_value in (resolver.get("group_queries") or ["Individual and Family Plans"])
+        if str(query_value).strip()
     ]
     groups_by_id: dict[str, dict[str, Any]] = {}
     for query in group_queries:
         group_url = urljoin(api_endpoint.rstrip("/") + "/", "group/")
         group_url = f"{group_url}?{urlencode({'groupname': query})}"
         group_payload = await _fetch_json_with_headers(
-            group_url, headers=headers, max_bytes=max_bytes, session=session
+            group_url, headers=headers_by_name, max_bytes=max_bytes, session=session
         )
         for group in group_payload.get("groups") or []:
             if not isinstance(group, dict):
@@ -12325,14 +12325,14 @@ async def _resolve_providence_mrf_api(
             if group_id:
                 groups_by_id.setdefault(group_id, group)
     max_groups = _as_int(resolver.get("max_groups")) or 25
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     for group_id in list(groups_by_id)[:max_groups]:
         toc_url = urljoin(api_endpoint.rstrip("/") + "/", "toc/")
         toc_url = f"{toc_url}?{urlencode({'groupid': group_id})}"
         toc_payload = await _fetch_json_with_headers(
-            toc_url, headers=headers, max_bytes=max_bytes, session=session
+            toc_url, headers=headers_by_name, max_bytes=max_bytes, session=session
         )
-        targets.extend(
+        crawl_targets.extend(
             _providence_toc_targets_from_payload(
                 source,
                 toc_payload,
@@ -12340,13 +12340,13 @@ async def _resolve_providence_mrf_api(
                 resolver_type=resolver_type,
             )
         )
-    targets = _dedupe_crawl_targets_by_url(targets)
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no Providence MRF API targets found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _looks_direct_toc_url(url: str | None) -> bool:

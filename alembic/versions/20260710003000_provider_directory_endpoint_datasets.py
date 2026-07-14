@@ -12,6 +12,13 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from db.migration_adoption import (
+    add_column_if_missing,
+    create_foreign_key_if_missing,
+    create_table_or_validate,
+)
+from db.migration_index_adoption import create_index_if_missing
+
 
 revision = "20260710003000_provider_directory_endpoint_datasets"
 down_revision = "20260709110000_provider_directory_overlay_coordinates"
@@ -25,7 +32,8 @@ def _schema() -> str:
 
 def upgrade():
     schema = _schema()
-    op.create_table(
+    create_table_or_validate(
+        op,
         "provider_directory_api_endpoint",
         sa.Column("endpoint_id", sa.String(length=64), nullable=False),
         sa.Column("canonical_api_base", sa.Text(), nullable=False),
@@ -48,7 +56,8 @@ def upgrade():
         schema=schema,
     )
 
-    op.create_table(
+    create_table_or_validate(
+        op,
         "provider_directory_endpoint_dataset",
         sa.Column("dataset_id", sa.String(length=96), nullable=False),
         sa.Column("endpoint_id", sa.String(length=64), nullable=False),
@@ -71,19 +80,22 @@ def upgrade():
         sa.PrimaryKeyConstraint("dataset_id", name="provider_directory_endpoint_dataset_pkey"),
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_endpoint_dataset_endpoint_idx",
         "provider_directory_endpoint_dataset",
         ["endpoint_id"],
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_endpoint_dataset_status_idx",
         "provider_directory_endpoint_dataset",
         ["status"],
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_endpoint_dataset_current_idx",
         "provider_directory_endpoint_dataset",
         ["endpoint_id"],
@@ -91,14 +103,16 @@ def upgrade():
         schema=schema,
         postgresql_where=sa.text("is_current = true"),
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_endpoint_dataset_hash_idx",
         "provider_directory_endpoint_dataset",
         ["dataset_hash"],
         schema=schema,
     )
 
-    op.create_table(
+    create_table_or_validate(
+        op,
         "provider_directory_dataset_resource",
         sa.Column("dataset_id", sa.String(length=96), nullable=False),
         sa.Column("resource_type", sa.String(length=64), nullable=False),
@@ -118,35 +132,40 @@ def upgrade():
         ),
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_dataset_resource_type_id_idx",
         "provider_directory_dataset_resource",
         ["resource_type", "resource_id"],
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_dataset_resource_hash_idx",
         "provider_directory_dataset_resource",
         ["payload_hash"],
         schema=schema,
     )
 
-    op.add_column(
+    add_column_if_missing(
+        op,
         "provider_directory_source",
         sa.Column("endpoint_id", sa.String(length=64), nullable=True),
         schema=schema,
     )
-    op.create_foreign_key(
-        "provider_directory_source_endpoint_id_fkey",
+    create_foreign_key_if_missing(
+        op,
         "provider_directory_source",
-        "provider_directory_api_endpoint",
-        ["endpoint_id"],
-        ["endpoint_id"],
-        source_schema=schema,
-        referent_schema=schema,
-        ondelete="SET NULL",
+        sa.ForeignKeyConstraint(
+            ["endpoint_id"],
+            [f"{schema}.provider_directory_api_endpoint.endpoint_id"],
+            name="provider_directory_source_endpoint_id_fkey",
+            ondelete="SET NULL",
+        ),
+        schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_source_endpoint_id_idx",
         "provider_directory_source",
         ["endpoint_id"],

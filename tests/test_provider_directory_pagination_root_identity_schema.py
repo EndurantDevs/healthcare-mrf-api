@@ -77,6 +77,7 @@ def _assert_upgrade_backfill_sql(recorder):
     assert "acquisition_root_run_id IS NULL" in checkpoint_update_sql
     assert "root_backfill_failed" in root_assertion_sql
     assert "IS DISTINCT FROM" in root_assertion_sql
+    assert "checkpoint.dataset_id IS NOT NULL" in root_assertion_sql
 
 
 def _assert_root_column_is_required(recorder):
@@ -140,6 +141,29 @@ def test_pagination_root_identity_upgrade_backfills_and_rekeys(monkeypatch):
     _assert_upgrade_backfill_sql(recorder)
     _assert_root_column_is_required(recorder)
     _assert_root_key_and_index(recorder)
+
+
+def test_pagination_root_identity_adopts_current_key_without_rekey(monkeypatch):
+    migration = _load_migration()
+    recorder = _OpRecorder()
+    monkeypatch.setattr(migration, "op", recorder)
+    monkeypatch.setattr(migration, "column_is_nullable", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        migration,
+        "primary_key_columns",
+        lambda *_args, **_kwargs: migration.ROOT_PRIMARY_KEY_COLUMNS,
+    )
+    monkeypatch.setattr(
+        migration,
+        "create_index_if_missing",
+        lambda *_args, **_kwargs: None,
+    )
+
+    migration.upgrade()
+
+    assert recorder.altered_columns == []
+    assert recorder.dropped_constraints == []
+    assert recorder.primary_keys == []
 
 
 def test_pagination_root_identity_downgrade_restores_original_key(monkeypatch):

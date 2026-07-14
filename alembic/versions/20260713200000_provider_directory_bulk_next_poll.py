@@ -11,6 +11,8 @@ import os
 from alembic import op
 import sqlalchemy as sa
 
+from db.migration_adoption import add_column_if_missing
+
 
 revision = "20260713200000_provider_directory_bulk_next_poll"
 down_revision = "20260713193000_address_canonical_incomplete_line2_unit"
@@ -23,7 +25,8 @@ def _schema() -> str:
 
 
 def upgrade():
-    op.add_column(
+    add_column_if_missing(
+        op,
         "provider_directory_bulk_acquisition_checkpoint",
         sa.Column("next_poll_at", sa.TIMESTAMP(), nullable=True),
         schema=_schema(),

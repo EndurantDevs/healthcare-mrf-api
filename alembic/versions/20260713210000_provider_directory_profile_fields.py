@@ -11,6 +11,8 @@ import os
 from alembic import op
 import sqlalchemy as sa
 
+from db.migration_adoption import add_column_if_missing
+
 
 revision = "20260713210000_provider_directory_profile_fields"
 down_revision = "20260713200000_provider_directory_bulk_next_poll"
@@ -67,7 +69,7 @@ def upgrade():
     schema = _schema()
     for table_name, columns in PROFILE_COLUMNS.items():
         for column in columns:
-            op.add_column(table_name, column, schema=schema)
+            add_column_if_missing(op, table_name, column, schema=schema)
 
 
 def downgrade():

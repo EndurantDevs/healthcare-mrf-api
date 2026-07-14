@@ -11,6 +11,8 @@ import os
 from alembic import op
 import sqlalchemy as sa
 
+from db.migration_adoption import add_column_if_missing
+
 
 revision = "20260713233000_provider_directory_resource_identifiers"
 down_revision = "20260713230000_provider_directory_role_accepting_medicaid"
@@ -40,7 +42,7 @@ def upgrade():
     schema = _schema()
     for table_name, columns in RESOURCE_COLUMNS.items():
         for column in columns:
-            op.add_column(table_name, column, schema=schema)
+            add_column_if_missing(op, table_name, column, schema=schema)
 
 
 def downgrade():

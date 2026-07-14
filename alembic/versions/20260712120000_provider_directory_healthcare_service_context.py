@@ -11,6 +11,8 @@ import os
 from alembic import op
 import sqlalchemy as sa
 
+from db.migration_adoption import add_column_if_missing
+
 
 revision = "20260712120000_provider_directory_healthcare_service_context"
 down_revision = "20260711120000_provider_directory_affiliation_telecom"
@@ -24,17 +26,20 @@ def _schema() -> str:
 
 def upgrade():
     schema = _schema()
-    op.add_column(
+    add_column_if_missing(
+        op,
         "provider_directory_healthcare_service",
         sa.Column("provided_by_ref", sa.Text(), nullable=True),
         schema=schema,
     )
-    op.add_column(
+    add_column_if_missing(
+        op,
         "provider_directory_healthcare_service",
         sa.Column("accepting_patients", sa.JSON(), nullable=True),
         schema=schema,
     )
-    op.add_column(
+    add_column_if_missing(
+        op,
         "provider_directory_healthcare_service",
         sa.Column("npi", sa.BigInteger(), nullable=True),
         schema=schema,

@@ -152,8 +152,8 @@ def test_plan_scalar_columns_are_generated_and_migrated():
         / "20260713237000_provider_directory_plan_scalars.py"
     ).read_text()
     assert "sa.Computed" in migration_text
-    assert "INCLUDE (plan_identifier)" in migration_text
-    assert "WHERE plan_active" in migration_text
+    assert 'postgresql_include=("plan_identifier",)' in migration_text
+    assert 'postgresql_where=sa.text("plan_active")' in migration_text
 
 
 def test_plan_scalar_capability_requires_both_generated_columns():

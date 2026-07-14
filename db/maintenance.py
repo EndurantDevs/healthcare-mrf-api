@@ -10,12 +10,28 @@ import click
 from sqlalchemy import inspect, text
 
 from db.connection import Base, db
+from db.migration_index_adoption import has_matching_index
 from db.models import ProviderDirectoryPaginationCheckpoint
 from db.provider_directory_schema import (
     ensure_provider_directory_pagination_root_identity,
 )
 
 logger = logging.getLogger(__name__)
+
+EXACT_RUNTIME_INDEXES = {
+    "provider_directory_dataset_insurance_plan_active_lookup_idx",
+}
+
+
+class _BoundMigrationOperations:
+    """Expose a synchronous SQLAlchemy connection to migration validators."""
+
+    def __init__(self, database_connection: Any):
+        self._database_connection = database_connection
+
+    def get_bind(self) -> Any:
+        """Return the synchronous connection used by the runtime schema pass."""
+        return self._database_connection
 
 
 async def sync_structure(add_columns: bool = True, add_indexes: bool = True) -> Dict[str, List[str]]:
@@ -124,6 +140,13 @@ def _compile_column_definition(column, dialect) -> str | None:
     col_type = column.type.compile(dialect=dialect)
     pieces = [f'"{column.name}" {col_type}']
 
+    if column.computed is not None:
+        persisted = " STORED" if column.computed.persisted is not False else ""
+        pieces.append(
+            f"GENERATED ALWAYS AS ({column.computed.sqltext}){persisted}"
+        )
+        return " ".join(pieces)
+
     default = None
     if column.server_default is not None:
         default = str(column.server_default.arg)
@@ -150,6 +173,20 @@ def _ensure_indexes(sync_conn, inspector, table, model, results: Dict[str, List[
     for spec in _iter_index_specs(model):
         name = spec["name"]
         if name in existing_indexes:
+            if name in EXACT_RUNTIME_INDEXES:
+                has_matching_index(
+                    _BoundMigrationOperations(sync_conn),
+                    name,
+                    table_name,
+                    spec["columns"],
+                    schema=schema or "public",
+                    unique=bool(spec.get("unique", False)),
+                    postgresql_include=spec.get("include") or (),
+                    postgresql_where=(
+                        text(spec["where"]) if spec.get("where") else None
+                    ),
+                    postgresql_using=spec.get("using"),
+                )
             continue
         schema_prefix = f'"{schema}".' if schema else ""
         index_sql = _build_index_sql(name, schema_prefix, table_name, spec)
@@ -180,6 +217,7 @@ def _iter_index_specs(model) -> Iterable[Dict[str, Any]]:
                 "unique": extra.get("unique", False),
                 "using": extra.get("using"),
                 "where": extra.get("where"),
+                "include": _normalize_index_columns(extra.get("include", ())),
             }
         )
     return specs
@@ -198,8 +236,16 @@ def _build_index_sql(name: str, schema_prefix: str, table_name: str, spec: Dict[
     using_clause = f" USING {spec['using']}" if spec.get("using") else ""
     unique_clause = "UNIQUE " if spec.get("unique") else ""
     where_clause = f" WHERE {spec['where']}" if spec.get("where") else ""
+    include_columns = _normalize_index_columns(spec.get("include") or ())
+    include_clause = (
+        f" INCLUDE ({', '.join(include_columns)})" if include_columns else ""
+    )
     qualified_table = f'{schema_prefix}"{table_name}"'
-    return f"CREATE {unique_clause}INDEX IF NOT EXISTS {name} ON {qualified_table}{using_clause} ({column_clause}){where_clause};"
+    return (
+        f"CREATE {unique_clause}INDEX IF NOT EXISTS {name} "
+        f"ON {qualified_table}{using_clause} ({column_clause})"
+        f"{include_clause}{where_clause};"
+    )
 
 
 def _normalize_index_columns(columns: Any) -> Tuple[str, ...]:

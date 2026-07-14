@@ -11,6 +11,8 @@ import os
 import sqlalchemy as sa
 from alembic import op
 
+from db.migration_index_adoption import create_index_if_missing
+
 
 revision = "20260713235000_import_run_provider_directory_retry_child"
 down_revision = "20260713234000_provider_directory_plan_lookup_index"
@@ -61,8 +63,24 @@ def _duplicate_retry_children(bind, schema: str) -> list[dict[str, object]]:
     return [dict(row) for row in result.mappings().all()]
 
 
+def _is_offline_mode() -> bool:
+    get_context = getattr(op, "get_context", None)
+    return bool(get_context and get_context().as_sql)
+
+
 def upgrade():
     schema = _schema()
+    if _is_offline_mode():
+        op.create_index(
+            INDEX_NAME,
+            TABLE_NAME,
+            ["retry_of_run_id"],
+            schema=schema,
+            unique=True,
+            if_not_exists=True,
+            postgresql_where=sa.text(INDEX_PREDICATE),
+        )
+        return
     bind = op.get_bind()
     if not _table_exists(bind, schema):
         return
@@ -77,7 +95,8 @@ def upgrade():
             f"duplicate direct children exist: {details}. "
             "Resolve the duplicates explicitly before rerunning this migration; no data was deleted."
         )
-    op.create_index(
+    create_index_if_missing(
+        op,
         INDEX_NAME,
         TABLE_NAME,
         ["retry_of_run_id"],
@@ -89,6 +108,14 @@ def upgrade():
 
 def downgrade():
     schema = _schema()
+    if _is_offline_mode():
+        op.drop_index(
+            INDEX_NAME,
+            table_name=TABLE_NAME,
+            schema=schema,
+            if_exists=True,
+        )
+        return
     if not _table_exists(op.get_bind(), schema):
         return
     op.drop_index(INDEX_NAME, table_name=TABLE_NAME, schema=schema)

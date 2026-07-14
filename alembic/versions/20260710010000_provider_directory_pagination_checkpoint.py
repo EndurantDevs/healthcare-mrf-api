@@ -12,6 +12,9 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from db.migration_adoption import create_table_or_validate
+from db.migration_index_adoption import create_index_if_missing
+
 
 revision = "20260710010000_provider_directory_pagination_checkpoint"
 down_revision = "20260710003000_provider_directory_endpoint_datasets"
@@ -25,7 +28,8 @@ def _schema() -> str:
 
 def upgrade():
     schema = _schema()
-    op.create_table(
+    create_table_or_validate(
+        op,
         "provider_directory_pagination_checkpoint",
         sa.Column("canonical_api_base", sa.Text(), nullable=False),
         sa.Column("resource_type", sa.String(length=64), nullable=False),
@@ -70,20 +74,36 @@ def upgrade():
             name="provider_directory_pagination_checkpoint_dataset_id_fkey",
         ),
         schema=schema,
+        accepted_primary_keys=(
+            (
+                "canonical_api_base",
+                "resource_type",
+                "source_scope_hash",
+            ),
+            (
+                "canonical_api_base",
+                "resource_type",
+                "source_scope_hash",
+                "acquisition_root_run_id",
+            ),
+        ),
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_pagination_checkpoint_owner_idx",
         "provider_directory_pagination_checkpoint",
         ["owner_run_id"],
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_pagination_checkpoint_state_updated_idx",
         "provider_directory_pagination_checkpoint",
         ["state", "updated_at"],
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "provider_directory_pagination_checkpoint_dataset_idx",
         "provider_directory_pagination_checkpoint",
         ["dataset_id"],

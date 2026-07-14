@@ -11,6 +11,8 @@ import os
 from alembic import op
 import sqlalchemy as sa
 
+from db.migration_adoption import add_column_if_missing
+
 
 revision = "20260713120000_provider_directory_fhir_completeness"
 down_revision = "20260712120000_provider_directory_healthcare_service_context"
@@ -48,14 +50,19 @@ def upgrade():
     schema = _schema()
     for table_name in FHIR_RESOURCE_TABLES:
         for column in _provenance_columns():
-            op.add_column(table_name, column, schema=schema)
+            add_column_if_missing(op, table_name, column, schema=schema)
 
     for column in (
         sa.Column("product_identifiers", sa.JSON(), nullable=True),
         sa.Column("plan_backbones", sa.JSON(), nullable=True),
         sa.Column("coverage", sa.JSON(), nullable=True),
     ):
-        op.add_column("provider_directory_insurance_plan", column, schema=schema)
+        add_column_if_missing(
+            op,
+            "provider_directory_insurance_plan",
+            column,
+            schema=schema,
+        )
 
     for column in (
         sa.Column("available_time", sa.JSON(), nullable=True),
@@ -64,7 +71,12 @@ def upgrade():
         sa.Column("new_patient_acceptance", sa.JSON(), nullable=True),
         sa.Column("telehealth", sa.JSON(), nullable=True),
     ):
-        op.add_column("provider_directory_practitioner_role", column, schema=schema)
+        add_column_if_missing(
+            op,
+            "provider_directory_practitioner_role",
+            column,
+            schema=schema,
+        )
 
 
 def downgrade():
