@@ -27,7 +27,7 @@ PROFILE_SCHEMA_VERSION = 1
 PROFILE_FACT_LIMIT = 100
 PROFILE_FACT_EVIDENCE_LIMIT = 25
 NPI_MIN = 1_000_000_000
-NPI_MAX = 9_999_999_999
+NPI_MAX = 2_999_999_999
 NPI_LUHN_PREFIX_DIGIT_SUM = 24
 
 PROFILE_INDEX_SUFFIXES = ("generation_idx",)
@@ -80,13 +80,16 @@ def qualified_table(schema: str, table_name: str) -> str:
 
 
 def is_valid_npi(value: Any) -> bool:
-    """Return whether a value is a ten-digit NPI with a valid check digit."""
+    """Return whether a value is a CMS-assignable NPI with a valid check digit."""
     value_text = str(value).strip()
     if (
         len(value_text) != 10
         or not value_text.isascii()
         or not value_text.isdigit()
     ):
+        return False
+    npi_value = int(value_text)
+    if not NPI_MIN <= npi_value <= NPI_MAX:
         return False
     digits = [int(digit) for digit in value_text]
     digit_sum = NPI_LUHN_PREFIX_DIGIT_SUM + digits[-1]
@@ -100,7 +103,7 @@ def is_valid_npi(value: Any) -> bool:
 
 
 def valid_npi_sql(value_sql: str) -> str:
-    """Build an inline PostgreSQL NPI range and Luhn predicate."""
+    """Build the matching PostgreSQL assignable-range and Luhn predicate."""
     digit_terms: list[str] = []
     for position in range(1, 11):
         divisor = 10 ** (10 - position)

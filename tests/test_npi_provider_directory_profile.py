@@ -212,7 +212,7 @@ async def test_profile_fetch_rejects_invalid_npi_before_query(monkeypatch):
     monkeypatch.setattr(npi_module, "_execute_stmt", execute)
 
     profiles_by_npi = await npi_module._fetch_provider_directory_profile_map(
-        [1000000492, 999999999, "not-an-npi"]
+        [1000000492, 999999999, 3_000_000_000, "not-an-npi"]
     )
 
     assert profiles_by_npi == {}

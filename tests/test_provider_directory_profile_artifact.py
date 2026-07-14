@@ -5,10 +5,12 @@ from __future__ import annotations
 import contextlib
 import importlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import asyncpg
 import pytest
 
 from process import provider_directory_profile as profile
@@ -85,17 +87,64 @@ def test_profile_tables_and_indexes_are_bounded_and_npi_indexed():
     assert profile.PROFILE_FACT_EVIDENCE_LIMIT == 25
 
 
-@pytest.mark.parametrize("npi", [1000000491, 1234567893, 1588616783])
+@pytest.mark.parametrize(
+    "npi",
+    [1000000491, 1234567893, 1588616783, 2000000002, 2999999990],
+)
 def test_profile_npi_validation_accepts_valid_check_digits(npi):
     assert profile.is_valid_npi(npi)
 
 
 @pytest.mark.parametrize(
     "npi",
-    [None, "", "not-an-npi", 999999999, 10_000_000_000, 1000000492],
+    [
+        None,
+        "",
+        "not-an-npi",
+        999999999,
+        3_000_000_000,
+        10_000_000_000,
+        1000000492,
+    ],
 )
 def test_profile_npi_validation_rejects_invalid_values(npi):
     assert not profile.is_valid_npi(npi)
+
+
+@pytest.mark.asyncio
+async def test_profile_npi_sql_predicate_matches_python_in_postgresql():
+    dsn = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_PROFILE_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("set the profile PostgreSQL DSN to run predicate parity")
+    candidates = [
+        999_999_999,
+        1_000_000_491,
+        1_000_000_492,
+        2_000_000_002,
+        2_999_999_990,
+        3_000_000_000,
+        10_000_000_000,
+    ]
+    connection = await asyncpg.connect(dsn)
+    try:
+        predicate_rows = await connection.fetch(
+            f"""
+            SELECT candidate, {profile.valid_npi_sql("candidate")} AS is_valid
+              FROM unnest($1::bigint[]) AS candidate_values(candidate)
+             ORDER BY candidate;
+            """,
+            candidates,
+        )
+    finally:
+        await connection.close()
+
+    assert {
+        int(predicate_row["candidate"]): bool(predicate_row["is_valid"])
+        for predicate_row in predicate_rows
+    } == {
+        candidate: profile.is_valid_npi(candidate)
+        for candidate in candidates
+    }
 
 
 def test_profile_publication_filters_invalid_npis_from_new_and_copied_rows():
@@ -119,10 +168,10 @@ def test_profile_publication_filters_invalid_npis_from_new_and_copied_rows():
         profile_stage_ref='"fixture"."new_profile"',
     )
 
-    assert "(npi) BETWEEN 1000000000 AND 9999999999" in evidence_insert_sql
-    assert "(npi) BETWEEN 1000000000 AND 9999999999" in evidence_copy_sql
+    assert "(npi) BETWEEN 1000000000 AND 2999999999" in evidence_insert_sql
+    assert "(npi) BETWEEN 1000000000 AND 2999999999" in evidence_copy_sql
     assert (
-        "(profile.npi) BETWEEN 1000000000 AND 9999999999"
+        "(profile.npi) BETWEEN 1000000000 AND 2999999999"
         in profile_copy_sql
     )
     assert "JOIN \"mrf\".\"npi\"" not in evidence_insert_sql
@@ -166,7 +215,7 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
     assert "'comment', service.comment" in sql
     assert "JOIN \"fixture\".\"endpoint\" AS endpoint" in sql
     assert "'accepting_patients', COALESCE(" in sql
-    assert "npi) BETWEEN 1000000000 AND 9999999999" in sql
+    assert "npi) BETWEEN 1000000000 AND 2999999999" in sql
     assert "AND MOD(" in sql
     assert "{{VALID_NPI_SQL}}" not in sql
     assert "ON CONFLICT (evidence_key) DO NOTHING" in sql
