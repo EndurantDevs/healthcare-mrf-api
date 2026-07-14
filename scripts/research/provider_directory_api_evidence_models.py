@@ -14,6 +14,9 @@ class SourceSelection:
     classification: str
     required: bool
     resources: tuple[str, ...] = ()
+    resource_profile: str = "NONE"
+    matrix_checks: tuple[str, ...] = ()
+    profile_fact_resources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -23,6 +26,30 @@ class OverlaySample:
     source_id: str
     npi: int
     phone: str | None
+    address_key: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+
+
+def normalized_coordinate(value: object) -> float | None:
+    """Return a finite coordinate value, or ``None`` for unusable input."""
+    try:
+        coordinate = float(value)
+    except (TypeError, ValueError):
+        return None
+    return coordinate if coordinate == coordinate else None
+
+
+@dataclass(frozen=True)
+class SourceProvenance:
+    """Current public FHIR provenance expected for one selected source."""
+
+    source_id: str
+    endpoint_id: str
+    dataset_id: str
+    api_base: str
+    org_name: str | None = None
+    plan_name: str | None = None
 
 
 @dataclass(frozen=True)

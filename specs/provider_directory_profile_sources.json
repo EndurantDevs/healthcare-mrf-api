@@ -40,6 +40,42 @@
     "pdfhir_569c8c60329e96aefd3e5983",
     "pdfhir_72257bf04f7fb816c0ad6fb9"
   ],
+  "verification_matrix": {
+    "check_codes": ["A", "P", "G", "F", "V"],
+    "resource_profiles": {
+      "R8": {"resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"]},
+      "A7": {"resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"]},
+      "H5": {"resources": ["InsurancePlan", "Location", "Organization", "Practitioner", "PractitionerRole"]},
+      "I6": {"resources": ["HealthcareService", "InsurancePlan", "Location", "Organization", "Practitioner", "PractitionerRole"]},
+      "A6": {"resources": ["InsurancePlan", "Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]},
+      "M5": {"resources": ["Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]},
+      "ALOHR_GRAPHQL_R4": {
+        "transport": "graphql",
+        "tenant": "alohr",
+        "resources": ["Practitioner", "Organization", "Location", "PractitionerRole"],
+        "organization_affiliation_supported": false
+      }
+    },
+    "sources": [
+      {"entry_id": "aetna-commercial-medicare", "source_id": "pdfhir_d68a896335981928bdbbb80e", "resource_profile": "A7"},
+      {"entry_id": "alohr", "source_id": "pdfhir_0f81c146991b27031b1ec366", "resource_profile": "ALOHR_GRAPHQL_R4"},
+      {"entry_id": "amerihealth-caritas-carrier", "source_id": "pdfhir_3e8f8d73e9f63b41f4f3fca5", "resource_profile": "A6"},
+      {"entry_id": "arkansas", "source_id": "pdfhir_d6b52e94ddf5ca7b9faafe17", "resource_profile": "R8"},
+      {"entry_id": "caresource", "source_id": "pdfhir_b627b38e07cae99151baa4b7", "resource_profile": "R8"},
+      {"entry_id": "cigna", "source_id": "pdfhir_46bcb068e81b0bc844e327e9", "resource_profile": "R8"},
+      {"entry_id": "contra-costa", "source_id": "pdfhir_8ee2865f928f1d67b8a86090", "resource_profile": "A7"},
+      {"entry_id": "hap", "source_id": "pdfhir_eee751f2c17d5c473daf3060", "resource_profile": "H5"},
+      {"entry_id": "health-partners-plans", "source_id": "pdfhir_384bff82e94cf93d2aec8af2", "resource_profile": "R8"},
+      {"entry_id": "humana", "source_id": "pdfhir_00a3d35311756763d420b0d6", "resource_profile": "H5"},
+      {"entry_id": "idaho", "source_id": "pdfhir_b6fdc036a4686d0ab69f6f3a", "resource_profile": "R8"},
+      {"entry_id": "iehp", "source_id": "pdfhir_56521fb2d273045f2c3b73dc", "resource_profile": "I6"},
+      {"entry_id": "maine", "source_id": "pdfhir_59350503a7be3498a85d8cf2", "resource_profile": "M5"},
+      {"entry_id": "molina", "source_id": "pdfhir_0661ff143952c214d680d95d", "resource_profile": "M5"},
+      {"entry_id": "nebraska", "source_id": "pdfhir_6843a6194d9793a0a6cc36b4", "resource_profile": "A7"},
+      {"entry_id": "texas-tmhp", "source_id": "pdfhir_569c8c60329e96aefd3e5983", "resource_profile": "A7"},
+      {"entry_id": "wyoming", "source_id": "pdfhir_72257bf04f7fb816c0ad6fb9", "resource_profile": "R8"}
+    ]
+  },
   "excluded_public_fields": [
     "birthDate",
     "photo.data",

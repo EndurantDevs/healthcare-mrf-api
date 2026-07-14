@@ -13,8 +13,18 @@ from typing import Any, Callable, Mapping
 
 from scripts.research.provider_directory_api_evidence_models import (
     OverlaySample,
+    SourceProvenance,
     SourceEvaluationContext,
     SourceSelection,
+)
+from scripts.research.provider_directory_api_evidence_matrix_checks import (
+    build_matrix_checks,
+    safe_provenance,
+    has_passing_source_checks,
+)
+from scripts.research.provider_directory_api_evidence_mapped import (
+    evaluate_witness as _evaluate_witness,
+    mapped_evidence_capabilities as _mapped_evidence_capabilities,
 )
 from scripts.research.provider_directory_api_evidence_typed import (
     MappedEvidenceWitness,
@@ -33,6 +43,7 @@ __all__ = (
     "OverlaySample",
     "ProviderDirectoryApiClient",
     "SourceSelection",
+    "SourceProvenance",
     "SourceEvaluationContext",
     "evaluate_source",
     "has_row_source_provenance",
@@ -220,11 +231,16 @@ def _evaluate_sample(
 ) -> dict[str, Any]:
     detail_result = api_client.get_json(
         f"providers/{sample.npi}",
-        {"include_sources": "true", "include_evidence": "true"},
+        {
+            "include_sources": "true",
+            "include_evidence": "true",
+            **({"address_key": sample.address_key} if sample.address_key else {}),
+        },
     )
     source_check_map: dict[str, Any] = {
         "npi": sample.npi,
         "detail": _http_summary(detail_result),
+        "_detail_payload": detail_result.payload,
         "detail_source_present": detail_result.status_code == 200
         and _has_detail_source(detail_result.payload, source_id),
         "detail_within_latency_slo": is_within_latency_slo(
@@ -256,157 +272,33 @@ def _evaluate_sample(
     return source_check_map
 
 
-def _safe_witness_summary(witness: MappedEvidenceWitness) -> dict[str, Any]:
-    return {
-        "npi": witness.npi,
-        "resource_type": witness.resource_type,
-        "resource_id": witness.resource_id,
-        "insurance_plan_ids": list(witness.insurance_plan_ids),
-        "network_ids": [network.resource_id for network in witness.networks],
-    }
-
-
-def _evaluate_witness(
-    witness: MappedEvidenceWitness,
+def _evaluate_geo_sample(
+    sample: OverlaySample,
+    source_id: str,
     api_client: ProviderDirectoryApiClient,
+    candidate_limit: int,
     api_latency_slo_ms: float,
-) -> dict[str, Any]:
-    detail_param_map = {"include_sources": "true", "include_evidence": "true"}
-    if witness.address_key:
-        detail_param_map["address_key"] = witness.address_key
-    detail_result = api_client.get_json(
-        f"providers/{witness.npi}",
-        detail_param_map,
-    )
-    search_result = api_client.get_json(
-        "providers",
+) -> dict[str, Any] | None:
+    if sample.latitude is None or sample.longitude is None:
+        return None
+    geo_result = api_client.get_json(
+        "providers/match-candidates",
         {
-            "npi": str(witness.npi), "include_sources": "true",
-            "include_evidence": "true",
-            **({"address_key": witness.address_key} if witness.address_key else {}),
+            "lat": str(sample.latitude),
+            "long": str(sample.longitude),
+            "radius_miles": "0.1",
+            "limit": str(candidate_limit),
+            "include_sources": "true",
         },
     )
     return {
-        "witness": _safe_witness_summary(witness),
-        "detail": _http_summary(detail_result),
-        "detail_evidence_present": detail_result.status_code == 200
-        and has_detail_witness(detail_result.payload, witness),
-        "detail_within_latency_slo": is_within_latency_slo(
-            detail_result, api_latency_slo_ms
-        ),
-        "provider_search": _http_summary(search_result),
-        "provider_search_evidence_present": search_result.status_code == 200
-        and has_provider_search_witness(search_result.payload, witness),
-        "provider_search_within_latency_slo": is_within_latency_slo(
-            search_result, api_latency_slo_ms
+        "geo_match_candidates": _http_summary(geo_result),
+        "geo_source_present": geo_result.status_code == 200
+        and _has_phone_candidate_source(geo_result.payload, source_id, sample.npi),
+        "geo_within_latency_slo": is_within_latency_slo(
+            geo_result, api_latency_slo_ms
         ),
     }
-
-
-def _is_witness_check_passing(witness_check: Mapping[str, Any]) -> bool:
-    return bool(
-        witness_check["detail_evidence_present"]
-        and witness_check["detail_within_latency_slo"]
-        and witness_check["provider_search_evidence_present"]
-        and witness_check["provider_search_within_latency_slo"]
-    )
-
-
-def _mapped_resource_capability(
-    selection: SourceSelection,
-    resource_type: str,
-    resource_witnesses: list[MappedEvidenceWitness],
-    capability_checks: list[Mapping[str, Any]],
-    completion_state: str,
-    api_enabled: bool,
-    context: SourceEvaluationContext,
-) -> dict[str, Any]:
-    capability_map: dict[str, Any] = {
-        "declared": resource_type in selection.resources,
-        "witness_count": len(resource_witnesses),
-        "completion_witness_count": sum(
-            witness.supports_completion for witness in resource_witnesses
-        ),
-        "current_dataset_completion": completion_state,
-    }
-    if resource_type not in selection.resources:
-        capability_map["state"] = "not_applicable"
-        return capability_map
-    if not resource_witnesses:
-        capability_map["state"] = (
-            completion_state
-            if completion_state
-            in {"completed_empty", "provider_surface_not_applicable"}
-            else "not_observed"
-        )
-        if context.completion_probe_error:
-            capability_map["reason"] = "current_dataset_completion_probe_failed"
-        elif context.witness_probe_error:
-            capability_map["reason"] = "mapped_evidence_probe_failed"
-        return capability_map
-    if not api_enabled:
-        capability_map["state"] = "fail"
-        capability_map["reason"] = (
-            context.api_skip_reason or "api_credentials_unavailable"
-        )
-        return capability_map
-    if completion_state == "completed_empty":
-        capability_map["state"] = "fail"
-        capability_map["reason"] = "completion_proof_contradicts_mapped_witness"
-        return capability_map
-    capability_map["state"] = (
-        "pass"
-        if capability_checks
-        and all(map(_is_witness_check_passing, capability_checks))
-        else "fail"
-    )
-    return capability_map
-
-
-def _mapped_evidence_capabilities(
-    selection: SourceSelection,
-    witnesses: list[MappedEvidenceWitness],
-    witness_checks: list[Mapping[str, Any]],
-    context: SourceEvaluationContext,
-    completion_proofs: Mapping[str, Mapping[str, Any]] | None,
-    *,
-    api_enabled: bool,
-) -> dict[str, dict[str, Any]]:
-    """Classify each declared mapped resource without weakening empty proofs."""
-    checks_by_resource = {
-        str(check["witness"]["resource_type"]): [] for check in witness_checks
-    }
-    for check in witness_checks:
-        checks_by_resource[str(check["witness"]["resource_type"])].append(check)
-    capability_by_name: dict[str, dict[str, Any]] = {}
-    for resource_type, capability_name in (
-        ("PractitionerRole", "practitioner_role"),
-        ("OrganizationAffiliation", "organization_affiliation"),
-    ):
-        resource_witnesses = [
-            witness for witness in witnesses if witness.resource_type == resource_type
-        ]
-        completion_proof = (completion_proofs or {}).get(resource_type, {})
-        completion_state = str(completion_proof.get("state") or "unproven")
-        capability_by_name[capability_name] = _mapped_resource_capability(
-            selection,
-            resource_type,
-            resource_witnesses,
-            checks_by_resource.get(resource_type, []),
-            completion_state,
-            api_enabled,
-            context,
-        )
-    return capability_by_name
-
-
-def _is_source_check_passing(source_check: Mapping[str, Any]) -> bool:
-    return bool(
-        source_check["detail_source_present"]
-        and source_check["detail_within_latency_slo"]
-        and source_check.get("phone_source_present", True)
-        and source_check.get("phone_within_latency_slo", True)
-    )
 
 
 def _base_source_result(
@@ -418,31 +310,37 @@ def _base_source_result(
         "classification": selection.classification,
         "required": selection.required,
         "resources": list(selection.resources),
+        "resource_profile": selection.resource_profile,
         "samples": [
-            {"npi": sample.npi, "phone": _masked_phone(sample.phone)}
+            {
+                "npi": sample.npi,
+                "phone": _masked_phone(sample.phone),
+                "has_address_key": bool(sample.address_key),
+                "has_coordinates": (
+                    sample.latitude is not None and sample.longitude is not None
+                ),
+            }
             for sample in samples
         ],
     }
 
 
-def evaluate_source(
+def _attach_mapped_evidence(
+    source_result: dict[str, Any],
     selection: SourceSelection,
-    samples: list[OverlaySample],
+    witnesses: list[MappedEvidenceWitness],
     api_client: ProviderDirectoryApiClient | None,
     context: SourceEvaluationContext,
-    *,
-    witnesses: list[MappedEvidenceWitness] | None = None,
-    completion_proofs: Mapping[str, Mapping[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Verify bounded API detail and phone evidence for one manifest source."""
-    witnesses = witnesses or []
-    source_result = _base_source_result(selection, samples)
-    witness_checks: list[dict[str, Any]] = []
-    if api_client is not None:
-        witness_checks = [
+    completion_proofs: Mapping[str, Mapping[str, Any]] | None,
+) -> None:
+    witness_checks = (
+        [
             _evaluate_witness(witness, api_client, context.api_latency_slo_ms)
             for witness in witnesses
         ]
+        if api_client is not None
+        else []
+    )
     source_result["mapped_evidence_capabilities"] = _mapped_evidence_capabilities(
         selection,
         witnesses,
@@ -453,6 +351,97 @@ def evaluate_source(
     )
     if witness_checks:
         source_result["mapped_evidence_checks"] = witness_checks
+
+
+def _attach_sample_checks(
+    source_result: dict[str, Any],
+    selection: SourceSelection,
+    samples: list[OverlaySample],
+    api_client: ProviderDirectoryApiClient,
+    context: SourceEvaluationContext,
+    expected_provenance: SourceProvenance | None,
+) -> None:
+    source_checks = [
+        _evaluate_sample(
+            sample,
+            selection.source_id,
+            api_client,
+            context.candidate_limit,
+            context.api_latency_slo_ms,
+        )
+        for sample in samples
+    ]
+    source_result["checks"] = source_checks
+    if selection.matrix_checks:
+        _attach_matrix_checks(
+            source_result,
+            selection,
+            samples,
+            source_checks,
+            api_client,
+            context,
+            expected_provenance,
+        )
+    for source_check in source_checks:
+        source_check.pop("_detail_payload", None)
+
+
+def _attach_matrix_checks(
+    source_result: dict[str, Any],
+    selection: SourceSelection,
+    samples: list[OverlaySample],
+    source_checks: list[Mapping[str, Any]],
+    api_client: ProviderDirectoryApiClient,
+    context: SourceEvaluationContext,
+    expected_provenance: SourceProvenance | None,
+) -> None:
+    geo_checks = [
+        _evaluate_geo_sample(
+            sample,
+            selection.source_id,
+            api_client,
+            context.candidate_limit,
+            context.api_latency_slo_ms,
+        )
+        for sample in samples
+    ]
+    source_result["verification_matrix"] = [
+        build_matrix_checks(
+            selection,
+            sample,
+            source_check,
+            geo_check,
+            expected_provenance,
+        )
+        for sample, source_check, geo_check in zip(samples, source_checks, geo_checks)
+    ]
+
+
+def evaluate_source(
+    selection: SourceSelection,
+    samples: list[OverlaySample],
+    api_client: ProviderDirectoryApiClient | None,
+    context: SourceEvaluationContext,
+    *,
+    witnesses: list[MappedEvidenceWitness] | None = None,
+    completion_proofs: Mapping[str, Mapping[str, Any]] | None = None,
+    expected_provenance: SourceProvenance | None = None,
+) -> dict[str, Any]:
+    """Verify bounded API detail and phone evidence for one manifest source."""
+    witnesses = witnesses or []
+    source_result = _base_source_result(selection, samples)
+    if expected_provenance is not None:
+        source_result["expected_fhir_provenance"] = safe_provenance(
+            expected_provenance
+        )
+    _attach_mapped_evidence(
+        source_result,
+        selection,
+        witnesses,
+        api_client,
+        context,
+        completion_proofs,
+    )
     if not samples:
         source_result["status"] = "fail" if selection.required else "skip"
         source_result["reason"] = (
@@ -467,19 +456,16 @@ def evaluate_source(
             context.api_skip_reason or "api_credentials_unavailable"
         )
         return source_result
-    source_checks = [
-        _evaluate_sample(
-            sample,
-            selection.source_id,
-            api_client,
-            context.candidate_limit,
-            context.api_latency_slo_ms,
-        )
-        for sample in samples
-    ]
-    source_result["checks"] = source_checks
+    _attach_sample_checks(
+        source_result,
+        selection,
+        samples,
+        api_client,
+        context,
+        expected_provenance,
+    )
     source_result["status"] = (
-        "pass" if all(map(_is_source_check_passing, source_checks)) else "fail"
+        "pass" if has_passing_source_checks(source_result) else "fail"
     )
     return source_result
 
