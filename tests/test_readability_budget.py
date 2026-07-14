@@ -375,3 +375,38 @@ def test_readability_ratchet_holds_at_zero(tmp_path):
             str(repo_root / "readability-baseline.json"),
         ]
     ) == 0
+
+
+def test_readability_ratchet_zero_percent_prevents_net_growth(tmp_path):
+    repo_root = tmp_path
+    package = repo_root / "pkg"
+    package.mkdir()
+    module = package / "module.py"
+    module.write_text(
+        f"def existing():\n    return 1  {NOQA_FIXTURE}\n",
+        encoding="utf-8",
+    )
+    _write_config(repo_root)
+    assert readability_budget.main(["--repo-root", str(repo_root), "--write-baseline"]) == 0
+    base_baseline = repo_root / "readability-base.json"
+    base_baseline.write_text(
+        (repo_root / "readability-baseline.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    ratchet_args = [
+        "--repo-root",
+        str(repo_root),
+        "--ratchet-baseline",
+        str(base_baseline),
+        "--required-reduction-percent",
+        "0",
+    ]
+
+    assert readability_budget.main(ratchet_args) == 0
+    module.write_text(
+        f"def existing():\n    return 1  {NOQA_FIXTURE}\n\n"
+        f"def added():\n    return 2  {NOQA_FIXTURE}\n",
+        encoding="utf-8",
+    )
+    assert readability_budget.main(["--repo-root", str(repo_root), "--write-baseline"]) == 0
+    assert readability_budget.main(ratchet_args) == 1
