@@ -375,11 +375,13 @@ def _edge_direction_index(tokens: list[str]) -> int | None:
 
 
 def city_norm(value: str | None) -> str | None:
+    """Normalize a city value for canonical address identity matching."""
     cleaned = re.sub(r"[^a-z0-9]", "", (value or "").lower())
     return cleaned or None
 
 
 def state_code(value: str | None) -> str | None:
+    """Resolve a state name or abbreviation to its USPS code."""
     cleaned = re.sub(r"[^A-Za-z]", "", value or "").upper()
     if not cleaned:
         return None
@@ -387,6 +389,7 @@ def state_code(value: str | None) -> str | None:
 
 
 def zip5_norm(value: str | None) -> str | None:
+    """Normalize a postal code to a five-digit US ZIP when possible."""
     digits = re.sub(r"[^0-9]", "", value or "")
     if len(digits) >= 5:
         return digits[:5]
@@ -396,6 +399,7 @@ def zip5_norm(value: str | None) -> str | None:
 
 
 def country_code(value: str | None) -> str:
+    """Normalize common United States country labels to US."""
     cleaned = re.sub(r"[^A-Za-z]", "", value or "").upper()
     if not cleaned or cleaned in {"US", "USA", "UNITEDSTATES", "UNITEDSTATESOFAMERICA"}:
         return "US"
@@ -409,16 +413,19 @@ def _clamp_text(value: str | None, limit: int) -> str | None:
 
 
 def unit_norm(line1: str | None, line2: str | None) -> str:
+    """Return the canonical unit component selected from two address lines."""
     return _unit_decision(line1, line2).unit
 
 
 def street_norm(line1: str | None, line2: str | None) -> str | None:
+    """Normalize the street component selected from two address lines."""
     tokens = _street_tokens(line1, line2)
     cleaned = "".join(_normalized_street_tokens(tokens))
     return cleaned or None
 
 
 def street_suffix_token(line1: str | None, line2: str | None) -> str | None:
+    """Return the canonical terminal street suffix when one is present."""
     tokens = _street_tokens(line1, line2)
     if len(tokens) < 2 or not _street_token_is_suffix(tokens[-1]):
         return None
@@ -426,6 +433,7 @@ def street_suffix_token(line1: str | None, line2: str | None) -> str | None:
 
 
 def street_suffixless_norm(line1: str | None, line2: str | None) -> str | None:
+    """Normalize a street after removing a recognized terminal suffix."""
     tokens = _street_tokens(line1, line2)
     stop = len(tokens)
     if len(tokens) >= 2 and _street_token_is_suffix(tokens[-1]):
@@ -438,6 +446,7 @@ def street_suffixless_norm(line1: str | None, line2: str | None) -> str | None:
 
 
 def street_direction_token(line1: str | None, line2: str | None) -> str | None:
+    """Return a canonical directional token at a street edge."""
     tokens = _street_tokens(line1, line2)
     direction_index = _edge_direction_index(tokens)
     if direction_index is None:
@@ -446,6 +455,7 @@ def street_direction_token(line1: str | None, line2: str | None) -> str | None:
 
 
 def street_directionless_norm(line1: str | None, line2: str | None) -> str | None:
+    """Normalize a street after removing its recognized edge direction."""
     tokens = _street_tokens(line1, line2)
     direction_index = _edge_direction_index(tokens)
     retained = [
@@ -461,6 +471,7 @@ def street_directionless_norm(line1: str | None, line2: str | None) -> str | Non
 
 
 def street_completion_norm(line1: str | None, line2: str | None) -> str | None:
+    """Normalize a street for conservative suffix and direction completion."""
     tokens = _street_tokens(line1, line2)
     direction_index = _edge_direction_index(tokens)
     drop_indexes = {direction_index} if direction_index is not None else set()
@@ -480,6 +491,7 @@ def identity_key_v1(
     zip_code: str | None,
     country: str | None = "US",
 ) -> str | None:
+    """Build the versioned canonical address identity string."""
     street = street_norm(first_line, second_line)
     unit = unit_norm(first_line, second_line)
     city_value = city_norm(city)
@@ -516,6 +528,7 @@ def premise_identity_key_v1(
     zip_code: str | None,
     country: str | None = "US",
 ) -> str | None:
+    """Build a unit-independent canonical premise identity string."""
     street = street_norm(first_line, second_line)
     state_value = state_code(state)
     zip_value = zip5_norm(zip_code)
@@ -535,6 +548,7 @@ def premise_identity_key_v1(
 
 
 def key_from_identity(identity: str | None) -> uuid.UUID | None:
+    """Derive the stable UUID key for a canonical identity string."""
     if identity is None:
         return None
     return uuid.UUID(bytes=hashlib.sha256(identity.encode("utf-8")).digest()[:16])
@@ -548,10 +562,12 @@ def address_key_v1(
     zip_code: str | None,
     country: str | None = "US",
 ) -> uuid.UUID | None:
+    """Derive the stable canonical key for one normalized address."""
     return key_from_identity(identity_key_v1(first_line, second_line, city, state, zip_code, country))
 
 
 def source_enabled(source_name: str) -> bool:
+    """Report whether canonicalization is enabled for a named source."""
     raw = os.getenv("HLTHPRT_ADDRESS_CANON_SOURCES", "").strip()
     if not raw:
         return False
@@ -560,6 +576,7 @@ def source_enabled(source_name: str) -> bool:
 
 
 def archive_table_name() -> str:
+    """Return the configured canonical address archive table name."""
     value = os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip()
     return value or "address_archive_v2"
 
@@ -592,10 +609,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def pub28_source_sha256() -> str:
+    """Hash the USPS Publication 28 rules bundled with the importer."""
     return hashlib.sha256(Path(__file__).with_name("address_pub28.py").read_bytes()).hexdigest()
 
 
 def current_canon_version() -> dict[str, Any]:
+    """Describe the active address identity and normalization ruleset."""
     return {
         "identity_version": CURRENT_ADDRESS_IDENTITY_VERSION,
         "identity_prefix": CURRENT_ADDRESS_IDENTITY_PREFIX,
@@ -700,6 +719,7 @@ def _keyed_raw_copy_sql(
     zip_code: str,
     country: str,
 ) -> str:
+    """Build SQL that copies normalized staging rows into keyed scratch data."""
     return f"""
         WITH raw AS (
             SELECT
@@ -970,6 +990,7 @@ async def stamp_address_keys(
     update_existing: bool = True,
     honor_env_override: bool = True,
 ) -> int:
+    """Stamp canonical address keys onto a staging table in bounded shards."""
     schema = schema or _schema_name()
     override_shards = os.getenv("HLTHPRT_ADDRESS_CANON_STAMP_SHARDS")
     if honor_env_override and override_shards:
@@ -993,8 +1014,7 @@ async def stamp_address_keys(
         only_null_address_key=True,
     )
     first, second, city, state, zip_code, country = _address_sql(schema, field_map)
-    total = 0
-    completed = 0
+    progress_by_metric = {"completed": 0, "updated": 0}
     semaphore = asyncio.Semaphore(stamp_concurrency)
     progress_lock = asyncio.Lock()
     _emit_progress(
@@ -1032,7 +1052,6 @@ async def stamp_address_keys(
             return 0
 
     async def _stamp_shard(shard: int) -> None:
-        nonlocal completed, total
         async with semaphore:
             if cancel_check:
                 await cancel_check()
@@ -1069,20 +1088,20 @@ async def stamp_address_keys(
                 shard=shard,
             )
             async with progress_lock:
-                total += int(rowcount or 0)
-                completed += 1
+                progress_by_metric["updated"] += int(rowcount or 0)
+                progress_by_metric["completed"] += 1
                 _emit_progress(
                     phase="address key stamping",
                     unit="shard",
                     total=shards,
-                    done=completed,
-                    pct=(completed / shards) * 100.0,
+                    done=progress_by_metric["completed"],
+                    pct=(progress_by_metric["completed"] / shards) * 100.0,
                     message="stamping canonical address keys",
                 )
             await asyncio.sleep(0)
 
     await asyncio.gather(*(_stamp_shard(shard) for shard in range(shards)))
-    return total
+    return progress_by_metric["updated"]
 
 
 async def propagate_child_address_keys(
@@ -1106,8 +1125,7 @@ async def propagate_child_address_keys(
     if stamp_concurrency <= 0:
         raise ValueError("HLTHPRT_ADDRESS_CANON_STAMP_CONCURRENCY must be a positive integer")
     stamp_concurrency = min(stamp_concurrency, shards)
-    total = 0
-    completed = 0
+    progress_by_metric = {"completed": 0, "updated": 0}
     semaphore = asyncio.Semaphore(stamp_concurrency)
     progress_lock = asyncio.Lock()
     same_address = """
@@ -1160,7 +1178,7 @@ async def propagate_child_address_keys(
             return 0
 
     async def _propagate_shard(shard: int) -> None:
-        nonlocal completed, total
+        """Propagate parent keys for one deterministic child-row shard."""
         async with semaphore:
             if cancel_check:
                 await cancel_check()
@@ -1245,20 +1263,22 @@ async def propagate_child_address_keys(
                     )
                 ).scalar()
             async with progress_lock:
-                total += int(cleared or 0) + int(propagated or 0)
-                completed += 1
+                progress_by_metric["updated"] += int(cleared or 0) + int(
+                    propagated or 0
+                )
+                progress_by_metric["completed"] += 1
                 _emit_progress(
                     phase="address key propagation",
                     unit="shard",
                     total=shards,
-                    done=completed,
-                    pct=(completed / shards) * 100.0,
+                    done=progress_by_metric["completed"],
+                    pct=(progress_by_metric["completed"] / shards) * 100.0,
                     message="propagating canonical address keys",
                 )
             await asyncio.sleep(0)
 
     await asyncio.gather(*(_propagate_shard(shard) for shard in range(shards)))
-    return total
+    return progress_by_metric["updated"]
 
 
 async def _table_exists_in_session(session: Any, schema: str, table: str) -> bool:
@@ -1323,6 +1343,7 @@ def _zip_restore_sql(
     has_address_key: bool,
     only_null_address_key: bool,
 ) -> str:
+    """Build the state-checked coordinate-to-ZIP restoration statement."""
     qschema = _quote_ident(schema)
     qtable = _qtable(schema, staging_table)
     qzip = _quote_ident(zip_column)
@@ -1475,11 +1496,9 @@ async def restore_missing_zip_from_tiger_zcta(
     country_expr = _expr(field_map, "country", "'US'")
     semaphore = asyncio.Semaphore(concurrency)
     progress_lock = asyncio.Lock()
-    completed = 0
-    restored = 0
+    progress_by_metric = {"completed": 0, "restored": 0}
 
     async def _restore_shard(shard: int) -> None:
-        nonlocal completed, restored
         async with semaphore:
             if cancel_check:
                 await cancel_check()
@@ -1500,19 +1519,20 @@ async def restore_missing_zip_from_tiger_zcta(
                 shard=shard,
             )
             async with progress_lock:
-                restored += int(rowcount or 0)
-                completed += 1
+                progress_by_metric["restored"] += int(rowcount or 0)
+                progress_by_metric["completed"] += 1
                 _emit_progress(
                     phase="address ZIP restore",
                     unit="shard",
                     total=shards,
-                    done=completed,
-                    pct=(completed / shards) * 100.0,
+                    done=progress_by_metric["completed"],
+                    pct=(progress_by_metric["completed"] / shards) * 100.0,
                     message="restoring missing source ZIPs from coordinates",
                 )
             await asyncio.sleep(0)
 
     await asyncio.gather(*(_restore_shard(shard) for shard in range(shards)))
+    restored = progress_by_metric["restored"]
     logger.info("Restored %d missing ZIPs for %s.%s from coordinates.", restored, schema, staging_table)
     return restored
 
@@ -1532,6 +1552,7 @@ def _completion_alias_sql(
     keyed_table: str,
     archive: str,
 ) -> str:
+    """Build conservative street completion aliases for archive resolution."""
     qschema = _quote_ident(schema)
     return f"""
         CREATE TEMP TABLE address_completion_aliases ON COMMIT DROP AS
@@ -1745,6 +1766,7 @@ async def resolve_into_archive(
     gate_sample_limit: int = 20,
     cancel_check: Callable[[], Awaitable[None]] | None = None,
 ) -> ResolveStats:
+    """Resolve staging addresses into the canonical archive and return gates."""
     started = time.monotonic()
     schema = schema or _schema_name()
     archive_table = await _select_canonical_archive_table(schema, archive_table or archive_table_name())

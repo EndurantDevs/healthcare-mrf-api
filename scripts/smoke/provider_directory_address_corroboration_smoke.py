@@ -89,6 +89,7 @@ def _served_address_verification(row: dict[str, Any], *, network_names: list[str
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse disposable database and schema options for the smoke run."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--schema", default=os.getenv("HLTHPRT_SMOKE_SCHEMA") or _default_schema())
     parser.add_argument("--host", default=os.getenv("HLTHPRT_DB_HOST") or "127.0.0.1")
@@ -111,6 +112,7 @@ async def _connect(args: argparse.Namespace) -> asyncpg.Connection:
 
 
 async def _seed(conn: asyncpg.Connection, schema: str) -> None:
+    """Create and populate the minimal Provider Directory smoke schema."""
     await conn.execute(f'CREATE SCHEMA "{schema}";')
     await conn.execute(
         f"""
@@ -260,6 +262,7 @@ async def _seed(conn: asyncpg.Connection, schema: str) -> None:
 
 
 async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
+    """Build the real corroboration view and validate its public evidence."""
     schema = _validate_identifier(args.schema, label="schema")
     conn = await _connect(args)
     try:
@@ -355,6 +358,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> None:
+    """Run the corroboration smoke and print its evidence rows."""
     result = asyncio.run(run_smoke(parse_args()))
     for row in result["rows"]:
         print(row)

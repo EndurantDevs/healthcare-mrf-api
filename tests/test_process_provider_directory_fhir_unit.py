@@ -5209,6 +5209,7 @@ async def test_probe_sources_records_credential_descriptor_without_secret(monkey
 async def test_caresource_public_override_probes_and_selects_without_credentials(
     monkeypatch,
 ):
+    """CareSource probes and imports anonymously despite its stale auth label."""
     monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
     monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
     calls: list[str] = []
