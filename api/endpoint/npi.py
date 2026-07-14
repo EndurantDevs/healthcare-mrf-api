@@ -4605,7 +4605,7 @@ def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
 
 _CURRENT_PROVIDER_DIRECTORY_PHONE_CTES = """
 current_provider_directory_runs AS MATERIALIZED (
-    SELECT source.source_id,
+    SELECT source.source_id, dataset.dataset_id,
            COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar
                AS run_id
       FROM mrf.provider_directory_source AS source
@@ -4617,7 +4617,8 @@ current_provider_directory_runs AS MATERIALIZED (
        AND dataset.superseded_at IS NULL
 ), matching_provider_directory_phone_rows AS MATERIALIZED (
     SELECT overlay.npi, overlay.address_key, overlay.source_id,
-           overlay.last_seen_run_id, overlay.source_record_id
+           overlay.last_seen_run_id, overlay.source_record_id,
+           overlay.resource_type, overlay.resource_id
       FROM mrf.provider_directory_address_overlay AS overlay
      WHERE overlay.phone_number = :phone_digits
        AND overlay.npi IS NOT NULL
@@ -4671,6 +4672,10 @@ phone_candidate_rows AS MATERIALIZED (
       JOIN current_provider_directory_runs AS current_run
         ON current_run.source_id = overlay.source_id
        AND current_run.run_id = overlay.last_seen_run_id
+      JOIN mrf.provider_directory_dataset_resource AS dataset_resource
+        ON dataset_resource.dataset_id = current_run.dataset_id
+       AND dataset_resource.resource_type = overlay.resource_type
+       AND dataset_resource.resource_id = overlay.resource_id
 )
 """
 
