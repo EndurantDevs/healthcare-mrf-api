@@ -55,15 +55,23 @@ jobs:
         run: python scripts/smoke/provider_directory_runtime_contract.py
       - name: Check Provider Directory support documentation
         run: python scripts/generate_provider_directory_support_docs.py --check
+      - name: Check readability CI policy
+        run: bash tests/test_ci_readability_policy.sh
       - name: Readability budget
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           if [ -n "$BASE_SHA" ]; then
             git show "$BASE_SHA:readability-baseline.json" > "$RUNNER_TEMP/readability-base.json"
-            python scripts/readability_budget.py \
+            if git diff --quiet "$BASE_SHA" HEAD -- '*.py' '*.pyi'; then
+              python scripts/readability_budget.py \
               --ratchet-baseline "$RUNNER_TEMP/readability-base.json" \
               --required-reduction-percent 0
+            else
+              python scripts/readability_budget.py \
+                --ratchet-baseline "$RUNNER_TEMP/readability-base.json" \
+                --required-reduction-percent 1
+            fi
           else
             python scripts/readability_budget.py
           fi
