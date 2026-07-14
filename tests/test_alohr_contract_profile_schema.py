@@ -33,6 +33,7 @@ def test_alohr_contract_profile_repair_is_current_dataset_scoped(monkeypatch):
 
     migration.upgrade()
 
+    assert migration.revision == "20260714161000_alohr_contract_profile"
     assert migration.down_revision == (
         "20260714150000_provider_directory_pagination_census"
     )
