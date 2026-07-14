@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
@@ -17,16 +16,36 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SHARED_GENERATION,
     shared_semantic_fingerprint,
 )
+from process.ptg_parts.ptg2_shared_source_set import (
+    PTG2_V3_SOURCE_SET_CONTRACT,
+    _normalized_sha256,
+    shared_source_set_metadata,
+)
 from process.ptg_parts.source_files import _derive_plan_fields
 from process.ptg_parts.values import build_source_trace_set
 
 
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_PHYSICAL_SOURCE_TYPE_RE = re.compile(
+    r"[a-z0-9][a-z0-9._-]{0,63}",
+    flags=re.ASCII,
+)
 _PHYSICAL_IDENTITY_KINDS = frozenset(
     {"logical_json_sha256_v1", "raw_container_sha256_v1"}
 )
 _PHYSICAL_OPTION_KEYS: tuple[str, ...] = ()
-PTG2_V3_SOURCE_SET_CONTRACT = "sorted_raw_container_sha256_bytes_v1"
+
+
+def _normalized_physical_source_type(value: Any) -> str:
+    """Return the canonical ASCII token used in Python and Rust identities."""
+
+    raw_value = str(value or "").strip()
+    normalized = raw_value.lower() if raw_value.isascii() else ""
+    if not _PHYSICAL_SOURCE_TYPE_RE.fullmatch(normalized):
+        raise ValueError(
+            "strict shared V3 physical source_type must be a nonempty lowercase "
+            "ASCII token of at most 64 bytes"
+        )
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -41,6 +60,19 @@ class SharedPhysicalArtifactIdentity:
     source_type: str
     identity_kind: str
     identity_sha256: str
+
+    def __post_init__(self) -> None:
+        source_type = _normalized_physical_source_type(self.source_type)
+        identity_kind = str(self.identity_kind or "").strip()
+        if identity_kind not in _PHYSICAL_IDENTITY_KINDS:
+            raise ValueError("strict shared V3 physical artifact identity is incomplete")
+        identity_sha256 = _normalized_sha256(
+            self.identity_sha256,
+            field_name="identity_sha256",
+        )
+        object.__setattr__(self, "source_type", source_type)
+        object.__setattr__(self, "identity_kind", identity_kind)
+        object.__setattr__(self, "identity_sha256", identity_sha256)
 
     def as_dict(self) -> dict[str, str]:
         """Return this physical artifact identity in manifest form."""
@@ -87,36 +119,6 @@ class SharedInputIdentity:
         return len(self.source_identities)
 
 
-def shared_source_set_metadata(
-    raw_container_sha256_values: Iterable[Any],
-) -> dict[str, Any]:
-    """Seal a complete source set without exposing its individual identities."""
-
-    raw_hashes = sorted(
-        _normalized_sha256(value, field_name="raw_container_sha256")
-        for value in raw_container_sha256_values
-    )
-    if not raw_hashes:
-        raise ValueError("strict shared V3 source set requires at least one source")
-    if len(raw_hashes) != len(set(raw_hashes)):
-        raise ValueError("strict shared V3 source set contains duplicate raw containers")
-    digest = hashlib.sha256()
-    for raw_hash in raw_hashes:
-        digest.update(bytes.fromhex(raw_hash))
-    return {
-        "contract": PTG2_V3_SOURCE_SET_CONTRACT,
-        "source_count": len(raw_hashes),
-        "raw_container_sha256_digest": digest.hexdigest(),
-    }
-
-
-def _normalized_sha256(value: Any, *, field_name: str) -> str:
-    normalized = str(value or "").strip().lower()
-    if not _SHA256_RE.fullmatch(normalized):
-        raise ValueError(f"strict shared V3 input is missing a valid {field_name}")
-    return normalized
-
-
 def _normalized_logical_plan(job: Mapping[str, Any]) -> SharedLogicalPlanScope:
     meta = job.get("meta") if isinstance(job.get("meta"), dict) else {}
     plan_info = job.get("plan_info") if isinstance(job.get("plan_info"), list) else None
@@ -161,7 +163,7 @@ def _downloaded_artifact_payload(downloaded: PTG2DownloadedJob) -> dict[str, Any
     # limited to byte-identical containers. Once a real logical digest is known,
     # differently wrapped containers can share the same physical layout.
     return {
-        "source_type": str(downloaded.job.get("type") or "").strip().lower(),
+        "source_type": _normalized_physical_source_type(downloaded.job.get("type")),
         "identity_kind": (
             "raw_container_sha256_v1"
             if logical_hash_deferred
@@ -217,13 +219,13 @@ def normalized_physical_artifact_identity(
 
     if isinstance(value, SharedPhysicalArtifactIdentity):
         return value
-    source_type = str(value.get("source_type") or "").strip().lower()
+    source_type = _normalized_physical_source_type(value.get("source_type"))
     identity_kind = str(value.get("identity_kind") or "").strip()
     identity_sha256 = _normalized_sha256(
         value.get("identity_sha256"),
         field_name="identity_sha256",
     )
-    if not source_type or identity_kind not in _PHYSICAL_IDENTITY_KINDS:
+    if identity_kind not in _PHYSICAL_IDENTITY_KINDS:
         raise ValueError("strict shared V3 physical artifact identity is incomplete")
     return SharedPhysicalArtifactIdentity(
         source_type=source_type,

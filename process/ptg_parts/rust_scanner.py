@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 import queue
+import signal
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Mapping, NamedTuple
 
@@ -70,6 +73,10 @@ _V3_CODE_DICTIONARY_VERSION = 4
 _V3_SHARED_GRAPH_SUMMARY_FORMAT = "ptg2_v3_shared_graph_summary_v1"
 _V3_SHARED_GRAPH_SUMMARY_FRAME = b"v3_shared_graph_summary"
 _V3_SHARED_GRAPH_SUMMARY_MAX_BYTES = 1024 * 1024
+_PROCESS_GROUP_TERM_TIMEOUT_SECONDS = 2.0
+_PROCESS_GROUP_KILL_TIMEOUT_SECONDS = 2.0
+_PROCESS_GROUP_POLL_SECONDS = 0.02
+_ASYNC_READER_QUEUE_PUT_TIMEOUT_SECONDS = 0.05
 _V3_SHARED_GRAPH_OUTPUT_NAMES = {
     "block_copy_path": "graph-blocks.copy",
     "owner_copy_path": "graph-owners.copy",
@@ -112,6 +119,221 @@ class _SharedGraphExpected(NamedTuple):
     input_byte_count: int
     group_npi_input_edge_count: int
     group_provider_set_input_edge_count: int
+
+
+def _subprocess_session_options(spawn: Any | None = None) -> dict[str, bool]:
+    """Start native workers in a group that can be cancelled as one unit."""
+
+    if os.name != "posix":
+        return {}
+    if spawn is not None:
+        try:
+            parameters = inspect.signature(spawn).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        if parameters and not any(
+            parameter.name == "start_new_session"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ):
+            return {}
+    return {"start_new_session": True}
+
+
+def _is_process_group_alive(process_group_id: int) -> bool:
+    if os.name != "posix":
+        return False
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _signal_process_group(process: Any, signal_number: int) -> None:
+    """Signal the session created for a child, falling back to its leader."""
+
+    if os.name == "posix":
+        try:
+            os.killpg(int(process.pid), signal_number)
+            return
+        except ProcessLookupError:
+            if getattr(process, "returncode", None) is not None:
+                return
+        except PermissionError:
+            if process.poll() is not None:
+                return
+    try:
+        process.send_signal(signal_number)
+    except ProcessLookupError:
+        return
+
+
+def _wait_for_subprocess_group_exit(
+    process: subprocess.Popen[Any], timeout: float
+) -> int:
+    deadline = time.monotonic() + timeout
+    while True:
+        return_code = process.poll()
+        is_group_alive = _is_process_group_alive(int(process.pid))
+        if return_code is not None and not is_group_alive:
+            return int(return_code)
+        if time.monotonic() >= deadline:
+            raise TimeoutError
+        time.sleep(_PROCESS_GROUP_POLL_SECONDS)
+
+
+def _terminate_subprocess_group(process: subprocess.Popen[Any]) -> int:
+    """Terminate a native process tree with bounded TERM/KILL escalation."""
+
+    if process.poll() is not None and not _is_process_group_alive(int(process.pid)):
+        return int(process.wait())
+    _signal_process_group(process, signal.SIGTERM)
+    try:
+        return _wait_for_subprocess_group_exit(
+            process, _PROCESS_GROUP_TERM_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        _signal_process_group(process, signal.SIGKILL)
+    try:
+        return _wait_for_subprocess_group_exit(
+            process, _PROCESS_GROUP_KILL_TIMEOUT_SECONDS
+        )
+    except TimeoutError as exc:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        raise RuntimeError("PTG2 Rust process group did not exit after SIGKILL") from exc
+
+
+async def _wait_for_asyncio_subprocess_group_exit(
+    process: asyncio.subprocess.Process, timeout: float
+) -> int:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        return_code = process.returncode
+        is_group_alive = _is_process_group_alive(int(process.pid))
+        if return_code is not None and not is_group_alive:
+            await process.wait()
+            return int(return_code)
+        if loop.time() >= deadline:
+            raise TimeoutError
+        await asyncio.sleep(_PROCESS_GROUP_POLL_SECONDS)
+
+
+async def _terminate_asyncio_subprocess_group(
+    process: asyncio.subprocess.Process,
+) -> int:
+    """Async counterpart of `_terminate_subprocess_group`."""
+
+    if process.returncode is not None and not _is_process_group_alive(int(process.pid)):
+        return int(await process.wait())
+    _signal_process_group(process, signal.SIGTERM)
+    try:
+        return await _wait_for_asyncio_subprocess_group_exit(
+            process, _PROCESS_GROUP_TERM_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        _signal_process_group(process, signal.SIGKILL)
+    try:
+        return await _wait_for_asyncio_subprocess_group_exit(
+            process, _PROCESS_GROUP_KILL_TIMEOUT_SECONDS
+        )
+    except TimeoutError as exc:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+        raise RuntimeError("PTG2 Rust process group did not exit after SIGKILL") from exc
+
+
+async def _await_cancellation_resistant_cleanup(
+    cleanup_task: asyncio.Task[Any],
+) -> Any:
+    """Finish cleanup before re-delivering cancellation to the caller."""
+
+    pending_cancellation: asyncio.CancelledError | None = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as exc:
+            pending_cancellation = exc
+    result = cleanup_task.result()
+    if pending_cancellation is not None:
+        raise pending_cancellation
+    return result
+
+
+async def _cleanup_failed_shared_graph_conversion(
+    *,
+    process: asyncio.subprocess.Process | None,
+    spawn_task: asyncio.Task[asyncio.subprocess.Process],
+    output_directory: Path,
+    manifest_path: Path,
+) -> None:
+    """Reap a converter spawned during cancellation and remove retry blockers."""
+
+    if process is None:
+        try:
+            process = await asyncio.shield(spawn_task)
+        except asyncio.CancelledError:
+            process = None
+        except Exception:
+            process = None
+    try:
+        process_id = getattr(process, "pid", None)
+        is_process_group_alive = bool(
+            process_id is not None
+            and _is_process_group_alive(int(process_id))
+        )
+        if process is not None and (
+            process.returncode is None or is_process_group_alive
+        ):
+            await _terminate_asyncio_subprocess_group(process)
+    finally:
+        shutil.rmtree(output_directory, ignore_errors=True)
+        manifest_path.unlink(missing_ok=True)
+
+
+class _ScannerProcessControl:
+    """Allow another thread to stop and reap a scanner blocked in pipe IO."""
+
+    def __init__(self) -> None:
+        self._state_lock = threading.Lock()
+        self._termination_lock = threading.Lock()
+        self._process: subprocess.Popen[Any] | None = None
+        self._termination_requested = False
+
+    @property
+    def is_termination_requested(self) -> bool:
+        """Return whether cancellation has been requested for this process."""
+
+        with self._state_lock:
+            return self._termination_requested
+
+    def attach(self, process: subprocess.Popen[Any]) -> None:
+        """Attach the spawned scanner and honor any earlier cancellation."""
+
+        with self._state_lock:
+            if self._process is not None:
+                raise RuntimeError("PTG2 scanner process control is already attached")
+            self._process = process
+            should_terminate = self._termination_requested
+        if should_terminate:
+            self.terminate()
+
+    def terminate(self) -> int | None:
+        """Request termination and synchronously reap an attached process."""
+
+        with self._state_lock:
+            self._termination_requested = True
+            process = self._process
+        if process is None:
+            return None
+        with self._termination_lock:
+            return _terminate_subprocess_group(process)
 
 
 def _ptg2_scanner_binary_profile(path: Path) -> str:
@@ -216,7 +438,7 @@ def _shared_graph_artifact_manifest(
         raise RuntimeError(
             f"strict V3 graph artifact byte count does not match {path}"
         )
-    normalized_metadata: dict[str, Any] = {
+    metadata_by_name: dict[str, Any] = {
         "record_format": record_format,
         "sha256": digest.hex(),
         "byte_count": byte_count,
@@ -227,18 +449,18 @@ def _shared_graph_artifact_manifest(
         metadata, "member_global_count", required=False
     )
     if member_global_count is not None:
-        normalized_metadata["member_global_count"] = member_global_count
+        metadata_by_name["member_global_count"] = member_global_count
     for field_name in ("name", "source_shard_id", "shard_id"):
-        value = metadata.get(field_name)
-        if value is None:
+        metadata_value = metadata.get(field_name)
+        if metadata_value is None:
             continue
-        if not isinstance(value, str):
+        if not isinstance(metadata_value, str):
             raise RuntimeError(
                 f"strict V3 graph artifact metadata has invalid {field_name}"
             )
-        normalized_metadata[field_name] = value
+        metadata_by_name[field_name] = metadata_value
     return (
-        {"path": str(path), "metadata": normalized_metadata},
+        {"path": str(path), "metadata": metadata_by_name},
         byte_count,
         member_count,
     )
@@ -267,7 +489,7 @@ def _shared_graph_manifest(
                 "strict V3 shared-graph conversion requires unique shard ids"
             )
         shard_ids.add(shard_id)
-        manifest_shard: dict[str, Any] = {"shard_id": shard_id}
+        shard_manifest_map: dict[str, Any] = {"shard_id": shard_id}
         for field_name in (
             "group_npi",
             "npi_group",
@@ -277,13 +499,13 @@ def _shared_graph_manifest(
             artifact_payload, artifact_bytes, member_count = (
                 _shared_graph_artifact_manifest(getattr(shard, field_name))
             )
-            manifest_shard[field_name] = artifact_payload
+            shard_manifest_map[field_name] = artifact_payload
             input_byte_count += artifact_bytes
             if field_name == "group_npi":
                 group_npi_input_edge_count += member_count
             elif field_name == "group_provider_set":
                 group_provider_set_input_edge_count += member_count
-        manifest_shards.append(manifest_shard)
+        manifest_shards.append(shard_manifest_map)
     return (
         {
             "provider_set_key_map_path": str(provider_set_key_map_path),
@@ -335,21 +557,21 @@ def _shared_graph_metric_object(
 
 
 def _shared_graph_result_from_summary(
-    payload: Any,
+    summary_fields: Any,
     *,
     expected_output_directory: Path,
     expected: _SharedGraphExpected,
 ) -> SharedGraphConversionResult:
     """Validate strict V3 graph outputs and build their conversion result."""
-    if not isinstance(payload, dict) or frozenset(payload) != (
+    if not isinstance(summary_fields, dict) or frozenset(summary_fields) != (
         _V3_SHARED_GRAPH_SUMMARY_FIELDS
     ):
         raise RuntimeError("strict V3 shared-graph summary has incompatible fields")
-    if payload.get("format") != _V3_SHARED_GRAPH_SUMMARY_FORMAT:
+    if summary_fields.get("format") != _V3_SHARED_GRAPH_SUMMARY_FORMAT:
         raise RuntimeError("strict V3 shared-graph summary has incompatible format")
     output_directory = expected_output_directory.resolve()
     for field_name in ("scratch_directory", "output_directory"):
-        raw_path = payload.get(field_name)
+        raw_path = summary_fields.get(field_name)
         if (
             not isinstance(raw_path, str)
             or not Path(raw_path).is_absolute()
@@ -363,36 +585,40 @@ def _shared_graph_result_from_summary(
     observed_names = {path.name for path in output_directory.iterdir()}
     if observed_names != set(_V3_SHARED_GRAPH_OUTPUT_NAMES.values()):
         raise RuntimeError("strict V3 shared-graph output set is incomplete or unexpected")
-    output_paths = {
+    output_path_by_name = {
         field_name: _shared_graph_summary_path(
-            payload,
+            summary_fields,
             field_name,
             expected_path=(output_directory / output_name).resolve(),
         )
         for field_name, output_name in _V3_SHARED_GRAPH_OUTPUT_NAMES.items()
     }
 
-    block_count = _shared_graph_strict_int(payload.get("block_count"), "block_count")
-    owner_count = _shared_graph_strict_int(payload.get("owner_count"), "owner_count")
-    provider_group_count = _shared_graph_strict_int(
-        payload.get("provider_group_count"), "provider_group_count"
+    block_count = _shared_graph_strict_int(
+        summary_fields.get("block_count"), "block_count"
     )
-    npi_count = _shared_graph_strict_int(payload.get("npi_count"), "npi_count")
+    owner_count = _shared_graph_strict_int(
+        summary_fields.get("owner_count"), "owner_count"
+    )
+    provider_group_count = _shared_graph_strict_int(
+        summary_fields.get("provider_group_count"), "provider_group_count"
+    )
+    npi_count = _shared_graph_strict_int(summary_fields.get("npi_count"), "npi_count")
     input_byte_count = _shared_graph_strict_int(
-        payload.get("input_byte_count"), "input_byte_count"
+        summary_fields.get("input_byte_count"), "input_byte_count"
     )
     raw_block_byte_count = _shared_graph_strict_int(
-        payload.get("raw_block_byte_count"), "raw_block_byte_count"
+        summary_fields.get("raw_block_byte_count"), "raw_block_byte_count"
     )
     stored_block_byte_count = _shared_graph_strict_int(
-        payload.get("stored_block_byte_count"), "stored_block_byte_count"
+        summary_fields.get("stored_block_byte_count"), "stored_block_byte_count"
     )
     if input_byte_count != expected.input_byte_count:
         raise RuntimeError("strict V3 shared-graph summary input byte count changed")
     if stored_block_byte_count != raw_block_byte_count:
         raise RuntimeError("strict V3 shared-graph summary has incompatible block storage")
 
-    digest_text = payload.get("support_digest")
+    digest_text = summary_fields.get("support_digest")
     if not isinstance(digest_text, str) or digest_text != digest_text.lower():
         raise RuntimeError("strict V3 shared-graph summary has invalid support_digest")
     try:
@@ -404,7 +630,7 @@ def _shared_graph_result_from_summary(
     if len(support_digest) != 32:
         raise RuntimeError("strict V3 shared-graph summary has invalid support_digest")
 
-    raw_direction_metrics = payload.get("direction_metrics")
+    raw_direction_metrics = summary_fields.get("direction_metrics")
     if not isinstance(raw_direction_metrics, list) or len(raw_direction_metrics) != 4:
         raise RuntimeError("strict V3 shared-graph summary has invalid direction_metrics")
     direction_fields = frozenset(
@@ -490,7 +716,7 @@ def _shared_graph_result_from_summary(
     ):
         raise RuntimeError("strict V3 shared-graph summary block bytes disagree")
 
-    raw_edge_metrics = payload.get("edge_metrics")
+    raw_edge_metrics = summary_fields.get("edge_metrics")
     if not isinstance(raw_edge_metrics, list) or len(raw_edge_metrics) != 2:
         raise RuntimeError("strict V3 shared-graph summary has invalid edge_metrics")
     edge_fields = frozenset(
@@ -501,7 +727,7 @@ def _shared_graph_result_from_summary(
             "duplicate_edge_count",
         }
     )
-    expected_edge_inputs = {
+    expected_edge_count_by_kind = {
         "group_npi": expected.group_npi_input_edge_count,
         "group_provider_set": expected.group_provider_set_input_edge_count,
     }
@@ -514,7 +740,7 @@ def _shared_graph_result_from_summary(
             expected_fields=edge_fields,
         )
         edge_kind = metric.get("edge_kind")
-        if not isinstance(edge_kind, str) or edge_kind not in expected_edge_inputs:
+        if not isinstance(edge_kind, str) or edge_kind not in expected_edge_count_by_kind:
             raise RuntimeError("strict V3 shared-graph summary has invalid edge kind")
         if edge_kind in seen_edge_kinds:
             raise RuntimeError("strict V3 shared-graph summary repeats an edge kind")
@@ -529,7 +755,7 @@ def _shared_graph_result_from_summary(
             metric.get("duplicate_edge_count"), "edge duplicate_edge_count"
         )
         if (
-            metric_input_count != expected_edge_inputs[edge_kind]
+            metric_input_count != expected_edge_count_by_kind[edge_kind]
             or metric_input_count != unique_edge_count + duplicate_edge_count
         ):
             raise RuntimeError("strict V3 shared-graph summary edge counts disagree")
@@ -542,7 +768,7 @@ def _shared_graph_result_from_summary(
             )
         )
     edge_metrics.sort(key=lambda metric: metric.edge_kind)
-    if seen_edge_kinds != set(expected_edge_inputs):
+    if seen_edge_kinds != set(expected_edge_count_by_kind):
         raise RuntimeError("strict V3 shared-graph summary omits an edge kind")
 
     integrity_fields = frozenset(
@@ -558,11 +784,11 @@ def _shared_graph_result_from_summary(
         }
     )
     raw_integrity = _shared_graph_metric_object(
-        payload.get("integrity"),
+        summary_fields.get("integrity"),
         field_name="integrity",
         expected_fields=integrity_fields,
     )
-    integrity_values = {
+    integrity_value_by_name = {
         field_name: _shared_graph_strict_int(
             raw_integrity.get(field_name), f"integrity {field_name}"
         )
@@ -571,7 +797,7 @@ def _shared_graph_result_from_summary(
     edge_input_count = sum(metric.input_edge_count for metric in edge_metrics)
     unique_edge_count = sum(metric.unique_edge_count for metric in edge_metrics)
     duplicate_edge_count = sum(metric.duplicate_edge_count for metric in edge_metrics)
-    expected_integrity = {
+    expected_integrity_by_name = {
         "shard_count": expected.shard_count,
         "artifact_count": expected.shard_count * 4,
         "checksum_byte_count": expected.input_byte_count,
@@ -581,16 +807,16 @@ def _shared_graph_result_from_summary(
         "unique_edge_count": unique_edge_count,
         "duplicate_edge_count": duplicate_edge_count,
     }
-    if integrity_values != expected_integrity:
+    if integrity_value_by_name != expected_integrity_by_name:
         raise RuntimeError("strict V3 shared-graph summary integrity counts disagree")
 
-    fixed_file_sizes = {
+    fixed_file_size_by_name = {
         "owner_spool_path": owner_count * 25,
         "group_map_path": provider_group_count * 20,
         "reference_path": block_count * 57,
     }
-    for field_name, expected_size in fixed_file_sizes.items():
-        if output_paths[field_name].stat().st_size != expected_size:
+    for field_name, expected_size in fixed_file_size_by_name.items():
+        if output_path_by_name[field_name].stat().st_size != expected_size:
             raise RuntimeError(
                 f"strict V3 shared-graph output has invalid {field_name} size"
             )
@@ -600,23 +826,23 @@ def _shared_graph_result_from_summary(
         "group_copy_path",
         "npi_copy_path",
     ):
-        if output_paths[field_name].stat().st_size < 21:
+        if output_path_by_name[field_name].stat().st_size < 21:
             raise RuntimeError(
                 f"strict V3 shared-graph output has invalid {field_name} size"
             )
-    if block_count and output_paths["block_spool_path"].stat().st_size <= 0:
+    if block_count and output_path_by_name["block_spool_path"].stat().st_size <= 0:
         raise RuntimeError("strict V3 shared-graph block spool is empty")
 
     return SharedGraphConversionResult(
         scratch_directory=output_directory,
-        block_copy_path=output_paths["block_copy_path"],
-        owner_copy_path=output_paths["owner_copy_path"],
-        group_copy_path=output_paths["group_copy_path"],
-        npi_copy_path=output_paths["npi_copy_path"],
-        block_spool_path=output_paths["block_spool_path"],
-        owner_spool_path=output_paths["owner_spool_path"],
-        group_map_path=output_paths["group_map_path"],
-        reference_path=output_paths["reference_path"],
+        block_copy_path=output_path_by_name["block_copy_path"],
+        owner_copy_path=output_path_by_name["owner_copy_path"],
+        group_copy_path=output_path_by_name["group_copy_path"],
+        npi_copy_path=output_path_by_name["npi_copy_path"],
+        block_spool_path=output_path_by_name["block_spool_path"],
+        owner_spool_path=output_path_by_name["owner_spool_path"],
+        group_map_path=output_path_by_name["group_map_path"],
+        reference_path=output_path_by_name["reference_path"],
         block_count=block_count,
         owner_count=owner_count,
         provider_group_count=provider_group_count,
@@ -627,7 +853,7 @@ def _shared_graph_result_from_summary(
         input_byte_count=input_byte_count,
         raw_block_byte_count=raw_block_byte_count,
         stored_block_byte_count=stored_block_byte_count,
-        integrity=SharedGraphIntegrityMetrics(**integrity_values),
+        integrity=SharedGraphIntegrityMetrics(**integrity_value_by_name),
     )
 
 
@@ -683,53 +909,57 @@ def _strict_non_negative_int(value: Any, field_name: str) -> int:
 
 
 def _validated_v3_file_frame(
-    payload: Any,
+    frame_fields: Any,
     *,
     label: str,
     fields: tuple[str, ...],
     expected_format: str,
     expected_version: int,
 ) -> dict[str, Any]:
-    if not isinstance(payload, dict):
+    if not isinstance(frame_fields, dict):
         raise RuntimeError(f"strict V3 scanner emitted invalid {label} frame")
-    normalized = {field_name: payload.get(field_name) for field_name in fields}
-    raw_path = str(normalized.get("path") or "").strip()
+    field_by_name = {
+        field_name: frame_fields.get(field_name) for field_name in fields
+    }
+    raw_path = str(field_by_name.get("path") or "").strip()
     if not raw_path:
         raise RuntimeError(f"strict V3 scanner emitted {label} without a path")
-    if str(normalized.get("format") or "") != expected_format:
+    if str(field_by_name.get("format") or "") != expected_format:
         raise RuntimeError(f"strict V3 scanner emitted incompatible {label} format")
-    if _strict_non_negative_int(normalized.get("version"), f"{label} version") != int(
-        expected_version
-    ):
+    if _strict_non_negative_int(
+        field_by_name.get("version"), f"{label} version"
+    ) != int(expected_version):
         raise RuntimeError(f"strict V3 scanner emitted incompatible {label} version")
     row_count = _strict_non_negative_int(
-        normalized.get("row_count"), f"{label} row_count"
+        field_by_name.get("row_count"), f"{label} row_count"
     )
-    byte_count = _strict_non_negative_int(normalized.get("bytes"), f"{label} bytes")
+    byte_count = _strict_non_negative_int(
+        field_by_name.get("bytes"), f"{label} bytes"
+    )
     if row_count <= 0 or byte_count <= 0:
         raise RuntimeError(f"strict V3 scanner emitted empty {label} metadata")
-    if "partition" in normalized:
+    if "partition" in field_by_name:
         partition = _strict_non_negative_int(
-            normalized.get("partition"), f"{label} partition"
+            field_by_name.get("partition"), f"{label} partition"
         )
         partition_count = _strict_non_negative_int(
-            normalized.get("partition_count"), f"{label} partition_count"
+            field_by_name.get("partition_count"), f"{label} partition_count"
         )
         if partition_count <= 0 or partition >= partition_count:
             raise RuntimeError(f"strict V3 scanner emitted invalid {label} partition")
-    return normalized
+    return field_by_name
 
 
 def _validate_v3_scanner_config(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise RuntimeError("strict V3 scanner emitted invalid scanner_config")
-    required = {
+    required_value_by_name = {
         "snapshot_arch": "postgres_binary_v3",
         "storage_generation": PTG2_V3_SHARED_GENERATION,
         "serving_row_semantics": "source_multiset_v1",
         "serving_run_format": _V3_SERVING_RUN_FORMAT,
     }
-    for field_name, expected in required.items():
+    for field_name, expected in required_value_by_name.items():
         if str(payload.get(field_name) or "") != expected:
             raise RuntimeError(
                 f"strict V3 scanner_config has incompatible {field_name}"
@@ -843,14 +1073,18 @@ async def convert_v3_provider_membership_shards_to_shared_graph_rust(
         os.fsync(manifest_file.fileno())
 
     process: asyncio.subprocess.Process | None = None
-    try:
-        process = await asyncio.create_subprocess_exec(
+    spawn_task = asyncio.create_task(
+        asyncio.create_subprocess_exec(
             str(binary),
             "--convert-shared-graph",
             str(manifest_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **_subprocess_session_options(asyncio.create_subprocess_exec),
         )
+    )
+    try:
+        process = await asyncio.shield(spawn_task)
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
             stderr_tail = stderr.decode("utf-8", errors="replace")[-2000:]
@@ -866,16 +1100,23 @@ async def convert_v3_provider_membership_shards_to_shared_graph_rust(
                 "PTG2 native shared-graph converter stderr: %s",
                 stderr.decode("utf-8", errors="replace")[-2000:],
             )
-        return _parse_shared_graph_summary_frame(
+        conversion_result = _parse_shared_graph_summary_frame(
             stdout,
             expected_output_directory=output,
             expected=expected,
         )
+        manifest_path.unlink()
+        return conversion_result
     except BaseException:
-        if process is not None and process.returncode is None:
-            process.kill()
-            await process.wait()
-        shutil.rmtree(output, ignore_errors=True)
+        cleanup_task = asyncio.create_task(
+            _cleanup_failed_shared_graph_conversion(
+                process=process,
+                spawn_task=spawn_task,
+                output_directory=output,
+                manifest_path=manifest_path,
+            )
+        )
+        await _await_cancellation_resistant_cleanup(cleanup_task)
         raise
 
 
@@ -886,15 +1127,15 @@ def _scanner_error_message(prefix: str, return_code: int, stderr_tail: list[str]
 def _scanner_progress_fields(line: str) -> dict[str, str] | None:
     if not line.startswith(_SCANNER_PROGRESS_PREFIX):
         return None
-    fields: dict[str, str] = {}
+    field_by_name: dict[str, str] = {}
     for part in line[len(_SCANNER_PROGRESS_PREFIX):].split("\t"):
         if "=" not in part:
             continue
         key, value = part.split("=", 1)
         key = key.strip()
         if key:
-            fields[key] = value.strip()
-    return fields
+            field_by_name[key] = value.strip()
+    return field_by_name
 
 
 def _coerce_progress_int(value: Any) -> int | None:
@@ -1019,10 +1260,10 @@ def _emit_scanner_live_progress(
     if not fields:
         return
     progress = _parse_scanner_progress(fields)
-    context = {
-        key: value
-        for key, value in (live_progress_context or {}).items()
-        if value not in (None, "")
+    progress_context_map = {
+        context_key: context_value
+        for context_key, context_value in (live_progress_context or {}).items()
+        if context_value not in (None, "")
     }
     use_object_progress = bool(
         not progress.is_done
@@ -1033,13 +1274,15 @@ def _emit_scanner_live_progress(
     phase_pct = None if use_object_progress else progress.percent
     overall_pct = _scale_stage_progress_pct(
         phase_pct,
-        context.get("overall_progress_start_pct"),
-        context.get("overall_progress_end_pct"),
+        progress_context_map.get("overall_progress_start_pct"),
+        progress_context_map.get("overall_progress_end_pct"),
     )
     pct = overall_pct if overall_pct is not None else phase_pct
     object_rate = None
     if use_object_progress:
-        pct = _coerce_progress_float(context.get("overall_progress_start_pct"))
+        pct = _coerce_progress_float(
+            progress_context_map.get("overall_progress_start_pct")
+        )
         message, object_rate = _scanner_object_progress_message(
             phase,
             progress.scanner_object_count_by_kind,
@@ -1069,7 +1312,7 @@ def _emit_scanner_live_progress(
         progress_total = progress.total_bytes
         progress_eta = progress.eta_seconds
     progress_value_by_field: dict[str, Any] = {
-        **context,
+        **progress_context_map,
         "phase": phase,
         "unit": progress_unit,
         "done": progress_done,
@@ -1174,9 +1417,12 @@ def _iter_top_level_object_bytes_rust(
         [str(binary), str(path), *sorted(array_names)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        **_subprocess_session_options(subprocess.Popen),
     )
+    process_control = _ScannerProcessControl()
+    process_control.attach(process)
     assert process.stdout is not None
-    stderr_tail: list[str] = []
+    stderr_lines: list[str] = []
     stderr_thread: threading.Thread | None = None
     if process.stderr is not None:
 
@@ -1186,9 +1432,9 @@ def _iter_top_level_object_bytes_rust(
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
-                stderr_tail.append(line)
-                if len(stderr_tail) > 20:
-                    del stderr_tail[:-20]
+                stderr_lines.append(line)
+                if len(stderr_lines) > 20:
+                    del stderr_lines[:-20]
                 if line.startswith(_SCANNER_PROGRESS_PREFIX):
                     _emit_screen_line(line)
                     logger.info(line)
@@ -1206,7 +1452,7 @@ def _iter_top_level_object_bytes_rust(
             daemon=True,
         )
         stderr_thread.start()
-    terminated_by_consumer = False
+    is_terminated_by_consumer = False
     try:
         while True:
             header = process.stdout.readline()
@@ -1217,26 +1463,24 @@ def _iter_top_level_object_bytes_rust(
                 payload_len = int(length_bytes)
             except Exception as exc:
                 raise RuntimeError(f"Invalid PTG2 Rust scanner frame header: {header!r}") from exc
-            payload = _read_exactly(process.stdout, payload_len)
-            if len(payload) != payload_len:
+            frame_bytes = _read_exactly(process.stdout, payload_len)
+            if len(frame_bytes) != payload_len:
                 raise RuntimeError("PTG2 Rust scanner ended mid-frame")
             trailer = process.stdout.read(1)
             if trailer not in {b"", b"\n"}:
                 raise RuntimeError("Invalid PTG2 Rust scanner frame trailer")
-            yield name_bytes.decode("utf-8"), payload
+            yield name_bytes.decode("utf-8"), frame_bytes
     finally:
         if process.poll() is None:
-            terminated_by_consumer = True
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            is_terminated_by_consumer = True
+            process_control.terminate()
         return_code = process.wait()
         if stderr_thread is not None:
-            stderr_thread.join(timeout=2)
-        if return_code != 0 and not terminated_by_consumer:
-            raise RuntimeError(_scanner_error_message("PTG2 Rust scanner", return_code, stderr_tail))
+            stderr_thread.join()
+        if return_code != 0 and not is_terminated_by_consumer:
+            raise RuntimeError(
+                _scanner_error_message("PTG2 Rust scanner", return_code, stderr_lines)
+            )
 
 
 def _iter_compact_serving_records_rust(
@@ -1273,6 +1517,7 @@ def _iter_compact_serving_records_rust(
     source_network_names: list[str] | tuple[str, ...] | set[str] | None = None,
     manifest_only: bool | None = None,
     live_progress_context: dict[str, Any] | None = None,
+    _process_control: _ScannerProcessControl | None = None,
 ):
     """Run the Rust compact scanner and yield validated decoded record frames."""
     binary = _ptg2_rust_scanner_binary()
@@ -1284,7 +1529,7 @@ def _iter_compact_serving_records_rust(
     _log_ptg2_rust_scanner_binary(binary)
     if live_progress_context is None:
         live_progress_context = current_live_progress_context()
-    env = {
+    scanner_environment_map = {
         **os.environ,
         "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v3",
         "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": snapshot_id,
@@ -1294,68 +1539,124 @@ def _iter_compact_serving_records_rust(
         "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": source_trace_set_hash,
         "HLTHPRT_PTG2_COMPACT_CONFIDENCE_CODE": confidence_code,
     }
-    env.pop("HLTHPRT_PTG2_SOURCE_NETWORK_NAMES_JSON", None)
+    scanner_environment_map.pop("HLTHPRT_PTG2_SOURCE_NETWORK_NAMES_JSON", None)
     if compact_copy_path is not None:
-        env["HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH"] = str(compact_copy_path)
+        scanner_environment_map["HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH"] = str(
+            compact_copy_path
+        )
     if procedure_copy_path is not None:
-        env["HLTHPRT_PTG2_PROCEDURE_COPY_PATH"] = str(procedure_copy_path)
+        scanner_environment_map["HLTHPRT_PTG2_PROCEDURE_COPY_PATH"] = str(
+            procedure_copy_path
+        )
     if price_code_set_copy_path is not None:
-        env["HLTHPRT_PTG2_PRICE_CODE_SET_COPY_PATH"] = str(price_code_set_copy_path)
+        scanner_environment_map["HLTHPRT_PTG2_PRICE_CODE_SET_COPY_PATH"] = str(
+            price_code_set_copy_path
+        )
     if price_atom_copy_path is not None:
-        env["HLTHPRT_PTG2_PRICE_ATOM_COPY_PATH"] = str(price_atom_copy_path)
+        scanner_environment_map["HLTHPRT_PTG2_PRICE_ATOM_COPY_PATH"] = str(
+            price_atom_copy_path
+        )
     if price_set_entry_copy_path is not None:
-        env["HLTHPRT_PTG2_PRICE_SET_ENTRY_COPY_PATH"] = str(price_set_entry_copy_path)
+        scanner_environment_map["HLTHPRT_PTG2_PRICE_SET_ENTRY_COPY_PATH"] = str(
+            price_set_entry_copy_path
+        )
     if provider_set_copy_path is not None:
-        env["HLTHPRT_PTG2_PROVIDER_SET_COPY_PATH"] = str(provider_set_copy_path)
+        scanner_environment_map["HLTHPRT_PTG2_PROVIDER_SET_COPY_PATH"] = str(
+            provider_set_copy_path
+        )
     if provider_group_member_copy_path is not None:
-        env["HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH"] = str(provider_group_member_copy_path)
+        scanner_environment_map["HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH"] = str(
+            provider_group_member_copy_path
+        )
     if provider_set_component_copy_path is not None:
-        env["HLTHPRT_PTG2_PROVIDER_SET_COMPONENT_COPY_PATH"] = str(provider_set_component_copy_path)
+        scanner_environment_map["HLTHPRT_PTG2_PROVIDER_SET_COMPONENT_COPY_PATH"] = str(
+            provider_set_component_copy_path
+        )
     if provider_set_entry_copy_path is not None:
-        env["HLTHPRT_PTG2_PROVIDER_SET_ENTRY_COPY_PATH"] = str(provider_set_entry_copy_path)
+        scanner_environment_map["HLTHPRT_PTG2_PROVIDER_SET_ENTRY_COPY_PATH"] = str(
+            provider_set_entry_copy_path
+        )
     if provider_entry_component_copy_path is not None:
-        env["HLTHPRT_PTG2_PROVIDER_ENTRY_COMPONENT_COPY_PATH"] = str(provider_entry_component_copy_path)
+        scanner_environment_map["HLTHPRT_PTG2_PROVIDER_ENTRY_COMPONENT_COPY_PATH"] = str(
+            provider_entry_component_copy_path
+        )
     if manifest_serving_copy_path is not None:
-        env["HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH"] = str(manifest_serving_copy_path)
+        scanner_environment_map["HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH"] = str(
+            manifest_serving_copy_path
+        )
     if manifest_lean_serving_copy_path is not None:
-        env["HLTHPRT_PTG2_MANIFEST_LEAN_SERVING_COPY_PATH"] = str(manifest_lean_serving_copy_path)
+        scanner_environment_map["HLTHPRT_PTG2_MANIFEST_LEAN_SERVING_COPY_PATH"] = str(
+            manifest_lean_serving_copy_path
+        )
     if v3_serving_run_directory is None:
         raise RuntimeError("strict V3 scanner requires an explicit serving-run directory")
-    env["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"] = str(v3_serving_run_directory)
+    scanner_environment_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"] = str(
+        v3_serving_run_directory
+    )
     if manifest_provider_forward_sidecar_path is not None:
-        env["HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH"] = str(manifest_provider_forward_sidecar_path)
+        scanner_environment_map[
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH"
+        ] = str(manifest_provider_forward_sidecar_path)
     if manifest_provider_inverted_sidecar_path is not None:
-        env["HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH"] = str(manifest_provider_inverted_sidecar_path)
+        scanner_environment_map[
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH"
+        ] = str(manifest_provider_inverted_sidecar_path)
     if manifest_provider_npi_sidecar_path is not None:
-        env["HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_PATH"] = str(manifest_provider_npi_sidecar_path)
-    if manifest_price_forward_sidecar_path is not None:
-        env["HLTHPRT_PTG2_MANIFEST_PRICE_FORWARD_SIDECAR_PATH"] = str(manifest_price_forward_sidecar_path)
-    if manifest_price_atom_copy_path is not None:
-        env["HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH"] = str(manifest_price_atom_copy_path)
-    if manifest_price_set_atom_copy_path is not None:
-        env["HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH"] = str(manifest_price_set_atom_copy_path)
-    if manifest_provider_group_member_copy_path is not None:
-        env["HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH"] = str(manifest_provider_group_member_copy_path)
-    if manifest_code_count_copy_path is not None:
-        env["HLTHPRT_PTG2_MANIFEST_CODE_COUNT_COPY_PATH"] = str(manifest_code_count_copy_path)
-    if manifest_provider_set_dictionary_copy_path is not None:
-        env["HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COPY_PATH"] = str(
-            manifest_provider_set_dictionary_copy_path
+        scanner_environment_map["HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_PATH"] = str(
+            manifest_provider_npi_sidecar_path
         )
+    if manifest_price_forward_sidecar_path is not None:
+        scanner_environment_map[
+            "HLTHPRT_PTG2_MANIFEST_PRICE_FORWARD_SIDECAR_PATH"
+        ] = str(manifest_price_forward_sidecar_path)
+    if manifest_price_atom_copy_path is not None:
+        scanner_environment_map["HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH"] = str(
+            manifest_price_atom_copy_path
+        )
+    if manifest_price_set_atom_copy_path is not None:
+        scanner_environment_map[
+            "HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH"
+        ] = str(manifest_price_set_atom_copy_path)
+    if manifest_provider_group_member_copy_path is not None:
+        scanner_environment_map[
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH"
+        ] = str(manifest_provider_group_member_copy_path)
+    if manifest_code_count_copy_path is not None:
+        scanner_environment_map["HLTHPRT_PTG2_MANIFEST_CODE_COUNT_COPY_PATH"] = str(
+            manifest_code_count_copy_path
+        )
+    if manifest_provider_set_dictionary_copy_path is not None:
+        scanner_environment_map[
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COPY_PATH"
+        ] = str(manifest_provider_set_dictionary_copy_path)
     if manifest_only is not None:
-        env["HLTHPRT_PTG2_MANIFEST_ONLY"] = "true" if manifest_only else "false"
-    env.setdefault(PTG2_RUST_WORKERS_ENV, str(PTG2_DEFAULT_RUST_WORKERS))
-    env.setdefault(PTG2_RUST_WORK_QUEUE_ENV, str(PTG2_DEFAULT_RUST_WORK_QUEUE))
-    env.setdefault(PTG2_RUST_EVENT_QUEUE_ENV, str(PTG2_DEFAULT_RUST_EVENT_QUEUE))
-    env.setdefault(PTG2_RUST_SPLIT_NEGOTIATED_RATES_ENV, str(PTG2_DEFAULT_RUST_SPLIT_NEGOTIATED_RATES))
+        scanner_environment_map["HLTHPRT_PTG2_MANIFEST_ONLY"] = (
+            "true" if manifest_only else "false"
+        )
+    scanner_environment_map.setdefault(
+        PTG2_RUST_WORKERS_ENV, str(PTG2_DEFAULT_RUST_WORKERS)
+    )
+    scanner_environment_map.setdefault(
+        PTG2_RUST_WORK_QUEUE_ENV, str(PTG2_DEFAULT_RUST_WORK_QUEUE)
+    )
+    scanner_environment_map.setdefault(
+        PTG2_RUST_EVENT_QUEUE_ENV, str(PTG2_DEFAULT_RUST_EVENT_QUEUE)
+    )
+    scanner_environment_map.setdefault(
+        PTG2_RUST_SPLIT_NEGOTIATED_RATES_ENV,
+        str(PTG2_DEFAULT_RUST_SPLIT_NEGOTIATED_RATES),
+    )
+    process_control = _process_control or _ScannerProcessControl()
     process = subprocess.Popen(
         [str(binary), "--compact-serving", str(path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=env,
+        env=scanner_environment_map,
+        **_subprocess_session_options(subprocess.Popen),
     )
+    process_control.attach(process)
     assert process.stdout is not None
-    stderr_tail: list[str] = []
+    stderr_lines: list[str] = []
     stderr_thread: threading.Thread | None = None
     if process.stderr is not None:
 
@@ -1365,9 +1666,9 @@ def _iter_compact_serving_records_rust(
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
-                stderr_tail.append(line)
-                if len(stderr_tail) > 20:
-                    del stderr_tail[:-20]
+                stderr_lines.append(line)
+                if len(stderr_lines) > 20:
+                    del stderr_lines[:-20]
                 if (
                     line.startswith(_SCANNER_PROGRESS_PREFIX)
                     or line.startswith("PTG2_DEDUPE_SUMMARY\t")
@@ -1390,7 +1691,7 @@ def _iter_compact_serving_records_rust(
             daemon=True,
         )
         stderr_thread.start()
-    terminated_by_consumer = False
+    is_terminated_by_consumer = False
     has_frame_stream_failure = False
     has_stdout_terminal_summary = False
     has_scanner_config = False
@@ -1407,8 +1708,8 @@ def _iter_compact_serving_records_rust(
                 payload_len = int(length_bytes)
             except Exception as exc:
                 raise RuntimeError(f"Invalid PTG2 Rust compact frame header: {header!r}") from exc
-            payload = _read_exactly(process.stdout, payload_len)
-            if len(payload) != payload_len:
+            frame_bytes = _read_exactly(process.stdout, payload_len)
+            if len(frame_bytes) != payload_len:
                 has_frame_stream_failure = True
                 try:
                     frame_return_code = process.wait(timeout=2)
@@ -1417,22 +1718,22 @@ def _iter_compact_serving_records_rust(
                     frame_process_status = "still running after stdout closed"
                 if stderr_thread is not None:
                     stderr_thread.join(timeout=2)
-                stderr_detail = chr(10).join(stderr_tail)[-1000:]
+                stderr_detail = chr(10).join(stderr_lines)[-1000:]
                 raise RuntimeError(
                     "PTG2 Rust compact scanner ended mid-frame "
                     f"kind={name_bytes.decode('utf-8', errors='replace')} "
-                    f"expected_bytes={payload_len} received_bytes={len(payload)} "
+                    f"expected_bytes={payload_len} received_bytes={len(frame_bytes)} "
                     f"process={frame_process_status}: {stderr_detail}"
                 )
             trailer = process.stdout.read(1)
             if trailer not in {b"", b"\n"}:
                 raise RuntimeError("Invalid PTG2 Rust compact scanner frame trailer")
             record_kind = name_bytes.decode("utf-8")
-            record_payload = _json_loads(payload)
+            frame_field_map = _json_loads(frame_bytes)
             if record_kind == "v3_serving_run_partition_file":
                 serving_run_partition_files.append(
                     _validated_v3_file_frame(
-                        record_payload,
+                        frame_field_map,
                         label="serving-run partition",
                         fields=(
                             "path",
@@ -1450,17 +1751,17 @@ def _iter_compact_serving_records_rust(
             elif record_kind == "v3_serving_code_dictionary_file":
                 serving_run_code_dictionary_files.append(
                     _validated_v3_file_frame(
-                        record_payload,
+                        frame_field_map,
                         label="code-dictionary",
                         fields=("path", "row_count", "bytes", "format", "version"),
                         expected_format=_V3_CODE_DICTIONARY_FORMAT,
                         expected_version=_V3_CODE_DICTIONARY_VERSION,
                     )
                 )
-            elif record_kind == "scanner_summary" and isinstance(record_payload, dict):
+            elif record_kind == "scanner_summary" and isinstance(frame_field_map, dict):
                 has_scanner_summary = True
-                record_payload = {
-                    **record_payload,
+                frame_field_map = {
+                    **frame_field_map,
                     "serving_run_partition_files": list(serving_run_partition_files),
                     "serving_run_code_dictionary_files": list(
                         serving_run_code_dictionary_files
@@ -1469,43 +1770,48 @@ def _iter_compact_serving_records_rust(
             elif record_kind == "scanner_summary":
                 raise RuntimeError("strict V3 scanner emitted invalid scanner_summary")
             elif record_kind == "scanner_config":
-                record_payload = _validate_v3_scanner_config(record_payload)
+                frame_field_map = _validate_v3_scanner_config(frame_field_map)
                 has_scanner_config = True
             if record_kind in {"dedupe_summary", "scanner_summary"}:
                 has_stdout_terminal_summary = True
-            if record_kind in _SCANNER_METRIC_RECORD_KINDS and isinstance(record_payload, dict):
+            if record_kind in _SCANNER_METRIC_RECORD_KINDS and isinstance(
+                frame_field_map, dict
+            ):
                 _emit_scanner_metric_progress(
                     record_kind,
-                    record_payload,
+                    frame_field_map,
                     live_progress_context=live_progress_context,
                 )
-            yield record_kind, record_payload
+            yield record_kind, frame_field_map
         if not has_scanner_config or not has_scanner_summary:
             raise RuntimeError(
                 "strict V3 scanner completed without its required config and summary frames"
             )
     finally:
+        is_terminated_by_consumer = (
+            is_terminated_by_consumer or process_control.is_termination_requested
+        )
         if process.poll() is None:
-            terminated_by_consumer = True
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            is_terminated_by_consumer = True
+            process_control.terminate()
         return_code = process.wait()
         if stderr_thread is not None:
-            stderr_thread.join(timeout=2)
+            stderr_thread.join()
         if (
             return_code != 0
-            and not terminated_by_consumer
+            and not is_terminated_by_consumer
             and not has_frame_stream_failure
             and not _is_scanner_sigterm_after_dedupe(
                 return_code,
-                stderr_tail,
+                stderr_lines,
                 has_stdout_terminal_summary=has_stdout_terminal_summary,
             )
         ):
-            raise RuntimeError(_scanner_error_message("PTG2 Rust compact scanner", return_code, stderr_tail))
+            raise RuntimeError(
+                _scanner_error_message(
+                    "PTG2 Rust compact scanner", return_code, stderr_lines
+                )
+            )
 
 
 async def _aiter_compact_serving_records_rust(
@@ -1544,6 +1850,7 @@ async def _aiter_compact_serving_records_rust(
 ):
     """Yield compact scanner records asynchronously through a bounded queue."""
     live_progress_context = current_live_progress_context()
+    process_control = _ScannerProcessControl()
     iterator = _iter_compact_serving_records_rust(
         path,
         snapshot_id=snapshot_id,
@@ -1577,21 +1884,50 @@ async def _aiter_compact_serving_records_rust(
         source_network_names=source_network_names,
         manifest_only=manifest_only,
         live_progress_context=live_progress_context,
+        _process_control=process_control,
     )
     event_queue: queue.Queue[Any] = queue.Queue(
         maxsize=max(_env_int(PTG2_RUST_EVENT_QUEUE_ENV, PTG2_DEFAULT_RUST_EVENT_QUEUE), 1)
     )
     sentinel = object()
+    reader_stop = threading.Event()
+    event_ready = asyncio.Event()
+    event_loop = asyncio.get_running_loop()
+
+    def notify_event_ready() -> None:
+        """Wake the async consumer when the reader thread publishes an event."""
+
+        try:
+            event_loop.call_soon_threadsafe(event_ready.set)
+        except RuntimeError:
+            return
+
+    def has_enqueued_reader_event(scanner_event: Any) -> bool:
+        """Enqueue one event unless shutdown has already stopped the reader."""
+
+        while not reader_stop.is_set():
+            try:
+                event_queue.put(
+                    scanner_event,
+                    timeout=_ASYNC_READER_QUEUE_PUT_TIMEOUT_SECONDS,
+                )
+            except queue.Full:
+                continue
+            notify_event_ready()
+            return True
+        return False
 
     def read_records() -> None:
         """Forward records or failures to the queue, followed by a sentinel."""
         try:
-            for item in iterator:
-                event_queue.put(item)
+            for scanner_event in iterator:
+                if not has_enqueued_reader_event(scanner_event):
+                    break
         except BaseException as exc:
-            event_queue.put(exc)
+            has_enqueued_reader_event(exc)
         finally:
-            event_queue.put(sentinel)
+            has_enqueued_reader_event(sentinel)
+            notify_event_ready()
 
     reader_thread = threading.Thread(
         target=read_records,
@@ -1599,24 +1935,54 @@ async def _aiter_compact_serving_records_rust(
         daemon=True,
     )
     reader_thread.start()
+    is_reader_complete = False
+
+    def close_iterator() -> None:
+        """Close the scanner iterator once it is no longer executing."""
+
+        close = getattr(iterator, "close", None)
+        if close is None:
+            return
+        try:
+            close()
+        except ValueError as exc:
+            if "generator already executing" not in str(exc):
+                raise
+
+    def complete_reader_cleanup() -> None:
+        """Terminate, close, and join every reader-side resource in order."""
+
+        try:
+            if not is_reader_complete:
+                process_control.terminate()
+        finally:
+            try:
+                close_iterator()
+            finally:
+                try:
+                    reader_thread.join()
+                finally:
+                    close_iterator()
+
     try:
         while True:
-            item = await asyncio.to_thread(event_queue.get)
-            if item is sentinel:
+            event_ready.clear()
+            try:
+                scanner_event = event_queue.get_nowait()
+            except queue.Empty:
+                await event_ready.wait()
+                continue
+            if scanner_event is sentinel:
+                is_reader_complete = True
                 break
-            if isinstance(item, BaseException):
-                raise item
-            yield item
+            if isinstance(scanner_event, BaseException):
+                raise scanner_event
+            yield scanner_event
     finally:
-        if reader_thread.is_alive():
-            close = getattr(iterator, "close", None)
-            if close is not None:
-                try:
-                    await asyncio.to_thread(close)
-                except ValueError as exc:
-                    if "generator already executing" not in str(exc):
-                        raise
-            reader_thread.join(timeout=5)
+        reader_stop.set()
+        event_ready.set()
+        cleanup_task = asyncio.create_task(asyncio.to_thread(complete_reader_cleanup))
+        await _await_cancellation_resistant_cleanup(cleanup_task)
 
 
 def _scanner_return_code_label(return_code: int) -> str:
@@ -1624,8 +1990,6 @@ def _scanner_return_code_label(return_code: int) -> str:
         return f"exit code {return_code}"
     signal_number = -return_code
     try:
-        import signal
-
         signal_name = signal.Signals(signal_number).name
     except ValueError:
         return f"signal {signal_number}"

@@ -34,7 +34,10 @@ from process.ptg_parts.ptg2_shared_blocks import (
     reserve_shared_layout,
     shared_semantic_fingerprint,
 )
-from process.ptg_parts.ptg2_shared_finalize import attach_v3_source_run_contract
+from process.ptg_parts.ptg2_shared_finalize import (
+    attach_v3_dictionary_contract,
+    attach_v3_source_run_contract,
+)
 from process.ptg_parts.ptg2_shared_graph import (
     PTG2_V3_GRAPH_GROUP_TO_NPI,
     PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
@@ -212,11 +215,20 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         logical_json_sha256="a" * 64,
         logical_hash_deferred=False,
     )
+    scanner_summary = scanner_tests._single_frame(scan["frames"], "scanner_summary")
     serving_run_entries = attach_v3_source_run_contract(
         scan["partition_frames"],
         source_identity=source_identity,
-        scanner_summary=scanner_tests._single_frame(scan["frames"], "scanner_summary"),
+        scanner_summary=scanner_summary,
         scanner_config=scanner_tests._single_frame(scan["frames"], "scanner_config"),
+    )
+    code_dictionary_entries = attach_v3_dictionary_contract(
+        scan["code_dictionary_frames"],
+        source_identity=source_identity,
+        source_run_contract_sha256=serving_run_entries[0][
+            "source_run_contract_sha256"
+        ],
+        scanner_summary=scanner_summary,
     )
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
@@ -226,7 +238,13 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
     )
     monkeypatch.setenv("HLTHPRT_PTG2_BINARY_IDS", "true")
     monkeypatch.setenv("HLTHPRT_PTG2_RUST_SCANNER_BIN", str(scanner_binary))
-    monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_MEMORY_RECORDS", "1")
+    monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_WORKERS", "1")
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES", "67108864"
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_V3_FINALIZER_TOTAL_SORT_MEMORY_BYTES", "16777216"
+    )
     monkeypatch.setenv("HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION", "none")
     monkeypatch.setenv("HLTHPRT_PTG2_SERVING_BINARY_BLOCK_BYTES", "65536")
 
@@ -310,7 +328,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             logical_snapshot_id=snapshot_id,
             expected_source_identities=[source_identity],
             serving_run_entries=serving_run_entries,
-            code_dictionary_entries=scan["code_dictionary_frames"],
+            code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
             graph_artifact_entries=graph_entries,
             scratch_parent=tmp_path,
@@ -725,7 +743,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             logical_snapshot_id=reused_snapshot_id,
             expected_source_identities=[source_identity],
             serving_run_entries=serving_run_entries,
-            code_dictionary_entries=scan["code_dictionary_frames"],
+            code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
             graph_artifact_entries=graph_entries,
             scratch_parent=tmp_path,

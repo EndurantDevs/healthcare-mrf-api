@@ -512,7 +512,7 @@ def test_indexed_workers_drain_bounded_rotation_events_before_join(tmp_path):
 
     scanner_summary_frame = _single_frame(scanner_run, "scanner_summary")
     assert sum(worker["rates_seen"] for worker in scanner_summary_frame["workers"]) == 24 * 8
-    assert scanner_summary_frame["event_queue_unbounded"] is True
+    assert scanner_summary_frame["event_queue_unbounded"] is False
     artifact_event_paths = [
         payload["path"]
         for record_kind, payload in scanner_run["frames"]

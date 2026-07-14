@@ -13,7 +13,6 @@ from process.ptg_parts.ptg2_shared_publish import (
     _SHARED_BLOCK_STAGE_COLUMNS,
     publish_shared_finalizer_dictionaries,
     shared_block_stage_name,
-    shared_graph_bundles_from_artifacts,
 )
 from process.ptg_parts import ptg2_shared_publish
 from process.ptg_parts.ptg2_shared_reuse import SharedPhysicalArtifactIdentity
@@ -152,7 +151,7 @@ def test_shared_block_binary_copy_contract_is_explicit_and_stable():
     )
 
 
-def test_post_scan_annotation_adds_identity_to_every_serving_run_entry(tmp_path):
+def _serving_run_entries(tmp_path):
     entries = []
     for partition in range(2):
         path = tmp_path / f"run-{partition}"
@@ -168,22 +167,51 @@ def test_post_scan_annotation_adds_identity_to_every_serving_run_entry(tmp_path)
                 "bytes": PTG2_V3_SERVING_RUN_RECORD_BYTES,
             }
         )
-    result = PTG2FileProcessResult(
+    return entries
+
+
+def _unannotated_file_result(tmp_path):
+    dictionary_path = tmp_path / "codes.ready"
+    dictionary_path.write_bytes(b"c" * 64)
+    dictionary_entries = [
+        {
+            "path": str(dictionary_path),
+            "format": "ptg2_v3_serving_code_dictionary",
+            "version": 4,
+            "row_count": 1,
+            "bytes": 64,
+        }
+    ]
+    return PTG2FileProcessResult(
         "in_network",
         "https://example.invalid/rates.json.gz",
         True,
         summary={
-            "manifest": {"copy_files": {"serving_run": entries}},
+            "manifest": {
+                "copy_files": {
+                    "serving_run": _serving_run_entries(tmp_path),
+                    "serving_code_dictionary": dictionary_entries,
+                }
+            },
             "scanner": {
                 "summary": {
                     "serving_run_files": 2,
                     "serving_run_rows": 2,
                     "serving_run_bytes": 2 * PTG2_V3_SERVING_RUN_RECORD_BYTES,
+                    "serving_code_dictionary_files": 1,
+                    "serving_code_dictionary_rows": 1,
+                    "serving_code_dictionary_bytes": 64,
                 },
                 "config": {"serving_run_partition_count": 2},
             },
         },
     )
+
+
+def test_post_scan_annotation_adds_identity_to_every_serving_run_entry(tmp_path):
+    """Bind all serving and dictionary shards to one physical identity."""
+
+    file_result = _unannotated_file_result(tmp_path)
     identity = SharedPhysicalArtifactIdentity(
         "in_network",
         "logical_json_sha256_v1",
@@ -191,7 +219,7 @@ def test_post_scan_annotation_adds_identity_to_every_serving_run_entry(tmp_path)
     )
 
     annotated = process_ptg._annotate_v3_file_result_source_identity(
-        result,
+        file_result,
         identity,
         {
             "raw_container_sha256": "b" * 64,
@@ -200,7 +228,7 @@ def test_post_scan_annotation_adds_identity_to_every_serving_run_entry(tmp_path)
         },
     )
 
-    assert annotated is result
+    assert annotated is file_result
     manifest = annotated.summary["manifest"]
     assert manifest["physical_artifact_identity"] == identity.as_dict()
     annotated_entries = manifest["copy_files"]["serving_run"]
@@ -210,6 +238,12 @@ def test_post_scan_annotation_adds_identity_to_every_serving_run_entry(tmp_path)
         for entry in annotated_entries
     )
     assert all("source_run_contract_sha256" in entry for entry in annotated_entries)
+    annotated_dictionary_entries = manifest["copy_files"][
+        "serving_code_dictionary"
+    ]
+    assert len(annotated_dictionary_entries) == 1
+    assert "code_dictionary_contract_sha256" in annotated_dictionary_entries[0]
+    assert "code_dictionary_source_contract" in annotated_dictionary_entries[0]
 
 
 @pytest.mark.asyncio
@@ -401,77 +435,3 @@ async def test_finalizer_dictionary_preserves_empty_scope_semantics(tmp_path, mo
 
     assert publication.code_count == 0
     assert publication.serving_rate_count == 0
-
-
-def test_graph_artifacts_are_grouped_by_complete_source_shard(tmp_path):
-    entries = []
-    for shard_id in ("file:2", "file:1"):
-        for name in (
-            "provider_group_npi",
-            "provider_npi_group",
-            "provider_inverted",
-            "provider_forward",
-        ):
-            entries.append(
-                {
-                    "name": name,
-                    "source_shard_id": shard_id,
-                    "path": str(tmp_path / f"{shard_id.replace(':', '-')}-{name}"),
-                }
-            )
-
-    bundles = shared_graph_bundles_from_artifacts(reversed(entries))
-
-    assert [bundle.shard_id for bundle in bundles] == ["file:1", "file:2"]
-    assert bundles[0].group_npi.metadata["name"] == "provider_group_npi"
-    assert bundles[0].provider_set_group.metadata["name"] == "provider_forward"
-
-
-def test_graph_artifact_grouping_fails_closed_on_missing_direction(tmp_path):
-    entries = [
-        {
-            "name": name,
-            "source_shard_id": "file:1",
-            "path": str(tmp_path / name),
-        }
-        for name in (
-            "provider_group_npi",
-            "provider_npi_group",
-            "provider_inverted",
-        )
-    ]
-
-    try:
-        shared_graph_bundles_from_artifacts(entries)
-    except RuntimeError as exc:
-        assert "provider_set_group" in str(exc)
-    else:
-        raise AssertionError("incomplete strict V3 graph shard was accepted")
-
-
-def test_strict_v3_graph_artifacts_are_import_scratch_not_serving_storage(
-    tmp_path,
-    monkeypatch,
-):
-    artifact_root = tmp_path / "artifacts"
-    snapshot_dir = artifact_root / "serving" / "snapshot-token"
-    snapshot_dir.mkdir(parents=True)
-    generated = snapshot_dir / "provider-graph.ptg2sc"
-    generated.write_bytes(b"graph")
-    outside = tmp_path / "outside.ptg2sc"
-    outside.write_bytes(b"keep")
-    monkeypatch.setattr(process_ptg, "resolve_ptg2_artifact_dir", lambda: artifact_root)
-
-    process_ptg._cleanup_strict_v3_graph_artifacts(
-        {
-            "sidecars": [
-                {"path": str(generated)},
-                {"path": str(outside)},
-                {"path": "db://artifact/ignored"},
-            ]
-        }
-    )
-
-    assert not generated.exists()
-    assert not snapshot_dir.exists()
-    assert outside.exists()

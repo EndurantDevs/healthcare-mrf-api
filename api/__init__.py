@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from sanic import response
 from sanic.blueprints import Blueprint
 
 from api.control import blueprint as control_blueprint
@@ -20,13 +21,31 @@ from api.endpoint.partd_formulary import blueprint as v1_partd_formulary
 from api.endpoint.pharmacy_license import blueprint as v1_pharmacy_license
 from api.endpoint.reports import blueprint as v1_reports
 from api.endpoint.site_intelligence import blueprint as v1_site_intelligence
+from api.ptg2_capacity_evidence import (
+    CapacityEvidenceError,
+    guard_isolated_capacity_process_request,
+)
 from db.connection import db
+
+
+def _capacity_process_request_guard(request):
+    """Keep an isolated cold-evidence process unavailable to other routes."""
+
+    try:
+        guard_isolated_capacity_process_request(request)
+    except CapacityEvidenceError:
+        return response.json(
+            {"error": "capacity_evidence_process_isolated"},
+            status=503,
+        )
+    return None
 
 
 def init_api(api):
     """Register public API blueprints on the Sanic application."""
 
     db.init_app(api)
+    api.register_middleware(_capacity_process_request_guard, "request")
     api.blueprint(control_blueprint)
     api.blueprint(metrics_blueprint)
     api_bluenprint = Blueprint.group(

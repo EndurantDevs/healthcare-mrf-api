@@ -181,6 +181,19 @@ Each shard covers a 1,024-key `provider_set_key` interval, with
 numbered contiguously from `0`; a missing, repeated, or out-of-order fragment
 fails the strict reader.
 
+One `(code_key, provider_set_key)` may contain more occurrences than one block
+can hold. The writer splits that logical group into adjacent continuation
+chunks before its configured payload bound is reached. Equal provider keys are
+valid only for those contiguous chunks, and `(price_key, source_key)` remains
+globally ordered across the boundary. Readers reject a decreasing provider,
+noncontiguous provider reuse, decreasing occurrences, or an oversized single
+occurrence. Duplicate occurrences remain duplicate source facts.
+
+Provider-to-code blocks retain their canonical wire format, but the finalizer
+spools encoded entries through bounded import scratch and streams physical
+fragments instead of retaining a complete 1,024-provider block twice in
+memory. Import scratch is disposable; API serving still reads only PostgreSQL.
+
 `by_code_price_page_v4` is a separate 64-row fast first-page projection. It is
 not the authoritative membership stream and cannot replace the provider-shard
 blocks. Standard cost-ordered provider searches use that projection for a
@@ -235,6 +248,37 @@ runs, code dictionaries, provider-graph conversion files, external-sort runs,
 and PostgreSQL COPY inputs. Worker queues, input limits, decompression limits,
 and finalizer record limits bound the work; capacity planning must still
 reserve scratch for every concurrent unique physical build.
+
+Gzip scanning uses `rapidgzip` by default. When `provider_references` appears
+after `in_network`, the scanner builds a temporary seek index, reads the
+provider range first, and then processes indexed in-network ranges in parallel.
+The explicit disable switch remains diagnostic only. Release tests require
+byte-identical COPY rows, serving runs, sidecars, and dedupe summaries at 1, 8,
+and 16 workers. The finalizer likewise produces identical committed bytes and
+support digest at those worker counts; its active-worker memory divisor counts
+only nonempty partition jobs.
+
+Code dictionaries remain worker-sharded. Every shard carries an exact byte and
+row count, SHA-256 digest, dense physical-source key, and source-run contract
+digest. Rust verifies these before allocating or decoding variable-length
+fields and charges the conservative dictionary resident estimate to the
+process identity-map limit.
+
+Physical-source keys are not caller-selected identifiers. Python normalizes
+each source identity as a lowercase ASCII token, one supported digest kind,
+and a 32-byte digest; sorting that tuple assigns the contiguous keys. Rust
+independently rejects unsupported identity kinds, duplicate identities,
+noncanonical source types, and any key-to-identity ordering that differs from
+that deterministic assignment.
+
+The scanner summary also authenticates the complete code-dictionary shard set
+for each physical source. Python turns its exact file, row, and byte totals into
+a source-bound contract containing every shard digest. Each dictionary entry
+carries that contract digest, while the finalizer manifest carries the complete
+per-source contract set and its canonical SHA-256. Rust recomputes both levels
+and compares the observed descriptors exactly. Recomputing only aggregate
+manifest totals after omitting a shard therefore cannot produce an acceptable
+finalizer input.
 
 Scratch lives under temporary directories selected by the import runtime and
 is removed after success or failure. Disposable PostgreSQL stages are unlogged
@@ -294,9 +338,9 @@ Publication proceeds in this order:
 2. Compute physical identity and reserve or reuse a layout.
 3. For a reuse hit, publish only the new logical snapshot, scope, and pointers.
 4. For a new layout, scan to bounded runs and disposable PostgreSQL stages.
-5. Validate every source-bound scanner run contract, including its complete
-   partition vector, aggregate rows and bytes, file hashes, and physical
-   source identity.
+5. Validate every source-bound scanner run and code-dictionary contract,
+   including complete partition and shard vectors, aggregate rows and bytes,
+   file hashes, deterministic dense source keys, and physical source identity.
 6. Finalize dense blocks, dictionaries, prices, and all provider-graph
    directions.
 7. Build and persist the publication audit sample.
@@ -394,9 +438,12 @@ redacted report contract and invocation.
 ## Performance And Capacity Gates
 
 The target for a new, unique large physical build is 10 to 15 minutes
-end-to-end, including durable PostgreSQL publication and sealing. Reuse-only
-logical publication is measured separately and cannot be used to satisfy that
-target.
+end-to-end. The timer starts before source processing and ends only after
+durable PostgreSQL publication and sealing, candidate-audit queueing and
+execution, attestation, exact-predecessor pointer activation, and cleanup.
+Reuse-only logical publication is measured separately and cannot be used to
+satisfy the fresh-build target, but its nonzero duration is charged to the
+reuse-adjusted capacity projection.
 
 Current status: **the large-import measured gate is pending**. Repository unit
 and integration coverage establish architecture behavior, but there is not yet
@@ -404,28 +451,62 @@ accepted dev evidence for a complete large import under this strict contract.
 Do not cite historical runs from another layout or an incomplete measurement
 as proof.
 
-A qualifying measurement must use the deployed release scanner and schema,
+A qualifying measurement uses authenticated capacity schema version 7 and at
+least 30 unique large builds. Every build must use the deployed release scanner
+and schema,
 logged durable relations, a fresh physical fingerprint, complete source
 coverage, bounded scratch, persisted audit publication, and the release audit
-floors above. Record end-to-end and stage time, peak memory and scratch,
-PostgreSQL bytes/WAL/I/O/connections, reuse status, GC impact, and cold
-first-page latency.
+floors above. The same report needs at least 30 reuse-only timing samples and
+enough successful candidate-audit samples to cover every end-to-end sample.
+The collector commits one joined stage record per logical import and signs the
+measurement with a short-lived receipt bound to the exact release,
+environment, and collector. Record build, reuse, audit queue, audit,
+activation, and cleanup timestamps for the same logical import.
 
 For 2,000 logical imports per 30-day month:
 
-- At 10 minutes per unique build, the unreused workload is about 333 worker
-  hours per month and 46 percent of one continuously available lane.
-- At 15 minutes per unique build, it is 500 worker hours and 69 percent of one
-  continuously available lane.
-- One lane therefore has little burst, retry, maintenance, and audit headroom
-  near the 15-minute bound even though its theoretical steady-state capacity is
-  2,880 builds per 30-day month.
+- At 10 minutes of build-lane work per unique build, the unreused workload is
+  about 333 worker hours per month and 46 percent of one continuously available
+  build lane.
+- At 15 minutes of build-lane work per unique build, it is 500 worker hours and
+  69 percent of one continuously available build lane. A passing end-to-end
+  15-minute measurement necessarily leaves less than 15 minutes for that build
+  stage because audit queueing, audit, and activation are included.
+- One build lane therefore has little burst, retry, and maintenance headroom
+  near that bound even though its theoretical steady-state capacity is 2,880
+  builds per 30-day month. Candidate audits use separately measured lanes and
+  availability, and every logical activation consumes at least 3,000 standard
+  API HTTP calls, or 6,000,000 calls at the monthly objective.
 - Physical reuse reduces build work only when the complete-set fingerprint
   matches. Capacity models must measure the reuse hit rate and keep an
   unreused scenario.
 - Concurrent lanes multiply peak scratch, database connections, COPY traffic,
   WAL, I/O, and GC demand. Increase concurrency only from measured database
   headroom, not from CPU count alone.
+
+Peak-arrival evidence must contain at least 30 timestamped, non-overlapping
+windows of at least 30 minutes spread across at least seven days. Their
+redacted list and cryptographic commitment must reconcile exactly. Maximum
+import queue delay and
+candidate-audit queue age are each fixed at 30 minutes. Both build/reuse demand
+and audit demand must fit those SLOs; an observed low queue age does not expand
+capacity.
+
+The contention run lasts at least 30 minutes with every configured build and
+audit lane active. It includes at least 3,000 requests and 1 request/second of
+normal API traffic plus observed candidate-audit request totals whose duration
+and derived rate reconcile with the 3,000-request-per-audit floor. It must use
+fresh API processes and separate error-free cold p95 measurements at or below
+40 ms for at least 100 distinct matched-positive, 250 distinct negative, and
+2,500 distinct deterministic-random requests. Every cold sample must fall
+inside the signed contention interval.
+
+Release evidence also includes pool wait, checkpoints, PostgreSQL temp space,
+autovacuum, scratch, and GC. Connection, write, WAL, checkpoint time,
+PostgreSQL temp, autovacuum workers, scratch, and GC throughput each retain at
+least 20 percent headroom under the contention profile. GC covers at least 24
+hourly cycles and 30 eligible/deleted layouts; positivity alone is not capacity
+evidence.
 
 ## Immutable Replacement And GC
 
@@ -478,6 +559,21 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
   hard minimum of 250.
 - Cold first-page p95 is at or below 40 ms separately for matched-positive,
   negative, and deterministic-random requests.
+- The authenticated schema-v7 monthly capacity report passes with at least 30
+  qualifying large builds, 30 reuse-only samples, committed end-to-end timing
+  for every logical sample, reconciled candidate-audit traffic, signed raw
+  arrivals behind the timestamped seven-day peak profile, the 30-minute
+  contention run, contention-bound resource observations, and all fixed
+  resource headroom gates.
+- Every accepted cold request is API-signed over its start, completion,
+  monotonic duration, contention run, semantic class, selection ordinal,
+  ordinal-zero process state, result count, status, and response digest. Its
+  complete request interval remains inside all required build and audit lanes,
+  and no API process identity is reused by another cold sample. An isolated
+  evidence process accepts exactly one HTTP request: it must be the challenged
+  canonical pricing route. Readiness traffic, aliases, and unchallenged or
+  subsequent requests fail closed, so each cold sample starts a dedicated
+  process outside the ordinary service load-balancer lifecycle.
 - A claimed 10-to-15-minute large import is backed by a current complete
   measured report; until then the gate remains pending.
 - Replacement and rollback bindings are retained as intended, and GC dry-run

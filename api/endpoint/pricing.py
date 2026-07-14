@@ -26,6 +26,10 @@ from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SY
 from api.endpoint.pagination import parse_pagination
 from api.ptg2_candidate_audit import attach_candidate_audit_access
 from api.ptg2_audit_occurrences import audit_occurrences_payload
+from api.ptg2_capacity_evidence import (
+    begin_capacity_evidence,
+    maybe_attach_capacity_evidence_headers,
+)
 from api.ptg2_serving import (
     normalize_ptg2_mode,
     search_current_ptg2_index,
@@ -65,6 +69,18 @@ def _json_response(payload: Any, *, status: int = 200):
         body,
         status=status,
         content_type="application/json",
+    )
+
+
+def _ptg_json_response(request: Any, payload: Any, *, status: int = 200):
+    """Serialize one PTG result and optionally attach authenticated evidence."""
+
+    item_rows = payload.get("items") if isinstance(payload, Mapping) else None
+    result_count = len(item_rows) if isinstance(item_rows, list) else None
+    return maybe_attach_capacity_evidence_headers(
+        request,
+        _json_response(payload, status=status),
+        result_count=result_count,
     )
 
 
@@ -1301,21 +1317,21 @@ def _extract_query_values(args, key: str) -> list[Any]:
 
 
 def _parse_code_list_query_param(args, key: str) -> list[str]:
-    values = _extract_query_values(args, key)
-    parsed: list[str] = []
-    for raw_value in values:
+    raw_values = _extract_query_values(args, key)
+    parsed_codes: list[str] = []
+    for raw_value in raw_values:
         for token in str(raw_value or "").split(","):
             normalized = str(token).strip().upper()
             if normalized:
-                parsed.append(normalized)
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for token in parsed:
-        if token in seen:
+                parsed_codes.append(normalized)
+    deduped_codes: list[str] = []
+    seen_codes: set[str] = set()
+    for token in parsed_codes:
+        if token in seen_codes:
             continue
-        seen.add(token)
-        deduped.append(token)
-    return deduped
+        seen_codes.add(token)
+        deduped_codes.append(token)
+    return deduped_codes
 
 
 def _geography_candidates(
@@ -1338,14 +1354,14 @@ def _geography_candidates(
     candidates.append(("national", "US"))
 
     # Keep order and de-duplicate.
-    seen: set[tuple[str, str]] = set()
-    ordered: list[tuple[str, str]] = []
-    for item in candidates:
-        if item in seen:
+    seen_candidates: set[tuple[str, str]] = set()
+    ordered_candidates: list[tuple[str, str]] = []
+    for candidate in candidates:
+        if candidate in seen_candidates:
             continue
-        seen.add(item)
-        ordered.append(item)
-    return ordered
+        seen_candidates.add(candidate)
+        ordered_candidates.append(candidate)
+    return ordered_candidates
 
 
 async def _enrich_provider_service_cost_indices(
@@ -1852,14 +1868,14 @@ def _provider_type_search_terms(args, specialty: str | None) -> list[str]:
         if value:
             terms.append(str(value).strip())
     terms.extend(_parse_csv_terms(args.get("taxonomy_codes")))
-    seen: set[str] = set()
-    deduped: list[str] = []
+    seen_term_keys: set[str] = set()
+    deduped_terms: list[str] = []
     for term in terms:
         key = _normalize_term_key(term)
-        if key and key not in seen:
-            seen.add(key)
-            deduped.append(term)
-    return deduped
+        if key and key not in seen_term_keys:
+            seen_term_keys.add(key)
+            deduped_terms.append(term)
+    return deduped_terms
 
 
 async def _provider_type_filter_clause(session, args, provider_type_column, specialty: str | None) -> tuple[Any | None, dict[str, Any] | None]:
@@ -2324,15 +2340,15 @@ def _build_provider_quality_response_payload(
     return response_payload
 
 
-def _parse_token_list(value: Any) -> list[str]:
-    if value is None:
+def _parse_token_list(raw_tokens: Any) -> list[str]:
+    if raw_tokens is None:
         return []
 
-    token_source: list[Any] = []
-    if isinstance(value, (list, tuple, set)):
-        token_source = list(value)
-    elif isinstance(value, str):
-        raw_text = value.strip()
+    token_values: list[Any] = []
+    if isinstance(raw_tokens, (list, tuple, set)):
+        token_values = list(raw_tokens)
+    elif isinstance(raw_tokens, str):
+        raw_text = raw_tokens.strip()
         if not raw_text:
             return []
         parsed_json: Any = None
@@ -2342,15 +2358,15 @@ def _parse_token_list(value: Any) -> list[str]:
             except json.JSONDecodeError:
                 parsed_json = None
         if isinstance(parsed_json, list):
-            token_source = list(parsed_json)
+            token_values = list(parsed_json)
         else:
-            token_source = re.split(r"[,\s|;]+", raw_text)
+            token_values = re.split(r"[,\s|;]+", raw_text)
     else:
-        token_source = [value]
+        token_values = [raw_tokens]
 
     normalized_tokens: list[str] = []
-    for item in token_source:
-        token = str(item or "").strip().upper()
+    for token_value in token_values:
+        token = str(token_value or "").strip().upper()
         if not token:
             continue
         if INT_PATTERN.fullmatch(token):
@@ -4121,13 +4137,13 @@ def _taxonomy_rule_for_reported_code(code: Any) -> dict[str, Any] | None:
 
 def _dedupe_taxonomy_codes(*groups: list[str] | tuple[str, ...]) -> list[str]:
     codes: list[str] = []
-    seen: set[str] = set()
+    seen_codes: set[str] = set()
     for group in groups:
         for value in group:
             code = str(value or "").strip().upper()
-            if not code or code in seen:
+            if not code or code in seen_codes:
                 continue
-            seen.add(code)
+            seen_codes.add(code)
             codes.append(code)
     return codes
 
@@ -7968,6 +7984,7 @@ async def list_ptg2_audit_occurrences(request):
 @blueprint.get("/physicians/by-service", name="pricing.physicians.by_service")
 async def list_providers_by_procedure(request):
     """List providers with pricing records matching a procedure or service code."""
+    begin_capacity_evidence(request)
     session = _get_session(request)
     args = request.args
 
@@ -8177,7 +8194,8 @@ async def list_providers_by_procedure(request):
             if year is not None:
                 query_payload["ignored_params"] = ["year"]
                 query_payload["year_semantics"] = "ignored_for_plan_scoped_ptg_rates"
-            return response.json(
+            return _ptg_json_response(
+                request,
                 {
                     "result_state": _ptg2_empty_result_state(
                         ptg_empty_status,
@@ -8198,7 +8216,7 @@ async def list_providers_by_procedure(request):
                         "page": pagination.page,
                     },
                     "query": query_payload,
-                }
+                },
             )
         _annotate_ptg2_query_payload(
             ptg2_payload,
@@ -8211,7 +8229,7 @@ async def list_providers_by_procedure(request):
             has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
             has_location_filter=_has_ptg2_location_filter(args),
         )
-        return _json_response(ptg2_payload)
+        return _ptg_json_response(request, ptg2_payload)
     if order_by == "cost_index":
         if not code:
             raise InvalidUsage("Parameter 'order_by=cost_index' requires 'code'")

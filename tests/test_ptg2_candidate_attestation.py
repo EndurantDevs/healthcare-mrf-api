@@ -45,7 +45,7 @@ def _release_report(**target_overrides):
     target.update(target_overrides)
     return {
         "schema_version": 2,
-        "harness": {"name": "ptg2_v3_source_api_audit", "version": "2.6.0"},
+        "harness": {"name": "ptg2_v3_source_api_audit", "version": "2.9.0"},
         "status": "pass",
         "profile": "release",
         "release_profile_enforced": True,

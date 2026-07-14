@@ -21,8 +21,9 @@ use ptg2_scanner::hashing::{
     semantic_hash, update_hash_optional_str, update_hash_string_list, xxh3_63,
 };
 use ptg2_scanner::input::{
-    is_gzip, open_full_scan_json_reader, open_full_scan_reader_exporting_index,
-    open_indexed_ranges_reader, open_json_reader, strict_utf8_reader_preserving_bom,
+    is_gzip, open_full_scan_json_reader, open_full_scan_reader,
+    open_full_scan_reader_exporting_index, open_indexed_ranges_reader, open_json_reader,
+    open_plain_range_json_reader, strict_utf8_reader, strict_utf8_reader_preserving_bom,
     RapidgzipConfig,
 };
 #[cfg(test)]
@@ -43,20 +44,20 @@ use ptg2_scanner::shared_graph::{
     convert_shared_provider_graph, MembershipArtifactDescriptor, MembershipMetadata,
     SharedGraphShardDescriptor,
 };
-#[cfg(test)]
-use ptg2_scanner::v3_runs::natural_lean_code_identity;
+use ptg2_scanner::v3_dense::{DenseIdentityMap, DenseIdentityValue};
 use ptg2_scanner::v3_runs::{
-    external_sort_dense_ids, external_sort_lexicographic_records,
-    external_sort_provider_identities, external_sort_tagged_partition_files,
-    parse_coverage_scope_id, read_code_dictionary, source_key_bits, source_key_bytes,
-    write_audit_candidate_file, AuditCandidateSelector, MultiFileSortStats, NaturalLeanCode,
-    NaturalLeanCodeFields, ServingRunPartitionWriter, ServingRunRecord, TaggedServingRunCodec,
-    TaggedServingRunRecord, AUDIT_CANDIDATE_FORMAT, AUDIT_CANDIDATE_FORMAT_VERSION,
-    AUDIT_CANDIDATE_MAX_RECORDS, AUDIT_CANDIDATE_RECORD_BYTES, AUDIT_CANDIDATE_SELECTION,
-    CODE_DICTIONARY_FORMAT, CODE_DICTIONARY_FORMAT_VERSION, COVERAGE_SCOPE_ID_BYTES,
-    DENSE_ID_RECORD_BYTES, PROVIDER_IDENTITY_RECORD_BYTES, SERVING_RUN_FORMAT,
-    SERVING_RUN_FORMAT_VERSION, SERVING_RUN_RECORD_BYTES,
+    external_sort_assigned_serving_records, external_sort_provider_code_pairs,
+    external_sort_provider_identities, parse_coverage_scope_id, partition_for_record,
+    read_code_dictionary_exact, source_key_bits, source_key_bytes, write_audit_candidate_file,
+    AuditCandidateSelector, MultiFileSortStats, NaturalLeanCode, NaturalLeanCodeFields,
+    ServingRunPartitionWriter, ServingRunRecord, TaggedServingRunCodec, AUDIT_CANDIDATE_FORMAT,
+    AUDIT_CANDIDATE_FORMAT_VERSION, AUDIT_CANDIDATE_MAX_RECORDS, AUDIT_CANDIDATE_RECORD_BYTES,
+    AUDIT_CANDIDATE_SELECTION, CODE_DICTIONARY_FORMAT, CODE_DICTIONARY_FORMAT_VERSION,
+    COVERAGE_SCOPE_ID_BYTES, PROVIDER_CODE_PAIR_RECORD_BYTES, PROVIDER_IDENTITY_RECORD_BYTES,
+    SERVING_RUN_FORMAT, SERVING_RUN_FORMAT_VERSION, SERVING_RUN_RECORD_BYTES,
 };
+#[cfg(test)]
+use ptg2_scanner::v3_runs::{natural_lean_code_identity, read_code_dictionary};
 use rayon::prelude::*;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -68,7 +69,7 @@ use std::env;
 use std::fmt::Display;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -83,7 +84,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 const DEFAULT_PROVIDER_REF_CHUNK_ITEMS: usize = 1024;
 const DEFAULT_INDEXED_RANGE_PRODUCERS: usize = 4;
-const MAX_INDEXED_RANGE_PRODUCERS: usize = 8;
+const MAX_INDEXED_RANGE_PRODUCERS: usize = 16;
 const MAX_RETAINED_CAPTURE_BYTES: usize = READ_BUF_SIZE;
 const DEFAULT_V3_SERVING_RUN_PARTITIONS: usize = 64;
 const DEFAULT_V3_SERVING_RUN_PARTITION_BUFFER_BYTES: usize = 64 * 1024;
@@ -125,6 +126,24 @@ fn take_sidecar_lock_wait_micros() -> u128 {
 
 fn to_io_error(error: impl Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+fn compact_pipeline_error(
+    worker_error: Option<io::Error>,
+    producer_error: Option<io::Error>,
+) -> Option<io::Error> {
+    match (worker_error, producer_error) {
+        (Some(error), Some(producer_error))
+            if matches!(
+                producer_error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            Some(error)
+        }
+        (_, Some(error)) | (Some(error), None) => Some(error),
+        (None, None) => None,
+    }
 }
 
 fn scan(path: &Path, requested: &[String]) -> io::Result<()> {
@@ -792,7 +811,7 @@ fn send_worker_job<W: Write>(
         if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "indexed range production cancelled",
+                "parallel range production cancelled",
             ));
         }
         let depth_before_send = tx.len();
@@ -4370,6 +4389,10 @@ impl QueueByteMetrics {
     fn peak_bytes(&self) -> u64 {
         self.peak_queued_bytes.load(Ordering::Relaxed)
     }
+
+    fn current_bytes(&self) -> u64 {
+        self.queued_bytes.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Default)]
@@ -5026,6 +5049,10 @@ impl<R: Read> BufferedJsonByteReader<R> {
         }
     }
 
+    fn into_unread_reader(self) -> PrefixReader<R> {
+        PrefixReader::new(self.buffer[self.pos..self.filled].to_vec(), self.inner)
+    }
+
     fn drain_inner_to_eof(&mut self) -> io::Result<()> {
         self.pos = self.filled;
         drain_reader_to_eof(&mut self.inner)
@@ -5047,6 +5074,52 @@ fn next_array_value<R: Read>(
         reader.skip_whitespace()?;
     }
     Ok(true)
+}
+
+fn mark_compact_top_level_array_seen(
+    name: &str,
+    saw_provider_references: &mut bool,
+    saw_in_network: &mut bool,
+) -> io::Result<()> {
+    let seen = match name {
+        "provider_references" => saw_provider_references,
+        "in_network" => saw_in_network,
+        _ => return Ok(()),
+    };
+    if std::mem::replace(seen, true) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "duplicate PTG top-level array",
+        ));
+    }
+    Ok(())
+}
+
+fn finish_compact_rate_object<R: Read>(
+    mut json_reader: JsonStreamReader<R>,
+    mut saw_provider_references: bool,
+    mut saw_in_network: bool,
+) -> io::Result<()> {
+    while json_reader.has_next().map_err(to_io_error)? {
+        let name = json_reader.next_name_owned().map_err(to_io_error)?;
+        mark_compact_top_level_array_seen(
+            &name,
+            &mut saw_provider_references,
+            &mut saw_in_network,
+        )?;
+        json_reader.skip_value().map_err(to_io_error)?;
+    }
+    json_reader.end_object().map_err(to_io_error)?;
+    json_reader
+        .consume_trailing_whitespace()
+        .map_err(to_io_error)
+}
+
+fn validate_compact_rate_object_suffix<R: Read>(reader: R) -> io::Result<()> {
+    let prefix = br#"{"provider_references":null,"in_network":null"#.to_vec();
+    let mut json_reader = JsonStreamReader::new(PrefixReader::new(prefix, reader));
+    json_reader.begin_object().map_err(to_io_error)?;
+    finish_compact_rate_object(json_reader, false, false)
 }
 
 struct JoinedProviderRefs {
@@ -6737,6 +6810,12 @@ struct CompactIndexedReorder {
     decoder_threads: usize,
 }
 
+struct CompactPlainReorder {
+    provider_references: TopLevelArrayRange,
+    in_network: TopLevelArrayRange,
+    in_network_object_count: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IndexedInNetworkRange {
     offset: u64,
@@ -6764,6 +6843,7 @@ struct CompactByteScanOptions {
     preflight_metrics: CompactPreflightMetrics,
     rapidgzip_config: RapidgzipConfig,
     indexed_reorder: Option<CompactIndexedReorder>,
+    plain_reorder: Option<CompactPlainReorder>,
 }
 
 enum IndexedReaderStage {
@@ -6971,19 +7051,59 @@ fn emit_indexed_range_progress(
     );
 }
 
+fn emit_plain_reorder_progress(
+    path: &Path,
+    expected_objects: u64,
+    completed_objects: u64,
+    completed_rates: u64,
+    started_at: Instant,
+    done: bool,
+) {
+    let completed_objects = completed_objects.min(expected_objects);
+    let elapsed_seconds = started_at.elapsed().as_secs_f64();
+    let percent = if expected_objects > 0 {
+        completed_objects as f64 * 100.0 / expected_objects as f64
+    } else {
+        0.0
+    };
+    let eta_seconds = if completed_objects > 0 && completed_objects < expected_objects {
+        Some(
+            elapsed_seconds * (expected_objects - completed_objects) as f64
+                / completed_objects as f64,
+        )
+    } else {
+        None
+    };
+    eprintln!(
+        "PTG2_SCANNER_PROGRESS\tpath={}\tprogress_basis=plain_reordered_objects\tin_network_objects_completed={}\tin_network_objects_total={}\tpercent={:.2}\tnegotiated_rates_completed={}\telapsed_seconds={:.1}\teta_seconds={}\tdone={}",
+        path.display(),
+        completed_objects,
+        expected_objects,
+        percent,
+        completed_rates,
+        elapsed_seconds,
+        eta_seconds
+            .map(|value| format!("{value:.1}"))
+            .unwrap_or_else(|| "unknown".to_string()),
+        if done { "true" } else { "false" },
+    );
+}
+
 fn produce_indexed_in_network_range(
     config: IndexedRangeProducerConfig,
 ) -> io::Result<IndexedRangeProducerOutput> {
     let started_at = Instant::now();
     let compressed_bytes_read = Arc::new(AtomicU64::new(0));
     let range_spec = format!("{}@{}", config.range.length, config.range.offset);
-    let range_reader = open_indexed_ranges_reader(
-        &config.path,
-        Arc::clone(&compressed_bytes_read),
-        &config.rapidgzip_config,
-        &config.index_path,
-        &range_spec,
-    )?;
+    let range_reader = config
+        .rapidgzip_config
+        .open_indexed_ranges_reader_cancellable(
+            &config.path,
+            Arc::clone(&compressed_bytes_read),
+            &config.index_path,
+            &range_spec,
+            Arc::clone(&config.cancelled),
+        )?;
     let range_reader = strict_utf8_reader_preserving_bom(range_reader);
     let wrapped_reader =
         WrappedIndexedRangeReader::new(range_reader, config.range.length, b"[", b"]");
@@ -7090,11 +7210,14 @@ fn scan_compact_byte_top_level_parallel(
         preflight_metrics,
         rapidgzip_config,
         indexed_reorder,
+        plain_reorder,
     } = options;
     let total_bytes = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
     let compressed_bytes_read = Arc::new(AtomicU64::new(0));
     let indexed_reorder_used = indexed_reorder.is_some();
-    let provider_reference_order_label = if indexed_reorder_used {
+    let plain_reorder_used = plain_reorder.is_some();
+    let top_level_reorder_used = indexed_reorder_used || plain_reorder_used;
+    let provider_reference_order_label = if top_level_reorder_used {
         "after_in_network"
     } else {
         "before_in_network"
@@ -7135,6 +7258,24 @@ fn scan_compact_byte_top_level_parallel(
         .as_ref()
         .map(|reorder| reorder.in_network_object_count)
         .unwrap_or(0);
+    let plain_provider_range_offset = plain_reorder
+        .as_ref()
+        .map(|reorder| reorder.provider_references.offset);
+    let plain_provider_range_bytes = plain_reorder
+        .as_ref()
+        .map(|reorder| reorder.provider_references.length)
+        .unwrap_or(0);
+    let plain_in_network_range_offset = plain_reorder
+        .as_ref()
+        .map(|reorder| reorder.in_network.offset);
+    let plain_in_network_range_bytes = plain_reorder
+        .as_ref()
+        .map(|reorder| reorder.in_network.length)
+        .unwrap_or(0);
+    let plain_in_network_object_count = plain_reorder
+        .as_ref()
+        .map(|reorder| reorder.in_network_object_count)
+        .unwrap_or(0);
     let indexed_range_config_payload = indexed_reorder
         .as_ref()
         .map(|reorder| {
@@ -7149,30 +7290,40 @@ fn scan_compact_byte_top_level_parallel(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let mut reader: Box<dyn Read> = match indexed_reorder.as_ref() {
-        Some(reorder) => {
-            let ranges = format!(
-                "{}@{}",
-                reorder.provider_references.length, reorder.provider_references.offset,
-            );
-            let range_reader = open_indexed_ranges_reader(
-                path,
-                Arc::clone(&compressed_bytes_read),
-                &rapidgzip_config,
-                &reorder.index.path,
-                &ranges,
-            )?;
-            let range_reader = strict_utf8_reader_preserving_bom(range_reader);
-            Box::new(WrappedIndexedRangeReader::new(
-                range_reader,
-                reorder.provider_references.length,
-                br#"{"provider_references":"#,
-                br#","in_network":[]}"#,
-            ))
-        }
-        None => {
-            open_full_scan_json_reader(path, Arc::clone(&compressed_bytes_read), &rapidgzip_config)?
-        }
+    let mut reader: Box<dyn Read> = if let Some(reorder) = indexed_reorder.as_ref() {
+        let ranges = format!(
+            "{}@{}",
+            reorder.provider_references.length, reorder.provider_references.offset,
+        );
+        let range_reader = open_indexed_ranges_reader(
+            path,
+            Arc::clone(&compressed_bytes_read),
+            &rapidgzip_config,
+            &reorder.index.path,
+            &ranges,
+        )?;
+        let range_reader = strict_utf8_reader_preserving_bom(range_reader);
+        Box::new(WrappedIndexedRangeReader::new(
+            range_reader,
+            reorder.provider_references.length,
+            br#"{"provider_references":"#,
+            br#","in_network":[]}"#,
+        ))
+    } else if let Some(reorder) = plain_reorder.as_ref() {
+        let range_reader = open_plain_range_json_reader(
+            path,
+            reorder.provider_references.offset,
+            reorder.provider_references.length,
+            Arc::clone(&compressed_bytes_read),
+        )?;
+        Box::new(WrappedIndexedRangeReader::new(
+            range_reader,
+            reorder.provider_references.length,
+            br#"{"provider_references":"#,
+            br#","in_network":[]}"#,
+        ))
+    } else {
+        open_full_scan_json_reader(path, Arc::clone(&compressed_bytes_read), &rapidgzip_config)?
     };
     let progress_bytes_interval = progress_interval(
         "HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES",
@@ -7218,7 +7369,8 @@ fn scan_compact_byte_top_level_parallel(
     let event_queue_size = env_usize(
         "HLTHPRT_PTG2_RUST_EVENT_QUEUE",
         (bounded_queue_size * 4).max(worker_count),
-    );
+    )
+    .max(1);
     let dedupe = Arc::new(SharedDedupe::new(worker_count));
     let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
         Some(Arc::new(Mutex::new(ManifestSidecarCollector::for_import(
@@ -7228,11 +7380,7 @@ fn scan_compact_byte_top_level_parallel(
         None
     };
     let (tx, rx) = bounded::<WorkerJob>(bounded_queue_size);
-    let (event_tx, event_rx) = if indexed_reorder_used {
-        unbounded::<CopyFileEvent>()
-    } else {
-        bounded::<CopyFileEvent>(event_queue_size)
-    };
+    let (event_tx, event_rx) = bounded::<CopyFileEvent>(event_queue_size);
     let indexed_cancelled = Arc::new(AtomicBool::new(false));
     let indexed_producer_progress = Arc::new(IndexedProducerProgress::default());
     let stdout = io::stdout();
@@ -7272,7 +7420,7 @@ fn scan_compact_byte_top_level_parallel(
             "worker_count": worker_count,
             "work_queue": bounded_queue_size,
             "event_queue": event_queue_size,
-            "event_queue_unbounded": indexed_reorder_used,
+            "event_queue_unbounded": false,
             "split_negotiated_rates": negotiated_rate_chunk_size,
             "raw_chunk_bytes": raw_chunk_byte_limit,
             "read_buffer_bytes": READ_BUF_SIZE,
@@ -7289,6 +7437,8 @@ fn scan_compact_byte_top_level_parallel(
             "top_level_byte_scan_fallback_reason": Value::Null,
             "execution_mode": if indexed_reorder_used {
                 "parallel_top_level_bytes_indexed_reorder"
+            } else if plain_reorder_used {
+                "parallel_top_level_bytes_plain_range_reorder"
             } else {
                 "parallel_top_level_bytes"
             },
@@ -7308,8 +7458,14 @@ fn scan_compact_byte_top_level_parallel(
             "indexed_ranges": indexed_range_config_payload,
             "indexed_range_coverage_bytes": indexed_range_coverage_bytes,
             "indexed_range_coverage_object_count": indexed_range_coverage_objects,
+            "plain_range_reorder": plain_reorder_used,
+            "plain_provider_range_offset": plain_provider_range_offset,
+            "plain_provider_range_bytes": plain_provider_range_bytes,
+            "plain_in_network_range_offset": plain_in_network_range_offset,
+            "plain_in_network_range_bytes": plain_in_network_range_bytes,
+            "plain_in_network_object_count": plain_in_network_object_count,
             "full_decompression_passes": if indexed_reorder_used { 2 } else { 1 },
-            "order_probe_partial_pass": true,
+            "order_probe_partial_pass": provider_reference_order_label != "missing",
             "order_detection_seconds": preflight_metrics.order_detection_seconds,
             "order_detection_compressed_bytes": preflight_metrics.order_detection_compressed_bytes,
             "order_detection_compressed_mib_s": preflight_metrics.compressed_mib_s(),
@@ -7711,124 +7867,176 @@ fn scan_compact_byte_top_level_parallel(
                                 .entry("negotiated_rates".to_string())
                                 .or_insert(0) += metrics.rate_count;
                         }
-                    } else if parse_in_workers {
-                        let prefixed_reader = PrefixReader::new(prefix, reader);
-                        let mut byte_reader = BufferedJsonByteReader::new(prefixed_reader);
-                        byte_reader.expect_byte(b'[')?;
-                        let mut first_item = true;
-                        while next_array_value(&mut byte_reader, &mut first_item)? {
-                            let mut enqueue_io = InNetworkEnqueueIo {
-                                tx: &tx,
-                                event_rx: &event_rx,
-                                writer: &mut writer,
-                                cancelled: None,
-                                producer_blocked_micros: &mut producer_blocked_micros,
-                                raw_chunk_stats: &mut raw_chunk_stats,
-                            };
-                            let rate_count = enqueue_in_network_raw_byte_scan(
-                                &mut byte_reader,
-                                &mut enqueue_io,
-                                InNetworkEnqueueOptions {
-                                    chunk_size: negotiated_rate_chunk_size,
-                                    raw_chunk_byte_limit,
-                                    parse_in_workers,
-                                },
-                            )?;
-                            drain_copy_file_events(&event_rx, &mut writer)?;
-                            *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
-                            *object_counts
-                                .entry("negotiated_rates".to_string())
-                                .or_insert(0) += rate_count;
-                            let bytes = compressed_bytes_read.load(Ordering::Relaxed);
-                            let objects: u64 = object_counts.values().sum();
-                            if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
-                                emit_progress(
-                                    path,
-                                    total_bytes,
-                                    &compressed_bytes_read,
-                                    &object_counts,
-                                    started_at,
-                                    false,
-                                );
-                                while bytes >= next_progress_bytes {
-                                    next_progress_bytes += progress_bytes_interval;
-                                }
-                            } else if progress_objects_interval > 0
-                                && objects >= next_progress_objects
-                            {
-                                emit_progress(
-                                    path,
-                                    total_bytes,
-                                    &compressed_bytes_read,
-                                    &object_counts,
-                                    started_at,
-                                    false,
-                                );
-                                while objects >= next_progress_objects {
-                                    next_progress_objects += progress_objects_interval;
-                                }
-                            }
-                        }
-                        byte_reader.drain_inner_to_eof()?;
                     } else {
-                        let prefixed_reader = PrefixReader::new(prefix, reader);
-                        let mut json_reader = JsonStreamReader::new(prefixed_reader);
-                        json_reader.begin_array().map_err(to_io_error)?;
-                        while json_reader.has_next().map_err(to_io_error)? {
-                            let mut enqueue_io = InNetworkEnqueueIo {
-                                tx: &tx,
-                                event_rx: &event_rx,
-                                writer: &mut writer,
-                                cancelled: None,
-                                producer_blocked_micros: &mut producer_blocked_micros,
-                                raw_chunk_stats: &mut raw_chunk_stats,
+                        let rate_reader: Box<dyn Read> =
+                            if let Some(reorder) = plain_reorder.as_ref() {
+                                let mut provider_range_reader = PrefixReader::new(prefix, reader);
+                                drain_reader_to_eof(&mut provider_range_reader)?;
+                                let range_reader = open_plain_range_json_reader(
+                                    path,
+                                    reorder.in_network.offset,
+                                    reorder.in_network.length,
+                                    Arc::clone(&compressed_bytes_read),
+                                )?;
+                                Box::new(WrappedIndexedRangeReader::new(
+                                    range_reader,
+                                    reorder.in_network.length,
+                                    br#"{"in_network":"#,
+                                    b"}",
+                                ))
+                            } else {
+                                let array_and_suffix = PrefixReader::new(prefix, reader);
+                                Box::new(PrefixReader::new(
+                                    br#"{"in_network":"#.to_vec(),
+                                    array_and_suffix,
+                                ))
                             };
-                            let rate_count = enqueue_in_network_struson(
-                                &mut json_reader,
-                                &mut enqueue_io,
-                                InNetworkEnqueueOptions {
-                                    chunk_size: negotiated_rate_chunk_size,
-                                    raw_chunk_byte_limit,
-                                    parse_in_workers,
-                                },
-                            )?;
-                            drain_copy_file_events(&event_rx, &mut writer)?;
-                            *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
-                            *object_counts
-                                .entry("negotiated_rates".to_string())
-                                .or_insert(0) += rate_count;
-                            let bytes = compressed_bytes_read.load(Ordering::Relaxed);
-                            let objects: u64 = object_counts.values().sum();
-                            if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
-                                emit_progress(
-                                    path,
-                                    total_bytes,
-                                    &compressed_bytes_read,
-                                    &object_counts,
-                                    started_at,
-                                    false,
-                                );
-                                while bytes >= next_progress_bytes {
-                                    next_progress_bytes += progress_bytes_interval;
-                                }
-                            } else if progress_objects_interval > 0
-                                && objects >= next_progress_objects
-                            {
-                                emit_progress(
-                                    path,
-                                    total_bytes,
-                                    &compressed_bytes_read,
-                                    &object_counts,
-                                    started_at,
-                                    false,
-                                );
-                                while objects >= next_progress_objects {
-                                    next_progress_objects += progress_objects_interval;
+                        if parse_in_workers {
+                            let mut byte_reader = BufferedJsonByteReader::new(rate_reader);
+                            byte_reader.expect_byte(b'{')?;
+                            let mut name_bytes = Vec::with_capacity(16);
+                            let mut decoded_name = String::new();
+                            let name =
+                                byte_reader.read_string_name(&mut name_bytes, &mut decoded_name)?;
+                            if name != "in_network" {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "synthetic rate object must start with in_network",
+                                ));
+                            }
+                            byte_reader.expect_byte(b':')?;
+                            byte_reader.expect_byte(b'[')?;
+                            let mut first_item = true;
+                            while next_array_value(&mut byte_reader, &mut first_item)? {
+                                let mut enqueue_io = InNetworkEnqueueIo {
+                                    tx: &tx,
+                                    event_rx: &event_rx,
+                                    writer: &mut writer,
+                                    cancelled: Some(&indexed_cancelled),
+                                    producer_blocked_micros: &mut producer_blocked_micros,
+                                    raw_chunk_stats: &mut raw_chunk_stats,
+                                };
+                                let rate_count = enqueue_in_network_raw_byte_scan(
+                                    &mut byte_reader,
+                                    &mut enqueue_io,
+                                    InNetworkEnqueueOptions {
+                                        chunk_size: negotiated_rate_chunk_size,
+                                        raw_chunk_byte_limit,
+                                        parse_in_workers,
+                                    },
+                                )?;
+                                drain_copy_file_events(&event_rx, &mut writer)?;
+                                *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
+                                *object_counts
+                                    .entry("negotiated_rates".to_string())
+                                    .or_insert(0) += rate_count;
+                                let bytes = compressed_bytes_read.load(Ordering::Relaxed);
+                                let objects: u64 = object_counts.values().sum();
+                                if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
+                                    emit_progress(
+                                        path,
+                                        total_bytes,
+                                        &compressed_bytes_read,
+                                        &object_counts,
+                                        started_at,
+                                        false,
+                                    );
+                                    while bytes >= next_progress_bytes {
+                                        next_progress_bytes += progress_bytes_interval;
+                                    }
+                                } else if progress_objects_interval > 0
+                                    && objects >= next_progress_objects
+                                {
+                                    emit_progress(
+                                        path,
+                                        total_bytes,
+                                        &compressed_bytes_read,
+                                        &object_counts,
+                                        started_at,
+                                        false,
+                                    );
+                                    while objects >= next_progress_objects {
+                                        next_progress_objects += progress_objects_interval;
+                                    }
                                 }
                             }
+                            if let Err(error) = validate_compact_rate_object_suffix(
+                                byte_reader.into_unread_reader(),
+                            ) {
+                                indexed_cancelled.store(true, Ordering::Release);
+                                producer_error = Some(error);
+                            }
+                        } else {
+                            let mut json_reader = JsonStreamReader::new(rate_reader);
+                            json_reader.begin_object().map_err(to_io_error)?;
+                            let name = json_reader.next_name_owned().map_err(to_io_error)?;
+                            if name != "in_network" {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "synthetic rate object must start with in_network",
+                                ));
+                            }
+                            json_reader.begin_array().map_err(to_io_error)?;
+                            while json_reader.has_next().map_err(to_io_error)? {
+                                let mut enqueue_io = InNetworkEnqueueIo {
+                                    tx: &tx,
+                                    event_rx: &event_rx,
+                                    writer: &mut writer,
+                                    cancelled: Some(&indexed_cancelled),
+                                    producer_blocked_micros: &mut producer_blocked_micros,
+                                    raw_chunk_stats: &mut raw_chunk_stats,
+                                };
+                                let rate_count = enqueue_in_network_struson(
+                                    &mut json_reader,
+                                    &mut enqueue_io,
+                                    InNetworkEnqueueOptions {
+                                        chunk_size: negotiated_rate_chunk_size,
+                                        raw_chunk_byte_limit,
+                                        parse_in_workers,
+                                    },
+                                )?;
+                                drain_copy_file_events(&event_rx, &mut writer)?;
+                                *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
+                                *object_counts
+                                    .entry("negotiated_rates".to_string())
+                                    .or_insert(0) += rate_count;
+                                let bytes = compressed_bytes_read.load(Ordering::Relaxed);
+                                let objects: u64 = object_counts.values().sum();
+                                if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
+                                    emit_progress(
+                                        path,
+                                        total_bytes,
+                                        &compressed_bytes_read,
+                                        &object_counts,
+                                        started_at,
+                                        false,
+                                    );
+                                    while bytes >= next_progress_bytes {
+                                        next_progress_bytes += progress_bytes_interval;
+                                    }
+                                } else if progress_objects_interval > 0
+                                    && objects >= next_progress_objects
+                                {
+                                    emit_progress(
+                                        path,
+                                        total_bytes,
+                                        &compressed_bytes_read,
+                                        &object_counts,
+                                        started_at,
+                                        false,
+                                    );
+                                    while objects >= next_progress_objects {
+                                        next_progress_objects += progress_objects_interval;
+                                    }
+                                }
+                            }
+                            json_reader.end_array().map_err(to_io_error)?;
+                            if let Err(error) = finish_compact_rate_object(json_reader, true, true)
+                            {
+                                indexed_cancelled.store(true, Ordering::Release);
+                                producer_error = Some(error);
+                            }
                         }
-                        json_reader.end_array().map_err(to_io_error)?;
-                        drain_reader_to_eof(json_reader.reader_mut())?;
                     }
                     in_network_enqueue_seconds += in_network_started_at.elapsed().as_secs_f64();
                     in_network_compressed_bytes = if indexed_reorder_used {
@@ -7880,11 +8088,20 @@ fn scan_compact_byte_top_level_parallel(
                         emit_copy_file_event(&mut writer, &event)?;
                     }
                     writer.flush()?;
-                    if let Some(err) = producer_error {
+                    if let Some(err) = compact_pipeline_error(worker_error, producer_error) {
                         return Err(err);
                     }
-                    if let Some(err) = worker_error {
-                        return Err(err);
+                    if plain_reorder_used {
+                        let completed_objects =
+                            object_counts.get("in_network").copied().unwrap_or(0);
+                        if completed_objects != plain_in_network_object_count {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "plain reordered in-network scan completed {completed_objects} objects, expected {plain_in_network_object_count}"
+                                ),
+                            ));
+                        }
                     }
                     emit_dedupe_summary(&dedupe, &object_counts);
                     if let Some(sidecars) = manifest_sidecars.as_ref() {
@@ -7939,7 +8156,7 @@ fn scan_compact_byte_top_level_parallel(
                             "worker_count": worker_count,
                             "work_queue": bounded_queue_size,
                             "event_queue": event_queue_size,
-                            "event_queue_unbounded": indexed_reorder_used,
+                            "event_queue_unbounded": false,
                             "split_negotiated_rates": negotiated_rate_chunk_size,
                             "raw_chunk_bytes": raw_chunk_byte_limit,
                             "raw_chunk_count": raw_chunk_stats.chunk_count,
@@ -7951,6 +8168,7 @@ fn scan_compact_byte_top_level_parallel(
                             "work_queue_high_water": raw_chunk_stats.queue_high_water,
                             "work_queue_blocked_sends": raw_chunk_stats.queue_blocked_sends,
                             "peak_queued_bytes": raw_chunk_stats.queue_bytes.peak_bytes(),
+                            "queued_bytes_at_finish": raw_chunk_stats.queue_bytes.current_bytes(),
                             "producer_byte_framing_seconds": seconds_from_micros(raw_chunk_stats.framing_micros),
                             "producer_byte_capture_seconds": seconds_from_micros(raw_chunk_stats.capture_micros),
                             "producer_byte_capture_bytes": raw_chunk_stats.capture_bytes,
@@ -7963,6 +8181,7 @@ fn scan_compact_byte_top_level_parallel(
                             "provider_ref_queue_high_water": provider_ref_raw_chunk_stats.queue_high_water,
                             "provider_ref_queue_blocked_sends": provider_ref_raw_chunk_stats.queue_blocked_sends,
                             "provider_ref_peak_queued_bytes": provider_ref_raw_chunk_stats.queue_bytes.peak_bytes(),
+                            "provider_ref_queued_bytes_at_finish": provider_ref_raw_chunk_stats.queue_bytes.current_bytes(),
                             "provider_capture_bytes": provider_ref_raw_chunk_stats.capture_bytes,
                             "provider_capture_seconds": provider_capture_seconds,
                             "provider_capture_compressed_bytes": provider_capture_compressed_bytes,
@@ -8015,6 +8234,12 @@ fn scan_compact_byte_top_level_parallel(
                             "indexed_ranges": indexed_range_metrics.iter().map(IndexedRangeProducerOutput::payload).collect::<Vec<_>>(),
                             "indexed_range_coverage_bytes": indexed_range_coverage_bytes,
                             "indexed_range_coverage_object_count": indexed_range_coverage_objects,
+                            "plain_range_reorder": plain_reorder_used,
+                            "plain_provider_range_offset": plain_provider_range_offset,
+                            "plain_provider_range_bytes": plain_provider_range_bytes,
+                            "plain_in_network_range_offset": plain_in_network_range_offset,
+                            "plain_in_network_range_bytes": plain_in_network_range_bytes,
+                            "plain_in_network_object_count": plain_in_network_object_count,
                             "indexed_range_completed_object_count": indexed_producer_progress.completed_objects.load(Ordering::Acquire),
                             "indexed_range_completed_rate_count": indexed_producer_progress.completed_rates.load(Ordering::Relaxed),
                             "indexed_range_completed_raw_bytes": indexed_producer_progress.completed_raw_bytes.load(Ordering::Relaxed),
@@ -8029,7 +8254,7 @@ fn scan_compact_byte_top_level_parallel(
                                 None
                             },
                             "full_decompression_passes": if indexed_reorder_used { 2 } else { 1 },
-                            "order_probe_partial_pass": true,
+                            "order_probe_partial_pass": provider_reference_order_label != "missing",
                             "order_detection_seconds": preflight_metrics.order_detection_seconds,
                             "order_detection_compressed_bytes": preflight_metrics.order_detection_compressed_bytes,
                             "order_detection_compressed_mib_s": preflight_metrics.compressed_mib_s(),
@@ -8045,6 +8270,15 @@ fn scan_compact_byte_top_level_parallel(
                             path,
                             indexed_range_coverage_objects,
                             &indexed_producer_progress,
+                            in_network_started_at,
+                            true,
+                        );
+                    } else if plain_reorder_used {
+                        emit_plain_reorder_progress(
+                            path,
+                            plain_in_network_object_count,
+                            object_counts.get("in_network").copied().unwrap_or(0),
+                            object_counts.get("negotiated_rates").copied().unwrap_or(0),
                             in_network_started_at,
                             true,
                         );
@@ -8692,6 +8926,7 @@ fn scan_compact_struson_parallel(
                         "work_queue_high_water": raw_chunk_stats.queue_high_water,
                         "work_queue_blocked_sends": raw_chunk_stats.queue_blocked_sends,
                         "peak_queued_bytes": raw_chunk_stats.queue_bytes.peak_bytes(),
+                        "queued_bytes_at_finish": raw_chunk_stats.queue_bytes.current_bytes(),
                         "producer_byte_framing_seconds": seconds_from_micros(raw_chunk_stats.framing_micros),
                         "producer_byte_capture_seconds": seconds_from_micros(raw_chunk_stats.capture_micros),
                         "producer_byte_capture_bytes": raw_chunk_stats.capture_bytes,
@@ -8704,6 +8939,7 @@ fn scan_compact_struson_parallel(
                         "provider_ref_queue_high_water": provider_ref_raw_chunk_stats.queue_high_water,
                         "provider_ref_queue_blocked_sends": provider_ref_raw_chunk_stats.queue_blocked_sends,
                         "provider_ref_peak_queued_bytes": provider_ref_raw_chunk_stats.queue_bytes.peak_bytes(),
+                        "provider_ref_queued_bytes_at_finish": provider_ref_raw_chunk_stats.queue_bytes.current_bytes(),
                         "provider_capture_bytes": provider_ref_raw_chunk_stats.capture_bytes,
                         "provider_capture_seconds": provider_capture_seconds,
                         "provider_capture_compressed_bytes": provider_capture_compressed_bytes,
@@ -8791,6 +9027,7 @@ enum CompactProviderReferenceOrder {
     BeforeInNetwork,
     AfterInNetwork(HashMap<String, ProviderEntry>),
     AfterInNetworkIndexed(CompactIndexedReorder),
+    AfterInNetworkPlain(CompactPlainReorder),
 }
 
 impl CompactProviderReferenceOrder {
@@ -8798,7 +9035,9 @@ impl CompactProviderReferenceOrder {
         match self {
             Self::None => "missing",
             Self::BeforeInNetwork => "before_in_network",
-            Self::AfterInNetwork(_) | Self::AfterInNetworkIndexed(_) => "after_in_network",
+            Self::AfterInNetwork(_)
+            | Self::AfterInNetworkIndexed(_)
+            | Self::AfterInNetworkPlain(_) => "after_in_network",
         }
     }
 }
@@ -8949,6 +9188,305 @@ fn validate_indexed_in_network_ranges(
     Ok(())
 }
 
+#[derive(Debug)]
+struct CompactTopLevelArrayScan {
+    provider_references: TopLevelArrayRange,
+    in_network: TopLevelArrayRange,
+    in_network_ranges: Vec<IndexedInNetworkRange>,
+    in_network_object_count: u64,
+}
+
+struct CompactTopLevelArrayIndexer {
+    range_producers_selected: usize,
+    stream_offset: u64,
+    depth: usize,
+    in_string: bool,
+    escape: bool,
+    top_level_key_buffer: Vec<u8>,
+    capturing_top_level_key: bool,
+    candidate_key: Option<CompactTopLevelArrayKey>,
+    pending_key: Option<CompactTopLevelArrayKey>,
+    active_array: Option<(CompactTopLevelArrayKey, usize, u64)>,
+    provider_references: Option<TopLevelArrayRange>,
+    in_network: Option<TopLevelArrayRange>,
+    in_network_ranges: Vec<IndexedInNetworkRange>,
+    in_network_object_start: Option<u64>,
+    in_network_object_count: u64,
+    in_network_after_value: bool,
+}
+
+impl CompactTopLevelArrayIndexer {
+    fn new(range_producers_selected: usize) -> io::Result<Self> {
+        if range_producers_selected == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "top-level range scan requires at least one selected producer",
+            ));
+        }
+        Ok(Self {
+            range_producers_selected,
+            stream_offset: 0,
+            depth: 0,
+            in_string: false,
+            escape: false,
+            top_level_key_buffer: Vec::with_capacity(32),
+            capturing_top_level_key: false,
+            candidate_key: None,
+            pending_key: None,
+            active_array: None,
+            provider_references: None,
+            in_network: None,
+            in_network_ranges: Vec::with_capacity(range_producers_selected),
+            in_network_object_start: None,
+            in_network_object_count: 0,
+            in_network_after_value: false,
+        })
+    }
+
+    fn ingest(&mut self, bytes: &[u8]) -> io::Result<()> {
+        for (idx, &byte) in bytes.iter().enumerate() {
+            let absolute_offset = self.stream_offset.saturating_add(idx as u64);
+            if self.in_string {
+                if self.escape {
+                    if self.capturing_top_level_key {
+                        self.top_level_key_buffer.push(byte);
+                    }
+                    self.escape = false;
+                } else if byte == b'\\' {
+                    if self.capturing_top_level_key {
+                        self.top_level_key_buffer.push(byte);
+                    }
+                    self.escape = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                    if self.capturing_top_level_key {
+                        self.candidate_key = match self.top_level_key_buffer.as_slice() {
+                            b"provider_references" => {
+                                Some(CompactTopLevelArrayKey::ProviderReferences)
+                            }
+                            b"in_network" => Some(CompactTopLevelArrayKey::InNetwork),
+                            _ => None,
+                        };
+                        self.capturing_top_level_key = false;
+                    }
+                } else if self.capturing_top_level_key {
+                    self.top_level_key_buffer.push(byte);
+                }
+                continue;
+            }
+
+            if byte == b'"' {
+                self.in_string = true;
+                self.escape = false;
+                if self.depth == 1 && self.active_array.is_none() {
+                    self.top_level_key_buffer.clear();
+                    self.capturing_top_level_key = true;
+                } else {
+                    self.capturing_top_level_key = false;
+                }
+                continue;
+            }
+
+            if let Some(candidate) = self.candidate_key.take() {
+                if byte.is_ascii_whitespace() {
+                    self.candidate_key = Some(candidate);
+                    continue;
+                }
+                if byte == b':' {
+                    self.pending_key = Some(candidate);
+                    continue;
+                }
+            }
+            if let Some(pending) = self.pending_key.take() {
+                if byte.is_ascii_whitespace() {
+                    self.pending_key = Some(pending);
+                    continue;
+                }
+                if byte == b'[' && self.depth == 1 {
+                    self.depth += 1;
+                    self.active_array = Some((pending, self.depth, absolute_offset));
+                    if matches!(pending, CompactTopLevelArrayKey::InNetwork) {
+                        self.in_network_after_value = false;
+                    }
+                    continue;
+                }
+            }
+
+            if let Some((CompactTopLevelArrayKey::InNetwork, array_depth, array_offset)) =
+                self.active_array
+            {
+                if let Some(object_offset) = self.in_network_object_start {
+                    if byte == b'}' && self.depth == array_depth.saturating_add(1) {
+                        retain_coalesced_indexed_range(
+                            &mut self.in_network_ranges,
+                            TopLevelArrayRange {
+                                offset: object_offset,
+                                length: absolute_offset
+                                    .saturating_sub(object_offset)
+                                    .saturating_add(1),
+                            },
+                            self.range_producers_selected,
+                        );
+                        self.in_network_object_start = None;
+                        self.in_network_object_count =
+                            self.in_network_object_count.saturating_add(1);
+                        self.in_network_after_value = true;
+                        self.depth = self.depth.saturating_sub(1);
+                        continue;
+                    }
+                } else if self.depth == array_depth {
+                    if byte.is_ascii_whitespace() {
+                        continue;
+                    }
+                    match byte {
+                        b'{' if !self.in_network_after_value => {
+                            self.in_network_object_start = Some(absolute_offset);
+                            self.depth += 1;
+                            continue;
+                        }
+                        b',' if self.in_network_after_value => {
+                            self.in_network_after_value = false;
+                            continue;
+                        }
+                        b']' if self.in_network_after_value
+                            || self.in_network_object_count == 0 =>
+                        {
+                            set_top_level_array_range(
+                                CompactTopLevelArrayKey::InNetwork,
+                                TopLevelArrayRange {
+                                    offset: array_offset,
+                                    length: absolute_offset
+                                        .saturating_sub(array_offset)
+                                        .saturating_add(1),
+                                },
+                                &mut self.provider_references,
+                                &mut self.in_network,
+                            )?;
+                            self.active_array = None;
+                            self.depth = self.depth.saturating_sub(1);
+                            continue;
+                        }
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "in-network array contains a non-object child or invalid separator",
+                            ));
+                        }
+                    }
+                }
+            }
+
+            match byte {
+                b'{' | b'[' => self.depth += 1,
+                b']' => {
+                    if let Some((key, array_depth, array_offset)) = self.active_array {
+                        if self.depth == array_depth {
+                            set_top_level_array_range(
+                                key,
+                                TopLevelArrayRange {
+                                    offset: array_offset,
+                                    length: absolute_offset
+                                        .saturating_sub(array_offset)
+                                        .saturating_add(1),
+                                },
+                                &mut self.provider_references,
+                                &mut self.in_network,
+                            )?;
+                            self.active_array = None;
+                        }
+                    }
+                    self.depth = self.depth.saturating_sub(1);
+                }
+                b'}' => self.depth = self.depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        self.stream_offset = self.stream_offset.saturating_add(bytes.len() as u64);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<Option<CompactTopLevelArrayScan>> {
+        if self.in_string
+            || self.active_array.is_some()
+            || self.in_network_object_start.is_some()
+            || self.depth != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete JSON while indexing PTG top-level arrays",
+            ));
+        }
+        let (Some(provider_references), Some(in_network)) =
+            (self.provider_references.take(), self.in_network.take())
+        else {
+            return Ok(None);
+        };
+        if provider_references.offset <= in_network.offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "top-level reorder requested for non-reversed PTG arrays",
+            ));
+        }
+        if self.in_network_object_count == 0 {
+            return Ok(None);
+        }
+        validate_indexed_in_network_ranges(
+            &self.in_network_ranges,
+            in_network,
+            self.in_network_object_count,
+        )?;
+        Ok(Some(CompactTopLevelArrayScan {
+            provider_references,
+            in_network,
+            in_network_ranges: std::mem::take(&mut self.in_network_ranges),
+            in_network_object_count: self.in_network_object_count,
+        }))
+    }
+}
+
+struct CompactTopLevelArrayIndexingReader {
+    inner: Box<dyn Read>,
+    indexer: Arc<Mutex<CompactTopLevelArrayIndexer>>,
+}
+
+impl Read for CompactTopLevelArrayIndexingReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if read > 0 {
+            self.indexer
+                .lock()
+                .map_err(|_| io::Error::other("top-level range indexer mutex is poisoned"))?
+                .ingest(&buffer[..read])?;
+        }
+        Ok(read)
+    }
+}
+
+fn scan_compact_top_level_array_ranges(
+    reader: Box<dyn Read>,
+    range_producers_selected: usize,
+) -> io::Result<Option<CompactTopLevelArrayScan>> {
+    let indexer = Arc::new(Mutex::new(CompactTopLevelArrayIndexer::new(
+        range_producers_selected,
+    )?));
+    let indexing_reader = CompactTopLevelArrayIndexingReader {
+        inner: reader,
+        indexer: Arc::clone(&indexer),
+    };
+    // The indexer sees original bytes (including a BOM) while the strict reader strips the BOM
+    // for the parser. This preserves seek offsets and validates every JSON token in one pass.
+    let mut json_reader = JsonStreamReader::new(strict_utf8_reader(indexing_reader));
+    json_reader.skip_value().map_err(to_io_error)?;
+    json_reader
+        .consume_trailing_whitespace()
+        .map_err(to_io_error)?;
+    let result = indexer
+        .lock()
+        .map_err(|_| io::Error::other("top-level range indexer mutex is poisoned"))?
+        .finish();
+    result
+}
+
 fn build_indexed_top_level_reorder(
     path: &Path,
     rapidgzip_config: &RapidgzipConfig,
@@ -8963,225 +9501,48 @@ fn build_indexed_top_level_reorder(
         rapidgzip_config,
         &index.path,
     )?;
-    let mut reader = strict_utf8_reader_preserving_bom(reader);
-    let mut buffer = vec![0u8; READ_BUF_SIZE];
-    let mut stream_offset = 0u64;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut top_level_key_buffer = Vec::with_capacity(32);
-    let mut capturing_top_level_key = false;
-    let mut candidate_key: Option<CompactTopLevelArrayKey> = None;
-    let mut pending_key: Option<CompactTopLevelArrayKey> = None;
-    let mut active_array: Option<(CompactTopLevelArrayKey, usize, u64)> = None;
-    let mut provider_references = None;
-    let mut in_network = None;
-    let mut in_network_ranges = Vec::with_capacity(range_producers_selected);
-    let mut in_network_object_start = None;
-    let mut in_network_object_count = 0u64;
-    let mut in_network_after_value = false;
-
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        for (idx, &byte) in buffer[..read].iter().enumerate() {
-            let absolute_offset = stream_offset.saturating_add(idx as u64);
-            if in_string {
-                if escape {
-                    if capturing_top_level_key {
-                        top_level_key_buffer.push(byte);
-                    }
-                    escape = false;
-                } else if byte == b'\\' {
-                    if capturing_top_level_key {
-                        top_level_key_buffer.push(byte);
-                    }
-                    escape = true;
-                } else if byte == b'"' {
-                    in_string = false;
-                    if capturing_top_level_key {
-                        candidate_key = match top_level_key_buffer.as_slice() {
-                            b"provider_references" => {
-                                Some(CompactTopLevelArrayKey::ProviderReferences)
-                            }
-                            b"in_network" => Some(CompactTopLevelArrayKey::InNetwork),
-                            _ => None,
-                        };
-                        capturing_top_level_key = false;
-                    }
-                } else if capturing_top_level_key {
-                    top_level_key_buffer.push(byte);
-                }
-                continue;
-            }
-
-            if byte == b'"' {
-                in_string = true;
-                escape = false;
-                if depth == 1 && active_array.is_none() {
-                    top_level_key_buffer.clear();
-                    capturing_top_level_key = true;
-                } else {
-                    capturing_top_level_key = false;
-                }
-                continue;
-            }
-
-            if let Some(candidate) = candidate_key.take() {
-                if byte.is_ascii_whitespace() {
-                    candidate_key = Some(candidate);
-                    continue;
-                }
-                if byte == b':' {
-                    pending_key = Some(candidate);
-                    continue;
-                }
-            }
-            if let Some(pending) = pending_key.take() {
-                if byte.is_ascii_whitespace() {
-                    pending_key = Some(pending);
-                    continue;
-                }
-                if byte == b'[' && depth == 1 {
-                    depth += 1;
-                    active_array = Some((pending, depth, absolute_offset));
-                    if matches!(pending, CompactTopLevelArrayKey::InNetwork) {
-                        in_network_after_value = false;
-                    }
-                    continue;
-                }
-            }
-
-            if let Some((CompactTopLevelArrayKey::InNetwork, array_depth, array_offset)) =
-                active_array
-            {
-                if let Some(object_offset) = in_network_object_start {
-                    if byte == b'}' && depth == array_depth.saturating_add(1) {
-                        retain_coalesced_indexed_range(
-                            &mut in_network_ranges,
-                            TopLevelArrayRange {
-                                offset: object_offset,
-                                length: absolute_offset
-                                    .saturating_sub(object_offset)
-                                    .saturating_add(1),
-                            },
-                            range_producers_selected,
-                        );
-                        in_network_object_start = None;
-                        in_network_object_count = in_network_object_count.saturating_add(1);
-                        in_network_after_value = true;
-                        depth = depth.saturating_sub(1);
-                        continue;
-                    }
-                } else if depth == array_depth {
-                    if byte.is_ascii_whitespace() {
-                        continue;
-                    }
-                    match byte {
-                        b'{' if !in_network_after_value => {
-                            in_network_object_start = Some(absolute_offset);
-                            depth += 1;
-                            continue;
-                        }
-                        b',' if in_network_after_value => {
-                            in_network_after_value = false;
-                            continue;
-                        }
-                        b']' if in_network_after_value || in_network_object_count == 0 => {
-                            set_top_level_array_range(
-                                CompactTopLevelArrayKey::InNetwork,
-                                TopLevelArrayRange {
-                                    offset: array_offset,
-                                    length: absolute_offset
-                                        .saturating_sub(array_offset)
-                                        .saturating_add(1),
-                                },
-                                &mut provider_references,
-                                &mut in_network,
-                            )?;
-                            active_array = None;
-                            depth = depth.saturating_sub(1);
-                            continue;
-                        }
-                        _ => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "in-network array contains a non-object child or invalid separator",
-                            ));
-                        }
-                    }
-                }
-            }
-
-            match byte {
-                b'{' | b'[' => depth += 1,
-                b']' => {
-                    if let Some((key, array_depth, array_offset)) = active_array {
-                        if depth == array_depth {
-                            set_top_level_array_range(
-                                key,
-                                TopLevelArrayRange {
-                                    offset: array_offset,
-                                    length: absolute_offset
-                                        .saturating_sub(array_offset)
-                                        .saturating_add(1),
-                                },
-                                &mut provider_references,
-                                &mut in_network,
-                            )?;
-                            active_array = None;
-                        }
-                    }
-                    depth = depth.saturating_sub(1);
-                }
-                b'}' => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
-        stream_offset = stream_offset.saturating_add(read as u64);
-    }
-
-    if in_string || active_array.is_some() || in_network_object_start.is_some() || depth != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "incomplete JSON while indexing PTG top-level arrays",
-        ));
-    }
-    let (Some(provider_references), Some(in_network)) = (provider_references, in_network) else {
+    let reader = strict_utf8_reader_preserving_bom(reader);
+    let Some(scan) = scan_compact_top_level_array_ranges(reader, range_producers_selected)? else {
         return Ok(None);
     };
-    if provider_references.offset <= in_network.offset {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "indexed reorder requested for non-reversed PTG arrays",
-        ));
-    }
     if index.byte_len() == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "rapidgzip produced an empty seek index",
         ));
     }
-    if in_network_object_count == 0 {
-        return Ok(None);
-    }
-    validate_indexed_in_network_ranges(&in_network_ranges, in_network, in_network_object_count)?;
     index.harden_file_permissions()?;
     Ok(Some(CompactIndexedReorder {
         index,
-        provider_references,
-        in_network_ranges,
+        provider_references: scan.provider_references,
+        in_network_ranges: scan.in_network_ranges,
         indexed_range_producers_requested: range_producers_requested,
-        in_network_object_count,
+        in_network_object_count: scan.in_network_object_count,
         decoder_threads: rapidgzip_config.decoder_threads,
+    }))
+}
+
+fn build_plain_top_level_reorder(
+    path: &Path,
+    rapidgzip_config: &RapidgzipConfig,
+    bytes_read: Arc<AtomicU64>,
+) -> io::Result<Option<CompactPlainReorder>> {
+    let reader = open_full_scan_reader(path, bytes_read, rapidgzip_config)?;
+    let reader = strict_utf8_reader_preserving_bom(reader);
+    let Some(scan) = scan_compact_top_level_array_ranges(reader, 1)? else {
+        return Ok(None);
+    };
+    Ok(Some(CompactPlainReorder {
+        provider_references: scan.provider_references,
+        in_network: scan.in_network,
+        in_network_object_count: scan.in_network_object_count,
     }))
 }
 
 fn compact_provider_reference_order(
     path: &Path,
     use_indexed_reorder: bool,
+    use_plain_reorder: bool,
     rapidgzip_config: &RapidgzipConfig,
     indexed_range_producers_requested: usize,
     indexed_range_producers_selected: usize,
@@ -9237,6 +9598,30 @@ fn compact_provider_reference_order(
                     }
                     return compact_provider_reference_order(
                         path,
+                        false,
+                        false,
+                        rapidgzip_config,
+                        indexed_range_producers_requested,
+                        indexed_range_producers_selected,
+                    );
+                }
+                if use_plain_reorder {
+                    drop(json_reader);
+                    let plain_bytes_read = Arc::new(AtomicU64::new(0));
+                    if let Some(plain_reorder) = build_plain_top_level_reorder(
+                        path,
+                        rapidgzip_config,
+                        Arc::clone(&plain_bytes_read),
+                    )? {
+                        return Ok(finish_provider_reference_preflight(
+                            CompactProviderReferenceOrder::AfterInNetworkPlain(plain_reorder),
+                            started_at,
+                            &plain_bytes_read,
+                        ));
+                    }
+                    return compact_provider_reference_order(
+                        path,
+                        false,
                         false,
                         rapidgzip_config,
                         indexed_range_producers_requested,
@@ -9353,7 +9738,7 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
     let provider_refs_in_workers_requested =
         env_bool("HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS", true);
     let rapidgzip_config = RapidgzipConfig {
-        enabled: env_bool("HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED", false),
+        enabled: env_bool("HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED", true),
         executable: env::var("HLTHPRT_PTG2_RUST_RAPIDGZIP_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("rapidgzip")),
@@ -9371,11 +9756,16 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
                 .max(rapidgzip_config.decoder_threads),
         ),
     };
+    let gzip_input = is_gzip(path)?;
     let use_indexed_reorder = copy_paths.has_file_paths()
         && top_level_byte_scan_requested
         && provider_refs_in_workers_requested
         && rapidgzip_config.enabled
-        && is_gzip(path)?;
+        && gzip_input;
+    let use_plain_reorder = copy_paths.has_file_paths()
+        && top_level_byte_scan_requested
+        && provider_refs_in_workers_requested
+        && !gzip_input;
     let indexed_range_producers_requested = if use_indexed_reorder {
         indexed_range_producers_requested()?
     } else {
@@ -9386,6 +9776,7 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
     let provider_reference_preflight = compact_provider_reference_order(
         path,
         use_indexed_reorder,
+        use_plain_reorder,
         &rapidgzip_index_config,
         indexed_range_producers_requested,
         indexed_range_producers_selected,
@@ -9395,13 +9786,17 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
         &provider_reference_preflight.order,
         CompactProviderReferenceOrder::BeforeInNetwork
             | CompactProviderReferenceOrder::AfterInNetworkIndexed(_)
+            | CompactProviderReferenceOrder::AfterInNetworkPlain(_)
     );
     if copy_paths.has_file_paths() && parallel_top_level_order_supported {
         if top_level_byte_scan_requested && provider_refs_in_workers_requested {
-            let indexed_reorder = match provider_reference_preflight.order {
-                CompactProviderReferenceOrder::BeforeInNetwork => None,
+            let (indexed_reorder, plain_reorder) = match provider_reference_preflight.order {
+                CompactProviderReferenceOrder::BeforeInNetwork => (None, None),
                 CompactProviderReferenceOrder::AfterInNetworkIndexed(indexed_reorder) => {
-                    Some(indexed_reorder)
+                    (Some(indexed_reorder), None)
+                }
+                CompactProviderReferenceOrder::AfterInNetworkPlain(plain_reorder) => {
+                    (None, Some(plain_reorder))
                 }
                 _ => unreachable!("parallel top-level order was checked above"),
             };
@@ -9422,6 +9817,7 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
                     preflight_metrics: provider_reference_preflight.metrics,
                     rapidgzip_config,
                     indexed_reorder,
+                    plain_reorder,
                 },
             );
         }
@@ -9460,6 +9856,9 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
             }
             CompactProviderReferenceOrder::AfterInNetworkIndexed(_) => {
                 "indexed_reorder_unavailable"
+            }
+            CompactProviderReferenceOrder::AfterInNetworkPlain(_) => {
+                "plain_range_reorder_unavailable"
             }
             CompactProviderReferenceOrder::BeforeInNetwork => "parallel_path_unavailable",
         }
@@ -9538,6 +9937,11 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
         CompactProviderReferenceOrder::AfterInNetworkIndexed(_) => {
             return Err(io::Error::other(
                 "indexed provider-reference reorder did not enter the parallel scanner",
+            ));
+        }
+        CompactProviderReferenceOrder::AfterInNetworkPlain(_) => {
+            return Err(io::Error::other(
+                "plain provider-reference reorder did not enter the parallel scanner",
             ));
         }
     };
@@ -10390,6 +10794,7 @@ fn pg_binary_negotiated_rate(field: &[u8]) -> io::Result<String> {
 }
 
 mod ptg2_serving_binary_v3 {
+    #[cfg(test)]
     use std::collections::{BTreeMap, BTreeSet};
     use std::io;
 
@@ -10870,6 +11275,7 @@ mod ptg2_serving_binary_v3 {
         Ok((Some(text.to_owned()), text_end))
     }
 
+    #[cfg(test)]
     pub(crate) fn encode_provider_code_set(
         code_keys: &[i64],
     ) -> io::Result<(Vec<u8>, CodeSetStats)> {
@@ -10905,6 +11311,83 @@ mod ptg2_serving_binary_v3 {
                 CODE_CONTAINER_BITMAP => stats.bitmap_container_count += 1,
                 _ => unreachable!(),
             }
+        }
+        stats.encoded_bytes = encoded.len();
+        Ok((encoded, stats))
+    }
+
+    pub(crate) fn encode_sorted_provider_code_set(
+        code_keys: &[i64],
+    ) -> io::Result<(Vec<u8>, CodeSetStats)> {
+        if code_keys.first().is_some_and(|key| *key < 0)
+            || code_keys
+                .last()
+                .is_some_and(|key| *key > i64::from(i32::MAX))
+        {
+            return Err(invalid_input(
+                "sorted provider code keys must fit in nonnegative signed PostgreSQL integers",
+            ));
+        }
+        if code_keys.windows(2).any(|keys| keys[0] >= keys[1]) {
+            return Err(invalid_input(
+                "sorted provider code keys must be strictly ordered",
+            ));
+        }
+        let container_count = code_keys
+            .iter()
+            .map(|key| (*key as u32 >> CODE_CONTAINER_SHIFT) as u16)
+            .fold((None, 0usize), |(previous, count), high_bits| {
+                if previous == Some(high_bits) {
+                    (previous, count)
+                } else {
+                    (Some(high_bits), count.saturating_add(1))
+                }
+            })
+            .1;
+        let mut encoded = vec![FORMAT_VERSION];
+        append_uvarint(&mut encoded, container_count as u64);
+        let mut previous_high = 0u16;
+        let mut container_index = 0usize;
+        let mut code_index = 0usize;
+        let mut stats = CodeSetStats {
+            code_count: code_keys.len(),
+            container_count,
+            sparse_container_count: 0,
+            run_container_count: 0,
+            bitmap_container_count: 0,
+            encoded_bytes: 0,
+        };
+        while code_index < code_keys.len() {
+            let high_bits = (code_keys[code_index] as u32 >> CODE_CONTAINER_SHIFT) as u16;
+            let container_start = code_index;
+            while code_index < code_keys.len()
+                && (code_keys[code_index] as u32 >> CODE_CONTAINER_SHIFT) as u16 == high_bits
+            {
+                code_index += 1;
+            }
+            let low_keys = code_keys[container_start..code_index]
+                .iter()
+                .map(|key| (*key as u32 & CODE_CONTAINER_LOW_MASK as u32) as u16)
+                .collect::<Vec<_>>();
+            let (kind, body) = smallest_code_container(&low_keys);
+            let high_delta = if container_index == 0 {
+                high_bits
+            } else {
+                high_bits - previous_high
+            };
+            append_uvarint(&mut encoded, u64::from(high_delta));
+            encoded.push(kind);
+            append_uvarint(&mut encoded, low_keys.len() as u64);
+            append_uvarint(&mut encoded, body.len() as u64);
+            encoded.extend_from_slice(&body);
+            match kind {
+                CODE_CONTAINER_SPARSE => stats.sparse_container_count += 1,
+                CODE_CONTAINER_RUNS => stats.run_container_count += 1,
+                CODE_CONTAINER_BITMAP => stats.bitmap_container_count += 1,
+                _ => unreachable!(),
+            }
+            previous_high = high_bits;
+            container_index += 1;
         }
         stats.encoded_bytes = encoded.len();
         Ok((encoded, stats))
@@ -10975,6 +11458,7 @@ mod ptg2_serving_binary_v3 {
         Ok(code_keys)
     }
 
+    #[cfg(test)]
     fn normalized_code_keys(code_keys: &[i64]) -> io::Result<Vec<u32>> {
         let normalized_keys: BTreeSet<i64> = code_keys.iter().copied().collect();
         if normalized_keys.first().is_some_and(|key| *key < 0) {
@@ -10994,6 +11478,7 @@ mod ptg2_serving_binary_v3 {
             .collect()
     }
 
+    #[cfg(test)]
     fn code_containers(code_keys: &[u32]) -> Vec<(u16, Vec<u16>)> {
         let mut containers: BTreeMap<u16, Vec<u16>> = BTreeMap::new();
         for &code_key in code_keys {
@@ -11392,6 +11877,10 @@ mod ptg2_serving_binary_v3 {
             let mut expected = source.clone();
             expected.sort_unstable();
             expected.dedup();
+            let (sorted_encoded, sorted_stats) =
+                encode_sorted_provider_code_set(&expected).unwrap();
+            assert_eq!(sorted_encoded, encoded);
+            assert_eq!(sorted_stats, stats);
             assert_eq!(
                 decode_provider_code_set(&encoded).unwrap(),
                 expected
@@ -11418,6 +11907,8 @@ mod ptg2_serving_binary_v3 {
         fn provider_code_set_rejects_boundaries_and_corruption() {
             assert!(encode_provider_code_set(&[-1]).is_err());
             assert!(encode_provider_code_set(&[i64::from(i32::MAX) + 1]).is_err());
+            assert!(encode_sorted_provider_code_set(&[2, 1]).is_err());
+            assert!(encode_sorted_provider_code_set(&[1, 1]).is_err());
 
             let valid = encode_provider_code_set(&(0..100).collect::<Vec<_>>())
                 .unwrap()
@@ -11446,6 +11937,11 @@ fn write_uvarint_to_vec(out: &mut Vec<u8>, value: u64) {
         }
         out.push(byte | 0x80);
     }
+}
+
+fn uvarint_encoded_len(value: u64) -> usize {
+    let significant_bits = 64usize.saturating_sub(value.leading_zeros() as usize);
+    significant_bits.max(1).div_ceil(7)
 }
 
 fn serving_binary_block_bytes() -> usize {
@@ -11825,6 +12321,108 @@ fn write_serving_binary_v3_logical_block<W: Write>(
     Ok(())
 }
 
+struct ServingBinaryV3SpoolBlock<'a> {
+    artifact_kind: &'a str,
+    block_key: i32,
+    entry_count: usize,
+    prefix: &'a [u8],
+    spool_bytes: u64,
+}
+
+fn write_serving_binary_v3_spooled_logical_block<W: Write, R: Read + Seek>(
+    writer: &mut W,
+    target_format: ServingBinaryTargetCopyFormat,
+    max_payload_bytes: usize,
+    logical_block: ServingBinaryV3SpoolBlock<'_>,
+    spool: &mut R,
+    stats: &mut ServingBinaryV3BlockStats,
+) -> io::Result<u64> {
+    if max_payload_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PTG2 v3 block byte limit must be positive",
+        ));
+    }
+    let total_payload_bytes = u64::try_from(logical_block.prefix.len())
+        .ok()
+        .and_then(|prefix_bytes| prefix_bytes.checked_add(logical_block.spool_bytes))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTG2 v3 spooled logical block byte count overflows u64",
+            )
+        })?;
+    if total_payload_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "PTG2 v3 {} cannot emit an empty logical block",
+                logical_block.artifact_kind
+            ),
+        ));
+    }
+    spool.seek(SeekFrom::Start(0))?;
+    let mut prefix_offset = 0usize;
+    let mut remaining_spool_bytes = logical_block.spool_bytes;
+    let mut fragment = Vec::with_capacity(max_payload_bytes.min(1024 * 1024));
+    let mut block_no = 0usize;
+    while prefix_offset < logical_block.prefix.len() || remaining_spool_bytes > 0 {
+        fragment.clear();
+        let prefix_bytes = (logical_block.prefix.len() - prefix_offset).min(max_payload_bytes);
+        fragment
+            .extend_from_slice(&logical_block.prefix[prefix_offset..prefix_offset + prefix_bytes]);
+        prefix_offset += prefix_bytes;
+        let available = max_payload_bytes - fragment.len();
+        let spool_fragment_bytes = usize::try_from(remaining_spool_bytes.min(available as u64))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PTG2 v3 spool fragment byte count exceeds usize",
+                )
+            })?;
+        if spool_fragment_bytes > 0 {
+            let prior_length = fragment.len();
+            fragment.resize(prior_length + spool_fragment_bytes, 0);
+            spool.read_exact(&mut fragment[prior_length..])?;
+            remaining_spool_bytes -= spool_fragment_bytes as u64;
+        }
+        let record_stats = write_serving_binary_copy_record_with_stats(
+            writer,
+            target_format,
+            logical_block.artifact_kind,
+            logical_block.block_key,
+            block_no,
+            if block_no == 0 {
+                logical_block.entry_count
+            } else {
+                0
+            },
+            &fragment,
+        )?;
+        stats.copy_record_count = stats.copy_record_count.saturating_add(1);
+        stats.stored_payload_bytes = stats
+            .stored_payload_bytes
+            .saturating_add(record_stats.stored_payload_bytes);
+        stats.raw_payload_bytes = stats
+            .raw_payload_bytes
+            .saturating_add(record_stats.raw_payload_bytes);
+        stats.compressed_records = stats
+            .compressed_records
+            .saturating_add(u64::from(record_stats.compressed));
+        block_no = block_no.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTG2 v3 spool fragment number overflows usize",
+            )
+        })?;
+    }
+    stats.logical_block_count = stats.logical_block_count.saturating_add(1);
+    stats.entry_count = stats
+        .entry_count
+        .saturating_add(logical_block.entry_count as u64);
+    Ok(logical_block.spool_bytes)
+}
+
 fn serving_binary_v3_block_key(source_key: i64, block_span: i64, name: &str) -> io::Result<i32> {
     if source_key < 0 {
         return Err(io::Error::new(
@@ -11908,13 +12506,24 @@ fn serving_binary_v3_validate_atom_key(atom_key: i64, atom_key_bits: u8) -> io::
     Ok(())
 }
 
+fn serving_binary_v3_spill_directory() -> io::Result<PathBuf> {
+    let base_directory = env::var_os("HLTHPRT_PTG2_MANIFEST_SPILL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir);
+    std::fs::create_dir_all(&base_directory)?;
+    Ok(base_directory)
+}
+
 struct ServingBinaryV3ProviderCodeState {
     max_payload_bytes: usize,
+    maximum_code_keys: Option<usize>,
     previous_pair: Option<(i64, i64)>,
     current_provider_key: Option<i64>,
     current_code_keys: Vec<i64>,
     current_block_key: Option<i32>,
-    provider_entries: Vec<(i64, Vec<u8>)>,
+    block_spool: File,
+    block_spool_bytes: u64,
+    block_provider_count: usize,
     block_stats: ServingBinaryV3BlockStats,
     row_count: u64,
     duplicate_pair_count: u64,
@@ -11924,17 +12533,29 @@ struct ServingBinaryV3ProviderCodeState {
     sparse_container_count: u64,
     run_container_count: u64,
     bitmap_container_count: u64,
+    maximum_code_keys_buffered: usize,
+    scratch_bytes_read: u64,
+    scratch_bytes_written: u64,
 }
 
 impl ServingBinaryV3ProviderCodeState {
-    fn new(max_payload_bytes: usize) -> Self {
-        Self {
+    fn new(max_payload_bytes: usize, maximum_code_keys: Option<usize>) -> io::Result<Self> {
+        if max_payload_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "provider-code payload limit must be positive",
+            ));
+        }
+        Ok(Self {
             max_payload_bytes,
+            maximum_code_keys,
             previous_pair: None,
             current_provider_key: None,
             current_code_keys: Vec::new(),
             current_block_key: None,
-            provider_entries: Vec::new(),
+            block_spool: tempfile::tempfile_in(serving_binary_v3_spill_directory()?)?,
+            block_spool_bytes: 0,
+            block_provider_count: 0,
             block_stats: ServingBinaryV3BlockStats::default(),
             row_count: 0,
             duplicate_pair_count: 0,
@@ -11944,7 +12565,10 @@ impl ServingBinaryV3ProviderCodeState {
             sparse_container_count: 0,
             run_container_count: 0,
             bitmap_container_count: 0,
-        }
+            maximum_code_keys_buffered: 0,
+            scratch_bytes_read: 0,
+            scratch_bytes_written: 0,
+        })
     }
 
     fn push<W: Write>(
@@ -11985,7 +12609,19 @@ impl ServingBinaryV3ProviderCodeState {
             self.finish_provider(writer, target_format)?;
         }
         self.current_provider_key = Some(provider_set_key);
+        if self
+            .maximum_code_keys
+            .is_some_and(|maximum| self.current_code_keys.len() >= maximum)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "one provider references more code keys than the finalizer dictionary",
+            ));
+        }
         self.current_code_keys.push(code_key);
+        self.maximum_code_keys_buffered = self
+            .maximum_code_keys_buffered
+            .max(self.current_code_keys.len());
         self.previous_pair = Some(pair);
         self.code_count = self.code_count.saturating_add(1);
         Ok(())
@@ -12013,8 +12649,57 @@ impl ServingBinaryV3ProviderCodeState {
         self.current_block_key = Some(block_key);
         let code_keys = std::mem::take(&mut self.current_code_keys);
         let (code_payload, code_stats) =
-            ptg2_serving_binary_v3::encode_provider_code_set(&code_keys)?;
-        self.provider_entries.push((provider_set_key, code_payload));
+            ptg2_serving_binary_v3::encode_sorted_provider_code_set(&code_keys)?;
+        let block_start = i64::from(block_key)
+            .checked_mul(PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_BLOCK_SPAN)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PTG2 v3 provider block start overflows i64",
+                )
+            })?;
+        let relative_key = u64::try_from(provider_set_key - block_start).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTG2 v3 provider key is outside its logical block",
+            )
+        })?;
+        if relative_key >= PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_BLOCK_SPAN as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTG2 v3 provider key is outside its logical block",
+            ));
+        }
+        let mut entry_header = Vec::with_capacity(16);
+        write_uvarint_to_vec(&mut entry_header, relative_key);
+        write_uvarint_to_vec(&mut entry_header, code_payload.len() as u64);
+        self.block_spool.write_all(&entry_header)?;
+        self.block_spool.write_all(&code_payload)?;
+        let entry_bytes = u64::try_from(entry_header.len())
+            .ok()
+            .and_then(|header_bytes| header_bytes.checked_add(code_payload.len() as u64))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PTG2 v3 provider-code block byte count overflows u64",
+                )
+            })?;
+        self.block_spool_bytes =
+            self.block_spool_bytes
+                .checked_add(entry_bytes)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "PTG2 v3 provider-code block byte count overflows u64",
+                    )
+                })?;
+        self.scratch_bytes_written = self.scratch_bytes_written.saturating_add(entry_bytes);
+        self.block_provider_count = self.block_provider_count.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTG2 v3 provider-code block count overflows usize",
+            )
+        })?;
         self.provider_set_count = self.provider_set_count.saturating_add(1);
         self.container_count = self
             .container_count
@@ -12036,7 +12721,7 @@ impl ServingBinaryV3ProviderCodeState {
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
     ) -> io::Result<()> {
-        if self.provider_entries.is_empty() {
+        if self.block_provider_count == 0 {
             return Ok(());
         }
         let block_key = self.current_block_key.ok_or_else(|| {
@@ -12045,46 +12730,29 @@ impl ServingBinaryV3ProviderCodeState {
                 "PTG2 v3 provider block is missing its block key",
             )
         })?;
-        let provider_entries = std::mem::take(&mut self.provider_entries);
-        let mut block_payload = Vec::new();
-        write_uvarint_to_vec(&mut block_payload, provider_entries.len() as u64);
-        let block_start = i64::from(block_key)
-            .checked_mul(PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_BLOCK_SPAN)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "PTG2 v3 provider block start overflows i64",
-                )
-            })?;
-        for (provider_set_key, code_payload) in &provider_entries {
-            let relative_key = u64::try_from(*provider_set_key - block_start).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "PTG2 v3 provider key is outside its logical block",
-                )
-            })?;
-            if relative_key >= PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_BLOCK_SPAN as u64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "PTG2 v3 provider key is outside its logical block",
-                ));
-            }
-            write_uvarint_to_vec(&mut block_payload, relative_key);
-            write_uvarint_to_vec(&mut block_payload, code_payload.len() as u64);
-            block_payload.extend_from_slice(code_payload);
-        }
-        write_serving_binary_v3_logical_block(
+        self.block_spool.flush()?;
+        let mut block_prefix = Vec::with_capacity(8);
+        write_uvarint_to_vec(&mut block_prefix, self.block_provider_count as u64);
+        let scratch_bytes_read = write_serving_binary_v3_spooled_logical_block(
             writer,
             target_format,
             self.max_payload_bytes,
-            ServingBinaryV3LogicalBlock {
+            ServingBinaryV3SpoolBlock {
                 artifact_kind: PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND,
                 block_key,
-                entry_count: provider_entries.len(),
-                payload: &block_payload,
+                entry_count: self.block_provider_count,
+                prefix: &block_prefix,
+                spool_bytes: self.block_spool_bytes,
             },
+            &mut self.block_spool,
             &mut self.block_stats,
-        )
+        )?;
+        self.scratch_bytes_read = self.scratch_bytes_read.saturating_add(scratch_bytes_read);
+        self.block_spool.set_len(0)?;
+        self.block_spool.seek(SeekFrom::Start(0))?;
+        self.block_spool_bytes = 0;
+        self.block_provider_count = 0;
+        Ok(())
     }
 
     fn finish<W: Write>(
@@ -12348,7 +13016,7 @@ fn write_serving_binary_v3_provider_codes_copy_from_pg_binary_reader<R: Read, W:
 ) -> io::Result<Value> {
     read_pg_binary_copy_header(reader)?;
     write_serving_binary_copy_header(writer, target_format)?;
-    let mut state = ServingBinaryV3ProviderCodeState::new(max_payload_bytes);
+    let mut state = ServingBinaryV3ProviderCodeState::new(max_payload_bytes, None)?;
     while let Some(fields) = read_pg_binary_copy_row(reader, 2, "PTG2 v3 provider codes")? {
         let provider_set_key = pg_binary_nonnegative_i64(
             required_pg_binary_field(&fields, 0, "provider_set_key")?,
@@ -12549,6 +13217,15 @@ struct SourceEncoding {
     tagged_codec: TaggedServingRunCodec,
 }
 
+#[derive(Clone, Copy)]
+struct AssignedV3EncoderOptions {
+    grouped_payload_bytes: usize,
+    hot_payload_bytes: usize,
+    provider_code_sort_chunk_bytes: usize,
+    source: SourceEncoding,
+    source_field_present: bool,
+}
+
 fn validate_source_encoding(source_count: u64, source_bits: u8) -> io::Result<()> {
     let expected_bits = source_key_bits(source_count)?;
     if source_bits != expected_bits {
@@ -12642,10 +13319,9 @@ fn serving_binary_by_code_provider_shard_block_key(
 fn encode_serving_by_code_group(
     provider_set_key: i32,
     previous_provider_set_key: i32,
-    price_set_keys: &[u32],
-    source_keys: &[u32],
-    source_count: u64,
-    source_bits: u8,
+    occurrence_count: usize,
+    price_payload: &[u8],
+    source_payload: &[u8],
 ) -> io::Result<Vec<u8>> {
     if provider_set_key < previous_provider_set_key {
         return Err(io::Error::new(
@@ -12653,27 +13329,62 @@ fn encode_serving_by_code_group(
             "serving-binary grouped by-code rows must be ordered by provider_set_key within code_key",
         ));
     }
-    if price_set_keys.len() != source_keys.len() {
+    if occurrence_count == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "grouped by-code price/source occurrence vectors differ in length",
+            "grouped by-code occurrence chunk cannot be empty",
         ));
     }
-    let mut encoded = Vec::with_capacity(8 + price_set_keys.len() * 3);
+    let mut encoded = Vec::with_capacity(
+        8usize
+            .saturating_add(price_payload.len())
+            .saturating_add(source_payload.len()),
+    );
     write_uvarint_to_vec(
         &mut encoded,
         (provider_set_key - previous_provider_set_key) as u64,
     );
-    write_uvarint_to_vec(&mut encoded, price_set_keys.len() as u64);
-    for price_set_key in price_set_keys {
-        write_uvarint_to_vec(&mut encoded, u64::from(*price_set_key));
-    }
-    encoded.extend_from_slice(&encode_source_key_vector(
-        source_keys,
-        source_count,
-        source_bits,
-    )?);
+    write_uvarint_to_vec(&mut encoded, occurrence_count as u64);
+    encoded.extend_from_slice(price_payload);
+    encoded.extend_from_slice(source_payload);
     Ok(encoded)
+}
+
+fn serving_by_code_group_standalone_bytes(
+    provider_set_key: i32,
+    occurrence_count: usize,
+    price_uvarint_bytes: usize,
+    source_count: u64,
+    source_bits: u8,
+) -> io::Result<usize> {
+    validate_source_encoding(source_count, source_bits)?;
+    let provider_key = u64::try_from(provider_set_key).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider_set_key cannot be negative",
+        )
+    })?;
+    let source_bytes = occurrence_count
+        .checked_mul(usize::from(source_bits))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "grouped by-code source bit count overflows usize",
+            )
+        })?
+        .div_ceil(8);
+    2usize
+        .checked_add(uvarint_encoded_len(source_count))
+        .and_then(|value| value.checked_add(uvarint_encoded_len(provider_key)))
+        .and_then(|value| value.checked_add(uvarint_encoded_len(occurrence_count as u64)))
+        .and_then(|value| value.checked_add(price_uvarint_bytes))
+        .and_then(|value| value.checked_add(source_bytes))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "grouped by-code payload size overflows usize",
+            )
+        })
 }
 
 struct ServingBinaryByCodeProviderShardState {
@@ -12685,13 +13396,17 @@ struct ServingBinaryByCodeProviderShardState {
     previous_provider_set_key: i32,
     current_payload: Vec<u8>,
     current_provider_set_key: Option<i32>,
-    current_price_keys: Vec<u32>,
-    current_source_keys: Vec<u32>,
+    current_occurrence_count: usize,
+    current_price_payload: Vec<u8>,
+    current_source_payload: Vec<u8>,
+    current_group_is_continuation: bool,
     source_count: u64,
     source_bits: u8,
     copy_record_count: u64,
     logical_block_count: u64,
     group_count: u64,
+    occurrence_chunk_count: u64,
+    maximum_occurrences_buffered: usize,
 }
 
 impl ServingBinaryByCodeProviderShardState {
@@ -12712,13 +13427,17 @@ impl ServingBinaryByCodeProviderShardState {
             previous_provider_set_key: 0,
             current_payload: Vec::with_capacity(max_payload_bytes.min(1024 * 1024)),
             current_provider_set_key: None,
-            current_price_keys: Vec::new(),
-            current_source_keys: Vec::new(),
+            current_occurrence_count: 0,
+            current_price_payload: Vec::new(),
+            current_source_payload: Vec::new(),
+            current_group_is_continuation: false,
             source_count,
             source_bits,
             copy_record_count: 0,
             logical_block_count: 0,
             group_count: 0,
+            occurrence_chunk_count: 0,
+            maximum_occurrences_buffered: 0,
         })
     }
 
@@ -12734,6 +13453,7 @@ impl ServingBinaryByCodeProviderShardState {
         self.fragment_no = 0;
         self.previous_provider_set_key = 0;
         self.current_provider_set_key = None;
+        self.current_group_is_continuation = false;
         self.logical_block_count = self.logical_block_count.saturating_add(1);
         Ok(())
     }
@@ -12774,16 +13494,18 @@ fn append_serving_binary_by_code_provider_group<W: Write>(
     target_format: ServingBinaryTargetCopyFormat,
 ) -> io::Result<()> {
     let Some(provider_set_key) = state.current_provider_set_key else {
-        state.current_price_keys.clear();
-        state.current_source_keys.clear();
+        state.current_occurrence_count = 0;
+        state.current_price_payload.clear();
+        state.current_source_payload.clear();
         return Ok(());
     };
-    if state.current_price_keys.is_empty() {
+    if state.current_occurrence_count == 0 {
         return Ok(());
     }
     let Some(_code_key) = state.current_code else {
-        state.current_price_keys.clear();
-        state.current_source_keys.clear();
+        state.current_occurrence_count = 0;
+        state.current_price_payload.clear();
+        state.current_source_payload.clear();
         return Ok(());
     };
     if state.current_payload.is_empty() {
@@ -12797,10 +13519,9 @@ fn append_serving_binary_by_code_provider_group<W: Write>(
     let mut encoded = encode_serving_by_code_group(
         provider_set_key,
         state.previous_provider_set_key,
-        &state.current_price_keys,
-        &state.current_source_keys,
-        state.source_count,
-        state.source_bits,
+        state.current_occurrence_count,
+        &state.current_price_payload,
+        &state.current_source_payload,
     )?;
     if state.current_entry_count > 0
         && state.current_payload.len() + encoded.len() > state.max_payload_bytes
@@ -12822,18 +13543,134 @@ fn append_serving_binary_by_code_provider_group<W: Write>(
         encoded = encode_serving_by_code_group(
             provider_set_key,
             0,
-            &state.current_price_keys,
-            &state.current_source_keys,
-            state.source_count,
-            state.source_bits,
+            state.current_occurrence_count,
+            &state.current_price_payload,
+            &state.current_source_payload,
         )?;
+    }
+    if state.current_payload.len() + encoded.len() > state.max_payload_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "one grouped by-code occurrence chunk exceeds its payload limit",
+        ));
     }
     state.current_payload.extend_from_slice(&encoded);
     state.current_entry_count += 1;
     state.previous_provider_set_key = provider_set_key;
-    state.group_count = state.group_count.saturating_add(1);
-    state.current_price_keys.clear();
-    state.current_source_keys.clear();
+    if !state.current_group_is_continuation {
+        state.group_count = state.group_count.saturating_add(1);
+    }
+    state.occurrence_chunk_count = state.occurrence_chunk_count.saturating_add(1);
+    state.current_occurrence_count = 0;
+    state.current_price_payload.clear();
+    state.current_source_payload.clear();
+    Ok(())
+}
+
+fn push_serving_binary_by_code_occurrence<W: Write>(
+    writer: &mut W,
+    state: &mut ServingBinaryByCodeProviderShardState,
+    target_format: ServingBinaryTargetCopyFormat,
+    price_key: u32,
+    source_key: u32,
+) -> io::Result<()> {
+    let provider_set_key = state.current_provider_set_key.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "grouped by-code occurrence has no provider_set_key",
+        )
+    })?;
+    if u64::from(source_key) >= state.source_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "source_key {source_key} is outside dense source_count {}",
+                state.source_count
+            ),
+        ));
+    }
+    let next_count = state
+        .current_occurrence_count
+        .checked_add(1)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "grouped by-code occurrence count overflows usize",
+            )
+        })?;
+    let next_price_bytes = state
+        .current_price_payload
+        .len()
+        .checked_add(uvarint_encoded_len(u64::from(price_key)))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "grouped by-code price byte count overflows usize",
+            )
+        })?;
+    let next_standalone_bytes = serving_by_code_group_standalone_bytes(
+        provider_set_key,
+        next_count,
+        next_price_bytes,
+        state.source_count,
+        state.source_bits,
+    )?;
+    let mut appended_count = next_count;
+    if next_standalone_bytes > state.max_payload_bytes {
+        if state.current_occurrence_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "one grouped by-code occurrence cannot fit in the configured payload limit",
+            ));
+        }
+        append_serving_binary_by_code_provider_group(writer, state, target_format)?;
+        state.current_group_is_continuation = true;
+        appended_count = 1;
+        let single_occurrence_bytes = serving_by_code_group_standalone_bytes(
+            provider_set_key,
+            1,
+            uvarint_encoded_len(u64::from(price_key)),
+            state.source_count,
+            state.source_bits,
+        )?;
+        if single_occurrence_bytes > state.max_payload_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "one grouped by-code occurrence cannot fit in the configured payload limit",
+            ));
+        }
+    }
+    write_uvarint_to_vec(&mut state.current_price_payload, u64::from(price_key));
+    let source_bit_offset = state
+        .current_occurrence_count
+        .checked_mul(usize::from(state.source_bits))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "grouped by-code source bit offset overflows usize",
+            )
+        })?;
+    let next_source_bits = appended_count
+        .checked_mul(usize::from(state.source_bits))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "grouped by-code source bit count overflows usize",
+            )
+        })?;
+    state
+        .current_source_payload
+        .resize(next_source_bits.div_ceil(8), 0);
+    for source_bit in 0..state.source_bits {
+        if source_key & (1u32 << source_bit) != 0 {
+            let bit_offset = source_bit_offset + usize::from(source_bit);
+            state.current_source_payload[bit_offset / 8] |= 1u8 << (bit_offset % 8);
+        }
+    }
+    state.current_occurrence_count = appended_count;
+    state.maximum_occurrences_buffered = state
+        .maximum_occurrences_buffered
+        .max(state.current_occurrence_count);
     Ok(())
 }
 
@@ -13082,7 +13919,7 @@ fn write_serving_binary_v3_provider_pages<W: Write>(
     Ok(())
 }
 
-const SERVING_BINARY_V3_PROVIDER_CODE_PAIR_BYTES: usize = 8;
+const SERVING_BINARY_V3_PROVIDER_CODE_MERGE_FAN_IN: usize = 64;
 
 struct ServingBinaryV3ProviderCodeSpool {
     path: PathBuf,
@@ -13095,43 +13932,17 @@ struct ServingBinaryV3ProviderCodeSortSummary {
     input_pair_count: u64,
     unique_pair_count: u64,
     spill_bytes: u64,
-    chunk_count: usize,
+    scratch_read_bytes: u64,
+    scratch_written_bytes: u64,
+    chunk_count: u64,
+    merge_pass_count: usize,
+    maximum_merge_fan_in: usize,
     external_sort: bool,
-}
-
-#[derive(Eq)]
-struct ServingBinaryV3ProviderCodeMergeItem {
-    pair: [u8; SERVING_BINARY_V3_PROVIDER_CODE_PAIR_BYTES],
-    reader_index: usize,
-}
-
-impl Ord for ServingBinaryV3ProviderCodeMergeItem {
-    fn cmp(&self, other: &Self) -> CmpOrdering {
-        other
-            .pair
-            .cmp(&self.pair)
-            .then_with(|| other.reader_index.cmp(&self.reader_index))
-    }
-}
-
-impl PartialOrd for ServingBinaryV3ProviderCodeMergeItem {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for ServingBinaryV3ProviderCodeMergeItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.pair == other.pair && self.reader_index == other.reader_index
-    }
 }
 
 impl ServingBinaryV3ProviderCodeSpool {
     fn new() -> io::Result<Self> {
-        let base_dir = env::var_os("HLTHPRT_PTG2_MANIFEST_SPILL_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir);
-        std::fs::create_dir_all(&base_dir)?;
+        let base_dir = serving_binary_v3_spill_directory()?;
         let process_id = std::process::id();
         for attempt in 0..1000u32 {
             let path = base_dir.join(format!(
@@ -13173,27 +13984,68 @@ impl ServingBinaryV3ProviderCodeSpool {
         self.writer.flush()?;
         let spill_bytes = self
             .row_count
-            .saturating_mul(SERVING_BINARY_V3_PROVIDER_CODE_PAIR_BYTES as u64);
+            .saturating_mul(PROVIDER_CODE_PAIR_RECORD_BYTES as u64);
         if spill_bytes <= chunk_bytes as u64 {
             let unique_pair_count = self.emit_in_memory(writer, target_format, state)?;
             return Ok(ServingBinaryV3ProviderCodeSortSummary {
                 input_pair_count: self.row_count,
                 unique_pair_count,
                 spill_bytes,
-                chunk_count: usize::from(self.row_count > 0),
+                scratch_read_bytes: spill_bytes,
+                scratch_written_bytes: spill_bytes,
+                chunk_count: u64::from(self.row_count > 0),
+                merge_pass_count: 0,
+                maximum_merge_fan_in: 0,
                 external_sort: false,
             });
         }
 
         let mut temporary_files = ManifestPairTemporaryFiles::default();
-        let chunk_paths = self.write_sorted_chunks(chunk_bytes, &mut temporary_files)?;
-        let unique_pair_count =
-            merge_provider_code_chunks(&chunk_paths, writer, target_format, state)?;
+        let sorted_path = manifest_pair_temporary_path(&self.path, "provider-code-sorted", 0);
+        let temporary_directory = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let records_per_chunk = (chunk_bytes / PROVIDER_CODE_PAIR_RECORD_BYTES).max(1);
+        let stats = external_sort_provider_code_pairs(
+            std::slice::from_ref(&self.path),
+            &sorted_path,
+            temporary_directory,
+            records_per_chunk,
+        )?;
+        temporary_files.track(sorted_path.clone());
+        if stats.input_records != self.row_count || stats.input_bytes != spill_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider-code external sort input accounting mismatch",
+            ));
+        }
+        let mut sorted_reader = BufReader::new(File::open(&sorted_path)?);
+        let mut unique_pair_count = 0u64;
+        while let Some(pair) = read_provider_code_pair(&mut sorted_reader)? {
+            emit_provider_code_pair(writer, target_format, state, pair)?;
+            unique_pair_count = unique_pair_count.saturating_add(1);
+        }
+        if unique_pair_count != stats.unique_records {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider-code external sort output accounting mismatch",
+            ));
+        }
+        let merge_pass_count = provider_code_merge_pass_count(stats.chunk_count);
         Ok(ServingBinaryV3ProviderCodeSortSummary {
             input_pair_count: self.row_count,
             unique_pair_count,
             spill_bytes,
-            chunk_count: chunk_paths.len(),
+            scratch_read_bytes: stats
+                .input_bytes
+                .saturating_add(stats.spill_bytes)
+                .saturating_add(stats.output_bytes),
+            scratch_written_bytes: spill_bytes
+                .saturating_add(stats.spill_bytes)
+                .saturating_add(stats.output_bytes),
+            chunk_count: stats.chunk_count,
+            merge_pass_count,
+            maximum_merge_fan_in: usize::try_from(stats.chunk_count)
+                .unwrap_or(usize::MAX)
+                .min(SERVING_BINARY_V3_PROVIDER_CODE_MERGE_FAN_IN),
             external_sort: true,
         })
     }
@@ -13205,8 +14057,22 @@ impl ServingBinaryV3ProviderCodeSpool {
         state: &mut ServingBinaryV3ProviderCodeState,
     ) -> io::Result<u64> {
         let mut reader = BufReader::new(File::open(&self.path)?);
-        let mut pairs =
-            Vec::with_capacity(usize::try_from(self.row_count).unwrap_or(usize::MAX / 2));
+        let pair_capacity = usize::try_from(self.row_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider-code pair count exceeds usize",
+            )
+        })?;
+        let mut pairs = Vec::new();
+        pairs.try_reserve_exact(pair_capacity).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "unable to reserve {} bytes for provider-code sorting: {error}",
+                    pair_capacity.saturating_mul(PROVIDER_CODE_PAIR_RECORD_BYTES)
+                ),
+            )
+        })?;
         while let Some(pair) = read_provider_code_pair(&mut reader)? {
             pairs.push(pair);
         }
@@ -13216,43 +14082,6 @@ impl ServingBinaryV3ProviderCodeSpool {
             emit_provider_code_pair(writer, target_format, state, *pair)?;
         }
         Ok(pairs.len() as u64)
-    }
-
-    fn write_sorted_chunks(
-        &self,
-        chunk_bytes: usize,
-        temporary_files: &mut ManifestPairTemporaryFiles,
-    ) -> io::Result<Vec<PathBuf>> {
-        let records_per_chunk = (chunk_bytes / SERVING_BINARY_V3_PROVIDER_CODE_PAIR_BYTES).max(1);
-        let mut reader = BufReader::new(File::open(&self.path)?);
-        let mut chunk_paths = Vec::new();
-        loop {
-            let mut pairs = Vec::with_capacity(records_per_chunk);
-            while pairs.len() < records_per_chunk {
-                let Some(pair) = read_provider_code_pair(&mut reader)? else {
-                    break;
-                };
-                pairs.push(pair);
-            }
-            if pairs.is_empty() {
-                break;
-            }
-            pairs.sort_unstable();
-            pairs.dedup();
-            let chunk_path = manifest_pair_temporary_path(
-                &self.path,
-                "provider-code-sorted-chunk",
-                chunk_paths.len(),
-            );
-            let mut chunk_writer = BufWriter::new(File::create(&chunk_path)?);
-            for pair in pairs {
-                chunk_writer.write_all(&pair)?;
-            }
-            chunk_writer.flush()?;
-            temporary_files.track(chunk_path.clone());
-            chunk_paths.push(chunk_path);
-        }
-        Ok(chunk_paths)
     }
 }
 
@@ -13264,8 +14093,8 @@ impl Drop for ServingBinaryV3ProviderCodeSpool {
 
 fn read_provider_code_pair<R: Read>(
     reader: &mut R,
-) -> io::Result<Option<[u8; SERVING_BINARY_V3_PROVIDER_CODE_PAIR_BYTES]>> {
-    let mut pair = [0u8; SERVING_BINARY_V3_PROVIDER_CODE_PAIR_BYTES];
+) -> io::Result<Option<[u8; PROVIDER_CODE_PAIR_RECORD_BYTES]>> {
+    let mut pair = [0u8; PROVIDER_CODE_PAIR_RECORD_BYTES];
     let mut offset = 0usize;
     while offset < pair.len() {
         let bytes_read = reader.read(&mut pair[offset..])?;
@@ -13287,7 +14116,7 @@ fn emit_provider_code_pair<W: Write>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     state: &mut ServingBinaryV3ProviderCodeState,
-    pair: [u8; SERVING_BINARY_V3_PROVIDER_CODE_PAIR_BYTES],
+    pair: [u8; PROVIDER_CODE_PAIR_RECORD_BYTES],
 ) -> io::Result<()> {
     let provider_set_key = i32::from_be_bytes(pair[..4].try_into().map_err(|_| {
         io::Error::new(
@@ -13309,38 +14138,16 @@ fn emit_provider_code_pair<W: Write>(
     )
 }
 
-fn merge_provider_code_chunks<W: Write>(
-    chunk_paths: &[PathBuf],
-    writer: &mut W,
-    target_format: ServingBinaryTargetCopyFormat,
-    state: &mut ServingBinaryV3ProviderCodeState,
-) -> io::Result<u64> {
-    let mut readers = Vec::with_capacity(chunk_paths.len());
-    for chunk_path in chunk_paths {
-        readers.push(BufReader::new(File::open(chunk_path)?));
+fn provider_code_merge_pass_count(mut chunk_count: u64) -> usize {
+    if chunk_count == 0 {
+        return 0;
     }
-    let mut heap = BinaryHeap::new();
-    for (reader_index, reader) in readers.iter_mut().enumerate() {
-        if let Some(pair) = read_provider_code_pair(reader)? {
-            heap.push(ServingBinaryV3ProviderCodeMergeItem { pair, reader_index });
-        }
+    let mut pass_count = 1usize;
+    while chunk_count >= SERVING_BINARY_V3_PROVIDER_CODE_MERGE_FAN_IN as u64 {
+        chunk_count = chunk_count.div_ceil(SERVING_BINARY_V3_PROVIDER_CODE_MERGE_FAN_IN as u64);
+        pass_count = pass_count.saturating_add(1);
     }
-    let mut previous_pair = None;
-    let mut unique_pair_count = 0u64;
-    while let Some(item) = heap.pop() {
-        if previous_pair != Some(item.pair) {
-            emit_provider_code_pair(writer, target_format, state, item.pair)?;
-            previous_pair = Some(item.pair);
-            unique_pair_count = unique_pair_count.saturating_add(1);
-        }
-        if let Some(pair) = read_provider_code_pair(&mut readers[item.reader_index])? {
-            heap.push(ServingBinaryV3ProviderCodeMergeItem {
-                pair,
-                reader_index: item.reader_index,
-            });
-        }
-    }
-    Ok(unique_pair_count)
+    pass_count
 }
 
 #[cfg(test)]
@@ -13374,14 +14181,17 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_limi
         reader,
         writer,
         target_format,
-        grouped_payload_bytes,
-        hot_payload_bytes,
-        SourceEncoding {
-            count: 1,
-            key_bits: 0,
-            tagged_codec: TaggedServingRunCodec::new(1, 0)?,
+        AssignedV3EncoderOptions {
+            grouped_payload_bytes,
+            hot_payload_bytes,
+            provider_code_sort_chunk_bytes: serving_binary_v3_provider_code_sort_chunk_bytes(),
+            source: SourceEncoding {
+                count: 1,
+                key_bits: 0,
+                tagged_codec: TaggedServingRunCodec::new(1, 0)?,
+            },
+            source_field_present: false,
         },
-        false,
     )
 }
 
@@ -13392,13 +14202,23 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_prov
     reader: &mut R,
     writer: &mut CountingWriter<W>,
     target_format: ServingBinaryTargetCopyFormat,
-    grouped_payload_bytes: usize,
-    hot_payload_bytes: usize,
-    source: SourceEncoding,
-    source_field_present: bool,
+    options: AssignedV3EncoderOptions,
 ) -> io::Result<Value> {
+    let AssignedV3EncoderOptions {
+        grouped_payload_bytes,
+        hot_payload_bytes,
+        provider_code_sort_chunk_bytes,
+        source,
+        source_field_present,
+    } = options;
     let source_count = source.count;
     let source_bits = source.key_bits;
+    if provider_code_sort_chunk_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider-code sort chunk bytes must be positive",
+        ));
+    }
     validate_source_encoding(source_count, source_bits)?;
     if source.tagged_codec.source_count() != source_count
         || source.tagged_codec.source_key_bytes()
@@ -13521,10 +14341,16 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_prov
                 &mut provider_shard_state,
                 target_format,
             )?;
+            provider_shard_state.current_group_is_continuation = false;
         }
         provider_shard_state.current_provider_set_key = Some(provider_set_key);
-        provider_shard_state.current_price_keys.push(price_key);
-        provider_shard_state.current_source_keys.push(source_key);
+        push_serving_binary_by_code_occurrence(
+            writer,
+            &mut provider_shard_state,
+            target_format,
+            price_key,
+            source_key,
+        )?;
         push_serving_binary_v3_forward_page_candidate(
             &mut forward_page_candidates,
             (price_key, provider_set_key, source_key, provider_count),
@@ -13593,12 +14419,19 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_prov
     provider_shard_state.copy_record_count = provider_shard_state
         .copy_record_count
         .saturating_add(provider_count_block_stats.copy_record_count);
-    let mut provider_code_state = ServingBinaryV3ProviderCodeState::new(grouped_payload_bytes);
+    let maximum_code_keys = usize::try_from(code_count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PTG2 v3 code count exceeds usize",
+        )
+    })?;
+    let mut provider_code_state =
+        ServingBinaryV3ProviderCodeState::new(grouped_payload_bytes, Some(maximum_code_keys))?;
     let provider_code_sort = provider_code_spool.emit_sorted_unique(
         writer,
         target_format,
         &mut provider_code_state,
-        serving_binary_v3_provider_code_sort_chunk_bytes(),
+        provider_code_sort_chunk_bytes,
     )?;
     provider_code_state.finish(writer, target_format)?;
     let mut provider_page_block_stats = ServingBinaryV3BlockStats::default();
@@ -13623,10 +14456,19 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_prov
         "spool_input_pair_count": provider_code_sort.input_pair_count,
         "spool_unique_pair_count": provider_code_sort.unique_pair_count,
         "spool_bytes": provider_code_sort.spill_bytes,
-        "sort_chunk_bytes": serving_binary_v3_provider_code_sort_chunk_bytes(),
+        "scratch_bytes_read": provider_code_sort.scratch_read_bytes.saturating_add(provider_code_state.scratch_bytes_read),
+        "scratch_bytes_written": provider_code_sort.scratch_written_bytes.saturating_add(provider_code_state.scratch_bytes_written),
+        "sort_scratch_bytes_read": provider_code_sort.scratch_read_bytes,
+        "sort_scratch_bytes_written": provider_code_sort.scratch_written_bytes,
+        "block_spool_scratch_bytes_read": provider_code_state.scratch_bytes_read,
+        "block_spool_scratch_bytes_written": provider_code_state.scratch_bytes_written,
+        "sort_chunk_bytes": provider_code_sort_chunk_bytes,
         "sort_chunk_count": provider_code_sort.chunk_count,
+        "merge_pass_count": provider_code_sort.merge_pass_count,
+        "maximum_merge_fan_in": provider_code_sort.maximum_merge_fan_in,
         "external_sort": provider_code_sort.external_sort,
         "provider_set_count": provider_code_state.provider_set_count,
+        "maximum_code_keys_buffered": provider_code_state.maximum_code_keys_buffered,
         "code_count": provider_code_state.code_count,
         "container_count": provider_code_state.container_count,
         "sparse_container_count": provider_code_state.sparse_container_count,
@@ -13718,6 +14560,8 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_prov
             "payload_format_version": PTG2_SERVING_BINARY_V3_GROUPED_FORMAT_VERSION,
             "provider_shard_span": PTG2_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN,
             "group_count": provider_shard_state.group_count,
+            "occurrence_chunk_count": provider_shard_state.occurrence_chunk_count,
+            "maximum_occurrences_buffered": provider_shard_state.maximum_occurrences_buffered,
             "block_count": provider_shard_block_count,
             "copy_record_count": provider_shard_copy_record_count,
         },
@@ -13922,25 +14766,66 @@ fn write_serving_binary_v3_price_dictionary_copy_from_pg_binary_reader<R: Read, 
     }))
 }
 
-const V3_FINALIZER_DEFAULT_MEMORY_RECORDS: usize = 1_000_000;
+#[cfg(test)]
+const V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES: usize = 48 * 1024 * 1024 * 1024;
+const V3_FINALIZER_MAX_WORKERS: usize = 64;
+const V3_FINALIZER_RESOURCE_CONTRACT: &str = "ptg2_v3_finalizer_resources_v1";
+const V3_FINALIZER_SORT_MEMORY_SCOPE: &str = "process_total_across_workers_v1";
+const V3_FINALIZER_SORT_OVERHEAD_BYTES_PER_ACTIVE_WORKER: usize = 4 * 1024 * 1024;
 const V3_FINALIZER_HOT_BLOCK_BYTES: usize = 64 * 1024;
-const V3_FINALIZER_STAGE_PROVIDER_BYTES: usize = 44;
-const V3_FINALIZER_STAGE_PRICE_BYTES: usize = 32;
 const V3_FINALIZER_ASSIGNED_BYTES: usize = 20;
 const V3_FINALIZER_PRICE_KEY_MAP_RECORD_BYTES: usize = GLOBAL_ID_BYTES + 4;
+const V3_FINALIZER_PROVIDER_PROJECTION_MAX_BYTES_PER_ENTRY: usize = 1024;
+const V3_FINALIZER_ENCODER_BLOCK_BUFFER_MULTIPLIER: usize = 10;
+const V3_FINALIZER_ENCODER_PROVIDER_CODE_BYTES_PER_CODE: usize = 64;
+const V3_FINALIZER_ENCODER_FIXED_WORKSPACE_BYTES: usize = 2 * 1024 * 1024;
+const V3_FINALIZER_CODE_DICTIONARY_MEMORY_BYTES_PER_SOURCE_ROW: usize = 512;
+const V3_FINALIZER_CODE_DICTIONARY_FILE_MEMORY_MULTIPLIER: usize = 2;
 const V3_FINALIZER_SUPPORT_HASH_DOMAIN: &[u8] = b"PTG2V3SUPPORT\x01";
 const V3_FINALIZER_CODE_ROW_HASH_DOMAIN: &[u8] = b"PTG2V3CODEDICT\x01";
 const V3_FINALIZER_PROVIDER_ROW_HASH_DOMAIN: &[u8] = b"PTG2V3PROVIDERDICT\x01";
 const V3_FINALIZER_PRICE_KEY_MAP_HASH_DOMAIN: &[u8] = b"PTG2V3PRICEKEYMAP\x01";
 
+fn v3_finalizer_encoder_workspace_max_bytes(
+    grouped_payload_bytes: usize,
+    code_count: usize,
+) -> io::Result<usize> {
+    grouped_payload_bytes
+        .checked_mul(V3_FINALIZER_ENCODER_BLOCK_BUFFER_MULTIPLIER)
+        .and_then(|value| {
+            code_count
+                .checked_mul(V3_FINALIZER_ENCODER_PROVIDER_CODE_BYTES_PER_CODE)
+                .and_then(|code_bytes| value.checked_add(code_bytes))
+        })
+        .and_then(|value| value.checked_add(V3_FINALIZER_ENCODER_FIXED_WORKSPACE_BYTES))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "finalizer encoder workspace estimate overflows usize",
+            )
+        })
+}
+
+#[cfg(test)]
+fn v3_finalizer_test_sort_memory_bytes(
+    active_workers: usize,
+    assigned_records_per_worker: usize,
+) -> usize {
+    active_workers.saturating_mul(
+        V3_FINALIZER_SORT_OVERHEAD_BYTES_PER_ACTIVE_WORKER.saturating_add(
+            assigned_records_per_worker.saturating_mul(V3_FINALIZER_ASSIGNED_BYTES),
+        ),
+    )
+}
+
 #[derive(Clone, Debug)]
 struct V3FinalizerPartitionInput {
     path: PathBuf,
     partition: usize,
-    partition_count: usize,
     source_key: u32,
     row_count: u64,
     bytes: u64,
+    sha256: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -13948,12 +14833,57 @@ struct V3FinalizerCodeDictionaryInput {
     path: PathBuf,
     row_count: u64,
     bytes: u64,
+    sha256: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct V3CodeDictionaryFileDescriptor {
+    sha256: [u8; 32],
+    row_count: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct V3SourceRunFileDescriptor {
+    partition: usize,
+    sha256: [u8; 32],
+    row_count: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct V3SourceIdentity {
+    source_type: String,
+    identity_kind: String,
+    identity_sha256: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+struct V3SourceRunContract {
+    source_identity: V3SourceIdentity,
+    partition_count: usize,
+    partition_rows: Vec<u64>,
+    file_count: u64,
+    row_count: u64,
+    byte_count: u64,
+    files: Vec<V3SourceRunFileDescriptor>,
+}
+
+#[derive(Clone, Debug)]
+struct V3CodeDictionarySourceContract {
+    source_identity: V3SourceIdentity,
+    source_run_contract_sha256: [u8; 32],
+    file_count: u64,
+    row_count: u64,
+    byte_count: u64,
+    files: Vec<V3CodeDictionaryFileDescriptor>,
 }
 
 #[derive(Clone, Debug)]
 struct V3FinalizerInputs {
     partitions: Vec<V3FinalizerPartitionInput>,
     code_dictionaries: Vec<V3FinalizerCodeDictionaryInput>,
+    manifest_bytes: u64,
     partition_count: usize,
     source_count: u64,
     source_key_bits: u8,
@@ -13966,14 +14896,16 @@ struct V3FinalizerInputs {
 struct V3FinalizerOptions {
     output_directory: PathBuf,
     manifest_paths: Vec<PathBuf>,
-    memory_records: usize,
+    total_sort_memory_bytes: usize,
+    workers: usize,
+    identity_map_max_bytes: usize,
     price_key_map_input: PathBuf,
     price_membership_inputs: Vec<PathBuf>,
     price_atom_inputs: Vec<PathBuf>,
 }
 
 fn v3_finalizer_usage() -> &'static str {
-    "usage: ptg2_scanner --finalize-v3-runs <output_directory> --price-key-map-input PATH [--memory-records N] [--price-membership-input PATH]... [--price-atom-input PATH]... <scanner_summary.json>..."
+    "usage: ptg2_scanner --finalize-v3-runs <output_directory> --price-key-map-input PATH --workers N --identity-map-max-bytes N --total-sort-memory-bytes N [--price-membership-input PATH]... [--price-atom-input PATH]... <scanner_summary.json>..."
 }
 
 fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOptions> {
@@ -13989,7 +14921,9 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
             v3_finalizer_usage(),
         ));
     }
-    let mut memory_records = V3_FINALIZER_DEFAULT_MEMORY_RECORDS;
+    let mut total_sort_memory_bytes = None;
+    let mut workers = None;
+    let mut identity_map_max_bytes = None;
     let mut price_key_map_input = None;
     let mut price_membership_inputs = Vec::new();
     let mut price_atom_inputs = Vec::new();
@@ -13997,21 +14931,81 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
     let mut index = 1usize;
     while index < arguments.len() {
         match arguments[index].as_str() {
-            "--memory-records" => {
+            "--workers" => {
                 index += 1;
                 let value = arguments.get(index).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, v3_finalizer_usage())
                 })?;
-                memory_records = value.parse::<usize>().map_err(|error| {
+                let parsed = value.parse::<usize>().map_err(|error| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("invalid --memory-records value: {error}"),
+                        format!("invalid --workers value: {error}"),
                     )
                 })?;
-                if memory_records == 0 {
+                if parsed == 0 || parsed > V3_FINALIZER_MAX_WORKERS {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "--memory-records must be positive",
+                        format!("--workers must be between 1 and {V3_FINALIZER_MAX_WORKERS}"),
+                    ));
+                }
+                if workers.replace(parsed).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--workers may be specified only once",
+                    ));
+                }
+            }
+            "--memory-records" => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--memory-records is unsupported; use the process-wide --total-sort-memory-bytes budget",
+                ));
+            }
+            "--total-sort-memory-bytes" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, v3_finalizer_usage())
+                })?;
+                let parsed = value.parse::<usize>().map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid --total-sort-memory-bytes value: {error}"),
+                    )
+                })?;
+                if parsed == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--total-sort-memory-bytes must be positive",
+                    ));
+                }
+                if total_sort_memory_bytes.replace(parsed).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--total-sort-memory-bytes may be specified only once",
+                    ));
+                }
+            }
+            "--identity-map-max-bytes" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, v3_finalizer_usage())
+                })?;
+                let parsed = value.parse::<usize>().map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid --identity-map-max-bytes value: {error}"),
+                    )
+                })?;
+                if parsed == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--identity-map-max-bytes must be positive",
+                    ));
+                }
+                if identity_map_max_bytes.replace(parsed).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--identity-map-max-bytes may be specified only once",
                     ));
                 }
             }
@@ -14061,6 +15055,24 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
             "v3 finalizer requires --price-key-map-input PATH",
         )
     })?;
+    let workers = workers.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "v3 finalizer requires --workers N",
+        )
+    })?;
+    let identity_map_max_bytes = identity_map_max_bytes.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "v3 finalizer requires --identity-map-max-bytes N",
+        )
+    })?;
+    let total_sort_memory_bytes = total_sort_memory_bytes.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "v3 finalizer requires --total-sort-memory-bytes N",
+        )
+    })?;
     if !price_key_map_input.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -14081,7 +15093,9 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
     Ok(V3FinalizerOptions {
         output_directory: PathBuf::from(output_directory),
         manifest_paths,
-        memory_records,
+        total_sort_memory_bytes,
+        workers,
+        identity_map_max_bytes,
         price_key_map_input,
         price_membership_inputs,
         price_atom_inputs,
@@ -14126,6 +15140,381 @@ fn v3_manifest_required_u64(entry: &Value, name: &str) -> io::Result<u64> {
     })
 }
 
+fn v3_manifest_required_sha256(entry: &Value, name: &str) -> io::Result<[u8; 32]> {
+    let value = v3_manifest_required_text(entry, name)?;
+    if value.len() != 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("v3 finalizer manifest field {name} must be lowercase sha256 hex"),
+        ));
+    }
+    let mut digest = [0u8; 32];
+    for (index, destination) in digest.iter_mut().enumerate() {
+        let decode = |byte: u8| match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("v3 finalizer manifest field {name} must be lowercase sha256 hex"),
+            )),
+        };
+        *destination =
+            (decode(value.as_bytes()[index * 2])? << 4) | decode(value.as_bytes()[index * 2 + 1])?;
+    }
+    Ok(digest)
+}
+
+fn v3_manifest_source_contract_sha256(entry: &Value) -> io::Result<[u8; 32]> {
+    let mut contract = entry.as_object().cloned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v3 finalizer source-run contract must be an object",
+        )
+    })?;
+    contract.remove("source_key");
+    contract.remove("contract_sha256");
+    let encoded = serde_json::to_vec(&Value::Object(contract)).map_err(to_io_error)?;
+    Ok(Sha256::digest(encoded).into())
+}
+
+fn v3_manifest_code_dictionary_contract_sha256(entry: &Value) -> io::Result<[u8; 32]> {
+    let mut contract = entry.as_object().cloned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v3 finalizer code-dictionary source contract must be an object",
+        )
+    })?;
+    contract.remove("source_key");
+    contract.remove("contract_sha256");
+    let encoded = serde_json::to_vec(&Value::Object(contract)).map_err(to_io_error)?;
+    Ok(Sha256::digest(encoded).into())
+}
+
+fn v3_manifest_value_sha256(value: &Value) -> io::Result<[u8; 32]> {
+    let encoded = serde_json::to_vec(value).map_err(to_io_error)?;
+    Ok(Sha256::digest(encoded).into())
+}
+
+fn v3_manifest_source_identity(entry: &Value) -> io::Result<V3SourceIdentity> {
+    let source_identity = entry
+        .get("source_identity")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 source-run contract source_identity must be an object",
+            )
+        })?;
+    if source_identity.len() != 3
+        || ["source_type", "identity_kind", "identity_sha256"]
+            .iter()
+            .any(|field| !source_identity.contains_key(*field))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v3 source-run contract source_identity fields are incompatible",
+        ));
+    }
+    let source_identity = Value::Object(source_identity.clone());
+    let source_type = v3_manifest_required_text(&source_identity, "source_type")?;
+    let mut source_type_bytes = source_type.bytes();
+    if source_type.len() > 64
+        || !source_type_bytes
+            .next()
+            .is_some_and(|value| value.is_ascii_lowercase() || value.is_ascii_digit())
+        || source_type_bytes.any(|value| {
+            !(value.is_ascii_lowercase()
+                || value.is_ascii_digit()
+                || matches!(value, b'.' | b'_' | b'-'))
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v3 source identity source_type must be a lowercase ASCII token of at most 64 bytes",
+        ));
+    }
+    let identity_kind = v3_manifest_required_text(&source_identity, "identity_kind")?;
+    if !matches!(
+        identity_kind,
+        "logical_json_sha256_v1" | "raw_container_sha256_v1"
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v3 source identity identity_kind is unsupported",
+        ));
+    }
+    Ok(V3SourceIdentity {
+        source_type: source_type.to_owned(),
+        identity_kind: identity_kind.to_owned(),
+        identity_sha256: v3_manifest_required_sha256(&source_identity, "identity_sha256")?,
+    })
+}
+
+fn v3_manifest_source_contract(entry: &Value) -> io::Result<V3SourceRunContract> {
+    const CONTRACT_FIELDS: [&str; 10] = [
+        "source_key",
+        "contract_sha256",
+        "version",
+        "source_identity",
+        "partition_count",
+        "partition_rows",
+        "file_count",
+        "row_count",
+        "byte_count",
+        "files",
+    ];
+    let contract_object = entry.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v3 source-run contract must be an object",
+        )
+    })?;
+    if contract_object.len() != CONTRACT_FIELDS.len()
+        || CONTRACT_FIELDS
+            .iter()
+            .any(|field| !contract_object.contains_key(*field))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v3 source-run contract fields are incompatible",
+        ));
+    }
+    if v3_manifest_required_u64(entry, "version")? != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported v3 source-run contract version",
+        ));
+    }
+    let source_identity = v3_manifest_source_identity(entry)?;
+    let partition_count = usize::try_from(v3_manifest_required_u64(entry, "partition_count")?)
+        .map_err(to_io_error)?;
+    ptg2_scanner::v3_runs::validate_partition_count(partition_count)?;
+    let partition_rows = entry
+        .get("partition_rows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 source-run contract partition_rows must be an array",
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "v3 source-run contract partition row count must be non-negative",
+                )
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if partition_rows.len() != partition_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v3 source-run contract has incomplete partition coverage",
+        ));
+    }
+    let raw_files = entry
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 source-run contract files must be an array",
+            )
+        })?;
+    let mut files = Vec::with_capacity(raw_files.len());
+    for raw_file in raw_files {
+        let file_object = raw_file.as_object().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 source-run contract file descriptor must be an object",
+            )
+        })?;
+        if file_object.len() != 4
+            || ["partition", "row_count", "bytes", "sha256"]
+                .iter()
+                .any(|field| !file_object.contains_key(*field))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 source-run contract file descriptor fields are incompatible",
+            ));
+        }
+        let partition = usize::try_from(v3_manifest_required_u64(raw_file, "partition")?)
+            .map_err(to_io_error)?;
+        if partition >= partition_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 source-run contract file partition is outside partition_count",
+            ));
+        }
+        files.push(V3SourceRunFileDescriptor {
+            partition,
+            sha256: v3_manifest_required_sha256(raw_file, "sha256")?,
+            row_count: v3_manifest_required_u64(raw_file, "row_count")?,
+            bytes: v3_manifest_required_u64(raw_file, "bytes")?,
+        });
+    }
+    files.sort_unstable();
+    let contract = V3SourceRunContract {
+        source_identity,
+        partition_count,
+        partition_rows,
+        file_count: v3_manifest_required_u64(entry, "file_count")?,
+        row_count: v3_manifest_required_u64(entry, "row_count")?,
+        byte_count: v3_manifest_required_u64(entry, "byte_count")?,
+        files,
+    };
+    let mut declared_partition_rows = vec![0u64; partition_count];
+    for file in &contract.files {
+        declared_partition_rows[file.partition] = declared_partition_rows[file.partition]
+            .checked_add(file.row_count)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "v3 source-run contract partition row count overflows u64",
+                )
+            })?;
+    }
+    let declared_rows = contract.files.iter().try_fold(0u64, |total, file| {
+        total.checked_add(file.row_count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 source-run contract row count overflows u64",
+            )
+        })
+    })?;
+    let declared_bytes = contract.files.iter().try_fold(0u64, |total, file| {
+        total.checked_add(file.bytes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 source-run contract byte count overflows u64",
+            )
+        })
+    })?;
+    if contract.file_count != contract.files.len() as u64
+        || contract.row_count != declared_rows
+        || contract.byte_count != declared_bytes
+        || contract.partition_rows != declared_partition_rows
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v3 source-run contract aggregates do not match its declared files",
+        ));
+    }
+    Ok(contract)
+}
+
+fn v3_manifest_code_dictionary_source_contract(
+    entry: &Value,
+) -> io::Result<V3CodeDictionarySourceContract> {
+    const CONTRACT_FIELDS: [&str; 9] = [
+        "source_key",
+        "contract_sha256",
+        "version",
+        "source_identity",
+        "source_run_contract_sha256",
+        "file_count",
+        "row_count",
+        "byte_count",
+        "files",
+    ];
+    let contract_object = entry.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v3 code-dictionary source contract must be an object",
+        )
+    })?;
+    if contract_object.len() != CONTRACT_FIELDS.len()
+        || CONTRACT_FIELDS
+            .iter()
+            .any(|field| !contract_object.contains_key(*field))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v3 code-dictionary source contract fields are incompatible",
+        ));
+    }
+    if v3_manifest_required_u64(entry, "version")? != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported v3 code-dictionary source contract version",
+        ));
+    }
+    let raw_files = entry
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 code-dictionary source contract files must be an array",
+            )
+        })?;
+    let mut files = Vec::with_capacity(raw_files.len());
+    for raw_file in raw_files {
+        let file_object = raw_file.as_object().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 code-dictionary source contract file descriptor must be an object",
+            )
+        })?;
+        if file_object.len() != 3
+            || ["row_count", "bytes", "sha256"]
+                .iter()
+                .any(|field| !file_object.contains_key(*field))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 code-dictionary source contract file descriptor fields are incompatible",
+            ));
+        }
+        files.push(V3CodeDictionaryFileDescriptor {
+            sha256: v3_manifest_required_sha256(raw_file, "sha256")?,
+            row_count: v3_manifest_required_u64(raw_file, "row_count")?,
+            bytes: v3_manifest_required_u64(raw_file, "bytes")?,
+        });
+    }
+    files.sort_unstable();
+    let contract = V3CodeDictionarySourceContract {
+        source_identity: v3_manifest_source_identity(entry)?,
+        source_run_contract_sha256: v3_manifest_required_sha256(
+            entry,
+            "source_run_contract_sha256",
+        )?,
+        file_count: v3_manifest_required_u64(entry, "file_count")?,
+        row_count: v3_manifest_required_u64(entry, "row_count")?,
+        byte_count: v3_manifest_required_u64(entry, "byte_count")?,
+        files,
+    };
+    let declared_rows = contract.files.iter().try_fold(0u64, |total, file| {
+        total.checked_add(file.row_count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 code-dictionary source contract row count overflows u64",
+            )
+        })
+    })?;
+    let declared_bytes = contract.files.iter().try_fold(0u64, |total, file| {
+        total.checked_add(file.bytes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 code-dictionary source contract byte count overflows u64",
+            )
+        })
+    })?;
+    if contract.file_count != contract.files.len() as u64
+        || contract.row_count != declared_rows
+        || contract.byte_count != declared_bytes
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v3 code-dictionary source contract aggregates do not match its declared files",
+        ));
+    }
+    Ok(contract)
+}
+
 fn resolve_v3_manifest_path(manifest_path: &Path, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
     if path.is_absolute() {
@@ -14141,14 +15530,196 @@ fn resolve_v3_manifest_path(manifest_path: &Path, value: &str) -> PathBuf {
 fn load_v3_finalizer_inputs(manifest_paths: &[PathBuf]) -> io::Result<V3FinalizerInputs> {
     let mut partitions = Vec::new();
     let mut code_dictionaries = Vec::new();
+    let mut manifest_bytes = 0u64;
     let mut seen_partition_paths = HashSet::new();
     let mut seen_code_paths = HashSet::new();
     let mut common_partition_count = None;
     let mut common_source_count = None;
     let mut seen_source_keys = HashSet::new();
+    let mut seen_code_source_keys = HashSet::new();
+    let mut source_contract_sha_by_key = HashMap::new();
+    let mut source_identity_by_key = HashMap::new();
+    let mut code_dictionary_contract_sha_by_key = HashMap::new();
     for manifest_path in manifest_paths {
+        manifest_bytes = manifest_bytes.saturating_add(manifest_path.metadata()?.len());
         let reader = BufReader::new(File::open(manifest_path)?);
         let manifest: Value = serde_json::from_reader(reader).map_err(to_io_error)?;
+        let manifest_source_count = v3_manifest_required_u64(&manifest, "source_count")?;
+        source_key_bits(manifest_source_count).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid manifest source_count: {error}"),
+            )
+        })?;
+        if common_source_count.is_some_and(|value| value != manifest_source_count) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 finalizer manifests use inconsistent source_count values",
+            ));
+        }
+        common_source_count = Some(manifest_source_count);
+        let source_contract_entries = find_v3_manifest_array(&manifest, "source_run_contracts")
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "v3 finalizer manifest {} lacks source_run_contracts",
+                        manifest_path.display()
+                    ),
+                )
+            })?;
+        let expected_source_contract_set_sha256 =
+            v3_manifest_required_sha256(&manifest, "source_run_contract_set_sha256")?;
+        let actual_source_contract_set_sha256 = v3_manifest_value_sha256(&json!({
+            "source_run_contracts": source_contract_entries,
+        }))?;
+        if actual_source_contract_set_sha256 != expected_source_contract_set_sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 finalizer source-run contract set digest mismatch",
+            ));
+        }
+        let expected_serving_run_files =
+            v3_manifest_required_u64(&manifest, "expected_serving_run_files")?;
+        let expected_serving_run_rows =
+            v3_manifest_required_u64(&manifest, "expected_serving_run_rows")?;
+        let expected_serving_run_bytes =
+            v3_manifest_required_u64(&manifest, "expected_serving_run_bytes")?;
+        let expected_code_dictionary_files =
+            v3_manifest_required_u64(&manifest, "expected_code_dictionary_files")?;
+        let expected_code_dictionary_rows =
+            v3_manifest_required_u64(&manifest, "expected_code_dictionary_rows")?;
+        let expected_code_dictionary_bytes =
+            v3_manifest_required_u64(&manifest, "expected_code_dictionary_bytes")?;
+        let expected_code_contract_set_sha256 =
+            v3_manifest_required_sha256(&manifest, "code_dictionary_contract_set_sha256")?;
+        let mut manifest_source_contracts = HashMap::new();
+        for entry in source_contract_entries {
+            let source_key = u32::try_from(v3_manifest_required_u64(entry, "source_key")?)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "source-run contract source_key exceeds u32",
+                    )
+                })?;
+            if u64::from(source_key) >= manifest_source_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "source-run contract source_key {source_key} is outside source_count {manifest_source_count}"
+                    ),
+                ));
+            }
+            let declared_sha256 = v3_manifest_required_sha256(entry, "contract_sha256")?;
+            let actual_sha256 = v3_manifest_source_contract_sha256(entry)?;
+            if actual_sha256 != declared_sha256 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "source-run contract digest mismatch for source_key {source_key}: expected {}, got {}",
+                        sha256_hex(&declared_sha256),
+                        sha256_hex(&actual_sha256),
+                    ),
+                ));
+            }
+            if source_contract_sha_by_key
+                .insert(source_key, declared_sha256)
+                .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("duplicate source-run contract for source_key {source_key}"),
+                ));
+            }
+            let contract = v3_manifest_source_contract(entry)?;
+            source_identity_by_key.insert(source_key, contract.source_identity.clone());
+            manifest_source_contracts.insert(source_key, contract);
+        }
+        let code_dictionary_source_contract_entries =
+            find_v3_manifest_array(&manifest, "code_dictionary_source_contracts").ok_or_else(
+                || {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "v3 finalizer manifest {} lacks code_dictionary_source_contracts",
+                            manifest_path.display()
+                        ),
+                    )
+                },
+            )?;
+        let expected_code_dictionary_source_contract_set_sha256 =
+            v3_manifest_required_sha256(&manifest, "code_dictionary_source_contract_set_sha256")?;
+        let actual_code_dictionary_source_contract_set_sha256 = v3_manifest_value_sha256(&json!({
+            "code_dictionary_source_contracts": code_dictionary_source_contract_entries,
+        }))?;
+        if actual_code_dictionary_source_contract_set_sha256
+            != expected_code_dictionary_source_contract_set_sha256
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 finalizer code-dictionary source contract set digest mismatch",
+            ));
+        }
+        let mut manifest_code_dictionary_source_contracts = HashMap::new();
+        for entry in code_dictionary_source_contract_entries {
+            let source_key = u32::try_from(v3_manifest_required_u64(entry, "source_key")?)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "code-dictionary source contract source_key exceeds u32",
+                    )
+                })?;
+            if u64::from(source_key) >= manifest_source_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "code-dictionary source contract source_key is outside source_count",
+                ));
+            }
+            let source_contract = manifest_source_contracts.get(&source_key).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "code-dictionary source contract has no source-run contract for source_key {source_key}"
+                    ),
+                )
+            })?;
+            let declared_sha256 = v3_manifest_required_sha256(entry, "contract_sha256")?;
+            let actual_sha256 = v3_manifest_code_dictionary_contract_sha256(entry)?;
+            if declared_sha256 != actual_sha256 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "code-dictionary source contract digest mismatch for source_key {source_key}"
+                    ),
+                ));
+            }
+            let contract = v3_manifest_code_dictionary_source_contract(entry)?;
+            if contract.source_identity != source_contract.source_identity
+                || source_contract_sha_by_key.get(&source_key)
+                    != Some(&contract.source_run_contract_sha256)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "code-dictionary source contract is bound to another physical source for source_key {source_key}"
+                    ),
+                ));
+            }
+            if code_dictionary_contract_sha_by_key
+                .insert(source_key, declared_sha256)
+                .is_some()
+                || manifest_code_dictionary_source_contracts
+                    .insert(source_key, contract)
+                    .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "duplicate code-dictionary source contract for source_key {source_key}"
+                    ),
+                ));
+            }
+        }
         let partition_entries = find_v3_manifest_array(&manifest, "serving_run_partition_files")
             .ok_or_else(|| {
                 io::Error::new(
@@ -14169,6 +15740,15 @@ fn load_v3_finalizer_inputs(manifest_paths: &[PathBuf]) -> io::Result<V3Finalize
                 ),
             )
         })?;
+        let mut manifest_serving_descriptors: HashMap<u32, Vec<V3SourceRunFileDescriptor>> =
+            HashMap::new();
+        let mut manifest_code_contracts = Vec::with_capacity(code_entries.len());
+        let mut manifest_code_descriptors: HashMap<u32, Vec<V3CodeDictionaryFileDescriptor>> =
+            HashMap::new();
+        let mut manifest_serving_rows = 0u64;
+        let mut manifest_serving_bytes = 0u64;
+        let mut manifest_code_rows = 0u64;
+        let mut manifest_code_bytes = 0u64;
         for entry in partition_entries {
             let format = v3_manifest_required_text(entry, "format")?;
             let version = v3_manifest_required_u64(entry, "version")?;
@@ -14211,6 +15791,12 @@ fn load_v3_finalizer_inputs(manifest_paths: &[PathBuf]) -> io::Result<V3Finalize
                 ));
             }
             common_source_count = Some(source_count);
+            if source_count != manifest_source_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "serving run source_count differs from manifest source_count",
+                ));
+            }
             let source_key_value = v3_manifest_required_u64(entry, "source_key")?;
             if source_key_value >= source_count {
                 return Err(io::Error::new(
@@ -14226,6 +15812,20 @@ fn load_v3_finalizer_inputs(manifest_paths: &[PathBuf]) -> io::Result<V3Finalize
                     "serving run source_key exceeds u32",
                 )
             })?;
+            let source_contract = manifest_source_contracts.get(&source_key).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("serving run source_key {source_key} has no contract in its manifest"),
+                )
+            })?;
+            if source_contract.partition_count != partition_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "serving run partition_count does not match source contract for source_key {source_key}"
+                    ),
+                ));
+            }
             seen_source_keys.insert(source_key);
             let path =
                 resolve_v3_manifest_path(manifest_path, v3_manifest_required_text(entry, "path")?);
@@ -14237,6 +15837,7 @@ fn load_v3_finalizer_inputs(manifest_paths: &[PathBuf]) -> io::Result<V3Finalize
             }
             let row_count = v3_manifest_required_u64(entry, "row_count")?;
             let bytes = v3_manifest_required_u64(entry, "bytes")?;
+            let sha256 = v3_manifest_required_sha256(entry, "sha256")?;
             let actual_bytes = path.metadata()?.len();
             if actual_bytes != bytes
                 || bytes % SERVING_RUN_RECORD_BYTES as u64 != 0
@@ -14260,13 +15861,38 @@ fn load_v3_finalizer_inputs(manifest_paths: &[PathBuf]) -> io::Result<V3Finalize
                     format!("serving run file is not ready: {}", path.display()),
                 ));
             }
+            manifest_serving_rows =
+                manifest_serving_rows
+                    .checked_add(row_count)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "serving run manifest row count overflows u64",
+                        )
+                    })?;
+            manifest_serving_bytes =
+                manifest_serving_bytes.checked_add(bytes).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "serving run manifest byte count overflows u64",
+                    )
+                })?;
+            manifest_serving_descriptors
+                .entry(source_key)
+                .or_default()
+                .push(V3SourceRunFileDescriptor {
+                    partition,
+                    sha256,
+                    row_count,
+                    bytes,
+                });
             partitions.push(V3FinalizerPartitionInput {
                 path,
                 partition,
-                partition_count,
                 source_key,
                 row_count,
                 bytes,
+                sha256,
             });
         }
         for entry in code_entries {
@@ -14290,17 +15916,196 @@ fn load_v3_finalizer_inputs(manifest_paths: &[PathBuf]) -> io::Result<V3Finalize
             }
             let row_count = v3_manifest_required_u64(entry, "row_count")?;
             let bytes = v3_manifest_required_u64(entry, "bytes")?;
+            let source_count = v3_manifest_required_u64(entry, "source_count")?;
+            if common_source_count.is_some_and(|value| value != source_count) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "code dictionary source_count differs from serving-run source_count",
+                ));
+            }
+            if source_count != manifest_source_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "code dictionary source_count differs from manifest source_count",
+                ));
+            }
+            let source_key = u32::try_from(v3_manifest_required_u64(entry, "source_key")?)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "code dictionary source_key exceeds u32",
+                    )
+                })?;
+            if u64::from(source_key) >= source_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "code dictionary source_key must be inside source_count",
+                ));
+            }
+            if !manifest_source_contracts.contains_key(&source_key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "code dictionary source_key {source_key} has no contract in its manifest"
+                    ),
+                ));
+            }
+            seen_code_source_keys.insert(source_key);
+            let source_run_contract_sha256 =
+                v3_manifest_required_sha256(entry, "source_run_contract_sha256")?;
+            if source_contract_sha_by_key.get(&source_key) != Some(&source_run_contract_sha256) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "code dictionary source contract does not match source_key {source_key}"
+                    ),
+                ));
+            }
+            let code_dictionary_contract_sha256 =
+                v3_manifest_required_sha256(entry, "code_dictionary_contract_sha256")?;
+            if code_dictionary_contract_sha_by_key.get(&source_key)
+                != Some(&code_dictionary_contract_sha256)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "code dictionary file does not match complete source contract for source_key {source_key}"
+                    ),
+                ));
+            }
+            let sha256 = v3_manifest_required_sha256(entry, "sha256")?;
             if path.metadata()?.len() != bytes {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("code dictionary byte count mismatch for {}", path.display()),
                 ));
             }
+            manifest_code_rows = manifest_code_rows.checked_add(row_count).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "code dictionary manifest row count overflows u64",
+                )
+            })?;
+            manifest_code_bytes = manifest_code_bytes.checked_add(bytes).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "code dictionary manifest byte count overflows u64",
+                )
+            })?;
+            manifest_code_contracts.push(json!({
+                "source_key": source_key,
+                "row_count": row_count,
+                "bytes": bytes,
+                "sha256": sha256_hex(&sha256),
+                "source_run_contract_sha256": sha256_hex(&source_run_contract_sha256),
+                "code_dictionary_contract_sha256": sha256_hex(&code_dictionary_contract_sha256),
+            }));
+            manifest_code_descriptors
+                .entry(source_key)
+                .or_default()
+                .push(V3CodeDictionaryFileDescriptor {
+                    sha256,
+                    row_count,
+                    bytes,
+                });
             code_dictionaries.push(V3FinalizerCodeDictionaryInput {
                 path,
                 row_count,
                 bytes,
+                sha256,
             });
+        }
+        for (source_key, contract) in &manifest_source_contracts {
+            let mut observed = manifest_serving_descriptors
+                .remove(source_key)
+                .unwrap_or_default();
+            observed.sort_unstable();
+            if observed != contract.files {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "serving run files do not match complete source contract for source_key {source_key}"
+                    ),
+                ));
+            }
+            let mut partition_rows = vec![0u64; contract.partition_count];
+            for file in &observed {
+                partition_rows[file.partition] = partition_rows[file.partition]
+                    .checked_add(file.row_count)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "serving run partition row count overflows u64",
+                        )
+                    })?;
+            }
+            if partition_rows != contract.partition_rows
+                || observed.len() as u64 != contract.file_count
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "serving run aggregates do not match source contract for source_key {source_key}"
+                    ),
+                ));
+            }
+        }
+        if !manifest_serving_descriptors.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serving run files include undeclared source contracts",
+            ));
+        }
+        for (source_key, contract) in &manifest_code_dictionary_source_contracts {
+            let mut observed = manifest_code_descriptors
+                .remove(source_key)
+                .unwrap_or_default();
+            observed.sort_unstable();
+            if observed != contract.files
+                || observed.len() as u64 != contract.file_count
+                || observed.iter().map(|file| file.row_count).sum::<u64>() != contract.row_count
+                || observed.iter().map(|file| file.bytes).sum::<u64>() != contract.byte_count
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "code dictionary files do not match complete source contract for source_key {source_key}"
+                    ),
+                ));
+            }
+        }
+        if !manifest_code_descriptors.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code dictionary files include undeclared source contracts",
+            ));
+        }
+        if partition_entries.len() as u64 != expected_serving_run_files
+            || manifest_serving_rows != expected_serving_run_rows
+            || manifest_serving_bytes != expected_serving_run_bytes
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serving run manifest totals do not match declared expectations",
+            ));
+        }
+        if code_entries.len() as u64 != expected_code_dictionary_files
+            || manifest_code_rows != expected_code_dictionary_rows
+            || manifest_code_bytes != expected_code_dictionary_bytes
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code dictionary manifest totals do not match declared expectations",
+            ));
+        }
+        let actual_code_contract_set_sha256 = v3_manifest_value_sha256(&json!({
+            "code_dictionary_contracts": manifest_code_contracts,
+        }))?;
+        if actual_code_contract_set_sha256 != expected_code_contract_set_sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code dictionary contract set digest mismatch",
+            ));
         }
     }
     let partition_count = common_partition_count.ok_or_else(|| {
@@ -14320,6 +16125,60 @@ fn load_v3_finalizer_inputs(manifest_paths: &[PathBuf]) -> io::Result<V3Finalize
             io::ErrorKind::InvalidData,
             format!("serving run source keys are not dense in 0..{source_count}"),
         ));
+    }
+    if seen_code_source_keys != seen_source_keys {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "code dictionaries do not cover the complete dense physical source set",
+        ));
+    }
+    if source_contract_sha_by_key
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>()
+        != seen_source_keys
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source-run contracts do not cover the complete dense physical source set",
+        ));
+    }
+    if source_identity_by_key.len() as u64 != source_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source identities do not cover the complete dense physical source set",
+        ));
+    }
+    if code_dictionary_contract_sha_by_key
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>()
+        != seen_source_keys
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "code-dictionary source contracts do not cover the complete dense physical source set",
+        ));
+    }
+    let mut unique_source_identities = HashSet::with_capacity(source_identity_by_key.len());
+    let mut ordered_source_identities = Vec::with_capacity(source_identity_by_key.len());
+    for (source_key, source_identity) in source_identity_by_key {
+        if !unique_source_identities.insert(source_identity.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 finalizer source identities must be unique",
+            ));
+        }
+        ordered_source_identities.push((source_identity, source_key));
+    }
+    ordered_source_identities.sort_unstable();
+    for (expected_source_key, (_, source_key)) in ordered_source_identities.iter().enumerate() {
+        if usize::try_from(*source_key).map_err(to_io_error)? != expected_source_key {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v3 finalizer source keys do not match deterministic identity ordering",
+            ));
+        }
     }
     if code_dictionaries.is_empty() {
         return Err(io::Error::new(
@@ -14341,6 +16200,7 @@ fn load_v3_finalizer_inputs(manifest_paths: &[PathBuf]) -> io::Result<V3Finalize
     Ok(V3FinalizerInputs {
         partitions,
         code_dictionaries,
+        manifest_bytes,
         partition_count,
         source_count,
         source_key_bits,
@@ -14423,6 +16283,66 @@ impl Drop for AtomicFinalizerDirectory {
     }
 }
 
+fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let byte_count = reader.read(&mut buffer)?;
+        if byte_count == 0 {
+            break;
+        }
+        digest.update(&buffer[..byte_count]);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn v3_code_dictionary_memory_estimate(
+    inputs: &[V3FinalizerCodeDictionaryInput],
+) -> io::Result<usize> {
+    let source_bytes = inputs.iter().try_fold(0usize, |total, input| {
+        let bytes = usize::try_from(input.bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code dictionary source bytes exceed addressable memory",
+            )
+        })?;
+        total.checked_add(bytes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code dictionary source byte estimate overflow",
+            )
+        })
+    })?;
+    let source_rows = inputs.iter().try_fold(0usize, |total, input| {
+        let rows = usize::try_from(input.row_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code dictionary source rows exceed addressable memory",
+            )
+        })?;
+        total.checked_add(rows).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code dictionary source row estimate overflow",
+            )
+        })
+    })?;
+    source_bytes
+        .checked_mul(V3_FINALIZER_CODE_DICTIONARY_FILE_MEMORY_MULTIPLIER)
+        .and_then(|bytes| {
+            source_rows
+                .checked_mul(V3_FINALIZER_CODE_DICTIONARY_MEMORY_BYTES_PER_SOURCE_ROW)
+                .and_then(|row_bytes| bytes.checked_add(row_bytes))
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code dictionary resident memory estimate overflow",
+            )
+        })
+}
+
 fn load_v3_code_dictionary(
     inputs: &[V3FinalizerCodeDictionaryInput],
 ) -> io::Result<(BTreeMap<[u8; 16], NaturalLeanCode>, u64, u64)> {
@@ -14430,7 +16350,19 @@ fn load_v3_code_dictionary(
     let mut source_rows = 0u64;
     let mut source_bytes = 0u64;
     for input in inputs {
-        let records = read_code_dictionary(&input.path)?;
+        let actual_sha256 = sha256_file(&input.path)?;
+        if actual_sha256 != input.sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "code dictionary content digest mismatch for {}: expected {}, got {}",
+                    input.path.display(),
+                    sha256_hex(&input.sha256),
+                    sha256_hex(&actual_sha256),
+                ),
+            ));
+        }
+        let records = read_code_dictionary_exact(&input.path, input.row_count, input.bytes)?;
         if records.len() as u64 != input.row_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -14544,8 +16476,9 @@ fn read_provider_identity_record<R: Read>(reader: &mut R) -> io::Result<Option<(
     Ok(Some((id, provider_count)))
 }
 
+#[cfg(test)]
 fn read_dense_id_record<R: Read>(reader: &mut R) -> io::Result<Option<[u8; 16]>> {
-    let mut id = [0u8; DENSE_ID_RECORD_BYTES];
+    let mut id = [0u8; GLOBAL_ID_BYTES];
     read_exact_optional(reader, &mut id).map(|present| present.then_some(id))
 }
 
@@ -14585,7 +16518,6 @@ struct V3PriceKeyMapStageSummary {
 fn stage_v3_price_key_map(
     input_path: &Path,
     by_id_path: &Path,
-    by_key_unsorted_path: &Path,
 ) -> io::Result<V3PriceKeyMapStageSummary> {
     let input_bytes = input_path.metadata()?.len();
     let mut reader = BufReader::new(File::open(input_path)?);
@@ -14594,12 +16526,6 @@ fn stage_v3_price_key_map(
             .write(true)
             .create_new(true)
             .open(by_id_path)?,
-    );
-    let mut by_key = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(by_key_unsorted_path)?,
     );
     read_pg_binary_copy_header(&mut reader)?;
     let mut previous_price_set_id = None;
@@ -14630,8 +16556,6 @@ fn stage_v3_price_key_map(
         })?;
         by_id.write_all(&price_set_id)?;
         by_id.write_all(&price_key.to_be_bytes())?;
-        by_key.write_all(&price_key.to_be_bytes())?;
-        by_key.write_all(&price_set_id)?;
         digest.update(price_set_id);
         digest.update(price_key.to_be_bytes());
         previous_price_set_id = Some(price_set_id);
@@ -14650,9 +16574,7 @@ fn stage_v3_price_key_map(
         ));
     }
     by_id.flush()?;
-    by_key.flush()?;
     by_id.get_ref().sync_all()?;
-    by_key.get_ref().sync_all()?;
     Ok(V3PriceKeyMapStageSummary {
         row_count,
         input_bytes,
@@ -14660,34 +16582,7 @@ fn stage_v3_price_key_map(
     })
 }
 
-fn validate_v3_price_key_map_dense(by_key_path: &Path, expected_rows: u64) -> io::Result<()> {
-    let mut reader = BufReader::new(File::open(by_key_path)?);
-    let mut expected_price_key = 0u64;
-    while let Some((price_key, _)) = read_v3_price_key_map_by_key_record(&mut reader)? {
-        if u64::from(price_key) != expected_price_key {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "PTG2 v3 price-key map keys must be unique, dense, and contiguous from zero: expected {expected_price_key}, got {price_key}"
-                ),
-            ));
-        }
-        expected_price_key = expected_price_key.checked_add(1).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "price-key map key count overflow",
-            )
-        })?;
-    }
-    if expected_price_key != expected_rows {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "PTG2 v3 price-key map external sort did not preserve every row",
-        ));
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn validate_v3_price_key_map_source_ids(
     source_price_ids_path: &Path,
     price_key_map_by_id_path: &Path,
@@ -14819,26 +16714,50 @@ fn v3_support_digest(
 }
 
 struct AssignedPgBinaryStream {
-    reader: BufReader<File>,
+    paths: Vec<PathBuf>,
+    path_index: usize,
+    reader: Option<BufReader<File>>,
+    previous_record: Option<[u8; V3_FINALIZER_ASSIGNED_BYTES]>,
     pending: Vec<u8>,
     pending_offset: usize,
     phase: u8,
     audit_candidates: AuditCandidateSelector,
+    distinct_record_count: u64,
+    duplicate_record_count: u64,
 }
 
 impl AssignedPgBinaryStream {
-    fn new(path: &Path, population_count: u64) -> io::Result<Self> {
+    fn new_many(paths: Vec<PathBuf>, population_count: u64) -> io::Result<Self> {
+        if paths.iter().any(|path| !path.is_file()) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "assigned partition input does not exist",
+            ));
+        }
         Ok(Self {
-            reader: BufReader::new(File::open(path)?),
+            paths,
+            path_index: 0,
+            reader: None,
+            previous_record: None,
             pending: Vec::new(),
             pending_offset: 0,
             phase: 0,
             audit_candidates: AuditCandidateSelector::new(population_count),
+            distinct_record_count: 0,
+            duplicate_record_count: 0,
         })
     }
 
     fn audit_candidates(&self) -> io::Result<&[ptg2_scanner::v3_runs::AuditCandidateRecord]> {
         self.audit_candidates.finish()
+    }
+
+    fn distinct_record_count(&self) -> u64 {
+        self.distinct_record_count
+    }
+
+    fn duplicate_record_count(&self) -> u64 {
+        self.duplicate_record_count
     }
 
     fn fill_pending(&mut self) -> io::Result<bool> {
@@ -14851,7 +16770,35 @@ impl AssignedPgBinaryStream {
             }
             1 => {
                 let mut record = [0u8; V3_FINALIZER_ASSIGNED_BYTES];
-                if read_exact_optional(&mut self.reader, &mut record)? {
+                let has_record = loop {
+                    if self.reader.is_none() {
+                        let Some(path) = self.paths.get(self.path_index) else {
+                            break false;
+                        };
+                        self.reader = Some(BufReader::new(File::open(path)?));
+                        self.path_index += 1;
+                    }
+                    if read_exact_optional(self.reader.as_mut().unwrap(), &mut record)? {
+                        break true;
+                    }
+                    self.reader = None;
+                };
+                if has_record {
+                    if self
+                        .previous_record
+                        .is_some_and(|previous| record < previous)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "assigned partition files are not globally ordered",
+                        ));
+                    }
+                    if self.previous_record == Some(record) {
+                        self.duplicate_record_count = self.duplicate_record_count.saturating_add(1);
+                    } else {
+                        self.distinct_record_count = self.distinct_record_count.saturating_add(1);
+                    }
+                    self.previous_record = Some(record);
                     let code_key =
                         i32::from_be_bytes(record[0..4].try_into().map_err(to_io_error)?);
                     let provider_key =
@@ -14989,285 +16936,665 @@ fn is_zero_identity(value: &[u8; 16]) -> bool {
     value.iter().all(|byte| *byte == 0)
 }
 
-fn write_v3_finalizer_stage_inputs(
-    sorted_partition_paths: &[PathBuf],
+#[derive(Clone, Copy, Debug, Default)]
+struct V3ScratchBytes {
+    read: u64,
+    written: u64,
+}
+
+impl V3ScratchBytes {
+    fn add(&mut self, other: Self) {
+        self.read = self.read.saturating_add(other.read);
+        self.written = self.written.saturating_add(other.written);
+    }
+}
+
+fn try_zeroed_u64_vec(len: usize, label: &str) -> io::Result<Vec<u64>> {
+    let bytes = len.checked_mul(std::mem::size_of::<u64>()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} allocation size overflow"),
+        )
+    })?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("unable to reserve {bytes} bytes for {label}: {error}"),
+        )
+    })?;
+    values.resize(len, 0);
+    Ok(values)
+}
+
+#[derive(Debug)]
+struct V3PreparedPartition {
+    partition: usize,
+    inputs: Vec<V3FinalizerPartitionInput>,
+    provider_spool_path: PathBuf,
+    row_count: u64,
+    code_key_start: u32,
+    code_rate_counts: Vec<u64>,
+    elapsed_seconds: f64,
+    scratch: V3ScratchBytes,
+}
+
+#[derive(Debug)]
+struct V3AssignedPartition {
+    partition: usize,
+    assigned_path: PathBuf,
+    row_count: u64,
+    sort_stats: MultiFileSortStats,
+    elapsed_seconds: f64,
+    scratch: V3ScratchBytes,
+}
+
+struct V3PartitionScanContext<'a> {
+    partition_count: usize,
+    price_key_count: usize,
+    work_root: &'a Path,
+    code_map: &'a DenseIdentityMap,
+    code_partition_ranges: &'a [(u32, usize)],
+    price_map: &'a DenseIdentityMap,
+    combined_price_seen_words: &'a Mutex<Vec<u64>>,
+}
+
+fn build_v3_code_partition_ranges(
     code_dictionary: &BTreeMap<[u8; 16], NaturalLeanCode>,
-    source: SourceEncoding,
-    provider_spool_path: &Path,
-    price_spool_path: &Path,
-    provider_stage_path: &Path,
-    code_copy_path: &Path,
-) -> io::Result<V3StageWriteSummary> {
-    let mut provider_spool = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(provider_spool_path)?,
+    partition_count: usize,
+) -> io::Result<Vec<(u32, usize)>> {
+    let mut starts = vec![None; partition_count];
+    let mut lengths = vec![0usize; partition_count];
+    for (key, code_id) in code_dictionary.keys().enumerate() {
+        let partition = ptg2_scanner::v3_runs::partition_for_code_id(code_id, partition_count)?;
+        let key = u32::try_from(key)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "code_key exceeds uint32"))?;
+        let start = starts[partition].get_or_insert(key);
+        let expected_key = start
+            .checked_add(u32::try_from(lengths[partition]).map_err(to_io_error)?)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "code_key overflow"))?;
+        if key != expected_key {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code dictionary is not contiguous within leading-bit partitions",
+            ));
+        }
+        lengths[partition] = lengths[partition].checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "partition code count overflow")
+        })?;
+    }
+    Ok(starts
+        .into_iter()
+        .zip(lengths)
+        .map(|(start, length)| (start.unwrap_or(0), length))
+        .collect())
+}
+
+fn emit_v3_partition_progress(
+    stage: &str,
+    partition: usize,
+    partition_count: usize,
+    rows: u64,
+    elapsed_seconds: f64,
+    scratch: V3ScratchBytes,
+) {
+    eprintln!(
+        "{}",
+        json!({
+            "type": "v3_finalizer_partition_progress",
+            "stage": stage,
+            "partition": partition,
+            "partition_count": partition_count,
+            "row_count": rows,
+            "elapsed_seconds": elapsed_seconds,
+            "scratch_bytes_read": scratch.read,
+            "scratch_bytes_written": scratch.written,
+        })
     );
-    let mut price_spool = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(price_spool_path)?,
-    );
-    let mut provider_stage = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(provider_stage_path)?,
-    );
-    let mut code_copy = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(code_copy_path)?,
-    );
-    write_pg_binary_copy_header(&mut code_copy)?;
-    let mut code_digest = Sha256::new();
-    code_digest.update(V3_FINALIZER_CODE_ROW_HASH_DOMAIN);
-    let mut previous_code_id = None;
-    let mut current_code_key = None;
-    let mut current_code_rate_count = 0u64;
-    let mut code_count = 0u64;
+}
+
+fn build_v3_code_identity_map(
+    code_dictionary: &BTreeMap<[u8; 16], NaturalLeanCode>,
+) -> io::Result<DenseIdentityMap> {
+    let mut map = DenseIdentityMap::with_capacity(code_dictionary.len())?;
+    for (key, identity) in code_dictionary.keys().enumerate() {
+        let key = u32::try_from(key)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "code_key exceeds uint32"))?;
+        if key > i32::MAX as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code_key exceeds PostgreSQL int4",
+            ));
+        }
+        map.insert(*identity, DenseIdentityValue { key, auxiliary: 0 })?;
+    }
+    Ok(map)
+}
+
+fn prepare_v3_partition(
+    partition: usize,
+    inputs: Vec<V3FinalizerPartitionInput>,
+    context: &V3PartitionScanContext<'_>,
+) -> io::Result<V3PreparedPartition> {
+    let started_at = Instant::now();
+    let partition_directory = context.work_root.join(format!("partition-{partition:03}"));
+    std::fs::create_dir_all(&partition_directory)?;
+    let provider_spool_path = partition_directory.join("providers.unsorted");
+    let mut provider_spool = BufWriter::new(File::create(&provider_spool_path)?);
+    let &(code_key_start, partition_code_count) = context
+        .code_partition_ranges
+        .get(partition)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing code partition"))?;
+    if partition_code_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serving-run partition has rows but no code dictionary range",
+        ));
+    }
+    let mut code_rate_counts =
+        try_zeroed_u64_vec(partition_code_count, "partition code rate counts")?;
+    let price_seen_word_count = context.price_key_count.checked_add(63).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "price coverage bitmap length overflow",
+        )
+    })? / 64;
+    let mut price_seen_words =
+        try_zeroed_u64_vec(price_seen_word_count, "partition price coverage bitmap")?;
     let mut row_count = 0u64;
-    for partition_path in sorted_partition_paths {
-        let mut reader = BufReader::new(File::open(partition_path)?);
-        while let Some(tagged_record) =
-            TaggedServingRunRecord::read_from(&mut reader, source.tagged_codec)?
-        {
-            let record = tagged_record.record;
+    let mut source_bytes_read = 0u64;
+    for input in &inputs {
+        let mut reader = BufReader::new(File::open(&input.path)?);
+        let mut input_digest = Sha256::new();
+        let mut input_rows = 0u64;
+        while let Some(record) = ServingRunRecord::read_from(&mut reader)? {
+            input_digest.update(record.encode());
+            let actual_partition = partition_for_record(&record, context.partition_count)?;
+            if actual_partition != partition {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "serving run record belongs to partition {actual_partition}, expected {partition}"
+                    ),
+                ));
+            }
             if is_zero_identity(&record.provider_set_id) || is_zero_identity(&record.price_set_id) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "serving run record is missing a provider-set or price-set identity",
                 ));
             }
-            if previous_code_id != Some(record.code_id) {
-                if previous_code_id.is_some_and(|previous| record.code_id <= previous) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "sorted serving partitions are not globally ordered by code identity",
-                    ));
-                }
-                if let Some(previous_code_id) = previous_code_id {
-                    let previous_code_key = current_code_key.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "completed serving code group lacks code_key",
-                        )
-                    })?;
-                    let previous_code =
-                        code_dictionary.get(&previous_code_id).ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "serving run code identity {} is absent from code dictionaries",
-                                    sha256_hex(&previous_code_id)
-                                ),
-                            )
-                        })?;
-                    write_v3_code_dictionary_copy_row(
-                        &mut code_copy,
-                        previous_code_key,
-                        previous_code,
-                        current_code_rate_count,
-                        &mut code_digest,
-                    )?;
-                }
-                let code_key = i32::try_from(code_count).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "code_key exceeds PostgreSQL int4",
-                    )
-                })?;
-                code_dictionary.get(&record.code_id).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "serving run code identity {} is absent from code dictionaries",
-                            sha256_hex(&record.code_id)
-                        ),
-                    )
-                })?;
-                previous_code_id = Some(record.code_id);
-                current_code_key = Some(code_key);
-                current_code_rate_count = 0;
-                code_count = code_count.saturating_add(1);
-            }
-            let code_key = current_code_key.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "serving row lacks code_key")
+            let code = context.code_map.get(&record.code_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "serving run code identity {} is absent from code dictionaries",
+                        sha256_hex(&record.code_id)
+                    ),
+                )
             })?;
+            let price = context.price_map.get(&record.price_set_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "source price-set ID {} is missing from the authoritative price-key map",
+                        sha256_hex(&record.price_set_id)
+                    ),
+                )
+            })?;
+            let price_key = price.key as usize;
+            if price_key >= context.price_key_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "assigned price key is outside the authoritative map",
+                ));
+            }
+            price_seen_words[price_key / 64] |= 1u64 << (price_key % 64);
             provider_spool.write_all(&record.provider_set_id)?;
             provider_spool.write_all(&record.provider_count.to_be_bytes())?;
-            price_spool.write_all(&record.price_set_id)?;
-            provider_stage.write_all(&record.provider_set_id)?;
-            provider_stage.write_all(&code_key.to_be_bytes())?;
-            provider_stage.write_all(&record.price_set_id)?;
-            provider_stage.write_all(&record.provider_count.to_be_bytes())?;
-            provider_stage.write_all(&tagged_record.source_key.to_be_bytes())?;
-            current_code_rate_count = current_code_rate_count.checked_add(1).ok_or_else(|| {
+            let relative_code_key = code
+                .key
+                .checked_sub(code_key_start)
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value < code_rate_counts.len())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "code identity is outside its leading-bit partition range",
+                    )
+                })?;
+            let count = &mut code_rate_counts[relative_code_key];
+            *count = count.checked_add(1).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "code rate_count overflow")
             })?;
-            row_count = row_count.saturating_add(1);
+            row_count = row_count.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "partition row_count overflow")
+            })?;
+            input_rows = input_rows.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "input row_count overflow")
+            })?;
         }
-    }
-    if let Some(previous_code_id) = previous_code_id {
-        let previous_code_key = current_code_key.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "completed serving code group lacks code_key",
-            )
-        })?;
-        let previous_code = code_dictionary.get(&previous_code_id).ok_or_else(|| {
-            io::Error::new(
+        if input_rows != input.row_count {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "serving run code identity {} is absent from code dictionaries",
-                    sha256_hex(&previous_code_id)
+                    "serving run row count mismatch for {}: expected {}, got {input_rows}",
+                    input.path.display(),
+                    input.row_count
                 ),
-            )
-        })?;
-        write_v3_code_dictionary_copy_row(
-            &mut code_copy,
-            previous_code_key,
-            previous_code,
-            current_code_rate_count,
-            &mut code_digest,
-        )?;
+            ));
+        }
+        let actual_digest: [u8; 32] = input_digest.finalize().into();
+        if actual_digest != input.sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "serving run content digest mismatch during identity scan for {}: expected {}, got {}",
+                    input.path.display(),
+                    sha256_hex(&input.sha256),
+                    sha256_hex(&actual_digest),
+                ),
+            ));
+        }
+        source_bytes_read = source_bytes_read.saturating_add(input.bytes);
     }
-    if code_count != code_dictionary.len() as u64 {
+    provider_spool.flush()?;
+    provider_spool.get_ref().sync_all()?;
+    let expected_rows = inputs.iter().map(|input| input.row_count).sum::<u64>();
+    if row_count != expected_rows {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "code dictionary preservation mismatch: serving rows use {code_count} codes, dictionaries contain {}",
-                code_dictionary.len()
-            ),
+            "partition identity extraction changed the source multiset",
         ));
     }
-    write_pg_binary_copy_trailer(&mut code_copy)?;
-    for writer in [
-        &mut provider_spool as &mut dyn Write,
-        &mut price_spool,
-        &mut provider_stage,
-        &mut code_copy,
-    ] {
-        writer.flush()?;
+    {
+        let mut combined = context
+            .combined_price_seen_words
+            .lock()
+            .map_err(|_| io::Error::other("combined price coverage bitmap mutex is poisoned"))?;
+        if combined.len() != price_seen_words.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partition price coverage bitmap length mismatch",
+            ));
+        }
+        for (target, value) in combined.iter_mut().zip(price_seen_words) {
+            *target |= value;
+        }
     }
-    provider_spool.get_ref().sync_all()?;
-    price_spool.get_ref().sync_all()?;
-    provider_stage.get_ref().sync_all()?;
-    code_copy.get_ref().sync_all()?;
-    Ok(V3StageWriteSummary {
+    let provider_bytes = row_count.saturating_mul(PROVIDER_IDENTITY_RECORD_BYTES as u64);
+    let scratch = V3ScratchBytes {
+        read: source_bytes_read,
+        written: provider_bytes,
+    };
+    let elapsed_seconds = started_at.elapsed().as_secs_f64();
+    emit_v3_partition_progress(
+        "identity_scan",
+        partition,
+        context.partition_count,
         row_count,
-        code_count,
-        code_digest: code_digest.finalize().into(),
+        elapsed_seconds,
+        scratch,
+    );
+    Ok(V3PreparedPartition {
+        partition,
+        inputs,
+        provider_spool_path,
+        row_count,
+        code_key_start,
+        code_rate_counts,
+        elapsed_seconds,
+        scratch,
     })
 }
 
-fn join_v3_provider_keys(
-    provider_sorted_path: &Path,
-    provider_stage_sorted_path: &Path,
-    price_stage_path: &Path,
-) -> io::Result<u64> {
-    let mut providers = BufReader::new(File::open(provider_sorted_path)?);
-    let mut stage = BufReader::new(File::open(provider_stage_sorted_path)?);
-    let mut output = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(price_stage_path)?,
-    );
-    let mut current_provider = read_provider_identity_record(&mut providers)?;
-    let mut current_provider_key = 0u64;
-    let mut row_count = 0u64;
-    let mut record = [0u8; V3_FINALIZER_STAGE_PROVIDER_BYTES];
-    while read_exact_optional(&mut stage, &mut record)? {
-        let provider_id: [u8; 16] = record[..16].try_into().map_err(to_io_error)?;
-        while current_provider.is_some_and(|(id, _)| id < provider_id) {
-            current_provider = read_provider_identity_record(&mut providers)?;
-            current_provider_key = current_provider_key.saturating_add(1);
-        }
-        let (expected_provider_id, expected_provider_count) =
-            current_provider.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "assigned row provider identity is absent from dense dictionary",
-                )
-            })?;
-        let provider_count = u32::from_be_bytes(record[36..40].try_into().map_err(to_io_error)?);
-        if expected_provider_id != provider_id || expected_provider_count != provider_count {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "assigned row provider identity/count does not match dense dictionary",
-            ));
-        }
-        let provider_key = u32::try_from(current_provider_key).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "provider_set_key exceeds uint32",
-            )
-        })?;
-        if provider_key > i32::MAX as u32 {
+fn build_v3_provider_identity_map(path: &Path, expected_rows: u64) -> io::Result<DenseIdentityMap> {
+    let capacity = usize::try_from(expected_rows).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider identity map exceeds usize",
+        )
+    })?;
+    let mut map = DenseIdentityMap::with_capacity(capacity)?;
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut key = 0u32;
+    while let Some((identity, provider_count)) = read_provider_identity_record(&mut reader)? {
+        if key > i32::MAX as u32 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "provider_set_key exceeds PostgreSQL int4",
             ));
         }
-        output.write_all(&record[20..36])?;
-        output.write_all(&record[16..20])?;
-        output.write_all(&provider_key.to_be_bytes())?;
-        output.write_all(&record[40..44])?;
-        output.write_all(&provider_count.to_be_bytes())?;
-        row_count = row_count.saturating_add(1);
+        map.insert(
+            identity,
+            DenseIdentityValue {
+                key,
+                auxiliary: provider_count,
+            },
+        )?;
+        key = key.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "provider_set_key overflow")
+        })?;
     }
-    output.flush()?;
-    output.get_ref().sync_all()?;
-    Ok(row_count)
+    if u64::from(key) != expected_rows {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider identity map row count mismatch",
+        ));
+    }
+    Ok(map)
 }
 
-fn join_v3_price_keys(
-    price_key_map_by_id_path: &Path,
-    price_stage_sorted_path: &Path,
-    assigned_stage_path: &Path,
-) -> io::Result<u64> {
-    let mut prices = BufReader::new(File::open(price_key_map_by_id_path)?);
-    let mut stage = BufReader::new(File::open(price_stage_sorted_path)?);
-    let mut output = BufWriter::new(
+fn build_v3_price_identity_map_and_dictionary(
+    path: &Path,
+    expected_rows: u64,
+    by_key_path: &Path,
+) -> io::Result<DenseIdentityMap> {
+    let capacity = usize::try_from(expected_rows).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "price identity map exceeds usize",
+        )
+    })?;
+    let mut map = DenseIdentityMap::with_capacity(capacity)?;
+    let reverse_bytes = capacity.checked_mul(GLOBAL_ID_BYTES).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "price key dictionary memory estimate overflow",
+        )
+    })?;
+    let mut identities_by_key = Vec::new();
+    identities_by_key
+        .try_reserve_exact(capacity)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "unable to reserve {reverse_bytes} bytes for price key dictionary: {error}"
+                ),
+            )
+        })?;
+    identities_by_key.resize(capacity, [0u8; GLOBAL_ID_BYTES]);
+    let mut reader = BufReader::new(File::open(path)?);
+    while let Some((identity, key)) = read_v3_price_key_map_by_id_record(&mut reader)? {
+        if is_zero_identity(&identity) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "price-key map contains a zero global identity",
+            ));
+        }
+        let slot = identities_by_key.get_mut(key as usize).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "price-key map key {key} is outside its declared row count {expected_rows}"
+                ),
+            )
+        })?;
+        if !is_zero_identity(slot) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("price-key map contains duplicate dense key {key}"),
+            ));
+        }
+        *slot = identity;
+        map.insert(identity, DenseIdentityValue { key, auxiliary: 0 })?;
+    }
+    if map.len() as u64 != expected_rows {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "price identity map row count mismatch",
+        ));
+    }
+    if let Some(missing_key) = identities_by_key.iter().position(is_zero_identity) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "price-key map keys must be unique, dense, and contiguous from zero: missing {missing_key}"
+            ),
+        ));
+    }
+    let mut writer = BufWriter::new(
         OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(assigned_stage_path)?,
+            .open(by_key_path)?,
     );
-    let mut current_price = read_v3_price_key_map_by_id_record(&mut prices)?;
-    let mut row_count = 0u64;
-    let mut record = [0u8; V3_FINALIZER_STAGE_PRICE_BYTES];
-    while read_exact_optional(&mut stage, &mut record)? {
-        let price_id: [u8; 16] = record[..16].try_into().map_err(to_io_error)?;
-        while current_price.is_some_and(|(id, _)| id < price_id) {
-            current_price = read_v3_price_key_map_by_id_record(&mut prices)?;
-        }
-        let Some((mapped_price_id, price_key)) = current_price else {
-            return Err(io::Error::new(
+    for (key, identity) in identities_by_key.iter().enumerate() {
+        let key = u32::try_from(key).map_err(|_| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
-                "assigned row price identity is absent from the authoritative price-key map",
-            ));
-        };
-        if mapped_price_id != price_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "assigned row price identity is absent from the authoritative price-key map",
-            ));
-        }
-        output.write_all(&record[16..20])?;
-        output.write_all(&record[20..24])?;
-        output.write_all(&price_key.to_be_bytes())?;
-        output.write_all(&record[24..28])?;
-        output.write_all(&record[28..32])?;
-        row_count = row_count.saturating_add(1);
+                "price-key map key exceeds uint32",
+            )
+        })?;
+        writer.write_all(&key.to_be_bytes())?;
+        writer.write_all(identity)?;
     }
-    output.flush()?;
-    output.get_ref().sync_all()?;
-    Ok(row_count)
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(map)
+}
+
+fn write_v3_code_dictionary_copy(
+    code_dictionary: &BTreeMap<[u8; 16], NaturalLeanCode>,
+    partitions: &[V3PreparedPartition],
+    code_copy_path: &Path,
+) -> io::Result<V3StageWriteSummary> {
+    let mut expected_code_key = 0usize;
+    for partition in partitions {
+        if partition.code_key_start as usize != expected_code_key {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partition code-count ranges are not dense and contiguous",
+            ));
+        }
+        expected_code_key = expected_code_key
+            .checked_add(partition.code_rate_counts.len())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "partition code-count range overflow",
+                )
+            })?;
+    }
+    if expected_code_key != code_dictionary.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "code dictionary rate counts are incomplete",
+        ));
+    }
+    let mut writer = BufWriter::new(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(code_copy_path)?,
+    );
+    write_pg_binary_copy_header(&mut writer)?;
+    let mut digest = Sha256::new();
+    digest.update(V3_FINALIZER_CODE_ROW_HASH_DOMAIN);
+    let mut row_count = 0u64;
+    let mut rate_counts = partitions
+        .iter()
+        .flat_map(|partition| partition.code_rate_counts.iter().copied());
+    for (key, code) in code_dictionary.values().enumerate() {
+        let rate_count = rate_counts.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code dictionary rate counts ended early",
+            )
+        })?;
+        if rate_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code dictionary rate counts contain an unused code",
+            ));
+        }
+        let code_key = i32::try_from(key).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code_key exceeds PostgreSQL int4",
+            )
+        })?;
+        write_v3_code_dictionary_copy_row(&mut writer, code_key, code, rate_count, &mut digest)?;
+        row_count = row_count.saturating_add(rate_count);
+    }
+    if rate_counts.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "code dictionary rate counts contain trailing entries",
+        ));
+    }
+    write_pg_binary_copy_trailer(&mut writer)?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(V3StageWriteSummary {
+        row_count,
+        code_count: code_dictionary.len() as u64,
+        code_digest: digest.finalize().into(),
+    })
+}
+
+fn assign_v3_partition(
+    prepared: &V3PreparedPartition,
+    partition_count: usize,
+    assigned_record_limit: usize,
+    code_map: &DenseIdentityMap,
+    provider_map: &DenseIdentityMap,
+    price_map: &DenseIdentityMap,
+) -> io::Result<V3AssignedPartition> {
+    let started_at = Instant::now();
+    let partition_directory = prepared.provider_spool_path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "partition path has no parent")
+    })?;
+    let unsorted_path = partition_directory.join("assigned.unsorted");
+    let assigned_path = partition_directory.join("assigned.sorted");
+    let mut writer = BufWriter::new(File::create(&unsorted_path)?);
+    let mut row_count = 0u64;
+    let mut source_bytes_read = 0u64;
+    for input in &prepared.inputs {
+        let mut reader = BufReader::new(File::open(&input.path)?);
+        let mut input_digest = Sha256::new();
+        let mut input_rows = 0u64;
+        while let Some(record) = ServingRunRecord::read_from(&mut reader)? {
+            input_digest.update(record.encode());
+            let actual_partition = partition_for_record(&record, partition_count)?;
+            if actual_partition != prepared.partition {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "serving run record belongs to partition {actual_partition}, expected {}",
+                        prepared.partition
+                    ),
+                ));
+            }
+            let code = code_map.get(&record.code_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "assigned code identity is absent",
+                )
+            })?;
+            let provider = provider_map.get(&record.provider_set_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "assigned provider identity is absent",
+                )
+            })?;
+            if provider.auxiliary != record.provider_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "assigned provider identity/count conflicts with immutable dense map",
+                ));
+            }
+            let price = price_map.get(&record.price_set_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "assigned price identity is absent",
+                )
+            })?;
+            writer.write_all(&code.key.to_be_bytes())?;
+            writer.write_all(&provider.key.to_be_bytes())?;
+            writer.write_all(&price.key.to_be_bytes())?;
+            writer.write_all(&input.source_key.to_be_bytes())?;
+            writer.write_all(&record.provider_count.to_be_bytes())?;
+            row_count = row_count.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "partition row_count overflow")
+            })?;
+            input_rows = input_rows.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "input row_count overflow")
+            })?;
+        }
+        if input_rows != input.row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "serving run row count changed between identity and assignment scans for {}",
+                    input.path.display()
+                ),
+            ));
+        }
+        let actual_digest: [u8; 32] = input_digest.finalize().into();
+        if actual_digest != input.sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "serving run content digest mismatch during assignment scan for {}: expected {}, got {}",
+                    input.path.display(),
+                    sha256_hex(&input.sha256),
+                    sha256_hex(&actual_digest),
+                ),
+            ));
+        }
+        source_bytes_read = source_bytes_read.saturating_add(input.bytes);
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    if row_count != prepared.row_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partition assignment changed the source multiset",
+        ));
+    }
+    let sort_stats = external_sort_assigned_serving_records(
+        std::slice::from_ref(&unsorted_path),
+        &assigned_path,
+        partition_directory,
+        assigned_record_limit,
+    )?;
+    if sort_stats.input_records != row_count
+        || sort_stats.unique_records != row_count
+        || sort_stats.output_bytes != row_count.saturating_mul(V3_FINALIZER_ASSIGNED_BYTES as u64)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partition-local assignment sort did not preserve every source occurrence",
+        ));
+    }
+    let assigned_bytes = row_count.saturating_mul(V3_FINALIZER_ASSIGNED_BYTES as u64);
+    let scratch = V3ScratchBytes {
+        read: source_bytes_read
+            .saturating_add(sort_stats.input_bytes)
+            .saturating_add(sort_stats.spill_bytes),
+        written: assigned_bytes
+            .saturating_add(sort_stats.spill_bytes)
+            .saturating_add(sort_stats.output_bytes),
+    };
+    let elapsed_seconds = started_at.elapsed().as_secs_f64();
+    emit_v3_partition_progress(
+        "assign_sort",
+        prepared.partition,
+        partition_count,
+        row_count,
+        elapsed_seconds,
+        scratch,
+    );
+    Ok(V3AssignedPartition {
+        partition: prepared.partition,
+        assigned_path,
+        row_count,
+        sort_stats,
+        elapsed_seconds,
+        scratch,
+    })
 }
 
 fn pg_binary_i16(field: &[u8], name: &str) -> io::Result<i16> {
@@ -15440,6 +17767,76 @@ fn sync_counting_writer(writer: &mut CountingWriter<BufWriter<File>>) -> io::Res
     writer.inner.get_ref().sync_all()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct V3SortMemoryBudget {
+    active_workers: usize,
+    reserved_overhead_bytes: usize,
+    payload_bytes: usize,
+    bytes_per_active_worker: usize,
+    single_sort_payload_bytes: usize,
+    assigned_records_per_worker: usize,
+    provider_identity_records: usize,
+}
+
+fn v3_sort_memory_budget(
+    total_sort_memory_bytes: usize,
+    active_workers: usize,
+) -> io::Result<V3SortMemoryBudget> {
+    if active_workers == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "v3 finalizer must have at least one active worker",
+        ));
+    }
+    let reserved_overhead_bytes = V3_FINALIZER_SORT_OVERHEAD_BYTES_PER_ACTIVE_WORKER
+        .checked_mul(active_workers)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "v3 finalizer sort overhead estimate overflow",
+            )
+        })?;
+    let payload_bytes = total_sort_memory_bytes
+        .checked_sub(reserved_overhead_bytes)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "--total-sort-memory-bytes must reserve {V3_FINALIZER_SORT_OVERHEAD_BYTES_PER_ACTIVE_WORKER} bytes per active worker"
+                ),
+            )
+        })?;
+    let bytes_per_active_worker = payload_bytes / active_workers;
+    let single_sort_payload_bytes = total_sort_memory_bytes
+        .checked_sub(V3_FINALIZER_SORT_OVERHEAD_BYTES_PER_ACTIVE_WORKER)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--total-sort-memory-bytes cannot reserve single-sort overhead",
+            )
+        })?;
+    let assigned_records_per_worker = bytes_per_active_worker / V3_FINALIZER_ASSIGNED_BYTES;
+    let provider_identity_records = single_sort_payload_bytes / PROVIDER_IDENTITY_RECORD_BYTES;
+    if assigned_records_per_worker == 0 || provider_identity_records == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "--total-sort-memory-bytes must provide at least {} bytes per active worker",
+                V3_FINALIZER_ASSIGNED_BYTES.max(PROVIDER_IDENTITY_RECORD_BYTES)
+            ),
+        ));
+    }
+    Ok(V3SortMemoryBudget {
+        active_workers,
+        reserved_overhead_bytes,
+        payload_bytes,
+        bytes_per_active_worker,
+        single_sort_payload_bytes,
+        assigned_records_per_worker,
+        provider_identity_records,
+    })
+}
+
 fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
     let started_at = Instant::now();
     let validation_started_at = Instant::now();
@@ -15449,6 +17846,17 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         key_bits: inputs.source_key_bits,
         tagged_codec: inputs.tagged_codec,
     };
+    let code_dictionary_memory_estimate =
+        v3_code_dictionary_memory_estimate(&inputs.code_dictionaries)?;
+    if code_dictionary_memory_estimate > options.identity_map_max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "code dictionary resident state requires {code_dictionary_memory_estimate} bytes, exceeding --identity-map-max-bytes {}",
+                options.identity_map_max_bytes
+            ),
+        ));
+    }
     let (code_dictionary, code_dictionary_source_rows, code_dictionary_source_bytes) =
         load_v3_code_dictionary(&inputs.code_dictionaries)?;
     let validation_seconds = validation_started_at.elapsed().as_secs_f64();
@@ -15478,138 +17886,255 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         .tempdir_in(work_parent)?;
     let output = AtomicFinalizerDirectory::new(&options.output_directory)?;
 
-    let partition_sort_started_at = Instant::now();
-    let mut sorted_partition_paths = Vec::new();
-    let mut partition_sort_stats = MultiFileSortStats::default();
-    for partition in 0..inputs.partition_count {
-        let input_paths = inputs
-            .partitions
-            .iter()
-            .filter(|input| input.partition == partition)
-            .map(|input| {
-                debug_assert_eq!(input.partition_count, inputs.partition_count);
-                (input.path.clone(), input.source_key)
-            })
-            .collect::<Vec<_>>();
-        if input_paths.is_empty() {
-            continue;
-        }
-        let sorted_path = work_directory
-            .path()
-            .join(format!("partition-{partition:03}.sorted"));
-        let stats = external_sort_tagged_partition_files(
-            &input_paths,
-            &sorted_path,
-            work_directory.path(),
-            options.memory_records,
-            partition,
-            inputs.partition_count,
-            inputs.tagged_codec,
-        )?;
-        accumulate_sort_stats(&mut partition_sort_stats, stats);
-        sorted_partition_paths.push(sorted_path);
+    let partition_jobs = (0..inputs.partition_count)
+        .filter_map(|partition| {
+            let partition_inputs = inputs
+                .partitions
+                .iter()
+                .filter(|input| input.partition == partition)
+                .cloned()
+                .collect::<Vec<_>>();
+            (!partition_inputs.is_empty()).then_some((partition, partition_inputs))
+        })
+        .collect::<Vec<_>>();
+    let active_workers = options.workers.min(partition_jobs.len().max(1));
+    let sort_memory = v3_sort_memory_budget(options.total_sort_memory_bytes, active_workers)?;
+    let code_map_estimate = DenseIdentityMap::estimated_memory_bytes(code_dictionary.len())?;
+    let code_identity_peak_bytes = code_dictionary_memory_estimate
+        .checked_add(code_map_estimate)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code identity state memory estimate overflow",
+            )
+        })?;
+    if code_identity_peak_bytes > options.identity_map_max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "code dictionary and immutable identity map require {code_identity_peak_bytes} bytes, exceeding --identity-map-max-bytes {}",
+                options.identity_map_max_bytes
+            ),
+        ));
     }
-    if partition_sort_stats.input_records != source_record_count
-        || partition_sort_stats.input_bytes != source_run_bytes
-        || partition_sort_stats
-            .unique_records
-            .saturating_add(partition_sort_stats.duplicate_records)
-            != source_record_count
-        || partition_sort_stats.output_bytes
-            != source_record_count.saturating_mul(inputs.tagged_record_bytes as u64)
+    let code_map = Arc::new(build_v3_code_identity_map(&code_dictionary)?);
+    let code_partition_ranges =
+        build_v3_code_partition_ranges(&code_dictionary, inputs.partition_count)?;
+    let code_count_bytes = code_dictionary
+        .len()
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partition code-count memory estimate overflow",
+            )
+        })?;
+    let price_key_map_by_id_path = work_directory.path().join("price-key-map.by-id");
+    let price_key_map_stage =
+        stage_v3_price_key_map(&options.price_key_map_input, &price_key_map_by_id_path)?;
+    let price_map_entries = usize::try_from(price_key_map_stage.row_count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "price identity map exceeds usize",
+        )
+    })?;
+    let price_map_bytes = DenseIdentityMap::estimated_memory_bytes(price_map_entries)?;
+    let price_reverse_bytes = price_map_entries
+        .checked_mul(GLOBAL_ID_BYTES)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "price dictionary memory estimate overflow",
+            )
+        })?;
+    let price_build_peak_bytes = code_dictionary_memory_estimate
+        .checked_add(code_map.memory_bytes())
+        .and_then(|value| value.checked_add(price_map_bytes))
+        .and_then(|value| value.checked_add(price_reverse_bytes))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "price identity state memory estimate overflow",
+            )
+        })?;
+    if price_build_peak_bytes > options.identity_map_max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "price dictionary build requires {price_build_peak_bytes} bytes, exceeding --identity-map-max-bytes {}",
+                options.identity_map_max_bytes
+            ),
+        ));
+    }
+    let price_key_map_by_key_path = work_directory.path().join("price-key-map.by-key");
+    let price_map = Arc::new(build_v3_price_identity_map_and_dictionary(
+        &price_key_map_by_id_path,
+        price_key_map_stage.row_count,
+        &price_key_map_by_key_path,
+    )?);
+    let price_bitmap_bytes_per_worker = price_map_entries
+        .saturating_add(63)
+        .checked_div(64)
+        .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "price coverage bitmap memory estimate overflow",
+            )
+        })?;
+    let identity_scan_peak_bytes = code_dictionary_memory_estimate
+        .checked_add(code_map.memory_bytes())
+        .and_then(|value| value.checked_add(price_map.memory_bytes()))
+        .and_then(|value| value.checked_add(code_count_bytes))
+        .and_then(|value| {
+            price_bitmap_bytes_per_worker
+                .checked_mul(active_workers.saturating_add(1))
+                .and_then(|bitmap_bytes| value.checked_add(bitmap_bytes))
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "identity scan memory estimate overflow",
+            )
+        })?;
+    if identity_scan_peak_bytes > options.identity_map_max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "identity scan maps and coverage bitmaps require {identity_scan_peak_bytes} bytes, exceeding --identity-map-max-bytes {}",
+                options.identity_map_max_bytes
+            ),
+        ));
+    }
+    let combined_price_seen_words = Arc::new(Mutex::new(try_zeroed_u64_vec(
+        price_map_entries.saturating_add(63) / 64,
+        "combined price coverage bitmap",
+    )?));
+    let worker_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(active_workers)
+        .thread_name(|index| format!("ptg2-v3-finalizer-{index:02}"))
+        .build()
+        .map_err(to_io_error)?;
+    let identity_scan_started_at = Instant::now();
+    let mut prepared_partitions = {
+        let scan_context = V3PartitionScanContext {
+            partition_count: inputs.partition_count,
+            price_key_count: price_map_entries,
+            work_root: work_directory.path(),
+            code_map: code_map.as_ref(),
+            code_partition_ranges: &code_partition_ranges,
+            price_map: price_map.as_ref(),
+            combined_price_seen_words: combined_price_seen_words.as_ref(),
+        };
+        worker_pool.install(|| {
+            partition_jobs
+                .into_par_iter()
+                .map(|(partition, partition_inputs)| {
+                    prepare_v3_partition(partition, partition_inputs, &scan_context)
+                })
+                .collect::<io::Result<Vec<_>>>()
+        })?
+    };
+    prepared_partitions.sort_by_key(|partition| partition.partition);
+    let mut preparation_scratch = V3ScratchBytes::default();
+    for prepared in &prepared_partitions {
+        preparation_scratch.add(prepared.scratch);
+    }
+    if prepared_partitions
+        .iter()
+        .map(|partition| partition.row_count)
+        .sum::<u64>()
+        != source_record_count
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "serving run source metadata does not match externally sorted inputs",
+            "serving run source metadata does not match identity-scan inputs",
         ));
     }
-    let partition_sort_seconds = partition_sort_started_at.elapsed().as_secs_f64();
-
-    let provider_spool_path = work_directory.path().join("providers.unsorted");
-    let price_spool_path = work_directory.path().join("prices.unsorted");
-    let provider_stage_path = work_directory.path().join("assigned-provider.unsorted");
-    let code_copy_path = output.path("code_dictionary.copy");
-    let stage_started_at = Instant::now();
-    let stage_summary = write_v3_finalizer_stage_inputs(
-        &sorted_partition_paths,
-        &code_dictionary,
-        source_encoding,
-        &provider_spool_path,
-        &price_spool_path,
-        &provider_stage_path,
-        &code_copy_path,
-    )?;
-    if stage_summary.row_count != source_record_count {
+    let price_seen_words = combined_price_seen_words
+        .lock()
+        .map_err(|_| io::Error::other("combined price coverage bitmap mutex is poisoned"))?;
+    if let Some(missing_price_key) =
+        (0..price_map_entries).find(|key| price_seen_words[*key / 64] & (1u64 << (*key % 64)) == 0)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "sorted serving-row multiset was not preserved into dense assignment staging",
+            format!("authoritative price-key map contains unused price key {missing_price_key}"),
         ));
     }
-    let stage_seconds = stage_started_at.elapsed().as_secs_f64();
+    drop(price_seen_words);
+    drop(combined_price_seen_words);
+    let identity_scan_seconds = identity_scan_started_at.elapsed().as_secs_f64();
 
     let identity_sort_started_at = Instant::now();
     let provider_sorted_path = work_directory.path().join("providers.sorted");
-    let price_sorted_path = work_directory.path().join("prices.sorted");
+    let provider_spool_paths = prepared_partitions
+        .iter()
+        .map(|partition| partition.provider_spool_path.clone())
+        .collect::<Vec<_>>();
     let provider_sort_stats = external_sort_provider_identities(
-        std::slice::from_ref(&provider_spool_path),
+        &provider_spool_paths,
         &provider_sorted_path,
         work_directory.path(),
-        options.memory_records,
+        sort_memory.provider_identity_records,
     )?;
-    let price_sort_stats = external_sort_dense_ids(
-        std::slice::from_ref(&price_spool_path),
-        &price_sorted_path,
-        work_directory.path(),
-        options.memory_records,
-    )?;
-    if stage_summary.row_count > 0 && price_sort_stats.unique_records == 0 {
+    let provider_map_entries =
+        usize::try_from(provider_sort_stats.unique_records).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider identity map exceeds usize",
+            )
+        })?;
+    let provider_map_bytes = DenseIdentityMap::estimated_memory_bytes(provider_map_entries)?;
+    let provider_projection_max_bytes = provider_map_entries
+        .checked_mul(V3_FINALIZER_PROVIDER_PROJECTION_MAX_BYTES_PER_ENTRY)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider projection memory estimate overflow",
+            )
+        })?;
+    let grouped_payload_bytes = serving_binary_block_bytes();
+    let encoder_workspace_max_bytes =
+        v3_finalizer_encoder_workspace_max_bytes(grouped_payload_bytes, code_map.len())?;
+    let estimated_resident_state_bytes = code_dictionary_memory_estimate
+        .checked_add(code_map.memory_bytes())
+        .and_then(|value| value.checked_add(provider_map_bytes))
+        .and_then(|value| value.checked_add(price_map.memory_bytes()))
+        .and_then(|value| value.checked_add(code_count_bytes))
+        .and_then(|value| value.checked_add(provider_projection_max_bytes))
+        .and_then(|value| value.checked_add(encoder_workspace_max_bytes))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "finalizer resident-state memory estimate overflow",
+            )
+        })?;
+    if estimated_resident_state_bytes > options.identity_map_max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "serving rows exist but required price-set identities are absent",
+            format!(
+                "identity maps, bounded provider projections, and encoder workspace require {estimated_resident_state_bytes} bytes, exceeding --identity-map-max-bytes {}",
+                options.identity_map_max_bytes
+            ),
         ));
     }
-    let price_key_map_by_id_path = work_directory.path().join("price-key-map.by-id");
-    let price_key_map_by_key_unsorted_path =
-        work_directory.path().join("price-key-map.by-key.unsorted");
-    let price_key_map_stage = stage_v3_price_key_map(
-        &options.price_key_map_input,
-        &price_key_map_by_id_path,
-        &price_key_map_by_key_unsorted_path,
-    )?;
-    let price_key_map_by_key_path = work_directory.path().join("price-key-map.by-key");
-    let price_key_map_sort_stats = external_sort_lexicographic_records(
-        std::slice::from_ref(&price_key_map_by_key_unsorted_path),
-        &price_key_map_by_key_path,
-        work_directory.path(),
-        V3_FINALIZER_PRICE_KEY_MAP_RECORD_BYTES,
-        options.memory_records,
-        false,
-    )?;
-    if price_key_map_sort_stats.input_records != price_key_map_stage.row_count
-        || price_key_map_sort_stats.unique_records != price_key_map_stage.row_count
-        || price_key_map_sort_stats.output_bytes
-            != price_key_map_stage
-                .row_count
-                .saturating_mul(V3_FINALIZER_PRICE_KEY_MAP_RECORD_BYTES as u64)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "authoritative price-key map was not preserved through bounded external sort",
-        ));
-    }
-    validate_v3_price_key_map_dense(&price_key_map_by_key_path, price_key_map_stage.row_count)?;
-    let matched_price_key_map_rows =
-        validate_v3_price_key_map_source_ids(&price_sorted_path, &price_key_map_by_id_path)?;
-    if matched_price_key_map_rows != price_sort_stats.unique_records
-        || matched_price_key_map_rows != price_key_map_stage.row_count
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "authoritative price-key map does not exactly cover source price-set identities",
-        ));
-    }
+    let provider_map = Arc::new(build_v3_provider_identity_map(
+        &provider_sorted_path,
+        provider_sort_stats.unique_records,
+    )?);
     let identity_sort_seconds = identity_sort_started_at.elapsed().as_secs_f64();
 
+    let stage_started_at = Instant::now();
+    let code_copy_path = output.path("code_dictionary.copy");
+    let stage_summary =
+        write_v3_code_dictionary_copy(&code_dictionary, &prepared_partitions, &code_copy_path)?;
+    if stage_summary.row_count != source_record_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partition code counts do not preserve the source multiset",
+        ));
+    }
     let provider_dictionary_path = output.path("provider_set_dictionary.copy");
     let (provider_dictionary_rows, provider_digest) =
         write_v3_provider_dictionary_copy(&provider_sorted_path, &provider_dictionary_path)?;
@@ -15619,57 +18144,45 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "provider dictionary output count mismatch",
         ));
     }
+    for prepared in &mut prepared_partitions {
+        prepared.code_rate_counts = Vec::new();
+    }
+    let stage_seconds = stage_started_at.elapsed().as_secs_f64();
 
     let assignment_started_at = Instant::now();
-    let provider_stage_sorted_path = work_directory.path().join("assigned-provider.sorted");
-    let provider_stage_sort = external_sort_lexicographic_records(
-        std::slice::from_ref(&provider_stage_path),
-        &provider_stage_sorted_path,
-        work_directory.path(),
-        V3_FINALIZER_STAGE_PROVIDER_BYTES,
-        options.memory_records,
-        false,
-    )?;
-    let price_stage_path = work_directory.path().join("assigned-price.unsorted");
-    let provider_join_rows = join_v3_provider_keys(
-        &provider_sorted_path,
-        &provider_stage_sorted_path,
-        &price_stage_path,
-    )?;
-    let price_stage_sorted_path = work_directory.path().join("assigned-price.sorted");
-    let price_stage_sort = external_sort_lexicographic_records(
-        std::slice::from_ref(&price_stage_path),
-        &price_stage_sorted_path,
-        work_directory.path(),
-        V3_FINALIZER_STAGE_PRICE_BYTES,
-        options.memory_records,
-        false,
-    )?;
-    let assigned_unsorted_path = work_directory.path().join("assigned.unsorted");
-    let price_join_rows = join_v3_price_keys(
-        &price_key_map_by_id_path,
-        &price_stage_sorted_path,
-        &assigned_unsorted_path,
-    )?;
-    let assigned_sorted_path = work_directory.path().join("assigned.sorted");
-    let assigned_sort_stats = external_sort_lexicographic_records(
-        std::slice::from_ref(&assigned_unsorted_path),
-        &assigned_sorted_path,
-        work_directory.path(),
-        V3_FINALIZER_ASSIGNED_BYTES,
-        options.memory_records,
-        false,
-    )?;
-    if provider_stage_sort.unique_records != stage_summary.row_count
-        || provider_join_rows != stage_summary.row_count
-        || price_stage_sort.unique_records != stage_summary.row_count
-        || price_join_rows != stage_summary.row_count
-        || assigned_sort_stats.unique_records != stage_summary.row_count
+    let mut assigned_partitions = worker_pool.install(|| {
+        prepared_partitions
+            .par_iter()
+            .map(|prepared| {
+                assign_v3_partition(
+                    prepared,
+                    inputs.partition_count,
+                    sort_memory.assigned_records_per_worker,
+                    &code_map,
+                    &provider_map,
+                    &price_map,
+                )
+            })
+            .collect::<io::Result<Vec<_>>>()
+    })?;
+    assigned_partitions.sort_by_key(|partition| partition.partition);
+    let mut assigned_sort_stats = MultiFileSortStats::default();
+    let mut assignment_scratch = V3ScratchBytes::default();
+    for assigned in &assigned_partitions {
+        accumulate_sort_stats(&mut assigned_sort_stats, assigned.sort_stats);
+        assignment_scratch.add(assigned.scratch);
+    }
+    if assigned_sort_stats.unique_records != stage_summary.row_count
         || assigned_sort_stats.input_records != stage_summary.row_count
+        || assigned_partitions
+            .iter()
+            .map(|value| value.row_count)
+            .sum::<u64>()
+            != stage_summary.row_count
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-                "source serving-row multiset was not exactly preserved through dense-key external joins",
+            "source serving-row multiset was not exactly preserved through partition-local assignment",
         ));
     }
     let assignment_seconds = assignment_started_at.elapsed().as_secs_f64();
@@ -15681,21 +18194,31 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         .create_new(true)
         .open(&serving_blocks_path)?;
     let mut serving_blocks_writer = CountingWriter::new(BufWriter::new(serving_blocks_file));
+    let assigned_paths = assigned_partitions
+        .iter()
+        .map(|partition| partition.assigned_path.clone())
+        .collect::<Vec<_>>();
     let mut assigned_stream =
-        AssignedPgBinaryStream::new(&assigned_sorted_path, assigned_sort_stats.unique_records)?;
+        AssignedPgBinaryStream::new_many(assigned_paths, assigned_sort_stats.unique_records)?;
     let assigned_summary =
         write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_provenance(
             &mut assigned_stream,
             &mut serving_blocks_writer,
             ServingBinaryTargetCopyFormat::SharedBinary,
-            serving_binary_block_bytes(),
-            V3_FINALIZER_HOT_BLOCK_BYTES,
-            source_encoding,
-            true,
+            AssignedV3EncoderOptions {
+                grouped_payload_bytes,
+                hot_payload_bytes: V3_FINALIZER_HOT_BLOCK_BYTES,
+                provider_code_sort_chunk_bytes: serving_binary_v3_provider_code_sort_chunk_bytes()
+                    .min(sort_memory.single_sort_payload_bytes),
+                source: source_encoding,
+                source_field_present: true,
+            },
         )?;
     sync_counting_writer(&mut serving_blocks_writer)?;
 
     let audit_candidate_path = output.path("audit_candidates.bin");
+    let distinct_serving_records = assigned_stream.distinct_record_count();
+    let duplicate_serving_records = assigned_stream.duplicate_record_count();
     let audit_candidate_records = assigned_stream.audit_candidates()?;
     let mut audit_candidate_counts_by_source = BTreeMap::<u32, u64>::new();
     for candidate in audit_candidate_records {
@@ -15777,6 +18300,53 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         ));
     }
 
+    let price_map_stage_bytes = price_key_map_stage
+        .row_count
+        .saturating_mul(V3_FINALIZER_PRICE_KEY_MAP_RECORD_BYTES as u64);
+    let identity_scratch = V3ScratchBytes {
+        read: provider_sort_stats
+            .input_bytes
+            .saturating_add(provider_sort_stats.spill_bytes)
+            .saturating_add(provider_sort_stats.output_bytes.saturating_mul(2))
+            .saturating_add(price_key_map_stage.input_bytes)
+            .saturating_add(price_map_stage_bytes),
+        written: provider_sort_stats
+            .spill_bytes
+            .saturating_add(provider_sort_stats.output_bytes)
+            .saturating_add(price_map_stage_bytes.saturating_mul(2)),
+    };
+    let provider_code_scratch_read = assigned_summary
+        .pointer("/provider_set_codes/scratch_bytes_read")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let provider_code_scratch_written = assigned_summary
+        .pointer("/provider_set_codes/scratch_bytes_written")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let encoding_scratch = V3ScratchBytes {
+        read: assigned_sort_stats
+            .output_bytes
+            .saturating_add(price_map_stage_bytes)
+            .saturating_add(provider_code_scratch_read),
+        written: provider_code_scratch_written,
+    };
+    let validation_scratch = V3ScratchBytes {
+        read: inputs
+            .manifest_bytes
+            .saturating_add(code_dictionary_source_bytes.saturating_mul(2)),
+        written: 0,
+    };
+    let mut total_scratch = V3ScratchBytes::default();
+    for stage in [
+        validation_scratch,
+        preparation_scratch,
+        identity_scratch,
+        assignment_scratch,
+        encoding_scratch,
+    ] {
+        total_scratch.add(stage);
+    }
+
     let summary = json!({
         "format": "ptg2_v3_direct_finalizer_v3",
         "storage_generation": REQUIRED_STORAGE_GENERATION,
@@ -15802,10 +18372,24 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "code_dictionary_file_count": inputs.code_dictionaries.len(),
             "code_dictionary_rows": code_dictionary_source_rows,
             "code_dictionary_bytes": code_dictionary_source_bytes,
+            "manifest_bytes": inputs.manifest_bytes,
         },
-        "partition_sort": sort_stats_payload(partition_sort_stats),
+        "source_identity_scan": {
+            "strategy": "raw_run_provider_spool_and_price_coverage_v1",
+            "passes": 1,
+            "record_count": source_record_count,
+            "bytes_read": source_run_bytes,
+            "provider_identity_bytes_written": source_record_count.saturating_mul(PROVIDER_IDENTITY_RECORD_BYTES as u64),
+            "price_identity_spool": false,
+            "tagged_partition_sort": false,
+        },
         "provider_identity_sort": sort_stats_payload(provider_sort_stats),
-        "price_identity_sort": sort_stats_payload(price_sort_stats),
+        "price_identity_assignment": {
+            "strategy": "authoritative_dense_map_lookup_with_source_coverage_bitmap_v1",
+            "source_identity_spool": false,
+            "source_identity_sort": false,
+            "source_ids_exact_match": true,
+        },
         "price_key_map": {
             "path": options.price_key_map_input.display().to_string(),
             "copy_format": "postgresql_binary_copy",
@@ -15818,12 +18402,37 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "dense_price_ordering": "minimum_negotiated_rate_then_global_id_128_v1",
             "keys_unique_dense_contiguous": true,
             "source_ids_exact_match": true,
-            "dictionary_external_sort": sort_stats_payload(price_key_map_sort_stats),
+            "dictionary_strategy": "dense_key_vector_direct_write_v1",
+            "dictionary_external_sort": false,
         },
-        "dense_assignment_sorts": {
-            "provider": sort_stats_payload(provider_stage_sort),
-            "price": sort_stats_payload(price_stage_sort),
-            "assigned": sort_stats_payload(assigned_sort_stats),
+        "partition_assignment_sorts": {
+            "strategy": "immutable_dense_maps_partition_local_v1",
+            "global_assignment_cascade": false,
+            "record_bytes": V3_FINALIZER_ASSIGNED_BYTES,
+            "aggregate": sort_stats_payload(assigned_sort_stats),
+            "partitions": assigned_partitions.iter().map(|partition| json!({
+                "partition": partition.partition,
+                "row_count": partition.row_count,
+                "elapsed_seconds": partition.elapsed_seconds,
+                "scratch_bytes_read": partition.scratch.read,
+                "scratch_bytes_written": partition.scratch.written,
+                "sort": sort_stats_payload(partition.sort_stats),
+            })).collect::<Vec<_>>(),
+        },
+        "identity_maps": {
+            "implementation": "immutable_open_addressed_128_v1",
+            "code_dictionary_resident_memory_estimate_bytes": code_dictionary_memory_estimate,
+            "code_dictionary_memory_contract": "twice_source_bytes_plus_512_bytes_per_source_row_v1",
+            "code": {"entries": code_map.len(), "memory_bytes": code_map.memory_bytes()},
+            "provider_set": {"entries": provider_map.len(), "memory_bytes": provider_map.memory_bytes()},
+            "price": {"entries": price_map.len(), "memory_bytes": price_map.memory_bytes()},
+            "price_coverage_bitmap_bytes_per_worker": price_bitmap_bytes_per_worker,
+            "identity_scan_peak_bytes": identity_scan_peak_bytes,
+            "provider_projection_max_bytes": provider_projection_max_bytes,
+            "encoder_workspace_max_bytes": encoder_workspace_max_bytes,
+            "encoder_workspace_contract": "ten_block_buffers_plus_64_bytes_per_code_plus_2mib_v1",
+            "total_map_memory_bytes": code_map.memory_bytes().saturating_add(provider_map.memory_bytes()).saturating_add(price_map.memory_bytes()),
+            "estimated_peak_resident_state_bytes": estimated_resident_state_bytes,
         },
         "dense_keys": {
             "code": {"count": stage_summary.code_count, "minimum": (stage_summary.code_count > 0).then_some(0), "maximum": stage_summary.code_count.checked_sub(1)},
@@ -15878,13 +18487,13 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         },
         "preservation": {
             "source_records": source_record_count,
-            "sorted_records": partition_sort_stats.unique_records.saturating_add(partition_sort_stats.duplicate_records),
+            "sorted_records": assigned_sort_stats.unique_records,
             "staged_records": stage_summary.row_count,
             "assigned_records": assigned_sort_stats.unique_records,
             "encoded_records": assigned_output_rows,
-            "distinct_serving_records": partition_sort_stats.unique_records,
-            "duplicate_serving_records": partition_sort_stats.duplicate_records,
-            "source_equals_sorted": source_record_count == partition_sort_stats.unique_records.saturating_add(partition_sort_stats.duplicate_records),
+            "distinct_serving_records": distinct_serving_records,
+            "duplicate_serving_records": duplicate_serving_records,
+            "source_equals_sorted": source_record_count == assigned_sort_stats.unique_records,
             "sorted_equals_staged": source_record_count == stage_summary.row_count,
             "staged_equals_assigned": stage_summary.row_count == assigned_sort_stats.unique_records,
             "assigned_equals_encoded": assigned_sort_stats.unique_records == assigned_output_rows,
@@ -15895,10 +18504,42 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "price_atom_inputs": options.price_atom_inputs.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
             "fused": false,
         },
-        "memory_record_limit": options.memory_records,
+        "resource_configuration": {
+            "contract": V3_FINALIZER_RESOURCE_CONTRACT,
+            "workers": options.workers,
+            "identity_map_max_bytes": options.identity_map_max_bytes,
+            "total_sort_memory_bytes": options.total_sort_memory_bytes,
+            "sort_memory_scope": V3_FINALIZER_SORT_MEMORY_SCOPE,
+        },
+        "workers": active_workers,
+        "configured_workers": options.workers,
+        "total_sort_memory_bytes": options.total_sort_memory_bytes,
+        "sort_memory_reserved_overhead_bytes": sort_memory.reserved_overhead_bytes,
+        "sort_memory_payload_bytes": sort_memory.payload_bytes,
+        "sort_memory_bytes_per_active_worker": sort_memory.bytes_per_active_worker,
+        "single_sort_payload_bytes": sort_memory.single_sort_payload_bytes,
+        "assigned_sort_record_limit_per_worker": sort_memory.assigned_records_per_worker,
+        "provider_identity_sort_record_limit": sort_memory.provider_identity_records,
+        "identity_map_max_bytes": options.identity_map_max_bytes,
+        "scratch_io": {
+            "definition": "all finalizer input and temporary-file IO; committed output writes excluded",
+            "validation": {"bytes_read": validation_scratch.read, "bytes_written": validation_scratch.written},
+            "identity_scan": {"bytes_read": preparation_scratch.read, "bytes_written": preparation_scratch.written},
+            "identity_maps": {"bytes_read": identity_scratch.read, "bytes_written": identity_scratch.written},
+            "partition_assignment": {"bytes_read": assignment_scratch.read, "bytes_written": assignment_scratch.written},
+            "block_encoding": {"bytes_read": encoding_scratch.read, "bytes_written": encoding_scratch.written},
+            "total_bytes_read": total_scratch.read,
+            "total_bytes_written": total_scratch.written,
+        },
+        "partition_progress": prepared_partitions.iter().map(|partition| json!({
+            "partition": partition.partition,
+            "row_count": partition.row_count,
+            "prepare_seconds": partition.elapsed_seconds,
+            "assignment_seconds": assigned_partitions.iter().find(|assigned| assigned.partition == partition.partition).map(|assigned| assigned.elapsed_seconds),
+        })).collect::<Vec<_>>(),
         "timings": {
             "validation_seconds": validation_seconds,
-            "partition_sort_seconds": partition_sort_seconds,
+            "identity_scan_seconds": identity_scan_seconds,
             "stage_seconds": stage_seconds,
             "identity_sort_seconds": identity_sort_seconds,
             "assignment_seconds": assignment_seconds,
@@ -16191,6 +18832,34 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    #[test]
+    fn compact_worker_failure_precedes_peer_cancellation() {
+        for peer_kind in [io::ErrorKind::Interrupted, io::ErrorKind::BrokenPipe] {
+            let error = compact_pipeline_error(
+                Some(io::Error::other("primary worker failure")),
+                Some(io::Error::new(peer_kind, "peer rapidgzip producer stopped")),
+            )
+            .unwrap();
+            assert_eq!(error.to_string(), "primary worker failure");
+        }
+    }
+
+    #[test]
+    fn compact_producer_failure_precedes_secondary_worker_failure() {
+        let error = compact_pipeline_error(
+            Some(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "worker observed closed producer channel",
+            )),
+            Some(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "primary rapidgzip producer failure",
+            )),
+        )
+        .unwrap();
+        assert_eq!(error.to_string(), "primary rapidgzip producer failure");
+    }
+
     struct LateErrorReader {
         bytes: Cursor<Vec<u8>>,
         emitted_error: bool,
@@ -16368,6 +19037,39 @@ mod tests {
         std::fs::write(path, payload).unwrap();
     }
 
+    fn read_worker_copy_text(base_path: &Path) -> io::Result<String> {
+        let parent = base_path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "COPY path has no parent")
+        })?;
+        let base_name = base_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "COPY path is not UTF-8"))?;
+        let mut shard_paths = std::fs::read_dir(parent)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| {
+                        name == base_name || name.starts_with(&format!("{base_name}."))
+                    })
+            })
+            .collect::<Vec<_>>();
+        shard_paths.sort_unstable();
+        if shard_paths.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no COPY shards found for {}", base_path.display()),
+            ));
+        }
+        let mut output = String::new();
+        for shard_path in shard_paths {
+            output.push_str(&std::fs::read_to_string(shard_path)?);
+        }
+        Ok(output)
+    }
+
     fn test_price_lite(negotiated_rate: &str) -> PriceLite {
         PriceLite {
             negotiated_type: Some("negotiated".to_string()),
@@ -16389,6 +19091,47 @@ mod tests {
             source_trace_set_hash: "trace-test".to_string(),
             confidence_code: "test".to_string(),
         }
+    }
+
+    #[test]
+    fn top_level_range_scan_rejects_invalid_json_outside_replayed_arrays() {
+        let payload = br#"{
+            "in_network":[{"billing_code":"10000","negotiated_rates":[]}],
+            "invalid":not_json,
+            "provider_references":[{"provider_group_id":1,"provider_groups":[]}]
+        }"#;
+
+        let error = scan_compact_top_level_array_ranges(Box::new(Cursor::new(payload.to_vec())), 2)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("JSON"), "{error}");
+    }
+
+    #[test]
+    fn top_level_range_scan_preserves_bom_and_multibyte_byte_offsets() {
+        let mut payload = b"\xef\xbb\xbf".to_vec();
+        payload.extend_from_slice(
+            "{\"label\":\"é\",\"in_network\":[{\"billing_code\":\"10000\",\"negotiated_rates\":[]}],\"provider_references\":[{\"provider_group_id\":1,\"provider_groups\":[]}]}"
+                .as_bytes(),
+        );
+
+        let scan = scan_compact_top_level_array_ranges(Box::new(Cursor::new(payload.clone())), 2)
+            .unwrap()
+            .unwrap();
+        let provider_range = &payload[scan.provider_references.offset as usize
+            ..scan
+                .provider_references
+                .offset
+                .saturating_add(scan.provider_references.length) as usize];
+        let in_network_range = &payload[scan.in_network.offset as usize
+            ..scan
+                .in_network
+                .offset
+                .saturating_add(scan.in_network.length) as usize];
+
+        assert!(serde_json::from_slice::<Value>(provider_range).is_ok());
+        assert!(serde_json::from_slice::<Value>(in_network_range).is_ok());
+        assert_eq!(scan.in_network_object_count, 1);
     }
 
     #[test]
@@ -17101,9 +19844,7 @@ mod tests {
         let provider_ref = serde_json::to_string(&valid_provider_reference()).unwrap();
         std::fs::write(
             &input_path,
-            format!(
-                r#"{{"in_network":[],"provider_references":[{provider_ref}],"provider_references":[{provider_ref}]}}"#
-            ),
+            format!(r#"{{"in_network":[],"provider_references":[{provider_ref},{provider_ref}]}}"#),
         )
         .unwrap();
         let _strict_env = strict_scan_env(&serving_run_directory);
@@ -17625,8 +20366,8 @@ mod tests {
             })
             .unwrap();
         let code_dictionary = read_code_dictionary(code_dictionary_path).unwrap();
-        let price_atom_rows = std::fs::read_to_string(&price_atom_path).unwrap();
-        let provider_member_rows = std::fs::read_to_string(&provider_member_path).unwrap();
+        let price_atom_rows = read_worker_copy_text(&price_atom_path).unwrap();
+        let provider_member_rows = read_worker_copy_text(&provider_member_path).unwrap();
         assert_eq!(serving_run_bytes, SERVING_RUN_RECORD_BYTES as u64);
         assert_eq!(code_dictionary.len(), 1);
         assert_eq!(
@@ -17852,6 +20593,73 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(provider_map.is_empty());
+    }
+
+    fn assert_normal_order_suffix_rejected(
+        suffix_label: &str,
+        suffix: &str,
+        parse_in_workers: bool,
+        expected_error: &str,
+    ) {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-normal-suffix-{suffix_label}-{}-{}",
+            parse_in_workers,
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let input_path = base.join("input.json");
+        let serving_run_directory = base.join("serving-runs");
+        let provider_reference = valid_provider_reference();
+        std::fs::write(
+            &input_path,
+            format!(r#"{{"provider_references":[{provider_reference}],"in_network":[]{suffix}"#,),
+        )
+        .unwrap();
+        let _strict_env = strict_scan_env(&serving_run_directory);
+        let _env = [
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN", "true"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS", "true"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED", "false"),
+            TestEnvVar::set(
+                "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS",
+                if parse_in_workers { "true" } else { "false" },
+            ),
+            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES", "0"),
+            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS", "0"),
+        ];
+
+        let error = scan_compact_struson(&input_path).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(expected_error), "{error}");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn normal_order_byte_scan_rejects_duplicate_rate_array_suffix() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        for parse_in_workers in [true, false] {
+            assert_normal_order_suffix_rejected(
+                "duplicate-array",
+                r#", "in_network":[]}"#,
+                parse_in_workers,
+                "duplicate PTG top-level array",
+            );
+        }
+    }
+
+    #[test]
+    fn normal_order_byte_scan_rejects_malformed_json_suffix() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        for parse_in_workers in [true, false] {
+            assert_normal_order_suffix_rejected(
+                "malformed-json",
+                r#", "invalid":not_json}"#,
+                parse_in_workers,
+                "JSON",
+            );
+        }
     }
 
     #[test]
@@ -18316,6 +21124,208 @@ mod tests {
         value
     }
 
+    fn indexed_test_id(domain: u64, index: u64) -> [u8; GLOBAL_ID_BYTES] {
+        let mut value = [0u8; GLOBAL_ID_BYTES];
+        value[..8].copy_from_slice(&domain.to_be_bytes());
+        value[8..].copy_from_slice(&index.to_be_bytes());
+        value
+    }
+
+    fn test_file_sha256(path: &Path) -> String {
+        let mut reader = BufReader::new(File::open(path).unwrap());
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 1024 * 1024];
+        loop {
+            let read = reader.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        sha256_hex(&digest.finalize())
+    }
+
+    fn test_json_sha256(value: &Value) -> String {
+        sha256_hex(&Sha256::digest(serde_json::to_vec(value).unwrap()))
+    }
+
+    fn v3_finalizer_test_source_contract(
+        output: &ptg2_scanner::v3_runs::ServingRunOutput,
+        _label: &str,
+        source_key: u32,
+    ) -> (Value, String) {
+        let partition_count = output
+            .partition_files
+            .first()
+            .map(|file| file.partition_count)
+            .unwrap_or(1);
+        let mut partition_rows = vec![0u64; partition_count];
+        let mut files = output
+            .partition_files
+            .iter()
+            .map(|file| {
+                partition_rows[file.partition_index] =
+                    partition_rows[file.partition_index].saturating_add(file.record_count);
+                json!({
+                    "partition": file.partition_index,
+                    "row_count": file.record_count,
+                    "bytes": file.bytes,
+                    "sha256": test_file_sha256(&file.path),
+                })
+            })
+            .collect::<Vec<_>>();
+        files.sort_by_key(|entry| {
+            (
+                entry["partition"].as_u64().unwrap(),
+                entry["sha256"].as_str().unwrap().to_owned(),
+                entry["row_count"].as_u64().unwrap(),
+                entry["bytes"].as_u64().unwrap(),
+            )
+        });
+        let contract = json!({
+            "version": 1,
+            "source_identity": {
+                "source_type": "in_network",
+                "identity_kind": "logical_json_sha256_v1",
+                "identity_sha256": format!("{source_key:064x}"),
+            },
+            "partition_count": partition_count,
+            "partition_rows": partition_rows,
+            "file_count": output.partition_files.len(),
+            "row_count": output.partition_files.iter().map(|file| file.record_count).sum::<u64>(),
+            "byte_count": output.partition_files.iter().map(|file| file.bytes).sum::<u64>(),
+            "files": files,
+        });
+        let contract_sha256 = test_json_sha256(&contract);
+        let mut entry = contract.as_object().unwrap().clone();
+        entry.insert("source_key".to_owned(), json!(source_key));
+        entry.insert("contract_sha256".to_owned(), json!(contract_sha256.clone()));
+        (Value::Object(entry), contract_sha256)
+    }
+
+    fn complete_v3_finalizer_test_manifest_contracts(manifest: &mut Value) {
+        let source_contracts = manifest["source_run_contracts"].as_array().unwrap().clone();
+        let serving_entries = manifest["serving_run_partition_files"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let dictionary_entries = manifest["serving_run_code_dictionary_files"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let source_count = serving_entries
+            .first()
+            .and_then(|entry| entry["source_count"].as_u64())
+            .or_else(|| manifest["source_count"].as_u64())
+            .unwrap();
+        let mut dictionary_source_contracts = Vec::with_capacity(source_contracts.len());
+        for source_contract in &source_contracts {
+            let source_key = source_contract["source_key"].as_u64().unwrap();
+            let mut files = dictionary_entries
+                .iter()
+                .filter(|entry| entry["source_key"].as_u64() == Some(source_key))
+                .map(|entry| {
+                    json!({
+                        "row_count": entry["row_count"],
+                        "bytes": entry["bytes"],
+                        "sha256": entry["sha256"],
+                    })
+                })
+                .collect::<Vec<_>>();
+            files.sort_by_key(|entry| {
+                (
+                    entry["sha256"].as_str().unwrap().to_owned(),
+                    entry["row_count"].as_u64().unwrap(),
+                    entry["bytes"].as_u64().unwrap(),
+                )
+            });
+            let contract = json!({
+                "version": 1,
+                "source_identity": source_contract["source_identity"],
+                "source_run_contract_sha256": source_contract["contract_sha256"],
+                "file_count": files.len(),
+                "row_count": files.iter().map(|entry| entry["row_count"].as_u64().unwrap()).sum::<u64>(),
+                "byte_count": files.iter().map(|entry| entry["bytes"].as_u64().unwrap()).sum::<u64>(),
+                "files": files,
+            });
+            let contract_sha256 = test_json_sha256(&contract);
+            for entry in manifest["serving_run_code_dictionary_files"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .filter(|entry| entry["source_key"].as_u64() == Some(source_key))
+            {
+                entry["code_dictionary_contract_sha256"] = json!(contract_sha256);
+            }
+            let mut contract_entry = contract.as_object().unwrap().clone();
+            contract_entry.insert("source_key".to_owned(), json!(source_key));
+            contract_entry.insert("contract_sha256".to_owned(), json!(contract_sha256));
+            dictionary_source_contracts.push(Value::Object(contract_entry));
+        }
+        dictionary_source_contracts.sort_by_key(|entry| entry["source_key"].as_u64().unwrap());
+        let dictionary_entries = manifest["serving_run_code_dictionary_files"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let dictionary_contracts = dictionary_entries
+            .iter()
+            .map(|entry| {
+                json!({
+                    "source_key": entry["source_key"],
+                    "row_count": entry["row_count"],
+                    "bytes": entry["bytes"],
+                    "sha256": entry["sha256"],
+                    "source_run_contract_sha256": entry["source_run_contract_sha256"],
+                    "code_dictionary_contract_sha256": entry["code_dictionary_contract_sha256"],
+                })
+            })
+            .collect::<Vec<_>>();
+        manifest["source_count"] = json!(source_count);
+        manifest["source_run_contract_set_sha256"] = json!(test_json_sha256(&json!({
+            "source_run_contracts": source_contracts,
+        })));
+        manifest["code_dictionary_source_contracts"] = json!(dictionary_source_contracts.clone());
+        manifest["code_dictionary_source_contract_set_sha256"] = json!(test_json_sha256(&json!({
+            "code_dictionary_source_contracts": dictionary_source_contracts,
+        })));
+        manifest["expected_serving_run_files"] = json!(serving_entries.len());
+        manifest["expected_serving_run_rows"] = json!(serving_entries
+            .iter()
+            .map(|entry| entry["row_count"].as_u64().unwrap())
+            .sum::<u64>());
+        manifest["expected_serving_run_bytes"] = json!(serving_entries
+            .iter()
+            .map(|entry| entry["bytes"].as_u64().unwrap())
+            .sum::<u64>());
+        manifest["expected_code_dictionary_files"] = json!(dictionary_entries.len());
+        manifest["expected_code_dictionary_rows"] = json!(dictionary_entries
+            .iter()
+            .map(|entry| entry["row_count"].as_u64().unwrap())
+            .sum::<u64>());
+        manifest["expected_code_dictionary_bytes"] = json!(dictionary_entries
+            .iter()
+            .map(|entry| entry["bytes"].as_u64().unwrap())
+            .sum::<u64>());
+        manifest["code_dictionary_contract_set_sha256"] = json!(test_json_sha256(&json!({
+            "code_dictionary_contracts": dictionary_contracts,
+        })));
+    }
+
+    fn set_v3_finalizer_test_source_identity(manifest: &mut Value, source_identity: Value) {
+        manifest["source_run_contracts"][0]["source_identity"] = source_identity;
+        let contract_sha256 = sha256_hex(
+            &v3_manifest_source_contract_sha256(&manifest["source_run_contracts"][0]).unwrap(),
+        );
+        manifest["source_run_contracts"][0]["contract_sha256"] = json!(contract_sha256.clone());
+        for entry in manifest["serving_run_code_dictionary_files"]
+            .as_array_mut()
+            .unwrap()
+        {
+            entry["source_run_contract_sha256"] = json!(contract_sha256);
+        }
+        complete_v3_finalizer_test_manifest_contracts(manifest);
+    }
+
     #[derive(Clone)]
     struct V3FinalizerTestRow {
         coverage_scope_id: [u8; COVERAGE_SCOPE_ID_BYTES],
@@ -18342,10 +21352,28 @@ mod tests {
         source_key: u32,
         source_count: u64,
     ) -> PathBuf {
+        write_v3_finalizer_test_manifest_with_source_and_partitions(
+            base,
+            label,
+            rows,
+            source_key,
+            source_count,
+            4,
+        )
+    }
+
+    fn write_v3_finalizer_test_manifest_with_source_and_partitions(
+        base: &Path,
+        label: &str,
+        rows: &[V3FinalizerTestRow],
+        source_key: u32,
+        source_count: u64,
+        partition_count: usize,
+    ) -> PathBuf {
         let run_directory = base.join(format!("{label}-runs"));
         let mut writer = ServingRunPartitionWriter::with_buffer_capacity(
             &run_directory,
-            4,
+            partition_count,
             label,
             SERVING_RUN_RECORD_BYTES,
         )
@@ -18371,8 +21399,11 @@ mod tests {
                 .unwrap();
         }
         let output = writer.finish().unwrap();
+        let (source_contract, source_run_contract_sha256) =
+            v3_finalizer_test_source_contract(&output, label, source_key);
         let manifest_path = base.join(format!("{label}.json"));
-        let manifest = json!({
+        let mut manifest = json!({
+            "source_run_contracts": [source_contract],
             "serving_run_partition_files": output.partition_files.iter().map(|file| json!({
                 "path": file.path,
                 "partition": file.partition_index,
@@ -18381,17 +21412,110 @@ mod tests {
                 "source_count": source_count,
                 "row_count": file.record_count,
                 "bytes": file.bytes,
+                "sha256": test_file_sha256(&file.path),
                 "format": SERVING_RUN_FORMAT,
                 "version": SERVING_RUN_FORMAT_VERSION,
             })).collect::<Vec<_>>(),
             "serving_run_code_dictionary_files": output.code_dictionary_file.iter().map(|file| json!({
                 "path": file.path,
+                "source_key": source_key,
+                "source_count": source_count,
+                "source_run_contract_sha256": source_run_contract_sha256,
                 "row_count": file.record_count,
                 "bytes": file.bytes,
+                "sha256": test_file_sha256(&file.path),
                 "format": CODE_DICTIONARY_FORMAT,
                 "version": CODE_DICTIONARY_FORMAT_VERSION,
             })).collect::<Vec<_>>(),
         });
+        complete_v3_finalizer_test_manifest_contracts(&mut manifest);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        manifest_path
+    }
+
+    fn write_v3_finalizer_benchmark_manifest(
+        base: &Path,
+        label: &str,
+        row_count: usize,
+        provider_cardinality: usize,
+        price_cardinality: usize,
+        partition_count: usize,
+    ) -> PathBuf {
+        let codes = [
+            "10001", "10002", "10003", "10004", "20001", "20002", "20003", "20004", "30001",
+            "30002", "30003", "30004", "40001", "40002", "40003", "40004", "50001", "50002",
+            "50003", "50004", "60001", "60002", "60003", "60004", "70001", "70002", "70003",
+            "70004", "80001", "80002", "80003", "80004",
+        ];
+        let run_directory = base.join(format!("{label}-runs"));
+        let mut writer = ServingRunPartitionWriter::with_buffer_capacity(
+            &run_directory,
+            partition_count,
+            label,
+            SERVING_RUN_RECORD_BYTES,
+        )
+        .unwrap();
+        let coverage_scope_id = [0x75; COVERAGE_SCOPE_ID_BYTES];
+        for index in 0..row_count {
+            let unique_bucket = index / 2;
+            let provider_index = unique_bucket % provider_cardinality;
+            let provider_cycle = unique_bucket / provider_cardinality;
+            let price_index = (provider_index
+                .wrapping_mul(7_919)
+                .wrapping_add(provider_cycle.wrapping_mul(104_729)))
+                % price_cardinality;
+            let code_fields = NaturalLeanCodeFields {
+                coverage_scope_id: &coverage_scope_id,
+                reported_code_system: Some("CPT"),
+                reported_code: Some(codes[(provider_index + provider_cycle) % codes.len()]),
+                negotiation_arrangement: Some("FFS"),
+                billing_code_type_version: None,
+                name: None,
+                description: None,
+            };
+            writer
+                .write_natural_lean_record(
+                    &ServingRunRecord {
+                        code_id: code_fields.identity(),
+                        provider_set_id: indexed_test_id(0x5100, provider_index as u64 + 1),
+                        price_set_id: indexed_test_id(0x6200, price_index as u64 + 1),
+                        provider_count: (provider_index % 200 + 1) as u32,
+                    },
+                    code_fields,
+                )
+                .unwrap();
+        }
+        let output = writer.finish().unwrap();
+        let (source_contract, source_run_contract_sha256) =
+            v3_finalizer_test_source_contract(&output, label, 0);
+        let manifest_path = base.join(format!("{label}.json"));
+        let mut manifest = json!({
+            "source_run_contracts": [source_contract],
+            "serving_run_partition_files": output.partition_files.iter().map(|file| json!({
+                "path": file.path,
+                "partition": file.partition_index,
+                "partition_count": file.partition_count,
+                "source_key": 0,
+                "source_count": 1,
+                "row_count": file.record_count,
+                "bytes": file.bytes,
+                "sha256": test_file_sha256(&file.path),
+                "format": SERVING_RUN_FORMAT,
+                "version": SERVING_RUN_FORMAT_VERSION,
+            })).collect::<Vec<_>>(),
+            "serving_run_code_dictionary_files": output.code_dictionary_file.iter().map(|file| json!({
+                "path": file.path,
+                "source_key": 0,
+                "source_count": 1,
+                "source_run_contract_sha256": source_run_contract_sha256,
+                "row_count": file.record_count,
+                "bytes": file.bytes,
+                "sha256": test_file_sha256(&file.path),
+                "format": CODE_DICTIONARY_FORMAT,
+                "version": CODE_DICTIONARY_FORMAT_VERSION,
+            })).collect::<Vec<_>>(),
+        });
+        complete_v3_finalizer_test_manifest_contracts(&mut manifest);
         std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         manifest_path
     }
@@ -18494,9 +21618,18 @@ mod tests {
 
     fn reference_v3_assigned_records(
         rows: &[V3FinalizerTestRow],
+        source_keys: &[u32],
         output_directory: &Path,
         price_ids_in_key_order: &[[u8; GLOBAL_ID_BYTES]],
     ) -> (Vec<TestServingBinaryRecord>, Vec<TestServingBinaryRecord>) {
+        assert_eq!(source_keys.len(), rows.len());
+        let source_count = source_keys
+            .iter()
+            .copied()
+            .max()
+            .map(u64::from)
+            .unwrap_or(0)
+            .saturating_add(1);
         let code_rows =
             read_v3_code_dictionary_rows(&output_directory.join("code_dictionary.copy"));
         let provider_keys = read_v3_provider_dictionary_keys(
@@ -18517,7 +21650,8 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let mut assigned_rows = rows
             .iter()
-            .map(|row| {
+            .zip(source_keys)
+            .map(|(row, source_key)| {
                 let code_id = natural_lean_code_identity(
                     &row.coverage_scope_id,
                     row.code_system,
@@ -18533,18 +21667,32 @@ mod tests {
                     pg_i32_field(provider_key),
                     pg_i64_field(i64::from(provider_count)),
                     pg_i64_field(price_keys[&row.price_id]),
+                    pg_i64_field(i64::from(*source_key)),
                 ]
             })
             .collect::<Vec<_>>();
         assigned_rows.sort();
         let assigned_source = pg_binary_copy_rows(&assigned_rows);
         let mut assigned_output = CountingWriter::new(Vec::new());
-        write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_limits(
+        write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_provenance(
             &mut Cursor::new(assigned_source),
             &mut assigned_output,
             ServingBinaryTargetCopyFormat::SharedBinary,
-            serving_binary_block_bytes(),
-            V3_FINALIZER_HOT_BLOCK_BYTES,
+            AssignedV3EncoderOptions {
+                grouped_payload_bytes: serving_binary_block_bytes(),
+                hot_payload_bytes: V3_FINALIZER_HOT_BLOCK_BYTES,
+                provider_code_sort_chunk_bytes: serving_binary_v3_provider_code_sort_chunk_bytes(),
+                source: SourceEncoding {
+                    count: source_count,
+                    key_bits: source_key_bits(source_count).unwrap(),
+                    tagged_codec: TaggedServingRunCodec::new(
+                        source_count,
+                        source_key_bytes(source_count).unwrap(),
+                    )
+                    .unwrap(),
+                },
+                source_field_present: true,
+            },
         )
         .unwrap();
 
@@ -18739,12 +21887,19 @@ mod tests {
             price_id: price_b,
             provider_count: 2,
         };
-        let manifest_a =
-            write_v3_finalizer_test_manifest(&base, "input-a", &[row_b.clone(), row_a.clone()]);
-        let manifest_b = write_v3_finalizer_test_manifest(
+        let manifest_a = write_v3_finalizer_test_manifest_with_source(
+            &base,
+            "input-a",
+            &[row_b.clone(), row_a.clone()],
+            0,
+            2,
+        );
+        let manifest_b = write_v3_finalizer_test_manifest_with_source(
             &base,
             "input-b",
             &[row_c.clone(), row_d.clone(), row_a.clone()],
+            1,
+            2,
         );
         let price_ids_in_key_order = [price_b, price_a];
         let price_key_map_input =
@@ -18754,7 +21909,9 @@ mod tests {
         let summary_a = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: output_a.clone(),
             manifest_paths: vec![manifest_a.clone(), manifest_b.clone()],
-            memory_records: 1,
+            total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(2, 1),
+            workers: 2,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input: price_key_map_input.clone(),
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
@@ -18764,7 +21921,9 @@ mod tests {
         let summary_b = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: output_b.clone(),
             manifest_paths: vec![manifest_b, manifest_a],
-            memory_records: 1,
+            total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(2, 1),
+            workers: 2,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
@@ -18798,17 +21957,25 @@ mod tests {
         assert_eq!(summary_a["audit_candidates"]["maximum_rows"], 4096);
         assert_eq!(summary_a["audit_candidates"]["source_row_count"], 5);
         assert_eq!(summary_a["source"]["record_count"], 5);
-        assert_eq!(summary_a["source_key_bytes"], 0);
-        assert_eq!(summary_a["tagged_record_bytes"], 52);
-        assert_eq!(summary_a["source"]["source_key_bytes"], 0);
-        assert_eq!(summary_a["source"]["tagged_record_bytes"], 52);
-        assert_eq!(summary_a["partition_sort"]["output_bytes"], 5 * 52);
+        assert_eq!(summary_a["source_key_bytes"], 1);
+        assert_eq!(summary_a["tagged_record_bytes"], 53);
+        assert_eq!(summary_a["source"]["source_key_bytes"], 1);
+        assert_eq!(summary_a["source"]["tagged_record_bytes"], 53);
+        assert_eq!(summary_a["source_identity_scan"]["bytes_read"], 5 * 52);
+        assert_eq!(
+            summary_a["source_identity_scan"]["tagged_partition_sort"],
+            false
+        );
+        assert_eq!(
+            summary_a["price_identity_assignment"]["source_identity_sort"],
+            false
+        );
         assert_eq!(summary_a["preservation"]["sorted_records"], 5);
         assert_eq!(summary_a["preservation"]["staged_records"], 5);
         assert_eq!(summary_a["preservation"]["assigned_records"], 5);
         assert_eq!(summary_a["preservation"]["encoded_records"], 5);
-        assert_eq!(summary_a["preservation"]["distinct_serving_records"], 4);
-        assert_eq!(summary_a["preservation"]["duplicate_serving_records"], 1);
+        assert_eq!(summary_a["preservation"]["distinct_serving_records"], 5);
+        assert_eq!(summary_a["preservation"]["duplicate_serving_records"], 0);
         assert!(
             summary_a["preservation"]["all_source_occurrences_preserved"]
                 .as_bool()
@@ -18826,11 +21993,13 @@ mod tests {
             "minimum_negotiated_rate_then_global_id_128_v1"
         );
         assert_eq!(summary_a["price_key_map"]["source_ids_exact_match"], true);
-        assert!(
-            summary_a["price_key_map"]["dictionary_external_sort"]["chunk_count"]
-                .as_u64()
-                .unwrap()
-                > 1
+        assert_eq!(
+            summary_a["price_key_map"]["dictionary_external_sort"],
+            false
+        );
+        assert_eq!(
+            summary_a["price_key_map"]["dictionary_strategy"],
+            "dense_key_vector_direct_write_v1"
         );
         assert_eq!(summary_a["dictionaries"]["code"]["field_count"], 10);
         assert_eq!(
@@ -18900,10 +22069,19 @@ mod tests {
         assert!(summary_a["preservation"]["assigned_equals_encoded"]
             .as_bool()
             .unwrap());
-        assert!(summary_a["partition_sort"]["chunk_count"].as_u64().unwrap() > 1);
+        assert!(
+            summary_a["partition_assignment_sorts"]["aggregate"]["chunk_count"]
+                .as_u64()
+                .unwrap()
+                > 1
+        );
 
-        let (reference_serving, reference_price) =
-            reference_v3_assigned_records(&source_rows, &output_a, &price_ids_in_key_order);
+        let (reference_serving, reference_price) = reference_v3_assigned_records(
+            &source_rows,
+            &[0, 0, 1, 1, 1],
+            &output_a,
+            &price_ids_in_key_order,
+        );
         let shared_serving = read_test_shared_binary_records(
             std::fs::read(output_a.join("shared_serving_blocks.copy")).unwrap(),
         );
@@ -18916,7 +22094,7 @@ mod tests {
             ptg2_scanner::v3_runs::read_audit_candidate_file(output_a.join("audit_candidates.bin"))
                 .unwrap();
         assert_eq!(audit_candidates.len(), 5);
-        assert!(audit_candidates.windows(2).any(|pair| pair[0] == pair[1]));
+        assert!(audit_candidates.windows(2).all(|pair| pair[0] != pair[1]));
         let provider_code_record = shared_serving
             .iter()
             .find(|record| record.kind == PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND)
@@ -18930,6 +22108,374 @@ mod tests {
             provider_code_record.block_key,
         )
         .is_empty());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn direct_v3_finalizer_is_byte_identical_with_1_8_and_16_workers() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        let _compression = TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV, "none");
+        let _block_bytes = TestEnvVar::set(PTG2_SERVING_BINARY_BLOCK_BYTES_ENV, "65536");
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-direct-v3-finalizer-worker-parity-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let coverage_scope_id = [0x73; COVERAGE_SCOPE_ID_BYTES];
+        let partition_count = 64usize;
+        let mut rows_by_partition = BTreeMap::new();
+        for candidate in 0..10_000usize {
+            let code: &'static str =
+                Box::leak(format!("{:05}", 10_000 + candidate).into_boxed_str());
+            let code_fields = NaturalLeanCodeFields {
+                coverage_scope_id: &coverage_scope_id,
+                reported_code_system: Some("CPT"),
+                reported_code: Some(code),
+                negotiation_arrangement: Some("FFS"),
+                billing_code_type_version: None,
+                name: None,
+                description: None,
+            };
+            let record = ServingRunRecord {
+                code_id: code_fields.identity(),
+                provider_set_id: prefixed_test_id(1, candidate as u8),
+                price_set_id: prefixed_test_id(2, 1),
+                provider_count: candidate as u32 + 1,
+            };
+            let partition = partition_for_record(&record, partition_count).unwrap();
+            rows_by_partition
+                .entry(partition)
+                .or_insert(V3FinalizerTestRow {
+                    coverage_scope_id,
+                    code_system: Some("CPT"),
+                    code: Some(code),
+                    negotiation_arrangement: Some("FFS"),
+                    provider_id: record.provider_set_id,
+                    price_id: record.price_set_id,
+                    provider_count: record.provider_count,
+                });
+            if rows_by_partition.len() == 16 {
+                break;
+            }
+        }
+        assert_eq!(rows_by_partition.len(), 16);
+        let rows = rows_by_partition.into_values().collect::<Vec<_>>();
+        let manifest = write_v3_finalizer_test_manifest_with_source_and_partitions(
+            &base,
+            "worker-parity",
+            &rows,
+            0,
+            1,
+            partition_count,
+        );
+        let price_key_map_input = write_v3_finalizer_test_price_key_map(
+            &base,
+            "worker-parity",
+            &[prefixed_test_id(2, 1)],
+        );
+        let file_names = [
+            "audit_candidates.bin",
+            "shared_serving_blocks.copy",
+            "shared_price_dictionary_blocks.copy",
+            "code_dictionary.copy",
+            "provider_set_dictionary.copy",
+        ];
+        let mut baseline_files = None;
+        let mut baseline_support_digest = None;
+        for workers in [1usize, 8, 16] {
+            let output = base.join(format!("output-{workers}"));
+            let summary = finalize_v3_runs(&V3FinalizerOptions {
+                output_directory: output.clone(),
+                manifest_paths: vec![manifest.clone()],
+                total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(workers, 4),
+                workers,
+                identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
+                price_key_map_input: price_key_map_input.clone(),
+                price_membership_inputs: Vec::new(),
+                price_atom_inputs: Vec::new(),
+            })
+            .unwrap();
+            assert_eq!(summary["configured_workers"], workers);
+            assert_eq!(summary["workers"], workers);
+            let files = file_names
+                .iter()
+                .map(|file_name| (*file_name, std::fs::read(output.join(file_name)).unwrap()))
+                .collect::<BTreeMap<_, _>>();
+            let support_digest = summary["dictionaries"]["support_digest"].clone();
+            if let Some(expected) = baseline_files.as_ref() {
+                assert_eq!(&files, expected, "V3 output changed with {workers} workers");
+                assert_eq!(
+                    Some(&support_digest),
+                    baseline_support_digest.as_ref(),
+                    "support digest changed with {workers} workers"
+                );
+            } else {
+                baseline_files = Some(files);
+                baseline_support_digest = Some(support_digest);
+            }
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn direct_v3_finalizer_matches_reference_on_randomized_duplicate_heavy_rows() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        let _compression = TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV, "none");
+        let _block_bytes = TestEnvVar::set(PTG2_SERVING_BINARY_BLOCK_BYTES_ENV, "65536");
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-direct-v3-finalizer-randomized-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let codes = [
+            "10001", "10002", "10003", "10004", "20001", "20002", "20003", "20004", "30001",
+            "30002", "30003", "30004", "40001", "40002", "40003", "40004",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let mut rows = Vec::new();
+        for index in 0..600usize {
+            let code_index = next() as usize % codes.len();
+            let provider_index = next() as usize % 24;
+            let price_index = next() as usize % 17;
+            let row = V3FinalizerTestRow {
+                coverage_scope_id: [0x71; COVERAGE_SCOPE_ID_BYTES],
+                code_system: Some("CPT"),
+                code: Some(codes[code_index]),
+                negotiation_arrangement: Some(if code_index.is_multiple_of(2) {
+                    "FFS"
+                } else {
+                    "BUNDLE"
+                }),
+                provider_id: prefixed_test_id(0x3100, provider_index as u8 + 1),
+                price_id: prefixed_test_id(0x4200, price_index as u8 + 1),
+                provider_count: provider_index as u32 + 1,
+            };
+            rows.push(row.clone());
+            if index.is_multiple_of(2) {
+                rows.push(row.clone());
+            }
+            if index.is_multiple_of(7) {
+                rows.push(row);
+            }
+        }
+        let manifest = write_v3_finalizer_test_manifest(&base, "randomized", &rows);
+        let price_ids_in_key_order = (0..17usize)
+            .rev()
+            .map(|index| prefixed_test_id(0x4200, index as u8 + 1))
+            .collect::<Vec<_>>();
+        let price_key_map_input =
+            write_v3_finalizer_test_price_key_map(&base, "randomized", &price_ids_in_key_order);
+        let output = base.join("output");
+        let summary = finalize_v3_runs(&V3FinalizerOptions {
+            output_directory: output.clone(),
+            manifest_paths: vec![manifest],
+            total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(4, 13),
+            workers: 4,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
+            price_key_map_input,
+            price_membership_inputs: Vec::new(),
+            price_atom_inputs: Vec::new(),
+        })
+        .unwrap();
+
+        let (reference_serving, reference_price) = reference_v3_assigned_records(
+            &rows,
+            &vec![0; rows.len()],
+            &output,
+            &price_ids_in_key_order,
+        );
+        assert_eq!(
+            read_test_shared_binary_records(
+                std::fs::read(output.join("shared_serving_blocks.copy")).unwrap()
+            ),
+            reference_serving
+        );
+        assert_eq!(
+            read_test_shared_binary_records(
+                std::fs::read(output.join("shared_price_dictionary_blocks.copy")).unwrap()
+            ),
+            reference_price
+        );
+        assert_eq!(summary["preservation"]["source_records"], rows.len() as u64);
+        assert!(
+            summary["preservation"]["duplicate_serving_records"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            summary["partition_assignment_sorts"]["strategy"],
+            "immutable_dense_maps_partition_local_v1"
+        );
+        assert_eq!(
+            summary["partition_assignment_sorts"]["global_assignment_cascade"],
+            false
+        );
+        assert!(summary.get("dense_assignment_sorts").is_none());
+        assert!(
+            summary["scratch_io"]["total_bytes_written"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn strict_v3_source_has_no_global_assignment_cascade_artifacts() {
+        let source = include_str!("main.rs");
+        for obsolete in [
+            ["assigned", "-provider.unsorted"].concat(),
+            ["assigned", "-price.unsorted"].concat(),
+            ["join_v3_", "provider_keys"].concat(),
+            ["join_v3_", "price_keys"].concat(),
+        ] {
+            assert!(
+                !source.contains(&obsolete),
+                "obsolete V3 cascade artifact: {obsolete}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "focused release-mode V3 finalizer benchmark"]
+    fn benchmark_v3_finalizer_250k_duplicate_heavy_rows() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        let _compression = TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV, "none");
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-v3-finalizer-benchmark-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let codes = [
+            "10001", "10002", "10003", "10004", "20001", "20002", "20003", "20004", "30001",
+            "30002", "30003", "30004", "40001", "40002", "40003", "40004",
+        ];
+        let rows = (0..250_000usize)
+            .map(|index| {
+                let duplicate_bucket = index / 2;
+                let code_index = duplicate_bucket % codes.len();
+                let provider_index = duplicate_bucket % 64;
+                let price_index = duplicate_bucket % 32;
+                V3FinalizerTestRow {
+                    coverage_scope_id: [0x73; COVERAGE_SCOPE_ID_BYTES],
+                    code_system: Some("CPT"),
+                    code: Some(codes[code_index]),
+                    negotiation_arrangement: Some("FFS"),
+                    provider_id: prefixed_test_id(0x5100, provider_index as u8 + 1),
+                    price_id: prefixed_test_id(0x6200, price_index as u8 + 1),
+                    provider_count: provider_index as u32 + 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let manifest = write_v3_finalizer_test_manifest(&base, "benchmark", &rows);
+        let price_ids = (0..32usize)
+            .rev()
+            .map(|index| prefixed_test_id(0x6200, index as u8 + 1))
+            .collect::<Vec<_>>();
+        let price_key_map_input =
+            write_v3_finalizer_test_price_key_map(&base, "benchmark", &price_ids);
+        let output = base.join("output");
+        let started_at = Instant::now();
+        let summary = finalize_v3_runs(&V3FinalizerOptions {
+            output_directory: output,
+            manifest_paths: vec![manifest],
+            total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(8, 50_000),
+            workers: 8,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
+            price_key_map_input,
+            price_membership_inputs: Vec::new(),
+            price_atom_inputs: Vec::new(),
+        })
+        .unwrap();
+        eprintln!(
+            "{}",
+            json!({
+                "benchmark": "v3_finalizer_250k_duplicate_heavy_rows",
+                "elapsed_seconds": started_at.elapsed().as_secs_f64(),
+                "scratch_io": summary["scratch_io"],
+                "timings": summary["timings"],
+            })
+        );
+        assert_eq!(summary["preservation"]["encoded_records"], 250_000);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    #[ignore = "focused release-mode V3 finalizer scaling benchmark"]
+    fn benchmark_v3_finalizer_10m_high_cardinality_rows() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        let _compression = TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV, "zlib");
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-v3-finalizer-scaling-benchmark-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let row_count = 10_000_000usize;
+        let provider_cardinality = 100_000usize;
+        let price_cardinality = 200_000usize;
+        let partition_count = 64usize;
+        let manifest = write_v3_finalizer_benchmark_manifest(
+            &base,
+            "scaling",
+            row_count,
+            provider_cardinality,
+            price_cardinality,
+            partition_count,
+        );
+        let price_ids = (0..price_cardinality)
+            .map(|index| indexed_test_id(0x6200, index as u64 + 1))
+            .collect::<Vec<_>>();
+        let price_key_map_input =
+            write_v3_finalizer_test_price_key_map(&base, "scaling", &price_ids);
+        let output = base.join("output");
+        let started_at = Instant::now();
+        let summary = finalize_v3_runs(&V3FinalizerOptions {
+            output_directory: output,
+            manifest_paths: vec![manifest],
+            total_sort_memory_bytes: 16 * 16 * 1024 * 1024,
+            workers: 16,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
+            price_key_map_input,
+            price_membership_inputs: Vec::new(),
+            price_atom_inputs: Vec::new(),
+        })
+        .unwrap();
+        eprintln!(
+            "{}",
+            json!({
+                "benchmark": "v3_finalizer_10m_high_cardinality_rows",
+                "elapsed_seconds": started_at.elapsed().as_secs_f64(),
+                "row_count": row_count,
+                "provider_cardinality": provider_cardinality,
+                "price_cardinality": price_cardinality,
+                "partition_count": partition_count,
+                "resource_configuration": summary["resource_configuration"],
+                "scratch_io": summary["scratch_io"],
+                "timings": summary["timings"],
+                "serving_storage": summary["blocks"]["serving"]["stored_payload_bytes"],
+                "price_storage": summary["blocks"]["price_dictionary"]["stored_payload_bytes"],
+            })
+        );
+        assert_eq!(summary["preservation"]["source_records"], row_count as u64);
+        assert_eq!(summary["preservation"]["encoded_records"], row_count as u64);
+        assert!(summary["preservation"]["all_source_occurrences_preserved"]
+            .as_bool()
+            .unwrap());
+        assert_eq!(
+            summary["price_key_map"]["row_count"],
+            price_cardinality as u64
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -18967,7 +22513,9 @@ mod tests {
         let summary = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: output.clone(),
             manifest_paths: vec![source_one, source_zero],
-            memory_records: 1,
+            total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(2, 1),
+            workers: 2,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
@@ -18978,6 +22526,16 @@ mod tests {
         assert_eq!(summary["storage_generation"], "shared_blocks_v3");
         assert_eq!(summary["cold_lookup_contract"], "ptg_v3_cold_v2");
         assert_eq!(summary["shared_block_layout"], "dense_shared_blocks_v3");
+        assert_eq!(
+            summary["resource_configuration"],
+            json!({
+                "contract": V3_FINALIZER_RESOURCE_CONTRACT,
+                "workers": 2,
+                "identity_map_max_bytes": V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
+                "total_sort_memory_bytes": v3_finalizer_test_sort_memory_bytes(2, 1),
+                "sort_memory_scope": V3_FINALIZER_SORT_MEMORY_SCOPE,
+            })
+        );
         assert_eq!(summary["source_count"], 2);
         assert_eq!(summary["source_key_bits"], 1);
         assert_eq!(summary["source_key_bytes"], 1);
@@ -18985,7 +22543,11 @@ mod tests {
         assert_eq!(summary["source"]["record_count"], 3);
         assert_eq!(summary["source"]["source_key_bytes"], 1);
         assert_eq!(summary["source"]["tagged_record_bytes"], 53);
-        assert_eq!(summary["partition_sort"]["output_bytes"], 3 * 53);
+        assert_eq!(summary["source_identity_scan"]["bytes_read"], 3 * 52);
+        assert_eq!(
+            summary["source_identity_scan"]["tagged_partition_sort"],
+            false
+        );
         assert_eq!(
             summary["source"]["record_counts_by_source"],
             json!({"0": 2, "1": 1})
@@ -19130,6 +22692,541 @@ mod tests {
     }
 
     #[test]
+    fn v3_finalizer_rejects_invalid_duplicate_and_non_deterministic_source_identities() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-direct-v3-finalizer-source-identities-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let row = V3FinalizerTestRow {
+            coverage_scope_id: [0x64; COVERAGE_SCOPE_ID_BYTES],
+            code_system: Some("CPT"),
+            code: Some("99221"),
+            negotiation_arrangement: Some("FFS"),
+            provider_id: prefixed_test_id(1, 1),
+            price_id: prefixed_test_id(2, 1),
+            provider_count: 1,
+        };
+        let source_zero = write_v3_finalizer_test_manifest_with_source(
+            &base,
+            "identity-zero",
+            std::slice::from_ref(&row),
+            0,
+            2,
+        );
+        let source_one = write_v3_finalizer_test_manifest_with_source(
+            &base,
+            "identity-one",
+            std::slice::from_ref(&row),
+            1,
+            2,
+        );
+        let zero_payload: Value =
+            serde_json::from_slice(&std::fs::read(&source_zero).unwrap()).unwrap();
+        let one_payload: Value =
+            serde_json::from_slice(&std::fs::read(&source_one).unwrap()).unwrap();
+        let zero_identity = zero_payload["source_run_contracts"][0]["source_identity"].clone();
+        let one_identity = one_payload["source_run_contracts"][0]["source_identity"].clone();
+
+        let mut duplicate_one = one_payload.clone();
+        set_v3_finalizer_test_source_identity(&mut duplicate_one, zero_identity.clone());
+        let duplicate_one_path = base.join("duplicate-one.json");
+        std::fs::write(
+            &duplicate_one_path,
+            serde_json::to_vec(&duplicate_one).unwrap(),
+        )
+        .unwrap();
+        let error =
+            load_v3_finalizer_inputs(&[source_zero.clone(), duplicate_one_path]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("source identities must be unique"));
+
+        let mut swapped_zero = zero_payload.clone();
+        let mut swapped_one = one_payload.clone();
+        set_v3_finalizer_test_source_identity(&mut swapped_zero, one_identity);
+        set_v3_finalizer_test_source_identity(&mut swapped_one, zero_identity);
+        let swapped_zero_path = base.join("swapped-zero.json");
+        let swapped_one_path = base.join("swapped-one.json");
+        std::fs::write(
+            &swapped_zero_path,
+            serde_json::to_vec(&swapped_zero).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&swapped_one_path, serde_json::to_vec(&swapped_one).unwrap()).unwrap();
+        let error = load_v3_finalizer_inputs(&[swapped_zero_path, swapped_one_path]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("source keys do not match deterministic identity ordering"));
+
+        for (label, identity) in [
+            (
+                "unicode-source-type",
+                json!({
+                    "source_type": "in_netwörk",
+                    "identity_kind": "logical_json_sha256_v1",
+                    "identity_sha256": "00".repeat(32),
+                }),
+            ),
+            (
+                "unsupported-identity-kind",
+                json!({
+                    "source_type": "in_network",
+                    "identity_kind": "sha256",
+                    "identity_sha256": "00".repeat(32),
+                }),
+            ),
+        ] {
+            let mut payload = zero_payload.clone();
+            set_v3_finalizer_test_source_identity(&mut payload, identity);
+            let path = base.join(format!("{label}.json"));
+            std::fs::write(&path, serde_json::to_vec(&payload).unwrap()).unwrap();
+            let error = load_v3_finalizer_inputs(&[path]).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn v3_finalizer_authenticates_run_content_on_both_scans() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-direct-v3-finalizer-run-authentication-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let provider_a = prefixed_test_id(1, 1);
+        let provider_b = prefixed_test_id(1, 2);
+        let price_id = prefixed_test_id(2, 1);
+        let rows = [
+            V3FinalizerTestRow {
+                coverage_scope_id: [0x55; COVERAGE_SCOPE_ID_BYTES],
+                code_system: Some("CPT"),
+                code: Some("99213"),
+                negotiation_arrangement: Some("FFS"),
+                provider_id: provider_a,
+                price_id,
+                provider_count: 2,
+            },
+            V3FinalizerTestRow {
+                coverage_scope_id: [0x55; COVERAGE_SCOPE_ID_BYTES],
+                code_system: Some("CPT"),
+                code: Some("99213"),
+                negotiation_arrangement: Some("FFS"),
+                provider_id: provider_b,
+                price_id,
+                provider_count: 2,
+            },
+        ];
+        let manifest = write_v3_finalizer_test_manifest_with_source_and_partitions(
+            &base,
+            "authenticated",
+            &rows,
+            0,
+            1,
+            1,
+        );
+        let inputs = load_v3_finalizer_inputs(std::slice::from_ref(&manifest)).unwrap();
+        let (code_dictionary, _, _) = load_v3_code_dictionary(&inputs.code_dictionaries).unwrap();
+        let code_map = build_v3_code_identity_map(&code_dictionary).unwrap();
+        let code_partition_ranges =
+            build_v3_code_partition_ranges(&code_dictionary, inputs.partition_count).unwrap();
+        let mut price_map = DenseIdentityMap::with_capacity(1).unwrap();
+        price_map
+            .insert(
+                price_id,
+                DenseIdentityValue {
+                    key: 0,
+                    auxiliary: 0,
+                },
+            )
+            .unwrap();
+        let combined_price_seen_words = Mutex::new(vec![0u64; 1]);
+        let prepared = prepare_v3_partition(
+            0,
+            inputs.partitions,
+            &V3PartitionScanContext {
+                partition_count: 1,
+                price_key_count: 1,
+                work_root: &base,
+                code_map: &code_map,
+                code_partition_ranges: &code_partition_ranges,
+                price_map: &price_map,
+                combined_price_seen_words: &combined_price_seen_words,
+            },
+        )
+        .unwrap();
+        let mut provider_map = DenseIdentityMap::with_capacity(2).unwrap();
+        provider_map
+            .insert(
+                provider_a,
+                DenseIdentityValue {
+                    key: 0,
+                    auxiliary: 2,
+                },
+            )
+            .unwrap();
+        provider_map
+            .insert(
+                provider_b,
+                DenseIdentityValue {
+                    key: 1,
+                    auxiliary: 2,
+                },
+            )
+            .unwrap();
+
+        let run_path = &prepared.inputs[0].path;
+        let mut encoded = std::fs::read(run_path).unwrap();
+        let second_provider_offset = SERVING_RUN_RECORD_BYTES + GLOBAL_ID_BYTES;
+        let first_provider = encoded[GLOBAL_ID_BYTES..2 * GLOBAL_ID_BYTES].to_vec();
+        let second_provider =
+            encoded[second_provider_offset..second_provider_offset + GLOBAL_ID_BYTES].to_vec();
+        encoded[GLOBAL_ID_BYTES..2 * GLOBAL_ID_BYTES].copy_from_slice(&second_provider);
+        encoded[second_provider_offset..second_provider_offset + GLOBAL_ID_BYTES]
+            .copy_from_slice(&first_provider);
+        std::fs::write(run_path, encoded).unwrap();
+
+        let identity_mismatch_work = base.join("identity-mismatch");
+        std::fs::create_dir_all(&identity_mismatch_work).unwrap();
+        let identity_mismatch_seen = Mutex::new(vec![0u64; 1]);
+        let identity_error = prepare_v3_partition(
+            0,
+            prepared.inputs.clone(),
+            &V3PartitionScanContext {
+                partition_count: 1,
+                price_key_count: 1,
+                work_root: &identity_mismatch_work,
+                code_map: &code_map,
+                code_partition_ranges: &code_partition_ranges,
+                price_map: &price_map,
+                combined_price_seen_words: &identity_mismatch_seen,
+            },
+        )
+        .unwrap_err();
+        assert!(identity_error
+            .to_string()
+            .contains("digest mismatch during identity scan"));
+
+        let error =
+            assign_v3_partition(&prepared, 1, 2, &code_map, &provider_map, &price_map).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("digest mismatch during assignment scan"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn v3_finalizer_authenticates_code_dictionary_before_parsing() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-direct-v3-finalizer-code-authentication-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let row = V3FinalizerTestRow {
+            coverage_scope_id: [0x56; COVERAGE_SCOPE_ID_BYTES],
+            code_system: Some("CPT"),
+            code: Some("99214"),
+            negotiation_arrangement: Some("FFS"),
+            provider_id: prefixed_test_id(1, 1),
+            price_id: prefixed_test_id(2, 1),
+            provider_count: 1,
+        };
+        let manifest = write_v3_finalizer_test_manifest(&base, "dictionary-auth", &[row]);
+        let inputs = load_v3_finalizer_inputs(std::slice::from_ref(&manifest)).unwrap();
+        let dictionary_path = &inputs.code_dictionaries[0].path;
+        let mut encoded = std::fs::read(dictionary_path).unwrap();
+        encoded[..8].copy_from_slice(&u64::MAX.to_be_bytes());
+        std::fs::write(dictionary_path, encoded).unwrap();
+
+        let error = load_v3_code_dictionary(&inputs.code_dictionaries).unwrap_err();
+        assert!(error.to_string().contains("content digest mismatch"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn v3_finalizer_accepts_multiple_dictionary_shards_for_one_source() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-direct-v3-finalizer-code-shards-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let row = V3FinalizerTestRow {
+            coverage_scope_id: [0x60; COVERAGE_SCOPE_ID_BYTES],
+            code_system: Some("CPT"),
+            code: Some("99218"),
+            negotiation_arrangement: Some("FFS"),
+            provider_id: prefixed_test_id(1, 1),
+            price_id: prefixed_test_id(2, 1),
+            provider_count: 1,
+        };
+        let manifest = write_v3_finalizer_test_manifest(&base, "dictionary-shards", &[row]);
+        let mut payload: Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        let first_entry = payload["serving_run_code_dictionary_files"][0].clone();
+        let first_path = PathBuf::from(first_entry["path"].as_str().unwrap());
+        let second_path = first_path.with_file_name("dictionary-shard-2.ready");
+        std::fs::copy(&first_path, &second_path).unwrap();
+        let mut second_entry = first_entry;
+        second_entry["path"] = json!(second_path);
+        payload["serving_run_code_dictionary_files"]
+            .as_array_mut()
+            .unwrap()
+            .push(second_entry);
+        complete_v3_finalizer_test_manifest_contracts(&mut payload);
+        std::fs::write(&manifest, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        let inputs = load_v3_finalizer_inputs(std::slice::from_ref(&manifest)).unwrap();
+        assert_eq!(inputs.code_dictionaries.len(), 2);
+        let (codes, source_rows, source_bytes) =
+            load_v3_code_dictionary(&inputs.code_dictionaries).unwrap();
+        assert_eq!(codes.len(), 1);
+        assert_eq!(source_rows, 2);
+        assert_eq!(source_bytes, first_path.metadata().unwrap().len() * 2);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn v3_finalizer_rejects_coherent_serving_manifest_subset() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-direct-v3-finalizer-serving-subset-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let row = V3FinalizerTestRow {
+            coverage_scope_id: [0x61; COVERAGE_SCOPE_ID_BYTES],
+            code_system: Some("CPT"),
+            code: Some("99219"),
+            negotiation_arrangement: Some("FFS"),
+            provider_id: prefixed_test_id(1, 1),
+            price_id: prefixed_test_id(2, 1),
+            provider_count: 1,
+        };
+        let manifest = write_v3_finalizer_test_manifest(&base, "serving-subset", &[row]);
+        let mut payload: Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        payload["serving_run_partition_files"] = json!([]);
+        complete_v3_finalizer_test_manifest_contracts(&mut payload);
+        std::fs::write(&manifest, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        let error = load_v3_finalizer_inputs(std::slice::from_ref(&manifest)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("files do not match complete source contract"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn v3_finalizer_rejects_dictionary_array_that_omits_declared_shard() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-direct-v3-finalizer-dictionary-subset-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let row = V3FinalizerTestRow {
+            coverage_scope_id: [0x62; COVERAGE_SCOPE_ID_BYTES],
+            code_system: Some("CPT"),
+            code: Some("99220"),
+            negotiation_arrangement: Some("FFS"),
+            provider_id: prefixed_test_id(1, 1),
+            price_id: prefixed_test_id(2, 1),
+            provider_count: 1,
+        };
+        let manifest = write_v3_finalizer_test_manifest(&base, "dictionary-subset", &[row]);
+        let mut payload: Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        let first_entry = payload["serving_run_code_dictionary_files"][0].clone();
+        let first_path = PathBuf::from(first_entry["path"].as_str().unwrap());
+        let second_path = first_path.with_file_name("dictionary-subset-shard-2.ready");
+        std::fs::copy(&first_path, &second_path).unwrap();
+        let mut second_entry = first_entry;
+        second_entry["path"] = json!(second_path);
+        payload["serving_run_code_dictionary_files"]
+            .as_array_mut()
+            .unwrap()
+            .push(second_entry);
+        complete_v3_finalizer_test_manifest_contracts(&mut payload);
+
+        payload["serving_run_code_dictionary_files"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        let remaining = payload["serving_run_code_dictionary_files"]
+            .as_array()
+            .unwrap()
+            .clone();
+        payload["expected_code_dictionary_files"] = json!(remaining.len());
+        payload["expected_code_dictionary_rows"] = json!(remaining
+            .iter()
+            .map(|entry| entry["row_count"].as_u64().unwrap())
+            .sum::<u64>());
+        payload["expected_code_dictionary_bytes"] = json!(remaining
+            .iter()
+            .map(|entry| entry["bytes"].as_u64().unwrap())
+            .sum::<u64>());
+        let entry_contracts = remaining
+            .iter()
+            .map(|entry| {
+                json!({
+                    "source_key": entry["source_key"],
+                    "row_count": entry["row_count"],
+                    "bytes": entry["bytes"],
+                    "sha256": entry["sha256"],
+                    "source_run_contract_sha256": entry["source_run_contract_sha256"],
+                    "code_dictionary_contract_sha256": entry["code_dictionary_contract_sha256"],
+                })
+            })
+            .collect::<Vec<_>>();
+        payload["code_dictionary_contract_set_sha256"] = json!(test_json_sha256(&json!({
+            "code_dictionary_contracts": entry_contracts,
+        })));
+        std::fs::write(&manifest, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        let error = load_v3_finalizer_inputs(std::slice::from_ref(&manifest)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("files do not match complete source contract"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn v3_finalizer_rejects_dictionary_source_contract_mismatch() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-direct-v3-finalizer-code-contract-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let row = V3FinalizerTestRow {
+            coverage_scope_id: [0x57; COVERAGE_SCOPE_ID_BYTES],
+            code_system: Some("CPT"),
+            code: Some("99215"),
+            negotiation_arrangement: Some("FFS"),
+            provider_id: prefixed_test_id(1, 1),
+            price_id: prefixed_test_id(2, 1),
+            provider_count: 1,
+        };
+        let manifest = write_v3_finalizer_test_manifest(&base, "contract-auth", &[row]);
+        let mut payload: Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        payload["serving_run_code_dictionary_files"][0]["source_run_contract_sha256"] =
+            json!("00".repeat(32));
+        let mismatched = base.join("contract-mismatch.json");
+        std::fs::write(&mismatched, serde_json::to_vec(&payload).unwrap()).unwrap();
+        let error = load_v3_finalizer_inputs(&[mismatched]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("code dictionary source contract does not match"));
+
+        let mut payload: Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        payload["source_run_contracts"][0]["row_count"] = json!(2);
+        let corrupt = base.join("corrupt-source-contract.json");
+        std::fs::write(&corrupt, serde_json::to_vec(&payload).unwrap()).unwrap();
+        let error = load_v3_finalizer_inputs(&[corrupt]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("source-run contract set digest mismatch"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn v3_finalizer_rejects_dictionary_memory_before_loading_it() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-direct-v3-finalizer-code-memory-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let row = V3FinalizerTestRow {
+            coverage_scope_id: [0x58; COVERAGE_SCOPE_ID_BYTES],
+            code_system: Some("CPT"),
+            code: Some("99216"),
+            negotiation_arrangement: Some("FFS"),
+            provider_id: prefixed_test_id(1, 1),
+            price_id: prefixed_test_id(2, 1),
+            provider_count: 1,
+        };
+        let manifest = write_v3_finalizer_test_manifest(&base, "dictionary-memory", &[row]);
+        let inputs = load_v3_finalizer_inputs(std::slice::from_ref(&manifest)).unwrap();
+        let required = v3_code_dictionary_memory_estimate(&inputs.code_dictionaries).unwrap();
+        let dictionary_path = &inputs.code_dictionaries[0].path;
+        let mut encoded = std::fs::read(dictionary_path).unwrap();
+        encoded[..8].copy_from_slice(&u64::MAX.to_be_bytes());
+        std::fs::write(dictionary_path, encoded).unwrap();
+        let price_key_map_input =
+            write_v3_finalizer_test_price_key_map(&base, "memory", &[prefixed_test_id(2, 1)]);
+
+        let error = finalize_v3_runs(&V3FinalizerOptions {
+            output_directory: base.join("output"),
+            manifest_paths: vec![manifest],
+            total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(1, 1),
+            workers: 1,
+            identity_map_max_bytes: required - 1,
+            price_key_map_input,
+            price_membership_inputs: Vec::new(),
+            price_atom_inputs: Vec::new(),
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("code dictionary resident state requires"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn v3_finalizer_counts_only_nonempty_partition_workers() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-direct-v3-finalizer-sparse-workers-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let row = V3FinalizerTestRow {
+            coverage_scope_id: [0x59; COVERAGE_SCOPE_ID_BYTES],
+            code_system: Some("CPT"),
+            code: Some("99217"),
+            negotiation_arrangement: Some("FFS"),
+            provider_id: prefixed_test_id(1, 1),
+            price_id: prefixed_test_id(2, 1),
+            provider_count: 1,
+        };
+        let manifest = write_v3_finalizer_test_manifest_with_source_and_partitions(
+            &base,
+            "sparse-workers",
+            &[row],
+            0,
+            1,
+            128,
+        );
+        let price_key_map_input =
+            write_v3_finalizer_test_price_key_map(&base, "sparse", &[prefixed_test_id(2, 1)]);
+        let summary = finalize_v3_runs(&V3FinalizerOptions {
+            output_directory: base.join("output"),
+            manifest_paths: vec![manifest],
+            total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(1, 2),
+            workers: 16,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
+            price_key_map_input,
+            price_membership_inputs: Vec::new(),
+            price_atom_inputs: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(summary["configured_workers"], 16);
+        assert_eq!(summary["workers"], 1);
+        assert_eq!(
+            summary["sort_memory_reserved_overhead_bytes"],
+            V3_FINALIZER_SORT_OVERHEAD_BYTES_PER_ACTIVE_WORKER
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn v3_finalizer_requires_one_existing_price_key_map_input() {
         let base = std::env::temp_dir().join(format!(
             "ptg2-direct-v3-finalizer-price-map-cli-{}",
@@ -19162,11 +23259,60 @@ mod tests {
             output,
             "--price-key-map-input".to_owned(),
             map_path.display().to_string(),
-            manifest,
+            "--workers".to_owned(),
+            "2".to_owned(),
+            "--identity-map-max-bytes".to_owned(),
+            (64 * 1024 * 1024usize).to_string(),
+            "--total-sort-memory-bytes".to_owned(),
+            (32 * 1024 * 1024usize).to_string(),
+            manifest.clone(),
         ])
         .unwrap();
         assert_eq!(options.price_key_map_input, map_path);
+        assert_eq!(options.workers, 2);
+        assert_eq!(options.identity_map_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(options.total_sort_memory_bytes, 32 * 1024 * 1024);
+
+        let legacy = parse_v3_finalizer_options(&[
+            base.join("legacy-output").display().to_string(),
+            "--price-key-map-input".to_owned(),
+            map_path.display().to_string(),
+            "--memory-records".to_owned(),
+            "1000".to_owned(),
+            manifest,
+        ])
+        .unwrap_err();
+        assert!(legacy.to_string().contains("process-wide"));
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn v3_finalizer_sort_memory_budget_is_process_wide() {
+        let total = v3_finalizer_test_sort_memory_bytes(4, 2);
+        let budget = v3_sort_memory_budget(total, 4).unwrap();
+        assert_eq!(budget.active_workers, 4);
+        assert_eq!(
+            budget.reserved_overhead_bytes,
+            4 * V3_FINALIZER_SORT_OVERHEAD_BYTES_PER_ACTIVE_WORKER
+        );
+        assert_eq!(budget.payload_bytes, 160);
+        assert_eq!(budget.bytes_per_active_worker, 40);
+        assert_eq!(
+            budget.single_sort_payload_bytes,
+            total - V3_FINALIZER_SORT_OVERHEAD_BYTES_PER_ACTIVE_WORKER
+        );
+        assert_eq!(budget.assigned_records_per_worker, 2);
+        assert_eq!(
+            budget.provider_identity_records,
+            budget.single_sort_payload_bytes / PROVIDER_IDENTITY_RECORD_BYTES
+        );
+        assert!(v3_sort_memory_budget(
+            4 * V3_FINALIZER_SORT_OVERHEAD_BYTES_PER_ACTIVE_WORKER - 1,
+            4
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("reserve"));
     }
 
     #[test]
@@ -19183,19 +23329,11 @@ mod tests {
         let validate = |label: &str, rows: Vec<Vec<Option<Vec<u8>>>>| -> io::Result<()> {
             let input = base.join(format!("{label}.copy"));
             let by_id = base.join(format!("{label}.by-id"));
-            let by_key_unsorted = base.join(format!("{label}.by-key-unsorted"));
             let by_key = base.join(format!("{label}.by-key"));
             std::fs::write(&input, pg_binary_copy_rows(&rows))?;
-            let staged = stage_v3_price_key_map(&input, &by_id, &by_key_unsorted)?;
-            external_sort_lexicographic_records(
-                &[by_key_unsorted],
-                &by_key,
-                &base,
-                V3_FINALIZER_PRICE_KEY_MAP_RECORD_BYTES,
-                1,
-                false,
-            )?;
-            validate_v3_price_key_map_dense(&by_key, staged.row_count)
+            let staged = stage_v3_price_key_map(&input, &by_id)?;
+            build_v3_price_identity_map_and_dictionary(&by_id, staged.row_count, &by_key)
+                .map(|_| ())
         };
 
         validate(
@@ -19232,7 +23370,7 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert!(gap.to_string().contains("expected 1, got 2"));
+        assert!(gap.to_string().contains("outside its declared row count"));
 
         let duplicate = validate(
             "duplicate-keys",
@@ -19242,7 +23380,7 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert!(duplicate.to_string().contains("expected 1, got 0"));
+        assert!(duplicate.to_string().contains("duplicate dense key"));
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -19266,8 +23404,7 @@ mod tests {
         let stage_map = |label: &str, ids_in_key_order: &[[u8; GLOBAL_ID_BYTES]]| -> PathBuf {
             let input = write_v3_finalizer_test_price_key_map(&base, label, ids_in_key_order);
             let by_id = base.join(format!("{label}.by-id"));
-            let by_key = base.join(format!("{label}.by-key-unsorted"));
-            stage_v3_price_key_map(&input, &by_id, &by_key).unwrap();
+            stage_v3_price_key_map(&input, &by_id).unwrap();
             by_id
         };
 
@@ -19297,7 +23434,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let provider = prefixed_test_id(1, 1);
-        let manifest_a = write_v3_finalizer_test_manifest(
+        let manifest_a = write_v3_finalizer_test_manifest_with_source(
             &base,
             "conflict-a",
             &[V3FinalizerTestRow {
@@ -19309,8 +23446,10 @@ mod tests {
                 price_id: prefixed_test_id(2, 1),
                 provider_count: 2,
             }],
+            0,
+            2,
         );
-        let manifest_b = write_v3_finalizer_test_manifest(
+        let manifest_b = write_v3_finalizer_test_manifest_with_source(
             &base,
             "conflict-b",
             &[V3FinalizerTestRow {
@@ -19322,6 +23461,8 @@ mod tests {
                 price_id: prefixed_test_id(2, 2),
                 provider_count: 3,
             }],
+            1,
+            2,
         );
         let price_key_map_input = write_v3_finalizer_test_price_key_map(
             &base,
@@ -19332,7 +23473,9 @@ mod tests {
         let error = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: output.clone(),
             manifest_paths: vec![manifest_a, manifest_b],
-            memory_records: 1,
+            total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(2, 1),
+            workers: 2,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
@@ -19519,6 +23662,62 @@ mod tests {
     }
 
     #[test]
+    fn serving_binary_v3_provider_shard_continuations_bound_duplicate_occurrences() {
+        let input = pg_binary_copy_rows(
+            &(0..8)
+                .map(|_| {
+                    vec![
+                        pg_i32_field(4),
+                        pg_i32_field(5),
+                        pg_i32_field(1),
+                        pg_i64_field(0),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut reader = Cursor::new(input);
+        let mut writer = CountingWriter::new(Vec::new());
+
+        let summary =
+            write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_limits(
+                &mut reader,
+                &mut writer,
+                ServingBinaryTargetCopyFormat::SharedBinary,
+                8,
+                1024,
+            )
+            .unwrap();
+        let records = read_test_shared_binary_records(writer.inner);
+        let shard_records = records
+            .iter()
+            .filter(|record| record.kind == PTG2_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND)
+            .collect::<Vec<_>>();
+        assert_eq!(shard_records.len(), 3);
+        assert!(shard_records.iter().all(|record| record.payload.len() <= 8));
+        assert_eq!(
+            shard_records
+                .iter()
+                .flat_map(|record| decode_test_by_code_provider_shard_fragment(record))
+                .flat_map(|(provider_set_key, occurrences)| {
+                    occurrences
+                        .into_iter()
+                        .map(move |occurrence| (provider_set_key, occurrence))
+                })
+                .collect::<Vec<_>>(),
+            vec![(5, (0, 0)); 8]
+        );
+        assert_eq!(summary["group_count"], 1);
+        assert_eq!(
+            summary["by_code_provider_shard"]["occurrence_chunk_count"],
+            3
+        );
+        assert_eq!(
+            summary["by_code_provider_shard"]["maximum_occurrences_buffered"],
+            3
+        );
+    }
+
+    #[test]
     fn serving_binary_v3_provider_shards_decode_exact_rows_with_source_provenance() {
         let source = SourceEncoding {
             count: 3,
@@ -19553,10 +23752,13 @@ mod tests {
                 &mut reader,
                 &mut writer,
                 ServingBinaryTargetCopyFormat::SharedBinary,
-                1024,
-                1024,
-                source,
-                true,
+                AssignedV3EncoderOptions {
+                    grouped_payload_bytes: 1024,
+                    hot_payload_bytes: 1024,
+                    provider_code_sort_chunk_bytes: 1024,
+                    source,
+                    source_field_present: true,
+                },
             )
             .unwrap();
         let records = read_test_shared_binary_records(writer.inner);
@@ -19896,6 +24098,93 @@ mod tests {
         assert_eq!(summary["provider_set_codes"]["sort_chunk_count"], 2);
         assert_eq!(summary["provider_set_codes"]["spool_bytes"], 32);
         assert_eq!(summary["provider_set_codes"]["spool_unique_pair_count"], 4);
+    }
+
+    #[test]
+    fn serving_binary_v3_provider_code_sort_stays_bounded_beyond_one_merge_fan_in() {
+        let _lock = scanner_env_lock().lock().unwrap();
+        let _sort_chunk = TestEnvVar::set(
+            PTG2_SERVING_BINARY_V3_PROVIDER_CODE_SORT_CHUNK_BYTES_ENV,
+            "8",
+        );
+        let rows = (1..=130)
+            .map(|provider_set_key| {
+                vec![
+                    pg_i32_field(1),
+                    pg_i32_field(provider_set_key),
+                    pg_i32_field(1),
+                    pg_i64_field(i64::from(provider_set_key - 1)),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut reader = Cursor::new(pg_binary_copy_rows(&rows));
+        let mut writer = CountingWriter::new(Vec::new());
+
+        let summary = write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader(
+            &mut reader,
+            &mut writer,
+            ServingBinaryTargetCopyFormat::SharedBinary,
+            1024,
+        )
+        .unwrap();
+        let provider_codes = &summary["provider_set_codes"];
+
+        assert_eq!(provider_codes["external_sort"], true);
+        assert_eq!(provider_codes["spool_input_pair_count"], 130);
+        assert_eq!(provider_codes["spool_unique_pair_count"], 130);
+        assert_eq!(provider_codes["sort_chunk_count"], 130);
+        assert_eq!(provider_codes["merge_pass_count"], 2);
+        assert_eq!(provider_codes["maximum_merge_fan_in"], 64);
+        assert_eq!(provider_codes["sort_scratch_bytes_read"], 4_144);
+        assert_eq!(provider_codes["sort_scratch_bytes_written"], 4_144);
+        assert!(
+            provider_codes["block_spool_scratch_bytes_read"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            provider_codes["scratch_bytes_read"].as_u64().unwrap(),
+            provider_codes["sort_scratch_bytes_read"].as_u64().unwrap()
+                + provider_codes["block_spool_scratch_bytes_read"]
+                    .as_u64()
+                    .unwrap()
+        );
+        assert_eq!(
+            provider_codes["scratch_bytes_written"].as_u64().unwrap(),
+            provider_codes["sort_scratch_bytes_written"]
+                .as_u64()
+                .unwrap()
+                + provider_codes["block_spool_scratch_bytes_written"]
+                    .as_u64()
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn provider_code_merge_pass_count_includes_eager_fan_in_boundaries() {
+        assert_eq!(provider_code_merge_pass_count(0), 0);
+        assert_eq!(provider_code_merge_pass_count(1), 1);
+        assert_eq!(provider_code_merge_pass_count(63), 1);
+        assert_eq!(provider_code_merge_pass_count(64), 2);
+        assert_eq!(provider_code_merge_pass_count(65), 2);
+        assert_eq!(provider_code_merge_pass_count(4_032), 2);
+        assert_eq!(provider_code_merge_pass_count(4_095), 3);
+        assert_eq!(provider_code_merge_pass_count(4_096), 3);
+    }
+
+    #[test]
+    fn v3_finalizer_encoder_workspace_contract_is_exact_and_checked() {
+        let block_bytes = 64 * 1024;
+        let code_count = 17usize;
+        assert_eq!(
+            v3_finalizer_encoder_workspace_max_bytes(block_bytes, code_count).unwrap(),
+            block_bytes * V3_FINALIZER_ENCODER_BLOCK_BUFFER_MULTIPLIER
+                + code_count * V3_FINALIZER_ENCODER_PROVIDER_CODE_BYTES_PER_CODE
+                + V3_FINALIZER_ENCODER_FIXED_WORKSPACE_BYTES
+        );
+        assert!(v3_finalizer_encoder_workspace_max_bytes(usize::MAX, 1).is_err());
+        assert!(v3_finalizer_encoder_workspace_max_bytes(1, usize::MAX).is_err());
     }
 
     #[test]
