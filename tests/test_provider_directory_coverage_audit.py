@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from scripts.research import provider_directory_coverage_audit as audit
+from scripts.research import provider_directory_endpoint_acquisition_harness as acquisition
 
 
 def test_provider_directory_coverage_audit_parse_args_accepts_ptg_plan_filter():
@@ -63,9 +64,15 @@ def test_provider_directory_coverage_audit_loads_all_maintained_source_ids():
     source_ids = audit._maintained_source_ids_from_manifest(
         audit.DEFAULT_SEMANTIC_SOURCE_MANIFEST
     )
+    manifest = acquisition.load_manifest(audit.DEFAULT_SEMANTIC_SOURCE_MANIFEST)
+    expected_source_ids = {
+        source_id
+        for entry in manifest["entries"]
+        for source_id in entry["source_ids"]
+    }
 
-    assert len(source_ids) == 29
-    assert len(set(source_ids)) == 29
+    assert set(source_ids) == expected_source_ids
+    assert len(source_ids) == len(expected_source_ids)
     assert all(audit.PROVIDER_DIRECTORY_SOURCE_ID_RE.fullmatch(source_id) for source_id in source_ids)
 
 
@@ -3074,7 +3081,11 @@ async def test_provider_directory_coverage_audit_fast_readiness_skips_exact_unif
     assert source_resource_coverage.call_args.kwargs["include_unified"] is False
     assert unified_summary.call_args.kwargs["fast_probe"] is True
     assert semantic_readiness.call_args.kwargs["include_unified"] is True
-    assert len(semantic_readiness.call_args.kwargs["maintained_source_ids"]) == 29
+    assert semantic_readiness.call_args.kwargs[
+        "maintained_source_ids"
+    ] == audit._maintained_source_ids_from_manifest(
+        audit.DEFAULT_SEMANTIC_SOURCE_MANIFEST
+    )
     conn.close.assert_awaited_once()
 
 

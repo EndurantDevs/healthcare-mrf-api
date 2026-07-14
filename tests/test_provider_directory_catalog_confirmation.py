@@ -7,6 +7,14 @@ from scripts import generate_provider_directory_support_docs as generator
 
 def test_rendered_catalog_snapshot_distinguishes_full_catalog_from_curated_matrix():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    blockers = generator.validate_blocker_registry(
+        generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY)
+    )
+    curated_entry_count = len(manifest["entries"]) + len(blockers)
+    acquisition_entry_count = sum(
+        support_record["support_level"] == "acquisition-configured"
+        for support_record in manifest["support_documentation"]["entry_support"].values()
+    )
 
     rendered_document = generator.render_markdown(manifest)
 
@@ -16,7 +24,8 @@ def test_rendered_catalog_snapshot_distinguishes_full_catalog_from_curated_matri
     assert "## Catalog Inventory Snapshot" in rendered_document
     assert "entire live catalog: `866` sources confirmed in `mrf-dev`" in rendered_document
     assert (
-        "not the curated support matrix below, which tracks `32` entries, including `16` "
+        "not the curated support matrix below, which tracks "
+        f"`{curated_entry_count}` entries, including `{acquisition_entry_count}` "
         "acquisition-configured entries"
     ) in rendered_document
     assert (
