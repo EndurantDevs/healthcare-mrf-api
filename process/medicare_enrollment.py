@@ -290,6 +290,7 @@ async def _publish_stage_table(db_schema: str, model_cls, stage_cls) -> None:
 
 
 async def process_data(ctx, task=None):
+    """Load Medicare enrollment source data into staging."""
     task = task or {}
     ctx.setdefault("context", {})
 
@@ -436,6 +437,7 @@ async def process_data(ctx, task=None):
 
 
 async def startup(ctx):
+    """Initialize the Medicare enrollment worker context."""
     await my_init_db(db)
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()
@@ -469,6 +471,7 @@ async def startup(ctx):
 
 
 async def shutdown(ctx):
+    """Publish a completed Medicare enrollment import."""
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
@@ -548,6 +551,7 @@ async def shutdown(ctx):
 
 
 async def main(test_mode: bool = False):
+    """Queue a Medicare enrollment import."""
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,

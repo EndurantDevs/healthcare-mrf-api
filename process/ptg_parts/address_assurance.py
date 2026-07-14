@@ -352,6 +352,7 @@ def validate_ptg_price_address_item(
     require_displayed_address: bool = True,
     require_network_bound_address: bool = False,
 ) -> list[dict[str, Any]]:
+    """Validate address evidence attached to one pricing item."""
     issues: list[dict[str, Any]] = []
     verification = item.get("address_verification")
     has_address = _usable_address(item)
@@ -536,6 +537,7 @@ def summarize_ptg_price_address_payload(
     require_source_file_version_id: bool = False,
     require_network_bound_address: bool = False,
 ) -> dict[str, Any]:
+    """Summarize address assurance across a pricing payload."""
     require_network_names = require_network_names or require_network_bound_address
     require_source_file_version_id = require_source_file_version_id or require_network_bound_address
     items = _items_from_payload(payload)
@@ -636,6 +638,7 @@ def build_price_address_assurance_report(
     require_source_file_version_id: bool = False,
     require_network_bound_address: bool = False,
 ) -> dict[str, Any]:
+    """Build a combined API and raw-artifact assurance report."""
     raw_reports = []
     raw_source_map = raw_artifact_source_file_version_ids_by_path or {}
     for raw_path in raw_artifact_paths or []:

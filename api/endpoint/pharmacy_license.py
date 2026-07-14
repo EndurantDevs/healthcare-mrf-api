@@ -74,6 +74,7 @@ async def _table_exists(session, table_name: str, schema: str = "mrf") -> bool:
 
 @blueprint.get("/import/status")
 async def get_pharmacy_license_import_status(request):
+    """Return the latest or requested pharmacy-license import status."""
     session = _get_session(request)
     if not await _table_exists(session, PharmacyLicenseImportRun.__tablename__):
         raise NotFound("No pharmacy-license imports found")
@@ -127,6 +128,7 @@ async def get_pharmacy_license_import_status(request):
 
 @blueprint.get("/coverage")
 async def get_pharmacy_license_coverage(request):
+    """Return pharmacy-license source coverage by state."""
     session = _get_session(request)
     if not await _table_exists(session, PharmacyLicenseStateCoverage.__tablename__):
         return response.json(
@@ -184,6 +186,7 @@ async def get_pharmacy_license_coverage(request):
 
 @blueprint.get("/pharmacies/<npi>")
 async def get_pharmacy_license_by_npi(request, npi):
+    """Return current and historical pharmacy licenses for an NPI."""
     session = _get_session(request)
     parsed_npi = _parse_npi(npi)
     as_of = _parse_date_param(request.args.get("as_of"), "as_of") or datetime.date.today()

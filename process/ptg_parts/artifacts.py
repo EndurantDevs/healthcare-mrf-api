@@ -39,6 +39,7 @@ class _PTG2FileLock:
         self._fd: int | None = None
 
     def acquire(self) -> None:
+        """Acquire the process and filesystem artifact lock."""
         self._thread_lock.acquire()
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,6 +57,7 @@ class _PTG2FileLock:
             raise
 
     def release(self) -> None:
+        """Release the filesystem and process artifact lock."""
         if self._fd is None:
             return
         try:
@@ -308,6 +310,7 @@ def choose_reusable_raw_artifact(
     store: PTG2ArtifactStore | None = None,
     reuse_policy: str = "metadata_or_hash",
 ) -> tuple[dict[str, Any] | None, str | None]:
+    """Choose a retained raw artifact that satisfies reuse policy."""
     candidates = [
         candidate
         for candidate in candidates
@@ -318,6 +321,7 @@ def choose_reusable_raw_artifact(
         return None, None
 
     def raw_exists(candidate: dict[str, Any]) -> bool:
+        """Return whether a candidate's retained raw file exists."""
         if store is None:
             return True
         raw_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")

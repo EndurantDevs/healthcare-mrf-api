@@ -490,6 +490,7 @@ async def import_terminology_synonyms(
     test_mode: bool = False,
     import_id: str | None = None,
 ) -> dict[str, Any]:
+    """Import normalized terminology synonyms into a staged snapshot."""
     schema = _schema()
     suffix = _import_id(import_id)
     if test_mode:
@@ -534,6 +535,7 @@ async def main(
     import_id: str | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
+    """Run the terminology synonym import entry point."""
     _ = run_id
     await init_db(db)
     try:

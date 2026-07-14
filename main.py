@@ -66,6 +66,7 @@ def _default_api_workers() -> int:
 @click.option('--debug', help='Enable or disable debugging', is_flag=True)
 @click.option('--accesslog', help='Enable or disable access log', is_flag=True)
 def start(host, port, workers, debug, accesslog):
+    """Start the API server with the requested runtime options."""
     connection._detect_server_capabilities = lambda *a, **kw: ServerCapabilities(
         advisory_locks=False,
         notifications=False,
@@ -95,6 +96,7 @@ server.add_command(start)
 
 @click.group()
 def cli():
+    """Initialize the command-line entry point and event loop."""
     # Ensure every CLI invocation has an event loop so libraries relying on
     # asyncio.get_event_loop() behave consistently (e.g. arq worker setup).
     try:

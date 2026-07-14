@@ -1,0 +1,233 @@
+{
+  "sources": {
+    "profile-source-a": [
+      {
+        "resourceType": "PractitionerRole",
+        "id": "role-a",
+        "active": true,
+        "identifier": [
+          {
+            "system": "http://hl7.org/fhir/sid/us-npi",
+            "value": "1588616783"
+          }
+        ],
+        "organization": {
+          "reference": "https://payer-a.test/fhir/Organization/clinic"
+        }
+      },
+      {
+        "resourceType": "Organization",
+        "id": "parent",
+        "active": true,
+        "name": "Example Health Plan"
+      },
+      {
+        "resourceType": "Organization",
+        "id": "clinic",
+        "active": true,
+        "name": "Example Medical Group"
+      },
+      {
+        "resourceType": "OrganizationAffiliation",
+        "id": "aff-positive",
+        "active": true,
+        "identifier": [
+          {
+            "system": "https://payer.test/affiliation-id",
+            "value": "group-contract-1"
+          }
+        ],
+        "organization": {
+          "reference": "Organization/parent"
+        },
+        "participatingOrganization": {
+          "reference": "Organization/clinic"
+        },
+        "network": [
+          {
+            "reference": "Organization/network-1"
+          }
+        ],
+        "healthcareService": [
+          {
+            "reference": "HealthcareService/primary-care"
+          }
+        ],
+        "location": [
+          {
+            "reference": "Location/main-clinic"
+          }
+        ],
+        "specialty": [
+          {
+            "coding": [
+              {
+                "system": "http://nucc.org/provider-taxonomy",
+                "code": "207Q00000X",
+                "display": "Family Medicine"
+              }
+            ]
+          }
+        ],
+        "code": [
+          {
+            "coding": [
+              {
+                "code": "member",
+                "display": "Member"
+              }
+            ]
+          }
+        ],
+        "telecom": [
+          {
+            "system": "phone",
+            "value": "312-555-0100",
+            "use": "work"
+          }
+        ],
+        "period": {
+          "start": "2026-01-01",
+          "end": "2026-12-31"
+        }
+      },
+      {
+        "resourceType": "OrganizationAffiliation",
+        "id": "aff-primary-only",
+        "active": true,
+        "organization": {
+          "reference": "Organization/clinic"
+        },
+        "network": [
+          {
+            "reference": "Organization/network-primary-only"
+          }
+        ]
+      },
+      {
+        "resourceType": "OrganizationAffiliation",
+        "id": "aff-primary-match",
+        "active": true,
+        "organization": {
+          "reference": "Organization/clinic"
+        },
+        "participatingOrganization": {
+          "reference": "Organization/other-clinic"
+        },
+        "network": [
+          {
+            "reference": "Organization/network-false-primary-match"
+          }
+        ]
+      },
+      {
+        "resourceType": "OrganizationAffiliation",
+        "id": "aff-stale",
+        "active": true,
+        "organization": {
+          "reference": "Organization/parent"
+        },
+        "participatingOrganization": {
+          "reference": "Organization/clinic"
+        },
+        "network": [
+          {
+            "reference": "Organization/network-stale"
+          }
+        ]
+      }
+    ],
+    "profile-source-b": [
+      {
+        "resourceType": "PractitionerRole",
+        "id": "role-b",
+        "active": true,
+        "identifier": [
+          {
+            "system": "http://hl7.org/fhir/sid/us-npi",
+            "value": "1588616783"
+          }
+        ],
+        "organization": {
+          "reference": "Organization/clinic/_history/8"
+        }
+      },
+      {
+        "resourceType": "Organization",
+        "id": "parent",
+        "active": true,
+        "name": "Example Health Plan"
+      },
+      {
+        "resourceType": "Organization",
+        "id": "clinic",
+        "active": true,
+        "name": "Example Medical Group"
+      },
+      {
+        "resourceType": "OrganizationAffiliation",
+        "id": "aff-positive",
+        "active": true,
+        "identifier": [
+          {
+            "system": "https://payer.test/affiliation-id",
+            "value": "group-contract-1"
+          }
+        ],
+        "organization": {
+          "reference": "https://payer-b.test/fhir/Organization/parent"
+        },
+        "participatingOrganization": {
+          "reference": "https://payer-b.test/fhir/Organization/clinic/_history/7?view=current"
+        },
+        "network": [
+          {
+            "reference": "Organization/network-1"
+          }
+        ],
+        "healthcareService": [
+          {
+            "reference": "HealthcareService/primary-care"
+          }
+        ],
+        "location": [
+          {
+            "reference": "Location/main-clinic"
+          }
+        ],
+        "specialty": [
+          {
+            "coding": [
+              {
+                "system": "http://nucc.org/provider-taxonomy",
+                "code": "207Q00000X",
+                "display": "Family Medicine"
+              }
+            ]
+          }
+        ],
+        "code": [
+          {
+            "coding": [
+              {
+                "code": "member",
+                "display": "Member"
+              }
+            ]
+          }
+        ],
+        "telecom": [
+          {
+            "system": "phone",
+            "value": "312-555-0100",
+            "use": "work"
+          }
+        ],
+        "period": {
+          "start": "2026-01-01",
+          "end": "2026-12-31"
+        }
+      }
+    ]
+  }
+}

@@ -104,6 +104,7 @@ async def _create_fixture_tables(database: Database, schema: str, stage_table: s
 
 
 async def _insert_practitioner_rows(database: Database, schema: str) -> None:
+    """Insert practitioner rows used by the overlay fixture."""
     rows = [
         (
             "source-target",
@@ -190,6 +191,7 @@ async def _insert_practitioner_rows(database: Database, schema: str) -> None:
 async def test_practitioner_address_overlay_executes_scoped_sql_in_isolated_schema(
     monkeypatch,
 ):
+    """Verify overlay SQL remains scoped to the isolated schema."""
     stage_table = "provider_directory_practitioner_address_stage"
     async with _temporary_schema(monkeypatch) as (database, schema):
         await _install_canonical_functions(database, schema)

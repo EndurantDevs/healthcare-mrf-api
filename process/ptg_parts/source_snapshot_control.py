@@ -34,6 +34,7 @@ class _TransactionExecutor:
         self._session = session
 
     async def all(self, statement: Any, **params: Any) -> list[Any]:
+        """Execute a statement and return all result rows."""
         result = await self._session.execute(
             _text(statement) if isinstance(statement, str) else statement,
             params,
@@ -41,6 +42,7 @@ class _TransactionExecutor:
         return result.all()
 
     async def status(self, statement: Any, **params: Any) -> int | None:
+        """Execute a statement and return its affected row count."""
         result = await self._session.execute(
             _text(statement) if isinstance(statement, str) else statement,
             params,

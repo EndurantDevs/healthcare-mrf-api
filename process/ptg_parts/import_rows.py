@@ -89,6 +89,7 @@ def _build_provider_set_entry(
     provider_groups: list[dict[str, Any]],
     network_names: list[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]] | tuple[None, None]:
+    """Build one normalized provider-set entry and metadata row."""
     group_payloads: list[dict[str, Any]] = []
     union_npis: set[int] = set()
     tin_values: set[tuple[str, str]] = set()
@@ -155,6 +156,7 @@ def _combine_provider_set_entries(
     entries: list[dict[str, Any]],
     network_names: list[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]] | tuple[None, None]:
+    """Combine compatible provider-set entries into one row."""
     clean_entries = [entry for entry in entries if entry and entry.get("__hash__")]
     if not clean_entries:
         return None, None

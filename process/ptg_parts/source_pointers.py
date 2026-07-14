@@ -297,6 +297,7 @@ async def _compare_and_swap_source_pointer(
     updated_at: datetime.datetime,
     allow_already_current: bool = True,
 ) -> None:
+    """Atomically replace a source pointer at its expected value."""
     cas_query_result = await session.execute(
         db.text(
             f"""
@@ -413,6 +414,7 @@ async def _publish_snapshot_in_pointer_transaction(
     schema_name: str,
     snapshot_attributes: dict[str, Any] | None,
 ) -> None:
+    """Publish snapshot metadata within a pointer transaction."""
     if snapshot_attributes is None:
         return
     if snapshot_attributes.get("status") != PTG2_STATUS_PUBLISHED:
@@ -889,6 +891,7 @@ async def _activate_ptg2_source_candidate_in_transaction(
     snapshot_id: str,
     expected_current_snapshot_id: str | None,
 ) -> dict[str, Any]:
+    """Activate a source candidate within its pointer transaction."""
     candidate = await _locked_candidate_activation_row(
         session,
         schema_name=schema_name,
