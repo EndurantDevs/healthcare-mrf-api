@@ -395,6 +395,7 @@ def _initialized_capacity_evidence_app(monkeypatch) -> Sanic:
     """Build the routed API with deterministic PTG serving dependencies."""
 
     import api as api_package
+    from api import control as control_api
     from api.endpoint import pricing
 
     async def fake_search(_session, _args, pagination):
@@ -414,11 +415,19 @@ def _initialized_capacity_evidence_app(monkeypatch) -> Sanic:
         async def bind_session(request):
             request.ctx.sa_session = object()
 
+    async def skip_control_schema_ensure():
+        return None
+
     process_identity = _install_fresh_process_identity(monkeypatch)
     process_identity.started_at = datetime.now(timezone.utc).replace(microsecond=0)
     for environment_name, environment_value in SIGNING_ENV.items():
         monkeypatch.setenv(environment_name, environment_value)
     monkeypatch.setattr(api_package.db, "init_app", bind_test_session)
+    monkeypatch.setattr(
+        control_api,
+        "ensure_import_run_table",
+        skip_control_schema_ensure,
+    )
     monkeypatch.setattr(pricing, "search_current_ptg2_index", fake_search)
 
     app = Sanic(f"ptg2-capacity-evidence-{uuid.uuid4().hex}")
