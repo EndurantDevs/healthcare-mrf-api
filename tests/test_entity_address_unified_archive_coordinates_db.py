@@ -100,6 +100,55 @@ INSERT INTO {schema_name}.entity_address_unified
 VALUES ('live-supplied', 'a95430ba-8cbe-777f-c710-08e45e130b4e', NULL, NULL);
 """
 
+_SAME_PROVIDER_FIXTURES_SQL = (
+    """
+    CREATE TABLE {schema_name}.entity_address_unified_replacement (
+        location_key text PRIMARY KEY,
+        address_source text NOT NULL,
+        entity_type text NOT NULL,
+        entity_id text NOT NULL,
+        npi bigint,
+        inferred_npi bigint,
+        address_key uuid,
+        telephone_number text,
+        phone_number text,
+        phone_extension text,
+        fax_number text,
+        fax_number_digits text,
+        fax_extension text,
+        lat numeric,
+        long numeric,
+        source_count integer NOT NULL,
+        updated_at timestamptz
+    );
+    """,
+    """
+    INSERT INTO {schema_name}.entity_address_unified_replacement
+        (location_key, address_source, entity_type, entity_id, npi,
+         address_key, telephone_number, phone_number, lat, long,
+         source_count, updated_at)
+    VALUES
+        ('fhir-affected', 'provider_directory_fhir', 'npi', '1234567890',
+         1234567890, '00000000-0000-0000-0000-000000000900',
+         NULL, NULL, NULL, NULL, 1, '2026-07-14T12:00:00Z'),
+        ('nppes-unchanged', 'npi', 'npi', '1234567890', 1234567890,
+         '00000000-0000-0000-0000-000000000900', '+1 512-555-0199',
+         '5125550199', 30.2672, -97.7431, 2, '2026-07-13T12:00:00Z'),
+        ('fhir-unaffected', 'provider_directory_fhir', 'npi', '1234567890',
+         1234567890, '00000000-0000-0000-0000-000000000900',
+         NULL, NULL, NULL, NULL, 1, '2026-07-12T12:00:00Z');
+    """,
+    """
+    CREATE TABLE {schema_name}.provider_directory_coordinate_scope (
+        location_key text PRIMARY KEY
+    );
+    """,
+    """
+    INSERT INTO {schema_name}.provider_directory_coordinate_scope (location_key)
+    VALUES ('fhir-affected');
+    """,
+)
+
 
 def _require_disposable_postgres() -> None:
     if "test" not in os.getenv("HLTHPRT_DB_DATABASE", "").lower():
@@ -126,6 +175,11 @@ async def _prepare_coordinate_fixtures(database: Database, schema_name: str) -> 
     await database.status(_ARCHIVE_FIXTURES_SQL.format(schema_name=schema_name))
     await database.status(_STAGE_FIXTURES_SQL.format(schema_name=schema_name))
     await database.status(_LIVE_FIXTURE_SQL.format(schema_name=schema_name))
+
+
+async def _prepare_same_provider_fixtures(database: Database, schema_name: str) -> None:
+    for fixture_sql in _SAME_PROVIDER_FIXTURES_SQL:
+        await database.status(fixture_sql.format(schema_name=schema_name))
 
 
 async def _archive_snapshot(database: Database, schema_name: str) -> list[tuple]:
@@ -275,3 +329,43 @@ async def test_partial_archive_coordinate_backfill_excludes_unchanged_live_group
         assert stage_by_case["unchanged-current"][-2:] == (None, None)
         assert await _archive_snapshot(database, schema_name) == archive_before
         await _assert_live_table_unchanged(database, schema_name)
+
+
+@pytest.mark.asyncio
+async def test_partial_same_provider_backfill_uses_unaffected_cross_source_donor():
+    """An affected FHIR target may inherit from an unchanged non-FHIR stage row."""
+    async with _temporary_schema() as (database, schema_name):
+        await _prepare_same_provider_fixtures(database, schema_name)
+
+        updated_rows = await database.status(
+            entity_address_unified._backfill_same_provider_address_fields_sql(
+                schema_name,
+                "entity_address_unified_replacement",
+                coordinate_scope_table="provider_directory_coordinate_scope",
+            )
+        )
+        stage_records = await database.all(
+            f"""
+            SELECT location_key, telephone_number, phone_number, lat, long
+              FROM {schema_name}.entity_address_unified_replacement
+          ORDER BY location_key;
+            """
+        )
+        rows_by_location = {
+            stage_record[0]: tuple(stage_record[1:]) for stage_record in stage_records
+        }
+
+        assert int(updated_rows or 0) == 1
+        assert rows_by_location["fhir-affected"][:2] == (
+            "+1 512-555-0199",
+            "5125550199",
+        )
+        assert tuple(map(float, rows_by_location["fhir-affected"][-2:])) == (
+            30.2672,
+            -97.7431,
+        )
+        assert rows_by_location["nppes-unchanged"][:2] == (
+            "+1 512-555-0199",
+            "5125550199",
+        )
+        assert rows_by_location["fhir-unaffected"] == (None, None, None, None)
