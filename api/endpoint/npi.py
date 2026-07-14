@@ -4447,7 +4447,7 @@ async def _fetch_provider_directory_profile_map(
         {
             int(npi)
             for npi in npis
-            if npi is not None and str(npi).isdigit()
+            if profile_artifact.is_valid_npi(npi)
         }
     )
     if not normalized_npis:
@@ -9235,7 +9235,28 @@ async def get_npi(request, npi):
     data = await _build_npi_details(npi, **build_kwargs)
 
     if not data:
-        raise sanic.exceptions.NotFound
+        if not profile_record:
+            raise sanic.exceptions.NotFound
+        data = {
+            "npi": npi,
+            "provider_directory_profile": profile_record["profile"],
+        }
+        if include_evidence and profile_record.get("evidence") is not None:
+            data["provider_directory_profile_evidence"] = profile_record[
+                "evidence"
+            ]
+        response_body = json.dumps(
+            data,
+            default=str,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if _npi_detail_response_cacheable(
+            data,
+            force_address_update=force_address_update,
+            sync_geocode=sync_geocode,
+        ):
+            _npi_detail_response_cache_set(cache_key, response_body)
+        return response.raw(response_body, content_type="application/json")
 
     address_total = data.pop("address_total", None)
 

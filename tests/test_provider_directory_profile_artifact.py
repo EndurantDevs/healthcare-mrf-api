@@ -85,6 +85,49 @@ def test_profile_tables_and_indexes_are_bounded_and_npi_indexed():
     assert profile.PROFILE_FACT_EVIDENCE_LIMIT == 25
 
 
+@pytest.mark.parametrize("npi", [1000000491, 1234567893, 1588616783])
+def test_profile_npi_validation_accepts_valid_check_digits(npi):
+    assert profile.is_valid_npi(npi)
+
+
+@pytest.mark.parametrize(
+    "npi",
+    [None, "", "not-an-npi", 999999999, 10_000_000_000, 1000000492],
+)
+def test_profile_npi_validation_rejects_invalid_values(npi):
+    assert not profile.is_valid_npi(npi)
+
+
+def test_profile_publication_filters_invalid_npis_from_new_and_copied_rows():
+    evidence_insert_sql = profile.profile_evidence_insert_sql(
+        target_ref='"fixture"."evidence"',
+        source_ref='"fixture"."source"',
+        practitioner_ref='"fixture"."practitioner"',
+        role_ref='"fixture"."role"',
+        organization_ref='"fixture"."organization"',
+        service_ref='"fixture"."service"',
+        endpoint_ref='"fixture"."endpoint"',
+    )
+    evidence_copy_sql = profile.copy_existing_evidence_sql(
+        source_ref='"fixture"."old_evidence"',
+        target_ref='"fixture"."new_evidence"',
+    )
+    profile_copy_sql = profile.copy_unaffected_profiles_sql(
+        profile_source_ref='"fixture"."old_profile"',
+        evidence_source_ref='"fixture"."old_evidence"',
+        evidence_stage_ref='"fixture"."new_evidence"',
+        profile_stage_ref='"fixture"."new_profile"',
+    )
+
+    assert "(npi) BETWEEN 1000000000 AND 9999999999" in evidence_insert_sql
+    assert "(npi) BETWEEN 1000000000 AND 9999999999" in evidence_copy_sql
+    assert (
+        "(profile.npi) BETWEEN 1000000000 AND 9999999999"
+        in profile_copy_sql
+    )
+    assert "JOIN \"mrf\".\"npi\"" not in evidence_insert_sql
+
+
 def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
     sql = profile.profile_evidence_insert_sql(
         target_ref='"fixture"."evidence"',
@@ -123,6 +166,9 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
     assert "'comment', service.comment" in sql
     assert "JOIN \"fixture\".\"endpoint\" AS endpoint" in sql
     assert "'accepting_patients', COALESCE(" in sql
+    assert "npi) BETWEEN 1000000000 AND 9999999999" in sql
+    assert "AND MOD(" in sql
+    assert "{{VALID_NPI_SQL}}" not in sql
     assert "ON CONFLICT (evidence_key) DO NOTHING" in sql
 
 
