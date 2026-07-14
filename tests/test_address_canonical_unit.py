@@ -155,6 +155,7 @@ def test_unit_keyword_does_not_steal_street_suffix():
 
 
 def test_unit_extraction_uses_one_decision_for_street_and_unit():
+    """Street and unit normalization share one deterministic line decision."""
     assert address_canon.street_norm("100 Florida Ave Fl 2", "") == "100floridaave"
     assert address_canon.street_norm("100 Fleet St Fl 2", "") == "100fleetst"
     assert address_canon.address_key_v1("100 Florida Ave Fl 2", "", "Austin", "TX", "78701", "US") != (
@@ -725,17 +726,18 @@ async def test_stamp_address_keys_rejects_invalid_env_shard_override(monkeypatch
 @pytest.mark.asyncio
 async def test_stamp_address_keys_can_run_shards_concurrently(monkeypatch):
     calls = []
-    active = 0
-    max_active = 0
+    concurrency_by_metric = {"active": 0, "max_active": 0}
 
     class _FakeDB:
         async def status(self, sql, **kwargs):
-            nonlocal active, max_active
             calls.append((sql, kwargs))
-            active += 1
-            max_active = max(max_active, active)
+            concurrency_by_metric["active"] += 1
+            concurrency_by_metric["max_active"] = max(
+                concurrency_by_metric["max_active"],
+                concurrency_by_metric["active"],
+            )
             await asyncio.sleep(0.01)
-            active -= 1
+            concurrency_by_metric["active"] -= 1
             return 1
 
     monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_STAMP_SHARDS", "4")
@@ -759,23 +761,24 @@ async def test_stamp_address_keys_can_run_shards_concurrently(monkeypatch):
 
     assert stamped == 4
     assert len(calls) == 4
-    assert max_active == 2
+    assert concurrency_by_metric["max_active"] == 2
 
 
 @pytest.mark.asyncio
 async def test_stamp_address_keys_clamps_concurrency_to_db_pool(monkeypatch):
     calls = []
-    active = 0
-    max_active = 0
+    concurrency_by_metric = {"active": 0, "max_active": 0}
 
     class _FakeDB:
         async def status(self, sql, **kwargs):
-            nonlocal active, max_active
             calls.append((sql, kwargs))
-            active += 1
-            max_active = max(max_active, active)
+            concurrency_by_metric["active"] += 1
+            concurrency_by_metric["max_active"] = max(
+                concurrency_by_metric["max_active"],
+                concurrency_by_metric["active"],
+            )
             await asyncio.sleep(0.01)
-            active -= 1
+            concurrency_by_metric["active"] -= 1
             return 1
 
     monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_STAMP_SHARDS", "4")
@@ -799,15 +802,15 @@ async def test_stamp_address_keys_clamps_concurrency_to_db_pool(monkeypatch):
 
     assert stamped == 4
     assert len(calls) == 4
-    assert max_active == 2
+    assert concurrency_by_metric["max_active"] == 2
 
 
 @pytest.mark.asyncio
 async def test_restore_missing_zip_from_tiger_zcta_uses_unique_state_checked_point_match(monkeypatch):
+    """Coordinate ZIP restoration requires one state-consistent ZCTA match."""
     statements = []
     progress = []
-    active = 0
-    max_active = 0
+    concurrency_by_metric = {"active": 0, "max_active": 0}
 
     class _FakeResult:
         def __init__(self, value=None):
@@ -838,12 +841,14 @@ async def test_restore_missing_zip_from_tiger_zcta_uses_unique_state_checked_poi
             return _FakeTransaction()
 
         async def status(self, sql, **kwargs):
-            nonlocal active, max_active
             statements.append((sql, kwargs))
-            active += 1
-            max_active = max(max_active, active)
+            concurrency_by_metric["active"] += 1
+            concurrency_by_metric["max_active"] = max(
+                concurrency_by_metric["max_active"],
+                concurrency_by_metric["active"],
+            )
             await asyncio.sleep(0.01)
-            active -= 1
+            concurrency_by_metric["active"] -= 1
             return 2
 
     monkeypatch.setattr(address_canon, "db", _FakeDB())
@@ -863,7 +868,7 @@ async def test_restore_missing_zip_from_tiger_zcta_uses_unique_state_checked_poi
 
     assert restored == 8
     assert len(statements) == 4
-    assert max_active == 2
+    assert concurrency_by_metric["max_active"] == 2
     sql = statements[0][0]
     assert 'UPDATE "mrf"."address_stage" AS target' in sql
     assert 'SET "postal_code" = unique_matches.zip5' in sql
@@ -926,9 +931,9 @@ async def test_stamp_address_keys_rejects_invalid_env_concurrency(monkeypatch, o
 
 @pytest.mark.asyncio
 async def test_propagate_child_address_keys_uses_parent_join_and_concurrency(monkeypatch):
+    """Child-key propagation uses parent identity joins across bounded shards."""
     calls = []
-    active = 0
-    max_active = 0
+    concurrency_by_metric = {"active": 0, "max_active": 0}
     events = []
 
     class _FakeResult:
@@ -940,13 +945,15 @@ async def test_propagate_child_address_keys_uses_parent_join_and_concurrency(mon
 
     class _FakeSession:
         async def execute(self, sql, params=None):
-            nonlocal active, max_active
             sql_text = str(sql)
             calls.append((sql_text, params or {}))
-            active += 1
-            max_active = max(max_active, active)
+            concurrency_by_metric["active"] += 1
+            concurrency_by_metric["max_active"] = max(
+                concurrency_by_metric["max_active"],
+                concurrency_by_metric["active"],
+            )
             await asyncio.sleep(0.01)
-            active -= 1
+            concurrency_by_metric["active"] -= 1
             if "WITH cleared AS" in sql_text or "WITH propagated AS" in sql_text:
                 return _FakeResult(2)
             return _FakeResult()
@@ -975,7 +982,7 @@ async def test_propagate_child_address_keys_uses_parent_join_and_concurrency(mon
 
     assert propagated == 16
     assert len(calls) == 20
-    assert max_active == 2
+    assert concurrency_by_metric["max_active"] == 2
     create_sql = next(sql for sql, _kwargs in calls if "CREATE TEMP TABLE" in sql)
     clear_sql = next(sql for sql, _kwargs in calls if "WITH cleared AS" in sql)
     propagate_sql = next(sql for sql, _kwargs in calls if "WITH propagated AS" in sql)
@@ -1447,6 +1454,7 @@ def test_entity_address_unified_integer_ranges_are_half_open():
 
 
 def test_entity_address_unified_sql_carries_address_key(monkeypatch):
+    """Unified address projection preserves the canonical address key."""
     raw_sql = entity_address_unified._prepare_raw_stage_sql("mrf", "entity_address_unified_raw")
     enrich_sql = entity_address_unified._enrich_raw_stage_sql("mrf", "entity_address_unified_raw")
     insert_sql = entity_address_unified._insert_raw_from_source_sql(
@@ -1706,6 +1714,7 @@ def test_entity_address_unified_raw_enrichment_can_shard_by_checksum():
 
 @pytest.mark.asyncio
 async def test_entity_address_unified_sql_phase_uses_scoped_bulk_settings(monkeypatch):
+    """Unified SQL materialization scopes bulk settings to its transaction."""
     statements = []
     events = []
 
@@ -1806,6 +1815,7 @@ async def test_entity_address_unified_sql_phase_skips_unprivileged_bulk_setting(
 
 @pytest.mark.asyncio
 async def test_entity_address_unified_support_stage_records_bulk_phase_timings(monkeypatch):
+    """Unified support staging reports timing for each bulk phase."""
     statements = []
     events = []
 
@@ -1877,6 +1887,7 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
 
 @pytest.mark.asyncio
 async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkeypatch):
+    """Independent unified support inserts execute concurrently."""
     concurrency_map = {"active": 0, "max_active": 0}
     order = []
 
@@ -2319,6 +2330,7 @@ def test_entity_address_unified_support_statements_can_skip_optional_serving_tab
 
 
 def test_entity_address_unified_evidence_stage_updates_by_location_key():
+    """Evidence staging joins provider records through stable location keys."""
     evidence_table = entity_address_unified._evidence_stage_table_name("entity_address_unified_stage")
     prepare_sql = entity_address_unified._prepare_multi_source_evidence_table_sql(
         "mrf",
@@ -3019,6 +3031,7 @@ async def test_entity_address_unified_support_code_location_indexes_can_be_enabl
 
 @pytest.mark.asyncio
 async def test_entity_address_unified_serving_stage_index_profile_skips_debug_indexes(monkeypatch):
+    """Serving-stage index creation omits diagnostic-only indexes."""
     statements = []
     context = {}
 
@@ -3523,6 +3536,7 @@ def test_entity_address_unified_keep_raw_stage_is_opt_in(monkeypatch):
 
 
 def test_entity_address_unified_indexes_cover_primary_serving_queries():
+    """Unified address indexes cover the primary API lookup predicates."""
     indexes = {index["name"]: index for index in EntityAddressUnified.__my_additional_indexes__}
 
     assert indexes["primary_npi"] == {

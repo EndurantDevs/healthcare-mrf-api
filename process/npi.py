@@ -172,6 +172,7 @@ async def _ensure_required_extensions() -> None:
 
 
 def is_test_mode(ctx: dict) -> bool:
+    """Return whether the active NPI worker context is in test mode."""
     return bool(ctx.get("context", {}).get("test_mode"))
 
 
@@ -262,6 +263,7 @@ def _taxonomy_array_from_npi_row(row: dict, taxonomy_int_code_map: dict[str, int
 
 
 async def process_npi_chunk(ctx, task):
+    """Parse one NPPES CSV chunk and enqueue or persist normalized rows."""
     redis = ctx['redis']
     canonical_addresses_enabled = source_enabled("nppes")
     taxonomy_int_code_map = task.get("taxonomy_int_code_map") or {}
@@ -400,6 +402,7 @@ async def process_npi_chunk(ctx, task):
 
 
 async def process_data(ctx, task=None):  # pragma: no cover
+    """Download and process the configured NPPES dissemination files."""
     # Track whether any work actually ran so shutdown can distinguish "no jobs" from a bad import
     task = task or {}
     await raise_if_cancelled(ctx, task)
@@ -435,6 +438,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
     )
 
     async def enqueue_or_flush(coros: list, coro) -> None:
+        """Bound pending save tasks by flushing the active task batch."""
         coros.append(asyncio.create_task(coro))
         if len(coros) >= max_pending_save_tasks:
             await asyncio.gather(*coros)
@@ -792,6 +796,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
 
 
 async def startup(ctx):  # pragma: no cover
+    """Initialize NPI worker state and import staging tables."""
     await my_init_db(db)
     ctx['context'] = {}
     ctx['context']['start'] = datetime.datetime.utcnow()
@@ -818,7 +823,7 @@ async def startup(ctx):  # pragma: no cover
                 f"CREATE UNIQUE INDEX IF NOT EXISTS {obj.__tablename__}_idx_primary ON "
                 f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
     except DuplicateTableError:
-        pass
+        print(f"Address archive table {db_schema}.{obj.__tablename__} already exists.")
 
     for cls in (NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIAddress, NPIPhoneStaffing):
         tables[cls.__main_table__] = make_class(cls, import_date)
@@ -933,6 +938,7 @@ async def refresh_taxonomy_arrays(
     taxonomy_table: str,
     schema: str,
 ) -> int:
+    """Refresh denormalized taxonomy integer arrays on NPI addresses."""
     update_sql = f"""
         WITH sub AS (
             SELECT
@@ -966,6 +972,7 @@ async def resolve_npi_address_archive(
     schema: str,
     cancel_check,
 ):
+    """Stamp and resolve NPI staging addresses into the canonical archive."""
     missing_key_rows = int(
         await db.scalar(
             f"SELECT count(*) FROM {schema}.{staging_table} WHERE address_key IS NULL;"
@@ -1031,6 +1038,7 @@ async def rebuild_phone_staffing_table(
     address_table: str,
     schema: str,
 ) -> None:
+    """Rebuild the phone-level provider staffing materialization."""
     if not await db.scalar(f"SELECT to_regclass('{schema}.{target_table}');"):
         print(
             f"Skipping phone staffing materialization for {schema}.{target_table}: "
@@ -1101,12 +1109,14 @@ async def rebuild_phone_staffing_table(
 
 
 async def shutdown(ctx):  # pragma: no cover
+    """Finalize, index, validate, and atomically publish an NPI import."""
     import_date = ctx['import_date']
     context = ctx.get('context') or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
     shutdown_phase_timings: list[dict[str, object]] = []
 
     async def timed_shutdown_phase(phase: str, awaitable):
+        """Run one finalization phase while recording progress and timing."""
         started = time.monotonic()
         started_at = datetime.datetime.now(datetime.UTC).isoformat()
         print(f"NPI_SHUTDOWN_PHASE_START phase={phase} started_at={started_at}")
@@ -1216,10 +1226,12 @@ async def shutdown(ctx):  # pragma: no cover
     )
 
     async def table_exists(table_name: str) -> bool:
+        """Check whether a table exists in the active import schema."""
         exists = await db.scalar(f"SELECT to_regclass('{db_schema}.{table_name}');")
         return bool(exists)
 
     async def table_has_column(table_name: str, column_name: str) -> bool:
+        """Check whether an import table exposes a named column."""
         return bool(await db.scalar(
             f"""
             SELECT EXISTS (
@@ -1240,19 +1252,20 @@ async def shutdown(ctx):  # pragma: no cover
                 await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_obj.__tablename__};") or 0
             )
 
-    postgis_available: bool | None = None
+    postgis_cache: dict[str, bool | None] = {"available": None}
 
     async def has_postgis() -> bool:
-        nonlocal postgis_available
-        if postgis_available is None:
+        """Cache whether PostGIS types and constructors are available."""
+        if postgis_cache["available"] is None:
             geography_type = await db.scalar("SELECT to_regtype('geography');")
             st_makepoint = await db.scalar("SELECT to_regprocedure('st_makepoint(double precision, double precision)');")
-            postgis_available = bool(geography_type and st_makepoint)
-            if not postgis_available:
+            postgis_cache["available"] = bool(geography_type and st_makepoint)
+            if not postgis_cache["available"]:
                 print("PostGIS is unavailable; geo GIST index creation will be skipped.")
-        return postgis_available
+        return bool(postgis_cache["available"])
 
     async def archive_index(index_name: str) -> str:
+        """Move a live index name aside before staged table promotion."""
         archived_name = _archived_identifier(index_name)
         await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_name};")
         await db.status(
@@ -1331,6 +1344,7 @@ async def shutdown(ctx):  # pragma: no cover
         return await timed_shutdown_phase("geocode_archive_enrichment", _run_geo_update())
 
     async def create_additional_indexes(cls, obj) -> None:
+        """Create model-declared secondary indexes on a staged table."""
         if not hasattr(cls, '__my_additional_indexes__') or not cls.__my_additional_indexes__:
             return
         for index in cls.__my_additional_indexes__:
@@ -1519,6 +1533,7 @@ WHERE
 
     # Run VACUUM FULL ANALYZE in parallel for all tables
     async def vacuum_table(obj):
+        """Run the post-index full vacuum for one promoted NPI table."""
         if not await table_exists(obj.__tablename__):
             print(f"Skipping VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__}: table is missing.")
             return
@@ -1596,6 +1611,7 @@ WHERE
 
 
 async def save_npi_data(ctx, task):
+    """Persist one normalized NPI payload into its staging models."""
     import_date = ctx['import_date']
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     await ensure_database(test_mode)
@@ -1625,6 +1641,7 @@ async def save_npi_data(ctx, task):
 
 
 async def main(test_mode: bool = False):  # pragma: no cover
+    """Enqueue an NPI import through the configured worker queue."""
     redis = await create_pool(build_redis_settings(),
                               job_serializer=serialize_job,
                               job_deserializer=deserialize_job)

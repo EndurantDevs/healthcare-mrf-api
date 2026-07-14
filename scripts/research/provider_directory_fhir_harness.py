@@ -44,6 +44,7 @@ class CaseResult:
     error: str | None = None
 
     def to_json(self) -> dict[str, Any]:
+        """Serialize one harness case without exposing internal objects."""
         return {
             "case_id": self.case_id,
             "kind": self.kind,
@@ -56,6 +57,7 @@ class CaseResult:
 
 
 def _fixture_resources() -> list[dict[str, Any]]:
+    """Return the linked Plan-Net fixture used by parser completeness checks."""
     return [
         {
             "resourceType": "InsurancePlan",
@@ -327,6 +329,7 @@ CREATE TABLE {schema}.provider_directory_import_seen_stage_test (
 
 
 async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
+    """Exercise generated SQL against an isolated PostgreSQL schema."""
     started = time.monotonic()
     schema = _validate_identifier(args.sql_schema or _sql_typing_schema(), label="sql schema")
     user = urllib.parse.quote(str(args.db_user), safe="")
@@ -347,6 +350,7 @@ async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
         importer = importlib.import_module("process.provider_directory_fhir")
 
         async def raw(sql: str) -> None:
+            """Execute schema lifecycle SQL outside SQLAlchemy transactions."""
             conn = await asyncpg.connect(asyncpg_dsn)
             try:
                 await conn.execute(sql)
@@ -432,6 +436,7 @@ def _parse_import_metrics(output: str) -> dict[str, Any]:
 
 
 def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
+    """Run one local importer CLI case and capture its structured metrics."""
     started = time.monotonic()
     python = args.python or sys.executable
     command = [
@@ -530,6 +535,7 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
 
 
 def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
+    """Launch and monitor one import through the control API."""
     started = time.monotonic()
     control_url = str(args.control_url or "").rstrip("/")
     token = args.control_token or os.getenv("HLTHPRT_CONTROL_API_TOKEN")
@@ -756,6 +762,7 @@ def _run_coverage_audit_case(args: argparse.Namespace) -> CaseResult:
 
 
 def render_markdown(report: dict[str, Any]) -> str:
+    """Render a compact human-readable report for one harness run."""
     lines = [
         "# Provider Directory FHIR Harness Report",
         "",
@@ -799,12 +806,14 @@ def render_markdown(report: dict[str, Any]) -> str:
 
 
 def write_report(report: dict[str, Any], output_root: Path) -> None:
+    """Write JSON and Markdown evidence beneath the selected report root."""
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output_root / "report.md").write_text(render_markdown(report), encoding="utf-8")
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    """Execute selected harness cases and persist the combined report."""
     results = [_run_fixture_case()]
     if args.sql_typing:
         results.append(_run_sql_typing_case(args))
@@ -907,6 +916,7 @@ def _add_import_behavior_args(parser: argparse.ArgumentParser) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse harness options and normalize repeated environment overrides."""
     parser = argparse.ArgumentParser(description="Run Provider Directory FHIR self-harness cases.")
     _add_harness_case_args(parser)
     _add_database_args(parser)
@@ -924,6 +934,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the harness and return a process status matching its result."""
     report = run(parse_args(argv))
     print(json.dumps({"overall_status": report["overall_status"], "output_dir": report["output_dir"]}, sort_keys=True))
     return 0 if report["overall_status"] == "succeeded" else 1

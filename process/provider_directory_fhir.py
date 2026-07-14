@@ -701,6 +701,15 @@ CIGNA_EXPECTED_NONEMPTY_RESOURCES = frozenset(
 )
 CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR = "cigna_expected_nonempty_resource_returned_zero_rows"
 CIGNA_EMPTY_COLLECTION_RETRY_DELAYS_SECONDS = (15.0, 30.0, 60.0, 120.0)
+CARESOURCE_PROVIDER_DIRECTORY_BASE = (
+    "https://orchestrateserver.caresource.careevolution.com/api/fhir/provider-directory"
+)
+CARESOURCE_PROVIDER_DIRECTORY_METADATA_URL = (
+    f"{CARESOURCE_PROVIDER_DIRECTORY_BASE}/metadata"
+)
+CARESOURCE_EXPECTED_NONEMPTY_RESOURCES = frozenset(
+    {"InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location"}
+)
 EXPECTED_NONEMPTY_RESOURCE_ERROR = (
     "provider_directory_expected_nonempty_resource_returned_zero_rows"
 )
@@ -909,6 +918,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
         ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE,
         ARKANSAS_PROVIDER_DIRECTORY_BASE,
+        CARESOURCE_PROVIDER_DIRECTORY_BASE,
         CIGNA_PROVIDER_DIRECTORY_BASE,
         HAP_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
@@ -4418,6 +4428,44 @@ def _cigna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
     }
 
 
+def _caresource_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(row.get("api_base"))
+    if api_base != CARESOURCE_PROVIDER_DIRECTORY_BASE:
+        return None
+    supported_resources = list(DEFAULT_RESOURCES)
+    return {
+        "api_base": CARESOURCE_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": CARESOURCE_PROVIDER_DIRECTORY_BASE,
+        "requires_registration": False,
+        "requires_api_key": False,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "endpoints": _source_override_endpoint_fields(
+            CARESOURCE_PROVIDER_DIRECTORY_BASE
+        ),
+        "metadata": {
+            "provider_directory_override": "caresource_public_provider_directory",
+            "provider_directory_override_reason": (
+                "CareSource publishes anonymous R4 Provider Directory metadata and resources "
+                "at its CareEvolution orchestration endpoint; the catalog auth label is stale."
+            ),
+            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_confirmed_base": CARESOURCE_PROVIDER_DIRECTORY_BASE,
+            "provider_directory_confirmed_metadata_url": (
+                CARESOURCE_PROVIDER_DIRECTORY_METADATA_URL
+            ),
+            "provider_directory_supported_resources": supported_resources,
+            "provider_directory_expected_nonempty_resources": sorted(
+                CARESOURCE_EXPECTED_NONEMPTY_RESOURCES
+            ),
+            "provider_directory_fully_enumerable_resources": supported_resources,
+            "provider_directory_coverage_mode": "carrier_directory",
+            "provider_directory_directory_scope": "carrier",
+            "provider_directory_acquisition_enabled": True,
+        },
+    }
+
+
 def _centene_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
     api_base = _canonical_base(row.get("api_base"))
     portal_url = (_clean_text(row.get("portal_url")) or "").lower()
@@ -5115,6 +5163,7 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
         _aetna_provider_directory_override(row)
         or _alohr_provider_directory_override(row)
         or _cigna_provider_directory_override(row)
+        or _caresource_provider_directory_override(row)
         or _centene_provider_directory_override(row)
         or _amerihealth_caritas_provider_directory_override(row)
         or _molina_provider_directory_override(row)
@@ -5224,7 +5273,11 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
             if override and "requires_registration" in override
             else bool(_bool_from_seed(row.get("requires_registration")))
         ),
-        "requires_api_key": bool(_bool_from_seed(row.get("requires_api_key"))),
+        "requires_api_key": (
+            bool(override["requires_api_key"])
+            if override and "requires_api_key" in override
+            else bool(_bool_from_seed(row.get("requires_api_key")))
+        ),
         "auth_type": override.get("auth_type") if override else _clean_text(row.get("auth_type")),
         "last_validated": _clean_text(row.get("last_validated")),
         "last_validated_status": (

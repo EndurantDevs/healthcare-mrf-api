@@ -234,6 +234,7 @@ def _serving_readiness_contract_report() -> dict[str, Any]:
 
 
 def build_report() -> dict[str, Any]:
+    """Evaluate the database-free Provider Directory runtime contract."""
     checks = {
         "provider_directory_cli": _provider_directory_cli_report(),
         "coverage_audit_cli": _coverage_audit_cli_report(),
@@ -255,12 +256,14 @@ def build_report() -> dict[str, Any]:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse output formatting options for the runtime contract smoke."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--format", choices=("text", "json"), default="text")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Print the runtime contract report and return its status."""
     args = parse_args(argv)
     report = build_report()
     if args.format == "json":
