@@ -215,11 +215,13 @@ temporary index; it does not preserve the index.
 
 ## Monthly capacity gate
 
-`ptg2_v3_capacity_gate.py` evaluates aggregate production-like measurements
-for the 2,000-logical-imports-per-month objective. It is separate from the
-source audit because it needs a measurement window that includes concurrent
-imports, normal API traffic, PostgreSQL write and WAL rates, scratch use,
-retained storage, and garbage collection.
+`ptg2_v3_capacity_gate.py` evaluates fixed-schema aggregate measurements for
+the 2,000-logical-imports-per-month objective. Schema version 2 is a breaking
+contract: version 1 evidence is rejected because it has no representative
+sample floor, candidate-audit capacity, class-specific latency, or resource
+pressure evidence. The capacity gate is separate from the source audit because
+it combines many audit runs with import, queue, API, PostgreSQL, scratch,
+storage, and GC observations.
 
 Create the fixed-schema example without target or customer identifiers:
 
@@ -236,20 +238,54 @@ python3 scripts/validation/ptg2_v3_capacity_gate.py \
   --report reports/ptg2-v3-capacity-report.json
 ```
 
-The gate fails unless the evidence covers at least 2,000 logical imports per
-month, every qualifying unique build finishes within 15 minutes, worst-case
-lane utilization is at most 70 percent, peak arrivals fit the observed queue
-window, scratch cleanup succeeds, and PostgreSQL connection, write, WAL,
-storage-retention, and GC capacity remain within their declared headroom. It
-also requires at least 3,000 error-free API requests during the configured
-concurrent import load, at least 2,500 cold first-page observations from fresh
-processes, and cold p95 at or below 40 ms.
+The release profile requires all of the following:
+
+- At least 30 unique large builds must use fresh fingerprints, complete input
+  coverage, the release scanner, durable publication, and persisted audit
+  creation. Every sample must qualify. The 15-minute ceiling is calculated
+  through retry-adjusted build time, candidate-audit queue age and duration,
+  attestation, and activation.
+- Reuse-only work has at least 30 timing samples. Its measured duration is
+  charged to reuse-adjusted worker hours and combined with the same audited
+  activation path; a reuse hit is discounted only after audited activation is
+  verified.
+- Candidate audits have at least 30 successful samples and zero errors. Their
+  lane count and availability are independent from build lanes, monthly and
+  peak utilization must stay at or below 70 percent, maximum queue age is 30
+  minutes, and every activation is charged at least 3,000 standard-API HTTP
+  requests. At the release objective that floor is 6,000,000 audit HTTP
+  requests per month.
+- Peak evidence contains at least 30 non-overlapping windows of at least 30
+  minutes across at least seven days. The observed peak must meet the target's
+  prorated average floor, maximum import queue delay is 30 minutes, and both
+  weighted import work and candidate-audit work must fit their queue SLOs.
+- Simultaneous import, candidate-audit, and normal API contention lasts at
+  least 30 minutes. It covers every configured import and audit lane, at least
+  3,000 API requests, at least 1 request/second, and enough audit request rate
+  to deliver 3,000 HTTP calls per active audit within its measured duration.
+- Fresh processes produce separate cold first-page p95 values at or below 40
+  ms for matched-positive, negative, and deterministic-random requests. The
+  floors are 100, 250, and 2,500 samples respectively, including at least 100
+  distinct matched-positive keys. Aggregate p95 and repeated single-key
+  evidence are not accepted. HTTP and per-class errors must all be zero.
+- Scratch and PostgreSQL temp space retain at least 20 percent measured
+  headroom. Pool-wait evidence covers the combined normal and candidate-audit
+  request rate over the contention interval with p95 at most 10 ms, maximum at
+  most 100 ms, and zero timeouts. At least two non-requested
+  checkpoints complete with 20 percent time headroom; connection, write, WAL,
+  and autovacuum worker capacity also retain 20 percent headroom.
+- GC evidence spans at least 24 hourly cycles and 30 eligible/deleted layouts,
+  has zero overlaps or reference-check failures, drains eligible bytes with 20
+  percent throughput headroom, and keeps backlog within its declared bound.
+  Retained storage must still fit after the unreused projection, and its
+  logical sample must cover the population used to claim the reuse ratio.
 
 Reuse reduces the capacity projection only when the measurement proves a
 complete physical-input fingerprint match, an independently published logical
-binding, and production-like observation for every claimed hit. The report is
-aggregate-only and rejects unknown input fields; it does not echo paths,
-identifiers, URLs, arbitrary JSON values, or exception text.
+binding, production-like observation, and audited activation for every claimed
+hit. The report is aggregate-only and rejects unknown input fields; it does not
+echo paths, target or client identifiers, URLs, arbitrary JSON values, or
+exception text.
 
 Exit status is `0` for a passing capacity gate, `1` for a completed gate
 failure, and `2` for invalid or unavailable evidence. A passing example proves

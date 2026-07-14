@@ -90,7 +90,7 @@ total is not yet known; a false `total_is_exact` marks `total` and
 | Automatic candidate audit orchestration | Implemented in repository | The generic `ptg-candidate-audit` job resolves one validated candidate, leases and verifies retained inputs, runs the release audit, records the attestation, and atomically promotes the exact predecessor. |
 | Class-specific cold first-page p95 <= 40 ms | Pending release measurement | Fresh API processes, distinct keys, and complete first-page observations measured separately for matched-positive, negative, and deterministic-random requests. |
 | Unique large import in 10-15 minutes | Pending dev measurement | Complete fresh build, logged PostgreSQL publication, audit, seal, and resource report. |
-| 2,000 imports/month | Gate implemented; measurement pending | `ptg2_v3_capacity_gate.py` requires observed arrival shape, qualified reuse, retries, concurrent API load, GC, storage, scratch, and PostgreSQL headroom. |
+| 2,000 imports/month | Schema-v2 gate implemented; measurement pending | `ptg2_v3_capacity_gate.py` requires 30 qualifying large builds, reuse and audited-activation timing, separate audit lanes and HTTP cost, seven-day peak shape, 30-minute import/API contention, class-specific cold p95, zero errors, and fixed resource headroom. |
 
 There is no accepted dev large-import proof for the strict architecture yet.
 Do not promote the target or a projection to a measured result.
@@ -191,18 +191,21 @@ without partial success.
 
 ## Large Import Gate
 
-The target is 10 to 15 minutes end-to-end for one unique large physical build.
+The target is 10 to 15 minutes end-to-end for a unique large physical build.
 The timer starts before source processing and ends only after durable
-PostgreSQL publication, persisted audit creation, sealing, logical binding, and
-pointer publication complete.
+PostgreSQL publication, persisted audit creation, sealing, candidate-audit
+queueing and execution, attestation, exact-predecessor pointer activation, and
+cleanup complete. A release capacity claim requires at least 30 such builds;
+one successful build is diagnostic evidence only.
 
 A qualifying dev measurement must:
 
-1. Use the exact release scanner/finalizer and migrated schema intended for
-   deployment.
+1. Use capacity schema version 2 and collect at least 30 representative large
+   builds with the exact release scanner/finalizer and migrated schema intended
+   for deployment.
 2. Select a complete representative input set without diagnostic truncation.
-3. Force a fresh physical semantic fingerprint; record reuse-only logical
-   publication as a different workload.
+3. Force a fresh physical semantic fingerprint for every qualifying build;
+   collect at least 30 reuse-only durations as a different workload.
 4. Use logged durable shared relations and the normal PostgreSQL transaction
    path.
 5. Exercise bounded temporary scratch and prove cleanup after completion.
@@ -211,12 +214,14 @@ A qualifying dev measurement must:
    occurrences, 2,500 pseudo-random complete pricing requests, at least 3,000
    observed standard-API HTTP requests, and 500 negative checks by default with
    a hard minimum of 250.
-8. Submit the report while it is fresh, attest the exact sealed sample and
-   source set, and consume that receipt through exact-predecessor activation.
+8. Collect at least 30 successful candidate audits with zero errors. Record
+   audit lane count and availability, duration, queue age, at least 3,000 HTTP
+   requests per activation, attestation, and exact-predecessor activation.
 9. Start fresh API processes and pass cold first-page p95 <= 40 ms separately
    for matched-positive, negative, and deterministic-random requests.
-10. Record enough resource data to determine whether the result can coexist
-   with other imports and serving traffic.
+10. Run at least 30 minutes of simultaneous configured import lanes,
+    candidate-audit lanes, and normal API traffic. Record enough resource data
+    to prove coexistence rather than extrapolating from tiny positive load.
 
 The report must separate at least these stages:
 
@@ -228,11 +233,13 @@ The report must separate at least these stages:
 - price and graph publication;
 - persisted audit generation;
 - mapping validation and seal;
-- logical binding and pointer cutover; and
+- candidate-audit queue wait and audit execution;
+- attestation, logical binding, and exact-predecessor pointer cutover; and
 - scratch cleanup.
 
-Also record peak process memory, peak temporary bytes, PostgreSQL relation and
-index bytes, WAL bytes, database CPU and I/O, connection usage, row/block
+Also record peak process memory, peak scratch and PostgreSQL temporary bytes,
+PostgreSQL relation and index bytes, WAL bytes, database CPU and I/O,
+connection and pool-wait usage, checkpoint time, autovacuum workers, row/block
 counts, retry count, and GC candidates created. Redact source names, plan and
 snapshot identifiers, URLs, paths, target addresses, credentials, and exact
 client-specific source sizes from durable reports.
@@ -277,38 +284,65 @@ artifact-set, or scanner identity change must miss preflight reuse.
 
 Use a 30-day month for comparable arithmetic. With no reuse:
 
-| Unique-build time | Build hours/month | One-lane utilization | Theoretical one-lane maximum |
+| Build-lane time | Build hours/month | One-lane utilization | Theoretical one-lane maximum |
 | --- | ---: | ---: | ---: |
 | 10 minutes | 333.3 | 46.3% | 4,320/month |
 | 15 minutes | 500.0 | 69.4% | 2,880/month |
 
-These are steady-state compute bounds, not an operations plan. At the
-15-minute target, one lane has only 30.6 percent time headroom before accounting
-for burstiness, retries, deployment drains, database maintenance, audits, or
-GC. Queueing delay grows quickly as utilization approaches the theoretical
-limit.
+These are steady-state build-lane bounds, not an operations plan or an
+end-to-end latency claim. At 15 minutes, one lane has only 30.6 percent time
+headroom before burstiness, retries, deployment drains, database maintenance,
+or GC. Candidate audits consume separately configured lanes, while their queue
+age, execution, and activation durations still count toward end-to-end import
+latency.
 
 Let `U` be the observed fraction of logical imports that require a unique
-physical build. Approximate monthly build hours as:
+physical build. The gate calculates build-lane and audit-lane hours separately:
 
 ```text
-2,000 * U * measured_unique_build_minutes / 60
+build_lane_hours = 2,000 * (
+    U * retry_adjusted_unique_build_minutes
+    + (1 - U) * reuse_only_minutes
+) / 60
+
+audit_lane_hours = 2,000 * (
+    candidate_audit_minutes + activation_minutes
+) / 60
 ```
 
-Do not assume a reuse discount until production-like fingerprints demonstrate
-it. Track both logical-import throughput and unique-layout throughput.
+Queue age consumes end-to-end latency but not lane service time. Do not assume
+a reuse discount until production-like fingerprints and audited activation
+demonstrate it. Track logical-import, unique-layout, and audited-activation
+throughput.
 
-Capacity tests must include:
+Schema-v2 release evidence uses these fixed representativeness policies:
 
-- peak and sustained arrival rates, not only monthly averages;
-- the measured physical-reuse hit rate and reuse lookup overhead;
-- retry and failed-build rates;
-- scratch capacity per concurrent unique build;
-- PostgreSQL COPY, WAL, checkpoint, storage, vacuum, I/O, and connection
-  headroom under concurrent imports and API traffic;
-- release-audit API load and duration;
-- shared-block growth after content-addressed deduplication; and
-- layout release plus bounded block-sweep throughput.
+- At least 30 fully qualifying representative large builds, 30 reuse-only
+  samples, and 30 successful candidate audits. All candidate-audit and API
+  error counts are zero.
+- Candidate-audit queue age and import queue delay are each at most 30 minutes;
+  import and audit lane utilization are at most 70 percent.
+- At least 30 non-overlapping peak windows of at least 30 minutes span at least
+  seven days. The observed peak meets the target's prorated average and both
+  import and audit demand fit the fixed queue SLOs.
+- Simultaneous configured build lanes, audit lanes, and API traffic run for at
+  least 30 minutes with at least 3,000 requests and 1 request/second. Audit load
+  also covers 3,000 HTTP calls per active audit within measured audit duration.
+- Fresh-process cold first-page p95 is at most 40 ms independently for at
+  least 100 matched-positive, 250 negative, and 2,500 deterministic-random
+  samples. At least 100 matched-positive keys are distinct.
+- PostgreSQL pool wait covers the combined normal and candidate-audit request
+  rate over the contention interval with p95 at most 10 ms, maximum at most 100
+  ms, and no timeout. At least two non-requested checkpoints complete.
+- Connections, COPY/write, WAL, checkpoint time, PostgreSQL temp, autovacuum
+  workers, scratch, and GC throughput retain at least 20 percent headroom.
+- GC spans at least 24 hourly cycles and 30 eligible/deleted layouts with no
+  overlap or reference-check failure. Storage and backlog projections fit
+  their declared retention and reserve bounds.
+
+The report also retains the measured reuse hit rate, retry and failed-build
+work, shared-block growth after content-addressed deduplication, and bounded
+layout release/block-sweep throughput.
 
 Adding worker lanes is acceptable only while PostgreSQL and scratch stay within
 measured limits and the API keeps the cold first-page gate. A scheduler should

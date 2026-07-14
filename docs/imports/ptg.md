@@ -394,9 +394,12 @@ redacted report contract and invocation.
 ## Performance And Capacity Gates
 
 The target for a new, unique large physical build is 10 to 15 minutes
-end-to-end, including durable PostgreSQL publication and sealing. Reuse-only
-logical publication is measured separately and cannot be used to satisfy that
-target.
+end-to-end. The timer starts before source processing and ends only after
+durable PostgreSQL publication and sealing, candidate-audit queueing and
+execution, attestation, exact-predecessor pointer activation, and cleanup.
+Reuse-only logical publication is measured separately and cannot be used to
+satisfy the fresh-build target, but its nonzero duration is charged to the
+reuse-adjusted capacity projection.
 
 Current status: **the large-import measured gate is pending**. Repository unit
 and integration coverage establish architecture behavior, but there is not yet
@@ -404,28 +407,54 @@ accepted dev evidence for a complete large import under this strict contract.
 Do not cite historical runs from another layout or an incomplete measurement
 as proof.
 
-A qualifying measurement must use the deployed release scanner and schema,
+A qualifying measurement uses capacity schema version 2 and at least 30 unique
+large builds. Every build must use the deployed release scanner and schema,
 logged durable relations, a fresh physical fingerprint, complete source
 coverage, bounded scratch, persisted audit publication, and the release audit
-floors above. Record end-to-end and stage time, peak memory and scratch,
-PostgreSQL bytes/WAL/I/O/connections, reuse status, GC impact, and cold
-first-page latency.
+floors above. The same report needs at least 30 reuse-only timing samples and
+30 successful candidate-audit samples. Record build, reuse, audit queue, audit,
+activation, and cleanup durations separately.
 
 For 2,000 logical imports per 30-day month:
 
-- At 10 minutes per unique build, the unreused workload is about 333 worker
-  hours per month and 46 percent of one continuously available lane.
-- At 15 minutes per unique build, it is 500 worker hours and 69 percent of one
-  continuously available lane.
-- One lane therefore has little burst, retry, maintenance, and audit headroom
-  near the 15-minute bound even though its theoretical steady-state capacity is
-  2,880 builds per 30-day month.
+- At 10 minutes of build-lane work per unique build, the unreused workload is
+  about 333 worker hours per month and 46 percent of one continuously available
+  build lane.
+- At 15 minutes of build-lane work per unique build, it is 500 worker hours and
+  69 percent of one continuously available build lane. A passing end-to-end
+  15-minute measurement necessarily leaves less than 15 minutes for that build
+  stage because audit queueing, audit, and activation are included.
+- One build lane therefore has little burst, retry, and maintenance headroom
+  near that bound even though its theoretical steady-state capacity is 2,880
+  builds per 30-day month. Candidate audits use separately measured lanes and
+  availability, and every logical activation consumes at least 3,000 standard
+  API HTTP calls, or 6,000,000 calls at the monthly objective.
 - Physical reuse reduces build work only when the complete-set fingerprint
   matches. Capacity models must measure the reuse hit rate and keep an
   unreused scenario.
 - Concurrent lanes multiply peak scratch, database connections, COPY traffic,
   WAL, I/O, and GC demand. Increase concurrency only from measured database
   headroom, not from CPU count alone.
+
+Peak-arrival evidence must contain at least 30 non-overlapping windows of at
+least 30 minutes over at least seven days. Maximum import queue delay and
+candidate-audit queue age are each fixed at 30 minutes. Both build/reuse demand
+and audit demand must fit those SLOs; an observed low queue age does not expand
+capacity.
+
+The contention run lasts at least 30 minutes with every configured build and
+audit lane active. It includes at least 3,000 requests and 1 request/second of
+normal API traffic plus the calculated 3,000-request-per-audit rate. It must
+use fresh API processes, at least 100 distinct matched-positive keys, and
+separate error-free cold p95 measurements at or below 40 ms for
+matched-positive, negative, and deterministic-random requests.
+
+Release evidence also includes pool wait, checkpoints, PostgreSQL temp space,
+autovacuum, scratch, and GC. Connection, write, WAL, checkpoint time,
+PostgreSQL temp, autovacuum workers, scratch, and GC throughput each retain at
+least 20 percent headroom under the contention profile. GC covers at least 24
+hourly cycles and 30 eligible/deleted layouts; positivity alone is not capacity
+evidence.
 
 ## Immutable Replacement And GC
 
@@ -478,6 +507,10 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
   hard minimum of 250.
 - Cold first-page p95 is at or below 40 ms separately for matched-positive,
   negative, and deterministic-random requests.
+- The schema-v2 monthly capacity report passes with at least 30 qualifying
+  large builds, 30 reuse-only samples, 30 successful candidate audits, the
+  seven-day peak profile, the 30-minute contention run, and all fixed resource
+  headroom gates.
 - A claimed 10-to-15-minute large import is backed by a current complete
   measured report; until then the gate remains pending.
 - Replacement and rollback bindings are retained as intended, and GC dry-run
