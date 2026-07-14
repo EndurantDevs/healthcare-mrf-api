@@ -806,7 +806,7 @@ async def test_stamp_address_keys_clamps_concurrency_to_db_pool(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_restore_missing_zip_from_tiger_zcta_uses_unique_state_checked_point_match(monkeypatch):
+async def test_tiger_zip_restore_checks_state(monkeypatch):
     """Coordinate ZIP restoration requires one state-consistent ZCTA match."""
     statements = []
     progress = []
@@ -1278,7 +1278,7 @@ async def test_latest_provider_directory_partial_scope_returns_scope_sources(mon
     assert scope_sources == ["resource_rows"]
 
 
-def test_entity_address_unified_stage_index_name_is_hash_safe_for_long_names():
+def test_stage_index_name_hash_safety():
     first = entity_address_unified._stage_index_name(
         "provider_location_codex_member_partial_smokefull_member_coverage",
         "npi",
@@ -1396,7 +1396,7 @@ def test_entity_address_unified_mrf_source_borrows_arrays_from_primary_npi_addre
     assert "a.address_key::uuid AS address_key" in mrf_source
 
 
-def test_entity_address_unified_nppes_source_does_not_restore_missing_zip_from_archive():
+def test_nppes_missing_zip_stays_missing():
     selects = entity_address_unified._source_selects(
         "mrf",
         {

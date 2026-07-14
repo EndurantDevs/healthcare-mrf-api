@@ -1210,7 +1210,7 @@ async def test_get_pricing_provider_score_live_override_path():
 
 
 @pytest.mark.asyncio
-async def test_get_pricing_provider_score_live_override_all_modes_when_benchmark_not_forced():
+async def test_live_score_override_all_modes():
     """Apply live overrides across modes when no benchmark is forced."""
     request = make_request(
         [

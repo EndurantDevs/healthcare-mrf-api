@@ -829,7 +829,7 @@ def test_lease_release_removes_marker_and_starts_unleased_grace(tmp_path):
     assert not list((root / ".retention" / "unleased").glob("*.json"))
 
 
-def test_one_shared_lease_release_does_not_start_grace_while_another_is_live(tmp_path):
+def test_live_shared_lease_prevents_grace(tmp_path):
     root = tmp_path / "artifacts"
     store = PTG2ArtifactStore(root)
     raw_path = _make_file(store.artifact_path("a1" * 32), b"shared")

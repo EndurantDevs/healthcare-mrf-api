@@ -4866,6 +4866,101 @@ def test_molina_quota_response_is_deferred_without_reclassifying_generic_403():
     ) is False
 
 
+def test_molina_200_quota_is_deferred():
+    current_time = datetime.datetime(2026, 7, 11, 23, 51, tzinfo=datetime.UTC)
+    quota_payload_dict = {
+        "resourceType": "OperationOutcome",
+        "issue": [
+            {
+                "diagnostics": (
+                    "Out of call volume quota. Quota will be replenished in "
+                    "00:09:00."
+                )
+            }
+        ],
+    }
+    molina_source_lookup = {
+        "source_id": "molina",
+        "api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE,
+    }
+    request_url = (
+        f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_count=100&cursorMark=opaque"
+    )
+
+    fetch_result = importer._source_fetch_result_with_payload_error(
+        molina_source_lookup,
+        request_url,
+        (200, quota_payload_dict, None, 7),
+    )
+
+    assert importer._classify_http(
+        200,
+        None,
+        quota_payload_dict,
+        provider_directory_source=molina_source_lookup,
+    ) == "quota_exhausted"
+    assert fetch_result == (
+        200,
+        quota_payload_dict,
+        importer.SOURCE_QUOTA_EXHAUSTED_ERROR,
+        7,
+    )
+    assert importer._molina_quota_retry_not_before(
+        molina_source_lookup,
+        fetch_result[0],
+        fetch_result[1],
+        now_utc=current_time,
+    ) == "2026-07-12T00:01:00Z"
+
+
+def test_generic_200_quota_text_is_unchanged():
+    quota_payload_dict = {
+        "resourceType": "OperationOutcome",
+        "issue": [{"diagnostics": "Out of call volume quota."}],
+    }
+
+    generic_fetch_result = importer._source_fetch_result_with_payload_error(
+        {"source_id": "other", "api_base": "https://payer.example/fhir"},
+        "https://payer.example/fhir/Practitioner?page=2",
+        (200, quota_payload_dict, None, 7),
+    )
+    assert generic_fetch_result == (200, quota_payload_dict, None, 7)
+
+
+def test_non_bundle_backoff_is_bounded():
+    current_time = datetime.datetime(2026, 7, 12, 12, 0, tzinfo=datetime.UTC)
+    checkpoint_context = importer.PaginationCheckpointContext(
+        canonical_api_base=importer.CIGNA_PROVIDER_DIRECTORY_BASE,
+        source_scope_hash="scope_a",
+        source_ids=("source_a",),
+        owner_run_id="run_retry",
+        retry_of_run_id="run_original",
+        acquisition_root_run_id="run_original",
+        dataset_id="dataset_a",
+        lineage_verified=True,
+    )
+    response_payload_dict = {
+        "resourceType": "OperationOutcome",
+        importer.SOURCE_RETRY_AFTER_FIELD: "3600",
+    }
+
+    assert importer._checkpoint_non_bundle_retry_not_before(
+        checkpoint_context,
+        True,
+        200,
+        response_payload_dict,
+        now_utc=current_time,
+    ) == "2026-07-12T12:10:00Z"
+    assert importer._checkpoint_non_bundle_retry_not_before(
+        checkpoint_context,
+        False,
+        200,
+        response_payload_dict,
+        now_utc=current_time,
+    ) is None
+
+
 def test_molina_quota_selects_later_uncapped_reset():
     current_time = datetime.datetime(2026, 7, 11, 19, 0, tzinfo=datetime.UTC)
     quota_payload_dict = {
@@ -16272,6 +16367,27 @@ def _cigna_checkpoint_source():
     }
 
 
+def _molina_checkpoint_source():
+    return {
+        "source_id": "molina",
+        "api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE,
+    }
+
+
+def _molina_checkpoint_context():
+    return importer.PaginationCheckpointContext(
+        canonical_api_base=importer.MOLINA_PROVIDER_DIRECTORY_BASE,
+        source_scope_hash="molina_scope",
+        source_ids=("molina",),
+        owner_run_id="run_retry",
+        retry_of_run_id="run_original",
+        acquisition_root_run_id="run_original",
+        dataset_id="dataset_molina",
+        lineage_verified=True,
+    )
+
+
 def _cigna_checkpoint_context(
     owner_run_id: str,
     retry_of_run_id: str | None = None,
@@ -17002,6 +17118,89 @@ async def test_fetch_resource_rows_resumes_exact_checkpoint_url(monkeypatch):
     assert saved_checkpoints[0]["next_url"] is None
     assert saved_checkpoints[0]["pages_processed"] == 8
     assert saved_checkpoints[0]["rows_processed"] == 701
+
+
+def _non_bundle_checkpoint_callbacks(resume_url):
+    saved_checkpoints: list[dict[str, Any]] = []
+
+    async def load_checkpoint(_context, _resource_type, _start_url):
+        return importer.PaginationResumeState(
+            next_url=resume_url,
+            pages_processed=3057,
+            rows_processed=305700,
+            recent_url_hashes=(),
+            resumed=True,
+        )
+
+    async def fetch_source_json(_source, request_url, *, timeout):
+        assert request_url == resume_url
+        assert timeout == 3
+        return (
+            200,
+            {
+                "resourceType": "OperationOutcome",
+                "issue": [{"diagnostics": "Temporary upstream response"}],
+            },
+            None,
+            5,
+        )
+
+    async def save_checkpoint(_context, _resource_type, **checkpoint_values):
+        saved_checkpoints.append(checkpoint_values)
+
+    return saved_checkpoints, load_checkpoint, fetch_source_json, save_checkpoint
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_non_bundle_preserves_cursor(monkeypatch):
+    resume_url = (
+        f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/OrganizationAffiliation?"
+        "_count=100&cursorMark=opaque"
+    )
+    (
+        saved_checkpoints,
+        load_checkpoint,
+        fetch_source_json,
+        save_checkpoint,
+    ) = _non_bundle_checkpoint_callbacks(resume_url)
+
+    clear_checkpoint = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        load_checkpoint,
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
+    monkeypatch.setattr(
+        importer,
+        "_clear_checkpoint_dataset_resource_type",
+        clear_checkpoint,
+    )
+
+    fetch_result = await importer._fetch_resource_rows(
+        _molina_checkpoint_source(),
+        "OrganizationAffiliation",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=AsyncMock(return_value=0),
+        row_batch_size=1000,
+        retain_rows=False,
+        pagination_checkpoint=_molina_checkpoint_context(),
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error == "non_bundle_payload"
+    assert fetch_result.pages_fetched == 3057
+    assert fetch_result.rows_fetched == 305700
+    assert fetch_result.next_url_remaining is True
+    assert fetch_result.retry_not_before is not None
+    assert saved_checkpoints == []
+    clear_checkpoint.assert_not_awaited()
 
 
 def _cooldown_checkpoint_callbacks(resume_url, responses):

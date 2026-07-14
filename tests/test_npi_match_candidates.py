@@ -212,7 +212,7 @@ def test_match_candidate_query_keeps_explicit_taxonomy_scope_restrictive():
     assert "t.npi = COALESCE(a.npi, a.inferred_npi)" in candidate_locations_sql
 
 
-def test_match_candidate_query_uses_indexable_geo_bbox_when_geo_is_only_locator():
+def test_geo_only_locator_uses_bbox():
     params = {
         "address_site_key": None,
         "address_key": None,

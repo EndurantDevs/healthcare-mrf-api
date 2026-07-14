@@ -51,7 +51,7 @@ def test_dev_deploy_workflow_requires_successful_ci_for_exact_main_sha():
     assert "run.conclusion === 'success'" in workflow
 
 
-def test_ptg_strict_v3_cutover_readiness_requires_all_pointers_and_idle_imports():
+def test_cutover_requires_idle_valid_pointers():
     module = _load_script("ptg2_strict_v3_cutover_ready")
     statements = []
 
@@ -92,7 +92,7 @@ def test_ptg_strict_v3_cutover_readiness_requires_all_pointers_and_idle_imports(
     assert "jsonb_typeof(snapshot.manifest_jsonb" in statements[0]
 
 
-def test_ptg_strict_v3_cutover_readiness_fails_for_legacy_pointer_or_active_run():
+def test_cutover_rejects_legacy_or_active():
     module = _load_script("ptg2_strict_v3_cutover_ready")
 
     class Executor:

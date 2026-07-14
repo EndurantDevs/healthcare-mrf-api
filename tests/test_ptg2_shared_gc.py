@@ -549,7 +549,7 @@ async def test_layout_release_rechecks_binding_after_lock_selection():
 
 
 @pytest.mark.asyncio
-async def test_dry_run_reports_layout_candidates_bytes_and_exact_sweep_hashes_without_mutation():
+async def test_dry_run_keeps_sweep_immutable():
     executor = _SharedGCExecutor()
     queued_hash = _hash(11)
     sweep_hash = _hash(12)

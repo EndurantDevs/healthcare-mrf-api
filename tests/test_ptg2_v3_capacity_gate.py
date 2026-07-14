@@ -94,7 +94,7 @@ def test_unreused_2000_month_arithmetic_at_10m_and_15m(minutes, expected_hours):
     assert _gate_map(report)["unique_build_duration"] is True
 
 
-def test_one_lane_15m_is_below_70_percent_only_at_full_availability():
+def test_one_lane_capacity_threshold():
     record = _without_retry(_record())
     record["unique_build"]["p95_minutes"] = 15
     record["unique_build"]["max_minutes"] = 15

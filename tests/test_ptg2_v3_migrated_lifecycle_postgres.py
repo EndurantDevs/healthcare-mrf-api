@@ -691,7 +691,7 @@ async def _snapshot_state(snapshot_id: str) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_strict_v3_migrated_postgres_lifecycle_is_cache_free_and_fail_closed(
+async def test_v3_lifecycle_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

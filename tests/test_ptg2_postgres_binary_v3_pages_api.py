@@ -40,7 +40,7 @@ def _source_vector(source_keys, source_count):
     return bytes(encoded)
 
 
-def test_v3_v4_and_s2_pages_decode_row_aligned_source_keys():
+def test_page_decodes_aligned_source_keys():
     forward_payload = b"".join(
         [
             _page_header(2, 2),
@@ -88,7 +88,7 @@ def test_v3_v4_and_s2_pages_decode_row_aligned_source_keys():
     ]
 
 
-def test_v3_v4_page_rejects_manifest_source_count_mismatch_and_trailing_bytes():
+def test_page_rejects_bad_source_layout():
     payload = b"".join(
         [
             _page_header(2, 1),

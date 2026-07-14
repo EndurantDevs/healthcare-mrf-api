@@ -930,7 +930,7 @@ async def test_refresh_mrf_address_summary_defers_source_array_indexes(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_refresh_mrf_address_summary_defers_all_address_indexes_when_ingest_skips_aggregate(monkeypatch):
+async def test_skipped_aggregate_defers_address_indexes(monkeypatch):
     statements = []
 
     class FakeSession:

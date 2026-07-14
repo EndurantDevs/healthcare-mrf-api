@@ -815,10 +815,10 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
     async def fake_create_indexes(table_name, schema):
         seen["create_indexes"] = (schema, table_name)
 
-    async def fake_refresh_archive_geocodes_from_openaddresses_sharded(**_kwargs):
+    async def fake_refresh_archive_geocodes_sharded(**_kwargs):
         return openaddresses.OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
 
-    async def fake_restore_openaddresses_zip5_from_tiger_zcta(**_kwargs):
+    async def fake_restore_zip5_from_tiger(**_kwargs):
         return openaddresses.OpenAddressesZipRestoreStats()
 
     class FakeTransaction:
@@ -849,12 +849,12 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
     monkeypatch.setattr(
         openaddresses,
         "refresh_archive_geocodes_from_openaddresses_sharded",
-        fake_refresh_archive_geocodes_from_openaddresses_sharded,
+        fake_refresh_archive_geocodes_sharded,
     )
     monkeypatch.setattr(
         openaddresses,
         "restore_openaddresses_zip5_from_tiger_zcta",
-        fake_restore_openaddresses_zip5_from_tiger_zcta,
+        fake_restore_zip5_from_tiger,
     )
     monkeypatch.setattr(openaddresses, "db", FakeDb())
     monkeypatch.setattr(openaddresses, "print_time_info", lambda _started_at: None)

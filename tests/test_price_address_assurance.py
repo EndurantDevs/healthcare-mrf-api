@@ -117,7 +117,7 @@ def test_price_address_assurance_accepts_network_name_provider_directory_address
     assert summary["issues"] == []
 
 
-def test_price_address_assurance_rejects_network_name_proof_that_does_not_match_served_network():
+def test_network_name_proof_must_match():
     payload = {
         "data": {
             "items": [
@@ -842,7 +842,7 @@ def test_price_address_assurance_schema_mode_rejects_false_displayed_address_wit
     )
 
 
-def test_price_address_assurance_schema_mode_rejects_false_displayed_address_with_phone_only():
+def test_phone_only_cannot_display_address():
     payload = {
         "data": {
             "items": [
@@ -1420,7 +1420,7 @@ def test_price_address_assurance_report_exposes_raw_displayable_location_fields(
     assert report["raw_artifacts"][0]["provider_groups_with_displayable_location_fields"] == 1
 
 
-def test_source_file_version_ids_from_ptg_payload_extracts_nested_source_trace_ids():
+def test_ptg_payload_extracts_trace_ids():
     payload = {
         "data": {
             "items": [

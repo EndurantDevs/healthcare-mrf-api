@@ -231,7 +231,7 @@ def test_audit_tic_provider_location_evidence_scans_fhir_address_line_arrays(tmp
     ]
 
 
-def test_audit_tic_provider_location_evidence_falls_back_for_small_json_without_ijson(monkeypatch, tmp_path):
+def test_small_json_uses_fallback(monkeypatch, tmp_path):
     artifact = tmp_path / "rates.json"
     _write_json(
         artifact,
@@ -261,7 +261,7 @@ def test_audit_tic_provider_location_evidence_falls_back_for_small_json_without_
     assert summary["address_field_paths"]["address.city"] == 1
 
 
-def test_audit_tic_provider_location_evidence_keeps_phone_only_separate_from_displayable_address(tmp_path):
+def test_phone_only_evidence_stays_separate(tmp_path):
     artifact = tmp_path / "rates.json"
     _write_json(
         artifact,
