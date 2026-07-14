@@ -75,6 +75,7 @@ WRITE_BATCH_SIZE = max(
 HTTP_TOTAL_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_HTTP_TIMEOUT", "300")), 1)
 HTTP_READ_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_READ_TIMEOUT", "120")), 1)
 DEFAULT_FILE_PROBE_TYPES = ("in-network", "allowed-amounts")
+DISCOVERY_CATALOG_EXPORT_VERSION = 1
 USER_AGENT = "HealthPorta mrf-source-discovery/1.0"
 BROWSER_FALLBACK_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -14266,6 +14267,7 @@ def _discovery_control_metrics(
     bytes_streamed: int = 0,
 ) -> dict[str, Any]:
     return {
+        "catalog_export_version": DISCOVERY_CATALOG_EXPORT_VERSION,
         "crawl_run_id": crawl_run_id,
         "crawl_status": crawl_status,
         "run_mode": run_mode,
