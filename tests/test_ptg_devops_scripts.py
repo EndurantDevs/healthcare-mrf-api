@@ -53,9 +53,11 @@ def test_dev_deploy_workflow_requires_successful_ci_for_exact_main_sha():
 
 def test_ptg_strict_v3_cutover_readiness_requires_all_pointers_and_idle_imports():
     module = _load_script("ptg2_strict_v3_cutover_ready")
+    statements = []
 
     class Executor:
         async def all(self, statement):
+            statements.append(statement)
             if "WITH pointers AS" in statement:
                 return [
                     {
@@ -86,6 +88,8 @@ def test_ptg_strict_v3_cutover_readiness_requires_all_pointers_and_idle_imports(
     assert result["ready"] is True
     assert result["pointer_count"] == 7
     assert not any(result["failure_counts"].values())
+    assert "manifest::jsonb AS manifest_jsonb" in statements[0]
+    assert "jsonb_typeof(snapshot.manifest_jsonb" in statements[0]
 
 
 def test_ptg_strict_v3_cutover_readiness_fails_for_legacy_pointer_or_active_run():

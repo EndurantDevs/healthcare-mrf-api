@@ -59,26 +59,29 @@ async def collect_cutover_readiness(
             SELECT pointer.snapshot_id,
                    snapshot.snapshot_id IS NOT NULL AS snapshot_exists,
                    snapshot.status = 'published' AS snapshot_published,
-                   COALESCE(snapshot.manifest->'serving_index'->>'arch_version', '')
+                   COALESCE(snapshot.manifest_jsonb->'serving_index'->>'arch_version', '')
                        = 'postgres_binary_v3' AS manifest_arch_valid,
-                   COALESCE(snapshot.manifest->'serving_index'->>'storage_generation', '')
+                   COALESCE(snapshot.manifest_jsonb->'serving_index'->>'storage_generation', '')
                        = 'shared_blocks_v3' AS manifest_generation_valid,
-                   jsonb_typeof(snapshot.manifest->'serving_index'->'source_set')
+                   jsonb_typeof(snapshot.manifest_jsonb->'serving_index'->'source_set')
                        = 'object' AS source_set_sealed,
-                   jsonb_typeof(snapshot.manifest->'serving_index'->'audit_sample')
+                   jsonb_typeof(snapshot.manifest_jsonb->'serving_index'->'audit_sample')
                        = 'object' AS audit_sample_sealed,
                    binding.snapshot_id IS NOT NULL AS binding_exists,
                    layout.state = 'sealed' AS layout_sealed,
                    layout.generation = 'shared_blocks_v3' AS layout_generation_valid,
                    CASE
-                       WHEN snapshot.manifest->'serving_index'->>'shared_snapshot_key'
+                       WHEN snapshot.manifest_jsonb->'serving_index'->>'shared_snapshot_key'
                             ~ '^[1-9][0-9]*$'
-                       THEN (snapshot.manifest->'serving_index'->>'shared_snapshot_key')::bigint
+                       THEN (snapshot.manifest_jsonb->'serving_index'->>'shared_snapshot_key')::bigint
                             = binding.snapshot_key
                        ELSE FALSE
                    END AS manifest_binding_matches
               FROM pointers AS pointer
-              LEFT JOIN {schema}.ptg2_snapshot AS snapshot
+              LEFT JOIN (
+                    SELECT snapshot_id, status, manifest::jsonb AS manifest_jsonb
+                      FROM {schema}.ptg2_snapshot
+              ) AS snapshot
                 ON snapshot.snapshot_id = pointer.snapshot_id
               LEFT JOIN {schema}.ptg2_v3_snapshot_binding AS binding
                 ON binding.snapshot_id = pointer.snapshot_id
