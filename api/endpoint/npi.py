@@ -6912,6 +6912,7 @@ def _replace_stale_geo_provider_directory_evidence(
     """Remove serving-row FHIR evidence before exact current corroboration."""
     for candidate_row in candidate_row_list:
         candidate_row.pop(PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY, None)
+        candidate_row["source_count"] = 0
         candidate_row["source_record_ids"] = [
             record_id
             for record_id in _merge_unique_list_values(
@@ -6965,6 +6966,9 @@ async def _attach_geo_candidate_record_ids(
         )
         record_ids = record_ids_by_candidate.get(candidate_key)
         if record_ids:
+            candidate_row["source_count"] = len(
+                _provider_directory_source_ids_from_record_ids(record_ids)
+            )
             candidate_row["source_record_ids"] = _merge_unique_list_values(
                 candidate_row.get("source_record_ids"), record_ids
             )
