@@ -35,6 +35,7 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
     )
 
     async def archive_index(index_name: str) -> str:
+        """Move a live index name aside before publishing its replacement."""
         archived_name = _archived_identifier(index_name)
         await db.status(f"DROP INDEX IF EXISTS {schema}.{archived_name};")
         await db.status(f"ALTER INDEX IF EXISTS {schema}.{index_name} RENAME TO {archived_name};")

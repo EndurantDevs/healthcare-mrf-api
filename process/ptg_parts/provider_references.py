@@ -91,6 +91,7 @@ async def _process_provider_reference_file(
     import_run_id: str | None = None,
     keep_partial_artifacts: bool | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
+    """Materialize one provider-reference artifact and return grouped providers."""
     provider_cls = classes["PTGProviderGroup"]
     file_cls = classes["PTGFile"]
     import_log_cls = classes["ImportLog"]

@@ -17,12 +17,14 @@ ALEMBIC_INI = BASE_DIR / 'alembic.ini'
 
 @click.group()
 def db_group():
-    pass
+    """Group database migration commands under the CLI entrypoint."""
+    return None
 
 
 @click.command(help="Downgrade to revision")
 @click.option("-r", help="Revision", default="-1")
 def downgrade(r):
+    """Downgrade the database by the requested revision count."""
     alembic_cfg = Config(ALEMBIC_INI)
     make_downgrade(alembic_cfg, r)
 
@@ -30,6 +32,7 @@ def downgrade(r):
 @click.command(help="Apply migrations")
 @click.option("-r", help="Revision (head by default)", default="head")
 def migrate(r):
+    """Upgrade the database to the requested revision."""
     alembic_cfg = Config(ALEMBIC_INI)
     upgrade(alembic_cfg, r)
 
@@ -37,6 +40,7 @@ def migrate(r):
 @click.command(help="Auto generate migrations")
 @click.option("-m", help="Migration message", required=True)
 def generate(m):
+    """Generate a migration revision with the supplied message."""
     alembic_cfg = Config(ALEMBIC_INI)
     revision_kwargs = {'autogenerate': True}
     if m is not None:
@@ -46,12 +50,14 @@ def generate(m):
 
 @click.command(help="List changeset scripts in chronological order")
 def history():
+    """Print the available database migration history."""
     alembic_cfg = Config(ALEMBIC_INI)
     show_history(alembic_cfg)
 
 
 @click.command(help="Show current revision")
 def current():
+    """Print the database's current migration revision."""
     alembic_cfg = Config(ALEMBIC_INI)
     show_current(alembic_cfg)
 

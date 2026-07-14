@@ -21,14 +21,17 @@ from process.ptg_parts.domain import PTG2_MONEY_KEYS, PTG2_SET_LIKE_KEYS, PTG2_S
 
 
 def sha256_bytes(value: bytes) -> str:
+    """Return the hexadecimal SHA-256 digest for raw bytes."""
     return hashlib.sha256(value).hexdigest()
 
 
 def hash_prefix(value: str, length: int = 16) -> str:
+    """Return a stable digest prefix for text."""
     return str(value)[:length]
 
 
 def normalize_money(value: Any) -> str | None:
+    """Normalize a monetary value to canonical decimal text."""
     if value is None:
         return None
     if isinstance(value, float):
@@ -56,6 +59,7 @@ def normalize_money(value: Any) -> str | None:
 
 
 def money_number(value: Any) -> int | float | None:
+    """Convert normalized money text to a numeric value."""
     try:
         normalized = normalize_money(value)
     except (TypeError, ValueError, InvalidOperation):
@@ -68,6 +72,7 @@ def money_number(value: Any) -> int | float | None:
 
 
 def normalize_date(value: Any) -> str | None:
+    """Normalize supported date values to ISO text."""
     if value is None:
         return None
     if isinstance(value, datetime.datetime):
@@ -82,7 +87,7 @@ def normalize_date(value: Any) -> str | None:
         try:
             return datetime.date.fromisoformat(candidate).isoformat()
         except ValueError:
-            pass
+            candidate = ""
     try:
         parsed = parse_date(text)
     except (ValueError, TypeError) as exc:

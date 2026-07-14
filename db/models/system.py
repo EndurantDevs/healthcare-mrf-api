@@ -43,6 +43,7 @@ __all__ = (
     "ProviderDirectoryDatasetAffiliationOrganization",
     "ProviderDirectoryDatasetInsurancePlan",
     "ProviderDirectoryDatasetNetworkPlan",
+    "ProviderDirectoryDatasetRehydrationCheckpoint",
     "ProviderDirectoryDatasetResource",
     "ProviderDirectoryEndpoint",
     "ProviderDirectoryEndpointDataset",
@@ -1162,6 +1163,47 @@ class ProviderDirectorySourceResource(Base, JSONOutputMixin):
     last_seen_run_id = Column(String(64))
     observed_at = Column(TIMESTAMP)
     updated_at = Column(TIMESTAMP)
+
+
+class ProviderDirectoryDatasetRehydrationCheckpoint(Base, JSONOutputMixin):
+    """Durable, scope-fenced progress for retained-dataset rehydration."""
+
+    __tablename__ = "provider_directory_dataset_rehydration_checkpoint"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "source_id", "dataset_id", "acquisition_root_run_id", "resource_type"
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = [
+        "source_id", "dataset_id", "acquisition_root_run_id", "resource_type"
+    ]
+    __my_additional_indexes__ = [
+        {"index_elements": ("owner_run_id",), "name": "pd_dataset_rehydrate_checkpoint_owner_idx"},
+        {"index_elements": ("state", "updated_at"), "name": "pd_dataset_rehydrate_checkpoint_state_idx"},
+        {"index_elements": ("dataset_id",), "name": "pd_dataset_rehydrate_checkpoint_dataset_idx"},
+    ]
+
+    source_id = Column(String(64), ForeignKey(ProviderDirectorySource.source_id), nullable=False)
+    dataset_id = Column(String(96), ForeignKey(ProviderDirectoryEndpointDataset.dataset_id), nullable=False)
+    acquisition_root_run_id = Column(String(64), nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    endpoint_id = Column(String(64), ForeignKey(ProviderDirectoryAPIEndpoint.endpoint_id), nullable=False)
+    dataset_hash = Column(String(64), nullable=False)
+    owner_run_id = Column(String(64), nullable=False)
+    state = Column(String(32), nullable=False)
+    last_resource_id = Column(String(256))
+    expected_input_count = Column(BigInteger, nullable=False, default=0)
+    input_count = Column(BigInteger, nullable=False, default=0)
+    mapped_count = Column(BigInteger, nullable=False, default=0)
+    rejected_count = Column(BigInteger, nullable=False, default=0)
+    evidence_json = Column(JSON, nullable=False, default=dict)
+    error = Column(TEXT)
+    created_at = Column(TIMESTAMP, nullable=False)
+    started_at = Column(TIMESTAMP, nullable=False)
+    updated_at = Column(TIMESTAMP, nullable=False)
+    completed_at = Column(TIMESTAMP)
 
 
 class ProviderDirectoryBulkAcquisitionCheckpoint(Base, JSONOutputMixin):

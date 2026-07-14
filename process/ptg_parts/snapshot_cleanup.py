@@ -330,6 +330,7 @@ async def _missing_snapshot_serving_resources(
     snapshot_id: str,
     serving_index: dict[str, Any],
 ) -> tuple[list[str], list[str]]:
+    """Return missing serving resources and contract errors for a snapshot."""
     arch_version = str(serving_index.get("arch_version") or "").strip().lower()
     storage_generation = (
         str(serving_index.get("storage_generation") or "").strip().lower()

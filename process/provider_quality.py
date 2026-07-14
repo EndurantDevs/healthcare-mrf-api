@@ -558,6 +558,7 @@ def _extract_qpp_score(row: dict[str, Any], *keys: str) -> float | None:
 
 
 async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mode: bool) -> None:
+    """Load normalized QPP provider rows from one source artifact."""
     rows: list[dict[str, Any]] = []
     accepted = 0
     progress_start = time.monotonic()
@@ -661,6 +662,7 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
 
 
 async def _load_svi_rows(path: str, svi_cls: type, reporting_year: int, test_mode: bool) -> None:
+    """Load normalized social-vulnerability rows from one source artifact."""
     rows: list[dict[str, Any]] = []
     accepted = 0
     skipped_missing_zcta = 0
@@ -801,6 +803,7 @@ async def _materialize_quality_rows_cohort(classes: dict[str, type], schema: str
             **shard_params,
         )
 async def _materialize_quality_rows(classes: dict[str, type], schema: str, run_id: str) -> None:
+    """Materialize provider-quality rows using the configured cohort mode."""
     if PROVIDER_QUALITY_COHORT_ENABLED and _cohort_models_present(classes):
         await _materialize_quality_rows_cohort(classes, schema, run_id)
         return
@@ -1592,6 +1595,7 @@ async def _materialize_quality_rows_sharded(
     test_mode: bool,
     manifest: dict[str, Any],
 ) -> None:
+    """Materialize provider-quality rows through resumable shard phases."""
     years = _materialize_reporting_years(manifest)
     await _ensure_provider_quality_rx_agg_table(classes, schema, years)
     context = await _build_cohort_materialization_context(classes, schema)
@@ -1707,6 +1711,7 @@ async def _materialize_quality_rows_sharded(
 
 
 async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwargs: Any) -> dict[str, Any]:
+    """Prepare a provider-quality run and enqueue its source chunks."""
     task = task or {}
     test_mode = bool(task.get("test_mode", False))
     import_id_val = _normalize_import_id(task.get("import_id"))
@@ -1897,6 +1902,7 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
 
 
 async def provider_quality_process_chunk(ctx, task: dict[str, Any] | None = None, **_kwargs: Any) -> dict[str, Any]:
+    """Load one provider-quality source chunk into staging tables."""
     task = task or {}
     dataset_key = str(task.get("dataset_key") or "")
     chunk_id = str(task.get("chunk_id") or "")
@@ -1947,6 +1953,7 @@ async def provider_quality_process_chunk(ctx, task: dict[str, Any] | None = None
 
 
 async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_kwargs: Any) -> dict[str, Any]:
+    """Finalize, validate, and publish a provider-quality run."""
     task = task or {}
     import_id_val = _normalize_import_id(task.get("import_id"))
     run_id = str(task.get("run_id") or "")
@@ -2095,6 +2102,7 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
 
 
 async def main(test_mode: bool = False, import_id: str | None = None) -> dict[str, Any]:
+    """Queue a provider-quality import and return its run identity."""
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
     run_id = _normalize_run_id(None)
     payload = {
@@ -2130,6 +2138,7 @@ async def finish_main(
     test_mode: bool = False,
     manifest_path: str | None = None,
 ) -> dict[str, Any]:
+    """Queue finalization for an existing provider-quality run."""
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
     stage_suffix = _build_stage_suffix(_normalize_import_id(import_id), run_id)
     payload = {
