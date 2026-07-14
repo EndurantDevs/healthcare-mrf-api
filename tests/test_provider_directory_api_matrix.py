@@ -84,14 +84,29 @@ def _candidate_payload() -> dict:
 
 
 class MatrixClient:
-    def __init__(self, *, endpoint_id: str = "endpoint-1", latency_ms: float = 1.0):
+    def __init__(
+        self,
+        *,
+        endpoint_id: str = "endpoint-1",
+        latency_ms: float = 1.0,
+        geo_source_present: bool = True,
+    ):
         self.endpoint_id = endpoint_id
         self.latency_ms = latency_ms
+        self.geo_source_present = geo_source_present
         self.calls = []
 
     def get_json(self, path, params):
         self.calls.append((path, dict(params)))
-        payload = _candidate_payload() if path.endswith("match-candidates") else _build_detail_response(endpoint_id=self.endpoint_id)
+        is_candidate_request = path.endswith("match-candidates")
+        is_geo_request = is_candidate_request and "lat" in params
+        payload = (
+            {"data": {"candidates": [{"npi": 1234567890}]}}
+            if is_geo_request and not self.geo_source_present
+            else _candidate_payload()
+            if is_candidate_request
+            else _build_detail_response(endpoint_id=self.endpoint_id)
+        )
         return support.HttpResult(200, self.latency_ms, payload)
 
 
@@ -158,6 +173,27 @@ def test_matrix_fails_when_profile_provenance_does_not_match_current_dataset():
     assert result["status"] == "fail"
     assert checks["F"]["reason"] == "profile_fact_evidence_not_found"
     assert checks["V"]["reason"] == "exact_profile_provenance_not_found"
+
+
+def test_matrix_labels_missing_geo_candidate_provenance():
+    result = support.evaluate_source(
+        _selection(),
+        [_build_overlay_sample()],
+        MatrixClient(geo_source_present=False),
+        support.SourceEvaluationContext(5, 40.0),
+        expected_provenance=PROVENANCE,
+    )
+
+    checks = result["verification_matrix"][0]
+    assert result["status"] == "fail"
+    assert {checks[code]["state"] for code in ("A", "P", "F", "V")} == {
+        "pass"
+    }
+    assert checks["G"] == {
+        "state": "fail",
+        "reason": "exact_geo_provenance_not_found",
+        "geo_match_candidates": {"status_code": 200, "latency_ms": 1.0},
+    }
 
 
 def test_matrix_marks_missing_overlay_inputs_without_silent_passes():

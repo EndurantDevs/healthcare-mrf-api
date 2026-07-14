@@ -6078,6 +6078,48 @@ def _match_candidate_column_sql(address_table_sql: str) -> dict[str, str]:
     }
 
 
+def _current_provider_directory_geo_evidence_sql() -> str:
+    """Return exact current-overlay provenance for bounded geo candidates."""
+    source_table = _schema_cache_key("provider_directory_source")
+    dataset_table = _schema_cache_key("provider_directory_endpoint_dataset")
+    overlay_table = _schema_cache_key("provider_directory_address_overlay")
+    return f"""
+        WITH requested_candidates AS MATERIALIZED (
+            SELECT requested.npi, requested.address_key
+              FROM unnest(
+                       CAST(:candidate_npis AS bigint[]),
+                       CAST(:candidate_address_keys AS uuid[])
+                   ) AS requested(npi, address_key)
+        ), current_provider_directory_runs AS MATERIALIZED (
+            SELECT source.source_id,
+                   COALESCE(
+                       dataset.acquisition_root_run_id, dataset.import_run_id
+                   )::varchar AS run_id
+              FROM {source_table} AS source
+              JOIN {dataset_table} AS dataset
+                ON dataset.endpoint_id = source.endpoint_id
+             WHERE dataset.is_current IS TRUE
+               AND dataset.status = 'published'
+               AND dataset.published_at IS NOT NULL
+               AND dataset.superseded_at IS NULL
+        )
+        SELECT requested.npi, requested.address_key::text AS address_key,
+               ARRAY_AGG(
+                   DISTINCT overlay.source_record_id
+                   ORDER BY overlay.source_record_id
+               ) AS source_record_ids
+          FROM requested_candidates AS requested
+          JOIN {overlay_table} AS overlay
+            ON overlay.npi = requested.npi
+           AND overlay.address_key = requested.address_key
+          JOIN current_provider_directory_runs AS current_run
+            ON current_run.source_id = overlay.source_id
+           AND current_run.run_id = overlay.last_seen_run_id
+         WHERE overlay.source_record_id IS NOT NULL
+      GROUP BY requested.npi, requested.address_key;
+    """
+
+
 def _match_candidate_taxonomy_filter_sql(
     params: dict[str, Any],
     query_params: dict[str, Any],
@@ -6812,11 +6854,72 @@ async def _attach_match_candidate_source_details(
     """Attach compact FHIR provenance without expanding role evidence."""
     if not (params.get("include_sources") or params.get("include_evidence")):
         return
+    await _attach_geo_candidate_record_ids(
+        rows,
+        params,
+        database_session=session,
+    )
     await _attach_provider_directory_source_details(
         rows,
         include_role_evidence=False,
         session=session,
     )
+
+
+def _geo_candidate_address_pairs(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[tuple[int, str]]:
+    candidate_pairs: list[tuple[int, str]] = []
+    for row in rows:
+        npi_value = row.get("npi")
+        address_key = str(row.get("address_key") or "").strip()
+        if npi_value is None or not address_key:
+            continue
+        candidate_pair = (int(npi_value), address_key)
+        if candidate_pair not in candidate_pairs:
+            candidate_pairs.append(candidate_pair)
+    return candidate_pairs
+
+
+async def _attach_geo_candidate_record_ids(
+    candidate_row_list: list[dict[str, Any]],
+    candidate_params: Mapping[str, Any],
+    *,
+    database_session: Any = None,
+) -> None:
+    """Corroborate bounded geo rows with exact current overlay evidence."""
+    if candidate_params.get("lat") is None or candidate_params.get("long") is None:
+        return
+    candidate_pairs = _geo_candidate_address_pairs(candidate_row_list)
+    if not candidate_pairs:
+        return
+    evidence_result = await _execute_stmt(
+        text(_current_provider_directory_geo_evidence_sql()),
+        session=database_session,
+        params={
+            "candidate_npis": [npi for npi, _address_key in candidate_pairs],
+            "candidate_address_keys": [
+                address_key for _npi, address_key in candidate_pairs
+            ],
+        },
+    )
+    record_ids_by_candidate = {
+        (int(mapping["npi"]), str(mapping["address_key"])): mapping[
+            "source_record_ids"
+        ]
+        for evidence_row in evidence_result.all()
+        for mapping in [getattr(evidence_row, "_mapping", evidence_row)]
+    }
+    for candidate_row in candidate_row_list:
+        candidate_key = (
+            int(candidate_row["npi"]),
+            str(candidate_row.get("address_key") or ""),
+        )
+        record_ids = record_ids_by_candidate.get(candidate_key)
+        if record_ids:
+            candidate_row["source_record_ids"] = _merge_unique_list_values(
+                candidate_row.get("source_record_ids"), record_ids
+            )
 
 
 @blueprint.get("/match-candidates")

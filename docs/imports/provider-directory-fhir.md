@@ -448,6 +448,13 @@ aliases. Profile-fact evidence additionally requires a source-backed FHIR
 verified through the existing typed witness checks when those resources are
 applicable.
 
+Geo candidate provenance is corroborated by exact `(npi, address_key)` matches
+against address-overlay rows from current published Provider Directory runs.
+This preserves source attribution when the coordinates are served by a
+canonical base row, such as an NPPES address, while a Provider Directory row
+confirms the same provider and canonical address. Stale overlays and matches
+that share only coordinates are not accepted as provenance.
+
 Resource applicability is data-driven. The profile specification maps each
 source to its FHIR resource profile, so a source that does not support
 `OrganizationAffiliation` is reported as not applicable rather than treated as

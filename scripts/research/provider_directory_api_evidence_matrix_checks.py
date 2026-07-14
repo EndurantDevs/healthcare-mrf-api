@@ -163,10 +163,12 @@ def _phone_check(sample: OverlaySample, sample_check: Mapping[str, Any]) -> dict
 def _geo_check(geo_check: Mapping[str, Any] | None) -> dict[str, Any]:
     if geo_check is None:
         return _check_state("missing_data", reason="current_overlay_coordinates_not_found")
+    source_present = bool(geo_check["geo_source_present"])
     return _check_state(
         "pass"
-        if geo_check["geo_source_present"] and geo_check["geo_within_latency_slo"]
+        if source_present and geo_check["geo_within_latency_slo"]
         else "fail",
+        reason=None if source_present else "exact_geo_provenance_not_found",
         request_summary={"geo_match_candidates": geo_check["geo_match_candidates"]},
     )
 
