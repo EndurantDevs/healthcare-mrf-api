@@ -29,6 +29,9 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     )
     assert "OAuth2 client credentials | Bulk" in rendered_document
     assert "Cigna (`cigna`) | Acquisition-configured | None | REST" in rendered_document
+    assert "CareSource (`caresource`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint" in rendered_document
+    assert "same-origin opaque _page/_searchId next links across two 100-row pages" in rendered_document
+    assert "No product membership is inferred from the catalog row" in rendered_document
     assert "_count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets" in rendered_document
     assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://" in rendered_document
     assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Probe | None configured" in rendered_document
@@ -37,11 +40,11 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "clears plan_name and does not claim NH product membership" in rendered_document
     assert "Exhaustive equivalence with plan-code bases" in rendered_document
     assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 15 |" in rendered_document
+    assert "| Acquisition-configured | 16 |" in rendered_document
     assert "| Externally supported | 1 |" in rendered_document
     assert "| Probe-only | 12 |" in rendered_document
     assert "| Known not importable | 3 |" in rendered_document
-    assert "| Total tracked | 31 |" in rendered_document
+    assert "| Total tracked | 32 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required" in rendered_document
     assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Required" in rendered_document
@@ -63,6 +66,35 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "Territory of Puerto Rico" in rendered_document
     assert "User token | Required" in rendered_document
     assert "[campaign report]" not in rendered_document
+
+
+def test_caresource_manifest_entry_is_public_carrier_level_r8_rest_support():
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    entry = next(item for item in manifest["entries"] if item["entry_id"] == "caresource")
+    support = manifest["support_documentation"]["entry_support"]["caresource"]
+
+    assert entry["owner_id"] == "caresource-provider-directory"
+    assert entry["source_ids"] == ["pdfhir_b627b38e07cae99151baa4b7"]
+    assert entry["canonical_base"] == (
+        "https://orchestrateserver.caresource.careevolution.com/"
+        "api/fhir/provider-directory"
+    )
+    assert entry["classification"] == "acquisition"
+    assert entry["resource_profile"] == "R8"
+    assert entry["resources"] == [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint",
+    ]
+    assert support["access_requirement"] == "none"
+    assert support["requires_registration"] is False
+    assert support["method"] == "rest"
+    assert "No product membership is inferred" in support["limitation"]
 
 
 def test_rendered_live_proof_summarizes_resource_rows():

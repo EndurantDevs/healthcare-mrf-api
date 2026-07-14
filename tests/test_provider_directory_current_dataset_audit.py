@@ -17,8 +17,13 @@ def test_current_dataset_audit_renders_separately_from_acquisition_support():
     )
 
     assert "## Current Published Dataset Audit" in rendered_document
+    assert "Audit as of `2026-07-14`" in rendered_document
     assert "Molina (`molina`) | No current dataset | - | Not applicable" in rendered_document
     assert "Texas TMHP (`texas-tmhp`) | Current published (`pdds_87113f97f3f9...`) | 782,642 | Not proven" in rendered_document
+    assert "CareSource (`caresource`) | No current dataset | - | Not proven" in rendered_document
+    assert "exhaustive acquisition and downstream proof are pending" in rendered_document
+    assert "No product membership is inferred" in rendered_document
+    assert "Humana Carrier Directory (`humana`) | Current published (`pdds_97a8b36ca361...`) | 16,140,342 | Not proven" in rendered_document
     assert "ALOHR (`alohr`) | Current published (`pdds_085b7d2da6de...`) | 319,384 | Contract/live mismatch" in rendered_document
     assert "Aetna Commercial and Medicare (`aetna-commercial-medicare`)" in rendered_document
 

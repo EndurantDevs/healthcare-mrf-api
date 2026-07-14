@@ -937,6 +937,12 @@
       },
       "terminal_status": "succeeded"
     },
+    "caresource": {
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "run_id": null,
+      "terminal_status": null
+    },
     "centene": {
       "access_verification": "not_recorded",
       "checked_at": null,
