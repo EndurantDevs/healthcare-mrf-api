@@ -96,7 +96,7 @@ async def test_checksum_bridge_primary_key_is_checksum_only():
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_pub28_backed():
+async def test_address_sql_is_parallel_safe():
     """Verify address canonical sql functions are immutable parallel safe and pub28 backed."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")

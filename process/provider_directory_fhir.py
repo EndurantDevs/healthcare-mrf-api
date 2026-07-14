@@ -15190,10 +15190,18 @@ def _is_molina_quota_response(
     api_base = _canonical_base(
         source_record.get("canonical_api_base") or source_record.get("api_base")
     )
+    if (
+        api_base != MOLINA_PROVIDER_DIRECTORY_BASE
+        or not _is_call_volume_quota_payload(fhir_payload)
+    ):
+        return False
+    if status_code == 403:
+        return True
+    if status_code != 200 or not isinstance(fhir_payload, dict):
+        return False
     return bool(
-        api_base == MOLINA_PROVIDER_DIRECTORY_BASE
-        and status_code == 403
-        and _is_call_volume_quota_payload(fhir_payload)
+        fhir_payload.get("resourceType") == "OperationOutcome"
+        or str(fhir_payload.get("statusCode") or "").strip() == "403"
     )
 
 
@@ -15207,12 +15215,12 @@ def _classify_http(status_code: int | None, error: str | None, payload: dict[str
         if "name or service not known" in lower or "getaddrinfo" in lower:
             return "dns_failure"
         return "unreachable"
+    if provider_directory_source and _is_molina_quota_response(provider_directory_source, status_code, payload):
+        return "quota_exhausted"
     if status_code == 200:
         if payload and payload.get("resourceType") == "CapabilityStatement":
             return "valid"
         return "valid_non_fhir"
-    if provider_directory_source and _is_molina_quota_response(provider_directory_source, status_code, payload):
-        return "quota_exhausted"
     if status_code in {401, 403}:
         return "auth_required"
     if status_code == 404:
@@ -15580,6 +15588,35 @@ def _transient_source_retry_not_before(
     )
     current_time = now_utc or datetime.datetime.now(datetime.UTC)
     retry_at = current_time + datetime.timedelta(seconds=math.ceil(delay_seconds))
+    return retry_at.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _checkpoint_non_bundle_retry_not_before(
+    checkpoint_context: PaginationCheckpointContext | None,
+    is_continuation: bool,
+    status_code: int | None,
+    response_payload: dict[str, Any] | None,
+    *,
+    now_utc: datetime.datetime | None = None,
+) -> str | None:
+    """Return a bounded defer time for an invalid checkpoint continuation."""
+    if (
+        checkpoint_context is None
+        or not is_continuation
+        or status_code != 200
+        or _is_bundle_payload(response_payload)
+    ):
+        return None
+    retry_delay_seconds = _source_retry_after_seconds(
+        response_payload,
+        now_utc=now_utc,
+    )
+    if retry_delay_seconds is None:
+        retry_delay_seconds = float(SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS)
+    current_time = now_utc or datetime.datetime.now(datetime.UTC)
+    retry_at = current_time + datetime.timedelta(
+        seconds=math.ceil(retry_delay_seconds)
+    )
     return retry_at.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
@@ -23663,6 +23700,25 @@ async def _fetch_resource_rows(
                     or cooldown_result.deadline_blocked
                 )
             status_code, response_payload, error, _elapsed = page_fetch_result
+            is_checkpoint_continuation = bool(
+                checkpoint_context
+                and (
+                    pages > 0
+                    or (resume_state is not None and resume_state.resumed)
+                    or (
+                        checkpoint_start_url is not None
+                        and url != checkpoint_start_url
+                    )
+                )
+            )
+            checkpoint_non_bundle_retry_at = (
+                _checkpoint_non_bundle_retry_not_before(
+                    checkpoint_context,
+                    is_checkpoint_continuation,
+                    status_code,
+                    response_payload,
+                )
+            )
             if status_code != 200 or error:
                 if (
                     checkpoint_context
@@ -23705,7 +23761,7 @@ async def _fetch_resource_rows(
                     response_payload,
                     error,
                     retry_count=int((fetch_diagnostic or {}).get("retry_count") or 0),
-                )
+                ) or checkpoint_non_bundle_retry_at
                 current_error = error or f"http_{status_code}"
                 if is_partitioned_fetch:
                     partition_error_count += 1
@@ -23715,6 +23771,7 @@ async def _fetch_resource_rows(
                 error_message = current_error
                 break
             if not _is_bundle_payload(response_payload):
+                retry_not_before = checkpoint_non_bundle_retry_at
                 if is_partitioned_fetch:
                     partition_error_count += 1
                     error_message = f"partition_errors_{partition_error_count}_last_non_bundle_payload"

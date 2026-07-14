@@ -208,7 +208,7 @@ def test_provider_directory_coverage_audit_endpoint_discovery_classifier():
     )
 
 
-def test_provider_directory_coverage_audit_source_sample_retains_portal_url_without_api_base():
+def test_source_sample_keeps_portal_url():
     sample = audit._credential_source_sample(
         {
             "source_id": "pdfhir_uhc",
@@ -1396,7 +1396,7 @@ async def test_provider_directory_coverage_audit_ptg_summary_fast_probe_uses_est
     }
 
 
-def test_provider_directory_coverage_audit_ptg_network_overlap_sql_uses_serving_network_names():
+def test_overlap_uses_serving_network_names():
     sql = audit._ptg_network_name_overlap_cte_sql("mrf", ptg_plan_filter="AND plan_ids.plan_id = $1")
 
     assert '"mrf"."provider_directory_address_corroboration"' in sql
@@ -1662,7 +1662,7 @@ def test_provider_directory_coverage_audit_serving_readiness_respects_pod_safe_s
     assert checks["searchable_phone_overlay"]["required"] is False
 
 
-def test_provider_directory_coverage_audit_serving_readiness_uses_resource_summary_when_pod_safe():
+def test_readiness_uses_resource_summary():
     summary = audit._serving_readiness_summary(
         {
             "source_summary": {
@@ -1825,7 +1825,7 @@ def test_provider_directory_coverage_audit_main_can_gate_serving_readiness(monke
     assert "Provider Directory serving readiness gate failed" in captured.err
 
 
-def test_provider_directory_coverage_audit_plan_network_context_sql_uses_ref_bearing_resources():
+def test_plan_context_uses_ref_resources():
     sql = audit._plan_network_context_cte_sql("mrf")
 
     assert '"mrf"."provider_directory_insurance_plan"' in sql
@@ -1943,7 +1943,7 @@ def test_provider_directory_coverage_audit_markdown_includes_network_catalog():
     assert "| Issuer A | 2 | 7 | 3 | 2 | 2 | Choice Network, PPO |" in markdown
 
 
-def test_provider_directory_coverage_audit_gaps_when_requested_plan_has_no_ptg_rows():
+def test_empty_plan_rows_create_gap():
     report = {
         "ptg_plan_filter": "TESTPLAN001",
         "ptg_summary": {
@@ -2008,7 +2008,7 @@ def test_provider_directory_coverage_audit_suppresses_network_corroboration_gap_
     assert audit._derive_gaps(report) == []
 
 
-def test_provider_directory_coverage_audit_gaps_for_missing_unified_source_ids_and_numeric_country():
+def test_gaps_include_missing_source_country():
     report = {
         "unified_summary": {
             "available": True,
@@ -2298,7 +2298,7 @@ def test_provider_directory_coverage_audit_markdown_includes_plan_network_contex
     assert "| Example Payer | 8 | 4 | 3 | Choice, Premier |" in markdown
 
 
-def test_provider_directory_coverage_audit_markdown_includes_unified_source_id_and_country_counts():
+def test_markdown_includes_source_country_counts():
     """Verify provider directory coverage audit markdown includes unified source id and country counts."""
     markdown = audit.render_markdown(
         {
