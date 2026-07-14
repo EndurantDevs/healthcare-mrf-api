@@ -43,7 +43,9 @@ def _build_provenance_entry(**field_overrides) -> dict:
     return provenance_entry_dict
 
 
-def _build_detail_response(*, endpoint_id: str = "endpoint-1") -> dict:
+def _build_detail_response(
+    *, endpoint_id: str = "endpoint-1", detail_geo_present: bool = True
+) -> dict:
     source_provenance_dict = _build_provenance_entry(endpoint_id=endpoint_id)
     fact_evidence_dict = {
         **source_provenance_dict,
@@ -54,7 +56,12 @@ def _build_detail_response(*, endpoint_id: str = "endpoint-1") -> dict:
         "data": {
             "npi": {
                 "address_list": [
-                    {"provider_directory_sources": [_source_summary()]}
+                    {
+                        "address_key": ADDRESS_KEY,
+                        "lat": 40.0 if detail_geo_present else None,
+                        "long": -75.0 if detail_geo_present else None,
+                        "provider_directory_sources": [_source_summary()],
+                    }
                 ],
                 "provider_directory_profile": {"sources": [source_provenance_dict]},
                 "provider_directory_profile_evidence": {
@@ -70,28 +77,49 @@ def _build_detail_response(*, endpoint_id: str = "endpoint-1") -> dict:
     }
 
 
-def _candidate_payload() -> dict:
+def _candidate_payload(*, npi: int = 1234567890, count: int = 1) -> dict:
     return {
         "data": {
             "candidates": [
                 {
-                    "npi": 1234567890,
+                    "npi": npi + index,
                     "provider_directory_sources": [_source_summary()],
                 }
+                for index in range(count)
             ]
         }
     }
 
 
 class MatrixClient:
-    def __init__(self, *, endpoint_id: str = "endpoint-1", latency_ms: float = 1.0):
+    def __init__(
+        self,
+        *,
+        endpoint_id: str = "endpoint-1",
+        latency_ms: float = 1.0,
+        geo_candidate_present: bool = True,
+        detail_geo_present: bool = True,
+    ):
         self.endpoint_id = endpoint_id
         self.latency_ms = latency_ms
+        self.geo_candidate_present = geo_candidate_present
+        self.detail_geo_present = detail_geo_present
         self.calls = []
 
     def get_json(self, path, params):
         self.calls.append((path, dict(params)))
-        payload = _candidate_payload() if path.endswith("match-candidates") else _build_detail_response(endpoint_id=self.endpoint_id)
+        is_candidate_request = path.endswith("match-candidates")
+        is_geo_request = is_candidate_request and "lat" in params
+        payload = (
+            _candidate_payload(npi=9876543210, count=20)
+            if is_geo_request and not self.geo_candidate_present
+            else _candidate_payload()
+            if is_candidate_request
+            else _build_detail_response(
+                endpoint_id=self.endpoint_id,
+                detail_geo_present=self.detail_geo_present,
+            )
+        )
         return support.HttpResult(200, self.latency_ms, payload)
 
 
@@ -158,6 +186,48 @@ def test_matrix_fails_when_profile_provenance_does_not_match_current_dataset():
     assert result["status"] == "fail"
     assert checks["F"]["reason"] == "profile_fact_evidence_not_found"
     assert checks["V"]["reason"] == "exact_profile_provenance_not_found"
+
+
+def test_matrix_accepts_detail_geo_without_candidate():
+    result = support.evaluate_source(
+        _selection(),
+        [_build_overlay_sample()],
+        MatrixClient(geo_candidate_present=False),
+        support.SourceEvaluationContext(5, 40.0),
+        expected_provenance=PROVENANCE,
+    )
+
+    checks = result["verification_matrix"][0]
+    assert result["status"] == "pass"
+    assert {checks[code]["state"] for code in ("A", "P", "F", "V")} == {
+        "pass"
+    }
+    assert checks["G"] == {
+        "state": "pass",
+        "geo_match_candidates": {"status_code": 200, "latency_ms": 1.0},
+        "geo_candidate_source_present": False,
+        "geo_detail": {"status_code": 200, "latency_ms": 1.0},
+    }
+
+
+def test_matrix_fails_when_exact_detail_geo_is_missing():
+    result = support.evaluate_source(
+        _selection(),
+        [_build_overlay_sample()],
+        MatrixClient(detail_geo_present=False),
+        support.SourceEvaluationContext(5, 40.0),
+        expected_provenance=PROVENANCE,
+    )
+
+    checks = result["verification_matrix"][0]
+    assert result["status"] == "fail"
+    assert checks["G"] == {
+        "state": "fail",
+        "reason": "exact_geo_provenance_not_found",
+        "geo_match_candidates": {"status_code": 200, "latency_ms": 1.0},
+        "geo_candidate_source_present": True,
+        "geo_detail": {"status_code": 200, "latency_ms": 1.0},
+    }
 
 
 def test_matrix_marks_missing_overlay_inputs_without_silent_passes():
