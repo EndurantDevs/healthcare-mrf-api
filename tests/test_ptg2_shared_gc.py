@@ -20,9 +20,17 @@ def _hash(value: int) -> bytes:
     return bytes([value]) * 32
 
 
-def test_shared_schema_requires_scope_and_audit_occurrence_lifecycle_tables():
+def test_shared_schema_requires_all_migration_owned_lifecycle_tables():
     assert "ptg2_v3_snapshot_scope" in shared_gc._SHARED_TABLE_NAMES
     assert "ptg2_v3_snapshot_source" in shared_gc._SHARED_TABLE_NAMES
+    assert (
+        "ptg2_v3_candidate_audit_attestation"
+        in shared_gc.PTG2_V3_MIGRATION_OWNED_TABLE_NAMES
+    )
+    assert (
+        shared_gc._SHARED_TABLE_NAMES
+        == shared_gc.PTG2_V3_MIGRATION_OWNED_TABLE_NAMES
+    )
     assert "ptg2_v3_snapshot_scope" in snapshot_cleanup._STRICT_V3_SHARED_TABLE_NAMES
     assert "ptg2_v3_audit_occurrence" in shared_gc._SHARED_TABLE_NAMES
     assert "ptg2_v3_audit_occurrence" in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES
@@ -93,6 +101,13 @@ class _SharedGCExecutor:
     ) -> list[int]:
         eligible: list[int] = []
         for snapshot_key, layout in self.layouts.items():
+            selected_bindings = [
+                snapshot_id
+                for snapshot_id, bound_key in self.bindings.items()
+                if bound_key == snapshot_key and snapshot_id in removing_snapshot_ids
+            ]
+            if removing_snapshot_ids and not selected_bindings:
+                continue
             outside_bindings = [
                 snapshot_id
                 for snapshot_id, bound_key in self.bindings.items()
@@ -158,6 +173,15 @@ class _SharedGCExecutor:
                 building_max_age_seconds=int(params["building_max_age_seconds"]),
                 limit=int(params["layout_limit"]),
             )
+            if params.get("restrict_layout_keys"):
+                allowed_layout_keys = {
+                    int(value) for value in params.get("layout_keys", ())
+                }
+                layout_keys = [
+                    snapshot_key
+                    for snapshot_key in layout_keys
+                    if snapshot_key in allowed_layout_keys
+                ]
             return [{"snapshot_key": snapshot_key} for snapshot_key in layout_keys]
         if "WITH layout_batch AS MATERIALIZED" in statement:
             assert "GREATEST(" in statement
@@ -249,6 +273,79 @@ class _SharedGCExecutor:
                 self.candidates.pop(block_hash, None)
             return len(orphaned)
         raise AssertionError(statement)
+
+
+@pytest.mark.asyncio
+async def test_migration_preflight_requires_candidate_attestation_table():
+    executor = _SharedGCExecutor()
+    executor.present_tables.remove("ptg2_v3_candidate_audit_attestation")
+
+    with pytest.raises(
+        RuntimeError,
+        match="ptg2_v3_candidate_audit_attestation.*alembic upgrade head",
+    ):
+        await shared_gc.require_ptg2_v3_migration_owned_tables(executor, "mrf")
+    with pytest.raises(
+        RuntimeError,
+        match="complete shared schema.*ptg2_v3_candidate_audit_attestation",
+    ):
+        await shared_gc.build_ptg2_shared_layout_release_plan(
+            executor=executor,
+            require_shared=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_candidate_projection_excludes_unrelated_unbound_layouts():
+    executor = _SharedGCExecutor()
+    selected_hash = _hash(30)
+    unrelated_hash = _hash(31)
+    executor.add_layout(10)
+    executor.add_layout(20)
+    executor.add_block(selected_hash, 25)
+    executor.add_block(unrelated_hash, 1_000)
+    executor.map_block(10, selected_hash)
+    executor.map_block(20, unrelated_hash)
+    executor.bindings["selected-snapshot"] = 10
+
+    plan = await shared_gc.build_ptg2_shared_layout_release_plan(
+        executor=executor,
+        removing_snapshot_ids=("selected-snapshot",),
+        all_eligible_layouts=True,
+        require_shared=True,
+    )
+
+    assert plan == shared_gc.PTG2SharedLayoutGCStats(1, 1, 25)
+    statement, params = next(
+        call
+        for call in executor.calls
+        if "WITH eligible_layouts AS MATERIALIZED" in call[0]
+    )
+    assert "candidate_binding.snapshot_id" in statement
+    assert params["removing_snapshot_ids"] == ["selected-snapshot"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_release_is_limited_to_projected_layout_keys():
+    executor = _SharedGCExecutor()
+    selected_hash = _hash(32)
+    unrelated_hash = _hash(33)
+    executor.add_layout(10)
+    executor.add_layout(20)
+    executor.add_block(selected_hash, 25)
+    executor.add_block(unrelated_hash, 1_000)
+    executor.map_block(10, selected_hash)
+    executor.map_block(20, unrelated_hash)
+
+    released = await shared_gc.release_unbound_ptg2_shared_layouts(
+        executor=executor,
+        layout_keys=(10,),
+        require_shared=True,
+    )
+
+    assert released == shared_gc.PTG2SharedLayoutGCStats(1, 1, 25)
+    assert set(executor.layouts) == {20}
+    assert (20, unrelated_hash) in executor.mappings
 
 
 @pytest.mark.asyncio
@@ -541,6 +638,11 @@ async def test_normal_snapshot_cleanup_releases_shared_layouts(monkeypatch):
 async def test_source_snapshot_gc_does_not_project_unrelated_shared_layout_bytes():
     class _SourceGCExecutor:
         async def all(self, statement, **_params):
+            if "FROM information_schema.tables" in statement:
+                return [
+                    {"table_name": table_name}
+                    for table_name in shared_gc.PTG2_V3_MIGRATION_OWNED_TABLE_NAMES
+                ]
             if "SELECT DISTINCT snapshot_id" in statement:
                 return []
             if 'FROM "mrf".ptg2_snapshot' in statement:
@@ -557,6 +659,18 @@ async def test_source_snapshot_gc_does_not_project_unrelated_shared_layout_bytes
                         },
                     }
                 ]
+            if "WITH eligible_layouts AS MATERIALIZED" in statement:
+                assert "candidate_binding.snapshot_id" in statement
+                assert _params["removing_snapshot_ids"] == ["shared-old"]
+                # The selected layout is 25 bytes. A separate 1,000-byte
+                # unbound layout is deliberately outside this projection.
+                return [
+                    {
+                        "logical_layout_count": 1,
+                        "candidate_hash_count": 1,
+                        "stored_bytes": 25,
+                    }
+                ]
             raise AssertionError(statement)
 
     plan = await source_snapshot_gc.build_ptg2_source_snapshot_gc_plan(
@@ -564,16 +678,23 @@ async def test_source_snapshot_gc_does_not_project_unrelated_shared_layout_bytes
     )
 
     assert plan.shared_snapshot_ids == ("shared-old",)
-    assert plan.shared_layout_count == 0
-    assert plan.shared_candidate_hash_count == 0
-    assert plan.shared_stored_bytes == 0
-    assert plan.total_bytes == 0
+    assert plan.shared_layout_count == 1
+    assert plan.shared_candidate_hash_count == 1
+    assert plan.shared_stored_bytes == 25
+    assert plan.total_bytes == 25
     source_snapshot_gc.validate_ptg2_source_snapshot_gc_plan(
         plan,
         max_snapshots=10,
         max_tables=10,
-        max_bytes=0,
+        max_bytes=25,
     )
+    with pytest.raises(RuntimeError, match="candidate bytes 25"):
+        source_snapshot_gc.validate_ptg2_source_snapshot_gc_plan(
+            plan,
+            max_snapshots=10,
+            max_tables=10,
+            max_bytes=24,
+        )
 
 
 @pytest.mark.asyncio
@@ -582,6 +703,10 @@ async def test_source_snapshot_gc_releases_unbound_layout_in_same_transaction(mo
     state = {"connection": None}
 
     class _Connection:
+        async def all(self, statement, **_params):
+            assert "SELECT DISTINCT snapshot_key" in statement
+            return [{"snapshot_key": 10}]
+
         async def status(self, statement, **_params):
             if 'DELETE FROM "mrf".ptg2_v3_snapshot_binding' in statement:
                 events.append("binding-delete")
@@ -630,12 +755,17 @@ async def test_source_snapshot_gc_releases_unbound_layout_in_same_transaction(mo
         schema_name="mrf",
         executor=state["connection"],
         require_shared=True,
+        layout_keys=(10,),
     )
 
 
 @pytest.mark.asyncio
 async def test_source_snapshot_gc_skips_layout_release_without_deleted_binding(monkeypatch):
     class _Connection:
+        async def all(self, statement, **_params):
+            assert "SELECT DISTINCT snapshot_key" in statement
+            return [{"snapshot_key": 10}]
+
         async def status(self, statement, **_params):
             if 'DELETE FROM "mrf".ptg2_v3_snapshot_binding' in statement:
                 return 0
@@ -679,8 +809,8 @@ async def test_source_snapshot_gc_skips_layout_release_without_deleted_binding(m
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_release_and_sweep_sql():
-    """Exercise shared-layout release and block sweep SQL against PostgreSQL."""
+async def test_real_postgres_candidate_scoped_release_and_sweep_sql():
+    """Exercise candidate-scoped layout release and block sweep in PostgreSQL."""
 
     if os.getenv("HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST") != "1":
         pytest.skip("set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 for the isolated PostgreSQL test")
@@ -689,6 +819,7 @@ async def test_real_postgres_release_and_sweep_sql():
     schema_name = f"ptg2_shared_gc_test_{uuid.uuid4().hex}"
     schema = f'"{schema_name}"'
     block_hash = _hash(20)
+    unrelated_hash = _hash(21)
     await database.connect()
     try:
         async with database.acquire() as connection:
@@ -764,6 +895,9 @@ async def test_real_postgres_release_and_sweep_sql():
                 VALUES (
                     10, :generation, 'sealed', transaction_timestamp(),
                     transaction_timestamp(), NULL
+                ), (
+                    20, :generation, 'sealed', transaction_timestamp(),
+                    transaction_timestamp(), NULL
                 )
                 """,
                 generation=shared_gc.PTG2_V3_SHARED_GENERATION,
@@ -773,29 +907,60 @@ async def test_real_postgres_release_and_sweep_sql():
                     f"INSERT INTO {schema}.\"{table_name}\" (snapshot_key) VALUES (10)"
                 )
             await connection.status(
-                f"INSERT INTO {schema}.ptg2_v3_block (block_hash, stored_byte_count) VALUES (:block_hash, 25)",
-                block_hash=block_hash,
+                f"""
+                INSERT INTO {schema}.ptg2_snapshot (snapshot_id, manifest)
+                VALUES ('selected-snapshot', '{{}}'::jsonb)
+                """
             )
             await connection.status(
-                f"INSERT INTO {schema}.ptg2_v3_snapshot_block (snapshot_key, block_hash) VALUES (10, :block_hash)",
+                f"""
+                INSERT INTO {schema}.ptg2_v3_snapshot_binding
+                    (snapshot_id, snapshot_key)
+                VALUES ('selected-snapshot', 10)
+                """
+            )
+            await connection.status(
+                f"""
+                INSERT INTO {schema}.ptg2_v3_block
+                    (block_hash, stored_byte_count)
+                VALUES (:block_hash, 25), (:unrelated_hash, 1000)
+                """,
                 block_hash=block_hash,
+                unrelated_hash=unrelated_hash,
+            )
+            await connection.status(
+                f"""
+                INSERT INTO {schema}.ptg2_v3_snapshot_block
+                    (snapshot_key, block_hash)
+                VALUES (10, :block_hash), (20, :unrelated_hash)
+                """,
+                block_hash=block_hash,
+                unrelated_hash=unrelated_hash,
             )
 
         async with database.acquire() as connection:
             dry_run = await shared_gc.build_ptg2_shared_layout_release_plan(
                 schema_name=schema_name,
                 executor=connection,
+                removing_snapshot_ids=("selected-snapshot",),
                 all_eligible_layouts=True,
                 require_shared=True,
             )
         assert dry_run == shared_gc.PTG2SharedLayoutGCStats(1, 1, 25)
 
         async with database.acquire() as connection:
+            await connection.status(
+                f"""
+                DELETE FROM {schema}.ptg2_v3_snapshot_binding
+                 WHERE snapshot_id = 'selected-snapshot'
+                """
+            )
             released = await shared_gc.release_unbound_ptg2_shared_layouts(
                 schema_name=schema_name,
                 executor=connection,
                 grace_seconds=0,
                 require_shared=True,
+                layout_keys=(10,),
             )
         assert released == shared_gc.PTG2SharedLayoutGCStats(1, 1, 25)
 
@@ -811,10 +976,10 @@ async def test_real_postgres_release_and_sweep_sql():
         async with database.acquire() as connection:
             assert await connection.scalar(
                 f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_layout"
-            ) == 0
+            ) == 1
             assert await connection.scalar(
                 f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block"
-            ) == 0
+            ) == 1
             assert await connection.scalar(
                 f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate"
             ) == 0

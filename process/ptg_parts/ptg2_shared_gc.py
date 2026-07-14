@@ -30,7 +30,7 @@ PTG2_V3_BLOCK_GC_MAX_BYTES_DEFAULT = 80 * 1024 * 1024 * 1024
 PTG2_V3_LAYOUT_GC_BATCH_ROWS_DEFAULT = 400
 PTG2_V3_BLOCK_GC_MAX_ROWS_DEFAULT = 1_000
 
-_SHARED_TABLE_NAMES = (
+PTG2_V3_MIGRATION_OWNED_TABLE_NAMES = (
     "ptg2_v3_snapshot_layout",
     "ptg2_v3_layout_fingerprint",
     "ptg2_v3_snapshot_binding",
@@ -48,6 +48,9 @@ _SHARED_TABLE_NAMES = (
     "ptg2_v3_candidate_audit_attestation",
     "ptg2_v3_gc_candidate",
 )
+
+# Compatibility for cleanup callers and tests that predate explicit ownership.
+_SHARED_TABLE_NAMES = PTG2_V3_MIGRATION_OWNED_TABLE_NAMES
 
 
 @dataclass(frozen=True)
@@ -113,6 +116,63 @@ def _row_mapping(row: Any) -> dict[str, Any]:
     if isinstance(row, dict):
         return row
     return dict(getattr(row, "_mapping", row))
+
+
+def resolve_ptg2_schema(schema_name: str | None = None) -> str:
+    """Resolve the PTG schema with the same conflict rules as Alembic."""
+
+    if schema_name:
+        return str(schema_name)
+    runtime_schema = os.getenv("HLTHPRT_DB_SCHEMA")
+    legacy_schema = os.getenv("DB_SCHEMA")
+    if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
+        raise RuntimeError(
+            "DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema"
+        )
+    return runtime_schema or legacy_schema or "mrf"
+
+
+async def missing_ptg2_v3_migration_owned_tables(
+    executor: Any,
+    schema_name: str,
+) -> tuple[str, ...]:
+    """Return strict V3 tables that must have been created by Alembic."""
+
+    rows = await executor.all(
+        """
+        SELECT table_name
+          FROM information_schema.tables
+         WHERE table_schema = :schema_name
+           AND table_name = ANY(CAST(:table_names AS text[]))
+        """,
+        schema_name=schema_name,
+        table_names=list(PTG2_V3_MIGRATION_OWNED_TABLE_NAMES),
+    )
+    present = {
+        str(_row_mapping(row).get("table_name") or "")
+        for row in rows
+        if _row_mapping(row).get("table_name")
+    }
+    return tuple(
+        sorted(set(PTG2_V3_MIGRATION_OWNED_TABLE_NAMES) - present)
+    )
+
+
+async def require_ptg2_v3_migration_owned_tables(
+    executor: Any,
+    schema_name: str,
+) -> None:
+    """Fail before runtime DDL or cleanup when the V3 migration is absent."""
+
+    missing = await missing_ptg2_v3_migration_owned_tables(
+        executor,
+        schema_name,
+    )
+    if missing:
+        raise RuntimeError(
+            "PTG V3 migration-owned tables are missing from schema "
+            f"{schema_name}: {', '.join(missing)}; run alembic upgrade head"
+        )
 
 
 def _env_non_negative_int(name: str, default: int) -> int:
@@ -310,6 +370,17 @@ def _layout_plan_sql(schema_name: str) -> str:
                             )
                        )
                )
+               AND (
+                    cardinality(CAST(:removing_snapshot_ids AS varchar[])) = 0
+                    OR EXISTS (
+                        SELECT 1
+                          FROM {schema}.ptg2_v3_snapshot_binding AS candidate_binding
+                         WHERE candidate_binding.snapshot_key = layout.snapshot_key
+                           AND candidate_binding.snapshot_id = ANY(
+                                CAST(:removing_snapshot_ids AS varchar[])
+                           )
+                    )
+               )
              ORDER BY layout.created_at, layout.snapshot_key
              LIMIT :layout_limit
         ),
@@ -363,7 +434,7 @@ async def build_ptg2_shared_layout_release_plan(
 ) -> PTG2SharedLayoutGCStats:
     """Plan layout release without reading block payloads or changing state."""
 
-    schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema(schema_name)
     executor = executor or db
     if not await _shared_tables_available(
         executor,
@@ -386,6 +457,10 @@ def _lock_layouts_sql(schema_name: str) -> str:
         SELECT layout.snapshot_key
           FROM {schema}.ptg2_v3_snapshot_layout AS layout
          WHERE layout.generation = ANY(CAST(:cleanup_generations AS text[]))
+           AND (
+                NOT :restrict_layout_keys
+                OR layout.snapshot_key = ANY(CAST(:layout_keys AS bigint[]))
+           )
            AND NOT EXISTS (
                 SELECT 1
                   FROM {schema}.ptg2_v3_snapshot_binding AS binding
@@ -514,12 +589,15 @@ async def _release_layouts_ready(
     building_max_age_seconds: int,
     grace_seconds: int,
     max_layouts: int,
+    layout_keys: Sequence[int] | None,
 ) -> PTG2SharedLayoutGCStats:
     locked_rows = await executor.all(
         _lock_layouts_sql(schema_name),
         cleanup_generations=list(PTG2_V3_CLEANUP_GENERATIONS),
         building_max_age_seconds=building_max_age_seconds,
         layout_limit=max_layouts,
+        restrict_layout_keys=layout_keys is not None,
+        layout_keys=list(layout_keys or ()),
     )
     layout_keys = [
         int(_row_mapping(row).get("snapshot_key"))
@@ -551,10 +629,11 @@ async def release_unbound_ptg2_shared_layouts(
     grace_seconds: int | None = None,
     max_layouts: int | None = None,
     require_shared: bool = False,
+    layout_keys: Sequence[int] | None = None,
 ) -> PTG2SharedLayoutGCStats:
-    """Queue mapped hashes and delete one bounded batch of unbound layouts."""
+    """Queue hashes and delete one bounded batch of eligible unbound layouts."""
 
-    schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema(schema_name)
     building_age = _building_max_age_seconds(building_max_age_seconds)
     grace = _block_gc_grace_seconds(grace_seconds)
     layout_limit = _layout_batch_rows(max_layouts)
@@ -572,6 +651,7 @@ async def release_unbound_ptg2_shared_layouts(
             building_max_age_seconds=building_age,
             grace_seconds=grace,
             max_layouts=layout_limit,
+            layout_keys=layout_keys,
         )
 
     if executor is not None and executor is not db:
@@ -652,7 +732,7 @@ async def build_ptg2_shared_block_sweep_plan(
 ) -> PTG2SharedBlockSweepPlan:
     """Select the exact eligible block hashes a bounded sweep would delete."""
 
-    schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema(schema_name)
     executor = executor or db
     if not await _shared_tables_available(
         executor,
@@ -755,7 +835,7 @@ async def sweep_ptg2_shared_blocks(
 ) -> PTG2SharedBlockSweepPlan:
     """Delete one eligible, byte-bounded block batch after a final mapping check."""
 
-    schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema(schema_name)
     byte_limit = _block_gc_max_bytes(max_bytes)
     row_limit = _block_gc_max_rows(max_rows)
 
@@ -792,7 +872,7 @@ async def build_ptg2_shared_gc_plan(
 ) -> PTG2SharedGCPlan:
     """Build a metadata-only dry-run plan for layout release and block sweep."""
 
-    schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema(schema_name)
     executor = executor or db
     if not await _shared_tables_available(
         executor,

@@ -7,6 +7,11 @@ from process.ptg_parts import ptg2_source_snapshot_gc as snapshot_gc
 
 class _BacklogExecutor:
     async def all(self, statement, **_params):
+        if "FROM information_schema.tables" in statement:
+            return [
+                {"table_name": table_name}
+                for table_name in snapshot_gc.PTG2_V3_MIGRATION_OWNED_TABLE_NAMES
+            ]
         if "SELECT DISTINCT snapshot_id" in statement:
             return []
         if 'FROM "mrf".ptg2_snapshot' in statement:
@@ -21,6 +26,14 @@ class _BacklogExecutor:
                     },
                 }
                 for index in range(1, 5)
+            ]
+        if "WITH eligible_layouts AS MATERIALIZED" in statement:
+            return [
+                {
+                    "logical_layout_count": 0,
+                    "candidate_hash_count": 0,
+                    "stored_bytes": 0,
+                }
             ]
         raise AssertionError(statement)
 

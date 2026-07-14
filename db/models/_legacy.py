@@ -33,6 +33,20 @@ from sqlalchemy.orm import declared_attr
 from db.connection import Base, db
 from db.json_mixin import JSONOutputMixin
 
+
+def _resolve_ptg2_database_schema() -> str:
+    runtime_schema = os.getenv("HLTHPRT_DB_SCHEMA")
+    legacy_schema = os.getenv("DB_SCHEMA")
+    if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
+        raise RuntimeError(
+            "DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema"
+        )
+    return runtime_schema or legacy_schema or "mrf"
+
+
+_PTG2_DATABASE_SCHEMA = _resolve_ptg2_database_schema()
+
+
 NAME_SEARCH_VECTOR = (
     "LOWER("
     "COALESCE(provider_first_name,'') || ' ' || "
@@ -1762,7 +1776,7 @@ class PTG2ImportRun(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("import_run_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["import_run_id"]
     __my_additional_indexes__ = [
@@ -1786,7 +1800,7 @@ class PTG2Snapshot(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("snapshot_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["snapshot_id"]
     __my_additional_indexes__ = [
@@ -1810,7 +1824,7 @@ class PTG2CurrentSnapshot(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("slot"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["slot"]
 
@@ -1825,7 +1839,7 @@ class PTG2CurrentSourceSnapshot(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("source_key"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["source_key"]
     __my_additional_indexes__ = [
@@ -1845,7 +1859,7 @@ class PTG2CurrentPlanSource(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("plan_source_key"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["plan_source_key"]
     __my_additional_indexes__ = [
@@ -1870,7 +1884,7 @@ class PTG2SourceCatalog(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("source_catalog_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["source_catalog_id"]
     __my_additional_indexes__ = [
@@ -1904,7 +1918,7 @@ class PTG2SourceIdentity(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("source_identity_hash"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["source_identity_hash"]
     __my_additional_indexes__ = [
@@ -1926,7 +1940,7 @@ class PTG2SourceFileVersion(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("source_file_version_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["source_file_version_id"]
     __my_additional_indexes__ = [
@@ -1957,7 +1971,7 @@ class PTG2ContentIdentity(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("content_hash"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["content_hash"]
     __my_additional_indexes__ = [
@@ -1978,7 +1992,7 @@ class PTG2ImportJob(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("import_job_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["import_job_id"]
     __my_additional_indexes__ = [
@@ -2007,7 +2021,7 @@ class PTG2ArtifactManifest(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("artifact_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["artifact_id"]
     __my_additional_indexes__ = [
@@ -2032,7 +2046,7 @@ class PTG2ArtifactBlobChunk(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("artifact_id", "chunk_no"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["artifact_id", "chunk_no"]
     __my_additional_indexes__ = [
@@ -2090,7 +2104,7 @@ class PTG2V3SnapshotLayout(Base, JSONOutputMixin):
             ),
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2133,7 +2147,7 @@ class PTG2V3LayoutFingerprint(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ["snapshot_key"],
             [
-                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                f"{_PTG2_DATABASE_SCHEMA}."
                 "ptg2_v3_snapshot_layout.snapshot_key"
             ],
             name="ptg2_v3_layout_fingerprint_snapshot_key_fkey",
@@ -2148,7 +2162,7 @@ class PTG2V3LayoutFingerprint(Base, JSONOutputMixin):
             "snapshot_key",
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2172,14 +2186,14 @@ class PTG2V3SnapshotBinding(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_id"],
-            [f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}.ptg2_snapshot.snapshot_id"],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_snapshot.snapshot_id"],
             name="ptg2_v3_snapshot_binding_snapshot_id_fkey",
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
             [
-                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                f"{_PTG2_DATABASE_SCHEMA}."
                 "ptg2_v3_snapshot_layout.snapshot_key"
             ],
             name="ptg2_v3_snapshot_binding_snapshot_key_fkey",
@@ -2190,7 +2204,7 @@ class PTG2V3SnapshotBinding(Base, JSONOutputMixin):
             "snapshot_key",
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2214,7 +2228,7 @@ class PTG2V3SnapshotScope(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_id"],
-            [f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}.ptg2_snapshot.snapshot_id"],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_snapshot.snapshot_id"],
             name="ptg2_v3_snapshot_scope_snapshot_id_fkey",
             ondelete="CASCADE",
         ),
@@ -2228,7 +2242,7 @@ class PTG2V3SnapshotScope(Base, JSONOutputMixin):
             "coverage_scope_id",
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2259,7 +2273,7 @@ class PTG2V3CandidateAuditAttestation(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ["snapshot_id"],
             [
-                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                f"{_PTG2_DATABASE_SCHEMA}."
                 "ptg2_v3_snapshot_scope.snapshot_id"
             ],
             name="ptg2_v3_candidate_audit_attestation_snapshot_id_fkey",
@@ -2268,7 +2282,7 @@ class PTG2V3CandidateAuditAttestation(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ["snapshot_key"],
             [
-                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                f"{_PTG2_DATABASE_SCHEMA}."
                 "ptg2_v3_snapshot_layout.snapshot_key"
             ],
             name="ptg2_v3_candidate_audit_attestation_snapshot_key_fkey",
@@ -2304,7 +2318,7 @@ class PTG2V3CandidateAuditAttestation(Base, JSONOutputMixin):
             "activated_at",
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2346,7 +2360,7 @@ class PTG2V3SnapshotSource(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ["snapshot_id"],
             [
-                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                f"{_PTG2_DATABASE_SCHEMA}."
                 "ptg2_v3_snapshot_scope.snapshot_id"
             ],
             name="ptg2_v3_snapshot_source_snapshot_id_fkey",
@@ -2355,7 +2369,7 @@ class PTG2V3SnapshotSource(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ["source_trace_set_hash"],
             [
-                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                f"{_PTG2_DATABASE_SCHEMA}."
                 "ptg2_source_trace_set.source_trace_set_hash"
             ],
             name="ptg2_v3_snapshot_source_trace_set_hash_fkey",
@@ -2401,7 +2415,7 @@ class PTG2V3SnapshotSource(Base, JSONOutputMixin):
             name="ptg2_v3_snapshot_source_trace_set_hash_check",
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2451,7 +2465,7 @@ class PTG2V3Block(Base, JSONOutputMixin):
             name="ptg2_v3_block_payload_size_check",
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
             "postgresql_partition_by": "HASH (block_hash)",
         },
@@ -2486,7 +2500,7 @@ class PTG2V3SnapshotBlock(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ["snapshot_key"],
             [
-                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                f"{_PTG2_DATABASE_SCHEMA}."
                 "ptg2_v3_snapshot_layout.snapshot_key"
             ],
             name="ptg2_v3_snapshot_block_snapshot_key_fkey",
@@ -2495,7 +2509,7 @@ class PTG2V3SnapshotBlock(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ["block_hash"],
             [
-                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                f"{_PTG2_DATABASE_SCHEMA}."
                 "ptg2_v3_block.block_hash"
             ],
             name="ptg2_v3_snapshot_block_block_hash_fkey",
@@ -2520,7 +2534,7 @@ class PTG2V3SnapshotBlock(Base, JSONOutputMixin):
             "block_key",
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2571,7 +2585,7 @@ class PTG2V3GraphOwner(Base, JSONOutputMixin):
             ],
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2635,7 +2649,7 @@ class PTG2V3Code(Base, JSONOutputMixin):
             postgresql_include=["code_key", "negotiation_arrangement", "rate_count"],
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2680,7 +2694,7 @@ class PTG2V3ProviderSet(Base, JSONOutputMixin):
             name="ptg2_v3_provider_set_key_check",
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2715,7 +2729,7 @@ class PTG2V3ProviderGroup(Base, JSONOutputMixin):
             name="ptg2_v3_provider_group_key_check",
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2743,7 +2757,7 @@ class PTG2V3PriceAttr(Base, JSONOutputMixin):
             postgresql_nulls_not_distinct=True,
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2768,7 +2782,7 @@ class PTG2V3NPIScope(Base, JSONOutputMixin):
             name="ptg2_v3_npi_scope_npi_check",
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
             "postgresql_partition_by": "HASH (snapshot_key)",
         },
@@ -2820,7 +2834,7 @@ class PTG2V3AuditOccurrence(Base, JSONOutputMixin):
             name="ptg2_v3_audit_occurrence_atom_key_check",
         ),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
             "postgresql_partition_by": "HASH (snapshot_key)",
         },
@@ -2848,7 +2862,7 @@ class PTG2V3GCCandidate(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ["block_hash"],
             [
-                f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}."
+                f"{_PTG2_DATABASE_SCHEMA}."
                 "ptg2_v3_block.block_hash"
             ],
             name="ptg2_v3_gc_candidate_block_hash_fkey",
@@ -2856,7 +2870,7 @@ class PTG2V3GCCandidate(Base, JSONOutputMixin):
         ),
         Index("ptg2_v3_gc_candidate_eligible_at_idx", "eligible_at"),
         {
-            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "schema": _PTG2_DATABASE_SCHEMA,
             "extend_existing": True,
         },
     )
@@ -2875,7 +2889,7 @@ class PTG2Plan(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("plan_hash"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["plan_hash"]
     __my_additional_indexes__ = [
@@ -2901,7 +2915,7 @@ class PTG2PlanAlias(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("alias_hash"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["alias_hash"]
     __my_additional_indexes__ = [
@@ -2921,7 +2935,7 @@ class PTG2PlanMonth(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("plan_month_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["plan_month_id"]
     __my_additional_indexes__ = [
@@ -3491,7 +3505,7 @@ class PTG2SourceTraceSet(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("source_trace_set_hash"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["source_trace_set_hash"]
 

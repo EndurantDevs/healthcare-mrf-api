@@ -3,7 +3,8 @@
 
 This helper targets terminal snapshots and abandoned building snapshots that
 are not referenced by any current pointer table. A building snapshot remains
-protected while its import run is active and heartbeating.
+protected while its import run is active and heartbeating. Validated candidates
+are never admitted by age-based GC and require explicit authenticated removal.
 """
 
 from __future__ import annotations
@@ -17,13 +18,20 @@ from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
 from process.ptg_parts.ptg2_lifecycle_lock import PTG2_SOURCE_POINTER_GC_LOCK_KEY
-from process.ptg_parts.ptg2_shared_gc import release_unbound_ptg2_shared_layouts
+from process.ptg_parts.ptg2_shared_gc import (
+    PTG2_V3_MIGRATION_OWNED_TABLE_NAMES,
+    build_ptg2_shared_layout_release_plan,
+    release_unbound_ptg2_shared_layouts,
+    require_ptg2_v3_migration_owned_tables,
+    resolve_ptg2_schema,
+)
 from process.ptg_parts.snapshot_cleanup import (
     is_strict_ptg2_v3_shared_blocks_manifest,
 )
 
 
 _GC_CANDIDATE_STATUSES = frozenset({"published", "failed"})
+_AGE_GC_PROTECTED_STATUSES = frozenset({"validated"})
 _STALE_BUILD_SECONDS_ENV = "HLTHPRT_PTG2_STALE_BUILD_SECONDS"
 _STALE_BUILD_SECONDS_DEFAULT = 21_600
 
@@ -153,8 +161,9 @@ async def build_ptg2_source_snapshot_gc_plan(
 ) -> PTG2SourceSnapshotGCPlan:
     """Build a bounded plan while retaining lineage behind every current pointer."""
 
-    schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema(schema_name)
     executor = executor or db
+    await require_ptg2_v3_migration_owned_tables(executor, schema_name)
     current_rows = await executor.all(
         f"""
         SELECT DISTINCT snapshot_id
@@ -217,20 +226,26 @@ async def build_ptg2_source_snapshot_gc_plan(
     for raw_row in snapshot_rows:
         row = _row_mapping(raw_row)
         snapshot_id = str(row.get("snapshot_id") or "")
+        snapshot_status = str(row.get("status") or "")
         serving_index = _serving_index(row)
         is_strict_v3 = is_strict_ptg2_v3_shared_blocks_manifest(serving_index)
         # Strict V3 snapshot state is owned by shared-block tables; no manifest
         # may authorize per-snapshot table cleanup.
         table_names: tuple[str, ...] = ()
+        # Until audit runs have durable leases, age alone cannot distinguish an
+        # abandoned validated candidate from one with an active external audit.
+        if snapshot_status in _AGE_GC_PROTECTED_STATUSES:
+            continue
         terminal_candidate = (
             bool(snapshot_id)
             and is_strict_v3
-            and str(row.get("status") or "") in _GC_CANDIDATE_STATUSES
+            and snapshot_status in _GC_CANDIDATE_STATUSES
             and snapshot_id not in protected_snapshot_ids
         )
         stale_building_candidate = (
             bool(snapshot_id)
             and is_strict_v3
+            and snapshot_status == "building"
             and bool(row.get("stale_building"))
             and snapshot_id not in protected_snapshot_ids
         )
@@ -316,6 +331,20 @@ async def build_ptg2_source_snapshot_gc_plan(
         shared_snapshot_ids = tuple(
             candidate.snapshot_id for candidate in selected_candidates if candidate.is_shared
         )
+        shared_layout_count = 0
+        shared_candidate_hash_count = 0
+        shared_stored_bytes = 0
+        if shared_snapshot_ids:
+            shared_plan = await build_ptg2_shared_layout_release_plan(
+                schema_name=schema_name,
+                executor=executor,
+                removing_snapshot_ids=shared_snapshot_ids,
+                all_eligible_layouts=True,
+                require_shared=True,
+            )
+            shared_layout_count = shared_plan.logical_layout_count
+            shared_candidate_hash_count = shared_plan.candidate_hash_count
+            shared_stored_bytes = shared_plan.stored_bytes
         return PTG2SourceSnapshotGCPlan(
             current_snapshot_ids=current_snapshot_ids,
             candidate_snapshot_ids=tuple(
@@ -327,9 +356,9 @@ async def build_ptg2_source_snapshot_gc_plan(
                 for candidate in selected_candidates
             ),
             shared_snapshot_ids=shared_snapshot_ids,
-            shared_layout_count=0,
-            shared_candidate_hash_count=0,
-            shared_stored_bytes=0,
+            shared_layout_count=shared_layout_count,
+            shared_candidate_hash_count=shared_candidate_hash_count,
+            shared_stored_bytes=shared_stored_bytes,
         )
 
     if table_limit is None and byte_limit is None:
@@ -409,7 +438,7 @@ async def execute_ptg2_source_snapshot_gc_plan(
 ) -> PTG2SourceSnapshotGCPlan:
     """Recompute and execute a bounded cleanup plan in one transaction."""
 
-    schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema(schema_name)
     await ensure_ptg2_artifact_blob_table(schema_name)
     async with db.acquire() as connection:
         await connection.status("SELECT set_config('lock_timeout', :lock_timeout, true)", lock_timeout=lock_timeout)
@@ -432,8 +461,22 @@ async def execute_ptg2_source_snapshot_gc_plan(
         for table_name in sorted({table.table_name for table in plan.tables}):
             await connection.status(
                 f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)}"
-            )
+        )
         if plan.candidate_snapshot_ids:
+            layout_rows = await connection.all(
+                f"""
+                SELECT DISTINCT snapshot_key
+                  FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_binding
+                 WHERE snapshot_id = ANY(:snapshot_ids)
+                 ORDER BY snapshot_key
+                """,
+                snapshot_ids=list(plan.candidate_snapshot_ids),
+            )
+            candidate_layout_keys = tuple(
+                int(_row_mapping(row).get("snapshot_key"))
+                for row in layout_rows
+                if _row_mapping(row).get("snapshot_key") is not None
+            )
             await connection.status(
                 f"""
                 DELETE FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope
@@ -483,6 +526,7 @@ async def execute_ptg2_source_snapshot_gc_plan(
                     schema_name=schema_name,
                     executor=connection,
                     require_shared=True,
+                    layout_keys=candidate_layout_keys,
                 )
         return plan
 

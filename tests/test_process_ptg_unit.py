@@ -2844,10 +2844,17 @@ def test_ptg2_ensure_tables_uses_existing_db_create_table(monkeypatch):
     async def fake_status(_statement):
         return None
 
+    async def fake_all(_statement, **params):
+        return [
+            {"table_name": table_name}
+            for table_name in params["table_names"]
+        ]
+
     async def fake_create_table(table, **_kwargs):
         created.append(table.name)
 
     monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "all", fake_all)
     monkeypatch.setattr(process_ptg.db, "create_table", fake_create_table)
 
     asyncio.run(process_ptg.ensure_ptg2_tables())
@@ -2859,15 +2866,61 @@ def test_ptg2_ensure_tables_uses_existing_db_create_table(monkeypatch):
     assert expected.issubset(set(created))
 
 
+def test_ptg2_runtime_table_setup_does_not_own_v3_migration_tables():
+    runtime_owned = {
+        model.__table__.name for model in process_ptg.PTG2_MODEL_CLASSES
+    }
+
+    assert not {
+        table_name for table_name in runtime_owned if table_name.startswith("ptg2_v3_")
+    }
+
+
+def test_ptg2_ensure_tables_requires_v3_migration_before_runtime_ddl(monkeypatch):
+    created = []
+
+    async def fake_status(_statement):
+        return None
+
+    async def fake_all(_statement, **params):
+        return [
+            {"table_name": table_name}
+            for table_name in params["table_names"]
+            if table_name != "ptg2_v3_candidate_audit_attestation"
+        ]
+
+    async def fake_create_table(table, **_kwargs):
+        created.append(table.name)
+
+    monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "all", fake_all)
+    monkeypatch.setattr(process_ptg.db, "create_table", fake_create_table)
+
+    with pytest.raises(
+        RuntimeError,
+        match="ptg2_v3_candidate_audit_attestation.*alembic upgrade head",
+    ):
+        asyncio.run(process_ptg.ensure_ptg2_tables())
+
+    assert created == []
+
+
 def test_ptg2_ensure_tables_fails_fast_on_create_error(monkeypatch):
     async def fake_status(_statement):
         return None
+
+    async def fake_all(_statement, **params):
+        return [
+            {"table_name": table_name}
+            for table_name in params["table_names"]
+        ]
 
     async def fake_create_table(table, **_kwargs):
         if table.name == "ptg2_snapshot":
             raise RuntimeError("no permission")
 
     monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "all", fake_all)
     monkeypatch.setattr(process_ptg.db, "create_table", fake_create_table)
 
     with pytest.raises(RuntimeError, match="ptg2_snapshot"):
