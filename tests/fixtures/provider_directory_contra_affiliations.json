@@ -1,0 +1,62 @@
+{
+  "resourceType": "Bundle",
+  "type": "searchset",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "OrganizationAffiliation",
+        "id": "contra-organization-only",
+        "active": true,
+        "organization": {
+          "reference": "Organization/org-b"
+        },
+        "network": [
+          {
+            "reference": "Organization/net-shared"
+          }
+        ],
+        "location": [
+          {
+            "reference": "Location/contra-clinic"
+          }
+        ],
+        "specialty": [
+          {
+            "coding": [
+              {
+                "system": "http://nucc.org/provider-taxonomy",
+                "code": "207Q00000X",
+                "display": "Family Medicine"
+              }
+            ]
+          }
+        ],
+        "telecom": [
+          {
+            "system": "phone",
+            "value": "(925) 313-6000",
+            "use": "work"
+          }
+        ]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "OrganizationAffiliation",
+        "id": "contra-explicit-participating",
+        "active": true,
+        "organization": {
+          "reference": "Organization/contra-costa-health-plan"
+        },
+        "participatingOrganization": {
+          "reference": "Organization/org-a"
+        },
+        "network": [
+          {
+            "reference": "Organization/net-shared"
+          }
+        ]
+      }
+    }
+  ]
+}
