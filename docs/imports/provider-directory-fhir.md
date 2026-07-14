@@ -287,10 +287,23 @@ non-importable coverage blockers from unresolved endpoint-discovery gaps.
 row with an importable API base also points to a deterministic
 `provider_directory_api_endpoint`. The endpoint identity is the same identity
 used to group resource acquisition: canonical API base, non-secret credential
-descriptor, and the complete resource-endpoint signature. Endpoint rows are
-upserted before their source aliases, so every alias in one acquisition group
-has the same `endpoint_id` without making plan names part of transport
-identity.
+descriptor, the complete resource-endpoint signature, and any connector-specific
+transport contract. For ALOHR that connector contract includes the GraphQL URL,
+tenant header and value, stream roots, and query hashes without storing a
+credential. Endpoint rows are upserted before their source aliases. A new
+source alias takes the acquisition endpoint immediately, while an existing
+source alias retains its published serving endpoint until a replacement
+dataset is promoted. This keeps plan names out of transport identity without
+making an in-progress or failed acquisition hide the last published dataset.
+
+When an acquisition contract changes, the next normal acquisition creates and
+validates a fresh dataset under the new endpoint identity; it cannot reuse or
+mutate a published dataset from the prior endpoint identity. Validated
+replacement discovery uses immutable dataset `source_ids` metadata while the
+stable source alias still resolves the old published evidence. Artifact
+publication locks both endpoint identities and atomically publishes the new
+dataset, installs its serving relations, and switches the source alias. Any
+failure rolls back the entire cutover.
 
 That endpoint grouping is an acquisition contract, not an implicit publication
 scope. An artifact-only run with explicit `source_ids` publishes exactly those
@@ -975,7 +988,15 @@ not a FHIR REST base. Its real FHIR metadata base is
 seed rows to that FHIR base and uses a source-specific GraphQL connector at
 `https://api.esante.us/graphql` with tenant `alohr` to stream public provider
 and organization rows into the normal Provider Directory practitioner,
-organization, location, role, and affiliation tables.
+organization, location, and role tables. The stable source ID continues to use
+the normalized FHIR catalog base, while immutable endpoint identity also binds
+the GraphQL URL, `tenantId`, stream roots, and query projections that define
+acquisition. The next normal import therefore creates a fresh dataset under the
+correct endpoint identity; it does not modify the previously published dataset.
+The stable source alias remains on the previous serving endpoint until that
+fresh dataset passes validation and is atomically published with its artifacts.
+The acquisition contract contains exactly `Practitioner`, `Organization`,
+`Location`, and `PractitionerRole`.
 
 Cigna seed rows can appear through Availity non-FHIR/onboarding paths even
 though Cigna publishes a public R4 Provider Directory at

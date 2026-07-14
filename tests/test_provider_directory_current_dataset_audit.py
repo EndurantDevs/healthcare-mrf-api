@@ -25,6 +25,7 @@ def test_current_dataset_audit_renders_separately_from_acquisition_support():
     assert "No product membership is inferred" in rendered_document
     assert "Humana Carrier Directory (`humana`) | Current published (`pdds_97a8b36ca361...`) | 16,140,342 | Not proven" in rendered_document
     assert "ALOHR (`alohr`) | Current published (`pdds_085b7d2da6de...`) | 319,384 | Contract/live mismatch" in rendered_document
+    assert "fresh four-resource acquisition" in rendered_document
     assert "Aetna Commercial and Medicare (`aetna-commercial-medicare`)" in rendered_document
 
 

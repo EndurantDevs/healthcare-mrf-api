@@ -151,18 +151,22 @@ def _validate_endpoint_classification(
     classification = entry.get("classification")
     resources = entry.get("resources")
     expected_support = {
-        "acquisition": ("acquisition-configured", "rest", True),
-        "bulk_acquisition": ("acquisition-configured", "bulk", True),
-        "probe_only": ("probe-only", "probe", False),
-        "external": ("externally-supported", "graphql", False),
+        "acquisition": ("acquisition-configured", {"graphql", "rest"}, True),
+        "bulk_acquisition": ("acquisition-configured", {"bulk"}, True),
+        "probe_only": ("probe-only", {"probe"}, False),
+        "external": ("externally-supported", {"graphql"}, False),
     }.get(classification)
     if expected_support is None:
         raise SupportDocumentationError(f"{entry_id}: invalid classification")
-    support_level, method, expects_resources = expected_support
-    if support.get("support_level") != support_level or support.get("method") != method:
+    support_level, methods, expects_resources = expected_support
+    if (
+        support.get("support_level") != support_level
+        or support.get("method") not in methods
+    ):
+        method_list = " or ".join(sorted(methods))
         raise SupportDocumentationError(
             f"{entry_id}: {classification} classification requires "
-            f"{support_level} support and {method} method"
+            f"{support_level} support and {method_list} method"
         )
     if bool(resources) != expects_resources:
         requirement = "non-empty" if expects_resources else "empty"

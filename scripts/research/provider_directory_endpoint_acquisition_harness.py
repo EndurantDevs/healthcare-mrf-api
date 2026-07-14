@@ -33,6 +33,12 @@ DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifes
 SOURCE_ID_PATTERN = re.compile(r"^pdfhir_[0-9a-f]{24}$")
 SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 RESOURCE_PROFILES = {
+    "G4": [
+        "Practitioner",
+        "Organization",
+        "Location",
+        "PractitionerRole",
+    ],
     "R8": [
         "InsurancePlan",
         "PractitionerRole",

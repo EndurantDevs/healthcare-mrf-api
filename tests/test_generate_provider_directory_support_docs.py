@@ -33,22 +33,22 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "processed and unique candidate resource IDs equal unchanged post-scan census" in rendered_document
     assert "No product membership is inferred from the catalog row" in rendered_document
     assert "_count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets" in rendered_document
-    assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://" in rendered_document
+    assert "ALOHR (`alohr`) | Acquisition-configured | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://" in rendered_document
     assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Probe | None configured" in rendered_document
     assert "AmeriHealth Caritas Carrier Directory (`amerihealth-caritas-carrier`) | Acquisition-configured | None | REST | InsurancePlan, Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole" in rendered_document
     assert "AmeriHealth Caritas DC (`amerihealth-dc`) | Probe-only" in rendered_document
     assert "clears plan_name and does not claim NH product membership" in rendered_document
     assert "Exhaustive equivalence with plan-code bases" in rendered_document
     assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 16 |" in rendered_document
-    assert "| Externally supported | 1 |" in rendered_document
+    assert "| Acquisition-configured | 17 |" in rendered_document
+    assert "| Externally supported | 0 |" in rendered_document
     assert "| Probe-only | 12 |" in rendered_document
     assert "| Known not importable | 3 |" in rendered_document
     assert "| Total tracked | 32 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required" in rendered_document
     assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Required" in rendered_document
-    assert "ALOHR (`alohr`) | Externally supported | Private connector | Required" in rendered_document
+    assert "ALOHR (`alohr`) | Acquisition-configured | Private connector | Required" in rendered_document
     assert "First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Not supported | User token | Required" in rendered_document
     assert "| Registration | Reviewed at | Review valid through |" in rendered_document
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`)" in rendered_document
@@ -57,7 +57,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "Not required | 2026-07-10 | 2026-08-24 | Sequential REST pagination" in rendered_document
     assert "## Observed Live Verification" in rendered_document
     assert "| Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at |" in rendered_document
-    assert "| ALOHR (`alohr`) | Current | External Completed | Complete | Promoted | Ready |" in rendered_document
+    assert "| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not Promoted | Not Ready |" in rendered_document
     assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Promoted | Ready |" in rendered_document
     assert "scripts/update_provider_directory_verification.py" in rendered_document
     assert "## Known Not Importable" in rendered_document
@@ -95,6 +95,48 @@ def test_caresource_manifest_entry_is_public_carrier_level_r8_rest_support():
     assert support["requires_registration"] is False
     assert support["method"] == "rest"
     assert "No product membership is inferred" in support["limitation"]
+
+
+def test_alohr_manifest_requires_fresh_four_resource_graphql_proof():
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    alohr_entry = next(
+        manifest_entry
+        for manifest_entry in manifest["entries"]
+        if manifest_entry["entry_id"] == "alohr"
+    )
+    alohr_support = manifest["support_documentation"]["entry_support"]["alohr"]
+    alohr_verification = generator.load_verification_snapshot(
+        generator.DEFAULT_VERIFICATION_SNAPSHOT
+    )["entries"]["alohr"]
+
+    assert alohr_entry["classification"] == "acquisition"
+    assert alohr_entry["launch_mode"] == "create"
+    assert alohr_entry["resource_profile"] == "G4"
+    assert alohr_entry["resources"] == [
+        "Practitioner",
+        "Organization",
+        "Location",
+        "PractitionerRole",
+    ]
+    assert "external_run_id" not in alohr_entry
+    assert alohr_support["support_level"] == "acquisition-configured"
+    assert alohr_support["method"] == "graphql"
+    assert "documented_resources" not in alohr_support
+    assert alohr_verification["access_verification"] == "not_recorded"
+    assert alohr_verification["proof_state"] == "not_recorded"
+    assert alohr_verification["terminal_status"] is None
+    assert alohr_verification["publication_readiness"][
+        "derived_artifact_state"
+    ] == (
+        "not_promoted"
+    )
+    assert alohr_verification["publication_readiness"]["unified_api_state"] == (
+        "not_ready"
+    )
+    assert "current_observation" not in alohr_verification
+    assert "terminal_evidence" not in alohr_verification
+    assert "OrganizationAffiliation" not in json.dumps(alohr_verification)
+    assert "357802" not in json.dumps(alohr_verification)
 
 
 def test_rendered_live_proof_summarizes_resource_rows():
@@ -190,7 +232,29 @@ def test_validate_manifest_rejects_invalid_endpoint_contract(
 
 def test_validate_manifest_rejects_external_support_without_documented_resources():
     manifest = copy.deepcopy(generator.load_manifest(generator.DEFAULT_MANIFEST))
+    entry = next(item for item in manifest["entries"] if item["entry_id"] == "alohr")
     support = manifest["support_documentation"]["entry_support"]["alohr"]
+    entry.update(
+        {
+            "classification": "external",
+            "launch_mode": "external_completed",
+            "external_run_id": "run_17baae4934f54639bd748d50554a9cbd",
+            "resource_profile": "NONE",
+            "resources": [],
+        }
+    )
+    support.update(
+        {
+            "support_level": "externally-supported",
+            "method": "graphql",
+            "documented_resources": [
+                "Practitioner",
+                "Organization",
+                "Location",
+                "PractitionerRole",
+            ],
+        }
+    )
     support.pop("documented_resources")
 
     with pytest.raises(generator.SupportDocumentationError, match="requires documented_resources"):
@@ -199,8 +263,29 @@ def test_validate_manifest_rejects_external_support_without_documented_resources
 
 def test_validate_manifest_rejects_external_method_mismatch():
     manifest = copy.deepcopy(generator.load_manifest(generator.DEFAULT_MANIFEST))
+    entry = next(item for item in manifest["entries"] if item["entry_id"] == "alohr")
     support = manifest["support_documentation"]["entry_support"]["alohr"]
-    support["method"] = "rest"
+    entry.update(
+        {
+            "classification": "external",
+            "launch_mode": "external_completed",
+            "external_run_id": "run_17baae4934f54639bd748d50554a9cbd",
+            "resource_profile": "NONE",
+            "resources": [],
+        }
+    )
+    support.update(
+        {
+            "support_level": "externally-supported",
+            "method": "rest",
+            "documented_resources": [
+                "Practitioner",
+                "Organization",
+                "Location",
+                "PractitionerRole",
+            ],
+        }
+    )
 
     with pytest.raises(generator.SupportDocumentationError, match="external classification"):
         generator.validate_manifest(manifest)
@@ -381,7 +466,7 @@ def test_freshness_validation_accepts_current_reviews():
         ("scan", "1,000-result search ceiling"),
         ("centene", "Location requires at least one resource search parameter"),
         ("contra-costa", "Seven public collections follow opaque next-link pagination"),
-        ("alohr", "FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr"),
+        ("alohr", "A fresh four-resource GraphQL acquisition"),
     ],
 )
 def test_support_metadata_retains_audited_source_details(entry_id, expected_detail):

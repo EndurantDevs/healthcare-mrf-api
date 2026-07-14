@@ -65,7 +65,7 @@
       "scan": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-13", "method": "probe", "limitation": "The server enforces a 1,000-result search ceiling: family=MA has 2,679 Practitioner matches and returns HTTP 413 SearchTooCostly when rows are requested. Fixed name-prefix shards therefore cannot prove completeness. Generic acquisition remains blocked. The importer now implements adaptive half-open _lastUpdated partitions, pre/post unfiltered and ranged census reconciliation, durable retry checkpoints, and twin-pass staged-row proof, but SCAN remains probe-only until a live all-resource campaign produces matching terminal completeness metrics."},
       "centene": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-13", "method": "probe", "limitation": "The production base now returns public FHIR metadata from dev egress. Location requires at least one resource search parameter: an _count-only request returns HTTP 400, while address-state=OK with _count=1 returns 200 rows plus a next link. Generic resource acquisition is blocked in the importer because stable exhaustive pagination and equivalent behavior across all directory collections remain unverified."},
       "contra-costa": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-13", "method": "rest", "limitation": "Seven public collections follow opaque next-link pagination; Endpoint is unsupported and excluded. The official catalog can return HTTP 403, so the confirmed fallback base is retained. Terminal acquisition succeeded, and current artifact plus unified/API readiness is recorded in the tracked verification snapshot."},
-      "alohr": {"support_level": "externally-supported", "access_requirement": "private-connector", "requires_registration": true, "reviewed_at": "2026-07-13", "method": "graphql", "documented_resources": ["Practitioner", "Organization", "Location", "PractitionerRole"], "limitation": "FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr. The source does not expose organization-affiliation relationships, so the connector does not invent self-referential OrganizationAffiliation resources."}
+      "alohr": {"support_level": "acquisition-configured", "access_requirement": "private-connector", "requires_registration": true, "reviewed_at": "2026-07-14", "method": "graphql", "limitation": "FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr. The prior five-resource run is not proof for the corrected contract because the source does not expose organization-affiliation relationships. A fresh four-resource GraphQL acquisition, validation, artifact publication, and unified/API proof are pending."}
     }
   },
   "parameter_profiles": {
@@ -445,11 +445,10 @@
       "owner_id": "state-of-alabama-alohr",
       "source_ids": ["pdfhir_0f81c146991b27031b1ec366"],
       "canonical_base": "https://fhir.alabamaonehealthrecord.com/csp/healthshare/hsods/fhir/r4",
-      "classification": "external",
-      "launch_mode": "external_completed",
-      "external_run_id": "run_17baae4934f54639bd748d50554a9cbd",
-      "resource_profile": "NONE",
-      "resources": []
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "G4",
+      "resources": ["Practitioner", "Organization", "Location", "PractitionerRole"]
     }
   ]
 }
