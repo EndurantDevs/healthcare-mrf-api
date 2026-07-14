@@ -671,7 +671,11 @@ python main.py start provider-directory-fhir --canonical-backfill-only
 ```
 
 Use `--resources Location,Practitioner` to backfill only selected resource
-types during controlled validation. This backfill is additive/idempotent: it
+types during controlled validation. Resource selection accepts the legacy
+comma-separated string, a JSON array such as `["Location", "Practitioner"]`,
+or an already-decoded list from the control API. Every selected entry must be a
+string naming a supported resource; malformed arrays and non-string entries are
+rejected clearly. This backfill is additive/idempotent: it
 upserts canonical rows keyed by `(canonical_api_base, resource_type,
 resource_id)` and source edges keyed by `(source_id, resource_type,
 resource_id)`.
