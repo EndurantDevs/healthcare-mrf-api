@@ -8487,6 +8487,50 @@ async def test_incomplete_endpoint_dataset_candidate_is_not_published(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_endpoint_dataset_checkpoint_clears_only_after_validation(monkeypatch):
+    checkpoint_context = _cigna_checkpoint_context(
+        "run_2",
+        root_run_id="run_2",
+        dataset_id="dataset_new",
+    )
+    candidate = dataclasses.replace(
+        _endpoint_dataset_candidate(),
+        checkpoint_context=checkpoint_context,
+    )
+    clear_checkpoints = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_clear_pagination_checkpoints",
+        clear_checkpoints,
+    )
+
+    await importer._clear_finalized_endpoint_dataset_pagination_checkpoints(
+        candidate,
+        {
+            "dataset_id": candidate.dataset_id,
+            "status": importer.ENDPOINT_DATASET_INCOMPLETE,
+            "published": False,
+        },
+    )
+    clear_checkpoints.assert_not_awaited()
+
+    await importer._clear_finalized_endpoint_dataset_pagination_checkpoints(
+        candidate,
+        {
+            "dataset_id": candidate.dataset_id,
+            "status": importer.ENDPOINT_DATASET_VALIDATED,
+            "validated": True,
+            "published": False,
+        },
+    )
+
+    clear_checkpoints.assert_awaited_once_with(
+        checkpoint_context,
+        ["Practitioner"],
+    )
+
+
+@pytest.mark.asyncio
 async def test_failed_endpoint_dataset_candidate_does_not_change_current_pointer(
     monkeypatch,
 ):
@@ -13057,6 +13101,35 @@ async def test_uhc_plan_graph_completion_does_not_request_pagination_retry(monke
 
 
 @pytest.mark.asyncio
+async def test_complete_candidate_checkpoint_is_retained_until_validation(monkeypatch):
+    source_lookup = _cigna_checkpoint_source()
+    source_lookup["_pagination_checkpoint_context"] = (
+        _cigna_checkpoint_context("run-1")
+    )
+    clear_checkpoints = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_clear_pagination_checkpoints",
+        clear_checkpoints,
+    )
+
+    await importer._finalize_source_pagination_checkpoints(
+        source_lookup,
+        {
+            "Location": {
+                "complete": True,
+                "bounded": False,
+                "error": None,
+            }
+        },
+        set(),
+        retain_complete_checkpoint=True,
+    )
+
+    clear_checkpoints.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_uhc_plan_graph_failure_precedes_generic_checkpoint_resume():
     source_lookup = _uhc_reverse_lookup_source()
     source_lookup["_pagination_checkpoint_context"] = importer._pagination_checkpoint_context(
@@ -16776,6 +16849,133 @@ async def test_caresource_opaque_cursor_scan_reconciles_and_checkpoints_terminal
     _assert_caresource_completion_metrics(fetch_result)
 
 
+def _caresource_expired_census_proofs():
+    old_proof_by_field = {
+        "strategy_version": importer.CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
+        "verified": False,
+        "pre_count": 2,
+    }
+    fresh_proof_by_field = {
+        "strategy_version": importer.CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
+        "verified": False,
+        "pre_count": 0,
+    }
+    verified_proof_by_field = {
+        **fresh_proof_by_field,
+        "post_count": 0,
+        "processed_rows": 0,
+        "unique_candidate_rows": 0,
+        "verified": True,
+    }
+    return old_proof_by_field, fresh_proof_by_field, verified_proof_by_field
+
+
+def _patch_caresource_expired_cursor_callbacks(monkeypatch, start_url, resume_url):
+    old_proof_by_field, fresh_proof_by_field, verified_proof_by_field = (
+        _caresource_expired_census_proofs()
+    )
+    prepare_census = AsyncMock(
+        side_effect=[old_proof_by_field, fresh_proof_by_field]
+    )
+    reset_checkpoint = AsyncMock()
+    finish_census = AsyncMock(
+        return_value=importer.CareSourceOpaqueCursorOutcome(
+            proof=verified_proof_by_field,
+        )
+    )
+
+    async def load_checkpoint(_context, _resource_type, _start_url):
+        return importer.PaginationResumeState(
+            next_url=resume_url,
+            pages_processed=2,
+            rows_processed=2,
+            recent_url_hashes=("old-cursor",),
+            resumed=True,
+            completeness=old_proof_by_field,
+        )
+
+    async def fetch_source_json(_source, request_url, *, timeout):
+        assert timeout == 3
+        if request_url == resume_url:
+            return 410, {"resourceType": "OperationOutcome"}, None, 1
+        assert request_url == start_url
+        return 200, {"resourceType": "Bundle", "type": "searchset"}, None, 1
+
+    callback_by_name = {
+        "_load_or_initialize_pagination_checkpoint": load_checkpoint,
+        "_prepare_caresource_pre_census": prepare_census,
+        "_fetch_source_json": fetch_source_json,
+        "_reset_pagination_checkpoint": reset_checkpoint,
+        "_finish_caresource_opaque_cursor_census": finish_census,
+        "_save_pagination_checkpoint": AsyncMock(),
+    }
+    for callback_name, callback in callback_by_name.items():
+        monkeypatch.setattr(importer, callback_name, callback)
+    return (
+        prepare_census,
+        reset_checkpoint,
+        finish_census,
+        fresh_proof_by_field,
+        verified_proof_by_field,
+    )
+
+
+@pytest.mark.asyncio
+async def test_caresource_expired_cursor_restarts_with_fresh_census(monkeypatch):
+    """Restart an expired CareSource cursor against a new census proof."""
+    start_url = (
+        f"{importer.CARESOURCE_PROVIDER_DIRECTORY_BASE}/"
+        "PractitionerRole?_count=1000"
+    )
+    resume_url = f"{start_url}&_searchId=expired&_page=2"
+    (
+        prepare_census,
+        reset_checkpoint,
+        finish_census,
+        fresh_proof_by_field,
+        verified_proof_by_field,
+    ) = _patch_caresource_expired_cursor_callbacks(
+        monkeypatch,
+        start_url,
+        resume_url,
+    )
+
+    fetch_result = await importer._fetch_resource_rows(
+        {
+            "source_id": "caresource_source",
+            "api_base": importer.CARESOURCE_PROVIDER_DIRECTORY_BASE,
+            "canonical_api_base": importer.CARESOURCE_PROVIDER_DIRECTORY_BASE,
+            "endpoint_practitioner_role": start_url,
+        },
+        "PractitionerRole",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=AsyncMock(return_value=0),
+        row_batch_size=1000,
+        retain_rows=False,
+        pagination_checkpoint=_caresource_checkpoint_context(),
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.fetch_diagnostic == verified_proof_by_field
+    reset_checkpoint.assert_awaited_once_with(
+        _caresource_checkpoint_context(),
+        "PractitionerRole",
+        start_url,
+        hashlib.sha256(start_url.encode("utf-8")).hexdigest(),
+    )
+    assert prepare_census.await_count == 2
+    fresh_resume_state = prepare_census.await_args_list[1].args[4]
+    assert fresh_resume_state.rows_processed == 0
+    assert fresh_resume_state.completeness == {}
+    finish_census.assert_awaited_once()
+    assert finish_census.await_args.args[4] == fresh_proof_by_field
+
+
 @pytest.mark.asyncio
 async def test_caresource_retry_reuses_persisted_pre_census(monkeypatch):
     persisted_proof_by_field = {
@@ -17096,6 +17296,7 @@ async def test_empty_checkpoint_restart_rejects_concurrent_progress(monkeypatch)
     assert "source_ids::jsonb = CAST(:source_ids AS jsonb)" in restart_sql
     assert "pages_processed = 0" in restart_sql
     assert "rows_processed = 0" in restart_sql
+    assert "completeness_json = '{}'::jsonb" in restart_sql
     assert "owner_run_id = :observed_owner_run_id" in restart_sql
     assert restart_connection.status.await_count == 1
 
@@ -17192,6 +17393,123 @@ async def test_checkpoint_worker_guard_covers_group_writes(monkeypatch):
 
     assert counts == {"Location": 1}
     assert events == ["guard_enter", "fetch", "write", "finalize", "guard_exit"]
+
+
+def _checkpoint_validation_candidate(source_record, checkpoint_context):
+    return importer.EndpointDatasetCandidate(
+        endpoint_id="endpoint_1",
+        dataset_id="dataset_1",
+        acquisition_root_run_id="run_1",
+        source_ids=(source_record["source_id"],),
+        selected_resources=("Location",),
+        import_run_id="run_1",
+        previous_dataset_id=None,
+        checkpoint_context=checkpoint_context,
+    )
+
+
+def _patch_candidate_checkpoint_flow(monkeypatch, checkpoint_context, endpoint_candidate):
+    events: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def fake_guard(_context):
+        events.append("guard_enter")
+        yield
+        events.append("guard_exit")
+
+    async def fake_prepare(source_records, *_args, **_kwargs):
+        prepared_source_lookup = dict(source_records[0])
+        prepared_source_lookup["_pagination_checkpoint_context"] = (
+            checkpoint_context
+        )
+        prepared_source_lookup["_endpoint_dataset_id"] = (
+            endpoint_candidate.dataset_id
+        )
+        return [prepared_source_lookup], endpoint_candidate
+
+    async def fake_fetch(source_lookup, _resource_type, **kwargs):
+        events.append("fetch")
+        written = await kwargs["row_batch_handler"](
+            ProviderDirectoryLocation,
+            [{"source_id": source_lookup["source_id"], "resource_id": "loc-1"}],
+        )
+        return _checkpoint_complete_fetch_result(
+            ProviderDirectoryLocation,
+            written,
+        )
+
+    async def fake_upsert(_model, rows, **_kwargs):
+        events.append("write")
+        return len(rows)
+
+    async def fake_validate(_candidate, _diagnostics):
+        events.append("validate")
+        return {
+            "dataset_id": endpoint_candidate.dataset_id,
+            "status": importer.ENDPOINT_DATASET_VALIDATED,
+            "validated": True,
+            "published": False,
+        }
+
+    async def fake_clear(context, resource_types):
+        assert context == checkpoint_context
+        assert resource_types == ["Location"]
+        events.append("clear")
+
+    callback_by_name = {
+        "_pagination_checkpoint_worker_guard": fake_guard,
+        "_prepare_resource_import_source_group": fake_prepare,
+        "_fetch_resource_rows": fake_fetch,
+        "_upsert_resource_rows": fake_upsert,
+        "_finalize_endpoint_dataset_candidate": fake_validate,
+        "_clear_pagination_checkpoints": fake_clear,
+    }
+    for callback_name, callback in callback_by_name.items():
+        monkeypatch.setattr(importer, callback_name, callback)
+    return events
+
+
+@pytest.mark.asyncio
+async def test_candidate_checkpoint_clears_after_validation_inside_guard(monkeypatch):
+    """Clear candidate checkpoints only after validation and inside the guard."""
+    _stub_resource_import_metadata(monkeypatch)
+    source_record = _cigna_checkpoint_source()
+    checkpoint_context = _cigna_checkpoint_context(
+        "run_1",
+        root_run_id="run_1",
+        dataset_id="dataset_1",
+    )
+    endpoint_candidate = _checkpoint_validation_candidate(
+        source_record,
+        checkpoint_context,
+    )
+    events = _patch_candidate_checkpoint_flow(
+        monkeypatch,
+        checkpoint_context,
+        endpoint_candidate,
+    )
+
+    counts = await importer._import_resources(
+        [source_record],
+        resources=["Location"],
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_1",
+        stream_batch_size=1,
+        is_pagination_checkpointing_enabled=True,
+    )
+
+    assert counts == {"Location": 1}
+    assert events == [
+        "guard_enter",
+        "fetch",
+        "write",
+        "validate",
+        "clear",
+        "guard_exit",
+    ]
 
 
 @pytest.mark.asyncio
@@ -17495,7 +17813,7 @@ async def test_checkpoint_non_bundle_preserves_cursor(monkeypatch):
         save_checkpoint,
     ) = _non_bundle_checkpoint_callbacks(resume_url)
 
-    clear_checkpoint = AsyncMock()
+    reset_checkpoint = AsyncMock()
     monkeypatch.setattr(
         importer,
         "_load_or_initialize_pagination_checkpoint",
@@ -17505,8 +17823,8 @@ async def test_checkpoint_non_bundle_preserves_cursor(monkeypatch):
     monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
     monkeypatch.setattr(
         importer,
-        "_clear_checkpoint_dataset_resource_type",
-        clear_checkpoint,
+        "_reset_pagination_checkpoint",
+        reset_checkpoint,
     )
 
     fetch_result = await importer._fetch_resource_rows(
@@ -17531,7 +17849,7 @@ async def test_checkpoint_non_bundle_preserves_cursor(monkeypatch):
     assert fetch_result.next_url_remaining is True
     assert fetch_result.retry_not_before is not None
     assert saved_checkpoints == []
-    clear_checkpoint.assert_not_awaited()
+    reset_checkpoint.assert_not_awaited()
 
 
 def _cooldown_checkpoint_callbacks(resume_url, responses):
@@ -17862,17 +18180,12 @@ async def test_offset_pagination_stops_on_terminal_empty_bundle(monkeypatch, api
     assert saved_next_urls == [None]
 
 
-@pytest.mark.asyncio
-async def test_fetch_resource_rows_restarts_expired_resume_once(monkeypatch):
-    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
-    resume_url = (
-        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
-        "_getpages=expired&_count=100"
-    )
-    calls: list[str] = []
+def _generic_expired_resume_test_callbacks(start_url, resume_url):
+    requested_urls: list[str] = []
     saved_next_urls: list[str | None] = []
+    reset_checkpoint = AsyncMock()
 
-    async def fake_load_checkpoint(_context, _resource_type, _start_url):
+    async def load_checkpoint(_context, _resource_type, _start_url):
         return importer.PaginationResumeState(
             next_url=resume_url,
             pages_processed=5,
@@ -17881,25 +18194,59 @@ async def test_fetch_resource_rows_restarts_expired_resume_once(monkeypatch):
             resumed=True,
         )
 
-    async def fake_fetch_source_json(_source, request_url, *, timeout):
-        calls.append(request_url)
+    async def fetch_source_json(_source, request_url, *, timeout):
+        requested_urls.append(request_url)
         if request_url == resume_url:
-            return 410, {"resourceType": "OperationOutcome"}, None, 5
-        return 200, {"resourceType": "Bundle", "entry": []}, None, 5
+            return 410, {"resourceType": "OperationOutcome"}, None, timeout
+        return 200, {"resourceType": "Bundle", "entry": []}, None, timeout
 
-    async def fake_save_checkpoint(_context, _resource_type, **checkpoint):
+    async def save_checkpoint(_context, _resource_type, **checkpoint):
         saved_next_urls.append(checkpoint["next_url"])
 
     async def row_batch_handler(_model, rows):
         return len(rows)
 
+    return (
+        requested_urls,
+        saved_next_urls,
+        reset_checkpoint,
+        load_checkpoint,
+        fetch_source_json,
+        save_checkpoint,
+        row_batch_handler,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_restarts_expired_resume_once(monkeypatch):
+    """Restart one expired generic cursor and persist the replacement state."""
+    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    resume_url = (
+        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_getpages=expired&_count=100"
+    )
+    (
+        requested_urls,
+        saved_next_urls,
+        reset_checkpoint,
+        load_checkpoint,
+        fetch_source_json,
+        save_checkpoint,
+        row_batch_handler,
+    ) = _generic_expired_resume_test_callbacks(start_url, resume_url)
+
     monkeypatch.setattr(
         importer,
         "_load_or_initialize_pagination_checkpoint",
-        fake_load_checkpoint,
+        load_checkpoint,
     )
-    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
-    monkeypatch.setattr(importer, "_save_pagination_checkpoint", fake_save_checkpoint)
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(
+        importer,
+        "_reset_pagination_checkpoint",
+        reset_checkpoint,
+    )
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
 
     fetch_result = await importer._fetch_resource_rows(
         _cigna_checkpoint_source(),
@@ -17920,8 +18267,14 @@ async def test_fetch_resource_rows_restarts_expired_resume_once(monkeypatch):
 
     assert fetch_result is not None
     assert fetch_result.complete is True
-    assert calls == [resume_url, start_url]
-    assert saved_next_urls == [start_url, None]
+    assert requested_urls == [resume_url, start_url]
+    assert saved_next_urls == [None]
+    reset_checkpoint.assert_awaited_once_with(
+        _cigna_checkpoint_context("run_retry", "run_original"),
+        "Practitioner",
+        start_url,
+        hashlib.sha256(start_url.encode("utf-8")).hexdigest(),
+    )
 
 
 @pytest.mark.parametrize(
@@ -17990,7 +18343,7 @@ async def test_humana_403_continuation_restart_stops_after_one_reset(monkeypatch
         request_urls,
         saved_next_urls,
     )
-    clear_checkpoint = AsyncMock()
+    reset_checkpoint = AsyncMock()
     monkeypatch.setattr(
         importer,
         "_load_or_initialize_pagination_checkpoint",
@@ -18000,8 +18353,8 @@ async def test_humana_403_continuation_restart_stops_after_one_reset(monkeypatch
     monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
     monkeypatch.setattr(
         importer,
-        "_clear_checkpoint_dataset_resource_type",
-        clear_checkpoint,
+        "_reset_pagination_checkpoint",
+        reset_checkpoint,
     )
 
     fetch_result = await importer._fetch_resource_rows(
@@ -18022,8 +18375,13 @@ async def test_humana_403_continuation_restart_stops_after_one_reset(monkeypatch
     assert fetch_result.complete is False
     assert fetch_result.error == "http_403"
     assert request_urls == [resume_url, start_url]
-    assert saved_next_urls == [start_url]
-    clear_checkpoint.assert_awaited_once_with(checkpoint_context, "Practitioner")
+    assert saved_next_urls == []
+    reset_checkpoint.assert_awaited_once_with(
+        checkpoint_context,
+        "Practitioner",
+        start_url,
+        hashlib.sha256(start_url.encode("utf-8")).hexdigest(),
+    )
 
 
 @pytest.mark.asyncio
