@@ -10,7 +10,11 @@ import pytest
 from db.models import ProviderDirectoryLocation
 from process.provider_directory_dataset_rehydrate import (
     DatasetRehydrationError,
-    _proof_complete,
+    RehydrationCheckpoint,
+    RehydrationRequest,
+    RehydrationRuntime,
+    ResourceProof,
+    _is_proof_complete,
     _validate_payload,
     rehydrate_current_dataset,
 )
@@ -25,9 +29,9 @@ def _payload() -> dict[str, object]:
     }
 
 
-def _hash(payload: dict[str, object]) -> str:
+def _hash(mapped_payload: dict[str, object]) -> str:
     return hashlib.sha256(
-        json.dumps(payload, sort_keys=True).encode()
+        json.dumps(mapped_payload, sort_keys=True).encode()
     ).hexdigest()
 
 
@@ -49,15 +53,28 @@ def test_retained_payload_rejects_wrong_shape_or_provenance(payload, expected):
 
 
 def test_exact_proof_rejects_rows_outside_dataset_membership():
-    checkpoint = {"input": 2, "mapped": 2, "rejected": 0}
-    proof = {"input": 2, "typed": 2, "typed_extra": 1, "canonical_hash_matched": 2, "source_edges": 2, "source_edge_extra": 0}
-    assert not _proof_complete(checkpoint, proof, 2)
+    checkpoint_record = RehydrationCheckpoint(
+        state="complete", last_resource_id="location-2", expected_count=2,
+        input_count=2, mapped_count=2, rejected_count=0,
+    )
+    resource_proof = ResourceProof(
+        input_count=2, typed_count=2, typed_extra_count=1,
+        canonical_hash_count=2, canonical_extra_count=0, source_edge_count=2,
+        source_edge_extra_count=0,
+    )
+    assert not _is_proof_complete(checkpoint_record, resource_proof)
 
 
 @pytest.mark.asyncio
 async def test_rehydrate_rejects_unbounded_batch_before_database_access():
     with pytest.raises(DatasetRehydrationError, match="batch_size_invalid"):
+        runtime = RehydrationRuntime(object(), "mrf", {}, None)
+        request = RehydrationRequest(
+            source_id="source", dataset_id="dataset",
+            acquisition_root_run_id="root", owner_run_id="owner",
+            batch_size=25_001,
+        )
         await rehydrate_current_dataset(
-            object(), "mrf", {}, None, source_id="source", dataset_id="dataset",
-            acquisition_root_run_id="root", owner_run_id="owner", batch_size=25_001,
+            runtime,
+            request,
         )

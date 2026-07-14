@@ -80,6 +80,8 @@ from process.provider_directory_dataset_rehydrate import (
     DEFAULT_BATCH_SIZE as DEFAULT_DATASET_REHYDRATE_BATCH_SIZE,
     DatasetRehydrationError,
     DatasetScope,
+    RehydrationRequest,
+    RehydrationRuntime,
     rehydrate_current_dataset,
 )
 from process.provider_directory_time_partition import (
@@ -31862,16 +31864,34 @@ def _dataset_rehydrate_resource_types(raw: Any) -> tuple[str, ...]:
     values = raw.split(",") if isinstance(raw, str) else raw
     if isinstance(values, (bytes, bytearray, dict)) or not hasattr(values, "__iter__"):
         raise ValueError("provider_directory_dataset_rehydrate_resources_invalid")
-    result = tuple(_clean_text(value) for value in values)
-    if not all(result) or len(result) != len(set(result)):
+    resource_types = tuple(_clean_text(value) for value in values)
+    if not all(resource_types) or len(resource_types) != len(set(resource_types)):
         raise ValueError("provider_directory_dataset_rehydrate_resources_invalid")
-    return result
+    return resource_types
 
 
 async def _run_provider_directory_dataset_rehydrate(
     ctx: dict[str, Any], task: dict[str, Any], run_id: str | None, source_ids: list[str]
 ) -> dict[str, Any]:
     """Run the retained-dataset path without source discovery or network access."""
+    request = _dataset_rehydration_request(task, run_id, source_ids)
+    runtime = _dataset_rehydration_runtime(ctx, task, request)
+    metrics = await rehydrate_current_dataset(runtime, request)
+    ctx["context"]["audit"] = metrics
+    ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
+    print(
+        "PROVIDER_DIRECTORY_DATASET_REHYDRATE_DONE\t"
+        + json.dumps(metrics, sort_keys=True, default=str)
+    )
+    return metrics
+
+
+def _dataset_rehydration_request(
+    task: dict[str, Any],
+    run_id: str | None,
+    source_ids: list[str],
+) -> RehydrationRequest:
+    """Validate task exclusivity and build an exact dataset request."""
     if len(source_ids) != 1:
         raise ValueError("provider_directory_dataset_rehydrate_requires_exactly_one_source_id")
     if not run_id:
@@ -31880,48 +31900,73 @@ async def _run_provider_directory_dataset_rehydrate(
     root_run_id = _clean_text(task.get("rehydrate_acquisition_root_run_id"))
     if not dataset_id or not root_run_id:
         raise ValueError("provider_directory_dataset_rehydrate_dataset_and_root_required")
-    incompatible = (
+    incompatible_fields = (
         "canonical_backfill_only", "contact_backfill_only", "publish_artifacts_only",
         "publish_artifacts", "publish_after_acquisition", "import_resources",
         "full_refresh", "stale_cleanup", "bulk_export", "seed_only", "refresh_preset",
         "resources", "resource_limit", "page_limit", "stream_batch_size",
     )
-    if any(task.get(name) for name in incompatible):
+    if any(task.get(field_name) for field_name in incompatible_fields):
         raise ValueError("provider_directory_dataset_rehydrate_incompatible_parameters")
+    return RehydrationRequest(
+        source_id=source_ids[0],
+        dataset_id=dataset_id,
+        acquisition_root_run_id=root_run_id,
+        owner_run_id=run_id,
+        resource_types=_dataset_rehydrate_resource_types(
+            task.get("rehydrate_resources") or task.get("rehydrate_resource")
+        ),
+        batch_size=_int_or_default(
+            task.get("rehydrate_batch_size"),
+            DEFAULT_DATASET_REHYDRATE_BATCH_SIZE,
+        ),
+    )
+
+
+def _dataset_rehydration_runtime(
+    ctx: dict[str, Any],
+    task: dict[str, Any],
+    request: RehydrationRequest,
+) -> RehydrationRuntime:
+    """Bind normal upserts and control lifecycle callbacks to a request."""
 
     async def upsert(model: type, rows: list[dict[str, Any]], scope: DatasetScope) -> int:
+        """Write one retained batch through normal provenance upserts."""
         return await _upsert_resource_rows(
             model, rows, run_id=scope.acquisition_root_run_id, track_seen=False,
             canonical_api_base=scope.canonical_api_base, source_ids=[scope.source_id],
         )
 
     async def cancelled() -> None:
+        """Raise when import-control cancelled the owning run."""
         await raise_if_cancelled(ctx, task)
 
     async def report(progress: dict[str, Any]) -> None:
+        """Publish bounded row progress without failing the import."""
         try:
             await mark_control_run(
-                run_id, status="running", phase_detail=str(progress["phase"]),
+                request.owner_run_id,
+                status="running",
+                phase_detail=str(progress["phase"]),
                 progress=progress,
-                metrics={"dataset_rehydrate": {"source_id": source_ids[0], "dataset_id": dataset_id}},
+                metrics={
+                    "dataset_rehydrate": {
+                        "source_id": request.source_id,
+                        "dataset_id": request.dataset_id,
+                    }
+                },
             )
         except Exception as error:
             LOGGER.warning("Provider Directory rehydration progress update failed: %s", error)
 
-    metrics = await rehydrate_current_dataset(
-        db, _schema(), RESOURCE_MODELS_BY_TYPE, upsert,
-        source_id=source_ids[0], dataset_id=dataset_id,
-        acquisition_root_run_id=root_run_id, owner_run_id=run_id,
-        resource_types=_dataset_rehydrate_resource_types(
-            task.get("rehydrate_resources") or task.get("rehydrate_resource")
-        ),
-        batch_size=_int_or_default(task.get("rehydrate_batch_size"), DEFAULT_DATASET_REHYDRATE_BATCH_SIZE),
-        cancel_check=cancelled, progress=report,
+    return RehydrationRuntime(
+        database=db,
+        schema=_schema(),
+        models_by_type=RESOURCE_MODELS_BY_TYPE,
+        upsert_batch=upsert,
+        cancel_check=cancelled,
+        progress_callback=report,
     )
-    ctx["context"]["audit"] = metrics
-    ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
-    print("PROVIDER_DIRECTORY_DATASET_REHYDRATE_DONE\t" + json.dumps(metrics, sort_keys=True, default=str))
-    return metrics
 
 
 async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
