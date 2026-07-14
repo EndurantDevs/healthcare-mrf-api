@@ -58,6 +58,7 @@ async def test_match_candidate_params_reject_entity_conflict():
 
 @pytest.mark.asyncio
 async def test_match_candidate_params_accept_every_public_filter(monkeypatch):
+    """Verify match candidate params accept every public filter."""
     async def fake_ensure_specialty_resolution_cache(session):
         assert session == "test-session"
 

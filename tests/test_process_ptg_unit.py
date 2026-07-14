@@ -4696,6 +4696,7 @@ def test_manifest_copy_entry_cleanup_removes_registered_v3_runs(tmp_path):
 
 
 def test_source_import_lock_serializes_different_snapshots_for_one_source(monkeypatch):
+    """Verify source import lock serializes different snapshots for one source."""
     lock_state = {"held": False}
     real_sleep = asyncio.sleep
 
@@ -4833,6 +4834,7 @@ def _build_published_snapshot_fields(import_month, updated_at):
 
 
 def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkeypatch):
+    """Verify ptg2 candidate stage binds layout without mutating live pointers."""
     executed = []
     updated_at = process_ptg._utcnow()
     import_month = process_ptg.normalize_import_month("2026-04")
@@ -5337,6 +5339,7 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
 
 
 def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
+    """Verify ptg2 import defers live pointer mutation by default."""
     pushed = []
     publish_source_pointers = AsyncMock()
     cleanup_old_source_tables = AsyncMock()
@@ -5435,6 +5438,7 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
 
 
 def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
+    """Verify ptg2 completion timing ends after post publish work."""
     clock = {"seconds": 0.0}
     pushed: list[tuple[str, dict]] = []
     completion_events: list[tuple[str, float]] = []
@@ -5717,6 +5721,7 @@ def test_failed_shared_layout_abandonment_retries_transient_database_errors(monk
 
 
 def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
+    """Verify ptg2 test mode uses manifest source scoped import."""
     pushed = []
 
     async def fake_push(rows, cls, **_kwargs):

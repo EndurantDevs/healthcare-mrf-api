@@ -289,6 +289,7 @@ async def test_plan_get_plan_success():
 
 @pytest.mark.asyncio
 async def test_plan_find_plan_success():
+    """Verify plan find plan success."""
     plan_entry = {
         "plan_id": "P123",
         "year": 2024,
@@ -922,6 +923,7 @@ async def test_get_plan_with_variant(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_plan_normalizes_variant_identifiers():
+    """Verify get plan normalizes variant identifiers."""
     request = make_request(
         [
             FakeResult(rows=[{"plan_id": "P1", "year": 2024, "issuer_id": 7}]),

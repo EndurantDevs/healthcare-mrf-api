@@ -78,6 +78,7 @@ def test_site_intelligence_pharmacy_geo_stmt_uses_unified_addresses(site_intel_m
 
 @pytest.mark.asyncio
 async def test_site_intelligence_returns_trade_area_metrics(monkeypatch, site_intel_module):
+    """Verify site intelligence returns trade area metrics."""
     async def _always_exists(_session, _model):
         return True
 
@@ -194,6 +195,7 @@ async def test_site_intelligence_returns_trade_area_metrics(monkeypatch, site_in
 
 @pytest.mark.asyncio
 async def test_site_intelligence_target_scripts_gates_recommendation(monkeypatch, site_intel_module):
+    """Verify site intelligence target scripts gates recommendation."""
     async def _always_exists(_session, _model):
         return True
 

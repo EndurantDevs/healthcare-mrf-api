@@ -286,6 +286,7 @@ async def test_native_shared_graph_bridge_matches_real_cli_when_built(
     tmp_path,
     monkeypatch,
 ):
+    """Verify native shared graph bridge matches real cli when built."""
     binary = (
         Path(__file__).resolve().parents[1]
         / "support"

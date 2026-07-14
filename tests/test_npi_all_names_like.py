@@ -465,6 +465,7 @@ async def test_get_all_unified_phone_facet_counts_include_service_locations(monk
 
 @pytest.mark.asyncio
 async def test_get_all_unified_phone_lookup_returns_provider_directory_only_row(monkeypatch):
+    """Verify get all unified phone lookup returns provider directory only row."""
     class ProviderDirectoryOnlyConnection:
         def __init__(self):
             self.sql_calls = []
@@ -560,6 +561,7 @@ async def test_get_all_unified_phone_lookup_returns_provider_directory_only_row(
 
 @pytest.mark.asyncio
 async def test_get_all_unified_address_site_key_lookup_returns_provider_directory_only_row(monkeypatch):
+    """Verify get all unified address site key lookup returns provider directory only row."""
     address_site_key = "00000000-0000-0000-0000-000000000002"
 
     class ProviderDirectoryOnlyConnection:
@@ -657,6 +659,7 @@ async def test_get_all_unified_address_site_key_lookup_returns_provider_director
 
 @pytest.mark.asyncio
 async def test_get_all_unified_exact_npi_lookup_returns_provider_directory_only_row(monkeypatch):
+    """Verify get all unified exact npi lookup returns provider directory only row."""
     class ProviderDirectoryOnlyConnection:
         def __init__(self):
             self.sql_calls = []
@@ -758,6 +761,7 @@ async def test_get_all_rejects_invalid_npi_filter(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_all_unified_exact_lookup_can_include_provider_directory_source_summary(monkeypatch):
+    """Verify get all unified exact lookup can include provider directory source summary."""
     class ProviderDirectoryOnlyConnection:
         async def all(self, sql, **_params):
             sql_text = str(sql)

@@ -17,6 +17,7 @@ def _sha256(value: str) -> str:
 
 
 def _release_report(**target_overrides):
+    """Support the release report test fixture."""
     completed_at = datetime.datetime.now(datetime.timezone.utc).replace(
         microsecond=0
     )
@@ -592,6 +593,7 @@ def test_non_candidate_publication_cannot_rewrite_a_strict_candidate():
 
 
 def test_generic_publish_uses_locked_database_candidate_not_caller_attributes(monkeypatch):
+    """Verify generic publish uses locked database candidate not caller attributes."""
     session = object()
     activate = AsyncMock(return_value={"status": "promoted"})
     source_plan_rows = AsyncMock(side_effect=AssertionError("legacy path was selected"))
@@ -726,6 +728,7 @@ def test_activation_cas_does_not_accept_candidate_already_current():
 
 
 def test_strict_candidate_activation_verifies_and_consumes_attestation_atomically(monkeypatch):
+    """Verify strict candidate activation verifies and consumes attestation atomically."""
     events = []
     cas_calls = []
     session = object()
@@ -838,6 +841,7 @@ def test_strict_candidate_activation_verifies_and_consumes_attestation_atomicall
 
 
 def test_attestation_consumption_failure_rolls_back_all_activation_state(monkeypatch):
+    """Verify attestation consumption failure rolls back all activation state."""
     session = object()
     state = {
         "source_pointer": "snap_old",

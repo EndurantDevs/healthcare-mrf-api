@@ -216,6 +216,7 @@ def test_execute_gc_deletes_v3_metadata_with_strict_sql_admission(monkeypatch):
 async def test_real_postgres_stale_cutoff_is_utc_naive_under_non_utc_session(
     monkeypatch,
 ):
+    """Verify real postgres stale cutoff is utc naive under non utc session."""
     if os.getenv("HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST") != "1":
         pytest.skip(
             "set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 for the isolated "

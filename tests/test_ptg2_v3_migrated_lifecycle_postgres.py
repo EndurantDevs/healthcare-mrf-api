@@ -194,6 +194,7 @@ def _configure_disposable_database(monkeypatch: pytest.MonkeyPatch, dsn: str) ->
 
 
 async def _assert_migrated_empty_target(database_name: str) -> None:
+    """Support the assert migrated empty target test fixture."""
     selected_database = await db.scalar("SELECT current_database()")
     assert selected_database == database_name
 

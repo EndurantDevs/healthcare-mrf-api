@@ -221,6 +221,7 @@ def test_build_ptg2_source_snapshot_remove_plan_rejects_legacy_manifest(monkeypa
 
 
 def test_remove_ptg2_source_snapshot_deletes_only_v3_metadata(monkeypatch):
+    """Verify remove ptg2 source snapshot deletes only v3 metadata."""
     status_calls = []
     transaction_statements = []
     transaction = _RecordingTransaction(transaction_statements)
@@ -288,6 +289,7 @@ def test_remove_ptg2_source_snapshot_deletes_only_v3_metadata(monkeypatch):
 
 
 def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(monkeypatch):
+    """Verify retire ptg2 source snapshot deletes current source and plan pointers."""
     status_calls = []
     reference_calls = []
     transaction_statements = []

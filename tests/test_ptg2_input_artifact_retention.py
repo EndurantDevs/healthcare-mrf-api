@@ -60,6 +60,7 @@ def test_concurrent_identical_artifact_has_one_logical_file_and_two_safe_leases(
     tmp_path,
     monkeypatch,
 ):
+    """Verify concurrent identical artifact has one logical file and two safe leases."""
     root = tmp_path / "artifacts"
     store = PTG2ArtifactStore(root)
     staged_zip = tmp_path / "rates.zip"
@@ -131,6 +132,7 @@ def test_url_validation_failure_does_not_unlink_shared_raw_artifact(
     tmp_path,
     monkeypatch,
 ):
+    """Verify url validation failure does not unlink shared raw artifact."""
     root = tmp_path / "artifacts"
     store = PTG2ArtifactStore(root)
     payload = b'{"in_network":[]}'
@@ -537,6 +539,7 @@ def test_gc_deletes_stale_unreferenced_raw_and_logical_files(tmp_path):
 
 
 def test_gc_compacts_manifest_and_drops_missing_artifact_records(tmp_path):
+    """Verify gc compacts manifest and drops missing artifact records."""
     root = tmp_path / "artifacts"
     store = PTG2ArtifactStore(root)
     raw_path = _make_file(

@@ -53,6 +53,7 @@ def _run_source_import():
 
 
 def test_deterministic_rerun_returns_already_published_without_table_work(monkeypatch):
+    """Verify deterministic rerun returns already published without table work."""
     calls = []
     create_stage = AsyncMock()
     cleanup = AsyncMock()

@@ -52,6 +52,7 @@ class FakeSessionContext:
 
 @pytest.mark.asyncio
 async def test_get_facility_connected_providers_returns_providers_and_specialty_stats(monkeypatch):
+    """Verify get facility connected providers returns providers and specialty stats."""
     fake_session = FakeSession(
         [
             FakeResult(first_row={"total_providers": 2}),

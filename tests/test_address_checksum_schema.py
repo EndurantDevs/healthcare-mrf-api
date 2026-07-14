@@ -305,6 +305,7 @@ def test_facility_anchor_npi_candidate_model_supports_review_queue():
 
 
 def test_entity_address_facility_anchor_uses_source_npi_and_ccn_inference():
+    """Verify entity address facility anchor uses source npi and ccn inference."""
     source_sql = "\n".join(
         entity_address_unified._source_selects(
             "mrf",

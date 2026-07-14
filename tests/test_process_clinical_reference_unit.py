@@ -44,6 +44,7 @@ def test_umls_download_url_redaction_keeps_api_key_out_of_errors():
 
 
 def test_build_clinical_area_rows_maps_mesh_and_rxnorm_to_areas():
+    """Verify build clinical area rows maps mesh and rxnorm to areas."""
     concepts = {
         ("MESH", "D006331"): {
             "code_system": "MESH",

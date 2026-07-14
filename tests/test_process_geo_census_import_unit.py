@@ -119,6 +119,7 @@ def test_to_float_handles_suppressed_values(value, expected):
 
 @pytest.mark.asyncio
 async def test_collect_profile_map_merges_and_filters_cbp_non_zcta(monkeypatch):
+    """Verify collect profile map merges and filters cbp non zcta."""
     async def _fake_get_http_client(*_args, **_kwargs):
         return _DummyClient()
 
@@ -132,6 +133,7 @@ async def test_collect_profile_map_merges_and_filters_cbp_non_zcta(monkeypatch):
         _test_mode,
         _test_row_limit,
     ):
+        """Support the fake fetch rows test fixture."""
         if spec.name == "acs_subject":
             return {
                 "60654": {

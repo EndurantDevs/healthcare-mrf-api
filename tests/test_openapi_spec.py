@@ -174,6 +174,7 @@ def _collect_query_params(node: ast.AST) -> set[str]:
 
 
 def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
+    """Support the collect spec routes test fixture."""
     spec_routes: dict[tuple[str, str], dict[str, set[str]]] = {}
     lines = OPENAPI_PATH.read_text().splitlines()
     in_paths = False

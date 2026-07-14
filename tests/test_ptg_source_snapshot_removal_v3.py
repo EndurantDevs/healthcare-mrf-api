@@ -36,6 +36,7 @@ class _RecordingTransaction:
 
 @pytest.mark.asyncio
 async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(monkeypatch):
+    """Verify remove v3 snapshot releases layout in the removal transaction."""
     transaction = _RecordingTransaction()
     events = []
 
@@ -100,6 +101,7 @@ async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(mon
 
 
 async def _create_production_shaped_schema(database, schema_name):
+    """Support the create production shaped schema test fixture."""
     schema = f'"{schema_name}"'
     async with database.acquire() as connection:
         await connection.status(f"CREATE SCHEMA {schema}")
@@ -290,6 +292,7 @@ async def _create_production_shaped_schema(database, schema_name):
 
 
 async def _insert_shared_snapshots(database, schema_name):
+    """Support the insert shared snapshots test fixture."""
     schema = f'"{schema_name}"'
     manifests = {
         snapshot_id: json.dumps(

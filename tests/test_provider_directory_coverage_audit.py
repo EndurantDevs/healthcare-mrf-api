@@ -269,6 +269,7 @@ def test_provider_directory_coverage_audit_accepts_retest_results_path():
 
 
 def test_provider_directory_coverage_audit_retest_coverage_counts_current_redirected_and_missing():
+    """Verify provider directory coverage audit retest coverage counts current redirected and missing."""
     coverage = audit._source_catalog_retest_coverage(
         {
             "tested_at": "2026-06-03T17:43:09Z",
@@ -367,6 +368,7 @@ def test_provider_directory_coverage_audit_retest_coverage_counts_current_redire
 
 
 def test_provider_directory_coverage_audit_retest_coverage_groups_unchecked_backlog():
+    """Verify provider directory coverage audit retest coverage groups unchecked backlog."""
     coverage = audit._source_catalog_retest_coverage(
         {
             "results": [
@@ -671,6 +673,7 @@ def test_provider_directory_coverage_audit_invalid_candidate_credential_file_is_
 
 
 def test_provider_directory_coverage_audit_credential_backlog_export_is_non_secret():
+    """Verify provider directory coverage audit credential backlog export is non secret."""
     export = audit._credential_backlog_export(
         {
             "generated_at": "2026-06-29T00:00:00Z",
@@ -784,6 +787,7 @@ def test_provider_directory_coverage_audit_credential_backlog_export_is_non_secr
 
 
 def test_provider_directory_coverage_audit_credential_api_base_targets_export_is_actionable():
+    """Verify provider directory coverage audit credential api base targets export is actionable."""
     export = audit._credential_api_base_targets_export(
         {
             "generated_at": "2026-06-29T00:00:00Z",
@@ -884,6 +888,7 @@ def test_provider_directory_coverage_audit_credential_api_base_targets_export_is
 
 
 def test_provider_directory_coverage_audit_credential_config_template_groups_by_host():
+    """Verify provider directory coverage audit credential config template groups by host."""
     template = audit._credential_config_template_export(
         {
             "generated_at": "2026-06-29T00:00:00Z",
@@ -1000,6 +1005,7 @@ def test_provider_directory_coverage_audit_credential_config_template_groups_by_
 
 
 def test_provider_directory_coverage_audit_credential_priority_export_rolls_up_hosts():
+    """Verify provider directory coverage audit credential priority export rolls up hosts."""
     priority = audit._credential_priority_export(
         {
             "generated_at": "2026-06-29T00:00:00Z",
@@ -2286,6 +2292,7 @@ def test_provider_directory_coverage_audit_markdown_includes_plan_network_contex
 
 
 def test_provider_directory_coverage_audit_markdown_includes_unified_source_id_and_country_counts():
+    """Verify provider directory coverage audit markdown includes unified source id and country counts."""
     markdown = audit.render_markdown(
         {
             "generated_at": "2026-06-28T00:00:00Z",
@@ -2509,6 +2516,7 @@ def test_provider_directory_coverage_audit_markdown_caps_credential_groups_witho
 
 @pytest.mark.asyncio
 async def test_provider_directory_coverage_audit_source_resource_coverage_summary(monkeypatch):
+    """Verify provider directory coverage audit source resource coverage summary."""
     async def is_relation_available(_conn, _schema, name):
         return name in {
             "provider_directory_source",
@@ -3152,6 +3160,7 @@ def test_provider_directory_coverage_audit_gap_includes_practitioner_role_reimpo
 
 
 def test_provider_directory_coverage_audit_markdown_includes_source_resource_coverage():
+    """Verify provider directory coverage audit markdown includes source resource coverage."""
     markdown = audit.render_markdown(
         {
             "generated_at": "2026-06-28T00:00:00Z",

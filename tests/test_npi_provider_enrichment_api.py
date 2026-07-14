@@ -193,6 +193,7 @@ async def test_get_npi_includes_provider_enrichment(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_filters_non_street_addresses_unless_extra_info(monkeypatch):
+    """Verify get npi filters non street addresses unless extra info."""
     async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,

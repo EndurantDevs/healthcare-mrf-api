@@ -636,6 +636,7 @@ async def test_normal_snapshot_cleanup_releases_shared_layouts(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_source_snapshot_gc_does_not_project_unrelated_shared_layout_bytes():
+    """Verify source snapshot gc does not project unrelated shared layout bytes."""
     class _SourceGCExecutor:
         async def all(self, statement, **_params):
             if "FROM information_schema.tables" in statement:

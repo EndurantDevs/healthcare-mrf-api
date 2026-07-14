@@ -183,6 +183,7 @@ def test_v3_followup_is_the_single_alembic_head():
 
 @pytest.mark.asyncio
 async def test_real_postgres_fresh_v3_migrations_have_gc_contract():
+    """Verify real postgres fresh v3 migrations have gc contract."""
     if os.getenv("HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST") != "1":
         pytest.skip(
             "set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 for the isolated "
@@ -266,6 +267,7 @@ async def test_real_postgres_fresh_v3_migrations_have_gc_contract():
 
 
 def test_ptg2_models_support_db_schema_alias_without_cross_schema_fks():
+    """Verify ptg2 models support db schema alias without cross schema fks."""
     root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
     env.pop("HLTHPRT_DB_SCHEMA", None)

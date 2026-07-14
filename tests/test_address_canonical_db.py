@@ -97,6 +97,7 @@ async def test_checksum_bridge_primary_key_is_checksum_only():
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_pub28_backed():
+    """Verify address canonical sql functions are immutable parallel safe and pub28 backed."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     rows = await db.all(
@@ -374,6 +375,7 @@ async def test_address_archive_v2_state_code_rejects_unmapped_values():
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_stamp_and_resolve_addresses_into_archive_v2(monkeypatch):
+    """Verify stamp and resolve addresses into archive v2."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_table = "address_canon_stage_test"
@@ -534,6 +536,7 @@ async def test_stamp_and_resolve_addresses_into_archive_v2(monkeypatch):
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_rust_materialized_resolve_matches_sql_resolve(monkeypatch):
+    """Verify rust materialized resolve matches sql resolve."""
     _requires_test_database()
     if address_canon._ptg2_rust_scanner_binary() is None:
         pytest.skip("Rust ptg2_scanner binary is required for address materialization parity")
@@ -612,6 +615,7 @@ async def test_rust_materialized_resolve_matches_sql_resolve(monkeypatch):
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_resolve_aborts_when_stamped_key_disagrees_with_identity(monkeypatch):
+    """Verify resolve aborts when stamped key disagrees with identity."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_table = "address_canon_stale_stamp_test"
@@ -675,6 +679,7 @@ async def test_resolve_aborts_when_stamped_key_disagrees_with_identity(monkeypat
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_migrate_legacy_archive_to_v2_builds_bridge_and_verifies_geocodes():
+    """Verify migrate legacy archive to v2 builds bridge and verifies geocodes."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     legacy_table = "address_archive_legacy_migrate_test"
@@ -846,6 +851,7 @@ async def test_resolve_reports_gate_warning_for_eligible_unstamped_rows(monkeypa
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_python_and_sql_address_canonical_golden_corpus_match():
+    """Verify python and sql address canonical golden corpus match."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     cases = _golden_cases()
@@ -930,6 +936,7 @@ async def test_python_and_sql_address_canonical_golden_corpus_match():
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_resolve_reason_buckets_and_collision_abort(monkeypatch):
+    """Verify resolve reason buckets and collision abort."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_table = "address_canon_stage_collision_test"
@@ -1050,6 +1057,7 @@ async def test_resolve_reason_buckets_and_collision_abort(monkeypatch):
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_resolve_aliases_missing_suffix_and_direction_only_when_unique(monkeypatch):
+    """Verify resolve aliases missing suffix and direction only when unique."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_table = "address_canon_stage_completion_alias_test"
@@ -1140,6 +1148,7 @@ async def test_resolve_aliases_missing_suffix_and_direction_only_when_unique(mon
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_resolve_leaves_missing_zip_unkeyed_without_coordinate_restore(monkeypatch):
+    """Verify resolve leaves missing zip unkeyed without coordinate restore."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_table = "address_canon_stage_missing_zip_repair_test"
@@ -1216,6 +1225,7 @@ async def test_resolve_leaves_missing_zip_unkeyed_without_coordinate_restore(mon
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_resolve_aborts_same_batch_identity_collision(monkeypatch):
+    """Verify resolve aborts same batch identity collision."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_table = "address_canon_stage_batch_collision_test"
@@ -1290,6 +1300,7 @@ async def test_resolve_aborts_same_batch_identity_collision(monkeypatch):
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
+    """Verify facility anchor coordinates refresh archive geocode fields."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_table = "facility_anchor_geocode_fixture"
@@ -1400,6 +1411,7 @@ async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_key():
+    """Verify entity address unified rebuild includes mrf source with address key."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_cls = make_class(EntityAddressUnified, "mrf_source_fixture")
@@ -1489,6 +1501,7 @@ async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_k
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_address_canonical_helpers_honor_cancel_before_writes():
+    """Verify address canonical helpers honor cancel before writes."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_table = "address_canon_stage_cancel_test"

@@ -178,6 +178,7 @@ def test_scanner_indexes_reversed_top_level_arrays_for_parallel_workers(tmp_path
 
 
 def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
+    """Verify indexed range producers preserve rows and digests."""
     payload = _mixed_inline_referenced_payload()
     artifact = tmp_path / "mixed-reversed.json.gz"
     _write_gzip_json(
@@ -262,6 +263,7 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
 
 
 def test_delayed_indexed_range_emits_object_coverage_progress(tmp_path):
+    """Verify delayed indexed range emits object coverage progress."""
     payload = _mixed_inline_referenced_payload()
     artifact = tmp_path / "delayed-reversed.json.gz"
     _write_gzip_json(

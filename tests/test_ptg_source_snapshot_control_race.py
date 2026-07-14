@@ -123,6 +123,7 @@ class _InterleavingDB:
 
 
 def _install_control_fakes(monkeypatch, state):
+    """Support the install control fakes test fixture."""
     fake_db = _InterleavingDB(state)
     monkeypatch.setattr(source_pointers, "db", fake_db)
     monkeypatch.setattr(snapshot_cleanup, "db", fake_db)
