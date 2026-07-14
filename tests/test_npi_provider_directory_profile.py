@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import types
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -150,7 +151,7 @@ async def test_profile_fetch_returns_compact_and_optional_evidence(monkeypatch):
                         "profile_json": json.dumps(profile_dict),
                         "evidence_json": evidence_dict,
                         "generation_id": "generation_1",
-                        "published_at": "2026-07-13 20:00:00",
+                        "published_at": datetime(2026, 7, 13, 20, 0, 0, 123456),
                     }
                 ]
             ),
@@ -175,6 +176,12 @@ async def test_profile_fetch_returns_compact_and_optional_evidence(monkeypatch):
     assert profiles_by_npi[1588616783]["evidence"]["facts"]["age"]["items"][0][
         "evidence"
     ][0]["source_id"] == "s1"
+    assert profiles_by_npi[1588616783]["profile"]["published_at"] == (
+        "2026-07-13T20:00:00.123456Z"
+    )
+    assert profiles_by_npi[1588616783]["evidence"]["published_at"] == (
+        "2026-07-13T20:00:00.123456Z"
+    )
     profile_query = execute.await_args_list[1]
     assert "evidence_json" in str(profile_query.args[0])
     assert "WHERE npi = ANY(CAST(:npis AS bigint[]))" in str(
@@ -182,6 +189,21 @@ async def test_profile_fetch_returns_compact_and_optional_evidence(monkeypatch):
     )
     assert " JOIN " not in str(profile_query.args[0]).upper()
     assert profile_query.kwargs["params"] == {"npis": [1588616783]}
+
+
+def test_profile_publication_timestamp_normalizes_aware_datetime_to_utc():
+    published_at = datetime(
+        2026,
+        7,
+        13,
+        22,
+        0,
+        tzinfo=timezone(timedelta(hours=2)),
+    )
+
+    assert npi_module._serialize_utc_rfc3339_datetime(published_at) == (
+        "2026-07-13T20:00:00Z"
+    )
 
 
 @pytest.mark.asyncio
