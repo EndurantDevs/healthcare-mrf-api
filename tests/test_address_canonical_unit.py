@@ -2698,6 +2698,31 @@ async def test_provider_directory_shutdown_rejects_support_patch_publish(monkeyp
         await entity_address_unified.shutdown(ctx)
 
 
+def _partial_shutdown_payload():
+    return {
+        "import_date": "20260614",
+        "context": {
+            "run": 1,
+            "test_mode": True,
+            "refresh_mode": "provider-directory-partial",
+            "stage_indexes_prepared": True,
+            "support_stage_indexes_prepared": True,
+            "partial_provider_directory_replacement_publish": True,
+            "partial_provider_directory_coordinate_scope_table": (
+                "entity_address_unified_20260614_pd_live_locations"
+            ),
+            "partial_provider_directory_replacement_rows": 120,
+            "partial_provider_directory_unaffected_live_rows_copied": 100,
+            "partial_provider_directory_affected_stage_rows_copied": 20,
+            "staged_rows": 120,
+            "npi_rows": 0,
+            "inferred_rows": 0,
+            "multi_source_rows": 0,
+            "support_counts": {},
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_provider_directory_partial_shutdown_uses_atomic_publisher(monkeypatch):
     statements = []
@@ -2726,27 +2751,7 @@ async def test_provider_directory_partial_shutdown_uses_atomic_publisher(monkeyp
     monkeypatch.setattr(entity_address_unified, "mark_control_run", AsyncMock())
     monkeypatch.setattr(entity_address_unified, "_publish_staged_entity_address_tables", publish_mock)
 
-    shutdown_payload_map = {
-        "import_date": "20260614",
-        "context": {
-            "run": 1,
-            "test_mode": True,
-            "refresh_mode": "provider-directory-partial",
-            "stage_indexes_prepared": True,
-            "support_stage_indexes_prepared": True,
-            "partial_provider_directory_replacement_publish": True,
-            "partial_provider_directory_replacement_rows": 120,
-            "partial_provider_directory_unaffected_live_rows_copied": 100,
-            "partial_provider_directory_affected_stage_rows_copied": 20,
-            "staged_rows": 120,
-            "npi_rows": 0,
-            "inferred_rows": 0,
-            "multi_source_rows": 0,
-            "support_counts": {},
-        },
-    }
-
-    await entity_address_unified.shutdown(shutdown_payload_map)
+    await entity_address_unified.shutdown(_partial_shutdown_payload())
 
     joined = "\n".join(statements)
     assert "DELETE FROM" not in joined
@@ -2754,6 +2759,9 @@ async def test_provider_directory_partial_shutdown_uses_atomic_publisher(monkeyp
     assert publish_mock.await_args.args[0] == "mrf"
     assert publish_mock.await_args.args[1].__tablename__ == "entity_address_unified_20260614"
     assert publish_mock.await_args.kwargs["partial_support_patch"] is False
+    assert "entity_address_unified_20260614_pd_live_locations" in joined
+    assert "UPDATE mrf.entity_address_unified AS" not in joined
+    assert "LOCK TABLE" not in joined
 
 
 def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(monkeypatch):
@@ -3476,6 +3484,57 @@ def test_entity_address_unified_archive_coordinate_backfill_sql_only_fills_missi
     assert "ABS(t.lat) < 0.0000001" in sql
 
 
+def test_provider_directory_partial_post_build_mutations_only_touch_scoped_stage_rows():
+    scope_table = "entity_address_unified_20260614_pd_live_locations"
+    same_key_sql = entity_address_unified._backfill_archive_coordinates_sql(
+        "mrf",
+        "entity_address_unified_20260614",
+        coordinate_scope_table=scope_table,
+    )
+    inherited_sql = entity_address_unified._inherit_archive_coordinates_sql(
+        "mrf",
+        "entity_address_unified_20260614",
+        coordinate_scope_table=scope_table,
+    )
+    same_provider_sql = entity_address_unified._backfill_same_provider_address_fields_sql(
+        "mrf",
+        "entity_address_unified_20260614",
+        coordinate_scope_table=scope_table,
+    )
+    clear_invalid_sql = entity_address_unified._clear_invalid_coordinates_sql(
+        "mrf",
+        "entity_address_unified_20260614",
+        coordinate_scope_table=scope_table,
+    )
+
+    for sql in (same_key_sql, inherited_sql, same_provider_sql, clear_invalid_sql):
+        assert f"mrf.{scope_table} AS scope" in sql
+        assert "UPDATE mrf.entity_address_unified_20260614 AS" in sql
+        assert "UPDATE mrf.entity_address_unified AS" not in sql
+        assert "LOCK TABLE" not in sql
+
+    assert "WITH scoped_targets AS MATERIALIZED" in same_key_sql
+    assert "t.location_key = scope.location_key" in same_key_sql
+    assert "t.ctid = scoped.target_row_id" in same_key_sql
+    assert "JOIN mrf.address_archive_v2 AS a" in same_key_sql
+    assert "JOIN mrf.entity_address_unified_20260614_pd_live_locations AS scope" in inherited_sql
+    assert "scope.location_key = target.location_key" in inherited_sql
+    assert "source_row.location_key" in same_provider_sql
+    assert "scope.location_key = source_row.location_key" in same_provider_sql
+    assert "scoped_targets AS MATERIALIZED" in same_provider_sql
+    assert "target_row.ctid = scoped_targets.target_row_id" in same_provider_sql
+    assert "t.location_key = scope.location_key" in clear_invalid_sql
+
+    assert scope_table not in entity_address_unified._backfill_same_provider_address_fields_sql(
+        "mrf",
+        "entity_address_unified_20260614",
+    )
+    assert scope_table not in entity_address_unified._clear_invalid_coordinates_sql(
+        "mrf",
+        "entity_address_unified_20260614",
+    )
+
+
 def test_legacy_coordinate_inheritance_sql():
     sql = entity_address_unified._inherit_archive_coordinates_sql(
         "mrf",
@@ -3525,6 +3584,21 @@ def test_entity_address_unified_clears_invalid_coordinates_before_validation():
 
     assert source.index("_clear_invalid_coordinates_sql") < source.index("_validate_publish_integrity")
     assert "invalid_coordinate_clear_rows" in source
+
+
+def test_provider_directory_partial_keeps_scope_for_all_post_build_mutations():
+    source = inspect.getsource(entity_address_unified.shutdown)
+
+    same_key_backfill = source.index("_backfill_archive_coordinates_sql")
+    inherited_backfill = source.index("_inherit_archive_coordinates(", same_key_backfill)
+    same_provider_backfill = source.index("_backfill_same_provider_address_fields_sql")
+    invalid_coordinate_clear = source.index("_clear_invalid_coordinates_sql")
+    scope_drop = source.index("dropping Provider Directory post-build scope")
+    validation = source.index("_validate_publish_integrity")
+
+    assert same_key_backfill < inherited_backfill < same_provider_backfill
+    assert same_provider_backfill < invalid_coordinate_clear < scope_drop < validation
+    assert source.count("coordinate_scope_table=coordinate_scope_table or None") == 4
 
 
 def test_entity_address_unified_keep_raw_stage_is_opt_in(monkeypatch):

@@ -4896,9 +4896,35 @@ def _coordinate_missing_or_invalid_sql(alias: str) -> str:
     )
 
 
-def _backfill_archive_coordinates_sql(db_schema: str, table_name: str) -> str:
+def _backfill_archive_coordinates_sql(
+    db_schema: str,
+    table_name: str,
+    *,
+    coordinate_scope_table: str | None = None,
+) -> str:
     target_coordinate_missing = _coordinate_missing_or_invalid_sql("t")
     archive_coordinate_missing = _coordinate_missing_or_invalid_sql("a")
+    if coordinate_scope_table:
+        return f"""
+        WITH scoped_targets AS MATERIALIZED (
+            SELECT t.ctid AS target_row_id, t.address_key
+              FROM {db_schema}.{coordinate_scope_table} AS scope
+              JOIN {db_schema}.{table_name} AS t
+                ON t.location_key = scope.location_key
+             WHERE t.address_key IS NOT NULL
+               AND ({target_coordinate_missing})
+        )
+        UPDATE {db_schema}.{table_name} AS t
+           SET lat = a.lat,
+               long = a.long
+          FROM scoped_targets AS scoped
+          JOIN {db_schema}.address_archive_v2 AS a
+            ON a.address_key = scoped.address_key
+         WHERE t.ctid = scoped.target_row_id
+           AND a.merged_into IS NULL
+           AND NOT ({archive_coordinate_missing})
+           AND ({target_coordinate_missing});
+        """
     return f"""
     UPDATE {db_schema}.{table_name} AS t
        SET lat = a.lat,
@@ -4916,7 +4942,14 @@ def _archive_coordinate_eligible_targets_sql(
     db_schema: str,
     table_name: str,
     target_coordinate_missing: str,
+    *,
+    coordinate_scope_table: str | None = None,
 ) -> str:
+    coordinate_scope_join = ""
+    if coordinate_scope_table:
+        coordinate_scope_join = f"""
+          JOIN {db_schema}.{coordinate_scope_table} AS scope
+            ON scope.location_key = target.location_key"""
     return f"""
     eligible_targets AS MATERIALIZED (
         SELECT
@@ -4929,6 +4962,7 @@ def _archive_coordinate_eligible_targets_sql(
             current_archive.zip5,
             current_archive.country_code
           FROM {db_schema}.{table_name} AS target
+          {coordinate_scope_join}
           JOIN {db_schema}.address_archive_v2 AS current_archive
             ON current_archive.address_key = target.address_key
            AND current_archive.merged_into IS NULL
@@ -4974,7 +5008,12 @@ def _archive_coordinate_candidate_groups_sql(
     """
 
 
-def _inherit_archive_coordinates_sql(db_schema: str, table_name: str) -> str:
+def _inherit_archive_coordinates_sql(
+    db_schema: str,
+    table_name: str,
+    *,
+    coordinate_scope_table: str | None = None,
+) -> str:
     """Inherit coordinates from one exact older identity without changing identity fields."""
     target_coordinate_missing = _coordinate_missing_or_invalid_sql("target")
     legacy_coordinate_missing = _coordinate_missing_or_invalid_sql("legacy")
@@ -4982,6 +5021,7 @@ def _inherit_archive_coordinates_sql(db_schema: str, table_name: str) -> str:
         db_schema,
         table_name,
         target_coordinate_missing,
+        coordinate_scope_table=coordinate_scope_table,
     )
     candidate_groups_sql = _archive_coordinate_candidate_groups_sql(
         db_schema,
@@ -5010,8 +5050,19 @@ def _inherit_archive_coordinates_sql(db_schema: str, table_name: str) -> str:
     """
 
 
-async def _inherit_archive_coordinates(db_schema: str, table_name: str) -> dict[str, int]:
-    rows = await db.all(_inherit_archive_coordinates_sql(db_schema, table_name))
+async def _inherit_archive_coordinates(
+    db_schema: str,
+    table_name: str,
+    *,
+    coordinate_scope_table: str | None = None,
+) -> dict[str, int]:
+    rows = await db.all(
+        _inherit_archive_coordinates_sql(
+            db_schema,
+            table_name,
+            coordinate_scope_table=coordinate_scope_table,
+        )
+    )
     if not rows:
         return {"inherited_rows": 0, "ambiguous_rows": 0}
     metrics = _row_mapping(rows[0])
@@ -5038,7 +5089,27 @@ def _archive_coordinate_publish_metrics(context: dict) -> dict[str, int]:
     }
 
 
-def _clear_invalid_coordinates_sql(db_schema: str, table_name: str) -> str:
+def _clear_invalid_coordinates_sql(
+    db_schema: str,
+    table_name: str,
+    *,
+    coordinate_scope_table: str | None = None,
+) -> str:
+    if coordinate_scope_table:
+        return f"""
+        WITH scoped_targets AS MATERIALIZED (
+            SELECT t.ctid AS target_row_id
+              FROM {db_schema}.{coordinate_scope_table} AS scope
+              JOIN {db_schema}.{table_name} AS t
+                ON t.location_key = scope.location_key
+        )
+        UPDATE {db_schema}.{table_name} AS t
+           SET lat = NULL,
+               long = NULL
+          FROM scoped_targets AS scoped
+         WHERE t.ctid = scoped.target_row_id
+           AND {_coordinate_invalid_sql("t")};
+        """
     return f"""
     UPDATE {db_schema}.{table_name} AS t
        SET lat = NULL,
@@ -5084,25 +5155,53 @@ def _same_provider_update_needed_sql(target_coordinate_missing: str) -> str:
     """
 
 
-def _same_provider_source_rows_sql(db_schema: str, table_name: str) -> str:
+def _same_provider_source_rows_sql(
+    db_schema: str,
+    table_name: str,
+    *,
+    coordinate_scope_table: str | None = None,
+) -> str:
+    if not coordinate_scope_table:
+        return f"""
+        source_rows AS MATERIALIZED (
+            SELECT
+                location_key,
+                {_entity_address_provider_npi_expr()} AS provider_npi,
+                address_key,
+                telephone_number,
+                phone_number,
+                phone_extension,
+                fax_number,
+                fax_number_digits,
+                fax_extension,
+                lat,
+                long,
+                source_count,
+                updated_at
+              FROM {db_schema}.{table_name}
+             WHERE address_key IS NOT NULL
+        )
+        """
     return f"""
     source_rows AS MATERIALIZED (
         SELECT
-            location_key,
-            {_entity_address_provider_npi_expr()} AS provider_npi,
-            address_key,
-            telephone_number,
-            phone_number,
-            phone_extension,
-            fax_number,
-            fax_number_digits,
-            fax_extension,
-            lat,
-            long,
-            source_count,
-            updated_at
-          FROM {db_schema}.{table_name}
-         WHERE address_key IS NOT NULL
+            source_row.location_key,
+            {_entity_address_provider_npi_expr("source_row")} AS provider_npi,
+            source_row.address_key,
+            source_row.telephone_number,
+            source_row.phone_number,
+            source_row.phone_extension,
+            source_row.fax_number,
+            source_row.fax_number_digits,
+            source_row.fax_extension,
+            source_row.lat,
+            source_row.long,
+            source_row.source_count,
+            source_row.updated_at
+          FROM {db_schema}.{table_name} AS source_row
+          JOIN {db_schema}.{coordinate_scope_table} AS scope
+            ON scope.location_key = source_row.location_key
+         WHERE source_row.address_key IS NOT NULL
     )
     """
 
@@ -5148,18 +5247,39 @@ def _same_provider_set_clause_sql(target_coordinate_missing: str) -> str:
     """
 
 
-def _backfill_same_provider_address_fields_sql(db_schema: str, table_name: str) -> str:
+def _backfill_same_provider_address_fields_sql(
+    db_schema: str,
+    table_name: str,
+    *,
+    coordinate_scope_table: str | None = None,
+) -> str:
     """Fill missing contacts and coordinates from same-provider rows at the same address key."""
     target_coordinate_missing = _coordinate_missing_or_invalid_sql("target_row")
+    scoped_targets_sql = ""
+    target_scope_filter = ""
+    if coordinate_scope_table:
+        scoped_targets_sql = f""",
+    scoped_targets AS MATERIALIZED (
+        SELECT target_row.ctid AS target_row_id
+          FROM {db_schema}.{coordinate_scope_table} AS scope
+          JOIN {db_schema}.{table_name} AS target_row
+            ON target_row.location_key = scope.location_key
+    )"""
+        target_scope_filter = "\n       AND target_row.ctid = scoped_targets.target_row_id"
     return f"""
-    WITH {_same_provider_source_rows_sql(db_schema, table_name)},
-    {_same_provider_grouped_fields_sql()}
+    WITH {_same_provider_source_rows_sql(
+        db_schema,
+        table_name,
+        coordinate_scope_table=coordinate_scope_table,
+    )},
+    {_same_provider_grouped_fields_sql()}{scoped_targets_sql}
     UPDATE {db_schema}.{table_name} AS target_row
        SET {_same_provider_set_clause_sql(target_coordinate_missing)}
-      FROM grouped_fields
+      FROM grouped_fields{", scoped_targets" if coordinate_scope_table else ""}
      WHERE target_row.address_key IS NOT NULL
        AND target_row.address_key = grouped_fields.address_key
        AND {_entity_address_provider_npi_expr("target_row")} = grouped_fields.provider_npi
+       {target_scope_filter}
        AND ({_same_provider_update_needed_sql(target_coordinate_missing)}
        );
     """
@@ -11521,6 +11641,7 @@ async def process_data(ctx, task=None):
             await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{affected_live_location_table};") or 0
         )
         context["partial_provider_directory_affected_live_locations"] = affected_live_locations
+        context["partial_provider_directory_coordinate_scope_table"] = affected_live_location_table
         copied_rows = await _run_sql_phase(
             _copy_unaffected_live_entity_rows_by_location_sql(
                 db_schema,
@@ -11602,19 +11723,6 @@ async def process_data(ctx, task=None):
             message="dropping affected Provider Directory groups",
             emit_done=True,
         )
-        await _run_sql_phase(
-            f"DROP TABLE IF EXISTS {db_schema}.{affected_live_location_table};",
-            context=context,
-            run_id=run_id,
-            phase="entity-address-unified dropping Provider Directory affected locations",
-            unit="tables",
-            done=1,
-            total=1,
-            pct=90,
-            message="dropping Provider Directory affected live locations",
-            emit_done=True,
-        )
-
     if not ctx["context"].get("stage_indexes_prepared"):
         if run_id:
             enqueue_live_progress(
@@ -11728,6 +11836,9 @@ async def shutdown(ctx):
     affected_live_location_table = str(
         context.get("partial_provider_directory_affected_live_location_table") or ""
     ).strip()
+    coordinate_scope_table = str(
+        context.get("partial_provider_directory_coordinate_scope_table") or ""
+    ).strip()
     partial_support_patch = bool(context.get("partial_support_patch_publish"))
     is_partial_provider_directory_refresh = (
         context.get("refresh_mode") == ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
@@ -11748,6 +11859,14 @@ async def shutdown(ctx):
             "entity-address-unified provider-directory-partial refresh must publish "
             "through replacement-stage table swap; live support patch publishing is disabled."
         )
+    if is_partial_provider_directory_refresh and context.get(
+        "partial_provider_directory_replacement_publish"
+    ):
+        if not coordinate_scope_table or not await _table_exists(db_schema, coordinate_scope_table):
+            raise RuntimeError(
+                "entity-address-unified provider-directory-partial replacement publish requires "
+                "the affected location scope through staged coordinate backfill."
+            )
 
     cached_stage_rows = _int_context_metric(context, "staged_rows")
     stage_rows = cached_stage_rows
@@ -11840,7 +11959,11 @@ async def shutdown(ctx):
     )
     if await _table_exists(db_schema, "address_archive_v2"):
         archive_coordinate_same_key_backfill_rows = await _run_sql_phase(
-            _backfill_archive_coordinates_sql(db_schema, stage_cls.__tablename__),
+            _backfill_archive_coordinates_sql(
+                db_schema,
+                stage_cls.__tablename__,
+                coordinate_scope_table=coordinate_scope_table or None,
+            ),
             context=context,
             run_id=run_id,
             phase="entity-address-unified backfilling archive coordinates",
@@ -11860,6 +11983,7 @@ async def shutdown(ctx):
         inheritance_metrics = await _inherit_archive_coordinates(
             db_schema,
             stage_cls.__tablename__,
+            coordinate_scope_table=coordinate_scope_table or None,
         )
         _record_phase_timing(
             context,
@@ -11884,7 +12008,11 @@ async def shutdown(ctx):
         context["archive_coordinate_inherited_rows"] = 0
         context["archive_coordinate_ambiguous_rows"] = 0
     same_provider_address_backfill_rows = await _run_sql_phase(
-        _backfill_same_provider_address_fields_sql(db_schema, stage_cls.__tablename__),
+        _backfill_same_provider_address_fields_sql(
+            db_schema,
+            stage_cls.__tablename__,
+            coordinate_scope_table=coordinate_scope_table or None,
+        ),
         context=context,
         run_id=run_id,
         phase="entity-address-unified backfilling same-provider address fields",
@@ -11898,7 +12026,11 @@ async def shutdown(ctx):
     )
     context["same_provider_address_backfill_rows"] = int(same_provider_address_backfill_rows or 0)
     invalid_coordinate_clear_rows = await _run_sql_phase(
-        _clear_invalid_coordinates_sql(db_schema, stage_cls.__tablename__),
+        _clear_invalid_coordinates_sql(
+            db_schema,
+            stage_cls.__tablename__,
+            coordinate_scope_table=coordinate_scope_table or None,
+        ),
         context=context,
         run_id=run_id,
         phase="entity-address-unified clearing invalid coordinates",
@@ -11911,6 +12043,19 @@ async def shutdown(ctx):
         emit_done=True,
     )
     context["invalid_coordinate_clear_rows"] = int(invalid_coordinate_clear_rows or 0)
+    if coordinate_scope_table:
+        await _run_sql_phase(
+            f"DROP TABLE IF EXISTS {db_schema}.{coordinate_scope_table};",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified dropping Provider Directory post-build scope",
+            unit="tables",
+            done=1,
+            total=1,
+            pct=97,
+            message="dropping Provider Directory post-build scope",
+            emit_done=True,
+        )
     context["publish_validation_deferred"] = defer_publish_validation
     if defer_publish_validation:
         context["publish_validation"] = {

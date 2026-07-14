@@ -33,6 +33,7 @@ _TABLE_DEFINITION_SQL = (
     """
     CREATE TABLE {schema_name}.entity_address_unified_stage (
         case_name text PRIMARY KEY,
+        location_key text NOT NULL UNIQUE,
         address_key uuid,
         address_precision text NOT NULL,
         archive_identity_version text NOT NULL,
@@ -79,18 +80,18 @@ VALUES
 
 _STAGE_FIXTURES_SQL = """
 INSERT INTO {schema_name}.entity_address_unified_stage
-    (case_name, address_key, address_precision, archive_identity_version,
+    (case_name, location_key, address_key, address_precision, archive_identity_version,
      identity_marker, lat, long)
 VALUES
-    ('supplied', 'a95430ba-8cbe-777f-c710-08e45e130b4e', 'street', 'v2', 'keep-supplied', NULL, NULL),
-    ('current-wins', '00000000-0000-0000-0000-000000000100', 'street', 'v2', 'keep-current', NULL, NULL),
-    ('duplicate', '00000000-0000-0000-0000-000000000200', 'street', 'v2', 'keep-duplicate', NULL, NULL),
-    ('city-mismatch', '00000000-0000-0000-0000-000000000300', 'street', 'v2', 'keep-city', NULL, NULL),
-    ('zip-mismatch', '00000000-0000-0000-0000-000000000400', 'street', 'v2', 'keep-zip', NULL, NULL),
-    ('state-mismatch', '00000000-0000-0000-0000-000000000500', 'street', 'v2', 'keep-state', NULL, NULL),
-    ('non-us', '00000000-0000-0000-0000-000000000600', 'street', 'v2', 'keep-country', NULL, NULL),
-    ('non-street', '00000000-0000-0000-0000-000000000700', 'city_zip', 'v2', 'keep-precision', NULL, NULL),
-    ('fuzzy-only', '00000000-0000-0000-0000-000000000800', 'street', 'v2', 'keep-fuzzy', NULL, NULL);
+    ('supplied', 'replacement-new', 'a95430ba-8cbe-777f-c710-08e45e130b4e', 'street', 'v2', 'keep-supplied', NULL, NULL),
+    ('current-wins', 'affected-existing', '00000000-0000-0000-0000-000000000100', 'street', 'v2', 'keep-current', NULL, NULL),
+    ('duplicate', 'duplicate', '00000000-0000-0000-0000-000000000200', 'street', 'v2', 'keep-duplicate', NULL, NULL),
+    ('city-mismatch', 'city-mismatch', '00000000-0000-0000-0000-000000000300', 'street', 'v2', 'keep-city', NULL, NULL),
+    ('zip-mismatch', 'zip-mismatch', '00000000-0000-0000-0000-000000000400', 'street', 'v2', 'keep-zip', NULL, NULL),
+    ('state-mismatch', 'state-mismatch', '00000000-0000-0000-0000-000000000500', 'street', 'v2', 'keep-state', NULL, NULL),
+    ('non-us', 'non-us', '00000000-0000-0000-0000-000000000600', 'street', 'v2', 'keep-country', NULL, NULL),
+    ('non-street', 'non-street', '00000000-0000-0000-0000-000000000700', 'city_zip', 'v2', 'keep-precision', NULL, NULL),
+    ('fuzzy-only', 'fuzzy-only', '00000000-0000-0000-0000-000000000800', 'street', 'v2', 'keep-fuzzy', NULL, NULL);
 """
 
 _LIVE_FIXTURE_SQL = """
@@ -215,5 +216,62 @@ async def test_archive_coordinate_backfill_inherits_only_one_exact_legacy_identi
         assert metrics_by_name == {"inherited_rows": 1, "ambiguous_rows": 1}
         stage_by_case = await _stage_rows_by_case(database, schema_name)
         _assert_stage_coordinate_outcomes(stage_by_case)
+        assert await _archive_snapshot(database, schema_name) == archive_before
+        await _assert_live_table_unchanged(database, schema_name)
+
+
+@pytest.mark.asyncio
+async def test_partial_archive_coordinate_backfill_excludes_unchanged_live_groups():
+    """Provider Directory replacement scope includes affected and new locations only."""
+    async with _temporary_schema() as (database, schema_name):
+        await _prepare_coordinate_fixtures(database, schema_name)
+        await database.status(
+            f"""
+            INSERT INTO {schema_name}.entity_address_unified_stage
+                (case_name, location_key, address_key, address_precision,
+                 archive_identity_version, identity_marker, lat, long)
+            VALUES
+                ('unchanged-current', 'unchanged-existing',
+                 '00000000-0000-0000-0000-000000000100', 'street', 'v2',
+                 'keep-unchanged', NULL, NULL);
+            """
+        )
+        await database.status(
+            f"""
+            CREATE UNLOGGED TABLE {schema_name}.provider_directory_coordinate_scope (
+                location_key text PRIMARY KEY
+            );
+            """
+        )
+        await database.status(
+            f"""
+            INSERT INTO {schema_name}.provider_directory_coordinate_scope (location_key)
+            VALUES ('affected-existing'), ('replacement-new');
+            """
+        )
+        archive_before = await _archive_snapshot(database, schema_name)
+
+        same_key_rows = await database.status(
+            entity_address_unified._backfill_archive_coordinates_sql(
+                schema_name,
+                "entity_address_unified_stage",
+                coordinate_scope_table="provider_directory_coordinate_scope",
+            )
+        )
+        metric_records = await database.all(
+            entity_address_unified._inherit_archive_coordinates_sql(
+                schema_name,
+                "entity_address_unified_stage",
+                coordinate_scope_table="provider_directory_coordinate_scope",
+            )
+        )
+        metrics_by_name = dict(metric_records[0]._mapping)
+        stage_by_case = await _stage_rows_by_case(database, schema_name)
+
+        assert same_key_rows == 1
+        assert metrics_by_name == {"inherited_rows": 1, "ambiguous_rows": 0}
+        assert tuple(map(float, stage_by_case["current-wins"][-2:])) == (30.1, -97.1)
+        assert tuple(map(float, stage_by_case["supplied"][-2:])) == (26.252675, -98.205322)
+        assert stage_by_case["unchanged-current"][-2:] == (None, None)
         assert await _archive_snapshot(database, schema_name) == archive_before
         await _assert_live_table_unchanged(database, schema_name)
