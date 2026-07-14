@@ -69,10 +69,8 @@ class StatementAdapter:
     def __init__(self, db: "Database", stmt: Executable):
         self._db = db
         self._stmt = stmt
-
     def _wrap(self, stmt: Executable):
         return _wrap_statement(self._db, stmt)
-
     def __getattr__(self, item: str):
         attr = getattr(self._stmt, item)
         if callable(attr):
@@ -81,28 +79,28 @@ class StatementAdapter:
                 return self._wrap(result)
             return _wrapped
         return attr
-
     async def execute(self, **params: Any):
+        """Execute the wrapped statement with bound parameters."""
         async with self._db._execution_session() as session:
             return await session.execute(self._stmt, params)
-
     async def all(self, **params: Any):
+        """Return every row produced by the wrapped statement."""
         result = await self.execute(**params)
         return result.all()
-
     async def first(self, **params: Any):
+        """Return the first row produced by the wrapped statement."""
         result = await self.execute(**params)
         return result.first()
-
     async def scalar(self, **params: Any):
+        """Return the first scalar produced by the wrapped statement."""
         result = await self.execute(**params)
         return result.scalar()
-
     async def status(self, **params: Any):
+        """Return the affected-row count for the wrapped statement."""
         result = await self.execute(**params)
         return getattr(result, "rowcount", None)
-
     async def iterate(self, **params: Any):
+        """Yield rows from the wrapped statement without buffering them."""
         async with self._db._execution_session() as session:
             async_result = await session.stream(self._stmt, params)
             async for row in async_result:
@@ -128,7 +126,6 @@ class DeleteAdapter(StatementAdapter):
 class FuncProxy:
     def __init__(self, db: "Database"):
         self._db = db
-
     def __getattr__(self, item: str):
         attr = getattr(sa_func, item)
 
@@ -143,32 +140,33 @@ class ConnectionProxy:
         self._db = db
         self._connection = connection
         self.raw_connection = raw_connection
-
     async def all(self, stmt: Any, **params: Any):
+        """Execute a statement and return all rows on this connection."""
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
         result = await self._connection.execute(stmt, params)
         return result.all()
-
     async def first(self, stmt: Any, **params: Any):
+        """Execute a statement and return its first row."""
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
         result = await self._connection.execute(stmt, params)
         return result.first()
-
     async def scalar(self, stmt: Any, **params: Any):
+        """Execute a statement and return its first scalar value."""
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
         result = await self._connection.execute(stmt, params)
         return result.scalar()
-
     async def status(self, stmt: Any, **params: Any):
+        """Execute a statement and return its affected-row count."""
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
         result = await self._connection.execute(stmt, params)
         return getattr(result, "rowcount", None)
 
     @asynccontextmanager
     async def transaction(self):
+        """Expose the transaction already owned by this connection proxy."""
         yield self
-
     async def close(self):
+        """Preserve the proxy close contract without closing its owner."""
         return None
 
 
@@ -188,6 +186,7 @@ _TRANSACTION: contextvars.ContextVar[Tuple[_TransactionBinding, ...]] = (
 
 
 def current_session() -> AsyncSession:
+    """Return the SQLAlchemy session bound to the current context."""
     try:
         return _SESSION.get()
     except LookupError as exc:
@@ -210,11 +209,10 @@ class Database:
 
     text = staticmethod(sa_text)
     metadata = Base.metadata
-
     def __post_init__(self) -> None:
         self.func = FuncProxy(self)
-
     async def connect(self) -> None:
+        """Create the configured async engine and session factory."""
         if _ASYNC_IMPORT_ERROR is not None:
             raise RuntimeError(
                 "SQLAlchemy async support requires SQLAlchemy >= 1.4"
@@ -263,13 +261,13 @@ class Database:
             autoflush=False,
         )
         self._database_name = requested_db
-
     def select(self, *columns: Any):
+        """Build a select statement bound to this database helper."""
         columns = _coerce_columns(columns)
         stmt = sa_select(*columns)
         return SelectAdapter(self, stmt)
-
     def insert(self, *args: Any, **kwargs: Any):
+        """Build a PostgreSQL-aware insert statement for a table or model."""
         target = args[0] if args else None
         table = None
         remaining_args = args
@@ -284,44 +282,44 @@ class Database:
         else:
             stmt = sa_insert(*args, **kwargs)
         return InsertAdapter(self, stmt)
-
     def update(self, *args: Any, **kwargs: Any):
+        """Build an update statement bound to this database helper."""
         stmt = sa_update(*args, **kwargs)
         return UpdateAdapter(self, stmt)
-
     def delete(self, *args: Any, **kwargs: Any):
+        """Build a delete statement bound to this database helper."""
         stmt = sa_delete(*args, **kwargs)
         return DeleteAdapter(self, stmt)
-
     async def status(self, stmt: Any, **params: Any):
+        """Execute a statement and return its affected-row count."""
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
         async with self._execution_session() as session:
             result = await session.execute(stmt, params)
             return getattr(result, "rowcount", None)
-
     async def execute(self, stmt: Any, **params: Any):
+        """Execute a statement in the current or a short-lived session."""
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
         async with self._execution_session() as session:
             return await session.execute(stmt, params)
-
     async def all(self, stmt: Any, **params: Any):
+        """Execute a statement and return all rows."""
         result = await self.execute(stmt, **params)
         return result.all()
-
     async def first(self, stmt: Any, **params: Any):
+        """Execute a statement and return its first row."""
         result = await self.execute(stmt, **params)
         return result.first()
-
     async def scalar(self, stmt: Any, **params: Any):
+        """Execute a statement and return its first scalar value."""
         result = await self.execute(stmt, **params)
         return result.scalar()
-
     async def stream(self, stmt: Any, **params: Any):
+        """Execute a statement and return its streaming result."""
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
         async with self._execution_session() as session:
             return await session.stream(stmt, params)
-
     async def create_table(self, table: SATable, **kwargs: Any) -> None:
+        """Create a table and its schema when either is absent."""
         if self.engine is None:
             await self.connect()
         assert self.engine is not None
@@ -331,16 +329,16 @@ class Database:
                 schema_name = preparer.quote_schema(table.schema)
                 await connection.exec_driver_sql(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
             await connection.run_sync(table.create, **kwargs)
-
     async def disconnect(self) -> None:
+        """Dispose the active engine and clear connection state."""
         if self.engine is None:
             return
         await self.engine.dispose()
         self.engine = None
         self.session_factory = None
         self._database_name = None
-
     async def execute_ddl(self, statement: str) -> None:
+        """Execute DDL through an autocommit connection."""
         if self.engine is None:
             await self.connect()
         assert self.engine is not None
@@ -352,6 +350,7 @@ class Database:
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
+        """Yield a context-bound session with commit and rollback handling."""
         if _ASYNC_IMPORT_ERROR is not None:
             raise RuntimeError(
                 "SQLAlchemy async support requires SQLAlchemy >= 1.4"
@@ -372,7 +371,6 @@ class Database:
         finally:
             await session.close()
             _SESSION.reset(token)
-
     def _transaction_binding(self) -> Optional[_TransactionBinding]:
         binding = next(
             (
@@ -401,6 +399,7 @@ class Database:
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[AsyncSession]:
+        """Yield an owned transaction or a nested transaction when reentered."""
         binding = self._transaction_binding()
         if binding is not None:
             async with binding.session.begin_nested():
@@ -425,6 +424,7 @@ class Database:
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[ConnectionProxy]:
+        """Yield a compatibility proxy around an engine-owned connection."""
         if self.engine is None:
             await self.connect()
         assert self.engine is not None
@@ -432,8 +432,8 @@ class Database:
             raw_connection = await connection.get_raw_connection()
             proxy = ConnectionProxy(self, connection, raw_connection)
             yield proxy
-
     def init_app(self, app) -> None:
+        """Register database lifecycle and request-session hooks on an app."""
         if _ASYNC_IMPORT_ERROR is not None:
             raise RuntimeError(
                 "SQLAlchemy async support requires SQLAlchemy >= 1.4"

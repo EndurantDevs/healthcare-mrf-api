@@ -5718,7 +5718,7 @@ async def test_html_mrf_resolver_filters_query_before_target_limit(monkeypatch):
 async def test_healthcarebluebook_resolver_filters_nested_links_by_target_query(
     monkeypatch,
 ):
-    source = {
+    discovery_source = {
         "source_id": "source_hbb",
         "display_name": "Example HBB",
         "metadata_json": {"raw": {"target_payer_query": "Example Employer"}},
@@ -5756,21 +5756,21 @@ async def test_healthcarebluebook_resolver_filters_nested_links_by_target_query(
         discovery, "_crawl_targets_for_source", fake_crawl_targets_for_source
     )
 
-    targets = await discovery._resolve_healthcarebluebook_mrf(
-        source,
+    discovery_targets = await discovery._resolve_healthcarebluebook_mrf(
+        discovery_source,
         "https://mrf.healthcarebluebook.com/example",
         {"type": "healthcarebluebook_mrf"},
         session=None,
     )
 
     assert nested_calls == ["https://example.sapphiremrfhub.com/"]
-    assert [target.label for target in targets] == ["Example Employer"]
-    assert targets[0].metadata["healthcarebluebook_link_label"] == "Example Employer"
+    assert [discovery_target.label for discovery_target in discovery_targets] == ["Example Employer"]
+    assert discovery_targets[0].metadata["healthcarebluebook_link_label"] == "Example Employer"
 
 
 @pytest.mark.asyncio
 async def test_generic_html_file_reference_infers_plan_info_from_filename(monkeypatch):
-    source = {
+    discovery_source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Example Carrier",
@@ -5788,14 +5788,14 @@ async def test_generic_html_file_reference_infers_plan_info_from_filename(monkey
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
 
-    [target] = await discovery._crawl_targets_for_source(
-        source, "https://example.test/mrf/", None
+    [discovery_target] = await discovery._crawl_targets_for_source(
+        discovery_source, "https://example.test/mrf/", None
     )
 
-    assert target.label == "123 Alpha Benefit Plan Ffs"
-    assert target.metadata["target_kind"] == "file_reference"
-    assert target.metadata["target_file_type"] == "in-network"
-    assert target.metadata["plan_info"] == [
+    assert discovery_target.label == "123 Alpha Benefit Plan Ffs"
+    assert discovery_target.metadata["target_kind"] == "file_reference"
+    assert discovery_target.metadata["target_file_type"] == "in-network"
+    assert discovery_target.metadata["plan_info"] == [
         {
             "plan_id": None,
             "plan_id_type": None,
@@ -5807,7 +5807,7 @@ async def test_generic_html_file_reference_infers_plan_info_from_filename(monkey
 
 @pytest.mark.asyncio
 async def test_html_mrf_resolver_follows_mrf_iframe_pages(monkeypatch):
-    source = {
+    discovery_source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Group Administrators",
@@ -5831,28 +5831,28 @@ async def test_html_mrf_resolver_follows_mrf_iframe_pages(monkeypatch):
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
 
-    targets = await discovery._resolve_html_mrf_links(
-        source,
+    discovery_targets = await discovery._resolve_html_mrf_links(
+        discovery_source,
         "https://www.groupadministrators.com/machinereadablefiles/",
         {"type": "html_mrf_links", "max_frames": 2},
         None,
     )
 
-    assert [target.url for target in targets] == [
+    assert [discovery_target.url for discovery_target in discovery_targets] == [
         "https://mrf.example.test/example_in-network-rates.json",
         "https://mrf.example.test/example_allowed-amounts.json",
     ]
-    assert targets[0].metadata["resolver"] == "html_file_reference"
-    assert targets[0].metadata["target_file_type"] == "in-network"
-    assert targets[0].metadata["frame_url"] == (
+    assert discovery_targets[0].metadata["resolver"] == "html_file_reference"
+    assert discovery_targets[0].metadata["target_file_type"] == "in-network"
+    assert discovery_targets[0].metadata["frame_url"] == (
         "https://www.groupadministrators.com/mrfhtml/mrf2023082301.html?parm=2023082302"
     )
-    assert targets[1].metadata["target_file_type"] == "allowed-amounts"
+    assert discovery_targets[1].metadata["target_file_type"] == "allowed-amounts"
 
 
 @pytest.mark.asyncio
 async def test_html_mrf_resolver_can_follow_directories_on_mixed_pages(monkeypatch):
-    source = {
+    discovery_source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Boon-Chapman",
@@ -5877,8 +5877,8 @@ async def test_html_mrf_resolver_can_follow_directories_on_mixed_pages(monkeypat
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
 
-    targets = await discovery._resolve_html_mrf_links(
-        source,
+    discovery_targets = await discovery._resolve_html_mrf_links(
+        discovery_source,
         "https://boonchapman-mrf.zakipointhealth.com/",
         {
             "type": "html_mrf_links",
@@ -5888,23 +5888,23 @@ async def test_html_mrf_resolver_can_follow_directories_on_mixed_pages(monkeypat
         None,
     )
 
-    assert [target.url for target in targets] == [
+    assert [discovery_target.url for discovery_target in discovery_targets] == [
         (
             "https://mrf-public-collection.s3.amazonaws.com/boonchapman/"
             "allowed_amount/division_id=002429/002429.zip"
         ),
         "https://www.healthplan.org/mrf/first-health/2026-06-01_first-health_index.json",
     ]
-    assert targets[0].metadata["target_file_type"] == "allowed-amounts"
-    assert targets[1].metadata["target_file_type"] == "table-of-contents"
-    assert targets[1].metadata["directory_url"] == (
+    assert discovery_targets[0].metadata["target_file_type"] == "allowed-amounts"
+    assert discovery_targets[1].metadata["target_file_type"] == "table-of-contents"
+    assert discovery_targets[1].metadata["directory_url"] == (
         "https://www.healthplan.org/first_health_mrfs"
     )
 
 
 @pytest.mark.asyncio
 async def test_html_mrf_resolver_follows_nested_directory_pages(monkeypatch):
-    source = {
+    discovery_source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Example Health Plan",
@@ -5932,29 +5932,29 @@ async def test_html_mrf_resolver_follows_nested_directory_pages(monkeypatch):
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
 
-    targets = await discovery._resolve_html_mrf_links(
-        source,
+    discovery_targets = await discovery._resolve_html_mrf_links(
+        discovery_source,
         "https://example.test/transparency",
         {"type": "html_mrf_links", "max_directories": 2},
         None,
     )
 
-    assert [target.url for target in targets] == [
+    assert [discovery_target.url for discovery_target in discovery_targets] == [
         "https://mrfproddestinationdata.blob.core.windows.net/example-mrf-output/2026-06-01_Example-INN_index.json"
     ]
-    assert targets[0].metadata["resolver"] == "html_mrf_link"
-    assert targets[0].metadata["target_file_type"] == "table-of-contents"
-    assert targets[0].metadata["directory_url"] == (
+    assert discovery_targets[0].metadata["resolver"] == "html_mrf_link"
+    assert discovery_targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert discovery_targets[0].metadata["directory_url"] == (
         "https://example.test/vendor/machine-readable-data"
     )
-    assert targets[0].metadata["nested_directory_url"] == (
+    assert discovery_targets[0].metadata["nested_directory_url"] == (
         "https://mrfproddestinationdata.blob.core.windows.net/example-mrf-output/Example-INN_index.html"
     )
 
 
 @pytest.mark.asyncio
 async def test_healthez_resolver_normalizes_legacy_network_links(monkeypatch):
-    source = {
+    discovery_source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "HealthEZ",
@@ -5977,14 +5977,14 @@ async def test_healthez_resolver_normalizes_legacy_network_links(monkeypatch):
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
 
-    targets = await discovery._resolve_healthez_benefits_mrf(
-        source,
+    discovery_targets = await discovery._resolve_healthez_benefits_mrf(
+        discovery_source,
         "https://healthezbenefits.com/plandocuments/",
         {"type": "healthez_benefits_mrf"},
         None,
     )
 
-    assert [target.url for target in targets] == [
+    assert [discovery_target.url for discovery_target in discovery_targets] == [
         (
             "https://healthezbenefits.com/api/outbound/latest?"
             "fileType=inNetwork&groupName=HealthEZ&network=AP"
@@ -5998,22 +5998,22 @@ async def test_healthez_resolver_normalizes_legacy_network_links(monkeypatch):
             "fileType=outOfNetwork&groupName=HealthEZ"
         ),
     ]
-    assert [target.label for target in targets] == [
+    assert [discovery_target.label for discovery_target in discovery_targets] == [
         "HealthEZ AP",
         "HealthEZ AE",
         "HealthEZ",
     ]
-    assert [target.metadata["target_file_type"] for target in targets] == [
+    assert [discovery_target.metadata["target_file_type"] for discovery_target in discovery_targets] == [
         "in-network",
         "in-network",
         "allowed-amounts",
     ]
-    assert all(target.metadata["container_format"] == "zip" for target in targets)
+    assert all(discovery_target.metadata["container_format"] == "zip" for discovery_target in discovery_targets)
 
 
 @pytest.mark.asyncio
 async def test_healthcarebluebook_resolver_catalogs_stable_file_links(monkeypatch):
-    source = {
+    discovery_source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Lucent Health",
@@ -6038,25 +6038,25 @@ async def test_healthcarebluebook_resolver_catalogs_stable_file_links(monkeypatc
         AsyncMock(return_value=True),
     )
 
-    targets = await discovery._resolve_healthcarebluebook_mrf(
-        source,
+    discovery_targets = await discovery._resolve_healthcarebluebook_mrf(
+        discovery_source,
         "https://mrf.healthcarebluebook.com/Lucent",
         {"type": "healthcarebluebook_mrf"},
         None,
     )
 
-    assert [target.url for target in targets] == [
+    assert [discovery_target.url for discovery_target in discovery_targets] == [
         "https://mrf.healthcarebluebook.com/Lucent/350504",
         "https://mrf.healthcarebluebook.com/Lucent/350380",
         "https://hcbbmrfprod.blob.core.windows.net/mrf/External/example_in-network-rates.json.zip",
     ]
-    assert targets[0].metadata["target_file_type"] == "table-of-contents"
-    assert targets[0].metadata["source_format"] == "zip"
-    assert targets[1].metadata["target_file_type"] == "allowed-amounts"
-    assert targets[1].metadata["plan_info"][0]["plan_id"] == "042171239"
-    assert targets[1].metadata["plan_info"][0]["plan_id_type"] == "ein"
-    assert targets[2].metadata["target_file_type"] == "in-network"
-    assert targets[2].metadata["container_format"] == "zip"
+    assert discovery_targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert discovery_targets[0].metadata["source_format"] == "zip"
+    assert discovery_targets[1].metadata["target_file_type"] == "allowed-amounts"
+    assert discovery_targets[1].metadata["plan_info"][0]["plan_id"] == "042171239"
+    assert discovery_targets[1].metadata["plan_info"][0]["plan_id_type"] == "ein"
+    assert discovery_targets[2].metadata["target_file_type"] == "in-network"
+    assert discovery_targets[2].metadata["container_format"] == "zip"
 
 
 @pytest.mark.asyncio
@@ -6102,7 +6102,7 @@ async def test_healthcarebluebook_resolver_skips_html_error_numeric_links(
 
 @pytest.mark.asyncio
 async def test_healthcarebluebook_resolver_extracts_table_row_data_href(monkeypatch):
-    source = {
+    discovery_source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Lucent Health",
@@ -6128,22 +6128,22 @@ async def test_healthcarebluebook_resolver_extracts_table_row_data_href(monkeypa
         AsyncMock(return_value=True),
     )
 
-    [target] = await discovery._resolve_healthcarebluebook_mrf(
-        source,
+    [discovery_target] = await discovery._resolve_healthcarebluebook_mrf(
+        discovery_source,
         "https://mrf.healthcarebluebook.com/Lucent",
         {"type": "healthcarebluebook_mrf"},
         None,
     )
 
-    assert target.url == "https://mrf.healthcarebluebook.com/Lucent/350380"
-    assert target.metadata["target_file_type"] == "allowed-amounts"
-    assert target.metadata["plan_info"][0]["plan_id"] == "042171239"
-    assert target.metadata["plan_info"][0]["plan_id_type"] == "ein"
+    assert discovery_target.url == "https://mrf.healthcarebluebook.com/Lucent/350380"
+    assert discovery_target.metadata["target_file_type"] == "allowed-amounts"
+    assert discovery_target.metadata["plan_info"][0]["plan_id"] == "042171239"
+    assert discovery_target.metadata["plan_info"][0]["plan_id_type"] == "ein"
 
 
 @pytest.mark.asyncio
 async def test_healthcarebluebook_resolver_applies_max_targets_early(monkeypatch):
-    source = {
+    discovery_source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Lucent Health",
@@ -6168,14 +6168,14 @@ async def test_healthcarebluebook_resolver_applies_max_targets_early(monkeypatch
         AsyncMock(return_value=True),
     )
 
-    targets = await discovery._resolve_healthcarebluebook_mrf(
-        source,
+    discovery_targets = await discovery._resolve_healthcarebluebook_mrf(
+        discovery_source,
         "https://mrf.healthcarebluebook.com/Lucent",
         {"type": "healthcarebluebook_mrf", "max_targets": 2},
         None,
     )
 
-    assert [target.url for target in targets] == [
+    assert [discovery_target.url for discovery_target in discovery_targets] == [
         "https://mrf.healthcarebluebook.com/Lucent/350504",
         "https://mrf.healthcarebluebook.com/Lucent/350380",
     ]
