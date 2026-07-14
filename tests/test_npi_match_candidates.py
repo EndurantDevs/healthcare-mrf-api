@@ -265,7 +265,7 @@ def test_match_candidate_query_keeps_geo_as_scoring_signal_with_exact_locator():
 
 
 def test_match_candidate_output_scores_and_hides_internal_fields():
-    row = {
+    candidate_row_map = {
         "npi": 1234567890,
         "entity_type_code": 2,
         "provider_organization_name": "Example Hospital",
@@ -290,7 +290,7 @@ def test_match_candidate_output_scores_and_hides_internal_fields():
             }
         ],
     }
-    params = {
+    match_query_params = {
         "radius_miles": 1.0,
         "taxonomy_exact": ("282N00000X",),
         "taxonomy_prefixes": (),
@@ -299,7 +299,7 @@ def test_match_candidate_output_scores_and_hides_internal_fields():
         "include_sources": False,
         "include_evidence": True,
     }
-    enrichment = {
+    enrichment_summary_map = {
         "has_any_enrollment": True,
         "has_ffs_enrollment": True,
         "has_medicare_claims": True,
@@ -307,7 +307,7 @@ def test_match_candidate_output_scores_and_hides_internal_fields():
         "primary_provider_type_code": "12",
     }
 
-    candidate = npi_module._match_candidate_output(row, params, enrichment)
+    candidate = npi_module._match_candidate_output(candidate_row_map, match_query_params, enrichment_summary_map)
 
     assert candidate["npi"] == 1234567890
     assert candidate["address_site_key"] == "22222222-2222-2222-2222-222222222222"
