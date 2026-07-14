@@ -456,6 +456,7 @@ async def test_get_all_unified_phone_facet_counts_include_service_locations(monk
 
     assert data["rows"] == {"Pharmacy": 1}
     assert conn.last_params["phone_digits"] == "3125551212"
+    assert conn.last_params["candidate_limit"] == 500
     assert "FROM mrf.entity_address_unified AS c" in conn.last_sql
     assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in conn.last_sql
     assert "phone_candidates AS MATERIALIZED" in conn.last_sql
@@ -557,6 +558,18 @@ async def test_get_all_unified_phone_lookup_returns_provider_directory_only_row(
     assert "provider_directory_address_overlay AS overlay" in page_sql
     assert "dataset.status = 'published'" in page_sql
     assert any(params.get("phone_digits") == "2053663010" for _sql, params in conn.sql_calls)
+    page_params = next(params for sql, params in conn.sql_calls if "page_npis AS" in sql)
+    assert page_params["candidate_limit"] == 100
+
+
+def test_provider_list_phone_candidate_limit_covers_page_window_and_stays_bounded():
+    assert npi_module._provider_list_phone_candidate_limit(5) == 100
+    assert npi_module._provider_list_phone_candidate_limit(20, 20) == 320
+    assert npi_module._provider_list_phone_candidate_limit(200, 200) == 500
+    assert (
+        npi_module._provider_list_phone_candidate_limit(5, count_query=True)
+        == 500
+    )
 
 
 @pytest.mark.asyncio

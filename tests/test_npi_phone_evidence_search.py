@@ -35,6 +35,7 @@ def test_match_candidate_phone_lookup_includes_current_provider_directory_eviden
     sql = str(query)
 
     assert query_params["phone_digits"] == "4192517960"
+    assert query_params["candidate_limit"] == 40
     assert "current_provider_directory_runs AS MATERIALIZED" in sql
     assert "matching_provider_directory_phone_rows AS MATERIALIZED" in sql
     assert "phone_candidate_rows AS MATERIALIZED" in sql

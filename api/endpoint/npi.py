@@ -4539,6 +4539,25 @@ current_provider_directory_runs AS MATERIALIZED (
 )
 """
 
+MIN_PROVIDER_LIST_PHONE_CANDIDATES = 100
+MAX_PROVIDER_LIST_PHONE_CANDIDATES = 500
+
+
+def _provider_list_phone_candidate_limit(
+    page_limit: int,
+    page_offset: int = 0,
+    *,
+    count_query: bool = False,
+) -> int:
+    """Bound phone candidates while retaining enough rows for paging/filtering."""
+    if count_query:
+        return MAX_PROVIDER_LIST_PHONE_CANDIDATES
+    requested_window = max(int(page_offset), 0) + max(int(page_limit), 1)
+    return min(
+        max(requested_window * 8, MIN_PROVIDER_LIST_PHONE_CANDIDATES),
+        MAX_PROVIDER_LIST_PHONE_CANDIDATES,
+    )
+
 
 _PHONE_CANDIDATE_ROWS_CTE = """
 phone_candidate_rows AS MATERIALIZED (
@@ -5980,6 +5999,10 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     phone_source_record_ids = "ARRAY[]::varchar[]"
     if selected_locator_name == "phone" and _address_table_is_unified(address_table_sql):
         phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
+        query_params["candidate_limit"] = min(
+            max(int(params["limit"]) * 8, 20),
+            500,
+        )
         address_from_sql = _address_phone_candidates_lateral_from(
             address_table_sql,
             "a",
@@ -7190,6 +7213,11 @@ async def get_all(request):
         }
         query_params.update(dynamic_code_params)
         query_params.update(npi_params)
+        if phone_candidates_cte:
+            query_params["candidate_limit"] = _provider_list_phone_candidate_limit(
+                limit,
+                count_query=True,
+            )
 
         async with db.acquire() as conn:
             rows = await conn.all(query, **query_params)
@@ -7335,6 +7363,11 @@ async def get_all(request):
         }
         query_params.update(dynamic_code_params)
         query_params.update(npi_params)
+        if phone_candidates_cte:
+            query_params["candidate_limit"] = _provider_list_phone_candidate_limit(
+                limit,
+                count_query=True,
+            )
         async with db.acquire() as conn:
             rows = await conn.all(query, **query_params)
         return {row[0]: row[1] for row in rows if row and row[0]}
@@ -7572,24 +7605,32 @@ async def get_all(request):
 
         res = {}
         async with db.acquire() as conn:
-            rows_iter = await conn.all(
-                q,
-                start=start,
-                limit=limit,
-                classification=classification,
-                section=section,
-                display_name=display_name,
-                plan_network_array=plan_network,
-                specialization=specialization,
-                city=city,
-                state=state,
-                zip_code=zip_code,
-                phone_digits=phone_digits,
-                address_key=address_key,
-                address_site_key=address_site_key,
-                npi_filter=exact_npi,
+            query_params = {
+                "start": start,
+                "limit": limit,
+                "classification": classification,
+                "section": section,
+                "display_name": display_name,
+                "plan_network_array": plan_network,
+                "specialization": specialization,
+                "city": city,
+                "state": state,
+                "zip_code": zip_code,
+                "phone_digits": phone_digits,
+                "address_key": address_key,
+                "address_site_key": address_site_key,
+                "npi_filter": exact_npi,
                 **npi_params,
                 **dynamic_code_params,
+            }
+            if phone_candidates_cte:
+                query_params["candidate_limit"] = _provider_list_phone_candidate_limit(
+                    limit,
+                    start,
+                )
+            rows_iter = await conn.all(
+                q,
+                **query_params,
             )
             for r in rows_iter:
                 # Prefer key-based extraction so schema drift in upstream tables
