@@ -129,6 +129,9 @@ async def test_geo_candidate_attaches_current_overlay_provenance(geo_evidence_fa
             ],
             "address_sources": ["nppes", "provider_directory_fhir"],
             "provider_directory_sources": [{"source_ids": ["pdfhir_stale"]}],
+            "source_count": 2,
+            "independent_source_count": 2,
+            "multi_source_confirmed": True,
         }
     ]
 
@@ -155,6 +158,9 @@ async def test_geo_candidate_attaches_current_overlay_provenance(geo_evidence_fa
         "nppes",
         "provider_directory_fhir",
     ]
+    assert candidate_row_list[0]["source_count"] == 2
+    assert candidate_row_list[0]["independent_source_count"] == 2
+    assert candidate_row_list[0]["multi_source_confirmed"] is True
     source_summary = candidate_row_list[0]["provider_directory_sources"][0]
     assert source_summary["source_ids"] == [SOURCE_ID, ALIAS_SOURCE_ID]
     assert len(candidate_row_list[0]["provider_directory_sources"]) == 1
@@ -183,6 +189,8 @@ async def test_geo_candidate_rejects_stale_serving_evidence(monkeypatch):
         "provider_directory_sources": [{"source_ids": ["pdfhir_stale"]}],
         "geo_distance_miles": 0.0,
         "source_count": 2,
+        "independent_source_count": 2,
+        "multi_source_confirmed": True,
     }
 
     candidate_params_by_name = _geo_candidate_params()
@@ -201,8 +209,12 @@ async def test_geo_candidate_rejects_stale_serving_evidence(monkeypatch):
         "nppes:1003968710:practice"
     ]
     assert candidate_row_by_name["address_sources"] == ["nppes"]
+    assert candidate_row_by_name["source_count"] == 1
+    assert candidate_row_by_name["independent_source_count"] == 1
+    assert candidate_row_by_name["multi_source_confirmed"] is False
     assert "provider_directory_sources" not in candidate_row_by_name
     assert candidate_output_map["sources"]["fhir"]["matched"] is False
+    assert candidate_output_map["sources"]["fhir"]["source_count"] == 1
 
 
 @pytest.mark.asyncio
