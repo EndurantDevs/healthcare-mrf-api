@@ -30,6 +30,36 @@ def test_affiliation_sql_has_explicit_contra_policy_and_dataset_org_join():
     assert "allow_organization_reference_fallback" in sql
     assert "FROM '(?i)(?:^|/)Organization/" in sql
     assert 'provider_directory_dataset_resource" AS resource' in sql
+    assert "NOT resolved.fallback_candidate" in sql
+
+
+def test_unresolved_standard_reference_preserves_normalized_edge():
+    proof = importer._validated_dataset_affiliation_organization_proof(
+        {
+            "target_dataset_count": 1,
+            "acquisition_root_run_id": "root-run",
+            "affiliation_resource_count": 1,
+            "affiliation_with_participating_organization_count": 1,
+            "empty_participating_organization_reference_count": 0,
+            "fallback_candidate_count": 0,
+            "fallback_resolved_count": 0,
+            "fallback_unresolved_count": 0,
+            "unresolved_reference_count": 1,
+            "malformed_reference_payload_count": 0,
+            "valid_reference_count": 0,
+            "invalid_reference_count": 0,
+            "expected_edge_count": 1,
+        },
+        dataset_id="dataset-standard",
+        build_run_id="standard-build",
+        replaced_edge_count=0,
+        inserted_edge_count=1,
+        expected_acquisition_root_run_id="root-run",
+    )
+
+    assert proof["complete"] is True
+    assert proof["unresolved_reference_count"] == 1
+    assert proof["edge_count"] == 1
 
 
 def test_unresolved_fallback_is_diagnostic_with_resolved_partition():

@@ -29940,7 +29940,11 @@ _AFFILIATION_ORG_EDGE_CTES_TEMPLATE = """
             SELECT DISTINCT resolved.affiliation_resource_id,
                    resolved.organization_resource_id
               FROM resolved_affiliations_status AS resolved
-             WHERE resolved.organization_exists
+             WHERE resolved.organization_resource_id IS NOT NULL
+               AND (
+                   NOT resolved.fallback_candidate
+                   OR resolved.organization_exists
+               )
         )
 """
 
