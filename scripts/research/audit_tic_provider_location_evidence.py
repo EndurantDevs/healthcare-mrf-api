@@ -17,6 +17,7 @@ from process.ptg_parts.provider_location_evidence import audit_tic_provider_loca
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the location evidence audit."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="+", help="Raw TiC JSON, JSON.GZ, or ZIP artifact path(s).")
     parser.add_argument("--max-samples", type=int, default=5, help="Maximum direct-location samples per artifact.")
@@ -29,6 +30,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Audit provider-location evidence in supplied TiC artifacts."""
     args = parse_args()
     summaries = []
     exit_code = 0

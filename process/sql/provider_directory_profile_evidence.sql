@@ -177,6 +177,98 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               JOIN {{ENDPOINT_REF}} AS endpoint
                 ON endpoint.source_id = role_rows.source_id
                AND endpoint.resource_id = NULLIF(BTRIM(CASE WHEN endpoint_reference.value LIKE '%/Endpoint/%' THEN regexp_replace(endpoint_reference.value, '^.*/Endpoint/', '') WHEN endpoint_reference.value LIKE 'Endpoint/%' THEN regexp_replace(endpoint_reference.value, '^Endpoint/', '') ELSE endpoint_reference.value END), '')
+        ), affiliation_rows AS MATERIALIZED (
+            SELECT role_rows.resolved_npi AS npi,
+                   role_rows.source_id,
+                   role_rows.endpoint_id,
+                   role_rows.dataset_id,
+                   role_rows.canonical_api_base,
+                   role_rows.source_org_name,
+                   role_rows.source_plan_name,
+                   role_rows.resource_id AS role_resource_id,
+                   affiliation.resource_id,
+                   affiliation.active,
+                   affiliation.period_start,
+                   affiliation.period_end,
+                   GREATEST(
+                       role_rows.updated_at,
+                       affiliation.updated_at,
+                       primary_organization.updated_at,
+                       participating_organization.updated_at
+                   ) AS updated_at,
+                   jsonb_strip_nulls(
+                       jsonb_build_object(
+                           'identifiers', affiliation.identifiers::jsonb,
+                           'primary_organization', jsonb_strip_nulls(
+                               jsonb_build_object(
+                                   'resource_id', normalized_affiliation.primary_organization_resource_id,
+                                   'name', primary_organization.name,
+                                   'active', primary_organization.active,
+                                   'type_codes', primary_organization.type_codes::jsonb
+                               )
+                           ),
+                           'participating_organization', jsonb_strip_nulls(
+                               jsonb_build_object(
+                                   'resource_id', affiliation_edge.participating_organization_resource_id,
+                                   'name', participating_organization.name,
+                                   'active', participating_organization.active,
+                                   'type_codes', participating_organization.type_codes::jsonb
+                               )
+                           ),
+                           'network_refs', affiliation.network_refs::jsonb,
+                           'healthcare_service_refs', affiliation.healthcare_service_refs::jsonb,
+                           'location_refs', affiliation.location_refs::jsonb,
+                           'specialty_codes', affiliation.specialty_codes::jsonb,
+                           'codes', affiliation.code_codes::jsonb,
+                           'telecom', affiliation.telecom::jsonb,
+                           'period_start', affiliation.period_start,
+                           'period_end', affiliation.period_end,
+                           'active', affiliation.active
+                       )
+                   ) AS affiliation_value
+              FROM role_rows
+              CROSS JOIN LATERAL (
+                   SELECT CASE
+                            WHEN BTRIM(role_rows.organization_ref) ~ '^[A-Za-z0-9.-]{1,64}$'
+                            THEN BTRIM(role_rows.organization_ref)
+                            ELSE substring(
+                                 BTRIM(role_rows.organization_ref)
+                                 FROM '(?i)(?:^|/)Organization/([A-Za-z0-9.-]{1,64})(?:/_history/[A-Za-z0-9.-]{1,64})?/?(?:[?#].*)?$'
+                            )
+                          END AS organization_resource_id
+              ) AS normalized_role
+              JOIN {{AFFILIATION_ORGANIZATION_REF}} AS affiliation_edge
+                ON affiliation_edge.dataset_id = role_rows.dataset_id
+               AND affiliation_edge.participating_organization_resource_id = normalized_role.organization_resource_id
+              JOIN {{AFFILIATION_REF}} AS affiliation
+                ON affiliation.source_id = role_rows.source_id
+               AND affiliation.resource_id = affiliation_edge.affiliation_resource_id
+              CROSS JOIN LATERAL (
+                   SELECT CASE
+                            WHEN BTRIM(affiliation.organization_ref) ~ '^[A-Za-z0-9.-]{1,64}$'
+                            THEN BTRIM(affiliation.organization_ref)
+                            ELSE substring(
+                                 BTRIM(affiliation.organization_ref)
+                                 FROM '(?i)(?:^|/)Organization/([A-Za-z0-9.-]{1,64})(?:/_history/[A-Za-z0-9.-]{1,64})?/?(?:[?#].*)?$'
+                            )
+                          END AS primary_organization_resource_id,
+                          CASE
+                            WHEN BTRIM(affiliation.participating_organization_ref) ~ '^[A-Za-z0-9.-]{1,64}$'
+                            THEN BTRIM(affiliation.participating_organization_ref)
+                            ELSE substring(
+                                 BTRIM(affiliation.participating_organization_ref)
+                                 FROM '(?i)(?:^|/)Organization/([A-Za-z0-9.-]{1,64})(?:/_history/[A-Za-z0-9.-]{1,64})?/?(?:[?#].*)?$'
+                            )
+                          END AS participating_organization_resource_id
+              ) AS normalized_affiliation
+              LEFT JOIN {{ORGANIZATION_REF}} AS primary_organization
+                ON primary_organization.source_id = affiliation.source_id
+               AND primary_organization.resource_id = normalized_affiliation.primary_organization_resource_id
+              LEFT JOIN {{ORGANIZATION_REF}} AS participating_organization
+                ON participating_organization.source_id = affiliation.source_id
+               AND participating_organization.resource_id = affiliation_edge.participating_organization_resource_id
+             WHERE normalized_affiliation.participating_organization_resource_id = affiliation_edge.participating_organization_resource_id
+               AND normalized_affiliation.participating_organization_resource_id = normalized_role.organization_resource_id
         ), facts AS (
             SELECT practitioner.npi,
                    'name'::varchar AS fact_type,
@@ -513,6 +605,19 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                 ON organization.source_id = role.source_id
                AND organization.resource_id = NULLIF(BTRIM(CASE WHEN role.organization_ref LIKE '%/Organization/%' THEN regexp_replace(role.organization_ref, '^.*/Organization/', '') WHEN role.organization_ref LIKE 'Organization/%' THEN regexp_replace(role.organization_ref, '^Organization/', '') ELSE role.organization_ref END), '')
              WHERE NULLIF(COALESCE(organization.name, role.organization_ref, ''), '') IS NOT NULL
+
+            UNION ALL
+            SELECT affiliation.npi, 'affiliation',
+                   md5(lower(affiliation.affiliation_value::text)),
+                   affiliation.affiliation_value,
+                   affiliation.source_id, affiliation.endpoint_id,
+                   affiliation.dataset_id, affiliation.canonical_api_base,
+                   affiliation.source_org_name, affiliation.source_plan_name,
+                   'OrganizationAffiliation', affiliation.resource_id,
+                   affiliation.role_resource_id, affiliation.active,
+                   affiliation.period_start, affiliation.period_end,
+                   affiliation.updated_at
+              FROM affiliation_rows AS affiliation
 
             UNION ALL
             SELECT service.npi, 'service',

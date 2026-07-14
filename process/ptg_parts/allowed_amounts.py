@@ -94,6 +94,7 @@ async def _parse_allowed_amounts(
     source_url: str,
     max_items: int | None = None,
 ) -> dict[str, Any]:
+    """Parse one allowed-amounts artifact into import rows."""
     item_cls = classes["PTGAllowedItem"]
     payment_cls = classes["PTGAllowedPayment"]
     provider_payment_cls = classes["PTGAllowedProviderPayment"]
@@ -231,6 +232,7 @@ async def _process_allowed_amounts_file(
     raw_artifact: PTG2RawArtifact | None = None,
     logical_artifact: PTG2LogicalArtifact | None = None,
 ) -> PTG2FileProcessResult:
+    """Download and process one allowed-amounts work item."""
     url = job["url"]
     description = job.get("description")
     plan_info = job.get("plan_info")

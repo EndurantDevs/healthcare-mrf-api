@@ -34,6 +34,7 @@ async def _record_source_version(
     logical_artifact: PTG2LogicalArtifact,
     import_run_id: str | None = None,
 ) -> PTG2SourceVersion:
+    """Record one retained raw and logical source version."""
     source_identity_hash = _source_identity_hash(source_type, raw_artifact.canonical_url)
     logical_hash_deferred = bool(logical_artifact.logical_hash_deferred)
     content_identity_kind = (

@@ -436,6 +436,7 @@ async def _download_raw_artifact_ranges(
     max_bytes: int | None,
     started_at: float,
 ) -> bool:
+    """Download a raw artifact through bounded byte ranges."""
     if not _is_strong_etag(etag):
         raise RuntimeError(f"Range download for {url} requires a strong ETag")
     if max_bytes is not None and total_bytes > max_bytes:
@@ -463,6 +464,7 @@ async def _download_raw_artifact_ranges(
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
     pending_ranges = [item for item in ranges if item not in completed]
     async def fetch_range(session: aiohttp.ClientSession, item: tuple[int, int]) -> None:
+        """Fetch and persist one pending byte range."""
         start, end = item
         headers = {"Range": f"bytes={start}-{end}"}
         if etag:
@@ -1160,6 +1162,7 @@ async def _retained_logical_artifact(
     store: PTG2ArtifactStore,
     raw_artifact: PTG2RawArtifact,
 ) -> PTG2LogicalArtifact:
+    """Expand or reuse the retained logical artifact for raw input."""
     logical_dir = _retained_logical_artifact_dir(store, raw_artifact)
     protect_artifact_prefix(store, logical_dir)
     async with async_named_artifact_lock(
@@ -1311,6 +1314,7 @@ async def _iter_downloaded_ptg_jobs(
     max_bytes: int | None,
     keep_partial_artifacts: bool | None,
 ):
+    """Yield PTG jobs after acquiring their retained artifacts."""
     download_tasks = max(_env_int(PTG2_DOWNLOAD_TASKS_ENV, PTG2_DEFAULT_DOWNLOAD_TASKS), 1)
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=download_tasks,

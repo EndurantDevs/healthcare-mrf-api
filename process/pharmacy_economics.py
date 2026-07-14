@@ -310,6 +310,7 @@ async def _fetch_ful(client, ful_url: str) -> dict[str, float]:
 
 
 async def process_data(ctx, task=None):
+    """Load pharmacy economics source data into staging."""
     task = task or {}
     ctx.setdefault("context", {})
 
@@ -390,6 +391,7 @@ async def process_data(ctx, task=None):
 
 
 async def startup(ctx):
+    """Initialize the pharmacy economics worker context."""
     await my_init_db(db)
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()
@@ -413,6 +415,7 @@ async def startup(ctx):
 
 
 async def shutdown(ctx):
+    """Publish a completed pharmacy economics import."""
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
@@ -483,6 +486,7 @@ async def shutdown(ctx):
 
 
 async def main(test_mode: bool = False):
+    """Queue a pharmacy economics import."""
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,

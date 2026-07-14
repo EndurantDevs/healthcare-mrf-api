@@ -79,6 +79,14 @@ def qualified_table(schema: str, table_name: str) -> str:
     return f"{quote_identifier(schema)}.{quote_identifier(table_name)}"
 
 
+def sibling_table_ref(table_ref: str, table_name: str) -> str:
+    """Replace the final identifier in a schema-qualified table reference."""
+    qualifier, separator, _identifier = table_ref.rpartition(".")
+    if not separator:
+        return quote_identifier(table_name)
+    return f"{qualifier}.{quote_identifier(table_name)}"
+
+
 def is_valid_npi(value: Any) -> bool:
     """Return whether a value is a CMS-assignable NPI with a valid check digit."""
     value_text = str(value).strip()
@@ -379,6 +387,14 @@ def profile_evidence_insert_sql(
         "provider_directory_healthcare_service",
         "provider_directory_endpoint",
     )
+    affiliation_ref = sibling_table_ref(
+        organization_ref,
+        "provider_directory_organization_affiliation",
+    )
+    affiliation_organization_ref = sibling_table_ref(
+        organization_ref,
+        "provider_directory_dataset_affiliation_organization",
+    )
     return _render_sql_template(
         "provider_directory_profile_evidence.sql",
         {
@@ -387,6 +403,8 @@ def profile_evidence_insert_sql(
             "PRACTITIONER_REF": practitioner_ref,
             "ROLE_REF": role_ref,
             "ORGANIZATION_REF": organization_ref,
+            "AFFILIATION_REF": affiliation_ref,
+            "AFFILIATION_ORGANIZATION_REF": affiliation_organization_ref,
             "SERVICE_REF": service_ref,
             "ENDPOINT_REF": endpoint_ref,
             "VALID_NPI_SQL": valid_npi_sql("npi"),

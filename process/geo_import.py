@@ -73,6 +73,7 @@ async def _flush_rows(rows: List[Dict]):
 
 
 async def load_geo_lookup(source_file: Path | None = None):
+    """Load geographic lookup rows from the configured CSV source."""
     csv_path = Path(source_file) if source_file else DEFAULT_SOURCE
     if not csv_path.exists():
         raise FileNotFoundError(f"Geo source file not found: {csv_path}")
@@ -122,6 +123,7 @@ async def load_geo_lookup(source_file: Path | None = None):
 
 
 async def main(test_mode: bool = False, file_path: Path | str | None = None) -> dict[str, object]:
+    """Run the geographic lookup import entry point."""
     source_file = Path(file_path) if file_path else None
     await load_geo_lookup(source_file=source_file)
     return {"test_mode": bool(test_mode), "source_file": str(source_file or DEFAULT_SOURCE)}
@@ -135,4 +137,5 @@ async def main(test_mode: bool = False, file_path: Path | str | None = None) -> 
     help="Optional path to the geo CSV file (defaults to support/zip/geo_city_public.csv).",
 )
 def geo_lookup(file_path: Path | None = None):
+    """Run the geographic lookup import synchronously."""
     asyncio.run(load_geo_lookup(file_path))

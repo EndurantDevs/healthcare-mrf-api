@@ -10,6 +10,7 @@ class ImportCancelledError(RuntimeError):
 
 
 def run_id_from_task(task: dict[str, Any] | None) -> str | None:
+    """Extract a normalized control run identifier from a task."""
     if not isinstance(task, dict):
         return None
     run_id = str(task.get("run_id") or "").strip()
@@ -17,6 +18,7 @@ def run_id_from_task(task: dict[str, Any] | None) -> str | None:
 
 
 async def raise_if_cancelled(ctx: dict[str, Any], task: dict[str, Any] | None) -> None:
+    """Raise the control-plane cancellation signal when requested."""
     run_id = run_id_from_task(task)
     if not run_id:
         return

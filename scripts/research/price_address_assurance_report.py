@@ -44,6 +44,7 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the assurance report."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--api-payload",
@@ -186,6 +187,7 @@ async def _resolve_raw_artifacts_from_db(
     password: str,
     schema: str,
 ) -> list[dict[str, Any]]:
+    """Resolve retained raw artifacts for source-file versions."""
     if not source_file_version_ids:
         return []
     try:
@@ -306,6 +308,7 @@ def _raw_artifact_resolution_issues(
 
 
 def main() -> int:
+    """Build and print the requested price-address assurance report."""
     args = parse_args()
     api_payload = _load_api_payload(args.api_payload, args.api_url, args.api_key, args.timeout)
     source_file_version_ids = _dedupe(

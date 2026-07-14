@@ -17,6 +17,7 @@ blueprint = Blueprint("metrics")
 
 @blueprint.get("/metrics")
 async def prometheus_metrics(request):
+    """Serve authenticated Prometheus metrics for the API node."""
     if _metrics_require_auth():
         from api.control import _require_control_auth
 
@@ -25,6 +26,7 @@ async def prometheus_metrics(request):
 
 
 async def render_prometheus_metrics() -> str:
+    """Render current node and importer state in Prometheus format."""
     health = await node_health()
     status_counts, importer_counts = await _active_run_counts()
     lines = [

@@ -311,9 +311,11 @@ class ProviderSpecialtyFilter:
 
     @property
     def active(self) -> bool:
+        """Return whether any specialty constraint is active."""
         return bool(self.classification or self.taxonomy_codes)
 
     def response_payload(self) -> dict[str, Any] | None:
+        """Build the public response representation for this filter."""
         if not self.active:
             return None
         payload: dict[str, Any] = {
@@ -507,6 +509,7 @@ def provider_specialty_taxonomy_exists_sql(
     nt_alias: str | None = None,
     nucc_alias: str | None = None,
 ) -> str:
+    """Build a correlated taxonomy predicate for a specialty filter."""
     if not specialty_filter.active:
         return ""
 

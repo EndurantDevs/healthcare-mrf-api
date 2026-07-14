@@ -440,6 +440,26 @@ qualification start date. Its value always travels with the derivation basis,
 basis start date, and as-of date; it is not a claim about the provider's age or
 an independently verified employment start date.
 
+Doctor profiles expose typed `OrganizationAffiliation` evidence as additive
+`facts.affiliation` items. A `PractitionerRole` can reach an affiliation only
+when the normalized `PractitionerRole.organization` resource id equals the
+affiliation's normalized `participatingOrganization` resource id in the same
+current immutable endpoint dataset and source lineage. The affiliation's
+primary `organization` is descriptive context only and is never a provider
+join key. An affiliation that supplies only that primary organization emits no
+provider affiliation or network evidence.
+
+Each affiliation value can retain normalized primary and participating
+organization context, identifiers, network, healthcare-service and location
+references, specialty and affiliation codings, telecom, active status, and
+period when supplied. The compact profile remains schema version 1 because the
+new fact category is additive; normalized source evidence carries the concrete
+`OrganizationAffiliation` resource id, connecting `PractitionerRole` resource
+id, endpoint, and immutable dataset id. Semantically identical values are one
+profile item with bounded per-source evidence rather than duplicate public
+facts. Profile reads remain a single indexed lookup against the precomputed
+artifact and do not traverse the FHIR graph at request time.
+
 ## Provider Profile API Verification Matrix
 
 `scripts/research/provider_directory_api_evidence_harness.py` is the

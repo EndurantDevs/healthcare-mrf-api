@@ -209,6 +209,7 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
         "accepting_medicaid",
         "role_identifier",
         "organization",
+        "affiliation",
         "service",
         "endpoint",
     ):
@@ -223,6 +224,17 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
     assert "'accepting_patients', service.accepting_patients::jsonb" in sql
     assert "'comment', service.comment" in sql
     assert "JOIN \"fixture\".\"endpoint\" AS endpoint" in sql
+    assert (
+        "JOIN \"fixture\".\"provider_directory_dataset_affiliation_organization\" "
+        "AS affiliation_edge"
+    ) in sql
+    assert (
+        "JOIN \"fixture\".\"provider_directory_organization_affiliation\" "
+        "AS affiliation"
+    ) in sql
+    assert "affiliation.participating_organization_ref" in sql
+    assert "affiliation_edge.dataset_id = role_rows.dataset_id" in sql
+    assert "affiliation.organization_ref = role_rows.organization_ref" not in sql
     assert "'accepting_patients', COALESCE(" in sql
     assert "npi) BETWEEN 1000000000 AND 2999999999" in sql
     assert "AND MOD(" in sql
