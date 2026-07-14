@@ -653,17 +653,17 @@ async def test_enqueue_import_start_uses_control_run_id(monkeypatch):
         return FakeRedis()
 
     monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
-    row = {
+    import_run_map = {
         "run_id": "run_control",
         "importer": "claims-pricing",
         "import_id": "202606",
         "params": {"test_mode": True},
     }
 
-    result = await _enqueue_import_start(row)
+    enqueue_result_map = await _enqueue_import_start(import_run_map)
 
-    assert result["status"] == "queued"
-    assert result["metrics"]["queue"] == "arq:ClaimsPricing"
+    assert enqueue_result_map["status"] == "queued"
+    assert enqueue_result_map["metrics"]["queue"] == "arq:ClaimsPricing"
     args, kwargs = calls[0]
     assert args[0] == "claims_pricing_start"
     assert args[1]["run_id"] == "run_control"
@@ -688,17 +688,17 @@ async def test_enqueue_import_start_enqueues_ptg_control_job(monkeypatch):
         return FakeRedis()
 
     monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
-    row = {
+    import_run_map = {
         "run_id": "run_ptg",
         "importer": "ptg",
         "source_file_import_id": "source_file_import_1",
         "params": {"source_key": "example_source_a", "in_network_url": "https://example.com/rates.json.gz"},
     }
 
-    result = await _enqueue_import_start(row)
+    enqueue_result_map = await _enqueue_import_start(import_run_map)
 
-    assert result["status"] == "queued"
-    assert result["metrics"]["queue"] == "arq:PTG"
+    assert enqueue_result_map["status"] == "queued"
+    assert enqueue_result_map["metrics"]["queue"] == "arq:PTG"
     args, kwargs = calls[0]
     assert args[0] == "ptg_control_start"
     assert args[1]["run_id"] == "run_ptg"
@@ -724,7 +724,7 @@ async def test_enqueue_import_start_honors_ptg_lane(monkeypatch):
         return FakeRedis()
 
     monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
-    row = {
+    import_run_map = {
         "run_id": "run_ptg_lane",
         "importer": "ptg",
         "source_file_import_id": "source_file_import_1",
@@ -736,12 +736,12 @@ async def test_enqueue_import_start_honors_ptg_lane(monkeypatch):
         },
     }
 
-    result = await _enqueue_import_start(row)
+    enqueue_result_map = await _enqueue_import_start(import_run_map)
 
-    assert result["status"] == "queued"
-    assert result["metrics"]["queue"] == "arq:PTGSmall"
-    assert result["metrics"]["worker_class"] == "process.PTGSmall"
-    assert result["metrics"]["resource_class"] == "small"
+    assert enqueue_result_map["status"] == "queued"
+    assert enqueue_result_map["metrics"]["queue"] == "arq:PTGSmall"
+    assert enqueue_result_map["metrics"]["worker_class"] == "process.PTGSmall"
+    assert enqueue_result_map["metrics"]["resource_class"] == "small"
     args, kwargs = calls[0]
     assert args[0] == "ptg_control_start"
     assert args[1]["params"]["_expected_queue"] == "arq:PTGSmall"
@@ -750,17 +750,17 @@ async def test_enqueue_import_start_honors_ptg_lane(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_enqueue_import_start_rejects_invalid_ptg_lane():
-    row = {
+    import_run_map = {
         "run_id": "run_bad_ptg_lane",
         "importer": "ptg",
         "params": {"_expected_queue": "arq:NotAQueue"},
     }
 
-    result = await _enqueue_import_start(row)
+    enqueue_result_map = await _enqueue_import_start(import_run_map)
 
-    assert result["status"] == "failed"
-    assert result["error"]["code"] == "invalid_enqueue_adapter"
-    assert "unsupported PTG queue" in result["error"]["message"]
+    assert enqueue_result_map["status"] == "failed"
+    assert enqueue_result_map["error"]["code"] == "invalid_enqueue_adapter"
+    assert "unsupported PTG queue" in enqueue_result_map["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -779,15 +779,15 @@ async def test_enqueue_import_start_wraps_single_job_lifecycle(monkeypatch):
         return FakeRedis()
 
     monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
-    row = {
+    import_run_map = {
         "run_id": "run_nucc",
         "importer": "nucc",
         "params": {"test_mode": True},
     }
 
-    result = await _enqueue_import_start(row)
+    enqueue_result_map = await _enqueue_import_start(import_run_map)
 
-    assert result["status"] == "queued"
+    assert enqueue_result_map["status"] == "queued"
     args, kwargs = calls[0]
     assert args[0] == "control_single_job_start"
     assert args[1]["run_id"] == "run_nucc"
@@ -813,15 +813,15 @@ async def test_enqueue_import_start_wraps_direct_process_importers(monkeypatch):
         return FakeRedis()
 
     monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
-    row = {
+    import_run_map = {
         "run_id": "run_lodes",
         "importer": "lodes",
         "params": {"test_mode": True, "import_id": "smoke_lodes"},
     }
 
-    result = await _enqueue_import_start(row)
+    enqueue_result_map = await _enqueue_import_start(import_run_map)
 
-    assert result["status"] == "queued"
+    assert enqueue_result_map["status"] == "queued"
     args, kwargs = calls[0]
     assert args[0] == "control_single_job_start"
     assert args[1]["run_id"] == "run_lodes"
@@ -847,15 +847,15 @@ async def test_enqueue_import_start_wraps_kwargs_importers(monkeypatch):
         return FakeRedis()
 
     monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
-    row = {
+    import_run_map = {
         "run_id": "run_codes",
         "importer": "clinical-reference",
         "params": {"test_mode": True, "sources": "icd10cm", "import_id": "smoke_clinical"},
     }
 
-    result = await _enqueue_import_start(row)
+    enqueue_result_map = await _enqueue_import_start(import_run_map)
 
-    assert result["status"] == "queued"
+    assert enqueue_result_map["status"] == "queued"
     args, kwargs = calls[0]
     assert args[0] == "control_single_job_start"
     assert args[1]["run_id"] == "run_codes"
@@ -882,15 +882,15 @@ async def test_enqueue_import_start_wraps_ms_drg_importer(monkeypatch):
         return FakeRedis()
 
     monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
-    row = {
+    import_run_map = {
         "run_id": "run_ms_drg",
         "importer": "ms-drg",
         "params": {"test_mode": True, "include_relationships": True, "relationship_page_limit": 1},
     }
 
-    result = await _enqueue_import_start(row)
+    enqueue_result_map = await _enqueue_import_start(import_run_map)
 
-    assert result["status"] == "queued"
+    assert enqueue_result_map["status"] == "queued"
     args, kwargs = calls[0]
     assert args[0] == "control_single_job_start"
     assert args[1]["run_id"] == "run_ms_drg"
@@ -907,12 +907,12 @@ async def test_enqueue_import_start_marks_failed_on_enqueue_error(monkeypatch):
         raise RuntimeError("redis unavailable")
 
     monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
-    row = {"run_id": "run_npi", "importer": "npi", "params": {}}
+    import_run_map = {"run_id": "run_npi", "importer": "npi", "params": {}}
 
-    result = await _enqueue_import_start(row)
+    enqueue_result_map = await _enqueue_import_start(import_run_map)
 
-    assert result["status"] == "failed"
-    assert result["error"]["code"] == "enqueue_failed"
+    assert enqueue_result_map["status"] == "failed"
+    assert enqueue_result_map["error"]["code"] == "enqueue_failed"
 
 
 @pytest.mark.asyncio
@@ -2188,8 +2188,8 @@ async def test_sync_terminal_worker_failure_persists_oom_evidence(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_request_cancel_finishes_pending_adapter_run(monkeypatch):
-    calls = {"get": 0}
-    current = {
+    request_counts = {"get": 0}
+    current_run_map = {
         "run_id": "run_pending",
         "status": "queued",
         "progress": {"pct": 0},
@@ -2206,11 +2206,11 @@ async def test_request_cancel_finishes_pending_adapter_run(monkeypatch):
             return FakeResult()
 
     async def fake_get(_run_id):
-        calls["get"] += 1
-        if calls["get"] == 1:
-            return current
+        request_counts["get"] += 1
+        if request_counts["get"] == 1:
+            return current_run_map
         return {
-            **current,
+            **current_run_map,
             "status": "canceled",
             "metrics": {
                 "enqueue_adapter": "pending",
@@ -2221,16 +2221,19 @@ async def test_request_cancel_finishes_pending_adapter_run(monkeypatch):
     monkeypatch.setattr(control_imports, "db", FakeDb())
     monkeypatch.setattr(control_imports, "get_import_run", fake_get)
 
-    result = await control_imports.request_cancel("run_pending")
+    cancel_result_map = await control_imports.request_cancel("run_pending")
 
-    assert result["status"] == "canceled"
-    assert result["metrics"]["cancel_signal"] == {"redis": False, "pending_adapter": True}
+    assert cancel_result_map["status"] == "canceled"
+    assert cancel_result_map["metrics"]["cancel_signal"] == {
+        "redis": False,
+        "pending_adapter": True,
+    }
 
 
 @pytest.mark.asyncio
 async def test_request_cancel_finishes_queued_arq_run(monkeypatch):
-    calls = {"get": 0}
-    current = {
+    request_counts = {"get": 0}
+    current_run_map = {
         "run_id": "run_queued",
         "status": "queued",
         "progress": {"pct": 0},
@@ -2247,14 +2250,14 @@ async def test_request_cancel_finishes_queued_arq_run(monkeypatch):
             return FakeResult()
 
     async def fake_get(_run_id):
-        calls["get"] += 1
-        if calls["get"] == 1:
-            return current
+        request_counts["get"] += 1
+        if request_counts["get"] == 1:
+            return current_run_map
         return {
-            **current,
+            **current_run_map,
             "status": "canceled",
             "metrics": {
-                **current["metrics"],
+                **current_run_map["metrics"],
                 "cancel_signal": {
                     "redis": True,
                     "queue": "arq:NPI",
@@ -2266,23 +2269,23 @@ async def test_request_cancel_finishes_queued_arq_run(monkeypatch):
         }
 
     async def fake_remove_queued_job(run):
-        assert run == current
+        assert run == current_run_map
         return {"redis": True, "queue": "arq:NPI", "job_id": "job_1", "removed": True, "deleted_job_key": True}
 
     monkeypatch.setattr(control_imports, "db", FakeDb())
     monkeypatch.setattr(control_imports, "get_import_run", fake_get)
     monkeypatch.setattr(control_imports, "_remove_queued_job", fake_remove_queued_job)
 
-    result = await control_imports.request_cancel("run_queued")
+    cancel_result_map = await control_imports.request_cancel("run_queued")
 
-    assert result["status"] == "canceled"
-    assert result["metrics"]["cancel_signal"]["removed"] is True
+    assert cancel_result_map["status"] == "canceled"
+    assert cancel_result_map["metrics"]["cancel_signal"]["removed"] is True
 
 
 @pytest.mark.asyncio
 async def test_request_cancel_marks_running_run_canceling(monkeypatch):
-    calls = {"get": 0}
-    current = {
+    request_counts = {"get": 0}
+    current_run_map = {
         "run_id": "run_running",
         "importer": "npi",
         "status": "running",
@@ -2300,11 +2303,11 @@ async def test_request_cancel_marks_running_run_canceling(monkeypatch):
             return FakeResult()
 
     async def fake_get(_run_id):
-        calls["get"] += 1
-        if calls["get"] == 1:
-            return current
+        request_counts["get"] += 1
+        if request_counts["get"] == 1:
+            return current_run_map
         return {
-            **current,
+            **current_run_map,
             "status": "canceling",
             "metrics": {"cancel_signal": {"redis": True, "key": "cancel:run_running", "ttl_seconds": 10}},
         }
@@ -2316,10 +2319,10 @@ async def test_request_cancel_marks_running_run_canceling(monkeypatch):
     monkeypatch.setattr(control_imports, "get_import_run", fake_get)
     monkeypatch.setattr(control_imports, "_set_cancel_flag", fake_set_cancel_flag)
 
-    result = await control_imports.request_cancel("run_running")
+    cancel_result_map = await control_imports.request_cancel("run_running")
 
-    assert result["status"] == "canceling"
-    assert result["metrics"]["cancel_signal"]["redis"] is True
+    assert cancel_result_map["status"] == "canceling"
+    assert cancel_result_map["metrics"]["cancel_signal"]["redis"] is True
 
 
 @pytest.mark.asyncio
@@ -2414,7 +2417,7 @@ async def test_request_cancel_rejects_running_non_cancelable_importer(monkeypatc
 
 @pytest.mark.asyncio
 async def test_finalize_import_run_enqueues_finish_and_marks_finalizing(monkeypatch):
-    current = {
+    current_run_map = {
         "run_id": "run_claims",
         "importer": "claims-pricing",
         "status": "running",
@@ -2422,15 +2425,15 @@ async def test_finalize_import_run_enqueues_finish_and_marks_finalizing(monkeypa
         "metrics": {"total_chunks": 1},
         "import_id": None,
     }
-    executed = []
+    executed_statements = []
 
     class FakeResult:
         def scalar_one_or_none(self):
-            return current
+            return current_run_map
 
     class FakeDb:
         async def execute(self, statement):
-            executed.append(statement)
+            executed_statements.append(statement)
             return FakeResult()
 
     async def fake_finish_main(**kwargs):
@@ -2439,10 +2442,10 @@ async def test_finalize_import_run_enqueues_finish_and_marks_finalizing(monkeypa
     monkeypatch.setattr(control_imports, "db", FakeDb())
     monkeypatch.setattr(control_imports, "_finish_function", lambda _importer: fake_finish_main)
 
-    result = await finalize_import_run("run_claims", {})
+    finalize_result_map = await finalize_import_run("run_claims", {})
 
-    assert result["run_id"] == "run_claims"
-    update_values = executed[1].compile().params
+    assert finalize_result_map["run_id"] == "run_claims"
+    update_values = executed_statements[1].compile().params
     assert update_values["status"] == "finalizing"
     assert update_values["import_id"] == "20260603"
     assert update_values["metrics"]["finalize"]["run_id"] == "run_claims"

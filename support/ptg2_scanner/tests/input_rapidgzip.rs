@@ -384,7 +384,7 @@ fn full_scan_reader_retries_an_executable_that_is_temporarily_busy() {
     permissions.set_mode(0o700);
     std::fs::set_permissions(&executable_path, permissions).expect("make busy executable runnable");
     let release_thread = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(150));
         drop(executable_file);
     });
 

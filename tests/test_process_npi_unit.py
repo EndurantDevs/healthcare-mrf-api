@@ -28,7 +28,7 @@ def npi_module():
 
 
 def _build_minimal_row(npi: str) -> dict[str, str]:
-    row: dict[str, str] = {
+    npi_row_map: dict[str, str] = {
         "NPI": npi,
         "Entity Type Code": "2",
         "Provider Organization Name (Legal Business Name)": "Example Org",
@@ -52,19 +52,19 @@ def _build_minimal_row(npi: str) -> dict[str, str]:
     }
 
     for idx in range(1, 16):
-        row[f"Healthcare Provider Taxonomy Code_{idx}"] = ""
-        row[f"Provider License Number_{idx}"] = ""
-        row[f"Provider License Number State Code_{idx}"] = ""
-        row[f"Healthcare Provider Primary Taxonomy Switch_{idx}"] = ""
-        row[f"Healthcare Provider Taxonomy Group_{idx}"] = ""
+        npi_row_map[f"Healthcare Provider Taxonomy Code_{idx}"] = ""
+        npi_row_map[f"Provider License Number_{idx}"] = ""
+        npi_row_map[f"Provider License Number State Code_{idx}"] = ""
+        npi_row_map[f"Healthcare Provider Primary Taxonomy Switch_{idx}"] = ""
+        npi_row_map[f"Healthcare Provider Taxonomy Group_{idx}"] = ""
 
     for idx in range(1, 51):
-        row[f"Other Provider Identifier_{idx}"] = ""
-        row[f"Other Provider Identifier Type Code_{idx}"] = ""
-        row[f"Other Provider Identifier State_{idx}"] = ""
-        row[f"Other Provider Identifier Issuer_{idx}"] = ""
+        npi_row_map[f"Other Provider Identifier_{idx}"] = ""
+        npi_row_map[f"Other Provider Identifier Type Code_{idx}"] = ""
+        npi_row_map[f"Other Provider Identifier State_{idx}"] = ""
+        npi_row_map[f"Other Provider Identifier Issuer_{idx}"] = ""
 
-    return row
+    return npi_row_map
 
 
 def _fake_make_class_factory(schema: str = "mrf"):
@@ -210,10 +210,14 @@ async def test_process_data_rejects_missing_nucc_before_download(monkeypatch, np
 
     monkeypatch.setattr(npi_module.db, "scalar", fake_scalar)
 
-    ctx = {"context": {}, "redis": SimpleNamespace(enqueue_job=AsyncMock()), "import_date": "20251107"}
+    worker_context_map = {
+        "context": {},
+        "redis": SimpleNamespace(enqueue_job=AsyncMock()),
+        "import_date": "20251107",
+    }
 
     with pytest.raises(npi_module.NPIPrerequisiteError, match="nucc_taxonomy"):
-        await npi_module.process_data(ctx)
+        await npi_module.process_data(worker_context_map)
 
     download_mock.assert_not_awaited()
 
@@ -223,31 +227,37 @@ async def test_process_npi_chunk_enqueues_basic_payload(monkeypatch, npi_module)
     monkeypatch.delenv("HLTHPRT_ADDRESS_CANON_SOURCES", raising=False)
 
     fake_redis = SimpleNamespace(enqueue_job=AsyncMock())
-    ctx = {"redis": fake_redis, "import_date": "20251104"}
+    worker_context_map = {"redis": fake_redis, "import_date": "20251104"}
 
     npi_csv_map = {
         "NPI": "npi",
         "Entity Type Code": "entity_type_code",
         "Provider Organization Name (Legal Business Name)": "provider_organization_name",
     }
-    npi_csv_map_reverse = {value: key for key, value in npi_csv_map.items()}
+    npi_csv_map_reverse = {
+        column_name: source_name
+        for source_name, column_name in npi_csv_map.items()
+    }
 
-    row = _build_minimal_row("1215387113")
+    npi_row_map = _build_minimal_row("1215387113")
 
-    task = {
+    chunk_task_map = {
         "npi_csv_map": npi_csv_map,
         "npi_csv_map_reverse": npi_csv_map_reverse,
         "taxonomy_int_code_map": {"1223D0001X": 4101},
-        "row_list": [row],
+        "row_list": [npi_row_map],
     }
 
-    await npi_module.process_npi_chunk(ctx, task)
+    await npi_module.process_npi_chunk(worker_context_map, chunk_task_map)
 
     fake_redis.enqueue_job.assert_awaited_once()
-    payload = fake_redis.enqueue_job.await_args.args[1]
+    enqueue_payload_map = fake_redis.enqueue_job.await_args.args[1]
 
-    assert payload["npi_obj_list"][0]["npi"] == 1215387113
-    address_by_type = {entry["type"]: entry for entry in payload["npi_address_list"]}
+    assert enqueue_payload_map["npi_obj_list"][0]["npi"] == 1215387113
+    address_by_type = {
+        entry["type"]: entry
+        for entry in enqueue_payload_map["npi_address_list"]
+    }
     assert address_by_type["primary"]["city_name"] == "AUSTIN"
     assert address_by_type["mail"]["first_line"] == "PO Box 1"
 
@@ -257,28 +267,34 @@ async def test_process_npi_chunk_precomputes_address_key_when_enabled(monkeypatc
     monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_SOURCES", "nppes")
 
     fake_redis = SimpleNamespace(enqueue_job=AsyncMock())
-    ctx = {"redis": fake_redis, "import_date": "20251104"}
+    worker_context_map = {"redis": fake_redis, "import_date": "20251104"}
 
     npi_csv_map = {
         "NPI": "npi",
         "Entity Type Code": "entity_type_code",
         "Provider Organization Name (Legal Business Name)": "provider_organization_name",
     }
-    npi_csv_map_reverse = {value: key for key, value in npi_csv_map.items()}
+    npi_csv_map_reverse = {
+        column_name: source_name
+        for source_name, column_name in npi_csv_map.items()
+    }
 
-    row = _build_minimal_row("1215387113")
+    npi_row_map = _build_minimal_row("1215387113")
 
     await npi_module.process_npi_chunk(
-        ctx,
+        worker_context_map,
         {
             "npi_csv_map": npi_csv_map,
             "npi_csv_map_reverse": npi_csv_map_reverse,
-            "row_list": [row],
+            "row_list": [npi_row_map],
         },
     )
 
-    payload = fake_redis.enqueue_job.await_args.args[1]
-    address_by_type = {entry["type"]: entry for entry in payload["npi_address_list"]}
+    enqueue_payload_map = fake_redis.enqueue_job.await_args.args[1]
+    address_by_type = {
+        entry["type"]: entry
+        for entry in enqueue_payload_map["npi_address_list"]
+    }
     assert address_by_type["primary"]["address_key"] == npi_module.address_key_v1(
         "123 Main St",
         "",
@@ -303,9 +319,9 @@ async def test_process_npi_chunk_batches_address_key_precompute(monkeypatch, npi
 
     seen_batches = []
 
-    def fake_canonicalize_batch(rows):
-        rows = list(rows)
-        seen_batches.append(rows)
+    def fake_canonicalize_batch(address_rows):
+        address_row_list = list(address_rows)
+        seen_batches.append(address_row_list)
         return [
             {"address_key": "00000000-0000-4000-8000-000000000001"},
             {"address_key": "00000000-0000-4000-8000-000000000002"},
@@ -313,17 +329,20 @@ async def test_process_npi_chunk_batches_address_key_precompute(monkeypatch, npi
 
     monkeypatch.setattr(npi_module, "canonicalize_address_batch", fake_canonicalize_batch)
     fake_redis = SimpleNamespace(enqueue_job=AsyncMock())
-    ctx = {"redis": fake_redis, "import_date": "20251104"}
+    worker_context_map = {"redis": fake_redis, "import_date": "20251104"}
 
     npi_csv_map = {
         "NPI": "npi",
         "Entity Type Code": "entity_type_code",
         "Provider Organization Name (Legal Business Name)": "provider_organization_name",
     }
-    npi_csv_map_reverse = {value: key for key, value in npi_csv_map.items()}
+    npi_csv_map_reverse = {
+        column_name: source_name
+        for source_name, column_name in npi_csv_map.items()
+    }
 
     await npi_module.process_npi_chunk(
-        ctx,
+        worker_context_map,
         {
             "npi_csv_map": npi_csv_map,
             "npi_csv_map_reverse": npi_csv_map_reverse,
@@ -331,8 +350,11 @@ async def test_process_npi_chunk_batches_address_key_precompute(monkeypatch, npi
         },
     )
 
-    payload = fake_redis.enqueue_job.await_args.args[1]
-    address_by_type = {entry["type"]: entry for entry in payload["npi_address_list"]}
+    enqueue_payload_map = fake_redis.enqueue_job.await_args.args[1]
+    address_by_type = {
+        entry["type"]: entry
+        for entry in enqueue_payload_map["npi_address_list"]
+    }
     assert len(seen_batches) == 1
     assert seen_batches[0] == [
         ("123 Main St", "", "AUSTIN", "TX", "78701", "US"),
@@ -348,9 +370,9 @@ async def test_process_npi_chunk_batches_contact_normalization(monkeypatch, npi_
 
     seen_batches = []
 
-    def fake_canonicalize_contact_batch(rows):
-        rows = list(rows)
-        seen_batches.append(rows)
+    def fake_canonicalize_contact_batch(contact_rows):
+        contact_row_list = list(contact_rows)
+        seen_batches.append(contact_row_list)
         return [
             {
                 "phone_number": "5125550100",
@@ -368,17 +390,20 @@ async def test_process_npi_chunk_batches_contact_normalization(monkeypatch, npi_
 
     monkeypatch.setattr(npi_module, "canonicalize_contact_batch", fake_canonicalize_contact_batch)
     fake_redis = SimpleNamespace(enqueue_job=AsyncMock())
-    ctx = {"redis": fake_redis, "import_date": "20251104"}
+    worker_context_map = {"redis": fake_redis, "import_date": "20251104"}
 
     npi_csv_map = {
         "NPI": "npi",
         "Entity Type Code": "entity_type_code",
         "Provider Organization Name (Legal Business Name)": "provider_organization_name",
     }
-    npi_csv_map_reverse = {value: key for key, value in npi_csv_map.items()}
+    npi_csv_map_reverse = {
+        column_name: source_name
+        for source_name, column_name in npi_csv_map.items()
+    }
 
     await npi_module.process_npi_chunk(
-        ctx,
+        worker_context_map,
         {
             "npi_csv_map": npi_csv_map,
             "npi_csv_map_reverse": npi_csv_map_reverse,
@@ -386,8 +411,11 @@ async def test_process_npi_chunk_batches_contact_normalization(monkeypatch, npi_
         },
     )
 
-    payload = fake_redis.enqueue_job.await_args.args[1]
-    address_by_type = {entry["type"]: entry for entry in payload["npi_address_list"]}
+    enqueue_payload_map = fake_redis.enqueue_job.await_args.args[1]
+    address_by_type = {
+        entry["type"]: entry
+        for entry in enqueue_payload_map["npi_address_list"]
+    }
     assert seen_batches == [
         [
             ("5125550100", "", "US"),
@@ -403,51 +431,57 @@ async def test_process_npi_chunk_populates_taxonomy_variants(monkeypatch, npi_mo
     monkeypatch.delenv("HLTHPRT_ADDRESS_CANON_SOURCES", raising=False)
 
     fake_redis = SimpleNamespace(enqueue_job=AsyncMock())
-    ctx = {"redis": fake_redis, "import_date": "20251105"}
+    worker_context_map = {"redis": fake_redis, "import_date": "20251105"}
 
     npi_csv_map = {
         "NPI": "npi",
         "Entity Type Code": "entity_type_code",
         "Provider Organization Name (Legal Business Name)": "provider_organization_name",
     }
-    npi_csv_map_reverse = {value: key for key, value in npi_csv_map.items()}
+    npi_csv_map_reverse = {
+        column_name: source_name
+        for source_name, column_name in npi_csv_map.items()
+    }
 
-    row = _build_minimal_row("1415980663")
-    row["Entity Type Code"] = "<UNAVAIL>"
-    row["Last Update Date"] = "2024-01-15"
-    row["Healthcare Provider Taxonomy Code_1"] = "1223D0001X"
-    row["Healthcare Provider Primary Taxonomy Switch_1"] = "Y"
-    row["Provider License Number_1"] = "12345"
-    row["Provider License Number State Code_1"] = "TX"
-    row["Healthcare Provider Taxonomy Group_1"] = "Special Group"
-    row["Other Provider Identifier_1"] = "ALT123"
-    row["Other Provider Identifier Type Code_1"] = "05"
-    row["Other Provider Identifier State_1"] = "TX"
-    row["Other Provider Identifier Issuer_1"] = "Issuer"
+    npi_row_map = _build_minimal_row("1415980663")
+    npi_row_map["Entity Type Code"] = "<UNAVAIL>"
+    npi_row_map["Last Update Date"] = "2024-01-15"
+    npi_row_map["Healthcare Provider Taxonomy Code_1"] = "1223D0001X"
+    npi_row_map["Healthcare Provider Primary Taxonomy Switch_1"] = "Y"
+    npi_row_map["Provider License Number_1"] = "12345"
+    npi_row_map["Provider License Number State Code_1"] = "TX"
+    npi_row_map["Healthcare Provider Taxonomy Group_1"] = "Special Group"
+    npi_row_map["Other Provider Identifier_1"] = "ALT123"
+    npi_row_map["Other Provider Identifier Type Code_1"] = "05"
+    npi_row_map["Other Provider Identifier State_1"] = "TX"
+    npi_row_map["Other Provider Identifier Issuer_1"] = "Issuer"
 
-    task = {
+    chunk_task_map = {
         "npi_csv_map": npi_csv_map,
         "npi_csv_map_reverse": npi_csv_map_reverse,
         "taxonomy_int_code_map": {"1223D0001X": 4101},
-        "row_list": [row],
+        "row_list": [npi_row_map],
     }
 
-    await npi_module.process_npi_chunk(ctx, task)
+    await npi_module.process_npi_chunk(worker_context_map, chunk_task_map)
 
     fake_redis.enqueue_job.assert_awaited_once()
-    payload = fake_redis.enqueue_job.await_args.args[1]
+    enqueue_payload_map = fake_redis.enqueue_job.await_args.args[1]
 
-    taxonomy_entry = payload["npi_taxonomy_list"][0]
+    taxonomy_entry = enqueue_payload_map["npi_taxonomy_list"][0]
     assert taxonomy_entry["healthcare_provider_taxonomy_code"] == "1223D0001X"
     assert taxonomy_entry["provider_license_number_state_code"] == "TX"
 
-    other_identifier = payload["npi_other_id_list"][0]
+    other_identifier = enqueue_payload_map["npi_other_id_list"][0]
     assert other_identifier["other_provider_identifier"] == "ALT123"
 
-    taxonomy_group = payload["npi_taxonomy_group_list"][0]
+    taxonomy_group = enqueue_payload_map["npi_taxonomy_group_list"][0]
     assert taxonomy_group["healthcare_provider_taxonomy_group"] == "Special Group"
 
-    address_by_type = {entry["type"]: entry for entry in payload["npi_address_list"]}
+    address_by_type = {
+        entry["type"]: entry
+        for entry in enqueue_payload_map["npi_address_list"]
+    }
     assert address_by_type["primary"]["taxonomy_array"] == [4101]
     assert address_by_type["mail"]["taxonomy_array"] == [4101]
 
@@ -463,8 +497,8 @@ async def test_save_npi_data_dispatch(monkeypatch, npi_module):
     monkeypatch.setattr(npi_module, "push_objects", fake_push)
     monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
 
-    ctx = {"import_date": "20251106"}
-    task = {
+    worker_context_map = {"import_date": "20251106"}
+    save_task_map = {
         "npi_obj_list": [{"npi": 1, "entity_type_code": 2}],
         "npi_taxonomy_list": [{"npi": 1, "checksum": 10}],
         "npi_other_id_list": [{"npi": 1, "checksum": 11}],
@@ -473,10 +507,10 @@ async def test_save_npi_data_dispatch(monkeypatch, npi_module):
         "unexpected": [{"value": 99}],
     }
 
-    await npi_module.save_npi_data(ctx, task)
+    await npi_module.save_npi_data(worker_context_map, save_task_map)
 
-    table_flags = {name: flag for name, flag, _ in push_calls}
-    assert table_flags == {
+    rewrite_flags_by_table = {name: flag for name, flag, _ in push_calls}
+    assert rewrite_flags_by_table == {
         "npi_20251106": True,
         "npi_taxonomy_20251106": True,
         "npi_other_identifier_20251106": False,
@@ -500,11 +534,15 @@ async def test_process_data_no_remote_files(monkeypatch, npi_module):
     monkeypatch.setattr(npi_module, "_load_nucc_taxonomy_int_code_map", AsyncMock(return_value={}))
     monkeypatch.setattr(npi_module.db, "status", AsyncMock())
 
-    ctx = {"context": {}, "redis": SimpleNamespace(enqueue_job=AsyncMock()), "import_date": "20251107"}
+    worker_context_map = {
+        "context": {},
+        "redis": SimpleNamespace(enqueue_job=AsyncMock()),
+        "import_date": "20251107",
+    }
 
-    await npi_module.process_data(ctx)
+    await npi_module.process_data(worker_context_map)
 
-    assert ctx["context"]["run"] == 1
+    assert worker_context_map["context"]["run"] == 1
     download_mock.assert_awaited()
 
 
@@ -522,12 +560,16 @@ async def test_process_data_failure_does_not_mark_run(monkeypatch, npi_module):
     monkeypatch.setattr(npi_module, "_load_nucc_taxonomy_int_code_map", AsyncMock(return_value={}))
     monkeypatch.setattr(npi_module.db, "status", AsyncMock())
 
-    ctx = {"context": {}, "redis": SimpleNamespace(enqueue_job=AsyncMock()), "import_date": "20251107"}
+    worker_context_map = {
+        "context": {},
+        "redis": SimpleNamespace(enqueue_job=AsyncMock()),
+        "import_date": "20251107",
+    }
 
     with pytest.raises(RuntimeError):
-        await npi_module.process_data(ctx)
+        await npi_module.process_data(worker_context_map)
 
-    assert ctx["context"].get("run", 0) == 0
+    assert worker_context_map["context"].get("run", 0) == 0
 
 
 def test_nppes_listing_regex_is_v2_only(npi_module):

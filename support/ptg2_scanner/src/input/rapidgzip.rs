@@ -12,8 +12,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const MAX_STDERR_BYTES: usize = 16 * 1024;
-const SPAWN_BUSY_RETRIES: usize = 10;
-const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+// CI and atomic executable replacement can delay an ETXTBSY release beyond one scheduler tick.
+const SPAWN_BUSY_RETRIES: usize = 40;
+const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RapidgzipConfig {
