@@ -230,17 +230,33 @@ def test_overlay_query_is_current_deterministic_and_has_no_role_scan():
     sql = evidence_db.overlay_sample_sql("mrf")
 
     assert '"mrf".provider_directory_address_overlay' in sql
+    assert '"mrf".provider_directory_profile_evidence' in sql
     assert "overlay.source_id = current_source.source_id" in sql
     assert "overlay.last_seen_run_id = current_source.run_id" in sql
+    assert "profile_evidence.source_id = current_source.source_id" in sql
+    assert "profile_evidence.dataset_id = current_source.dataset_id" in sql
+    assert "profile_evidence.npi = overlay.npi" in sql
     assert "NULLIF(overlay.phone_number, '') IS NOT NULL" in sql
     assert "overlay.lat::double precision AS latitude" in sql
     assert "overlay.long::double precision AS longitude" in sql
     assert "overlay.latitude" not in sql
     assert "overlay.longitude" not in sql
-    assert "ORDER BY overlay.resource_type, overlay.resource_id" in sql
+    assert "overlay.resource_type, overlay.resource_id" in sql
     assert "LIMIT $2" in sql
     assert "provider_directory_dataset_resource" not in sql
     assert "provider_directory_practitioner_role" not in sql
+
+
+def test_overlay_query_prioritizes_complete_profile_evidence_rows():
+    sql = evidence_db.overlay_sample_sql("mrf")
+
+    assert "overlay.lat IS NOT NULL" in sql
+    assert "overlay.long IS NOT NULL" in sql
+    assert "COALESCE(profile_match.has_profile_evidence, FALSE)" in sql
+    assert "LIMIT 1" in sql
+    assert sql.index("overlay.lat IS NOT NULL") < sql.index(
+        "overlay.resource_type, overlay.resource_id"
+    )
 
 
 def test_mapped_witness_query_retains_exact_address_key():
@@ -297,6 +313,104 @@ async def test_overlay_probe_falls_back_to_address_without_phone():
     assert samples[SOURCE_A] == [support.OverlaySample(SOURCE_A, 1234567890, None)]
     assert "NULLIF(overlay.phone_number, '') IS NOT NULL" in conn.calls[0][0]
     assert "NULLIF(overlay.phone_number, '') IS NOT NULL" not in conn.calls[1][0]
+
+
+@pytest.mark.asyncio
+async def test_mapped_witness_failure_does_not_suppress_provenance_or_completion(
+    monkeypatch, tmp_path
+):
+    selection = support.SourceSelection(
+        "acquired",
+        SOURCE_A,
+        "acquisition",
+        True,
+        resources=("PractitionerRole",),
+    )
+    config = _harness_config(tmp_path, require_mapped_evidence=True)
+    observed_probes = []
+    expected_provenance = support.SourceProvenance(
+        SOURCE_A,
+        "endpoint-1",
+        "dataset-1",
+        "https://fhir.example.test",
+    )
+    expected_completion_by_source = {
+        SOURCE_A: {"PractitionerRole": {"state": "positive"}}
+    }
+
+    async def fetch_samples(*_args, **_kwargs):
+        return {SOURCE_A: [support.OverlaySample(SOURCE_A, 1234567890, None)]}
+
+    async def fail_witness_probe(*_args, **_kwargs):
+        raise RuntimeError("witness query failed")
+
+    async def fetch_provenance(*_args, **_kwargs):
+        observed_probes.append("provenance")
+        return {SOURCE_A: expected_provenance}
+
+    async def fetch_completion(*_args, **_kwargs):
+        observed_probes.append("completion")
+        return expected_completion_by_source
+
+    monkeypatch.setattr(harness, "fetch_overlay_samples", fetch_samples)
+    monkeypatch.setattr(
+        harness, "fetch_mapped_evidence_witnesses", fail_witness_probe
+    )
+    monkeypatch.setattr(
+        harness, "fetch_current_source_provenance", fetch_provenance
+    )
+    monkeypatch.setattr(
+        harness, "fetch_current_dataset_completion_proofs", fetch_completion
+    )
+
+    probe = await harness._current_samples(config, FakeConn([]), [selection])
+
+    assert observed_probes == ["provenance", "completion"]
+    assert probe.witness_probe_error == "RuntimeError"
+    assert probe.provenance_by_source == {SOURCE_A: expected_provenance}
+    assert probe.completion_proofs_by_source == expected_completion_by_source
+
+
+def test_mapped_witness_failure_remains_fail_closed_in_source_result(tmp_path):
+    selection = support.SourceSelection(
+        "acquired",
+        SOURCE_A,
+        "acquisition",
+        True,
+        resources=("PractitionerRole",),
+    )
+    config = _harness_config(tmp_path, require_mapped_evidence=True)
+    current_probe = harness.CurrentEvidenceProbe(
+        samples_by_source={
+            SOURCE_A: [support.OverlaySample(SOURCE_A, 1234567890, None)]
+        },
+        witnesses_by_source={SOURCE_A: []},
+        completion_proofs_by_source={
+            SOURCE_A: {"PractitionerRole": {"state": "positive"}}
+        },
+        provenance_by_source={
+            SOURCE_A: support.SourceProvenance(
+                SOURCE_A,
+                "endpoint-1",
+                "dataset-1",
+                "https://fhir.example.test",
+            )
+        },
+        witness_probe_error="RuntimeError",
+    )
+
+    source_result = harness._source_results(
+        config,
+        [selection],
+        current_probe,
+        None,
+        "data_only_mode",
+    )[0]
+
+    capability = source_result["mapped_evidence_capabilities"]["practitioner_role"]
+    assert capability["state"] == "not_observed"
+    assert capability["reason"] == "mapped_evidence_probe_failed"
+    assert source_result["expected_fhir_provenance"]["dataset_id"] == "dataset-1"
 
 
 @pytest.mark.asyncio

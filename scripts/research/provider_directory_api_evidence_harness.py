@@ -112,6 +112,7 @@ async def _current_samples(
             empty_provenance_by_source,
             database_error=type(exc).__name__,
         )
+    witness_probe_error = None
     try:
         witnesses_by_source = await fetch_mapped_evidence_witnesses(
             conn,
@@ -120,13 +121,8 @@ async def _current_samples(
             witnesses_per_resource=config.samples_per_source,
         )
     except Exception as exc:
-        return CurrentEvidenceProbe(
-            samples_by_source,
-            empty_witnesses_by_source,
-            {},
-            empty_provenance_by_source,
-            witness_probe_error=type(exc).__name__,
-        )
+        witnesses_by_source = empty_witnesses_by_source
+        witness_probe_error = type(exc).__name__
     provenance_by_source, provenance_probe_error = await _current_provenance(
         config, conn, selections
     )
@@ -138,6 +134,7 @@ async def _current_samples(
         witnesses_by_source,
         completion_proofs,
         provenance_by_source,
+        witness_probe_error=witness_probe_error,
         completion_probe_error=completion_probe_error,
         provenance_probe_error=provenance_probe_error,
     )

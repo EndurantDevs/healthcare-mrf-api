@@ -122,12 +122,12 @@ class ActivityChunkProgress:
     started_chunks: int
 
     def pct(self) -> float | None:
+        """Return bounded completion percentage when measurable."""
         if self.bytes_total > 0:
             return min((self.bytes_done / self.bytes_total) * 100.0, 99.9)
         if self.total_chunks > 0:
             return min((self.done_chunks / self.total_chunks) * 100.0, 99.9)
         return None
-
 
 LEGACY_PARTD_TABLES = (
     "partd_import_run",
@@ -275,8 +275,8 @@ def _row_index(row: dict[str, Any]) -> dict[str, Any]:
         indexed[_normalize_key(key)] = value
     return indexed
 
-
 def _extract_dispensing_fee_fields(values: dict[str, Any]) -> dict[str, float | None]:
+    """Extract normalized dispensing fees from a source row."""
     field_candidates = {
         "dispensing_fee_brand_30": (
             "branddispensingfee30dayssupply",
@@ -857,8 +857,8 @@ async def _activity_done_chunk_ids(redis, run_id: str, snapshot_id: str) -> set[
 async def _activity_completed_rows(redis, run_id: str, snapshot_id: str) -> int:
     return _safe_int(await redis.get(_state_key(run_id, snapshot_id, "activity_rows")), 0)
 
-
 async def _wait_for_activity_chunks(redis, run_id: str, snapshot_id: str, total_chunks: int) -> tuple[int, set[str]]:
+    """Wait for all activity chunks while detecting stalled work."""
     if total_chunks <= 0:
         return 0, set()
     last_signature: tuple[int, int, int, int] | None = None
@@ -958,8 +958,8 @@ async def _drop_legacy_partd_tables(schema: str) -> None:
     for table_name in LEGACY_PARTD_TABLES:
         await db.status(f"DROP TABLE IF EXISTS {schema}.{table_name} CASCADE;")
 
-
 async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
+    """Replace one canonical activity snapshot from staged rows."""
     canonical_table = f"{schema}.{PartDPharmacyActivity.__tablename__}"
     stage_table = f"{schema}.{PartDPharmacyActivityStage.__tablename__}"
     await _fill_activity_address_from_npi(schema, PartDPharmacyActivityStage.__tablename__)
@@ -1263,8 +1263,8 @@ async def _fill_activity_state_from_zip(schema: str, table_name: str) -> None:
         """
     )
 
-
 async def _materialize_pricing_snapshot(schema: str, snapshot_id: str) -> None:
+    """Replace one canonical pricing snapshot from staged rows."""
     canonical_table = f"{schema}.{PartDMedicationCost.__tablename__}"
     stage_table = f"{schema}.{PartDMedicationCostStage.__tablename__}"
     await db.status(f"ANALYZE {stage_table};")
@@ -1499,7 +1499,6 @@ def _load_formulary_ndc_map(file_path: Path) -> dict[tuple[str, str], str]:
                 mapping[fallback_key] = rxnorm_id[:32]
     return mapping
 
-
 def _activity_row_from_source(
     row: dict[str, Any],
     *,
@@ -1507,6 +1506,7 @@ def _activity_row_from_source(
     source_type: str,
     default_date: datetime.date,
 ) -> dict[str, Any] | None:
+    """Normalize one pharmacy activity source row."""
     values = _row_index(row)
     npi = _to_npi(_row_value(values, "npi", "pharmacynpi", "pharmacynumber", "pharmacyid", "providernpi"))
     if npi is None:
@@ -1578,7 +1578,6 @@ def _activity_row_from_source(
         "source_type": source_type,
     }
 
-
 def _pricing_rows_from_source(
     row: dict[str, Any],
     *,
@@ -1588,6 +1587,7 @@ def _pricing_rows_from_source(
     plan_to_formulary: dict[tuple[str, str, str], str],
     formulary_ndc_to_rxnorm: dict[tuple[str, str], str],
 ) -> list[dict[str, Any]]:
+    """Normalize one source row into medication cost rows."""
     values = _row_index(row)
     contract_id, plan_component, segment_id, plan_id = _extract_plan_fields(values)
 
@@ -1657,12 +1657,13 @@ def _pricing_rows_from_source(
         )
     return rows
 
-
 async def _flush_batches(
     activity_batch: list[dict[str, Any]],
     pricing_batch: list[dict[str, Any]],
 ) -> None:
+    """Flush normalized activity and pricing batches to staging."""
     def _activity_stage_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Aggregate duplicate activity rows within one chunk."""
         # Chunk-level pre-aggregation to reduce stage footprint before COPY.
         grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
         for row in rows:
@@ -1780,7 +1781,6 @@ async def _flush_batches(
     if tasks:
         await asyncio.gather(*tasks)
 
-
 async def _process_activity_file(
     file_path: Path,
     *,
@@ -1845,6 +1845,7 @@ async def _import_artifact(
     redis=None,
     run_id: str = "",
 ) -> tuple[int, int]:
+    """Import all supported data files from one source artifact."""
     Path(PARTD_WORKDIR).mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="partd_", dir=PARTD_WORKDIR) as tmpdir:
         zip_path = str(Path(tmpdir) / artifact.artifact_name)
@@ -1987,6 +1988,7 @@ async def _import_artifact(
 
 
 async def partd_formulary_network_process_chunk(ctx, task=None):  # pragma: no cover
+    """Process one queued Part D activity-file chunk."""
     task = task or {}
     run_id = str(task.get("run_id") or "")
     snapshot_id = str(task.get("snapshot_id") or "")
@@ -2062,6 +2064,7 @@ async def _upsert_snapshot(payload: dict[str, Any]) -> None:
 
 
 async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
+    """Start and coordinate a Part D formulary import run."""
     task = task or {}
     run_id = _normalize_run_id(task.get("run_id"))
     import_id = _normalize_import_id(task.get("import_id"))
@@ -2292,6 +2295,7 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
 
 
 async def partd_formulary_network_finalize(_ctx, task=None):  # pragma: no cover
+    """Mark a queued Part D formulary import as finalized."""
     task = task or {}
     run_id = _normalize_run_id(task.get("run_id"))
     import_id = _normalize_import_id(task.get("import_id"))
@@ -2310,6 +2314,7 @@ async def partd_formulary_network_finalize(_ctx, task=None):  # pragma: no cover
 
 
 async def main(test_mode: bool = False, import_id: str | None = None):  # pragma: no cover
+    """Queue a Part D formulary import."""
     run_id = _normalize_run_id(None)
     normalized_import_id = _normalize_import_id(import_id)
     redis = await create_pool(
@@ -2347,6 +2352,7 @@ async def finish_main(
     test_mode: bool = False,
     manifest_path: str | None = None,
 ):  # pragma: no cover
+    """Queue finalization for a Part D formulary import."""
     del manifest_path
     normalized_run_id = _normalize_run_id(run_id)
     normalized_import_id = _normalize_import_id(import_id)
@@ -2379,8 +2385,10 @@ async def finish_main(
 
 
 async def startup(_ctx):  # pragma: no cover
+    """Initialize the Part D worker database connection."""
     await db_startup(_ctx)
 
 
 async def shutdown(_ctx):  # pragma: no cover
+    """Complete the Part D worker shutdown hook."""
     return None

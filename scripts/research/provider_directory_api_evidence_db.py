@@ -65,11 +65,27 @@ def overlay_sample_sql(schema: str, *, phone_required: bool = True) -> str:
                      overlay.lat::double precision AS latitude,
                      overlay.long::double precision AS longitude
                 FROM {quoted_schema}.provider_directory_address_overlay AS overlay
+               LEFT JOIN LATERAL (
+                   SELECT TRUE AS has_profile_evidence
+                     FROM {quoted_schema}.provider_directory_profile_evidence
+                            AS profile_evidence
+                    WHERE profile_evidence.npi = overlay.npi
+                      AND profile_evidence.source_id = current_source.source_id
+                      AND profile_evidence.dataset_id = current_source.dataset_id
+                    LIMIT 1
+               ) AS profile_match ON TRUE
                WHERE overlay.source_id = current_source.source_id
                  AND overlay.last_seen_run_id = current_source.run_id
                  AND overlay.npi IS NOT NULL
                  {phone_predicate}
-               ORDER BY overlay.resource_type, overlay.resource_id
+               ORDER BY (
+                   overlay.lat IS NOT NULL
+                   AND overlay.long IS NOT NULL
+                   AND COALESCE(profile_match.has_profile_evidence, FALSE)
+               ) DESC,
+               (overlay.lat IS NOT NULL AND overlay.long IS NOT NULL) DESC,
+               COALESCE(profile_match.has_profile_evidence, FALSE) DESC,
+               overlay.resource_type, overlay.resource_id
                LIMIT $2
           ) AS sampled
          ORDER BY current_source.source_id, sampled.npi;
