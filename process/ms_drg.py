@@ -67,6 +67,7 @@ class _TableParser(HTMLParser):
         self._current_cell: list[str] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Begin table-row or cell capture for an opening HTML tag."""
         if tag == "tr":
             self._current_row = []
         elif tag in {"td", "th"} and self._current_row is not None:
@@ -75,10 +76,12 @@ class _TableParser(HTMLParser):
             self._current_cell.append(" ")
 
     def handle_data(self, data: str) -> None:
+        """Append text to the active HTML table cell."""
         if self._current_cell is not None:
             self._current_cell.append(data)
 
     def handle_endtag(self, tag: str) -> None:
+        """Finalize captured HTML table cells and rows."""
         if tag in {"td", "th"} and self._current_cell is not None and self._current_row is not None:
             self._current_row.append(_clean_text("".join(self._current_cell)))
             self._current_cell = None
@@ -287,6 +290,7 @@ async def _download_many(urls: list[str], concurrency: int) -> list[tuple[str, s
     semaphore = asyncio.Semaphore(max(concurrency, 1))
 
     async def fetch(url: str) -> tuple[str, str]:
+        """Download one MS-DRG source under the shared concurrency limit."""
         async with semaphore:
             return url, await asyncio.to_thread(_download_text, url)
 
@@ -525,6 +529,7 @@ async def import_ms_drg(
     import_id: str | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
+    """Download, normalize, and persist MS-DRG reference data."""
     await ensure_database(test_mode)
     schema = _schema()
     await _ensure_tables(schema)
@@ -680,6 +685,7 @@ async def main(
     import_id: str | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
+    """Run the MS-DRG import entry point."""
     await init_db(db)
     try:
         return await import_ms_drg(

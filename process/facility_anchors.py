@@ -295,6 +295,7 @@ def _archived_identifier(name: str, suffix: str = "_old") -> str:
 
 
 async def _fetch_and_parse_hrsa(client, stage_cls, batch_size: int, test_mode: bool, test_limit: int) -> int:
+    """Fetch HRSA facility data and normalize accepted anchor rows."""
     logger.info("Fetching HRSA FQHC data...")
     accepted = 0
     batch = []
@@ -491,6 +492,7 @@ async def _fetch_and_parse_cms_hospitals(
 
 
 async def process_data(ctx, task=None):
+    """Process one queued facility-anchor import task."""
     task = task or {}
     ctx.setdefault("context", {})
 
@@ -527,6 +529,7 @@ async def process_data(ctx, task=None):
 
 
 async def startup(ctx):
+    """Initialize resources required by the facility-anchor worker."""
     await my_init_db(db)
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()
@@ -550,6 +553,7 @@ async def startup(ctx):
 
 
 async def shutdown(ctx):
+    """Finalize the facility-anchor run and release worker resources."""
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
@@ -705,6 +709,7 @@ async def shutdown(ctx):
 
 
 async def main(test_mode: bool = False):
+    """Run the facility-anchor import entry point."""
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,

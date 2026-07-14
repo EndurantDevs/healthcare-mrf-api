@@ -202,6 +202,7 @@ def _finalize_profile_record(record: dict[str, object]) -> None:
 
 
 def _dataset_specs(acs5_year: int, decennial_year: int, cbp_year: int) -> tuple[DatasetSpec, ...]:
+    """Return the supported Census dataset specifications."""
     return (
         DatasetSpec(
             name="acs_subject",
@@ -294,6 +295,7 @@ async def _fetch_dataset_rows(
     test_mode: bool,
     test_row_limit: int,
 ) -> dict[str, dict[str, int | float | None]]:
+    """Fetch rows for one Census dataset specification."""
     params: dict[str, str] = {
         "get": ",".join(["NAME", *(var for _, var, _ in spec.fields)]),
         "for": spec.geography,
@@ -499,6 +501,7 @@ async def _ensure_profile_columns(schema: str) -> None:
 
 
 async def load_geo_census_lookup(test_mode: bool = False) -> int:
+    """Build and persist the ZIP-level Census lookup."""
     profiles = await _collect_profile_map(test_mode=test_mode)
     await ensure_database(test_mode)
     await db.create_table(GeoZipCensusProfile.__table__, checkfirst=True)
@@ -523,4 +526,5 @@ async def load_geo_census_lookup(test_mode: bool = False) -> int:
 @click.command(help="Load Census ZIP profile metrics by ZIP/ZCTA and persist locally.")
 @click.option("--test", is_flag=True, help="Load a deterministic sample of rows for quick smoke testing.")
 def geo_census_lookup(test: bool) -> None:
+    """Run the Census lookup command entry point."""
     asyncio.run(load_geo_census_lookup(test_mode=test))

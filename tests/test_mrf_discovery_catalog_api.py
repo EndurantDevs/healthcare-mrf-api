@@ -90,6 +90,28 @@ async def test_source_page_is_cursor_bounded_and_merges_payer_identity(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_source_page_filters_exact_discovery_run(monkeypatch):
+    source_statements = []
+
+    async def capture_statement(source_statement):
+        source_statements.append(source_statement)
+        return []
+
+    monkeypatch.setattr(catalog.db, "all", capture_statement)
+
+    await catalog.list_discovery_sources_page(
+        limit=2,
+        discovery_run_id="run_example",
+    )
+
+    assert len(source_statements) == 1
+    compiled_query = source_statements[0].compile()
+    compiled_value_set = set(compiled_query.params.values())
+    assert "discovery_run_id" in compiled_value_set
+    assert "run_example" in compiled_value_set
+
+
+@pytest.mark.asyncio
 async def test_file_page_normalizes_label_only_plan_identity(monkeypatch):
     async def fake_all(_statement):
         return [
@@ -187,7 +209,14 @@ async def test_control_source_endpoint_passes_cursor_query_and_limit(monkeypatch
     monkeypatch.setattr(control, "list_discovery_sources_page", fake_page)
 
     result = await control.control_mrf_discovery_sources(
-        _request(args={"cursor": "source_010", "limit": "25", "q": "Example"})
+        _request(
+            args={
+                "cursor": "source_010",
+                "limit": "25",
+                "q": "Example",
+                "run_id": "run_example",
+            }
+        )
     )
 
     assert json.loads(result.body) == {"items": [], "next_cursor": None}
@@ -195,6 +224,7 @@ async def test_control_source_endpoint_passes_cursor_query_and_limit(monkeypatch
         "cursor": "source_010",
         "limit": 25,
         "query": "Example",
+        "discovery_run_id": "run_example",
     }
 
 

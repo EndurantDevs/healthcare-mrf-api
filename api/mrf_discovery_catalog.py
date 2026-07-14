@@ -85,6 +85,7 @@ async def list_discovery_sources_page(
     cursor: str | None = None,
     limit: int = DEFAULT_SOURCE_PAGE_SIZE,
     query: str | None = None,
+    discovery_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Return one deterministic page of discovered source records."""
 
@@ -102,18 +103,49 @@ async def list_discovery_sources_page(
             payer_table.c.metadata_json.label("payer_metadata_json"),
         )
     )
-    statement = select(*selected_columns).select_from(
+    source_statement = select(*selected_columns).select_from(
         source_table.outerjoin(
             payer_table,
             payer_table.c.payer_id == source_table.c.payer_id,
         )
     )
+    source_statement = _filtered_source_statement(
+        source_statement,
+        source_table,
+        payer_table,
+        cursor=cursor,
+        query=query,
+        discovery_run_id=discovery_run_id,
+    )
+    source_query_rows = await db.all(
+        source_statement.order_by(source_table.c.source_id).limit(limit + 1)
+    )
+    page_rows, next_cursor = _bounded_rows(
+        source_query_rows, limit=limit, cursor_key="source_id"
+    )
+    return {
+        "items": [_source_item(source_row) for source_row in page_rows],
+        "next_cursor": next_cursor,
+    }
+
+
+def _filtered_source_statement(
+    source_statement: Any,
+    source_table: Any,
+    payer_table: Any,
+    *,
+    cursor: str | None,
+    query: str | None,
+    discovery_run_id: str | None,
+) -> Any:
+    """Apply cursor, text, and run identity filters to a source query."""
+
     if cursor:
-        statement = statement.where(source_table.c.source_id > cursor)
+        source_statement = source_statement.where(source_table.c.source_id > cursor)
     normalized_query = str(query or "").strip().lower()
     if normalized_query:
         search_pattern = f"%{normalized_query}%"
-        statement = statement.where(
+        source_statement = source_statement.where(
             or_(
                 func.lower(source_table.c.display_name).like(search_pattern),
                 func.lower(func.coalesce(payer_table.c.canonical_name, "")).like(
@@ -125,16 +157,13 @@ async def list_discovery_sources_page(
                 func.lower(cast(payer_table.c.aliases, String)).like(search_pattern),
             )
         )
-    source_query_rows = await db.all(
-        statement.order_by(source_table.c.source_id).limit(limit + 1)
-    )
-    page_rows, next_cursor = _bounded_rows(
-        source_query_rows, limit=limit, cursor_key="source_id"
-    )
-    return {
-        "items": [_source_item(source_row) for source_row in page_rows],
-        "next_cursor": next_cursor,
-    }
+    normalized_run_id = str(discovery_run_id or "").strip()
+    if normalized_run_id:
+        source_statement = source_statement.where(
+            source_table.c.metadata_json["discovery_run_id"].as_string()
+            == normalized_run_id
+        )
+    return source_statement
 
 
 async def list_discovery_source_files_page(

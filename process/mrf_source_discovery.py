@@ -2742,7 +2742,10 @@ async def _ensure_catalog_tables() -> None:
 
 
 def _candidate_to_rows(
-    candidate: SourceCandidate, now: dt.datetime
+    candidate: SourceCandidate,
+    now: dt.datetime,
+    *,
+    discovery_run_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Convert one source candidate into payer and source database rows."""
     payer_id = _id("mrfpayer", _clean_text(candidate.payer_name).lower())
@@ -2800,6 +2803,10 @@ def _candidate_to_rows(
         )
     )
     source_key = f"{source_key_base[:80]}-{source_id[-8:]}"
+    source_metadata_dict = dict(candidate_metadata)
+    normalized_discovery_run_id = _clean_text(discovery_run_id)
+    if normalized_discovery_run_id:
+        source_metadata_dict["discovery_run_id"] = normalized_discovery_run_id
     source_row = {
         "source_id": source_id,
         "payer_id": payer_id,
@@ -2825,7 +2832,7 @@ def _candidate_to_rows(
         "confidence": candidate.confidence,
         "license_status": candidate.license_status,
         "review_status": candidate.review_status,
-        "metadata_json": candidate_metadata,
+        "metadata_json": source_metadata_dict,
         "created_at": now,
         "updated_at": now,
     }
@@ -2863,13 +2870,19 @@ def _candidate_metadata(
 
 async def _store_candidates(
     candidates: list[SourceCandidate],
+    *,
+    discovery_run_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Normalize and persist discovered payer and source rows."""
     now = _utc_now()
     payer_rows_by_id: dict[str, dict[str, Any]] = {}
     source_rows_by_id: dict[str, dict[str, Any]] = {}
     for candidate in candidates:
-        payer_row, source_row = _candidate_to_rows(candidate, now)
+        payer_row, source_row = _candidate_to_rows(
+            candidate,
+            now,
+            discovery_run_id=discovery_run_id,
+        )
         existing = payer_rows_by_id.get(payer_row["payer_id"])
         if existing:
             existing["aliases"] = sorted(
@@ -15068,7 +15081,10 @@ async def main(
         raise
 
     try:
-        payer_rows, source_rows = await _store_candidates(candidates)
+        payer_rows, source_rows = await _store_candidates(
+            candidates,
+            discovery_run_id=control_run_id,
+        )
     except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
         await record_discovery_failure(exc)
         raise

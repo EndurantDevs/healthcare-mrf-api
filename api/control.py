@@ -109,6 +109,7 @@ async def control_mrf_discovery_sources(request):
             cursor=request.args.get("cursor"),
             limit=limit,
             query=request.args.get("q"),
+            discovery_run_id=request.args.get("run_id"),
         )
     except ValueError as exc:
         raise BadRequest(str(exc)) from exc

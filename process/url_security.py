@@ -33,6 +33,7 @@ def _allow_local() -> bool:
 
 
 def fetch_max_bytes(default: int) -> int:
+    """Return the configured maximum safe response size in bytes."""
     raw = os.getenv(FETCH_MAX_BYTES_ENV)
     if raw:
         try:
@@ -45,6 +46,7 @@ def fetch_max_bytes(default: int) -> int:
 
 
 def assert_public_ip(ip: ipaddress._BaseAddress) -> None:
+    """Reject loopback and private destination addresses."""
     if ip.is_loopback or ip.is_private:
         if _allow_local():
             return
@@ -82,11 +84,13 @@ def _resolve_and_check(hostname: str, port: int) -> None:
 
 
 def assert_safe_url_sync(url: str) -> None:
+    """Validate URL scheme, host, and destination synchronously."""
     hostname, port = _validate_scheme_and_host(url)
     _resolve_and_check(hostname, port)
 
 
 async def assert_safe_url(url: str) -> None:
+    """Validate URL scheme, host, and destination asynchronously."""
     hostname, port = _validate_scheme_and_host(url)
     await asyncio.to_thread(_resolve_and_check, hostname, port)
 
@@ -95,6 +99,7 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Re-validate every redirect target so a public host cannot bounce to a private one."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Validate a redirect target before constructing its request."""
         assert_safe_url_sync(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 

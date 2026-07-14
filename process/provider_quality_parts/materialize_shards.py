@@ -62,6 +62,7 @@ async def _run_materialize_shard_job(
     target_table_key: str,
     include_run_id: bool = False,
 ) -> dict[str, Any]:
+    """Run one provider-quality materialization shard."""
     run_id, stage_suffix, schema, test_mode, year, shard_id, shard_count = _materialize_shard_task_values(task)
     redis = ctx.get("redis")
     started_at = time.monotonic()
@@ -158,6 +159,7 @@ async def _run_materialize_shard_job(
 async def provider_quality_materialize_lsh_shard(
     ctx, task: dict[str, Any] | None = None, **_kwargs: Any
 ) -> dict[str, Any]:
+    """Materialize one provider-quality LSH shard."""
     return await _run_materialize_shard_job(
         ctx,
         task,
@@ -170,6 +172,7 @@ async def provider_quality_materialize_lsh_shard(
 async def provider_quality_materialize_measure_shard(
     ctx, task: dict[str, Any] | None = None, **_kwargs: Any
 ) -> dict[str, Any]:
+    """Materialize one provider-quality measure shard."""
     return await _run_materialize_shard_job(
         ctx,
         task,
@@ -182,6 +185,7 @@ async def provider_quality_materialize_measure_shard(
 async def provider_quality_materialize_domain_shard(
     ctx, task: dict[str, Any] | None = None, **_kwargs: Any
 ) -> dict[str, Any]:
+    """Materialize one provider-quality domain shard."""
     return await _run_materialize_shard_job(
         ctx,
         task,
@@ -194,6 +198,7 @@ async def provider_quality_materialize_domain_shard(
 async def provider_quality_materialize_score_shard(
     ctx, task: dict[str, Any] | None = None, **_kwargs: Any
 ) -> dict[str, Any]:
+    """Materialize one provider-quality score shard."""
     return await _run_materialize_shard_job(
         ctx,
         task,

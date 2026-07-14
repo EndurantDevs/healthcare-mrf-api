@@ -523,6 +523,7 @@ def _build_chain_summary_sql(
     include_states: bool,
     address_table_sql: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
+    """Build chain summary SQL."""
     address_table_sql = address_table_sql or _pharmacy_address_table_sql()
     address_order_expr = _pharmacy_address_order_expr("a", address_table_sql)
     match_all_names = _is_match_all_name_filters(names)
@@ -767,6 +768,7 @@ def _build_pharmacy_state_stats_sql(
     has_staffing_helper: bool,
     address_table_sql: str | None = None,
 ) -> str:
+    """Build pharmacy state stats SQL."""
     address_table_sql = address_table_sql or _pharmacy_address_table_sql()
     address_order_expr = _pharmacy_address_order_expr("a", address_table_sql)
     schema = "mrf"
@@ -997,6 +999,7 @@ def _build_market_sql(
     chain: str | None,
     address_table_sql: str | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
+    """Build market SQL."""
     address_table_sql = address_table_sql or _pharmacy_address_table_sql()
     address_zip5_expr = _pharmacy_address_zip5_expr("a", address_table_sql)
     params: dict[str, Any] = {}
@@ -1509,6 +1512,7 @@ async def _query_market_summaries(
     chain: str | None = None,
     market_id: str | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
+    """Query market summaries."""
     has_partd = await _table_exists(session, PartDPharmacyActivity.__table__)
     has_license = await _table_exists(session, PharmacyLicenseRecord.__table__)
     has_other_id = await _table_exists(session, NPIDataOtherIdentifier.__table__)
@@ -1609,6 +1613,7 @@ async def _query_market_summaries(
 
 
 async def _fetch_pharmacy_context(session, *, npi: int, as_of: datetime.date) -> dict[str, Any] | None:
+    """Fetch pharmacy context."""
     has_partd = await _table_exists(session, PartDPharmacyActivity.__table__)
     has_license = await _table_exists(session, PharmacyLicenseRecord.__table__)
     has_other_id = await _table_exists(session, NPIDataOtherIdentifier.__table__)

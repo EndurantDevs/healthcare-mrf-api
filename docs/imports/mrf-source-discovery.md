@@ -145,8 +145,9 @@ must preserve stable plan and source-file identities and keep large
 The authenticated control API exposes deterministic keyset pages for this
 purpose:
 
-- `GET /control/v1/mrf/discovery/sources?cursor=...&limit=...` lists stored
-  sources and payer identity context. The maximum page size is 250.
+- `GET /control/v1/mrf/discovery/sources?cursor=...&limit=...&run_id=...` lists
+  stored sources and payer identity context. `run_id` scopes reconciliation to
+  sources written by one discovery run. The maximum page size is 250.
 - `GET /control/v1/mrf/discovery/sources/{source_id}/files?cursor=...&limit=...`
   lists normalized file and `plan_info` records for one source. The maximum
   page size is 500.
