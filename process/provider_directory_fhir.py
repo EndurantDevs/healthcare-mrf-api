@@ -11644,14 +11644,6 @@ def _provider_directory_profile_build_ref(
     return _unscoped_qt(build.schema, table_name)
 
 
-def _logged_provider_directory_profile_stage_sql(stage_sql: str) -> str:
-    """Render one profile stage as LOGGED from its initial creation."""
-    unlogged_clause = "CREATE UNLOGGED TABLE"
-    if stage_sql.count(unlogged_clause) != 1:
-        raise RuntimeError("provider_directory_profile_stage_ddl_invalid")
-    return stage_sql.replace(unlogged_clause, "CREATE TABLE", 1)
-
-
 async def _resolve_provider_directory_profile_build(
     schema: str,
     run_id: str | None,
@@ -11697,11 +11689,10 @@ async def _create_provider_directory_profile_evidence_stage(
         build.evidence_stage,
     )
     await db.status(
-        _logged_provider_directory_profile_stage_sql(
-            profile_artifact.profile_evidence_table_sql(
-                build.schema,
-                build.evidence_stage,
-            )
+        profile_artifact.profile_evidence_table_sql(
+            build.schema,
+            build.evidence_stage,
+            logged=True,
         )
     )
     if has_evidence_target:
@@ -11772,11 +11763,10 @@ async def _create_provider_directory_profile_compact_stage(
         profile_artifact.PROFILE_EVIDENCE_TABLE,
     )
     await db.status(
-        _logged_provider_directory_profile_stage_sql(
-            profile_artifact.profile_table_sql(
-                build.schema,
-                build.profile_stage,
-            )
+        profile_artifact.profile_table_sql(
+            build.schema,
+            build.profile_stage,
+            logged=True,
         )
     )
     should_rebuild_all_profiles = not has_existing_artifacts

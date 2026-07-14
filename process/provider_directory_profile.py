@@ -184,10 +184,16 @@ def configured_profile_source_ids(path: Path | None = None) -> tuple[str, ...]:
     return tuple(sorted(load_profile_source_spec(path)["source_ids"]))
 
 
-def profile_table_sql(schema: str, table_name: str = PROFILE_TABLE) -> str:
+def profile_table_sql(
+    schema: str,
+    table_name: str = PROFILE_TABLE,
+    *,
+    logged: bool = False,
+) -> str:
     """Build the compact NPI profile serving-table definition."""
+    persistence = "" if logged else "UNLOGGED "
     return f"""
-        CREATE UNLOGGED TABLE {qualified_table(schema, table_name)} (
+        CREATE {persistence}TABLE {qualified_table(schema, table_name)} (
             npi bigint PRIMARY KEY,
             profile_json jsonb NOT NULL,
             evidence_json jsonb NOT NULL,
@@ -206,10 +212,13 @@ def profile_table_sql(schema: str, table_name: str = PROFILE_TABLE) -> str:
 def profile_evidence_table_sql(
     schema: str,
     table_name: str = PROFILE_EVIDENCE_TABLE,
+    *,
+    logged: bool = False,
 ) -> str:
     """Build the normalized source-evidence serving-table definition."""
+    persistence = "" if logged else "UNLOGGED "
     return f"""
-        CREATE UNLOGGED TABLE {qualified_table(schema, table_name)} (
+        CREATE {persistence}TABLE {qualified_table(schema, table_name)} (
             evidence_key char(32) PRIMARY KEY,
             npi bigint NOT NULL,
             fact_type varchar(64) NOT NULL,
