@@ -6288,8 +6288,8 @@ def _address(resource: dict[str, Any]) -> dict[str, Any]:
     addresses = resource.get("address")
     if isinstance(addresses, dict):
         addresses = [addresses]
-    first = next((item for item in addresses or [] if isinstance(item, dict)), {})
-    lines = [str(value).strip() for value in first.get("line") or [] if _clean_text(value)]
+    first = next((address_entry for address_entry in addresses or [] if isinstance(address_entry, dict)), {})
+    lines = [str(address_line_value).strip() for address_line_value in first.get("line") or [] if _clean_text(address_line_value)]
     postal_code = _clean_text(first.get("postalCode"))
     zip5 = None
     if postal_code:
@@ -6422,7 +6422,7 @@ def parse_fhir_resource(
             "formulary_id",
             allow_systemless=True,
         )
-        row = {
+        resource_row_map = {
             **base,
             "plan_identifier": identifier,
             "product_identifiers": _normalized_identifiers(
@@ -6442,10 +6442,10 @@ def parse_fhir_resource(
             "period_start": period_start,
             "period_end": period_end,
         }
-        return ProviderDirectoryInsurancePlan, row
+        return ProviderDirectoryInsurancePlan, resource_row_map
     if resource_type == "Practitioner":
         family, given, full_name = _name(resource)
-        row = {
+        resource_row_map = {
             **base,
             "npi": _resource_npi(resource),
             "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
@@ -6471,9 +6471,9 @@ def parse_fhir_resource(
             ),
             "photos": _normalized_photo_metadata(resource.get("photo")),
         }
-        return ProviderDirectoryPractitioner, row
+        return ProviderDirectoryPractitioner, resource_row_map
     if resource_type == "Organization":
-        row = {
+        resource_row_map = {
             **base,
             "npi": _resource_npi(resource),
             "tax_id": _tin(resource),
@@ -6488,13 +6488,13 @@ def parse_fhir_resource(
             "part_of_ref": _first_reference(resource.get("partOf")),
             "endpoint_refs": _references(resource.get("endpoint")),
         }
-        return ProviderDirectoryOrganization, row
+        return ProviderDirectoryOrganization, resource_row_map
     if resource_type == "Location":
         telecom = _telecom(resource)
         address = _address(resource)
         telephone_number = _phone(telecom)
         fax_number = _fax(telecom)
-        row = {
+        resource_row_map = {
             **base,
             "status": _clean_text(resource.get("status")),
             "name": _clean_text(resource.get("name")),
@@ -6521,11 +6521,11 @@ def parse_fhir_resource(
             **{key: value for key, value in address.items() if key != "address_json"},
         }
         if normalize_location_contacts:
-            row.update(_location_contact_fields(telephone_number, fax_number, address.get("country_code")))
-        return ProviderDirectoryLocation, row
+            resource_row_map.update(_location_contact_fields(telephone_number, fax_number, address.get("country_code")))
+        return ProviderDirectoryLocation, resource_row_map
     if resource_type == "PractitionerRole":
         period_start, period_end = _period(resource)
-        row = {
+        resource_row_map = {
             **base,
             "npi": _npi(resource),
             "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
@@ -6544,9 +6544,9 @@ def parse_fhir_resource(
             "period_start": period_start,
             "period_end": period_end,
         }
-        return ProviderDirectoryPractitionerRole, row
+        return ProviderDirectoryPractitionerRole, resource_row_map
     if resource_type == "HealthcareService":
-        row = {
+        resource_row_map = {
             **base,
             "provided_by_ref": _first_reference(resource.get("providedBy")),
             "accepting_patients": _plan_net_accepting_patients(resource),
@@ -6591,10 +6591,10 @@ def parse_fhir_resource(
             "comment": _profile_text(resource.get("comment")),
             "photos": _normalized_photo_metadata(resource.get("photo")),
         }
-        return ProviderDirectoryHealthcareService, row
+        return ProviderDirectoryHealthcareService, resource_row_map
     if resource_type == "OrganizationAffiliation":
         period_start, period_end = _period(resource)
-        row = {
+        resource_row_map = {
             **base,
             "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
             "identifiers": _normalized_identifiers(resource.get("identifier")),
@@ -6610,12 +6610,12 @@ def parse_fhir_resource(
             "period_start": period_start,
             "period_end": period_end,
         }
-        return ProviderDirectoryOrganizationAffiliation, row
+        return ProviderDirectoryOrganizationAffiliation, resource_row_map
     if resource_type == "Endpoint":
         period_start, period_end = _period(resource)
         connection_type = resource.get("connectionType") if isinstance(resource.get("connectionType"), dict) else {}
         contact = resource.get("contact") or []
-        row = {
+        resource_row_map = {
             **base,
             "status": _clean_text(resource.get("status")),
             "connection_type_system": _clean_text(connection_type.get("system")),
@@ -6631,7 +6631,7 @@ def parse_fhir_resource(
             "address": _clean_text(resource.get("address")),
             "header": _string_list(resource.get("header")),
         }
-        return ProviderDirectoryEndpoint, row
+        return ProviderDirectoryEndpoint, resource_row_map
     return None
 
 
@@ -11691,6 +11691,7 @@ async def _create_provider_directory_profile_evidence_stage(
     *,
     has_evidence_target: bool,
 ) -> None:
+    """Build the logged evidence replacement table and its serving indexes."""
     evidence_stage_ref = _provider_directory_profile_build_ref(
         build,
         build.evidence_stage,
@@ -20032,7 +20033,7 @@ async def _fetch_owned_checkpointed_bulk_resource_rows(
 
 
 async def _fetch_bulk_export_resource_rows(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     resource_type: str,
     *,
     per_resource_limit: int,
@@ -20043,14 +20044,14 @@ async def _fetch_bulk_export_resource_rows(
     retain_rows: bool = True,
 ) -> ResourceFetchResult | None:
     """Fetch bulk export resource rows for provider-directory ingestion."""
-    checkpoint_context = source.get("_pagination_checkpoint_context")
+    checkpoint_context = source_record.get("_pagination_checkpoint_context")
     if (
         per_resource_limit <= 0
         and row_batch_handler is not None
         and _is_durable_bulk_checkpoint_context(checkpoint_context)
     ):
         return await _fetch_checkpointed_bulk_export_resource_rows(
-            source,
+            source_record,
             resource_type,
             checkpoint_context,
             BulkExportFetchOptions(
@@ -20059,7 +20060,7 @@ async def _fetch_bulk_export_resource_rows(
                     max(
                         1,
                         int(
-                            source.get("_bulk_export_max_pending_seconds")
+                            source_record.get("_bulk_export_max_pending_seconds")
                             or DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS
                         ),
                     )
@@ -20071,13 +20072,13 @@ async def _fetch_bulk_export_resource_rows(
             ),
         )
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
-    url = _bulk_export_start_url(source, resource_type)
+    url = _bulk_export_start_url(source_record, resource_type)
     if model is None or not url:
         return None
     async with _bulk_client_session() as session:
         status_code, headers, _payload, error = await _bulk_http_get_json(
             session,
-            source,
+            source_record,
             url,
             timeout=timeout,
             prefer_async=True,
@@ -20087,7 +20088,7 @@ async def _fetch_bulk_export_resource_rows(
         )
         _bulk_export_log(
             "start",
-            source_id=source.get("source_id"),
+            source_id=source_record.get("source_id"),
             resource=resource_type,
             status=status_code,
             error=error,
@@ -20124,7 +20125,7 @@ async def _fetch_bulk_export_resource_rows(
         else:
             try:
                 status_url = _resolved_bulk_export_status_url(
-                    source,
+                    source_record,
                     url,
                     status_location,
                 )
@@ -20145,7 +20146,7 @@ async def _fetch_bulk_export_resource_rows(
                 )
             output_urls, poll_error, polls = await _bulk_export_poll_outputs(
                 session,
-                source,
+                source_record,
                 status_url,
                 resource_type=resource_type,
                 timeout=timeout,
@@ -20165,15 +20166,15 @@ async def _fetch_bulk_export_resource_rows(
                     error=poll_error,
                     fetch_mode="bulk_export",
                 )
-        rows: list[dict[str, Any]] = []
+        retained_resource_rows: list[dict[str, Any]] = []
         rows_fetched = 0
         rows_written = 0
-        row_limit_reached = False
+        has_reached_row_limit = False
         output_error: str | None = None
         for output_url in output_urls or []:
             batch_rows, fetched, written, limited, error = await _stream_bulk_export_output_rows(
                 session,
-                source,
+                source_record,
                 output_url,
                 model=model,
                 resource_type=resource_type,
@@ -20187,36 +20188,36 @@ async def _fetch_bulk_export_resource_rows(
             )
             _bulk_export_log(
                 "stream_output",
-                source_id=source.get("source_id"),
+                source_id=source_record.get("source_id"),
                 resource=resource_type,
                 fetched=fetched,
                 written=written,
                 limited=limited,
                 error=error,
             )
-            rows.extend(batch_rows)
+            retained_resource_rows.extend(batch_rows)
             rows_fetched += fetched
             rows_written += written
             if error:
                 output_error = error
                 break
             if limited:
-                row_limit_reached = True
+                has_reached_row_limit = True
                 break
         if output_error and rows_fetched == 0 and rows_written == 0:
             return None
-        complete = not output_error and not row_limit_reached
+        is_complete = not output_error and not has_reached_row_limit
     return ResourceFetchResult(
         model=model,
-        rows=rows,
+        rows=retained_resource_rows,
         rows_fetched=rows_fetched,
         rows_written=rows_written,
         pages_fetched=(output_urls and len(output_urls) or 0) + polls,
-        complete=complete,
-        row_limit_reached=row_limit_reached,
+        complete=is_complete,
+        row_limit_reached=has_reached_row_limit,
         page_limit_reached=False,
         hard_page_limit_reached=False,
-        next_url_remaining=row_limit_reached,
+        next_url_remaining=has_reached_row_limit,
         error=output_error,
         fetch_mode="bulk_export",
     )
@@ -23334,7 +23335,7 @@ async def _fetch_last_updated_partition_resource_rows(
 
 
 async def _fetch_resource_rows(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     resource_type: str,
     *,
     per_resource_limit: int,
@@ -23358,13 +23359,13 @@ async def _fetch_resource_rows(
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
     if model is None:
         return None
-    supported_resource_types = _source_supported_resource_types(source)
+    supported_resource_types = _source_supported_resource_types(source_record)
     if (
         supported_resource_types is not None
         and resource_type not in supported_resource_types
     ):
         return None
-    raw_partition_config = _source_metadata(source).get(
+    raw_partition_config = _source_metadata(source_record).get(
         LAST_UPDATED_PARTITION_METADATA_KEY
     )
     partition_acquisition_declared = (
@@ -23373,11 +23374,11 @@ async def _fetch_resource_rows(
     )
     if partition_acquisition_declared:
         partition_config, partition_config_error = (
-            _last_updated_partition_config(source, resource_type)
+            _last_updated_partition_config(source_record, resource_type)
         )
         if partition_config is not None:
             return await _fetch_last_updated_partition_resource_rows(
-                source,
+                source_record,
                 resource_type,
                 model,
                 partition_config,
@@ -23401,7 +23402,7 @@ async def _fetch_resource_rows(
                 None,
                 partition_config_error or "resource_not_opted_in",
             )
-    resource_timeout = _source_resource_timeout(source, resource_type, timeout)
+    resource_timeout = _source_resource_timeout(source_record, resource_type, timeout)
     start_urls: list[str] | None = None
     bulk_checkpoint_context = (
         pagination_checkpoint
@@ -23413,20 +23414,20 @@ async def _fetch_resource_rows(
         )
         else None
     )
-    if _is_aetna_medicaid_targeted_source(source):
+    if _is_aetna_medicaid_targeted_source(source_record):
         page_count = _source_full_refresh_page_count(
-            source,
+            source_record,
             page_count,
             per_resource_limit,
             page_limit,
         )
         start_urls = _resource_start_urls(
-            source,
+            source_record,
             resource_type,
             page_count=page_count,
         )
         targeted_search_error = _aetna_medicaid_targeted_search_error(
-            source,
+            source_record,
             start_urls,
         )
         if targeted_search_error:
@@ -23445,13 +23446,13 @@ async def _fetch_resource_rows(
                 fetch_mode="targeted_required",
             )
     elif _is_source_bulk_export_effective(
-        source,
+        source_record,
         bulk_export,
         per_resource_limit=per_resource_limit,
         checkpoint_context=bulk_checkpoint_context,
     ):
         bulk_source_lookup = {
-            **source,
+            **source_record,
             "_bulk_export_max_pending_seconds": (
                 bulk_export_max_pending_seconds
             ),
@@ -23461,7 +23462,7 @@ async def _fetch_resource_rows(
                 **bulk_source_lookup,
                 "_pagination_checkpoint_context": bulk_checkpoint_context,
             }
-        result = await _fetch_bulk_export_resource_rows(
+        bulk_fetch_result = await _fetch_bulk_export_resource_rows(
             bulk_source_lookup,
             resource_type,
             per_resource_limit=per_resource_limit,
@@ -23471,9 +23472,9 @@ async def _fetch_resource_rows(
             row_batch_size=row_batch_size,
             retain_rows=retain_rows,
         )
-        if result is not None:
-            return result
-    if _scan_practitioner_role_requires_reverse_lookup(source, resource_type):
+        if bulk_fetch_result is not None:
+            return bulk_fetch_result
+    if _scan_practitioner_role_requires_reverse_lookup(source_record, resource_type):
         return ResourceFetchResult(
             model=model,
             rows=[],
@@ -23490,13 +23491,13 @@ async def _fetch_resource_rows(
         )
     if start_urls is None:
         page_count = _source_full_refresh_page_count(
-            source,
+            source_record,
             page_count,
             per_resource_limit,
             page_limit,
         )
         start_urls = _resource_start_urls(
-            source,
+            source_record,
             resource_type,
             page_count=page_count,
         )
@@ -23537,7 +23538,7 @@ async def _fetch_resource_rows(
             next_url_remaining=False,
             fetch_mode="checkpoint_complete",
         )
-    rows: list[dict[str, Any]] = []
+    retained_resource_rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
     rows_fetched = resume_state.rows_processed if resume_state else 0
     fetch_counts_by_name = {"rows_written": 0}
@@ -23546,10 +23547,10 @@ async def _fetch_resource_rows(
     recent_url_hashes = list(resume_state.recent_url_hashes if resume_state else ())
     persisted_url_hashes = set(recent_url_hashes)
     has_restart_attempted = False
-    row_limit_reached = False
-    page_limit_reached = False
-    hard_page_limit_reached = False
-    next_url_remaining = False
+    has_reached_row_limit = False
+    has_reached_page_limit = False
+    has_reached_hard_page_limit = False
+    has_next_url = False
     error_message: str | None = None
     retry_not_before: str | None = None
     fetch_diagnostic: dict[str, Any] | None = None
@@ -23561,7 +23562,7 @@ async def _fetch_resource_rows(
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
     is_deadline_reached = False
     source_api_base = _canonical_base(
-        source.get("canonical_api_base") or source.get("api_base")
+        source_record.get("canonical_api_base") or source_record.get("api_base")
     )
     is_uhc_partition_scan = (
         source_api_base == UHC_PROVIDER_DIRECTORY_BASE and len(start_urls) > 1
@@ -23576,9 +23577,9 @@ async def _fetch_resource_rows(
         if resume_state and resume_state.next_url
         else list(start_urls)
     )
-    partitioned_fetch = len(pending_start_urls) > 1
+    is_partitioned_fetch = len(pending_start_urls) > 1
     if (
-        partitioned_fetch
+        is_partitioned_fetch
         and per_resource_limit <= 0
         and page_limit <= 0
     ):
@@ -23594,7 +23595,7 @@ async def _fetch_resource_rows(
             cancel_task=cancel_task,
         )
         return await _fetch_partitioned_resource_rows(
-            source,
+            source_record,
             resource_type,
             model,
             pending_start_urls,
@@ -23619,15 +23620,15 @@ async def _fetch_resource_rows(
                 await raise_if_cancelled(cancel_ctx, cancel_task)
             if deadline_at is not None and time.monotonic() >= deadline_at:
                 is_deadline_reached = True
-                next_url_remaining = True
+                has_next_url = True
                 break
             if page_limit > 0 and pages >= page_limit:
-                page_limit_reached = True
-                next_url_remaining = True
+                has_reached_page_limit = True
+                has_next_url = True
                 break
             if max_pages > 0 and pages >= max_pages:
-                hard_page_limit_reached = True
-                next_url_remaining = True
+                has_reached_hard_page_limit = True
+                has_next_url = True
                 break
             request_identity = _pagination_url_identity(url)
             request_url_hash = _pagination_url_hash(url)
@@ -23637,11 +23638,11 @@ async def _fetch_resource_rows(
                     if _has_replay_sensitive_continuation(url)
                     else "pagination loop detected"
                 )
-                next_url_remaining = True
+                has_next_url = True
                 break
             seen_urls.add(request_identity)
             page_fetch_result = await _fetch_source_json(
-                source,
+                source_record,
                 url,
                 timeout=resource_timeout,
             )
@@ -23650,7 +23651,7 @@ async def _fetch_resource_rows(
                 page_fetch_result[2],
             ):
                 cooldown_result = await _retry_rest_pagination_after_cooldown(
-                    source,
+                    source_record,
                     url,
                     page_fetch_result,
                     timeout=resource_timeout,
@@ -23669,7 +23670,7 @@ async def _fetch_resource_rows(
                     is_pagination_cooldown_deadline_blocked
                     or cooldown_result.deadline_blocked
                 )
-            status_code, payload, error, _elapsed = page_fetch_result
+            status_code, response_payload, error, _elapsed = page_fetch_result
             if status_code != 200 or error:
                 if (
                     checkpoint_context
@@ -23702,27 +23703,27 @@ async def _fetch_resource_rows(
                     has_restart_attempted = True
                     url = checkpoint_start_url
                     continue
-                fetch_diagnostic = _terminal_source_fetch_diagnostic(source, url)
+                fetch_diagnostic = _terminal_source_fetch_diagnostic(source_record, url)
                 retry_not_before = _molina_quota_retry_not_before(
-                    source,
+                    source_record,
                     status_code,
-                    payload,
+                    response_payload,
                 ) or _transient_source_retry_not_before(
                     status_code,
-                    payload,
+                    response_payload,
                     error,
                     retry_count=int((fetch_diagnostic or {}).get("retry_count") or 0),
                 )
                 current_error = error or f"http_{status_code}"
-                if partitioned_fetch:
+                if is_partitioned_fetch:
                     partition_error_count += 1
                     error_message = f"partition_errors_{partition_error_count}_last_{current_error}"
                     url = None
                     break
                 error_message = current_error
                 break
-            if not _is_bundle_payload(payload):
-                if partitioned_fetch:
+            if not _is_bundle_payload(response_payload):
+                if is_partitioned_fetch:
                     partition_error_count += 1
                     error_message = f"partition_errors_{partition_error_count}_last_non_bundle_payload"
                     url = None
@@ -23730,18 +23731,18 @@ async def _fetch_resource_rows(
                 error_message = "non_bundle_payload"
                 break
             pages += 1
-            child_urls = _uhc_adaptive_partition_child_urls(source, resource_type, url, payload)
+            child_urls = _uhc_adaptive_partition_child_urls(source_record, resource_type, url, response_payload)
             if child_urls:
-                partitioned_fetch = True
+                is_partitioned_fetch = True
                 pending_start_urls = child_urls + pending_start_urls
                 url = None
                 break
-            if _is_uhc_partition_cap_exhausted(source, url, payload):
+            if _is_uhc_partition_cap_exhausted(source_record, url, response_payload):
                 error_message = f"uhc_{resource_type.lower()}_partition_cap_exhausted"
-            entries = _bundle_entries(payload)
+            entries = _bundle_entries(response_payload)
             for entry_index, entry in enumerate(entries):
                 parsed = parse_fhir_resource(
-                    source["source_id"],
+                    source_record["source_id"],
                     entry["resource"],
                     resource_url=_clean_text(entry.get("fullUrl")),
                     acquisition=_rest_bundle_acquisition(entry, url),
@@ -23750,18 +23751,18 @@ async def _fetch_resource_rows(
                 )
                 if not parsed:
                     continue
-                parsed_model, row = parsed
+                parsed_model, parsed_resource_row = parsed
                 if parsed_model is not model:
                     continue
                 rows_fetched += 1
                 if retain_rows:
-                    rows.append(row)
+                    retained_resource_rows.append(parsed_resource_row)
                 if row_batch_handler:
-                    pending_rows.append(row)
+                    pending_rows.append(parsed_resource_row)
                     if len(pending_rows) >= max(1, row_batch_size):
                         await flush_pending_rows()
                 if not _limit_allows_more(rows_fetched, per_resource_limit):
-                    row_limit_reached = entry_index < len(entries) - 1
+                    has_reached_row_limit = entry_index < len(entries) - 1
                     break
                 if (
                     not checkpoint_context
@@ -23769,21 +23770,21 @@ async def _fetch_resource_rows(
                     and time.monotonic() >= deadline_at
                 ):
                     is_deadline_reached = True
-                    next_url_remaining = True
+                    has_next_url = True
                     break
-            next_url = _next_link(payload)
+            next_url = _next_link(response_payload)
             source_api_base = _canonical_base(
-                source.get("canonical_api_base") or source.get("api_base")
+                source_record.get("canonical_api_base") or source_record.get("api_base")
             )
             try:
                 resolved_next_url = (
-                    _synthetic_skip_pagination_next_url(source, url, len(entries))
+                    _synthetic_skip_pagination_next_url(source_record, url, len(entries))
                     if source_api_base in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
-                    else _resolved_fhir_next_url(source, url, next_url)
+                    else _resolved_fhir_next_url(source_record, url, next_url)
                 )
             except ValueError as exc:
                 error_message = str(exc)
-                next_url_remaining = True
+                has_next_url = True
                 break
             if not entries and source_api_base in FHIR_OFFSET_PAGINATION_BASES:
                 resolved_next_url = None
@@ -23812,49 +23813,49 @@ async def _fetch_resource_rows(
                 )
             url = resolved_next_url
             if not _limit_allows_more(rows_fetched, per_resource_limit) and url:
-                row_limit_reached = True
-                next_url_remaining = True
+                has_reached_row_limit = True
+                has_next_url = True
                 break
         if (
-            row_limit_reached
-            or page_limit_reached
-            or hard_page_limit_reached
+            has_reached_row_limit
+            or has_reached_page_limit
+            or has_reached_hard_page_limit
             or is_deadline_reached
-            or (error_message and not partitioned_fetch)
+            or (error_message and not is_partitioned_fetch)
             or not _limit_allows_more(rows_fetched, per_resource_limit)
         ):
             break
     await flush_pending_rows()
     if (
         not error_message
-        and not row_limit_reached
-        and not page_limit_reached
-        and not hard_page_limit_reached
+        and not has_reached_row_limit
+        and not has_reached_page_limit
+        and not has_reached_hard_page_limit
         and not is_deadline_reached
         and not url
         and not pending_start_urls
     ):
-        error_message = _uhc_partition_residual_error(source, resource_type)
-    complete = (
+        error_message = _uhc_partition_residual_error(source_record, resource_type)
+    is_complete = (
         not error_message
-        and not row_limit_reached
-        and not page_limit_reached
-        and not hard_page_limit_reached
+        and not has_reached_row_limit
+        and not has_reached_page_limit
+        and not has_reached_hard_page_limit
         and not is_deadline_reached
         and not url
         and not pending_start_urls
     )
     return ResourceFetchResult(
         model=model,
-        rows=rows,
+        rows=retained_resource_rows,
         rows_fetched=rows_fetched,
         rows_written=fetch_counts_by_name["rows_written"],
         pages_fetched=pages,
-        complete=complete,
-        row_limit_reached=row_limit_reached,
-        page_limit_reached=page_limit_reached,
-        hard_page_limit_reached=hard_page_limit_reached,
-        next_url_remaining=next_url_remaining or bool(url) or bool(pending_start_urls),
+        complete=is_complete,
+        row_limit_reached=has_reached_row_limit,
+        page_limit_reached=has_reached_page_limit,
+        hard_page_limit_reached=has_reached_hard_page_limit,
+        next_url_remaining=has_next_url or bool(url) or bool(pending_start_urls),
         error=error_message or ("deadline_reached" if is_deadline_reached else None),
         fetch_mode="checkpointed_paged" if checkpoint_context else "paged",
         deadline_reached=is_deadline_reached,
@@ -23871,32 +23872,32 @@ async def _fetch_resource_rows(
 
 
 async def _fetch_scan_practitioner_role_rows(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     rows_by_resource: dict[str, list[dict[str, Any]]],
     options: ScanPractitionerRoleFetchOptions,
 ) -> ResourceFetchResult:
     """Fetch scan practitioner role rows for provider-directory ingestion."""
     if options.source is None:
-        options = replace(options, source=source)
+        options = replace(options, source=source_record)
     await _mark_checkpointed_reverse_lookup_roles_seen(options)
     reverse_lookup_concurrency = _scan_practitioner_role_reverse_lookup_concurrency()
     if reverse_lookup_concurrency > 1 and options.per_resource_limit <= 0 and options.page_limit <= 0:
         return await _fetch_scan_practitioner_role_rows_concurrent(
-            source,
+            source_record,
             rows_by_resource,
             options,
             concurrency=reverse_lookup_concurrency,
         )
     model = ProviderDirectoryPractitionerRole
-    rows: list[dict[str, Any]] = []
+    retained_role_rows: list[dict[str, Any]] = []
     seen_role_ids: set[str] | None = set() if options.retain_rows else None
     seed_count = 0
     rows_fetched = 0
     pages = 0
-    row_limit_reached = False
-    page_limit_reached = False
-    hard_page_limit_reached = False
-    next_url_remaining = False
+    has_reached_row_limit = False
+    has_reached_page_limit = False
+    has_reached_hard_page_limit = False
+    has_next_url = False
     error_message: str | None = None
     reverse_error_count = 0
     stream_buffer = _StreamedResourceRowBuffer(
@@ -23906,7 +23907,7 @@ async def _fetch_scan_practitioner_role_rows(
         pending_row_items=[],
     )
     resource_timeout = _source_resource_timeout(
-        options.source or source,
+        options.source or source_record,
         "PractitionerRole",
         options.timeout,
     )
@@ -23929,10 +23930,10 @@ async def _fetch_scan_practitioner_role_rows(
             break
         if deadline_at is not None and time.monotonic() >= deadline_at:
             is_deadline_reached = True
-            next_url_remaining = True
+            has_next_url = True
             break
         url = _scan_practitioner_role_reverse_lookup_url(
-            source,
+            source_record,
             search_param,
             seed_resource_type,
             seed_resource_id,
@@ -23943,18 +23944,18 @@ async def _fetch_scan_practitioner_role_rows(
                 await raise_if_cancelled(options.cancel_ctx, options.cancel_task)
             if deadline_at is not None and time.monotonic() >= deadline_at:
                 is_deadline_reached = True
-                next_url_remaining = True
+                has_next_url = True
                 break
             if options.page_limit > 0 and pages >= options.page_limit:
-                page_limit_reached = True
-                next_url_remaining = True
+                has_reached_page_limit = True
+                has_next_url = True
                 break
             if max_pages > 0 and pages >= max_pages:
-                hard_page_limit_reached = True
-                next_url_remaining = True
+                has_reached_hard_page_limit = True
+                has_next_url = True
                 break
-            status_code, payload, error, _elapsed = await _fetch_source_json(
-                source,
+            status_code, response_payload, error, _elapsed = await _fetch_source_json(
+                source_record,
                 url,
                 timeout=resource_timeout,
             )
@@ -23963,15 +23964,15 @@ async def _fetch_scan_practitioner_role_rows(
                 reverse_error_count += 1
                 error_message = f"reverse_lookup_errors_{reverse_error_count}_last_{current_error}"
                 break
-            if not payload or payload.get("resourceType") != "Bundle":
+            if not response_payload or response_payload.get("resourceType") != "Bundle":
                 reverse_error_count += 1
                 error_message = f"reverse_lookup_errors_{reverse_error_count}_last_non_bundle_payload"
                 break
             pages += 1
-            entries = _bundle_entries(payload)
+            entries = _bundle_entries(response_payload)
             for entry_index, entry in enumerate(entries):
                 parsed = parse_fhir_resource(
-                    source["source_id"],
+                    source_record["source_id"],
                     entry["resource"],
                     resource_url=_clean_text(entry.get("fullUrl")),
                     acquisition=_rest_bundle_acquisition(entry, url),
@@ -23979,10 +23980,10 @@ async def _fetch_scan_practitioner_role_rows(
                 )
                 if not parsed:
                     continue
-                parsed_model, row = parsed
+                parsed_model, practitioner_role_row = parsed
                 if parsed_model is not model:
                     continue
-                role_id = _clean_text(row.get("resource_id"))
+                role_id = _clean_text(practitioner_role_row.get("resource_id"))
                 if not role_id:
                     continue
                 if seen_role_ids is not None and role_id in seen_role_ids:
@@ -23990,28 +23991,28 @@ async def _fetch_scan_practitioner_role_rows(
                 if seen_role_ids is not None:
                     seen_role_ids.add(role_id)
                 if options.retain_rows:
-                    rows.append(row)
-                await stream_buffer.add(row)
+                    retained_role_rows.append(practitioner_role_row)
+                await stream_buffer.add(practitioner_role_row)
                 rows_fetched += 1
                 if not _limit_allows_more(rows_fetched, options.per_resource_limit):
-                    row_limit_reached = entry_index < len(entries) - 1
+                    has_reached_row_limit = entry_index < len(entries) - 1
                     break
-            next_url = _next_link(payload)
+            next_url = _next_link(response_payload)
             try:
-                url = _resolved_fhir_next_url(source, url, next_url)
+                url = _resolved_fhir_next_url(source_record, url, next_url)
             except ValueError as exc:
                 reverse_error_count += 1
                 error_message = (
                     f"reverse_lookup_errors_{reverse_error_count}_last_{exc}"
                 )
-                next_url_remaining = True
+                has_next_url = True
                 url = None
                 break
             if not _limit_allows_more(rows_fetched, options.per_resource_limit) and url:
-                row_limit_reached = True
-                next_url_remaining = True
+                has_reached_row_limit = True
+                has_next_url = True
                 break
-        if row_limit_reached or page_limit_reached or hard_page_limit_reached:
+        if has_reached_row_limit or has_reached_page_limit or has_reached_hard_page_limit:
             break
         if is_deadline_reached:
             break
@@ -24032,31 +24033,31 @@ async def _fetch_scan_practitioner_role_rows(
             error=SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR,
             fetch_mode="source_specific_deferred",
         )
-    complete = (
+    is_complete = (
         not error_message
-        and not row_limit_reached
-        and not page_limit_reached
-        and not hard_page_limit_reached
+        and not has_reached_row_limit
+        and not has_reached_page_limit
+        and not has_reached_hard_page_limit
         and not is_deadline_reached
-        and not next_url_remaining
+        and not has_next_url
     )
     reverse_lookup_result = ResourceFetchResult(
         model=model,
-        rows=rows,
+        rows=retained_role_rows,
         rows_fetched=rows_fetched,
         rows_written=stream_buffer.rows_written,
         pages_fetched=pages,
-        complete=complete,
-        row_limit_reached=row_limit_reached,
-        page_limit_reached=page_limit_reached,
-        hard_page_limit_reached=hard_page_limit_reached,
-        next_url_remaining=next_url_remaining,
+        complete=is_complete,
+        row_limit_reached=has_reached_row_limit,
+        page_limit_reached=has_reached_page_limit,
+        hard_page_limit_reached=has_reached_hard_page_limit,
+        next_url_remaining=has_next_url,
         error=error_message or ("deadline_reached" if is_deadline_reached else None),
         fetch_mode="source_specific_reverse_lookup",
     )
     if reverse_lookup_result.complete and options.resume_completed_seeds:
         await _clear_reverse_lookup_checkpoints(
-            options.source or source,
+            options.source or source_record,
             run_id=options.run_id,
         )
     return reverse_lookup_result
