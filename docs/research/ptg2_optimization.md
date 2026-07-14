@@ -90,7 +90,7 @@ total is not yet known; a false `total_is_exact` marks `total` and
 | Automatic candidate audit orchestration | Implemented in repository | The generic `ptg-candidate-audit` job resolves one validated candidate, leases and verifies retained inputs, runs the release audit, records the attestation, and atomically promotes the exact predecessor. |
 | Class-specific cold first-page p95 <= 40 ms | Pending release measurement | Fresh API processes, distinct keys, and complete first-page observations measured separately for matched-positive, negative, and deterministic-random requests. |
 | Unique large import in 10-15 minutes | Pending dev measurement | Complete fresh build, logged PostgreSQL publication, audit, seal, and resource report. |
-| 2,000 imports/month | Schema-v2 gate implemented; measurement pending | `ptg2_v3_capacity_gate.py` requires 30 qualifying large builds, reuse and audited-activation timing, separate audit lanes and HTTP cost, seven-day peak shape, 30-minute import/API contention, class-specific cold p95, zero errors, and fixed resource headroom. |
+| 2,000 imports/month | Authenticated schema-v3 gate implemented; measurement pending | `ptg2_v3_capacity_gate.py` requires a fresh collector receipt, committed per-import end-to-end timings, 30 qualifying large builds and reuse samples, reconciled audit HTTP cost, timestamped seven-day peaks, concurrent cold API samples, zero errors, and fixed resource headroom. |
 
 There is no accepted dev large-import proof for the strict architecture yet.
 Do not promote the target or a projection to a measured result.
@@ -315,22 +315,30 @@ a reuse discount until production-like fingerprints and audited activation
 demonstrate it. Track logical-import, unique-layout, and audited-activation
 throughput.
 
-Schema-v2 release evidence uses these fixed representativeness policies:
+Schema-v3 release evidence uses these fixed representativeness policies:
 
 - At least 30 fully qualifying representative large builds, 30 reuse-only
-  samples, and 30 successful candidate audits. All candidate-audit and API
-  error counts are zero.
+  samples, and a directly observed end-to-end stage record for every logical
+  sample. Each record joins the same import's build/reuse, audit queue, audit,
+  attestation, and activation timestamps. Every committed record completes in
+  at most 15 minutes; unrelated aggregate maxima cannot be added to claim that
+  result. All candidate-audit and API error counts are zero.
 - Candidate-audit queue age and import queue delay are each at most 30 minutes;
   import and audit lane utilization are at most 70 percent.
-- At least 30 non-overlapping peak windows of at least 30 minutes span at least
-  seven days. The observed peak meets the target's prorated average and both
-  import and audit demand fit the fixed queue SLOs.
+- At least 30 timestamped, non-overlapping peak windows of at least 30 minutes
+  are spread across at least seven days. Counts, span, peaks, and queue maxima
+  reconcile to the committed redacted window list. The observed peak meets the
+  target's prorated average and both import and audit demand fit the fixed queue
+  SLOs.
 - Simultaneous configured build lanes, audit lanes, and API traffic run for at
-  least 30 minutes with at least 3,000 requests and 1 request/second. Audit load
-  also covers 3,000 HTTP calls per active audit within measured audit duration.
+  least 30 minutes with at least 3,000 normal requests and 1 request/second.
+  Candidate-audit request totals, duration, and derived rate reconcile both in
+  the sample population and contention interval, covering at least 3,000 HTTP
+  calls per active audit and 6,000,000 projected calls per 2,000 activations.
 - Fresh-process cold first-page p95 is at most 40 ms independently for at
   least 100 matched-positive, 250 negative, and 2,500 deterministic-random
-  samples. At least 100 matched-positive keys are distinct.
+  samples and distinct keys. All three committed sample sets are collected
+  inside the simultaneous contention interval.
 - PostgreSQL pool wait covers the combined normal and candidate-audit request
   rate over the contention interval with p95 at most 10 ms, maximum at most 100
   ms, and no timeout. At least two non-requested checkpoints complete.
@@ -343,6 +351,15 @@ Schema-v2 release evidence uses these fixed representativeness policies:
 The report also retains the measured reuse hit rate, retry and failed-build
 work, shared-block growth after content-addressed deduplication, and bounded
 layout release/block-sweep throughput.
+
+Numeric JSON is not a release credential. The deployed collector signs the
+canonical schema-v3 measurement with HMAC-SHA256 using a protected out-of-band
+key. Its receipt is valid for at most two hours and binds the expected release
+digest, environment digest, collector id/version, observation timestamps, and
+SHA-256 commitments to per-import stage rows, redacted peak windows, and each
+cold request class. The evaluator rejects examples, unsigned reports, identity
+mismatches, stale receipts, tampering, and incoherent commitment counts before
+running capacity arithmetic.
 
 Adding worker lanes is acceptable only while PostgreSQL and scratch stay within
 measured limits and the API keeps the cold first-page gate. A scheduler should

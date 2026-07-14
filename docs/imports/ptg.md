@@ -407,13 +407,17 @@ accepted dev evidence for a complete large import under this strict contract.
 Do not cite historical runs from another layout or an incomplete measurement
 as proof.
 
-A qualifying measurement uses capacity schema version 2 and at least 30 unique
-large builds. Every build must use the deployed release scanner and schema,
+A qualifying measurement uses authenticated capacity schema version 3 and at
+least 30 unique large builds. Every build must use the deployed release scanner
+and schema,
 logged durable relations, a fresh physical fingerprint, complete source
 coverage, bounded scratch, persisted audit publication, and the release audit
 floors above. The same report needs at least 30 reuse-only timing samples and
-30 successful candidate-audit samples. Record build, reuse, audit queue, audit,
-activation, and cleanup durations separately.
+enough successful candidate-audit samples to cover every end-to-end sample.
+The collector commits one joined stage record per logical import and signs the
+measurement with a short-lived receipt bound to the exact release,
+environment, and collector. Record build, reuse, audit queue, audit,
+activation, and cleanup timestamps for the same logical import.
 
 For 2,000 logical imports per 30-day month:
 
@@ -436,18 +440,22 @@ For 2,000 logical imports per 30-day month:
   WAL, I/O, and GC demand. Increase concurrency only from measured database
   headroom, not from CPU count alone.
 
-Peak-arrival evidence must contain at least 30 non-overlapping windows of at
-least 30 minutes over at least seven days. Maximum import queue delay and
+Peak-arrival evidence must contain at least 30 timestamped, non-overlapping
+windows of at least 30 minutes spread across at least seven days. Their
+redacted list and cryptographic commitment must reconcile exactly. Maximum
+import queue delay and
 candidate-audit queue age are each fixed at 30 minutes. Both build/reuse demand
 and audit demand must fit those SLOs; an observed low queue age does not expand
 capacity.
 
 The contention run lasts at least 30 minutes with every configured build and
 audit lane active. It includes at least 3,000 requests and 1 request/second of
-normal API traffic plus the calculated 3,000-request-per-audit rate. It must
-use fresh API processes, at least 100 distinct matched-positive keys, and
-separate error-free cold p95 measurements at or below 40 ms for
-matched-positive, negative, and deterministic-random requests.
+normal API traffic plus observed candidate-audit request totals whose duration
+and derived rate reconcile with the 3,000-request-per-audit floor. It must use
+fresh API processes and separate error-free cold p95 measurements at or below
+40 ms for at least 100 distinct matched-positive, 250 distinct negative, and
+2,500 distinct deterministic-random requests. Every cold sample must fall
+inside the signed contention interval.
 
 Release evidence also includes pool wait, checkpoints, PostgreSQL temp space,
 autovacuum, scratch, and GC. Connection, write, WAL, checkpoint time,
@@ -507,8 +515,9 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
   hard minimum of 250.
 - Cold first-page p95 is at or below 40 ms separately for matched-positive,
   negative, and deterministic-random requests.
-- The schema-v2 monthly capacity report passes with at least 30 qualifying
-  large builds, 30 reuse-only samples, 30 successful candidate audits, the
+- The authenticated schema-v3 monthly capacity report passes with at least 30
+  qualifying large builds, 30 reuse-only samples, committed end-to-end timing
+  for every logical sample, reconciled candidate-audit traffic, the timestamped
   seven-day peak profile, the 30-minute contention run, and all fixed resource
   headroom gates.
 - A claimed 10-to-15-minute large import is backed by a current complete

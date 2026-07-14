@@ -1,27 +1,43 @@
 #!/usr/bin/env python3
-"""Strict aggregate capacity release gate for PTG2 V3.
+"""Authenticated aggregate capacity release gate for strict PTG2 V3.
 
-The input contract intentionally accepts only fixed-schema numeric, boolean,
-and enumerated evidence. Reports never echo input paths, unknown keys, JSON
-values, or exception text. Exit codes are stable: 0 passes, 1 is a completed
-release-gate failure, and 2 is invalid or unavailable evidence.
+Release evidence requires a short-lived HMAC collector receipt tied to
+out-of-band release, environment, and collector identities. Reports contain
+only fixed-schema aggregates, UTC timestamps, and SHA-256 commitments. They
+never echo input paths, unknown keys, arbitrary JSON values, or exception text.
+Exit codes are stable: 0 passes, 1 is a completed gate failure or non-release
+example, and 2 is invalid or unavailable evidence.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
+import re
+import stat
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-SCRIPT_VERSION = "2.0.0"
-SCHEMA_VERSION = 2
+SCRIPT_VERSION = "3.0.0"
+SCHEMA_VERSION = 3
+RECEIPT_VERSION = 1
+RECEIPT_PURPOSE = "ptg2_v3_monthly_capacity_release"
+RECEIPT_ALGORITHM = "hmac-sha256"
+MAX_RECEIPT_AGE = timedelta(minutes=120)
+MAX_RECEIPT_LIFETIME = timedelta(minutes=120)
+MAX_COLLECTOR_DELAY = timedelta(minutes=15)
+MAX_CLOCK_SKEW = timedelta(minutes=5)
+MIN_HMAC_KEY_BYTES = 32
+MAX_HMAC_KEY_BYTES = 4_096
 DEFAULT_TARGET_LOGICAL_IMPORTS_PER_MONTH = 2_000
 MIN_RELEASE_TARGET_LOGICAL_IMPORTS_PER_MONTH = 2_000
 MONTH_DAYS = 30
@@ -47,6 +63,8 @@ MIN_MATCHED_POSITIVE_COLD_SAMPLES = 100
 MIN_NEGATIVE_COLD_SAMPLES = 250
 MIN_RANDOM_COLD_SAMPLES = 2_500
 MIN_DISTINCT_MATCHED_KEYS = 100
+MIN_DISTINCT_NEGATIVE_KEYS = 250
+MIN_DISTINCT_RANDOM_KEYS = 2_500
 MIN_HTTP_REQUESTS_PER_ACTIVATION = 3_000
 MIN_POOL_WAIT_OBSERVATIONS = 3_000
 MAX_POOL_WAIT_P95_MS = Decimal("10")
@@ -67,6 +85,9 @@ EXIT_INVALID_EVIDENCE = 2
 _ROOT_FIELDS = (
     "schema_version",
     "evidence_profile",
+    "release_evidence",
+    "receipt",
+    "end_to_end",
     "unique_build",
     "reuse",
     "retry",
@@ -78,6 +99,17 @@ _ROOT_FIELDS = (
     "storage",
     "gc",
     "api",
+)
+
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+_IDENTIFIER_RE = re.compile(r"[a-z0-9][a-z0-9._-]{2,63}\Z")
+_UTC_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_COMMITMENT_NAMES = (
+    "logical_import_stage_samples",
+    "peak_windows",
+    "cold_matched_positive_samples",
+    "cold_negative_samples",
+    "cold_random_samples",
 )
 
 
@@ -188,6 +220,54 @@ def _at_most(value: int, maximum: int, field: str) -> None:
 
 
 @dataclass(frozen=True)
+class ReceiptTrust:
+    """Out-of-band trust policy controlled by the release environment."""
+
+    key_id: str
+    hmac_key: bytes
+    release_digest: str
+    environment_id: str
+    collector_id: str
+    collector_version: str
+
+
+@dataclass(frozen=True)
+class CommitmentEvidence:
+    """Authenticated commitment to a redacted collector sample set."""
+
+    sha256: str
+    sample_count: int
+    distinct_query_keys: int | None = None
+    contention_samples: int | None = None
+
+
+@dataclass(frozen=True)
+class VerifiedReceipt:
+    """Receipt fields retained after identity, freshness, and HMAC verification."""
+
+    issued_at: datetime
+    expires_at: datetime
+    observation_started_at: datetime
+    observation_ended_at: datetime
+    measurement_sha256: str
+    commitments: Mapping[str, CommitmentEvidence]
+
+
+@dataclass(frozen=True)
+class EndToEndEvidence:
+    """Per-logical-import end-to-end timing summary."""
+
+    sample_count: int
+    unique_build_samples: int
+    reuse_samples: int
+    complete_stage_samples: int
+    within_15_minutes: int
+    p95_minutes: Decimal
+    max_minutes: Decimal
+    errors: int
+
+
+@dataclass(frozen=True)
 class UniqueBuildEvidence:
     sample_count: int
     p95_minutes: Decimal
@@ -251,7 +331,22 @@ class CandidateAuditEvidence:
     lane_count: int
     availability_factor: Decimal
     http_requests_per_activation: int
+    activations_with_http_floor: int
+    observed_http_requests: int
+    observed_request_seconds: Decimal
     errors: int
+
+
+@dataclass(frozen=True)
+class PeakWindowEvidence:
+    """One redacted aggregate arrival window."""
+
+    started_at: datetime
+    ended_at: datetime
+    logical_imports: int
+    unique_builds: int
+    candidate_audits: int
+    max_queue_delay_minutes: Decimal
 
 
 @dataclass(frozen=True)
@@ -263,6 +358,7 @@ class PeakArrivalEvidence:
     max_queue_delay_minutes: Decimal
     observed_peak_logical_imports: int
     observed_peak_unique_builds: int
+    windows: tuple[PeakWindowEvidence, ...]
 
 
 @dataclass(frozen=True)
@@ -389,8 +485,12 @@ class GcEvidence:
 class ApiClassEvidence:
     samples: int
     distinct_query_keys: int
+    contention_samples: int
+    contention_distinct_query_keys: int
     errors: int
     cold_first_page_p95_ms: Decimal
+    sample_started_at: datetime
+    sample_ended_at: datetime
 
 
 @dataclass(frozen=True)
@@ -398,9 +498,13 @@ class ApiEvidence:
     concurrent_unique_builds: int
     concurrent_candidate_audits: int
     contention_seconds: Decimal
+    contention_started_at: datetime
+    contention_ended_at: datetime
     fresh_processes: bool
     requests: int
     requests_while_imports_running: int
+    candidate_audit_requests: int
+    candidate_audit_requests_while_imports_running: int
     errors: int
     matched_positive: ApiClassEvidence
     negative: ApiClassEvidence
@@ -410,6 +514,7 @@ class ApiEvidence:
 @dataclass(frozen=True)
 class CapacityEvidence:
     target_logical_imports_per_month: int
+    end_to_end: EndToEndEvidence
     unique_build: UniqueBuildEvidence
     reuse: ReuseEvidence
     retry: RetryEvidence
@@ -421,6 +526,313 @@ class CapacityEvidence:
     storage: StorageEvidence
     gc: GcEvidence
     api: ApiEvidence
+
+
+def _canonical_number(value: Decimal | float) -> str:
+    number = value if isinstance(value, Decimal) else Decimal(str(value))
+    if not number.is_finite():
+        raise EvidenceError("invalid_value", "canonical_number")
+    if number == 0:
+        return "0"
+    rendered = format(number, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered
+
+
+def _canonical_json_text(value: Any) -> str:
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, (Decimal, float)):
+        return _canonical_number(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise EvidenceError("invalid_type", "canonical_object")
+        fields = (
+            f"{_canonical_json_text(key)}:{_canonical_json_text(value[key])}"
+            for key in sorted(value)
+        )
+        return "{" + ",".join(fields) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_canonical_json_text(item) for item in value) + "]"
+    raise EvidenceError("invalid_type", "canonical_value")
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    """Return the collector/gate canonical JSON representation."""
+
+    return _canonical_json_text(value).encode("ascii")
+
+
+def measurement_sha256(record: Mapping[str, Any]) -> str:
+    """Hash every signed measurement field while excluding the receipt itself."""
+
+    measurement = {key: value for key, value in record.items() if key != "receipt"}
+    return hashlib.sha256(canonical_json_bytes(measurement)).hexdigest()
+
+
+def receipt_signing_payload(
+    record: Mapping[str, Any], receipt: Mapping[str, Any]
+) -> bytes:
+    """Return the exact bytes an authenticated collector must sign."""
+
+    unsigned_receipt = {
+        key: value for key, value in receipt.items() if key != "signature"
+    }
+    measurement = {key: value for key, value in record.items() if key != "receipt"}
+    return canonical_json_bytes(
+        {"measurement": measurement, "receipt": unsigned_receipt}
+    )
+
+
+def sample_set_sha256(value: Any) -> str:
+    """Hash one redacted sample set using the receipt canonicalization."""
+
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _timestamp_value(value: Any, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise EvidenceError("invalid_type", field)
+    try:
+        parsed = datetime.strptime(value, _UTC_TIMESTAMP_FORMAT).replace(tzinfo=UTC)
+    except ValueError:
+        raise EvidenceError("invalid_timestamp", field)
+    return parsed
+
+
+def _timestamp(obj: Mapping[str, Any], name: str, path: str) -> datetime:
+    return _timestamp_value(obj[name], _field(path, name))
+
+
+def _digest(obj: Mapping[str, Any], name: str, path: str) -> str:
+    value = obj[name]
+    field = _field(path, name)
+    if not isinstance(value, str):
+        raise EvidenceError("invalid_type", field)
+    if not _DIGEST_RE.fullmatch(value) or value == "0" * 64:
+        raise EvidenceError("invalid_digest", field)
+    return value
+
+
+def _identifier(obj: Mapping[str, Any], name: str, path: str) -> str:
+    value = obj[name]
+    field = _field(path, name)
+    if not isinstance(value, str):
+        raise EvidenceError("invalid_type", field)
+    if not _IDENTIFIER_RE.fullmatch(value):
+        raise EvidenceError("invalid_identifier", field)
+    return value
+
+
+def _validate_trust(trust: ReceiptTrust | None) -> ReceiptTrust:
+    if trust is None:
+        raise EvidenceError("receipt_trust_unavailable")
+    if not _IDENTIFIER_RE.fullmatch(trust.key_id):
+        raise EvidenceError("invalid_trust_configuration", "receipt.key_id")
+    if not _IDENTIFIER_RE.fullmatch(trust.collector_id):
+        raise EvidenceError("invalid_trust_configuration", "receipt.collector_id")
+    if not _IDENTIFIER_RE.fullmatch(trust.collector_version):
+        raise EvidenceError(
+            "invalid_trust_configuration", "receipt.collector_version"
+        )
+    if not _DIGEST_RE.fullmatch(trust.release_digest):
+        raise EvidenceError("invalid_trust_configuration", "receipt.release_digest")
+    if not _DIGEST_RE.fullmatch(trust.environment_id):
+        raise EvidenceError("invalid_trust_configuration", "receipt.environment_id")
+    if not isinstance(trust.hmac_key, bytes) or not (
+        MIN_HMAC_KEY_BYTES <= len(trust.hmac_key) <= MAX_HMAC_KEY_BYTES
+    ):
+        raise EvidenceError("invalid_trust_configuration", "receipt.hmac_key")
+    return trust
+
+
+def _validate_commitment(
+    commitments: Mapping[str, Any],
+    name: str,
+    *,
+    cold_class: bool,
+) -> CommitmentEvidence:
+    path = f"receipt.commitments.{name}"
+    fields = ["sha256", "sample_count"]
+    if cold_class:
+        fields.extend(("distinct_query_keys", "contention_samples"))
+    obj = _object(commitments[name], path, tuple(fields))
+    return CommitmentEvidence(
+        sha256=_digest(obj, "sha256", path),
+        sample_count=_integer(obj, "sample_count", path, minimum=1),
+        distinct_query_keys=(
+            _integer(obj, "distinct_query_keys", path, minimum=1)
+            if cold_class
+            else None
+        ),
+        contention_samples=(
+            _integer(obj, "contention_samples", path, minimum=1)
+            if cold_class
+            else None
+        ),
+    )
+
+
+def verify_receipt(
+    record: Any,
+    *,
+    trust: ReceiptTrust | None,
+    now: datetime | None = None,
+) -> VerifiedReceipt:
+    """Authenticate one release receipt against protected trust configuration."""
+
+    measurement_fields = tuple(name for name in _ROOT_FIELDS if name != "receipt")
+    root = _object(record, "", measurement_fields, ("objective", "receipt"))
+    if not _boolean(root, "release_evidence", ""):
+        raise EvidenceError("non_release_example", "release_evidence")
+    if "receipt" not in root:
+        raise EvidenceError("missing_field", "receipt")
+    trusted = _validate_trust(trust)
+    path = "receipt"
+    fields = (
+        "version",
+        "purpose",
+        "algorithm",
+        "key_id",
+        "collector_id",
+        "collector_version",
+        "release_digest",
+        "environment_id",
+        "issued_at",
+        "expires_at",
+        "observation_started_at",
+        "observation_ended_at",
+        "measurement_sha256",
+        "commitments",
+        "signature",
+    )
+    receipt = _object(root[path], path, fields)
+    if _integer(receipt, "version", path, minimum=1) != RECEIPT_VERSION:
+        raise EvidenceError("unsupported_receipt_version", f"{path}.version")
+    _fixed_string(receipt, "purpose", path, RECEIPT_PURPOSE)
+    _fixed_string(receipt, "algorithm", path, RECEIPT_ALGORITHM)
+    identities = {
+        "key_id": _identifier(receipt, "key_id", path),
+        "collector_id": _identifier(receipt, "collector_id", path),
+        "collector_version": _identifier(receipt, "collector_version", path),
+        "release_digest": _digest(receipt, "release_digest", path),
+        "environment_id": _digest(receipt, "environment_id", path),
+    }
+    expected = {
+        "key_id": trusted.key_id,
+        "collector_id": trusted.collector_id,
+        "collector_version": trusted.collector_version,
+        "release_digest": trusted.release_digest,
+        "environment_id": trusted.environment_id,
+    }
+    for name, value in identities.items():
+        if not hmac.compare_digest(value, expected[name]):
+            raise EvidenceError("receipt_identity_mismatch", f"{path}.{name}")
+
+    issued_at = _timestamp(receipt, "issued_at", path)
+    expires_at = _timestamp(receipt, "expires_at", path)
+    observed_from = _timestamp(receipt, "observation_started_at", path)
+    observed_to = _timestamp(receipt, "observation_ended_at", path)
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise EvidenceError("invalid_trust_configuration", "current_time")
+    current = current.astimezone(UTC)
+    if not observed_from < observed_to <= issued_at:
+        raise EvidenceError("invalid_receipt_window", f"{path}.observation_ended_at")
+    if issued_at - observed_to > MAX_COLLECTOR_DELAY:
+        raise EvidenceError("stale_observation", f"{path}.observation_ended_at")
+    if not issued_at < expires_at <= issued_at + MAX_RECEIPT_LIFETIME:
+        raise EvidenceError("invalid_receipt_window", f"{path}.expires_at")
+    if issued_at > current + MAX_CLOCK_SKEW:
+        raise EvidenceError("receipt_from_future", f"{path}.issued_at")
+    if current - issued_at > MAX_RECEIPT_AGE or current > expires_at:
+        raise EvidenceError("expired_receipt", f"{path}.expires_at")
+
+    claimed_measurement_hash = _digest(receipt, "measurement_sha256", path)
+    actual_measurement_hash = measurement_sha256(root)
+    if not hmac.compare_digest(claimed_measurement_hash, actual_measurement_hash):
+        raise EvidenceError("measurement_digest_mismatch", f"{path}.measurement_sha256")
+    commitments_obj = _object(
+        receipt["commitments"],
+        f"{path}.commitments",
+        _COMMITMENT_NAMES,
+    )
+    commitments = {
+        name: _validate_commitment(
+            commitments_obj,
+            name,
+            cold_class=name.startswith("cold_"),
+        )
+        for name in _COMMITMENT_NAMES
+    }
+    signature = _digest(receipt, "signature", path)
+    expected_signature = hmac.new(
+        trusted.hmac_key,
+        receipt_signing_payload(root, receipt),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected_signature):
+        raise EvidenceError("invalid_receipt_signature", f"{path}.signature")
+    return VerifiedReceipt(
+        issued_at=issued_at,
+        expires_at=expires_at,
+        observation_started_at=observed_from,
+        observation_ended_at=observed_to,
+        measurement_sha256=claimed_measurement_hash,
+        commitments=commitments,
+    )
+
+
+def _validate_end_to_end(root: Mapping[str, Any]) -> EndToEndEvidence:
+    path = "end_to_end"
+    fields = (
+        "sample_count",
+        "unique_build_samples",
+        "reuse_samples",
+        "complete_stage_samples",
+        "within_15_minutes",
+        "p95_minutes",
+        "max_minutes",
+        "errors",
+    )
+    obj = _object(root[path], path, fields)
+    sample_count = _integer(obj, "sample_count", path, minimum=1)
+    unique = _integer(obj, "unique_build_samples", path, minimum=0)
+    reuse = _integer(obj, "reuse_samples", path, minimum=0)
+    if unique + reuse != sample_count:
+        raise EvidenceError("inconsistent_evidence", f"{path}.sample_count")
+    complete = _integer(obj, "complete_stage_samples", path, minimum=0)
+    within = _integer(obj, "within_15_minutes", path, minimum=0)
+    errors = _integer(obj, "errors", path, minimum=0)
+    for name, value in (
+        ("complete_stage_samples", complete),
+        ("within_15_minutes", within),
+        ("errors", errors),
+    ):
+        _at_most(value, sample_count, f"{path}.{name}")
+    p95 = _decimal(obj, "p95_minutes", path, minimum=Decimal(0))
+    maximum = _decimal(obj, "max_minutes", path, minimum=Decimal(0))
+    if p95 > maximum:
+        raise EvidenceError("inconsistent_evidence", f"{path}.p95_minutes")
+    return EndToEndEvidence(
+        sample_count=sample_count,
+        unique_build_samples=unique,
+        reuse_samples=reuse,
+        complete_stage_samples=complete,
+        within_15_minutes=within,
+        p95_minutes=p95,
+        max_minutes=maximum,
+        errors=errors,
+    )
 
 
 def _validate_unique_build(root: Mapping[str, Any]) -> UniqueBuildEvidence:
@@ -582,6 +994,9 @@ def _validate_candidate_audit(root: Mapping[str, Any]) -> CandidateAuditEvidence
         "lane_count",
         "availability_factor",
         "http_requests_per_activation",
+        "activations_with_http_floor",
+        "observed_http_requests",
+        "observed_request_seconds",
         "errors",
     )
     obj = _object(root[path], path, fields)
@@ -618,6 +1033,30 @@ def _validate_candidate_audit(root: Mapping[str, Any]) -> CandidateAuditEvidence
     if durations["activation_max_minutes"] <= 0:
         raise EvidenceError("invalid_value", f"{path}.activation_max_minutes")
 
+    observed_http_requests = _integer(
+        obj,
+        "observed_http_requests",
+        path,
+        minimum=1,
+    )
+    observed_request_seconds = _decimal(
+        obj,
+        "observed_request_seconds",
+        path,
+        minimum=Decimal(0),
+        minimum_inclusive=False,
+    )
+    activations_with_http_floor = _integer(
+        obj,
+        "activations_with_http_floor",
+        path,
+        minimum=0,
+    )
+    _at_most(
+        activations_with_http_floor,
+        successful,
+        f"{path}.activations_with_http_floor",
+    )
     return CandidateAuditEvidence(
         sample_count=sample_count,
         successful_audits=successful,
@@ -642,6 +1081,9 @@ def _validate_candidate_audit(root: Mapping[str, Any]) -> CandidateAuditEvidence
             path,
             minimum=1,
         ),
+        activations_with_http_floor=activations_with_http_floor,
+        observed_http_requests=observed_http_requests,
+        observed_request_seconds=observed_request_seconds,
         errors=errors,
     )
 
@@ -656,11 +1098,121 @@ def _validate_peak(root: Mapping[str, Any]) -> PeakArrivalEvidence:
         "max_queue_delay_minutes",
         "observed_peak_logical_imports",
         "observed_peak_unique_builds",
+        "windows",
     )
     obj = _object(root[path], path, fields)
+    windows_value = obj["windows"]
+    if not isinstance(windows_value, list) or not windows_value:
+        raise EvidenceError("invalid_type", f"{path}.windows")
+    windows: list[PeakWindowEvidence] = []
+    for index, value in enumerate(windows_value):
+        window_path = f"{path}.windows.{index}"
+        window_obj = _object(
+            value,
+            window_path,
+            (
+                "started_at",
+                "ended_at",
+                "logical_imports",
+                "unique_builds",
+                "candidate_audits",
+                "max_queue_delay_minutes",
+            ),
+        )
+        started_at = _timestamp(window_obj, "started_at", window_path)
+        ended_at = _timestamp(window_obj, "ended_at", window_path)
+        if started_at >= ended_at:
+            raise EvidenceError("invalid_window", f"{window_path}.ended_at")
+        logical_imports = _integer(
+            window_obj,
+            "logical_imports",
+            window_path,
+            minimum=0,
+        )
+        unique_builds = _integer(
+            window_obj,
+            "unique_builds",
+            window_path,
+            minimum=0,
+        )
+        candidate_audits = _integer(
+            window_obj,
+            "candidate_audits",
+            window_path,
+            minimum=0,
+        )
+        _at_most(unique_builds, logical_imports, f"{window_path}.unique_builds")
+        if candidate_audits != logical_imports:
+            raise EvidenceError(
+                "inconsistent_evidence",
+                f"{window_path}.candidate_audits",
+            )
+        windows.append(
+            PeakWindowEvidence(
+                started_at=started_at,
+                ended_at=ended_at,
+                logical_imports=logical_imports,
+                unique_builds=unique_builds,
+                candidate_audits=candidate_audits,
+                max_queue_delay_minutes=_decimal(
+                    window_obj,
+                    "max_queue_delay_minutes",
+                    window_path,
+                    minimum=Decimal(0),
+                ),
+            )
+        )
+
+    window_minutes = _decimal(
+        obj,
+        "window_minutes",
+        path,
+        minimum=Decimal(0),
+        minimum_inclusive=False,
+    )
+    previous_end: datetime | None = None
+    for index, window in enumerate(windows):
+        if previous_end is not None and window.started_at < previous_end:
+            raise EvidenceError(
+                "overlapping_windows",
+                f"{path}.windows.{index}.started_at",
+            )
+        duration = Decimal(str((window.ended_at - window.started_at).total_seconds()))
+        if duration / Decimal(60) != window_minutes:
+            raise EvidenceError(
+                "inconsistent_evidence",
+                f"{path}.windows.{index}.ended_at",
+            )
+        previous_end = window.ended_at
+
+    sample_windows = _integer(obj, "sample_windows", path, minimum=1)
+    if sample_windows != len(windows):
+        raise EvidenceError("inconsistent_evidence", f"{path}.sample_windows")
+    observation_minutes = _decimal(
+        obj,
+        "observation_minutes",
+        path,
+        minimum=Decimal(0),
+        minimum_inclusive=False,
+    )
+    observed_span = Decimal(
+        str((windows[-1].ended_at - windows[0].started_at).total_seconds())
+    ) / Decimal(60)
+    if observation_minutes != observed_span:
+        raise EvidenceError("inconsistent_evidence", f"{path}.observation_minutes")
     logical = _integer(obj, "observed_peak_logical_imports", path, minimum=1)
     unique = _integer(obj, "observed_peak_unique_builds", path, minimum=0)
     _at_most(unique, logical, f"{path}.observed_peak_unique_builds")
+    if logical != max(window.logical_imports for window in windows):
+        raise EvidenceError(
+            "inconsistent_evidence",
+            f"{path}.observed_peak_logical_imports",
+        )
+    if unique != max(window.unique_builds for window in windows):
+        raise EvidenceError(
+            "inconsistent_evidence",
+            f"{path}.observed_peak_unique_builds",
+        )
     p95_queue = _decimal(
         obj,
         "queue_delay_p95_minutes",
@@ -678,26 +1230,20 @@ def _validate_peak(root: Mapping[str, Any]) -> PeakArrivalEvidence:
             "inconsistent_evidence",
             f"{path}.queue_delay_p95_minutes",
         )
+    if max_queue != max(window.max_queue_delay_minutes for window in windows):
+        raise EvidenceError(
+            "inconsistent_evidence",
+            f"{path}.max_queue_delay_minutes",
+        )
     return PeakArrivalEvidence(
-        sample_windows=_integer(obj, "sample_windows", path, minimum=1),
-        observation_minutes=_decimal(
-            obj,
-            "observation_minutes",
-            path,
-            minimum=Decimal(0),
-            minimum_inclusive=False,
-        ),
-        window_minutes=_decimal(
-            obj,
-            "window_minutes",
-            path,
-            minimum=Decimal(0),
-            minimum_inclusive=False,
-        ),
+        sample_windows=sample_windows,
+        observation_minutes=observation_minutes,
+        window_minutes=window_minutes,
         queue_delay_p95_minutes=p95_queue,
         max_queue_delay_minutes=max_queue,
         observed_peak_logical_imports=logical,
         observed_peak_unique_builds=unique,
+        windows=tuple(windows),
     )
 
 
@@ -1230,18 +1776,46 @@ def _validate_api_class(obj: Any, path: str) -> ApiClassEvidence:
     fields = (
         "samples",
         "distinct_query_keys",
+        "contention_samples",
+        "contention_distinct_query_keys",
         "errors",
         "cold_first_page_p95_ms",
+        "sample_started_at",
+        "sample_ended_at",
     )
     class_obj = _object(obj, path, fields)
     samples = _integer(class_obj, "samples", path, minimum=1)
     distinct = _integer(class_obj, "distinct_query_keys", path, minimum=1)
+    contention_samples = _integer(
+        class_obj,
+        "contention_samples",
+        path,
+        minimum=1,
+    )
+    contention_distinct = _integer(
+        class_obj,
+        "contention_distinct_query_keys",
+        path,
+        minimum=1,
+    )
     errors = _integer(class_obj, "errors", path, minimum=0)
     _at_most(distinct, samples, f"{path}.distinct_query_keys")
+    _at_most(contention_samples, samples, f"{path}.contention_samples")
+    _at_most(
+        contention_distinct,
+        contention_samples,
+        f"{path}.contention_distinct_query_keys",
+    )
     _at_most(errors, samples, f"{path}.errors")
+    sample_started_at = _timestamp(class_obj, "sample_started_at", path)
+    sample_ended_at = _timestamp(class_obj, "sample_ended_at", path)
+    if sample_started_at >= sample_ended_at:
+        raise EvidenceError("invalid_window", f"{path}.sample_ended_at")
     return ApiClassEvidence(
         samples=samples,
         distinct_query_keys=distinct,
+        contention_samples=contention_samples,
+        contention_distinct_query_keys=contention_distinct,
         errors=errors,
         cold_first_page_p95_ms=_decimal(
             class_obj,
@@ -1249,6 +1823,8 @@ def _validate_api_class(obj: Any, path: str) -> ApiClassEvidence:
             path,
             minimum=Decimal(0),
         ),
+        sample_started_at=sample_started_at,
+        sample_ended_at=sample_ended_at,
     )
 
 
@@ -1258,9 +1834,13 @@ def _validate_api(root: Mapping[str, Any]) -> ApiEvidence:
         "concurrent_unique_builds",
         "concurrent_candidate_audits",
         "contention_seconds",
+        "contention_started_at",
+        "contention_ended_at",
         "fresh_processes",
         "requests",
         "requests_while_imports_running",
+        "candidate_audit_requests",
+        "candidate_audit_requests_while_imports_running",
         "errors",
         "matched_positive",
         "negative",
@@ -1269,12 +1849,24 @@ def _validate_api(root: Mapping[str, Any]) -> ApiEvidence:
     obj = _object(root[path], path, fields)
     requests = _integer(obj, "requests", path, minimum=1)
     overlap = _integer(obj, "requests_while_imports_running", path, minimum=0)
+    audit_requests = _integer(obj, "candidate_audit_requests", path, minimum=1)
+    audit_overlap = _integer(
+        obj,
+        "candidate_audit_requests_while_imports_running",
+        path,
+        minimum=0,
+    )
     errors = _integer(obj, "errors", path, minimum=0)
     for name, value in (
         ("requests_while_imports_running", overlap),
         ("errors", errors),
     ):
         _at_most(value, requests, f"{path}.{name}")
+    _at_most(
+        audit_overlap,
+        audit_requests,
+        f"{path}.candidate_audit_requests_while_imports_running",
+    )
     matched_positive = _validate_api_class(
         obj["matched_positive"],
         f"{path}.matched_positive",
@@ -1286,6 +1878,35 @@ def _validate_api(root: Mapping[str, Any]) -> ApiEvidence:
         raise EvidenceError("inconsistent_evidence", f"{path}.requests")
     if sum(item.errors for item in classes) > errors:
         raise EvidenceError("inconsistent_evidence", f"{path}.errors")
+    contention_started_at = _timestamp(obj, "contention_started_at", path)
+    contention_ended_at = _timestamp(obj, "contention_ended_at", path)
+    if contention_started_at >= contention_ended_at:
+        raise EvidenceError("invalid_window", f"{path}.contention_ended_at")
+    contention_seconds = _decimal(
+        obj,
+        "contention_seconds",
+        path,
+        minimum=Decimal(0),
+        minimum_inclusive=False,
+    )
+    timestamp_seconds = Decimal(
+        str((contention_ended_at - contention_started_at).total_seconds())
+    )
+    if contention_seconds != timestamp_seconds:
+        raise EvidenceError("inconsistent_evidence", f"{path}.contention_seconds")
+    for class_name, item in zip(
+        ("matched_positive", "negative", "random"),
+        classes,
+        strict=True,
+    ):
+        if not (
+            contention_started_at <= item.sample_started_at
+            and item.sample_ended_at <= contention_ended_at
+        ):
+            raise EvidenceError(
+                "sample_outside_contention",
+                f"{path}.{class_name}.sample_started_at",
+            )
     return ApiEvidence(
         concurrent_unique_builds=_integer(
             obj,
@@ -1299,16 +1920,14 @@ def _validate_api(root: Mapping[str, Any]) -> ApiEvidence:
             path,
             minimum=1,
         ),
-        contention_seconds=_decimal(
-            obj,
-            "contention_seconds",
-            path,
-            minimum=Decimal(0),
-            minimum_inclusive=False,
-        ),
+        contention_seconds=contention_seconds,
+        contention_started_at=contention_started_at,
+        contention_ended_at=contention_ended_at,
         fresh_processes=_boolean(obj, "fresh_processes", path),
         requests=requests,
         requests_while_imports_running=overlap,
+        candidate_audit_requests=audit_requests,
+        candidate_audit_requests_while_imports_running=audit_overlap,
         errors=errors,
         matched_positive=matched_positive,
         negative=negative,
@@ -1328,6 +1947,8 @@ def validate_measurement(
     if schema_version != SCHEMA_VERSION:
         raise EvidenceError("unsupported_schema_version", "schema_version")
     _fixed_string(root, "evidence_profile", "", EVIDENCE_PROFILE)
+    if not _boolean(root, "release_evidence", ""):
+        raise EvidenceError("non_release_example", "release_evidence")
 
     objective_target = DEFAULT_TARGET_LOGICAL_IMPORTS_PER_MONTH
     if "objective" in root:
@@ -1351,6 +1972,7 @@ def validate_measurement(
 
     evidence = CapacityEvidence(
         target_logical_imports_per_month=objective_target,
+        end_to_end=_validate_end_to_end(root),
         unique_build=_validate_unique_build(root),
         reuse=_validate_reuse(root),
         retry=_validate_retry(root),
@@ -1363,6 +1985,19 @@ def validate_measurement(
         gc=_validate_gc(root),
         api=_validate_api(root),
     )
+    if (
+        evidence.end_to_end.unique_build_samples != evidence.unique_build.sample_count
+        or evidence.end_to_end.reuse_samples != evidence.reuse.reuse_only_sample_count
+    ):
+        raise EvidenceError(
+            "inconsistent_evidence",
+            "end_to_end.sample_count",
+        )
+    if evidence.candidate_audit.sample_count != evidence.end_to_end.sample_count:
+        raise EvidenceError(
+            "inconsistent_evidence",
+            "candidate_audit.sample_count",
+        )
     if evidence.scratch.configured_concurrent_unique_builds > evidence.lanes.count:
         raise EvidenceError(
             "inconsistent_evidence",
@@ -1378,6 +2013,65 @@ def validate_measurement(
             "peak_arrival.observation_minutes",
         )
     return evidence
+
+
+def _validate_commitment_bindings(
+    record: Mapping[str, Any],
+    evidence: CapacityEvidence,
+    receipt: VerifiedReceipt,
+) -> None:
+    commitments = receipt.commitments
+    end_to_end = commitments["logical_import_stage_samples"]
+    if end_to_end.sample_count != evidence.end_to_end.sample_count:
+        raise EvidenceError(
+            "commitment_count_mismatch",
+            "receipt.commitments.logical_import_stage_samples.sample_count",
+        )
+    peak = commitments["peak_windows"]
+    if peak.sample_count != evidence.peak_arrival.sample_windows:
+        raise EvidenceError(
+            "commitment_count_mismatch",
+            "receipt.commitments.peak_windows.sample_count",
+        )
+    expected_peak_hash = sample_set_sha256(record["peak_arrival"]["windows"])
+    if not hmac.compare_digest(peak.sha256, expected_peak_hash):
+        raise EvidenceError(
+            "commitment_digest_mismatch",
+            "receipt.commitments.peak_windows.sha256",
+        )
+
+    api_commitments = (
+        ("cold_matched_positive_samples", evidence.api.matched_positive),
+        ("cold_negative_samples", evidence.api.negative),
+        ("cold_random_samples", evidence.api.random),
+    )
+    for commitment_name, api_class in api_commitments:
+        commitment = commitments[commitment_name]
+        if (
+            commitment.sample_count != api_class.samples
+            or commitment.distinct_query_keys != api_class.distinct_query_keys
+            or commitment.contention_samples != api_class.contention_samples
+        ):
+            raise EvidenceError(
+                "commitment_count_mismatch",
+                f"receipt.commitments.{commitment_name}.sample_count",
+            )
+
+    commitment_hashes = [item.sha256 for item in commitments.values()]
+    if len(set(commitment_hashes)) != len(commitment_hashes):
+        raise EvidenceError(
+            "duplicate_commitment",
+            "receipt.commitments",
+        )
+    peak_first = evidence.peak_arrival.windows[0].started_at
+    peak_last = evidence.peak_arrival.windows[-1].ended_at
+    if not (
+        receipt.observation_started_at <= peak_first
+        and peak_last <= receipt.observation_ended_at
+        and receipt.observation_started_at <= evidence.api.contention_started_at
+        and evidence.api.contention_ended_at <= receipt.observation_ended_at
+    ):
+        raise EvidenceError("sample_outside_observation", "receipt.observation_started_at")
 
 
 def _json_number(value: Decimal | int | None) -> int | float | None:
@@ -1431,10 +2125,15 @@ def _gate(gate_id: str, passed: bool) -> dict[str, Any]:
     return {"id": gate_id, "passed": bool(passed)}
 
 
-def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
+def evaluate_evidence(
+    evidence: CapacityEvidence,
+    *,
+    receipt: VerifiedReceipt,
+) -> dict[str, Any]:
     """Calculate all aggregate metrics and return a deterministic gate report."""
 
     target = evidence.target_logical_imports_per_month
+    end_to_end = evidence.end_to_end
     unique = evidence.unique_build
     reuse = evidence.reuse
     retry = evidence.retry
@@ -1474,28 +2173,9 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
     )
     audit_lane_utilization = audit_worker_hours / available_audit_lane_hours
     monthly_audit_http_requests = target * audit.http_requests_per_activation
-    fresh_activation_max_minutes = (
-        retry_adjusted_minutes + audit.queue_age_max_minutes + audit_service_minutes
+    observed_audit_http_requests_per_second = (
+        Decimal(audit.observed_http_requests) / audit.observed_request_seconds
     )
-    fresh_activation_p95_minutes = (
-        unique.p95_minutes
-        + retry_overhead_minutes
-        + audit.queue_age_p95_minutes
-        + audit.duration_p95_minutes
-        + audit.activation_p95_minutes
-    )
-    reuse_activation_max_minutes = (
-        reuse.reuse_only_max_minutes
-        + audit.queue_age_max_minutes
-        + audit_service_minutes
-    )
-    reuse_activation_p95_minutes = (
-        reuse.reuse_only_p95_minutes
-        + audit.queue_age_p95_minutes
-        + audit.duration_p95_minutes
-        + audit.activation_p95_minutes
-    )
-
     peak = evidence.peak_arrival
     peak_import_service_minutes = (
         Decimal(active_lane_count)
@@ -1587,6 +2267,9 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
     )
     api = evidence.api
     observed_api_requests_per_second = Decimal(api.requests) / api.contention_seconds
+    observed_candidate_audit_requests_per_second = (
+        Decimal(api.candidate_audit_requests) / api.contention_seconds
+    )
     required_candidate_audit_requests_per_second = Decimal(
         audit.lane_count * audit.http_requests_per_activation
     ) / (audit.duration_max_minutes * Decimal(60))
@@ -1669,8 +2352,16 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
             qualifying_unique_builds == unique.sample_count,
         ),
         _gate(
-            "unique_build_duration",
-            fresh_activation_max_minutes <= MAX_UNIQUE_BUILD_MINUTES,
+            "logical_import_end_to_end_sample_floor",
+            end_to_end.sample_count
+            >= MIN_QUALIFYING_UNIQUE_BUILDS + MIN_REUSE_ONLY_SAMPLES,
+        ),
+        _gate(
+            "logical_import_end_to_end_duration",
+            end_to_end.complete_stage_samples == end_to_end.sample_count
+            and end_to_end.within_15_minutes == end_to_end.sample_count
+            and end_to_end.errors == 0
+            and end_to_end.max_minutes <= MAX_UNIQUE_BUILD_MINUTES,
         ),
         _gate(
             "reuse_only_sample_floor",
@@ -1679,10 +2370,6 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
         _gate(
             "reuse_complete_fingerprint_evidence",
             qualified_reuse_hits == reuse.observed_reuse_hits,
-        ),
-        _gate(
-            "reuse_audited_activation_duration",
-            reuse_activation_max_minutes <= MAX_UNIQUE_BUILD_MINUTES,
         ),
         _gate(
             "candidate_audit_sample_floor",
@@ -1696,6 +2383,15 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
         _gate(
             "candidate_audit_http_cost",
             audit.http_requests_per_activation >= MIN_HTTP_REQUESTS_PER_ACTIVATION,
+        ),
+        _gate(
+            "candidate_audit_http_observation",
+            audit.activations_with_http_floor == audit.successful_audits
+            and audit.observed_http_requests
+            >= audit.successful_audits * audit.http_requests_per_activation
+            and audit.successful_audits == end_to_end.sample_count
+            and observed_audit_http_requests_per_second
+            >= required_candidate_audit_requests_per_second,
         ),
         _gate("candidate_audit_errors", audit.errors == 0),
         _gate(
@@ -1749,11 +2445,13 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
             >= scratch.configured_concurrent_unique_builds
             and postgres.load.concurrent_candidate_audits >= audit.lane_count
             and postgres.load.sample_seconds >= MIN_CONTENTION_SECONDS
-            and postgres.load.sample_seconds >= api.contention_seconds
+            and postgres.load.sample_seconds == api.contention_seconds
             and postgres.load.api_requests_per_second
-            >= observed_api_requests_per_second
+            == observed_api_requests_per_second
             and postgres.load.api_requests_per_second >= MIN_API_REQUESTS_PER_SECOND
             and postgres.load.candidate_audit_requests_per_second
+            == observed_candidate_audit_requests_per_second
+            and observed_candidate_audit_requests_per_second
             >= required_candidate_audit_requests_per_second,
         ),
         _gate(
@@ -1848,6 +2546,8 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
         _gate(
             "api_import_overlap",
             api.requests_while_imports_running == api.requests
+            and api.candidate_audit_requests_while_imports_running
+            == api.candidate_audit_requests
             and api.concurrent_unique_builds
             >= scratch.configured_concurrent_unique_builds
             and api.concurrent_candidate_audits >= audit.lane_count
@@ -1862,11 +2562,28 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
             "api_cold_sample_coverage",
             api.matched_positive.samples >= MIN_MATCHED_POSITIVE_COLD_SAMPLES
             and api.negative.samples >= MIN_NEGATIVE_COLD_SAMPLES
-            and api.random.samples >= MIN_RANDOM_COLD_SAMPLES,
+            and api.random.samples >= MIN_RANDOM_COLD_SAMPLES
+            and api.matched_positive.contention_samples
+            == api.matched_positive.samples
+            and api.negative.contention_samples == api.negative.samples
+            and api.random.contention_samples == api.random.samples,
         ),
         _gate(
             "api_distinct_matched_keys",
-            api.matched_positive.distinct_query_keys >= MIN_DISTINCT_MATCHED_KEYS,
+            api.matched_positive.distinct_query_keys >= MIN_DISTINCT_MATCHED_KEYS
+            and api.matched_positive.contention_distinct_query_keys
+            >= MIN_DISTINCT_MATCHED_KEYS,
+        ),
+        _gate(
+            "api_distinct_negative_keys",
+            api.negative.distinct_query_keys >= MIN_DISTINCT_NEGATIVE_KEYS
+            and api.negative.contention_distinct_query_keys
+            >= MIN_DISTINCT_NEGATIVE_KEYS,
+        ),
+        _gate(
+            "api_distinct_random_keys",
+            api.random.distinct_query_keys >= MIN_DISTINCT_RANDOM_KEYS
+            and api.random.contention_distinct_query_keys >= MIN_DISTINCT_RANDOM_KEYS,
         ),
         _gate("api_fresh_processes", api.fresh_processes),
         _gate(
@@ -1899,6 +2616,25 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
         "status": status,
         "release": status == "pass",
         "exit_code": exit_code,
+        "evidence_receipt": {
+            "authenticated": True,
+            "measurement_sha256": receipt.measurement_sha256,
+            "issued_at": receipt.issued_at.strftime(_UTC_TIMESTAMP_FORMAT),
+            "expires_at": receipt.expires_at.strftime(_UTC_TIMESTAMP_FORMAT),
+            "observation_started_at": receipt.observation_started_at.strftime(
+                _UTC_TIMESTAMP_FORMAT
+            ),
+            "observation_ended_at": receipt.observation_ended_at.strftime(
+                _UTC_TIMESTAMP_FORMAT
+            ),
+            "commitments": {
+                name: {
+                    "sha256": commitment.sha256,
+                    "sample_count": commitment.sample_count,
+                }
+                for name, commitment in receipt.commitments.items()
+            },
+        },
         "objective": {
             "target_logical_imports_per_month": target,
             "month_days": MONTH_DAYS,
@@ -1948,30 +2684,30 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
             "api_minimum_negative_samples": MIN_NEGATIVE_COLD_SAMPLES,
             "api_minimum_random_samples": MIN_RANDOM_COLD_SAMPLES,
             "api_minimum_distinct_matched_keys": MIN_DISTINCT_MATCHED_KEYS,
+            "api_minimum_distinct_negative_keys": MIN_DISTINCT_NEGATIVE_KEYS,
+            "api_minimum_distinct_random_keys": MIN_DISTINCT_RANDOM_KEYS,
         },
         "metrics": {
+            "end_to_end": {
+                "sample_count": end_to_end.sample_count,
+                "unique_build_samples": end_to_end.unique_build_samples,
+                "reuse_samples": end_to_end.reuse_samples,
+                "complete_stage_samples": end_to_end.complete_stage_samples,
+                "within_15_minutes": end_to_end.within_15_minutes,
+                "p95_minutes": _json_number(end_to_end.p95_minutes),
+                "max_minutes": _json_number(end_to_end.max_minutes),
+                "errors": end_to_end.errors,
+            },
             "unique_build": {
                 "sample_count": unique.sample_count,
                 "qualifying_builds": qualifying_unique_builds,
                 "p95_minutes": _json_number(unique.p95_minutes),
                 "worst_case_minutes": _json_number(unique.max_minutes),
-                "audited_activation_p95_minutes": _json_number(
-                    fresh_activation_p95_minutes
-                ),
-                "audited_activation_worst_case_minutes": _json_number(
-                    fresh_activation_max_minutes
-                ),
             },
             "reuse": {
                 "sample_count": reuse.reuse_only_sample_count,
                 "p95_minutes": _json_number(reuse.reuse_only_p95_minutes),
                 "worst_case_minutes": _json_number(reuse.reuse_only_max_minutes),
-                "audited_activation_p95_minutes": _json_number(
-                    reuse_activation_p95_minutes
-                ),
-                "audited_activation_worst_case_minutes": _json_number(
-                    reuse_activation_max_minutes
-                ),
             },
             "candidate_audit": {
                 "sample_count": audit.sample_count,
@@ -1989,6 +2725,13 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
                 "lane_utilization_fraction": _json_number(audit_lane_utilization),
                 "http_requests_per_activation": (audit.http_requests_per_activation),
                 "http_requests_per_month": monthly_audit_http_requests,
+                "observed_http_requests": audit.observed_http_requests,
+                "observed_request_seconds": _json_number(
+                    audit.observed_request_seconds
+                ),
+                "observed_requests_per_second": _json_number(
+                    observed_audit_http_requests_per_second
+                ),
                 "errors": audit.errors,
             },
             "monthly_capacity": {
@@ -2173,12 +2916,23 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
                 "requests": api.requests,
                 "requests_while_imports_running": (api.requests_while_imports_running),
                 "requests_per_second": _json_number(observed_api_requests_per_second),
+                "candidate_audit_requests": api.candidate_audit_requests,
+                "candidate_audit_requests_while_imports_running": (
+                    api.candidate_audit_requests_while_imports_running
+                ),
+                "candidate_audit_requests_per_second": _json_number(
+                    observed_candidate_audit_requests_per_second
+                ),
                 "errors": api.errors,
                 "error_rate_fraction": _json_number(api_error_rate),
                 "fresh_processes": api.fresh_processes,
                 "matched_positive": {
                     "samples": api.matched_positive.samples,
                     "distinct_query_keys": (api.matched_positive.distinct_query_keys),
+                    "contention_samples": api.matched_positive.contention_samples,
+                    "contention_distinct_query_keys": (
+                        api.matched_positive.contention_distinct_query_keys
+                    ),
                     "cold_first_page_p95_ms": _json_number(
                         api.matched_positive.cold_first_page_p95_ms
                     ),
@@ -2187,6 +2941,10 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
                 "negative": {
                     "samples": api.negative.samples,
                     "distinct_query_keys": api.negative.distinct_query_keys,
+                    "contention_samples": api.negative.contention_samples,
+                    "contention_distinct_query_keys": (
+                        api.negative.contention_distinct_query_keys
+                    ),
                     "cold_first_page_p95_ms": _json_number(
                         api.negative.cold_first_page_p95_ms
                     ),
@@ -2195,6 +2953,10 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
                 "random": {
                     "samples": api.random.samples,
                     "distinct_query_keys": api.random.distinct_query_keys,
+                    "contention_samples": api.random.contention_samples,
+                    "contention_distinct_query_keys": (
+                        api.random.contention_distinct_query_keys
+                    ),
                     "cold_first_page_p95_ms": _json_number(
                         api.random.cold_first_page_p95_ms
                     ),
@@ -2205,7 +2967,7 @@ def evaluate_evidence(evidence: CapacityEvidence) -> dict[str, Any]:
         "gates": gates,
         "failures": failed_gate_ids,
         "redaction": {
-            "policy": "fixed_schema_aggregate_metrics_only",
+            "policy": "authenticated_redacted_aggregate_commitments_only",
             "input_values_echoed": False,
             "sensitive_identifiers_emitted": False,
         },
@@ -2216,12 +2978,15 @@ def evaluate_measurement(
     record: Any,
     *,
     target_override: int | None = None,
+    trust: ReceiptTrust | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Validate and evaluate one JSON-compatible measurement record."""
+    """Authenticate, validate, and evaluate one release measurement record."""
 
-    return evaluate_evidence(
-        validate_measurement(record, target_override=target_override)
-    )
+    receipt = verify_receipt(record, trust=trust, now=now)
+    evidence = validate_measurement(record, target_override=target_override)
+    _validate_commitment_bindings(record, evidence, receipt)
+    return evaluate_evidence(evidence, receipt=receipt)
 
 
 def invalid_report(exc: EvidenceError) -> dict[str, Any]:
@@ -2238,7 +3003,7 @@ def invalid_report(exc: EvidenceError) -> dict[str, Any]:
         "exit_code": EXIT_INVALID_EVIDENCE,
         "errors": [error],
         "redaction": {
-            "policy": "fixed_schema_aggregate_metrics_only",
+            "policy": "authenticated_redacted_aggregate_commitments_only",
             "input_values_echoed": False,
             "sensitive_identifiers_emitted": False,
         },
@@ -2246,13 +3011,49 @@ def invalid_report(exc: EvidenceError) -> dict[str, Any]:
 
 
 def example_measurement() -> dict[str, Any]:
-    """Return a passing example containing aggregate evidence only."""
+    """Return an explicitly unsigned, non-release schema example."""
 
     gigabyte = 1_000_000_000
+    peak_start = datetime(2026, 7, 6, tzinfo=UTC)
+    peak_windows = []
+    for index in range(MIN_PEAK_SAMPLE_WINDOWS):
+        started_at = peak_start + timedelta(hours=index * 6)
+        ended_at = started_at + timedelta(hours=1)
+        peak_windows.append(
+            {
+                "started_at": started_at.strftime(_UTC_TIMESTAMP_FORMAT),
+                "ended_at": ended_at.strftime(_UTC_TIMESTAMP_FORMAT),
+                "logical_imports": 8,
+                "unique_builds": 7,
+                "candidate_audits": 8,
+                "max_queue_delay_minutes": 10,
+            }
+        )
+    observation_minutes = int(
+        (
+            datetime.strptime(
+                peak_windows[-1]["ended_at"],
+                _UTC_TIMESTAMP_FORMAT,
+            ).replace(tzinfo=UTC)
+            - peak_start
+        ).total_seconds()
+        / 60
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "evidence_profile": EVIDENCE_PROFILE,
+        "release_evidence": False,
         "objective": {"target_logical_imports_per_month": 2_000},
+        "end_to_end": {
+            "sample_count": 80,
+            "unique_build_samples": 40,
+            "reuse_samples": 40,
+            "complete_stage_samples": 80,
+            "within_15_minutes": 80,
+            "p95_minutes": 12.35,
+            "max_minutes": 14,
+            "errors": 0,
+        },
         "unique_build": {
             "sample_count": 40,
             "p95_minutes": 7.5,
@@ -2284,8 +3085,8 @@ def example_measurement() -> dict[str, Any]:
         },
         "lanes": {"count": 2, "availability_factor": 0.9},
         "candidate_audit": {
-            "sample_count": 40,
-            "successful_audits": 40,
+            "sample_count": 80,
+            "successful_audits": 80,
             "duration_p95_minutes": 3.5,
             "duration_max_minutes": 4,
             "queue_age_p95_minutes": 1,
@@ -2295,16 +3096,20 @@ def example_measurement() -> dict[str, Any]:
             "lane_count": 2,
             "availability_factor": 0.9,
             "http_requests_per_activation": 3_000,
+            "activations_with_http_floor": 80,
+            "observed_http_requests": 240_000,
+            "observed_request_seconds": 8_000,
             "errors": 0,
         },
         "peak_arrival": {
-            "sample_windows": 720,
-            "observation_minutes": 43_200,
+            "sample_windows": len(peak_windows),
+            "observation_minutes": observation_minutes,
             "window_minutes": 60,
             "queue_delay_p95_minutes": 5,
             "max_queue_delay_minutes": 10,
             "observed_peak_logical_imports": 8,
             "observed_peak_unique_builds": 7,
+            "windows": peak_windows,
         },
         "scratch": {
             "configured_concurrent_unique_builds": 2,
@@ -2406,27 +3211,43 @@ def example_measurement() -> dict[str, Any]:
             "concurrent_unique_builds": 2,
             "concurrent_candidate_audits": 2,
             "contention_seconds": 3_600,
+            "contention_started_at": "2026-07-13T08:00:00Z",
+            "contention_ended_at": "2026-07-13T09:00:00Z",
             "fresh_processes": True,
             "requests": 36_000,
             "requests_while_imports_running": 36_000,
+            "candidate_audit_requests": 108_000,
+            "candidate_audit_requests_while_imports_running": 108_000,
             "errors": 0,
             "matched_positive": {
                 "samples": 500,
                 "distinct_query_keys": 500,
+                "contention_samples": 500,
+                "contention_distinct_query_keys": 500,
                 "errors": 0,
                 "cold_first_page_p95_ms": 32,
+                "sample_started_at": "2026-07-13T08:05:00Z",
+                "sample_ended_at": "2026-07-13T08:55:00Z",
             },
             "negative": {
                 "samples": 500,
                 "distinct_query_keys": 500,
+                "contention_samples": 500,
+                "contention_distinct_query_keys": 500,
                 "errors": 0,
                 "cold_first_page_p95_ms": 30,
+                "sample_started_at": "2026-07-13T08:05:00Z",
+                "sample_ended_at": "2026-07-13T08:55:00Z",
             },
             "random": {
                 "samples": 2_500,
                 "distinct_query_keys": 2_500,
+                "contention_samples": 2_500,
+                "contention_distinct_query_keys": 2_500,
                 "errors": 0,
                 "cold_first_page_p95_ms": 35,
+                "sample_started_at": "2026-07-13T08:05:00Z",
+                "sample_ended_at": "2026-07-13T08:55:00Z",
             },
         },
     }
@@ -2532,6 +3353,75 @@ def _positive_target(value: str) -> int:
     return target
 
 
+def _configured_value(explicit: str | None, environment_name: str) -> str | None:
+    return explicit if explicit is not None else os.environ.get(environment_name)
+
+
+def _read_receipt_key(path_value: str | None) -> bytes:
+    if not path_value:
+        raise EvidenceError("receipt_trust_unavailable")
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path_value, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise EvidenceError("insecure_receipt_key")
+        key = os.read(descriptor, MAX_HMAC_KEY_BYTES + 1).strip()
+    except EvidenceError:
+        raise
+    except OSError:
+        raise EvidenceError("receipt_trust_unavailable")
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+    if not MIN_HMAC_KEY_BYTES <= len(key) <= MAX_HMAC_KEY_BYTES:
+        raise EvidenceError("invalid_trust_configuration", "receipt.hmac_key")
+    return key
+
+
+def _receipt_trust_from_arguments(args: argparse.Namespace) -> ReceiptTrust:
+    values = {
+        "key_id": _configured_value(
+            args.expected_key_id,
+            "HLTHPRT_PTG2_CAPACITY_RECEIPT_KEY_ID",
+        ),
+        "release_digest": _configured_value(
+            args.expected_release_digest,
+            "HLTHPRT_PTG2_CAPACITY_RELEASE_DIGEST",
+        ),
+        "environment_id": _configured_value(
+            args.expected_environment_id,
+            "HLTHPRT_PTG2_CAPACITY_ENVIRONMENT_ID",
+        ),
+        "collector_id": _configured_value(
+            args.expected_collector_id,
+            "HLTHPRT_PTG2_CAPACITY_COLLECTOR_ID",
+        ),
+        "collector_version": _configured_value(
+            args.expected_collector_version,
+            "HLTHPRT_PTG2_CAPACITY_COLLECTOR_VERSION",
+        ),
+    }
+    if any(value is None for value in values.values()):
+        raise EvidenceError("receipt_trust_unavailable")
+    key_file = _configured_value(
+        args.receipt_key_file,
+        "HLTHPRT_PTG2_CAPACITY_RECEIPT_KEY_FILE",
+    )
+    return _validate_trust(
+        ReceiptTrust(
+            key_id=values["key_id"],
+            hmac_key=_read_receipt_key(key_file),
+            release_digest=values["release_digest"],
+            environment_id=values["environment_id"],
+            collector_id=values["collector_id"],
+            collector_version=values["collector_version"],
+        )
+    )
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     """Build the redacting command-line parser for the capacity gate."""
 
@@ -2555,8 +3445,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         nargs="?",
         const="-",
         metavar="PATH",
-        help="Write a redacted passing example to PATH, or stdout when omitted",
+        help="Write an unsigned non-release schema example to PATH or stdout",
     )
+    parser.add_argument("--receipt-key-file")
+    parser.add_argument("--expected-key-id")
+    parser.add_argument("--expected-release-digest")
+    parser.add_argument("--expected-environment-id")
+    parser.add_argument("--expected-collector-id")
+    parser.add_argument("--expected-collector-version")
     return parser
 
 
@@ -2574,7 +3470,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         except EvidenceError as exc:
             sys.stderr.write(_serialized(invalid_report(exc), pretty=False))
             return EXIT_INVALID_EVIDENCE
-        return EXIT_PASS
+        return EXIT_GATE_FAILURE
 
     if (args.measurement is None) == (args.input_path is None):
         report = invalid_report(EvidenceError("measurement_input_required"))
@@ -2586,10 +3482,12 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
 
     input_path = args.input_path if args.input_path is not None else args.measurement
     try:
+        trust = _receipt_trust_from_arguments(args)
         record = load_measurement(input_path)
         report = evaluate_measurement(
             record,
             target_override=args.target_logical_imports_per_month,
+            trust=trust,
         )
     except EvidenceError as exc:
         report = invalid_report(exc)
