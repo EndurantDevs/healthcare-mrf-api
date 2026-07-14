@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 import urllib.error
@@ -192,6 +193,34 @@ def _has_detail_source(payload: Mapping[str, Any] | None, source_id: str) -> boo
     )
 
 
+def _has_detail_geo_source(
+    payload: Mapping[str, Any] | None,
+    source_id: str,
+    sample: OverlaySample,
+) -> bool:
+    """Return whether exact detail exposes the selected sourced coordinates."""
+    if sample.address_key is None or sample.latitude is None or sample.longitude is None:
+        return False
+    for row in _envelope_rows(payload, "address_list"):
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("address_key") or "") != sample.address_key:
+            continue
+        try:
+            row_latitude = float(row.get("lat"))
+            row_longitude = float(row.get("long"))
+        except (TypeError, ValueError):
+            continue
+        if not (
+            math.isclose(row_latitude, sample.latitude, rel_tol=0.0, abs_tol=1e-6)
+            and math.isclose(row_longitude, sample.longitude, rel_tol=0.0, abs_tol=1e-6)
+        ):
+            continue
+        if has_row_source_provenance(row, source_id):
+            return True
+    return False
+
+
 def _has_phone_candidate_source(
     payload: Mapping[str, Any] | None, source_id: str, npi: int
 ) -> bool:
@@ -243,6 +272,8 @@ def _evaluate_sample(
         "_detail_payload": detail_result.payload,
         "detail_source_present": detail_result.status_code == 200
         and _has_detail_source(detail_result.payload, source_id),
+        "detail_geo_source_present": detail_result.status_code == 200
+        and _has_detail_geo_source(detail_result.payload, source_id, sample),
         "detail_within_latency_slo": is_within_latency_slo(
             detail_result, api_latency_slo_ms
         ),
@@ -275,6 +306,7 @@ def _evaluate_sample(
 def _evaluate_geo_sample(
     sample: OverlaySample,
     source_id: str,
+    sample_check: Mapping[str, Any],
     api_client: ProviderDirectoryApiClient,
     candidate_limit: int,
     api_latency_slo_ms: float,
@@ -292,9 +324,12 @@ def _evaluate_geo_sample(
         },
     )
     return {
-        "geo_match_candidates": _http_summary(geo_result),
-        "geo_source_present": geo_result.status_code == 200
+        "geo_detail": sample_check["detail"],
+        "geo_detail_source_present": bool(sample_check["detail_geo_source_present"]),
+        "geo_surface_available": geo_result.status_code == 200,
+        "geo_candidate_source_present": geo_result.status_code == 200
         and _has_phone_candidate_source(geo_result.payload, source_id, sample.npi),
+        "geo_match_candidates": _http_summary(geo_result),
         "geo_within_latency_slo": is_within_latency_slo(
             geo_result, api_latency_slo_ms
         ),
@@ -399,11 +434,12 @@ def _attach_matrix_checks(
         _evaluate_geo_sample(
             sample,
             selection.source_id,
+            source_check,
             api_client,
             context.candidate_limit,
             context.api_latency_slo_ms,
         )
-        for sample in samples
+        for sample, source_check in zip(samples, source_checks)
     ]
     source_result["verification_matrix"] = [
         build_matrix_checks(

@@ -453,7 +453,11 @@ against address-overlay rows from current published Provider Directory runs.
 This preserves source attribution when the coordinates are served by a
 canonical base row, such as an NPPES address, while a Provider Directory row
 confirms the same provider and canonical address. Stale overlays and matches
-that share only coordinates are not accepted as provenance.
+that share only coordinates are not accepted as provenance. This candidate
+corroboration applies only to rows returned by bounded geo search; verifier
+witness proof uses the exact detail response for the selected `(npi,
+address_key)` and matching coordinates, while geo search proves reachability
+and latency.
 
 Resource applicability is data-driven. The profile specification maps each
 source to its FHIR resource profile, so a source that does not support
