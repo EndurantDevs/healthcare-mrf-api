@@ -37,6 +37,7 @@ async def _build_cohort_materialization_context(
     table_exists: Callable[[str, str], Awaitable[bool]] = _table_exists,
     table_columns: Callable[[str, str], Awaitable[set[str]]] = _table_columns,
 ) -> dict[str, Any]:
+    """Build table and column context for cohort materialization."""
     qpp_table = classes["PricingQppProvider"].__tablename__
     svi_table = classes["PricingSviZcta"].__tablename__
     measure_table = classes["PricingProviderQualityMeasure"].__tablename__

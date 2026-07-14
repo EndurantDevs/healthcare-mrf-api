@@ -43,6 +43,7 @@ def _row_to_dict(row):
 
 @blueprint.get("/id/<issuer_id>")
 async def get_issuer_data(request, issuer_id):
+    """Return the requested issuer and its related plan metadata."""
     session = getattr(request.ctx, "sa_session", None)
     if session is None:
         raise RuntimeError("SQLAlchemy session not available on request context")
@@ -189,6 +190,7 @@ async def get_issuer_data(request, issuer_id):
 @blueprint.get("/", name="issuer_list")
 @blueprint.get("/state/<state>")
 async def get_issuers(request, state=None):
+    """List issuers, optionally restricted to one state."""
     session = getattr(request.ctx, "sa_session", None)
     if session is None:
         raise RuntimeError("SQLAlchemy session not available on request context")

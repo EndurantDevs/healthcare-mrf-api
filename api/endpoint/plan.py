@@ -397,6 +397,7 @@ async def _states_for_zip(session, zip_code: str) -> list[str]:
 
 @blueprint.get("/")
 async def index_status(request):
+    """Return plan index readiness and generation metadata."""
     session = _get_session(request)
 
     plan_count_res = await session.execute(
@@ -427,6 +428,7 @@ async def index_status(request):
 
 @blueprint.get("/all")
 async def all_plans(request):
+    """List plans matching the supplied request filters."""
     session = _get_session(request)
     result = await session.execute(select(plan_table))
     rows = [_row_to_dict(row) for row in _result_rows(result)]
@@ -435,6 +437,7 @@ async def all_plans(request):
 
 @blueprint.get("/all/variants")
 async def all_plans_variants(request):
+    """List plan variants matching the supplied request filters."""
     session = _get_session(request)
     limit = request.args.get("limit")
     offset = request.args.get("offset")
@@ -528,6 +531,7 @@ async def _fetch_network_entry(session, checksum):
 
 @blueprint.get("/network/id/<checksum>")
 async def get_network_by_checksum(request, checksum):
+    """Return a network identified by its stable checksum."""
     session = _get_session(request)
     entry = await _fetch_network_entry(session, int(checksum))
     if entry is None:
@@ -537,6 +541,7 @@ async def get_network_by_checksum(request, checksum):
 
 @blueprint.get("/network/multiple/<checksums>")
 async def get_networks_by_checksums(request, checksums):
+    """Return networks matching a collection of stable checksums."""
     session = _get_session(request)
     values = [value.strip() for value in checksums.split(",") if value.strip()]
     payload = []
@@ -562,6 +567,7 @@ async def get_networks_by_checksums(request, checksums):
 
 @blueprint.get("/network/autocomplete")
 async def get_autocomplete_list(request):
+    """Return plan-search autocomplete candidates."""
     session = _get_session(request)
     text = request.args.get("query")
     if not text:
@@ -620,6 +626,7 @@ async def get_autocomplete_list(request):
 
 @blueprint.get("/search", name="find_a_plan")
 async def find_a_plan(request):
+    """Search indexed plans using normalized request criteria."""
     args = request.args
     # Explicit access keeps route/query introspection in sync with OpenAPI.
     args.get("page")
@@ -1038,6 +1045,7 @@ async def find_a_plan(request):
 @blueprint.get("/price/<plan_id>", name="get_price_plan_by_plan_id")
 @blueprint.get("/price/<plan_id>/year", name="get_price_plan_by_plan_id_and_year")
 async def get_price_plan(request, plan_id, year=None, variant=None):
+    """Return price data for one plan version."""
     session = _get_session(request)
     age = request.args.get("age")
     request.args.get("rating_area")
@@ -1071,6 +1079,7 @@ async def get_price_plan(request, plan_id, year=None, variant=None):
 
 @blueprint.post("/price/bulk", name="get_price_plans_bulk")
 async def get_price_plans_bulk(request):
+    """Return price data for a bounded collection of plans."""
     session = _get_session(request)
     payload = request.json or {}
     if not isinstance(payload, dict):
@@ -1137,6 +1146,7 @@ async def get_price_plans_bulk(request):
 @blueprint.get("/id/<plan_id>/<year>", name="get_plan_by_plan_id_and_year")
 @blueprint.get("/id/<plan_id>/<year>/<variant>", name="get_plan_variant_by_plan_id_and_year")
 async def get_plan(request, plan_id, year=None, variant=None):
+    """Return one plan version and its indexed attributes."""
     session = _get_session(request)
 
     stmt = select(plan_table).where(plan_table.c.plan_id == plan_id)

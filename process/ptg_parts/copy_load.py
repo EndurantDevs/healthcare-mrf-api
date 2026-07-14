@@ -218,6 +218,7 @@ async def _copy_stage_price_set_rows(rows: list[dict[str, Any]], snapshot_id: st
 
 
 async def _copy_stage_serving_rate_rows(rows: list[dict[str, Any]], snapshot_id: str) -> None:
+    """Bulk-copy serving-rate rows into the snapshot staging table."""
     if not rows:
         return
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"

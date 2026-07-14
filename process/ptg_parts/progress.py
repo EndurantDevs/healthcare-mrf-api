@@ -80,6 +80,7 @@ def _maybe_log_artifact_progress(
     ref_count: int = 0,
     item_count: int = 0,
 ) -> None:
+    """Log bounded artifact progress when the configured interval elapses."""
     interval = max(_env_int(PTG2_PROGRESS_INTERVAL_SECONDS_ENV, 30), 1)
     now = time.monotonic()
     if state.get("last_log") and now - state["last_log"] < interval:

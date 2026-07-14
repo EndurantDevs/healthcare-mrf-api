@@ -11,6 +11,7 @@ blueprint = Blueprint('nucc', url_prefix='/nucc', version=1)
 
 @blueprint.get('/')
 async def index_status_nucc(_request):
+    """Return the current NUCC index status."""
     return response.json({})
 
 
@@ -23,6 +24,7 @@ def _get_session(request):
 
 @blueprint.get('/all')
 async def all_of_nucc(request):
+    """Return the filtered NUCC taxonomy collection."""
     session = _get_session(request)
     args = request.args
     table = NUCCTaxonomy.__table__

@@ -20,6 +20,7 @@ ADDRESS_ARCHIVE_QUEUE_NAME = "arq:AddressArchive"
 
 
 async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Process one address-archive migration task."""
     payload = task if isinstance(task, dict) else {}
     run_id = str(payload.get("run_id") or ctx.get("control_run_id") or "").strip()
 

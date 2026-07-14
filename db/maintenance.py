@@ -280,6 +280,7 @@ def _should_manage_table_schema(schema: str | None, managed_schemas: set[str]) -
 
 
 def render_sync_summary(results: Dict[str, List[str]]) -> None:
+    """Render a concise summary of database synchronization results."""
     if results.get("retired"):
         click.echo(f"Retired objects: {', '.join(results['retired'])}")
     if results["tables"]:

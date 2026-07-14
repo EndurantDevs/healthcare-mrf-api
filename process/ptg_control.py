@@ -43,6 +43,7 @@ _TERMINAL_RUN_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_
 
 
 async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
+    """Run one PTG control task with cancellation and heartbeat handling."""
     payload = task if isinstance(task, dict) else {}
     run_id = str(payload.get("run_id") or "").strip()
     params = payload.get("params") if isinstance(payload.get("params"), dict) else payload

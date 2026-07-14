@@ -941,6 +941,7 @@ def _normalize_marketplace_address_entry(address):
 
 
 def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_updated_on, issuer_lookup=None):
+    """Build canonical address and evidence rows from one MRF provider record."""
     addresses = res.get("addresses", []) or []
     if not isinstance(addresses, list):
         return [], []
@@ -1100,6 +1101,7 @@ async def _push_mrf_duplicate_tolerant_rows(rows, cls) -> None:
 
 
 async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None:
+    """Refresh the materialized MRF address summary for one import date."""
     address_cls = make_class(MRFAddress, import_date, schema_override=db_schema)
     evidence_cls = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
     deferred_indexes = _mrf_address_summary_deferred_indexes(address_cls)
@@ -1267,7 +1269,7 @@ async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
                 + f"{db_schema}.{ImportHistory.__tablename__} ({cols});"
             )
         except IntegrityError:
-            pass
+            logger.debug("Import-history primary index already has conflicting rows")
 
     for cls in (
         Issuer,
@@ -1288,11 +1290,11 @@ async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
         try:
             await db.status("DROP TABLE IF EXISTS " + f"{db_schema}.{obj.__tablename__};")
         except ProgrammingError:
-            pass
+            logger.debug("Import staging table could not be dropped: %s", obj.__tablename__)
         try:
             await db.create_table(obj.__table__, checkfirst=True)
         except (ProgrammingError, DuplicateTableError, IntegrityError):
-            pass
+            logger.debug("Import staging table already exists: %s", obj.__tablename__)
         if hasattr(obj, "__my_index_elements__") and obj.__my_index_elements__:
             cols = ", ".join(obj.__my_index_elements__)
             try:
@@ -1302,7 +1304,7 @@ async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
                     + f"{db_schema}.{obj.__tablename__} ({cols});"
                 )
             except IntegrityError:
-                pass
+                logger.debug("Import staging primary index has conflicting rows: %s", obj.__tablename__)
         if cls in {PlanBenefitsMarketplace, MRFAddress, MRFAddressEvidence}:
             await _create_named_indexes(obj, db_schema)
 
@@ -1988,6 +1990,7 @@ def _chunked(values, chunk_size=500):
 
 
 async def _refresh_plan_drug_statistics(plan_ids, import_date, db_schema):
+    """Refresh aggregate drug statistics for the selected plans."""
     plan_ids = [value for value in set(plan_ids) if value]
     if not plan_ids:
         return
@@ -2277,6 +2280,7 @@ async def process_formulary(ctx, task):
 
 
 async def save_mrf_data(ctx, task):
+    """Persist one queued batch of normalized MRF records."""
     if "context" in task:
         ctx["context"] = task["context"]
     import_date = ctx["context"]["import_date"]
@@ -2321,7 +2325,7 @@ async def save_mrf_data(ctx, task):
                 mynpiaddress = make_class(NPIAddress, import_date, schema_override=db_schema)
                 x.append(push_objects(task["npi_address_list"], mynpiaddress, rewrite=True))
             case "context":
-                pass
+                continue
             case _:
                 print("Some wrong key passed")
     await asyncio.gather(*x)
@@ -2720,12 +2724,6 @@ async def update_issuer_names_data(test_mode: bool = False):
             with zipfile.ZipFile(tmp_filename, "r") as zip_ref:
                 zip_ref.extractall(tmpdirname)
 
-            # tmp_filename = glob.glob(f"{tmpdirname}/*PUF*.zip")[0]
-            # print(f"Trying to unpack: {tmp_filename}")
-            # tmpdirname = str(PurePath(str(tmpdirname), 'PUF_FILES'))
-            # # temp solution
-            # with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
-            #     zip_ref.extractall(tmpdirname)
             print(glob.glob(f"{tmpdirname}/*PUF*.csv"))
 
             csv_files = glob.glob(f"{tmpdirname}/*PUF*.csv")
@@ -2961,7 +2959,7 @@ async def init_file(ctx, task=None):
             try:
                 os.unlink(zip_path)
             except FileNotFoundError:
-                pass
+                logger.debug("Issuer archive was already removed: %s", zip_path)
 
         await asyncio.gather(
             push_objects(list(issuer_list.values()), myissuer), push_objects(list(plan_list.values()), myplan)
@@ -3383,6 +3381,7 @@ async def main(test_mode: bool = False):
 
 
 async def finish_main(test_mode: bool = False, import_id: str | None = None):
+    """Queue finalization for one MRF import run."""
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
     resolved_import_id = import_id or os.environ.get("HLTHPRT_IMPORT_ID_OVERRIDE") or datetime.datetime.utcnow().strftime(
         "%Y%m%d"

@@ -292,6 +292,7 @@ def _audit_provider_reference(
     samples: list[dict[str, Any]],
     max_samples: int,
 ) -> None:
+    """Accumulate location evidence from one provider reference."""
     summary["provider_references"] += 1
     ref_id = ref.get("provider_group_id") or ref.get("provider_group_ref")
     ref_fields = dict(ref)

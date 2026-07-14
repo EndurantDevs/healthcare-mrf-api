@@ -1920,6 +1920,7 @@ def _provider_directory_network_plan_ctes_sql(
 
 
 def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
+    """Build CTEs that constrain provider-directory roles requested by callers."""
     plan_id = _provider_directory_reference_resource_id_sql("plan_ref.value", "InsurancePlan")
     service_id = _provider_directory_reference_resource_id_sql(
         "service_ref.value", "HealthcareService"

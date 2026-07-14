@@ -45,6 +45,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.schema import CreateColumn
 from sqlalchemy.sql.sqltypes import JSON as SQLAlchemyJSON
 
+from db.connection import ConnectionProxy
 from db.models import (
     ProviderDirectoryAPIEndpoint,
     ProviderDirectoryBulkAcquisitionCheckpoint,
@@ -54,6 +55,7 @@ from db.models import (
     ProviderDirectoryDatasetAffiliationOrganization,
     ProviderDirectoryDatasetInsurancePlan,
     ProviderDirectoryDatasetNetworkPlan,
+    ProviderDirectoryDatasetRehydrationCheckpoint,
     ProviderDirectoryDatasetResource,
     ProviderDirectoryEndpoint,
     ProviderDirectoryEndpointDataset,
@@ -75,6 +77,14 @@ from process.control_cancel import raise_if_cancelled
 from process.ext.address_canon import resolve_into_archive
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import ensure_database
+from process.provider_directory_dataset_rehydrate import (
+    DEFAULT_BATCH_SIZE as DEFAULT_DATASET_REHYDRATE_BATCH_SIZE,
+    DatasetRehydrationError,
+    DatasetScope,
+    RehydrationRequest,
+    RehydrationRuntime,
+    rehydrate_current_dataset,
+)
 from process.provider_directory_time_partition import (
     CountKind,
     CountObservation,
@@ -465,6 +475,7 @@ CANONICAL_RESOURCE_MODELS = (
     ProviderDirectoryDatasetAffiliationOrganization,
     ProviderDirectoryCanonicalResource,
     ProviderDirectorySourceResource,
+    ProviderDirectoryDatasetRehydrationCheckpoint,
     ProviderDirectoryBulkAcquisitionCheckpoint,
     ProviderDirectoryBulkOutputCheckpoint,
     ProviderDirectoryPaginationCheckpoint,
@@ -13467,6 +13478,21 @@ def _copy_upsert_min_rows() -> int:
         return 100
 
 
+def _transaction_session_options(
+    transaction_session: Any | None,
+) -> dict[str, Any]:
+    """Return optional transaction binding without changing normal call shape."""
+    if transaction_session is None:
+        return {}
+    return {"transaction_session": transaction_session}
+
+
+def _bound_upsert_session() -> Any | None:
+    """Return the task-local transaction session when one is active."""
+    transaction_binding = db._transaction_binding()
+    return transaction_binding.session if transaction_binding is not None else None
+
+
 def _location_address_key_batch_size() -> int:
     try:
         return max(
@@ -14072,12 +14098,14 @@ async def _upsert_rows_values(
     primary_keys: list[str],
     *,
     skip_unchanged: bool,
+    transaction_session: Any | None = None,
 ) -> int:
     if not normalized:
         return 0
     max_rows_per_statement = _max_rows_per_statement(len(columns))
     if len(normalized) > max_rows_per_statement:
         total = 0
+        transaction_options = _transaction_session_options(transaction_session)
         for offset in range(0, len(normalized), max_rows_per_statement):
             total += await _upsert_rows_values(
                 model,
@@ -14085,24 +14113,40 @@ async def _upsert_rows_values(
                 columns,
                 primary_keys,
                 skip_unchanged=skip_unchanged,
+                **transaction_options,
             )
         return total
     table = model.__table__
-    async with db.session() as session:
-        statement = pg_insert(table).values(normalized)
-        update_columns = {
-            column.name: _effective_update_expression(table, statement, column.name)
-            for column in table.columns
-            if column.name not in primary_keys
-        }
-        update_where = _upsert_changed_row_predicate(table, statement, columns, primary_keys) if skip_unchanged else None
-        statement = statement.on_conflict_do_update(
-            index_elements=primary_keys,
-            set_=update_columns,
-            where=update_where,
-        )
-        await session.execute(statement)
+    statement = pg_insert(table).values(normalized)
+    update_columns = {
+        column.name: _effective_update_expression(table, statement, column.name)
+        for column in table.columns
+        if column.name not in primary_keys
+    }
+    update_where = _upsert_changed_row_predicate(table, statement, columns, primary_keys) if skip_unchanged else None
+    statement = statement.on_conflict_do_update(
+        index_elements=primary_keys,
+        set_=update_columns,
+        where=update_where,
+    )
+    if transaction_session is not None:
+        await transaction_session.execute(statement)
+    else:
+        async with db.session() as session:
+            await session.execute(statement)
     return len(normalized)
+
+
+@contextlib.asynccontextmanager
+async def _copy_upsert_connection(transaction_session: Any | None):
+    """Yield a COPY-capable connection inside the requested transaction."""
+    if transaction_session is None:
+        async with db.acquire() as acquired_connection:
+            yield acquired_connection
+        return
+    transaction_connection = await transaction_session.connection()
+    raw_connection = await transaction_connection.get_raw_connection()
+    yield ConnectionProxy(db, transaction_connection, raw_connection)
 
 
 async def _copy_upsert_rows(
@@ -14112,6 +14156,7 @@ async def _copy_upsert_rows(
     primary_keys: list[str],
     *,
     skip_unchanged: bool,
+    transaction_session: Any | None = None,
 ) -> int:
     """Copy upsert rows into the destination tables."""
     table = model.__table__
@@ -14164,7 +14209,7 @@ async def _copy_upsert_rows(
               ON {primary_key_join}
             WHERE {changed_where}
             """
-    async with db.acquire() as conn:
+    async with _copy_upsert_connection(transaction_session) as conn:
         await conn.status(
             f"""
             CREATE TEMP TABLE {quoted_stage}
@@ -14206,6 +14251,7 @@ async def _upsert_rows(
     if not rows:
         return 0
     normalized = [{key: row.get(key) for key in columns} for row in rows]
+    transaction_options = _transaction_session_options(_bound_upsert_session())
     if _copy_upsert_enabled() and len(normalized) >= _copy_upsert_min_rows():
         try:
             return await _copy_upsert_rows(
@@ -14214,6 +14260,7 @@ async def _upsert_rows(
                 columns,
                 primary_keys,
                 skip_unchanged=skip_unchanged,
+                **transaction_options,
             )
         except Exception as exc:  # pragma: no cover - exercised on driver-specific fallback paths
             print(f"Provider Directory COPY upsert fallback for {model.__tablename__}: {_short_error(exc)}")
@@ -14223,6 +14270,7 @@ async def _upsert_rows(
         columns,
         primary_keys,
         skip_unchanged=skip_unchanged,
+        **transaction_options,
     )
 
 
@@ -26337,7 +26385,11 @@ async def _upsert_resource_rows(
             )
     if track_seen:
         await _mark_resource_rows_seen(model, rows, run_id, seen_table=seen_table)
-    return await _upsert_rows(model, rows, skip_unchanged=track_seen and bool(run_id))
+    return await _upsert_rows(
+        model,
+        rows,
+        skip_unchanged=track_seen and bool(run_id),
+    )
 
 
 async def _delete_stale_resource_rows(
@@ -31848,6 +31900,117 @@ async def _import_resources(
             await _drop_provider_directory_import_seen_stage_table(seen_stage_table)
 
 
+def _dataset_rehydrate_resource_types(raw: Any) -> tuple[str, ...]:
+    if raw in (None, "", (), []):
+        return ()
+    values = raw.split(",") if isinstance(raw, str) else raw
+    if isinstance(values, (bytes, bytearray, dict)) or not hasattr(values, "__iter__"):
+        raise ValueError("provider_directory_dataset_rehydrate_resources_invalid")
+    resource_types = tuple(_clean_text(value) for value in values)
+    if not all(resource_types) or len(resource_types) != len(set(resource_types)):
+        raise ValueError("provider_directory_dataset_rehydrate_resources_invalid")
+    return resource_types
+
+
+async def _run_provider_directory_dataset_rehydrate(
+    ctx: dict[str, Any], task: dict[str, Any], run_id: str | None, source_ids: list[str]
+) -> dict[str, Any]:
+    """Run the retained-dataset path without source discovery or network access."""
+    request = _dataset_rehydration_request(task, run_id, source_ids)
+    runtime = _dataset_rehydration_runtime(ctx, task, request)
+    metrics = await rehydrate_current_dataset(runtime, request)
+    ctx["context"]["audit"] = metrics
+    ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
+    print(
+        "PROVIDER_DIRECTORY_DATASET_REHYDRATE_DONE\t"
+        + json.dumps(metrics, sort_keys=True, default=str)
+    )
+    return metrics
+
+
+def _dataset_rehydration_request(
+    task: dict[str, Any],
+    run_id: str | None,
+    source_ids: list[str],
+) -> RehydrationRequest:
+    """Validate task exclusivity and build an exact dataset request."""
+    if len(source_ids) != 1:
+        raise ValueError("provider_directory_dataset_rehydrate_requires_exactly_one_source_id")
+    if not run_id:
+        raise ValueError("provider_directory_dataset_rehydrate_run_id_required")
+    dataset_id = _clean_text(task.get("rehydrate_dataset_id"))
+    root_run_id = _clean_text(task.get("rehydrate_acquisition_root_run_id"))
+    if not dataset_id or not root_run_id:
+        raise ValueError("provider_directory_dataset_rehydrate_dataset_and_root_required")
+    incompatible_fields = (
+        "canonical_backfill_only", "contact_backfill_only", "publish_artifacts_only",
+        "publish_artifacts", "publish_after_acquisition", "import_resources",
+        "full_refresh", "stale_cleanup", "bulk_export", "seed_only", "refresh_preset",
+        "resources", "resource_limit", "page_limit", "stream_batch_size",
+    )
+    if any(task.get(field_name) for field_name in incompatible_fields):
+        raise ValueError("provider_directory_dataset_rehydrate_incompatible_parameters")
+    return RehydrationRequest(
+        source_id=source_ids[0],
+        dataset_id=dataset_id,
+        acquisition_root_run_id=root_run_id,
+        owner_run_id=run_id,
+        resource_types=_dataset_rehydrate_resource_types(
+            task.get("rehydrate_resources") or task.get("rehydrate_resource")
+        ),
+        batch_size=_int_or_default(
+            task.get("rehydrate_batch_size"),
+            DEFAULT_DATASET_REHYDRATE_BATCH_SIZE,
+        ),
+    )
+
+
+def _dataset_rehydration_runtime(
+    ctx: dict[str, Any],
+    task: dict[str, Any],
+    request: RehydrationRequest,
+) -> RehydrationRuntime:
+    """Bind normal upserts and control lifecycle callbacks to a request."""
+
+    async def upsert(model: type, rows: list[dict[str, Any]], scope: DatasetScope) -> int:
+        """Write one retained batch through normal provenance upserts."""
+        return await _upsert_resource_rows(
+            model, rows, run_id=scope.acquisition_root_run_id, track_seen=False,
+            canonical_api_base=scope.canonical_api_base, source_ids=[scope.source_id],
+        )
+
+    async def cancelled() -> None:
+        """Raise when the owning control run is cancelled."""
+        await raise_if_cancelled(ctx, task)
+
+    async def report(progress: dict[str, Any]) -> None:
+        """Publish bounded row progress without failing the import."""
+        try:
+            await mark_control_run(
+                request.owner_run_id,
+                status="running",
+                phase_detail=str(progress["phase"]),
+                progress=progress,
+                metrics={
+                    "dataset_rehydrate": {
+                        "source_id": request.source_id,
+                        "dataset_id": request.dataset_id,
+                    }
+                },
+            )
+        except Exception as error:
+            LOGGER.warning("Provider Directory rehydration progress update failed: %s", error)
+
+    return RehydrationRuntime(
+        database=db,
+        schema=_schema(),
+        models_by_type=RESOURCE_MODELS_BY_TYPE,
+        upsert_batch=upsert,
+        cancel_check=cancelled,
+        progress_callback=report,
+    )
+
+
 async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
     """Run provider-directory discovery, import, and publication."""
     task = _apply_provider_directory_refresh_preset(task or {})
@@ -31872,6 +32035,13 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         or task.get("provider_directory_source_ids")
         or task.get("provider_directory_source_id")
     )
+    if bool(task.get("dataset_rehydrate_only")):
+        try:
+            return await _run_provider_directory_dataset_rehydrate(
+                ctx, task, run_id, requested_source_ids
+            )
+        except DatasetRehydrationError:
+            raise
     limit = int(task.get("limit") or 0) or None
     source_query = _clean_text(task.get("source_query"))
     timeout = int(task.get("timeout") or os.getenv("HLTHPRT_PROVIDER_DIRECTORY_TIMEOUT", "15"))
@@ -32414,6 +32584,11 @@ async def main(
     seed_only: bool = False,
     probe: bool = True,
     import_resources: bool = False,
+    dataset_rehydrate_only: bool = False,
+    rehydrate_dataset_id: str | None = None,
+    rehydrate_acquisition_root_run_id: str | None = None,
+    rehydrate_resources: list[str] | tuple[str, ...] | str | None = None,
+    rehydrate_batch_size: int | None = None,
     canonical_backfill_only: bool = False,
     contact_backfill_only: bool = False,
     publish_artifacts_only: bool = False,
@@ -32463,6 +32638,11 @@ async def main(
         "seed_only": seed_only,
         "probe": probe,
         "import_resources": import_resources,
+        "dataset_rehydrate_only": dataset_rehydrate_only,
+        "rehydrate_dataset_id": rehydrate_dataset_id,
+        "rehydrate_acquisition_root_run_id": rehydrate_acquisition_root_run_id,
+        "rehydrate_resources": rehydrate_resources,
+        "rehydrate_batch_size": rehydrate_batch_size,
         "canonical_backfill_only": canonical_backfill_only,
         "contact_backfill_only": contact_backfill_only,
         "publish_artifacts_only": publish_artifacts_only,

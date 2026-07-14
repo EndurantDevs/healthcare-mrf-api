@@ -1233,6 +1233,11 @@ def provider_enrichment(test: bool):
     default=None,
     help="Fetch resources from importable FHIR endpoints.",
 )
+@click.option("--dataset-rehydrate-only", is_flag=True, help="Rebuild typed rows from one retained current dataset without network calls.")
+@click.option("--rehydrate-dataset-id", help="Exact current immutable dataset id to rehydrate.")
+@click.option("--rehydrate-acquisition-root-run-id", help="Exact acquisition root run id recorded by the dataset.")
+@click.option("--rehydrate-resource", multiple=True, help="Typed resource to rehydrate; defaults to the dataset profile.")
+@click.option("--rehydrate-batch-size", type=int, help="Retained payload rows per transactional rehydration batch.")
 @click.option(
     "--canonical-backfill-only",
     is_flag=True,
@@ -1325,6 +1330,11 @@ def provider_directory_fhir(
     seed_only: bool,
     no_probe: bool,
     import_resources: bool,
+    dataset_rehydrate_only: bool,
+    rehydrate_dataset_id: str | None,
+    rehydrate_acquisition_root_run_id: str | None,
+    rehydrate_resource: tuple[str, ...],
+    rehydrate_batch_size: int | None,
     canonical_backfill_only: bool,
     contact_backfill_only: bool,
     publish_artifacts_only: bool,
@@ -1367,6 +1377,11 @@ def provider_directory_fhir(
             seed_only=seed_only,
             probe=not no_probe,
             import_resources=import_resources,
+            dataset_rehydrate_only=dataset_rehydrate_only,
+            rehydrate_dataset_id=rehydrate_dataset_id,
+            rehydrate_acquisition_root_run_id=rehydrate_acquisition_root_run_id,
+            rehydrate_resources=list(rehydrate_resource),
+            rehydrate_batch_size=rehydrate_batch_size,
             canonical_backfill_only=canonical_backfill_only,
             contact_backfill_only=contact_backfill_only,
             publish_artifacts_only=publish_artifacts_only,

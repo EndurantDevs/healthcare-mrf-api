@@ -38,12 +38,14 @@ async def _collect_import_stats():
 
 @blueprint.get('/')
 async def last_import_stats(_request):
+    """Return the most recent issuer import statistics."""
     data = await _collect_import_stats()
     return response.json(data, default=str)
 
 
 @blueprint.get('/issuer/<issuer_id>')
 async def issuer_import_data(_request, issuer_id):
+    """Return import details for one issuer identifier."""
     issuer_stmt = select(Issuer).where(Issuer.issuer_id == int(issuer_id))
     issuer = await db.scalar(issuer_stmt)
     if not issuer:

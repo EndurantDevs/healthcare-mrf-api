@@ -7,6 +7,7 @@ from shapely import wkt
 
 
 def square_poly(lat, lon, distance=25):
+    """Return a square polygon around a coordinate at the requested distance."""
     distance *= 1000
     distance /= sqrt(2)
     gs = gpd.GeoSeries(wkt.loads(f"POINT ({lon} {lat})"))
