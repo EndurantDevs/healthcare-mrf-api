@@ -6,6 +6,9 @@ from typing import Any
 
 
 SCAN_PROVIDER_DIRECTORY_BASE = "https://providerdirectory.scanhealthplan.com"
+CARESOURCE_PROVIDER_DIRECTORY_BASE = (
+    "https://orchestrateserver.caresource.careevolution.com/api/fhir/provider-directory"
+)
 LAST_UPDATED_PROOF_METRIC_NAMES = (
     "last_updated_unfiltered_pre",
     "last_updated_ranged_root_pre",
@@ -15,6 +18,12 @@ LAST_UPDATED_PROOF_METRIC_NAMES = (
     "last_updated_staged_candidate_count",
     "last_updated_ranged_root_post",
     "last_updated_unfiltered_post",
+)
+CARESOURCE_PROOF_METRIC_NAMES = (
+    "caresource_opaque_cursor_pre_count",
+    "caresource_opaque_cursor_processed_rows",
+    "caresource_opaque_cursor_unique_candidate_rows",
+    "caresource_opaque_cursor_post_count",
 )
 
 
@@ -60,6 +69,42 @@ def _last_updated_completeness_errors(
     return errors
 
 
+def _caresource_completeness_errors(
+    entry: dict[str, Any],
+    resource_type: str,
+    resource_stats: dict[str, Any],
+) -> list[str]:
+    """Require the durable opaque-cursor census for every CareSource source."""
+
+    canonical_base = str(entry.get("canonical_base") or "").rstrip("/")
+    proof_source_count = resource_stats.get("caresource_opaque_cursor_sources")
+    is_proof_required = (
+        canonical_base == CARESOURCE_PROVIDER_DIRECTORY_BASE
+        or proof_source_count not in (None, 0)
+    )
+    if not is_proof_required:
+        return []
+    expected_source_count = len(entry["source_ids"])
+    errors: list[str] = []
+    if proof_source_count != expected_source_count:
+        errors.append(f"{resource_type} lacks exact CareSource census source metrics")
+    if (
+        resource_stats.get("caresource_opaque_cursor_verified_sources")
+        != expected_source_count
+    ):
+        errors.append(f"{resource_type} lacks verified CareSource census proof")
+    proof_values = [
+        resource_stats.get(metric_name)
+        for metric_name in CARESOURCE_PROOF_METRIC_NAMES
+    ]
+    if any(
+        isinstance(proof_value, bool) or not isinstance(proof_value, int)
+        for proof_value in proof_values
+    ) or len(set(proof_values)) != 1:
+        errors.append(f"{resource_type} CareSource census counts do not reconcile")
+    return errors
+
+
 def acquisition_metric_errors(
     entry: dict[str, Any], metrics: dict[str, Any]
 ) -> list[str]:
@@ -93,6 +138,13 @@ def acquisition_metric_errors(
         if isinstance(resource_stats, dict):
             errors.extend(
                 _last_updated_completeness_errors(
+                    entry,
+                    resource_type,
+                    resource_stats,
+                )
+            )
+            errors.extend(
+                _caresource_completeness_errors(
                     entry,
                     resource_type,
                     resource_stats,

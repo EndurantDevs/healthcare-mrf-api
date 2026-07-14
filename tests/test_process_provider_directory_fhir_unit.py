@@ -433,6 +433,36 @@ def test_source_row_from_seed_overrides_caresource_stale_auth_label():
     )
 
 
+def test_caresource_full_refresh_uses_opaque_cursor_census_strategy():
+    source_lookup = {
+        "source_id": "caresource",
+        "api_base": importer.CARESOURCE_PROVIDER_DIRECTORY_BASE,
+    }
+
+    assert importer._source_full_refresh_page_count(source_lookup, 100, 0, 0) == 1000
+    assert importer._source_full_refresh_page_count(source_lookup, 100, 1, 0) == 100
+    checkpoint_context = importer._pagination_checkpoint_context(
+        source_lookup,
+        ["caresource"],
+        run_id="run_1",
+        retry_of_run_id=None,
+    )
+    assert checkpoint_context is not None
+    expected_scope_payload = json.dumps(
+        {
+            "strategy_version": importer.CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
+            "source_ids": ["caresource"],
+            "resource_group": importer._resource_import_group_key(source_lookup),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    assert checkpoint_context.source_scope_hash == hashlib.sha256(
+        expected_scope_payload.encode("utf-8")
+    ).hexdigest()
+
+
 def test_source_row_from_seed_overrides_centene_partner_portal_base():
     source_row = importer._source_row_from_seed(
         {
@@ -16449,6 +16479,45 @@ def _practitioner_search_bundle(resource_id: str, next_url: str | None = None):
     return payload
 
 
+def _caresource_checkpoint_context():
+    return importer.PaginationCheckpointContext(
+        canonical_api_base=importer.CARESOURCE_PROVIDER_DIRECTORY_BASE,
+        source_scope_hash="caresource_scope",
+        source_ids=("caresource_source",),
+        owner_run_id="run_retry",
+        retry_of_run_id="run_original",
+        acquisition_root_run_id="run_original",
+        dataset_id="dataset_caresource",
+        lineage_verified=True,
+    )
+
+
+def _caresource_role_bundle(resource_id: str, next_url: str | None = None):
+    payload = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "PractitionerRole",
+                    "id": resource_id,
+                }
+            }
+        ],
+    }
+    if next_url:
+        payload["link"] = [{"relation": "next", "url": next_url}]
+    return payload
+
+
+def _caresource_count_bundle(total: int):
+    return {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "total": total,
+    }
+
+
 def _checkpoint_page_callbacks(
     start_url: str,
     next_url: str,
@@ -16528,6 +16597,268 @@ def _checkpoint_complete_fetch_result(model, rows_written: int):
         hard_page_limit_reached=False,
         next_url_remaining=False,
     )
+
+
+def test_caresource_census_url_removes_cursor_and_page_controls():
+    census_url = importer._caresource_census_url(
+        f"{importer.CARESOURCE_PROVIDER_DIRECTORY_BASE}/PractitionerRole?"
+        "_count=1000&_searchId=opaque&_page=17&active=true"
+    )
+
+    assert urllib.parse.parse_qs(urllib.parse.urlsplit(census_url).query) == {
+        "_summary": ["count"],
+        "active": ["true"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("proof_overrides", "expected_failure"),
+    (
+        ({"post_count": 3}, "census_drift"),
+        ({"processed_rows": 1, "unique_candidate_rows": 1}, "cursor_loss"),
+        ({"processed_rows": 3, "unique_candidate_rows": 2}, "duplicate_resource_ids"),
+        ({"processed_rows": 3, "unique_candidate_rows": 3}, "processed_count_mismatch"),
+    ),
+)
+def test_caresource_completeness_proof_fails_closed(
+    proof_overrides,
+    expected_failure,
+):
+    proof_by_field = {
+        "pre_count": 2,
+        "post_count": 2,
+        "processed_rows": 2,
+        "unique_candidate_rows": 2,
+        **proof_overrides,
+    }
+
+    assert importer._caresource_proof_failure(proof_by_field) == expected_failure
+
+
+def _install_caresource_scan_callbacks(
+    monkeypatch,
+    start_url: str,
+    next_url: str,
+):
+    requested_urls: list[str] = []
+    saved_checkpoints: list[dict[str, Any]] = []
+    saved_proofs: list[dict[str, Any]] = []
+
+    async def load_checkpoint(_context, resource_type, request_url):
+        assert resource_type == "PractitionerRole"
+        assert request_url == start_url
+        return importer.PaginationResumeState(start_url, 0, 0, ())
+
+    async def fetch_source_json(_source, request_url, *, timeout):
+        assert timeout == 3
+        requested_urls.append(request_url)
+        if "_summary=count" in request_url:
+            return 200, _caresource_count_bundle(2), None, 1
+        if request_url == start_url:
+            return 200, _caresource_role_bundle("role-1", next_url), None, 1
+        assert request_url == next_url
+        return 200, _caresource_role_bundle("role-2"), None, 1
+
+    async def save_checkpoint(_context, _resource_type, **checkpoint):
+        saved_checkpoints.append(checkpoint)
+
+    async def save_proof(_context, _resource_type, proof):
+        saved_proofs.append(dict(proof))
+
+    async def row_batch_handler(_model, rows):
+        return len(rows)
+
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", "1")
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        load_checkpoint,
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
+    monkeypatch.setattr(
+        importer,
+        "_save_pagination_checkpoint_completeness",
+        save_proof,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_caresource_unique_candidate_count",
+        AsyncMock(return_value=2),
+    )
+    return requested_urls, saved_checkpoints, saved_proofs, row_batch_handler
+
+
+def _assert_caresource_completion_metrics(fetch_result):
+    resource_stats_by_type: dict[str, dict[str, Any]] = {}
+    importer._record_resource_fetch_stats(
+        resource_stats_by_type,
+        "PractitionerRole",
+        fetch_result,
+    )
+    role_stats_by_name = resource_stats_by_type["PractitionerRole"]
+    assert role_stats_by_name["caresource_opaque_cursor_sources"] == 1
+    assert role_stats_by_name["caresource_opaque_cursor_verified_sources"] == 1
+    assert role_stats_by_name["caresource_opaque_cursor_pre_count"] == 2
+    assert role_stats_by_name["caresource_opaque_cursor_processed_rows"] == 2
+    assert role_stats_by_name["caresource_opaque_cursor_unique_candidate_rows"] == 2
+    assert role_stats_by_name["caresource_opaque_cursor_post_count"] == 2
+
+
+def _assert_caresource_checkpoint_proofs(saved_proofs):
+    assert saved_proofs == [
+        {
+            "strategy_version": importer.CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
+            "verified": False,
+            "pre_count": 2,
+        },
+        {
+            "strategy_version": importer.CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
+            "verified": True,
+            "pre_count": 2,
+            "post_count": 2,
+            "processed_rows": 2,
+            "unique_candidate_rows": 2,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_caresource_opaque_cursor_scan_reconciles_and_checkpoints_terminal(
+    monkeypatch,
+):
+    """Complete only after opaque pagination and exact pre/post staging proof."""
+    source_lookup = {
+        "source_id": "caresource_source",
+        "api_base": importer.CARESOURCE_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.CARESOURCE_PROVIDER_DIRECTORY_BASE,
+    }
+    start_url = (
+        f"{importer.CARESOURCE_PROVIDER_DIRECTORY_BASE}/PractitionerRole?_count=1000"
+    )
+    next_url = (
+        f"{importer.CARESOURCE_PROVIDER_DIRECTORY_BASE}/PractitionerRole?"
+        "_count=1000&_searchId=opaque-cursor&_page=2"
+    )
+    requested_urls, saved_checkpoints, saved_proofs, row_batch_handler = (
+        _install_caresource_scan_callbacks(monkeypatch, start_url, next_url)
+    )
+
+    fetch_result = await importer._fetch_resource_rows(
+        source_lookup,
+        "PractitionerRole",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=row_batch_handler,
+        row_batch_size=1000,
+        retain_rows=False,
+        pagination_checkpoint=_caresource_checkpoint_context(),
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.fetch_mode == importer.CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+    assert fetch_result.rows_fetched == 2
+    assert fetch_result.rows_written == 2
+    assert fetch_result.pages_fetched == 2
+    assert requested_urls == [
+        importer._caresource_census_url(start_url),
+        start_url,
+        next_url,
+        importer._caresource_census_url(start_url),
+    ]
+    assert saved_checkpoints[-1]["next_url"] is None
+    assert saved_checkpoints[-1]["rows_processed"] == 2
+    _assert_caresource_checkpoint_proofs(saved_proofs)
+    _assert_caresource_completion_metrics(fetch_result)
+
+
+@pytest.mark.asyncio
+async def test_caresource_retry_reuses_persisted_pre_census(monkeypatch):
+    persisted_proof_by_field = {
+        "strategy_version": importer.CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
+        "verified": False,
+        "pre_count": 1828628,
+    }
+    fetch_census = AsyncMock()
+    monkeypatch.setattr(importer, "_fetch_caresource_census_count", fetch_census)
+
+    proof_by_field = await importer._prepare_caresource_pre_census(
+        {
+            "source_id": "caresource_source",
+            "api_base": importer.CARESOURCE_PROVIDER_DIRECTORY_BASE,
+        },
+        "PractitionerRole",
+        ProviderDirectoryPractitionerRole,
+        _caresource_checkpoint_context(),
+        importer.PaginationResumeState(
+            next_url="https://example.test/opaque",
+            pages_processed=1000,
+            rows_processed=1000000,
+            recent_url_hashes=(),
+            resumed=True,
+            completeness=persisted_proof_by_field,
+        ),
+        f"{importer.CARESOURCE_PROVIDER_DIRECTORY_BASE}/PractitionerRole?_count=1000",
+        timeout=3,
+    )
+
+    assert proof_by_field == persisted_proof_by_field
+    fetch_census.assert_not_awaited()
+
+
+def test_caresource_pre_census_round_trips_from_checkpoint_row():
+    context = _caresource_checkpoint_context()
+    start_url_hash = "start-hash"
+    proof_by_field = {
+        "strategy_version": importer.CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
+        "verified": False,
+        "pre_count": 1828628,
+    }
+    checkpoint_by_field = {
+        "dataset_id": context.dataset_id,
+        "source_ids": list(context.source_ids),
+        "acquisition_root_run_id": context.acquisition_root_run_id,
+        "owner_run_id": context.owner_run_id,
+        "start_url_hash": start_url_hash,
+        "next_url": "https://example.test/opaque",
+        "state": importer.PAGINATION_CHECKPOINT_ACTIVE,
+        "pages_processed": 1000,
+        "rows_processed": 1000000,
+        "recent_cursor_hashes": ["cursor-hash"],
+        "completeness_json": proof_by_field,
+    }
+
+    resume_state = importer._compatible_pagination_resume_state(
+        checkpoint_by_field,
+        context,
+        start_url_hash,
+    )
+
+    assert resume_state is not None
+    assert resume_state.completeness == proof_by_field
+    assert resume_state.rows_processed == 1000000
+
+
+def test_caresource_terminal_proof_failure_cannot_enter_resume_queue():
+    diagnostic_by_field = {
+        "fetch_mode": importer.CARESOURCE_OPAQUE_CURSOR_FETCH_MODE,
+        "error": (
+            f"{importer.CARESOURCE_OPAQUE_CURSOR_BLOCKED_ERROR}:cursor_loss"
+        ),
+    }
+
+    with pytest.raises(RuntimeError, match="cursor_loss"):
+        importer._handle_incomplete_source_pagination(
+            {"_pagination_checkpoint_context": _caresource_checkpoint_context()},
+            {"PractitionerRole": diagnostic_by_field},
+            ["PractitionerRole"],
+            set(),
+            True,
+        )
 
 
 def test_pagination_checkpoint_mode_requires_acquisition_only():

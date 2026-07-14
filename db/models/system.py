@@ -1351,6 +1351,7 @@ class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
     pages_processed = Column(BigInteger, nullable=False, default=0)
     rows_processed = Column(BigInteger, nullable=False, default=0)
     recent_cursor_hashes = Column(JSON, nullable=False, default=list)
+    completeness_json = Column(JSON, nullable=False, default=dict)
     created_at = Column(TIMESTAMP, nullable=False)
     updated_at = Column(TIMESTAMP, nullable=False)
     completed_at = Column(TIMESTAMP)

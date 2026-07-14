@@ -76,6 +76,7 @@ from process.ext.address_canon import resolve_into_archive
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import ensure_database
 from process.provider_directory_time_partition import (
+    CountKind,
     CountObservation,
     PartitionPlan,
     PartitionPlanError,
@@ -712,6 +713,16 @@ CARESOURCE_PROVIDER_DIRECTORY_METADATA_URL = (
 CARESOURCE_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     {"InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location"}
 )
+CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION = (
+    "provider-directory-fhir-caresource-opaque-cursor-v1"
+)
+CARESOURCE_OPAQUE_CURSOR_FETCH_MODE = "caresource_opaque_cursor"
+CARESOURCE_OPAQUE_CURSOR_BLOCKED_ERROR = (
+    "provider_directory_caresource_opaque_cursor_completeness_blocked"
+)
+CARESOURCE_OPAQUE_CURSOR_RETRYABLE_ERROR = (
+    "provider_directory_caresource_opaque_cursor_completeness_retryable"
+)
 EXPECTED_NONEMPTY_RESOURCE_ERROR = (
     "provider_directory_expected_nonempty_resource_returned_zero_rows"
 )
@@ -881,6 +892,7 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
     (UHC_PROVIDER_DIRECTORY_BASE, "InsurancePlan"): 1,
 }
 PREFERRED_FULL_REFRESH_PAGE_COUNT_BY_BASE = {
+    CARESOURCE_PROVIDER_DIRECTORY_BASE: 1000,
     HAP_PROVIDER_DIRECTORY_BASE: 1000,
 }
 SOURCE_REQUEST_INTERVAL_SECONDS_BY_BASE = {
@@ -1375,6 +1387,23 @@ class PaginationResumeState:
     recent_url_hashes: tuple[str, ...]
     complete: bool = False
     resumed: bool = False
+    completeness: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CareSourceCensusFetch:
+    count: int | None
+    error: str | None = None
+    transient: bool = False
+    retry_not_before: str | None = None
+
+
+@dataclass(frozen=True)
+class CareSourceOpaqueCursorOutcome:
+    proof: dict[str, Any]
+    error: str | None = None
+    retryable: bool = False
+    retry_not_before: str | None = None
 
 
 @dataclass
@@ -23363,6 +23392,291 @@ async def _fetch_last_updated_partition_resource_rows(
     )
 
 
+def _is_caresource_opaque_cursor_census(
+    source_record: dict[str, Any],
+    checkpoint_context: PaginationCheckpointContext | None,
+) -> bool:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    return bool(
+        checkpoint_context is not None
+        and checkpoint_context.dataset_id
+        and api_base == CARESOURCE_PROVIDER_DIRECTORY_BASE
+    )
+
+
+def _caresource_census_url(start_url: str) -> str:
+    parsed = urllib.parse.urlsplit(start_url)
+    removed_names = {
+        "_count",
+        "_page",
+        "_searchid",
+        "_summary",
+        "_total",
+    }
+    query_items = [
+        (name, value)
+        for name, value in urllib.parse.parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        )
+        if name.lower() not in removed_names
+    ]
+    query_items.append(("_summary", "count"))
+    return urllib.parse.urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urllib.parse.urlencode(query_items, doseq=True),
+            parsed.fragment,
+        )
+    )
+
+
+async def _fetch_caresource_census_count(
+    source_record: dict[str, Any],
+    start_url: str,
+    *,
+    timeout: int,
+) -> CareSourceCensusFetch:
+    census_url = _caresource_census_url(start_url)
+    status_code, response_payload, fetch_error, _elapsed = await _fetch_source_json(
+        source_record,
+        census_url,
+        timeout=timeout,
+    )
+    if status_code != 200 or fetch_error:
+        failure_detail = fetch_error or f"http_{status_code}"
+        is_transient = _is_transient_source_fetch_failure(status_code, fetch_error)
+        return CareSourceCensusFetch(
+            count=None,
+            error=failure_detail,
+            transient=is_transient,
+            retry_not_before=(
+                _last_updated_partition_retry_not_before(
+                    source_record,
+                    census_url,
+                    status_code,
+                    response_payload,
+                    fetch_error,
+                )
+                if is_transient
+                else None
+            ),
+        )
+    count_fetch = _validate_last_updated_partition_count_payload(response_payload)
+    observation = count_fetch.observation
+    if observation is None or observation.kind is not CountKind.EXACT:
+        return CareSourceCensusFetch(
+            count=None,
+            error=count_fetch.error or "count_not_exact",
+        )
+    return CareSourceCensusFetch(count=observation.count)
+
+
+def _caresource_proof_error_result(
+    model: type,
+    proof_by_field: dict[str, Any],
+    error: str,
+    *,
+    rows_processed: int,
+    pages_processed: int,
+    retryable: bool,
+    retry_not_before: str | None = None,
+) -> ResourceFetchResult:
+    error_prefix = (
+        CARESOURCE_OPAQUE_CURSOR_RETRYABLE_ERROR
+        if retryable
+        else CARESOURCE_OPAQUE_CURSOR_BLOCKED_ERROR
+    )
+    return ResourceFetchResult(
+        model=model,
+        rows=[],
+        rows_fetched=rows_processed,
+        rows_written=0,
+        pages_fetched=pages_processed,
+        complete=False,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=retryable,
+        error=f"{error_prefix}:{error}",
+        fetch_mode=CARESOURCE_OPAQUE_CURSOR_FETCH_MODE,
+        retry_not_before=retry_not_before,
+        fetch_diagnostic=proof_by_field,
+    )
+
+
+def _caresource_persisted_pre_count(
+    completeness: dict[str, Any],
+) -> tuple[int | None, str | None]:
+    if not completeness:
+        return None, None
+    if (
+        completeness.get("strategy_version")
+        != CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION
+    ):
+        return None, "checkpoint_strategy_mismatch"
+    pre_count = completeness.get("pre_count")
+    if isinstance(pre_count, bool) or not isinstance(pre_count, int) or pre_count < 0:
+        return None, "checkpoint_pre_count_invalid"
+    return pre_count, None
+
+
+async def _prepare_caresource_pre_census(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    checkpoint_context: PaginationCheckpointContext,
+    resume_state: PaginationResumeState,
+    start_url: str,
+    *,
+    timeout: int,
+) -> dict[str, Any] | ResourceFetchResult:
+    persisted_pre_count, persisted_error = _caresource_persisted_pre_count(
+        resume_state.completeness
+    )
+    if persisted_error:
+        return _caresource_proof_error_result(
+            model,
+            dict(resume_state.completeness),
+            persisted_error,
+            rows_processed=resume_state.rows_processed,
+            pages_processed=resume_state.pages_processed,
+            retryable=False,
+        )
+    if persisted_pre_count is not None:
+        return dict(resume_state.completeness)
+    census_fetch = await _fetch_caresource_census_count(
+        source_record,
+        start_url,
+        timeout=timeout,
+    )
+    if census_fetch.count is None:
+        proof_by_field = {
+            "strategy_version": CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
+            "verified": False,
+        }
+        return _caresource_proof_error_result(
+            model,
+            proof_by_field,
+            f"pre_census_{census_fetch.error or 'failed'}",
+            rows_processed=resume_state.rows_processed,
+            pages_processed=resume_state.pages_processed,
+            retryable=census_fetch.transient,
+            retry_not_before=census_fetch.retry_not_before,
+        )
+    proof_by_field = {
+        "strategy_version": CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
+        "verified": False,
+        "pre_count": census_fetch.count,
+    }
+    await _save_pagination_checkpoint_completeness(
+        checkpoint_context,
+        resource_type,
+        proof_by_field,
+    )
+    return proof_by_field
+
+
+async def _caresource_unique_candidate_count(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+) -> int:
+    if not context.dataset_id:
+        raise RuntimeError("provider_directory_caresource_dataset_id_missing")
+    count_row = await db.first(
+        f"""
+        SELECT COUNT(*) AS unique_candidate_rows
+          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND resource_type = :resource_type;
+        """,
+        dataset_id=context.dataset_id,
+        resource_type=resource_type,
+    )
+    count_map = _pagination_checkpoint_row_mapping(count_row)
+    return int(count_map.get("unique_candidate_rows") or 0)
+
+
+def _caresource_proof_failure(proof_by_field: dict[str, Any]) -> str | None:
+    pre_count = proof_by_field["pre_count"]
+    post_count = proof_by_field["post_count"]
+    rows_processed = proof_by_field["processed_rows"]
+    unique_candidate_rows = proof_by_field["unique_candidate_rows"]
+    if post_count != pre_count:
+        return "census_drift"
+    if rows_processed < pre_count:
+        return "cursor_loss"
+    if rows_processed != unique_candidate_rows:
+        return "duplicate_resource_ids"
+    if rows_processed != pre_count:
+        return "processed_count_mismatch"
+    if unique_candidate_rows != pre_count:
+        return "candidate_count_mismatch"
+    return None
+
+
+async def _finish_caresource_opaque_cursor_census(
+    source_record: dict[str, Any],
+    resource_type: str,
+    checkpoint_context: PaginationCheckpointContext,
+    start_url: str,
+    proof_by_field: dict[str, Any],
+    *,
+    timeout: int,
+    rows_processed: int,
+) -> CareSourceOpaqueCursorOutcome:
+    post_census = await _fetch_caresource_census_count(
+        source_record,
+        start_url,
+        timeout=timeout,
+    )
+    if post_census.count is None:
+        failed_proof_by_field = {
+            **proof_by_field,
+            "verified": False,
+            "processed_rows": rows_processed,
+        }
+        await _save_pagination_checkpoint_completeness(
+            checkpoint_context,
+            resource_type,
+            failed_proof_by_field,
+        )
+        return CareSourceOpaqueCursorOutcome(
+            proof=failed_proof_by_field,
+            error=f"post_census_{post_census.error or 'failed'}",
+            retryable=post_census.transient,
+            retry_not_before=post_census.retry_not_before,
+        )
+    unique_candidate_rows = await _caresource_unique_candidate_count(
+        checkpoint_context,
+        resource_type,
+    )
+    completed_proof_by_field = {
+        **proof_by_field,
+        "post_count": post_census.count,
+        "processed_rows": rows_processed,
+        "unique_candidate_rows": unique_candidate_rows,
+        "verified": False,
+    }
+    proof_failure = _caresource_proof_failure(completed_proof_by_field)
+    completed_proof_by_field["verified"] = proof_failure is None
+    if proof_failure:
+        completed_proof_by_field["failure"] = proof_failure
+    await _save_pagination_checkpoint_completeness(
+        checkpoint_context,
+        resource_type,
+        completed_proof_by_field,
+    )
+    return CareSourceOpaqueCursorOutcome(
+        proof=completed_proof_by_field,
+        error=proof_failure,
+    )
+
+
 async def _fetch_resource_rows(
     source_record: dict[str, Any],
     resource_type: str,
@@ -23553,7 +23867,40 @@ async def _fetch_resource_rows(
         if checkpoint_context and checkpoint_start_url
         else None
     )
+    is_caresource_census_enabled = _is_caresource_opaque_cursor_census(
+        source_record,
+        checkpoint_context,
+    )
+    caresource_proof_by_field: dict[str, Any] | None = None
+    if is_caresource_census_enabled:
+        assert checkpoint_context is not None
+        assert checkpoint_start_url is not None
+        assert resume_state is not None
+        prepared_census = await _prepare_caresource_pre_census(
+            source_record,
+            resource_type,
+            model,
+            checkpoint_context,
+            resume_state,
+            checkpoint_start_url,
+            timeout=resource_timeout,
+        )
+        if isinstance(prepared_census, ResourceFetchResult):
+            return prepared_census
+        caresource_proof_by_field = prepared_census
     if resume_state and resume_state.complete:
+        if is_caresource_census_enabled and (
+            not caresource_proof_by_field
+            or caresource_proof_by_field.get("verified") is not True
+        ):
+            return _caresource_proof_error_result(
+                model,
+                caresource_proof_by_field or {},
+                "checkpoint_completion_proof_missing",
+                rows_processed=resume_state.rows_processed,
+                pages_processed=resume_state.pages_processed,
+                retryable=False,
+            )
         return ResourceFetchResult(
             model=model,
             rows=[],
@@ -23565,7 +23912,12 @@ async def _fetch_resource_rows(
             page_limit_reached=False,
             hard_page_limit_reached=False,
             next_url_remaining=False,
-            fetch_mode="checkpoint_complete",
+            fetch_mode=(
+                CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+                if is_caresource_census_enabled
+                else "checkpoint_complete"
+            ),
+            fetch_diagnostic=caresource_proof_by_field,
         )
     retained_resource_rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
@@ -23846,7 +24198,10 @@ async def _fetch_resource_rows(
                 and _pagination_url_identity(resolved_next_url) == request_identity
             ):
                 resolved_next_url = None
-            if checkpoint_context:
+            defer_caresource_terminal_checkpoint = bool(
+                is_caresource_census_enabled and resolved_next_url is None
+            )
+            if checkpoint_context and not defer_caresource_terminal_checkpoint:
                 await flush_pending_rows()
                 recent_url_hashes.append(request_url_hash)
                 recent_url_hashes = recent_url_hashes[
@@ -23875,6 +24230,48 @@ async def _fetch_resource_rows(
         ):
             break
     await flush_pending_rows()
+    caresource_outcome: CareSourceOpaqueCursorOutcome | None = None
+    has_reached_unbounded_terminal_page = (
+        not error_message
+        and not has_reached_row_limit
+        and not has_reached_page_limit
+        and not has_reached_hard_page_limit
+        and not is_deadline_reached
+        and not url
+        and not pending_start_urls
+    )
+    if is_caresource_census_enabled and has_reached_unbounded_terminal_page:
+        assert checkpoint_context is not None
+        assert checkpoint_start_url is not None
+        assert caresource_proof_by_field is not None
+        caresource_outcome = await _finish_caresource_opaque_cursor_census(
+            source_record,
+            resource_type,
+            checkpoint_context,
+            checkpoint_start_url,
+            caresource_proof_by_field,
+            timeout=resource_timeout,
+            rows_processed=rows_fetched,
+        )
+        caresource_proof_by_field = caresource_outcome.proof
+        if caresource_outcome.error:
+            error_prefix = (
+                CARESOURCE_OPAQUE_CURSOR_RETRYABLE_ERROR
+                if caresource_outcome.retryable
+                else CARESOURCE_OPAQUE_CURSOR_BLOCKED_ERROR
+            )
+            error_message = f"{error_prefix}:{caresource_outcome.error}"
+            has_next_url = caresource_outcome.retryable
+            retry_not_before = caresource_outcome.retry_not_before
+        else:
+            await _save_pagination_checkpoint(
+                checkpoint_context,
+                resource_type,
+                next_url=None,
+                pages_processed=pages,
+                rows_processed=rows_fetched,
+                recent_url_hashes=recent_url_hashes,
+            )
     if (
         not error_message
         and not has_reached_row_limit
@@ -23906,10 +24303,14 @@ async def _fetch_resource_rows(
         hard_page_limit_reached=has_reached_hard_page_limit,
         next_url_remaining=has_next_url or bool(url) or bool(pending_start_urls),
         error=error_message or ("deadline_reached" if is_deadline_reached else None),
-        fetch_mode="checkpointed_paged" if checkpoint_context else "paged",
+        fetch_mode=(
+            CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+            if is_caresource_census_enabled
+            else ("checkpointed_paged" if checkpoint_context else "paged")
+        ),
         deadline_reached=is_deadline_reached,
         retry_not_before=retry_not_before,
-        fetch_diagnostic=fetch_diagnostic,
+        fetch_diagnostic=caresource_proof_by_field or fetch_diagnostic,
         pagination_cooldown_retries=pagination_cooldown_retries,
         pagination_cooldown_wait_seconds=pagination_cooldown_wait_seconds,
         is_pagination_cooldown_recovered=is_pagination_cooldown_recovered,
@@ -25426,6 +25827,12 @@ def _empty_resource_stats() -> dict[str, Any]:
         "last_updated_staged_candidate_count": 0,
         "last_updated_ranged_root_post": 0,
         "last_updated_unfiltered_post": 0,
+        "caresource_opaque_cursor_sources": 0,
+        "caresource_opaque_cursor_verified_sources": 0,
+        "caresource_opaque_cursor_pre_count": 0,
+        "caresource_opaque_cursor_processed_rows": 0,
+        "caresource_opaque_cursor_unique_candidate_rows": 0,
+        "caresource_opaque_cursor_post_count": 0,
     }
 
 
@@ -25519,6 +25926,28 @@ def _record_last_updated_partition_stats(
             resource_stats[f"last_updated_{proof_field}"] += proof_value
 
 
+def _record_caresource_opaque_cursor_stats(
+    resource_stats: dict[str, Any],
+    fetch_result: ResourceFetchResult,
+) -> None:
+    if fetch_result.fetch_mode != CARESOURCE_OPAQUE_CURSOR_FETCH_MODE:
+        return
+    resource_stats["caresource_opaque_cursor_sources"] += 1
+    proof = fetch_result.fetch_diagnostic
+    if not isinstance(proof, dict) or proof.get("verified") is not True:
+        return
+    resource_stats["caresource_opaque_cursor_verified_sources"] += 1
+    for proof_field in (
+        "pre_count",
+        "processed_rows",
+        "unique_candidate_rows",
+        "post_count",
+    ):
+        proof_value = proof.get(proof_field)
+        if isinstance(proof_value, int) and not isinstance(proof_value, bool):
+            resource_stats[f"caresource_opaque_cursor_{proof_field}"] += proof_value
+
+
 def _record_resource_fetch_stats(
     resource_stats_by_type: dict[str, dict[str, Any]],
     resource_type: str,
@@ -25545,6 +25974,7 @@ def _record_resource_fetch_stats(
     if fetch_result.complete and fetch_result.rows_fetched == 0:
         resource_stats["sources_empty"] += 1
     _record_last_updated_partition_stats(resource_stats, fetch_result)
+    _record_caresource_opaque_cursor_stats(resource_stats, fetch_result)
     if fetch_result.fetch_mode in {"bulk_export", "checkpointed_bulk_export"}:
         resource_stats["bulk_export_sources"] += 1
     if bulk_export_selection in {
@@ -25610,12 +26040,21 @@ def _resource_fetch_diagnostic(
         "retry_not_before": fetch_result.retry_not_before,
         "source_fetch": (
             None
-            if fetch_result.fetch_mode == LAST_UPDATED_PARTITION_FETCH_MODE
+            if fetch_result.fetch_mode
+            in {
+                LAST_UPDATED_PARTITION_FETCH_MODE,
+                CARESOURCE_OPAQUE_CURSOR_FETCH_MODE,
+            }
             else fetch_result.fetch_diagnostic
         ),
         "last_updated_completeness": (
             fetch_result.fetch_diagnostic
             if fetch_result.fetch_mode == LAST_UPDATED_PARTITION_FETCH_MODE
+            else None
+        ),
+        "caresource_opaque_cursor_completeness": (
+            fetch_result.fetch_diagnostic
+            if fetch_result.fetch_mode == CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
             else None
         ),
         "pagination_cooldown_retries": fetch_result.pagination_cooldown_retries,
@@ -26298,6 +26737,35 @@ def _is_pagination_checkpoint_mode_enabled(
     )
 
 
+def _pagination_checkpoint_root_run_id(
+    run_id: str,
+    retry_of_run_id: str | None,
+    pagination_root_run_id: str | None,
+) -> str:
+    """Validate and return the immutable checkpoint acquisition root."""
+    if retry_of_run_id:
+        if not pagination_root_run_id:
+            raise ValueError("provider_directory_pagination_retry_root_missing")
+        return pagination_root_run_id
+    if pagination_root_run_id and pagination_root_run_id != run_id:
+        raise ValueError("provider_directory_pagination_fresh_root_mismatch")
+    return run_id
+
+
+def _pagination_checkpoint_strategy_version(
+    canonical_api_base: str | None,
+    last_updated_partition_config: dict[str, Any],
+) -> str:
+    """Select the checkpoint compatibility contract for one endpoint."""
+    if canonical_api_base == CARESOURCE_PROVIDER_DIRECTORY_BASE:
+        return CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION
+    if last_updated_partition_config:
+        return LAST_UPDATED_PARTITION_STRATEGY_VERSION
+    if canonical_api_base == UHC_PROVIDER_DIRECTORY_BASE:
+        return UHC_PLAN_GRAPH_STRATEGY_VERSION
+    return PAGINATION_CHECKPOINT_STRATEGY_VERSION
+
+
 def _pagination_checkpoint_context(
     source_record: dict[str, Any],
     source_ids: list[str],
@@ -26306,6 +26774,7 @@ def _pagination_checkpoint_context(
     retry_of_run_id: str | None,
     pagination_root_run_id: str | None = None,
 ) -> PaginationCheckpointContext | None:
+    """Build the durable acquisition identity for one checkpointed source group."""
     canonical_api_base = _canonical_base(
         source_record.get("canonical_api_base") or source_record.get("api_base")
     )
@@ -26319,20 +26788,15 @@ def _pagination_checkpoint_context(
     )
     if not run_id or not source_ids or not supports_checkpoint:
         return None
-    if retry_of_run_id:
-        if not pagination_root_run_id:
-            raise ValueError("provider_directory_pagination_retry_root_missing")
-        acquisition_root_run_id = pagination_root_run_id
-    else:
-        if pagination_root_run_id and pagination_root_run_id != run_id:
-            raise ValueError("provider_directory_pagination_fresh_root_mismatch")
-        acquisition_root_run_id = run_id
-    if last_updated_partition_config:
-        strategy_version = LAST_UPDATED_PARTITION_STRATEGY_VERSION
-    elif canonical_api_base == UHC_PROVIDER_DIRECTORY_BASE:
-        strategy_version = UHC_PLAN_GRAPH_STRATEGY_VERSION
-    else:
-        strategy_version = PAGINATION_CHECKPOINT_STRATEGY_VERSION
+    acquisition_root_run_id = _pagination_checkpoint_root_run_id(
+        run_id,
+        retry_of_run_id,
+        pagination_root_run_id,
+    )
+    strategy_version = _pagination_checkpoint_strategy_version(
+        canonical_api_base,
+        last_updated_partition_config,
+    )
     scope_payload_dict = {
         "strategy_version": strategy_version,
         "source_ids": sorted(set(source_ids)),
@@ -27350,7 +27814,8 @@ async def _fetch_pagination_checkpoint(
         f"""
         SELECT dataset_id, source_ids, acquisition_root_run_id, owner_run_id,
                retry_of_run_id, start_url_hash, next_url, state,
-               pages_processed, rows_processed, recent_cursor_hashes
+               pages_processed, rows_processed, recent_cursor_hashes,
+               completeness_json
           FROM {_pagination_checkpoint_table_ref()}
          WHERE canonical_api_base = :canonical_api_base
            AND resource_type = :resource_type
@@ -27390,6 +27855,7 @@ def _compatible_pagination_resume_state(
         ),
         complete=is_complete,
         resumed=True,
+        completeness=_json_object(checkpoint.get("completeness_json")),
     )
 
 
@@ -27451,6 +27917,10 @@ def _pagination_checkpoint_observation_params(
         "observed_cursor_hashes": json.dumps(
             _json_text_list(checkpoint.get("recent_cursor_hashes"))
         ),
+        "observed_completeness": json.dumps(
+            _json_object(checkpoint.get("completeness_json")),
+            sort_keys=True,
+        ),
     }
 
 
@@ -27475,7 +27945,8 @@ def _pagination_checkpoint_adoption_sql() -> str:
            AND state = :observed_state
            AND pages_processed = :observed_pages_processed
            AND rows_processed = :observed_rows_processed
-           AND recent_cursor_hashes::jsonb = CAST(:observed_cursor_hashes AS jsonb);
+           AND recent_cursor_hashes::jsonb = CAST(:observed_cursor_hashes AS jsonb)
+           AND completeness_json::jsonb = CAST(:observed_completeness AS jsonb);
         """
 
 
@@ -27534,13 +28005,14 @@ def _pagination_checkpoint_reset_sql() -> str:
         source_ids, acquisition_root_run_id, owner_run_id, retry_of_run_id,
         start_url_hash,
         next_url, state, pages_processed, rows_processed,
-        recent_cursor_hashes, created_at, updated_at, completed_at
+        recent_cursor_hashes, completeness_json,
+        created_at, updated_at, completed_at
     ) VALUES (
         :canonical_api_base, :resource_type, :source_scope_hash, :dataset_id,
         CAST(:source_ids AS jsonb), :acquisition_root_run_id,
         :owner_run_id, :retry_of_run_id,
         :start_url_hash, :next_url, :state, 0, 0,
-        '[]'::jsonb, now(), now(), NULL
+        '[]'::jsonb, '{{}}'::jsonb, now(), now(), NULL
     )
     ON CONFLICT (
         canonical_api_base, resource_type, source_scope_hash,
@@ -27558,6 +28030,7 @@ def _pagination_checkpoint_reset_sql() -> str:
         pages_processed = 0,
         rows_processed = 0,
         recent_cursor_hashes = '[]'::jsonb,
+        completeness_json = '{{}}'::jsonb,
         created_at = now(),
         updated_at = now(),
         completed_at = NULL;
@@ -27641,7 +28114,8 @@ def _empty_pagination_checkpoint_restart_sql() -> str:
            AND state = :active_state
            AND pages_processed = 0
            AND rows_processed = 0
-           AND recent_cursor_hashes::jsonb = CAST(:observed_cursor_hashes AS jsonb);
+           AND recent_cursor_hashes::jsonb = CAST(:observed_cursor_hashes AS jsonb)
+           AND completeness_json::jsonb = CAST(:observed_completeness AS jsonb);
         """
 
 
@@ -27782,6 +28256,33 @@ async def _save_pagination_checkpoint(
         raise RuntimeError("provider_directory_pagination_checkpoint_ownership_lost")
 
 
+async def _save_pagination_checkpoint_completeness(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    completeness: dict[str, Any],
+) -> None:
+    updated = await db.status(
+        f"""
+        UPDATE {_pagination_checkpoint_table_ref()}
+           SET completeness_json = CAST(:completeness AS jsonb),
+               updated_at = now()
+         WHERE canonical_api_base = :canonical_api_base
+           AND resource_type = :resource_type
+           AND source_scope_hash = :source_scope_hash
+           AND acquisition_root_run_id = :acquisition_root_run_id
+           AND owner_run_id = :owner_run_id;
+        """,
+        completeness=json.dumps(completeness, sort_keys=True),
+        canonical_api_base=context.canonical_api_base,
+        resource_type=resource_type,
+        source_scope_hash=context.source_scope_hash,
+        acquisition_root_run_id=context.acquisition_root_run_id,
+        owner_run_id=context.owner_run_id,
+    )
+    if _coerce_rowcount(updated) <= 0:
+        raise RuntimeError("provider_directory_pagination_checkpoint_ownership_lost")
+
+
 async def _clear_pagination_checkpoints(
     context: PaginationCheckpointContext,
     resource_types: list[str],
@@ -27827,6 +28328,27 @@ def _last_updated_partition_terminal_failure_details(
     )
 
 
+def _caresource_terminal_failure_details(
+    diagnostics_by_resource: dict[str, dict[str, Any]],
+    incomplete_resource_types: list[str],
+) -> str | None:
+    terminal_resource_types = [
+        resource_type
+        for resource_type in incomplete_resource_types
+        if diagnostics_by_resource[resource_type].get("fetch_mode")
+        == CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+        and str(
+            diagnostics_by_resource[resource_type].get("error") or ""
+        ).startswith(CARESOURCE_OPAQUE_CURSOR_BLOCKED_ERROR)
+    ]
+    if not terminal_resource_types:
+        return None
+    return ",".join(
+        f"{resource_type}={diagnostics_by_resource[resource_type].get('error')}"
+        for resource_type in terminal_resource_types
+    )
+
+
 def _handle_incomplete_source_pagination(
     source_record: dict[str, Any],
     diagnostics_by_resource: dict[str, dict[str, Any]],
@@ -27840,6 +28362,12 @@ def _handle_incomplete_source_pagination(
     )
     if terminal_failure_details:
         raise RuntimeError(terminal_failure_details)
+    caresource_failure = _caresource_terminal_failure_details(
+        diagnostics_by_resource,
+        incomplete_resource_types,
+    )
+    if caresource_failure:
+        raise RuntimeError(caresource_failure)
     graph_failures = [
         resource_type
         for resource_type in incomplete_resource_types
