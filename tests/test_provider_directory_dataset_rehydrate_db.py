@@ -118,6 +118,12 @@ async def _create_fixture_tables(database: Database, schema: str) -> None:
                 model, schema, model.__tablename__
             )
         )
+        for primary_key_statement in importer._artifact_scope_pk_sql(
+            model,
+            schema,
+            model.__tablename__,
+        ):
+            await database.status(primary_key_statement)
 
 
 async def _insert_fixture(database: Database, schema: str) -> None:
