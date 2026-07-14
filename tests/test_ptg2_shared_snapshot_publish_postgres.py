@@ -226,7 +226,13 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
     )
     monkeypatch.setenv("HLTHPRT_PTG2_BINARY_IDS", "true")
     monkeypatch.setenv("HLTHPRT_PTG2_RUST_SCANNER_BIN", str(scanner_binary))
-    monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_MEMORY_RECORDS", "1")
+    monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_WORKERS", "1")
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES", "67108864"
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_V3_FINALIZER_TOTAL_SORT_MEMORY_BYTES", "16777216"
+    )
     monkeypatch.setenv("HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION", "none")
     monkeypatch.setenv("HLTHPRT_PTG2_SERVING_BINARY_BLOCK_BYTES", "65536")
 

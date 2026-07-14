@@ -7,10 +7,26 @@ import asyncio
 import hashlib
 import json
 import os
+import resource
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from process.ptg_parts.config import (
+    PTG2_V3_FINALIZER_CONFIGURED_MEMORY_DENOMINATOR,
+    PTG2_V3_FINALIZER_CONFIGURED_MEMORY_NUMERATOR,
+    PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES_ENV,
+    PTG2_V3_FINALIZER_LEGACY_MEMORY_RECORDS_ENV,
+    PTG2_V3_FINALIZER_MAX_IDENTITY_MAP_MAX_BYTES,
+    PTG2_V3_FINALIZER_MAX_TOTAL_SORT_MEMORY_BYTES,
+    PTG2_V3_FINALIZER_MAX_WORKERS,
+    PTG2_V3_FINALIZER_MIN_IDENTITY_MAP_MAX_BYTES,
+    PTG2_V3_FINALIZER_MIN_SORT_MEMORY_BYTES_PER_WORKER,
+    PTG2_V3_FINALIZER_MIN_UNBUDGETED_MEMORY_BYTES,
+    PTG2_V3_FINALIZER_TOTAL_SORT_MEMORY_BYTES_ENV,
+    PTG2_V3_FINALIZER_WORKERS_ENV,
+)
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_COLD_LOOKUP_CONTRACT,
     PTG2_V3_SHARED_BLOCK_LAYOUT,
@@ -26,7 +42,7 @@ from process.ptg_parts.rust_scanner import _ptg2_rust_scanner_binary
 
 
 PTG2_V3_FINALIZER_FORMAT = "ptg2_v3_direct_finalizer_v3"
-PTG2_V3_FINALIZER_MEMORY_RECORDS_ENV = "HLTHPRT_PTG2_V3_FINALIZER_MEMORY_RECORDS"
+PTG2_V3_FINALIZER_RESOURCE_CONTRACT = "ptg2_v3_finalizer_resources_v1"
 PTG2_V3_SERVING_RUN_FORMAT = "ptg2_v3_serving_run"
 PTG2_V3_SERVING_RUN_VERSION = 1
 PTG2_V3_SERVING_RUN_RECORD_BYTES = 52
@@ -63,6 +79,226 @@ _FINALIZER_BLOCK_KINDS = {
     ),
     "price_dictionary": frozenset({"by_code_price_dictionary"}),
 }
+_FINALIZER_RESOURCE_CONFIGURATION_FIELDS = frozenset(
+    {
+        "contract",
+        "workers",
+        "identity_map_max_bytes",
+        "total_sort_memory_bytes",
+        "sort_memory_scope",
+    }
+)
+_FINALIZER_SORT_MEMORY_SCOPE = "process_total_across_workers_v1"
+_MIB = 1024 * 1024
+_CGROUP_MEMORY_LIMIT_PATHS = (
+    Path("/sys/fs/cgroup/memory.max"),
+    Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+)
+_PRACTICALLY_UNLIMITED_BYTES = 1 << 60
+
+
+@dataclass(frozen=True, slots=True)
+class V3FinalizerResourceConfiguration:
+    """Validated process-wide resource limits for one strict V3 finalizer."""
+
+    workers: int
+    identity_map_max_bytes: int
+    total_sort_memory_bytes: int
+    process_memory_limit_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        _validate_v3_finalizer_resource_configuration(self)
+
+    def command_arguments(self) -> tuple[str, ...]:
+        """Return the unambiguous Rust CLI resource contract."""
+
+        return (
+            "--workers",
+            str(self.workers),
+            "--identity-map-max-bytes",
+            str(self.identity_map_max_bytes),
+            "--total-sort-memory-bytes",
+            str(self.total_sort_memory_bytes),
+        )
+
+    def contract_metadata(self) -> dict[str, Any]:
+        """Return values Rust must echo to prove it honored the invocation."""
+
+        return {
+            "contract": PTG2_V3_FINALIZER_RESOURCE_CONTRACT,
+            "workers": self.workers,
+            "identity_map_max_bytes": self.identity_map_max_bytes,
+            "total_sort_memory_bytes": self.total_sort_memory_bytes,
+            "sort_memory_scope": _FINALIZER_SORT_MEMORY_SCOPE,
+        }
+
+    def validation_metadata(self) -> dict[str, Any]:
+        """Return wrapper-side evidence suitable for progress and reports."""
+
+        return {
+            "configured_memory_budget_bytes": (
+                self.identity_map_max_bytes + self.total_sort_memory_bytes
+            ),
+            "sort_memory_bytes_per_worker": (
+                self.total_sort_memory_bytes // self.workers
+            ),
+            "finite_process_memory_limit_bytes": self.process_memory_limit_bytes,
+            "configured_memory_limit_fraction": (
+                f"{PTG2_V3_FINALIZER_CONFIGURED_MEMORY_NUMERATOR}/"
+                f"{PTG2_V3_FINALIZER_CONFIGURED_MEMORY_DENOMINATOR}"
+            ),
+        }
+
+
+def _required_positive_decimal_env(name: str) -> int:
+    raw_value = os.getenv(name)
+    normalized = str(raw_value or "").strip()
+    if raw_value is None or not normalized:
+        raise RuntimeError(f"strict V3 finalization requires {name}")
+    if (
+        not normalized.isascii()
+        or not normalized.isdecimal()
+        or normalized.startswith("0")
+    ):
+        raise RuntimeError(f"invalid {name}={raw_value!r}; expected a positive decimal")
+    return int(normalized)
+
+
+def _finite_process_memory_limit_bytes() -> int | None:
+    limits: list[int] = []
+    for path in _CGROUP_MEMORY_LIMIT_PATHS:
+        try:
+            raw_value = path.read_text(encoding="ascii").strip()
+        except (FileNotFoundError, OSError, UnicodeError):
+            continue
+        if not raw_value or raw_value == "max":
+            continue
+        try:
+            value = int(raw_value)
+        except ValueError:
+            continue
+        if 0 < value < _PRACTICALLY_UNLIMITED_BYTES:
+            limits.append(value)
+
+    try:
+        address_space_limit, _ = resource.getrlimit(resource.RLIMIT_AS)
+    except (AttributeError, OSError, ValueError):
+        address_space_limit = resource.RLIM_INFINITY
+    if (
+        address_space_limit != resource.RLIM_INFINITY
+        and 0 < address_space_limit < _PRACTICALLY_UNLIMITED_BYTES
+    ):
+        limits.append(int(address_space_limit))
+    return min(limits) if limits else None
+
+
+def _validate_v3_finalizer_resource_configuration(
+    configuration: V3FinalizerResourceConfiguration,
+) -> None:
+    """Validate static bounds and finite process-memory headroom."""
+
+    _validate_finalizer_resource_bounds(configuration)
+    _validate_finalizer_process_headroom(configuration)
+
+
+def _validate_finalizer_resource_bounds(
+    configuration: V3FinalizerResourceConfiguration,
+) -> None:
+    """Reject resource values that cannot form a bounded worker allocation."""
+
+    workers = configuration.workers
+    identity_bytes = configuration.identity_map_max_bytes
+    sort_bytes = configuration.total_sort_memory_bytes
+    if (
+        type(workers) is not int
+        or not 1 <= workers <= PTG2_V3_FINALIZER_MAX_WORKERS
+    ):
+        raise RuntimeError(
+            f"{PTG2_V3_FINALIZER_WORKERS_ENV} must be between 1 and "
+            f"{PTG2_V3_FINALIZER_MAX_WORKERS}"
+        )
+    if (
+        type(identity_bytes) is not int
+        or not PTG2_V3_FINALIZER_MIN_IDENTITY_MAP_MAX_BYTES
+        <= identity_bytes
+        <= PTG2_V3_FINALIZER_MAX_IDENTITY_MAP_MAX_BYTES
+        or identity_bytes % _MIB
+    ):
+        raise RuntimeError(
+            f"{PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES_ENV} must be a MiB-aligned "
+            f"value between {PTG2_V3_FINALIZER_MIN_IDENTITY_MAP_MAX_BYTES} and "
+            f"{PTG2_V3_FINALIZER_MAX_IDENTITY_MAP_MAX_BYTES}"
+        )
+    minimum_sort_bytes = (
+        workers * PTG2_V3_FINALIZER_MIN_SORT_MEMORY_BYTES_PER_WORKER
+    )
+    if (
+        type(sort_bytes) is not int
+        or sort_bytes < minimum_sort_bytes
+        or sort_bytes > PTG2_V3_FINALIZER_MAX_TOTAL_SORT_MEMORY_BYTES
+        or sort_bytes % (workers * _MIB)
+    ):
+        raise RuntimeError(
+            f"{PTG2_V3_FINALIZER_TOTAL_SORT_MEMORY_BYTES_ENV} must be no more than "
+            f"{PTG2_V3_FINALIZER_MAX_TOTAL_SORT_MEMORY_BYTES}, divide evenly into "
+            f"MiB-aligned shares for {workers} workers, and provide at least "
+            f"{PTG2_V3_FINALIZER_MIN_SORT_MEMORY_BYTES_PER_WORKER} bytes per worker"
+        )
+
+
+def _validate_finalizer_process_headroom(
+    configuration: V3FinalizerResourceConfiguration,
+) -> None:
+    """Reserve memory for finalizer structures outside the explicit caps."""
+
+    process_limit = configuration.process_memory_limit_bytes
+    if process_limit is None:
+        return
+    if type(process_limit) is not int or process_limit <= 0:
+        raise RuntimeError("strict V3 finalizer process memory limit is invalid")
+    configured_bytes = (
+        configuration.identity_map_max_bytes
+        + configuration.total_sort_memory_bytes
+    )
+    fraction_limit = (
+        process_limit * PTG2_V3_FINALIZER_CONFIGURED_MEMORY_NUMERATOR
+        // PTG2_V3_FINALIZER_CONFIGURED_MEMORY_DENOMINATOR
+    )
+    reserve_limit = max(
+        0,
+        process_limit - PTG2_V3_FINALIZER_MIN_UNBUDGETED_MEMORY_BYTES,
+    )
+    safe_configured_bytes = min(fraction_limit, reserve_limit)
+    if configured_bytes > safe_configured_bytes:
+        raise RuntimeError(
+            "strict V3 finalizer configured memory exceeds its safe process budget: "
+            f"identity maps plus total sort memory require {configured_bytes} bytes, "
+            f"but at most {safe_configured_bytes} bytes may be configured under the "
+            f"{process_limit}-byte process limit"
+        )
+
+
+def _load_v3_finalizer_resource_configuration(
+) -> V3FinalizerResourceConfiguration:
+    """Load the required strict resource contract without permissive fallbacks."""
+
+    legacy_value = os.getenv(PTG2_V3_FINALIZER_LEGACY_MEMORY_RECORDS_ENV)
+    if legacy_value is not None and str(legacy_value).strip():
+        raise RuntimeError(
+            f"{PTG2_V3_FINALIZER_LEGACY_MEMORY_RECORDS_ENV} is unsupported because "
+            "record limits multiply with worker count; configure the process-wide "
+            f"{PTG2_V3_FINALIZER_TOTAL_SORT_MEMORY_BYTES_ENV} budget instead"
+        )
+    return V3FinalizerResourceConfiguration(
+        workers=_required_positive_decimal_env(PTG2_V3_FINALIZER_WORKERS_ENV),
+        identity_map_max_bytes=_required_positive_decimal_env(
+            PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES_ENV
+        ),
+        total_sort_memory_bytes=_required_positive_decimal_env(
+            PTG2_V3_FINALIZER_TOTAL_SORT_MEMORY_BYTES_ENV
+        ),
+        process_memory_limit_bytes=_finite_process_memory_limit_bytes(),
+    )
 
 
 def _canonical_json_sha256(payload: Mapping[str, Any]) -> str:
@@ -532,6 +768,7 @@ def write_v3_finalizer_input_manifest(
     expected_source_identities: Iterable[
         Mapping[str, Any] | SharedPhysicalArtifactIdentity
     ],
+    resource_configuration: V3FinalizerResourceConfiguration | None = None,
 ) -> Path:
     """Write the small validated manifest consumed by the Rust finalizer."""
 
@@ -563,16 +800,52 @@ def write_v3_finalizer_input_manifest(
             code_dictionary_entries,
         ),
     }
+    if resource_configuration is not None:
+        payload["resource_configuration"] = (
+            resource_configuration.contract_metadata()
+        )
+        payload["resource_validation"] = (
+            resource_configuration.validation_metadata()
+        )
     with target.open("x", encoding="ascii") as output:
         json.dump(payload, output, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         output.write("\n")
     return target
 
 
+def _validated_finalizer_resource_contract(
+    resource_metadata: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(resource_metadata, Mapping) or set(resource_metadata) != set(
+        _FINALIZER_RESOURCE_CONFIGURATION_FIELDS
+    ):
+        raise RuntimeError(f"strict V3 finalizer {label} is incomplete")
+    contract_map = dict(resource_metadata)
+    if (
+        contract_map.get("contract") != PTG2_V3_FINALIZER_RESOURCE_CONTRACT
+        or contract_map.get("sort_memory_scope") != _FINALIZER_SORT_MEMORY_SCOPE
+    ):
+        raise RuntimeError(f"strict V3 finalizer {label} is incompatible")
+    for field_name in (
+        "workers",
+        "identity_map_max_bytes",
+        "total_sort_memory_bytes",
+    ):
+        value = contract_map.get(field_name)
+        if type(value) is not int or value <= 0:
+            raise RuntimeError(
+                f"strict V3 finalizer {label} has invalid {field_name}"
+            )
+    return contract_map
+
+
 def validate_v3_finalizer_summary(
     payload: Mapping[str, Any],
     *,
     expected_source_count: int | None = None,
+    expected_resource_configuration: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate the strict finalizer contract and return a shallow summary copy."""
 
@@ -585,6 +858,24 @@ def validate_v3_finalizer_summary(
         raise RuntimeError("strict V3 finalizer returned another cold lookup contract")
     if summary.get("shared_block_layout") != PTG2_V3_SHARED_BLOCK_LAYOUT:
         raise RuntimeError("strict V3 finalizer returned another shared block layout")
+    observed_resources = summary.get("resource_configuration")
+    normalized_observed_resources = (
+        _validated_finalizer_resource_contract(
+            observed_resources,
+            label="resource configuration",
+        )
+        if observed_resources is not None
+        else None
+    )
+    if expected_resource_configuration is not None:
+        normalized_expected_resources = _validated_finalizer_resource_contract(
+            expected_resource_configuration,
+            label="expected resource configuration",
+        )
+        if normalized_observed_resources != normalized_expected_resources:
+            raise RuntimeError(
+                "strict V3 finalizer did not confirm the invoked resource configuration"
+            )
     source_count = _required_non_negative_integer(
         summary.get("source_count"), field_name="source_count"
     )
@@ -676,21 +967,6 @@ def parse_v3_finalizer_stdout(stdout: bytes) -> dict[str, Any]:
     return validate_v3_finalizer_summary(payload)
 
 
-def _optional_memory_records() -> list[str]:
-    raw_value = str(os.getenv(PTG2_V3_FINALIZER_MEMORY_RECORDS_ENV) or "").strip()
-    if not raw_value:
-        return []
-    try:
-        value = int(raw_value)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"invalid {PTG2_V3_FINALIZER_MEMORY_RECORDS_ENV}={raw_value!r}"
-        ) from exc
-    if value <= 0:
-        raise RuntimeError(f"{PTG2_V3_FINALIZER_MEMORY_RECORDS_ENV} must be positive")
-    return ["--memory-records", str(value)]
-
-
 async def run_v3_direct_finalizer(
     *,
     work_directory: str | Path,
@@ -705,6 +981,7 @@ async def run_v3_direct_finalizer(
 ) -> dict[str, Any]:
     """Run the bounded Rust external-sort/finalize path without Python row materialization."""
 
+    resource_configuration = _load_v3_finalizer_resource_configuration()
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
         raise RuntimeError("strict V3 finalization requires the PTG2 Rust scanner binary")
@@ -715,6 +992,7 @@ async def run_v3_direct_finalizer(
         serving_run_entries=serving_run_entries,
         code_dictionary_entries=code_dictionary_entries,
         expected_source_identities=expected_source_identities,
+        resource_configuration=resource_configuration,
     )
     manifest_payload = json.loads(manifest_path.read_text(encoding="ascii"))
     expected_source_count = int(manifest_payload["source_count"])
@@ -728,7 +1006,7 @@ async def run_v3_direct_finalizer(
         str(output_directory),
         "--price-key-map-input",
         str(price_key_map_path),
-        *_optional_memory_records(),
+        *resource_configuration.command_arguments(),
     ]
     for path in price_membership_inputs:
         command.extend(("--price-membership-input", str(Path(path).resolve())))
@@ -749,16 +1027,21 @@ async def run_v3_direct_finalizer(
     summary = validate_v3_finalizer_summary(
         parse_v3_finalizer_stdout(stdout),
         expected_source_count=expected_source_count,
+        expected_resource_configuration=(
+            resource_configuration.contract_metadata()
+        ),
     )
     if Path(str(summary.get("output_directory") or "")).resolve() != output_directory.resolve():
         raise RuntimeError("strict V3 finalizer reported another output directory")
+    summary["resource_validation"] = resource_configuration.validation_metadata()
     return summary
 
 
 __all__ = [
     "PTG2_V3_FINALIZER_FORMAT",
-    "PTG2_V3_FINALIZER_MEMORY_RECORDS_ENV",
+    "PTG2_V3_FINALIZER_RESOURCE_CONTRACT",
     "PTG2_V3_SOURCE_RUN_CONTRACT_VERSION",
+    "V3FinalizerResourceConfiguration",
     "attach_v3_source_run_contract",
     "parse_v3_finalizer_stdout",
     "run_v3_direct_finalizer",

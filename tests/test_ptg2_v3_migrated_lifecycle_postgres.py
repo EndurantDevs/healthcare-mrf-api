@@ -710,7 +710,13 @@ async def test_v3_lifecycle_fails_closed(
     monkeypatch.setenv("HLTHPRT_PTG2_HASH_MODE", "sha256")
     monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT", "lean_provider_key_v1")
     monkeypatch.setenv("HLTHPRT_PTG2_BINARY_IDS", "true")
-    monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_MEMORY_RECORDS", "1")
+    monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_WORKERS", "1")
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES", "67108864"
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_V3_FINALIZER_TOTAL_SORT_MEMORY_BYTES", "16777216"
+    )
     monkeypatch.setenv("HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION", "none")
     monkeypatch.setenv("HLTHPRT_PTG2_SERVING_BINARY_BLOCK_BYTES", "65536")
     monkeypatch.setenv("HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID", COVERAGE_SCOPE_ID.hex())
