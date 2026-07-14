@@ -1026,6 +1026,9 @@ def _audit_config(**overrides):
 def _release_audit_config():
     return _audit_config(
         profile="release",
+        api_path=audit.DEFAULT_CANDIDATE_API_PATH,
+        validated_candidate=True,
+        seed=audit.DEFAULT_SEED,
         source_occurrence_samples=2_500,
         api_occurrence_samples=2_500,
         negative_samples=500,
@@ -1035,6 +1038,25 @@ def _release_audit_config():
         min_negative_checks=250,
         min_random_api_calls=2_500,
     )
+
+
+def test_published_release_profile_requires_verified_capacity_evidence():
+    with pytest.raises(
+        audit.ConfigurationError,
+        match="release_published_capacity_evidence_required",
+    ):
+        _audit_config(
+            profile="release",
+            seed=audit.DEFAULT_SEED,
+            source_occurrence_samples=2_500,
+            api_occurrence_samples=2_500,
+            negative_samples=500,
+            random_api_calls=2_500,
+            min_source_occurrence_checks=2_500,
+            min_api_occurrence_checks=2_500,
+            min_negative_checks=250,
+            min_random_api_calls=2_500,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1057,11 +1079,89 @@ def _release_audit_config():
         {"api_base_url": "https://api.example.invalid/prefix"},
         {"api_path": "/custom/pricing"},
         {"api_audit_path": "/custom/audit"},
+        {"seed": "caller-searchable-seed"},
     ],
 )
 def test_release_profile_cannot_relax_gate_requirements(changes):
     with pytest.raises(audit.ConfigurationError):
         replace(_release_audit_config(), **changes)
+
+
+def test_release_cli_rejects_caller_seed_search_and_uses_fixed_precommitment():
+    parser = audit.build_argument_parser()
+    required_arguments = [
+        "source.json",
+        "--report",
+        "report.json",
+        "--api-base-url",
+        "https://api.example.invalid",
+        "--plan-id",
+        "plan-value",
+        "--snapshot-id",
+        "snapshot-value",
+        "--api-path",
+        audit.DEFAULT_CANDIDATE_API_PATH,
+        "--plan-market-type",
+        "group",
+        "--source-key",
+        "source-value",
+        "--auth-token",
+        "audit-token",
+        "--validated-candidate",
+    ]
+    searched = parser.parse_args(
+        [*required_arguments, "--seed", "caller-searched-seed"]
+    )
+    with pytest.raises(
+        audit.ConfigurationError,
+        match="release_seed_caller_override_forbidden",
+    ):
+        audit._validate_args(searched)
+
+    fixed = parser.parse_args(required_arguments)
+    audit._validate_args(fixed)
+    config = audit._audit_config(fixed)
+    evidence = audit.sampling_seed_evidence(
+        config.profile,
+        config.seed,
+        config.capacity_evidence_trust,
+    )
+
+    assert config.seed == audit.DEFAULT_SEED
+    assert evidence["contract"] == audit.RELEASE_FIXED_SEED_CONTRACT
+    assert evidence["precommitted"] is True
+    assert evidence["seed_sha256"] == audit.sha256_text(audit.DEFAULT_SEED)
+
+
+def test_diagnostic_cli_retains_explicit_seed_for_reproduction():
+    parser = audit.build_argument_parser()
+    args = parser.parse_args(
+        [
+            "source.json",
+            "--report",
+            "report.json",
+            "--profile",
+            "diagnostic",
+            "--api-base-url",
+            "https://api.example.invalid",
+            "--plan-id",
+            "plan-value",
+            "--snapshot-id",
+            "snapshot-value",
+            "--seed",
+            "diagnostic-seed",
+        ]
+    )
+    audit._validate_args(args)
+
+    config = audit._audit_config(args)
+
+    assert config.seed == "diagnostic-seed"
+    assert audit.sampling_seed_evidence(
+        config.profile,
+        config.seed,
+        None,
+    )["contract"] == audit.DIAGNOSTIC_SEED_CONTRACT
 
 
 def _page_contract(config: audit.AuditConfig, *, matched: bool) -> audit.PageContract:
@@ -2504,6 +2604,8 @@ def test_validated_candidate_cli_adds_bound_header_and_requires_exact_scope():
             "report.json",
             "--api-base-url",
             "https://api.example.invalid",
+            "--api-path",
+            audit.DEFAULT_CANDIDATE_API_PATH,
             "--plan-id",
             "plan-value",
             "--snapshot-id",
@@ -2558,6 +2660,15 @@ def test_release_cli_rejects_insecure_transport_and_nonstandard_paths():
         "plan-value",
         "--snapshot-id",
         "snapshot-value",
+        "--api-path",
+        audit.DEFAULT_CANDIDATE_API_PATH,
+        "--plan-market-type",
+        "group",
+        "--source-key",
+        "source-value",
+        "--auth-token",
+        "audit-token",
+        "--validated-candidate",
     ]
     parser = audit.build_argument_parser()
 

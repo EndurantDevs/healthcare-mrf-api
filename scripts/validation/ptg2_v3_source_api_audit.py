@@ -44,6 +44,7 @@ import json
 import math
 import os
 import platform
+import secrets
 import sqlite3
 import statistics
 import struct
@@ -61,8 +62,14 @@ from urllib.parse import urlsplit
 import httpx
 import ijson
 
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
 
-SCRIPT_VERSION = "2.7.0"
+from api import ptg2_capacity_evidence as capacity_evidence
+
+
+SCRIPT_VERSION = "2.9.0"
 EXPECTED_ARCHITECTURE = "postgres_binary_v3"
 EXPECTED_STORAGE_GENERATION = "shared_blocks_v3"
 EXPECTED_DATABASE_BACKEND = "postgresql"
@@ -92,6 +99,10 @@ AUDIT_SAMPLE_DIGEST_COORDINATE_FIELDS = (
 _AUDIT_SAMPLE_DIGEST_COORDINATES = struct.Struct(">IIIQQQQ")
 DEFAULT_API_AUDIT_PAGE_SIZE = 100
 DEFAULT_SEED = "ptg2-v3-source-api-audit-v1"
+RELEASE_FIXED_SEED_CONTRACT = "fixed_versioned_audit_seed_v1"
+RELEASE_CAPACITY_SEED_CONTRACT = "pinned_capacity_trust_derived_seed_v1"
+DIAGNOSTIC_SEED_CONTRACT = "diagnostic_caller_selected_seed_v1"
+RELEASE_CAPACITY_SEED_DOMAIN = b"PTG2V3SOURCEAUDITSEED\x01"
 DEFAULT_SOURCE_OCCURRENCE_SAMPLES = 2_500
 DEFAULT_API_OCCURRENCE_SAMPLES = 2_500
 DEFAULT_NEGATIVE_SAMPLES = 500
@@ -102,6 +113,33 @@ RELEASE_MIN_API_OCCURRENCES = 2_500
 RELEASE_MIN_NEGATIVE_QUERIES = 250
 RELEASE_MIN_RANDOM_API_CALLS = 2_500
 RELEASE_MIN_TOTAL_API_CALLS = 3_000
+CAPACITY_MIN_MATCHED_POSITIVE_ELIGIBLE_HTTP_REQUESTS = 100
+CAPACITY_MIN_NEGATIVE_ELIGIBLE_HTTP_REQUESTS = 250
+CAPACITY_MIN_RANDOM_ELIGIBLE_HTTP_REQUESTS = 2_500
+CAPACITY_MIN_DISTINCT_RANDOM_QUERIES = 2_500
+CAPACITY_MIN_ELIGIBLE_HTTP_REQUESTS = 3_000
+CAPACITY_CLIENT_LATENCY_SOURCE = (
+    "verified_eligible_client_end_to_end_http_duration_ms"
+)
+CAPACITY_SIGNED_LATENCY_SOURCE = "api_signed_server_duration_ns_diagnostic_only"
+CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE = (
+    "unqualified_client_perf_counter_diagnostic_only"
+)
+CAPACITY_RANDOM_COHORT = "random_unique_without_replacement_v1"
+CAPACITY_POSITIVE_COHORT = "matched_positive_first_observation_v1"
+CAPACITY_NEGATIVE_COHORT = "negative_first_observation_v1"
+CAPACITY_COHORTS = frozenset(
+    {
+        CAPACITY_RANDOM_COHORT,
+        CAPACITY_POSITIVE_COHORT,
+        CAPACITY_NEGATIVE_COHORT,
+    }
+)
+_CAPACITY_SEMANTIC_CLASS_BY_COHORT = {
+    CAPACITY_POSITIVE_COHORT: "matched_positive",
+    CAPACITY_NEGATIVE_COHORT: "negative",
+    CAPACITY_RANDOM_COHORT: "random",
+}
 RELEASE_MIN_DISTINCT_MATCHED_QUERY_KEYS = 100
 RELEASE_MAX_FIRST_PAGE_P95_MS = 40.0
 RELEASE_MAX_LOGICAL_QUERY_P95_MS = 1_000.0
@@ -217,6 +255,1499 @@ class ApiSchemaError(AuditError):
     code = "api_schema"
 
 
+@dataclass(frozen=True)
+class CapacityEvidenceTrust:
+    """Pinned public trust used to verify isolated API-process observations."""
+
+    api_evidence_key_id: str
+    api_evidence_public_key: bytes = dataclasses.field(repr=False)
+    release_digest: str
+    environment_id: str
+
+    def __post_init__(self) -> None:
+        key_id_characters = set(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+        )
+        if (
+            not self.api_evidence_key_id
+            or len(self.api_evidence_key_id) > 64
+            or not self.api_evidence_key_id[0].isascii()
+            or not self.api_evidence_key_id[0].isalnum()
+            or any(
+                character not in key_id_characters
+                for character in self.api_evidence_key_id
+            )
+        ):
+            raise ConfigurationError("capacity_api_evidence_key_id_invalid")
+        if (
+            not isinstance(self.api_evidence_public_key, bytes)
+            or len(self.api_evidence_public_key) != 32
+        ):
+            raise ConfigurationError("capacity_api_evidence_public_key_invalid")
+        for field_name, digest in (
+            ("release_digest", self.release_digest),
+            ("environment_id", self.environment_id),
+        ):
+            if (
+                len(digest) != 64
+                or digest == "0" * 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ConfigurationError(f"capacity_{field_name}_invalid")
+
+    @property
+    def report_value(self) -> dict[str, Any]:
+        """Return only public or one-way trust coordinates."""
+
+        return {
+            "api_evidence_key_id": self.api_evidence_key_id,
+            "api_evidence_public_key_sha256": hashlib.sha256(
+                self.api_evidence_public_key
+            ).hexdigest(),
+            "release_digest": self.release_digest,
+            "environment_id": self.environment_id,
+        }
+
+
+@dataclass(frozen=True)
+class CapacityObservationIntent:
+    """Non-sensitive instruction to challenge one first-page HTTP request."""
+
+    cohort: str
+    first_for_query: bool
+
+    def __post_init__(self) -> None:
+        if self.cohort not in CAPACITY_COHORTS:
+            raise ConfigurationError("capacity_evidence_cohort_invalid")
+
+
+@dataclass(frozen=True)
+class CapacityHttpObservation:
+    """One physical attempt and its optional closed signed observation."""
+
+    record_id: int
+    plan_id: int
+    cohort: str
+    first_for_query: bool
+    attempt_index: int
+    latency_ms: float
+    response_status_code: int | None
+    response_redirect_count: int
+    observation: Mapping[str, Any] | None
+    verification_error: str | None
+
+
+@dataclass(frozen=True)
+class _CapacityObservationPlan:
+    plan_id: int
+    intent: CapacityObservationIntent
+    selection_ordinal: int
+
+
+@dataclass(frozen=True)
+class _CapacityResponseDetails:
+    challenge: str
+    query_parameters: Mapping[str, Any]
+    response_headers: Mapping[str, Any]
+    response_status_code: int
+    response_body: bytes
+    response_redirect_count: int
+    collector_received_at: dt.datetime
+    attempt_index: int
+    latency_ms: float
+
+
+class CapacityEvidenceCollector:
+    """Thread-safe signed-observation collector for one audit run."""
+
+    def __init__(
+        self,
+        trust: CapacityEvidenceTrust,
+        *,
+        contention_run_id: str,
+        run_nonce: str | None = None,
+        state: capacity_evidence.CapacityEvidenceState | None = None,
+        sampling_seed: str = DEFAULT_SEED,
+        sampling_profile: str = "diagnostic",
+    ):
+        self.trust = trust
+        self._contention_run_id = str(contention_run_id)
+        if (
+            len(self._contention_run_id) != 64
+            or self._contention_run_id == "0" * 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self._contention_run_id
+            )
+        ):
+            raise ConfigurationError("capacity_contention_run_id_invalid")
+        self._run_nonce = run_nonce or secrets.token_hex(32)
+        if (
+            len(self._run_nonce) != 64
+            or self._run_nonce == "0" * 64
+            or any(character not in "0123456789abcdef" for character in self._run_nonce)
+        ):
+            raise ConfigurationError("capacity_run_nonce_invalid")
+        self._state = state or capacity_evidence.CapacityEvidenceState()
+        self._sampling_seed_evidence = sampling_seed_evidence(
+            sampling_profile,
+            sampling_seed,
+            trust,
+        )
+        self._lock = threading.Lock()
+        self._challenges: set[str] = set()
+        self._next_plan_id = 1
+        self._next_record_id = 1
+        self._next_selection_ordinal_by_cohort: collections.Counter[str] = (
+            collections.Counter()
+        )
+        self._plans: dict[int, CapacityObservationIntent] = {}
+        self._records: dict[int, CapacityHttpObservation] = {}
+        self._semantic_success: dict[int, bool] = {}
+
+    def plan(self, intent: CapacityObservationIntent) -> _CapacityObservationPlan:
+        """Register one logical challenged request before any physical attempt."""
+
+        with self._lock:
+            plan_id = self._next_plan_id
+            self._next_plan_id += 1
+            selection_ordinal = self._next_selection_ordinal_by_cohort[intent.cohort]
+            self._next_selection_ordinal_by_cohort[intent.cohort] += 1
+            self._plans[plan_id] = intent
+        return _CapacityObservationPlan(
+            plan_id=plan_id,
+            intent=intent,
+            selection_ordinal=selection_ordinal,
+        )
+
+    def fresh_challenge(self) -> str:
+        """Return a unique lower-hex 32-byte challenge under concurrency."""
+
+        while True:
+            challenge = secrets.token_hex(32)
+            if challenge == self._run_nonce or challenge == "0" * 64:
+                continue
+            with self._lock:
+                if challenge in self._challenges:
+                    continue
+                self._challenges.add(challenge)
+                return challenge
+
+    def request_headers(
+        self, plan: _CapacityObservationPlan, challenge: str
+    ) -> dict[str, str]:
+        """Build request-local headers without exposing the run nonce elsewhere."""
+
+        return {
+            capacity_evidence.CAPACITY_CHALLENGE_HEADER: challenge,
+            capacity_evidence.CAPACITY_RUN_NONCE_HEADER: self._run_nonce,
+            capacity_evidence.CAPACITY_CONTENTION_RUN_ID_HEADER: (
+                self._contention_run_id
+            ),
+            capacity_evidence.CAPACITY_SEMANTIC_CLASS_HEADER: (
+                _CAPACITY_SEMANTIC_CLASS_BY_COHORT[plan.intent.cohort]
+            ),
+            capacity_evidence.CAPACITY_SELECTION_ORDINAL_HEADER: str(
+                plan.selection_ordinal
+            ),
+        }
+
+    def _store_attempt(
+        self,
+        plan: _CapacityObservationPlan,
+        *,
+        attempt_index: int,
+        latency_ms: float,
+        response_status_code: int | None,
+        response_redirect_count: int,
+        observation: Mapping[str, Any] | None,
+        verification_error: str | None,
+    ) -> CapacityHttpObservation:
+        with self._lock:
+            record_id = self._next_record_id
+            self._next_record_id += 1
+            record = CapacityHttpObservation(
+                record_id=record_id,
+                plan_id=plan.plan_id,
+                cohort=plan.intent.cohort,
+                first_for_query=plan.intent.first_for_query,
+                attempt_index=attempt_index,
+                latency_ms=latency_ms,
+                response_status_code=response_status_code,
+                response_redirect_count=response_redirect_count,
+                observation=(dict(observation) if observation is not None else None),
+                verification_error=verification_error,
+            )
+            self._records[record_id] = record
+            return record
+
+    def record_transport_failure(
+        self,
+        plan: _CapacityObservationPlan,
+        *,
+        attempt_index: int,
+        latency_ms: float,
+        reason: str = "transport_failure",
+    ) -> CapacityHttpObservation:
+        """Record a physical request that produced no HTTP response."""
+
+        if reason not in {"request_timeout", "transport_failure"}:
+            raise ConfigurationError("capacity_transport_failure_reason_invalid")
+
+        return self._store_attempt(
+            plan,
+            attempt_index=attempt_index,
+            latency_ms=latency_ms,
+            response_status_code=None,
+            response_redirect_count=0,
+            observation=None,
+            verification_error=reason,
+        )
+
+    def record_unverified_response(
+        self,
+        plan: _CapacityObservationPlan,
+        *,
+        attempt_index: int,
+        latency_ms: float,
+        response_status_code: int,
+        response_redirect_count: int,
+        reason: str,
+    ) -> CapacityHttpObservation:
+        """Record a response whose complete exact body could not be verified."""
+
+        return self._store_attempt(
+            plan,
+            attempt_index=attempt_index,
+            latency_ms=latency_ms,
+            response_status_code=response_status_code,
+            response_redirect_count=response_redirect_count,
+            observation=None,
+            verification_error=reason,
+        )
+
+    def collect_response(
+        self,
+        plan: _CapacityObservationPlan,
+        response: _CapacityResponseDetails | None = None,
+        **response_details_by_field: Any,
+    ) -> CapacityHttpObservation:
+        """Verify and retain one exact response without leaking request values."""
+
+        if response is None:
+            response = _CapacityResponseDetails(**response_details_by_field)
+        elif response_details_by_field:
+            raise TypeError("response_details_must_not_be_mixed")
+        observation: Mapping[str, Any] | None = None
+        verification_error: str | None = None
+        try:
+            observation = capacity_evidence.collect_capacity_http_observation(
+                response.response_headers,
+                challenge=response.challenge,
+                run_nonce=self._run_nonce,
+                query_parameters=response.query_parameters,
+                response_status_code=response.response_status_code,
+                response_body=response.response_body,
+                response_redirect_count=response.response_redirect_count,
+                collector_received_at=response.collector_received_at,
+                expected_api_evidence_key_id=self.trust.api_evidence_key_id,
+                expected_api_evidence_public_key=self.trust.api_evidence_public_key,
+                expected_release_digest=self.trust.release_digest,
+                expected_environment_id=self.trust.environment_id,
+                expected_contention_run_id=self._contention_run_id,
+                expected_semantic_class=(
+                    _CAPACITY_SEMANTIC_CLASS_BY_COHORT[plan.intent.cohort]
+                ),
+                expected_selection_ordinal=plan.selection_ordinal,
+                state=self._state,
+            )
+        except capacity_evidence.CapacityEvidenceError as exc:
+            verification_error = exc.code
+        return self._store_attempt(
+            plan,
+            attempt_index=response.attempt_index,
+            latency_ms=response.latency_ms,
+            response_status_code=response.response_status_code,
+            response_redirect_count=response.response_redirect_count,
+            observation=observation,
+            verification_error=verification_error,
+        )
+
+    def mark_semantic_outcome(
+        self,
+        observations: Sequence[CapacityHttpObservation],
+        *,
+        successful: bool,
+    ) -> None:
+        """Bind physical evidence to the completed semantic API audit result."""
+
+        with self._lock:
+            for observation in observations:
+                if observation.record_id not in self._records:
+                    raise ConfigurationError("capacity_observation_not_owned")
+                self._semantic_success[observation.record_id] = successful
+
+    @staticmethod
+    def _commitment(observations: Sequence[Mapping[str, Any]]) -> str:
+        digests = sorted(
+            sha256_text(canonical_json(observation)) for observation in observations
+        )
+        return sha256_text(canonical_json(digests))
+
+    def report(
+        self,
+        *,
+        complete_request_http_requests: int | None = None,
+        complete_request_retries: int | None = None,
+    ) -> dict[str, Any]:
+        """Return a redacted deterministic aggregate over all physical attempts."""
+
+        with self._lock:
+            plan_by_id = dict(self._plans)
+            attempt_records = tuple(self._records.values())
+            semantic_success_by_record_id = dict(self._semantic_success)
+        report = _capacity_report_payload(
+            self.trust,
+            plan_by_id,
+            attempt_records,
+            semantic_success_by_record_id,
+            self._commitment,
+            self._sampling_seed_evidence,
+        )
+        if (
+            complete_request_http_requests is None
+            and complete_request_retries is None
+        ):
+            return report
+        for accounting_count in (
+            complete_request_http_requests,
+            complete_request_retries,
+        ):
+            if (
+                isinstance(accounting_count, bool)
+                or not isinstance(accounting_count, int)
+                or accounting_count < 0
+            ):
+                raise ConfigurationError("complete_request_accounting_invalid")
+        report["complete_request_accounting"] = {
+            "contract": "all_standard_http_attempts_v1",
+            "actual_http_requests": complete_request_http_requests,
+            "retries": complete_request_retries,
+            "release_clean": complete_request_retries == 0,
+        }
+        return report
+
+
+@dataclass(frozen=True)
+class _CapacityReportMeasurements:
+    planned_by_cohort: collections.Counter[str]
+    physical_by_cohort: collections.Counter[str]
+    verified_by_cohort: collections.Counter[str]
+    eligible_by_cohort: collections.Counter[str]
+    rejected_by_cohort: collections.Counter[str]
+    status_counts: collections.Counter[str]
+    rejection_counts: collections.Counter[str]
+    verified_attempts: tuple[CapacityHttpObservation, ...]
+    eligible_attempts: tuple[CapacityHttpObservation, ...]
+    rejected_attempts: tuple[CapacityHttpObservation, ...]
+    client_physical_latencies: tuple[float, ...]
+    eligible_client_latencies: tuple[float, ...]
+    eligible_client_latencies_by_cohort: Mapping[str, tuple[float, ...]]
+    verified_server_latencies: tuple[float, ...]
+    eligible_server_latencies: tuple[float, ...]
+    eligible_server_latencies_by_cohort: Mapping[str, tuple[float, ...]]
+    distinct_query_digests_by_cohort: Mapping[str, set[str]]
+    reconciliation: Mapping[str, Any]
+
+
+@dataclass
+class _CapacityAttemptAccumulator:
+    physical_by_cohort: collections.Counter[str] = dataclasses.field(
+        default_factory=collections.Counter
+    )
+    verified_by_cohort: collections.Counter[str] = dataclasses.field(
+        default_factory=collections.Counter
+    )
+    eligible_by_cohort: collections.Counter[str] = dataclasses.field(
+        default_factory=collections.Counter
+    )
+    rejected_by_cohort: collections.Counter[str] = dataclasses.field(
+        default_factory=collections.Counter
+    )
+    status_counts: collections.Counter[str] = dataclasses.field(
+        default_factory=collections.Counter
+    )
+    rejection_counts: collections.Counter[str] = dataclasses.field(
+        default_factory=collections.Counter
+    )
+    structural_failure_counts: collections.Counter[str] = dataclasses.field(
+        default_factory=collections.Counter
+    )
+    verified_attempts: list[CapacityHttpObservation] = dataclasses.field(
+        default_factory=list
+    )
+    eligible_attempts: list[CapacityHttpObservation] = dataclasses.field(
+        default_factory=list
+    )
+    rejected_attempts: list[CapacityHttpObservation] = dataclasses.field(
+        default_factory=list
+    )
+    client_physical_latencies: list[float] = dataclasses.field(default_factory=list)
+    eligible_client_latencies: list[float] = dataclasses.field(default_factory=list)
+    eligible_client_latencies_by_cohort: dict[str, list[float]] = dataclasses.field(
+        default_factory=lambda: collections.defaultdict(list)
+    )
+    verified_server_latencies: list[float] = dataclasses.field(default_factory=list)
+    eligible_server_latencies: list[float] = dataclasses.field(default_factory=list)
+    eligible_server_latencies_by_cohort: dict[str, list[float]] = dataclasses.field(
+        default_factory=lambda: collections.defaultdict(list)
+    )
+    distinct_query_digests_by_cohort: dict[str, set[str]] = dataclasses.field(
+        default_factory=lambda: collections.defaultdict(set)
+    )
+    observed_plan_ids: set[int] = dataclasses.field(default_factory=set)
+    seen_record_ids: set[int] = dataclasses.field(default_factory=set)
+    seen_plan_attempts: set[tuple[int, int]] = dataclasses.field(default_factory=set)
+    attempt_indexes_by_plan: dict[int, list[int]] = dataclasses.field(
+        default_factory=lambda: collections.defaultdict(list)
+    )
+    initial_attempt_count: int = 0
+    retry_attempt_count: int = 0
+    invalid_attempt_index_count: int = 0
+    timeout_count: int = 0
+    transport_error_count: int = 0
+    http_error_count: int = 0
+    verification_error_count: int = 0
+
+
+@dataclass(frozen=True)
+class _CapacityAttemptTotals:
+    planned_count: int
+    physical_count: int
+    verified_count: int
+    eligible_count: int
+    rejected_count: int
+    verified_rejected_count: int
+    unclassified_count: int
+    missing_plan_count: int
+    semantic_outcome_without_physical: int
+
+
+def _signed_server_latency_ms(observation: Mapping[str, Any]) -> float:
+    duration_ns = observation.get("server_duration_ns")
+    if (
+        isinstance(duration_ns, bool)
+        or not isinstance(duration_ns, int)
+        or duration_ns < 0
+    ):
+        raise ConfigurationError("capacity_signed_duration_missing")
+    return duration_ns / 1_000_000.0
+
+
+def _latency_gate_summary(values: Sequence[float]) -> dict[str, Any]:
+    """Summarize latency with the strict capacity gate's nearest-rank p95."""
+
+    report = latency_summary(values)
+    if values:
+        ordered = sorted(float(value) for value in values)
+        rank_index = max(math.ceil(len(ordered) * 0.95) - 1, 0)
+        report["gate_p95_ms"] = round(
+            ordered[rank_index],
+            6,
+        )
+    return report
+
+
+def _record_capacity_attempt_status(
+    attempt_record: CapacityHttpObservation,
+    attempt_accumulator: _CapacityAttemptAccumulator,
+) -> None:
+    attempt_accumulator.physical_by_cohort[attempt_record.cohort] += 1
+    attempt_accumulator.client_physical_latencies.append(attempt_record.latency_ms)
+    if attempt_record.response_status_code is None:
+        attempt_accumulator.transport_error_count += 1
+        status_key = (
+            "timeout"
+            if attempt_record.verification_error == "request_timeout"
+            else "transport_error"
+        )
+    else:
+        status_key = str(attempt_record.response_status_code)
+        if attempt_record.response_status_code != 200:
+            attempt_accumulator.http_error_count += 1
+    attempt_accumulator.status_counts[status_key] += 1
+    if attempt_record.verification_error is not None:
+        attempt_accumulator.verification_error_count += 1
+    if attempt_record.verification_error == "request_timeout":
+        attempt_accumulator.timeout_count += 1
+
+
+def _capacity_attempt_structural_reasons(
+    attempt_record: CapacityHttpObservation,
+    plan_by_id: Mapping[int, CapacityObservationIntent],
+    attempt_accumulator: _CapacityAttemptAccumulator,
+) -> list[str]:
+    structural_reasons: list[str] = []
+    plan_intent = plan_by_id.get(attempt_record.plan_id)
+    if plan_intent is None:
+        structural_reasons.append("unknown_plan_id")
+    else:
+        attempt_accumulator.observed_plan_ids.add(attempt_record.plan_id)
+        if (
+            plan_intent.cohort != attempt_record.cohort
+            or plan_intent.first_for_query != attempt_record.first_for_query
+        ):
+            structural_reasons.append("plan_intent_mismatch")
+    if (
+        isinstance(attempt_record.record_id, bool)
+        or not isinstance(attempt_record.record_id, int)
+        or attempt_record.record_id < 1
+    ):
+        structural_reasons.append("invalid_record_id")
+    elif attempt_record.record_id in attempt_accumulator.seen_record_ids:
+        structural_reasons.append("duplicate_record_id")
+    else:
+        attempt_accumulator.seen_record_ids.add(attempt_record.record_id)
+    if (
+        isinstance(attempt_record.attempt_index, bool)
+        or not isinstance(attempt_record.attempt_index, int)
+        or attempt_record.attempt_index < 0
+    ):
+        attempt_accumulator.invalid_attempt_index_count += 1
+        structural_reasons.append("invalid_attempt_index")
+    else:
+        if attempt_record.attempt_index == 0:
+            attempt_accumulator.initial_attempt_count += 1
+        else:
+            attempt_accumulator.retry_attempt_count += 1
+        if plan_intent is not None:
+            attempt_accumulator.attempt_indexes_by_plan[
+                attempt_record.plan_id
+            ].append(attempt_record.attempt_index)
+            plan_attempt_coordinates = (
+                attempt_record.plan_id,
+                attempt_record.attempt_index,
+            )
+            if plan_attempt_coordinates in attempt_accumulator.seen_plan_attempts:
+                structural_reasons.append("duplicate_plan_attempt")
+            else:
+                attempt_accumulator.seen_plan_attempts.add(plan_attempt_coordinates)
+    return structural_reasons
+
+
+def _record_capacity_attempt_outcome(
+    attempt_record: CapacityHttpObservation,
+    semantic_success_by_record_id: Mapping[int, bool],
+    structural_reasons: Sequence[str],
+    attempt_accumulator: _CapacityAttemptAccumulator,
+) -> None:
+    rejection_reasons = _capacity_rejection_reasons(
+        attempt_record,
+        semantic_success_by_record_id,
+    )
+    rejection_reasons.extend(structural_reasons)
+    for structural_reason in set(structural_reasons):
+        attempt_accumulator.structural_failure_counts[structural_reason] += 1
+    if isinstance(attempt_record.observation, Mapping):
+        attempt_accumulator.verified_attempts.append(attempt_record)
+        attempt_accumulator.verified_by_cohort[attempt_record.cohort] += 1
+        attempt_accumulator.verified_server_latencies.append(
+            _signed_server_latency_ms(attempt_record.observation)
+        )
+    if not rejection_reasons and isinstance(attempt_record.observation, Mapping):
+        attempt_accumulator.eligible_attempts.append(attempt_record)
+        attempt_accumulator.eligible_by_cohort[attempt_record.cohort] += 1
+        attempt_accumulator.eligible_client_latencies.append(attempt_record.latency_ms)
+        attempt_accumulator.eligible_client_latencies_by_cohort[
+            attempt_record.cohort
+        ].append(attempt_record.latency_ms)
+        signed_server_latency_ms = _signed_server_latency_ms(
+            attempt_record.observation
+        )
+        attempt_accumulator.eligible_server_latencies.append(
+            signed_server_latency_ms
+        )
+        attempt_accumulator.eligible_server_latencies_by_cohort[
+            attempt_record.cohort
+        ].append(signed_server_latency_ms)
+        attempt_accumulator.distinct_query_digests_by_cohort[
+            attempt_record.cohort
+        ].add(str(attempt_record.observation["semantic_query_digest"]))
+    else:
+        attempt_accumulator.rejected_attempts.append(attempt_record)
+        attempt_accumulator.rejected_by_cohort[attempt_record.cohort] += 1
+    for rejection_reason in set(rejection_reasons):
+        attempt_accumulator.rejection_counts[rejection_reason] += 1
+
+
+def _record_capacity_attempt(
+    attempt_record: CapacityHttpObservation,
+    plan_by_id: Mapping[int, CapacityObservationIntent],
+    semantic_success_by_record_id: Mapping[int, bool],
+    attempt_accumulator: _CapacityAttemptAccumulator,
+) -> None:
+    _record_capacity_attempt_status(attempt_record, attempt_accumulator)
+    structural_reasons = _capacity_attempt_structural_reasons(
+        attempt_record, plan_by_id, attempt_accumulator
+    )
+    _record_capacity_attempt_outcome(
+        attempt_record,
+        semantic_success_by_record_id,
+        structural_reasons,
+        attempt_accumulator,
+    )
+
+
+def _record_capacity_plan_gaps(
+    plan_by_id: Mapping[int, CapacityObservationIntent],
+    semantic_success_by_record_id: Mapping[int, bool],
+    attempt_accumulator: _CapacityAttemptAccumulator,
+) -> tuple[int, int]:
+    for attempt_indexes in attempt_accumulator.attempt_indexes_by_plan.values():
+        distinct_indexes = set(attempt_indexes)
+        if 0 not in distinct_indexes:
+            attempt_accumulator.structural_failure_counts[
+                "plan_missing_initial_attempt"
+            ] += 1
+        if distinct_indexes and distinct_indexes != set(
+            range(max(distinct_indexes) + 1)
+        ):
+            attempt_accumulator.structural_failure_counts[
+                "attempt_sequence_gap"
+            ] += 1
+    missing_plan_count = len(
+        set(plan_by_id) - attempt_accumulator.observed_plan_ids
+    )
+    if missing_plan_count:
+        attempt_accumulator.rejection_counts[
+            "planned_without_physical_attempt"
+        ] += missing_plan_count
+        attempt_accumulator.structural_failure_counts[
+            "planned_without_physical_attempt"
+        ] += missing_plan_count
+    semantic_outcome_without_physical = len(
+        set(semantic_success_by_record_id) - attempt_accumulator.seen_record_ids
+    )
+    if semantic_outcome_without_physical:
+        attempt_accumulator.structural_failure_counts[
+            "semantic_outcome_without_physical_attempt"
+        ] += semantic_outcome_without_physical
+    return missing_plan_count, semantic_outcome_without_physical
+
+
+def _capacity_attempt_totals(
+    plan_by_id: Mapping[int, CapacityObservationIntent],
+    attempt_records: Sequence[CapacityHttpObservation],
+    attempt_accumulator: _CapacityAttemptAccumulator,
+    missing_plan_count: int,
+    semantic_outcome_without_physical: int,
+) -> _CapacityAttemptTotals:
+    physical_count = len(attempt_records)
+    eligible_count = len(attempt_accumulator.eligible_attempts)
+    rejected_count = len(attempt_accumulator.rejected_attempts)
+    return _CapacityAttemptTotals(
+        planned_count=len(plan_by_id),
+        physical_count=physical_count,
+        verified_count=len(attempt_accumulator.verified_attempts),
+        eligible_count=eligible_count,
+        rejected_count=rejected_count,
+        verified_rejected_count=sum(
+            isinstance(attempt.observation, Mapping)
+            for attempt in attempt_accumulator.rejected_attempts
+        ),
+        unclassified_count=physical_count - eligible_count - rejected_count,
+        missing_plan_count=missing_plan_count,
+        semantic_outcome_without_physical=semantic_outcome_without_physical,
+    )
+
+
+def _capacity_reconciliation_status(
+    attempt_accumulator: _CapacityAttemptAccumulator,
+    attempt_totals: _CapacityAttemptTotals,
+) -> tuple[bool, bool]:
+    accounting_checks = (
+        attempt_totals.planned_count
+        == len(attempt_accumulator.observed_plan_ids)
+        + attempt_totals.missing_plan_count,
+        attempt_totals.physical_count
+        == attempt_accumulator.initial_attempt_count
+        + attempt_accumulator.retry_attempt_count
+        + attempt_accumulator.invalid_attempt_index_count,
+        attempt_totals.physical_count
+        == attempt_totals.eligible_count + attempt_totals.rejected_count,
+        attempt_totals.verified_count
+        == attempt_totals.eligible_count + attempt_totals.verified_rejected_count,
+        sum(attempt_accumulator.status_counts.values())
+        == attempt_totals.physical_count,
+        sum(attempt_accumulator.physical_by_cohort.values())
+        == attempt_totals.physical_count,
+        sum(attempt_accumulator.eligible_by_cohort.values())
+        == attempt_totals.eligible_count,
+        attempt_totals.unclassified_count == 0,
+    )
+    is_accounted = all(accounting_checks)
+    is_release_clean = (
+        is_accounted
+        and not attempt_accumulator.structural_failure_counts
+        and attempt_totals.planned_count
+        == attempt_totals.physical_count
+        == attempt_totals.verified_count
+        == attempt_totals.eligible_count
+        == attempt_accumulator.initial_attempt_count
+        and attempt_totals.rejected_count == 0
+        and attempt_accumulator.retry_attempt_count == 0
+        and attempt_accumulator.timeout_count == 0
+        and attempt_accumulator.transport_error_count == 0
+        and attempt_accumulator.http_error_count == 0
+        and attempt_accumulator.verification_error_count == 0
+    )
+    return is_accounted, is_release_clean
+
+
+def _capacity_reconciliation(
+    attempt_accumulator: _CapacityAttemptAccumulator,
+    attempt_totals: _CapacityAttemptTotals,
+) -> dict[str, Any]:
+    is_accounted, is_release_clean = _capacity_reconciliation_status(
+        attempt_accumulator, attempt_totals
+    )
+    return {
+        "contract": "planned_first_attempt_outcomes_v1",
+        "accounted": is_accounted,
+        "release_clean": is_release_clean,
+        "planned_first_physical_attempts": attempt_totals.planned_count,
+        "plans_with_physical_attempt": len(attempt_accumulator.observed_plan_ids),
+        "planned_without_physical_attempt": attempt_totals.missing_plan_count,
+        "initial_physical_attempts": attempt_accumulator.initial_attempt_count,
+        "retry_physical_attempts": attempt_accumulator.retry_attempt_count,
+        "invalid_attempt_index_records": (
+            attempt_accumulator.invalid_attempt_index_count
+        ),
+        "eligible_physical_attempts": attempt_totals.eligible_count,
+        "rejected_physical_attempts": attempt_totals.rejected_count,
+        "unclassified_physical_attempts": attempt_totals.unclassified_count,
+        "verified_rejected_physical_attempts": (
+            attempt_totals.verified_rejected_count
+        ),
+        "semantic_outcomes_without_physical_attempt": (
+            attempt_totals.semantic_outcome_without_physical
+        ),
+        "structural_failures": dict(
+            sorted(attempt_accumulator.structural_failure_counts.items())
+        ),
+    }
+
+
+def _freeze_capacity_measurements(
+    planned_by_cohort: collections.Counter[str],
+    attempt_accumulator: _CapacityAttemptAccumulator,
+    reconciliation_map: Mapping[str, Any],
+) -> _CapacityReportMeasurements:
+    return _CapacityReportMeasurements(
+        planned_by_cohort=planned_by_cohort,
+        physical_by_cohort=attempt_accumulator.physical_by_cohort,
+        verified_by_cohort=attempt_accumulator.verified_by_cohort,
+        eligible_by_cohort=attempt_accumulator.eligible_by_cohort,
+        rejected_by_cohort=attempt_accumulator.rejected_by_cohort,
+        status_counts=attempt_accumulator.status_counts,
+        rejection_counts=attempt_accumulator.rejection_counts,
+        verified_attempts=tuple(attempt_accumulator.verified_attempts),
+        eligible_attempts=tuple(attempt_accumulator.eligible_attempts),
+        rejected_attempts=tuple(attempt_accumulator.rejected_attempts),
+        client_physical_latencies=tuple(
+            attempt_accumulator.client_physical_latencies
+        ),
+        eligible_client_latencies=tuple(
+            attempt_accumulator.eligible_client_latencies
+        ),
+        eligible_client_latencies_by_cohort={
+            cohort: tuple(latencies)
+            for cohort, latencies in (
+                attempt_accumulator.eligible_client_latencies_by_cohort.items()
+            )
+        },
+        verified_server_latencies=tuple(
+            attempt_accumulator.verified_server_latencies
+        ),
+        eligible_server_latencies=tuple(
+            attempt_accumulator.eligible_server_latencies
+        ),
+        eligible_server_latencies_by_cohort={
+            cohort: tuple(latencies)
+            for cohort, latencies in (
+                attempt_accumulator.eligible_server_latencies_by_cohort.items()
+            )
+        },
+        distinct_query_digests_by_cohort=(
+            attempt_accumulator.distinct_query_digests_by_cohort
+        ),
+        reconciliation=reconciliation_map,
+    )
+
+
+def _capacity_report_measurements(
+    plan_by_id: Mapping[int, CapacityObservationIntent],
+    attempt_records: Sequence[CapacityHttpObservation],
+    semantic_success_by_record_id: Mapping[int, bool],
+) -> _CapacityReportMeasurements:
+    """Reconcile every planned request with its physical attempt outcomes."""
+
+    planned_by_cohort = collections.Counter(
+        intent.cohort for intent in plan_by_id.values()
+    )
+    attempt_accumulator = _CapacityAttemptAccumulator()
+    for attempt_record in attempt_records:
+        _record_capacity_attempt(
+            attempt_record,
+            plan_by_id,
+            semantic_success_by_record_id,
+            attempt_accumulator,
+        )
+    missing_plan_count, semantic_outcome_without_physical = (
+        _record_capacity_plan_gaps(
+            plan_by_id,
+            semantic_success_by_record_id,
+            attempt_accumulator,
+        )
+    )
+    attempt_totals = _capacity_attempt_totals(
+        plan_by_id,
+        attempt_records,
+        attempt_accumulator,
+        missing_plan_count,
+        semantic_outcome_without_physical,
+    )
+    reconciliation_map = _capacity_reconciliation(
+        attempt_accumulator,
+        attempt_totals,
+    )
+    return _freeze_capacity_measurements(
+        planned_by_cohort,
+        attempt_accumulator,
+        reconciliation_map,
+    )
+
+
+def _capacity_rejection_reasons(
+    attempt_record: CapacityHttpObservation,
+    semantic_success_by_record_id: Mapping[int, bool],
+) -> list[str]:
+    reasons = []
+    if attempt_record.verification_error is not None:
+        reasons.append(attempt_record.verification_error)
+    signed_observation = attempt_record.observation
+    if not isinstance(signed_observation, Mapping):
+        reasons.append("api_signed_observation_missing")
+    else:
+        if signed_observation.get("cold") is not True:
+            reasons.append("api_signed_cold_not_true")
+        observation_ordinal = signed_observation.get("observation_ordinal")
+        if (
+            isinstance(observation_ordinal, bool)
+            or not isinstance(observation_ordinal, int)
+            or observation_ordinal != 0
+        ):
+            reasons.append("api_signed_observation_ordinal_not_zero")
+    if not attempt_record.first_for_query:
+        reasons.append("not_first_for_query")
+    if attempt_record.attempt_index != 0:
+        reasons.append("retry_attempt")
+    if attempt_record.response_status_code != 200:
+        reasons.append("status_not_200")
+    if attempt_record.response_redirect_count != 0:
+        reasons.append("redirect_observed")
+    if semantic_success_by_record_id.get(attempt_record.record_id) is not True:
+        reasons.append("semantic_audit_not_successful")
+    return reasons
+
+
+def _capacity_report_cohorts(
+    measurements: _CapacityReportMeasurements,
+) -> dict[str, dict[str, int]]:
+    return {
+        cohort: {
+            "planned": measurements.planned_by_cohort[cohort],
+            "physical": measurements.physical_by_cohort[cohort],
+            "verified": measurements.verified_by_cohort[cohort],
+            "eligible": measurements.eligible_by_cohort[cohort],
+            "rejected": measurements.rejected_by_cohort[cohort],
+            "distinct_semantic_queries": len(
+                measurements.distinct_query_digests_by_cohort[cohort]
+            ),
+        }
+        for cohort in sorted(CAPACITY_COHORTS)
+    }
+
+
+def _capacity_report_counters(
+    plan_by_id: Mapping[int, CapacityObservationIntent],
+    attempt_records: Sequence[CapacityHttpObservation],
+    measurements: _CapacityReportMeasurements,
+    cohort_report_by_name: Mapping[str, Mapping[str, int]],
+) -> dict[str, Any]:
+    distinct_query_digests = set().union(
+        *measurements.distinct_query_digests_by_cohort.values()
+    )
+    return {
+        "planned": len(plan_by_id),
+        "physical": len(attempt_records),
+        "verified": len(measurements.verified_attempts),
+        "eligible": len(measurements.eligible_attempts),
+        "rejected": len(measurements.rejected_attempts),
+        "distinct_semantic_queries": len(distinct_query_digests),
+        "retries": measurements.reconciliation["retry_physical_attempts"],
+        "timeouts": sum(
+            attempt.verification_error == "request_timeout"
+            for attempt in attempt_records
+        ),
+        "transport_errors": sum(
+            attempt.response_status_code is None for attempt in attempt_records
+        ),
+        "http_errors": sum(
+            attempt.response_status_code is not None
+            and attempt.response_status_code != 200
+            for attempt in attempt_records
+        ),
+        "verification_errors": sum(
+            attempt.verification_error is not None for attempt in attempt_records
+        ),
+        "redirects": sum(
+            attempt.response_redirect_count for attempt in attempt_records
+        ),
+        "status": dict(sorted(measurements.status_counts.items())),
+        "rejections": dict(sorted(measurements.rejection_counts.items())),
+        "cohorts": dict(cohort_report_by_name),
+        "reconciliation": dict(measurements.reconciliation),
+    }
+
+
+def _capacity_report_latency(
+    measurements: _CapacityReportMeasurements,
+) -> dict[str, Any]:
+    eligible_client_latency_by_cohort = {
+        cohort: _latency_gate_summary(
+            measurements.eligible_client_latencies_by_cohort.get(cohort, ())
+        )
+        for cohort in sorted(CAPACITY_COHORTS)
+    }
+    eligible_server_latency_by_cohort = {
+        cohort: _latency_gate_summary(
+            measurements.eligible_server_latencies_by_cohort.get(cohort, ())
+        )
+        for cohort in sorted(CAPACITY_COHORTS)
+    }
+    return {
+        "gate_source": CAPACITY_CLIENT_LATENCY_SOURCE,
+        "client_physical_attempt_ms": latency_summary(
+            measurements.client_physical_latencies
+        ),
+        "eligible_verified_client_http_duration_ms": latency_summary(
+            measurements.eligible_client_latencies
+        ),
+        "eligible_verified_client_http_duration_ms_by_cohort": (
+            eligible_client_latency_by_cohort
+        ),
+        "verified_signed_server_duration_ms": latency_summary(
+            measurements.verified_server_latencies
+        ),
+        "eligible_signed_server_duration_ms": latency_summary(
+            measurements.eligible_server_latencies
+        ),
+        "eligible_signed_server_duration_ms_by_cohort": (
+            eligible_server_latency_by_cohort
+        ),
+        "signed_server_measurement_source": CAPACITY_SIGNED_LATENCY_SOURCE,
+        "signed_server_duration_diagnostic_only": True,
+    }
+
+
+def _capacity_report_commitments(
+    measurements: _CapacityReportMeasurements,
+    commitment: Any,
+) -> dict[str, Any]:
+    verified_observations = [
+        attempt.observation
+        for attempt in measurements.verified_attempts
+        if attempt.observation is not None
+    ]
+    eligible_observations = [
+        attempt.observation
+        for attempt in measurements.eligible_attempts
+        if attempt.observation is not None
+    ]
+    run_digests = sorted(
+        {str(observation["run_digest"]) for observation in verified_observations}
+    )
+    distinct_query_digests = set().union(
+        *measurements.distinct_query_digests_by_cohort.values()
+    )
+    return {
+        "run_digest": run_digests[0] if len(run_digests) == 1 else None,
+        "run_digest_count": len(run_digests),
+        "verified_observations_sha256": commitment(verified_observations),
+        "eligible_observations_sha256": commitment(eligible_observations),
+        "eligible_semantic_queries_sha256": sha256_text(
+            canonical_json(sorted(distinct_query_digests))
+        ),
+    }
+
+
+def _capacity_report_requirements() -> dict[str, int]:
+    return {
+        "min_matched_positive_eligible_signed_http_requests": (
+            CAPACITY_MIN_MATCHED_POSITIVE_ELIGIBLE_HTTP_REQUESTS
+        ),
+        "min_negative_eligible_signed_http_requests": (
+            CAPACITY_MIN_NEGATIVE_ELIGIBLE_HTTP_REQUESTS
+        ),
+        "min_random_eligible_signed_http_requests": (
+            CAPACITY_MIN_RANDOM_ELIGIBLE_HTTP_REQUESTS
+        ),
+        "min_distinct_random_semantic_queries": (
+            CAPACITY_MIN_DISTINCT_RANDOM_QUERIES
+        ),
+        "min_eligible_signed_http_requests": CAPACITY_MIN_ELIGIBLE_HTTP_REQUESTS,
+    }
+
+
+def _capacity_report_payload(
+    trust: CapacityEvidenceTrust,
+    plan_by_id: Mapping[int, CapacityObservationIntent],
+    attempt_records: Sequence[CapacityHttpObservation],
+    semantic_success_by_record_id: Mapping[int, bool],
+    commitment: Any,
+    sampling_seed_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the redacted signed-capacity section of an audit report."""
+
+    measurements = _capacity_report_measurements(
+        plan_by_id,
+        attempt_records,
+        semantic_success_by_record_id,
+    )
+    cohort_report_by_name = _capacity_report_cohorts(measurements)
+    return {
+        "enabled": True,
+        "contract": "signed_isolated_standard_http_capacity_v3",
+        "trust": trust.report_value,
+        "selection": dict(sampling_seed_contract),
+        "page_contract": {
+            "method": "GET",
+            "path": capacity_evidence.CAPACITY_QUERY_PATH,
+            "first_page_only": True,
+            "offset": 0,
+            "limit": capacity_evidence.CAPACITY_PAGE_LIMIT,
+            "first_physical_attempt_only": True,
+            "api_signed_cold": True,
+            "api_signed_observation_ordinal": 0,
+            "status": 200,
+            "redirects": 0,
+            "latency_gate": CAPACITY_CLIENT_LATENCY_SOURCE,
+        },
+        "counters": _capacity_report_counters(
+            plan_by_id,
+            attempt_records,
+            measurements,
+            cohort_report_by_name,
+        ),
+        "latency": _capacity_report_latency(measurements),
+        "commitments": _capacity_report_commitments(measurements, commitment),
+        "requirements": _capacity_report_requirements(),
+    }
+
+
+def disabled_capacity_evidence_report() -> dict[str, Any]:
+    """Return the stable report shape for audits without signed evidence."""
+
+    return {
+        "enabled": False,
+        "contract": "signed_isolated_standard_http_capacity_v3",
+    }
+
+
+def validate_capacity_evidence_preflight(
+    *,
+    distinct_random_queries: int,
+    negative_queries: int,
+    positive_queries: int,
+) -> None:
+    """Fail before standard HTTP when a run cannot meet evidence floors."""
+
+    counts = (distinct_random_queries, negative_queries, positive_queries)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in counts
+    ):
+        raise ConfigurationError("capacity_preflight_count_invalid")
+    if positive_queries < CAPACITY_MIN_MATCHED_POSITIVE_ELIGIBLE_HTTP_REQUESTS:
+        raise SourceCoverageError(
+            "capacity_matched_positive_query_population_below_minimum"
+        )
+    if negative_queries < CAPACITY_MIN_NEGATIVE_ELIGIBLE_HTTP_REQUESTS:
+        raise SourceCoverageError(
+            "capacity_negative_query_population_below_minimum"
+        )
+    if distinct_random_queries < CAPACITY_MIN_DISTINCT_RANDOM_QUERIES:
+        raise SourceCoverageError(
+            "capacity_distinct_random_query_population_below_minimum"
+        )
+    if sum(counts) < CAPACITY_MIN_ELIGIBLE_HTTP_REQUESTS:
+        raise SourceCoverageError("capacity_planned_http_requests_below_minimum")
+
+
+def _capacity_client_latency_release_failures(
+    report: Mapping[str, Any],
+    counters: Mapping[str, Any],
+    cohorts: Mapping[str, Any],
+) -> list[str]:
+    """Validate the API-qualified client end-to-end latency evidence shape."""
+
+    latency = report.get("latency")
+    page_contract = report.get("page_contract")
+    if (
+        not isinstance(latency, Mapping)
+        or latency.get("gate_source") != CAPACITY_CLIENT_LATENCY_SOURCE
+        or not isinstance(page_contract, Mapping)
+        or page_contract.get("latency_gate") != CAPACITY_CLIENT_LATENCY_SOURCE
+    ):
+        return ["capacity_client_latency_gate_missing"]
+    overall = latency.get("eligible_verified_client_http_duration_ms")
+    by_cohort = latency.get(
+        "eligible_verified_client_http_duration_ms_by_cohort"
+    )
+    if not isinstance(overall, Mapping) or not isinstance(by_cohort, Mapping):
+        return ["capacity_client_latency_gate_missing"]
+    if overall.get("count") != counters.get("eligible"):
+        return ["capacity_client_latency_count_mismatch"]
+    for cohort in CAPACITY_COHORTS:
+        cohort_counts = cohorts.get(cohort)
+        cohort_latency = by_cohort.get(cohort)
+        gate_p95_ms = (
+            cohort_latency.get("gate_p95_ms")
+            if isinstance(cohort_latency, Mapping)
+            else None
+        )
+        if (
+            not isinstance(cohort_counts, Mapping)
+            or not isinstance(cohort_latency, Mapping)
+            or cohort_latency.get("count") != cohort_counts.get("eligible")
+            or isinstance(gate_p95_ms, bool)
+            or not isinstance(gate_p95_ms, (int, float))
+            or not math.isfinite(float(gate_p95_ms))
+            or float(gate_p95_ms) < 0
+        ):
+            return ["capacity_client_latency_cohort_invalid"]
+    return []
+
+
+def _is_complete_request_accounting_invalid(
+    report: Mapping[str, Any], counters: Mapping[str, Any]
+) -> bool:
+    complete_accounting = report.get("complete_request_accounting")
+    physical_attempt_count = counters.get("physical")
+    return (
+        not isinstance(complete_accounting, Mapping)
+        or complete_accounting.get("contract")
+        != "all_standard_http_attempts_v1"
+        or isinstance(complete_accounting.get("actual_http_requests"), bool)
+        or not isinstance(complete_accounting.get("actual_http_requests"), int)
+        or isinstance(physical_attempt_count, bool)
+        or not isinstance(physical_attempt_count, int)
+        or complete_accounting.get("actual_http_requests", -1)
+        < physical_attempt_count
+        or complete_accounting.get("retries") != 0
+        or complete_accounting.get("release_clean") is not True
+    )
+
+
+def _capacity_cohort_floor_failures(
+    cohorts: Mapping[str, Any],
+) -> list[str]:
+    cohort_requirements = (
+        (
+            CAPACITY_POSITIVE_COHORT,
+            CAPACITY_MIN_MATCHED_POSITIVE_ELIGIBLE_HTTP_REQUESTS,
+            "capacity_matched_positive_eligible_requests_below_minimum",
+        ),
+        (
+            CAPACITY_NEGATIVE_COHORT,
+            CAPACITY_MIN_NEGATIVE_ELIGIBLE_HTTP_REQUESTS,
+            "capacity_negative_eligible_requests_below_minimum",
+        ),
+        (
+            CAPACITY_RANDOM_COHORT,
+            CAPACITY_MIN_RANDOM_ELIGIBLE_HTTP_REQUESTS,
+            "capacity_random_eligible_requests_below_minimum",
+        ),
+    )
+    failures: list[str] = []
+    for cohort, minimum, reason in cohort_requirements:
+        cohort_report = cohorts.get(cohort)
+        cohort_eligible = (
+            cohort_report.get("eligible")
+            if isinstance(cohort_report, Mapping)
+            else None
+        )
+        if (
+            isinstance(cohort_eligible, bool)
+            or not isinstance(cohort_eligible, int)
+            or cohort_eligible < minimum
+        ):
+            failures.append(reason)
+    return failures
+
+
+def _capacity_volume_release_failures(
+    counters: Mapping[str, Any], cohorts: Mapping[str, Any]
+) -> list[str]:
+    failures: list[str] = []
+    eligible_count = counters.get("eligible")
+    if (
+        isinstance(eligible_count, bool)
+        or not isinstance(eligible_count, int)
+        or eligible_count < CAPACITY_MIN_ELIGIBLE_HTTP_REQUESTS
+    ):
+        failures.append("capacity_eligible_http_requests_below_minimum")
+    failures.extend(_capacity_cohort_floor_failures(cohorts))
+    random_cohort = cohorts.get(CAPACITY_RANDOM_COHORT)
+    distinct_random_queries = (
+        random_cohort.get("distinct_semantic_queries")
+        if isinstance(random_cohort, Mapping)
+        else None
+    )
+    if (
+        isinstance(distinct_random_queries, bool)
+        or not isinstance(distinct_random_queries, int)
+        or distinct_random_queries < CAPACITY_MIN_DISTINCT_RANDOM_QUERIES
+    ):
+        failures.append("capacity_distinct_random_queries_below_minimum")
+    return failures
+
+
+def _validated_capacity_counter_map(
+    counters: Mapping[str, Any],
+) -> dict[str, int] | None:
+    strict_counter_names = (
+        "planned",
+        "physical",
+        "verified",
+        "eligible",
+        "rejected",
+        "retries",
+        "timeouts",
+        "transport_errors",
+        "http_errors",
+        "verification_errors",
+        "redirects",
+    )
+    strict_count_map = {
+        name: counters.get(name) for name in strict_counter_names
+    }
+    if any(
+        isinstance(count, bool) or not isinstance(count, int) or count < 0
+        for count in strict_count_map.values()
+    ):
+        return None
+    return strict_count_map
+
+
+def _has_valid_capacity_reconciliation(
+    reconciliation_map: Any,
+    strict_count_map: Mapping[str, int],
+) -> bool:
+    if not (
+        isinstance(reconciliation_map, Mapping)
+        and reconciliation_map.get("contract")
+        == "planned_first_attempt_outcomes_v1"
+        and reconciliation_map.get("accounted") is True
+        and reconciliation_map.get("release_clean") is True
+        and reconciliation_map.get("structural_failures") == {}
+    ):
+        return False
+    return all(
+        (
+            reconciliation_map.get("planned_first_physical_attempts")
+            == strict_count_map["planned"],
+            reconciliation_map.get("plans_with_physical_attempt")
+            == strict_count_map["planned"],
+            reconciliation_map.get("initial_physical_attempts")
+            == strict_count_map["planned"],
+            reconciliation_map.get("retry_physical_attempts")
+            == strict_count_map["retries"],
+            reconciliation_map.get("eligible_physical_attempts")
+            == strict_count_map["eligible"],
+            reconciliation_map.get("rejected_physical_attempts")
+            == strict_count_map["rejected"],
+            reconciliation_map.get("planned_without_physical_attempt") == 0,
+            reconciliation_map.get("invalid_attempt_index_records") == 0,
+            reconciliation_map.get("unclassified_physical_attempts") == 0,
+            reconciliation_map.get("verified_rejected_physical_attempts") == 0,
+            reconciliation_map.get("semantic_outcomes_without_physical_attempt")
+            == 0,
+        )
+    )
+
+
+def _has_clean_capacity_top_level_counts(
+    counters: Mapping[str, Any], strict_count_map: Mapping[str, int]
+) -> bool:
+    status_counts = counters.get("status")
+    rejection_counts = counters.get("rejections")
+    return (
+        strict_count_map["planned"]
+        == strict_count_map["physical"]
+        == strict_count_map["verified"]
+        == strict_count_map["eligible"]
+        and strict_count_map["rejected"] == 0
+        and strict_count_map["retries"] == 0
+        and strict_count_map["timeouts"] == 0
+        and strict_count_map["transport_errors"] == 0
+        and strict_count_map["http_errors"] == 0
+        and strict_count_map["verification_errors"] == 0
+        and strict_count_map["redirects"] == 0
+        and isinstance(status_counts, Mapping)
+        and dict(status_counts) == {"200": strict_count_map["physical"]}
+        and isinstance(rejection_counts, Mapping)
+        and not rejection_counts
+    )
+
+
+def _has_clean_capacity_cohort_counts(
+    cohorts: Mapping[str, Any], strict_count_map: Mapping[str, int]
+) -> bool:
+    cohort_totals = collections.Counter()
+    for cohort in CAPACITY_COHORTS:
+        cohort_report = cohorts.get(cohort)
+        if not isinstance(cohort_report, Mapping):
+            return False
+        cohort_counts = [
+            cohort_report.get(name)
+            for name in ("planned", "physical", "verified", "eligible", "rejected")
+        ]
+        if (
+            any(
+                isinstance(cohort_count, bool)
+                or not isinstance(cohort_count, int)
+                or cohort_count < 0
+                for cohort_count in cohort_counts
+            )
+            or not (
+                cohort_counts[0]
+                == cohort_counts[1]
+                == cohort_counts[2]
+                == cohort_counts[3]
+            )
+            or cohort_counts[4] != 0
+        ):
+            return False
+        for name, count in zip(
+            ("planned", "physical", "verified", "eligible", "rejected"),
+            cohort_counts,
+            strict=True,
+        ):
+            cohort_totals[name] += count
+    return all(
+        cohort_totals[name] == strict_count_map[name]
+        for name in ("planned", "physical", "verified", "eligible", "rejected")
+    )
+
+
+def _has_clean_capacity_reconciliation(
+    counters: Mapping[str, Any], cohorts: Mapping[str, Any]
+) -> bool:
+    strict_count_map = _validated_capacity_counter_map(counters)
+    if strict_count_map is None:
+        return False
+    return (
+        _has_valid_capacity_reconciliation(
+            counters.get("reconciliation"), strict_count_map
+        )
+        and _has_clean_capacity_top_level_counts(counters, strict_count_map)
+        and _has_clean_capacity_cohort_counts(cohorts, strict_count_map)
+    )
+
+
+def _capacity_release_seed_failure(
+    report: Mapping[str, Any], require_release_seed: bool
+) -> str | None:
+    if not require_release_seed:
+        return None
+    try:
+        expected_selection = _release_seed_evidence_from_trust_report(
+            report.get("trust")
+        )
+    except (AuditError, TypeError, ValueError):
+        expected_selection = None
+    selection = report.get("selection")
+    if (
+        expected_selection is None
+        or not isinstance(selection, Mapping)
+        or dict(selection) != expected_selection
+    ):
+        return "capacity_release_seed_commitment_invalid"
+    return None
+
+
+def _capacity_run_commitment_failure(report: Mapping[str, Any]) -> str | None:
+    commitments = report.get("commitments")
+    run_digest = (
+        commitments.get("run_digest")
+        if isinstance(commitments, Mapping)
+        else None
+    )
+    run_digest_count = (
+        commitments.get("run_digest_count")
+        if isinstance(commitments, Mapping)
+        else None
+    )
+    if (
+        isinstance(run_digest_count, bool)
+        or run_digest_count != 1
+        or not isinstance(run_digest, str)
+        or len(run_digest) != 64
+        or run_digest == "0" * 64
+        or any(character not in "0123456789abcdef" for character in run_digest)
+    ):
+        return "capacity_run_commitment_invalid"
+    return None
+
+
+def capacity_evidence_release_failures(
+    report: Mapping[str, Any],
+    *,
+    require_release_seed: bool = True,
+) -> tuple[str, ...]:
+    """Return fail-closed release reasons for one aggregate evidence report."""
+
+    if report.get("enabled") is not True:
+        return ("capacity_evidence_disabled",)
+    counters = report.get("counters")
+    if not isinstance(counters, Mapping):
+        return ("capacity_evidence_counters_missing",)
+    cohorts_value = counters.get("cohorts")
+    cohorts = cohorts_value if isinstance(cohorts_value, Mapping) else {}
+    failures: list[str] = []
+    if report.get("contract") != "signed_isolated_standard_http_capacity_v3":
+        failures.append("capacity_evidence_contract_invalid")
+    failures.extend(
+        _capacity_client_latency_release_failures(report, counters, cohorts)
+    )
+    if _is_complete_request_accounting_invalid(report, counters):
+        failures.append("capacity_complete_request_accounting_failed")
+    failures.extend(_capacity_volume_release_failures(counters, cohorts))
+
+    if not _has_clean_capacity_reconciliation(counters, cohorts):
+        failures.append("capacity_request_reconciliation_failed")
+
+    seed_failure = _capacity_release_seed_failure(report, require_release_seed)
+    if seed_failure is not None:
+        failures.append(seed_failure)
+    commitment_failure = _capacity_run_commitment_failure(report)
+    if commitment_failure is not None:
+        failures.append(commitment_failure)
+    return tuple(failures)
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, Decimal):
         return canonical_decimal(value)
@@ -241,6 +1772,124 @@ def sha256_text(value: str) -> str:
     """Return the lowercase SHA-256 digest for UTF-8 text."""
 
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _is_nonzero_lower_hex_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value != "0" * 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _capacity_seed_authority_payload(
+    trust_report: Mapping[str, Any],
+) -> dict[str, str]:
+    """Return the closed pinned-trust coordinates that authorize a release seed."""
+
+    required_fields = {
+        "api_evidence_key_id",
+        "api_evidence_public_key_sha256",
+        "release_digest",
+        "environment_id",
+    }
+    if not isinstance(trust_report, Mapping) or set(trust_report) != required_fields:
+        raise ConfigurationError("capacity_seed_authority_invalid")
+    key_id = trust_report.get("api_evidence_key_id")
+    if (
+        not isinstance(key_id, str)
+        or not key_id
+        or len(key_id) > 64
+        or not key_id[0].isascii()
+        or not key_id[0].isalnum()
+        or any(
+            character
+            not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+            for character in key_id
+        )
+    ):
+        raise ConfigurationError("capacity_seed_authority_invalid")
+    for field_name in required_fields - {"api_evidence_key_id"}:
+        if not _is_nonzero_lower_hex_digest(trust_report.get(field_name)):
+            raise ConfigurationError("capacity_seed_authority_invalid")
+    return {
+        field_name: str(trust_report[field_name])
+        for field_name in sorted(required_fields)
+    }
+
+
+def _capacity_authoritative_release_seed(
+    trust_report: Mapping[str, Any],
+) -> str:
+    authority_payload = _capacity_seed_authority_payload(trust_report)
+    return hashlib.sha256(
+        RELEASE_CAPACITY_SEED_DOMAIN
+        + canonical_json(authority_payload).encode("ascii")
+    ).hexdigest()
+
+
+def authoritative_release_seed(
+    trust: CapacityEvidenceTrust | None,
+) -> str:
+    """Resolve the only accepted seed for one release authority."""
+
+    if trust is None:
+        return DEFAULT_SEED
+    return _capacity_authoritative_release_seed(trust.report_value)
+
+
+def _release_seed_evidence_from_trust_report(
+    trust_report: Mapping[str, Any],
+) -> dict[str, Any]:
+    authority_payload = _capacity_seed_authority_payload(trust_report)
+    seed = _capacity_authoritative_release_seed(authority_payload)
+    return {
+        "contract": RELEASE_CAPACITY_SEED_CONTRACT,
+        "precommitted": True,
+        "authority": "pinned_capacity_evidence_trust",
+        "authority_sha256": sha256_text(canonical_json(authority_payload)),
+        "seed_sha256": sha256_text(seed),
+    }
+
+
+def sampling_seed_evidence(
+    profile: str,
+    seed: str,
+    trust: CapacityEvidenceTrust | None,
+) -> dict[str, Any]:
+    """Describe the deterministic seed contract without exposing the seed."""
+
+    if not isinstance(seed, str) or not seed or seed != seed.strip():
+        raise ConfigurationError("seed_must_be_nonempty")
+    if profile == "release":
+        expected_seed = authoritative_release_seed(trust)
+        if seed != expected_seed:
+            raise ConfigurationError("release_seed_must_match_authority")
+        if trust is not None:
+            return _release_seed_evidence_from_trust_report(trust.report_value)
+        authority_payload_map = {
+            "contract": RELEASE_FIXED_SEED_CONTRACT,
+            "fixed_seed_sha256": sha256_text(DEFAULT_SEED),
+        }
+        return {
+            "contract": RELEASE_FIXED_SEED_CONTRACT,
+            "precommitted": True,
+            "authority": "versioned_audit_harness_constant",
+            "authority_sha256": sha256_text(
+                canonical_json(authority_payload_map)
+            ),
+            "seed_sha256": sha256_text(seed),
+        }
+    if profile != "diagnostic":
+        raise ConfigurationError("unknown_audit_profile")
+    return {
+        "contract": DIAGNOSTIC_SEED_CONTRACT,
+        "precommitted": False,
+        "authority": "diagnostic_caller",
+        "authority_sha256": None,
+        "seed_sha256": sha256_text(seed),
+    }
 
 
 def fingerprint(value: str, *, length: int = 24) -> str:
@@ -969,6 +2618,7 @@ class SourceIndex:
         *,
         seed: str,
         source_occurrence_sample_target: int,
+        capacity_query_sample_target: int = 0,
         sqlite_cache_mb: int = 64,
         max_list_values: int = 10_000,
         max_tuples_per_query: int = 10_000,
@@ -981,6 +2631,15 @@ class SourceIndex:
             source_occurrence_sample_target,
             seed=seed,
             namespace="source-occurrence-id",
+        )
+        self.capacity_query_sampler: BottomKSampler[SourceOccurrence] | None = (
+            BottomKSampler(
+                capacity_query_sample_target,
+                seed=seed,
+                namespace="capacity-distinct-semantic-query",
+            )
+            if capacity_query_sample_target > 0
+            else None
         )
         self.connection = sqlite3.connect(str(database_path))
         self.connection.row_factory = sqlite3.Row
@@ -1925,9 +3584,15 @@ class SourceIndex:
                 ),
             )
             self.occurrence_sampler.offer(occurrence.stable_key, occurrence)
+            if self.capacity_query_sampler is not None:
+                self.capacity_query_sampler.offer(query.stable_key, occurrence)
             occurrence_count += 1
         self.metrics["source_occurrences"] = occurrence_count
         self.metrics["sampled_source_occurrences"] = len(self.occurrence_sampler)
+        if self.capacity_query_sampler is not None:
+            self.metrics["sampled_capacity_distinct_queries"] = len(
+                self.capacity_query_sampler
+            )
         self._occurrence_sample_prepared = True
 
     def prepare_occurrence_sample(self) -> None:
@@ -1942,6 +3607,21 @@ class SourceIndex:
         if target > self.occurrence_sampler.capacity:
             raise ConfigurationError("source_occurrence_target_exceeds_sampler_capacity")
         return self.occurrence_sampler.values()[:target]
+
+    def capacity_query_occurrences(self, target: int) -> list[SourceOccurrence]:
+        """Return a deterministic sample containing at most one row per query."""
+
+        self.prepare_occurrence_sample()
+        if self.capacity_query_sampler is None:
+            raise ConfigurationError("capacity_query_sampler_disabled")
+        if target > self.capacity_query_sampler.capacity:
+            raise ConfigurationError("capacity_query_target_exceeds_sampler_capacity")
+        occurrences = self.capacity_query_sampler.values()[:target]
+        if len(occurrences) < target:
+            raise SourceCoverageError(
+                "capacity_distinct_random_query_population_below_minimum"
+            )
+        return occurrences
 
     def has_query(self, query: QueryKey) -> bool:
         """Return whether any eligible source rate serves the exact query."""
@@ -2099,6 +3779,11 @@ class SourceIndex:
             "sqlite_storage_bytes": sqlite_bytes,
             "max_canonical_tuples_per_query": self.max_tuples_per_query,
             "source_occurrence_sampler_capacity": self.occurrence_sampler.capacity,
+            "capacity_query_sampler_capacity": (
+                self.capacity_query_sampler.capacity
+                if self.capacity_query_sampler is not None
+                else 0
+            ),
             "memory_model": "ijson_event_stream_plus_disk_backed_sqlite_plus_fixed_bottom_k_occurrence_sampler",
         }
 
@@ -2136,6 +3821,7 @@ class FetchResult:
     pages: int
     retries: int
     response_fingerprint: str
+    capacity_observations: tuple[CapacityHttpObservation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2191,6 +3877,7 @@ class ApiFetcher(Protocol):
         *,
         phase: str,
         page_size: int | None = None,
+        capacity_intent: CapacityObservationIntent | None = None,
     ) -> FetchResult:
         """Fetch every result page for one query."""
 
@@ -2444,6 +4131,35 @@ class _FetchState:
     declared_total: int | None = None
     offset: int = 0
     retries: int = 0
+    capacity_observations: list[CapacityHttpObservation] = dataclasses.field(
+        default_factory=list
+    )
+
+
+class _ExactResponseHeaders(Mapping[str, str]):
+    """Mapping adapter that preserves duplicate HTTP response fields."""
+
+    def __init__(self, pairs: Sequence[tuple[str, str]]):
+        self._pairs = tuple(pairs)
+        self._by_name: dict[str, str] = {}
+        for name, value in self._pairs:
+            self._by_name.setdefault(name.lower(), value)
+
+    def __getitem__(self, name: str) -> str:
+        return self._by_name[name.lower()]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._by_name)
+
+    def __len__(self) -> int:
+        return len(self._by_name)
+
+    def items(self, multi: bool = False) -> Any:
+        """Return original duplicate-preserving pairs when requested."""
+
+        if multi:
+            return list(self._pairs)
+        return [(name, self._by_name[name]) for name in self._by_name]
 
 
 class HttpApiFetcher:
@@ -2451,7 +4167,12 @@ class HttpApiFetcher:
 
     RETRYABLE_STATUS = {429, 502, 503, 504}
 
-    def __init__(self, options: HttpApiFetcherOptions):
+    def __init__(
+        self,
+        options: HttpApiFetcherOptions,
+        *,
+        capacity_collector: CapacityEvidenceCollector | None = None,
+    ):
         parsed = urlsplit(options.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ConfigurationError("api_base_url_must_be_http_origin")
@@ -2461,6 +4182,16 @@ class HttpApiFetcher:
         self.retries = options.retries
         self.retry_backoff_seconds = options.retry_backoff_seconds
         self.max_response_bytes = options.max_response_bytes
+        self.capacity_collector = capacity_collector
+        if capacity_collector is not None and any(
+            name.lower()
+            in {
+                capacity_evidence.CAPACITY_CHALLENGE_HEADER.lower(),
+                capacity_evidence.CAPACITY_RUN_NONCE_HEADER.lower(),
+            }
+            for name in options.headers
+        ):
+            raise ConfigurationError("capacity_headers_must_be_request_local")
         self.client = httpx.Client(
             headers=dict(options.headers),
             timeout=httpx.Timeout(options.timeout_seconds),
@@ -2499,20 +4230,107 @@ class HttpApiFetcher:
         if delay > 0:
             time.sleep(delay)
 
-    def _request_page(self, params: Mapping[str, Any]) -> tuple[dict[str, Any], float, int]:
+    def _request_headers_for_capacity_plan(
+        self, capacity_plan: _CapacityObservationPlan | None
+    ) -> tuple[str | None, dict[str, str] | None]:
+        if capacity_plan is None:
+            return None, None
+        if self.capacity_collector is None:
+            raise ConfigurationError("capacity_collector_missing")
+        challenge = self.capacity_collector.fresh_challenge()
+        return challenge, self.capacity_collector.request_headers(
+            capacity_plan, challenge
+        )
+
+    def _execute_page_request(
+        self,
+        params: Mapping[str, Any],
+        capacity_plan: _CapacityObservationPlan | None,
+        attempt: int,
+        attempt_started: float,
+    ) -> tuple[int, str | None, int, bytes, tuple[CapacityHttpObservation, ...]]:
+        challenge, request_headers = self._request_headers_for_capacity_plan(capacity_plan)
+        capacity_observations: list[CapacityHttpObservation] = []
+        with self.client.stream("GET", self.url, params=dict(params), headers=request_headers) as response:
+            status_code = response.status_code
+            retry_after = response.headers.get("retry-after")
+            response_redirect_count = len(response.history) + int(response.is_redirect)
+            try:
+                body = self._read_bounded(response)
+            except ApiError:
+                if capacity_plan is not None:
+                    assert self.capacity_collector is not None
+                    capacity_observations.append(self.capacity_collector.record_unverified_response(capacity_plan, attempt_index=attempt, latency_ms=(time.perf_counter() - attempt_started) * 1000.0, response_status_code=status_code, response_redirect_count=response_redirect_count, reason="response_body_incomplete"))
+                raise
+            if capacity_plan is not None:
+                assert self.capacity_collector is not None and challenge is not None
+                capacity_observations.append(self.capacity_collector.collect_response(capacity_plan, _CapacityResponseDetails(challenge=challenge, query_parameters=params, response_headers=_ExactResponseHeaders(response.headers.multi_items()), response_status_code=status_code, response_body=body, response_redirect_count=response_redirect_count, collector_received_at=dt.datetime.now(dt.timezone.utc), attempt_index=attempt, latency_ms=(time.perf_counter() - attempt_started) * 1000.0)))
+        return status_code, retry_after, response_redirect_count, body, tuple(capacity_observations)
+
+    def _capacity_transport_failure(
+        self,
+        capacity_plan: _CapacityObservationPlan | None,
+        attempt: int,
+        attempt_started: float,
+        reason: str,
+    ) -> tuple[CapacityHttpObservation, ...]:
+        if capacity_plan is None:
+            return ()
+        assert self.capacity_collector is not None
+        return (
+            self.capacity_collector.record_transport_failure(
+                capacity_plan,
+                attempt_index=attempt,
+                latency_ms=(time.perf_counter() - attempt_started) * 1000.0,
+                reason=reason,
+            ),
+        )
+
+    @staticmethod
+    def _parse_success_payload(body: bytes) -> dict[str, Any]:
+        try:
+            response_payload = json.loads(body.decode("utf-8"), parse_float=Decimal, parse_int=int)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ApiSchemaError("response_is_not_valid_utf8_json") from exc
+        if not isinstance(response_payload, dict):
+            raise ApiSchemaError("response_root_must_be_object")
+        return response_payload
+
+    def _request_page(
+        self,
+        params: Mapping[str, Any],
+        *,
+        capacity_plan: _CapacityObservationPlan | None = None,
+    ) -> tuple[
+        dict[str, Any],
+        float,
+        int,
+        tuple[CapacityHttpObservation, ...],
+    ]:
         started = time.perf_counter()
         used_retries = 0
         last_transport_error: Exception | None = None
+        capacity_observations: list[CapacityHttpObservation] = []
         for attempt in range(self.retries + 1):
             with self._stats_lock:
                 self.request_count += 1
+            attempt_started = time.perf_counter()
             try:
-                with self.client.stream("GET", self.url, params=dict(params)) as response:
-                    body = self._read_bounded(response)
-                    status_code = response.status_code
-                    retry_after = response.headers.get("retry-after")
+                status_code, retry_after, response_redirect_count, body, attempt_observations = self._execute_page_request(params, capacity_plan, attempt, attempt_started)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_transport_error = exc
+                capacity_observations.extend(
+                    self._capacity_transport_failure(
+                        capacity_plan,
+                        attempt,
+                        attempt_started,
+                        (
+                            "request_timeout"
+                            if isinstance(exc, httpx.TimeoutException)
+                            else "transport_failure"
+                        ),
+                    )
+                )
                 if attempt >= self.retries:
                     break
                 used_retries += 1
@@ -2520,6 +4338,7 @@ class HttpApiFetcher:
                     self.retry_count += 1
                 self._sleep_before_retry(attempt, None)
                 continue
+            capacity_observations.extend(attempt_observations)
             if status_code in self.RETRYABLE_STATUS and attempt < self.retries:
                 used_retries += 1
                 with self._stats_lock:
@@ -2532,18 +4351,9 @@ class HttpApiFetcher:
                     status_code=status_code,
                     body_sha256=hashlib.sha256(body).hexdigest(),
                 )
-            try:
-                response_payload = json.loads(
-                    body.decode("utf-8"),
-                    parse_float=Decimal,
-                    parse_int=int,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ApiSchemaError("response_is_not_valid_utf8_json") from exc
-            if not isinstance(response_payload, dict):
-                raise ApiSchemaError("response_root_must_be_object")
+            response_payload = self._parse_success_payload(body)
             latency_ms = (time.perf_counter() - started) * 1000.0
-            return response_payload, latency_ms, used_retries
+            return response_payload, latency_ms, used_retries, tuple(capacity_observations)
         raise ApiError("transport_failure") from last_transport_error
 
     @staticmethod
@@ -2724,7 +4534,26 @@ class HttpApiFetcher:
             pages=page_number,
             retries=state.retries,
             response_fingerprint=sha256_text(canonical_json(state.response_items)),
+            capacity_observations=tuple(state.capacity_observations),
         )
+
+    def _page_request_parameters(
+        self,
+        params: Mapping[str, Any],
+        requested_page_size: int,
+        state: _FetchState,
+        page_number: int,
+        capacity_plan: _CapacityObservationPlan | None,
+    ) -> tuple[dict[str, Any], _CapacityObservationPlan | None]:
+        request_param_map = dict(params)
+        request_param_map.update({"limit": requested_page_size, "offset": state.offset})
+        page_capacity_plan = capacity_plan if page_number == 1 and state.offset == 0 else None
+        if page_capacity_plan is not None:
+            request_param_map = {
+                str(name): str(parameter_value)
+                for name, parameter_value in request_param_map.items()
+            }
+        return request_param_map, page_capacity_plan
 
     def fetch_all(
         self,
@@ -2732,6 +4561,7 @@ class HttpApiFetcher:
         *,
         phase: str,
         page_size: int | None = None,
+        capacity_intent: CapacityObservationIntent | None = None,
     ) -> FetchResult:
         """Fetch and validate every page for one exact source API query."""
 
@@ -2739,15 +4569,25 @@ class HttpApiFetcher:
         requested_page_size = self.page_size if page_size is None else page_size
         if requested_page_size < 1:
             raise ConfigurationError("invalid_api_page_size")
+        if capacity_intent is not None and requested_page_size != capacity_evidence.CAPACITY_PAGE_LIMIT:
+            raise ConfigurationError("capacity_page_limit_must_be_100")
+        capacity_plan = self.capacity_collector.plan(capacity_intent) if capacity_intent is not None and self.capacity_collector is not None else None
+        if capacity_intent is not None and capacity_plan is None:
+            raise ConfigurationError("capacity_collector_missing")
         state = _FetchState()
         started = time.perf_counter()
         for page_number in range(1, self.max_pages + 1):
-            request_param_map = dict(params)
-            request_param_map.update(
-                {"limit": requested_page_size, "offset": state.offset}
+            request_param_map, page_capacity_plan = self._page_request_parameters(
+                params, requested_page_size, state, page_number, capacity_plan
             )
-            response_payload, latency_ms, page_retries = self._request_page(
-                request_param_map
+            (
+                response_payload,
+                latency_ms,
+                page_retries,
+                page_capacity_observations,
+            ) = self._request_page(
+                request_param_map,
+                capacity_plan=page_capacity_plan,
             )
             page_items, has_more, total, page_fingerprint = self._validate_standard_page(
                 response_payload,
@@ -2756,6 +4596,7 @@ class HttpApiFetcher:
             )
             state.retries += page_retries
             state.page_latencies_ms.append(latency_ms)
+            state.capacity_observations.extend(page_capacity_observations)
             state.contracts.append(self._contract(response_payload))
             state.declared_total = total
             state.seen_page_fingerprints.add(page_fingerprint)
@@ -2763,11 +4604,7 @@ class HttpApiFetcher:
             if not has_more:
                 if len(state.response_items) != total:
                     raise ApiSchemaError("pagination_total_does_not_match_returned_rows")
-                return self._completed_fetch(
-                    state,
-                    page_number=page_number,
-                    started=started,
-                )
+                return self._completed_fetch(state, page_number=page_number, started=started)
             state.offset += len(page_items)
         raise ApiSchemaError("pagination_exceeded_max_pages")
 
@@ -3261,6 +5098,22 @@ def compare_tuple_counters(
     )
 
 
+def _is_https_api_origin(api_base_url: str) -> bool:
+    try:
+        parsed_origin = urlsplit(api_base_url)
+    except ValueError:
+        return False
+    return (
+        parsed_origin.scheme == "https"
+        and bool(parsed_origin.netloc)
+        and parsed_origin.path in {"", "/"}
+        and not parsed_origin.query
+        and not parsed_origin.fragment
+        and parsed_origin.username is None
+        and parsed_origin.password is None
+    )
+
+
 @dataclass(frozen=True)
 class AuditConfig:
     profile: str
@@ -3297,6 +5150,8 @@ class AuditConfig:
     validated_candidate: bool = False
     max_first_page_first_observation_p95_ms: float = RELEASE_MAX_FIRST_PAGE_P95_MS
     max_logical_query_p95_ms: float = RELEASE_MAX_LOGICAL_QUERY_P95_MS
+    capacity_evidence_trust: CapacityEvidenceTrust | None = None
+    capacity_contention_run_id: str | None = None
 
     def __post_init__(self) -> None:
         """Reject invalid settings and enforce immutable release-profile floors."""
@@ -3305,6 +5160,12 @@ class AuditConfig:
             raise ConfigurationError("unknown_audit_profile")
         self._validate_numeric_bounds()
         self._validate_sample_targets()
+        self._validate_capacity_evidence_contract()
+        sampling_seed_evidence(
+            self.profile,
+            self.seed,
+            self.capacity_evidence_trust,
+        )
         if self.profile != "release":
             return
         for reason, is_violated in self._release_rules_by_reason().items():
@@ -3363,21 +5224,52 @@ class AuditConfig:
         ):
             raise ConfigurationError("resolved_rate_fraction_out_of_range")
 
-    def _release_rules_by_reason(self) -> dict[str, bool]:
-        try:
-            parsed_origin = urlsplit(self.api_base_url)
-            is_https_origin = (
-                parsed_origin.scheme == "https"
-                and bool(parsed_origin.netloc)
-                and parsed_origin.path in {"", "/"}
-                and not parsed_origin.query
-                and not parsed_origin.fragment
-                and parsed_origin.username is None
-                and parsed_origin.password is None
+    def _validate_capacity_evidence_contract(self) -> None:
+        if self.capacity_evidence_trust is None:
+            if self.capacity_contention_run_id is not None:
+                raise ConfigurationError(
+                    "capacity_contention_run_requires_evidence_trust"
+                )
+            return
+        contention_run_id = self.capacity_contention_run_id
+        if (
+            not isinstance(contention_run_id, str)
+            or len(contention_run_id) != 64
+            or contention_run_id == "0" * 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in contention_run_id
             )
-        except ValueError:
-            is_https_origin = False
+        ):
+            raise ConfigurationError("capacity_contention_run_id_invalid")
+        if self.validated_candidate:
+            raise ConfigurationError(
+                "capacity_evidence_requires_published_standard_route"
+            )
+        if self.api_path != DEFAULT_API_PATH:
+            raise ConfigurationError("capacity_evidence_requires_standard_api_path")
+        if self.plan_market_type is not None or self.source_key is not None:
+            raise ConfigurationError(
+                "capacity_evidence_rejects_optional_scope_parameters"
+            )
+        if self.page_size != capacity_evidence.CAPACITY_PAGE_LIMIT:
+            raise ConfigurationError("capacity_page_limit_must_be_100")
+        if self.random_api_max_limit != capacity_evidence.CAPACITY_PAGE_LIMIT:
+            raise ConfigurationError("capacity_random_page_limit_must_be_100")
+        if self.random_api_calls < CAPACITY_MIN_DISTINCT_RANDOM_QUERIES:
+            raise ConfigurationError(
+                "capacity_random_query_target_below_minimum"
+            )
+
+    def _release_rules_by_reason(self) -> dict[str, bool]:
+        """Return release constraints keyed by their stable failure reason."""
+
+        is_https_origin = _is_https_api_origin(self.api_base_url)
         return {
+            "release_published_capacity_evidence_required": (
+                not self.validated_candidate
+                and self.capacity_evidence_trust is None
+            ),
             "release_tls_verification_required": not self.verify_tls,
             "release_api_base_url_must_be_https_origin": not is_https_origin,
             "release_standard_api_path_required": self.api_path
@@ -3486,6 +5378,7 @@ class AuditConfig:
                 "validated" if self.validated_candidate else "published"
             ),
             "tls_verified": self.verify_tls,
+            "capacity_evidence_enabled": self.capacity_evidence_trust is not None,
         }
 
 
@@ -3508,6 +5401,7 @@ class QueryAuditResult:
     warm_page_ms: tuple[float, ...]
     warm_query_ms: tuple[float, ...]
     retries: int
+    capacity_observations: tuple[CapacityHttpObservation, ...] = ()
 
 
 def _safe_http_example(query: QueryKey, exc: AuditError) -> dict[str, Any]:
@@ -3678,8 +5572,8 @@ class HttpApiOccurrenceSource:
             return True
         request_params = self.config.api_audit_params()
         request_params.update({"limit": 1, "offset": 0})
-        response_payload, _latency_ms, retries = self.fetcher._request_page(
-            request_params
+        response_payload, _latency_ms, retries, _capacity_observations = (
+            self.fetcher._request_page(request_params)
         )
         self._preflight_retries += retries
         items = response_payload.get("items")
@@ -3887,9 +5781,12 @@ class HttpApiOccurrenceSource:
             request_param_map.update(
                 {"limit": self.config.api_audit_page_size, "offset": state.offset}
             )
-            response_payload, _latency_ms, page_retries = self.fetcher._request_page(
-                request_param_map
-            )
+            (
+                response_payload,
+                _latency_ms,
+                page_retries,
+                _capacity_observations,
+            ) = self.fetcher._request_page(request_param_map)
             state.retries += page_retries
             page_items, pagination, total = self._validate_audit_pagination(
                 response_payload,
@@ -3949,6 +5846,43 @@ class _QueryAuditState:
     retries: int = 0
     matched_initial_traversal: bool = False
     matched_first_observation: bool = False
+    capacity_observations: list[CapacityHttpObservation] = dataclasses.field(
+        default_factory=list
+    )
+
+
+def _fetch_all_with_capacity_intent(
+    fetcher: ApiFetcher,
+    params: Mapping[str, Any],
+    *,
+    phase: str,
+    page_size: int | None = None,
+    capacity_intent: CapacityObservationIntent | None = None,
+) -> FetchResult:
+    """Keep the optional extension invisible to legacy and test fetchers."""
+
+    if capacity_intent is None:
+        return fetcher.fetch_all(params, phase=phase, page_size=page_size)
+    return fetcher.fetch_all(
+        params,
+        phase=phase,
+        page_size=page_size,
+        capacity_intent=capacity_intent,
+    )
+
+
+def _mark_capacity_semantic_outcome(
+    fetcher: ApiFetcher,
+    observations: Sequence[CapacityHttpObservation],
+    *,
+    successful: bool,
+) -> None:
+    collector = getattr(fetcher, "capacity_collector", None)
+    if not observations:
+        return
+    if not isinstance(collector, CapacityEvidenceCollector):
+        raise ConfigurationError("capacity_collector_missing")
+    collector.mark_semantic_outcome(observations, successful=successful)
 
 
 def _record_query_fetch(
@@ -3958,6 +5892,7 @@ def _record_query_fetch(
     is_cold: bool,
 ) -> None:
     state.retries += fetch_result.retries
+    state.capacity_observations.extend(fetch_result.capacity_observations)
     if is_cold:
         if fetch_result.page_latencies_ms:
             state.first_page_first_observation_ms.append(
@@ -3997,6 +5932,7 @@ def _query_audit_result(
         warm_page_ms=tuple(state.warm_page_ms),
         warm_query_ms=tuple(state.warm_query_ms),
         retries=state.retries,
+        capacity_observations=tuple(state.capacity_observations),
     )
 
 
@@ -4027,7 +5963,11 @@ def _audit_positive_warm_repeats(
 ) -> None:
     for _repeat in range(config.warm_repeats):
         try:
-            warm = fetcher.fetch_all(config.api_params(query), phase="warm")
+            warm = _fetch_all_with_capacity_intent(
+                fetcher,
+                config.api_params(query),
+                phase="warm",
+            )
         except AuditError as exc:
             state.failure_counts[exc.code] += 1
             state.examples.append(_safe_http_example(query, exc))
@@ -4086,9 +6026,19 @@ def _audit_positive_query(
         raise ConfigurationError("positive_initial_phase_invalid")
     state = _QueryAuditState()
     try:
-        initial = fetcher.fetch_all(
+        initial = _fetch_all_with_capacity_intent(
+            fetcher,
             config.api_params(query),
             phase=initial_phase,
+            capacity_intent=(
+                CapacityObservationIntent(
+                    cohort=CAPACITY_POSITIVE_COHORT,
+                    first_for_query=True,
+                )
+                if config.capacity_evidence_trust is not None
+                and initial_phase == "cold"
+                else None
+            ),
         )
     except AuditError as exc:
         state.failure_counts[exc.code] += 1
@@ -4117,6 +6067,15 @@ def _audit_positive_query(
     )
     state.failure_counts.update(comparison.failure_counts)
     state.examples.extend(comparison.examples)
+    _mark_capacity_semantic_outcome(
+        fetcher,
+        initial.capacity_observations,
+        successful=(
+            state.matched_initial_traversal
+            and not state.schema_errors
+            and not comparison.failure_counts
+        ),
+    )
     _audit_positive_warm_repeats(
         query,
         initial,
@@ -4151,7 +6110,11 @@ def _audit_negative_warm_repeats(
 ) -> None:
     for _repeat in range(config.warm_repeats):
         try:
-            warm = fetcher.fetch_all(config.api_params(query), phase="warm")
+            warm = _fetch_all_with_capacity_intent(
+                fetcher,
+                config.api_params(query),
+                phase="warm",
+            )
         except AuditError as exc:
             state.failure_counts[exc.code] += 1
             state.examples.append(_safe_http_example(query, exc))
@@ -4164,6 +6127,24 @@ def _audit_negative_warm_repeats(
             state.failure_counts["extra_fake"] += max(len(warm.items), 1)
         if warm.response_fingerprint != cold.response_fingerprint:
             state.failure_counts["altered"] += 1
+
+
+def _fetch_negative_cold_response(
+    query: QueryKey,
+    fetcher: ApiFetcher,
+    config: AuditConfig,
+) -> FetchResult:
+    capacity_intent = (
+        CapacityObservationIntent(cohort=CAPACITY_NEGATIVE_COHORT, first_for_query=True)
+        if config.capacity_evidence_trust is not None
+        else None
+    )
+    return _fetch_all_with_capacity_intent(
+        fetcher,
+        config.api_params(query),
+        phase="cold",
+        capacity_intent=capacity_intent,
+    )
 
 
 def _audit_negative_query(
@@ -4179,15 +6160,13 @@ def _audit_negative_query(
     empty_counts: collections.Counter[str] = collections.Counter()
     extracted = ExtractedTuples(empty_counts, {}, 0, ())
     try:
-        cold = fetcher.fetch_all(config.api_params(query), phase="cold")
+        cold = _fetch_negative_cold_response(query, fetcher, config)
     except AuditError as exc:
         state.failure_counts[exc.code] += 1
         state.examples.append(_safe_http_example(query, exc))
         return _failed_query_audit_result(query, empty_counts, state)
     _record_query_fetch(state, cold, is_cold=True)
-    state.schema_errors.extend(
-        _validate_contracts(cold.contracts, config, positive=False)
-    )
+    state.schema_errors.extend(_validate_contracts(cold.contracts, config, positive=False))
     extracted = (
         extract_api_tuples(cold.items, registry=identity_registry)
         if cold.items
@@ -4205,6 +6184,11 @@ def _audit_negative_query(
                 "reason": "negative_code_npi_combination_returned_items",
             }
         )
+    _mark_capacity_semantic_outcome(
+        fetcher,
+        cold.capacity_observations,
+        successful=not state.schema_errors and not state.failure_counts,
+    )
     _audit_negative_warm_repeats(
         query,
         cold,
@@ -4286,6 +6270,7 @@ class RandomApiResult:
     failure_counts: Mapping[str, int]
     examples: tuple[dict[str, Any], ...]
     response_fingerprint: str
+    capacity_observations: tuple[CapacityHttpObservation, ...] = ()
 
 
 def _seeded_index(seed: str, namespace: str, index: int, modulus: int) -> int:
@@ -4331,6 +6316,32 @@ def build_random_api_requests(
             )
         )
     return requests
+
+
+def build_capacity_random_api_requests(
+    occurrences: Sequence[SourceOccurrence],
+    *,
+    count: int,
+) -> list[RandomApiRequest]:
+    """Plan fixed-page capacity requests without semantic-query replacement."""
+
+    unique_by_query: dict[str, SourceOccurrence] = {}
+    for occurrence in occurrences:
+        unique_by_query.setdefault(occurrence.query.stable_key, occurrence)
+    if len(unique_by_query) < count:
+        raise SourceCoverageError(
+            "capacity_distinct_random_query_population_below_minimum"
+        )
+    return [
+        RandomApiRequest(
+            index=index,
+            query=occurrence.query,
+            source_occurrence_id=occurrence.occurrence_id,
+            page_size=capacity_evidence.CAPACITY_PAGE_LIMIT,
+            phase="cold",
+        )
+        for index, occurrence in enumerate(list(unique_by_query.values())[:count])
+    ]
 
 
 def _record_random_schema_errors(
@@ -4385,10 +6396,19 @@ def _audit_random_api_request(
     failures: collections.Counter[str] = collections.Counter()
     examples: list[dict[str, Any]] = []
     try:
-        response = fetcher.fetch_all(
+        response = _fetch_all_with_capacity_intent(
+            fetcher,
             config.api_params(request.query),
             phase=request.phase,
             page_size=request.page_size,
+            capacity_intent=(
+                CapacityObservationIntent(
+                    cohort=CAPACITY_RANDOM_COHORT,
+                    first_for_query=request.phase == "cold",
+                )
+                if config.capacity_evidence_trust is not None
+                else None
+            ),
         )
     except AuditError as exc:
         failures[exc.code] += 1
@@ -4418,6 +6438,11 @@ def _audit_random_api_request(
     )
     failures.update(comparison.failure_counts)
     examples.extend(comparison.examples)
+    _mark_capacity_semantic_outcome(
+        fetcher,
+        response.capacity_observations,
+        successful=not failures,
+    )
     return RandomApiResult(
         request=request,
         response_occurrences=sum(extracted.counter.values()),
@@ -4432,6 +6457,7 @@ def _audit_random_api_request(
         failure_counts=dict(failures),
         examples=tuple(examples[: config.failure_example_limit]),
         response_fingerprint=response.response_fingerprint,
+        capacity_observations=response.capacity_observations,
     )
 
 
@@ -4501,6 +6527,7 @@ class _AuditReportContext:
     random_http_requests: int
     standard_http_requests: int
     latency_reports: _LatencyReports
+    capacity_evidence: Mapping[str, Any]
 
 
 AUDIT_LIMITATIONS = (
@@ -4534,6 +6561,41 @@ REDACTION_EXCLUDED_FIELDS = (
 )
 
 
+def _latency_gate_semantics(uses_signed_capacity_gate: bool) -> dict[str, str]:
+    if uses_signed_capacity_gate:
+        return {
+            "first_page_first_observation": (
+                "client end-to-end HTTP duration for the first physical first-page "
+                "attempt whose cold request and response were API-signed and verified, "
+                "gated separately for matched positive, negative, and independently "
+                "random query classes"
+            ),
+            "logical_query": (
+                "client perf_counter wall time for all pages in the first traversal; "
+                "diagnostic only and not release evidence"
+            ),
+            "warm": (
+                "client perf_counter timing for repeated traversals and reserved positive "
+                "exactness checks; diagnostic only and not release evidence"
+            ),
+        }
+    return {
+        "first_page_first_observation": (
+            "page zero from the first traversal of each distinct matched positive "
+            "standard-pricing query outside the random reserved cohort; negative and "
+            "random requests are reported in separate classes"
+        ),
+        "logical_query": (
+            "wall time for all pages in the first traversal, gated separately for "
+            "disjoint matched positive, negative, and random positive query classes"
+        ),
+        "warm": (
+            "immediate repeated traversal of the same sampled query, plus positive "
+            "exactness traversals for query keys first observed by the random cohort"
+        ),
+    }
+
+
 class AuditRunner:
     def __init__(
         self,
@@ -4541,11 +6603,15 @@ class AuditRunner:
         fetcher: ApiFetcher,
         api_occurrence_source: ApiOccurrenceSource,
         config: AuditConfig,
+        capacity_collector: CapacityEvidenceCollector | None = None,
     ):
         self.source_index = source_index
         self.fetcher = fetcher
         self.api_occurrence_source = api_occurrence_source
         self.config = config
+        self.capacity_collector = capacity_collector
+        if config.capacity_evidence_trust is not None and capacity_collector is None:
+            raise ConfigurationError("capacity_collector_missing")
         self.identity_registry = SourceIdentityRegistry()
 
     @staticmethod
@@ -4612,12 +6678,20 @@ class AuditRunner:
         source_occurrences = self.source_index.source_occurrences(
             self.config.source_occurrence_samples
         )
-        random_requests = build_random_api_requests(
-            source_occurrences,
-            count=self.config.random_api_calls,
-            max_limit=self.config.random_api_max_limit,
-            seed=self.config.seed,
-        )
+        if self.config.capacity_evidence_trust is not None:
+            random_requests = build_capacity_random_api_requests(
+                self.source_index.capacity_query_occurrences(
+                    self.config.random_api_calls
+                ),
+                count=self.config.random_api_calls,
+            )
+        else:
+            random_requests = build_random_api_requests(
+                source_occurrences,
+                count=self.config.random_api_calls,
+                max_limit=self.config.random_api_max_limit,
+                seed=self.config.seed,
+            )
         api_sample = self.api_occurrence_source.sample_occurrences(
             sample_target=self.config.api_occurrence_samples,
             seed=self.config.seed,
@@ -4650,6 +6724,12 @@ class AuditRunner:
             for query in positive_queries
             if query.stable_key in random_query_keys
         ]
+        if self.config.capacity_evidence_trust is not None:
+            validate_capacity_evidence_preflight(
+                distinct_random_queries=len(random_query_keys),
+                negative_queries=len(negative_queries),
+                positive_queries=len(positive_first_observation_queries),
+            )
         return _AuditSamples(
             source_occurrences=source_occurrences,
             random_requests=random_requests,
@@ -5106,6 +7186,7 @@ class AuditRunner:
         *,
         resolved_fraction: float,
         standard_http_requests: int,
+        capacity_report: Mapping[str, Any],
     ) -> None:
         self._check_sample_minimums(progress)
         if (
@@ -5114,6 +7195,17 @@ class AuditRunner:
         ):
             progress.coverage_reasons.append(
                 "actual_http_requests_below_release_minimum"
+            )
+        if self.config.profile == "release" and progress.retries:
+            progress.coverage_reasons.append(
+                "standard_http_retries_observed"
+            )
+        if self.config.capacity_evidence_trust is not None:
+            progress.coverage_reasons.extend(
+                capacity_evidence_release_failures(
+                    capacity_report,
+                    require_release_seed=self.config.profile == "release",
+                )
             )
         self._check_source_integrity(progress, resolved_fraction)
         self._check_source_files(progress)
@@ -5152,10 +7244,14 @@ class AuditRunner:
             ],
         )
 
-    def _latency_reports(self, progress: _AuditProgress) -> _LatencyReports:
+    def _latency_reports(
+        self,
+        progress: _AuditProgress,
+        capacity_report: Mapping[str, Any] | None = None,
+    ) -> _LatencyReports:
         """Summarize latency classes and record any p95 gate failures."""
 
-        def gated_report(
+        def client_gated_report(
             samples: Sequence[float],
             *,
             category: str,
@@ -5181,59 +7277,192 @@ class AuditRunner:
                 )
             return report
 
-        positive_first_page = gated_report(
-            progress.first_page_first_observation_ms,
-            category="first_page_latency",
-            reason="matched_positive_first_observation_first_page_p95_above_limit",
-            maximum_p95_ms=self.config.max_first_page_first_observation_p95_ms,
-        )
-        negative_first_page = gated_report(
-            progress.negative_first_page_ms,
-            category="negative_first_page_latency",
-            reason="negative_first_observation_first_page_p95_above_limit",
-            maximum_p95_ms=self.config.max_first_page_first_observation_p95_ms,
-        )
-        random_first_page = gated_report(
-            progress.random_cold_first_page_ms,
-            category="random_first_page_latency",
-            reason="random_first_observation_first_page_p95_above_limit",
-            maximum_p95_ms=self.config.max_first_page_first_observation_p95_ms,
-        )
-        first_page_report = dict(positive_first_page)
-        first_page_report["by_class"] = {
+        def client_diagnostic_report(samples: Sequence[float]) -> dict[str, Any]:
+            """Return client timing as explicitly nongating diagnostics."""
+
+            report = latency_summary(samples)
+            report["measurement_source"] = (
+                CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
+            )
+            report["diagnostic_only"] = True
+            return report
+
+        def verified_client_gated_report(
+            cohort: str,
+            *,
+            category: str,
+            reason: str,
+        ) -> dict[str, Any]:
+            """Gate client HTTP timing only for API-verified cold responses."""
+
+            latency_section = (
+                capacity_report.get("latency")
+                if isinstance(capacity_report, Mapping)
+                else None
+            )
+            latency_by_cohort = (
+                latency_section.get(
+                    "eligible_verified_client_http_duration_ms_by_cohort"
+                )
+                if isinstance(latency_section, Mapping)
+                and latency_section.get("gate_source")
+                == CAPACITY_CLIENT_LATENCY_SOURCE
+                else None
+            )
+            cohort_report = (
+                latency_by_cohort.get(cohort)
+                if isinstance(latency_by_cohort, Mapping)
+                else None
+            )
+            report = (
+                dict(cohort_report)
+                if isinstance(cohort_report, Mapping)
+                else {"count": 0}
+            )
+            raw_p95_ms = report.get("gate_p95_ms")
+            gate_p95_ms = (
+                float(raw_p95_ms)
+                if not isinstance(raw_p95_ms, bool)
+                and isinstance(raw_p95_ms, (int, float))
+                and math.isfinite(float(raw_p95_ms))
+                and float(raw_p95_ms) >= 0
+                else None
+            )
+            report["measurement_source"] = CAPACITY_CLIENT_LATENCY_SOURCE
+            report["maximum_p95_ms"] = (
+                self.config.max_first_page_first_observation_p95_ms
+            )
+            self._record_latency_failure(
+                progress,
+                category=category,
+                reason=reason,
+                observed_p95_ms=gate_p95_ms,
+                maximum_p95_ms=(
+                    self.config.max_first_page_first_observation_p95_ms
+                ),
+            )
+            return report
+
+        uses_signed_capacity_gate = self.config.capacity_evidence_trust is not None
+        if uses_signed_capacity_gate:
+            positive_first_page = verified_client_gated_report(
+                CAPACITY_POSITIVE_COHORT,
+                category="first_page_latency",
+                reason=(
+                    "matched_positive_first_observation_first_page_p95_above_limit"
+                ),
+            )
+            negative_first_page = verified_client_gated_report(
+                CAPACITY_NEGATIVE_COHORT,
+                category="negative_first_page_latency",
+                reason="negative_first_observation_first_page_p95_above_limit",
+            )
+            random_first_page = verified_client_gated_report(
+                CAPACITY_RANDOM_COHORT,
+                category="random_first_page_latency",
+                reason="random_first_observation_first_page_p95_above_limit",
+            )
+        else:
+            positive_first_page = client_gated_report(
+                progress.first_page_first_observation_ms,
+                category="first_page_latency",
+                reason=(
+                    "matched_positive_first_observation_first_page_p95_above_limit"
+                ),
+                maximum_p95_ms=(
+                    self.config.max_first_page_first_observation_p95_ms
+                ),
+            )
+            negative_first_page = client_gated_report(
+                progress.negative_first_page_ms,
+                category="negative_first_page_latency",
+                reason="negative_first_observation_first_page_p95_above_limit",
+                maximum_p95_ms=(
+                    self.config.max_first_page_first_observation_p95_ms
+                ),
+            )
+            random_first_page = client_gated_report(
+                progress.random_cold_first_page_ms,
+                category="random_first_page_latency",
+                reason="random_first_observation_first_page_p95_above_limit",
+                maximum_p95_ms=(
+                    self.config.max_first_page_first_observation_p95_ms
+                ),
+            )
+        first_page_report_map = dict(positive_first_page)
+        first_page_report_map["by_class"] = {
             "matched_positive": positive_first_page,
             "negative": negative_first_page,
             "random_positive": random_first_page,
         }
+        if uses_signed_capacity_gate:
+            first_page_report_map["measurement_source"] = (
+                CAPACITY_CLIENT_LATENCY_SOURCE
+            )
+            first_page_report_map["client_diagnostics"] = {
+                "measurement_source": CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE,
+                "by_class": {
+                    "matched_positive": client_diagnostic_report(
+                        progress.first_page_first_observation_ms
+                    ),
+                    "negative": client_diagnostic_report(
+                        progress.negative_first_page_ms
+                    ),
+                    "random_positive": client_diagnostic_report(
+                        progress.random_cold_first_page_ms
+                    ),
+                },
+            }
 
-        positive_logical_query = gated_report(
-            progress.positive_cold_query_ms,
-            category="logical_query_latency",
-            reason="matched_positive_logical_query_p95_above_limit",
-            maximum_p95_ms=self.config.max_logical_query_p95_ms,
-        )
-        negative_logical_query = gated_report(
-            progress.negative_cold_query_ms,
-            category="negative_logical_query_latency",
-            reason="negative_logical_query_p95_above_limit",
-            maximum_p95_ms=self.config.max_logical_query_p95_ms,
-        )
-        random_logical_query = gated_report(
-            progress.random_cold_latency_ms,
-            category="random_logical_query_latency",
-            reason="random_positive_logical_query_p95_above_limit",
-            maximum_p95_ms=self.config.max_logical_query_p95_ms,
-        )
-        logical_query_report = dict(positive_logical_query)
-        logical_query_report["by_class"] = {
+        if uses_signed_capacity_gate:
+            positive_logical_query = client_diagnostic_report(
+                progress.positive_cold_query_ms
+            )
+            negative_logical_query = client_diagnostic_report(
+                progress.negative_cold_query_ms
+            )
+            random_logical_query = client_diagnostic_report(
+                progress.random_cold_latency_ms
+            )
+        else:
+            positive_logical_query = client_gated_report(
+                progress.positive_cold_query_ms,
+                category="logical_query_latency",
+                reason="matched_positive_logical_query_p95_above_limit",
+                maximum_p95_ms=self.config.max_logical_query_p95_ms,
+            )
+            negative_logical_query = client_gated_report(
+                progress.negative_cold_query_ms,
+                category="negative_logical_query_latency",
+                reason="negative_logical_query_p95_above_limit",
+                maximum_p95_ms=self.config.max_logical_query_p95_ms,
+            )
+            random_logical_query = client_gated_report(
+                progress.random_cold_latency_ms,
+                category="random_logical_query_latency",
+                reason="random_positive_logical_query_p95_above_limit",
+                maximum_p95_ms=self.config.max_logical_query_p95_ms,
+            )
+        logical_query_report_map = dict(positive_logical_query)
+        logical_query_report_map["by_class"] = {
             "matched_positive": positive_logical_query,
             "negative": negative_logical_query,
             "random_positive": random_logical_query,
         }
+        cold_page_report = latency_summary(progress.cold_page_ms)
+        if uses_signed_capacity_gate:
+            logical_query_report_map["measurement_source"] = (
+                CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
+            )
+            logical_query_report_map["diagnostic_only"] = True
+            cold_page_report["measurement_source"] = (
+                CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
+            )
+            cold_page_report["diagnostic_only"] = True
         return _LatencyReports(
-            first_page=first_page_report,
-            cold_pages=latency_summary(progress.cold_page_ms),
-            logical_query=logical_query_report,
+            first_page=first_page_report_map,
+            cold_pages=cold_page_report,
+            logical_query=logical_query_report_map,
         )
 
     def _sampling_report(self, samples: _AuditSamples) -> dict[str, Any]:
@@ -5257,15 +7486,25 @@ class AuditRunner:
             "independence": "API sampling receives no source-selected query keys",
             "negative_strategy": "seeded_recombination_of_individually_positive_codes_and_npis",
             "random_api_strategy": (
-                "seeded_with_replacement_source_occurrence_draws_with_reserved_query_keys_"
-                "and_cold_before_repeat_full_logical_query_traversal"
+                "seeded_unique_without_replacement_fixed_page_capacity_cohort"
+                if self.config.capacity_evidence_trust is not None
+                else (
+                    "seeded_with_replacement_source_occurrence_draws_with_reserved_query_keys_"
+                    "and_cold_before_repeat_full_logical_query_traversal"
+                )
             ),
         }
 
     def _reproducibility_report(self, samples: _AuditSamples) -> dict[str, Any]:
+        seed_contract = sampling_seed_evidence(
+            self.config.profile,
+            self.config.seed,
+            self.config.capacity_evidence_trust,
+        )
         return {
             "seed_profile": "default_v1" if self.config.seed == DEFAULT_SEED else "custom",
             "seed_sha256": sha256_text(self.config.seed),
+            "seed_contract": seed_contract,
             "python_version": platform.python_version(),
             "source_order": "ascending_content_sha256",
             "sampling": self._sampling_report(samples),
@@ -5308,6 +7547,17 @@ class AuditRunner:
         progress: _AuditProgress,
         random_http_requests: int,
     ) -> dict[str, Any]:
+        random_cold_latency = latency_summary(progress.random_cold_latency_ms)
+        random_warm_latency = latency_summary(progress.random_warm_latency_ms)
+        if self.config.capacity_evidence_trust is not None:
+            for diagnostic_report in (
+                random_cold_latency,
+                random_warm_latency,
+            ):
+                diagnostic_report["measurement_source"] = (
+                    CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
+                )
+                diagnostic_report["diagnostic_only"] = True
         return {
             "planned_logical_request_count": progress.checks["random_api_requests_executed"],
             "actual_http_request_count": random_http_requests,
@@ -5326,8 +7576,8 @@ class AuditRunner:
             "response_occurrence_count": progress.random_response_occurrences,
             "failures": dict(sorted(progress.random_failure_counts.items())),
             "latency": {
-                "cold": latency_summary(progress.random_cold_latency_ms),
-                "warm": latency_summary(progress.random_warm_latency_ms),
+                "cold": random_cold_latency,
+                "warm": random_warm_latency,
                 "semantics": (
                     "cold is the first standard-pricing request in this run for each reserved "
                     "query key; every cold draw completes before repeated warm draws begin"
@@ -5351,6 +7601,7 @@ class AuditRunner:
         samples: _AuditSamples,
         progress: _AuditProgress,
         standard_http_requests: int,
+        capacity_report: Mapping[str, Any],
     ) -> dict[str, Any]:
         return {
             "page_size": self.config.page_size,
@@ -5363,6 +7614,7 @@ class AuditRunner:
             "standard_api_actual_http_requests": standard_http_requests,
             "release_min_actual_http_requests": RELEASE_MIN_TOTAL_API_CALLS,
             "retries_observed": progress.retries + samples.api_sample.retries,
+            "capacity_evidence": dict(capacity_report),
         }
 
     @staticmethod
@@ -5370,30 +7622,38 @@ class AuditRunner:
         progress: _AuditProgress,
         latency_reports: _LatencyReports,
     ) -> dict[str, Any]:
+        """Describe signed cold gates and nongating warm diagnostics."""
+
+        uses_signed_capacity_gate = (
+            latency_reports.first_page.get("measurement_source")
+            == CAPACITY_CLIENT_LATENCY_SOURCE
+        )
+        warm_page_report = latency_summary(progress.warm_page_ms)
+        warm_query_report = latency_summary(progress.warm_query_ms)
+        if uses_signed_capacity_gate:
+            for diagnostic_report in (warm_page_report, warm_query_report):
+                diagnostic_report["measurement_source"] = (
+                    CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
+                )
+                diagnostic_report["diagnostic_only"] = True
+        latency_semantics = _latency_gate_semantics(uses_signed_capacity_gate)
         return {
+            "gate_source": (
+                CAPACITY_CLIENT_LATENCY_SOURCE
+                if uses_signed_capacity_gate
+                else "client_perf_counter"
+            ),
             "cold": {
                 "first_page_first_observation": latency_reports.first_page,
                 "all_pages": latency_reports.cold_pages,
                 "logical_query": latency_reports.logical_query,
             },
             "warm": {
-                "all_pages": latency_summary(progress.warm_page_ms),
-                "logical_query": latency_summary(progress.warm_query_ms),
+                "all_pages": warm_page_report,
+                "logical_query": warm_query_report,
             },
             "semantics": {
-                "first_page_first_observation": (
-                    "page zero from the first traversal of each distinct matched positive "
-                    "standard-pricing query outside the random reserved cohort; negative and "
-                    "random requests are reported in separate classes"
-                ),
-                "logical_query": (
-                    "wall time for all pages in the first traversal, gated separately for "
-                    "disjoint matched positive, negative, and random positive query classes"
-                ),
-                "warm": (
-                    "immediate repeated traversal of the same sampled query, plus positive "
-                    "exactness traversals for query keys first observed by the random cohort"
-                ),
+                **latency_semantics,
                 "query_key_cohorts": (
                     "random query keys are reserved from positive first-observation traversal; "
                     "their positive exactness checks run afterward without contributing to cold gates"
@@ -5444,7 +7704,12 @@ class AuditRunner:
             "random_api_requests": self._random_api_report(
                 samples, progress, context.random_http_requests
             ),
-            "http": self._http_report(samples, progress, context.standard_http_requests),
+            "http": self._http_report(
+                samples,
+                progress,
+                context.standard_http_requests,
+                context.capacity_evidence,
+            ),
             "latency": self._latency_report(progress, context.latency_reports),
             "failures": {
                 "counts": dict(sorted(progress.failure_counts.items())),
@@ -5485,12 +7750,22 @@ class AuditRunner:
         )
         progress.checks["random_api_actual_http_requests"] = random_http_requests
         progress.checks["standard_api_actual_http_requests"] = standard_http_requests
+        capacity_report = (
+            self.capacity_collector.report(
+                complete_request_http_requests=standard_http_requests,
+                complete_request_retries=progress.retries,
+            )
+            if self.capacity_collector is not None
+            else disabled_capacity_evidence_report()
+        )
+        self._record_capacity_evidence_checks(progress, capacity_report)
         self._apply_coverage_checks(
             progress,
             resolved_fraction=resolved_fraction,
             standard_http_requests=standard_http_requests,
+            capacity_report=capacity_report,
         )
-        latency_reports = self._latency_reports(progress)
+        latency_reports = self._latency_reports(progress, capacity_report)
         context = _AuditReportContext(
             started_at=started_at,
             completed_at=dt.datetime.now(dt.timezone.utc),
@@ -5498,8 +7773,42 @@ class AuditRunner:
             random_http_requests=random_http_requests,
             standard_http_requests=standard_http_requests,
             latency_reports=latency_reports,
+            capacity_evidence=capacity_report,
         )
         return self._build_report(samples, progress, context)
+
+    @staticmethod
+    def _record_capacity_evidence_checks(
+        progress: _AuditProgress,
+        capacity_report: Mapping[str, Any],
+    ) -> None:
+        capacity_counters = capacity_report.get("counters")
+        if not isinstance(capacity_counters, Mapping):
+            return
+        progress.checks["capacity_evidence_eligible_http_requests"] = int(
+            capacity_counters.get("eligible", 0)
+        )
+        cohorts_by_name = capacity_counters.get("cohorts")
+        if isinstance(cohorts_by_name, Mapping):
+            for check_name, cohort in (
+                ("matched_positive", CAPACITY_POSITIVE_COHORT),
+                ("negative", CAPACITY_NEGATIVE_COHORT),
+                ("random", CAPACITY_RANDOM_COHORT),
+            ):
+                cohort_report = cohorts_by_name.get(cohort)
+                if isinstance(cohort_report, Mapping):
+                    progress.checks[
+                        f"capacity_evidence_{check_name}_eligible_http_requests"
+                    ] = int(cohort_report.get("eligible", 0))
+        random_cohort = (
+            cohorts_by_name.get(CAPACITY_RANDOM_COHORT)
+            if isinstance(cohorts_by_name, Mapping)
+            else None
+        )
+        if isinstance(random_cohort, Mapping):
+            progress.checks["capacity_evidence_distinct_random_query_keys"] = int(
+                random_cohort.get("distinct_semantic_queries", 0)
+            )
 
 
 def _positive_int(value: str) -> int:
@@ -5540,7 +7849,32 @@ def _header(value: str) -> tuple[str, str]:
     return name, header_value
 
 
+def _add_capacity_evidence_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--capacity-api-evidence-key-id",
+        default=os.getenv("PTG_AUDIT_CAPACITY_API_EVIDENCE_KEY_ID"),
+    )
+    parser.add_argument(
+        "--capacity-api-evidence-public-key-hex",
+        default=os.getenv("PTG_AUDIT_CAPACITY_API_EVIDENCE_PUBLIC_KEY_HEX"),
+    )
+    parser.add_argument(
+        "--capacity-release-digest",
+        default=os.getenv("PTG_AUDIT_CAPACITY_RELEASE_DIGEST"),
+    )
+    parser.add_argument(
+        "--capacity-environment-id",
+        default=os.getenv("PTG_AUDIT_CAPACITY_ENVIRONMENT_ID"),
+    )
+    parser.add_argument(
+        "--capacity-contention-run-id",
+        default=os.getenv("PTG_AUDIT_CAPACITY_CONTENTION_RUN_ID"),
+    )
+
+
 def _add_target_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add source, API target, auth, and capacity-evidence arguments."""
+
     parser.add_argument("sources", nargs="+", type=Path, help="Original TiC in-network JSON or gzip file(s)")
     parser.add_argument("--report", type=Path, required=True, help="Machine-readable JSON report path")
     parser.add_argument("--profile", choices=("release", "diagnostic"), default="release")
@@ -5578,7 +7912,12 @@ def _add_target_arguments(parser: argparse.ArgumentParser) -> None:
             "candidate; requires source and market selectors"
         ),
     )
-    parser.add_argument("--seed", default=DEFAULT_SEED)
+    parser.add_argument(
+        "--seed",
+        default=None,
+        help="Diagnostic-only sampling seed; release profiles use authoritative precommitment",
+    )
+    _add_capacity_evidence_arguments(parser)
 
 
 def _add_sample_arguments(parser: argparse.ArgumentParser) -> None:
@@ -5698,8 +8037,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ConfigurationError("retry_backoff_must_be_nonnegative")
     if not canonical_scalar(args.plan_id) or not canonical_scalar(args.snapshot_id):
         raise ConfigurationError("plan_and_snapshot_must_be_nonempty")
-    if not canonical_scalar(args.seed):
+    if args.seed is not None and not canonical_scalar(args.seed):
         raise ConfigurationError("seed_must_be_nonempty")
+    if args.profile == "release" and args.seed is not None:
+        raise ConfigurationError("release_seed_caller_override_forbidden")
     if args.work_dir is not None and not args.work_dir.is_dir():
         raise ConfigurationError("work_dir_must_exist")
     if args.validated_candidate and (
@@ -5710,6 +8051,33 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ConfigurationError(
             "validated_candidate_requires_auth_source_and_market"
         )
+
+
+def _capacity_evidence_trust(
+    args: argparse.Namespace,
+) -> CapacityEvidenceTrust | None:
+    raw_values = (
+        args.capacity_api_evidence_key_id,
+        args.capacity_api_evidence_public_key_hex,
+        args.capacity_release_digest,
+        args.capacity_environment_id,
+    )
+    if not any(value not in (None, "") for value in raw_values):
+        return None
+    if any(value in (None, "") for value in raw_values):
+        raise ConfigurationError("capacity_evidence_trust_incomplete")
+    public_key_hex = str(args.capacity_api_evidence_public_key_hex)
+    if (
+        len(public_key_hex) != 64
+        or any(character not in "0123456789abcdef" for character in public_key_hex)
+    ):
+        raise ConfigurationError("capacity_api_evidence_public_key_invalid")
+    return CapacityEvidenceTrust(
+        api_evidence_key_id=str(args.capacity_api_evidence_key_id),
+        api_evidence_public_key=bytes.fromhex(public_key_hex),
+        release_digest=str(args.capacity_release_digest),
+        environment_id=str(args.capacity_environment_id),
+    )
 
 
 def _request_headers(args: argparse.Namespace) -> dict[str, str]:
@@ -5726,20 +8094,22 @@ def _request_headers(args: argparse.Namespace) -> dict[str, str]:
 
 
 def _audit_config(args: argparse.Namespace) -> AuditConfig:
+    capacity_trust = _capacity_evidence_trust(args)
+    seed = (
+        authoritative_release_seed(capacity_trust)
+        if args.profile == "release"
+        else str(args.seed if args.seed is not None else DEFAULT_SEED)
+    )
     return AuditConfig(
         profile=args.profile,
         api_base_url=str(args.api_base_url),
-        api_path=(
-            DEFAULT_CANDIDATE_API_PATH
-            if args.validated_candidate
-            else str(args.api_path)
-        ),
+        api_path=str(args.api_path),
         api_audit_path=str(args.api_audit_path),
         plan_id=str(args.plan_id).strip(),
         snapshot_id=str(args.snapshot_id).strip(),
         plan_market_type=canonical_scalar(args.plan_market_type),
         source_key=canonical_scalar(args.source_key),
-        seed=str(args.seed),
+        seed=seed,
         source_occurrence_samples=args.source_occurrence_samples,
         api_occurrence_samples=args.api_occurrence_samples,
         negative_samples=args.negative_samples,
@@ -5767,6 +8137,12 @@ def _audit_config(args: argparse.Namespace) -> AuditConfig:
             args.max_first_page_first_observation_p95_ms
         ),
         max_logical_query_p95_ms=args.max_logical_query_p95_ms,
+        capacity_evidence_trust=capacity_trust,
+        capacity_contention_run_id=(
+            str(args.capacity_contention_run_id)
+            if args.capacity_contention_run_id not in (None, "")
+            else None
+        ),
     )
 
 
@@ -5804,6 +8180,15 @@ def fatal_report(
                 "default_v1" if config and config.seed == DEFAULT_SEED else "custom" if config else None
             ),
             "seed_sha256": sha256_text(config.seed) if config else None,
+            "seed_contract": (
+                sampling_seed_evidence(
+                    config.profile,
+                    config.seed,
+                    config.capacity_evidence_trust,
+                )
+                if config
+                else None
+            ),
             "canonicalization": CANONICALIZATION,
             "sources": [
                 {
@@ -5844,6 +8229,33 @@ def _http_fetcher_options(
     )
 
 
+def _execute_indexed_audit(
+    args: argparse.Namespace,
+    config: AuditConfig,
+    specs: Sequence[SourceSpec],
+    source_index: SourceIndex,
+    *,
+    started_at: dt.datetime,
+) -> dict[str, Any]:
+    source_index.index(specs)
+    verify_sources_unchanged(specs)
+    standard_options = _http_fetcher_options(args, config, api_path=config.api_path, page_size=config.page_size, max_pages=config.max_pages)
+    audit_options = _http_fetcher_options(args, config, api_path=config.api_audit_path, page_size=config.api_audit_page_size, max_pages=config.api_audit_max_pages)
+    capacity_collector = (
+        CapacityEvidenceCollector(
+            config.capacity_evidence_trust,
+            contention_run_id=str(config.capacity_contention_run_id),
+            sampling_seed=config.seed,
+            sampling_profile=config.profile,
+        )
+        if config.capacity_evidence_trust is not None
+        else None
+    )
+    with HttpApiFetcher(standard_options, capacity_collector=capacity_collector) as fetcher, HttpApiFetcher(audit_options) as audit_fetcher:
+        occurrence_source = HttpApiOccurrenceSource(audit_fetcher, config, source_set_evidence_from_specs(specs))
+        return AuditRunner(source_index, fetcher, occurrence_source, config, capacity_collector=capacity_collector).execute_audit(started_at=started_at)
+
+
 def _execute_configured_audit(
     args: argparse.Namespace,
     config: AuditConfig,
@@ -5860,40 +8272,18 @@ def _execute_configured_audit(
             database_path,
             seed=config.seed,
             source_occurrence_sample_target=config.source_occurrence_samples,
+            capacity_query_sample_target=(
+                config.random_api_calls
+                if config.capacity_evidence_trust is not None
+                else 0
+            ),
             sqlite_cache_mb=args.sqlite_cache_mb,
             max_list_values=args.max_list_values,
             max_tuples_per_query=args.max_tuples_per_query,
         ) as source_index:
-            source_index.index(specs)
-            verify_sources_unchanged(specs)
-            standard_options = _http_fetcher_options(
-                args,
-                config,
-                api_path=config.api_path,
-                page_size=config.page_size,
-                max_pages=config.max_pages,
+            return _execute_indexed_audit(
+                args, config, specs, source_index, started_at=started_at
             )
-            audit_options = _http_fetcher_options(
-                args,
-                config,
-                api_path=config.api_audit_path,
-                page_size=config.api_audit_page_size,
-                max_pages=config.api_audit_max_pages,
-            )
-            with HttpApiFetcher(standard_options) as fetcher, HttpApiFetcher(
-                audit_options
-            ) as audit_fetcher:
-                occurrence_source = HttpApiOccurrenceSource(
-                    audit_fetcher,
-                    config,
-                    source_set_evidence_from_specs(specs),
-                )
-                return AuditRunner(
-                    source_index,
-                    fetcher,
-                    occurrence_source,
-                    config,
-                ).execute_audit(started_at=started_at)
 
 
 def _print_audit_summary(

@@ -22,7 +22,7 @@ from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 
 PTG2_CANDIDATE_ATTESTATION_CONTRACT = "ptg2_v3_release_audit_attestation_v1"
 PTG2_CANDIDATE_AUDIT_TOOL = "ptg2_v3_source_api_audit"
-PTG2_CANDIDATE_AUDIT_TOOL_VERSION = "2.6.0"
+PTG2_CANDIDATE_AUDIT_TOOL_VERSION = "2.9.0"
 PTG2_CANDIDATE_API_PATH = "/api/v1/pricing/providers/audit-search-by-procedure"
 PTG2_CANDIDATE_OCCURRENCE_API_PATH = "/api/v1/pricing/providers/audit-occurrences"
 PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_ENV = (
