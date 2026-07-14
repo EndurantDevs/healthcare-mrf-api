@@ -15,7 +15,7 @@ from collections import OrderedDict, defaultdict
 from datetime import UTC, datetime
 from textwrap import dedent
 from types import SimpleNamespace
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 import sanic.exceptions
 from sanic import Blueprint, response
@@ -6123,7 +6123,7 @@ def _current_provider_directory_geo_evidence_sql() -> str:
                ARRAY_AGG(
                    DISTINCT overlay.source_record_id
                    ORDER BY overlay.source_record_id
-               ) AS source_record_ids
+               ) AS source_record_ids, COUNT(DISTINCT current_run.dataset_id)::integer AS provider_directory_source_count
           FROM requested_candidates AS requested
           JOIN {overlay_table} AS overlay
             ON overlay.npi = requested.npi
@@ -6326,6 +6326,16 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
         if params.get("phone_digits")
         else "false"
     )
+    geo_source_count_order = (
+        ""
+        if params.get("lat") is not None and params.get("long") is not None
+        else "source_count DESC NULLS LAST,"
+    )
+    filtered_geo_source_count_order = (
+        ""
+        if params.get("lat") is not None and params.get("long") is not None
+        else "f.source_count DESC NULLS LAST,"
+    )
     taxonomy_table_sql = _schema_cache_key(NPIDataTaxonomy.__tablename__)
     nucc_table_sql = _schema_cache_key(NUCCTaxonomy.__tablename__)
     query = text(
@@ -6370,7 +6380,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                    phone_matched DESC,
                    phone_provider_directory_matched DESC,
                    geo_distance_miles ASC NULLS LAST,
-                   source_count DESC NULLS LAST,
+                   {geo_source_count_order}
                    location_key
              LIMIT :candidate_limit
         ),
@@ -6416,7 +6426,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                f.phone_matched DESC,
                f.phone_provider_directory_matched DESC,
                f.geo_distance_miles ASC NULLS LAST,
-               f.source_count DESC NULLS LAST,
+               {filtered_geo_source_count_order}
                f.npi
          LIMIT :candidate_limit
         """
@@ -6775,6 +6785,9 @@ def _match_candidate_output(
     fhir_sources = _json_array_value(public_provider_map.get(PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY))
     address_sources = _json_array_value(provider_row.get("address_sources"))
     fhir_matched = bool(fhir_sources) or "provider_directory_fhir" in address_sources
+    fhir_source_count = provider_row.get("provider_directory_source_count")
+    if fhir_source_count is None:
+        fhir_source_count = provider_row.get("source_count") or len(fhir_sources)
     ffs_matched = bool(enrichment and (
         enrichment.get("has_any_enrollment")
         or enrichment.get("has_ffs_enrollment")
@@ -6822,7 +6835,7 @@ def _match_candidate_output(
         "nppes": {"matched": True},
         "fhir": {
             "matched": fhir_matched,
-            "source_count": provider_row.get("source_count") or len(fhir_sources),
+            "source_count": fhir_source_count,
         },
         "ffs": {
             "matched": ffs_matched,
@@ -6927,6 +6940,7 @@ def _replace_stale_geo_provider_directory_evidence(
             if str(address_source).strip().lower() != "provider_directory_fhir"
         ]
         _sync_match_candidate_source_counts(candidate_row)
+        candidate_row["provider_directory_source_count"] = 0
 
 
 def _sync_match_candidate_source_counts(candidate_row: dict[str, Any]) -> None:
@@ -6960,10 +6974,11 @@ async def _attach_geo_candidate_record_ids(
             ],
         },
     )
-    record_ids_by_candidate = {
-        (int(mapping["npi"]), str(mapping["address_key"])): mapping[
-            "source_record_ids"
-        ]
+    evidence_by_candidate = {
+        (int(mapping["npi"]), str(mapping["address_key"])): (
+            mapping["source_record_ids"],
+            int(mapping.get("provider_directory_source_count") or 0),
+        )
         for evidence_row in evidence_result.all()
         for mapping in [getattr(evidence_row, "_mapping", evidence_row)]
     }
@@ -6972,8 +6987,9 @@ async def _attach_geo_candidate_record_ids(
             int(candidate_row["npi"]),
             str(candidate_row.get("address_key") or ""),
         )
-        record_ids = record_ids_by_candidate.get(candidate_key)
-        if record_ids:
+        evidence = evidence_by_candidate.get(candidate_key)
+        if evidence:
+            record_ids, provider_directory_source_count = evidence
             candidate_row["source_record_ids"] = _merge_unique_list_values(
                 candidate_row.get("source_record_ids"), record_ids
             )
@@ -6982,6 +6998,44 @@ async def _attach_geo_candidate_record_ids(
                 "provider_directory_fhir",
             )
             _sync_match_candidate_source_counts(candidate_row)
+            candidate_row[
+                "provider_directory_source_count"
+            ] = provider_directory_source_count
+
+
+async def _run_match_candidate_stage_bounded(
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    started_at: float,
+    stage_name: str,
+    database_session: Any = None,
+) -> Any:
+    """Run one endpoint stage within the shared remaining query budget."""
+    try:
+        remaining_seconds = _MATCH_CANDIDATES_TIMEOUT_SECONDS - (
+            time.monotonic() - started_at
+        )
+        if remaining_seconds <= 0:
+            raise asyncio.TimeoutError()
+        return await asyncio.wait_for(operation(), timeout=remaining_seconds)
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError as exc:
+        await _rollback_match_candidate_session(database_session)
+        raise sanic.exceptions.ServiceUnavailable(
+            f"match candidate {stage_name} exceeded the "
+            f"{_MATCH_CANDIDATES_TIMEOUT_SECONDS:g} second endpoint budget"
+        ) from exc
+    except Exception as exc:
+        await _rollback_match_candidate_session(database_session)
+        logger.warning(
+            "match candidate %s failed: %s",
+            stage_name,
+            type(exc).__name__,
+        )
+        raise sanic.exceptions.ServiceUnavailable(
+            f"match candidate {stage_name} is temporarily unavailable"
+        ) from exc
 
 
 async def _attach_candidate_sources_bounded(
@@ -6992,36 +7046,50 @@ async def _attach_candidate_sources_bounded(
     database_session: Any = None,
 ) -> None:
     """Attach source details within the endpoint's remaining query budget."""
-    try:
-        remaining_seconds = _MATCH_CANDIDATES_TIMEOUT_SECONDS - (
-            time.monotonic() - started_at
-        )
-        if remaining_seconds <= 0:
-            raise asyncio.TimeoutError()
-        await asyncio.wait_for(
-            _attach_match_candidate_source_details(
-                candidate_row_list,
-                candidate_params,
-                session=database_session,
-            ),
-            timeout=remaining_seconds,
-        )
-    except asyncio.CancelledError:
-        raise
-    except asyncio.TimeoutError as exc:
-        await _rollback_match_candidate_session(database_session)
-        raise sanic.exceptions.ServiceUnavailable(
-            f"match candidate source lookup exceeded the {_MATCH_CANDIDATES_TIMEOUT_SECONDS:g} second query budget"
-        ) from exc
-    except Exception as exc:
-        await _rollback_match_candidate_session(database_session)
-        logger.warning(
-            "match candidate source lookup failed: %s",
-            type(exc).__name__,
-        )
-        raise sanic.exceptions.ServiceUnavailable(
-            "match candidate source lookup is temporarily unavailable"
-        ) from exc
+    await _run_match_candidate_stage_bounded(
+        lambda: _attach_match_candidate_source_details(
+            candidate_row_list,
+            candidate_params,
+            session=database_session,
+        ),
+        started_at=started_at,
+        stage_name="source lookup",
+        database_session=database_session,
+    )
+
+
+async def _fetch_enriched_match_candidate_rows_bounded(
+    candidate_params: dict[str, Any],
+    *,
+    started_at: float,
+    database_session: Any = None,
+) -> tuple[list[dict[str, Any]], Mapping[int, Mapping[str, Any]]]:
+    """Run candidate lookup, corroboration, and enrichment on one deadline."""
+    candidate_rows = await _run_match_candidate_stage_bounded(
+        lambda: _fetch_match_candidate_rows(
+            candidate_params,
+            session=database_session,
+        ),
+        started_at=started_at,
+        stage_name="lookup",
+        database_session=database_session,
+    )
+    await _attach_candidate_sources_bounded(
+        candidate_rows,
+        candidate_params,
+        started_at=started_at,
+        database_session=database_session,
+    )
+    enrichment_map = await _run_match_candidate_stage_bounded(
+        lambda: _fetch_provider_enrichment_summary_map(
+            [candidate_row.get("npi") for candidate_row in candidate_rows],
+            session=database_session,
+        ),
+        started_at=started_at,
+        stage_name="enrichment lookup",
+        database_session=database_session,
+    )
+    return candidate_rows, enrichment_map
 
 
 @blueprint.get("/match-candidates")
@@ -7046,21 +7114,10 @@ async def match_candidates(request):
     request.args.get("debug")
     params = await _normalize_match_candidate_params(request)
     request_session = _request_session(request)
-    try:
-        candidate_rows = await _fetch_match_candidate_rows(params, session=request_session)
-    except asyncio.TimeoutError as exc:
-        raise sanic.exceptions.ServiceUnavailable(
-            f"match candidate lookup exceeded the {_MATCH_CANDIDATES_TIMEOUT_SECONDS:g} second query budget"
-        ) from exc
-    await _attach_candidate_sources_bounded(
-        candidate_rows,
+    candidate_rows, enrichment_map = await _fetch_enriched_match_candidate_rows_bounded(
         params,
         started_at=started,
         database_session=request_session,
-    )
-    enrichment_map = await _fetch_provider_enrichment_summary_map(
-        [candidate_row.get("npi") for candidate_row in candidate_rows],
-        session=request_session,
     )
     candidates = _rank_match_candidate_outputs(candidate_rows, params, enrichment_map)
     return response.json(

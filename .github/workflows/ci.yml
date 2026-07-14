@@ -109,10 +109,12 @@ jobs:
           tests/test_process_mrf_unit.py
           tests/test_process_npi_import.py
           tests/test_npi_api.py
+          tests/test_npi_geo_evidence_search.py
           tests/test_npi_provider_directory_evidence.py
           tests/test_npi_provider_directory_affiliation_evidence.py
           tests/test_npi_provider_directory_dataset_relations.py
           tests/test_npi_provider_directory_typed_evidence.py
+          tests/test_provider_directory_api_matrix.py
           tests/test_provider_directory_api_typed_evidence_harness.py
           tests/test_process_ms_drg_unit.py
           tests/test_process_pharmacy_license_unit.py
@@ -409,6 +411,7 @@ jobs:
       - name: Run address canonical DB tests
         run: |
           python -m pytest -q tests/test_address_canonical_db.py
+          python -m pytest -q tests/test_npi_geo_evidence_search_db.py
           python -m pytest -q tests/test_npi_provider_directory_role_evidence_db.py
           python -m pytest -q tests/test_provider_directory_dataset_serving_relations_db.py
           python -m pytest -q tests/test_provider_directory_dataset_artifact_db.py

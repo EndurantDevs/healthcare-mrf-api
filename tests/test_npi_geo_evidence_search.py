@@ -27,15 +27,20 @@ ADDRESS_KEY = "47ab23c8-74f7-41eb-8ffb-e8b9f6214594"
 
 def _geo_candidate_params() -> dict:
     return {
+        "address_site_key": None,
+        "address_key": None,
         "lat": 41.09967,
         "long": -101.67646,
         "radius_miles": 0.1,
+        "phone_digits": None,
+        "entity_type_code": None,
         "taxonomy_exact": (),
         "taxonomy_prefixes": (),
         "provider_type": None,
         "specialty_filter": None,
         "include_sources": True,
         "include_evidence": False,
+        "limit": 5,
     }
 
 
@@ -67,6 +72,18 @@ def test_geo_candidate_evidence_query_is_exact_and_current():
     assert "dataset_resource.dataset_id = current_run.dataset_id" in sql
     assert "dataset_resource.resource_type = overlay.resource_type" in sql
     assert "dataset_resource.resource_id = overlay.resource_id" in sql
+    assert "COUNT(DISTINCT current_run.dataset_id)::integer" in sql
+    assert "AS provider_directory_source_count" in sql
+
+
+def test_geo_candidate_query_does_not_rank_by_serving_source_count():
+    """Geo preselection cannot rank with stale serving provenance counts."""
+    query, _query_params = npi_module._match_candidate_query(
+        _geo_candidate_params(),
+        "mrf.entity_address_unified",
+    )
+
+    assert "source_count DESC NULLS LAST" not in str(query)
 
 
 @pytest.fixture
@@ -84,6 +101,7 @@ def geo_evidence_fakes(monkeypatch):
             "npi": 1003968710,
             "address_key": ADDRESS_KEY,
             "source_record_ids": [SOURCE_RECORD_ID, ALIAS_SOURCE_RECORD_ID],
+            "provider_directory_source_count": 1,
         }
         return types.SimpleNamespace(all=lambda: [evidence_row_by_name])
 
@@ -161,6 +179,7 @@ async def test_geo_candidate_attaches_current_overlay_provenance(geo_evidence_fa
     assert candidate_row_list[0]["source_count"] == 2
     assert candidate_row_list[0]["independent_source_count"] == 2
     assert candidate_row_list[0]["multi_source_confirmed"] is True
+    assert candidate_row_list[0]["provider_directory_source_count"] == 1
     source_summary = candidate_row_list[0]["provider_directory_sources"][0]
     assert source_summary["source_ids"] == [SOURCE_ID, ALIAS_SOURCE_ID]
     assert len(candidate_row_list[0]["provider_directory_sources"]) == 1
@@ -212,9 +231,69 @@ async def test_geo_candidate_rejects_stale_serving_evidence(monkeypatch):
     assert candidate_row_by_name["source_count"] == 1
     assert candidate_row_by_name["independent_source_count"] == 1
     assert candidate_row_by_name["multi_source_confirmed"] is False
+    assert candidate_row_by_name["provider_directory_source_count"] == 0
     assert "provider_directory_sources" not in candidate_row_by_name
     assert candidate_output_map["sources"]["fhir"]["matched"] is False
-    assert candidate_output_map["sources"]["fhir"]["source_count"] == 1
+    assert candidate_output_map["sources"]["fhir"]["source_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_geo_candidate_ranking_uses_current_source_count(monkeypatch):
+    """Only exact current corroboration contributes to the final FHIR rank."""
+    async def fake_execute(*_args, **_kwargs):
+        current_evidence_map = {
+            "npi": 1003968711,
+            "address_key": ADDRESS_KEY,
+            "source_record_ids": [SOURCE_RECORD_ID, ALIAS_SOURCE_RECORD_ID],
+            "provider_directory_source_count": 1,
+        }
+        return types.SimpleNamespace(all=lambda: [current_evidence_map])
+
+    monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
+    candidate_rows = [
+        {
+            "npi": 1003968710,
+            "address_key": "57ab23c8-74f7-41eb-8ffb-e8b9f6214594",
+            "source_record_ids": [STALE_SOURCE_RECORD_ID],
+            "address_sources": ["provider_directory_fhir"],
+            "source_count": 99,
+            "geo_distance_miles": 0.0,
+            "taxonomy_list": [],
+        },
+        {
+            "npi": 1003968711,
+            "address_key": ADDRESS_KEY,
+            "source_record_ids": [STALE_SOURCE_RECORD_ID],
+            "address_sources": ["provider_directory_fhir"],
+            "source_count": 50,
+            "geo_distance_miles": 0.0,
+            "taxonomy_list": [],
+        },
+    ]
+    candidate_params = _geo_candidate_params()
+    candidate_params["include_sources"] = False
+    candidate_params["limit"] = 2
+
+    await npi_module._attach_match_candidate_source_details(
+        candidate_rows,
+        candidate_params,
+    )
+    ranked_candidates = npi_module._rank_match_candidate_outputs(
+        candidate_rows,
+        candidate_params,
+        {},
+    )
+
+    assert [
+        candidate_row["source_count"] for candidate_row in candidate_rows
+    ] == [0, 1]
+    assert [
+        candidate_row["provider_directory_source_count"]
+        for candidate_row in candidate_rows
+    ] == [0, 1]
+    assert ranked_candidates[0]["npi"] == 1003968711
+    assert ranked_candidates[0]["sources"]["fhir"]["source_count"] == 1
+    assert ranked_candidates[1]["sources"]["fhir"]["source_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -249,6 +328,10 @@ async def test_geo_evidence_query_caps_candidate_pairs(monkeypatch):
 
 async def _one_geo_candidate(_params, *, session=None):
     return [{"npi": 1003968710, "address_key": ADDRESS_KEY}]
+
+
+async def _no_candidate_sources(*_args, **_kwargs):
+    return None
 
 
 @pytest.mark.asyncio
@@ -288,3 +371,95 @@ async def test_match_candidates_returns_503_on_source_lookup_db_failure(monkeypa
         await npi_module.match_candidates(
             _request({"lat": "41.09967", "long": "-101.67646", "include_sources": "true"})
         )
+
+
+@pytest.mark.asyncio
+async def test_match_candidates_enrichment_uses_remaining_deadline(monkeypatch):
+    """Later enrichment receives the original endpoint deadline, not a reset."""
+    async def slow_candidate_lookup(*_args, **_kwargs):
+        await asyncio.sleep(0.12)
+        return await _one_geo_candidate({}, session=None)
+
+    async def slow_enrichment(*_args, **_kwargs):
+        await asyncio.sleep(0.12)
+        return {}
+
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_match_candidate_rows",
+        slow_candidate_lookup,
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_attach_match_candidate_source_details",
+        _no_candidate_sources,
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_enrichment_summary_map",
+        slow_enrichment,
+    )
+    monkeypatch.setattr(npi_module, "_MATCH_CANDIDATES_TIMEOUT_SECONDS", 0.2)
+
+    with pytest.raises(
+        sanic.exceptions.ServiceUnavailable,
+        match="enrichment lookup exceeded",
+    ):
+        await npi_module.match_candidates(
+            _request({"lat": "41.09967", "long": "-101.67646"})
+        )
+
+
+@pytest.mark.asyncio
+async def test_match_candidates_returns_503_on_enrichment_timeout(monkeypatch):
+    """A slow enrichment query cannot outlive the endpoint deadline."""
+    async def slow_enrichment(*_args, **_kwargs):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(npi_module, "_fetch_match_candidate_rows", _one_geo_candidate)
+    monkeypatch.setattr(
+        npi_module,
+        "_attach_match_candidate_source_details",
+        _no_candidate_sources,
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_enrichment_summary_map",
+        slow_enrichment,
+    )
+    monkeypatch.setattr(npi_module, "_MATCH_CANDIDATES_TIMEOUT_SECONDS", 0.001)
+
+    with pytest.raises(
+        sanic.exceptions.ServiceUnavailable,
+        match="enrichment lookup exceeded",
+    ):
+        await npi_module.match_candidates(
+            _request({"lat": "41.09967", "long": "-101.67646"})
+        )
+
+
+@pytest.mark.asyncio
+async def test_match_candidates_returns_503_on_enrichment_db_failure(monkeypatch):
+    """An enrichment DB failure is translated without exposing raw details."""
+    async def failing_enrichment(*_args, **_kwargs):
+        raise RuntimeError("database connection secret")
+
+    monkeypatch.setattr(npi_module, "_fetch_match_candidate_rows", _one_geo_candidate)
+    monkeypatch.setattr(
+        npi_module,
+        "_attach_match_candidate_source_details",
+        _no_candidate_sources,
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_enrichment_summary_map",
+        failing_enrichment,
+    )
+
+    with pytest.raises(sanic.exceptions.ServiceUnavailable) as exc_info:
+        await npi_module.match_candidates(
+            _request({"lat": "41.09967", "long": "-101.67646"})
+        )
+
+    assert "enrichment lookup is temporarily unavailable" in str(exc_info.value)
+    assert "database connection secret" not in str(exc_info.value)
