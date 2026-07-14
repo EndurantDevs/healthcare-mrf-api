@@ -183,26 +183,26 @@ def test_provider_directory_coverage_audit_accepts_credential_config_file():
 
 
 def test_provider_directory_coverage_audit_endpoint_discovery_classifier():
-    assert audit._looks_like_provider_directory_portal_target(
+    assert audit._is_provider_directory_portal_target(
         source_host="www.uhc.com",
         api_base="https://www.uhc.com/legal/interoperability-apis",
     )
-    assert audit._looks_like_provider_directory_portal_target(
+    assert audit._is_provider_directory_portal_target(
         source_host="developer.kp.org",
         api_base=None,
     )
-    assert audit._credential_backlog_endpoint_discovery_needed(
+    assert audit._is_credential_backlog_endpoint_discovery_needed(
         {
             "source_host": "partners.centene.com",
             "portal_url": "https://partners.centene.com/apis",
         },
         api_base=None,
     )
-    assert not audit._looks_like_provider_directory_portal_target(
+    assert not audit._is_provider_directory_portal_target(
         source_host="api.1up.health",
         api_base="https://api.1up.health/fhir-r4/payer",
     )
-    assert not audit._looks_like_provider_directory_portal_target(
+    assert not audit._is_provider_directory_portal_target(
         source_host="fhir.cigna.com",
         api_base="https://fhir.cigna.com/ProviderDirectory/v1",
     )
@@ -252,7 +252,7 @@ async def test_provider_directory_coverage_audit_credential_backlog_uses_seed_va
                 }
             ]
 
-    monkeypatch.setattr(audit, "_relation_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(audit, "_has_relation", AsyncMock(return_value=True))
 
     backlog = await audit._credential_onboarding_backlog(
         FakeConn(),
@@ -522,7 +522,7 @@ def test_provider_directory_coverage_audit_retest_coverage_groups_unchecked_back
 
 
 def test_provider_directory_coverage_audit_renders_probe_timeout_backlog():
-    report = {
+    audit_report_dict = {
         "generated_at": "2026-06-29T23:52:16Z",
         "schema": "mrf",
         "source_summary": {
@@ -559,11 +559,11 @@ def test_provider_directory_coverage_audit_renders_probe_timeout_backlog():
             ],
         },
     }
-    report["gaps"] = audit._derive_gaps(report)
+    audit_report_dict["gaps"] = audit._derive_gaps(audit_report_dict)
 
-    markdown = audit.render_markdown(report)
+    markdown = audit.render_markdown(audit_report_dict)
 
-    assert "4 Provider Directory source probe(s) timed out across 1 host(s)." in report["gaps"]
+    assert "4 Provider Directory source probe(s) timed out across 1 host(s)." in audit_report_dict["gaps"]
     assert "- timed-out source probes: `4` (40.0%)" in markdown
     assert "- probe timeout backlog: `4` source(s) across `1` host(s)" in markdown
     assert "## Probe Timeout Backlog" in markdown
@@ -595,7 +595,7 @@ def test_provider_directory_coverage_audit_credential_spec_matches_importer_keys
         "org_names:example payer",
         "sources:source_a",
     ]
-    assert audit._credential_spec_has_material(spec) is True
+    assert audit._has_credential_spec_material(spec) is True
 
 
 def test_provider_directory_coverage_audit_credential_spec_disabled_rule_counts_missing():
@@ -605,7 +605,7 @@ def test_provider_directory_coverage_audit_credential_spec_disabled_rule_counts_
     )
 
     assert spec == {}
-    assert audit._credential_spec_has_material(spec) is False
+    assert audit._has_credential_spec_material(spec) is False
 
 
 def test_provider_directory_coverage_audit_credential_secret_status_tracks_missing_env(monkeypatch):
@@ -1445,7 +1445,7 @@ async def test_provider_directory_coverage_audit_unified_summary_fast_probe(monk
             }
 
     conn = FakeConn()
-    monkeypatch.setattr(audit, "_relation_exists", relation_exists)
+    monkeypatch.setattr(audit, "_has_relation", relation_exists)
 
     summary = await audit._unified_summary(conn, "mrf", fast_probe=True)
 
@@ -1487,7 +1487,7 @@ async def test_provider_directory_coverage_audit_overlay_fast_probe_is_bounded(m
             }
 
     conn = FakeConn()
-    monkeypatch.setattr(audit, "_relation_exists", is_relation_present)
+    monkeypatch.setattr(audit, "_has_relation", is_relation_present)
 
     summary = await audit._unified_summary(conn, "mrf", fast_probe=True)
 
@@ -1736,7 +1736,7 @@ def test_provider_directory_coverage_audit_gap_wording_for_fast_probe_lower_boun
 
 
 def test_provider_directory_coverage_audit_markdown_renders_serving_readiness():
-    report = {
+    audit_report_dict = {
         "generated_at": "2026-07-01T12:00:00Z",
         "schema": "mrf",
         "source_summary": {
@@ -1782,7 +1782,7 @@ def test_provider_directory_coverage_audit_markdown_renders_serving_readiness():
         },
     }
 
-    markdown = audit.render_markdown(report)
+    markdown = audit.render_markdown(audit_report_dict)
 
     assert "- serving readiness: `not_ready` (`1`/`3` required checks passing)" in markdown
     assert "## Serving Readiness Gate" in markdown
@@ -1880,7 +1880,7 @@ async def test_provider_directory_coverage_audit_network_catalog_summary(monkeyp
             ]
 
     conn = FakeConn()
-    monkeypatch.setattr(audit, "_relation_exists", relation_exists)
+    monkeypatch.setattr(audit, "_has_relation", relation_exists)
 
     summary = await audit._network_catalog_summary(conn, "mrf", sample_limit=5)
 
@@ -1894,7 +1894,7 @@ async def test_provider_directory_coverage_audit_network_catalog_summary(monkeyp
 
 
 def test_provider_directory_coverage_audit_gaps_when_network_catalog_not_published():
-    report = {
+    audit_report_dict = {
         "plan_network_context_summary": {
             "available": True,
             "sources_with_resolved_network_names": 3,
@@ -1906,7 +1906,7 @@ def test_provider_directory_coverage_audit_gaps_when_network_catalog_not_publish
         },
     }
 
-    assert audit._derive_gaps(report) == [
+    assert audit._derive_gaps(audit_report_dict) == [
         "Provider Directory has resolved network names, but `provider_directory_network_catalog` is not published."
     ]
 
@@ -1944,7 +1944,7 @@ def test_provider_directory_coverage_audit_markdown_includes_network_catalog():
 
 
 def test_empty_plan_rows_create_gap():
-    report = {
+    audit_report_dict = {
         "ptg_plan_filter": "TESTPLAN001",
         "ptg_summary": {
             "ptg_unified_address": {"available": True, "ptg_unified_address_rows": 0},
@@ -1952,13 +1952,13 @@ def test_empty_plan_rows_create_gap():
         },
     }
 
-    assert audit._derive_gaps(report) == [
+    assert audit._derive_gaps(audit_report_dict) == [
         "Requested PTG plan `TESTPLAN001` has no PTG-associated unified address rows."
     ]
 
 
 def test_provider_directory_coverage_audit_gaps_when_requested_plan_lacks_corroboration():
-    report = {
+    audit_report_dict = {
         "ptg_plan_filter": "codex_plan_a",
         "ptg_summary": {
             "ptg_unified_address": {"available": True, "ptg_unified_address_rows": 10},
@@ -1966,13 +1966,13 @@ def test_provider_directory_coverage_audit_gaps_when_requested_plan_lacks_corrob
         },
     }
 
-    assert audit._derive_gaps(report) == [
+    assert audit._derive_gaps(audit_report_dict) == [
         "Requested PTG plan `codex_plan_a` has no Provider Directory address corroboration rows."
     ]
 
 
 def test_provider_directory_coverage_audit_gaps_when_network_context_lacks_corroboration_publish():
-    report = {
+    audit_report_dict = {
         "plan_network_context_summary": {
             "available": True,
             "sources_with_resolved_network_names": 29,
@@ -1983,14 +1983,14 @@ def test_provider_directory_coverage_audit_gaps_when_network_context_lacks_corro
         },
     }
 
-    assert audit._derive_gaps(report) == [
+    assert audit._derive_gaps(audit_report_dict) == [
         "Provider Directory has resolved network names from 29 source(s), "
         "but `provider_directory_address_corroboration` is not published for PTG network matching."
     ]
 
 
 def test_provider_directory_coverage_audit_suppresses_network_corroboration_gap_when_ptg_skipped():
-    report = {
+    audit_report_dict = {
         "plan_network_context_summary": {
             "available": True,
             "sources_with_resolved_network_names": 29,
@@ -2005,11 +2005,11 @@ def test_provider_directory_coverage_audit_suppresses_network_corroboration_gap_
         },
     }
 
-    assert audit._derive_gaps(report) == []
+    assert audit._derive_gaps(audit_report_dict) == []
 
 
 def test_gaps_include_missing_source_country():
-    report = {
+    audit_report_dict = {
         "unified_summary": {
             "available": True,
             "provider_directory_rows": 10,
@@ -2018,14 +2018,14 @@ def test_gaps_include_missing_source_country():
         },
     }
 
-    gaps = audit._derive_gaps(report)
+    gaps = audit._derive_gaps(audit_report_dict)
 
     assert "3 Provider Directory unified-address rows lack retained FHIR source record IDs." in gaps
     assert "2 Provider Directory unified-address rows still expose country_code `001`." in gaps
 
 
 def test_provider_directory_coverage_audit_gaps_for_advertised_resource_without_rows():
-    report = {
+    audit_report_dict = {
         "advertised_resource_gap_summary": {
             "available": True,
             "advertised_without_rows": 3,
@@ -2042,13 +2042,13 @@ def test_provider_directory_coverage_audit_gaps_for_advertised_resource_without_
         }
     }
 
-    assert audit._derive_gaps(report) == [
+    assert audit._derive_gaps(audit_report_dict) == [
         "Provider Directory advertised-resource imports have supported sources with zero rows: Location=2, Endpoint=1."
     ]
 
 
 def test_provider_directory_coverage_audit_gaps_for_resource_level_auth_blocks():
-    report = {
+    audit_report_dict = {
         "valid_sources_without_resource_rows": {
             "available": True,
             "source_count": 3,
@@ -2073,7 +2073,7 @@ def test_provider_directory_coverage_audit_gaps_for_resource_level_auth_blocks()
         },
     }
 
-    assert audit._derive_gaps(report) == [
+    assert audit._derive_gaps(audit_report_dict) == [
         "2 Provider Directory source(s) have valid metadata but resource endpoints require auth.",
         "3 Provider Directory source(s) have valid metadata but no imported resource rows.",
         "Provider Directory advertised-resource imports are auth-blocked after metadata success: Location=2, Practitioner=2.",
@@ -2082,7 +2082,7 @@ def test_provider_directory_coverage_audit_gaps_for_resource_level_auth_blocks()
 
 
 def test_provider_directory_coverage_audit_gaps_for_missing_retest_source_catalog_coverage():
-    report = {
+    audit_report_dict = {
         "source_catalog_retest_coverage": {
             "available": True,
             "missing_result_count": 2,
@@ -2091,13 +2091,13 @@ def test_provider_directory_coverage_audit_gaps_for_missing_retest_source_catalo
         }
     }
 
-    assert audit._derive_gaps(report) == [
+    assert audit._derive_gaps(audit_report_dict) == [
         "1 importable and 1 credential-gated retest result(s) are not covered by the current normalized Provider Directory source catalog."
     ]
 
 
 def test_provider_directory_coverage_audit_gaps_for_source_resource_projection_coverage():
-    report = {
+    audit_report_dict = {
         "source_resource_coverage_summary": {
             "available": True,
             "catalog_only_source_count": 4,
@@ -2108,7 +2108,7 @@ def test_provider_directory_coverage_audit_gaps_for_source_resource_projection_c
         }
     }
 
-    assert audit._derive_gaps(report) == [
+    assert audit._derive_gaps(audit_report_dict) == [
         "4 Provider Directory source(s) have no imported resource rows.",
         "2 Provider Directory source(s) have Location rows but no keyed Location rows.",
         "1 Provider Directory source(s) have Location rows but no unified-address projection rows.",
@@ -2152,7 +2152,7 @@ def test_provider_directory_coverage_audit_projection_gap_reason_classifier():
 
 
 def test_provider_directory_coverage_audit_gaps_for_non_fhir_credential_gateways():
-    report = {
+    audit_report_dict = {
         "source_summary": {
             "available": True,
             "live_auth_required_count": 329,
@@ -2162,7 +2162,7 @@ def test_provider_directory_coverage_audit_gaps_for_non_fhir_credential_gateways
         "capability_status_counts": [{"probe_status": "valid_non_fhir", "count": 299}],
     }
 
-    gaps = audit._derive_gaps(report)
+    gaps = audit._derive_gaps(audit_report_dict)
 
     assert "329 Provider Directory sources require auth/registration before full import." in gaps
     assert (
@@ -2173,20 +2173,20 @@ def test_provider_directory_coverage_audit_gaps_for_non_fhir_credential_gateways
 
 
 def test_provider_directory_coverage_audit_gaps_for_missing_credential_config():
-    report = {
+    audit_report_dict = {
         "credential_onboarding_backlog": {
             "available": True,
             "credential_config_missing_source_count": 7,
         }
     }
 
-    assert audit._derive_gaps(report) == [
+    assert audit._derive_gaps(audit_report_dict) == [
         "7 Provider Directory auth/onboarding source(s) do not match a configured credential rule."
     ]
 
 
 def test_provider_directory_coverage_audit_gaps_for_missing_credential_env_secrets():
-    report = {
+    audit_report_dict = {
         "credential_onboarding_backlog": {
             "available": True,
             "credential_config_missing_source_count": 0,
@@ -2194,13 +2194,13 @@ def test_provider_directory_coverage_audit_gaps_for_missing_credential_env_secre
         }
     }
 
-    assert audit._derive_gaps(report) == [
+    assert audit._derive_gaps(audit_report_dict) == [
         "5 Provider Directory credential-configured source(s) reference missing environment secrets."
     ]
 
 
 def test_provider_directory_coverage_audit_gaps_for_zero_ptg_network_name_overlap():
-    report = {
+    audit_report_dict = {
         "ptg_summary": {
             "ptg_network_name_overlap": {
                 "available": True,
@@ -2210,13 +2210,13 @@ def test_provider_directory_coverage_audit_gaps_for_zero_ptg_network_name_overla
         }
     }
 
-    assert audit._derive_gaps(report) == [
+    assert audit._derive_gaps(audit_report_dict) == [
         "Provider Directory network names are present for PTG plan pairs, but none match PTG serving network_names."
     ]
 
 
 def test_provider_directory_coverage_audit_gaps_for_network_refs_without_resolved_names():
-    report = {
+    audit_report_dict = {
         "plan_network_context_summary": {
             "available": True,
             "insurance_plan_rows": 12,
@@ -2226,7 +2226,7 @@ def test_provider_directory_coverage_audit_gaps_for_network_refs_without_resolve
         }
     }
 
-    assert audit._derive_gaps(report) == [
+    assert audit._derive_gaps(audit_report_dict) == [
         "Provider Directory network refs are present, but none resolve to network Organization names for PTG matching."
     ]
 
@@ -2495,7 +2495,7 @@ def test_provider_directory_coverage_audit_markdown_caps_credential_groups_witho
         }
         for index in range(audit.CREDENTIAL_BACKLOG_MARKDOWN_GROUP_LIMIT + 2)
     ]
-    report = {
+    audit_report_dict = {
         "generated_at": "2026-06-29T00:00:00Z",
         "schema": "mrf",
         "credential_onboarding_backlog": {
@@ -2510,9 +2510,9 @@ def test_provider_directory_coverage_audit_markdown_caps_credential_groups_witho
         },
     }
 
-    markdown = audit.render_markdown(report)
+    markdown = audit.render_markdown(audit_report_dict)
 
-    assert len(report["credential_onboarding_backlog"]["groups"]) == (
+    assert len(audit_report_dict["credential_onboarding_backlog"]["groups"]) == (
         audit.CREDENTIAL_BACKLOG_MARKDOWN_GROUP_LIMIT + 2
     )
     assert "`host-0.example`" in markdown
@@ -2628,8 +2628,8 @@ async def test_provider_directory_coverage_audit_source_resource_coverage_summar
                 }
             ]
 
-    monkeypatch.setattr(audit, "_relation_exists", is_relation_available)
-    monkeypatch.setattr(audit, "_column_exists", is_column_available)
+    monkeypatch.setattr(audit, "_has_relation", is_relation_available)
+    monkeypatch.setattr(audit, "_has_column", is_column_available)
 
     summary = await audit._source_resource_coverage_summary(
         FakeConn(),
@@ -2927,8 +2927,8 @@ async def test_provider_directory_coverage_audit_source_semantic_readiness_summa
             return _semantic_readiness_probe_rows()
 
     conn = FakeConn()
-    monkeypatch.setattr(audit, "_relation_exists", is_relation_available)
-    monkeypatch.setattr(audit, "_column_exists", is_column_available)
+    monkeypatch.setattr(audit, "_has_relation", is_relation_available)
+    monkeypatch.setattr(audit, "_has_column", is_column_available)
 
     summary = await audit._bounded_source_semantic_readiness_summary(
         conn,
@@ -2960,8 +2960,8 @@ async def test_provider_directory_coverage_audit_exact_semantic_scope_retains_mi
     conn = SemanticReadinessFakeConnection(
         _exact_semantic_readiness_probe_rows(ready_source_id, missing_source_id)
     )
-    monkeypatch.setattr(audit, "_relation_exists", is_relation_available)
-    monkeypatch.setattr(audit, "_column_exists", is_column_available)
+    monkeypatch.setattr(audit, "_has_relation", is_relation_available)
+    monkeypatch.setattr(audit, "_has_column", is_column_available)
 
     summary = await audit._bounded_source_semantic_readiness_summary(
         conn,
@@ -3020,15 +3020,15 @@ async def test_provider_directory_coverage_audit_selected_pod_safe_report_stays_
     monkeypatch.setattr(audit, "_connect", AsyncMock(return_value=FakeConn()))
     monkeypatch.setattr(audit, "_bounded_source_semantic_readiness_summary", bounded_semantic_summary)
 
-    report = await audit.build_report(args)
+    audit_report_dict = await audit.build_report(args)
 
     assert captured_by_name["include_unified"] is False
     assert captured_by_name["maintained_source_ids"] == ["pdfhir_b6fdc036a4686d0ab69f6f3a"]
     assert captured_by_name["closed"] is True
-    assert report["semantic_source_selection"]["selected_entry_ids"] == ["idaho"]
-    assert report["source_resource_coverage_summary"]["skipped"] is True
-    assert report["resource_summary"] == {}
-    markdown = audit.render_markdown(report)
+    assert audit_report_dict["semantic_source_selection"]["selected_entry_ids"] == ["idaho"]
+    assert audit_report_dict["source_resource_coverage_summary"]["skipped"] is True
+    assert audit_report_dict["resource_summary"] == {}
+    markdown = audit.render_markdown(audit_report_dict)
     assert "semantic audit selection: `1` source(s)" in markdown
     assert "selected manifest entries: `idaho`" in markdown
     assert "broad source/resource aggregates: were skipped" in markdown
@@ -3137,7 +3137,7 @@ async def test_practitioner_role_reimport_gap_summary_flags_missing_roles(monkey
             ]
 
     conn = FakeConn()
-    monkeypatch.setattr(audit, "_relation_exists", relation_exists)
+    monkeypatch.setattr(audit, "_has_relation", relation_exists)
 
     summary = await audit._practitioner_role_reimport_gap_summary(conn, "mrf", sample_limit=5)
 
@@ -3151,7 +3151,7 @@ async def test_practitioner_role_reimport_gap_summary_flags_missing_roles(monkey
 
 
 def test_provider_directory_coverage_audit_gap_includes_practitioner_role_reimport_gap():
-    report = {
+    audit_report_dict = {
         "source_summary": {"available": True, "source_count": 1, "auth_required_sources": 0},
         "capability_status_counts": {},
         "unified_summary": {"available": False},
@@ -3162,7 +3162,7 @@ def test_provider_directory_coverage_audit_gap_includes_practitioner_role_reimpo
         },
     }
 
-    gaps = audit._derive_gaps(report)
+    gaps = audit._derive_gaps(audit_report_dict)
 
     assert (
         "2 Provider Directory source(s) expose PractitionerRole endpoints and have practitioners/locations, but no imported PractitionerRole rows."
@@ -3308,8 +3308,8 @@ async def test_resource_estimates_from_stats(monkeypatch):
             return 38
 
     monkeypatch.setattr(audit, "PROVIDER_DIRECTORY_RESOURCE_TABLES", ("provider_directory_practitioner",))
-    monkeypatch.setattr(audit, "_relation_exists", is_relation_available)
-    monkeypatch.setattr(audit, "_column_exists", has_column)
+    monkeypatch.setattr(audit, "_has_relation", is_relation_available)
+    monkeypatch.setattr(audit, "_has_column", has_column)
 
     summary = await audit._resource_summary(FakeConn(), "mrf", use_estimates=True)
     practitioner_summary = summary["provider_directory_practitioner"]
