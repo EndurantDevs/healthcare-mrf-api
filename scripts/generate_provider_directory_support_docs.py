@@ -250,7 +250,7 @@ def _support_document_header(manifest: dict[str, Any]) -> list[str]:
         "",
         "`None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.",
         "",
-        "A canonical base identifies acquisition transport; its source IDs retain product or plan provenance. Shared endpoint aliases must not be collapsed into one published product result merely because they share a transport base. Access configuration, current published dataset state, terminal acquisition proof, derived artifact state, and unified/API readiness are separate claims.",
+        "A canonical base identifies the maintained source endpoint; its source IDs retain product or plan provenance. A documented mixed-mode connector may use a separate acquisition transport without changing that source identity. Shared endpoint aliases must not be collapsed into one published product result merely because they share a transport base. Access configuration, current published dataset state, terminal acquisition proof, derived artifact state, and unified/API readiness are separate claims.",
         "",
         "Freshness policy: catalog confirmation expires after `"
         + str(policy["catalog_confirmation_max_age_days"])

@@ -9358,8 +9358,13 @@ def test_endpoint_dataset_uses_only_resources_supported_by_endpoint_connector():
         "Practitioner",
         "Organization",
         "Location",
-        "OrganizationAffiliation",
     ]
+    assert importer._endpoint_dataset_expected_resources([alohr_source_map]) == (
+        "Location",
+        "Organization",
+        "Practitioner",
+        "PractitionerRole",
+    )
 
 
 def test_aetna_endpoint_dataset_selection_requires_fully_enumerable_resources():

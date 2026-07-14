@@ -616,7 +616,6 @@ ALOHR_ORGANIZATION_CHECKPOINT_RESOURCE = "ALOHRGraphQLOrganization"
 ALOHR_GRAPHQL_RESOURCE_TYPES = (
     "Location",
     "Organization",
-    "OrganizationAffiliation",
     "Practitioner",
     "PractitionerRole",
 )

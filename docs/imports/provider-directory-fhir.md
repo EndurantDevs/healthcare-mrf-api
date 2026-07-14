@@ -946,7 +946,10 @@ not a FHIR REST base. Its real FHIR metadata base is
 seed rows to that FHIR base and uses a source-specific GraphQL connector at
 `https://api.esante.us/graphql` with tenant `alohr` to stream public provider
 and organization rows into the normal Provider Directory practitioner,
-organization, location, role, and affiliation tables.
+organization, location, and role tables. The FHIR base remains the stable
+source endpoint identity; the GraphQL URL and tenant are separate acquisition
+metadata and fetch provenance. The published dataset contract contains exactly
+`Practitioner`, `Organization`, `Location`, and `PractitionerRole`.
 
 Cigna seed rows can appear through Availity non-FHIR/onboarding paths even
 though Cigna publishes a public R4 Provider Directory at
