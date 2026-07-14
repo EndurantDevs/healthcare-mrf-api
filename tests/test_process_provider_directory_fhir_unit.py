@@ -5977,16 +5977,33 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert endpoint_row["last_seen_run_id"] == "run_2"
 
 
-def test_derived_age_requires_safe_full_date_and_rejects_implausible_values():
+@pytest.mark.parametrize(
+    ("birth_date", "expected"),
+    [
+        ("2009-07-13", (None, None)),
+        ("2008-07-13", (18, "2026-07-13")),
+        ("1926-07-13", (100, "2026-07-13")),
+        ("1925-07-13", (None, None)),
+    ],
+)
+def test_derived_age_enforces_credible_provider_age_bounds(birth_date, expected):
+    as_of = datetime.date(2026, 7, 13)
+
+    assert importer._derived_age(birth_date, as_of=as_of) == expected
+
+
+@pytest.mark.parametrize(
+    "birth_date",
+    ["1970", "1970-02-30", "2026-07-14", "2027-01-01"],
+)
+def test_derived_age_requires_safe_full_nonfuture_date(birth_date):
     as_of = datetime.date(2026, 7, 13)
 
     assert importer._derived_age("1970-07-14", as_of=as_of) == (
         55,
         "2026-07-13",
     )
-    assert importer._derived_age("1970", as_of=as_of) == (None, None)
-    assert importer._derived_age("2027-01-01", as_of=as_of) == (None, None)
-    assert importer._derived_age("1800-01-01", as_of=as_of) == (None, None)
+    assert importer._derived_age(birth_date, as_of=as_of) == (None, None)
 
 
 def test_derived_years_of_practice_uses_earliest_plausible_qualification():

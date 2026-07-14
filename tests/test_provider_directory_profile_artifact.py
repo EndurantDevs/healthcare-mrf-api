@@ -215,6 +215,8 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
         assert f"'{fact_type}'" in sql
     assert "practitioner.birth_date" not in sql
     assert "practitioner.birthDate" not in sql
+    assert "practitioner.age_years BETWEEN 18 AND 100" in sql
+    assert "'derivation', 'FHIR Practitioner.birthDate'" in sql
     assert "basis_start_date" in sql
     assert "'identifiers', role.identifiers::jsonb" in sql
     assert "'identifiers', service.identifiers::jsonb" in sql

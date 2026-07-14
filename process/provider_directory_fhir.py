@@ -98,6 +98,8 @@ LOGGER = logging.getLogger(__name__)
 MAX_FHIR_JSON_BODY_BYTES = 20 * 1024 * 1024
 READ_CHUNK_BYTES = 256 * 1024
 DEFAULT_MAX_PAGE_COUNT = 1000
+MIN_CREDIBLE_PROVIDER_AGE_YEARS = 18
+MAX_CREDIBLE_PROVIDER_AGE_YEARS = 100
 DEFAULT_RESOURCES = (
     "InsurancePlan",
     "PractitionerRole",
@@ -5933,7 +5935,7 @@ def _derived_age(
     age_years = as_of.year - birth_date.year - (
         (as_of.month, as_of.day) < (birth_date.month, birth_date.day)
     )
-    if birth_date > as_of or not 0 <= age_years <= 120:
+    if not MIN_CREDIBLE_PROVIDER_AGE_YEARS <= age_years <= MAX_CREDIBLE_PROVIDER_AGE_YEARS:
         return None, None
     return age_years, as_of.isoformat()
 
