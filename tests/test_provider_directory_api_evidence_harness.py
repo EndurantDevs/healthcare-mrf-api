@@ -233,6 +233,10 @@ def test_overlay_query_is_current_deterministic_and_has_no_role_scan():
     assert "overlay.source_id = current_source.source_id" in sql
     assert "overlay.last_seen_run_id = current_source.run_id" in sql
     assert "NULLIF(overlay.phone_number, '') IS NOT NULL" in sql
+    assert "overlay.lat::double precision AS latitude" in sql
+    assert "overlay.long::double precision AS longitude" in sql
+    assert "overlay.latitude" not in sql
+    assert "overlay.longitude" not in sql
     assert "ORDER BY overlay.resource_type, overlay.resource_id" in sql
     assert "LIMIT $2" in sql
     assert "provider_directory_dataset_resource" not in sql

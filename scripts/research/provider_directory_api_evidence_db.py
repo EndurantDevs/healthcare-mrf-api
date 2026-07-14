@@ -62,8 +62,8 @@ def overlay_sample_sql(schema: str, *, phone_required: bool = True) -> str:
           CROSS JOIN LATERAL (
               SELECT overlay.npi, overlay.phone_number,
                      overlay.address_key::text AS address_key,
-                     NULLIF(BTRIM(overlay.latitude), '')::double precision AS latitude,
-                     NULLIF(BTRIM(overlay.longitude), '')::double precision AS longitude
+                     overlay.lat::double precision AS latitude,
+                     overlay.long::double precision AS longitude
                 FROM {quoted_schema}.provider_directory_address_overlay AS overlay
                WHERE overlay.source_id = current_source.source_id
                  AND overlay.last_seen_run_id = current_source.run_id
