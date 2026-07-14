@@ -63,7 +63,7 @@ jobs:
             git show "$BASE_SHA:readability-baseline.json" > "$RUNNER_TEMP/readability-base.json"
             python scripts/readability_budget.py \
               --ratchet-baseline "$RUNNER_TEMP/readability-base.json" \
-              --required-reduction-percent 0
+              --required-reduction-percent 1
           else
             python scripts/readability_budget.py
           fi

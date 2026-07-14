@@ -55,6 +55,9 @@ from process.ptg_parts.canonical import canonicalize_url, semantic_hash
 from process.ptg_parts.source_jobs import parse_toc_catalog_entries
 
 SOURCE_CONFIG_ENV = "HLTHPRT_MRF_DISCOVERY_SOURCE_CONFIG"
+PRIVATE_SEED_CONTEXT_PATHS_ENV = "HLTHPRT_MRF_DISCOVERY_PRIVATE_SEED_CONTEXT_PATHS"
+PRIVATE_QUERY_CONTEXT_PATHS_ENV = "HLTHPRT_MRF_DISCOVERY_PRIVATE_QUERY_CONTEXT_PATHS"
+PRIVATE_QUERY_CONTEXT_LIMIT_ENV = "HLTHPRT_MRF_DISCOVERY_PRIVATE_QUERY_CONTEXT_LIMIT"
 DEFAULT_SOURCE_CONFIG = Path("specs/mrf_source_discovery_sources.json")
 DISCOVERY_TABLES = (
     MRFPayer,
@@ -108,6 +111,7 @@ DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "auxiant_wordpress",
     "payercompass_mrf",
 )
+DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT = 5000
 NON_IMPORTABLE_SOURCE_STATUSES = {
     "archived",
     "needs_review",
@@ -160,6 +164,16 @@ class SourceCandidate:
     raw_payload: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class PrivateQueryContext:
+    """One private employer-to-carrier lookup without repository-owned identity data."""
+
+    target_payer_query: str
+    carrier_query: str
+    benefit_line: str
+    metadata_by_key: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class DiscoveryResult:
     providers: list[str]
@@ -177,6 +191,7 @@ class DiscoveryResult:
     def as_dict(self) -> dict[str, Any]:
         """Serialize discovery counters, errors, and run identity."""
         return {
+            "catalog_export_version": DISCOVERY_CATALOG_EXPORT_VERSION,
             "providers": self.providers,
             "candidates": self.candidates,
             "payers": self.payers,
@@ -341,7 +356,378 @@ def _load_seed_list_rows(name: str | None) -> list[dict[str, str]]:
             {key: str(value or "").strip() for key, value in row.items()}
             for row in reader
         ]
-    return rows
+    return _merge_private_seed_context_rows(name, rows)
+
+
+def _private_context_paths(
+    environment_name: str,
+    context_label: str,
+    *,
+    supports_optional_paths: bool = False,
+) -> list[Path]:
+    configured_paths = str(os.getenv(environment_name) or "").strip()
+    resolved_paths: list[Path] = []
+    for configured_value in configured_paths.split(os.pathsep):
+        configured_value = configured_value.strip()
+        if not configured_value:
+            continue
+        is_optional_path = supports_optional_paths and configured_value.lower().startswith(
+            "optional="
+        )
+        if is_optional_path:
+            configured_value = configured_value[len("optional=") :].strip()
+            if not configured_value:
+                continue
+        context_path = _resolve_config_path(os.path.expanduser(configured_value))
+        if context_path.exists():
+            resolved_paths.append(context_path)
+            continue
+        if is_optional_path:
+            logging.getLogger(__name__).warning(
+                "%s file not mounted: %s", context_label, context_path
+            )
+            continue
+        raise ValueError(f"{context_label} file does not exist: {context_path}")
+    return resolved_paths
+
+
+def _private_seed_context_paths() -> list[Path]:
+    return _private_context_paths(
+        PRIVATE_SEED_CONTEXT_PATHS_ENV, "private seed context"
+    )
+
+
+def _private_seed_context_rows(seed_list_name: str | None) -> list[dict[str, str]]:
+    context_rows: list[dict[str, str]] = []
+    for context_path in _private_seed_context_paths():
+        with context_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if "group_number" not in set(reader.fieldnames or ()):
+                raise ValueError(
+                    f"private seed context {context_path} missing group_number"
+                )
+            for context_row in reader:
+                context_by_field = {
+                    key: str(field_value or "").strip()
+                    for key, field_value in context_row.items()
+                }
+                configured_seed_list = (
+                    context_by_field.get("seed_list")
+                    or context_by_field.get("seed_list_name")
+                    or context_by_field.get("list_name")
+                    or ""
+                ).strip()
+                if configured_seed_list and configured_seed_list != str(
+                    seed_list_name or ""
+                ):
+                    continue
+                context_rows.append(context_by_field)
+    return context_rows
+
+
+def _merge_private_seed_context_rows(
+    seed_list_name: str | None, public_rows: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    private_rows = _private_seed_context_rows(seed_list_name)
+    if not private_rows:
+        return public_rows
+    public_by_group = {
+        str(public_row.get("group_number") or "").strip(): dict(public_row)
+        for public_row in public_rows
+        if str(public_row.get("group_number") or "").strip()
+    }
+    ordered_groups = list(public_by_group)
+    for private_row in private_rows:
+        group_number = str(private_row.get("group_number") or "").strip()
+        if not group_number:
+            continue
+        merged_by_field = dict(public_by_group.get(group_number, {}))
+        merged_by_field.update(
+            {
+                key: field_value
+                for key, field_value in private_row.items()
+                if key not in {"seed_list", "seed_list_name", "list_name"}
+                and field_value
+            }
+        )
+        merged_by_field.setdefault("status", "active")
+        merged_by_field["group_number"] = group_number
+        public_by_group[group_number] = merged_by_field
+        if group_number not in ordered_groups:
+            ordered_groups.append(group_number)
+    return [public_by_group[group_number] for group_number in ordered_groups]
+
+
+def _private_query_context_paths() -> list[Path]:
+    return _private_context_paths(
+        PRIVATE_QUERY_CONTEXT_PATHS_ENV,
+        "private query context",
+        supports_optional_paths=True,
+    )
+
+
+def _private_query_context_rows() -> list[dict[str, str]]:
+    context_rows: list[dict[str, str]] = []
+    for context_path in _private_query_context_paths():
+        with context_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for context_row in csv.DictReader(handle):
+                context_by_field = {
+                    key: str(field_value or "").strip()
+                    for key, field_value in context_row.items()
+                }
+                context_by_field["_query_context_scope"] = "private"
+                context_rows.append(context_by_field)
+    return context_rows
+
+
+def _context_field_value(context_row: dict[str, str], *keys: str) -> str:
+    value_by_key = {
+        str(key or "").strip().lower(): field_value
+        for key, field_value in context_row.items()
+    }
+    for key in keys:
+        field_value = str(value_by_key.get(key.lower()) or "").strip()
+        if field_value:
+            return field_value
+    return ""
+
+
+def _split_private_context_cell(cell_value: Any) -> list[str]:
+    raw_text = str(cell_value or "").strip()
+    if not raw_text:
+        return []
+    try:
+        parsed_json = json.loads(raw_text)
+    except json.JSONDecodeError:
+        parsed_json = None
+    if isinstance(parsed_json, list):
+        return [_clean_text(entry) for entry in parsed_json if _clean_text(entry)]
+    return [
+        part.strip(" \t-*")
+        for part in re.split(r"\r?\n|;", raw_text)
+        if part.strip(" \t-*")
+    ]
+
+
+def _private_context_list(context_row: dict[str, str], *keys: str) -> list[str]:
+    return _split_private_context_cell(_context_field_value(context_row, *keys))
+
+
+def _private_context_value_at(entries: list[str], index: int) -> str | None:
+    if index < len(entries):
+        return entries[index]
+    return entries[0] if len(entries) == 1 else None
+
+
+def _private_query_employer_metadata(
+    context_row: dict[str, str], employer_query: str
+) -> dict[str, Any]:
+    metadata_by_key: dict[str, Any] = {
+        "query_context_employer_name": employer_query,
+        "query_context_scope": _context_field_value(
+            context_row, "_query_context_scope"
+        )
+        or "private",
+        "query_context_employer_aliases": _private_context_list(
+            context_row, "employer_aliases", "aliases", "company_aliases"
+        ),
+        "query_context_employer_ein": _context_field_value(
+            context_row, "ein", "employer_ein"
+        ),
+        "query_context_erisa_plan_number": _context_field_value(
+            context_row, "erisa_plan_number", "plan_number"
+        ),
+        "query_context_evidence_plan_year": _context_field_value(
+            context_row, "evidence_plan_year", "plan_year"
+        ),
+        "query_context_verification_status": _context_field_value(
+            context_row, "current_verification_status", "verification_status"
+        ),
+    }
+    return {
+        key: metadata_value
+        for key, metadata_value in metadata_by_key.items()
+        if metadata_value not in (None, "", [])
+    }
+
+
+def _private_query_carrier_metadata(
+    context_row: dict[str, str], benefit_line: str, carrier_index: int
+) -> dict[str, str]:
+    field_names_by_metadata_key = {
+        "query_context_carrier_policy_number": (
+            f"{benefit_line}_policy_numbers",
+            f"{benefit_line}_policy_number",
+            f"{benefit_line}_contract_numbers",
+            f"{benefit_line}_contract_number",
+        ),
+        "query_context_carrier_region": (
+            f"{benefit_line}_carrier_regions",
+            f"{benefit_line}_regions",
+        ),
+        "query_context_lookup_type": (
+            f"{benefit_line}_lookup_types",
+            f"{benefit_line}_lookup_type",
+        ),
+    }
+    metadata_by_key = {
+        metadata_key: _private_context_value_at(
+            _private_context_list(context_row, *field_names), carrier_index
+        )
+        for metadata_key, field_names in field_names_by_metadata_key.items()
+    }
+    return {
+        key: metadata_value
+        for key, metadata_value in metadata_by_key.items()
+        if metadata_value not in (None, "")
+    }
+
+
+_PRIVATE_QUERY_CONTEXT_LINE_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("medical", ("medical_carriers", "medical_carrier", "medical")),
+    ("dental", ("dental_carriers", "dental_carrier", "dental")),
+    ("vision", ("vision_carriers", "vision_carrier", "vision")),
+)
+
+
+def _private_query_context_entries() -> list[PrivateQueryContext]:
+    context_entries: list[PrivateQueryContext] = []
+    for context_row in _private_query_context_rows():
+        employer_query = _clean_text(
+            _context_field_value(
+                context_row,
+                "target_payer_query",
+                "company_name",
+                "employer_name",
+                "client_name",
+                "alias",
+            )
+        )
+        if not employer_query:
+            continue
+        employer_metadata = _private_query_employer_metadata(
+            context_row, employer_query
+        )
+        for benefit_line, carrier_columns in _PRIVATE_QUERY_CONTEXT_LINE_COLUMNS:
+            carrier_queries = [
+                carrier_query
+                for column in carrier_columns
+                for carrier_query in _split_private_context_cell(
+                    _context_field_value(context_row, column)
+                )
+            ]
+            for carrier_index, carrier_query in enumerate(carrier_queries):
+                context_entries.append(
+                    PrivateQueryContext(
+                        target_payer_query=employer_query,
+                        carrier_query=_clean_text(carrier_query),
+                        benefit_line=benefit_line,
+                        metadata_by_key={
+                            **employer_metadata,
+                            **_private_query_carrier_metadata(
+                                context_row, benefit_line, carrier_index
+                            ),
+                        },
+                    )
+                )
+    return [entry for entry in context_entries if entry.carrier_query]
+
+
+def _supports_candidate_benefit_line(
+    candidate: SourceCandidate, benefit_line: str
+) -> bool:
+    normalized_line = _clean_text(benefit_line).lower()
+    if not normalized_line:
+        return True
+    supported_lines = _normalize_benefit_lines(candidate.benefit_lines)
+    return not supported_lines or bool(
+        {normalized_line, "mixed", "unknown"}.intersection(supported_lines)
+    )
+
+
+def _private_query_context_limit() -> int:
+    configured_limit = str(os.getenv(PRIVATE_QUERY_CONTEXT_LIMIT_ENV) or "").strip()
+    try:
+        return max(1, int(configured_limit or DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT))
+    except ValueError:
+        return DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT
+
+
+def _private_context_match_key(context: PrivateQueryContext) -> tuple[str, str]:
+    return (context.benefit_line.lower(), context.carrier_query.lower())
+
+
+def _private_candidate_key(
+    candidate: SourceCandidate, context: PrivateQueryContext
+) -> tuple[str, str | None, str, str, str]:
+    return (
+        _clean_text(candidate.payer_name).lower(),
+        _canonical_or_none(candidate.index_url or candidate.human_url),
+        context.target_payer_query.lower(),
+        context.carrier_query.lower(),
+        context.benefit_line.lower(),
+    )
+
+
+def _private_context_candidate(
+    candidate: SourceCandidate, context: PrivateQueryContext
+) -> SourceCandidate:
+    expanded_candidate = _candidate_with_target_payer_query(
+        candidate, context.target_payer_query
+    )
+    return replace(
+        expanded_candidate,
+        raw_payload={
+            **dict(expanded_candidate.raw_payload or {}),
+            **context.metadata_by_key,
+            "private_query_context": True,
+            "private_context_benefit_line": context.benefit_line,
+            "private_context_carrier_query": context.carrier_query,
+        },
+    )
+
+
+def _private_context_candidate_matches(
+    eligible_candidates: list[SourceCandidate], context: PrivateQueryContext
+) -> list[SourceCandidate]:
+    return [
+        candidate
+        for candidate in eligible_candidates
+        if _supports_candidate_benefit_line(candidate, context.benefit_line)
+        and _candidate_matches_text_filters(
+            candidate, entity_types=(), payer_query=context.carrier_query
+        )
+    ]
+
+
+def _private_query_expanded_candidates(
+    candidates: list[SourceCandidate],
+) -> list[SourceCandidate]:
+    eligible_candidates = [
+        candidate
+        for candidate in candidates
+        if _candidate_is_importable_source(candidate)
+        and _candidate_supports_source_query_expansion(candidate)
+    ]
+    matches_by_context: dict[tuple[str, str], list[SourceCandidate]] = {}
+    expanded_candidates: list[SourceCandidate] = []
+    seen_keys: set[tuple[str, str | None, str, str, str]] = set()
+    candidate_limit = _private_query_context_limit()
+    for context in _private_query_context_entries():
+        match_key = _private_context_match_key(context)
+        if match_key not in matches_by_context:
+            matches_by_context[match_key] = _private_context_candidate_matches(
+                eligible_candidates, context
+            )
+        for candidate in matches_by_context[match_key]:
+            candidate_key = _private_candidate_key(candidate, context)
+            if candidate_key in seen_keys:
+                continue
+            seen_keys.add(candidate_key)
+            expanded_candidates.append(_private_context_candidate(candidate, context))
+            if len(expanded_candidates) >= candidate_limit:
+                return expanded_candidates
+    return expanded_candidates
 
 
 def _configured_provider_names(key: str) -> list[str]:
@@ -2265,7 +2651,9 @@ async def _load_candidates(
     if parser == "master-list":
         path = _resolve_config_path(str(config.get("path") or ""))
         candidates = parse_master_list(path.read_text(encoding="utf-8"))
-        return candidates[:limit] if limit else candidates
+        private_candidates = _private_query_expanded_candidates(candidates)
+        public_candidates = candidates[:limit] if limit else candidates
+        return _dedupe_candidates(public_candidates + private_candidates)
     if test_mode:
         return []
     raise ValueError(f"unsupported provider: {provider}")
