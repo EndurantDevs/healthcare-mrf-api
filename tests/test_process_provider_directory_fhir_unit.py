@@ -7735,8 +7735,13 @@ def test_endpoint_dataset_expected_resources_rejects_alias_profile_drift():
         )
 
 
-def test_artifact_scope_sql_is_typed_immutable_and_alias_expanding():
+def test_artifact_scope_sql_defers_bounded_primary_key_and_expands_aliases():
     create_sql = importer._provider_directory_artifact_scope_table_sql(
+        ProviderDirectoryLocation,
+        "mrf",
+        "location_scope_test",
+    )
+    primary_key_sql = importer._artifact_scope_pk_sql(
         ProviderDirectoryLocation,
         "mrf",
         "location_scope_test",
@@ -7750,13 +7755,30 @@ def test_artifact_scope_sql_is_typed_immutable_and_alias_expanding():
     assert 'CREATE UNLOGGED TABLE "mrf"."location_scope_test"' in create_sql
     assert "resource_id VARCHAR(256) NOT NULL" in create_sql
     assert "latitude VARCHAR(64)" in create_sql
-    assert 'PRIMARY KEY ("source_id", "resource_id")' in create_sql
+    assert "PRIMARY KEY" not in create_sql
+    assert primary_key_sql == (
+        'CREATE UNIQUE INDEX "location_scope_test_pk_build_idx" '
+        'ON "mrf"."location_scope_test" ("source_id", "resource_id");',
+        'ALTER TABLE "mrf"."location_scope_test" '
+        'ADD CONSTRAINT "location_scope_test_pkey" PRIMARY KEY '
+        'USING INDEX "location_scope_test_pk_build_idx";',
+    )
     assert "FROM unnest(" in insert_sql
     assert "selected.source_id" in insert_sql
     assert "selected.evidence_run_id" in insert_sql
     assert 'JOIN "mrf"."provider_directory_dataset_resource" AS resource' in insert_sql
     assert "resource.resource_type = :resource_type" in insert_sql
     assert "provider_directory_location AS" not in insert_sql
+
+    long_table_name = "provider_directory_practitioner_role_artifact_scope_0123456789abcdef"
+    names = importer._artifact_scope_pk_names(
+        long_table_name
+    )
+    assert names == importer._artifact_scope_pk_names(
+        long_table_name
+    )
+    assert names[0] != names[1]
+    assert all(len(name) <= importer.POSTGRES_IDENTIFIER_MAX_LENGTH for name in names)
 
 
 def test_artifact_relation_scope_wires_address_and_network_builders():
@@ -7823,7 +7845,14 @@ async def test_artifact_dataset_scope_drops_private_tables_in_finally(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_artifact_scope_materialization_cleans_partial_tables(monkeypatch):
+@pytest.mark.parametrize(
+    "materialization_failure",
+    [RuntimeError("materialization failed"), asyncio.CancelledError()],
+)
+async def test_artifact_scope_materialization_cleans_partial_tables(
+    monkeypatch,
+    materialization_failure,
+):
     fence = importer.ProviderDirectoryArtifactDatasetFence(
         (_artifact_dataset(selected_resources=("Location",)),)
     )
@@ -7840,12 +7869,12 @@ async def test_artifact_scope_materialization_cleans_partial_tables(monkeypatch)
     monkeypatch.setattr(
         importer,
         "_materialize_provider_directory_artifact_resource_scope",
-        AsyncMock(side_effect=RuntimeError("materialization failed")),
+        AsyncMock(side_effect=materialization_failure),
     )
     cleanup = AsyncMock()
     monkeypatch.setattr(importer, "_drop_artifact_scope_tables", cleanup)
 
-    with pytest.raises(RuntimeError, match="materialization failed"):
+    with pytest.raises(type(materialization_failure)):
         await importer._materialize_artifact_scope_tables(
             "mrf",
             "run_1",
@@ -8122,13 +8151,68 @@ async def test_artifact_resource_scope_does_not_copy_unrequested_model(monkeypat
         frozenset({"Location"}),
     )
 
-    assert len(status.await_args_list) == 2
+    assert len(status.await_args_list) == 4
     assert status.await_args_list[0].args[0].startswith(
         'CREATE UNLOGGED TABLE "mrf"."practitioner_scope"'
     )
-    assert status.await_args_list[1].args[0] == (
+    assert status.await_args_list[1].args[0].startswith(
+        'CREATE UNIQUE INDEX "practitioner_scope_pk_build_idx"'
+    )
+    assert status.await_args_list[2].args[0].startswith(
+        'ALTER TABLE "mrf"."practitioner_scope"'
+    )
+    assert status.await_args_list[3].args[0] == (
         'ANALYZE "mrf"."practitioner_scope";'
     )
+
+
+@pytest.mark.asyncio
+async def test_artifact_source_scope_builds_primary_key_after_insert(monkeypatch):
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+
+    await importer._materialize_provider_directory_artifact_source_scope(
+        "mrf",
+        "source_scope",
+        ["source_a"],
+    )
+
+    statements = [call.args[0].strip() for call in status.await_args_list]
+    assert len(statements) == 5
+    assert statements[0].startswith('CREATE UNLOGGED TABLE "mrf"."source_scope"')
+    assert statements[1].startswith('INSERT INTO "mrf"."source_scope"')
+    assert statements[2].startswith(
+        'CREATE UNIQUE INDEX "source_scope_pk_build_idx"'
+    )
+    assert statements[3].startswith('ALTER TABLE "mrf"."source_scope"')
+    assert statements[4] == 'ANALYZE "mrf"."source_scope";'
+
+
+@pytest.mark.asyncio
+async def test_artifact_resource_scope_builds_primary_key_after_insert(monkeypatch):
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (_artifact_dataset(selected_resources=("Location",)),)
+    )
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+
+    await importer._materialize_provider_directory_artifact_resource_scope(
+        "mrf",
+        "location_scope",
+        ProviderDirectoryLocation,
+        fence,
+        frozenset({"Location"}),
+    )
+
+    statements = [call.args[0].strip() for call in status.await_args_list]
+    assert len(statements) == 5
+    assert statements[0].startswith('CREATE UNLOGGED TABLE "mrf"."location_scope"')
+    assert statements[1].startswith('INSERT INTO "mrf"."location_scope"')
+    assert statements[2].startswith(
+        'CREATE UNIQUE INDEX "location_scope_pk_build_idx"'
+    )
+    assert statements[3].startswith('ALTER TABLE "mrf"."location_scope"')
+    assert statements[4] == 'ANALYZE "mrf"."location_scope";'
 
 
 @pytest.mark.asyncio

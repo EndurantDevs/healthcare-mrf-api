@@ -81,6 +81,12 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
                 model.__tablename__,
             )
         )
+        for statement in importer._artifact_scope_pk_sql(
+            model,
+            schema,
+            model.__tablename__,
+        ):
+            await database.status(statement)
 
 
 async def _insert_fixture_sources(database: Database, schema: str) -> None:

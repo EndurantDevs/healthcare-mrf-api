@@ -10101,18 +10101,54 @@ def _provider_directory_artifact_scope_table_sql(
         str(CreateColumn(column).compile(dialect=dialect)).strip()
         for column in model.__table__.columns
     ]
-    primary_key_columns = [
-        _q(column.name) for column in model.__table__.primary_key.columns
-    ]
-    if primary_key_columns:
-        column_definitions.append(
-            f"PRIMARY KEY ({', '.join(primary_key_columns)})"
-        )
     return (
         f"CREATE UNLOGGED TABLE {_qt(schema, table_name)} (\n    "
         + ",\n    ".join(column_definitions)
         + "\n);"
     )
+
+
+def _artifact_scope_pk_names(
+    table_name: str,
+) -> tuple[str, str]:
+    return (
+        _bounded_identifier(f"{table_name}_pk_build_idx"),
+        _bounded_identifier(f"{table_name}_pkey"),
+    )
+
+
+def _artifact_scope_pk_sql(
+    model: Any,
+    schema: str,
+    table_name: str,
+) -> tuple[str, ...]:
+    primary_key_columns = [
+        _q(column.name) for column in model.__table__.primary_key.columns
+    ]
+    if not primary_key_columns:
+        return ()
+    index_name, constraint_name = _artifact_scope_pk_names(table_name)
+    column_sql = ", ".join(primary_key_columns)
+    return (
+        f"CREATE UNIQUE INDEX {_q(index_name)} "
+        f"ON {_qt(schema, table_name)} ({column_sql});",
+        f"ALTER TABLE {_qt(schema, table_name)} "
+        f"ADD CONSTRAINT {_q(constraint_name)} PRIMARY KEY "
+        f"USING INDEX {_q(index_name)};",
+    )
+
+
+async def _build_artifact_scope_pk(
+    model: Any,
+    schema: str,
+    table_name: str,
+) -> None:
+    for statement in _artifact_scope_pk_sql(
+        model,
+        schema,
+        table_name,
+    ):
+        await db.status(statement)
 
 
 def _provider_directory_artifact_payload_column_sql(column: Any) -> str:
@@ -10188,6 +10224,11 @@ async def _materialize_provider_directory_artifact_source_scope(
         """,
         source_ids=source_ids,
     )
+    await _build_artifact_scope_pk(
+        model,
+        schema,
+        table_name,
+    )
     await db.status(f"ANALYZE {_qt(schema, table_name)};")
 
 
@@ -10222,6 +10263,11 @@ async def _materialize_provider_directory_artifact_resource_scope(
             ],
             resource_type=resource_type,
         )
+    await _build_artifact_scope_pk(
+        model,
+        schema,
+        table_name,
+    )
     await db.status(f"ANALYZE {_qt(schema, table_name)};")
 
 
