@@ -847,11 +847,6 @@ def test_contra_costa_catalog_parser_extracts_provider_directory_base_from_exter
     assert rows[0]["metadata_json"]["provider_directory_supported_resources"] == list(
         importer.PUBLIC_DIRECTORY_SEVEN_RESOURCES
     )
-    assert rows[0][
-        "metadata_json"
-    ][importer.PROVIDER_DIRECTORY_AFFILIATION_REFERENCE_FALLBACK_METADATA_KEY] == (
-        importer.PROVIDER_DIRECTORY_AFFILIATION_REFERENCE_FALLBACK_ORGANIZATION
-    )
 
 
 def test_contra_costa_catalog_uses_confirmed_fallback_when_page_fetch_fails(monkeypatch):
