@@ -14359,7 +14359,7 @@ def _canonical_backfill_resource_sql(resource_type: str, table_name: str) -> tup
 
 async def backfill_provider_directory_canonical_resources(
     *,
-    resources: str | None = None,
+    resources: Any = None,
 ) -> dict[str, Any]:
     """Backfill provider directory canonical resources for existing provider-directory rows."""
     await _ensure_provider_directory_tables()
@@ -26509,15 +26509,55 @@ async def _delete_source_catalog_rows_except(
     return deleted_row_counts_by_table
 
 
-def _selected_resources(raw: str | None) -> list[str]:
-    if not raw:
+def _selected_resources(raw: Any) -> list[str]:
+    if raw is None:
         return list(DEFAULT_RESOURCES)
-    selected = [item.strip() for item in raw.split(",") if item.strip()]
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return list(DEFAULT_RESOURCES)
+        if raw.startswith(("[", "{")):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "Provider Directory FHIR resources must be a valid JSON array "
+                    "or comma-separated string"
+                ) from exc
+            if not isinstance(raw, list):
+                raise ValueError(
+                    "Provider Directory FHIR resources JSON value must be an array"
+                )
+    if isinstance(raw, (list, tuple)):
+        selected_resource_types = []
+        for index, resource_value in enumerate(raw):
+            if not isinstance(resource_value, str):
+                raise ValueError(
+                    "Provider Directory FHIR resource at index "
+                    f"{index} must be a string, got {type(resource_value).__name__}"
+                )
+            resource_name = resource_value.strip()
+            if not resource_name:
+                raise ValueError(
+                    f"Provider Directory FHIR resource at index {index} must not be empty"
+                )
+            selected_resource_types.append(resource_name)
+    elif isinstance(raw, str):
+        selected_resource_types = [
+            resource_name.strip()
+            for resource_name in raw.split(",")
+            if resource_name.strip()
+        ]
+    else:
+        raise ValueError(
+            "Provider Directory FHIR resources must be a list, tuple, JSON array, "
+            f"or comma-separated string, got {type(raw).__name__}"
+        )
     allowed = set(DEFAULT_RESOURCES)
-    unknown = sorted(set(selected) - allowed)
+    unknown = sorted(set(selected_resource_types) - allowed)
     if unknown:
         raise ValueError(f"Unsupported Provider Directory FHIR resources: {', '.join(unknown)}")
-    return selected
+    return selected_resource_types
 
 
 def _source_resource_fetch_order(
@@ -31848,7 +31888,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     )
     stale_cleanup_raw = task.get("stale_cleanup")
     stale_cleanup = _bool_or_default(stale_cleanup_raw, not test_mode and import_resources)
-    resources = _selected_resources(_clean_text(task.get("resources")))
+    resources = _selected_resources(task.get("resources"))
     publish_artifacts = _bool_or_default(
         task.get("publish_artifacts"),
         import_resources and set(resources) == set(DEFAULT_RESOURCES),
@@ -31870,7 +31910,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     )
     if canonical_backfill_only:
         metrics = await backfill_provider_directory_canonical_resources(
-            resources=_clean_text(task.get("resources")),
+            resources=task.get("resources"),
         )
         ctx["context"]["audit"] = metrics
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1

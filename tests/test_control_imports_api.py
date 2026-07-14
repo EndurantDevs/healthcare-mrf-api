@@ -62,6 +62,13 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert items["provider-directory-fhir"]["queue"] == "arq:ProviderDirectoryFHIR"
     assert items["provider-directory-fhir"]["schedulable"] is True
     assert items["provider-directory-fhir"]["cancelable"] is True
+    resources_param = next(
+        param
+        for param in items["provider-directory-fhir"]["params_schema"]
+        if param["name"] == "resources"
+    )
+    assert resources_param["type"] == "text"
+    assert "JSON array" in resources_param["help"]
     assert any(param["name"] == "source_query" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "retest_results_path" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "retest_results_url" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
@@ -215,6 +222,7 @@ def test_control_wrapped_publish_importers_request_shutdown():
         {"run_id": "run_provider_directory", "importer": "provider-directory-fhir", "family": "provider"},
         {
             "import_resources": True,
+            "resources": ["Location", "Practitioner"],
             "resource_limit": 100,
             "retest_results_url": "https://raw.githubusercontent.com/hltiunn/provider-directory-db/main/data/retest_results.json",
         },
@@ -225,6 +233,7 @@ def test_control_wrapped_publish_importers_request_shutdown():
     assert openaddresses_payload["run_shutdown"] is True
     assert provider_directory_payload["run_shutdown"] is True
     assert provider_directory_payload["target_module"] == "process.provider_directory_fhir"
+    assert provider_directory_payload["task"]["resources"] == ["Location", "Practitioner"]
     assert provider_directory_payload["task"]["resource_limit"] == 100
     assert (
         provider_directory_payload["task"]["retest_results_url"]

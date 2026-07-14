@@ -18888,8 +18888,25 @@ async def test_duplicate_base_uses_one_compatibility_row(monkeypatch):
 def test_selected_resources_rejects_unknown_resource():
     assert "Endpoint" in importer._selected_resources(None)
     assert importer._selected_resources("InsurancePlan,Location") == ["InsurancePlan", "Location"]
+    assert importer._selected_resources([" InsurancePlan ", "Location"]) == [
+        "InsurancePlan",
+        "Location",
+    ]
+    assert importer._selected_resources('["InsurancePlan", "Location"]') == [
+        "InsurancePlan",
+        "Location",
+    ]
     with pytest.raises(ValueError, match="Unsupported Provider Directory FHIR resources"):
         importer._selected_resources("InsurancePlan,Patient")
+
+
+def test_selected_resources_rejects_malformed_json_and_non_string_entries():
+    with pytest.raises(ValueError, match="valid JSON array"):
+        importer._selected_resources('["Location"')
+    with pytest.raises(ValueError, match="index 1 must be a string"):
+        importer._selected_resources(["Location", 42])
+    with pytest.raises(ValueError, match="index 1 must not be empty"):
+        importer._selected_resources(["Location", " "])
 
 
 def test_source_resource_fetch_order_attempts_cigna_practitioner_role_last():
