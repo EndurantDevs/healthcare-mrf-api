@@ -28,6 +28,8 @@ def test_affiliation_sql_has_explicit_contra_policy_and_dataset_org_join():
     assert importer.CONTRA_COSTA_PROVIDER_DIRECTORY_BASE in sql
     assert "resource.resource_type = 'Organization'" in sql
     assert "allow_organization_reference_fallback" in sql
+    assert "FROM '(?i)(?:^|/)Organization/" in sql
+    assert 'provider_directory_dataset_resource" AS resource' in sql
 
 
 def test_unresolved_fallback_is_diagnostic_with_resolved_partition():

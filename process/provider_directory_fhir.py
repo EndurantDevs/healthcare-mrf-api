@@ -29951,8 +29951,8 @@ def _affiliation_org_edge_ctes(
 ) -> str:
     """Build reference-resolution and expected-edge CTEs."""
     return _AFFILIATION_ORG_EDGE_CTES_TEMPLATE % (
-        resource_ref,
         organization_reference_pattern,
+        resource_ref,
     )
 
 _AFFILIATION_ORG_PROOF_SELECT = """
