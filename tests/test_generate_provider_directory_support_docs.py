@@ -30,7 +30,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "OAuth2 client credentials | Bulk" in rendered_document
     assert "Cigna (`cigna`) | Acquisition-configured | None | REST" in rendered_document
     assert "CareSource (`caresource`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint" in rendered_document
-    assert "same-origin opaque _page/_searchId next links across two 100-row pages" in rendered_document
+    assert "processed and unique candidate resource IDs equal unchanged post-scan census" in rendered_document
     assert "No product membership is inferred from the catalog row" in rendered_document
     assert "_count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets" in rendered_document
     assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://" in rendered_document
