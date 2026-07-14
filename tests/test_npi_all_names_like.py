@@ -32,6 +32,20 @@ class RecordingConnection:
         return None
 
 
+class CandidateLimitConnection(RecordingConnection):
+    async def all(self, sql, **params):
+        sql_text = str(sql)
+        if "LIMIT :candidate_limit" in sql_text:
+            assert "candidate_limit" in params
+        self.calls += 1
+        self.last_sql = sql_text
+        self.last_params = params
+        self.sql_calls.append((sql_text, dict(params)))
+        if "COUNT(DISTINCT c.npi)" in sql_text:
+            return [(5,)]
+        return []
+
+
 class FakeAcquire:
     def __init__(self, conn):
         self._conn = conn
@@ -82,6 +96,47 @@ async def test_get_all_locator_defaults_to_no_total_query(monkeypatch):
     assert conn.calls == 1
     assert data["total"] == 10
     assert data["total_source"] == "estimated_page_floor"
+
+
+@pytest.mark.asyncio
+async def test_get_all_unified_phone_list_and_count_bind_candidate_limit(monkeypatch):
+    async def fake_table_columns(table_name, *, session=None):
+        assert session is None
+        if table_name == "entity_address_unified":
+            return npi_module._public_address_serving_column_keys() | {
+                "address_precision",
+                "location_key",
+                "source_count",
+                "updated_at",
+                "zip5",
+                "phone_number",
+            }
+        return set()
+
+    conn = CandidateLimitConnection()
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    response = await get_all(
+        types.SimpleNamespace(
+            args={
+                "phone": "8106526315",
+                "limit": "5",
+                "start": "0",
+                "include_total": "1",
+            }
+        )
+    )
+
+    assert json.loads(response.body)["total"] == 5
+    phone_candidate_calls = [
+        params
+        for sql, params in conn.sql_calls
+        if "LIMIT :candidate_limit" in sql
+    ]
+    assert {params["candidate_limit"] for params in phone_candidate_calls} == {100, 500}
+
 
 
 @pytest.mark.asyncio
