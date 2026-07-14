@@ -29504,9 +29504,8 @@ def _assert_serving_relation_complete(
     error_prefix: str,
     *,
     actual_edge_count: int | None = None,
-    unresolved_field: str | None = None,
 ) -> int:
-    """Reject malformed, unresolved, or incomplete serving relations."""
+    """Reject malformed or incomplete serving relations."""
     malformed_count = _dataset_network_plan_count(
         proof_by_field,
         malformed_field,
@@ -29517,16 +29516,6 @@ def _assert_serving_relation_complete(
             f"{error_prefix}_invalid_references:{dataset_id}:"
             f"malformed={malformed_count}:invalid={invalid_count}"
         )
-    if unresolved_field is not None:
-        unresolved_count = _dataset_network_plan_count(
-            proof_by_field,
-            unresolved_field,
-        )
-        if unresolved_count:
-            raise RuntimeError(
-                f"{error_prefix}_unresolved_references:{dataset_id}:"
-                f"fallback={unresolved_count}"
-            )
     expected_count = _dataset_network_plan_count(
         proof_by_field,
         "expected_edge_count",
@@ -29849,9 +29838,27 @@ _AFFILIATION_ORG_SOURCE_CTES_TEMPLATE = f"""
                        ELSE false
                    END AS empty_reference,
                    CASE
-                       WHEN participating_reference_json IS NOT NULL
-                        AND participating_reference_json <> 'null'::jsonb
-                        AND jsonb_typeof(participating_reference_json) <> 'string'
+                       WHEN (
+                           participating_reference_json IS NOT NULL
+                           AND participating_reference_json <> 'null'::jsonb
+                           AND jsonb_typeof(participating_reference_json) <> 'string'
+                       ) OR (
+                           (
+                               participating_reference_json IS NULL
+                               OR participating_reference_json = 'null'::jsonb
+                               OR (
+                                   jsonb_typeof(participating_reference_json) = 'string'
+                                   AND NULLIF(
+                                       BTRIM(participating_reference_json #>> '{{}}'),
+                                       ''
+                                   ) IS NULL
+                               )
+                           )
+                           AND allow_organization_reference_fallback
+                           AND organization_reference_json IS NOT NULL
+                           AND organization_reference_json <> 'null'::jsonb
+                           AND jsonb_typeof(organization_reference_json) <> 'string'
+                       )
                        THEN true
                        ELSE false
                    END AS malformed_reference
@@ -30081,6 +30088,51 @@ def _dataset_affiliation_organization_edge_insert_sql(
     )
 
 
+def _validate_affiliation_fallback_partition(
+    proof_by_field: dict[str, Any],
+    dataset_id: str,
+    error_prefix: str,
+) -> tuple[int, int]:
+    """Require exhaustive fallback metrics and one resolvable candidate."""
+    fallback_candidate_count = _dataset_network_plan_count(
+        proof_by_field,
+        "fallback_candidate_count",
+    )
+    fallback_resolved_count = _dataset_network_plan_count(
+        proof_by_field,
+        "fallback_resolved_count",
+    )
+    fallback_unresolved_count = _dataset_network_plan_count(
+        proof_by_field,
+        "fallback_unresolved_count",
+    )
+    if fallback_candidate_count != (
+        fallback_resolved_count + fallback_unresolved_count
+    ):
+        raise RuntimeError(
+            f"{error_prefix}_fallback_partition_mismatch:{dataset_id}:"
+            f"candidates={fallback_candidate_count}:"
+            f"resolved={fallback_resolved_count}:"
+            f"unresolved={fallback_unresolved_count}"
+        )
+    return fallback_candidate_count, fallback_resolved_count
+
+
+AFFILIATION_ORGANIZATION_PROOF_COUNT_FIELDS = (
+    "affiliation_resource_count",
+    "affiliation_with_participating_organization_count",
+    "empty_participating_organization_reference_count",
+    "fallback_candidate_count",
+    "fallback_resolved_count",
+    "fallback_unresolved_count",
+    "unresolved_reference_count",
+    "malformed_reference_payload_count",
+    "valid_reference_count",
+    "invalid_reference_count",
+    "expected_edge_count",
+)
+
+
 def _validated_dataset_affiliation_organization_proof(
     proof_by_field: dict[str, Any],
     *,
@@ -30098,6 +30150,13 @@ def _validated_dataset_affiliation_organization_proof(
         expected_acquisition_root_run_id,
         error_prefix,
     )
+    fallback_candidate_count, fallback_resolved_count = (
+        _validate_affiliation_fallback_partition(
+            proof_by_field,
+            dataset_id,
+            error_prefix,
+        )
+    )
     _assert_serving_relation_complete(
         proof_by_field,
         dataset_id,
@@ -30105,21 +30164,11 @@ def _validated_dataset_affiliation_organization_proof(
         "invalid_reference_count",
         error_prefix,
         actual_edge_count=inserted_edge_count,
-        unresolved_field="unresolved_reference_count",
     )
-    count_fields = (
-        "affiliation_resource_count",
-        "affiliation_with_participating_organization_count",
-        "empty_participating_organization_reference_count",
-        "fallback_candidate_count",
-        "fallback_resolved_count",
-        "fallback_unresolved_count",
-        "unresolved_reference_count",
-        "malformed_reference_payload_count",
-        "valid_reference_count",
-        "invalid_reference_count",
-        "expected_edge_count",
-    )
+    if fallback_candidate_count and not fallback_resolved_count:
+        raise RuntimeError(
+            f"{error_prefix}_fallback_no_resolved_edges:{dataset_id}"
+        )
     return {
         "complete": True,
         "version": (
@@ -30130,7 +30179,7 @@ def _validated_dataset_affiliation_organization_proof(
         "build_run_id": build_run_id,
         **{
             field_name: _dataset_network_plan_count(proof_by_field, field_name)
-            for field_name in count_fields
+            for field_name in AFFILIATION_ORGANIZATION_PROOF_COUNT_FIELDS
         },
         "edge_count": inserted_edge_count,
         "replaced_edge_count": replaced_edge_count,

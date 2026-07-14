@@ -30,7 +30,35 @@ def test_affiliation_sql_has_explicit_contra_policy_and_dataset_org_join():
     assert "allow_organization_reference_fallback" in sql
 
 
-def test_unresolved_fallback_is_diagnostic_and_not_complete():
+def test_unresolved_fallback_is_diagnostic_with_resolved_partition():
+    proof_by_field = {
+        "target_dataset_count": 1,
+        "acquisition_root_run_id": "root-run",
+        "affiliation_resource_count": 2,
+        "affiliation_with_participating_organization_count": 0,
+        "empty_participating_organization_reference_count": 1,
+        "fallback_candidate_count": 2,
+        "fallback_resolved_count": 1,
+        "fallback_unresolved_count": 1,
+        "unresolved_reference_count": 1,
+        "malformed_reference_payload_count": 0,
+        "valid_reference_count": 1,
+        "invalid_reference_count": 0,
+        "expected_edge_count": 1,
+    }
+    proof = importer._validated_dataset_affiliation_organization_proof(
+        proof_by_field,
+        dataset_id="dataset-contra",
+        build_run_id="contra-build",
+        replaced_edge_count=0,
+        inserted_edge_count=1,
+        expected_acquisition_root_run_id="root-run",
+    )
+    assert proof["complete"] is True
+    assert proof["fallback_unresolved_count"] == 1
+
+
+def test_all_unresolved_fallback_candidates_fail_closed():
     proof_by_field = {
         "target_dataset_count": 1,
         "acquisition_root_run_id": "root-run",
@@ -46,9 +74,35 @@ def test_unresolved_fallback_is_diagnostic_and_not_complete():
         "invalid_reference_count": 0,
         "expected_edge_count": 0,
     }
-    with pytest.raises(RuntimeError, match="unresolved_references"):
+    with pytest.raises(RuntimeError, match="fallback_no_resolved_edges"):
         importer._validated_dataset_affiliation_organization_proof(
             proof_by_field,
+            dataset_id="dataset-contra",
+            build_run_id="contra-build",
+            replaced_edge_count=0,
+            inserted_edge_count=0,
+            expected_acquisition_root_run_id="root-run",
+        )
+
+
+def test_malformed_fallback_reference_fails_closed():
+    with pytest.raises(RuntimeError, match="invalid_references"):
+        importer._validated_dataset_affiliation_organization_proof(
+            {
+                "target_dataset_count": 1,
+                "acquisition_root_run_id": "root-run",
+                "affiliation_resource_count": 1,
+                "affiliation_with_participating_organization_count": 0,
+                "empty_participating_organization_reference_count": 1,
+                "fallback_candidate_count": 1,
+                "fallback_resolved_count": 0,
+                "fallback_unresolved_count": 1,
+                "unresolved_reference_count": 0,
+                "malformed_reference_payload_count": 1,
+                "valid_reference_count": 0,
+                "invalid_reference_count": 0,
+                "expected_edge_count": 0,
+            },
             dataset_id="dataset-contra",
             build_run_id="contra-build",
             replaced_edge_count=0,
@@ -134,13 +188,14 @@ async def test_unresolved_contra_fallback_preserves_existing_edges(monkeypatch):
             assert proof["fallback_unresolved_count"] == 1
             assert proof["unresolved_reference_count"] == 1
             assert proof["expected_edge_count"] == 3
-            with pytest.raises(RuntimeError, match="unresolved_references"):
-                await importer._build_provider_directory_dataset_affiliation_organization(
-                    connection,
-                    "dataset-a",
-                    build_run_id="bad-contra-build",
-                    expected_acquisition_root_run_id="root-a",
-                )
+            rebuilt = await importer._build_provider_directory_dataset_affiliation_organization(
+                connection,
+                "dataset-a",
+                build_run_id="contra-build",
+                expected_acquisition_root_run_id="root-a",
+            )
+            assert rebuilt["complete"] is True
+            assert rebuilt["edge_count"] == 3
 
         await db_fixtures._assert_dataset_a_relations_unchanged(
             database,

@@ -592,9 +592,11 @@ participating reference is absent. Existing rows are also recognized by the
 stable Contra Costa canonical API base, so an artifact-only rebuild does not
 require a source-row mutation. Fallback candidates, resolved candidates,
 unresolved candidates, and unresolved references are retained in the build
-proof. Unresolved references do not become relation edges and prevent a
-complete artifact proof, avoiding a published zero-edge relation that hides
-missing provider evidence.
+proof. Unresolved references do not become relation edges; resolvable edges
+still publish when the fallback partition is exhaustive and at least one
+fallback candidate resolves. A fallback population with no resolved edge,
+malformed reference shapes, or inconsistent proof counts fails closed, avoiding
+a published zero-edge relation that hides missing provider evidence.
 
 ## Usage
 
