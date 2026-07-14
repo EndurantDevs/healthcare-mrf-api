@@ -181,6 +181,19 @@ Each shard covers a 1,024-key `provider_set_key` interval, with
 numbered contiguously from `0`; a missing, repeated, or out-of-order fragment
 fails the strict reader.
 
+One `(code_key, provider_set_key)` may contain more occurrences than one block
+can hold. The writer splits that logical group into adjacent continuation
+chunks before its configured payload bound is reached. Equal provider keys are
+valid only for those contiguous chunks, and `(price_key, source_key)` remains
+globally ordered across the boundary. Readers reject a decreasing provider,
+noncontiguous provider reuse, decreasing occurrences, or an oversized single
+occurrence. Duplicate occurrences remain duplicate source facts.
+
+Provider-to-code blocks retain their canonical wire format, but the finalizer
+spools encoded entries through bounded import scratch and streams physical
+fragments instead of retaining a complete 1,024-provider block twice in
+memory. Import scratch is disposable; API serving still reads only PostgreSQL.
+
 `by_code_price_page_v4` is a separate 64-row fast first-page projection. It is
 not the authoritative membership stream and cannot replace the provider-shard
 blocks. Standard cost-ordered provider searches use that projection for a
@@ -235,6 +248,37 @@ runs, code dictionaries, provider-graph conversion files, external-sort runs,
 and PostgreSQL COPY inputs. Worker queues, input limits, decompression limits,
 and finalizer record limits bound the work; capacity planning must still
 reserve scratch for every concurrent unique physical build.
+
+Gzip scanning uses `rapidgzip` by default. When `provider_references` appears
+after `in_network`, the scanner builds a temporary seek index, reads the
+provider range first, and then processes indexed in-network ranges in parallel.
+The explicit disable switch remains diagnostic only. Release tests require
+byte-identical COPY rows, serving runs, sidecars, and dedupe summaries at 1, 8,
+and 16 workers. The finalizer likewise produces identical committed bytes and
+support digest at those worker counts; its active-worker memory divisor counts
+only nonempty partition jobs.
+
+Code dictionaries remain worker-sharded. Every shard carries an exact byte and
+row count, SHA-256 digest, dense physical-source key, and source-run contract
+digest. Rust verifies these before allocating or decoding variable-length
+fields and charges the conservative dictionary resident estimate to the
+process identity-map limit.
+
+Physical-source keys are not caller-selected identifiers. Python normalizes
+each source identity as a lowercase ASCII token, one supported digest kind,
+and a 32-byte digest; sorting that tuple assigns the contiguous keys. Rust
+independently rejects unsupported identity kinds, duplicate identities,
+noncanonical source types, and any key-to-identity ordering that differs from
+that deterministic assignment.
+
+The scanner summary also authenticates the complete code-dictionary shard set
+for each physical source. Python turns its exact file, row, and byte totals into
+a source-bound contract containing every shard digest. Each dictionary entry
+carries that contract digest, while the finalizer manifest carries the complete
+per-source contract set and its canonical SHA-256. Rust recomputes both levels
+and compares the observed descriptors exactly. Recomputing only aggregate
+manifest totals after omitting a shard therefore cannot produce an acceptable
+finalizer input.
 
 Scratch lives under temporary directories selected by the import runtime and
 is removed after success or failure. Disposable PostgreSQL stages are unlogged
@@ -294,9 +338,9 @@ Publication proceeds in this order:
 2. Compute physical identity and reserve or reuse a layout.
 3. For a reuse hit, publish only the new logical snapshot, scope, and pointers.
 4. For a new layout, scan to bounded runs and disposable PostgreSQL stages.
-5. Validate every source-bound scanner run contract, including its complete
-   partition vector, aggregate rows and bytes, file hashes, and physical
-   source identity.
+5. Validate every source-bound scanner run and code-dictionary contract,
+   including complete partition and shard vectors, aggregate rows and bytes,
+   file hashes, deterministic dense source keys, and physical source identity.
 6. Finalize dense blocks, dictionaries, prices, and all provider-graph
    directions.
 7. Build and persist the publication audit sample.
@@ -407,7 +451,7 @@ accepted dev evidence for a complete large import under this strict contract.
 Do not cite historical runs from another layout or an incomplete measurement
 as proof.
 
-A qualifying measurement uses authenticated capacity schema version 3 and at
+A qualifying measurement uses authenticated capacity schema version 7 and at
 least 30 unique large builds. Every build must use the deployed release scanner
 and schema,
 logged durable relations, a fresh physical fingerprint, complete source
@@ -515,11 +559,21 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
   hard minimum of 250.
 - Cold first-page p95 is at or below 40 ms separately for matched-positive,
   negative, and deterministic-random requests.
-- The authenticated schema-v3 monthly capacity report passes with at least 30
+- The authenticated schema-v7 monthly capacity report passes with at least 30
   qualifying large builds, 30 reuse-only samples, committed end-to-end timing
-  for every logical sample, reconciled candidate-audit traffic, the timestamped
-  seven-day peak profile, the 30-minute contention run, and all fixed resource
-  headroom gates.
+  for every logical sample, reconciled candidate-audit traffic, signed raw
+  arrivals behind the timestamped seven-day peak profile, the 30-minute
+  contention run, contention-bound resource observations, and all fixed
+  resource headroom gates.
+- Every accepted cold request is API-signed over its start, completion,
+  monotonic duration, contention run, semantic class, selection ordinal,
+  ordinal-zero process state, result count, status, and response digest. Its
+  complete request interval remains inside all required build and audit lanes,
+  and no API process identity is reused by another cold sample. An isolated
+  evidence process accepts exactly one HTTP request: it must be the challenged
+  canonical pricing route. Readiness traffic, aliases, and unchallenged or
+  subsequent requests fail closed, so each cold sample starts a dedicated
+  process outside the ordinary service load-balancer lifecycle.
 - A claimed 10-to-15-minute large import is backed by a current complete
   measured report; until then the gate remains pending.
 - Replacement and rollback bindings are retained as intended, and GC dry-run

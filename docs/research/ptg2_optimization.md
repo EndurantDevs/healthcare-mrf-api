@@ -41,12 +41,23 @@ change, not a performance candidate.
 
 ## Current Implementation Shape
 
-The scanner emits partitioned serving runs, code dictionaries, and temporary
-provider-membership inputs. A Rust finalizer performs bounded-memory external
+The scanner emits partitioned serving runs, source-bound code-dictionary
+shards, and temporary provider-membership inputs. Every dictionary shard is
+authenticated by SHA-256 and exact row/byte metadata before parsing, and its
+resident-memory estimate is charged before allocation. A Rust finalizer performs bounded-memory external
 sorting and emits dense block streams. Publication stores content-addressed
 payloads and fixed support rows in PostgreSQL, validates the complete mapping,
 persists the audit sample, and atomically changes the layout from `building` to
 `sealed`.
+
+Completeness is source-bound rather than inferred from top-level totals. Each
+physical source has one deterministic dense key, one complete partition-run
+contract, and one complete code-dictionary shard contract. Python constructs
+those contracts from scanner-reported exact totals and canonical file digests;
+Rust independently validates their schemas, canonical hashes, identities,
+aggregate counts, descriptor sets, uniqueness, and source-key ordering. This
+closes the coherent-subset case where a caller could otherwise omit one shard
+and merely recompute aggregate manifest fields.
 
 The physical semantic fingerprint is order-independent and covers the complete
 artifact set and scanner/finalizer identity. Logical plan metadata is excluded
@@ -59,12 +70,25 @@ manifest, follows the sealed physical binding, and fetches only addressed
 PostgreSQL fragments. Block readers validate stored hashes and metadata and do
 not retain payloads between requests.
 
+The release scanner enables indexed `rapidgzip` decompression by default. A
+late `provider_references` array is sought and decoded first, after which 1, 8,
+or 16 parser workers consume indexed in-network ranges with byte-identical
+results. The finalizer schedules only nonempty partitions, so sparse layouts do
+not dilute the process-wide sort-memory budget across idle workers.
+
 The authoritative by-code writer emits only `by_code_provider_shard_v1`.
 Provider-set keys are partitioned into 1,024-key shards, where
 `shard_id = provider_set_key // 1024` and
 `block_key = (code_key << 31) | shard_id`; every block's fragments are dense
 and contiguous from `0`. The separate `by_code_price_page_v4` projection holds
 at most 64 rows and exists only for fast qualifying first-page reads.
+
+Large logical provider groups are emitted as bounded adjacent continuation
+chunks. The reader accepts equal provider keys only while occurrences remain
+globally ordered across the continuation, preserving duplicate multiplicity.
+Provider-to-code logical bytes remain canonical while block assembly uses a
+reusable import spool and bounded fragment buffer instead of a second complete
+block allocation.
 
 Standard cost-ordered provider pagination uses progressive exact selection for
 pages that cannot be satisfied by the projection. It expands the forward
@@ -83,6 +107,7 @@ total is not yet known; a false `total_is_exact` marks `total` and
 | Complete-set physical identity | Implemented in repository | Order independence, content sensitivity, scanner identity, and one-plan-per-snapshot tests. |
 | Independent logical binding | Implemented in repository | Two logical snapshots can share one layout while plan filtering and removal remain isolated. |
 | Temporary scratch cleanup | Implemented in repository | Scanner and graph/finalizer failure tests leave no serving scratch. |
+| Source and dictionary completeness | Implemented in repository | Per-source run and dictionary contracts bind exact file descriptors to canonical physical identities; Python/Rust parity and coherent-omission tests fail closed. |
 | Exact multiplicity | Implemented in repository | Duplicate source candidates and duplicate atom ordinals survive publication and audit. |
 | Persisted audit sample | Implemented in repository | Publish-time sample metadata, digest, row bound, and API readback tests. |
 | Independent release audit | Tooling implemented | A qualifying release report must meet the fixed sample and latency floors. |
@@ -90,7 +115,7 @@ total is not yet known; a false `total_is_exact` marks `total` and
 | Automatic candidate audit orchestration | Implemented in repository | The generic `ptg-candidate-audit` job resolves one validated candidate, leases and verifies retained inputs, runs the release audit, records the attestation, and atomically promotes the exact predecessor. |
 | Class-specific cold first-page p95 <= 40 ms | Pending release measurement | Fresh API processes, distinct keys, and complete first-page observations measured separately for matched-positive, negative, and deterministic-random requests. |
 | Unique large import in 10-15 minutes | Pending dev measurement | Complete fresh build, logged PostgreSQL publication, audit, seal, and resource report. |
-| 2,000 imports/month | Authenticated schema-v3 gate implemented; measurement pending | `ptg2_v3_capacity_gate.py` requires a fresh collector receipt, committed per-import end-to-end timings, 30 qualifying large builds and reuse samples, reconciled audit HTTP cost, timestamped seven-day peaks, concurrent cold API samples, zero errors, and fixed resource headroom. |
+| 2,000 imports/month | Authenticated schema-v7 gate implemented; measurement pending | `ptg2_v3_capacity_gate.py` requires a fresh Ed25519 collector receipt, committed per-import end-to-end timings, 30 qualifying large builds and reuse samples, reconciled retry and audit HTTP cost, signed raw import and audit arrivals behind gap-free seven-day peaks, independently server-signed fully contended cold API samples, zero errors, and raw contention-bound resource telemetry. |
 
 There is no accepted dev large-import proof for the strict architecture yet.
 Do not promote the target or a projection to a measured result.
@@ -108,7 +133,10 @@ python -m pytest -q \
   tests/test_ptg2_shared_gc.py \
   tests/test_ptg2_candidate_attestation.py \
   tests/test_ptg2_strict_v3_snapshot_validation.py \
-  tests/test_ptg2_v3_source_api_audit.py
+  tests/test_ptg2_v3_source_api_audit.py \
+  tests/test_ptg2_v3_source_api_audit_capacity.py \
+  tests/test_ptg2_capacity_evidence.py \
+  tests/test_ptg2_v3_capacity_gate_adversarial.py
 ```
 
 PostgreSQL-backed cases that are environment-gated must be run in a disposable
@@ -200,7 +228,7 @@ one successful build is diagnostic evidence only.
 
 A qualifying dev measurement must:
 
-1. Use capacity schema version 2 and collect at least 30 representative large
+1. Use capacity schema version 7 and collect at least 30 representative large
    builds with the exact release scanner/finalizer and migrated schema intended
    for deployment.
 2. Select a complete representative input set without diagnostic truncation.
@@ -315,7 +343,7 @@ a reuse discount until production-like fingerprints and audited activation
 demonstrate it. Track logical-import, unique-layout, and audited-activation
 throughput.
 
-Schema-v3 release evidence uses these fixed representativeness policies:
+Schema-v7 release evidence uses these fixed representativeness policies:
 
 - At least 30 fully qualifying representative large builds, 30 reuse-only
   samples, and a directly observed end-to-end stage record for every logical
@@ -325,16 +353,18 @@ Schema-v3 release evidence uses these fixed representativeness policies:
   result. All candidate-audit and API error counts are zero.
 - Candidate-audit queue age and import queue delay are each at most 30 minutes;
   import and audit lane utilization are at most 70 percent.
-- At least 30 timestamped, non-overlapping peak windows of at least 30 minutes
-  are spread across at least seven days. Counts, span, peaks, and queue maxima
-  reconcile to the committed redacted window list. The observed peak meets the
-  target's prorated average and both import and audit demand fit the fixed queue
-  SLOs.
+- Timestamped peak windows of at least 30 minutes form a gap-free, fully
+  covered sequence spanning at least seven days. Counts, span, peaks, and queue
+  maxima reconcile to the committed redacted window list. The observed peak
+  meets the target's prorated average and both import and audit demand fit the
+  fixed queue SLOs.
 - Simultaneous configured build lanes, audit lanes, and API traffic run for at
   least 30 minutes with at least 3,000 normal requests and 1 request/second.
   Candidate-audit request totals, duration, and derived rate reconcile both in
   the sample population and contention interval, covering at least 3,000 HTTP
   calls per active audit and 6,000,000 projected calls per 2,000 activations.
+  The signed raw timestamps cover at least 99 percent of the contention interval
+  with no import, audit, or HTTP observation gap above five seconds.
 - Fresh-process cold first-page p95 is at most 40 ms independently for at
   least 100 matched-positive, 250 negative, and 2,500 deterministic-random
   samples and distinct keys. All three committed sample sets are collected
@@ -353,13 +383,24 @@ work, shared-block growth after content-addressed deduplication, and bounded
 layout release/block-sweep throughput.
 
 Numeric JSON is not a release credential. The deployed collector signs the
-canonical schema-v3 measurement with HMAC-SHA256 using a protected out-of-band
-key. Its receipt is valid for at most two hours and binds the expected release
-digest, environment digest, collector id/version, observation timestamps, and
-SHA-256 commitments to per-import stage rows, redacted peak windows, and each
-cold request class. The evaluator rejects examples, unsigned reports, identity
-mismatches, stale receipts, tampering, and incoherent commitment counts before
-running capacity arithmetic.
+canonical schema-v7 measurement with Ed25519. Each challenged HTTP observation
+is separately signed by the isolated API process using a distinct Ed25519 key.
+That API signature covers the server-received and completion timestamps,
+monotonic duration, contention run, semantic class, selection ordinal,
+ordinal-zero cold-process claim, result count, status, and body digest. Latency
+and full-contention membership are derived only from these signed fields, and
+every accepted cold sample must have a unique process identity. Isolated
+evidence mode is application-wide and single-use: the first request must be the
+challenged canonical pricing path, while readiness probes, route aliases,
+missing challenges, and second requests fail closed and consume the process.
+The evaluator loads both public keys only from a fixed, root-owned trust file;
+the collector cannot manufacture API latency evidence. Its receipt is
+valid for at most two hours and binds the expected release digest, environment
+digest, collector id/version, contention run, observation timestamps, and
+SHA-256 commitments to embedded redacted import, audit, peak-window, and cold
+request rows. The evaluator rejects examples, unsigned reports, identity
+mismatches, stale receipts, tampering, and incoherent raw rows or aggregates
+before running capacity arithmetic.
 
 Adding worker lanes is acceptable only while PostgreSQL and scratch stay within
 measured limits and the API keeps the cold first-page gate. A scheduler should

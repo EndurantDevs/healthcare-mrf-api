@@ -13,6 +13,11 @@ the normal pricing response and persisted-audit endpoint to report
 `postgres_binary_v3`, `shared_blocks_v3`, PostgreSQL storage, the pinned
 snapshot, and plan-scoped pricing. A missing or mismatched marker fails the run.
 
+The imported layout must have passed the strict source-run and code-dictionary
+source contracts. Those contracts use deterministic dense physical-source keys
+and exact per-file SHA-256, row, and byte descriptors; they are build-time
+completeness checks and are separate from this independent source-to-API audit.
+
 ## Run
 
 Use environment variables for secrets and target identifiers so they do not
@@ -215,13 +220,15 @@ temporary index; it does not preserve the index.
 
 ## Monthly capacity gate
 
-`ptg2_v3_capacity_gate.py` evaluates authenticated, fixed-schema aggregate
-measurements for the 2,000-logical-imports-per-month objective. Schema version
-3 rejects schema 1 and 2 reports. Numeric assertions alone are not release
-evidence: every release report needs a fresh HMAC-SHA256 collector receipt tied
-to the expected release digest, environment identity, collector id/version,
-observation interval, and cryptographic commitments to the underlying sample
-sets.
+`ptg2_v3_capacity_gate.py` evaluates authenticated, fixed-schema measurements
+for the 2,000-logical-imports-per-month objective. Schema version 7 rejects
+older reports. Numeric assertions alone are not release evidence: every release
+report embeds the redacted import-lifecycle, audit-result, raw peak-arrival,
+peak-window, and HTTP sample rows used by the arithmetic and needs a fresh
+Ed25519 collector receipt.
+The receipt binds the expected release digest, environment identity, collector
+id/version, contention run, observation interval, and cryptographic commitments
+to those rows.
 
 Create the fixed-schema example without target or customer identifiers:
 
@@ -235,19 +242,28 @@ not create a receipt. It is a shape example only. Editing its values cannot
 make it releasable.
 
 The deployed collector, not this evaluator, creates the signed report. Release
-automation supplies the trust anchor independently from the report. The HMAC
-key file must be a regular file readable only by its owner and contain at least
-32 bytes. The expected digests and collector identity must come from protected
-release configuration, not from report contents:
+automation installs the verifier trust policy at the non-overridable path
+`/etc/healthporta/ptg2-capacity-trust.json`. It must be a root-owned regular
+file with no group or world write permission. The expected release,
+environment, key, and collector identities come from this protected file, not
+from report contents or caller-controlled environment variables:
+
+```json
+{
+  "version": 2,
+  "algorithm": "ed25519",
+  "key_id": "capacity-collector-2026-01",
+  "public_key_hex": "<64-lowercase-hex-ed25519-public-key>",
+  "api_evidence_key_id": "capacity-api-2026-01",
+  "api_evidence_public_key_hex": "<64-lowercase-hex-ed25519-public-key>",
+  "release_digest": "<64-lowercase-hex-release-digest>",
+  "environment_id": "<64-lowercase-hex-environment-id>",
+  "collector_id": "ptg2-capacity-collector",
+  "collector_version": "7.0.0"
+}
+```
 
 ```bash
-export HLTHPRT_PTG2_CAPACITY_RECEIPT_KEY_FILE=/run/secrets/ptg2-capacity.key
-export HLTHPRT_PTG2_CAPACITY_RECEIPT_KEY_ID=capacity-collector-2026-01
-export HLTHPRT_PTG2_CAPACITY_RELEASE_DIGEST=<64-lowercase-hex-release-digest>
-export HLTHPRT_PTG2_CAPACITY_ENVIRONMENT_ID=<64-lowercase-hex-environment-id>
-export HLTHPRT_PTG2_CAPACITY_COLLECTOR_ID=ptg2-capacity-collector
-export HLTHPRT_PTG2_CAPACITY_COLLECTOR_VERSION=3.0.0
-
 python3 scripts/validation/ptg2_v3_capacity_gate.py \
   reports/ptg2-v3-capacity-receipt.json \
   --output reports/ptg2-v3-capacity-report.json
@@ -258,8 +274,24 @@ most 15 minutes, and is rejected when expired, future-dated, signed by another
 key, or bound to another release, environment, or collector. The signature
 covers every measurement field and all commitment metadata. The canonical
 signing bytes are exposed by `receipt_signing_payload()` so an independently
-deployed collector can implement the same standard-library JSON/HMAC contract;
-the evaluator has no signing CLI and no embedded key.
+deployed collector can implement the same canonical JSON/Ed25519 contract; the
+evaluator has no signing CLI, private key, or caller-selected trust path.
+The API evidence key is separate from the collector key. The isolated API
+process signs each eligible first-page response status, body digest, semantic
+query digest, challenge, unique process identity, request start and completion,
+monotonic server duration, contention run, semantic cohort, selection ordinal,
+and result count. The gate derives latency from that signed duration and
+requires the complete request interval to remain inside every configured import
+and audit lane. A process can contribute only its signed ordinal-zero request as
+cold evidence. In isolated evidence mode the process is single-use across the
+entire HTTP application: its first request must be the challenged canonical
+pricing path. A readiness request, alias route, missing challenge, or second
+request is rejected and consumes that process, so the collector must launch one
+fresh API process directly for each sample rather than place evidence workers
+behind ordinary readiness or shared-service traffic. The source/API audit must receive
+the same 64-character contention digest through
+`PTG_AUDIT_CAPACITY_CONTENTION_RUN_ID` (or
+`--capacity-contention-run-id`) that the resource collector records.
 
 The release profile requires all of the following:
 
@@ -273,7 +305,10 @@ The release profile requires all of the following:
 - Reuse-only work has at least 30 timing samples. Its measured duration is
   charged to reuse-adjusted worker hours and combined with the same audited
   activation path; a reuse hit is discounted only after audited activation is
-  verified.
+  verified. Failed-attempt worker time must be nonzero for every reported
+  retry, reconciles across unique and reuse imports, and is charged across all
+  logical samples. Both unreused and reuse-adjusted lane utilization are hard
+  release gates.
 - Candidate audits have at least 30 successful samples and zero errors. Their
   lane count and availability are independent from build lanes, monthly and
   peak utilization must stay at or below 70 percent, maximum queue age is 30
@@ -282,29 +317,40 @@ The release profile requires all of the following:
   rate must reconcile with per-activation floors and the contention interval.
   At the release objective that floor is 6,000,000 audit HTTP requests per
   month.
-- Peak evidence contains at least 30 individually timestamped, non-overlapping
-  windows of at least 30 minutes spread across at least seven days. Summary
-  counts, span, peaks, queue maxima, and the window commitment must exactly
-  reconcile with those redacted windows. The observed peak must meet the
-  target's prorated average floor, maximum import queue delay is 30 minutes,
-  and both weighted import work and candidate-audit work must fit their queue
-  SLOs.
+- Peak evidence is a gap-free, fully covered sequence of individually
+  timestamped windows spanning at least seven days; every window is at least 30
+  minutes. Each window's logical, unique-build, reuse, audit, and queue counts
+  are recomputed from separately committed raw arrival events. Summary counts,
+  span, peaks, queue maxima, the window commitment, and the raw-event commitment
+  must exactly reconcile. Capacity is evaluated from each observed window's
+  actual workload mixture; maxima from different windows are never combined.
+  The observed peak must meet the target's prorated average floor, maximum
+  import queue delay is 30 minutes, and both weighted import work and
+  candidate-audit work must fit their queue SLOs.
 - Simultaneous import, candidate-audit, and normal API contention lasts at
   least 30 minutes. It covers every configured import and audit lane, at least
   3,000 API requests, at least 1 request/second, and enough audit request rate
   to deliver 3,000 HTTP calls per active audit within its measured duration.
+  Redacted timestamps must cover at least 99 percent of the contention interval
+  with no import, audit, or HTTP observation gap greater than five seconds.
 - Fresh processes produce separate cold first-page p95 values at or below 40
   ms for matched-positive, negative, and deterministic-random requests. The
-  floors are 100, 250, and 2,500 samples and distinct keys respectively. Every
-  committed cold sample is collected inside the signed contention interval.
-  Aggregate p95, out-of-window samples, and repeated single-key evidence are
-  not accepted. HTTP and per-class errors must all be zero.
+  floors are 100, 250, and 2,500 samples respectively. Every sample in each
+  class must use a distinct committed query-key digest; this deliberately
+  exceeds a minimum-distinct-count rule so repeated fast keys cannot dilute a
+  slow tail. Sample floors and p95 are computed only from observations made
+  while every configured unique-build lane and candidate-audit lane is active.
+  Aggregate p95, partially contended samples, out-of-window samples, and
+  repeated-key evidence are not accepted. HTTP and per-class errors must all
+  be zero.
 - Scratch and PostgreSQL temp space retain at least 20 percent measured
   headroom. Pool-wait evidence covers the combined normal and candidate-audit
   request rate over the contention interval with p95 at most 10 ms, maximum at
   most 100 ms, and zero timeouts. At least two non-requested
   checkpoints complete with 20 percent time headroom; connection, write, WAL,
-  and autovacuum worker capacity also retain 20 percent headroom.
+  and autovacuum worker capacity also retain 20 percent headroom. Resource,
+  storage, and GC summaries are accepted only when their signed observation
+  metadata binds them to the same contention run and fresh adjacent GC window.
 - GC evidence spans at least 24 hourly cycles and 30 eligible/deleted layouts,
   has zero overlaps or reference-check failures, drains eligible bytes with 20
   percent throughput headroom, and keeps backlog within its declared bound.
@@ -314,11 +360,12 @@ The release profile requires all of the following:
 Reuse reduces the capacity projection only when the measurement proves a
 complete physical-input fingerprint match, an independently published logical
 binding, production-like observation, and audited activation for every claimed
-hit. Report contents remain aggregate and redacted. Per-window aggregates carry
-only timestamps and counts; per-import and per-request rows remain represented
-by SHA-256 commitments. Reports reject unknown fields and do not echo paths,
-target identifiers, URLs, arbitrary JSON values, auth material, or exception
-text.
+hit. Embedded rows remain redacted: identities and query keys are SHA-256
+values, while lifecycle rows contain only fixed booleans, timestamps, counts,
+and durations. Reports reject unknown fields and do not echo paths, target
+identifiers, URLs, arbitrary JSON values, auth material, or exception text.
+The evaluator target must exactly match the objective signed into the evidence;
+a caller cannot substitute a smaller target on the command line.
 
 Exit status is `0` only for authenticated passing release evidence, `1` for a
 completed gate failure or `--write-example`, and `2` for invalid, unsigned,
