@@ -311,8 +311,13 @@ def profile_evidence_insert_sql(
     role_ref: str,
     organization_ref: str,
     service_ref: str,
+    endpoint_ref: str | None = None,
 ) -> str:
     """Build immutable source evidence from scoped typed FHIR resources."""
+    endpoint_ref = endpoint_ref or service_ref.replace(
+        "provider_directory_healthcare_service",
+        "provider_directory_endpoint",
+    )
     return _render_sql_template(
         "provider_directory_profile_evidence.sql",
         {
@@ -322,6 +327,7 @@ def profile_evidence_insert_sql(
             "ROLE_REF": role_ref,
             "ORGANIZATION_REF": organization_ref,
             "SERVICE_REF": service_ref,
+            "ENDPOINT_REF": endpoint_ref,
         },
     )
 

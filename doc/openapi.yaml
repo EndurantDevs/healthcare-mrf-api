@@ -2504,8 +2504,9 @@ paths:
         - name: force_address_update
           in: query
           schema:
-            type: integer
-          description: When non-zero, forces address geocoding refresh
+            type: boolean
+            default: false
+          description: Forces address geocoding refresh
         - name: show
           in: query
           schema:
@@ -2568,12 +2569,6 @@ paths:
           schema:
             type: boolean
           description: Include total address count metadata when address_list is paged
-        - name: address_key
-          in: query
-          schema:
-            type: string
-            format: uuid
-          description: Return only the exact canonical provider address UUID
       responses:
         '200':
           description: NPI detail payload
@@ -8475,8 +8470,7 @@ components:
         provider_directory_profile:
           $ref: '#/components/schemas/ProviderDirectoryProfile'
         provider_directory_profile_evidence:
-          allOf:
-            - $ref: '#/components/schemas/ProviderDirectoryProfile'
+          $ref: '#/components/schemas/ProviderDirectoryProfileEvidence'
           description: Per-fact source evidence, returned only when include_evidence is true
       additionalProperties: true
     ProviderDirectoryProfile:
@@ -8500,10 +8494,8 @@ components:
           items:
             $ref: '#/components/schemas/ProviderDirectoryProfileSource'
         facts:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'
-      additionalProperties: true
+          $ref: '#/components/schemas/ProviderDirectoryProfileFacts'
+      additionalProperties: false
     ProviderDirectoryProfileSource:
       type: object
       properties:
@@ -8520,7 +8512,54 @@ components:
           type: string
         plan_name:
           type: string
-      additionalProperties: true
+      additionalProperties: false
+    ProviderDirectoryProfileFacts:
+      type: object
+      properties:
+        name: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        administrative_gender: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        age: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        years_of_practice: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        credential: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        taxonomy_qualification: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        qualification: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        qualification_detail: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        language: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        contact: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        specialty: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        role: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        role_identifier: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        role_context: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        new_patient_acceptance: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        telehealth: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        accepting_medicaid: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        organization: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        service: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+        endpoint: {$ref: '#/components/schemas/ProviderDirectoryProfileFactCategory'}
+      additionalProperties: false
+    ProviderDirectoryProfileEvidence:
+      type: object
+      properties:
+        schema_version:
+          type: integer
+        generation_id:
+          type: string
+          nullable: true
+        published_at:
+          type: string
+          format: date-time
+          nullable: true
+        source_count:
+          type: integer
+        independent_source_count:
+          type: integer
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderDirectoryProfileSource'
+        facts:
+          $ref: '#/components/schemas/ProviderDirectoryProfileFacts'
+      additionalProperties: false
     ProviderDirectoryProfileFactCategory:
       type: object
       properties:
@@ -8532,13 +8571,12 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ProviderDirectoryProfileFact'
-      additionalProperties: true
+      additionalProperties: false
     ProviderDirectoryProfileFact:
       type: object
       properties:
         value:
-          type: object
-          additionalProperties: true
+          $ref: '#/components/schemas/ProviderDirectoryProfileFactValue'
         source_ids:
           type: array
           items:
@@ -8554,8 +8592,66 @@ components:
         evidence:
           type: array
           items:
-            type: object
-            additionalProperties: true
+            $ref: '#/components/schemas/ProviderDirectoryProfileFactEvidence'
+      additionalProperties: false
+    ProviderDirectoryProfileFactValue:
+      type: object
+      properties:
+        years: {type: integer}
+        as_of: {type: string}
+        derivation: {type: string}
+        estimated: {type: boolean}
+        basis: {type: string}
+        basis_start_date: {type: string}
+        accepted: {type: boolean}
+        name: {type: string}
+        active: {type: boolean}
+        accepting_patients:
+          type: array
+          items: {$ref: '#/components/schemas/ProviderDirectoryCodeableConcept'}
+        location_refs:
+          type: array
+          items: {type: string}
+        healthcare_service_refs:
+          type: array
+          items: {type: string}
+        endpoint_refs:
+          type: array
+          items: {type: string}
+        identifiers:
+          type: array
+          items: {type: object, additionalProperties: true}
+        coding:
+          $ref: '#/components/schemas/ProviderDirectoryCodeableConcept'
+        classification: {type: string}
+      additionalProperties: true
+    ProviderDirectoryProfileFactEvidence:
+      type: object
+      required: [source_id, resource_type, resource_id]
+      properties:
+        source_id: {type: string}
+        endpoint_id: {type: string}
+        dataset_id: {type: string}
+        api_base: {type: string, format: uri}
+        org_name: {type: string}
+        plan_name: {type: string}
+        resource_type: {type: string}
+        resource_id: {type: string}
+        role_resource_id: {type: string}
+        active: {type: boolean}
+        effective_start: {type: string}
+        effective_end: {type: string}
+        observed_at: {type: string, format: date-time}
+      additionalProperties: false
+    ProviderDirectoryCodeableConcept:
+      type: object
+      properties:
+        system: {type: string}
+        version: {type: string}
+        code: {type: string}
+        display: {type: string}
+        text: {type: string}
+        from_network_ref: {type: string}
       additionalProperties: true
     NpiTaxonomy:
       type: object

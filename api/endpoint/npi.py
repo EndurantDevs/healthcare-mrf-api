@@ -45,6 +45,8 @@ from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        ProviderEnrollmentHomeHealthAgency,
                        ProviderEnrollmentHospice, ProviderEnrollmentHospital,
                        ProviderEnrollmentRHC, ProviderEnrollmentSNF,
+                       ProviderDirectoryEndpoint,
+                       ProviderDirectoryHealthcareService,
                        ProviderDirectoryInsurancePlan,
                        ProviderDirectoryOrganization,
                        ProviderDirectoryOrganizationAffiliation,
@@ -618,6 +620,7 @@ def _primary_total_cache_set(value: int) -> int:
 MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS = 256
 MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE = 100
 MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS = 8192
+MAX_PROVIDER_DIRECTORY_ROLE_REFERENCE_DETAILS = 32
 MAX_PROVIDER_DIRECTORY_FHIR_PROVENANCE_VALUES = 32
 MAX_PROVIDER_DIRECTORY_FHIR_PROVENANCE_TEXT_LENGTH = 2048
 _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR = "_healthporta_provider_directory_role_jit_disabled"
@@ -1197,6 +1200,16 @@ _CURRENT_PROVIDER_DIRECTORY_TYPED_RESOURCE_MODELS = (
         "current_organizations",
         "Organization",
         ProviderDirectoryOrganization,
+    ),
+    (
+        "current_healthcare_services",
+        "HealthcareService",
+        ProviderDirectoryHealthcareService,
+    ),
+    (
+        "current_endpoints",
+        "Endpoint",
+        ProviderDirectoryEndpoint,
     ),
     (
         "current_roles",
@@ -1901,6 +1914,12 @@ def _provider_directory_network_plan_ctes_sql(
 
 def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
     plan_id = _provider_directory_reference_resource_id_sql("plan_ref.value", "InsurancePlan")
+    service_id = _provider_directory_reference_resource_id_sql(
+        "service_ref.value", "HealthcareService"
+    )
+    endpoint_id = _provider_directory_reference_resource_id_sql(
+        "endpoint_ref.value", "Endpoint"
+    )
     insurance_plan_active = _insurance_plan_active_sql("insurance_plan")
     return f"""
     requested_roles AS (
@@ -1915,6 +1934,7 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
                role.insurance_plan_refs::jsonb, role.network_refs::jsonb,
                role.active AS role_active,
                role.identifiers::jsonb AS role_identifiers,
+               role.location_refs::jsonb AS role_location_refs,
                role.healthcare_service_refs::jsonb AS role_healthcare_service_refs,
                role.endpoint_refs::jsonb AS role_endpoint_refs,
                role.specialty_codes::jsonb AS role_specialty_codes,
@@ -1925,13 +1945,93 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
                role.available_time::jsonb AS role_available_time,
                role.not_available::jsonb AS role_not_available,
                role.availability_exceptions AS role_availability_exceptions,
-               role.new_patient_acceptance::jsonb AS role_new_patient_acceptance,
+               COALESCE(
+                   role.new_patient_acceptance::jsonb,
+                   role.accepting_patients::jsonb
+               ) AS role_new_patient_acceptance,
+               role.accepting_patients::jsonb AS role_accepting_patients,
                role.telehealth AS role_telehealth,
                role.accepting_medicaid AS role_accepting_medicaid,
                role.fhir_meta::jsonb AS role_fhir_meta,
                role.fhir_self_url AS role_fhir_self_url,
                role.fhir_fetch_url AS role_fhir_fetch_url,
-               role.fhir_fetch_mode AS role_fhir_fetch_mode
+               role.fhir_fetch_mode AS role_fhir_fetch_mode,
+               COALESCE((
+                   SELECT jsonb_agg(endpoint_detail ORDER BY endpoint_detail ->> 'resource_id')
+                     FROM (
+                         SELECT jsonb_strip_nulls(
+                                    jsonb_build_object(
+                                        'source_id', endpoint.source_id,
+                                        'resource_id', endpoint.resource_id,
+                                        'status', endpoint.status,
+                                        'connection_type_system', endpoint.connection_type_system,
+                                        'connection_type_code', endpoint.connection_type_code,
+                                        'connection_type_display', endpoint.connection_type_display,
+                                        'name', endpoint.name,
+                                        'managing_organization_ref', endpoint.managing_organization_ref,
+                                        'contact', endpoint.contact::jsonb,
+                                        'period_start', endpoint.period_start,
+                                        'period_end', endpoint.period_end,
+                                        'payload_type_codes', endpoint.payload_type_codes::jsonb,
+                                        'payload_mime_types', endpoint.payload_mime_types::jsonb,
+                                        'address', endpoint.address,
+                                        'fhir_meta', endpoint.fhir_meta::jsonb,
+                                        'fhir_self_url', endpoint.fhir_self_url,
+                                        'fhir_fetch_url', endpoint.fhir_fetch_url,
+                                        'fhir_fetch_mode', endpoint.fhir_fetch_mode
+                                    )
+                                ) AS endpoint_detail
+                           FROM jsonb_array_elements_text(
+                                    COALESCE(role.endpoint_refs::jsonb, '[]'::jsonb)
+                                ) AS endpoint_ref(value)
+                           JOIN current_endpoints AS endpoint
+                             ON endpoint.dataset_id = role.dataset_id
+                            AND endpoint.source_id = role.source_id
+                            AND endpoint.resource_id = {endpoint_id}
+                          ORDER BY endpoint.resource_id
+                          LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_REFERENCE_DETAILS}
+                     ) AS resolved_endpoint
+               ), '[]'::jsonb) AS role_endpoints,
+               COALESCE((
+                   SELECT jsonb_agg(service_detail ORDER BY service_detail ->> 'resource_id')
+                     FROM (
+                         SELECT jsonb_strip_nulls(
+                                    jsonb_build_object(
+                                        'source_id', service.source_id,
+                                        'resource_id', service.resource_id,
+                                        'active', service.active,
+                                        'identifiers', service.identifiers::jsonb,
+                                        'name', service.name,
+                                        'type_codes', service.type_codes::jsonb,
+                                        'category_codes', service.category_codes::jsonb,
+                                        'specialty_codes', service.specialty_codes::jsonb,
+                                        'program_codes', service.program_codes::jsonb,
+                                        'communication_codes', service.communication_codes::jsonb,
+                                        'appointment_required', service.appointment_required,
+                                        'location_refs', service.location_refs::jsonb,
+                                        'endpoint_refs', service.endpoint_refs::jsonb,
+                                        'telecom', service.telecom::jsonb,
+                                        'available_time', service.available_time::jsonb,
+                                        'not_available', service.not_available::jsonb,
+                                        'availability_exceptions', service.availability_exceptions,
+                                        'accepting_patients', service.accepting_patients::jsonb,
+                                        'fhir_meta', service.fhir_meta::jsonb,
+                                        'fhir_self_url', service.fhir_self_url,
+                                        'fhir_fetch_url', service.fhir_fetch_url,
+                                        'fhir_fetch_mode', service.fhir_fetch_mode
+                                    )
+                                ) AS service_detail
+                           FROM jsonb_array_elements_text(
+                                    COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)
+                                ) AS service_ref(value)
+                           JOIN current_healthcare_services AS service
+                             ON service.dataset_id = role.dataset_id
+                            AND service.source_id = role.source_id
+                            AND service.resource_id = {service_id}
+                          ORDER BY service.resource_id
+                          LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_REFERENCE_DETAILS}
+                     ) AS resolved_service
+               ), '[]'::jsonb) AS role_healthcare_services
           FROM requested_roles AS requested
           JOIN current_roles AS role
             ON role.source_id = requested.source_id AND role.resource_id = requested.role_id
@@ -2160,12 +2260,15 @@ _PROVIDER_DIRECTORY_ROLE_EVIDENCE_SQL_TEMPLATE = """
            evidence.provenance, evidence.plan_returned, evidence.plan_total,
            evidence.plan_truncated, evidence.catalog_complete,
            role.role_active, role.organization_ref AS role_organization_ref,
-           role.role_healthcare_service_refs, role.role_endpoint_refs,
+           role.role_location_refs, role.role_healthcare_service_refs,
+           role.role_endpoint_refs, role.role_endpoints,
+           role.role_healthcare_services,
            role.role_specialty_codes, role.role_code_codes, role.role_telecom,
            role.role_identifiers,
            role.role_period_start, role.role_period_end, role.role_available_time,
            role.role_not_available, role.role_availability_exceptions,
-           role.role_new_patient_acceptance, role.role_telehealth,
+           role.role_new_patient_acceptance, role.role_accepting_patients,
+           role.role_telehealth,
            role.role_accepting_medicaid, role.role_fhir_meta,
            role.role_fhir_self_url, role.role_fhir_fetch_url, role.role_fhir_fetch_mode,
            {plan_payload_sql} AS plan_payload_json,
@@ -2259,7 +2362,7 @@ def _provider_directory_evidence_field(
 ) -> Any:
     if field_name in payload_map:
         return payload_map[field_name]
-    return mapping.get(f"{prefix}_{field_name}")
+    return mapping.get(f"{prefix}_{field_name}" if prefix else field_name)
 
 
 def _provider_directory_period(
@@ -2410,6 +2513,7 @@ def _provider_directory_role_detail(mapping: Mapping[str, Any]) -> dict[str, Any
         "active",
         "identifiers",
         "organization_ref",
+        "location_refs",
         "healthcare_service_refs",
         "endpoint_refs",
         "specialty_codes",
@@ -2419,19 +2523,126 @@ def _provider_directory_role_detail(mapping: Mapping[str, Any]) -> dict[str, Any
         "not_available",
         "availability_exceptions",
         "new_patient_acceptance",
+        "accepting_patients",
         "telehealth",
         "accepting_medicaid",
     ):
         field_value = mapping.get(f"role_{field_name}")
         if field_value is not None:
             role_detail_map[field_name] = field_value
+    if (
+        "new_patient_acceptance" not in role_detail_map
+        and "accepting_patients" in role_detail_map
+    ):
+        role_detail_map["new_patient_acceptance"] = role_detail_map[
+            "accepting_patients"
+        ]
+    if (
+        "accepting_patients" not in role_detail_map
+        and "new_patient_acceptance" in role_detail_map
+    ):
+        role_detail_map["accepting_patients"] = role_detail_map[
+            "new_patient_acceptance"
+        ]
     period = _provider_directory_period(mapping, "role")
     if period is not None:
         role_detail_map["period"] = period
     provenance = _provider_directory_fhir_provenance(mapping, "role")
     if provenance is not None:
         role_detail_map["fhir_provenance"] = provenance
+    endpoints = _provider_directory_endpoint_details(
+        mapping.get("role_endpoints")
+    )
+    if endpoints:
+        role_detail_map["endpoints"] = endpoints
+    healthcare_services = _provider_directory_healthcare_service_details(
+        mapping.get("role_healthcare_services")
+    )
+    if healthcare_services:
+        role_detail_map["healthcare_services"] = healthcare_services
     return role_detail_map
+
+
+def _provider_directory_evidence_list(value: Any) -> list[Mapping[str, Any]]:
+    if isinstance(value, str):
+        with contextlib.suppress(ValueError):
+            value = json.loads(value)
+    return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+
+def _provider_directory_endpoint_details(value: Any) -> list[dict[str, Any]]:
+    """Return bounded resolved Endpoint details scoped to one PractitionerRole."""
+    details: list[dict[str, Any]] = []
+    for raw_detail in _provider_directory_evidence_list(value):
+        detail = {
+            "resource_type": "Endpoint",
+            "source_id": raw_detail.get("source_id"),
+            "resource_id": raw_detail.get("resource_id"),
+        }
+        for field_name in (
+            "status",
+            "name",
+            "managing_organization_ref",
+            "contact",
+            "payload_type_codes",
+            "payload_mime_types",
+        ):
+            if raw_detail.get(field_name) is not None:
+                detail[field_name] = raw_detail[field_name]
+        connection_type = {
+            key: raw_detail[f"connection_type_{key}"]
+            for key in ("system", "code", "display")
+            if raw_detail.get(f"connection_type_{key}") is not None
+        }
+        if connection_type:
+            detail["connection_type"] = connection_type
+        period = _provider_directory_period(raw_detail, "")
+        if period is not None:
+            detail["period"] = period
+        address = _provider_directory_fhir_url_identity(raw_detail.get("address"))
+        if address is not None:
+            detail["address"] = address
+        provenance = _provider_directory_fhir_provenance(raw_detail, "")
+        if provenance is not None:
+            detail["fhir_provenance"] = provenance
+        details.append(detail)
+    return details
+
+
+def _provider_directory_healthcare_service_details(value: Any) -> list[dict[str, Any]]:
+    """Return source-backed HealthcareService details without inferring acceptance."""
+    details: list[dict[str, Any]] = []
+    for raw_detail in _provider_directory_evidence_list(value):
+        detail = {
+            "resource_type": "HealthcareService",
+            "source_id": raw_detail.get("source_id"),
+            "resource_id": raw_detail.get("resource_id"),
+        }
+        for field_name in (
+            "active",
+            "identifiers",
+            "name",
+            "type_codes",
+            "category_codes",
+            "specialty_codes",
+            "program_codes",
+            "communication_codes",
+            "appointment_required",
+            "location_refs",
+            "endpoint_refs",
+            "telecom",
+            "available_time",
+            "not_available",
+            "availability_exceptions",
+            "accepting_patients",
+        ):
+            if raw_detail.get(field_name) is not None:
+                detail[field_name] = raw_detail[field_name]
+        provenance = _provider_directory_fhir_provenance(raw_detail, "")
+        if provenance is not None:
+            detail["fhir_provenance"] = provenance
+        details.append(detail)
+    return details
 
 
 def _append_provider_directory_plan_evidence(
@@ -3165,7 +3376,9 @@ def _map_source_details(
             "source": "provider_directory_fhir",
             "source_id": source_id,
             "endpoint_id": mapping["endpoint_id"],
-            "canonical_api_base": mapping["canonical_api_base"],
+            "canonical_api_base": _normalized_provider_directory_api_base(
+                mapping["canonical_api_base"]
+            ),
             "org_name": mapping["org_name"],
             "plan_name": mapping["plan_name"],
         }
@@ -3196,12 +3409,10 @@ def _normalized_provider_directory_api_base(raw_api_base: Any) -> str:
     api_base = str(raw_api_base or "").strip()
     if not api_base:
         return ""
-    parsed = urllib.parse.urlsplit(api_base)
-    if not parsed.scheme or not parsed.netloc:
-        return api_base.rstrip("/")
-    return urllib.parse.urlunsplit(
-        (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "")
-    )
+    sanitized_api_base = _provider_directory_fhir_url_identity(api_base)
+    if sanitized_api_base is None:
+        return ""
+    return sanitized_api_base.rstrip("/")
 
 
 def _provider_directory_endpoint_group_key(

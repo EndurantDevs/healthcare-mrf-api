@@ -395,6 +395,7 @@ PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES = {
     ),
     "profile": frozenset(
         {
+            "Endpoint",
             "HealthcareService",
             "Organization",
             "Practitioner",
@@ -11672,6 +11673,10 @@ async def _create_provider_directory_profile_evidence_stage(
             service_ref=_qt(
                 build.schema,
                 ProviderDirectoryHealthcareService.__tablename__,
+            ),
+            endpoint_ref=_qt(
+                build.schema,
+                ProviderDirectoryEndpoint.__tablename__,
             ),
         ),
         source_ids=list(build.source_ids),
@@ -31763,6 +31768,8 @@ async def _address_overlay_scope_sources(
           FROM (
                 SELECT source_id FROM {_qt(schema, "provider_directory_organization")} WHERE last_seen_run_id = :run_id
                 UNION
+                SELECT source_id FROM {_qt(schema, "provider_directory_practitioner")} WHERE last_seen_run_id = :run_id
+                UNION
                 SELECT source_id FROM {_qt(schema, "provider_directory_practitioner_role")} WHERE last_seen_run_id = :run_id
                 UNION
                 SELECT source_id FROM {_qt(schema, "provider_directory_organization_affiliation")} WHERE last_seen_run_id = :run_id
@@ -32229,11 +32236,13 @@ def provider_directory_address_overlay_insert_sql(
 
 ADDRESS_OVERLAY_COMPONENT_SCOPE_TYPES = {
     "organization_address": "organization",
+    "practitioner_address": "practitioner",
     "practitioner_role": "role",
     "organization_affiliation": "affiliation",
 }
 ADDRESS_OVERLAY_COMPONENT_RESOURCE_TYPES = {
     "organization_address": "Organization",
+    "practitioner_address": "Practitioner",
     "practitioner_role": "PractitionerRole",
     "organization_affiliation": "OrganizationAffiliation",
 }
@@ -32382,6 +32391,120 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
             now() AS published_at
           FROM raw_org_addresses AS raw
           JOIN org_address_keys AS keys
+            ON keys.address_lookup_key = raw.address_lookup_key
+         WHERE keys.address_key IS NOT NULL;
+    """,
+    "practitioner_address": """
+        INSERT INTO {stage_ref} ({columns})
+        WITH practitioner_rows AS MATERIALIZED (
+            SELECT
+                practitioner.source_id::varchar AS source_id,
+                practitioner.last_seen_run_id::varchar AS last_seen_run_id,
+                practitioner.resource_id::varchar AS resource_id,
+                practitioner.npi::bigint AS npi,
+                practitioner.addresses::jsonb AS addresses,
+                practitioner.updated_at AS updated_at,
+                (
+                    SELECT telecom.value->>'value'
+                      FROM jsonb_array_elements(COALESCE(practitioner.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                     WHERE telecom.value->>'system' = 'phone'
+                       AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                     LIMIT 1
+                )::varchar AS telephone_number,
+                (
+                    SELECT telecom.value->>'value'
+                      FROM jsonb_array_elements(COALESCE(practitioner.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                     WHERE telecom.value->>'system' = 'fax'
+                       AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                     LIMIT 1
+                )::varchar AS fax_number
+              FROM {practitioner_table} AS practitioner
+             WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
+               AND practitioner.active IS DISTINCT FROM false
+               {component_scope}
+        ), raw_practitioner_addresses AS MATERIALIZED (
+            SELECT
+                ('provider_directory_fhir:practitioner_address:' || practitioner_rows.source_id || ':' ||
+                    practitioner_rows.resource_id || ':' || addr.ordinal::varchar)::varchar AS source_record_id,
+                practitioner_rows.source_id,
+                practitioner_rows.last_seen_run_id,
+                'Practitioner'::varchar AS resource_type,
+                practitioner_rows.resource_id,
+                practitioner_rows.npi,
+                jsonb_build_array(
+                    NULLIF(TRIM(addr.value->'line'->>0), ''),
+                    NULLIF(TRIM(addr.value->'line'->>1), ''),
+                    NULLIF(TRIM(addr.value->>'city'), ''),
+                    NULLIF(TRIM(addr.value->>'state'), ''),
+                    NULLIF(TRIM(addr.value->>'postalCode'), ''),
+                    {practitioner_address_country_expr}
+                )::text::varchar AS address_lookup_key,
+                NULLIF(TRIM(addr.value->'line'->>0), '')::varchar AS first_line,
+                NULLIF(TRIM(addr.value->'line'->>1), '')::varchar AS second_line,
+                NULLIF(TRIM(addr.value->>'city'), '')::varchar AS city_name,
+                NULLIF(TRIM(addr.value->>'state'), '')::varchar AS state_name,
+                NULLIF(TRIM(addr.value->>'postalCode'), '')::varchar AS postal_code,
+                {practitioner_address_country_expr}::varchar AS country_code,
+                practitioner_rows.telephone_number,
+                practitioner_rows.fax_number,
+                practitioner_rows.updated_at AS source_updated_at
+              FROM practitioner_rows
+              JOIN LATERAL jsonb_array_elements(
+                    COALESCE(practitioner_rows.addresses, '[]'::jsonb)
+              ) WITH ORDINALITY AS addr(value, ordinal) ON TRUE
+             WHERE NULLIF(TRIM(addr.value->'line'->>0), '') IS NOT NULL
+               AND NULLIF(TRIM(addr.value->>'city'), '') IS NOT NULL
+               AND NULLIF(TRIM(addr.value->>'postalCode'), '') IS NOT NULL
+        ), practitioner_address_keys AS MATERIALIZED (
+            SELECT
+                key_parts.address_lookup_key,
+                {qschema}.addr_key_v1(
+                    key_parts.first_line,
+                    key_parts.second_line,
+                    key_parts.city_name,
+                    key_parts.state_name,
+                    key_parts.postal_code,
+                    key_parts.country_code
+                ) AS address_key,
+                {qschema}.addr_state_code_v1(key_parts.state_name)::varchar AS state_code
+              FROM (
+                    SELECT DISTINCT
+                        address_lookup_key,
+                        first_line,
+                        second_line,
+                        city_name,
+                        state_name,
+                        postal_code,
+                        country_code
+                      FROM raw_practitioner_addresses
+              ) AS key_parts
+        )
+        SELECT
+            raw.source_record_id,
+            raw.source_id,
+            raw.last_seen_run_id,
+            raw.resource_type,
+            raw.resource_id,
+            raw.npi,
+            keys.address_key,
+            raw.first_line,
+            raw.second_line,
+            raw.city_name,
+            raw.state_name,
+            keys.state_code,
+            raw.postal_code,
+            raw.country_code,
+            raw.telephone_number,
+            raw.fax_number,
+            {raw_practitioner_phone_number_expr}::varchar AS phone_number,
+            {raw_practitioner_fax_number_expr}::varchar AS fax_number_digits,
+            NULL::numeric AS lat,
+            NULL::numeric AS long,
+            'street'::varchar AS address_precision,
+            raw.source_updated_at,
+            now() AS published_at
+          FROM raw_practitioner_addresses AS raw
+          JOIN practitioner_address_keys AS keys
             ON keys.address_lookup_key = raw.address_lookup_key
          WHERE keys.address_key IS NOT NULL;
     """,
@@ -32718,11 +32841,22 @@ def _address_overlay_sql_context(schema: str, stage_table: str | None, run_id: s
         raw_org_country_expr,
         location_country_expr,
     )
+    contact_sql_by_name.update(
+        _contact_pair_sql_context(
+            "raw_practitioner",
+            "raw.telephone_number",
+            "raw.fax_number",
+            _country_restore_default_us_sql("raw.country_code"),
+        )
+    )
     return {
         "stage_ref": _qt(schema, stage_table or _address_overlay_stage_table_name(run_id)),
         "columns": ", ".join(_provider_directory_address_overlay_columns()),
         "qschema": _q(schema),
         "org_address_country_expr": _country_restore_default_us_sql("addr.value->>'country'"),
+        "practitioner_address_country_expr": _country_restore_default_us_sql(
+            "addr.value->>'country'"
+        ),
         "location_country_expr": location_country_expr,
         **contact_sql_by_name,
         "location_lat_expr": _coordinate_from_location_sql(

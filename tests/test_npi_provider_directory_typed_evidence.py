@@ -24,6 +24,7 @@ def _typed_role_evidence_map():
             }
         ],
         "role_organization_ref": "Organization/org-1",
+        "role_location_refs": ["Location/location-1"],
         "role_healthcare_service_refs": ["HealthcareService/service-1"],
         "role_endpoint_refs": ["Endpoint/endpoint-1"],
         "role_specialty_codes": [{"code": "207Q00000X"}],
@@ -35,7 +36,28 @@ def _typed_role_evidence_map():
         "role_not_available": [{"description": "Holiday"}],
         "role_availability_exceptions": "Closed federal holidays",
         "role_new_patient_acceptance": {"code": "accepting"},
+        "role_accepting_patients": {"code": "accepting"},
         "role_telehealth": True,
+        "role_endpoints": [
+            {
+                "source_id": "pdfhir_aetna",
+                "resource_id": "endpoint-1",
+                "status": "active",
+                "connection_type_code": "hl7-fhir-rest",
+                "address": "https://user:secret@example.test/fhir?_token=secret",
+                "fhir_meta": {
+                    "source": "https://user:secret@example.test/fhir?_token=secret"
+                },
+            }
+        ],
+        "role_healthcare_services": [
+            {
+                "source_id": "pdfhir_aetna",
+                "resource_id": "service-1",
+                "name": "Primary care",
+                "accepting_patients": [{"code": "newpt"}],
+            }
+        ],
         "role_fhir_meta": {
             "versionId": "7",
             "source": "https://user:secret@example.test/fhir?_token=secret",
@@ -103,8 +125,16 @@ def test_role_evidence_sql_projects_typed_details_without_catalog_refs():
     for column in (
         "role.available_time::jsonb AS role_available_time",
         "role.identifiers::jsonb AS role_identifiers",
-        "role.new_patient_acceptance::jsonb AS role_new_patient_acceptance",
+        "role.location_refs::jsonb AS role_location_refs",
+        "role.accepting_patients::jsonb AS role_accepting_patients",
         "role.telehealth AS role_telehealth",
+        "current_endpoints AS NOT MATERIALIZED",
+        "current_healthcare_services AS NOT MATERIALIZED",
+        "JOIN current_endpoints AS endpoint",
+        "JOIN current_healthcare_services AS service",
+        "AS role_endpoints",
+        "AS role_healthcare_services",
+        "LIMIT 32",
         "plan.payload_json::jsonb - ARRAY[",
         "current_insurance_plans AS NOT MATERIALIZED",
         "WHERE resource.resource_type = 'InsurancePlan'",
@@ -178,6 +208,28 @@ def test_role_evidence_mapper_emits_availability_and_name_only_plan_details():
         }
     ]
     assert role_detail["new_patient_acceptance"] == {"code": "accepting"}
+    assert role_detail["accepting_patients"] == {"code": "accepting"}
+    assert role_detail["location_refs"] == ["Location/location-1"]
+    assert role_detail["endpoints"] == [
+        {
+            "resource_type": "Endpoint",
+            "source_id": "pdfhir_aetna",
+            "resource_id": "endpoint-1",
+            "status": "active",
+            "connection_type": {"code": "hl7-fhir-rest"},
+            "address": "https://example.test/fhir",
+            "fhir_provenance": {"meta": {"source": "https://example.test/fhir"}},
+        }
+    ]
+    assert role_detail["healthcare_services"] == [
+        {
+            "resource_type": "HealthcareService",
+            "source_id": "pdfhir_aetna",
+            "resource_id": "service-1",
+            "name": "Primary care",
+            "accepting_patients": [{"code": "newpt"}],
+        }
+    ]
     assert role_detail["telehealth"] is True
     assert role_detail["period"] == {"start": "2026-01-01", "end": "2026-12-31"}
     assert len(role_detail["fhir_provenance"]["meta"]["profiles"]) == 32
@@ -192,6 +244,49 @@ def test_role_evidence_mapper_emits_availability_and_name_only_plan_details():
     assert len(plan_detail["plan_backbones"]) == 2
     assert plan_detail["period"] == {"start": "2026-01-01"}
     assert plan_detail["fhir_provenance"]["fetch_mode"] == "read"
+
+
+def test_source_details_remove_url_userinfo_before_response_projection():
+    source_details = npi_module._map_source_details(
+        [
+            {
+                "source_id": "pdfhir_aetna",
+                "endpoint_id": "endpoint-aetna",
+                "canonical_api_base": (
+                    "https://user:secret@example.test/fhir?_token=secret"
+                ),
+                "org_name": "Example Health",
+                "plan_name": None,
+            }
+        ]
+    )
+
+    assert source_details["pdfhir_aetna"]["canonical_api_base"] == (
+        "https://example.test/fhir"
+    )
+
+
+def test_malformed_canonical_api_base_with_userinfo_fails_closed():
+    malformed_api_base = "https://user:secret@[invalid/fhir"
+
+    assert npi_module._normalized_provider_directory_api_base(
+        malformed_api_base
+    ) == ""
+    assert npi_module._normalized_provider_directory_api_base("relative/fhir") == (
+        "relative/fhir"
+    )
+
+
+def test_role_acceptance_aliases_only_fill_from_the_same_source_value():
+    legacy_role = _typed_role_evidence_map()
+    legacy_role.pop("role_new_patient_acceptance")
+
+    detail = npi_module._map_provider_directory_role_evidence([legacy_role])[
+        ("pdfhir_aetna", "role-100")
+    ]["practitioner_role"]
+
+    assert detail["accepting_patients"] == {"code": "accepting"}
+    assert detail["new_patient_acceptance"] == {"code": "accepting"}
 
 
 def test_endpoint_evidence_keeps_role_details_keyed_to_the_address_role():

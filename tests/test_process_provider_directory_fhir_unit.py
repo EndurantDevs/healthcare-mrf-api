@@ -18512,6 +18512,35 @@ def test_address_overlay_component_sql_is_bounded_to_one_component():
     assert "NULL::varchar AS phone_number" not in sql
 
 
+def test_address_overlay_direct_practitioner_component_is_canonical_and_bounded():
+    sql = importer._address_overlay_component_insert_sql(
+        "mrf",
+        "provider_directory_address_overlay_stage_test",
+        component="practitioner_address",
+        run_id="run_1",
+        source_ids=["source_a"],
+    )
+
+    assert 'INSERT INTO "mrf"."provider_directory_address_overlay_stage_test"' in sql
+    assert "provider_directory_fhir:practitioner_address:" in sql
+    assert "'Practitioner'::varchar AS resource_type" in sql
+    assert 'FROM "mrf"."provider_directory_practitioner" AS practitioner' in sql
+    assert "provider_directory_practitioner_role" not in sql
+    assert "provider_directory_organization_affiliation" not in sql
+    assert "practitioner.last_seen_run_id = CAST(:run_id AS varchar)" in sql
+    assert "practitioner.source_id = ANY(CAST(:source_ids AS varchar[]))" in sql
+    assert "practitioner.active IS DISTINCT FROM false" in sql
+    assert "COALESCE(practitioner_rows.addresses, '[]'::jsonb)" in sql
+    assert "raw_practitioner_addresses AS MATERIALIZED" in sql
+    assert "practitioner_address_keys AS MATERIALIZED" in sql
+    assert sql.count("addr_key_v1(") == 1
+    assert "raw.telephone_number" in sql
+    assert "raw.fax_number" in sql
+    assert "UNITEDSTATESOFAMERICA" in sql
+    assert "NULL::numeric AS lat" in sql
+    assert "NULL::numeric AS long" in sql
+
+
 def test_address_overlay_practitioner_component_uses_all_phone_and_location_paths():
     sql = importer._address_overlay_component_insert_sql(
         "mrf",
@@ -18998,6 +19027,7 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
         status_responses={
             "WHERE NOT (source_id = ANY": "INSERT 0 4",
             "provider_directory_fhir:organization_address:": "INSERT 0 6",
+            "provider_directory_fhir:practitioner_address:": "INSERT 0 5",
             "provider_directory_fhir:practitioner_role:": "INSERT 0 7",
             "provider_directory_fhir:organization_affiliation:": "INSERT 0 8",
             "duplicate_rank > 1": "DELETE 2",
@@ -19012,14 +19042,16 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
 
     assert metrics["published"] is True
     assert metrics["rows"] == 10
-    assert metrics["inserted"] == 21
+    assert metrics["inserted"] == 26
     assert metrics["inserted_by_component"] == {
         "organization_address": 6,
+        "practitioner_address": 5,
         "practitioner_role": 7,
         "organization_affiliation": 8,
     }
     assert set(metrics["component_seconds"]) == {
         "organization_address",
+        "practitioner_address",
         "practitioner_role",
         "organization_affiliation",
     }

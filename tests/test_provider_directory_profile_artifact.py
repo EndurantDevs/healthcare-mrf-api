@@ -93,6 +93,7 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
         role_ref='"fixture"."role"',
         organization_ref='"fixture"."organization"',
         service_ref='"fixture"."service"',
+        endpoint_ref='"fixture"."endpoint"',
     )
 
     for fact_type in (
@@ -110,6 +111,7 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
         "role_identifier",
         "organization",
         "service",
+        "endpoint",
     ):
         assert f"'{fact_type}'" in sql
     assert "practitioner.birth_date" not in sql
@@ -117,8 +119,18 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
     assert "basis_start_date" in sql
     assert "'identifiers', role.identifiers::jsonb" in sql
     assert "'identifiers', service.identifiers::jsonb" in sql
+    assert "'accepting_patients', service.accepting_patients::jsonb" in sql
     assert "'comment', service.comment" in sql
+    assert "JOIN \"fixture\".\"endpoint\" AS endpoint" in sql
+    assert "'accepting_patients', COALESCE(" in sql
     assert "ON CONFLICT (evidence_key) DO NOTHING" in sql
+
+
+def test_profile_artifact_scope_materializes_endpoint_resources():
+    assert "Endpoint" in importer.PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES[
+        "profile"
+    ]
+    assert "Endpoint" in importer.PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_TYPES
 
 
 def test_profile_aggregation_is_deterministic_and_evidence_bounded():
@@ -133,7 +145,10 @@ def test_profile_aggregation_is_deterministic_and_evidence_bounded():
     assert "fact_rank <= 100" in sql
     assert "ORDER BY evidence.source_id, evidence.endpoint_id" in sql
     assert "array_agg(DISTINCT evidence.source_id ORDER BY evidence.source_id)" in sql
-    assert "'api_base', evidence.canonical_api_base" in sql
+    assert "'api_base', regexp_replace(" in sql
+    assert "evidence.canonical_api_base," in sql
+    assert "'[?#].*$'" in sql
+    assert "'^([^:/?#]+://)[^/?#@]*@'" in sql
 
 
 def test_profile_source_dataset_pairs_preserve_sorted_alignment():

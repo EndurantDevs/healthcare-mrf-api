@@ -33,7 +33,11 @@ INSERT INTO {{TARGET_REF}} ("npi", "profile_json", "evidence_json", "source_ids"
                                'source_id', source_id,
                                'endpoint_id', endpoint_id,
                                'dataset_id', dataset_id,
-                               'api_base', canonical_api_base,
+                               'api_base', regexp_replace(
+                                   regexp_replace(canonical_api_base, '[?#].*$', ''),
+                                   '^([^:/?#]+://)[^/?#@]*@',
+                                   '\1'
+                               ),
                                'org_name', source_org_name,
                                'plan_name', source_plan_name,
                                'resource_type', resource_type,
@@ -129,7 +133,15 @@ INSERT INTO {{TARGET_REF}} ("npi", "profile_json", "evidence_json", "source_ids"
                        'source_id', evidence.source_id,
                        'endpoint_id', evidence.endpoint_id,
                        'dataset_id', evidence.dataset_id,
-                       'api_base', evidence.canonical_api_base,
+                       'api_base', regexp_replace(
+                           regexp_replace(
+                               evidence.canonical_api_base,
+                               '[?#].*$',
+                               ''
+                           ),
+                           '^([^:/?#]+://)[^/?#@]*@',
+                           '\1'
+                       ),
                        'org_name', evidence.source_org_name,
                        'plan_name', evidence.source_plan_name
                    )) ORDER BY evidence.source_id, evidence.endpoint_id,

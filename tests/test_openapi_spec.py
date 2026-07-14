@@ -310,3 +310,25 @@ def test_openapi_strict_ptg_pagination_exposes_exact_page_continuation():
         ]["$ref"]
         == "#/components/schemas/PtgPricingPaginationMeta"
     )
+
+
+def test_npi_profile_contract_is_typed_and_address_refresh_is_boolean():
+    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    npi_parameters = spec["paths"]["/npi/id/{npi}"]["get"]["parameters"]
+    parameters_by_name = {parameter["name"]: parameter for parameter in npi_parameters}
+    schemas = spec["components"]["schemas"]
+
+    assert list(parameter["name"] for parameter in npi_parameters).count("address_key") == 1
+    assert parameters_by_name["force_address_update"]["schema"] == {
+        "type": "boolean",
+        "default": False,
+    }
+    assert schemas["ProviderDirectoryProfile"]["additionalProperties"] is False
+    assert schemas["ProviderDirectoryProfileFact"]["additionalProperties"] is False
+    assert schemas["ProviderDirectoryProfileFactEvidence"]["additionalProperties"] is False
+    profile_evidence = schemas["NpiRecord"]["properties"][
+        "provider_directory_profile_evidence"
+    ]
+    assert profile_evidence["$ref"] == (
+        "#/components/schemas/ProviderDirectoryProfileEvidence"
+    )

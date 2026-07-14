@@ -109,7 +109,8 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    service.communication_codes,
                    service.referral_method_codes,
                    service.service_provision_codes, service.eligibility,
-                   service.appointment_required, service.telecom,
+                   service.appointment_required, service.accepting_patients,
+                   service.telecom,
                    service.available_time, service.not_available,
                    service.availability_exceptions, service.extra_details,
                    service.comment,
@@ -138,7 +139,8 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    service.communication_codes,
                    service.referral_method_codes,
                    service.service_provision_codes, service.eligibility,
-                   service.appointment_required, service.telecom,
+                   service.appointment_required, service.accepting_patients,
+                   service.telecom,
                    service.available_time, service.not_available,
                    service.availability_exceptions, service.extra_details,
                    service.comment,
@@ -151,6 +153,30 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
             SELECT * FROM role_service_rows
             UNION ALL
             SELECT * FROM direct_service_rows
+        ), role_endpoint_rows AS MATERIALIZED (
+            SELECT role_rows.resolved_npi AS npi,
+                   role_rows.source_id,
+                   role_rows.endpoint_id,
+                   role_rows.dataset_id,
+                   role_rows.canonical_api_base,
+                   role_rows.source_org_name,
+                   role_rows.source_plan_name,
+                   role_rows.resource_id AS role_resource_id,
+                   endpoint.resource_id, endpoint.status,
+                   endpoint.connection_type_system,
+                   endpoint.connection_type_code,
+                   endpoint.connection_type_display,
+                   endpoint.name, endpoint.managing_organization_ref,
+                   endpoint.contact, endpoint.period_start, endpoint.period_end,
+                   endpoint.payload_type_codes, endpoint.payload_mime_types,
+                   endpoint.address, endpoint.updated_at
+              FROM role_rows
+              CROSS JOIN LATERAL jsonb_array_elements_text(
+                   COALESCE(role_rows.endpoint_refs::jsonb, '[]'::jsonb)
+              ) AS endpoint_reference(value)
+              JOIN {{ENDPOINT_REF}} AS endpoint
+                ON endpoint.source_id = role_rows.source_id
+               AND endpoint.resource_id = NULLIF(BTRIM(CASE WHEN endpoint_reference.value LIKE '%/Endpoint/%' THEN regexp_replace(endpoint_reference.value, '^.*/Endpoint/', '') WHEN endpoint_reference.value LIKE 'Endpoint/%' THEN regexp_replace(endpoint_reference.value, '^Endpoint/', '') ELSE endpoint_reference.value END), '')
         ), facts AS (
             SELECT practitioner.npi,
                    'name'::varchar AS fact_type,
@@ -406,6 +432,10 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                            'not_available', role.not_available::jsonb,
                            'availability_exceptions', role.availability_exceptions,
                            'new_patient_acceptance', role.new_patient_acceptance::jsonb,
+                           'accepting_patients', COALESCE(
+                               role.new_patient_acceptance::jsonb,
+                               role.accepting_patients::jsonb
+                           ),
                            'telehealth', role.telehealth::jsonb,
                            'accepting_medicaid', role.accepting_medicaid,
                            'period_start', role.period_start,
@@ -429,7 +459,11 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    role.period_end, role.updated_at
               FROM role_rows AS role
               CROSS JOIN LATERAL jsonb_array_elements(
-                   COALESCE(role.new_patient_acceptance::jsonb, '[]'::jsonb)
+                   COALESCE(
+                       role.new_patient_acceptance::jsonb,
+                       role.accepting_patients::jsonb,
+                       '[]'::jsonb
+                   )
               ) AS acceptance(value)
 
             UNION ALL
@@ -496,6 +530,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                                'service_provision_codes', service.service_provision_codes::jsonb,
                                'eligibility', service.eligibility::jsonb,
                                'appointment_required', service.appointment_required,
+                               'accepting_patients', service.accepting_patients::jsonb,
                                'telecom', service.telecom::jsonb,
                                'available_time', service.available_time::jsonb,
                                'not_available', service.not_available::jsonb,
@@ -519,6 +554,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                            'service_provision_codes', service.service_provision_codes::jsonb,
                            'eligibility', service.eligibility::jsonb,
                            'appointment_required', service.appointment_required,
+                           'accepting_patients', service.accepting_patients::jsonb,
                            'telecom', service.telecom::jsonb,
                            'available_time', service.available_time::jsonb,
                            'not_available', service.not_available::jsonb,
@@ -533,6 +569,57 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    service.resource_id, service.role_resource_id, service.active,
                    NULL::varchar, NULL::varchar, service.updated_at
               FROM service_rows AS service
+
+            UNION ALL
+            SELECT endpoint.npi, 'endpoint',
+                   md5(
+                       jsonb_strip_nulls(
+                           jsonb_build_object(
+                               'status', endpoint.status,
+                               'connection_type_system', endpoint.connection_type_system,
+                               'connection_type_code', endpoint.connection_type_code,
+                               'connection_type_display', endpoint.connection_type_display,
+                               'name', endpoint.name,
+                               'managing_organization_ref', endpoint.managing_organization_ref,
+                               'contact', endpoint.contact::jsonb,
+                               'period_start', endpoint.period_start,
+                               'period_end', endpoint.period_end,
+                               'payload_type_codes', endpoint.payload_type_codes::jsonb,
+                               'payload_mime_types', endpoint.payload_mime_types::jsonb,
+                               'address', regexp_replace(
+                                   regexp_replace(endpoint.address, '[?#].*$', ''),
+                                   '^([^:/?#]+://)[^/?#@]*@',
+                                   '\1'
+                               )
+                           )
+                       )::text
+                   ),
+                   jsonb_strip_nulls(
+                       jsonb_build_object(
+                           'status', endpoint.status,
+                           'connection_type_system', endpoint.connection_type_system,
+                           'connection_type_code', endpoint.connection_type_code,
+                           'connection_type_display', endpoint.connection_type_display,
+                           'name', endpoint.name,
+                           'managing_organization_ref', endpoint.managing_organization_ref,
+                           'contact', endpoint.contact::jsonb,
+                           'period_start', endpoint.period_start,
+                           'period_end', endpoint.period_end,
+                           'payload_type_codes', endpoint.payload_type_codes::jsonb,
+                           'payload_mime_types', endpoint.payload_mime_types::jsonb,
+                           'address', regexp_replace(
+                               regexp_replace(endpoint.address, '[?#].*$', ''),
+                               '^([^:/?#]+://)[^/?#@]*@',
+                               '\1'
+                           )
+                       )
+                   ),
+                   endpoint.source_id, endpoint.endpoint_id, endpoint.dataset_id,
+                   endpoint.canonical_api_base, endpoint.source_org_name,
+                   endpoint.source_plan_name, 'Endpoint', endpoint.resource_id,
+                   endpoint.role_resource_id, endpoint.status = 'active',
+                   endpoint.period_start, endpoint.period_end, endpoint.updated_at
+              FROM role_endpoint_rows AS endpoint
         ), normalized_facts AS MATERIALIZED (
             SELECT DISTINCT ON (
                        npi, fact_type, fact_key, source_id,
