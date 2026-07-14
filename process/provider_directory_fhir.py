@@ -30550,10 +30550,50 @@ async def _clear_finalized_endpoint_dataset_pagination_checkpoints(
     )
     if not is_finalized:
         return
-    await _clear_pagination_checkpoints(
-        candidate.checkpoint_context,
-        list(candidate.selected_resources),
-    )
+    await _clear_finalized_dataset_checkpoints(candidate)
+
+
+async def _clear_finalized_dataset_checkpoints(
+    candidate: EndpointDatasetCandidate,
+) -> int:
+    """Retire every checkpoint attached to an immutable finalized dataset."""
+    async with db.acquire() as connection:
+        deleted_status = await connection.status(
+            f"""
+            DELETE FROM {_pagination_checkpoint_table_ref()} AS checkpoint
+             USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+             WHERE checkpoint.dataset_id = :dataset_id
+               AND checkpoint.acquisition_root_run_id = :acquisition_root_run_id
+               AND dataset.dataset_id = checkpoint.dataset_id
+               AND dataset.endpoint_id = :endpoint_id
+               AND dataset.acquisition_root_run_id IS NOT DISTINCT FROM
+                   :acquisition_root_run_id
+               AND dataset.status IN (:validated_status, :published_status);
+            """,
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=candidate.acquisition_root_run_id,
+            validated_status=ENDPOINT_DATASET_VALIDATED,
+            published_status=ENDPOINT_DATASET_PUBLISHED,
+        )
+        remaining_count = int(
+            await connection.scalar(
+                f"""
+                SELECT count(*)
+                  FROM {_pagination_checkpoint_table_ref()}
+                 WHERE dataset_id = :dataset_id
+                   AND acquisition_root_run_id = :acquisition_root_run_id;
+                """,
+                dataset_id=candidate.dataset_id,
+                acquisition_root_run_id=candidate.acquisition_root_run_id,
+            )
+            or 0
+        )
+        if remaining_count:
+            raise RuntimeError(
+                "provider_directory_finalized_dataset_checkpoint_cleanup_incomplete"
+            )
+    return _coerce_rowcount(deleted_status)
 
 
 async def _prepare_resource_import_source_group(
