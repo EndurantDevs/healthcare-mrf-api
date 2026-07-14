@@ -76,11 +76,12 @@ async def _save_checkpoint(
                 created_at, started_at, updated_at, completed_at
             ) VALUES (
                 :source_id, :dataset_id, :root_run_id, :resource_type,
-                :endpoint_id, :dataset_hash, :owner_run_id, :state,
+                :endpoint_id, :dataset_hash, :owner_run_id,
+                CAST(:state AS varchar),
                 :last_resource_id, :expected_count, :input_count,
                 :mapped_count, :rejected_count, CAST(:evidence_json AS jsonb),
                 :error, now(), now(), now(),
-                CASE WHEN :state='complete' THEN now() END
+                CASE WHEN CAST(:state AS varchar)='complete' THEN now() END
             ) ON CONFLICT (
                 source_id, dataset_id, acquisition_root_run_id, resource_type
             ) DO UPDATE SET

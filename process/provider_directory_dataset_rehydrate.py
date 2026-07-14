@@ -39,6 +39,7 @@ from process.provider_directory_dataset_rehydrate_types import (
     _clean_text,
     _payload_hash,
     _record_fields,
+    _run_cancel_check,
     _table_ref,
 )
 
@@ -208,7 +209,7 @@ async def _process_resource_batches(
     """Process committed batches until the retained input is exhausted."""
     current_checkpoint = checkpoint
     while current_checkpoint.input_count < context.expected_count:
-        await _check_cancel(context.runtime)
+        await _run_cancel_check(context.runtime)
         current_checkpoint = await _process_one_batch(context, current_checkpoint)
         await _report_progress(context, current_checkpoint)
         if current_checkpoint.state == "rejected":
@@ -238,7 +239,9 @@ async def _process_one_batch(
             await _save_checkpoint(context, next_checkpoint)
             return next_checkpoint
         mapped_count = await context.runtime.upsert_batch(
-            context.model, retained_batch.typed_rows, context.scope
+            context.model,
+            retained_batch.typed_rows,
+            context.scope,
         )
         if mapped_count != len(retained_batch.typed_rows):
             raise DatasetRehydrationError(
@@ -256,16 +259,22 @@ async def _read_retained_batch(
     checkpoint: RehydrationCheckpoint,
 ) -> list[Any]:
     """Read one ordered keyset page of retained mapped payloads."""
+    cursor_filter = ""
+    query_params_by_name: dict[str, Any] = {
+        "dataset_id": context.scope.dataset_id,
+        "resource_type": context.resource_type,
+        "batch_size": context.request.batch_size,
+    }
+    if checkpoint.last_resource_id is not None:
+        cursor_filter = "AND resource_id > :cursor"
+        query_params_by_name["cursor"] = checkpoint.last_resource_id
     retained_records = await context.runtime.database.all(
         f"""SELECT resource_id, payload_hash, payload_json
               FROM {_table_ref(context.runtime.schema, DATASET_RESOURCE_TABLE)}
              WHERE dataset_id=:dataset_id AND resource_type=:resource_type
-               AND (:cursor IS NULL OR resource_id > :cursor)
+               {cursor_filter}
              ORDER BY resource_id LIMIT :batch_size;""",
-        dataset_id=context.scope.dataset_id,
-        resource_type=context.resource_type,
-        cursor=checkpoint.last_resource_id,
-        batch_size=context.request.batch_size,
+        **query_params_by_name,
     )
     if not retained_records:
         raise DatasetRehydrationError(
@@ -402,12 +411,6 @@ async def _assert_scope_unchanged(
         raise DatasetRehydrationError(
             "provider_directory_dataset_rehydrate_scope_changed"
         )
-
-
-async def _check_cancel(runtime: RehydrationRuntime) -> None:
-    """Invoke the optional control-plane cancellation callback."""
-    if runtime.cancel_check is not None:
-        await runtime.cancel_check()
 
 
 async def _report_progress(

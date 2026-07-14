@@ -7,7 +7,9 @@ import getpass
 import hashlib
 import importlib
 import json
+import os
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.exc import OperationalError
@@ -181,14 +183,22 @@ async def _insert_retained_payload(
 @asynccontextmanager
 async def _fixture_database(monkeypatch):
     """Yield an isolated schema in local disposable PostgreSQL."""
-    monkeypatch.setenv("HLTHPRT_DB_DRIVER", "asyncpg")
-    monkeypatch.setenv("HLTHPRT_DB_HOST", "127.0.0.1")
-    monkeypatch.setenv("HLTHPRT_DB_PORT", "5440")
-    monkeypatch.setenv("HLTHPRT_DB_USER", getpass.getuser())
-    monkeypatch.setenv("HLTHPRT_DB_PASSWORD", "")
-    monkeypatch.setenv("HLTHPRT_DB_DATABASE", "healthporta_test")
+    database_defaults_by_variable = {
+        "HLTHPRT_DB_DRIVER": "asyncpg",
+        "HLTHPRT_DB_HOST": "127.0.0.1",
+        "HLTHPRT_DB_PORT": "5440",
+        "HLTHPRT_DB_USER": getpass.getuser(),
+        "HLTHPRT_DB_PASSWORD": "",
+        "HLTHPRT_DB_DATABASE": "healthporta_test",
+    }
+    for variable_name, default_value in database_defaults_by_variable.items():
+        monkeypatch.setenv(
+            variable_name,
+            os.getenv(variable_name, default_value),
+        )
     monkeypatch.setenv("HLTHPRT_DB_POOL_MIN_SIZE", "1")
     monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "4")
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS", "1")
     schema = f"provider_directory_rehydrate_{uuid.uuid4().hex[:12]}"
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     database = Database()
@@ -309,18 +319,18 @@ async def test_postgres_rolls_back_resumes_and_proves_exact_membership(
     monkeypatch,
 ):
     async with _fixture_database(monkeypatch) as (database, schema):
+        values_upsert = AsyncMock(
+            side_effect=AssertionError("COPY upsert unexpectedly fell back")
+        )
+        monkeypatch.setattr(importer, "_upsert_rows_values", values_upsert)
         original_save = rehydration._save_checkpoint
-        should_fail = True
 
         async def fail_second_checkpoint(context, checkpoint_record):
             """Fail after second-batch writes but before checkpoint commit."""
-            nonlocal should_fail
             if (
-                should_fail
-                and checkpoint_record.state == "running"
+                checkpoint_record.state == "running"
                 and checkpoint_record.input_count == 2
             ):
-                should_fail = False
                 raise RuntimeError("simulated checkpoint failure")
             await original_save(context, checkpoint_record)
 
@@ -360,3 +370,4 @@ async def test_postgres_rolls_back_resumes_and_proves_exact_membership(
             )
         assert await _persistence_counts(database, schema) == (4, 4, 4)
         assert (await _checkpoint_state(database, schema))[0] == "proof_failed"
+        assert values_upsert.await_count == 0

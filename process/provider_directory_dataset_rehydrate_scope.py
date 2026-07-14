@@ -22,6 +22,7 @@ from process.provider_directory_dataset_rehydrate_types import (
     _clean_text,
     _payload_hash,
     _record_fields,
+    _run_cancel_check,
     _table_ref,
 )
 
@@ -226,7 +227,7 @@ async def _verify_dataset_digest(
     digest_cursor: tuple[str, str] | None = None
     processed_count = 0
     while True:
-        await _check_cancel(runtime)
+        await _run_cancel_check(runtime)
         digest_rows = await _read_digest_page(runtime, scope, digest_cursor)
         if not digest_rows:
             break
@@ -297,4 +298,3 @@ def _append_digest_rows(
         processed_count += 1
         digest_cursor = digest_identity_parts[:2]
     return processed_count, digest_cursor
-

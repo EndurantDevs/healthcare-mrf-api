@@ -358,7 +358,7 @@ For the 16.14M-resource Humana dataset, retain the emitted
 includes the before/after digest and per-resource input, mapped, rejected,
 typed, canonical-hash, and source-edge counts. Do not publish artifacts until
 every selected resource has `state=complete`, `rejected=0`, `typed_extra=0`,
-and `source_edge_extra=0`.
+`canonical_extra=0`, and `source_edge_extra=0`.
 
 Checkpointed acquisitions retain the candidate `dataset_id`. Candidate identity
 uses `provider_directory_pagination_root_run_id` when an external orchestrator supplies

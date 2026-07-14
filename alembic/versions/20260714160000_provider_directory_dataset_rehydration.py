@@ -12,6 +12,9 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from db.migration_adoption import create_table_or_validate
+from db.migration_index_adoption import create_index_if_missing
+
 
 revision = "20260714160000_provider_directory_dataset_rehydration"
 down_revision = "20260714150000_provider_directory_pagination_census"
@@ -25,7 +28,8 @@ def _schema() -> str:
 
 def upgrade() -> None:
     schema = _schema()
-    op.create_table(
+    create_table_or_validate(
+        op,
         "provider_directory_dataset_rehydration_checkpoint",
         sa.Column("source_id", sa.String(64), nullable=False),
         sa.Column("dataset_id", sa.String(96), nullable=False),
@@ -46,15 +50,45 @@ def upgrade() -> None:
         sa.Column("started_at", sa.DateTime(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
         sa.Column("completed_at", sa.DateTime()),
-        sa.ForeignKeyConstraint(["source_id"], [f"{schema}.provider_directory_source.source_id"]),
-        sa.ForeignKeyConstraint(["dataset_id"], [f"{schema}.provider_directory_endpoint_dataset.dataset_id"]),
-        sa.ForeignKeyConstraint(["endpoint_id"], [f"{schema}.provider_directory_api_endpoint.endpoint_id"]),
+        sa.ForeignKeyConstraint(
+            ["source_id"],
+            [f"{schema}.provider_directory_source.source_id"],
+            name="provider_directory_dataset_rehydration_checkpoin_source_id_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["dataset_id"],
+            [f"{schema}.provider_directory_endpoint_dataset.dataset_id"],
+            name="provider_directory_dataset_rehydration_checkpoi_dataset_id_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["endpoint_id"],
+            [f"{schema}.provider_directory_api_endpoint.endpoint_id"],
+            name="provider_directory_dataset_rehydration_checkpo_endpoint_id_fkey",
+        ),
         sa.PrimaryKeyConstraint("source_id", "dataset_id", "acquisition_root_run_id", "resource_type"),
         schema=schema,
     )
-    op.create_index("pd_dataset_rehydrate_checkpoint_owner_idx", "provider_directory_dataset_rehydration_checkpoint", ["owner_run_id"], schema=schema)
-    op.create_index("pd_dataset_rehydrate_checkpoint_state_idx", "provider_directory_dataset_rehydration_checkpoint", ["state", "updated_at"], schema=schema)
-    op.create_index("pd_dataset_rehydrate_checkpoint_dataset_idx", "provider_directory_dataset_rehydration_checkpoint", ["dataset_id"], schema=schema)
+    create_index_if_missing(
+        op,
+        "pd_dataset_rehydrate_checkpoint_owner_idx",
+        "provider_directory_dataset_rehydration_checkpoint",
+        ["owner_run_id"],
+        schema=schema,
+    )
+    create_index_if_missing(
+        op,
+        "pd_dataset_rehydrate_checkpoint_state_idx",
+        "provider_directory_dataset_rehydration_checkpoint",
+        ["state", "updated_at"],
+        schema=schema,
+    )
+    create_index_if_missing(
+        op,
+        "pd_dataset_rehydrate_checkpoint_dataset_idx",
+        "provider_directory_dataset_rehydration_checkpoint",
+        ["dataset_id"],
+        schema=schema,
+    )
 
 
 def downgrade() -> None:

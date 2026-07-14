@@ -45,6 +45,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.schema import CreateColumn
 from sqlalchemy.sql.sqltypes import JSON as SQLAlchemyJSON
 
+from db.connection import ConnectionProxy
 from db.models import (
     ProviderDirectoryAPIEndpoint,
     ProviderDirectoryBulkAcquisitionCheckpoint,
@@ -13477,6 +13478,21 @@ def _copy_upsert_min_rows() -> int:
         return 100
 
 
+def _transaction_session_options(
+    transaction_session: Any | None,
+) -> dict[str, Any]:
+    """Return optional transaction binding without changing normal call shape."""
+    if transaction_session is None:
+        return {}
+    return {"transaction_session": transaction_session}
+
+
+def _bound_upsert_session() -> Any | None:
+    """Return the task-local transaction session when one is active."""
+    transaction_binding = db._transaction_binding()
+    return transaction_binding.session if transaction_binding is not None else None
+
+
 def _location_address_key_batch_size() -> int:
     try:
         return max(
@@ -14082,12 +14098,14 @@ async def _upsert_rows_values(
     primary_keys: list[str],
     *,
     skip_unchanged: bool,
+    transaction_session: Any | None = None,
 ) -> int:
     if not normalized:
         return 0
     max_rows_per_statement = _max_rows_per_statement(len(columns))
     if len(normalized) > max_rows_per_statement:
         total = 0
+        transaction_options = _transaction_session_options(transaction_session)
         for offset in range(0, len(normalized), max_rows_per_statement):
             total += await _upsert_rows_values(
                 model,
@@ -14095,24 +14113,40 @@ async def _upsert_rows_values(
                 columns,
                 primary_keys,
                 skip_unchanged=skip_unchanged,
+                **transaction_options,
             )
         return total
     table = model.__table__
-    async with db.session() as session:
-        statement = pg_insert(table).values(normalized)
-        update_columns = {
-            column.name: _effective_update_expression(table, statement, column.name)
-            for column in table.columns
-            if column.name not in primary_keys
-        }
-        update_where = _upsert_changed_row_predicate(table, statement, columns, primary_keys) if skip_unchanged else None
-        statement = statement.on_conflict_do_update(
-            index_elements=primary_keys,
-            set_=update_columns,
-            where=update_where,
-        )
-        await session.execute(statement)
+    statement = pg_insert(table).values(normalized)
+    update_columns = {
+        column.name: _effective_update_expression(table, statement, column.name)
+        for column in table.columns
+        if column.name not in primary_keys
+    }
+    update_where = _upsert_changed_row_predicate(table, statement, columns, primary_keys) if skip_unchanged else None
+    statement = statement.on_conflict_do_update(
+        index_elements=primary_keys,
+        set_=update_columns,
+        where=update_where,
+    )
+    if transaction_session is not None:
+        await transaction_session.execute(statement)
+    else:
+        async with db.session() as session:
+            await session.execute(statement)
     return len(normalized)
+
+
+@contextlib.asynccontextmanager
+async def _copy_upsert_connection(transaction_session: Any | None):
+    """Yield a COPY-capable connection inside the requested transaction."""
+    if transaction_session is None:
+        async with db.acquire() as acquired_connection:
+            yield acquired_connection
+        return
+    transaction_connection = await transaction_session.connection()
+    raw_connection = await transaction_connection.get_raw_connection()
+    yield ConnectionProxy(db, transaction_connection, raw_connection)
 
 
 async def _copy_upsert_rows(
@@ -14122,6 +14156,7 @@ async def _copy_upsert_rows(
     primary_keys: list[str],
     *,
     skip_unchanged: bool,
+    transaction_session: Any | None = None,
 ) -> int:
     """Copy upsert rows into the destination tables."""
     table = model.__table__
@@ -14174,7 +14209,7 @@ async def _copy_upsert_rows(
               ON {primary_key_join}
             WHERE {changed_where}
             """
-    async with db.acquire() as conn:
+    async with _copy_upsert_connection(transaction_session) as conn:
         await conn.status(
             f"""
             CREATE TEMP TABLE {quoted_stage}
@@ -14216,6 +14251,7 @@ async def _upsert_rows(
     if not rows:
         return 0
     normalized = [{key: row.get(key) for key in columns} for row in rows]
+    transaction_options = _transaction_session_options(_bound_upsert_session())
     if _copy_upsert_enabled() and len(normalized) >= _copy_upsert_min_rows():
         try:
             return await _copy_upsert_rows(
@@ -14224,6 +14260,7 @@ async def _upsert_rows(
                 columns,
                 primary_keys,
                 skip_unchanged=skip_unchanged,
+                **transaction_options,
             )
         except Exception as exc:  # pragma: no cover - exercised on driver-specific fallback paths
             print(f"Provider Directory COPY upsert fallback for {model.__tablename__}: {_short_error(exc)}")
@@ -14233,6 +14270,7 @@ async def _upsert_rows(
         columns,
         primary_keys,
         skip_unchanged=skip_unchanged,
+        **transaction_options,
     )
 
 
@@ -26347,7 +26385,11 @@ async def _upsert_resource_rows(
             )
     if track_seen:
         await _mark_resource_rows_seen(model, rows, run_id, seen_table=seen_table)
-    return await _upsert_rows(model, rows, skip_unchanged=track_seen and bool(run_id))
+    return await _upsert_rows(
+        model,
+        rows,
+        skip_unchanged=track_seen and bool(run_id),
+    )
 
 
 async def _delete_stale_resource_rows(
@@ -31938,7 +31980,7 @@ def _dataset_rehydration_runtime(
         )
 
     async def cancelled() -> None:
-        """Raise when import-control cancelled the owning run."""
+        """Raise when the owning control run is cancelled."""
         await raise_if_cancelled(ctx, task)
 
     async def report(progress: dict[str, Any]) -> None:

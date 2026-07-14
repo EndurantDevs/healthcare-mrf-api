@@ -152,6 +152,12 @@ def _table_ref(schema: str, table_name: str) -> str:
     return f"{_quote_identifier(schema)}.{_quote_identifier(table_name)}"
 
 
+async def _run_cancel_check(runtime: RehydrationRuntime) -> None:
+    """Invoke the optional control-plane cancellation callback."""
+    if runtime.cancel_check is not None:
+        await runtime.cancel_check()
+
+
 def _record_fields(database_record: Any) -> dict[str, Any]:
     """Convert SQLAlchemy rows and dictionaries to a plain mapping."""
     record_mapping = getattr(database_record, "_mapping", None)
@@ -167,4 +173,3 @@ def _payload_hash(mapped_payload: dict[str, Any]) -> str:
     """Reproduce the importer hash for a retained mapped payload."""
     encoded_payload = json.dumps(mapped_payload, sort_keys=True, default=str)
     return hashlib.sha256(encoded_payload.encode()).hexdigest()
-

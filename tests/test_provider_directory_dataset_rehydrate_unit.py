@@ -13,11 +13,11 @@ from process.provider_directory_dataset_rehydrate import (
     RehydrationCheckpoint,
     RehydrationRequest,
     RehydrationRuntime,
-    ResourceProof,
     _is_proof_complete,
     _validate_payload,
     rehydrate_current_dataset,
 )
+from process.provider_directory_dataset_rehydrate_types import ResourceProof
 
 
 def _payload() -> dict[str, object]:
