@@ -8497,11 +8497,11 @@ async def test_endpoint_dataset_checkpoint_clears_only_after_validation(monkeypa
         _endpoint_dataset_candidate(),
         checkpoint_context=checkpoint_context,
     )
-    clear_checkpoints = AsyncMock()
+    clear_dataset_checkpoints = AsyncMock()
     monkeypatch.setattr(
         importer,
-        "_clear_pagination_checkpoints",
-        clear_checkpoints,
+        "_clear_finalized_dataset_checkpoints",
+        clear_dataset_checkpoints,
     )
 
     await importer._clear_finalized_endpoint_dataset_pagination_checkpoints(
@@ -8512,7 +8512,7 @@ async def test_endpoint_dataset_checkpoint_clears_only_after_validation(monkeypa
             "published": False,
         },
     )
-    clear_checkpoints.assert_not_awaited()
+    clear_dataset_checkpoints.assert_not_awaited()
 
     await importer._clear_finalized_endpoint_dataset_pagination_checkpoints(
         candidate,
@@ -8524,10 +8524,7 @@ async def test_endpoint_dataset_checkpoint_clears_only_after_validation(monkeypa
         },
     )
 
-    clear_checkpoints.assert_awaited_once_with(
-        checkpoint_context,
-        ["Practitioner"],
-    )
+    clear_dataset_checkpoints.assert_awaited_once_with(candidate)
 
 
 @pytest.mark.asyncio
@@ -17451,9 +17448,8 @@ def _patch_candidate_checkpoint_flow(monkeypatch, checkpoint_context, endpoint_c
             "published": False,
         }
 
-    async def fake_clear(context, resource_types):
-        assert context == checkpoint_context
-        assert resource_types == ["Location"]
+    async def fake_clear(cleanup_candidate):
+        assert cleanup_candidate == endpoint_candidate
         events.append("clear")
 
     callback_by_name = {
@@ -17462,7 +17458,7 @@ def _patch_candidate_checkpoint_flow(monkeypatch, checkpoint_context, endpoint_c
         "_fetch_resource_rows": fake_fetch,
         "_upsert_resource_rows": fake_upsert,
         "_finalize_endpoint_dataset_candidate": fake_validate,
-        "_clear_pagination_checkpoints": fake_clear,
+        "_clear_finalized_dataset_checkpoints": fake_clear,
     }
     for callback_name, callback in callback_by_name.items():
         monkeypatch.setattr(importer, callback_name, callback)
