@@ -103,6 +103,7 @@ jobs:
           tests/test_address_canonical_unit.py
           tests/test_address_checksum_schema.py
           tests/test_mrf_source_discovery.py
+          tests/test_mrf_file_source_cursor_migration.py
           tests/test_process_mrf_unit.py
           tests/test_process_npi_import.py
           tests/test_npi_api.py
@@ -358,7 +359,11 @@ jobs:
       - name: Run Provider Directory migration adoption and repair cycle
         env:
           HLTHPRT_PROVIDER_DIRECTORY_MIGRATION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
-        run: python -m pytest -q tests/test_provider_directory_migration_adoption_postgres.py
+          HLTHPRT_MRF_FILE_CURSOR_MIGRATION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
+        run: >
+          python -m pytest -q
+          tests/test_provider_directory_migration_adoption_postgres.py
+          tests/test_mrf_file_source_cursor_migration.py
       - name: Run fresh-migrated PTG2 v3 PostgreSQL lifecycle gate
         env:
           HLTHPRT_PTG2_V3_LIFECYCLE_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
