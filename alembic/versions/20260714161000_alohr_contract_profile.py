@@ -51,7 +51,7 @@ def _repair_sql(schema: str) -> str:
            SET publication_metadata_json = jsonb_set(
                    jsonb_set(
                        jsonb_set(
-                           dataset.publication_metadata_json
+                           dataset.publication_metadata_json::jsonb
                                #- '{{resource_diagnostics,OrganizationAffiliation}}'
                                #- '{{completion_proof_v1,resource_diagnostics,OrganizationAffiliation}}',
                            '{{selected_resources}}',
@@ -71,11 +71,11 @@ def _repair_sql(schema: str) -> str:
            AND source.endpoint_id = dataset.endpoint_id
            AND dataset.is_current IS TRUE
            AND dataset.status = 'published'
-           AND dataset.publication_metadata_json -> 'selected_resources'
+           AND dataset.publication_metadata_json::jsonb -> 'selected_resources'
                = '{stale_json}'::jsonb
-           AND dataset.publication_metadata_json -> 'expected_resources'
+           AND dataset.publication_metadata_json::jsonb -> 'expected_resources'
                = '{stale_json}'::jsonb
-           AND dataset.publication_metadata_json
+           AND dataset.publication_metadata_json::jsonb
                #> '{{completion_proof_v1,selected_resources}}'
                = '{stale_json}'::jsonb
            AND (

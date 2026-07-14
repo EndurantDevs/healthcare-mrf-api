@@ -44,6 +44,7 @@ def test_alohr_contract_profile_repair_is_current_dataset_scoped(monkeypatch):
     assert "dataset.status = 'published'" in repair_sql
     assert "provider_directory_dataset_resource" in repair_sql
     assert "array_agg(DISTINCT resource.resource_type" in repair_sql
+    assert repair_sql.count("publication_metadata_json::jsonb") == 4
     assert "#- '{resource_diagnostics,OrganizationAffiliation}'" in repair_sql
     assert "#- '{completion_proof_v1,resource_diagnostics,OrganizationAffiliation}'" in repair_sql
     assert "'{completion_proof_v1,selected_resources}'" in repair_sql
