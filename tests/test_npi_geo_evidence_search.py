@@ -1,8 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
 import types
 
 import pytest
+import sanic.exceptions
 
 from api.endpoint import npi as npi_module
 
@@ -12,7 +14,36 @@ SOURCE_RECORD_ID = (
     "provider_directory_fhir:organization_address:"
     f"{SOURCE_ID}:organization-1:0"
 )
+ALIAS_SOURCE_ID = "pdfhir_nebraska_alias"
+ALIAS_SOURCE_RECORD_ID = (
+    "provider_directory_fhir:organization_affiliation:"
+    f"{ALIAS_SOURCE_ID}:affiliation-1:0"
+)
+STALE_SOURCE_RECORD_ID = (
+    "provider_directory_fhir:organization_address:pdfhir_stale:organization-1:0"
+)
 ADDRESS_KEY = "47ab23c8-74f7-41eb-8ffb-e8b9f6214594"
+
+
+def _geo_candidate_params() -> dict:
+    return {
+        "lat": 41.09967,
+        "long": -101.67646,
+        "radius_miles": 0.1,
+        "taxonomy_exact": (),
+        "taxonomy_prefixes": (),
+        "provider_type": None,
+        "specialty_filter": None,
+        "include_sources": True,
+        "include_evidence": False,
+    }
+
+
+def _request(args):
+    return types.SimpleNamespace(
+        args=args,
+        ctx=types.SimpleNamespace(sa_session=None),
+    )
 
 
 def test_geo_candidate_evidence_query_is_exact_and_current():
@@ -25,10 +56,17 @@ def test_geo_candidate_evidence_query_is_exact_and_current():
     assert "overlay.npi = requested.npi" in sql
     assert "overlay.address_key = requested.address_key" in sql
     assert "dataset.is_current IS TRUE" in sql
+    assert "current_endpoint_counts AS MATERIALIZED" in sql
+    assert "HAVING COUNT(*) = 1" in sql
+    assert "current_datasets AS MATERIALIZED" in sql
     assert "dataset.status = 'published'" in sql
     assert "dataset.published_at IS NOT NULL" in sql
     assert "dataset.superseded_at IS NULL" in sql
     assert "current_run.run_id = overlay.last_seen_run_id" in sql
+    assert "provider_directory_dataset_resource AS dataset_resource" in sql
+    assert "dataset_resource.dataset_id = current_run.dataset_id" in sql
+    assert "dataset_resource.resource_type = overlay.resource_type" in sql
+    assert "dataset_resource.resource_id = overlay.resource_id" in sql
 
 
 @pytest.fixture
@@ -45,12 +83,12 @@ def geo_evidence_fakes(monkeypatch):
         evidence_row_by_name = {
             "npi": 1003968710,
             "address_key": ADDRESS_KEY,
-            "source_record_ids": [SOURCE_RECORD_ID],
+            "source_record_ids": [SOURCE_RECORD_ID, ALIAS_SOURCE_RECORD_ID],
         }
         return types.SimpleNamespace(all=lambda: [evidence_row_by_name])
 
     async def fake_source_details(source_id_list, *, session=None):
-        assert source_id_list == [SOURCE_ID]
+        assert source_id_list == [SOURCE_ID, ALIAS_SOURCE_ID]
         assert session == "session"
         return {
             SOURCE_ID: {
@@ -59,7 +97,14 @@ def geo_evidence_fakes(monkeypatch):
                 "canonical_api_base": "https://nebraska.example/fhir",
                 "org_name": "State of Nebraska",
                 "plan_name": "Medicaid FFS",
-            }
+            },
+            ALIAS_SOURCE_ID: {
+                "source_id": ALIAS_SOURCE_ID,
+                "endpoint_id": "endpoint-nebraska",
+                "canonical_api_base": "https://nebraska.example/fhir",
+                "org_name": "Nebraska Alias",
+                "plan_name": None,
+            },
         }
 
     monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
@@ -78,19 +123,18 @@ async def test_geo_candidate_attaches_current_overlay_provenance(geo_evidence_fa
         {
             "npi": 1003968710,
             "address_key": ADDRESS_KEY,
-            "source_record_ids": ["nppes:1003968710:practice"],
+            "source_record_ids": [
+                "nppes:1003968710:practice",
+                STALE_SOURCE_RECORD_ID,
+            ],
+            "address_sources": ["nppes", "provider_directory_fhir"],
+            "provider_directory_sources": [{"source_ids": ["pdfhir_stale"]}],
         }
     ]
-    candidate_params_by_name = {
-        "lat": 41.09967,
-        "long": -101.67646,
-        "include_sources": True,
-        "include_evidence": False,
-    }
 
     await npi_module._attach_match_candidate_source_details(
         candidate_row_list,
-        candidate_params_by_name,
+        _geo_candidate_params(),
         session="session",
     )
 
@@ -105,6 +149,130 @@ async def test_geo_candidate_attaches_current_overlay_provenance(geo_evidence_fa
     assert candidate_row_list[0]["source_record_ids"] == [
         "nppes:1003968710:practice",
         SOURCE_RECORD_ID,
+        ALIAS_SOURCE_RECORD_ID,
+    ]
+    assert candidate_row_list[0]["address_sources"] == [
+        "nppes",
+        "provider_directory_fhir",
     ]
     source_summary = candidate_row_list[0]["provider_directory_sources"][0]
-    assert source_summary["source_ids"] == [SOURCE_ID]
+    assert source_summary["source_ids"] == [SOURCE_ID, ALIAS_SOURCE_ID]
+    assert len(candidate_row_list[0]["provider_directory_sources"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_geo_candidate_rejects_stale_serving_evidence(monkeypatch):
+    """No exact current membership means no FHIR match from serving residue."""
+    async def fake_execute(*_args, **_kwargs):
+        return types.SimpleNamespace(all=list)
+
+    async def unexpected_source_details(*_args, **_kwargs):
+        raise AssertionError("stale source details must not be fetched")
+
+    monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_directory_source_detail_map",
+        unexpected_source_details,
+    )
+    candidate_row_by_name = {
+        "npi": 1003968710,
+        "address_key": ADDRESS_KEY,
+        "source_record_ids": ["nppes:1003968710:practice", STALE_SOURCE_RECORD_ID],
+        "address_sources": ["nppes", "provider_directory_fhir"],
+        "provider_directory_sources": [{"source_ids": ["pdfhir_stale"]}],
+        "geo_distance_miles": 0.0,
+        "source_count": 2,
+    }
+
+    candidate_params_by_name = _geo_candidate_params()
+    candidate_params_by_name["include_sources"] = False
+    await npi_module._attach_match_candidate_source_details(
+        [candidate_row_by_name],
+        candidate_params_by_name,
+    )
+    candidate_output_map = npi_module._match_candidate_output(
+        candidate_row_by_name,
+        candidate_params_by_name,
+        None,
+    )
+
+    assert candidate_row_by_name["source_record_ids"] == [
+        "nppes:1003968710:practice"
+    ]
+    assert candidate_row_by_name["address_sources"] == ["nppes"]
+    assert "provider_directory_sources" not in candidate_row_by_name
+    assert candidate_output_map["sources"]["fhir"]["matched"] is False
+
+
+@pytest.mark.asyncio
+async def test_geo_evidence_query_caps_candidate_pairs(monkeypatch):
+    """Corroboration parameters stay bounded if upstream returns excess rows."""
+    captured_by_name = {}
+
+    async def fake_execute(_statement, **keyword_args):
+        captured_by_name.update(keyword_args.get("params") or {})
+        return types.SimpleNamespace(all=list)
+
+    monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
+    candidate_row_list = [
+        {
+            "npi": 1000000000 + candidate_index,
+            "address_key": f"00000000-0000-0000-0000-{candidate_index:012d}",
+        }
+        for candidate_index in range(
+            npi_module._MATCH_CANDIDATES_MAX_INTERNAL_ROWS + 1
+        )
+    ]
+
+    await npi_module._attach_geo_candidate_record_ids(
+        candidate_row_list,
+        _geo_candidate_params(),
+    )
+
+    expected_limit = npi_module._MATCH_CANDIDATES_MAX_INTERNAL_ROWS
+    assert len(captured_by_name["candidate_npis"]) == expected_limit
+    assert len(captured_by_name["candidate_address_keys"]) == expected_limit
+
+
+async def _one_geo_candidate(_params, *, session=None):
+    return [{"npi": 1003968710, "address_key": ADDRESS_KEY}]
+
+
+@pytest.mark.asyncio
+async def test_match_candidates_returns_503_on_source_lookup_timeout(monkeypatch):
+    """The added lookup cannot exceed the endpoint timeout budget."""
+    async def slow_source_lookup(*_args, **_kwargs):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(npi_module, "_fetch_match_candidate_rows", _one_geo_candidate)
+    monkeypatch.setattr(
+        npi_module,
+        "_attach_match_candidate_source_details",
+        slow_source_lookup,
+    )
+    monkeypatch.setattr(npi_module, "_MATCH_CANDIDATES_TIMEOUT_SECONDS", 0.001)
+
+    with pytest.raises(sanic.exceptions.ServiceUnavailable, match="source lookup exceeded"):
+        await npi_module.match_candidates(
+            _request({"lat": "41.09967", "long": "-101.67646", "include_sources": "true"})
+        )
+
+
+@pytest.mark.asyncio
+async def test_match_candidates_returns_503_on_source_lookup_db_failure(monkeypatch):
+    """A corroboration DB error fails closed instead of serving stale evidence."""
+    async def failing_source_lookup(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(npi_module, "_fetch_match_candidate_rows", _one_geo_candidate)
+    monkeypatch.setattr(
+        npi_module,
+        "_attach_match_candidate_source_details",
+        failing_source_lookup,
+    )
+
+    with pytest.raises(sanic.exceptions.ServiceUnavailable, match="temporarily unavailable"):
+        await npi_module.match_candidates(
+            _request({"lat": "41.09967", "long": "-101.67646", "include_sources": "true"})
+        )

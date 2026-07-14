@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 import time
 import urllib.error
@@ -26,6 +25,9 @@ from scripts.research.provider_directory_api_evidence_matrix_checks import (
 from scripts.research.provider_directory_api_evidence_mapped import (
     evaluate_witness as _evaluate_witness,
     mapped_evidence_capabilities as _mapped_evidence_capabilities,
+)
+from scripts.research.provider_directory_api_evidence_geo import (
+    has_detail_geo_source,
 )
 from scripts.research.provider_directory_api_evidence_typed import (
     MappedEvidenceWitness,
@@ -193,34 +195,6 @@ def _has_detail_source(payload: Mapping[str, Any] | None, source_id: str) -> boo
     )
 
 
-def _has_detail_geo_source(
-    payload: Mapping[str, Any] | None,
-    source_id: str,
-    sample: OverlaySample,
-) -> bool:
-    """Return whether exact detail exposes the selected sourced coordinates."""
-    if sample.address_key is None or sample.latitude is None or sample.longitude is None:
-        return False
-    for row in _envelope_rows(payload, "address_list"):
-        if not isinstance(row, Mapping):
-            continue
-        if str(row.get("address_key") or "") != sample.address_key:
-            continue
-        try:
-            row_latitude = float(row.get("lat"))
-            row_longitude = float(row.get("long"))
-        except (TypeError, ValueError):
-            continue
-        if not (
-            math.isclose(row_latitude, sample.latitude, rel_tol=0.0, abs_tol=1e-6)
-            and math.isclose(row_longitude, sample.longitude, rel_tol=0.0, abs_tol=1e-6)
-        ):
-            continue
-        if has_row_source_provenance(row, source_id):
-            return True
-    return False
-
-
 def _has_phone_candidate_source(
     payload: Mapping[str, Any] | None, source_id: str, npi: int
 ) -> bool:
@@ -273,7 +247,11 @@ def _evaluate_sample(
         "detail_source_present": detail_result.status_code == 200
         and _has_detail_source(detail_result.payload, source_id),
         "detail_geo_source_present": detail_result.status_code == 200
-        and _has_detail_geo_source(detail_result.payload, source_id, sample),
+        and has_detail_geo_source(
+            _envelope_rows(detail_result.payload, "address_list"),
+            source_id,
+            sample,
+        ),
         "detail_within_latency_slo": is_within_latency_slo(
             detail_result, api_latency_slo_ms
         ),

@@ -345,6 +345,7 @@ _NPI_ALL_TOTAL_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_NPI_ALL_TOTAL_TIMEOUT_
 _MATCH_CANDIDATES_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_MATCH_CANDIDATES_TIMEOUT_SECONDS", "8.0"))
 _MATCH_CANDIDATES_DEFAULT_LIMIT = 5
 _MATCH_CANDIDATES_MAX_LIMIT = 50
+_MATCH_CANDIDATES_MAX_INTERNAL_ROWS = _MATCH_CANDIDATES_MAX_LIMIT * 8
 _MATCH_CANDIDATES_DEFAULT_RADIUS_MILES = 1.0
 _MATCH_CANDIDATES_MAX_RADIUS_MILES = 100.0
 _NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS = max(
@@ -6082,6 +6083,7 @@ def _current_provider_directory_geo_evidence_sql() -> str:
     """Return exact current-overlay provenance for bounded geo candidates."""
     source_table = _schema_cache_key("provider_directory_source")
     dataset_table = _schema_cache_key("provider_directory_endpoint_dataset")
+    dataset_resource_table = _schema_cache_key("provider_directory_dataset_resource")
     overlay_table = _schema_cache_key("provider_directory_address_overlay")
     return f"""
         WITH requested_candidates AS MATERIALIZED (
@@ -6090,18 +6092,32 @@ def _current_provider_directory_geo_evidence_sql() -> str:
                        CAST(:candidate_npis AS bigint[]),
                        CAST(:candidate_address_keys AS uuid[])
                    ) AS requested(npi, address_key)
-        ), current_provider_directory_runs AS MATERIALIZED (
-            SELECT source.source_id,
+        ), current_endpoint_counts AS MATERIALIZED (
+            SELECT dataset.endpoint_id
+              FROM {dataset_table} AS dataset
+             WHERE dataset.is_current IS TRUE
+          GROUP BY dataset.endpoint_id
+            HAVING COUNT(*) = 1
+        ), current_datasets AS MATERIALIZED (
+            SELECT dataset.endpoint_id, dataset.dataset_id,
                    COALESCE(
                        dataset.acquisition_root_run_id, dataset.import_run_id
                    )::varchar AS run_id
-              FROM {source_table} AS source
-              JOIN {dataset_table} AS dataset
-                ON dataset.endpoint_id = source.endpoint_id
+              FROM {dataset_table} AS dataset
+              JOIN current_endpoint_counts AS current_endpoint
+                ON current_endpoint.endpoint_id = dataset.endpoint_id
              WHERE dataset.is_current IS TRUE
                AND dataset.status = 'published'
                AND dataset.published_at IS NOT NULL
                AND dataset.superseded_at IS NULL
+               AND COALESCE(
+                       dataset.acquisition_root_run_id, dataset.import_run_id
+                   ) IS NOT NULL
+        ), current_provider_directory_runs AS MATERIALIZED (
+            SELECT source.source_id, dataset.dataset_id, dataset.run_id
+              FROM {source_table} AS source
+              JOIN current_datasets AS dataset
+                ON dataset.endpoint_id = source.endpoint_id
         )
         SELECT requested.npi, requested.address_key::text AS address_key,
                ARRAY_AGG(
@@ -6115,6 +6131,10 @@ def _current_provider_directory_geo_evidence_sql() -> str:
           JOIN current_provider_directory_runs AS current_run
             ON current_run.source_id = overlay.source_id
            AND current_run.run_id = overlay.last_seen_run_id
+          JOIN {dataset_resource_table} AS dataset_resource
+            ON dataset_resource.dataset_id = current_run.dataset_id
+           AND dataset_resource.resource_type = overlay.resource_type
+           AND dataset_resource.resource_id = overlay.resource_id
          WHERE overlay.source_record_id IS NOT NULL
       GROUP BY requested.npi, requested.address_key;
     """
@@ -6170,7 +6190,10 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     columns = _match_candidate_column_sql(address_table_sql)
     query_params: dict[str, Any] = {
         "limit": int(params["limit"]),
-        "candidate_limit": min(max(int(params["limit"]) * 8, 100), 500),
+        "candidate_limit": min(
+            max(int(params["limit"]) * 8, 100),
+            _MATCH_CANDIDATES_MAX_INTERNAL_ROWS,
+        ),
     }
     address_where = [
         _provider_list_address_type_clause(
@@ -6212,7 +6235,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
         phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
         query_params["candidate_limit"] = min(
             max(int(params["limit"]) * 8, 20),
-            500,
+            _MATCH_CANDIDATES_MAX_INTERNAL_ROWS,
         )
         address_from_sql = _address_phone_candidates_lateral_from(
             address_table_sql,
@@ -6852,13 +6875,13 @@ async def _attach_match_candidate_source_details(
     session: Any = None,
 ) -> None:
     """Attach compact FHIR provenance without expanding role evidence."""
-    if not (params.get("include_sources") or params.get("include_evidence")):
-        return
     await _attach_geo_candidate_record_ids(
         rows,
         params,
         database_session=session,
     )
+    if not (params.get("include_sources") or params.get("include_evidence")):
+        return
     await _attach_provider_directory_source_details(
         rows,
         include_role_evidence=False,
@@ -6878,7 +6901,31 @@ def _geo_candidate_address_pairs(
         candidate_pair = (int(npi_value), address_key)
         if candidate_pair not in candidate_pairs:
             candidate_pairs.append(candidate_pair)
+        if len(candidate_pairs) >= _MATCH_CANDIDATES_MAX_INTERNAL_ROWS:
+            break
     return candidate_pairs
+
+
+def _replace_stale_geo_provider_directory_evidence(
+    candidate_row_list: Sequence[dict[str, Any]],
+) -> None:
+    """Remove serving-row FHIR evidence before exact current corroboration."""
+    for candidate_row in candidate_row_list:
+        candidate_row.pop(PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY, None)
+        candidate_row["source_record_ids"] = [
+            record_id
+            for record_id in _merge_unique_list_values(
+                None, candidate_row.get("source_record_ids")
+            )
+            if not str(record_id).startswith("provider_directory_fhir:")
+        ]
+        candidate_row["address_sources"] = [
+            address_source
+            for address_source in _merge_unique_list_values(
+                None, candidate_row.get("address_sources")
+            )
+            if str(address_source).strip().lower() != "provider_directory_fhir"
+        ]
 
 
 async def _attach_geo_candidate_record_ids(
@@ -6890,6 +6937,7 @@ async def _attach_geo_candidate_record_ids(
     """Corroborate bounded geo rows with exact current overlay evidence."""
     if candidate_params.get("lat") is None or candidate_params.get("long") is None:
         return
+    _replace_stale_geo_provider_directory_evidence(candidate_row_list)
     candidate_pairs = _geo_candidate_address_pairs(candidate_row_list)
     if not candidate_pairs:
         return
@@ -6920,6 +6968,50 @@ async def _attach_geo_candidate_record_ids(
             candidate_row["source_record_ids"] = _merge_unique_list_values(
                 candidate_row.get("source_record_ids"), record_ids
             )
+            candidate_row["address_sources"] = _merge_unique_list_values(
+                candidate_row.get("address_sources"),
+                "provider_directory_fhir",
+            )
+
+
+async def _attach_candidate_sources_bounded(
+    candidate_row_list: list[dict[str, Any]],
+    candidate_params: dict[str, Any],
+    *,
+    started_at: float,
+    database_session: Any = None,
+) -> None:
+    """Attach source details within the endpoint's remaining query budget."""
+    try:
+        remaining_seconds = _MATCH_CANDIDATES_TIMEOUT_SECONDS - (
+            time.monotonic() - started_at
+        )
+        if remaining_seconds <= 0:
+            raise asyncio.TimeoutError()
+        await asyncio.wait_for(
+            _attach_match_candidate_source_details(
+                candidate_row_list,
+                candidate_params,
+                session=database_session,
+            ),
+            timeout=remaining_seconds,
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError as exc:
+        await _rollback_match_candidate_session(database_session)
+        raise sanic.exceptions.ServiceUnavailable(
+            f"match candidate source lookup exceeded the {_MATCH_CANDIDATES_TIMEOUT_SECONDS:g} second query budget"
+        ) from exc
+    except Exception as exc:
+        await _rollback_match_candidate_session(database_session)
+        logger.warning(
+            "match candidate source lookup failed: %s",
+            type(exc).__name__,
+        )
+        raise sanic.exceptions.ServiceUnavailable(
+            "match candidate source lookup is temporarily unavailable"
+        ) from exc
 
 
 @blueprint.get("/match-candidates")
@@ -6950,7 +7042,12 @@ async def match_candidates(request):
         raise sanic.exceptions.ServiceUnavailable(
             f"match candidate lookup exceeded the {_MATCH_CANDIDATES_TIMEOUT_SECONDS:g} second query budget"
         ) from exc
-    await _attach_match_candidate_source_details(candidate_rows, params, session=request_session)
+    await _attach_candidate_sources_bounded(
+        candidate_rows,
+        params,
+        started_at=started,
+        database_session=request_session,
+    )
     enrichment_map = await _fetch_provider_enrichment_summary_map(
         [candidate_row.get("npi") for candidate_row in candidate_rows],
         session=request_session,

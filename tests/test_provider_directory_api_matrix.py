@@ -188,7 +188,7 @@ def test_matrix_fails_when_profile_provenance_does_not_match_current_dataset():
     assert checks["V"]["reason"] == "exact_profile_provenance_not_found"
 
 
-def test_matrix_accepts_exact_detail_geo_when_candidate_is_absent_from_top_20():
+def test_matrix_accepts_detail_geo_without_candidate():
     result = support.evaluate_source(
         _selection(),
         [_build_overlay_sample()],
