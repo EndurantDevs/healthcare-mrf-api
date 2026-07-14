@@ -41,6 +41,7 @@ class _TableParser(HTMLParser):
         self._current_cell: list[str] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Start table rows and cells while preserving explicit line breaks."""
         if tag == "tr":
             self._current_row = []
         elif tag in {"td", "th"} and self._current_row is not None:
@@ -49,10 +50,12 @@ class _TableParser(HTMLParser):
             self._current_cell.append(" ")
 
     def handle_data(self, data: str) -> None:
+        """Append text to the active table cell."""
         if self._current_cell is not None:
             self._current_cell.append(data)
 
     def handle_endtag(self, tag: str) -> None:
+        """Finalize parsed cells and completed table rows."""
         if tag in {"td", "th"} and self._current_cell is not None and self._current_row is not None:
             self._current_row.append(_clean_text("".join(self._current_cell)))
             self._current_cell = None
@@ -103,6 +106,7 @@ def _expand_code_range(raw_code: str, width: int) -> list[str]:
 
 
 def parse_pos_code_rows(source_html: str) -> list[CodeSetRow]:
+    """Parse CMS place-of-service table rows into normalized code records."""
     rows: list[CodeSetRow] = []
     for cells in _parse_tables(source_html):
         if len(cells) < 3:
@@ -129,6 +133,7 @@ def parse_pos_code_rows(source_html: str) -> list[CodeSetRow]:
 
 
 def parse_revenue_code_rows(source_html: str) -> list[CodeSetRow]:
+    """Parse Blue Button revenue-code tables into normalized code records."""
     rows: list[CodeSetRow] = []
     for cells in _parse_tables(source_html):
         if len(cells) < 2:
@@ -154,6 +159,7 @@ def parse_revenue_code_rows(source_html: str) -> list[CodeSetRow]:
 
 
 def modifier_code_rows() -> list[CodeSetRow]:
+    """Return the curated billing modifier records supported by pricing APIs."""
     modifier_rows = [
         (
             "26",
@@ -260,6 +266,7 @@ async def _upsert_code_rows(schema: str, rows: list[CodeSetRow]) -> int:
 
 
 async def import_code_sets(test_mode: bool = False) -> dict[str, Any]:
+    """Fetch, validate, and upsert POS, revenue, and modifier code sets."""
     await ensure_database(test_mode)
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     await _ensure_code_catalog(schema)
@@ -300,6 +307,7 @@ async def import_code_sets(test_mode: bool = False) -> dict[str, Any]:
 
 
 async def main(test_mode: bool = False) -> dict[str, Any]:
+    """Run code-set import with standalone database lifecycle handling."""
     await init_db(db)
     try:
         return await import_code_sets(test_mode=test_mode)
