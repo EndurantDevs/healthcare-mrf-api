@@ -177,7 +177,7 @@ def test_v3_followup_is_the_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260714150000_provider_directory_pagination_census"
+        "20260714160000_provider_directory_dataset_rehydration"
     ]
 
 
