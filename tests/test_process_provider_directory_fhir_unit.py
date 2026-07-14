@@ -386,6 +386,53 @@ def test_source_row_from_seed_overrides_cigna_availity_non_fhir_base():
     )
 
 
+def test_source_row_from_seed_overrides_caresource_stale_auth_label():
+    row = importer._source_row_from_seed(
+        {
+            "id": "57",
+            "org_tin": "31-1703368",
+            "org_name": "CareSource",
+            "plan_name": "Medicare Advantage, Medicaid MCO",
+            "api_base": importer.CARESOURCE_PROVIDER_DIRECTORY_BASE,
+            "requires_registration": "true",
+            "requires_api_key": "true",
+            "auth_type": "OAuth2/SMART",
+            "last_validated_status": "auth_required",
+            "source": "defacto_2024",
+        }
+    )
+
+    assert row["source_id"] == "pdfhir_b627b38e07cae99151baa4b7"
+    assert row["api_base"] == importer.CARESOURCE_PROVIDER_DIRECTORY_BASE
+    assert row["canonical_api_base"] == importer.CARESOURCE_PROVIDER_DIRECTORY_BASE
+    assert row["requires_registration"] is False
+    assert row["requires_api_key"] is False
+    assert row["auth_type"] == "none"
+    assert row["last_validated_status"] == "valid"
+    assert row["endpoint_practitioner"] == (
+        f"{importer.CARESOURCE_PROVIDER_DIRECTORY_BASE}/Practitioner"
+    )
+    metadata = row["metadata_json"]
+    assert metadata["provider_directory_override"] == (
+        "caresource_public_provider_directory"
+    )
+    assert metadata["provider_directory_confirmed_metadata_url"] == (
+        importer.CARESOURCE_PROVIDER_DIRECTORY_METADATA_URL
+    )
+    assert metadata["provider_directory_supported_resources"] == list(
+        importer.DEFAULT_RESOURCES
+    )
+    assert set(metadata["provider_directory_expected_nonempty_resources"]) == (
+        importer.CARESOURCE_EXPECTED_NONEMPTY_RESOURCES
+    )
+    assert metadata["provider_directory_fully_enumerable_resources"] == list(
+        importer.DEFAULT_RESOURCES
+    )
+    assert importer.CARESOURCE_PROVIDER_DIRECTORY_BASE in (
+        importer.PAGINATION_CHECKPOINT_API_BASES
+    )
+
+
 def test_source_row_from_seed_overrides_centene_partner_portal_base():
     source_row = importer._source_row_from_seed(
         {
@@ -5156,6 +5203,70 @@ async def test_probe_sources_records_credential_descriptor_without_secret(monkey
         "query_param_names": [],
     }
     assert "secret-token" not in json.dumps(metadata)
+
+
+@pytest.mark.asyncio
+async def test_caresource_public_override_probes_and_selects_without_credentials(
+    monkeypatch,
+):
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
+    calls: list[str] = []
+    capability_payload = {
+        "resourceType": "CapabilityStatement",
+        "fhirVersion": "4.0.1",
+        "rest": [{"resource": [{"type": "Practitioner"}]}],
+    }
+
+    async def fake_fetch_source_json(_source, request_url, *, timeout):
+        calls.append(request_url)
+        if request_url == importer.CARESOURCE_PROVIDER_DIRECTORY_METADATA_URL:
+            return 200, capability_payload, None, 4
+        assert request_url == (
+            f"{importer.CARESOURCE_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=1"
+        )
+        return 200, {"resourceType": "Bundle", "entry": []}, None, 5
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+    source = importer._source_row_from_seed(
+        {
+            "id": "57",
+            "org_tin": "31-1703368",
+            "org_name": "CareSource",
+            "plan_name": "Medicare Advantage, Medicaid MCO",
+            "api_base": importer.CARESOURCE_PROVIDER_DIRECTORY_BASE,
+            "requires_registration": "false",
+            "requires_api_key": "false",
+            "auth_type": "OAuth2/SMART",
+            "last_validated_status": "auth_required",
+            "source": "defacto_2024",
+        }
+    )
+
+    probe, returned_capability = await importer._probe_source(
+        source,
+        timeout=3,
+        run_id="run_caresource",
+    )
+    selected, metrics = importer._select_resource_import_sources(
+        [source],
+        valid_source_ids={source["source_id"]},
+        open_only=True,
+        include_auth_required=False,
+        requested_resource_types=list(importer.DEFAULT_RESOURCES),
+    )
+
+    assert returned_capability == capability_payload
+    assert probe["status"] == "valid"
+    assert probe["credential"] is None
+    assert selected == [source]
+    assert metrics["source_import_sources_selected"] == 1
+    assert metrics["source_import_sources_selected_live_probe_valid"] == 1
+    assert metrics["source_import_sources_selected_declared_credentialed"] == 0
+    assert calls == [
+        importer.CARESOURCE_PROVIDER_DIRECTORY_METADATA_URL,
+        f"{importer.CARESOURCE_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=1",
+    ]
 
 
 @pytest.mark.asyncio
