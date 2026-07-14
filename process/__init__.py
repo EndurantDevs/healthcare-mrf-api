@@ -1292,7 +1292,7 @@ def provider_enrichment(test: bool):
 @click.option("--include-auth-required", is_flag=True, help="Attempt resources from seed rows last marked auth_required.")
 @click.option(
     "--resources",
-    help="Comma-separated resources to fetch. Defaults to InsurancePlan,PractitionerRole,Practitioner,Organization,Location,HealthcareService,OrganizationAffiliation.",
+    help="Resources to fetch as comma-separated text or a JSON array. Defaults to the full supported resource set.",
 )
 @click.option("--resource-limit", type=int, help="Rows per source/resource to retain.")
 @click.option("--resource-deadline-seconds", type=int, help="Maximum seconds to spend fetching one regular resource endpoint.")
