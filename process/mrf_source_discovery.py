@@ -9536,6 +9536,8 @@ def _anthem_s3_employer_target_metadata(
         **context_by_key,
         "resolver": "anthem_s3_employer_ein",
         "target_kind": "file_reference",
+        "query_context_match": True,
+        "query_context_match_scope": "employer_identity",
         "anthem_employer_lookup_url": lookup_url,
         "anthem_name_index_url": name_index_url,
         "anthem_catalog_url": lookup_context.catalog_url,
@@ -13312,14 +13314,14 @@ def _crawl_target_search_values(target: CrawlTarget) -> list[Any]:
     return values
 
 
-def _matched_query_expansion_target(
-    target: CrawlTarget, query: str | None
-) -> CrawlTarget | None:
-    if not query:
-        return target
-    if not _search_values_match_query(_crawl_target_search_values(target), query):
-        return None
-    metadata = dict(target.metadata or {})
+def _with_query_expansion_match(
+    crawl_target: CrawlTarget,
+    query: str | None,
+    *,
+    match_scope: str | None = None,
+) -> CrawlTarget:
+    """Annotate a crawl target accepted for a scoped payer query."""
+    metadata = dict(crawl_target.metadata or {})
     query_label = _clean_text(query)
     if query_label:
         metadata.setdefault("company_name", query_label)
@@ -13328,19 +13330,40 @@ def _matched_query_expansion_target(
         metadata.get("company_name")
         or metadata.get("payer_name")
         or metadata.get("employer_name")
-        or target.label
+        or crawl_target.label
     )
     if target_label:
         metadata.setdefault("company_name", target_label)
         metadata.setdefault("employer_name", target_label)
     metadata["target_payer_query"] = query
     metadata["query_expansion_match"] = True
+    if match_scope:
+        metadata["query_expansion_match_scope"] = match_scope
     return CrawlTarget(
-        source=target.source,
-        url=target.url,
-        label=target.label,
-        resolved_from_url=target.resolved_from_url,
+        source=crawl_target.source,
+        url=crawl_target.url,
+        label=crawl_target.label,
+        resolved_from_url=crawl_target.resolved_from_url,
         metadata=metadata,
+    )
+
+
+def _matched_query_expansion_target(
+    crawl_target: CrawlTarget, query: str | None
+) -> CrawlTarget | None:
+    if not query:
+        return crawl_target
+    metadata = dict(crawl_target.metadata or {})
+    is_resolver_context_match = metadata.get("query_context_match") is True
+    if not is_resolver_context_match and not _search_values_match_query(
+        _crawl_target_search_values(crawl_target), query
+    ):
+        return None
+    match_scope = "resolver_context" if is_resolver_context_match else None
+    return _with_query_expansion_match(
+        crawl_target,
+        query,
+        match_scope=match_scope,
     )
 
 
@@ -13352,20 +13375,10 @@ def _supports_toc_plan_query_scan(target: CrawlTarget) -> bool:
 def _toc_level_query_expansion_target(
     target: CrawlTarget, query: str | None
 ) -> CrawlTarget:
-    metadata = dict(target.metadata or {})
-    query_label = _clean_text(query)
-    if query_label:
-        metadata.setdefault("company_name", query_label)
-        metadata.setdefault("employer_name", query_label)
-    metadata["target_payer_query"] = query
-    metadata["query_expansion_match"] = True
-    metadata["query_expansion_match_scope"] = "toc_plan"
-    return CrawlTarget(
-        source=target.source,
-        url=target.url,
-        label=target.label,
-        resolved_from_url=target.resolved_from_url,
-        metadata=metadata,
+    return _with_query_expansion_match(
+        target,
+        query,
+        match_scope="toc_plan",
     )
 
 
@@ -13460,6 +13473,7 @@ async def _resolve_crawl_targets(
                 session,
                 target_limit=crawl_target_limit,
             )
+            had_resolved_targets = bool(resolved_targets)
             if target_query:
                 resolved_targets.extend(
                     await query_probe_targets(source, url_text, target_query)
@@ -13470,11 +13484,16 @@ async def _resolve_crawl_targets(
                     limit=crawl_target_limit,
                 )
             if not resolved_targets:
+                skip_reason = (
+                    "resolved crawl targets did not match the target payer query"
+                    if target_query and had_resolved_targets
+                    else "no configured resolver and URL is not a direct JSON TOC"
+                )
                 return idx, [], [
                     _crawl_skipped_observation(
                         source,
                         url_text,
-                        "no configured resolver and URL is not a direct JSON TOC",
+                        skip_reason,
                         run_id,
                     )
                 ]
