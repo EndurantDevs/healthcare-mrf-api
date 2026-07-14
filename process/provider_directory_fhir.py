@@ -7726,7 +7726,33 @@ async def _is_provider_directory_dataset_cutover_committed(
             dataset_rows_by_id,
         ):
             return False
-    return True
+    return await _is_artifact_source_endpoint_cutover_committed(fence)
+
+
+async def _is_artifact_source_endpoint_cutover_committed(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> bool:
+    source_rows = await db.all(
+        f"""
+        SELECT source_id, endpoint_id
+          FROM {_qt(_schema(), ProviderDirectorySource.__tablename__)}
+         WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
+         ORDER BY source_id;
+        """,
+        source_ids=fence.source_ids,
+    )
+    actual_source_endpoint_tuples = tuple(
+        (
+            _clean_text(source_row_map.get("source_id")) or "",
+            _clean_text(source_row_map.get("endpoint_id")) or "",
+        )
+        for source_row in source_rows
+        if (source_row_map := _pagination_checkpoint_row_mapping(source_row))
+    )
+    return (
+        actual_source_endpoint_tuples
+        == fence.published_source_endpoint_tuples
+    )
 
 
 def _is_artifact_incumbent_superseded(
@@ -7899,6 +7925,38 @@ async def _promote_provider_directory_artifact_datasets(
     for dataset in fence.promotion_datasets:
         await _supersede_artifact_dataset_incumbent(dataset)
         await _publish_validated_artifact_dataset(dataset)
+    await _cutover_provider_directory_artifact_sources(fence)
+
+
+async def _cutover_provider_directory_artifact_sources(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> None:
+    source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
+    for dataset in sorted(fence.datasets, key=lambda item: item.source_id):
+        serving_endpoint_id = (
+            dataset.serving_endpoint_id or dataset.endpoint_id
+        )
+        if (
+            not dataset.promote_on_cutover
+            or serving_endpoint_id == dataset.endpoint_id
+        ):
+            continue
+        updated_count = await db.status(
+            f"""
+            UPDATE {source_ref}
+               SET endpoint_id = :endpoint_id,
+                   updated_at = now()
+             WHERE source_id = :source_id
+               AND endpoint_id = :serving_endpoint_id;
+            """,
+            source_id=dataset.source_id,
+            endpoint_id=dataset.endpoint_id,
+            serving_endpoint_id=serving_endpoint_id,
+        )
+        if _coerce_rowcount(updated_count) != 1:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_source_endpoint_dataset_changed"
+            )
 
 
 async def _supersede_artifact_dataset_incumbent(
@@ -8984,6 +9042,7 @@ class ProviderDirectoryArtifactDataset:
     endpoint_id: str
     dataset_id: str
     evidence_run_id: str
+    serving_endpoint_id: str | None = None
     selected_resources: tuple[str, ...] = ()
     expected_resources: tuple[str, ...] = ()
     recorded_expected_resources: tuple[str, ...] | None = None
@@ -9054,7 +9113,20 @@ class ProviderDirectoryArtifactDatasetFence:
 
     @property
     def source_endpoint_tuples(self) -> tuple[tuple[str, str], ...]:
-        """Return the complete alias mapping selected for publication."""
+        """Return the serving alias mapping that must hold before cutover."""
+        return tuple(
+            sorted(
+                (
+                    dataset.source_id,
+                    dataset.serving_endpoint_id or dataset.endpoint_id,
+                )
+                for dataset in self.datasets
+            )
+        )
+
+    @property
+    def published_source_endpoint_tuples(self) -> tuple[tuple[str, str], ...]:
+        """Return the alias mapping expected after atomic publication."""
         return tuple(
             sorted(
                 (dataset.source_id, dataset.endpoint_id)
@@ -9065,7 +9137,17 @@ class ProviderDirectoryArtifactDatasetFence:
     @property
     def endpoint_ids(self) -> list[str]:
         """Return the endpoint rows that serialize artifact cutover."""
-        return sorted({dataset.endpoint_id for dataset in self.datasets})
+        return sorted(
+            {
+                endpoint_id
+                for dataset in self.datasets
+                for endpoint_id in (
+                    dataset.endpoint_id,
+                    dataset.serving_endpoint_id,
+                )
+                if endpoint_id
+            }
+        )
 
     @property
     def source_ids(self) -> list[str]:
@@ -9166,6 +9248,7 @@ def _artifact_dataset_projection_sql() -> str:
     return """
         SELECT selected.source_id,
                selected.endpoint_id,
+               selected.serving_endpoint_id,
                selected.source_record_json,
                dataset.dataset_id,
                COALESCE(
@@ -9205,9 +9288,14 @@ def _artifact_dataset_explicit_selection_sql(source_ref: str) -> str:
     """Select only caller-requested aliases while retaining endpoint datasets."""
     return f"""
         selected_sources AS MATERIALIZED (
-            SELECT source_id, endpoint_id, to_jsonb(source) AS source_record_json
+            SELECT source.source_id,
+                   COALESCE(candidate.endpoint_id, source.endpoint_id)
+                       AS endpoint_id,
+                   source.endpoint_id AS serving_endpoint_id,
+                   to_jsonb(source) AS source_record_json
               FROM {source_ref} AS source
-             WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
+              {_artifact_validated_candidate_alias_join_sql()}
+             WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
         )
     """
 
@@ -9222,12 +9310,32 @@ def _artifact_dataset_all_source_selection_sql(
              WHERE dataset.selection_rank = 1
         ), selected_sources AS MATERIALIZED (
             SELECT source.source_id,
-                   source.endpoint_id,
+                   COALESCE(candidate.endpoint_id, source.endpoint_id)
+                       AS endpoint_id,
+                   source.endpoint_id AS serving_endpoint_id,
                    to_jsonb(source) AS source_record_json
               FROM {source_ref} AS source
-              JOIN selected_endpoints AS endpoint
-                ON endpoint.endpoint_id = source.endpoint_id
+              {_artifact_validated_candidate_alias_join_sql()}
+             WHERE source.endpoint_id IN (
+                       SELECT endpoint_id FROM selected_endpoints
+                   )
+                OR candidate.endpoint_id IS NOT NULL
         )
+    """
+
+
+def _artifact_validated_candidate_alias_join_sql() -> str:
+    """Match a validated replacement without moving the serving alias."""
+    return """
+        LEFT JOIN dataset_options AS candidate
+          ON CAST(:select_validated_candidates AS boolean)
+         AND candidate.is_current = false
+         AND candidate.status = :validated_status
+         AND candidate.superseded_at IS NULL
+         AND COALESCE(
+                 candidate.publication_metadata_json::jsonb -> 'source_ids',
+                 '[]'::jsonb
+             ) @> jsonb_build_array(source.source_id)
     """
 
 
@@ -9272,6 +9380,11 @@ def _provider_directory_artifact_dataset_from_row(
     if not all(value_by_name.values()):
         return None
     dataset_id = value_by_name["dataset_id"] or ""
+    serving_endpoint_id = (
+        _clean_text(dataset_row_map.get("serving_endpoint_id"))
+        or value_by_name["endpoint_id"]
+        or ""
+    )
     selected_resources, expected_resources, recorded_expected_resources = (
         _artifact_dataset_profiles_from_row(dataset_row_map, dataset_id)
     )
@@ -9285,6 +9398,7 @@ def _provider_directory_artifact_dataset_from_row(
         endpoint_id=value_by_name["endpoint_id"] or "",
         dataset_id=dataset_id,
         evidence_run_id=value_by_name["evidence_run_id"] or "",
+        serving_endpoint_id=serving_endpoint_id,
         selected_resources=selected_resources,
         expected_resources=expected_resources,
         recorded_expected_resources=recorded_expected_resources,
@@ -13474,6 +13588,11 @@ def _effective_update_expression(table, statement, column: str):
         and column in {"first_seen_at", "created_at"}
     ):
         return func.coalesce(getattr(table.c, column), excluded_value)
+    if (
+        table.name == ProviderDirectorySource.__tablename__
+        and column == "endpoint_id"
+    ):
+        return func.coalesce(table.c.endpoint_id, excluded_value)
     if table.name == ProviderDirectorySource.__tablename__ and column == "metadata_json":
         target_metadata = func.coalesce(
             table.c.metadata_json.cast(JSONB), func.jsonb_build_object()
@@ -13529,6 +13648,14 @@ def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_pr
         and column in {"first_seen_at", "created_at"}
     ):
         return f"COALESCE({target_prefix}.{_q(column)}, {incoming_prefix}.{_q(column)})"
+    if (
+        table.name == ProviderDirectorySource.__tablename__
+        and column == "endpoint_id"
+    ):
+        return (
+            f"COALESCE({target_prefix}.{_q(column)}, "
+            f"{incoming_prefix}.{_q(column)})"
+        )
     if table.name == ProviderDirectorySource.__tablename__ and column == "metadata_json":
         quoted = _q(column)
         merged_metadata = (

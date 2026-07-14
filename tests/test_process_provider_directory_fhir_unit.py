@@ -2030,6 +2030,10 @@ def test_alohr_endpoint_identity_records_graphql_acquisition_contract():
             "ALOHR_PROVIDER_QUERY",
             "query Replacement { providers(criteria: {}) { nextToken } }",
         ),
+        (
+            "ALOHR_ORGANIZATION_QUERY",
+            "query Replacement { providerOrgs(criteria: {}) { nextToken } }",
+        ),
     ],
 )
 def test_alohr_endpoint_identity_hashes_every_graphql_contract_field(
@@ -3254,6 +3258,41 @@ def test_provider_directory_source_seed_upsert_preserves_existing_probe_state():
         'THEN target_row."last_probe_status" '
         'ELSE stage_row."last_probe_status" END'
     ) == sql
+
+
+def test_provider_directory_source_seed_upsert_preserves_serving_endpoint():
+    table = ProviderDirectorySource.__table__
+    sql = importer._effective_update_sql(
+        table,
+        "endpoint_id",
+        target_prefix="target_row",
+        incoming_prefix="stage_row",
+    )
+
+    assert sql == (
+        'COALESCE(target_row."endpoint_id", stage_row."endpoint_id")'
+    )
+
+    statement = importer.pg_insert(table).values(
+        source_id="source_a",
+        org_name="ALOHR",
+        endpoint_id="endpoint_graphql",
+    )
+    expression = importer._effective_update_expression(
+        table,
+        statement,
+        "endpoint_id",
+    )
+    expression_sql = str(
+        expression.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "coalesce" in expression_sql.lower()
+    assert "provider_directory_source.endpoint_id" in expression_sql
+    assert "excluded.endpoint_id" in expression_sql
 
 
 def test_canonical_resource_compact_payload_update_preserves_only_matching_payload():
@@ -7346,6 +7385,7 @@ async def test_artifact_dataset_selection_scopes_explicit_and_filters_all_source
     assert "ranked_datasets AS MATERIALIZED" in all_sql
     assert "validated_candidate_count" in all_sql
     assert "dataset.superseded_at IS NULL" in all_sql
+    assert "publication_metadata_json::jsonb -> 'source_ids'" in all_sql
 
 
 @pytest.mark.asyncio

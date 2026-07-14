@@ -12,7 +12,7 @@ Freshness policy: catalog confirmation expires after `45` days, source reviews a
 
 ## Catalog Inventory Snapshot
 
-This snapshot covers the entire live catalog: `866` sources confirmed in `mrf-dev` against `mrf.provider_directory_source` at `2026-07-11T15:21:05Z`. It is not the curated support matrix below, which tracks `32` entries, including `16` acquisition-configured entries.
+This snapshot covers the entire live catalog: `866` sources confirmed in `mrf-dev` against `mrf.provider_directory_source` at `2026-07-11T15:21:05Z`. It is not the curated support matrix below, which tracks `32` entries, including `17` acquisition-configured entries.
 
 The `103` valid source rows collapse to `25` canonical bases after removing `78` aliases. `24` bases are represented by maintained entries; `1` is not. The only valid canonical base outside the maintained entries is Aetna's credentialed, targeted Medicaid directory. It is documented as an alternate Aetna base rather than a separate fully enumerable carrier directory.
 
@@ -32,8 +32,8 @@ The `103` valid source rows collapse to `25` canonical bases after removing `78`
 
 | Category | Count |
 | --- | ---: |
-| Acquisition-configured | 16 |
-| Externally supported | 1 |
+| Acquisition-configured | 17 |
+| Externally supported | 0 |
 | Probe-only | 12 |
 | Known not importable | 3 |
 | Total tracked | 32 |
@@ -44,7 +44,7 @@ The `103` valid source rows collapse to `25` canonical bases after removing `78`
 | --- | --- | --- | --- |
 | Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required |
 | Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Required |
-| ALOHR (`alohr`) | Externally supported | Private connector | Required |
+| ALOHR (`alohr`) | Acquisition-configured | Private connector | Required |
 | First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Not supported | User token | Required |
 
 ## Configured Sources
@@ -79,7 +79,7 @@ The `103` valid source rows collapse to `25` canonical bases after removing `78`
 | SCAN (`scan`) | Probe-only | None | Probe | None configured | https://providerdirectory.scanhealthplan.com | pdfhir_736ccaa7958218d4daeaf2e6 | Not required | 2026-07-13 | 2026-08-27 | The server enforces a 1,000-result search ceiling: family=MA has 2,679 Practitioner matches and returns HTTP 413 SearchTooCostly when rows are requested. Fixed name-prefix shards therefore cannot prove completeness. Generic acquisition remains blocked. The importer now implements adaptive half-open _lastUpdated partitions, pre/post unfiltered and ranged census reconciliation, durable retry checkpoints, and twin-pass staged-row proof, but SCAN remains probe-only until a live all-resource campaign produces matching terminal completeness metrics. |
 | Centene (`centene`) | Probe-only | None | Probe | None configured | https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory | pdfhir_00d0fb813f25b5d699a18eaa | Not required | 2026-07-13 | 2026-08-27 | The production base now returns public FHIR metadata from dev egress. Location requires at least one resource search parameter: an _count-only request returns HTTP 400, while address-state=OK with _count=1 returns 200 rows plus a next link. Generic resource acquisition is blocked in the importer because stable exhaustive pagination and equivalent behavior across all directory collections remain unverified. |
 | Contra Costa (`contra-costa`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation | https://ihyml0v6d9.execute-api.us-east-1.amazonaws.com/hxprod | pdfhir_8ee2865f928f1d67b8a86090 | Not required | 2026-07-13 | 2026-08-27 | Seven public collections follow opaque next-link pagination; Endpoint is unsupported and excluded. The official catalog can return HTTP 403, so the confirmed fallback base is retained. Terminal acquisition succeeded, and current artifact plus unified/API readiness is recorded in the tracked verification snapshot. |
-| ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://fhir.alabamaonehealthrecord.com/csp/healthshare/hsods/fhir/r4 | pdfhir_0f81c146991b27031b1ec366 | Required | 2026-07-13 | 2026-08-27 | FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr. The source does not expose organization-affiliation relationships, so the connector does not invent self-referential OrganizationAffiliation resources. |
+| ALOHR (`alohr`) | Acquisition-configured | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://fhir.alabamaonehealthrecord.com/csp/healthshare/hsods/fhir/r4 | pdfhir_0f81c146991b27031b1ec366 | Required | 2026-07-14 | 2026-08-28 | FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr. The prior five-resource run is not proof for the corrected contract because the source does not expose organization-affiliation relationships. A fresh four-resource GraphQL acquisition, validation, artifact publication, and unified/API proof are pending. |
 
 ## Current Published Dataset Audit
 
@@ -164,6 +164,6 @@ Verification environment: `mrf-dev`. Campaign: `provider-directory-canonical-acq
 | SCAN (`scan`) | Not recorded | Not recorded | Not applicable | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | Centene (`centene`) | Not recorded | Not recorded | Not applicable | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | Contra Costa (`contra-costa`) | Current | Succeeded | Complete | Promoted | Ready | 2026-07-12T23:53:00Z | run_600d3643ad2f40898ed4826713484629 | Succeeded (`run_600d3643ad2f40898ed4826713484629`) at `2026-07-12T22:27:09Z` | Verified | 2026-07-12T22:27:09Z | 2026-08-26 | InsurancePlan: 3<br>PractitionerRole: 31,897<br>Practitioner: 6,178<br>Organization: 81,811<br>Location: 81,429<br>HealthcareService: 484,544<br>OrganizationAffiliation: 264,673 | Source rows: 950,535<br>Location rows: 81,429<br>Address rows: 340,410<br>Address keys: 65,585<br>Phone rows: 340,258<br>Coordinate rows: 311,351<br>Role-to-plan refs: 31,897<br>Address Keys: Present<br>Address Overlay: Present<br>Addresses: Present<br>Coordinates: Present<br>Locations: Present<br>Phones: Present<br>Role To Plan Refs: Present |
-| ALOHR (`alohr`) | Current | External Completed | Complete | Promoted | Ready | 2026-07-12T23:53:00Z | run_17baae4934f54639bd748d50554a9cbd | Succeeded (`run_17baae4934f54639bd748d50554a9cbd`) at `2026-07-11T01:12:22Z` | Verified | 2026-07-11T01:12:22Z | 2026-08-25 | Evidence recorded | Source rows: 357,802<br>Location rows: 119,267<br>Address rows: 177,712<br>Address keys: 36,981<br>Phone rows: 165,733<br>Coordinate rows: 62,412<br>Role-to-plan refs: 0<br>Address Keys: Present<br>Address Overlay: Present<br>Addresses: Present<br>Coordinates: Present<br>Locations: Present<br>Phones: Present<br>Role To Plan Refs: Absent |
+| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not Promoted | Not Ready | 2026-07-14T16:34:49Z | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 
 Generated by `scripts/generate_provider_directory_support_docs.py`; do not edit this file directly.
