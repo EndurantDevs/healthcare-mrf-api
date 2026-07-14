@@ -328,6 +328,61 @@ def test_artifact_bundle_collects_profile_and_evidence_stages_together():
 
 
 @pytest.mark.asyncio
+async def test_profile_stages_are_logged_at_creation_without_set_logged(
+    monkeypatch,
+):
+    build = importer._ProviderDirectoryProfileBuild(
+        schema="mrf",
+        generation_id="generation_1",
+        source_ids=("source_a",),
+        dataset_ids=("dataset_a",),
+        evidence_stage="evidence_stage",
+        profile_stage="profile_stage",
+    )
+    build_fence = importer.ProviderDirectoryArtifactBuildFence(
+        target_oid=None
+    )
+    status = AsyncMock()
+    assert_logged = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        importer,
+        "_has_provider_directory_profile_artifacts",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_assert_provider_directory_logged_relation",
+        assert_logged,
+    )
+
+    _metrics, stages = await importer._build_provider_directory_profile_stages(
+        build,
+        build_fence,
+        build_fence,
+    )
+
+    joined_sql = "\n".join(
+        str(awaited.args[0]) for awaited in status.await_args_list
+    )
+    assert 'CREATE TABLE "mrf"."evidence_stage"' in joined_sql
+    assert 'CREATE TABLE "mrf"."profile_stage"' in joined_sql
+    assert "CREATE UNLOGGED TABLE" not in joined_sql
+    assert "SET LOGGED" not in joined_sql
+    assert [
+        awaited.args for awaited in assert_logged.await_args_list
+    ] == [
+        ("mrf", "evidence_stage"),
+        ("mrf", "profile_stage"),
+    ]
+    assert [stage.target_relation for stage in stages] == [
+        profile.PROFILE_EVIDENCE_TABLE,
+        profile.PROFILE_TABLE,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_profile_publish_refuses_a_partial_artifact_pair(monkeypatch):
     dataset = importer.ProviderDirectoryArtifactDataset(
         source_id="source_a",
