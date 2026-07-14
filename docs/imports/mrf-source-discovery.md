@@ -142,6 +142,19 @@ authenticated operator API and mirror them into its own catalog. Integrations
 must preserve stable plan and source-file identities and keep large
 `plan_info` payloads bounded.
 
+The authenticated control API exposes deterministic keyset pages for this
+purpose:
+
+- `GET /control/v1/mrf/discovery/sources?cursor=...&limit=...` lists stored
+  sources and payer identity context. The maximum page size is 250.
+- `GET /control/v1/mrf/discovery/sources/{source_id}/files?cursor=...&limit=...`
+  lists normalized file and `plan_info` records for one source. The maximum
+  page size is 500.
+
+Both responses return `items` and `next_cursor`. Consumers should continue
+until `next_cursor` is null, checkpoint only after a page is durably ingested,
+and treat replayed pages as idempotent.
+
 ## Safety Rules
 
 - Discovery never downloads full rate bodies.
@@ -161,9 +174,9 @@ must preserve stable plan and source-file identities and keep large
 Recommended schedules:
 
 - Daily: `--check-urls --provider master-list`
-- Weekly: `--provider master-list --limit 500 --check-urls --concurrency 10`
+- Weekly: `--provider master-list --check-urls --crawl --concurrency 10`
 - Smoke: `--provider master-list --limit 15 --check-urls --crawl --crawl-target-limit 2 --concurrency 5`
-- Monthly: `--provider master-list --limit 500 --check-urls --crawl --concurrency 10`
+- Monthly bounded audit: `--provider master-list --limit 500 --check-urls --crawl --concurrency 10`
 - TPA freshness smoke: `--probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10`
 
 Configure these in an external scheduler so operators can change cadence,

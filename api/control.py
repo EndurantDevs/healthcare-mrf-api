@@ -21,6 +21,15 @@ from api.control_imports import (
 )
 from api.control_workers import ensure_worker, worker_registry
 from api.control_auth import require_control_auth as _require_control_auth
+from api.mrf_discovery_catalog import (
+    DEFAULT_FILE_PAGE_SIZE,
+    DEFAULT_SOURCE_PAGE_SIZE,
+    MAX_FILE_PAGE_SIZE,
+    MAX_SOURCE_PAGE_SIZE,
+    list_discovery_source_files_page,
+    list_discovery_sources_page,
+    page_limit,
+)
 from process.ptg_parts.ptg2_candidate_attestation import (
     record_candidate_audit_attestation,
 )
@@ -83,6 +92,48 @@ async def control_ensure_worker(request):
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     return response.json(ensure_worker(payload), status=202, default=str)
+
+
+@blueprint.get("/mrf/discovery/sources")
+async def control_mrf_discovery_sources(request):
+    """Return a cursor-paginated view of stored discovery sources."""
+
+    _require_control_auth(request)
+    try:
+        limit = page_limit(
+            request.args.get("limit"),
+            default=DEFAULT_SOURCE_PAGE_SIZE,
+            maximum=MAX_SOURCE_PAGE_SIZE,
+        )
+        payload = await list_discovery_sources_page(
+            cursor=request.args.get("cursor"),
+            limit=limit,
+            query=request.args.get("q"),
+        )
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    return response.json(payload, default=str)
+
+
+@blueprint.get("/mrf/discovery/sources/<source_id:str>/files")
+async def control_mrf_discovery_source_files(request, source_id: str):
+    """Return a cursor-paginated view of files stored for one source."""
+
+    _require_control_auth(request)
+    try:
+        limit = page_limit(
+            request.args.get("limit"),
+            default=DEFAULT_FILE_PAGE_SIZE,
+            maximum=MAX_FILE_PAGE_SIZE,
+        )
+        payload = await list_discovery_source_files_page(
+            source_id,
+            cursor=request.args.get("cursor"),
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    return response.json(payload, default=str)
 
 
 @blueprint.post("/ptg/parse-toc-preview")

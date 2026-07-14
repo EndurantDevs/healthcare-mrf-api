@@ -972,18 +972,18 @@ def test_midlandschoice_resolver_preserves_network_labels():
       </tr>
     </table>
     """
-    source = {"source_id": "src-midlands", "display_name": "Synthetic Midlands"}
+    catalog_source_dict = {"source_id": "src-midlands", "display_name": "Synthetic Midlands"}
 
-    targets = discovery._parse_midlandschoice_mrf_rows(
+    network_targets = discovery._parse_midlandschoice_mrf_rows(
         html, base_url="https://api.midlandschoice.com/mrf"
     )
 
-    assert [target["network_code"] for target in targets] == ["A1", "B2"]
-    assert [target["network_name"] for target in targets] == [
+    assert [network_target["network_code"] for network_target in network_targets] == ["A1", "B2"]
+    assert [network_target["network_name"] for network_target in network_targets] == [
         "Network Alpha",
         "Network Beta",
     ]
-    assert targets[0]["url"].startswith(
+    assert network_targets[0]["url"].startswith(
         "https://api.midlandschoice.com/api/v1/fileshare/download?"
     )
 
@@ -998,7 +998,7 @@ def test_midlandschoice_resolver_preserves_network_labels():
     try:
         resolved = asyncio.run(
             discovery._resolve_midlandschoice_mrf(
-                source,
+                catalog_source_dict,
                 "https://api.midlandschoice.com/mrf",
                 {"type": "midlandschoice_mrf"},
                 None,
@@ -1958,7 +1958,7 @@ async def test_query_filtered_toc_stream_enforces_byte_limit(monkeypatch):
 
 def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plans():
     """Verify this source-discovery regression contract."""
-    source = {
+    catalog_source_dict = {
         "source_id": "src_aetna",
         "display_name": "Aetna",
         "metadata_json": {
@@ -1968,7 +1968,7 @@ def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plan
             }
         },
     }
-    payload = {
+    metadata_response_dict = {
         "files": [
             {
                 "reportingEntityName": "Example Reporting Entity",
@@ -2009,18 +2009,18 @@ def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plan
         ]
     }
 
-    targets = discovery._healthsparq_targets_from_metadata(
-        source,
+    matching_targets = discovery._healthsparq_targets_from_metadata(
+        catalog_source_dict,
         "https://mrf.healthsparq.com/example/prd/mrf/A/BRAND/latest_metadata.json",
-        payload,
+        metadata_response_dict,
         resolved_from_url="https://health1.aetna.com/app/public/#/one/insurerCode=A&brandCode=BRAND/",
         params={"insurerCode": "A", "brandCode": "BRAND"},
     )
 
-    assert len(targets) in {1}
-    [target] = targets
-    assert target.metadata["file_path"].endswith("2026-06-01_222_index.json.gz")
-    plan_info = target.metadata["plan_info"]
+    assert len(matching_targets) in {1}
+    [matching_target] = matching_targets
+    assert matching_target.metadata["file_path"].endswith("2026-06-01_222_index.json.gz")
+    plan_info = matching_target.metadata["plan_info"]
     assert [plan["plan_name"] for plan in plan_info] == [
         "HSA Aetna Choice POS II",
         "Aetna Choice POS II",
@@ -2043,7 +2043,7 @@ def test_healthsparq_query_expansion_splits_concatenated_plan_label():
 
 
 def test_healthsparq_metadata_rows_apply_query_expansion_plan_labels():
-    source = {
+    catalog_source_dict = {
         "source_id": "src_aetna",
         "metadata_json": {
             "raw": {
@@ -2052,7 +2052,7 @@ def test_healthsparq_metadata_rows_apply_query_expansion_plan_labels():
             }
         },
     }
-    payload = {
+    metadata_response_dict = {
         "files": [
             {
                 "reportingEntityName": "Example Reporting Entity",
@@ -2073,12 +2073,12 @@ def test_healthsparq_metadata_rows_apply_query_expansion_plan_labels():
     }
 
     plan_rows, file_rows = discovery._healthsparq_rows_from_metadata(
-        source,
+        catalog_source_dict,
         "https://mrf.healthsparq.com/example/prd/mrf/A/BRAND/latest_metadata.json",
-        payload,
+        metadata_response_dict,
     )
 
-    assert [row["plan_name"] for row in plan_rows] == ["HSA Aetna Choice POS II"]
+    assert [plan_row["plan_name"] for plan_row in plan_rows] == ["HSA Aetna Choice POS II"]
     [file_row] = file_rows
     assert file_row["plan_names"] == ["HSA Aetna Choice POS II"]
     plan_info = file_row["metadata_json"]["plan_info"]
@@ -2089,12 +2089,12 @@ def test_healthsparq_metadata_rows_apply_query_expansion_plan_labels():
 
 
 def test_healthsparq_metadata_rows_preserve_engine_plan_hashes_for_catalog_sync():
-    source = {
+    catalog_source_dict = {
         "source_id": "src_aetna",
         "payer_id": "payer_aetna",
         "display_name": "Example Carrier",
     }
-    payload = {
+    metadata_response_dict = {
         "files": [
             {
                 "reportingEntityName": "Example Reporting Entity",
@@ -2121,9 +2121,9 @@ def test_healthsparq_metadata_rows_preserve_engine_plan_hashes_for_catalog_sync(
     }
 
     _, file_rows = discovery._healthsparq_rows_from_metadata(
-        source,
+        catalog_source_dict,
         "https://mrf.healthsparq.com/example/prd/mrf/A/BRAND/latest_metadata.json",
-        payload,
+        metadata_response_dict,
     )
 
     assert len(file_rows) in {1}
@@ -2252,7 +2252,7 @@ def test_healthsparq_toc_target_plan_hashes_enrich_parsed_file_rows():
 
 def test_query_expanded_generic_toc_rows_normalize_plan_labels_before_merge():
     """Verify this source-discovery regression contract."""
-    source = {
+    catalog_source_dict = {
         "source_id": "src_aetna",
         "display_name": "Example Carrier",
         "metadata_json": {
@@ -2262,7 +2262,7 @@ def test_query_expanded_generic_toc_rows_normalize_plan_labels_before_merge():
             }
         },
     }
-    toc = {
+    toc_document_dict = {
         "reporting_entity_name": "Example Reporting Entity",
         "reporting_entity_type": "Third Party Administrator",
         "version": "1.0.0",
@@ -2291,8 +2291,8 @@ def test_query_expanded_generic_toc_rows_normalize_plan_labels_before_merge():
             }
         ],
     }
-    target = discovery.CrawlTarget(
-        source=source,
+    crawl_target = discovery.CrawlTarget(
+        source=catalog_source_dict,
         url="https://example.test/index.json",
         label="Example Packaging TOC",
         resolved_from_url="https://example.test/latest_metadata.json",
@@ -2319,10 +2319,10 @@ def test_query_expanded_generic_toc_rows_normalize_plan_labels_before_merge():
     )
 
     plan_rows, file_rows = discovery._toc_rows_from_content(
-        source, "https://example.test/index.json", toc
+        catalog_source_dict, "https://example.test/index.json", toc_document_dict
     )
 
-    assert [row["plan_name"] for row in plan_rows] == [
+    assert [plan_row["plan_name"] for plan_row in plan_rows] == [
         "HSA Choice Plan",
         "Choice Plan",
     ]
@@ -2335,7 +2335,7 @@ def test_query_expanded_generic_toc_rows_normalize_plan_labels_before_merge():
     assert {plan["company_name"] for plan in plan_info} == {"Example Packaging"}
 
     [annotated] = discovery._apply_crawl_target_context_to_file_rows(
-        [file_row], target
+        [file_row], crawl_target
     )
 
     merged = annotated["metadata_json"]["plan_info"]
@@ -5376,7 +5376,7 @@ def test_healthcarebluebook_grid_parser_extracts_nested_data_href_context():
 
 @pytest.mark.asyncio
 async def test_healthgram_resolver_expands_network_pages_to_toc_links(monkeypatch):
-    source = {
+    catalog_source_dict = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Healthgram",
@@ -5399,36 +5399,36 @@ async def test_healthgram_resolver_expands_network_pages_to_toc_links(monkeypatc
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
 
-    targets = await discovery._resolve_healthgram_network_index(
-        source,
+    network_targets = await discovery._resolve_healthgram_network_index(
+        catalog_source_dict,
         "https://mrf.healthgram.com/",
         {"type": "healthgram_network_index"},
         None,
     )
 
-    assert [target.url for target in targets] == [
+    assert [network_target.url for network_target in network_targets] == [
         "https://mrf.healthgram.com/mrfiles/EXAM/Example_index.json",
         "https://mrf.healthgram.com/mrfiles/OTHR/Other_index.json",
     ]
-    assert targets[0].label == "Example Network"
-    assert targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert network_targets[0].label == "Example Network"
+    assert network_targets[0].metadata["target_file_type"] == "table-of-contents"
     assert (
-        targets[0].metadata["healthgram_index_label"] == "2026-06-01_Example_index.json"
+        network_targets[0].metadata["healthgram_index_label"] == "2026-06-01_Example_index.json"
     )
-    assert targets[0].metadata["healthgram_network_name"] == "Example Network"
+    assert network_targets[0].metadata["healthgram_network_name"] == "Example Network"
     assert (
-        targets[0].resolved_from_url == "https://mrf.healthgram.com/network/example.cfm"
+        network_targets[0].resolved_from_url == "https://mrf.healthgram.com/network/example.cfm"
     )
 
 
 @pytest.mark.asyncio
 async def test_github_repo_resolver_expands_public_tree_to_raw_mrf_files(monkeypatch):
-    source = {
+    catalog_source_dict = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Example Carrier",
     }
-    payloads = {
+    github_response_by_url = {
         "https://api.github.com/repos/ExampleCarrier/MRF": {"default_branch": "main"},
         "https://api.github.com/repos/ExampleCarrier/MRF/git/trees/main?recursive=1": {
             "tree": [
@@ -5450,39 +5450,39 @@ async def test_github_repo_resolver_expands_public_tree_to_raw_mrf_files(monkeyp
     }
 
     async def fake_fetch_json(url, **_kwargs):
-        return payloads[url]
+        return github_response_by_url[url]
 
     monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
 
-    targets = await discovery._resolve_github_repo_mrf(
-        source,
+    repository_targets = await discovery._resolve_github_repo_mrf(
+        catalog_source_dict,
         "https://github.com/ExampleCarrier/MRF",
         {"type": "github_repo_mrf_tree"},
         None,
     )
 
-    assert [target.url for target in targets] == [
+    assert [repository_target.url for repository_target in repository_targets] == [
         "https://raw.githubusercontent.com/ExampleCarrier/MRF/main/in-network/2026-06-01_example_carrier_alpha_plan_in-network-rates.json.gz",
         "https://raw.githubusercontent.com/ExampleCarrier/MRF/main/allowed-amounts/2026-06-01_example_carrier_alpha_plan_allowed-amounts.zip",
     ]
-    assert targets[0].metadata["target_kind"] == "file_reference"
-    assert targets[0].metadata["target_file_type"] == "in-network"
-    assert targets[0].metadata["github_path"].endswith("in-network-rates.json.gz")
-    assert targets[0].metadata["blob_size"] == 123
-    assert targets[0].metadata["plan_info"][0]["plan_name"] == "Carrier Alpha Plan"
-    assert targets[1].metadata["target_file_type"] == "allowed-amounts"
+    assert repository_targets[0].metadata["target_kind"] == "file_reference"
+    assert repository_targets[0].metadata["target_file_type"] == "in-network"
+    assert repository_targets[0].metadata["github_path"].endswith("in-network-rates.json.gz")
+    assert repository_targets[0].metadata["blob_size"] == 123
+    assert repository_targets[0].metadata["plan_info"][0]["plan_name"] == "Carrier Alpha Plan"
+    assert repository_targets[1].metadata["target_file_type"] == "allowed-amounts"
 
 
 @pytest.mark.asyncio
 async def test_crawl_target_limit_caps_persisted_target_rows(monkeypatch):
-    source = {
+    catalog_source_dict = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Example Carrier",
     }
-    targets = [
+    crawl_targets = [
         discovery.CrawlTarget(
-            source=source,
+            source=catalog_source_dict,
             url=f"https://example.test/mrf/plan-{index}_in-network-rates.json.gz",
             label=f"Example Plan {index}",
             metadata={
@@ -5498,13 +5498,13 @@ async def test_crawl_target_limit_caps_persisted_target_rows(monkeypatch):
     captured_file_batches: list[list[dict]] = []
 
     async def fake_resolve_crawl_targets(*_args, **_kwargs):
-        return targets, []
+        return crawl_targets, []
 
     async def fake_push_crawl_row_batches(
         _plan_rows, file_rows, _observation_rows, **_kwargs
     ):
         if file_rows:
-            captured_file_batches.append([dict(row) for row in file_rows])
+            captured_file_batches.append([dict(file_row) for file_row in file_rows])
 
     monkeypatch.setattr(discovery, "_resolve_crawl_targets", fake_resolve_crawl_targets)
     monkeypatch.setattr(
@@ -5513,7 +5513,7 @@ async def test_crawl_target_limit_caps_persisted_target_rows(monkeypatch):
 
     plans_discovered, files_discovered, observations = (
         await discovery._crawl_toc_metadata(
-            [source],
+            [catalog_source_dict],
             test_mode=False,
             run_id="run_1",
             max_toc_bytes=1024,
@@ -5526,7 +5526,7 @@ async def test_crawl_target_limit_caps_persisted_target_rows(monkeypatch):
     assert files_discovered == 2
     assert len(observations) == 2
     assert len(captured_file_batches) in {1}
-    assert [row["description"] for row in captured_file_batches[0]] == [
+    assert [file_row["description"] for file_row in captured_file_batches[0]] == [
         "Example Plan 0",
         "Example Plan 1",
     ]
@@ -5581,21 +5581,21 @@ async def test_zipped_toc_plan_scope_filters_crawled_rows(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_crawl_targets_filters_query_expansion_matches(monkeypatch):
-    source = {
+    catalog_source_dict = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "BCBS Louisiana",
         "metadata_json": {"raw": {"target_payer_query": "Example Employer"}},
     }
-    targets = [
+    candidate_targets = [
         discovery.CrawlTarget(
-            source=source,
+            source=catalog_source_dict,
             url="https://example.sapphiremrfhub.com/tocs/current/example-employer",
             label="Example Employer",
             metadata={"payer_name": "Example Employer", "file_name": "example-employer"},
         ),
         discovery.CrawlTarget(
-            source=source,
+            source=catalog_source_dict,
             url="https://example.sapphiremrfhub.com/tocs/current/other-employer",
             label="Other Employer",
             metadata={"payer_name": "Other Employer", "file_name": "other-employer"},
@@ -5603,14 +5603,14 @@ async def test_resolve_crawl_targets_filters_query_expansion_matches(monkeypatch
     ]
 
     async def fake_crawl_targets_for_source(*_args, **_kwargs):
-        return targets
+        return candidate_targets
 
     monkeypatch.setattr(
         discovery, "_crawl_targets_for_source", fake_crawl_targets_for_source
     )
 
     resolved, observations = await discovery._resolve_crawl_targets(
-        [{**source, "index_url": "https://example.sapphiremrfhub.com/"}],
+        [{**catalog_source_dict, "index_url": "https://example.sapphiremrfhub.com/"}],
         session=None,
         run_id="run_1",
         concurrency=2,
@@ -6063,7 +6063,7 @@ async def test_healthcarebluebook_resolver_catalogs_stable_file_links(monkeypatc
 async def test_healthcarebluebook_resolver_skips_html_error_numeric_links(
     monkeypatch,
 ):
-    source = {
+    catalog_source_dict = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Example HBB",
@@ -6079,25 +6079,25 @@ async def test_healthcarebluebook_resolver_skips_html_error_numeric_links(
         assert url == "https://mrf.healthcarebluebook.com/Example"
         return html
 
-    async def fake_probe(url, _session):
+    async def is_numeric_file_downloadable(url, _session):
         return url.endswith("/222222")
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
     monkeypatch.setattr(
         discovery,
         "_healthcarebluebook_numeric_file_url_is_downloadable",
-        fake_probe,
+        is_numeric_file_downloadable,
     )
 
-    [target] = await discovery._resolve_healthcarebluebook_mrf(
-        source,
+    [download_target] = await discovery._resolve_healthcarebluebook_mrf(
+        catalog_source_dict,
         "https://mrf.healthcarebluebook.com/Example",
         {"type": "healthcarebluebook_mrf"},
         None,
     )
 
-    assert target.url == "https://mrf.healthcarebluebook.com/Example/222222"
-    assert target.label == "Valid file"
+    assert download_target.url == "https://mrf.healthcarebluebook.com/Example/222222"
+    assert download_target.label == "Valid file"
 
 
 @pytest.mark.asyncio
@@ -6313,13 +6313,13 @@ async def test_html_bluebook_direct_nested_error(
 @pytest.mark.asyncio
 async def test_socrata_data_json_resolver_discovers_latest_vhp_mrf_files(monkeypatch):
     """Verify this source-discovery regression contract."""
-    source = {
+    catalog_source_dict = {
         "source_id": "source_vhp",
         "payer_id": "payer_vhp",
         "display_name": "Valley Health Plan",
         "metadata_json": {"benefit_lines": ["medical", "dental", "vision"]},
     }
-    payload = {
+    catalog_response_dict = {
         "dataset": [
             {
                 "accessLevel": "public",
@@ -6422,12 +6422,12 @@ async def test_socrata_data_json_resolver_discovers_latest_vhp_mrf_files(monkeyp
 
     async def fake_fetch_json(url, **_kwargs):
         assert url == "https://data.sccgov.org/data.json"
-        return payload
+        return catalog_response_dict
 
     monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
 
-    targets = await discovery._resolve_socrata_data_json_mrf_catalog(
-        source,
+    dataset_targets = await discovery._resolve_socrata_data_json_mrf_catalog(
+        catalog_source_dict,
         "https://data.sccgov.org/data.json",
         {
             "type": "socrata_data_json_mrf_catalog",
@@ -6439,7 +6439,10 @@ async def test_socrata_data_json_resolver_discovers_latest_vhp_mrf_files(monkeyp
         None,
     )
 
-    by_id = {target.metadata["socrata_dataset_id"]: target for target in targets}
+    by_id = {
+        dataset_target.metadata["socrata_dataset_id"]: dataset_target
+        for dataset_target in dataset_targets
+    }
     assert set(by_id) == {"qq69-6225", "rj4i-khih", "bxvw-whxu", "d6r6-tdzg"}
     assert by_id["qq69-6225"].metadata["target_file_type"] == "in-network"
     assert by_id["qq69-6225"].metadata["benefit_line"] == "medical"
@@ -6458,15 +6461,15 @@ async def test_socrata_data_json_resolver_discovers_latest_vhp_mrf_files(monkeyp
 
 
 def test_asr_health_benefits_resolver_expands_configured_group_numbers():
-    source = {"source_id": "source_1", "display_name": "ASR Health Benefits"}
-    resolver = {
+    catalog_source_dict = {"source_id": "source_1", "display_name": "ASR Health Benefits"}
+    resolver_config_dict = {
         "type": "asr_health_benefits_mrf",
         "toc_path": "/umbraco/surface/mrfdownload",
         "group_numbers": ["1208"],
     }
 
     [target] = discovery._resolve_asr_health_benefits_mrf(
-        source, "https://www.asrhealthbenefits.com/MRF", resolver
+        catalog_source_dict, "https://www.asrhealthbenefits.com/MRF", resolver_config_dict
     )
 
     assert (
@@ -6480,17 +6483,17 @@ def test_asr_health_benefits_resolver_expands_configured_group_numbers():
 
 
 def test_asr_health_benefits_resolver_preserves_direct_group_number():
-    source = {"source_id": "source_1", "display_name": "ASR Health Benefits"}
-    resolver = {
+    catalog_source_dict = {"source_id": "source_1", "display_name": "ASR Health Benefits"}
+    resolver_config_dict = {
         "type": "asr_health_benefits_mrf",
         "toc_path": "/umbraco/surface/mrfdownload",
         "group_numbers": ["1208"],
     }
 
     targets = discovery._resolve_asr_health_benefits_mrf(
-        source,
+        catalog_source_dict,
         "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?fileType=TableOfContents&groupNumber=1194",
-        resolver,
+        resolver_config_dict,
     )
 
     assert [target.metadata["group_number"] for target in targets] == ["1194", "1208"]
@@ -6584,31 +6587,31 @@ def test_asr_health_benefits_seed_metadata_becomes_target_context(
         encoding="utf-8",
     )
     monkeypatch.setenv(discovery.SOURCE_CONFIG_ENV, str(config_path))
-    source = {"source_id": "source_1", "display_name": "ASR Health Benefits"}
-    resolver = {
+    catalog_source_dict = {"source_id": "source_1", "display_name": "ASR Health Benefits"}
+    resolver_config_dict = {
         "type": "asr_health_benefits_mrf",
         "toc_path": "/umbraco/surface/mrfdownload",
         "seed_list": "asr_test",
     }
 
-    [target] = discovery._resolve_asr_health_benefits_mrf(
-        source, "https://www.asrhealthbenefits.com/MRF", resolver
+    [group_target] = discovery._resolve_asr_health_benefits_mrf(
+        catalog_source_dict, "https://www.asrhealthbenefits.com/MRF", resolver_config_dict
     )
-    [row] = discovery._apply_crawl_target_context_to_file_rows(
+    [contextualized_file_row] = discovery._apply_crawl_target_context_to_file_rows(
         [{"mrf_file_id": "file_1", "metadata_json": {}}],
-        target,
+        group_target,
     )
 
-    assert target.label == "ASR Health Benefits group 1208 - Example Forge LLC"
-    assert target.metadata["company_name"] == "Example Forge LLC"
-    assert target.metadata["plan_name"] == "Example Forge ASR Plan"
-    assert target.metadata["evidence_url"] == "https://example.test/asr-1208"
-    assert row["metadata_json"]["group_number"] == "1208"
-    assert row["metadata_json"]["company_name"] == "Example Forge LLC"
-    assert row["metadata_json"]["employer_name"] == "Example Forge LLC"
-    assert row["metadata_json"]["plan_name"] == "Example Forge ASR Plan"
+    assert group_target.label == "ASR Health Benefits group 1208 - Example Forge LLC"
+    assert group_target.metadata["company_name"] == "Example Forge LLC"
+    assert group_target.metadata["plan_name"] == "Example Forge ASR Plan"
+    assert group_target.metadata["evidence_url"] == "https://example.test/asr-1208"
+    assert contextualized_file_row["metadata_json"]["group_number"] == "1208"
+    assert contextualized_file_row["metadata_json"]["company_name"] == "Example Forge LLC"
+    assert contextualized_file_row["metadata_json"]["employer_name"] == "Example Forge LLC"
+    assert contextualized_file_row["metadata_json"]["plan_name"] == "Example Forge ASR Plan"
     assert (
-        row["metadata_json"]["target_label"]
+        contextualized_file_row["metadata_json"]["target_label"]
         == "ASR Health Benefits group 1208 - Example Forge LLC"
     )
 
@@ -6860,7 +6863,7 @@ def test_mymedicalshopper_url_helpers_and_employer_selector():
 
 
 def test_mymedicalshopper_query_expansion_uses_employer_search_selector():
-    source = {
+    catalog_source_dict = {
         "metadata_json": {
             "raw": {
                 "target_payer_query": "Example Packaging, Inc.",
@@ -6868,10 +6871,10 @@ def test_mymedicalshopper_query_expansion_uses_employer_search_selector():
             }
         }
     }
-    base_selector = {"tpaSlug": "example-tpa", "status": "Enabled"}
-    expected_search_selector = {
+    base_selector_dict = {"tpaSlug": "example-tpa", "status": "Enabled"}
+    expected_search_selector_dict = {
         "$and": [
-            base_selector,
+            base_selector_dict,
             {
                 "$or": [
                     {"name": {"$regex": "example.*packaging", "$options": "i"}},
@@ -6883,28 +6886,28 @@ def test_mymedicalshopper_query_expansion_uses_employer_search_selector():
 
     assert (
         discovery._mymedicalshopper_employer_search_selector(
-            base_selector, "Example Packaging, Inc."
+            base_selector_dict, "Example Packaging, Inc."
         )
-        == expected_search_selector
+        == expected_search_selector_dict
     )
     assert discovery._mymedicalshopper_entity_employer_selectors(
         "example-tpa",
         all_employers_searchable=True,
-        source=source,
+        source=catalog_source_dict,
         resolver={},
-    ) == [expected_search_selector]
+    ) == [expected_search_selector_dict]
     assert discovery._mymedicalshopper_entity_employer_selectors(
         "example-tpa",
         all_employers_searchable=True,
-        source=source,
+        source=catalog_source_dict,
         resolver={"query_search_include_full_table": True},
-    ) == [expected_search_selector, base_selector]
+    ) == [expected_search_selector_dict, base_selector_dict]
     assert discovery._mymedicalshopper_entity_employer_selectors(
         "example-tpa",
         all_employers_searchable=True,
         source={},
         resolver={},
-    ) == [base_selector]
+    ) == [base_selector_dict]
 
 
 def test_mymedicalshopper_sockjs_frame_and_publication_helpers():
@@ -6957,15 +6960,15 @@ def test_mymedicalshopper_sockjs_frame_and_publication_helpers():
 
 def test_mymedicalshopper_targets_keep_latest_generated_toc_per_plan():
     """Verify this source-discovery regression contract."""
-    source = {"source_id": "source_varipro", "payer_id": "payer_varipro"}
-    employer = {
+    catalog_source_dict = {"source_id": "source_varipro", "payer_id": "payer_varipro"}
+    employer_dict = {
         "slug": "sample-employer-network-varipro-77100",
         "name": "Sample Employer - Network A",
         "tpaSlug": "varipro",
         "groupId": "77100",
         "ein": "111222333",
     }
-    generated = [
+    generated_plan_records = [
         {
             "planId": "4907",
             "planName": "Sample Employer In Network 01/01/2023",
@@ -6999,39 +7002,39 @@ def test_mymedicalshopper_targets_keep_latest_generated_toc_per_plan():
         },
     ]
 
-    targets = discovery._mymedicalshopper_targets_from_generated(
-        source,
+    toc_targets = discovery._mymedicalshopper_targets_from_generated(
+        catalog_source_dict,
         entity_slug="varipro",
-        employer=employer,
-        generated=generated,
+        employer=employer_dict,
+        generated=generated_plan_records,
         resolver_type="mymedicalshopper_talon_mrf",
         resolved_from_url="https://www.mymedicalshopper.com/mrf-search/varipro",
     )
 
-    assert [target.url for target in targets] == [
+    assert [toc_target.url for toc_target in toc_targets] == [
         "https://mrf.mmsanalytics.com/2026-06-01_sample_employer_index.json",
         "https://mrf.mmsanalytics.com/2026-06-01_sample_employer_2022_index.json",
     ]
     assert (
-        targets[0].label
+        toc_targets[0].label
         == "Sample Employer - Network A - Sample Employer In Network 01/01/2023 - 2026-06-01"
     )
-    assert targets[0].metadata["target_file_type"] == "table-of-contents"
-    assert targets[0].metadata["entity_slug"] == "varipro"
-    assert targets[0].metadata["tpa_slug"] == "varipro"
-    assert targets[0].metadata["tpa_name"] == "Varipro"
-    assert targets[0].metadata["client_id"] is None
-    assert targets[0].metadata["client_name"] == "Sample Employer - Network A"
+    assert toc_targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert toc_targets[0].metadata["entity_slug"] == "varipro"
+    assert toc_targets[0].metadata["tpa_slug"] == "varipro"
+    assert toc_targets[0].metadata["tpa_name"] == "Varipro"
+    assert toc_targets[0].metadata["client_id"] is None
+    assert toc_targets[0].metadata["client_name"] == "Sample Employer - Network A"
     assert (
-        targets[0].metadata["employer_slug"]
+        toc_targets[0].metadata["employer_slug"]
         == "sample-employer-network-varipro-77100"
     )
-    assert targets[0].metadata["employer_name"] == "Sample Employer - Network A"
-    assert targets[0].metadata["group_id"] == "77100"
-    assert targets[0].metadata["group_number"] == "77100"
-    assert targets[0].metadata["ein"] == "111222333"
-    assert targets[0].metadata["history_month_count"] == 3
-    context = discovery._crawl_target_context_metadata(targets[0])
+    assert toc_targets[0].metadata["employer_name"] == "Sample Employer - Network A"
+    assert toc_targets[0].metadata["group_id"] == "77100"
+    assert toc_targets[0].metadata["group_number"] == "77100"
+    assert toc_targets[0].metadata["ein"] == "111222333"
+    assert toc_targets[0].metadata["history_month_count"] == 3
+    context = discovery._crawl_target_context_metadata(toc_targets[0])
     assert context["client_name"] == "Sample Employer - Network A"
     assert context["tpa_slug"] == "varipro"
     assert context["group_number"] == "77100"
@@ -7391,7 +7394,7 @@ def test_mymedicalshopper_direct_employer_slug_infers_tpa_and_group_context():
 
 @pytest.mark.asyncio
 async def test_mymedicalshopper_resolver_honors_max_targets(monkeypatch):
-    generated_for = []
+    generated_employer_slugs = []
 
     class FakeWS:
         async def close(self):
@@ -7415,7 +7418,7 @@ async def test_mymedicalshopper_resolver_honors_max_targets(monkeypatch):
         ]
 
     async def fake_generated_for_employer(_ws, *, employer_slug, **_kwargs):
-        generated_for.append(employer_slug)
+        generated_employer_slugs.append(employer_slug)
         return [
             {
                 "planId": employer_slug,
@@ -7440,28 +7443,28 @@ async def test_mymedicalshopper_resolver_honors_max_targets(monkeypatch):
         fake_generated_for_employer,
     )
 
-    targets = await discovery._resolve_mymedicalshopper_talon_mrf(
+    employer_targets = await discovery._resolve_mymedicalshopper_talon_mrf(
         {"source_id": "source_bywater", "payer_id": "payer_bywater"},
         "https://www.mymedicalshopper.com/mrf-search/bywater",
         {"type": "mymedicalshopper_talon_mrf", "max_targets": 2},
         session=object(),
     )
 
-    assert generated_for == ["client-one-bywater-10001", "client-two-bywater-10002"]
-    assert [target.metadata["employer_slug"] for target in targets] == generated_for
+    assert generated_employer_slugs == ["client-one-bywater-10001", "client-two-bywater-10002"]
+    assert [employer_target.metadata["employer_slug"] for employer_target in employer_targets] == generated_employer_slugs
 
 
 @pytest.mark.asyncio
 async def test_viva_health_resolver_adds_commercial_and_employer_landing_targets(
     monkeypatch,
 ):
-    employer_seen = {}
+    employer_call_by_field = {}
 
     async def fake_employer_targets(source, *, employer_page_url, resolver, session):
-        employer_seen["source"] = source
-        employer_seen["url"] = employer_page_url
-        employer_seen["resolver"] = resolver
-        employer_seen["session"] = session
+        employer_call_by_field["source"] = source
+        employer_call_by_field["url"] = employer_page_url
+        employer_call_by_field["resolver"] = resolver
+        employer_call_by_field["session"] = session
         return [
             discovery._viva_health_employer_landing_target(
                 source=source,
@@ -7474,38 +7477,38 @@ async def test_viva_health_resolver_adds_commercial_and_employer_landing_targets
         discovery, "_viva_health_employer_landing_targets", fake_employer_targets
     )
 
-    source = {"source_id": "source_viva", "payer_id": "payer_viva"}
-    resolver = {
+    catalog_source_dict = {"source_id": "source_viva", "payer_id": "payer_viva"}
+    resolver_config_dict = {
         "type": "viva_health_mrf",
         "employer_path": "/mrf/employers/",
         "max_bytes": 1024,
         "max_employer_links": 7,
         "max_targets": 10,
     }
-    targets = await discovery._resolve_viva_health_mrf(
-        source,
+    discovery_targets = await discovery._resolve_viva_health_mrf(
+        catalog_source_dict,
         "https://www.vivahealth.com/mrf/",
-        resolver,
+        resolver_config_dict,
         session=object(),
     )
 
-    assert [target.url for target in targets[:2]] == [
+    assert [crawl_target.url for crawl_target in discovery_targets[:2]] == [
         "https://www.vivahealth.com/files/mrf/viva-health-commercial-in-network-rates",
         "https://www.vivahealth.com/files/mrf/viva-health-commercial-out-of-network-rates",
     ]
-    assert targets[0].metadata["target_file_type"] == "in-network"
-    assert targets[0].metadata["container_format"] == "zip"
-    assert targets[1].metadata["target_file_type"] == "allowed-amounts"
-    assert targets[2].metadata["target_kind"] == "source_landing_page"
-    assert targets[2].metadata["target_file_type"] == "source-landing-page"
-    assert targets[2].metadata["external_hosting_platform"] == "mymedicalshopper_talon"
-    assert targets[2].metadata["group_id"] == "x01234"
+    assert discovery_targets[0].metadata["target_file_type"] == "in-network"
+    assert discovery_targets[0].metadata["container_format"] == "zip"
+    assert discovery_targets[1].metadata["target_file_type"] == "allowed-amounts"
+    assert discovery_targets[2].metadata["target_kind"] == "source_landing_page"
+    assert discovery_targets[2].metadata["target_file_type"] == "source-landing-page"
+    assert discovery_targets[2].metadata["external_hosting_platform"] == "mymedicalshopper_talon"
+    assert discovery_targets[2].metadata["group_id"] == "x01234"
     assert (
-        targets[2].metadata["viva_employer_page_url"]
+        discovery_targets[2].metadata["viva_employer_page_url"]
         == "https://www.vivahealth.com/mrf/employers/"
     )
-    assert employer_seen["url"] == "https://www.vivahealth.com/mrf/employers/"
-    assert employer_seen["resolver"]["max_employer_links"] == 7
+    assert employer_call_by_field["url"] == "https://www.vivahealth.com/mrf/employers/"
+    assert employer_call_by_field["resolver"]["max_employer_links"] == 7
 
 
 def test_viva_health_direct_commercial_target_handles_extensionless_downloads():
@@ -7838,12 +7841,12 @@ async def test_uhc_blob_query_finds_late_match_before_target_limit(monkeypatch):
 
 def test_uhc_provider_mrf_targets_from_payload_catalogs_file_references():
     """Verify this source-discovery regression contract."""
-    source = {
+    catalog_source_dict = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "UnitedHealthcare IFP",
     }
-    payload = {
+    listing_response_dict = {
         "providers": [
             {
                 "name": "providers",
@@ -7879,38 +7882,38 @@ def test_uhc_provider_mrf_targets_from_payload_catalogs_file_references():
         ],
     }
 
-    targets = discovery._uhc_provider_mrf_targets_from_payload(
-        source,
-        payload,
+    file_targets = discovery._uhc_provider_mrf_targets_from_payload(
+        catalog_source_dict,
+        listing_response_dict,
         listing_url="https://providermrf.uhc.com/api/files/ui/ifp/",
     )
 
-    assert [target.url for target in targets] == [
+    assert [file_target.url for file_target in file_targets] == [
         "https://providermrf.uhc.com/api/stream/ui/ifp/providers/JSON_Providers_NMIEX.json",
         "https://legacy.providerlookuponline.com/mrf/optumrx/drugs/2877216/JSON_Drugs_UHCALEX_HIX.json",
         "https://providermrf.uhc.com/api/stream/ui/ifp/plans/JSON_PLANS_AL.json",
     ]
-    assert [target.metadata["target_file_type"] for target in targets] == [
+    assert [file_target.metadata["target_file_type"] for file_target in file_targets] == [
         "provider-network",
         "payer-drug",
         "plan-reference",
     ]
-    assert all(target.metadata["target_kind"] == "file_reference" for target in targets)
-    assert targets[0].label == "Providers Nmiex"
-    assert targets[0].metadata["uhc_provider_blob_path"] == (
+    assert all(file_target.metadata["target_kind"] == "file_reference" for file_target in file_targets)
+    assert file_targets[0].label == "Providers Nmiex"
+    assert file_targets[0].metadata["uhc_provider_blob_path"] == (
         "ui/ifp/providers/JSON_Providers_NMIEX.json"
     )
-    assert targets[1].metadata["uhc_provider_external"] is True
+    assert file_targets[1].metadata["uhc_provider_external"] is True
 
 
 @pytest.mark.asyncio
 async def test_uhc_provider_mrf_resolver_fetches_ifp_listing(monkeypatch):
-    source = {
+    catalog_source_dict = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "UnitedHealthcare IFP",
     }
-    payload = {
+    listing_response_dict = {
         "providers": [
             {
                 "name": "JSON_Providers_NMIEX.json",
@@ -7922,21 +7925,21 @@ async def test_uhc_provider_mrf_resolver_fetches_ifp_listing(monkeypatch):
 
     async def fake_fetch_json(url, **_kwargs):
         assert url == "https://providermrf.uhc.com/api/files/ui/ifp/"
-        return payload
+        return listing_response_dict
 
     monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
 
-    [target] = await discovery._crawl_targets_for_source(
-        source,
+    [provider_file_target] = await discovery._crawl_targets_for_source(
+        catalog_source_dict,
         "https://providermrf.uhc.com/IFP",
         None,
     )
 
-    assert target.url == (
+    assert provider_file_target.url == (
         "https://providermrf.uhc.com/api/stream/ui/ifp/providers/JSON_Providers_NMIEX.json"
     )
-    assert target.resolved_from_url == "https://providermrf.uhc.com/api/files/ui/ifp/"
-    assert target.metadata["resolver"] == "uhc_provider_mrf_files"
+    assert provider_file_target.resolved_from_url == "https://providermrf.uhc.com/api/files/ui/ifp/"
+    assert provider_file_target.metadata["resolver"] == "uhc_provider_mrf_files"
 
 
 def test_humana_pct_targets_from_payload_catalogs_tocs_only_by_default():
@@ -8150,9 +8153,9 @@ def test_healthsparq_target_is_landing():
 
 
 def test_healthsparq_metadata_rows_include_direct_file_urls_and_plans():
-    source = {"source_id": "source_1", "payer_id": "payer_1"}
+    catalog_source_dict = {"source_id": "source_1", "payer_id": "payer_1"}
     metadata_url = "https://mrf.healthsparq.com/example/prd/mrf/AETNACVS_I/ALICFI/latest_metadata.json"
-    payload = {
+    metadata_response_dict = {
         "files": [
             {
                 "reportingEntityName": "Aetna Health",
@@ -8174,7 +8177,7 @@ def test_healthsparq_metadata_rows_include_direct_file_urls_and_plans():
     }
 
     plan_rows, file_rows = discovery._healthsparq_rows_from_metadata(
-        source, metadata_url, payload
+        catalog_source_dict, metadata_url, metadata_response_dict
     )
 
     assert len(plan_rows) in {1}
@@ -8206,11 +8209,11 @@ def test_healthsparq_metadata_rows_include_direct_file_urls_and_plans():
 
 def test_healthsparq_targets_from_metadata_expand_direct_file_urls_and_plans():
     """Verify this source-discovery regression contract."""
-    source = {"source_id": "source_1", "payer_id": "payer_1"}
+    catalog_source_dict = {"source_id": "source_1", "payer_id": "payer_1"}
     metadata_url = (
         "https://mrf.healthsparq.com/example/prd/mrf/UNVRA_I/UNVRA/latest_metadata.json"
     )
-    payload = {
+    metadata_response_dict = {
         "files": [
             {
                 "reportingEntityName": "Univera Healthcare",
@@ -8240,26 +8243,26 @@ def test_healthsparq_targets_from_metadata_expand_direct_file_urls_and_plans():
         ]
     }
 
-    targets = discovery._healthsparq_targets_from_metadata(
-        source,
+    metadata_targets = discovery._healthsparq_targets_from_metadata(
+        catalog_source_dict,
         metadata_url,
-        payload,
+        metadata_response_dict,
         resolved_from_url="https://univerahc.healthsparq.com/healthsparq/public/",
         params={"insurerCode": "UNVRA_I", "brandCode": "UNVRA"},
     )
 
-    assert [target.metadata["target_kind"] for target in targets] == [
+    assert [metadata_target.metadata["target_kind"] for metadata_target in metadata_targets] == [
         "file_reference",
         "file_reference",
     ]
-    assert targets[0].url == (
+    assert metadata_targets[0].url == (
         "https://mrf.healthsparq.com/example/prd/mrf/UNVRA_I/UNVRA/"
         "2026-07-01/inNetworkRates/rates.json.zip"
     )
-    assert targets[0].metadata["target_file_type"] == "in-network"
-    assert targets[0].metadata["container_format"] == "zip"
-    assert targets[0].metadata["metadata_url"] == metadata_url
-    [plan_info] = targets[0].metadata["plan_info"]
+    assert metadata_targets[0].metadata["target_file_type"] == "in-network"
+    assert metadata_targets[0].metadata["container_format"] == "zip"
+    assert metadata_targets[0].metadata["metadata_url"] == metadata_url
+    [plan_info] = metadata_targets[0].metadata["plan_info"]
     assert {
         key: plan_info[key]
         for key in ("plan_id", "plan_id_type", "plan_market_type", "plan_name")
@@ -8270,12 +8273,12 @@ def test_healthsparq_targets_from_metadata_expand_direct_file_urls_and_plans():
         "plan_name": "Group PPO",
     }
     assert plan_info["engine_plan_hash"]
-    assert targets[1].metadata["target_file_type"] == "table-of-contents"
+    assert metadata_targets[1].metadata["target_file_type"] == "table-of-contents"
 
 
 @pytest.mark.asyncio
 async def test_healthsparq_resolver_expands_direct_metadata_manifest(monkeypatch):
-    source = {
+    catalog_source_dict = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Univera Healthcare",
@@ -8320,7 +8323,7 @@ async def test_healthsparq_resolver_expands_direct_metadata_manifest(monkeypatch
     monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allow_url)
 
     resolved_crawl_targets = await discovery._resolve_healthsparq_public_mrf(
-        source, source_url, resolver, None
+        catalog_source_dict, source_url, resolver, None
     )
 
     assert len(resolved_crawl_targets) in {1}
@@ -8508,7 +8511,7 @@ async def test_hs_metadata_fallback_landing(
 @pytest.mark.asyncio
 async def test_providence_resolver_reads_config_and_expands_group_tocs(monkeypatch):
     """Verify this source-discovery regression contract."""
-    source = {
+    catalog_source_dict = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "Providence Health Plan",
@@ -8557,8 +8560,8 @@ async def test_providence_resolver_reads_config_and_expands_group_tocs(monkeypat
         discovery, "_fetch_json_with_headers", fake_fetch_json_with_headers
     )
 
-    targets = await discovery._resolve_providence_mrf_api(
-        source,
+    group_toc_targets = await discovery._resolve_providence_mrf_api(
+        catalog_source_dict,
         "https://mrfhub.providencehealthplan.com/",
         {
             "type": "providence_mrf_api",
@@ -8567,17 +8570,17 @@ async def test_providence_resolver_reads_config_and_expands_group_tocs(monkeypat
         None,
     )
 
-    assert [target.url for target in targets] == [
+    assert [group_toc_target.url for group_toc_target in group_toc_targets] == [
         (
             "https://cms-price-transparency-hosting-prod.s3.amazonaws.com/"
             "ExternalPartnerData/Beacon/TOC/"
             "2026-06-05_ProvidenceHealthPlan_BEACON_Index.json"
         )
     ]
-    assert targets[0].metadata["target_kind"] == "toc_json"
-    assert targets[0].metadata["target_file_type"] == "table-of-contents"
-    assert targets[0].metadata["group_id"] == "106135"
-    assert targets[0].metadata["plan_info"][0]["plan_id_type"] == (
+    assert group_toc_targets[0].metadata["target_kind"] == "toc_json"
+    assert group_toc_targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert group_toc_targets[0].metadata["group_id"] == "106135"
+    assert group_toc_targets[0].metadata["plan_info"][0]["plan_id_type"] == (
         "providence_group_id"
     )
 
@@ -9298,7 +9301,7 @@ def test_parse_html_mrf_links_classifies_singular_table_of_content_indexes():
     ]
 
 
-def test_parse_html_mrf_links_accepts_dated_oon_plan_index_under_mrf_path():
+def test_html_mrf_links_accept_dated_oon_index_under_mrf_path():
     html = """
     <a href="https://mrfproddestinationdata.blob.core.windows.net/avmed-mrf-output/2026-06-01_AvMed-Health-Plans-OON_index.json">
       2026-06-01_AvMed-Health-Plans-OON_index.json
@@ -9329,7 +9332,7 @@ def test_parse_html_mrf_links_accepts_dated_oon_plan_index_under_mrf_path():
     ]
 
 
-def test_parse_html_mrf_links_accepts_plan_named_tic_index_under_mrf_path():
+def test_html_mrf_links_accept_plan_named_tic_index():
     html = """
     <a href="/mrf/thp/2026-06-01_The-Health-Plan-of-WV-Inc_index.json">
       2026-06-01_The-Health-Plan-of-WV-Inc_index.json
@@ -12062,17 +12065,17 @@ async def test_resolve_triples_mtt_api_fetches_latest_select_month(monkeypatch):
 
 def test_payercompass_targets_from_structure_use_file_list_download_ids():
     """Verify this source-discovery regression contract."""
-    source = {
+    catalog_source_dict = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "PayerCompass Plan",
     }
-    resolver = {
+    resolver_config_dict = {
         "type": "payercompass_mrf",
         "download_path": "/api/File/Download",
         "max_timeframes": 2,
     }
-    structure = {
+    structure_response_dict = {
         "mrfConfig": {
             "timeFrames": [
                 {
@@ -12090,7 +12093,7 @@ def test_payercompass_targets_from_structure_use_file_list_download_ids():
             ]
         }
     }
-    file_lists = {
+    files_by_timeframe = {
         "2026-06-01_2": [
             {
                 "id": "oon-file",
@@ -12107,24 +12110,24 @@ def test_payercompass_targets_from_structure_use_file_list_download_ids():
         ],
     }
 
-    targets = discovery._payercompass_targets_from_structure(
-        source,
+    download_targets = discovery._payercompass_targets_from_structure(
+        catalog_source_dict,
         base_url="https://example.mrf.payercompass.com/",
-        resolver=resolver,
-        structure=structure,
-        file_lists=file_lists,
+        resolver=resolver_config_dict,
+        structure=structure_response_dict,
+        file_lists=files_by_timeframe,
     )
 
-    assert [target.url for target in targets] == [
+    assert [download_target.url for download_target in download_targets] == [
         "https://example.mrf.payercompass.com/api/File/Download?Id=oon-file",
         "https://example.mrf.payercompass.com/api/File/Download?Id=inn-file",
     ]
-    assert targets[0].metadata["target_file_type"] == "allowed-amounts"
-    assert targets[0].metadata["container_format"] == "zip"
-    assert targets[0].metadata["size_bytes"] == 8970
-    assert targets[1].metadata["target_file_type"] == "in-network"
+    assert download_targets[0].metadata["target_file_type"] == "allowed-amounts"
+    assert download_targets[0].metadata["container_format"] == "zip"
+    assert download_targets[0].metadata["size_bytes"] == 8970
+    assert download_targets[1].metadata["target_file_type"] == "in-network"
     assert (
-        targets[1]
+        download_targets[1]
         .metadata["payercompass_file_name"]
         .endswith("in-network-rates.json.zip")
     )
@@ -12248,17 +12251,17 @@ async def test_pc_resolver_file_list_wrapper(
 @pytest.mark.asyncio
 async def test_resolve_payercompass_mrf_enriches_plans_from_index_zip(monkeypatch):
     """Verify this source-discovery regression contract."""
-    source = {
+    catalog_source_dict = {
         "source_id": "source_1",
         "payer_id": "payer_1",
         "display_name": "PayerCompass Plan",
     }
-    resolver = {
+    resolver_config_dict = {
         "type": "payercompass_mrf",
         "download_path": "/api/File/Download",
         "max_timeframes": 2,
     }
-    structure = {
+    structure_response_dict = {
         "mrfConfig": {
             "timeFrames": [
                 {
@@ -12276,7 +12279,7 @@ async def test_resolve_payercompass_mrf_enriches_plans_from_index_zip(monkeypatc
             ]
         }
     }
-    file_lists = {
+    files_by_timeframe = {
         "2026-06-01_2": [
             {
                 "id": "index-file",
@@ -12295,7 +12298,7 @@ async def test_resolve_payercompass_mrf_enriches_plans_from_index_zip(monkeypatc
             }
         ],
     }
-    index_toc = {
+    index_toc_dict = {
         "reporting_entity_name": "Example TPA",
         "reporting_entity_type": "third_party_administrator",
         "reporting_structure": [
@@ -12344,31 +12347,31 @@ async def test_resolve_payercompass_mrf_enriches_plans_from_index_zip(monkeypatc
     async def fake_post_json(url, payload, **_kwargs):
         assert url == "https://example.mrf.payercompass.com/api/Home/GetStructureInfo"
         assert payload == {}
-        return structure
+        return structure_response_dict
 
     async def fake_post_json_value(url, payload, **_kwargs):
         assert url == "https://example.mrf.payercompass.com/api/File/List"
-        return file_lists[payload["timeFrameId"]]
+        return files_by_timeframe[payload["timeFrameId"]]
 
     async def fake_fetch_zip_json_values(url, **_kwargs):
         fetch_calls.append(url)
-        return [("2026-06-01_example_index.json", index_toc)]
+        return [("2026-06-01_example_index.json", index_toc_dict)]
 
     monkeypatch.setattr(discovery, "_post_json", fake_post_json)
     monkeypatch.setattr(discovery, "_post_json_value", fake_post_json_value)
     monkeypatch.setattr(discovery, "_fetch_zip_json_values", fake_fetch_zip_json_values)
 
-    targets = await discovery._resolve_payercompass_mrf(
-        source,
+    resolved_targets = await discovery._resolve_payercompass_mrf(
+        catalog_source_dict,
         "https://example.mrf.payercompass.com/",
-        resolver,
+        resolver_config_dict,
         None,
     )
 
     assert fetch_calls == [
         "https://example.mrf.payercompass.com/api/File/Download?Id=index-file"
     ]
-    index_target, in_network_target = targets
+    index_target, in_network_target = resolved_targets
     assert "plan_info" not in index_target.metadata
     assert in_network_target.metadata["payercompass_plan_info_source"] == "index_toc"
     assert in_network_target.metadata["reporting_entity_name"] == "Example TPA"
@@ -13328,7 +13331,7 @@ def test_interleave_file_probe_targets_by_host():
 
 
 def test_crawl_sources_dedupe_by_canonical_url_and_prefer_curated_rows():
-    duplicate_lower_confidence = {
+    lower_confidence_source_dict = {
         "source_id": "vendor",
         "index_url": "https://transparency-in-coverage.uhc.com/",
         "canonical_url": "https://transparency-in-coverage.uhc.com/",
@@ -13336,7 +13339,7 @@ def test_crawl_sources_dedupe_by_canonical_url_and_prefer_curated_rows():
         "seed_provider": "manual",
         "confidence": 95,
     }
-    curated = {
+    curated_source_dict = {
         "source_id": "curated",
         "index_url": "https://transparency-in-coverage.uhc.com/",
         "canonical_url": "https://transparency-in-coverage.uhc.com/",
@@ -13344,7 +13347,7 @@ def test_crawl_sources_dedupe_by_canonical_url_and_prefer_curated_rows():
         "seed_provider": "master-list",
         "confidence": 85,
     }
-    other = {
+    other_source_dict = {
         "source_id": "other",
         "index_url": "https://mrfdata.hmhs.com/",
         "canonical_url": "https://mrfdata.hmhs.com/",
@@ -13353,11 +13356,11 @@ def test_crawl_sources_dedupe_by_canonical_url_and_prefer_curated_rows():
         "confidence": 85,
     }
 
-    rows = discovery._dedupe_source_rows_for_crawl(
-        [duplicate_lower_confidence, curated, other]
+    crawl_source_rows = discovery._dedupe_source_rows_for_crawl(
+        [lower_confidence_source_dict, curated_source_dict, other_source_dict]
     )
 
-    assert [row["source_id"] for row in rows] == ["curated", "other"]
+    assert [source_row["source_id"] for source_row in crawl_source_rows] == ["curated", "other"]
 
 
 @pytest.mark.asyncio
@@ -13513,10 +13516,10 @@ async def test_source_payer_query_filters_before_candidate_limit(monkeypatch):
 @pytest.mark.asyncio
 async def test_direct_discovery_run_emits_visible_state(monkeypatch):
     """Verify the source-discovery progress and persistence contract."""
-    pushed = []
+    persisted_batches = []
     events = []
     progress = []
-    flushed = []
+    flush_timeouts = []
 
     async def fake_load_candidates(_provider, *, test_mode, limit):
         assert test_mode is True
@@ -13530,8 +13533,8 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
             )
         ]
 
-    async def fake_push_objects(rows, model, *, rewrite, use_copy):
-        pushed.append((model, rows, rewrite, use_copy))
+    async def fake_push_objects(row_dicts, model, *, rewrite, use_copy):
+        persisted_batches.append((model, row_dicts, rewrite, use_copy))
 
     async def fake_store_candidates(_candidates):
         return (
@@ -13543,7 +13546,7 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
         return None
 
     async def fake_flush(timeout_seconds):
-        flushed.append(timeout_seconds)
+        flush_timeouts.append(timeout_seconds)
 
     monkeypatch.setattr(discovery, "_load_candidates", fake_load_candidates)
     monkeypatch.setattr(discovery, "init_db", fake_noop)
@@ -13559,12 +13562,12 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
     )
     monkeypatch.setattr(discovery, "flush_status_events", fake_flush)
 
-    result = await discovery.main(test_mode=True, provider="master-list", limit=1)
+    discovery_summary = await discovery.main(test_mode=True, provider="master-list", limit=1)
 
-    control_run_id = result["crawl_run_id"]
+    control_run_id = discovery_summary["crawl_run_id"]
     crawl_rows = [
-        rows[0]
-        for model, rows, _rewrite, _use_copy in pushed
+        row_batch[0]
+        for model, row_batch, _rewrite, _use_copy in persisted_batches
         if model is discovery.MRFCrawlRun
     ]
     assert control_run_id.startswith("mrfcrawl_")
@@ -13575,14 +13578,15 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
     assert events[0]["params"]["provider"] == "master-list"
     assert events[1]["metrics"]["crawl_run_id"] == control_run_id
     assert events[1]["metrics"]["crawl_status"] == "succeeded"
+    assert events[1]["metrics"]["catalog_export_version"] == 1
     assert events[1]["metrics"]["sources"] in {1}
-    assert [row["run_id"] for row in crawl_rows] == [control_run_id, control_run_id]
-    assert [item["run_id"] for item in progress] == [
+    assert [crawl_row["run_id"] for crawl_row in crawl_rows] == [control_run_id, control_run_id]
+    assert [progress_update["run_id"] for progress_update in progress] == [
         control_run_id,
         control_run_id,
         control_run_id,
     ]
-    assert flushed == [1.0]
+    assert flush_timeouts == [1.0]
 
 
 @pytest.mark.asyncio

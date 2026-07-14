@@ -261,6 +261,10 @@ class MRFFile(Base, JSONOutputMixin):
     __my_additional_indexes__ = [
         {"index_elements": ("payer_id",), "name": "mrf_file_payer_idx"},
         {"index_elements": ("source_id",), "name": "mrf_file_source_idx"},
+        {
+            "index_elements": ("source_id", "mrf_file_id"),
+            "name": "mrf_file_source_cursor_idx",
+        },
         {"index_elements": ("file_type",), "name": "mrf_file_type_idx"},
         {"index_elements": ("canonical_url",), "name": "mrf_file_canonical_url_idx"},
         {"index_elements": ("last_seen_at",), "name": "mrf_file_last_seen_idx"},
