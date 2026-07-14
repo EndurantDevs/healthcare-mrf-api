@@ -7117,7 +7117,7 @@ def _stub_artifact_scope_lifecycle(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_artifact_dataset_selection_is_current_published_isolates_failed_and_expands_aliases(
+async def test_artifact_dataset_selection_is_current_published_isolates_failed_sources(
     monkeypatch,
 ):
     lookup = AsyncMock(
@@ -7170,7 +7170,7 @@ async def test_artifact_dataset_selection_is_current_published_isolates_failed_a
 
 
 @pytest.mark.asyncio
-async def test_artifact_dataset_selection_expands_aliases_and_filters_all_source_publish(
+async def test_artifact_dataset_selection_scopes_explicit_and_filters_all_source_publish(
     monkeypatch,
 ):
     lookup = AsyncMock(
@@ -7215,18 +7215,43 @@ async def test_artifact_dataset_selection_expands_aliases_and_filters_all_source
 
     assert [dataset.source_id for dataset in explicit_fence.datasets] == [
         "source_a",
-        "source_b",
     ]
     assert [dataset.source_id for dataset in all_fence.datasets] == [
         "source_a",
         "source_b",
     ]
-    assert "requested_sources AS MATERIALIZED" in explicit_sql
-    assert "sibling.endpoint_id = requested.endpoint_id" in explicit_sql
+    assert "selected_sources AS MATERIALIZED" in explicit_sql
+    assert "sibling.endpoint_id = requested.endpoint_id" not in explicit_sql
     assert "selected_endpoints AS MATERIALIZED" in all_sql
     assert "ranked_datasets AS MATERIALIZED" in all_sql
     assert "validated_candidate_count" in all_sql
     assert "dataset.superseded_at IS NULL" in all_sql
+
+
+@pytest.mark.asyncio
+async def test_humana_explicit_artifact_selection_rejects_18_alias_expansion(
+    monkeypatch,
+):
+    canonical_source_id = "pdfhir_00a3d35311756763d420b0d6"
+    endpoint_id = "endpoint_humana"
+    dataset_rows = [
+        _artifact_selection_row(
+            canonical_source_id if alias_index == 0 else f"pdfhir_humana_alias_{alias_index:02d}",
+            endpoint_id,
+            "dataset_humana",
+        )
+        for alias_index in range(18)
+    ]
+    lookup = AsyncMock(return_value=dataset_rows)
+    monkeypatch.setattr(importer.db, "all", lookup)
+
+    fence = await importer._resolve_provider_directory_artifact_datasets(
+        [canonical_source_id]
+    )
+
+    assert fence.source_ids == [canonical_source_id]
+    assert fence.endpoint_ids == [endpoint_id]
+    assert "sibling.endpoint_id" not in lookup.await_args.args[0]
 
 
 def _artifact_selection_row(
@@ -7506,7 +7531,7 @@ def test_artifact_dataset_rejects_internal_recorded_profile_drift():
         )
 
 
-def test_artifact_dataset_recorded_profile_unifies_stale_aliases():
+def test_artifact_dataset_recorded_profile_does_not_expand_explicit_scope():
     dataset_rows = [
         {
             "source_id": source_id,
@@ -7528,10 +7553,7 @@ def test_artifact_dataset_recorded_profile_unifies_stale_aliases():
         ["source_a"],
     )
 
-    assert [dataset.source_id for dataset in fence.datasets] == [
-        "source_a",
-        "source_b",
-    ]
+    assert [dataset.source_id for dataset in fence.datasets] == ["source_a"]
     assert {
         dataset.expected_resources for dataset in fence.datasets
     } == {("Location",)}
@@ -7819,7 +7841,8 @@ async def test_artifact_cutover_locks_endpoint_and_rejects_alias_repoint(monkeyp
     assert "provider_directory_api_endpoint" in endpoint_lock_sql
     assert status.await_args.args[0].startswith("LOCK TABLE")
     assert "FOR SHARE OF source" in alias_lock_sql
-    assert "source.endpoint_id = ANY" in alias_lock_sql
+    assert "source.source_id = ANY" in alias_lock_sql
+    assert lookup.await_args_list[1].kwargs["source_ids"] == ["source_a"]
     assert "provider_directory_endpoint_dataset" not in alias_lock_sql
 
 
