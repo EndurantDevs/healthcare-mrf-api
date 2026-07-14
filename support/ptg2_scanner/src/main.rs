@@ -43,19 +43,20 @@ use ptg2_scanner::shared_graph::{
     convert_shared_provider_graph, MembershipArtifactDescriptor, MembershipMetadata,
     SharedGraphShardDescriptor,
 };
+use ptg2_scanner::v3_dense::{DenseIdentityMap, DenseIdentityValue};
 #[cfg(test)]
 use ptg2_scanner::v3_runs::natural_lean_code_identity;
 use ptg2_scanner::v3_runs::{
-    external_sort_dense_ids, external_sort_lexicographic_records,
-    external_sort_provider_identities, external_sort_tagged_partition_files,
-    parse_coverage_scope_id, read_code_dictionary, source_key_bits, source_key_bytes,
-    write_audit_candidate_file, AuditCandidateSelector, MultiFileSortStats, NaturalLeanCode,
-    NaturalLeanCodeFields, ServingRunPartitionWriter, ServingRunRecord, TaggedServingRunCodec,
-    TaggedServingRunRecord, AUDIT_CANDIDATE_FORMAT, AUDIT_CANDIDATE_FORMAT_VERSION,
-    AUDIT_CANDIDATE_MAX_RECORDS, AUDIT_CANDIDATE_RECORD_BYTES, AUDIT_CANDIDATE_SELECTION,
-    CODE_DICTIONARY_FORMAT, CODE_DICTIONARY_FORMAT_VERSION, COVERAGE_SCOPE_ID_BYTES,
-    DENSE_ID_RECORD_BYTES, PROVIDER_IDENTITY_RECORD_BYTES, SERVING_RUN_FORMAT,
-    SERVING_RUN_FORMAT_VERSION, SERVING_RUN_RECORD_BYTES,
+    external_sort_assigned_serving_records, external_sort_dense_ids,
+    external_sort_lexicographic_records, external_sort_provider_identities,
+    external_sort_tagged_partition_files, parse_coverage_scope_id, read_code_dictionary,
+    source_key_bits, source_key_bytes, write_audit_candidate_file, AuditCandidateSelector,
+    MultiFileSortStats, NaturalLeanCode, NaturalLeanCodeFields, ServingRunPartitionWriter,
+    ServingRunRecord, TaggedServingRunCodec, TaggedServingRunRecord, AUDIT_CANDIDATE_FORMAT,
+    AUDIT_CANDIDATE_FORMAT_VERSION, AUDIT_CANDIDATE_MAX_RECORDS, AUDIT_CANDIDATE_RECORD_BYTES,
+    AUDIT_CANDIDATE_SELECTION, CODE_DICTIONARY_FORMAT, CODE_DICTIONARY_FORMAT_VERSION,
+    COVERAGE_SCOPE_ID_BYTES, DENSE_ID_RECORD_BYTES, PROVIDER_IDENTITY_RECORD_BYTES,
+    SERVING_RUN_FORMAT, SERVING_RUN_FORMAT_VERSION, SERVING_RUN_RECORD_BYTES,
 };
 use rayon::prelude::*;
 use serde_json::{json, Map, Value};
@@ -13922,10 +13923,10 @@ fn write_serving_binary_v3_price_dictionary_copy_from_pg_binary_reader<R: Read, 
     }))
 }
 
-const V3_FINALIZER_DEFAULT_MEMORY_RECORDS: usize = 1_000_000;
+const V3_FINALIZER_DEFAULT_MEMORY_RECORDS: usize = 4_000_000;
+const V3_FINALIZER_DEFAULT_WORKERS: usize = 16;
+const V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES: usize = 48 * 1024 * 1024 * 1024;
 const V3_FINALIZER_HOT_BLOCK_BYTES: usize = 64 * 1024;
-const V3_FINALIZER_STAGE_PROVIDER_BYTES: usize = 44;
-const V3_FINALIZER_STAGE_PRICE_BYTES: usize = 32;
 const V3_FINALIZER_ASSIGNED_BYTES: usize = 20;
 const V3_FINALIZER_PRICE_KEY_MAP_RECORD_BYTES: usize = GLOBAL_ID_BYTES + 4;
 const V3_FINALIZER_SUPPORT_HASH_DOMAIN: &[u8] = b"PTG2V3SUPPORT\x01";
@@ -13967,13 +13968,15 @@ struct V3FinalizerOptions {
     output_directory: PathBuf,
     manifest_paths: Vec<PathBuf>,
     memory_records: usize,
+    workers: usize,
+    identity_map_max_bytes: usize,
     price_key_map_input: PathBuf,
     price_membership_inputs: Vec<PathBuf>,
     price_atom_inputs: Vec<PathBuf>,
 }
 
 fn v3_finalizer_usage() -> &'static str {
-    "usage: ptg2_scanner --finalize-v3-runs <output_directory> --price-key-map-input PATH [--memory-records N] [--price-membership-input PATH]... [--price-atom-input PATH]... <scanner_summary.json>..."
+    "usage: ptg2_scanner --finalize-v3-runs <output_directory> --price-key-map-input PATH [--workers N] [--memory-records N] [--identity-map-max-bytes N] [--price-membership-input PATH]... [--price-atom-input PATH]... <scanner_summary.json>..."
 }
 
 fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOptions> {
@@ -13990,6 +13993,8 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
         ));
     }
     let mut memory_records = V3_FINALIZER_DEFAULT_MEMORY_RECORDS;
+    let mut workers = V3_FINALIZER_DEFAULT_WORKERS;
+    let mut identity_map_max_bytes = V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES;
     let mut price_key_map_input = None;
     let mut price_membership_inputs = Vec::new();
     let mut price_atom_inputs = Vec::new();
@@ -13997,6 +14002,24 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
     let mut index = 1usize;
     while index < arguments.len() {
         match arguments[index].as_str() {
+            "--workers" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, v3_finalizer_usage())
+                })?;
+                workers = value.parse::<usize>().map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid --workers value: {error}"),
+                    )
+                })?;
+                if workers == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--workers must be positive",
+                    ));
+                }
+            }
             "--memory-records" => {
                 index += 1;
                 let value = arguments.get(index).ok_or_else(|| {
@@ -14012,6 +14035,24 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "--memory-records must be positive",
+                    ));
+                }
+            }
+            "--identity-map-max-bytes" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, v3_finalizer_usage())
+                })?;
+                identity_map_max_bytes = value.parse::<usize>().map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid --identity-map-max-bytes value: {error}"),
+                    )
+                })?;
+                if identity_map_max_bytes == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--identity-map-max-bytes must be positive",
                     ));
                 }
             }
@@ -14082,6 +14123,8 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
         output_directory: PathBuf::from(output_directory),
         manifest_paths,
         memory_records,
+        workers,
+        identity_map_max_bytes,
         price_key_map_input,
         price_membership_inputs,
         price_atom_inputs,
@@ -14819,7 +14862,10 @@ fn v3_support_digest(
 }
 
 struct AssignedPgBinaryStream {
-    reader: BufReader<File>,
+    paths: Vec<PathBuf>,
+    path_index: usize,
+    reader: Option<BufReader<File>>,
+    previous_record: Option<[u8; V3_FINALIZER_ASSIGNED_BYTES]>,
     pending: Vec<u8>,
     pending_offset: usize,
     phase: u8,
@@ -14827,9 +14873,18 @@ struct AssignedPgBinaryStream {
 }
 
 impl AssignedPgBinaryStream {
-    fn new(path: &Path, population_count: u64) -> io::Result<Self> {
+    fn new_many(paths: Vec<PathBuf>, population_count: u64) -> io::Result<Self> {
+        if paths.iter().any(|path| !path.is_file()) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "assigned partition input does not exist",
+            ));
+        }
         Ok(Self {
-            reader: BufReader::new(File::open(path)?),
+            paths,
+            path_index: 0,
+            reader: None,
+            previous_record: None,
             pending: Vec::new(),
             pending_offset: 0,
             phase: 0,
@@ -14851,7 +14906,30 @@ impl AssignedPgBinaryStream {
             }
             1 => {
                 let mut record = [0u8; V3_FINALIZER_ASSIGNED_BYTES];
-                if read_exact_optional(&mut self.reader, &mut record)? {
+                let has_record = loop {
+                    if self.reader.is_none() {
+                        let Some(path) = self.paths.get(self.path_index) else {
+                            break false;
+                        };
+                        self.reader = Some(BufReader::new(File::open(path)?));
+                        self.path_index += 1;
+                    }
+                    if read_exact_optional(self.reader.as_mut().unwrap(), &mut record)? {
+                        break true;
+                    }
+                    self.reader = None;
+                };
+                if has_record {
+                    if self
+                        .previous_record
+                        .is_some_and(|previous| record < previous)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "assigned partition files are not globally ordered",
+                        ));
+                    }
+                    self.previous_record = Some(record);
                     let code_key =
                         i32::from_be_bytes(record[0..4].try_into().map_err(to_io_error)?);
                     let provider_key =
@@ -14989,285 +15067,407 @@ fn is_zero_identity(value: &[u8; 16]) -> bool {
     value.iter().all(|byte| *byte == 0)
 }
 
-fn write_v3_finalizer_stage_inputs(
-    sorted_partition_paths: &[PathBuf],
-    code_dictionary: &BTreeMap<[u8; 16], NaturalLeanCode>,
-    source: SourceEncoding,
-    provider_spool_path: &Path,
-    price_spool_path: &Path,
-    provider_stage_path: &Path,
-    code_copy_path: &Path,
-) -> io::Result<V3StageWriteSummary> {
-    let mut provider_spool = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(provider_spool_path)?,
-    );
-    let mut price_spool = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(price_spool_path)?,
-    );
-    let mut provider_stage = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(provider_stage_path)?,
-    );
-    let mut code_copy = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(code_copy_path)?,
-    );
-    write_pg_binary_copy_header(&mut code_copy)?;
-    let mut code_digest = Sha256::new();
-    code_digest.update(V3_FINALIZER_CODE_ROW_HASH_DOMAIN);
-    let mut previous_code_id = None;
-    let mut current_code_key = None;
-    let mut current_code_rate_count = 0u64;
-    let mut code_count = 0u64;
-    let mut row_count = 0u64;
-    for partition_path in sorted_partition_paths {
-        let mut reader = BufReader::new(File::open(partition_path)?);
-        while let Some(tagged_record) =
-            TaggedServingRunRecord::read_from(&mut reader, source.tagged_codec)?
-        {
-            let record = tagged_record.record;
-            if is_zero_identity(&record.provider_set_id) || is_zero_identity(&record.price_set_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "serving run record is missing a provider-set or price-set identity",
-                ));
-            }
-            if previous_code_id != Some(record.code_id) {
-                if previous_code_id.is_some_and(|previous| record.code_id <= previous) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "sorted serving partitions are not globally ordered by code identity",
-                    ));
-                }
-                if let Some(previous_code_id) = previous_code_id {
-                    let previous_code_key = current_code_key.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "completed serving code group lacks code_key",
-                        )
-                    })?;
-                    let previous_code =
-                        code_dictionary.get(&previous_code_id).ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "serving run code identity {} is absent from code dictionaries",
-                                    sha256_hex(&previous_code_id)
-                                ),
-                            )
-                        })?;
-                    write_v3_code_dictionary_copy_row(
-                        &mut code_copy,
-                        previous_code_key,
-                        previous_code,
-                        current_code_rate_count,
-                        &mut code_digest,
-                    )?;
-                }
-                let code_key = i32::try_from(code_count).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "code_key exceeds PostgreSQL int4",
-                    )
-                })?;
-                code_dictionary.get(&record.code_id).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "serving run code identity {} is absent from code dictionaries",
-                            sha256_hex(&record.code_id)
-                        ),
-                    )
-                })?;
-                previous_code_id = Some(record.code_id);
-                current_code_key = Some(code_key);
-                current_code_rate_count = 0;
-                code_count = code_count.saturating_add(1);
-            }
-            let code_key = current_code_key.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "serving row lacks code_key")
-            })?;
-            provider_spool.write_all(&record.provider_set_id)?;
-            provider_spool.write_all(&record.provider_count.to_be_bytes())?;
-            price_spool.write_all(&record.price_set_id)?;
-            provider_stage.write_all(&record.provider_set_id)?;
-            provider_stage.write_all(&code_key.to_be_bytes())?;
-            provider_stage.write_all(&record.price_set_id)?;
-            provider_stage.write_all(&record.provider_count.to_be_bytes())?;
-            provider_stage.write_all(&tagged_record.source_key.to_be_bytes())?;
-            current_code_rate_count = current_code_rate_count.checked_add(1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "code rate_count overflow")
-            })?;
-            row_count = row_count.saturating_add(1);
-        }
+#[derive(Clone, Copy, Debug, Default)]
+struct V3ScratchBytes {
+    read: u64,
+    written: u64,
+}
+
+impl V3ScratchBytes {
+    fn add(&mut self, other: Self) {
+        self.read = self.read.saturating_add(other.read);
+        self.written = self.written.saturating_add(other.written);
     }
-    if let Some(previous_code_id) = previous_code_id {
-        let previous_code_key = current_code_key.ok_or_else(|| {
-            io::Error::new(
+}
+
+#[derive(Debug)]
+struct V3PreparedPartition {
+    partition: usize,
+    sorted_path: PathBuf,
+    provider_spool_path: PathBuf,
+    price_spool_path: PathBuf,
+    row_count: u64,
+    code_rate_counts: Vec<(u32, u64)>,
+    sort_stats: MultiFileSortStats,
+    elapsed_seconds: f64,
+    scratch: V3ScratchBytes,
+}
+
+#[derive(Debug)]
+struct V3AssignedPartition {
+    partition: usize,
+    assigned_path: PathBuf,
+    row_count: u64,
+    sort_stats: MultiFileSortStats,
+    elapsed_seconds: f64,
+    scratch: V3ScratchBytes,
+}
+
+fn emit_v3_partition_progress(
+    stage: &str,
+    partition: usize,
+    partition_count: usize,
+    rows: u64,
+    elapsed_seconds: f64,
+    scratch: V3ScratchBytes,
+) {
+    eprintln!(
+        "{}",
+        json!({
+            "type": "v3_finalizer_partition_progress",
+            "stage": stage,
+            "partition": partition,
+            "partition_count": partition_count,
+            "row_count": rows,
+            "elapsed_seconds": elapsed_seconds,
+            "scratch_bytes_read": scratch.read,
+            "scratch_bytes_written": scratch.written,
+        })
+    );
+}
+
+fn build_v3_code_identity_map(
+    code_dictionary: &BTreeMap<[u8; 16], NaturalLeanCode>,
+) -> io::Result<DenseIdentityMap> {
+    let mut map = DenseIdentityMap::with_capacity(code_dictionary.len())?;
+    for (key, identity) in code_dictionary.keys().enumerate() {
+        let key = u32::try_from(key)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "code_key exceeds uint32"))?;
+        if key > i32::MAX as u32 {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "completed serving code group lacks code_key",
-            )
-        })?;
-        let previous_code = code_dictionary.get(&previous_code_id).ok_or_else(|| {
+                "code_key exceeds PostgreSQL int4",
+            ));
+        }
+        map.insert(*identity, DenseIdentityValue { key, auxiliary: 0 })?;
+    }
+    Ok(map)
+}
+
+fn prepare_v3_partition(
+    partition: usize,
+    partition_count: usize,
+    input_paths: Vec<(PathBuf, u32)>,
+    tagged_codec: TaggedServingRunCodec,
+    memory_records: usize,
+    work_root: &Path,
+    code_map: &DenseIdentityMap,
+) -> io::Result<V3PreparedPartition> {
+    let started_at = Instant::now();
+    let partition_directory = work_root.join(format!("partition-{partition:03}"));
+    std::fs::create_dir_all(&partition_directory)?;
+    let sorted_path = partition_directory.join("tagged.sorted");
+    let sort_stats = external_sort_tagged_partition_files(
+        &input_paths,
+        &sorted_path,
+        &partition_directory,
+        memory_records,
+        partition,
+        partition_count,
+        tagged_codec,
+    )?;
+    let provider_spool_path = partition_directory.join("providers.unsorted");
+    let price_spool_path = partition_directory.join("prices.unsorted");
+    let mut provider_spool = BufWriter::new(File::create(&provider_spool_path)?);
+    let mut price_spool = BufWriter::new(File::create(&price_spool_path)?);
+    let mut reader = BufReader::new(File::open(&sorted_path)?);
+    let mut code_rate_counts = Vec::new();
+    let mut current_code_key = None;
+    let mut current_code_count = 0u64;
+    let mut row_count = 0u64;
+    while let Some(tagged) = TaggedServingRunRecord::read_from(&mut reader, tagged_codec)? {
+        let record = tagged.record;
+        if is_zero_identity(&record.provider_set_id) || is_zero_identity(&record.price_set_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serving run record is missing a provider-set or price-set identity",
+            ));
+        }
+        let code_key = code_map.get(&record.code_id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "serving run code identity {} is absent from code dictionaries",
-                    sha256_hex(&previous_code_id)
+                    sha256_hex(&record.code_id)
                 ),
             )
         })?;
-        write_v3_code_dictionary_copy_row(
-            &mut code_copy,
-            previous_code_key,
-            previous_code,
-            current_code_rate_count,
-            &mut code_digest,
-        )?;
+        if current_code_key != Some(code_key.key) {
+            if let Some(previous_key) = current_code_key {
+                if code_key.key <= previous_key {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "partition code identities are not in global dense-key order",
+                    ));
+                }
+                code_rate_counts.push((previous_key, current_code_count));
+            }
+            current_code_key = Some(code_key.key);
+            current_code_count = 0;
+        }
+        provider_spool.write_all(&record.provider_set_id)?;
+        provider_spool.write_all(&record.provider_count.to_be_bytes())?;
+        price_spool.write_all(&record.price_set_id)?;
+        current_code_count = current_code_count.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "code rate_count overflow")
+        })?;
+        row_count = row_count.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "partition row_count overflow")
+        })?;
     }
-    if code_count != code_dictionary.len() as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "code dictionary preservation mismatch: serving rows use {code_count} codes, dictionaries contain {}",
-                code_dictionary.len()
-            ),
-        ));
+    if let Some(code_key) = current_code_key {
+        code_rate_counts.push((code_key, current_code_count));
     }
-    write_pg_binary_copy_trailer(&mut code_copy)?;
-    for writer in [
-        &mut provider_spool as &mut dyn Write,
-        &mut price_spool,
-        &mut provider_stage,
-        &mut code_copy,
-    ] {
-        writer.flush()?;
-    }
+    provider_spool.flush()?;
+    price_spool.flush()?;
     provider_spool.get_ref().sync_all()?;
     price_spool.get_ref().sync_all()?;
-    provider_stage.get_ref().sync_all()?;
-    code_copy.get_ref().sync_all()?;
-    Ok(V3StageWriteSummary {
+    if row_count != sort_stats.input_records {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partition identity extraction changed the source multiset",
+        ));
+    }
+    let identity_bytes =
+        row_count.saturating_mul((PROVIDER_IDENTITY_RECORD_BYTES + DENSE_ID_RECORD_BYTES) as u64);
+    let scratch = V3ScratchBytes {
+        read: sort_stats
+            .spill_bytes
+            .saturating_add(sort_stats.output_bytes),
+        written: sort_stats
+            .spill_bytes
+            .saturating_add(sort_stats.output_bytes)
+            .saturating_add(identity_bytes),
+    };
+    let elapsed_seconds = started_at.elapsed().as_secs_f64();
+    emit_v3_partition_progress(
+        "prepare",
+        partition,
+        partition_count,
         row_count,
-        code_count,
-        code_digest: code_digest.finalize().into(),
+        elapsed_seconds,
+        scratch,
+    );
+    Ok(V3PreparedPartition {
+        partition,
+        sorted_path,
+        provider_spool_path,
+        price_spool_path,
+        row_count,
+        code_rate_counts,
+        sort_stats,
+        elapsed_seconds,
+        scratch,
     })
 }
 
-fn join_v3_provider_keys(
-    provider_sorted_path: &Path,
-    provider_stage_sorted_path: &Path,
-    price_stage_path: &Path,
-) -> io::Result<u64> {
-    let mut providers = BufReader::new(File::open(provider_sorted_path)?);
-    let mut stage = BufReader::new(File::open(provider_stage_sorted_path)?);
-    let mut output = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(price_stage_path)?,
-    );
-    let mut current_provider = read_provider_identity_record(&mut providers)?;
-    let mut current_provider_key = 0u64;
-    let mut row_count = 0u64;
-    let mut record = [0u8; V3_FINALIZER_STAGE_PROVIDER_BYTES];
-    while read_exact_optional(&mut stage, &mut record)? {
-        let provider_id: [u8; 16] = record[..16].try_into().map_err(to_io_error)?;
-        while current_provider.is_some_and(|(id, _)| id < provider_id) {
-            current_provider = read_provider_identity_record(&mut providers)?;
-            current_provider_key = current_provider_key.saturating_add(1);
-        }
-        let (expected_provider_id, expected_provider_count) =
-            current_provider.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "assigned row provider identity is absent from dense dictionary",
-                )
-            })?;
-        let provider_count = u32::from_be_bytes(record[36..40].try_into().map_err(to_io_error)?);
-        if expected_provider_id != provider_id || expected_provider_count != provider_count {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "assigned row provider identity/count does not match dense dictionary",
-            ));
-        }
-        let provider_key = u32::try_from(current_provider_key).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "provider_set_key exceeds uint32",
-            )
-        })?;
-        if provider_key > i32::MAX as u32 {
+fn build_v3_provider_identity_map(path: &Path, expected_rows: u64) -> io::Result<DenseIdentityMap> {
+    let capacity = usize::try_from(expected_rows).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider identity map exceeds usize",
+        )
+    })?;
+    let mut map = DenseIdentityMap::with_capacity(capacity)?;
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut key = 0u32;
+    while let Some((identity, provider_count)) = read_provider_identity_record(&mut reader)? {
+        if key > i32::MAX as u32 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "provider_set_key exceeds PostgreSQL int4",
             ));
         }
-        output.write_all(&record[20..36])?;
-        output.write_all(&record[16..20])?;
-        output.write_all(&provider_key.to_be_bytes())?;
-        output.write_all(&record[40..44])?;
-        output.write_all(&provider_count.to_be_bytes())?;
-        row_count = row_count.saturating_add(1);
+        map.insert(
+            identity,
+            DenseIdentityValue {
+                key,
+                auxiliary: provider_count,
+            },
+        )?;
+        key = key.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "provider_set_key overflow")
+        })?;
     }
-    output.flush()?;
-    output.get_ref().sync_all()?;
-    Ok(row_count)
+    if u64::from(key) != expected_rows {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider identity map row count mismatch",
+        ));
+    }
+    Ok(map)
 }
 
-fn join_v3_price_keys(
-    price_key_map_by_id_path: &Path,
-    price_stage_sorted_path: &Path,
-    assigned_stage_path: &Path,
-) -> io::Result<u64> {
-    let mut prices = BufReader::new(File::open(price_key_map_by_id_path)?);
-    let mut stage = BufReader::new(File::open(price_stage_sorted_path)?);
-    let mut output = BufWriter::new(
+fn build_v3_price_identity_map(path: &Path, expected_rows: u64) -> io::Result<DenseIdentityMap> {
+    let capacity = usize::try_from(expected_rows).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "price identity map exceeds usize",
+        )
+    })?;
+    let mut map = DenseIdentityMap::with_capacity(capacity)?;
+    let mut reader = BufReader::new(File::open(path)?);
+    while let Some((identity, key)) = read_v3_price_key_map_by_id_record(&mut reader)? {
+        map.insert(identity, DenseIdentityValue { key, auxiliary: 0 })?;
+    }
+    if map.len() as u64 != expected_rows {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "price identity map row count mismatch",
+        ));
+    }
+    Ok(map)
+}
+
+fn write_v3_code_dictionary_copy(
+    code_dictionary: &BTreeMap<[u8; 16], NaturalLeanCode>,
+    rate_counts: &[u64],
+    code_copy_path: &Path,
+) -> io::Result<V3StageWriteSummary> {
+    if rate_counts.len() != code_dictionary.len() || rate_counts.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "code dictionary rate counts are incomplete",
+        ));
+    }
+    let mut writer = BufWriter::new(
         OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(assigned_stage_path)?,
+            .open(code_copy_path)?,
     );
-    let mut current_price = read_v3_price_key_map_by_id_record(&mut prices)?;
+    write_pg_binary_copy_header(&mut writer)?;
+    let mut digest = Sha256::new();
+    digest.update(V3_FINALIZER_CODE_ROW_HASH_DOMAIN);
     let mut row_count = 0u64;
-    let mut record = [0u8; V3_FINALIZER_STAGE_PRICE_BYTES];
-    while read_exact_optional(&mut stage, &mut record)? {
-        let price_id: [u8; 16] = record[..16].try_into().map_err(to_io_error)?;
-        while current_price.is_some_and(|(id, _)| id < price_id) {
-            current_price = read_v3_price_key_map_by_id_record(&mut prices)?;
-        }
-        let Some((mapped_price_id, price_key)) = current_price else {
+    for (key, code) in code_dictionary.values().enumerate() {
+        let code_key = i32::try_from(key).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "code_key exceeds PostgreSQL int4",
+            )
+        })?;
+        write_v3_code_dictionary_copy_row(
+            &mut writer,
+            code_key,
+            code,
+            rate_counts[key],
+            &mut digest,
+        )?;
+        row_count = row_count.saturating_add(rate_counts[key]);
+    }
+    write_pg_binary_copy_trailer(&mut writer)?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(V3StageWriteSummary {
+        row_count,
+        code_count: code_dictionary.len() as u64,
+        code_digest: digest.finalize().into(),
+    })
+}
+
+fn assign_v3_partition(
+    prepared: &V3PreparedPartition,
+    partition_count: usize,
+    tagged_codec: TaggedServingRunCodec,
+    memory_records: usize,
+    code_map: &DenseIdentityMap,
+    provider_map: &DenseIdentityMap,
+    price_map: &DenseIdentityMap,
+) -> io::Result<V3AssignedPartition> {
+    let started_at = Instant::now();
+    let partition_directory = prepared.sorted_path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "partition path has no parent")
+    })?;
+    let unsorted_path = partition_directory.join("assigned.unsorted");
+    let assigned_path = partition_directory.join("assigned.sorted");
+    let mut writer = BufWriter::new(File::create(&unsorted_path)?);
+    let mut reader = BufReader::new(File::open(&prepared.sorted_path)?);
+    let mut row_count = 0u64;
+    while let Some(tagged) = TaggedServingRunRecord::read_from(&mut reader, tagged_codec)? {
+        let record = tagged.record;
+        let code = code_map.get(&record.code_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "assigned code identity is absent",
+            )
+        })?;
+        let provider = provider_map.get(&record.provider_set_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "assigned provider identity is absent",
+            )
+        })?;
+        if provider.auxiliary != record.provider_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "assigned row price identity is absent from the authoritative price-key map",
-            ));
-        };
-        if mapped_price_id != price_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "assigned row price identity is absent from the authoritative price-key map",
+                "assigned provider identity/count conflicts with immutable dense map",
             ));
         }
-        output.write_all(&record[16..20])?;
-        output.write_all(&record[20..24])?;
-        output.write_all(&price_key.to_be_bytes())?;
-        output.write_all(&record[24..28])?;
-        output.write_all(&record[28..32])?;
+        let price = price_map.get(&record.price_set_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "assigned price identity is absent",
+            )
+        })?;
+        writer.write_all(&code.key.to_be_bytes())?;
+        writer.write_all(&provider.key.to_be_bytes())?;
+        writer.write_all(&price.key.to_be_bytes())?;
+        writer.write_all(&tagged.source_key.to_be_bytes())?;
+        writer.write_all(&record.provider_count.to_be_bytes())?;
         row_count = row_count.saturating_add(1);
     }
-    output.flush()?;
-    output.get_ref().sync_all()?;
-    Ok(row_count)
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    if row_count != prepared.row_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partition assignment changed the source multiset",
+        ));
+    }
+    let sort_stats = external_sort_assigned_serving_records(
+        std::slice::from_ref(&unsorted_path),
+        &assigned_path,
+        partition_directory,
+        memory_records,
+    )?;
+    if sort_stats.input_records != row_count
+        || sort_stats.unique_records != row_count
+        || sort_stats.output_bytes != row_count.saturating_mul(V3_FINALIZER_ASSIGNED_BYTES as u64)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partition-local assignment sort did not preserve every source occurrence",
+        ));
+    }
+    let assigned_bytes = row_count.saturating_mul(V3_FINALIZER_ASSIGNED_BYTES as u64);
+    let scratch = V3ScratchBytes {
+        read: prepared
+            .sort_stats
+            .output_bytes
+            .saturating_add(sort_stats.input_bytes)
+            .saturating_add(sort_stats.spill_bytes),
+        written: assigned_bytes
+            .saturating_add(sort_stats.spill_bytes)
+            .saturating_add(sort_stats.output_bytes),
+    };
+    let elapsed_seconds = started_at.elapsed().as_secs_f64();
+    emit_v3_partition_progress(
+        "assign_sort",
+        prepared.partition,
+        partition_count,
+        row_count,
+        elapsed_seconds,
+        scratch,
+    );
+    Ok(V3AssignedPartition {
+        partition: prepared.partition,
+        assigned_path,
+        row_count,
+        sort_stats,
+        elapsed_seconds,
+        scratch,
+    })
 }
 
 fn pg_binary_i16(field: &[u8], name: &str) -> io::Result<i16> {
@@ -15478,36 +15678,50 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         .tempdir_in(work_parent)?;
     let output = AtomicFinalizerDirectory::new(&options.output_directory)?;
 
+    let code_map = Arc::new(build_v3_code_identity_map(&code_dictionary)?);
+    let worker_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(options.workers.min(inputs.partition_count.max(1)))
+        .thread_name(|index| format!("ptg2-v3-finalizer-{index:02}"))
+        .build()
+        .map_err(to_io_error)?;
+    let partition_jobs = (0..inputs.partition_count)
+        .filter_map(|partition| {
+            let input_paths = inputs
+                .partitions
+                .iter()
+                .filter(|input| input.partition == partition)
+                .map(|input| {
+                    debug_assert_eq!(input.partition_count, inputs.partition_count);
+                    (input.path.clone(), input.source_key)
+                })
+                .collect::<Vec<_>>();
+            (!input_paths.is_empty()).then_some((partition, input_paths))
+        })
+        .collect::<Vec<_>>();
+
     let partition_sort_started_at = Instant::now();
-    let mut sorted_partition_paths = Vec::new();
-    let mut partition_sort_stats = MultiFileSortStats::default();
-    for partition in 0..inputs.partition_count {
-        let input_paths = inputs
-            .partitions
-            .iter()
-            .filter(|input| input.partition == partition)
-            .map(|input| {
-                debug_assert_eq!(input.partition_count, inputs.partition_count);
-                (input.path.clone(), input.source_key)
+    let mut prepared_partitions = worker_pool.install(|| {
+        partition_jobs
+            .into_par_iter()
+            .map(|(partition, input_paths)| {
+                prepare_v3_partition(
+                    partition,
+                    inputs.partition_count,
+                    input_paths,
+                    inputs.tagged_codec,
+                    options.memory_records,
+                    work_directory.path(),
+                    &code_map,
+                )
             })
-            .collect::<Vec<_>>();
-        if input_paths.is_empty() {
-            continue;
-        }
-        let sorted_path = work_directory
-            .path()
-            .join(format!("partition-{partition:03}.sorted"));
-        let stats = external_sort_tagged_partition_files(
-            &input_paths,
-            &sorted_path,
-            work_directory.path(),
-            options.memory_records,
-            partition,
-            inputs.partition_count,
-            inputs.tagged_codec,
-        )?;
-        accumulate_sort_stats(&mut partition_sort_stats, stats);
-        sorted_partition_paths.push(sorted_path);
+            .collect::<io::Result<Vec<_>>>()
+    })?;
+    prepared_partitions.sort_by_key(|partition| partition.partition);
+    let mut partition_sort_stats = MultiFileSortStats::default();
+    let mut preparation_scratch = V3ScratchBytes::default();
+    for prepared in &prepared_partitions {
+        accumulate_sort_stats(&mut partition_sort_stats, prepared.sort_stats);
+        preparation_scratch.add(prepared.scratch);
     }
     if partition_sort_stats.input_records != source_record_count
         || partition_sort_stats.input_bytes != source_run_bytes
@@ -15525,44 +15739,30 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
     }
     let partition_sort_seconds = partition_sort_started_at.elapsed().as_secs_f64();
 
-    let provider_spool_path = work_directory.path().join("providers.unsorted");
-    let price_spool_path = work_directory.path().join("prices.unsorted");
-    let provider_stage_path = work_directory.path().join("assigned-provider.unsorted");
-    let code_copy_path = output.path("code_dictionary.copy");
-    let stage_started_at = Instant::now();
-    let stage_summary = write_v3_finalizer_stage_inputs(
-        &sorted_partition_paths,
-        &code_dictionary,
-        source_encoding,
-        &provider_spool_path,
-        &price_spool_path,
-        &provider_stage_path,
-        &code_copy_path,
-    )?;
-    if stage_summary.row_count != source_record_count {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "sorted serving-row multiset was not preserved into dense assignment staging",
-        ));
-    }
-    let stage_seconds = stage_started_at.elapsed().as_secs_f64();
-
     let identity_sort_started_at = Instant::now();
     let provider_sorted_path = work_directory.path().join("providers.sorted");
     let price_sorted_path = work_directory.path().join("prices.sorted");
+    let provider_spool_paths = prepared_partitions
+        .iter()
+        .map(|partition| partition.provider_spool_path.clone())
+        .collect::<Vec<_>>();
+    let price_spool_paths = prepared_partitions
+        .iter()
+        .map(|partition| partition.price_spool_path.clone())
+        .collect::<Vec<_>>();
     let provider_sort_stats = external_sort_provider_identities(
-        std::slice::from_ref(&provider_spool_path),
+        &provider_spool_paths,
         &provider_sorted_path,
         work_directory.path(),
         options.memory_records,
     )?;
     let price_sort_stats = external_sort_dense_ids(
-        std::slice::from_ref(&price_spool_path),
+        &price_spool_paths,
         &price_sorted_path,
         work_directory.path(),
         options.memory_records,
     )?;
-    if stage_summary.row_count > 0 && price_sort_stats.unique_records == 0 {
+    if source_record_count > 0 && price_sort_stats.unique_records == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "serving rows exist but required price-set identities are absent",
@@ -15608,8 +15808,78 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "authoritative price-key map does not exactly cover source price-set identities",
         ));
     }
+    let provider_map_entries =
+        usize::try_from(provider_sort_stats.unique_records).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider identity map exceeds usize",
+            )
+        })?;
+    let price_map_entries = usize::try_from(price_key_map_stage.row_count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "price identity map exceeds usize",
+        )
+    })?;
+    let provider_map_bytes = DenseIdentityMap::estimated_memory_bytes(provider_map_entries)?;
+    let price_map_bytes = DenseIdentityMap::estimated_memory_bytes(price_map_entries)?;
+    let estimated_identity_map_bytes = code_map
+        .memory_bytes()
+        .checked_add(provider_map_bytes)
+        .and_then(|value| value.checked_add(price_map_bytes))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "identity map memory estimate overflow",
+            )
+        })?;
+    if estimated_identity_map_bytes > options.identity_map_max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "immutable identity maps require {estimated_identity_map_bytes} bytes, exceeding --identity-map-max-bytes {}",
+                options.identity_map_max_bytes
+            ),
+        ));
+    }
+    let provider_map = Arc::new(build_v3_provider_identity_map(
+        &provider_sorted_path,
+        provider_sort_stats.unique_records,
+    )?);
+    let price_map = Arc::new(build_v3_price_identity_map(
+        &price_key_map_by_id_path,
+        price_key_map_stage.row_count,
+    )?);
     let identity_sort_seconds = identity_sort_started_at.elapsed().as_secs_f64();
 
+    let stage_started_at = Instant::now();
+    let mut code_rate_counts = vec![0u64; code_dictionary.len()];
+    for prepared in &prepared_partitions {
+        for &(key, count) in &prepared.code_rate_counts {
+            let slot = code_rate_counts.get_mut(key as usize).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "partition code_key is out of range",
+                )
+            })?;
+            if *slot != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "a code identity crossed leading-bit partitions",
+                ));
+            }
+            *slot = count;
+        }
+    }
+    let code_copy_path = output.path("code_dictionary.copy");
+    let stage_summary =
+        write_v3_code_dictionary_copy(&code_dictionary, &code_rate_counts, &code_copy_path)?;
+    if stage_summary.row_count != source_record_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partition code counts do not preserve the source multiset",
+        ));
+    }
     let provider_dictionary_path = output.path("provider_set_dictionary.copy");
     let (provider_dictionary_rows, provider_digest) =
         write_v3_provider_dictionary_copy(&provider_sorted_path, &provider_dictionary_path)?;
@@ -15619,57 +15889,43 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "provider dictionary output count mismatch",
         ));
     }
+    let stage_seconds = stage_started_at.elapsed().as_secs_f64();
 
     let assignment_started_at = Instant::now();
-    let provider_stage_sorted_path = work_directory.path().join("assigned-provider.sorted");
-    let provider_stage_sort = external_sort_lexicographic_records(
-        std::slice::from_ref(&provider_stage_path),
-        &provider_stage_sorted_path,
-        work_directory.path(),
-        V3_FINALIZER_STAGE_PROVIDER_BYTES,
-        options.memory_records,
-        false,
-    )?;
-    let price_stage_path = work_directory.path().join("assigned-price.unsorted");
-    let provider_join_rows = join_v3_provider_keys(
-        &provider_sorted_path,
-        &provider_stage_sorted_path,
-        &price_stage_path,
-    )?;
-    let price_stage_sorted_path = work_directory.path().join("assigned-price.sorted");
-    let price_stage_sort = external_sort_lexicographic_records(
-        std::slice::from_ref(&price_stage_path),
-        &price_stage_sorted_path,
-        work_directory.path(),
-        V3_FINALIZER_STAGE_PRICE_BYTES,
-        options.memory_records,
-        false,
-    )?;
-    let assigned_unsorted_path = work_directory.path().join("assigned.unsorted");
-    let price_join_rows = join_v3_price_keys(
-        &price_key_map_by_id_path,
-        &price_stage_sorted_path,
-        &assigned_unsorted_path,
-    )?;
-    let assigned_sorted_path = work_directory.path().join("assigned.sorted");
-    let assigned_sort_stats = external_sort_lexicographic_records(
-        std::slice::from_ref(&assigned_unsorted_path),
-        &assigned_sorted_path,
-        work_directory.path(),
-        V3_FINALIZER_ASSIGNED_BYTES,
-        options.memory_records,
-        false,
-    )?;
-    if provider_stage_sort.unique_records != stage_summary.row_count
-        || provider_join_rows != stage_summary.row_count
-        || price_stage_sort.unique_records != stage_summary.row_count
-        || price_join_rows != stage_summary.row_count
-        || assigned_sort_stats.unique_records != stage_summary.row_count
+    let mut assigned_partitions = worker_pool.install(|| {
+        prepared_partitions
+            .par_iter()
+            .map(|prepared| {
+                assign_v3_partition(
+                    prepared,
+                    inputs.partition_count,
+                    inputs.tagged_codec,
+                    options.memory_records,
+                    &code_map,
+                    &provider_map,
+                    &price_map,
+                )
+            })
+            .collect::<io::Result<Vec<_>>>()
+    })?;
+    assigned_partitions.sort_by_key(|partition| partition.partition);
+    let mut assigned_sort_stats = MultiFileSortStats::default();
+    let mut assignment_scratch = V3ScratchBytes::default();
+    for assigned in &assigned_partitions {
+        accumulate_sort_stats(&mut assigned_sort_stats, assigned.sort_stats);
+        assignment_scratch.add(assigned.scratch);
+    }
+    if assigned_sort_stats.unique_records != stage_summary.row_count
         || assigned_sort_stats.input_records != stage_summary.row_count
+        || assigned_partitions
+            .iter()
+            .map(|value| value.row_count)
+            .sum::<u64>()
+            != stage_summary.row_count
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-                "source serving-row multiset was not exactly preserved through dense-key external joins",
+            "source serving-row multiset was not exactly preserved through partition-local assignment",
         ));
     }
     let assignment_seconds = assignment_started_at.elapsed().as_secs_f64();
@@ -15681,8 +15937,12 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         .create_new(true)
         .open(&serving_blocks_path)?;
     let mut serving_blocks_writer = CountingWriter::new(BufWriter::new(serving_blocks_file));
+    let assigned_paths = assigned_partitions
+        .iter()
+        .map(|partition| partition.assigned_path.clone())
+        .collect::<Vec<_>>();
     let mut assigned_stream =
-        AssignedPgBinaryStream::new(&assigned_sorted_path, assigned_sort_stats.unique_records)?;
+        AssignedPgBinaryStream::new_many(assigned_paths, assigned_sort_stats.unique_records)?;
     let assigned_summary =
         write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_provenance(
             &mut assigned_stream,
@@ -15777,6 +16037,42 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         ));
     }
 
+    let price_map_stage_bytes = price_key_map_stage
+        .row_count
+        .saturating_mul(V3_FINALIZER_PRICE_KEY_MAP_RECORD_BYTES as u64);
+    let identity_scratch = V3ScratchBytes {
+        read: provider_sort_stats
+            .input_bytes
+            .saturating_add(provider_sort_stats.spill_bytes)
+            .saturating_add(price_sort_stats.input_bytes)
+            .saturating_add(price_sort_stats.spill_bytes)
+            .saturating_add(price_key_map_sort_stats.input_bytes)
+            .saturating_add(price_key_map_sort_stats.spill_bytes),
+        written: provider_sort_stats
+            .spill_bytes
+            .saturating_add(provider_sort_stats.output_bytes)
+            .saturating_add(price_sort_stats.spill_bytes)
+            .saturating_add(price_sort_stats.output_bytes)
+            .saturating_add(price_map_stage_bytes.saturating_mul(2))
+            .saturating_add(price_key_map_sort_stats.spill_bytes)
+            .saturating_add(price_key_map_sort_stats.output_bytes),
+    };
+    let encoding_scratch = V3ScratchBytes {
+        read: assigned_sort_stats
+            .output_bytes
+            .saturating_add(price_key_map_sort_stats.output_bytes),
+        written: 0,
+    };
+    let mut total_scratch = V3ScratchBytes::default();
+    for stage in [
+        preparation_scratch,
+        identity_scratch,
+        assignment_scratch,
+        encoding_scratch,
+    ] {
+        total_scratch.add(stage);
+    }
+
     let summary = json!({
         "format": "ptg2_v3_direct_finalizer_v3",
         "storage_generation": REQUIRED_STORAGE_GENERATION,
@@ -15820,10 +16116,26 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "source_ids_exact_match": true,
             "dictionary_external_sort": sort_stats_payload(price_key_map_sort_stats),
         },
-        "dense_assignment_sorts": {
-            "provider": sort_stats_payload(provider_stage_sort),
-            "price": sort_stats_payload(price_stage_sort),
-            "assigned": sort_stats_payload(assigned_sort_stats),
+        "partition_assignment_sorts": {
+            "strategy": "immutable_dense_maps_partition_local_v1",
+            "global_assignment_cascade": false,
+            "record_bytes": V3_FINALIZER_ASSIGNED_BYTES,
+            "aggregate": sort_stats_payload(assigned_sort_stats),
+            "partitions": assigned_partitions.iter().map(|partition| json!({
+                "partition": partition.partition,
+                "row_count": partition.row_count,
+                "elapsed_seconds": partition.elapsed_seconds,
+                "scratch_bytes_read": partition.scratch.read,
+                "scratch_bytes_written": partition.scratch.written,
+                "sort": sort_stats_payload(partition.sort_stats),
+            })).collect::<Vec<_>>(),
+        },
+        "identity_maps": {
+            "implementation": "immutable_open_addressed_128_v1",
+            "code": {"entries": code_map.len(), "memory_bytes": code_map.memory_bytes()},
+            "provider_set": {"entries": provider_map.len(), "memory_bytes": provider_map.memory_bytes()},
+            "price": {"entries": price_map.len(), "memory_bytes": price_map.memory_bytes()},
+            "total_memory_bytes": code_map.memory_bytes().saturating_add(provider_map.memory_bytes()).saturating_add(price_map.memory_bytes()),
         },
         "dense_keys": {
             "code": {"count": stage_summary.code_count, "minimum": (stage_summary.code_count > 0).then_some(0), "maximum": stage_summary.code_count.checked_sub(1)},
@@ -15895,7 +16207,24 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "price_atom_inputs": options.price_atom_inputs.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
             "fused": false,
         },
-        "memory_record_limit": options.memory_records,
+        "workers": options.workers.min(inputs.partition_count.max(1)),
+        "memory_record_limit_per_worker": options.memory_records,
+        "identity_map_max_bytes": options.identity_map_max_bytes,
+        "scratch_io": {
+            "definition": "temporary finalizer files only; source reads and committed outputs excluded",
+            "prepare": {"bytes_read": preparation_scratch.read, "bytes_written": preparation_scratch.written},
+            "identity_maps": {"bytes_read": identity_scratch.read, "bytes_written": identity_scratch.written},
+            "partition_assignment": {"bytes_read": assignment_scratch.read, "bytes_written": assignment_scratch.written},
+            "block_encoding": {"bytes_read": encoding_scratch.read, "bytes_written": encoding_scratch.written},
+            "total_bytes_read": total_scratch.read,
+            "total_bytes_written": total_scratch.written,
+        },
+        "partition_progress": prepared_partitions.iter().map(|partition| json!({
+            "partition": partition.partition,
+            "row_count": partition.row_count,
+            "prepare_seconds": partition.elapsed_seconds,
+            "assignment_seconds": assigned_partitions.iter().find(|assigned| assigned.partition == partition.partition).map(|assigned| assigned.elapsed_seconds),
+        })).collect::<Vec<_>>(),
         "timings": {
             "validation_seconds": validation_seconds,
             "partition_sort_seconds": partition_sort_seconds,
@@ -18755,6 +19084,8 @@ mod tests {
             output_directory: output_a.clone(),
             manifest_paths: vec![manifest_a.clone(), manifest_b.clone()],
             memory_records: 1,
+            workers: 2,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input: price_key_map_input.clone(),
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
@@ -18765,6 +19096,8 @@ mod tests {
             output_directory: output_b.clone(),
             manifest_paths: vec![manifest_b, manifest_a],
             memory_records: 1,
+            workers: 2,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
@@ -18934,6 +19267,194 @@ mod tests {
     }
 
     #[test]
+    fn direct_v3_finalizer_matches_reference_on_randomized_duplicate_heavy_rows() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        let _compression = TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV, "none");
+        let _block_bytes = TestEnvVar::set(PTG2_SERVING_BINARY_BLOCK_BYTES_ENV, "65536");
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-direct-v3-finalizer-randomized-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let codes = [
+            "10001", "10002", "10003", "10004", "20001", "20002", "20003", "20004", "30001",
+            "30002", "30003", "30004", "40001", "40002", "40003", "40004",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let mut rows = Vec::new();
+        for index in 0..600usize {
+            let code_index = next() as usize % codes.len();
+            let provider_index = next() as usize % 24;
+            let price_index = next() as usize % 17;
+            let row = V3FinalizerTestRow {
+                coverage_scope_id: [0x71; COVERAGE_SCOPE_ID_BYTES],
+                code_system: Some("CPT"),
+                code: Some(codes[code_index]),
+                negotiation_arrangement: Some(if code_index.is_multiple_of(2) {
+                    "FFS"
+                } else {
+                    "BUNDLE"
+                }),
+                provider_id: prefixed_test_id(0x3100, provider_index as u8 + 1),
+                price_id: prefixed_test_id(0x4200, price_index as u8 + 1),
+                provider_count: provider_index as u32 + 1,
+            };
+            rows.push(row.clone());
+            if index.is_multiple_of(2) {
+                rows.push(row.clone());
+            }
+            if index.is_multiple_of(7) {
+                rows.push(row);
+            }
+        }
+        let manifest = write_v3_finalizer_test_manifest(&base, "randomized", &rows);
+        let price_ids_in_key_order = (0..17usize)
+            .rev()
+            .map(|index| prefixed_test_id(0x4200, index as u8 + 1))
+            .collect::<Vec<_>>();
+        let price_key_map_input =
+            write_v3_finalizer_test_price_key_map(&base, "randomized", &price_ids_in_key_order);
+        let output = base.join("output");
+        let summary = finalize_v3_runs(&V3FinalizerOptions {
+            output_directory: output.clone(),
+            manifest_paths: vec![manifest],
+            memory_records: 13,
+            workers: 4,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
+            price_key_map_input,
+            price_membership_inputs: Vec::new(),
+            price_atom_inputs: Vec::new(),
+        })
+        .unwrap();
+
+        let (reference_serving, reference_price) =
+            reference_v3_assigned_records(&rows, &output, &price_ids_in_key_order);
+        assert_eq!(
+            read_test_shared_binary_records(
+                std::fs::read(output.join("shared_serving_blocks.copy")).unwrap()
+            ),
+            reference_serving
+        );
+        assert_eq!(
+            read_test_shared_binary_records(
+                std::fs::read(output.join("shared_price_dictionary_blocks.copy")).unwrap()
+            ),
+            reference_price
+        );
+        assert_eq!(summary["preservation"]["source_records"], rows.len() as u64);
+        assert!(
+            summary["preservation"]["duplicate_serving_records"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            summary["partition_assignment_sorts"]["strategy"],
+            "immutable_dense_maps_partition_local_v1"
+        );
+        assert_eq!(
+            summary["partition_assignment_sorts"]["global_assignment_cascade"],
+            false
+        );
+        assert!(summary.get("dense_assignment_sorts").is_none());
+        assert!(
+            summary["scratch_io"]["total_bytes_written"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn strict_v3_source_has_no_global_assignment_cascade_artifacts() {
+        let source = include_str!("main.rs");
+        for obsolete in [
+            ["assigned", "-provider.unsorted"].concat(),
+            ["assigned", "-price.unsorted"].concat(),
+            ["join_v3_", "provider_keys"].concat(),
+            ["join_v3_", "price_keys"].concat(),
+        ] {
+            assert!(
+                !source.contains(&obsolete),
+                "obsolete V3 cascade artifact: {obsolete}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "focused release-mode V3 finalizer benchmark"]
+    fn benchmark_v3_finalizer_250k_duplicate_heavy_rows() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        let _compression = TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV, "none");
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-v3-finalizer-benchmark-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let codes = [
+            "10001", "10002", "10003", "10004", "20001", "20002", "20003", "20004", "30001",
+            "30002", "30003", "30004", "40001", "40002", "40003", "40004",
+        ];
+        let rows = (0..250_000usize)
+            .map(|index| {
+                let duplicate_bucket = index / 2;
+                let code_index = duplicate_bucket % codes.len();
+                let provider_index = duplicate_bucket % 64;
+                let price_index = duplicate_bucket % 32;
+                V3FinalizerTestRow {
+                    coverage_scope_id: [0x73; COVERAGE_SCOPE_ID_BYTES],
+                    code_system: Some("CPT"),
+                    code: Some(codes[code_index]),
+                    negotiation_arrangement: Some("FFS"),
+                    provider_id: prefixed_test_id(0x5100, provider_index as u8 + 1),
+                    price_id: prefixed_test_id(0x6200, price_index as u8 + 1),
+                    provider_count: provider_index as u32 + 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let manifest = write_v3_finalizer_test_manifest(&base, "benchmark", &rows);
+        let price_ids = (0..32usize)
+            .rev()
+            .map(|index| prefixed_test_id(0x6200, index as u8 + 1))
+            .collect::<Vec<_>>();
+        let price_key_map_input =
+            write_v3_finalizer_test_price_key_map(&base, "benchmark", &price_ids);
+        let output = base.join("output");
+        let started_at = Instant::now();
+        let summary = finalize_v3_runs(&V3FinalizerOptions {
+            output_directory: output,
+            manifest_paths: vec![manifest],
+            memory_records: 50_000,
+            workers: 8,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
+            price_key_map_input,
+            price_membership_inputs: Vec::new(),
+            price_atom_inputs: Vec::new(),
+        })
+        .unwrap();
+        eprintln!(
+            "{}",
+            json!({
+                "benchmark": "v3_finalizer_250k_duplicate_heavy_rows",
+                "elapsed_seconds": started_at.elapsed().as_secs_f64(),
+                "scratch_io": summary["scratch_io"],
+                "timings": summary["timings"],
+            })
+        );
+        assert_eq!(summary["preservation"]["encoded_records"], 250_000);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn direct_v3_finalizer_preserves_dense_source_provenance_and_multiplicity() {
         let _env_lock = scanner_env_lock().lock().unwrap();
         let _compression = TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV, "none");
@@ -18968,6 +19489,8 @@ mod tests {
             output_directory: output.clone(),
             manifest_paths: vec![source_one, source_zero],
             memory_records: 1,
+            workers: 2,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
@@ -19333,6 +19856,8 @@ mod tests {
             output_directory: output.clone(),
             manifest_paths: vec![manifest_a, manifest_b],
             memory_records: 1,
+            workers: 2,
+            identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),

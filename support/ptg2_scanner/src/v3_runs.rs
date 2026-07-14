@@ -1523,6 +1523,7 @@ pub fn external_sort_tagged_partition_files(
 
 pub const DENSE_ID_RECORD_BYTES: usize = 16;
 pub const PROVIDER_IDENTITY_RECORD_BYTES: usize = 20;
+pub const ASSIGNED_SERVING_RECORD_BYTES: usize = 20;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DenseIdRecord(pub [u8; 16]);
@@ -1532,6 +1533,9 @@ pub struct ProviderIdentityRecord {
     pub id: [u8; 16],
     pub provider_count: u32,
 }
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AssignedServingRecord(pub [u8; ASSIGNED_SERVING_RECORD_BYTES]);
 
 impl PartialEq for ProviderIdentityRecord {
     fn eq(&self, other: &Self) -> bool {
@@ -1615,6 +1619,22 @@ impl FixedSortRecord for ProviderIdentityRecord {
     }
 }
 
+impl FixedSortRecord for AssignedServingRecord {
+    const BYTE_COUNT: usize = ASSIGNED_SERVING_RECORD_BYTES;
+
+    fn read_from<R: Read>(reader: &mut R) -> io::Result<Option<Self>> {
+        read_fixed_bytes(reader, "assigned serving record").map(|value| value.map(Self))
+    }
+
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(&self.0)
+    }
+
+    fn validate_duplicate(&self, _duplicate: &Self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub fn external_sort_dense_ids(
     input_paths: &[PathBuf],
     output_path: impl AsRef<Path>,
@@ -1626,6 +1646,7 @@ pub fn external_sort_dense_ids(
         output_path.as_ref(),
         temporary_directory.as_ref(),
         in_memory_record_limit,
+        true,
     )
 }
 
@@ -1640,6 +1661,23 @@ pub fn external_sort_provider_identities(
         output_path.as_ref(),
         temporary_directory.as_ref(),
         in_memory_record_limit,
+        true,
+    )
+}
+
+/// Sorts dense assigned rows while preserving every duplicate occurrence.
+pub fn external_sort_assigned_serving_records(
+    input_paths: &[PathBuf],
+    output_path: impl AsRef<Path>,
+    temporary_directory: impl AsRef<Path>,
+    in_memory_record_limit: usize,
+) -> io::Result<MultiFileSortStats> {
+    external_sort_fixed_records::<AssignedServingRecord>(
+        input_paths,
+        output_path.as_ref(),
+        temporary_directory.as_ref(),
+        in_memory_record_limit,
+        false,
     )
 }
 
@@ -1883,6 +1921,7 @@ fn external_sort_fixed_records<T: FixedSortRecord>(
     output_path: &Path,
     temporary_directory: &Path,
     in_memory_record_limit: usize,
+    dedupe: bool,
 ) -> io::Result<MultiFileSortStats> {
     if in_memory_record_limit == 0 {
         return Err(io::Error::new(
@@ -1935,7 +1974,7 @@ fn external_sort_fixed_records<T: FixedSortRecord>(
             .map(|metadata| total.saturating_add(metadata.len()))
     })?;
     let (run_paths, intermediate_duplicates, intermediate_spill_bytes) =
-        reduce_fixed_sort_runs::<T>(run_paths, temporary_directory, &mut temporary_files)?;
+        reduce_fixed_sort_runs::<T>(run_paths, temporary_directory, &mut temporary_files, dedupe)?;
     spill_bytes = spill_bytes.saturating_add(intermediate_spill_bytes);
     fs::create_dir_all(usable_parent(output_path))?;
     let (staged_path, staged_file) =
@@ -1943,7 +1982,7 @@ fn external_sort_fixed_records<T: FixedSortRecord>(
     temporary_files.track(staged_path.clone());
     let mut writer = BufWriter::with_capacity(DEFAULT_SORT_BUFFER_BYTES, staged_file);
     let (unique_records, final_duplicates) =
-        merge_fixed_sort_runs::<T, _>(&run_paths, &mut writer)?;
+        merge_fixed_sort_runs::<T, _>(&run_paths, &mut writer, dedupe)?;
     let duplicate_records = intermediate_duplicates.saturating_add(final_duplicates);
     writer.flush()?;
     writer.get_ref().sync_all()?;
@@ -1990,6 +2029,7 @@ fn spill_fixed_sort_run<T: FixedSortRecord>(
 fn merge_fixed_sort_runs<T: FixedSortRecord, W: Write>(
     run_paths: &[PathBuf],
     writer: &mut W,
+    dedupe: bool,
 ) -> io::Result<(u64, u64)> {
     let mut readers = run_paths
         .iter()
@@ -2006,7 +2046,7 @@ fn merge_fixed_sort_runs<T: FixedSortRecord, W: Write>(
     let mut duplicate_records = 0u64;
     while let Some(Reverse((record, reader_index))) = heap.pop() {
         if let Some(previous_record) = previous {
-            if record == previous_record {
+            if dedupe && record == previous_record {
                 previous_record.validate_duplicate(&record)?;
                 duplicate_records = duplicate_records.saturating_add(1);
             } else {
@@ -2030,6 +2070,7 @@ fn reduce_fixed_sort_runs<T: FixedSortRecord>(
     mut run_paths: Vec<PathBuf>,
     temporary_directory: &Path,
     temporary_files: &mut TemporaryFiles,
+    dedupe: bool,
 ) -> io::Result<(Vec<PathBuf>, u64, u64)> {
     let mut duplicate_records = 0u64;
     let mut spill_bytes = 0u64;
@@ -2045,7 +2086,7 @@ fn reduce_fixed_sort_runs<T: FixedSortRecord>(
             temporary_files.track(path.clone());
             let mut writer = BufWriter::with_capacity(DEFAULT_SORT_BUFFER_BYTES, file);
             let (_output_records, group_duplicates) =
-                merge_fixed_sort_runs::<T, _>(group, &mut writer)?;
+                merge_fixed_sort_runs::<T, _>(group, &mut writer, dedupe)?;
             writer.flush()?;
             drop(writer);
             duplicate_records = duplicate_records.saturating_add(group_duplicates);
@@ -3180,6 +3221,35 @@ mod tests {
         assert_eq!(stats.duplicate_records, 1);
         assert_eq!(stats.output_bytes, 4 * SERVING_RUN_RECORD_BYTES as u64);
         assert_eq!(read_records(&output), vec![first, first, second, third]);
+    }
+
+    #[test]
+    fn assigned_sort_is_fixed_width_and_preserves_duplicate_multiplicity() {
+        let base = TestDirectory::new("assigned-multiset");
+        let input = base.join("assigned.bin");
+        let output = base.join("assigned.sorted");
+        let mut first = [0u8; ASSIGNED_SERVING_RECORD_BYTES];
+        first[3] = 1;
+        let mut second = [0u8; ASSIGNED_SERVING_RECORD_BYTES];
+        second[3] = 2;
+        let mut writer = BufWriter::new(File::create(&input).unwrap());
+        for record in [second, first, first, second, first] {
+            writer.write_all(&record).unwrap();
+        }
+        writer.flush().unwrap();
+
+        let stats =
+            external_sort_assigned_serving_records(&[input], &output, base.join("temporary"), 1)
+                .unwrap();
+
+        assert_eq!(stats.input_records, 5);
+        assert_eq!(stats.unique_records, 5);
+        assert_eq!(stats.duplicate_records, 0);
+        assert_eq!(stats.output_bytes, 5 * ASSIGNED_SERVING_RECORD_BYTES as u64);
+        assert_eq!(
+            fs::read(output).unwrap(),
+            [first, first, first, second, second].concat()
+        );
     }
 
     #[test]
