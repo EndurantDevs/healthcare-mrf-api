@@ -94,7 +94,9 @@ jobs:
           tests/test_entity_address_unified_no_live_mutation.py
           tests/test_provider_directory_endpoint_dataset_schema.py
           tests/test_provider_directory_pagination_checkpoint_schema.py
+          tests/test_provider_directory_pagination_census_schema.py
           tests/test_provider_directory_pagination_root_identity_schema.py
+          tests/test_provider_directory_endpoint_acquisition_support.py
           tests/test_provider_directory_schema_sync.py
           tests/test_provider_directory_bulk_checkpoint_schema.py
           tests/test_generate_provider_directory_support_docs.py
@@ -363,6 +365,7 @@ jobs:
         run: >
           python -m pytest -q
           tests/test_provider_directory_migration_adoption_postgres.py
+          tests/test_provider_directory_caresource_census_db.py
           tests/test_mrf_file_source_cursor_migration.py
       - name: Run fresh-migrated PTG2 v3 PostgreSQL lifecycle gate
         env:

@@ -1006,7 +1006,9 @@ FHIR_CONTINUATION_QUERY_NAMES = frozenset(
         "_getpagesid",
         "_getpagesoffset",
         "_offset",
+        "_page",
         "_page_token",
+        "_searchid",
         "_skip",
         "cursor",
         "cursormark",
@@ -24083,19 +24085,37 @@ async def _fetch_resource_rows(
                         has_restart_attempted=has_restart_attempted,
                     )
                 ):
-                    await _clear_checkpoint_dataset_resource_type(
+                    await _reset_pagination_checkpoint(
                         checkpoint_context,
                         resource_type,
+                        checkpoint_start_url,
+                        hashlib.sha256(
+                            checkpoint_start_url.encode("utf-8")
+                        ).hexdigest(),
                     )
-                    await _save_pagination_checkpoint(
-                        checkpoint_context,
-                        resource_type,
+                    resume_state = PaginationResumeState(
                         next_url=checkpoint_start_url,
                         pages_processed=0,
                         rows_processed=0,
-                        recent_url_hashes=[],
+                        recent_url_hashes=(),
                     )
+                    if is_caresource_census_enabled:
+                        prepared_census = await _prepare_caresource_pre_census(
+                            source_record,
+                            resource_type,
+                            model,
+                            checkpoint_context,
+                            resume_state,
+                            checkpoint_start_url,
+                            timeout=resource_timeout,
+                        )
+                        if isinstance(prepared_census, ResourceFetchResult):
+                            return prepared_census
+                        caresource_proof_by_field = prepared_census
+                    retained_resource_rows.clear()
+                    pending_rows.clear()
                     rows_fetched = 0
+                    fetch_counts_by_name["rows_written"] = 0
                     pages = 0
                     seen_urls.clear()
                     recent_url_hashes.clear()
@@ -28099,6 +28119,7 @@ def _empty_pagination_checkpoint_restart_sql() -> str:
                pages_processed = 0,
                rows_processed = 0,
                recent_cursor_hashes = '[]'::jsonb,
+               completeness_json = '{{}}'::jsonb,
                created_at = now(),
                updated_at = now(),
                completed_at = NULL
@@ -28411,8 +28432,9 @@ async def _finalize_source_pagination_checkpoints(
     resume_required_entries: set[str] | None,
     *,
     require_complete_resources: bool = False,
+    retain_complete_checkpoint: bool = False,
 ) -> None:
-    """Clear complete checkpoints or classify incomplete work for the caller."""
+    """Classify pagination and clear proof only when its dataset is durable."""
     incomplete_resource_types = [
         resource_type
         for resource_type, diagnostic in diagnostics_by_resource.items()
@@ -28431,6 +28453,8 @@ async def _finalize_source_pagination_checkpoints(
         return
     context = source_record.get("_pagination_checkpoint_context")
     if not isinstance(context, PaginationCheckpointContext):
+        return
+    if retain_complete_checkpoint:
         return
     await _clear_pagination_checkpoints(
         context,
@@ -30504,6 +30528,34 @@ async def _finalize_endpoint_dataset_candidate(
     }
 
 
+async def _clear_finalized_endpoint_dataset_pagination_checkpoints(
+    candidate: EndpointDatasetCandidate | None,
+    finalization: dict[str, Any] | None,
+) -> None:
+    """Drop acquisition checkpoints only after immutable dataset validation."""
+    if candidate is None or candidate.checkpoint_context is None:
+        return
+    is_finalized = bool(
+        candidate.already_validated
+        or candidate.already_published
+        or (
+            finalization
+            and (
+                finalization.get("validated") is True
+                or finalization.get("published") is True
+                or finalization.get("status")
+                in {ENDPOINT_DATASET_VALIDATED, ENDPOINT_DATASET_PUBLISHED}
+            )
+        )
+    )
+    if not is_finalized:
+        return
+    await _clear_pagination_checkpoints(
+        candidate.checkpoint_context,
+        list(candidate.selected_resources),
+    )
+
+
 async def _prepare_resource_import_source_group(
     source_records: list[dict[str, Any]],
     resources: list[str],
@@ -30635,6 +30687,37 @@ def _is_finalized_endpoint_dataset_candidate(
     return bool(
         candidate is not None
         and (candidate.already_validated or candidate.already_published)
+    )
+
+
+async def _replay_finalized_candidate_and_clear_checkpoints(
+    candidate: EndpointDatasetCandidate,
+    resource_completion: dict[str, set[str]] | None,
+) -> ResourceImportGroupResult:
+    """Return replay proof and retire its completed acquisition checkpoints."""
+    import_summary = _finalized_endpoint_dataset_import_summary(
+        candidate,
+        resource_completion,
+    )
+    await _clear_finalized_endpoint_dataset_pagination_checkpoints(
+        candidate,
+        None,
+    )
+    return import_summary
+
+
+async def _finalize_candidate_and_clear_checkpoints(
+    candidate: EndpointDatasetCandidate | None,
+    diagnostics_by_resource: dict[str, dict[str, Any]],
+) -> None:
+    """Validate a candidate before retiring its acquisition checkpoints."""
+    finalization = await _finalize_endpoint_dataset_candidate(
+        candidate,
+        diagnostics_by_resource,
+    )
+    await _clear_finalized_endpoint_dataset_pagination_checkpoints(
+        candidate,
+        finalization,
     )
 
 
@@ -30929,6 +31012,9 @@ async def _import_resources(
                 import_summary[1],
                 pagination_resume_required,
                 require_complete_resources=require_complete_resources,
+                retain_complete_checkpoint=bool(
+                    source.get("_endpoint_dataset_id")
+                ),
             )
             _record_uhc_plan_graph_completion(
                 resource_completion,
@@ -31310,6 +31396,9 @@ async def _import_resources(
             source_resource_diagnostics,
             pagination_resume_required,
             require_complete_resources=require_complete_resources,
+            retain_complete_checkpoint=bool(
+                source.get("_endpoint_dataset_id")
+            ),
         )
         return (
             source_ids,
@@ -31328,9 +31417,7 @@ async def _import_resources(
     )
     stale_ready_source_ids_by_resource: dict[str, set[str]] = {}
 
-    async def run_with_limit(
-        source_records: list[dict[str, Any]],
-    ) -> ResourceImportGroupResult:
+    async def run_with_limit(source_records: list[dict[str, Any]]) -> ResourceImportGroupResult:
         """Run one import coroutine under the shared concurrency limit."""
         async with semaphore:
             candidate: EndpointDatasetCandidate | None = None
@@ -31365,16 +31452,18 @@ async def _import_resources(
                     )
                     if _is_finalized_endpoint_dataset_candidate(candidate):
                         assert candidate is not None
-                        return _finalized_endpoint_dataset_import_summary(
-                            candidate,
-                            resource_completion,
+                        return await (
+                            _replay_finalized_candidate_and_clear_checkpoints(
+                                candidate,
+                                resource_completion,
+                            )
                         )
                     try:
                         import_summary = await import_one_group(
                             prepared_source_records
                         )
                         diagnostics_by_resource = import_summary[1]
-                        await _finalize_endpoint_dataset_candidate(
+                        await _finalize_candidate_and_clear_checkpoints(
                             candidate,
                             diagnostics_by_resource,
                         )
