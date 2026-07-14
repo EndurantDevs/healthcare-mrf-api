@@ -84,6 +84,7 @@ def test_pagination_checkpoint_model_keeps_only_bounded_resume_metadata():
 
     assert isinstance(table.c.source_ids.type, sa.JSON)
     assert isinstance(table.c.recent_cursor_hashes.type, sa.JSON)
+    assert isinstance(table.c.completeness_json.type, sa.JSON)
     assert isinstance(table.c.pages_processed.type, sa.BigInteger)
     assert isinstance(table.c.rows_processed.type, sa.BigInteger)
     assert table.c.pages_processed.nullable is False
@@ -92,6 +93,8 @@ def test_pagination_checkpoint_model_keeps_only_bounded_resume_metadata():
     assert table.c.rows_processed.default.arg == 0
     assert table.c.recent_cursor_hashes.default.is_callable
     assert table.c.recent_cursor_hashes.default.arg(None) == []
+    assert table.c.completeness_json.default.is_callable
+    assert table.c.completeness_json.default.arg(None) == {}
     assert tuple(table.c.keys())[-3:] == ("created_at", "updated_at", "completed_at")
     assert {
         "index_elements": ("owner_run_id",),
@@ -148,7 +151,7 @@ def test_pagination_checkpoint_migration_matches_model_and_parent(monkeypatch):
     revision_model_columns = tuple(
         column_name
         for column_name in ProviderDirectoryPaginationCheckpoint.__table__.c.keys()
-        if column_name != "acquisition_root_run_id"
+        if column_name not in {"acquisition_root_run_id", "completeness_json"}
     )
     assert tuple(recorded_columns_by_name) == revision_model_columns
     assert isinstance(recorded_columns_by_name["source_ids"].type, postgresql.JSONB)

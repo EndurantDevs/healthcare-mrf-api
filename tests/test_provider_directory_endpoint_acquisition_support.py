@@ -31,6 +31,15 @@ def _scan_success_metrics(entry):
     }
 
 
+def _caresource_acquisition_entry():
+    return {
+        "canonical_base": support.CARESOURCE_PROVIDER_DIRECTORY_BASE,
+        "classification": "acquisition",
+        "source_ids": ["pdfhir_b627b38e07cae99151baa4b7"],
+        "resources": ["PractitionerRole"],
+    }
+
+
 def _add_last_updated_proof(resource_stats, count):
     resource_stats.update(
         {
@@ -39,6 +48,19 @@ def _add_last_updated_proof(resource_stats, count):
             **{
                 metric_name: count
                 for metric_name in support.LAST_UPDATED_PROOF_METRIC_NAMES
+            },
+        }
+    )
+
+
+def _add_caresource_proof(resource_stats, count):
+    resource_stats.update(
+        {
+            "caresource_opaque_cursor_sources": 1,
+            "caresource_opaque_cursor_verified_sources": 1,
+            **{
+                metric_name: count
+                for metric_name in support.CARESOURCE_PROOF_METRIC_NAMES
             },
         }
     )
@@ -76,5 +98,40 @@ def test_scan_metrics_reject_missing_or_drifted_last_updated_proof():
 
     assert (
         "Practitioner last-updated completeness counts do not reconcile"
+        in support.acquisition_metric_errors(entry, metrics)
+    )
+
+
+@pytest.mark.parametrize("resource_count", [0, 1828628])
+def test_caresource_metrics_require_reconciled_opaque_cursor_census(resource_count):
+    entry = _caresource_acquisition_entry()
+    metrics = _scan_success_metrics(entry)
+    role_stats = metrics["resource_fetch_stats"].pop("Practitioner")
+    metrics["resource_fetch_stats"]["PractitionerRole"] = role_stats
+    metrics["resource_fetch_completed_source_ids"] = {
+        "PractitionerRole": entry["source_ids"]
+    }
+    _add_caresource_proof(role_stats, resource_count)
+
+    assert support.acquisition_metric_errors(entry, metrics) == []
+
+
+def test_caresource_metrics_reject_missing_or_drifted_census_proof():
+    entry = _caresource_acquisition_entry()
+    metrics = _scan_success_metrics(entry)
+    role_stats = metrics["resource_fetch_stats"].pop("Practitioner")
+    metrics["resource_fetch_stats"]["PractitionerRole"] = role_stats
+    metrics["resource_fetch_completed_source_ids"] = {
+        "PractitionerRole": entry["source_ids"]
+    }
+
+    missing_errors = support.acquisition_metric_errors(entry, metrics)
+
+    assert any("lacks verified CareSource census proof" in error for error in missing_errors)
+    _add_caresource_proof(role_stats, 1828628)
+    role_stats["caresource_opaque_cursor_post_count"] = 1828629
+
+    assert (
+        "PractitionerRole CareSource census counts do not reconcile"
         in support.acquisition_metric_errors(entry, metrics)
     )

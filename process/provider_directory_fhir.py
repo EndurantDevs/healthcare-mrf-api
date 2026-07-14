@@ -76,6 +76,7 @@ from process.ext.address_canon import resolve_into_archive
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import ensure_database
 from process.provider_directory_time_partition import (
+    CountKind,
     CountObservation,
     PartitionPlan,
     PartitionPlanError,
@@ -712,6 +713,16 @@ CARESOURCE_PROVIDER_DIRECTORY_METADATA_URL = (
 CARESOURCE_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     {"InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location"}
 )
+CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION = (
+    "provider-directory-fhir-caresource-opaque-cursor-v1"
+)
+CARESOURCE_OPAQUE_CURSOR_FETCH_MODE = "caresource_opaque_cursor"
+CARESOURCE_OPAQUE_CURSOR_BLOCKED_ERROR = (
+    "provider_directory_caresource_opaque_cursor_completeness_blocked"
+)
+CARESOURCE_OPAQUE_CURSOR_RETRYABLE_ERROR = (
+    "provider_directory_caresource_opaque_cursor_completeness_retryable"
+)
 EXPECTED_NONEMPTY_RESOURCE_ERROR = (
     "provider_directory_expected_nonempty_resource_returned_zero_rows"
 )
@@ -881,6 +892,7 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
     (UHC_PROVIDER_DIRECTORY_BASE, "InsurancePlan"): 1,
 }
 PREFERRED_FULL_REFRESH_PAGE_COUNT_BY_BASE = {
+    CARESOURCE_PROVIDER_DIRECTORY_BASE: 1000,
     HAP_PROVIDER_DIRECTORY_BASE: 1000,
 }
 SOURCE_REQUEST_INTERVAL_SECONDS_BY_BASE = {
@@ -1375,6 +1387,23 @@ class PaginationResumeState:
     recent_url_hashes: tuple[str, ...]
     complete: bool = False
     resumed: bool = False
+    completeness: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CareSourceCensusFetch:
+    count: int | None
+    error: str | None = None
+    transient: bool = False
+    retry_not_before: str | None = None
+
+
+@dataclass(frozen=True)
+class CareSourceOpaqueCursorOutcome:
+    proof: dict[str, Any]
+    error: str | None = None
+    retryable: bool = False
+    retry_not_before: str | None = None
 
 
 @dataclass
@@ -2509,14 +2538,14 @@ def _candidate_base_urls(source: dict[str, Any]) -> list[str]:
 
 def _candidate_metadata_urls(source: dict[str, Any]) -> list[tuple[str, str]]:
     urls: list[tuple[str, str]] = []
-    seen: set[str] = set()
+    seen_metadata_urls: set[str] = set()
     metadata = _source_metadata(source)
     for explicit_url in (
         metadata.get("provider_directory_confirmed_metadata_url"),
         metadata.get("metadata_url"),
     ):
         metadata_url = _clean_text(explicit_url)
-        if not metadata_url or metadata_url in seen:
+        if not metadata_url or metadata_url in seen_metadata_urls:
             continue
         metadata_base = _provider_directory_base_from_metadata_url(metadata_url)
         api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
@@ -2524,13 +2553,13 @@ def _candidate_metadata_urls(source: dict[str, Any]) -> list[tuple[str, str]]:
         if not candidate_base:
             continue
         urls.append((candidate_base, metadata_url))
-        seen.add(metadata_url)
+        seen_metadata_urls.add(metadata_url)
     for api_base in _candidate_base_urls(source):
         for url in (f"{api_base}/metadata?_format=json", f"{api_base}/metadata"):
-            if url in seen:
+            if url in seen_metadata_urls:
                 continue
             urls.append((api_base, url))
-            seen.add(url)
+            seen_metadata_urls.add(url)
     return urls
 
 
@@ -3880,56 +3909,56 @@ def _credential_api_base_candidates(
     return candidate_api_bases
 
 
-def _credential_spec_for_source(source: dict[str, Any]) -> dict[str, Any]:
+def _credential_spec_for_source(source_record: dict[str, Any]) -> dict[str, Any]:
     config = _load_credentials_config()
     if not config:
         return {}
-    spec: dict[str, Any] = {}
+    credential_spec_by_field: dict[str, Any] = {}
     defaults = _mapping(config.get("defaults") or config.get("default"))
     if defaults:
-        spec = _merge_credential_spec(spec, defaults, matched_by="defaults")
+        credential_spec_by_field = _merge_credential_spec(credential_spec_by_field, defaults, matched_by="defaults")
 
-    source_id = _clean_text(source.get("source_id"))
-    canonical_api_base = _canonical_base(source.get("api_base") or source.get("canonical_api_base"))
+    source_id = _clean_text(source_record.get("source_id"))
+    canonical_api_base = _canonical_base(source_record.get("api_base") or source_record.get("canonical_api_base"))
     host = urllib.parse.urlsplit(canonical_api_base or "").netloc.lower()
-    org_name = _normalize_credential_key(source.get("org_name"))
-    metadata = _source_metadata(source)
+    org_name = _normalize_credential_key(source_record.get("org_name"))
+    metadata = _source_metadata(source_record)
 
     hosts = _mapping(config.get("hosts"))
     if host and host in {str(key).lower(): key for key in hosts}:
         key = {str(key).lower(): key for key in hosts}[host]
-        spec = _merge_credential_spec(spec, _mapping(hosts.get(key)), matched_by=f"hosts:{host}")
+        credential_spec_by_field = _merge_credential_spec(credential_spec_by_field, _mapping(hosts.get(key)), matched_by=f"hosts:{host}")
 
     api_bases = _mapping(config.get("api_bases") or config.get("apiBases"))
-    normalized_api_bases = {
+    api_base_key_lookup = {
         _canonical_base(str(key)) or str(key).rstrip("/"): key
         for key in api_bases
     }
     for candidate_api_base in _credential_api_base_candidates(
         canonical_api_base,
         metadata,
-        normalized_api_bases,
+        api_base_key_lookup,
     ):
-        if candidate_api_base and candidate_api_base in normalized_api_bases:
-            key = normalized_api_bases[candidate_api_base]
-            spec = _merge_credential_spec(
-                spec,
+        if candidate_api_base and candidate_api_base in api_base_key_lookup:
+            key = api_base_key_lookup[candidate_api_base]
+            credential_spec_by_field = _merge_credential_spec(
+                credential_spec_by_field,
                 _mapping(api_bases.get(key)),
                 matched_by=f"api_bases:{candidate_api_base}",
             )
 
     org_names = _mapping(config.get("org_names") or config.get("orgNames"))
-    normalized_orgs = {_normalize_credential_key(key): key for key in org_names}
-    if org_name and org_name in normalized_orgs:
-        key = normalized_orgs[org_name]
-        spec = _merge_credential_spec(spec, _mapping(org_names.get(key)), matched_by=f"org_names:{org_name}")
+    org_key_lookup = {_normalize_credential_key(key): key for key in org_names}
+    if org_name and org_name in org_key_lookup:
+        key = org_key_lookup[org_name]
+        credential_spec_by_field = _merge_credential_spec(credential_spec_by_field, _mapping(org_names.get(key)), matched_by=f"org_names:{org_name}")
 
-    sources = _mapping(config.get("sources"))
-    if source_id and source_id in sources:
-        spec = _merge_credential_spec(spec, _mapping(sources.get(source_id)), matched_by=f"sources:{source_id}")
-    if spec.get("enabled") is False:
+    source_records = _mapping(config.get("sources"))
+    if source_id and source_id in source_records:
+        credential_spec_by_field = _merge_credential_spec(credential_spec_by_field, _mapping(source_records.get(source_id)), matched_by=f"sources:{source_id}")
+    if credential_spec_by_field.get("enabled") is False:
         return {}
-    return spec
+    return credential_spec_by_field
 
 
 def _is_url_within_api_base(url: str, api_base: str) -> bool:
@@ -4015,47 +4044,47 @@ def _fetch_oauth2_client_credentials_token_sync(oauth2: dict[str, Any], *, timeo
     if cached and cached[1] > now:
         return cached[0]
 
-    form: dict[str, str] = {"grant_type": "client_credentials"}
+    form_by_name: dict[str, str] = {"grant_type": "client_credentials"}
     for field in ("scope", "audience", "resource"):
         resolved = _resolve_secret_text(oauth2.get(field))
         if resolved:
-            form[field] = resolved
-    for key, value in _mapping(oauth2.get("extra_params") or oauth2.get("extraParams")).items():
-        resolved = _resolve_secret_text(value)
+            form_by_name[field] = resolved
+    for key, token_value in _mapping(oauth2.get("extra_params") or oauth2.get("extraParams")).items():
+        resolved = _resolve_secret_text(token_value)
         if resolved:
-            form[str(key)] = resolved
+            form_by_name[str(key)] = resolved
 
     auth_mode = (_clean_text(oauth2.get("auth") or oauth2.get("client_auth") or oauth2.get("clientAuth")) or "basic").lower()
-    headers = {
+    headers_by_name = {
         "Accept": "application/json",
         "Content-Type": "application/x-www-form-urlencoded",
         "User-Agent": USER_AGENT,
     }
     if auth_mode in {"body", "post", "client_secret_post"}:
-        form["client_id"] = client_id
-        form["client_secret"] = client_secret
+        form_by_name["client_id"] = client_id
+        form_by_name["client_secret"] = client_secret
     else:
         token = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
-        headers["Authorization"] = f"Basic {token}"
+        headers_by_name["Authorization"] = f"Basic {token}"
 
     request = urllib.request.Request(
         token_url,
-        data=urllib.parse.urlencode(form).encode("utf-8"),
-        headers=headers,
+        data=urllib.parse.urlencode(form_by_name).encode("utf-8"),
+        headers=headers_by_name,
         method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
-            payload = _decode_json_body(response.read(1024 * 1024))
+            payload_by_field = _decode_json_body(response.read(1024 * 1024))
     except Exception:
         return None
-    if not payload:
+    if not payload_by_field:
         return None
-    access_token = _clean_text(payload.get("access_token"))
+    access_token = _clean_text(payload_by_field.get("access_token"))
     if not access_token:
         return None
     try:
-        expires_in = int(payload.get("expires_in") or 3600)
+        expires_in = int(payload_by_field.get("expires_in") or 3600)
     except Exception:
         expires_in = 3600
     _OAUTH_TOKEN_CACHE[cache_key] = (
@@ -4065,38 +4094,38 @@ def _fetch_oauth2_client_credentials_token_sync(oauth2: dict[str, Any], *, timeo
     return access_token
 
 
-def _credential_request_options_for_source(source: dict[str, Any], url: str) -> dict[str, Any]:
-    spec = _credential_spec_for_source(source)
-    if not spec or not _credential_allowed_for_url(source, url):
+def _credential_request_options_for_source(source_record: dict[str, Any], url: str) -> dict[str, Any]:
+    spec = _credential_spec_for_source(source_record)
+    if not spec or not _credential_allowed_for_url(source_record, url):
         return {"headers": {}, "query_params": {}, "descriptor": None}
-    headers: dict[str, str] = {}
+    headers_by_name: dict[str, str] = {}
     bearer = _resolve_secret_text(spec.get("bearer_token"))
     if bearer:
-        headers["Authorization"] = f"Bearer {bearer}"
+        headers_by_name["Authorization"] = f"Bearer {bearer}"
     elif _oauth2_spec(spec):
         oauth_token = _fetch_oauth2_client_credentials_token_sync(_oauth2_spec(spec))
         if oauth_token:
-            headers["Authorization"] = f"Bearer {oauth_token}"
+            headers_by_name["Authorization"] = f"Bearer {oauth_token}"
     api_key_header = _api_key_header(spec)
     if api_key_header:
-        headers[api_key_header[0]] = api_key_header[1]
-    for key, value in _mapping(spec.get("headers")).items():
-        resolved = _resolve_secret_text(value)
+        headers_by_name[api_key_header[0]] = api_key_header[1]
+    for key, credential_value in _mapping(spec.get("headers")).items():
+        resolved = _resolve_secret_text(credential_value)
         if resolved:
-            headers[str(key)] = resolved
-    query_params: dict[str, str] = {}
-    for key, value in _mapping(spec.get("query_params")).items():
-        resolved = _resolve_secret_text(value)
+            headers_by_name[str(key)] = resolved
+    query_params_by_name: dict[str, str] = {}
+    for key, credential_value in _mapping(spec.get("query_params")).items():
+        resolved = _resolve_secret_text(credential_value)
         if resolved:
-            query_params[str(key)] = resolved
-    descriptor = None
-    if headers or query_params:
-        descriptor = {
+            query_params_by_name[str(key)] = resolved
+    descriptor_by_field = None
+    if headers_by_name or query_params_by_name:
+        descriptor_by_field = {
             "matched_by": list(spec.get("_matched_by") or []),
-            "header_names": sorted(headers),
-            "query_param_names": sorted(query_params),
+            "header_names": sorted(headers_by_name),
+            "query_param_names": sorted(query_params_by_name),
         }
-    return {"headers": headers, "query_params": query_params, "descriptor": descriptor}
+    return {"headers": headers_by_name, "query_params": query_params_by_name, "descriptor": descriptor_by_field}
 
 
 def _source_declares_credentialed_access(source: dict[str, Any]) -> bool:
@@ -4248,15 +4277,15 @@ def _payer_alias_key(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
 
-def _aetna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
-    api_base = _canonical_base(row.get("api_base"))
+def _aetna_provider_directory_override(seed_row_by_field: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(seed_row_by_field.get("api_base"))
     if api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
         return None
     parsed_api_base = urllib.parse.urlsplit(api_base or "")
     api_host = parsed_api_base.netloc.lower()
     api_path = parsed_api_base.path.lower()
-    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
-    source_url = (_clean_text(row.get("source_url")) or "").lower()
+    portal_url = (_clean_text(seed_row_by_field.get("portal_url")) or "").lower()
+    source_url = (_clean_text(seed_row_by_field.get("source_url")) or "").lower()
     should_override = (
         api_base == "https://fhir-ehr.cerner.com/r4/aetna"
         or api_base == AETNA_PROVIDER_DIRECTORY_BASE
@@ -4270,7 +4299,7 @@ def _aetna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
     )
     if not should_override:
         return None
-    auth_type = _clean_text(row.get("auth_type"))
+    auth_type = _clean_text(seed_row_by_field.get("auth_type"))
     if (auth_type or "").strip().lower() in {"", "n/a", "na", "none", "open", "public"}:
         auth_type = "OAuth2/SMART"
     return {
@@ -4297,7 +4326,7 @@ def _aetna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
             ),
             "provider_directory_coverage_mode": "targeted",
             "provider_directory_fully_enumerable_resources": [],
-            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_previous_api_base": _clean_text(seed_row_by_field.get("api_base")),
         },
     }
 
@@ -4354,10 +4383,10 @@ def _aetna_provider_directory_data_seed_rows(*, source_query: str | None = None)
     )
 
 
-def _alohr_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
-    api_base = _canonical_base(row.get("api_base"))
-    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
-    source_url = (_clean_text(row.get("source_url")) or "").lower()
+def _alohr_provider_directory_override(seed_row_by_field: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(seed_row_by_field.get("api_base"))
+    portal_url = (_clean_text(seed_row_by_field.get("portal_url")) or "").lower()
+    source_url = (_clean_text(seed_row_by_field.get("source_url")) or "").lower()
     should_override = (
         api_base in {ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE, ALOHR_FHIR_PROVIDER_DIRECTORY_BASE}
         or "alohr.esante.us" in portal_url
@@ -4380,7 +4409,7 @@ def _alohr_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
                 "FHIR resource reads require auth, and public provider search is available through "
                 "the ALOHR GraphQL directory connector."
             ),
-            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_previous_api_base": _clean_text(seed_row_by_field.get("api_base")),
             "provider_directory_confirmed_base": ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
             "provider_directory_graphql_url": ALOHR_GRAPHQL_URL,
             "provider_directory_graphql_tenant_id": ALOHR_TENANT_ID,
@@ -4388,11 +4417,11 @@ def _alohr_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
     }
 
 
-def _cigna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
-    api_base = _canonical_base(row.get("api_base"))
-    org_name = (_clean_text(row.get("org_name")) or "").lower()
-    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
-    source_url = (_clean_text(row.get("source_url")) or "").lower()
+def _cigna_provider_directory_override(seed_row_by_field: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(seed_row_by_field.get("api_base"))
+    org_name = (_clean_text(seed_row_by_field.get("org_name")) or "").lower()
+    portal_url = (_clean_text(seed_row_by_field.get("portal_url")) or "").lower()
+    source_url = (_clean_text(seed_row_by_field.get("source_url")) or "").lower()
     should_override = (
         api_base == CIGNA_PROVIDER_DIRECTORY_BASE
         or api_base == "https://apps.availity.com/availity/public-fhir/fhir/v1/cigna/r4"
@@ -4420,7 +4449,7 @@ def _cigna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
                 "Cigna publishes public R4 Provider Directory metadata and resources at fhir.cigna.com; "
                 "upstream seed rows can point at Availity non-FHIR/onboarding paths."
             ),
-            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_previous_api_base": _clean_text(seed_row_by_field.get("api_base")),
             "provider_directory_confirmed_base": CIGNA_PROVIDER_DIRECTORY_BASE,
             "provider_directory_expected_nonempty_resources": sorted(
                 CIGNA_EXPECTED_NONEMPTY_RESOURCES
@@ -4430,8 +4459,8 @@ def _cigna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
     }
 
 
-def _caresource_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
-    api_base = _canonical_base(row.get("api_base"))
+def _caresource_provider_directory_override(seed_row_by_field: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(seed_row_by_field.get("api_base"))
     if api_base != CARESOURCE_PROVIDER_DIRECTORY_BASE:
         return None
     supported_resources = list(DEFAULT_RESOURCES)
@@ -4451,7 +4480,7 @@ def _caresource_provider_directory_override(row: dict[str, Any]) -> dict[str, An
                 "CareSource publishes anonymous R4 Provider Directory metadata and resources "
                 "at its CareEvolution orchestration endpoint; the catalog auth label is stale."
             ),
-            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_previous_api_base": _clean_text(seed_row_by_field.get("api_base")),
             "provider_directory_confirmed_base": CARESOURCE_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_metadata_url": (
                 CARESOURCE_PROVIDER_DIRECTORY_METADATA_URL
@@ -4468,11 +4497,11 @@ def _caresource_provider_directory_override(row: dict[str, Any]) -> dict[str, An
     }
 
 
-def _centene_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
-    api_base = _canonical_base(row.get("api_base"))
-    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
-    source_url = (_clean_text(row.get("source_url")) or "").lower()
-    source_detail = (_clean_text(row.get("source_detail")) or "").lower()
+def _centene_provider_directory_override(seed_row_by_field: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(seed_row_by_field.get("api_base"))
+    portal_url = (_clean_text(seed_row_by_field.get("portal_url")) or "").lower()
+    source_url = (_clean_text(seed_row_by_field.get("source_url")) or "").lower()
+    source_detail = (_clean_text(seed_row_by_field.get("source_detail")) or "").lower()
     should_override = (
         api_base in {CENTENE_PARTNER_PORTAL_APIS_URL, CENTENE_PROVIDER_DIRECTORY_BASE, CENTENE_STALE_GENERIC_BASE}
         or "partners.centene.com/apis" in portal_url
@@ -4494,7 +4523,7 @@ def _centene_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] 
                 "Centene's partner portal catalog publishes the concrete public FHIR Provider Directory "
                 "production host and path; seed rows can point at the portal API catalog page instead."
             ),
-            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_previous_api_base": _clean_text(seed_row_by_field.get("api_base")),
             "provider_directory_confirmed_base": CENTENE_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_catalog_url": CENTENE_PARTNER_PORTAL_APIS_URL,
             "provider_directory_confirmed_doc_url": CENTENE_PROVIDER_DIRECTORY_DOC_URL,
@@ -4600,13 +4629,13 @@ def _amerihealth_caritas_override_metadata(
     return metadata
 
 
-def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
+def _amerihealth_caritas_provider_directory_override(seed_row_by_field: dict[str, Any]) -> dict[str, Any] | None:
     """Resolve a catalog alias without assigning graph rows to its product."""
-    api_base = _canonical_base(row.get("api_base"))
-    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
-    source_url = (_clean_text(row.get("source_url")) or "").lower()
-    org_name = (_clean_text(row.get("org_name")) or "").lower()
-    plan_code = _amerihealth_caritas_plan_code(row)
+    api_base = _canonical_base(seed_row_by_field.get("api_base"))
+    portal_url = (_clean_text(seed_row_by_field.get("portal_url")) or "").lower()
+    source_url = (_clean_text(seed_row_by_field.get("source_url")) or "").lower()
+    org_name = (_clean_text(seed_row_by_field.get("org_name")) or "").lower()
+    plan_code = _amerihealth_caritas_plan_code(seed_row_by_field)
     parsed_api_base = urllib.parse.urlsplit(api_base or "")
     api_host = parsed_api_base.netloc.lower()
     should_override = (
@@ -4631,10 +4660,10 @@ def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dic
         "org_name": (
             AMERIHEALTH_CARITAS_CARRIER_ORG_NAME
             if is_carrier_acquisition
-            else _clean_text(row.get("org_name"))
+            else _clean_text(seed_row_by_field.get("org_name"))
         ),
         "plan_name": (
-            None if is_carrier_acquisition else _clean_text(row.get("plan_name"))
+            None if is_carrier_acquisition else _clean_text(seed_row_by_field.get("plan_name"))
         ),
         "requires_registration": False,
         "auth_type": "none",
@@ -4643,7 +4672,7 @@ def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dic
         ),
         "endpoints": _source_override_endpoint_fields(provider_base),
         "metadata": _amerihealth_caritas_override_metadata(
-            row,
+            seed_row_by_field,
             plan_code,
             provider_base,
             is_carrier_acquisition=is_carrier_acquisition,
@@ -5321,11 +5350,11 @@ def _resource_id(resource: dict[str, Any]) -> str:
 
 
 def _codings(values: Any) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
+    coding_rows: list[dict[str, Any]] = []
     if isinstance(values, dict):
         values = [values]
     if not isinstance(values, list):
-        return result
+        return coding_rows
     for value in values:
         if not isinstance(value, dict):
             continue
@@ -5333,21 +5362,21 @@ def _codings(values: Any) -> list[dict[str, Any]]:
         for coding in value.get("coding") or []:
             if not isinstance(coding, dict):
                 continue
-            item = {
+            coding_item_by_field = {
                 "system": _clean_text(coding.get("system")),
                 "code": _clean_text(coding.get("code")),
                 "display": _clean_text(coding.get("display")),
             }
-            if any(item.values()):
-                concept_items.append(item)
+            if any(coding_item_by_field.values()):
+                concept_items.append(coding_item_by_field)
         text = _clean_text(value.get("text"))
         if text:
             if concept_items:
                 concept_items[0]["text"] = text
             else:
                 concept_items.append({"text": text})
-        result.extend(concept_items)
-    return result
+        coding_rows.extend(concept_items)
+    return coding_rows
 
 
 def _references(values: Any) -> list[str]:
@@ -6665,40 +6694,40 @@ def _alohr_npi(value: Any) -> int | None:
         return None
 
 
-def _alohr_telecom(*items: Any) -> list[dict[str, Any]]:
-    telecom: list[dict[str, Any]] = []
-    for item in items:
-        if not item:
+def _alohr_telecom(*telecom_items: Any) -> list[dict[str, Any]]:
+    telecom_rows: list[dict[str, Any]] = []
+    for telecom_item_by_field in telecom_items:
+        if not telecom_item_by_field:
             continue
-        if isinstance(item, list):
-            for nested in item:
+        if isinstance(telecom_item_by_field, list):
+            for nested in telecom_item_by_field:
                 if isinstance(nested, dict):
                     system = _clean_text(nested.get("system"))
-                    value = _clean_text(nested.get("value"))
-                    if system and value:
-                        telecom.append({"system": system, "value": value, "use": _clean_text(nested.get("use"))})
+                    telecom_value = _clean_text(nested.get("value"))
+                    if system and telecom_value:
+                        telecom_rows.append({"system": system, "value": telecom_value, "use": _clean_text(nested.get("use"))})
             continue
-        if isinstance(item, dict):
-            for nested in item.get("contacts") or []:
+        if isinstance(telecom_item_by_field, dict):
+            for nested in telecom_item_by_field.get("contacts") or []:
                 if isinstance(nested, dict):
                     system = _clean_text(nested.get("system"))
-                    value = _clean_text(nested.get("value"))
-                    if system and value:
-                        telecom.append({"system": system, "value": value, "use": _clean_text(nested.get("use"))})
+                    telecom_value = _clean_text(nested.get("value"))
+                    if system and telecom_value:
+                        telecom_rows.append({"system": system, "value": telecom_value, "use": _clean_text(nested.get("use"))})
             continue
-        value = _clean_text(item)
-        if value:
-            system = "email" if "@" in value else "phone"
-            telecom.append({"system": system, "value": value})
-    deduped: list[dict[str, Any]] = []
-    seen: set[tuple[str | None, str | None, str | None]] = set()
-    for item in telecom:
-        key = (item.get("system"), item.get("value"), item.get("use"))
-        if key in seen:
+        telecom_value = _clean_text(telecom_item_by_field)
+        if telecom_value:
+            system = "email" if "@" in telecom_value else "phone"
+            telecom_rows.append({"system": system, "value": telecom_value})
+    deduped_telecom_rows: list[dict[str, Any]] = []
+    seen_telecom_keys: set[tuple[str | None, str | None, str | None]] = set()
+    for telecom_item_by_field in telecom_rows:
+        key = (telecom_item_by_field.get("system"), telecom_item_by_field.get("value"), telecom_item_by_field.get("use"))
+        if key in seen_telecom_keys:
             continue
-        seen.add(key)
-        deduped.append({key: value for key, value in item.items() if value is not None})
-    return deduped
+        seen_telecom_keys.add(key)
+        deduped_telecom_rows.append({key: telecom_value for key, telecom_value in telecom_item_by_field.items() if telecom_value is not None})
+    return deduped_telecom_rows
 
 
 def _alohr_specialty_codings(code: Any, display: Any) -> list[dict[str, Any]]:
@@ -6714,12 +6743,12 @@ def _alohr_specialty_codings(code: Any, display: Any) -> list[dict[str, Any]]:
     return [coding]
 
 
-def _alohr_address_items(item: dict[str, Any]) -> list[dict[str, Any]]:
-    raw_addresses = item.get("addresses") if isinstance(item.get("addresses"), list) else []
-    if not raw_addresses and isinstance(item.get("address"), dict):
-        raw_addresses = [item["address"]]
+def _alohr_address_items(address_item_by_field: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_addresses = address_item_by_field.get("addresses") if isinstance(address_item_by_field.get("addresses"), list) else []
+    if not raw_addresses and isinstance(address_item_by_field.get("address"), dict):
+        raw_addresses = [address_item_by_field["address"]]
     addresses: list[dict[str, Any]] = []
-    seen: set[tuple[str | None, ...]] = set()
+    seen_address_keys: set[tuple[str | None, ...]] = set()
     for raw in raw_addresses:
         if not isinstance(raw, dict):
             continue
@@ -6731,20 +6760,20 @@ def _alohr_address_items(item: dict[str, Any]) -> list[dict[str, Any]]:
         if not any((street1, city, state, zip_code)):
             continue
         key = (street1, street2, city, state, zip_code)
-        if key in seen:
+        if key in seen_address_keys:
             continue
-        seen.add(key)
-        address: dict[str, Any] = {
+        seen_address_keys.add(key)
+        address_by_field: dict[str, Any] = {
             "use": _clean_text(raw.get("type")) or "work",
-            "line": [value for value in (street1, street2) if value],
+            "line": [address_value for address_value in (street1, street2) if address_value],
             "city": city,
             "state": state,
             "postalCode": zip_code,
             "country": "US",
         }
         if _clean_text(raw.get("county")):
-            address["district"] = _clean_text(raw.get("county"))
-        addresses.append(address)
+            address_by_field["district"] = _clean_text(raw.get("county"))
+        addresses.append(address_by_field)
     return addresses
 
 
@@ -6847,13 +6876,13 @@ def _append_alohr_provider_rows(
     """Append normalized Practitioner, Location, and role rows for ALOHR."""
 
     provider_id = _clean_text(provider.get("providerId")) or _alohr_resource_id("prac", provider.get("npi"), provider.get("firstName"), provider.get("lastName"))
-    full_name = " ".join(value for value in (_clean_text(provider.get("firstName")), _clean_text(provider.get("lastName"))) if value)
+    full_name = " ".join(provider_value for provider_value in (_clean_text(provider.get("firstName")), _clean_text(provider.get("lastName"))) if provider_value)
     telecom = _alohr_telecom(provider.get("phone"), provider.get("email"))
     specialty = _alohr_specialty_codings(provider.get("specialty"), provider.get("specialtyDescription"))
     identifiers = []
     if _clean_text(provider.get("npi")):
         identifiers.append({"system": "http://hl7.org/fhir/sid/us-npi", "value": _clean_text(provider.get("npi"))})
-    practitioner = {
+    practitioner_by_field = {
         "resourceType": "Practitioner",
         "id": provider_id,
         "active": True,
@@ -6869,7 +6898,7 @@ def _append_alohr_provider_rows(
         "qualification": [{"code": {"coding": specialty}}] if specialty else [],
         "communication": [{"coding": [{"display": language}]} for language in provider.get("languages") or [] if _clean_text(language)],
     }
-    _append_alohr_parsed_resource(rows_by_model, source_id, practitioner, run_id=run_id)
+    _append_alohr_parsed_resource(rows_by_model, source_id, practitioner_by_field, run_id=run_id)
     location_refs: list[dict[str, str]] = []
     for address in _alohr_address_items(provider):
         location = _alohr_location_resource(provider_id, full_name or provider_id, address, telecom)
@@ -6894,16 +6923,16 @@ def _append_alohr_organization_rows(
 ) -> None:
     org_id = _clean_text(organization.get("orgId")) or _alohr_resource_id("org", organization.get("npi"), organization.get("name"))
     contacts = []
-    for item in organization.get("contacts") or []:
-        if isinstance(item, dict):
-            contacts.extend(item.get("contacts") or [])
+    for organization_item_by_field in organization.get("contacts") or []:
+        if isinstance(organization_item_by_field, dict):
+            contacts.extend(organization_item_by_field.get("contacts") or [])
     contacts.extend(organization.get("organizationContact") or [])
     telecom = _alohr_telecom(contacts)
     specialty = _alohr_specialty_codings(organization.get("specialty"), organization.get("specialtyDescription"))
     identifiers = []
     if _clean_text(organization.get("npi")):
         identifiers.append({"system": "http://hl7.org/fhir/sid/us-npi", "value": _clean_text(organization.get("npi"))})
-    org_resource = {
+    organization_resource_by_field = {
         "resourceType": "Organization",
         "id": org_id,
         "active": True,
@@ -6913,7 +6942,7 @@ def _append_alohr_organization_rows(
         "telecom": telecom,
         "address": _alohr_address_items(organization),
     }
-    _append_alohr_parsed_resource(rows_by_model, source_id, org_resource, run_id=run_id)
+    _append_alohr_parsed_resource(rows_by_model, source_id, organization_resource_by_field, run_id=run_id)
     for address in _alohr_address_items(organization):
         location = _alohr_location_resource(org_id, _clean_text(organization.get("name")) or org_id, address, telecom)
         _append_alohr_parsed_resource(rows_by_model, source_id, location, run_id=run_id)
@@ -13155,11 +13184,11 @@ async def _ensure_provider_directory_model_columns(model: Any, schema: str) -> N
         schema=schema,
         table_name=model.__tablename__,
     )
-    existing = {_clean_text((row._mapping if hasattr(row, "_mapping") else row).get("column_name")) for row in rows}
+    existing_column_names = {_clean_text((row._mapping if hasattr(row, "_mapping") else row).get("column_name")) for row in rows}
     table_ref = _qt(schema, model.__tablename__)
     dialect = postgresql.dialect()
     for column in model.__table__.columns:
-        if column.name in existing:
+        if column.name in existing_column_names:
             continue
         column_ddl = str(CreateColumn(column).compile(dialect=dialect)).strip()
         if not column_ddl:
@@ -13246,13 +13275,13 @@ async def _prepare_provider_directory_import_seen_stage_lookup(
 
 
 def _dedupe_rows_by_primary_key(primary_keys: list[str], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    deduped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    rows_by_primary_key: dict[tuple[Any, ...], dict[str, Any]] = {}
     for row in rows:
-        key = tuple(row.get(primary_key) for primary_key in primary_keys)
-        if any(value is None for value in key):
+        primary_key_values = tuple(row.get(primary_key) for primary_key in primary_keys)
+        if any(value is None for value in primary_key_values):
             continue
-        deduped[key] = row
-    return list(deduped.values())
+        rows_by_primary_key[primary_key_values] = row
+    return list(rows_by_primary_key.values())
 
 
 def _max_rows_per_statement(column_count: int) -> int:
@@ -13674,7 +13703,7 @@ def _canonical_resource_payload(row: dict[str, Any]) -> dict[str, Any]:
 
 def _canonical_resource_rows(
     model,
-    rows: list[dict[str, Any]],
+    resource_rows: list[dict[str, Any]],
     *,
     canonical_api_base: str | None,
     run_id: str | None,
@@ -13684,33 +13713,33 @@ def _canonical_resource_rows(
     api_base = _canonical_base(canonical_api_base)
     if not resource_type or not api_base:
         return []
-    seen: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        resource_id = _clean_text(row.get("resource_id"))
+    resource_rows_by_id: dict[str, dict[str, Any]] = {}
+    for resource_row_by_field in resource_rows:
+        resource_id = _clean_text(resource_row_by_field.get("resource_id"))
         if not resource_id:
             continue
-        payload = _canonical_resource_payload(row)
+        payload_by_field = _canonical_resource_payload(resource_row_by_field)
         payload_hash = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, default=_json_default).encode("utf-8")
+            json.dumps(payload_by_field, sort_keys=True, default=_json_default).encode("utf-8")
         ).hexdigest()
-        observed_at = row.get("observed_at") or _now()
-        seen[resource_id] = {
+        observed_at = resource_row_by_field.get("observed_at") or _now()
+        resource_rows_by_id[resource_id] = {
             "canonical_api_base": api_base,
             "resource_type": resource_type,
             "resource_id": resource_id,
-            "resource_url": row.get("resource_url"),
-            "fhir_meta": row.get("fhir_meta"),
-            "fhir_self_url": row.get("fhir_self_url"),
-            "fhir_fetch_url": row.get("fhir_fetch_url"),
-            "fhir_fetch_mode": row.get("fhir_fetch_mode"),
+            "resource_url": resource_row_by_field.get("resource_url"),
+            "fhir_meta": resource_row_by_field.get("fhir_meta"),
+            "fhir_self_url": resource_row_by_field.get("fhir_self_url"),
+            "fhir_fetch_url": resource_row_by_field.get("fhir_fetch_url"),
+            "fhir_fetch_mode": resource_row_by_field.get("fhir_fetch_mode"),
             "payload_hash": payload_hash,
-            "payload_json": payload if store_payload else None,
+            "payload_json": payload_by_field if store_payload else None,
             "first_seen_run_id": run_id,
             "last_seen_run_id": run_id,
             "observed_at": observed_at,
-            "updated_at": row.get("updated_at") or observed_at,
+            "updated_at": resource_row_by_field.get("updated_at") or observed_at,
         }
-    return list(seen.values())
+    return list(resource_rows_by_id.values())
 
 
 def _endpoint_dataset_resource_rows(
@@ -14464,16 +14493,16 @@ def _cms_sma_endpoint_directory_seed_rows_from_csv(
     source_url: str = CMS_SMA_ENDPOINT_DIRECTORY_URL,
 ) -> list[dict[str, Any]]:
     """Run the cms sma endpoint directory seed rows from csv step within provider-directory ingestion."""
-    rows = list(csv.reader(io.StringIO(csv_text)))
-    if len(rows) < 2:
+    csv_rows = list(csv.reader(io.StringIO(csv_text)))
+    if len(csv_rows) < 2:
         return []
-    section_headers = rows[0]
-    field_headers = rows[1]
+    section_headers = csv_rows[0]
+    field_headers = csv_rows[1]
     provider_start = next(
         (
             index
-            for index, value in enumerate(section_headers)
-            if _cms_sma_header_key(value) == "provider directory endpoint information"
+            for index, cell_value in enumerate(section_headers)
+            if _cms_sma_header_key(cell_value) == "provider directory endpoint information"
         ),
         0,
     )
@@ -14493,12 +14522,12 @@ def _cms_sma_endpoint_directory_seed_rows_from_csv(
         return []
 
     seed_rows: list[dict[str, Any]] = []
-    for row in rows[2:]:
-        state = _cms_sma_cell(row, state_col)
+    for csv_row_by_field in csv_rows[2:]:
+        state = _cms_sma_cell(csv_row_by_field, state_col)
         if not state:
             continue
-        status = _cms_sma_cell(row, status_col)
-        public_value = _cms_sma_cell(row, public_col)
+        status = _cms_sma_cell(csv_row_by_field, status_col)
+        public_value = _cms_sma_cell(csv_row_by_field, public_col)
         status_key = (status or "").strip().lower()
         if status_key not in CMS_SMA_TRACKED_PROVIDER_DIRECTORY_STATUSES:
             continue
@@ -14510,8 +14539,8 @@ def _cms_sma_endpoint_directory_seed_rows_from_csv(
             else CMS_SMA_CATALOG_IN_DEVELOPMENT_STATUS
         )
 
-        production_urls = _extract_urls_from_text(_cms_sma_cell(row, prod_col))
-        capability_urls = _extract_urls_from_text(_cms_sma_cell(row, cap_col))
+        production_urls = _extract_urls_from_text(_cms_sma_cell(csv_row_by_field, prod_col))
+        capability_urls = _extract_urls_from_text(_cms_sma_cell(csv_row_by_field, cap_col))
         capability_bases: list[str] = []
         capability_url_by_base: dict[str, str] = {}
         for capability_url in capability_urls:
@@ -14521,11 +14550,11 @@ def _cms_sma_endpoint_directory_seed_rows_from_csv(
             _append_unique(capability_bases, capability_base)
             capability_url_by_base.setdefault(capability_base, capability_url)
 
-        groups: dict[str, dict[str, Any]] = {}
+        rows_by_group: dict[str, dict[str, Any]] = {}
 
         def group_for(api_base: str) -> dict[str, Any]:
             """Return the seed group bucket for one CMS endpoint row."""
-            group = groups.setdefault(
+            group = rows_by_group.setdefault(
                 api_base,
                 {
                     "api_base": api_base,
@@ -14553,16 +14582,16 @@ def _cms_sma_endpoint_directory_seed_rows_from_csv(
             if endpoint_field and endpoint_field not in group["endpoints"]:
                 group["endpoints"][endpoint_field] = production_url
 
-        if not groups:
+        if not rows_by_group:
             for capability_base in capability_bases:
                 group = group_for(capability_base)
                 group["metadata_url"] = group["metadata_url"] or capability_url_by_base.get(capability_base)
 
-        source_date = _cms_sma_cell(row, source_date_col)
-        refresh = _cms_sma_cell(row, refresh_col)
-        fhir_version = _cms_sma_cell(row, version_col)
+        source_date = _cms_sma_cell(csv_row_by_field, source_date_col)
+        refresh = _cms_sma_cell(csv_row_by_field, refresh_col)
+        fhir_version = _cms_sma_cell(csv_row_by_field, version_col)
         state_key = re.sub(r"[^a-z0-9]+", "-", state.lower()).strip("-")
-        for group in groups.values():
+        for group in rows_by_group.values():
             api_base = group["api_base"]
             digest = hashlib.sha1(f"{state}|{api_base}".encode("utf-8")).hexdigest()[:8]
             metadata = {
@@ -14574,7 +14603,7 @@ def _cms_sma_endpoint_directory_seed_rows_from_csv(
             }
             if group["metadata_url"]:
                 metadata["provider_directory_confirmed_metadata_url"] = group["metadata_url"]
-            seed_row = {
+            seed_row_by_field = {
                 "id": f"cms-sma-{state_key}-{digest}",
                 "org_name": f"State of {state}",
                 "plan_name": f"{state} Medicaid Provider Directory",
@@ -14595,9 +14624,9 @@ def _cms_sma_endpoint_directory_seed_rows_from_csv(
                 **group["endpoints"],
             }
             if refresh:
-                seed_row["data_quality_checked"] = refresh
-            if _seed_row_matches_query(seed_row, source_query):
-                seed_rows.append(seed_row)
+                seed_row_by_field["data_quality_checked"] = refresh
+            if _seed_row_matches_query(seed_row_by_field, source_query):
+                seed_rows.append(seed_row_by_field)
     return seed_rows
 
 
@@ -14624,8 +14653,8 @@ def _amerihealth_caritas_seed_rows_from_catalog_html(
 ) -> list[dict[str, Any]]:
     parser = _AmeriHealthCaritasCatalogParser()
     parser.feed(html_text)
-    rows: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
+    seed_rows: list[dict[str, Any]] = []
+    seen_plan_keys: set[tuple[str, str, str]] = set()
     for cells, links in parser.rows:
         if len(cells) < 2 or cells[0].strip().lower() == "planid":
             continue
@@ -14642,10 +14671,10 @@ def _amerihealth_caritas_seed_rows_from_catalog_html(
         if not plan_code or not plan_name or not provider_base:
             continue
         key = (plan_code.lower(), _payer_alias_key(plan_name), provider_base)
-        if key in seen:
+        if key in seen_plan_keys:
             continue
-        seen.add(key)
-        row = {
+        seen_plan_keys.add(key)
+        seed_row_by_field = {
             "id": f"amerihealth-caritas-{plan_code.lower()}-{hashlib.sha1(plan_name.encode('utf-8')).hexdigest()[:8]}",
             "org_name": "AmeriHealth Caritas",
             "plan_name": plan_name,
@@ -14668,9 +14697,9 @@ def _amerihealth_caritas_seed_rows_from_catalog_html(
                 ),
             },
         }
-        if _seed_row_matches_query(row, source_query):
-            rows.append(row)
-    return rows
+        if _seed_row_matches_query(seed_row_by_field, source_query):
+            seed_rows.append(seed_row_by_field)
+    return seed_rows
 
 
 def _read_text_from_path_or_url(path: str | None, url: str, *, timeout: int) -> tuple[str, str]:
@@ -14750,16 +14779,16 @@ def _contra_costa_seed_rows_from_developer_html(
     parser = _HtmlLinkParser()
     parser.feed(html_text)
     rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen_plan_keys: set[str] = set()
     for label, href in parser.links:
         label_key = re.sub(r"[^a-z0-9]+", "", (_clean_text(label) or "").lower())
         if "providerdirectoryapibaseurl" not in label_key:
             continue
         target_url = _external_splash_target_url(href, source_url=source_url)
         provider_base = _provider_directory_base_from_metadata_url(target_url)
-        if not provider_base or provider_base in seen:
+        if not provider_base or provider_base in seen_plan_keys:
             continue
-        seen.add(provider_base)
+        seen_plan_keys.add(provider_base)
         row = _contra_costa_seed_row(provider_base, source_url=source_url, source_date=source_date)
         if _seed_row_matches_query(row, source_query):
             rows.append(row)
@@ -15064,40 +15093,40 @@ def _merge_skipped_source_row_metadata(target: dict[str, Any], skipped: dict[str
 
 
 def _dedupe_source_rows(source_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
+    deduped_source_rows: list[dict[str, Any]] = []
     seen_source_ids: set[str] = set()
     seen_source_keys: set[tuple[str, str, str]] = set()
     seen_org_base_keys: set[tuple[str, str]] = set()
     rows_by_source_id: dict[str, dict[str, Any]] = {}
     rows_by_source_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     rows_by_org_base_key: dict[tuple[str, str], dict[str, Any]] = {}
-    for row in source_rows:
-        source_id = _clean_text(row.get("source_id"))
-        org_name_key = (_clean_text(row.get("org_name")) or "").lower()
-        plan_name_key = (_clean_text(row.get("plan_name")) or "").lower()
-        api_base_key = _canonical_base(row.get("canonical_api_base") or row.get("api_base")) or ""
+    for source_row_by_field in source_rows:
+        source_id = _clean_text(source_row_by_field.get("source_id"))
+        org_name_key = (_clean_text(source_row_by_field.get("org_name")) or "").lower()
+        plan_name_key = (_clean_text(source_row_by_field.get("plan_name")) or "").lower()
+        api_base_key = _canonical_base(source_row_by_field.get("canonical_api_base") or source_row_by_field.get("api_base")) or ""
         source_key = (org_name_key, plan_name_key, api_base_key)
         org_base_key = (org_name_key, api_base_key)
-        is_retest = row.get("seed_source") == "provider-directory-db-retest"
+        is_retest = source_row_by_field.get("seed_source") == "provider-directory-db-retest"
         if source_id and source_id in seen_source_ids:
-            _merge_skipped_source_row_metadata(rows_by_source_id[source_id], row)
+            _merge_skipped_source_row_metadata(rows_by_source_id[source_id], source_row_by_field)
             continue
         if is_retest and (source_key in seen_source_keys or org_base_key in seen_org_base_keys):
             retained = rows_by_source_key.get(source_key) or rows_by_org_base_key.get(org_base_key)
             if retained is not None:
-                _merge_skipped_source_row_metadata(retained, row)
+                _merge_skipped_source_row_metadata(retained, source_row_by_field)
             continue
         if source_id:
             seen_source_ids.add(source_id)
-            rows_by_source_id[source_id] = row
+            rows_by_source_id[source_id] = source_row_by_field
         if is_retest:
             seen_source_keys.add(source_key)
-            rows_by_source_key[source_key] = row
+            rows_by_source_key[source_key] = source_row_by_field
         if org_name_key and api_base_key:
             seen_org_base_keys.add(org_base_key)
-            rows_by_org_base_key[org_base_key] = row
-        deduped.append(row)
-    return deduped
+            rows_by_org_base_key[org_base_key] = source_row_by_field
+        deduped_source_rows.append(source_row_by_field)
+    return deduped_source_rows
 
 
 def _download_seed_db(seed_db_url: str, destination: Path) -> Path:
@@ -15267,15 +15296,15 @@ def _fetch_json_sync(
     extra_headers: dict[str, str] | None = None,
     query_params: dict[str, str] | None = None,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
-    headers = {
+    headers_by_name = {
         "Accept": "application/fhir+json, application/json;q=0.9, */*;q=0.1",
         "User-Agent": USER_AGENT,
     }
     if extra_headers:
-        headers.update(extra_headers)
+        headers_by_name.update(extra_headers)
     fetch_url = _url_with_query_params(url, query_params)
     started = time.monotonic()
-    request = urllib.request.Request(fetch_url, headers=headers)
+    request = urllib.request.Request(fetch_url, headers=headers_by_name)
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
             body = _read_response_body_with_deadline(response, timeout=timeout)
@@ -17812,13 +17841,13 @@ def _bulk_export_pre_stream_should_fallback(status_code: int | None, error: str 
 
 
 def _bulk_json_headers(*, prefer_async: bool = False) -> dict[str, str]:
-    headers = {
+    headers_by_name = {
         "Accept": "application/fhir+json, application/json;q=0.9, */*;q=0.1",
         "User-Agent": USER_AGENT,
     }
     if prefer_async:
-        headers["Prefer"] = "respond-async"
-    return headers
+        headers_by_name["Prefer"] = "respond-async"
+    return headers_by_name
 
 
 def _bulk_ndjson_headers() -> dict[str, str]:
@@ -23363,6 +23392,291 @@ async def _fetch_last_updated_partition_resource_rows(
     )
 
 
+def _is_caresource_opaque_cursor_census(
+    source_record: dict[str, Any],
+    checkpoint_context: PaginationCheckpointContext | None,
+) -> bool:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    return bool(
+        checkpoint_context is not None
+        and checkpoint_context.dataset_id
+        and api_base == CARESOURCE_PROVIDER_DIRECTORY_BASE
+    )
+
+
+def _caresource_census_url(start_url: str) -> str:
+    parsed = urllib.parse.urlsplit(start_url)
+    removed_names = {
+        "_count",
+        "_page",
+        "_searchid",
+        "_summary",
+        "_total",
+    }
+    query_items = [
+        (name, value)
+        for name, value in urllib.parse.parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        )
+        if name.lower() not in removed_names
+    ]
+    query_items.append(("_summary", "count"))
+    return urllib.parse.urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urllib.parse.urlencode(query_items, doseq=True),
+            parsed.fragment,
+        )
+    )
+
+
+async def _fetch_caresource_census_count(
+    source_record: dict[str, Any],
+    start_url: str,
+    *,
+    timeout: int,
+) -> CareSourceCensusFetch:
+    census_url = _caresource_census_url(start_url)
+    status_code, response_payload, fetch_error, _elapsed = await _fetch_source_json(
+        source_record,
+        census_url,
+        timeout=timeout,
+    )
+    if status_code != 200 or fetch_error:
+        failure_detail = fetch_error or f"http_{status_code}"
+        is_transient = _is_transient_source_fetch_failure(status_code, fetch_error)
+        return CareSourceCensusFetch(
+            count=None,
+            error=failure_detail,
+            transient=is_transient,
+            retry_not_before=(
+                _last_updated_partition_retry_not_before(
+                    source_record,
+                    census_url,
+                    status_code,
+                    response_payload,
+                    fetch_error,
+                )
+                if is_transient
+                else None
+            ),
+        )
+    count_fetch = _validate_last_updated_partition_count_payload(response_payload)
+    observation = count_fetch.observation
+    if observation is None or observation.kind is not CountKind.EXACT:
+        return CareSourceCensusFetch(
+            count=None,
+            error=count_fetch.error or "count_not_exact",
+        )
+    return CareSourceCensusFetch(count=observation.count)
+
+
+def _caresource_proof_error_result(
+    model: type,
+    proof_by_field: dict[str, Any],
+    error: str,
+    *,
+    rows_processed: int,
+    pages_processed: int,
+    retryable: bool,
+    retry_not_before: str | None = None,
+) -> ResourceFetchResult:
+    error_prefix = (
+        CARESOURCE_OPAQUE_CURSOR_RETRYABLE_ERROR
+        if retryable
+        else CARESOURCE_OPAQUE_CURSOR_BLOCKED_ERROR
+    )
+    return ResourceFetchResult(
+        model=model,
+        rows=[],
+        rows_fetched=rows_processed,
+        rows_written=0,
+        pages_fetched=pages_processed,
+        complete=False,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=retryable,
+        error=f"{error_prefix}:{error}",
+        fetch_mode=CARESOURCE_OPAQUE_CURSOR_FETCH_MODE,
+        retry_not_before=retry_not_before,
+        fetch_diagnostic=proof_by_field,
+    )
+
+
+def _caresource_persisted_pre_count(
+    completeness: dict[str, Any],
+) -> tuple[int | None, str | None]:
+    if not completeness:
+        return None, None
+    if (
+        completeness.get("strategy_version")
+        != CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION
+    ):
+        return None, "checkpoint_strategy_mismatch"
+    pre_count = completeness.get("pre_count")
+    if isinstance(pre_count, bool) or not isinstance(pre_count, int) or pre_count < 0:
+        return None, "checkpoint_pre_count_invalid"
+    return pre_count, None
+
+
+async def _prepare_caresource_pre_census(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    checkpoint_context: PaginationCheckpointContext,
+    resume_state: PaginationResumeState,
+    start_url: str,
+    *,
+    timeout: int,
+) -> dict[str, Any] | ResourceFetchResult:
+    persisted_pre_count, persisted_error = _caresource_persisted_pre_count(
+        resume_state.completeness
+    )
+    if persisted_error:
+        return _caresource_proof_error_result(
+            model,
+            dict(resume_state.completeness),
+            persisted_error,
+            rows_processed=resume_state.rows_processed,
+            pages_processed=resume_state.pages_processed,
+            retryable=False,
+        )
+    if persisted_pre_count is not None:
+        return dict(resume_state.completeness)
+    census_fetch = await _fetch_caresource_census_count(
+        source_record,
+        start_url,
+        timeout=timeout,
+    )
+    if census_fetch.count is None:
+        proof_by_field = {
+            "strategy_version": CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
+            "verified": False,
+        }
+        return _caresource_proof_error_result(
+            model,
+            proof_by_field,
+            f"pre_census_{census_fetch.error or 'failed'}",
+            rows_processed=resume_state.rows_processed,
+            pages_processed=resume_state.pages_processed,
+            retryable=census_fetch.transient,
+            retry_not_before=census_fetch.retry_not_before,
+        )
+    proof_by_field = {
+        "strategy_version": CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
+        "verified": False,
+        "pre_count": census_fetch.count,
+    }
+    await _save_pagination_checkpoint_completeness(
+        checkpoint_context,
+        resource_type,
+        proof_by_field,
+    )
+    return proof_by_field
+
+
+async def _caresource_unique_candidate_count(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+) -> int:
+    if not context.dataset_id:
+        raise RuntimeError("provider_directory_caresource_dataset_id_missing")
+    count_row = await db.first(
+        f"""
+        SELECT COUNT(*) AS unique_candidate_rows
+          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND resource_type = :resource_type;
+        """,
+        dataset_id=context.dataset_id,
+        resource_type=resource_type,
+    )
+    count_map = _pagination_checkpoint_row_mapping(count_row)
+    return int(count_map.get("unique_candidate_rows") or 0)
+
+
+def _caresource_proof_failure(proof_by_field: dict[str, Any]) -> str | None:
+    pre_count = proof_by_field["pre_count"]
+    post_count = proof_by_field["post_count"]
+    rows_processed = proof_by_field["processed_rows"]
+    unique_candidate_rows = proof_by_field["unique_candidate_rows"]
+    if post_count != pre_count:
+        return "census_drift"
+    if rows_processed < pre_count:
+        return "cursor_loss"
+    if rows_processed != unique_candidate_rows:
+        return "duplicate_resource_ids"
+    if rows_processed != pre_count:
+        return "processed_count_mismatch"
+    if unique_candidate_rows != pre_count:
+        return "candidate_count_mismatch"
+    return None
+
+
+async def _finish_caresource_opaque_cursor_census(
+    source_record: dict[str, Any],
+    resource_type: str,
+    checkpoint_context: PaginationCheckpointContext,
+    start_url: str,
+    proof_by_field: dict[str, Any],
+    *,
+    timeout: int,
+    rows_processed: int,
+) -> CareSourceOpaqueCursorOutcome:
+    post_census = await _fetch_caresource_census_count(
+        source_record,
+        start_url,
+        timeout=timeout,
+    )
+    if post_census.count is None:
+        failed_proof_by_field = {
+            **proof_by_field,
+            "verified": False,
+            "processed_rows": rows_processed,
+        }
+        await _save_pagination_checkpoint_completeness(
+            checkpoint_context,
+            resource_type,
+            failed_proof_by_field,
+        )
+        return CareSourceOpaqueCursorOutcome(
+            proof=failed_proof_by_field,
+            error=f"post_census_{post_census.error or 'failed'}",
+            retryable=post_census.transient,
+            retry_not_before=post_census.retry_not_before,
+        )
+    unique_candidate_rows = await _caresource_unique_candidate_count(
+        checkpoint_context,
+        resource_type,
+    )
+    completed_proof_by_field = {
+        **proof_by_field,
+        "post_count": post_census.count,
+        "processed_rows": rows_processed,
+        "unique_candidate_rows": unique_candidate_rows,
+        "verified": False,
+    }
+    proof_failure = _caresource_proof_failure(completed_proof_by_field)
+    completed_proof_by_field["verified"] = proof_failure is None
+    if proof_failure:
+        completed_proof_by_field["failure"] = proof_failure
+    await _save_pagination_checkpoint_completeness(
+        checkpoint_context,
+        resource_type,
+        completed_proof_by_field,
+    )
+    return CareSourceOpaqueCursorOutcome(
+        proof=completed_proof_by_field,
+        error=proof_failure,
+    )
+
+
 async def _fetch_resource_rows(
     source_record: dict[str, Any],
     resource_type: str,
@@ -23553,7 +23867,40 @@ async def _fetch_resource_rows(
         if checkpoint_context and checkpoint_start_url
         else None
     )
+    is_caresource_census_enabled = _is_caresource_opaque_cursor_census(
+        source_record,
+        checkpoint_context,
+    )
+    caresource_proof_by_field: dict[str, Any] | None = None
+    if is_caresource_census_enabled:
+        assert checkpoint_context is not None
+        assert checkpoint_start_url is not None
+        assert resume_state is not None
+        prepared_census = await _prepare_caresource_pre_census(
+            source_record,
+            resource_type,
+            model,
+            checkpoint_context,
+            resume_state,
+            checkpoint_start_url,
+            timeout=resource_timeout,
+        )
+        if isinstance(prepared_census, ResourceFetchResult):
+            return prepared_census
+        caresource_proof_by_field = prepared_census
     if resume_state and resume_state.complete:
+        if is_caresource_census_enabled and (
+            not caresource_proof_by_field
+            or caresource_proof_by_field.get("verified") is not True
+        ):
+            return _caresource_proof_error_result(
+                model,
+                caresource_proof_by_field or {},
+                "checkpoint_completion_proof_missing",
+                rows_processed=resume_state.rows_processed,
+                pages_processed=resume_state.pages_processed,
+                retryable=False,
+            )
         return ResourceFetchResult(
             model=model,
             rows=[],
@@ -23565,7 +23912,12 @@ async def _fetch_resource_rows(
             page_limit_reached=False,
             hard_page_limit_reached=False,
             next_url_remaining=False,
-            fetch_mode="checkpoint_complete",
+            fetch_mode=(
+                CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+                if is_caresource_census_enabled
+                else "checkpoint_complete"
+            ),
+            fetch_diagnostic=caresource_proof_by_field,
         )
     retained_resource_rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
@@ -23846,7 +24198,10 @@ async def _fetch_resource_rows(
                 and _pagination_url_identity(resolved_next_url) == request_identity
             ):
                 resolved_next_url = None
-            if checkpoint_context:
+            defer_caresource_terminal_checkpoint = bool(
+                is_caresource_census_enabled and resolved_next_url is None
+            )
+            if checkpoint_context and not defer_caresource_terminal_checkpoint:
                 await flush_pending_rows()
                 recent_url_hashes.append(request_url_hash)
                 recent_url_hashes = recent_url_hashes[
@@ -23875,6 +24230,48 @@ async def _fetch_resource_rows(
         ):
             break
     await flush_pending_rows()
+    caresource_outcome: CareSourceOpaqueCursorOutcome | None = None
+    has_reached_unbounded_terminal_page = (
+        not error_message
+        and not has_reached_row_limit
+        and not has_reached_page_limit
+        and not has_reached_hard_page_limit
+        and not is_deadline_reached
+        and not url
+        and not pending_start_urls
+    )
+    if is_caresource_census_enabled and has_reached_unbounded_terminal_page:
+        assert checkpoint_context is not None
+        assert checkpoint_start_url is not None
+        assert caresource_proof_by_field is not None
+        caresource_outcome = await _finish_caresource_opaque_cursor_census(
+            source_record,
+            resource_type,
+            checkpoint_context,
+            checkpoint_start_url,
+            caresource_proof_by_field,
+            timeout=resource_timeout,
+            rows_processed=rows_fetched,
+        )
+        caresource_proof_by_field = caresource_outcome.proof
+        if caresource_outcome.error:
+            error_prefix = (
+                CARESOURCE_OPAQUE_CURSOR_RETRYABLE_ERROR
+                if caresource_outcome.retryable
+                else CARESOURCE_OPAQUE_CURSOR_BLOCKED_ERROR
+            )
+            error_message = f"{error_prefix}:{caresource_outcome.error}"
+            has_next_url = caresource_outcome.retryable
+            retry_not_before = caresource_outcome.retry_not_before
+        else:
+            await _save_pagination_checkpoint(
+                checkpoint_context,
+                resource_type,
+                next_url=None,
+                pages_processed=pages,
+                rows_processed=rows_fetched,
+                recent_url_hashes=recent_url_hashes,
+            )
     if (
         not error_message
         and not has_reached_row_limit
@@ -23906,10 +24303,14 @@ async def _fetch_resource_rows(
         hard_page_limit_reached=has_reached_hard_page_limit,
         next_url_remaining=has_next_url or bool(url) or bool(pending_start_urls),
         error=error_message or ("deadline_reached" if is_deadline_reached else None),
-        fetch_mode="checkpointed_paged" if checkpoint_context else "paged",
+        fetch_mode=(
+            CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+            if is_caresource_census_enabled
+            else ("checkpointed_paged" if checkpoint_context else "paged")
+        ),
         deadline_reached=is_deadline_reached,
         retry_not_before=retry_not_before,
-        fetch_diagnostic=fetch_diagnostic,
+        fetch_diagnostic=caresource_proof_by_field or fetch_diagnostic,
         pagination_cooldown_retries=pagination_cooldown_retries,
         pagination_cooldown_wait_seconds=pagination_cooldown_wait_seconds,
         is_pagination_cooldown_recovered=is_pagination_cooldown_recovered,
@@ -25426,6 +25827,12 @@ def _empty_resource_stats() -> dict[str, Any]:
         "last_updated_staged_candidate_count": 0,
         "last_updated_ranged_root_post": 0,
         "last_updated_unfiltered_post": 0,
+        "caresource_opaque_cursor_sources": 0,
+        "caresource_opaque_cursor_verified_sources": 0,
+        "caresource_opaque_cursor_pre_count": 0,
+        "caresource_opaque_cursor_processed_rows": 0,
+        "caresource_opaque_cursor_unique_candidate_rows": 0,
+        "caresource_opaque_cursor_post_count": 0,
     }
 
 
@@ -25519,6 +25926,28 @@ def _record_last_updated_partition_stats(
             resource_stats[f"last_updated_{proof_field}"] += proof_value
 
 
+def _record_caresource_opaque_cursor_stats(
+    resource_stats: dict[str, Any],
+    fetch_result: ResourceFetchResult,
+) -> None:
+    if fetch_result.fetch_mode != CARESOURCE_OPAQUE_CURSOR_FETCH_MODE:
+        return
+    resource_stats["caresource_opaque_cursor_sources"] += 1
+    proof = fetch_result.fetch_diagnostic
+    if not isinstance(proof, dict) or proof.get("verified") is not True:
+        return
+    resource_stats["caresource_opaque_cursor_verified_sources"] += 1
+    for proof_field in (
+        "pre_count",
+        "processed_rows",
+        "unique_candidate_rows",
+        "post_count",
+    ):
+        proof_value = proof.get(proof_field)
+        if isinstance(proof_value, int) and not isinstance(proof_value, bool):
+            resource_stats[f"caresource_opaque_cursor_{proof_field}"] += proof_value
+
+
 def _record_resource_fetch_stats(
     resource_stats_by_type: dict[str, dict[str, Any]],
     resource_type: str,
@@ -25545,6 +25974,7 @@ def _record_resource_fetch_stats(
     if fetch_result.complete and fetch_result.rows_fetched == 0:
         resource_stats["sources_empty"] += 1
     _record_last_updated_partition_stats(resource_stats, fetch_result)
+    _record_caresource_opaque_cursor_stats(resource_stats, fetch_result)
     if fetch_result.fetch_mode in {"bulk_export", "checkpointed_bulk_export"}:
         resource_stats["bulk_export_sources"] += 1
     if bulk_export_selection in {
@@ -25610,12 +26040,21 @@ def _resource_fetch_diagnostic(
         "retry_not_before": fetch_result.retry_not_before,
         "source_fetch": (
             None
-            if fetch_result.fetch_mode == LAST_UPDATED_PARTITION_FETCH_MODE
+            if fetch_result.fetch_mode
+            in {
+                LAST_UPDATED_PARTITION_FETCH_MODE,
+                CARESOURCE_OPAQUE_CURSOR_FETCH_MODE,
+            }
             else fetch_result.fetch_diagnostic
         ),
         "last_updated_completeness": (
             fetch_result.fetch_diagnostic
             if fetch_result.fetch_mode == LAST_UPDATED_PARTITION_FETCH_MODE
+            else None
+        ),
+        "caresource_opaque_cursor_completeness": (
+            fetch_result.fetch_diagnostic
+            if fetch_result.fetch_mode == CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
             else None
         ),
         "pagination_cooldown_retries": fetch_result.pagination_cooldown_retries,
@@ -26040,12 +26479,12 @@ def _apply_provider_directory_refresh_preset(task: dict[str, Any]) -> dict[str, 
             f"{preset!r}; expected one of {', '.join(PROVIDER_DIRECTORY_REFRESH_PRESETS)}"
         )
     defaults = PROVIDER_DIRECTORY_MONTHLY_FULL_DEFAULTS
-    normalized_task = dict(task)
-    normalized_task["refresh_preset"] = normalized_preset
+    normalized_task_by_field = dict(task)
+    normalized_task_by_field["refresh_preset"] = normalized_preset
     for key, value in defaults.items():
-        if normalized_task.get(key) in (None, ""):
-            normalized_task[key] = value
-    return normalized_task
+        if normalized_task_by_field.get(key) in (None, ""):
+            normalized_task_by_field[key] = value
+    return normalized_task_by_field
 
 
 def _int_or_default(value: Any, default: int) -> int:
@@ -26298,6 +26737,35 @@ def _is_pagination_checkpoint_mode_enabled(
     )
 
 
+def _pagination_checkpoint_root_run_id(
+    run_id: str,
+    retry_of_run_id: str | None,
+    pagination_root_run_id: str | None,
+) -> str:
+    """Validate and return the immutable checkpoint acquisition root."""
+    if retry_of_run_id:
+        if not pagination_root_run_id:
+            raise ValueError("provider_directory_pagination_retry_root_missing")
+        return pagination_root_run_id
+    if pagination_root_run_id and pagination_root_run_id != run_id:
+        raise ValueError("provider_directory_pagination_fresh_root_mismatch")
+    return run_id
+
+
+def _pagination_checkpoint_strategy_version(
+    canonical_api_base: str | None,
+    last_updated_partition_config: dict[str, Any],
+) -> str:
+    """Select the checkpoint compatibility contract for one endpoint."""
+    if canonical_api_base == CARESOURCE_PROVIDER_DIRECTORY_BASE:
+        return CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION
+    if last_updated_partition_config:
+        return LAST_UPDATED_PARTITION_STRATEGY_VERSION
+    if canonical_api_base == UHC_PROVIDER_DIRECTORY_BASE:
+        return UHC_PLAN_GRAPH_STRATEGY_VERSION
+    return PAGINATION_CHECKPOINT_STRATEGY_VERSION
+
+
 def _pagination_checkpoint_context(
     source_record: dict[str, Any],
     source_ids: list[str],
@@ -26306,6 +26774,7 @@ def _pagination_checkpoint_context(
     retry_of_run_id: str | None,
     pagination_root_run_id: str | None = None,
 ) -> PaginationCheckpointContext | None:
+    """Build the durable acquisition identity for one checkpointed source group."""
     canonical_api_base = _canonical_base(
         source_record.get("canonical_api_base") or source_record.get("api_base")
     )
@@ -26319,20 +26788,15 @@ def _pagination_checkpoint_context(
     )
     if not run_id or not source_ids or not supports_checkpoint:
         return None
-    if retry_of_run_id:
-        if not pagination_root_run_id:
-            raise ValueError("provider_directory_pagination_retry_root_missing")
-        acquisition_root_run_id = pagination_root_run_id
-    else:
-        if pagination_root_run_id and pagination_root_run_id != run_id:
-            raise ValueError("provider_directory_pagination_fresh_root_mismatch")
-        acquisition_root_run_id = run_id
-    if last_updated_partition_config:
-        strategy_version = LAST_UPDATED_PARTITION_STRATEGY_VERSION
-    elif canonical_api_base == UHC_PROVIDER_DIRECTORY_BASE:
-        strategy_version = UHC_PLAN_GRAPH_STRATEGY_VERSION
-    else:
-        strategy_version = PAGINATION_CHECKPOINT_STRATEGY_VERSION
+    acquisition_root_run_id = _pagination_checkpoint_root_run_id(
+        run_id,
+        retry_of_run_id,
+        pagination_root_run_id,
+    )
+    strategy_version = _pagination_checkpoint_strategy_version(
+        canonical_api_base,
+        last_updated_partition_config,
+    )
     scope_payload_dict = {
         "strategy_version": strategy_version,
         "source_ids": sorted(set(source_ids)),
@@ -27350,7 +27814,8 @@ async def _fetch_pagination_checkpoint(
         f"""
         SELECT dataset_id, source_ids, acquisition_root_run_id, owner_run_id,
                retry_of_run_id, start_url_hash, next_url, state,
-               pages_processed, rows_processed, recent_cursor_hashes
+               pages_processed, rows_processed, recent_cursor_hashes,
+               completeness_json
           FROM {_pagination_checkpoint_table_ref()}
          WHERE canonical_api_base = :canonical_api_base
            AND resource_type = :resource_type
@@ -27390,6 +27855,7 @@ def _compatible_pagination_resume_state(
         ),
         complete=is_complete,
         resumed=True,
+        completeness=_json_object(checkpoint.get("completeness_json")),
     )
 
 
@@ -27451,6 +27917,10 @@ def _pagination_checkpoint_observation_params(
         "observed_cursor_hashes": json.dumps(
             _json_text_list(checkpoint.get("recent_cursor_hashes"))
         ),
+        "observed_completeness": json.dumps(
+            _json_object(checkpoint.get("completeness_json")),
+            sort_keys=True,
+        ),
     }
 
 
@@ -27475,7 +27945,8 @@ def _pagination_checkpoint_adoption_sql() -> str:
            AND state = :observed_state
            AND pages_processed = :observed_pages_processed
            AND rows_processed = :observed_rows_processed
-           AND recent_cursor_hashes::jsonb = CAST(:observed_cursor_hashes AS jsonb);
+           AND recent_cursor_hashes::jsonb = CAST(:observed_cursor_hashes AS jsonb)
+           AND completeness_json::jsonb = CAST(:observed_completeness AS jsonb);
         """
 
 
@@ -27534,13 +28005,14 @@ def _pagination_checkpoint_reset_sql() -> str:
         source_ids, acquisition_root_run_id, owner_run_id, retry_of_run_id,
         start_url_hash,
         next_url, state, pages_processed, rows_processed,
-        recent_cursor_hashes, created_at, updated_at, completed_at
+        recent_cursor_hashes, completeness_json,
+        created_at, updated_at, completed_at
     ) VALUES (
         :canonical_api_base, :resource_type, :source_scope_hash, :dataset_id,
         CAST(:source_ids AS jsonb), :acquisition_root_run_id,
         :owner_run_id, :retry_of_run_id,
         :start_url_hash, :next_url, :state, 0, 0,
-        '[]'::jsonb, now(), now(), NULL
+        '[]'::jsonb, '{{}}'::jsonb, now(), now(), NULL
     )
     ON CONFLICT (
         canonical_api_base, resource_type, source_scope_hash,
@@ -27558,6 +28030,7 @@ def _pagination_checkpoint_reset_sql() -> str:
         pages_processed = 0,
         rows_processed = 0,
         recent_cursor_hashes = '[]'::jsonb,
+        completeness_json = '{{}}'::jsonb,
         created_at = now(),
         updated_at = now(),
         completed_at = NULL;
@@ -27641,7 +28114,8 @@ def _empty_pagination_checkpoint_restart_sql() -> str:
            AND state = :active_state
            AND pages_processed = 0
            AND rows_processed = 0
-           AND recent_cursor_hashes::jsonb = CAST(:observed_cursor_hashes AS jsonb);
+           AND recent_cursor_hashes::jsonb = CAST(:observed_cursor_hashes AS jsonb)
+           AND completeness_json::jsonb = CAST(:observed_completeness AS jsonb);
         """
 
 
@@ -27782,6 +28256,33 @@ async def _save_pagination_checkpoint(
         raise RuntimeError("provider_directory_pagination_checkpoint_ownership_lost")
 
 
+async def _save_pagination_checkpoint_completeness(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    completeness: dict[str, Any],
+) -> None:
+    updated = await db.status(
+        f"""
+        UPDATE {_pagination_checkpoint_table_ref()}
+           SET completeness_json = CAST(:completeness AS jsonb),
+               updated_at = now()
+         WHERE canonical_api_base = :canonical_api_base
+           AND resource_type = :resource_type
+           AND source_scope_hash = :source_scope_hash
+           AND acquisition_root_run_id = :acquisition_root_run_id
+           AND owner_run_id = :owner_run_id;
+        """,
+        completeness=json.dumps(completeness, sort_keys=True),
+        canonical_api_base=context.canonical_api_base,
+        resource_type=resource_type,
+        source_scope_hash=context.source_scope_hash,
+        acquisition_root_run_id=context.acquisition_root_run_id,
+        owner_run_id=context.owner_run_id,
+    )
+    if _coerce_rowcount(updated) <= 0:
+        raise RuntimeError("provider_directory_pagination_checkpoint_ownership_lost")
+
+
 async def _clear_pagination_checkpoints(
     context: PaginationCheckpointContext,
     resource_types: list[str],
@@ -27827,6 +28328,27 @@ def _last_updated_partition_terminal_failure_details(
     )
 
 
+def _caresource_terminal_failure_details(
+    diagnostics_by_resource: dict[str, dict[str, Any]],
+    incomplete_resource_types: list[str],
+) -> str | None:
+    terminal_resource_types = [
+        resource_type
+        for resource_type in incomplete_resource_types
+        if diagnostics_by_resource[resource_type].get("fetch_mode")
+        == CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+        and str(
+            diagnostics_by_resource[resource_type].get("error") or ""
+        ).startswith(CARESOURCE_OPAQUE_CURSOR_BLOCKED_ERROR)
+    ]
+    if not terminal_resource_types:
+        return None
+    return ",".join(
+        f"{resource_type}={diagnostics_by_resource[resource_type].get('error')}"
+        for resource_type in terminal_resource_types
+    )
+
+
 def _handle_incomplete_source_pagination(
     source_record: dict[str, Any],
     diagnostics_by_resource: dict[str, dict[str, Any]],
@@ -27840,6 +28362,12 @@ def _handle_incomplete_source_pagination(
     )
     if terminal_failure_details:
         raise RuntimeError(terminal_failure_details)
+    caresource_failure = _caresource_terminal_failure_details(
+        diagnostics_by_resource,
+        incomplete_resource_types,
+    )
+    if caresource_failure:
+        raise RuntimeError(caresource_failure)
     graph_failures = [
         resource_type
         for resource_type in incomplete_resource_types
