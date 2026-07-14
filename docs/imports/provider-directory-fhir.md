@@ -327,6 +327,39 @@ remote rows once rather than multiplying them by the alias count. Existing
 historical alias copies are intentionally not deleted by this change; their
 cleanup is a separate migration.
 
+### Current Dataset Rehydration
+
+Use retained-dataset rehydration when the current published dataset is intact
+but its source-scoped typed rows, canonical rows, or source-resource edges need
+restoration before downstream artifact/profile publication. This mode makes no
+HTTP requests and does not publish artifacts itself.
+
+The request must name exactly one source, its current published dataset, and
+the acquisition root. Before writes, it verifies source-to-endpoint identity,
+current/published state, source provenance in publication metadata, the
+declared resource count, and the ordered retained-payload digest. It repeats
+the digest after processing. Each batch restores typed, canonical, and
+source-edge rows through the normal upsert path and commits its checkpoint in
+the same transaction. Interrupted runs resume from the committed resource ID;
+a completed run proves exact membership and does no writes.
+
+```bash
+python main.py start provider-directory-fhir \
+  --run-id "$REHYDRATE_RUN_ID" \
+  --source-id "$HUMANA_SOURCE_ID" \
+  --dataset-rehydrate-only \
+  --rehydrate-dataset-id "$HUMANA_CURRENT_DATASET_ID" \
+  --rehydrate-acquisition-root-run-id "$HUMANA_ACQUISITION_ROOT_RUN_ID" \
+  --rehydrate-batch-size 5000
+```
+
+For the 16.14M-resource Humana dataset, retain the emitted
+`PROVIDER_DIRECTORY_DATASET_REHYDRATE_DONE` JSON as benchmark evidence. It
+includes the before/after digest and per-resource input, mapped, rejected,
+typed, canonical-hash, and source-edge counts. Do not publish artifacts until
+every selected resource has `state=complete`, `rejected=0`, `typed_extra=0`,
+and `source_edge_extra=0`.
+
 Checkpointed acquisitions retain the candidate `dataset_id`. Candidate identity
 uses `provider_directory_pagination_root_run_id` when an external orchestrator supplies
 it, so pagination and partition/reverse-lookup retries across multiple hops

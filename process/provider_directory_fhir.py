@@ -54,6 +54,7 @@ from db.models import (
     ProviderDirectoryDatasetAffiliationOrganization,
     ProviderDirectoryDatasetInsurancePlan,
     ProviderDirectoryDatasetNetworkPlan,
+    ProviderDirectoryDatasetRehydrationCheckpoint,
     ProviderDirectoryDatasetResource,
     ProviderDirectoryEndpoint,
     ProviderDirectoryEndpointDataset,
@@ -75,6 +76,12 @@ from process.control_cancel import raise_if_cancelled
 from process.ext.address_canon import resolve_into_archive
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import ensure_database
+from process.provider_directory_dataset_rehydrate import (
+    DEFAULT_BATCH_SIZE as DEFAULT_DATASET_REHYDRATE_BATCH_SIZE,
+    DatasetRehydrationError,
+    DatasetScope,
+    rehydrate_current_dataset,
+)
 from process.provider_directory_time_partition import (
     CountKind,
     CountObservation,
@@ -465,6 +472,7 @@ CANONICAL_RESOURCE_MODELS = (
     ProviderDirectoryDatasetAffiliationOrganization,
     ProviderDirectoryCanonicalResource,
     ProviderDirectorySourceResource,
+    ProviderDirectoryDatasetRehydrationCheckpoint,
     ProviderDirectoryBulkAcquisitionCheckpoint,
     ProviderDirectoryBulkOutputCheckpoint,
     ProviderDirectoryPaginationCheckpoint,
@@ -31848,6 +31856,74 @@ async def _import_resources(
             await _drop_provider_directory_import_seen_stage_table(seen_stage_table)
 
 
+def _dataset_rehydrate_resource_types(raw: Any) -> tuple[str, ...]:
+    if raw in (None, "", (), []):
+        return ()
+    values = raw.split(",") if isinstance(raw, str) else raw
+    if isinstance(values, (bytes, bytearray, dict)) or not hasattr(values, "__iter__"):
+        raise ValueError("provider_directory_dataset_rehydrate_resources_invalid")
+    result = tuple(_clean_text(value) for value in values)
+    if not all(result) or len(result) != len(set(result)):
+        raise ValueError("provider_directory_dataset_rehydrate_resources_invalid")
+    return result
+
+
+async def _run_provider_directory_dataset_rehydrate(
+    ctx: dict[str, Any], task: dict[str, Any], run_id: str | None, source_ids: list[str]
+) -> dict[str, Any]:
+    """Run the retained-dataset path without source discovery or network access."""
+    if len(source_ids) != 1:
+        raise ValueError("provider_directory_dataset_rehydrate_requires_exactly_one_source_id")
+    if not run_id:
+        raise ValueError("provider_directory_dataset_rehydrate_run_id_required")
+    dataset_id = _clean_text(task.get("rehydrate_dataset_id"))
+    root_run_id = _clean_text(task.get("rehydrate_acquisition_root_run_id"))
+    if not dataset_id or not root_run_id:
+        raise ValueError("provider_directory_dataset_rehydrate_dataset_and_root_required")
+    incompatible = (
+        "canonical_backfill_only", "contact_backfill_only", "publish_artifacts_only",
+        "publish_artifacts", "publish_after_acquisition", "import_resources",
+        "full_refresh", "stale_cleanup", "bulk_export", "seed_only", "refresh_preset",
+        "resources", "resource_limit", "page_limit", "stream_batch_size",
+    )
+    if any(task.get(name) for name in incompatible):
+        raise ValueError("provider_directory_dataset_rehydrate_incompatible_parameters")
+
+    async def upsert(model: type, rows: list[dict[str, Any]], scope: DatasetScope) -> int:
+        return await _upsert_resource_rows(
+            model, rows, run_id=scope.acquisition_root_run_id, track_seen=False,
+            canonical_api_base=scope.canonical_api_base, source_ids=[scope.source_id],
+        )
+
+    async def cancelled() -> None:
+        await raise_if_cancelled(ctx, task)
+
+    async def report(progress: dict[str, Any]) -> None:
+        try:
+            await mark_control_run(
+                run_id, status="running", phase_detail=str(progress["phase"]),
+                progress=progress,
+                metrics={"dataset_rehydrate": {"source_id": source_ids[0], "dataset_id": dataset_id}},
+            )
+        except Exception as error:
+            LOGGER.warning("Provider Directory rehydration progress update failed: %s", error)
+
+    metrics = await rehydrate_current_dataset(
+        db, _schema(), RESOURCE_MODELS_BY_TYPE, upsert,
+        source_id=source_ids[0], dataset_id=dataset_id,
+        acquisition_root_run_id=root_run_id, owner_run_id=run_id,
+        resource_types=_dataset_rehydrate_resource_types(
+            task.get("rehydrate_resources") or task.get("rehydrate_resource")
+        ),
+        batch_size=_int_or_default(task.get("rehydrate_batch_size"), DEFAULT_DATASET_REHYDRATE_BATCH_SIZE),
+        cancel_check=cancelled, progress=report,
+    )
+    ctx["context"]["audit"] = metrics
+    ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
+    print("PROVIDER_DIRECTORY_DATASET_REHYDRATE_DONE\t" + json.dumps(metrics, sort_keys=True, default=str))
+    return metrics
+
+
 async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
     """Run provider-directory discovery, import, and publication."""
     task = _apply_provider_directory_refresh_preset(task or {})
@@ -31872,6 +31948,13 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         or task.get("provider_directory_source_ids")
         or task.get("provider_directory_source_id")
     )
+    if bool(task.get("dataset_rehydrate_only")):
+        try:
+            return await _run_provider_directory_dataset_rehydrate(
+                ctx, task, run_id, requested_source_ids
+            )
+        except DatasetRehydrationError:
+            raise
     limit = int(task.get("limit") or 0) or None
     source_query = _clean_text(task.get("source_query"))
     timeout = int(task.get("timeout") or os.getenv("HLTHPRT_PROVIDER_DIRECTORY_TIMEOUT", "15"))
@@ -32414,6 +32497,11 @@ async def main(
     seed_only: bool = False,
     probe: bool = True,
     import_resources: bool = False,
+    dataset_rehydrate_only: bool = False,
+    rehydrate_dataset_id: str | None = None,
+    rehydrate_acquisition_root_run_id: str | None = None,
+    rehydrate_resources: list[str] | tuple[str, ...] | str | None = None,
+    rehydrate_batch_size: int | None = None,
     canonical_backfill_only: bool = False,
     contact_backfill_only: bool = False,
     publish_artifacts_only: bool = False,
@@ -32463,6 +32551,11 @@ async def main(
         "seed_only": seed_only,
         "probe": probe,
         "import_resources": import_resources,
+        "dataset_rehydrate_only": dataset_rehydrate_only,
+        "rehydrate_dataset_id": rehydrate_dataset_id,
+        "rehydrate_acquisition_root_run_id": rehydrate_acquisition_root_run_id,
+        "rehydrate_resources": rehydrate_resources,
+        "rehydrate_batch_size": rehydrate_batch_size,
         "canonical_backfill_only": canonical_backfill_only,
         "contact_backfill_only": contact_backfill_only,
         "publish_artifacts_only": publish_artifacts_only,

@@ -93,6 +93,8 @@ jobs:
           tests/test_entity_address_unified_provider_directory.py
           tests/test_entity_address_unified_no_live_mutation.py
           tests/test_provider_directory_endpoint_dataset_schema.py
+          tests/test_provider_directory_dataset_rehydrate_unit.py
+          tests/test_provider_directory_dataset_rehydration_schema.py
           tests/test_provider_directory_pagination_checkpoint_schema.py
           tests/test_provider_directory_pagination_census_schema.py
           tests/test_provider_directory_pagination_root_identity_schema.py
