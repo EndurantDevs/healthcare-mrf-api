@@ -247,6 +247,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               FROM practitioner_rows AS practitioner
              WHERE practitioner.age_years IS NOT NULL
                AND practitioner.age_as_of IS NOT NULL
+               AND practitioner.age_years BETWEEN 18 AND 100
 
             UNION ALL
             SELECT practitioner.npi, 'years_of_practice',
