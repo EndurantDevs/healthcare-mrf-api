@@ -26,6 +26,9 @@ PROFILE_SQL_PATH = Path(__file__).resolve().parent / "sql"
 PROFILE_SCHEMA_VERSION = 1
 PROFILE_FACT_LIMIT = 100
 PROFILE_FACT_EVIDENCE_LIMIT = 25
+NPI_MIN = 1_000_000_000
+NPI_MAX = 2_999_999_999
+NPI_LUHN_PREFIX_DIGIT_SUM = 24
 
 PROFILE_INDEX_SUFFIXES = ("generation_idx",)
 PROFILE_EVIDENCE_INDEX_SUFFIXES = (
@@ -74,6 +77,53 @@ def quote_identifier(identifier: str) -> str:
 def qualified_table(schema: str, table_name: str) -> str:
     """Return a safely quoted schema-qualified table reference."""
     return f"{quote_identifier(schema)}.{quote_identifier(table_name)}"
+
+
+def is_valid_npi(value: Any) -> bool:
+    """Return whether a value is a CMS-assignable NPI with a valid check digit."""
+    value_text = str(value).strip()
+    if (
+        len(value_text) != 10
+        or not value_text.isascii()
+        or not value_text.isdigit()
+    ):
+        return False
+    npi_value = int(value_text)
+    if not NPI_MIN <= npi_value <= NPI_MAX:
+        return False
+    digits = [int(digit) for digit in value_text]
+    digit_sum = NPI_LUHN_PREFIX_DIGIT_SUM + digits[-1]
+    for position, digit in enumerate(digits[:-1], start=1):
+        if position % 2:
+            doubled = digit * 2
+            digit_sum += doubled - 9 if doubled > 9 else doubled
+        else:
+            digit_sum += digit
+    return digit_sum % 10 == 0
+
+
+def valid_npi_sql(value_sql: str) -> str:
+    """Build the matching PostgreSQL assignable-range and Luhn predicate."""
+    digit_terms: list[str] = []
+    for position in range(1, 11):
+        divisor = 10 ** (10 - position)
+        digit_sql = f"((({value_sql}) / {divisor}) % 10)"
+        if position < 10 and position % 2:
+            digit_terms.append(
+                f"(({digit_sql} * 2) - CASE WHEN {digit_sql} >= 5 THEN 9 ELSE 0 END)"
+            )
+        else:
+            digit_terms.append(digit_sql)
+    checksum_sql = "\n                + ".join(
+        [str(NPI_LUHN_PREFIX_DIGIT_SUM), *digit_terms]
+    )
+    return f"""(
+            ({value_sql}) BETWEEN {NPI_MIN} AND {NPI_MAX}
+            AND MOD(
+                {checksum_sql},
+                10
+            ) = 0
+        )"""
 
 
 def _bounded_identifier(value: str) -> str:
@@ -269,7 +319,8 @@ def copy_existing_evidence_sql(
         INSERT INTO {target_ref} ({columns})
         SELECT {columns}
           FROM {source_ref}
-         WHERE source_id <> ALL(CAST(:source_ids AS varchar[]));
+         WHERE source_id <> ALL(CAST(:source_ids AS varchar[]))
+           AND {valid_npi_sql("npi")};
     """
 
 
@@ -295,7 +346,8 @@ def copy_unaffected_profiles_sql(
         )
         SELECT {columns}
           FROM {profile_source_ref} AS profile
-         WHERE NOT EXISTS (
+         WHERE {valid_npi_sql("profile.npi")}
+           AND NOT EXISTS (
                 SELECT 1
                   FROM affected_npis
                  WHERE affected_npis.npi = profile.npi
@@ -328,6 +380,7 @@ def profile_evidence_insert_sql(
             "ORGANIZATION_REF": organization_ref,
             "SERVICE_REF": service_ref,
             "ENDPOINT_REF": endpoint_ref,
+            "VALID_NPI_SQL": valid_npi_sql("npi"),
         },
     )
 

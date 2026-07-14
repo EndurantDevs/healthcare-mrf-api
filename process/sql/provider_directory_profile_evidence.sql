@@ -640,6 +640,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    effective_end, observed_at
               FROM facts
              WHERE npi IS NOT NULL
+               AND {{VALID_NPI_SQL}}
                AND value_json IS NOT NULL
                AND value_json <> '{}'::jsonb
              ORDER BY npi, fact_type, fact_key, source_id,
