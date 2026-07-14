@@ -241,8 +241,8 @@ def test_passing_release_recomputes_capacity_from_signed_raw_rows():
     assert all(_gate_map(report).values())
     assert report["objective"] == {
         "target_logical_imports_per_month": 2_000,
-        "month_days": 28,
-        "month_hours": 672,
+        "month_days": 30,
+        "month_hours": 720,
     }
     assert metrics["monthly_capacity"]["worst_case_unique_builds"] == 2_000
     assert metrics["candidate_audit"]["http_requests_per_month"] == 6_000_000

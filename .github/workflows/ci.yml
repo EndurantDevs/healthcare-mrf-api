@@ -126,6 +126,8 @@ jobs:
           tests/test_ptg2_postgres_binary_v3_hydration.py
           tests/test_ptg2_postgres_binary_v3_pages_api.py
           tests/test_ptg2_rust_shared_graph_bridge.py
+          tests/test_ptg2_finalizer_cancellation.py
+          tests/test_ptg2_scanner_cancellation.py
           tests/test_ptg2_scanner_indexed_rapidgzip.py
           tests/test_ptg2_scanner_late_references.py
           tests/test_ptg2_scanner_parallelism.py
@@ -137,11 +139,13 @@ jobs:
           tests/test_ptg2_shared_audit.py
           tests/test_ptg2_shared_blocks.py
           tests/test_ptg2_shared_finalize.py
+          tests/test_ptg2_shared_finalize_source_contracts.py
           tests/test_ptg2_shared_gc.py
           tests/test_ptg2_shared_graph.py
           tests/test_ptg2_shared_graph_postgres.py
           tests/test_ptg2_shared_price.py
           tests/test_ptg2_shared_publish.py
+          tests/test_ptg2_shared_publish_graph_artifacts.py
           tests/test_ptg2_shared_reuse.py
           tests/test_ptg2_shared_serving_api.py
           tests/test_ptg2_shared_snapshot_publish_postgres.py
@@ -152,18 +156,24 @@ jobs:
           tests/test_ptg2_strict_v3_snapshot_validation.py
           tests/test_ptg2_v3_cross_plan_reuse.py
           tests/test_ptg2_v3_audit_occurrences_api.py
+          tests/test_ptg2_candidate_attestation.py
           tests/test_ptg2_capacity_evidence.py
+          tests/test_ptg2_v3_bounded_readers.py
           tests/test_ptg2_v3_capacity_gate.py
           tests/test_ptg2_v3_capacity_gate_adversarial.py
           tests/test_ptg2_v3_capacity_resources.py
+          tests/test_ptg2_v3_finalizer_resources.py
+          tests/test_ptg2_v3_rust_python_forward_bridge.py
           tests/test_ptg2_v3_shared_schema.py
           tests/test_ptg2_v3_source_api_audit.py
           tests/test_ptg2_v3_source_api_audit_capacity.py
+          tests/test_pricing_api.py
           tests/test_ptg_control_unit.py
           tests/test_ptg_snapshot_claim_race.py
           tests/test_ptg_snapshot_cleanup_race.py
           tests/test_ptg_snapshot_cleanup_safety.py
           tests/test_ptg_strict_static_control_tables.py
+          tests/test_ptg_strict_v3_docs.py
           tests/test_ptg_source_snapshot_control.py
           tests/test_ptg_source_snapshot_control_race.py
           tests/test_ptg_source_snapshot_control_safety.py

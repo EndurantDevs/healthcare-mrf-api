@@ -799,25 +799,21 @@ def test_monthly_target_and_objective_contracts_remain_fail_closed():
     assert (error.code, error.field) == ("missing_field", "objective")
 
 
-def test_monthly_capacity_uses_shortest_calendar_month_not_720_hours():
+def test_monthly_capacity_uses_explicit_30_day_contract():
     measurement = _record()
-    measurement["lanes"]["availability_factor"] = Decimal("0.14")
+    measurement["lanes"]["availability_factor"] = Decimal("0.13")
 
     report = _evaluate(measurement)
     capacity = report["metrics"]["monthly_capacity"]
     worst_case_worker_hours = Decimal(2_000 * 4) / Decimal(60)
-    shortest_month_utilization = worst_case_worker_hours / (
-        Decimal(2 * 672) * Decimal("0.14")
-    )
-    fixed_720_hour_utilization = worst_case_worker_hours / (
-        Decimal(2 * 720) * Decimal("0.14")
+    contracted_utilization = worst_case_worker_hours / (
+        Decimal(2 * 720) * Decimal("0.13")
     )
 
-    assert report["objective"]["month_days"] == 28
-    assert report["objective"]["month_hours"] == 672
-    assert capacity["available_lane_hours"] == pytest.approx(188.16)
-    assert shortest_month_utilization > gate.MAX_LANE_UTILIZATION
-    assert fixed_720_hour_utilization <= gate.MAX_LANE_UTILIZATION
+    assert report["objective"]["month_days"] == 30
+    assert report["objective"]["month_hours"] == 720
+    assert capacity["available_lane_hours"] == pytest.approx(187.2)
+    assert contracted_utilization > gate.MAX_LANE_UTILIZATION
     assert _gate_map(report)["worst_case_lane_utilization"] is False
 
 

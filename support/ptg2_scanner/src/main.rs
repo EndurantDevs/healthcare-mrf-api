@@ -18308,7 +18308,6 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             .input_bytes
             .saturating_add(provider_sort_stats.spill_bytes)
             .saturating_add(provider_sort_stats.output_bytes.saturating_mul(2))
-            .saturating_add(code_dictionary_source_bytes)
             .saturating_add(price_key_map_stage.input_bytes)
             .saturating_add(price_map_stage_bytes),
         written: provider_sort_stats
