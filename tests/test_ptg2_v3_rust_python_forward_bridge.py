@@ -17,6 +17,7 @@ import pytest
 from api import ptg2_db_sidecars
 from api.ptg2_db_sidecars import PTG2ServingBinaryRow
 from process.ptg_parts.ptg2_shared_finalize import (
+    attach_v3_dictionary_contract,
     attach_v3_source_run_contract,
     write_v3_finalizer_input_manifest,
 )
@@ -192,15 +193,24 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
     manifest_path = tmp_path / "v3-forward-bridge-input.json"
     scanner_summary = scanner_support._single_frame(scan["frames"], "scanner_summary")
     scanner_config = scanner_support._single_frame(scan["frames"], "scanner_config")
+    serving_run_entries = attach_v3_source_run_contract(
+        scan["partition_frames"],
+        source_identity=source_identity,
+        scanner_summary=scanner_summary,
+        scanner_config=scanner_config,
+    )
+    code_dictionary_entries = attach_v3_dictionary_contract(
+        scan["code_dictionary_frames"],
+        source_identity=source_identity,
+        source_run_contract_sha256=serving_run_entries[0][
+            "source_run_contract_sha256"
+        ],
+        scanner_summary=scanner_summary,
+    )
     write_v3_finalizer_input_manifest(
         manifest_path,
-        serving_run_entries=attach_v3_source_run_contract(
-            scan["partition_frames"],
-            source_identity=source_identity,
-            scanner_summary=scanner_summary,
-            scanner_config=scanner_config,
-        ),
-        code_dictionary_entries=scan["code_dictionary_frames"],
+        serving_run_entries=serving_run_entries,
+        code_dictionary_entries=code_dictionary_entries,
         expected_source_identities=[source_identity],
     )
 
@@ -229,8 +239,7 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
             str(scanner_binary),
             "--finalize-v3-runs",
             str(output_directory),
-            "--memory-records",
-            "1",
+            *scanner_support._v3_finalizer_test_resource_args(),
             "--price-key-map-input",
             str(price_key_map_path),
             "--price-membership-input",

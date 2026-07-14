@@ -292,6 +292,14 @@ upserted before their source aliases, so every alias in one acquisition group
 has the same `endpoint_id` without making plan names part of transport
 identity.
 
+That endpoint grouping is an acquisition contract, not an implicit publication
+scope. An artifact-only run with explicit `source_ids` publishes exactly those
+source aliases, while still resolving and fencing the shared immutable endpoint
+dataset. It does not expand the request to sibling rows that happen to carry the
+same `endpoint_id`. An unfiltered artifact publication still selects all source
+aliases, and acquisition may continue to pass its complete endpoint group
+explicitly when every alias is required.
+
 Each endpoint acquisition writes to a non-current
 `provider_directory_endpoint_dataset` candidate. Normalized resources are
 stored once per `(dataset_id, resource_type, resource_id)` in

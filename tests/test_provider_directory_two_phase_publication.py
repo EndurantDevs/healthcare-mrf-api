@@ -243,7 +243,6 @@ async def test_full_scope_uses_candidate_while_targeted_uses_current(monkeypatch
             )
             assert [tuple(scope_name_row) for scope_name_row in scoped_names] == [
                 ("source_primary", "Candidate Clinic"),
-                ("source_sibling", "Candidate Clinic"),
             ]
 
 

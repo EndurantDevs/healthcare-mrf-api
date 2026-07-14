@@ -364,6 +364,8 @@ def run_release_audit(
             "release",
             "--api-base-url",
             api_base_url,
+            "--api-path",
+            ptg2_v3_source_api_audit.DEFAULT_CANDIDATE_API_PATH,
             "--plan-id",
             target.plan_id,
             "--snapshot-id",

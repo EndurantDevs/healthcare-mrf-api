@@ -22,6 +22,7 @@ def test_init_api_registers_group(monkeypatch):
         def __init__(self):
             self.config = {}
             self.registered = None
+            self.registered_middleware = []
             self.listeners = {}
 
         def listener(self, event):
@@ -35,6 +36,9 @@ def test_init_api_registers_group(monkeypatch):
                 return func
             return decorator
 
+        def register_middleware(self, middleware, phase):
+            self.registered_middleware.append((middleware, phase))
+
         def blueprint(self, group):
             self.registered = group
 
@@ -43,6 +47,9 @@ def test_init_api_registers_group(monkeypatch):
 
     assert called["init"] is True
     assert app.registered is not None
+    assert app.registered_middleware == [
+        (init_api.__globals__["_capacity_process_request_guard"], "request")
+    ]
     assert hasattr(app.registered, "blueprints")
     assert {bp.name for bp in app.registered.blueprints} == {
         "coverage",

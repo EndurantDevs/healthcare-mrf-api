@@ -1,13 +1,18 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import json
+import os
 import types
+from datetime import datetime, timedelta, timezone
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from api import ptg2_capacity_evidence as capacity_evidence
 from api.ptg2_candidate_audit import (
     PTG2_CANDIDATE_AUDIT_ACCESS_ARG,
     PTG2_CANDIDATE_AUDIT_HEADER,
@@ -2319,6 +2324,180 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     assert seen_argument_map["lat"] == 29.7604
     assert seen_argument_map["long"] == -95.3698
     assert seen_argument_map["radius_miles"] == 10.0
+
+
+def _configure_pricing_capacity_evidence(monkeypatch):
+    """Configure a fresh, isolated Ed25519 evidence signer for this test."""
+
+    private_key = Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33)))
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    release_digest = "11" * 32
+    environment_id = "22" * 32
+    key_id = "capacity-api-test-key"
+    run_nonce = "a1" * 32
+    contention_run_id = "b1" * 32
+    process_started_at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(
+        seconds=1
+    )
+
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "operator-secret")
+    monkeypatch.setenv(capacity_evidence.CAPACITY_ISOLATED_PROCESS_ENV, "1")
+    monkeypatch.setenv(
+        capacity_evidence.CAPACITY_PRIVATE_KEY_ENV,
+        private_key.private_bytes_raw().hex(),
+    )
+    monkeypatch.setenv(capacity_evidence.CAPACITY_KEY_ID_ENV, key_id)
+    monkeypatch.setenv(
+        capacity_evidence.CAPACITY_RELEASE_DIGEST_ENV, release_digest
+    )
+    monkeypatch.setenv(
+        capacity_evidence.CAPACITY_ENVIRONMENT_ID_ENV, environment_id
+    )
+    monkeypatch.setattr(
+        capacity_evidence._PROCESS_IDENTITY, "process_id", os.getpid()
+    )
+    monkeypatch.setattr(
+        capacity_evidence._PROCESS_IDENTITY, "instance", "ab" * 32
+    )
+    monkeypatch.setattr(
+        capacity_evidence._PROCESS_IDENTITY, "started_at", process_started_at
+    )
+    monkeypatch.setattr(
+        capacity_evidence._PROCESS_IDENTITY,
+        "challenge_state",
+        capacity_evidence.CapacityEvidenceState(),
+    )
+    monkeypatch.setattr(
+        capacity_evidence._PROCESS_IDENTITY,
+        "isolated_request_instance",
+        None,
+    )
+    return (
+        public_key,
+        release_digest,
+        environment_id,
+        key_id,
+        run_nonce,
+        contention_run_id,
+    )
+
+
+def _capacity_evidence_pricing_request(run_nonce, contention_run_id):
+    """Create the exact standard PTG request used by the evidence contract."""
+
+    request = make_request(
+        [],
+        args={
+            "plan_id": "TESTPLAN001",
+            "snapshot_id": "strict-v3-snapshot",
+            "mode": "exact_source",
+            "code_system": "CPT",
+            "code": "99213",
+            "npi": "1234567890",
+            "include_providers": "true",
+            "include_details": "true",
+            "include_sources": "true",
+            "include_allowed_amounts": "false",
+            "include_unverified_addresses": "true",
+            "order_by": "npi",
+            "order": "asc",
+            "offset": "0",
+            "limit": "100",
+        },
+    )
+    challenge = "7d" * 32
+    request.headers = {
+        "Authorization": "Bearer operator-secret",
+        capacity_evidence.CAPACITY_CHALLENGE_HEADER: challenge,
+        capacity_evidence.CAPACITY_RUN_NONCE_HEADER: run_nonce,
+        capacity_evidence.CAPACITY_CONTENTION_RUN_ID_HEADER: contention_run_id,
+        capacity_evidence.CAPACITY_SEMANTIC_CLASS_HEADER: "matched_positive",
+        capacity_evidence.CAPACITY_SELECTION_ORDINAL_HEADER: "0",
+    }
+    request.method = "GET"
+    request.path = capacity_evidence.CAPACITY_QUERY_PATH
+    request.route = types.SimpleNamespace(
+        name="pricing.providers.search_by_procedure"
+    )
+    return request, challenge
+
+
+def _assert_capacity_observation(observation_map, key_id, contention_run_id):
+    """Assert the endpoint-bound, redacted V3 evidence contract."""
+
+    assert observation_map["api_evidence_key_id"] == key_id
+    assert observation_map["response_status"] == 200
+    assert observation_map["observation_ordinal"] == 0
+    assert observation_map["cold"] is True
+    assert observation_map["first_observation"] is True
+    assert observation_map["contention_run_id"] == contention_run_id
+    assert observation_map["semantic_class"] == "matched_positive"
+    assert observation_map["selection_method"] == "known_match_v1"
+    assert observation_map["selection_ordinal"] == 0
+    assert observation_map["result_count"] == 1
+    assert observation_map["server_duration_ns"] >= 0
+    assert observation_map["page_limit"] == 100
+    serialized_observation = json.dumps(observation_map)
+    assert "TESTPLAN001" not in serialized_observation
+    assert "strict-v3-snapshot" not in serialized_observation
+
+
+@pytest.mark.asyncio
+async def test_standard_ptg_route_attaches_authenticated_capacity_evidence(
+    monkeypatch,
+):
+    """The public PTG route exposes a collector-verifiable signed response."""
+
+    async def fake_search(_session, _args, pagination):
+        return {
+            "items": [{"npi": 1234567890, "tic_prices": []}],
+            "pagination": {
+                "total": 1,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2"},
+        }
+
+    (
+        public_key,
+        release_digest,
+        environment_id,
+        key_id,
+        run_nonce,
+        contention_run_id,
+    ) = _configure_pricing_capacity_evidence(monkeypatch)
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request, challenge = _capacity_evidence_pricing_request(
+        run_nonce, contention_run_id
+    )
+
+    capacity_response = await list_providers_by_procedure(request)
+
+    observation = capacity_evidence.collect_capacity_http_observation(
+        capacity_response.headers,
+        challenge=challenge,
+        run_nonce=run_nonce,
+        query_parameters=request.args,
+        response_status_code=capacity_response.status,
+        response_body=capacity_response.body,
+        response_redirect_count=0,
+        collector_received_at=datetime.now(timezone.utc),
+        expected_api_evidence_key_id=key_id,
+        expected_api_evidence_public_key=public_key,
+        expected_release_digest=release_digest,
+        expected_environment_id=environment_id,
+        expected_contention_run_id=contention_run_id,
+        expected_semantic_class="matched_positive",
+        expected_selection_ordinal=0,
+        state=capacity_evidence.CapacityEvidenceState(),
+    )
+
+    _assert_capacity_observation(observation, key_id, contention_run_id)
 
 
 @pytest.mark.asyncio

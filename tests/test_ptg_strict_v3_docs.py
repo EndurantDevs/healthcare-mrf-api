@@ -29,6 +29,9 @@ def test_strict_ptg_docs_define_sharded_writer_and_bounded_cost_pages():
         assert "64" in text
         assert "progressive exact selection" in text.lower()
         assert "sparse reverse completion" in text.lower()
+        assert "adjacent continuation" in text.lower()
+        assert "globally ordered" in text.lower()
+        assert "bounded" in text.lower()
         assert "`has_more`" in text
         assert "`total_is_exact`" in text
         assert "`total_lower_bound`" in text

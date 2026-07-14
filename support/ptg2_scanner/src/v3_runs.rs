@@ -2,7 +2,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -1099,6 +1099,41 @@ fn write_dictionary_optional_text<W: Write>(writer: &mut W, value: Option<&str>)
 }
 
 pub fn read_code_dictionary(path: impl AsRef<Path>) -> io::Result<Vec<NaturalLeanCode>> {
+    let path = path.as_ref();
+    let file_bytes = path.metadata()?.len();
+    read_code_dictionary_inner(path, file_bytes, None)
+}
+
+pub fn read_code_dictionary_exact(
+    path: impl AsRef<Path>,
+    expected_record_count: u64,
+    expected_file_bytes: u64,
+) -> io::Result<Vec<NaturalLeanCode>> {
+    let path = path.as_ref();
+    let actual_file_bytes = path.metadata()?.len();
+    if actual_file_bytes != expected_file_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serving code dictionary byte count changed before parsing",
+        ));
+    }
+    read_code_dictionary_inner(path, actual_file_bytes, Some(expected_record_count))
+}
+
+fn read_code_dictionary_inner(
+    path: &Path,
+    file_bytes: u64,
+    expected_record_count: Option<u64>,
+) -> io::Result<Vec<NaturalLeanCode>> {
+    const HEADER_BYTES: u64 = 8 + 4 + 8;
+    const MINIMUM_RECORD_BYTES: u64 = 16 + COVERAGE_SCOPE_ID_BYTES as u64 + 6;
+
+    if file_bytes < HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serving code dictionary is shorter than its header",
+        ));
+    }
     let mut reader = BufReader::new(File::open(path)?);
     let mut magic = [0u8; CODE_DICTIONARY_MAGIC.len()];
     reader.read_exact(&mut magic)?;
@@ -1118,19 +1153,48 @@ pub fn read_code_dictionary(path: impl AsRef<Path>) -> io::Result<Vec<NaturalLea
         ));
     }
     let record_count = read_u64(&mut reader)?;
-    let capacity = usize::try_from(record_count).unwrap_or(usize::MAX / 2);
-    let mut records = Vec::with_capacity(capacity.min(1_000_000));
+    if expected_record_count.is_some_and(|expected| expected != record_count) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serving code dictionary record count differs from its authenticated manifest",
+        ));
+    }
+    let minimum_file_bytes = record_count
+        .checked_mul(MINIMUM_RECORD_BYTES)
+        .and_then(|bytes| bytes.checked_add(HEADER_BYTES))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serving code dictionary minimum size overflow",
+            )
+        })?;
+    if minimum_file_bytes > file_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serving code dictionary record count cannot fit in the file",
+        ));
+    }
+    let capacity = usize::try_from(record_count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serving code dictionary record count exceeds addressable memory",
+        )
+    })?;
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(capacity.min(1_000_000))
+        .map_err(|_| io::Error::other("serving code dictionary record allocation failed"))?;
     for _ in 0..record_count {
         let mut code_id = [0u8; 16];
         reader.read_exact(&mut code_id)?;
         let mut coverage_scope_id = [0u8; COVERAGE_SCOPE_ID_BYTES];
         reader.read_exact(&mut coverage_scope_id)?;
-        let reported_code_system = read_dictionary_optional_text(&mut reader)?;
-        let reported_code = read_dictionary_optional_text(&mut reader)?;
-        let negotiation_arrangement = read_dictionary_optional_text(&mut reader)?;
-        let billing_code_type_version = read_dictionary_optional_text(&mut reader)?;
-        let name = read_dictionary_optional_text(&mut reader)?;
-        let description = read_dictionary_optional_text(&mut reader)?;
+        let reported_code_system = read_dictionary_optional_text(&mut reader, file_bytes)?;
+        let reported_code = read_dictionary_optional_text(&mut reader, file_bytes)?;
+        let negotiation_arrangement = read_dictionary_optional_text(&mut reader, file_bytes)?;
+        let billing_code_type_version = read_dictionary_optional_text(&mut reader, file_bytes)?;
+        let name = read_dictionary_optional_text(&mut reader, file_bytes)?;
+        let description = read_dictionary_optional_text(&mut reader, file_bytes)?;
         let expected = natural_lean_code_identity(
             &coverage_scope_id,
             reported_code_system.as_deref(),
@@ -1179,9 +1243,26 @@ fn read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
     Ok(u64::from_be_bytes(value))
 }
 
-fn read_dictionary_text<R: Read>(reader: &mut R) -> io::Result<String> {
-    let length = read_u32(reader)? as usize;
-    let mut value = vec![0u8; length];
+fn read_dictionary_text<R: Read + Seek>(reader: &mut R, file_bytes: u64) -> io::Result<String> {
+    let length = u64::from(read_u32(reader)?);
+    let position = reader.stream_position()?;
+    if position > file_bytes || length > file_bytes - position {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serving code dictionary text length exceeds remaining file bytes",
+        ));
+    }
+    let length = usize::try_from(length).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serving code dictionary text length exceeds addressable memory",
+        )
+    })?;
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(length)
+        .map_err(|_| io::Error::other("serving code dictionary text allocation failed"))?;
+    value.resize(length, 0);
     reader.read_exact(&mut value)?;
     String::from_utf8(value).map_err(|error| {
         io::Error::new(
@@ -1191,12 +1272,15 @@ fn read_dictionary_text<R: Read>(reader: &mut R) -> io::Result<String> {
     })
 }
 
-fn read_dictionary_optional_text<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
+fn read_dictionary_optional_text<R: Read + Seek>(
+    reader: &mut R,
+    file_bytes: u64,
+) -> io::Result<Option<String>> {
     let mut tag = [0u8; 1];
     reader.read_exact(&mut tag)?;
     match tag[0] {
         0 => Ok(None),
-        1 => read_dictionary_text(reader).map(Some),
+        1 => read_dictionary_text(reader, file_bytes).map(Some),
         value => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("serving code dictionary has invalid nullable tag {value}"),
@@ -1222,6 +1306,95 @@ pub struct MultiFileSortStats {
     pub spill_bytes: u64,
     pub chunk_count: u64,
     pub output_bytes: u64,
+}
+
+trait TemporaryRunMerger {
+    fn merge_runs(&mut self, run_paths: Vec<PathBuf>) -> io::Result<PathBuf>;
+}
+
+struct BoundedRunAccumulator {
+    fan_in: usize,
+    levels: Vec<Vec<PathBuf>>,
+    initial_run_count: u64,
+    #[cfg(test)]
+    peak_active_path_count: usize,
+}
+
+impl BoundedRunAccumulator {
+    fn new(fan_in: usize) -> Self {
+        assert!(
+            fan_in >= 2,
+            "external sort merge fan-in must be at least two"
+        );
+        Self {
+            fan_in,
+            levels: Vec::new(),
+            initial_run_count: 0,
+            #[cfg(test)]
+            peak_active_path_count: 0,
+        }
+    }
+
+    fn push_initial<M: TemporaryRunMerger>(
+        &mut self,
+        path: PathBuf,
+        merger: &mut M,
+    ) -> io::Result<()> {
+        self.initial_run_count = self.initial_run_count.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "initial run count overflow")
+        })?;
+        self.push_at_level(0, path, merger)
+    }
+
+    fn push_at_level<M: TemporaryRunMerger>(
+        &mut self,
+        level: usize,
+        path: PathBuf,
+        merger: &mut M,
+    ) -> io::Result<()> {
+        if self.levels.len() == level {
+            self.levels.push(Vec::with_capacity(self.fan_in));
+        }
+        self.levels[level].push(path);
+        #[cfg(test)]
+        {
+            self.peak_active_path_count = self
+                .peak_active_path_count
+                .max(self.levels.iter().map(Vec::len).sum());
+        }
+        if self.levels[level].len() < self.fan_in {
+            return Ok(());
+        }
+
+        let group = std::mem::replace(&mut self.levels[level], Vec::with_capacity(self.fan_in));
+        let merged_path = merger.merge_runs(group)?;
+        self.push_at_level(level + 1, merged_path, merger)
+    }
+
+    fn initial_run_count(&self) -> u64 {
+        self.initial_run_count
+    }
+
+    fn finish<M: TemporaryRunMerger>(self, merger: &mut M) -> io::Result<Vec<PathBuf>> {
+        let mut run_paths = self.levels.into_iter().flatten().collect::<Vec<_>>();
+        while run_paths.len() > self.fan_in {
+            let group = run_paths.drain(..self.fan_in).collect();
+            run_paths.push(merger.merge_runs(group)?);
+        }
+        Ok(run_paths)
+    }
+
+    #[cfg(test)]
+    fn peak_active_path_count(&self) -> usize {
+        self.peak_active_path_count
+    }
+
+    #[cfg(test)]
+    fn maximum_active_path_metadata(fan_in: usize) -> usize {
+        (fan_in - 1)
+            .saturating_mul(u64::BITS as usize)
+            .saturating_add(1)
+    }
 }
 
 pub fn external_sort_dedupe_partition_files(
@@ -1288,7 +1461,15 @@ fn external_sort_partition_files_with_mode(
     fs::create_dir_all(temporary_directory)?;
     let mut temporary_files = TemporaryFiles::default();
     let mut records = Vec::with_capacity(in_memory_record_limit.min(8192));
-    let mut run_paths = Vec::new();
+    let mut runs = BoundedRunAccumulator::new(DEFAULT_SORT_MERGE_FAN_IN);
+    let mut merger = ServingRunMerger::<ServingRunRecord> {
+        temporary_directory,
+        temporary_files: &mut temporary_files,
+        dedupe,
+        duplicate_records: 0,
+        spill_bytes: 0,
+        record: std::marker::PhantomData,
+    };
     let mut input_records = 0u64;
     let mut input_bytes = 0u64;
     for input_path in input_paths {
@@ -1319,34 +1500,22 @@ fn external_sort_partition_files_with_mode(
             })?;
             records.push(record);
             if records.len() == in_memory_record_limit {
-                run_paths.push(spill_sorted_run(
-                    &mut records,
-                    temporary_directory,
-                    &mut temporary_files,
-                )?);
+                let path =
+                    spill_sorted_run(&mut records, temporary_directory, merger.temporary_files)?;
+                merger.record_initial_spill(&path)?;
+                runs.push_initial(path, &mut merger)?;
             }
         }
     }
     if !records.is_empty() {
-        run_paths.push(spill_sorted_run(
-            &mut records,
-            temporary_directory,
-            &mut temporary_files,
-        )?);
+        let path = spill_sorted_run(&mut records, temporary_directory, merger.temporary_files)?;
+        merger.record_initial_spill(&path)?;
+        runs.push_initial(path, &mut merger)?;
     }
-    let initial_chunk_count = run_paths.len() as u64;
-    let mut spill_bytes = run_paths.iter().try_fold(0u64, |total, path| {
-        path.metadata()
-            .map(|metadata| total.saturating_add(metadata.len()))
-    })?;
-    let (run_paths, intermediate_duplicates, intermediate_spill_bytes) =
-        reduce_serving_sort_runs::<ServingRunRecord>(
-            run_paths,
-            temporary_directory,
-            &mut temporary_files,
-            dedupe,
-        )?;
-    spill_bytes = spill_bytes.saturating_add(intermediate_spill_bytes);
+    let initial_chunk_count = runs.initial_run_count();
+    let run_paths = runs.finish(&mut merger)?;
+    let intermediate_duplicates = merger.duplicate_records;
+    let spill_bytes = merger.spill_bytes;
     let output_parent = usable_parent(output_path);
     fs::create_dir_all(output_parent)?;
     let (staged_output_path, staged_output) =
@@ -1363,6 +1532,7 @@ fn external_sort_partition_files_with_mode(
     output.flush()?;
     output.get_ref().sync_all()?;
     drop(output);
+    temporary_files.remove_all(&run_paths)?;
     let merged_input_records = if dedupe {
         output_records.saturating_add(duplicate_records)
     } else {
@@ -1379,6 +1549,7 @@ fn external_sort_partition_files_with_mode(
         .checked_mul(SERVING_RUN_RECORD_BYTES as u64)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "output byte count overflow"))?;
     fs::rename(&staged_output_path, output_path)?;
+    temporary_files.release(&staged_output_path);
     Ok(MultiFileSortStats {
         input_file_count: input_paths.len() as u64,
         input_records,
@@ -1419,7 +1590,13 @@ pub fn external_sort_tagged_partition_files(
     fs::create_dir_all(temporary_directory)?;
     let mut temporary_files = TemporaryFiles::default();
     let mut records = Vec::with_capacity(in_memory_record_limit.min(8192));
-    let mut run_paths = Vec::new();
+    let mut runs = BoundedRunAccumulator::new(DEFAULT_SORT_MERGE_FAN_IN);
+    let mut merger = TaggedRunMerger {
+        temporary_directory,
+        temporary_files: &mut temporary_files,
+        codec,
+        spill_bytes: 0,
+    };
     let mut input_records = 0u64;
     let mut input_bytes = 0u64;
     for (input_path, source_key) in input_paths {
@@ -1462,31 +1639,30 @@ pub fn external_sort_tagged_partition_files(
                 source_key: *source_key,
             });
             if records.len() == in_memory_record_limit {
-                run_paths.push(spill_tagged_sorted_run(
+                let path = spill_tagged_sorted_run(
                     &mut records,
                     temporary_directory,
-                    &mut temporary_files,
+                    merger.temporary_files,
                     codec,
-                )?);
+                )?;
+                merger.record_initial_spill(&path)?;
+                runs.push_initial(path, &mut merger)?;
             }
         }
     }
     if !records.is_empty() {
-        run_paths.push(spill_tagged_sorted_run(
+        let path = spill_tagged_sorted_run(
             &mut records,
             temporary_directory,
-            &mut temporary_files,
+            merger.temporary_files,
             codec,
-        )?);
+        )?;
+        merger.record_initial_spill(&path)?;
+        runs.push_initial(path, &mut merger)?;
     }
-    let initial_chunk_count = run_paths.len() as u64;
-    let mut spill_bytes = run_paths.iter().try_fold(0u64, |total, path| {
-        path.metadata()
-            .map(|metadata| total.saturating_add(metadata.len()))
-    })?;
-    let (run_paths, intermediate_spill_bytes) =
-        reduce_tagged_sort_runs(run_paths, temporary_directory, &mut temporary_files, codec)?;
-    spill_bytes = spill_bytes.saturating_add(intermediate_spill_bytes);
+    let initial_chunk_count = runs.initial_run_count();
+    let run_paths = runs.finish(&mut merger)?;
+    let spill_bytes = merger.spill_bytes;
     let output_parent = usable_parent(output_path);
     fs::create_dir_all(output_parent)?;
     let (staged_output_path, staged_output) =
@@ -1498,6 +1674,7 @@ pub fn external_sort_tagged_partition_files(
     output.flush()?;
     output.get_ref().sync_all()?;
     drop(output);
+    temporary_files.remove_all(&run_paths)?;
     if output_records != input_records {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1509,6 +1686,7 @@ pub fn external_sort_tagged_partition_files(
         .checked_mul(tagged_record_bytes)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "output byte count overflow"))?;
     fs::rename(&staged_output_path, output_path)?;
+    temporary_files.release(&staged_output_path);
     Ok(MultiFileSortStats {
         input_file_count: input_paths.len() as u64,
         input_records,
@@ -1523,6 +1701,8 @@ pub fn external_sort_tagged_partition_files(
 
 pub const DENSE_ID_RECORD_BYTES: usize = 16;
 pub const PROVIDER_IDENTITY_RECORD_BYTES: usize = 20;
+pub const ASSIGNED_SERVING_RECORD_BYTES: usize = 20;
+pub const PROVIDER_CODE_PAIR_RECORD_BYTES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DenseIdRecord(pub [u8; 16]);
@@ -1532,6 +1712,12 @@ pub struct ProviderIdentityRecord {
     pub id: [u8; 16],
     pub provider_count: u32,
 }
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AssignedServingRecord(pub [u8; ASSIGNED_SERVING_RECORD_BYTES]);
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProviderCodePairRecord([u8; PROVIDER_CODE_PAIR_RECORD_BYTES]);
 
 impl PartialEq for ProviderIdentityRecord {
     fn eq(&self, other: &Self) -> bool {
@@ -1615,6 +1801,38 @@ impl FixedSortRecord for ProviderIdentityRecord {
     }
 }
 
+impl FixedSortRecord for AssignedServingRecord {
+    const BYTE_COUNT: usize = ASSIGNED_SERVING_RECORD_BYTES;
+
+    fn read_from<R: Read>(reader: &mut R) -> io::Result<Option<Self>> {
+        read_fixed_bytes(reader, "assigned serving record").map(|value| value.map(Self))
+    }
+
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(&self.0)
+    }
+
+    fn validate_duplicate(&self, _duplicate: &Self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl FixedSortRecord for ProviderCodePairRecord {
+    const BYTE_COUNT: usize = PROVIDER_CODE_PAIR_RECORD_BYTES;
+
+    fn read_from<R: Read>(reader: &mut R) -> io::Result<Option<Self>> {
+        read_fixed_bytes(reader, "provider-code pair").map(|value| value.map(Self))
+    }
+
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(&self.0)
+    }
+
+    fn validate_duplicate(&self, _duplicate: &Self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub fn external_sort_dense_ids(
     input_paths: &[PathBuf],
     output_path: impl AsRef<Path>,
@@ -1626,6 +1844,7 @@ pub fn external_sort_dense_ids(
         output_path.as_ref(),
         temporary_directory.as_ref(),
         in_memory_record_limit,
+        true,
     )
 }
 
@@ -1640,6 +1859,39 @@ pub fn external_sort_provider_identities(
         output_path.as_ref(),
         temporary_directory.as_ref(),
         in_memory_record_limit,
+        true,
+    )
+}
+
+/// Sorts and deduplicates fixed-width provider/code key pairs by encoded byte order.
+pub fn external_sort_provider_code_pairs(
+    input_paths: &[PathBuf],
+    output_path: impl AsRef<Path>,
+    temporary_directory: impl AsRef<Path>,
+    in_memory_record_limit: usize,
+) -> io::Result<MultiFileSortStats> {
+    external_sort_fixed_records::<ProviderCodePairRecord>(
+        input_paths,
+        output_path.as_ref(),
+        temporary_directory.as_ref(),
+        in_memory_record_limit,
+        true,
+    )
+}
+
+/// Sorts dense assigned rows while preserving every duplicate occurrence.
+pub fn external_sort_assigned_serving_records(
+    input_paths: &[PathBuf],
+    output_path: impl AsRef<Path>,
+    temporary_directory: impl AsRef<Path>,
+    in_memory_record_limit: usize,
+) -> io::Result<MultiFileSortStats> {
+    external_sort_fixed_records::<AssignedServingRecord>(
+        input_paths,
+        output_path.as_ref(),
+        temporary_directory.as_ref(),
+        in_memory_record_limit,
+        false,
     )
 }
 
@@ -1661,7 +1913,15 @@ pub fn external_sort_lexicographic_records(
     fs::create_dir_all(temporary_directory)?;
     let mut temporary_files = TemporaryFiles::default();
     let mut records: Vec<Vec<u8>> = Vec::with_capacity(in_memory_record_limit.min(8192));
-    let mut run_paths = Vec::new();
+    let mut runs = BoundedRunAccumulator::new(DEFAULT_SORT_MERGE_FAN_IN);
+    let mut merger = LexicographicRunMerger {
+        temporary_directory,
+        temporary_files: &mut temporary_files,
+        record_bytes,
+        dedupe,
+        duplicate_records: 0,
+        spill_bytes: 0,
+    };
     let mut input_records = 0u64;
     let mut input_bytes = 0u64;
     for input_path in input_paths {
@@ -1681,37 +1941,31 @@ pub fn external_sort_lexicographic_records(
             input_records = input_records.saturating_add(1);
             records.push(record);
             if records.len() == in_memory_record_limit {
-                run_paths.push(spill_lexicographic_run(
+                let path = spill_lexicographic_run(
                     &mut records,
                     temporary_directory,
-                    &mut temporary_files,
+                    merger.temporary_files,
                     dedupe,
-                )?);
+                )?;
+                merger.record_initial_spill(&path)?;
+                runs.push_initial(path, &mut merger)?;
             }
         }
     }
     if !records.is_empty() {
-        run_paths.push(spill_lexicographic_run(
+        let path = spill_lexicographic_run(
             &mut records,
             temporary_directory,
-            &mut temporary_files,
-            dedupe,
-        )?);
-    }
-    let initial_chunk_count = run_paths.len() as u64;
-    let mut spill_bytes = run_paths.iter().try_fold(0u64, |total, path| {
-        path.metadata()
-            .map(|metadata| total.saturating_add(metadata.len()))
-    })?;
-    let (run_paths, intermediate_duplicates, intermediate_spill_bytes) =
-        reduce_lexicographic_sort_runs(
-            run_paths,
-            temporary_directory,
-            &mut temporary_files,
-            record_bytes,
+            merger.temporary_files,
             dedupe,
         )?;
-    spill_bytes = spill_bytes.saturating_add(intermediate_spill_bytes);
+        merger.record_initial_spill(&path)?;
+        runs.push_initial(path, &mut merger)?;
+    }
+    let initial_chunk_count = runs.initial_run_count();
+    let run_paths = runs.finish(&mut merger)?;
+    let intermediate_duplicates = merger.duplicate_records;
+    let spill_bytes = merger.spill_bytes;
     let output_path = output_path.as_ref();
     fs::create_dir_all(usable_parent(output_path))?;
     let (staged_path, staged_file) = create_unique_file(usable_parent(output_path), "lex-output")?;
@@ -1723,6 +1977,7 @@ pub fn external_sort_lexicographic_records(
     writer.flush()?;
     writer.get_ref().sync_all()?;
     drop(writer);
+    temporary_files.remove_all(&run_paths)?;
     if unique_records.saturating_add(duplicate_records) != input_records {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1733,6 +1988,7 @@ pub fn external_sort_lexicographic_records(
         .checked_mul(record_bytes as u64)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "output byte count overflow"))?;
     fs::rename(&staged_path, output_path)?;
+    temporary_files.release(&staged_path);
     Ok(MultiFileSortStats {
         input_file_count: input_paths.len() as u64,
         input_records,
@@ -1822,37 +2078,37 @@ fn merge_lexicographic_runs<W: Write>(
     Ok((output_records, duplicate_records))
 }
 
-fn reduce_lexicographic_sort_runs(
-    mut run_paths: Vec<PathBuf>,
-    temporary_directory: &Path,
-    temporary_files: &mut TemporaryFiles,
+struct LexicographicRunMerger<'a> {
+    temporary_directory: &'a Path,
+    temporary_files: &'a mut TemporaryFiles,
     record_bytes: usize,
     dedupe: bool,
-) -> io::Result<(Vec<PathBuf>, u64, u64)> {
-    let mut duplicate_records = 0u64;
-    let mut spill_bytes = 0u64;
-    while run_paths.len() > DEFAULT_SORT_MERGE_FAN_IN {
-        let mut next_paths =
-            Vec::with_capacity(run_paths.len().div_ceil(DEFAULT_SORT_MERGE_FAN_IN));
-        for group in run_paths.chunks(DEFAULT_SORT_MERGE_FAN_IN) {
-            if group.len() == 1 {
-                next_paths.push(group[0].clone());
-                continue;
-            }
-            let (path, file) = create_unique_file(temporary_directory, "lex-merge")?;
-            temporary_files.track(path.clone());
-            let mut writer = BufWriter::with_capacity(DEFAULT_SORT_BUFFER_BYTES, file);
-            let (_output_records, group_duplicates) =
-                merge_lexicographic_runs(group, &mut writer, record_bytes, dedupe)?;
-            writer.flush()?;
-            drop(writer);
-            duplicate_records = duplicate_records.saturating_add(group_duplicates);
-            spill_bytes = spill_bytes.saturating_add(path.metadata()?.len());
-            next_paths.push(path);
-        }
-        run_paths = next_paths;
+    duplicate_records: u64,
+    spill_bytes: u64,
+}
+
+impl LexicographicRunMerger<'_> {
+    fn record_initial_spill(&mut self, path: &Path) -> io::Result<()> {
+        self.spill_bytes = self.spill_bytes.saturating_add(path.metadata()?.len());
+        Ok(())
     }
-    Ok((run_paths, duplicate_records, spill_bytes))
+}
+
+impl TemporaryRunMerger for LexicographicRunMerger<'_> {
+    fn merge_runs(&mut self, run_paths: Vec<PathBuf>) -> io::Result<PathBuf> {
+        let (path, file) = create_unique_file(self.temporary_directory, "lex-merge")?;
+        self.temporary_files.track(path.clone());
+        let mut writer = BufWriter::with_capacity(DEFAULT_SORT_BUFFER_BYTES, file);
+        let (_output_records, group_duplicates) =
+            merge_lexicographic_runs(&run_paths, &mut writer, self.record_bytes, self.dedupe)?;
+        writer.flush()?;
+        drop(writer);
+        let output_bytes = path.metadata()?.len();
+        self.temporary_files.remove_all(&run_paths)?;
+        self.duplicate_records = self.duplicate_records.saturating_add(group_duplicates);
+        self.spill_bytes = self.spill_bytes.saturating_add(output_bytes);
+        Ok(path)
+    }
 }
 
 fn read_fixed_bytes<R: Read, const N: usize>(
@@ -1883,6 +2139,7 @@ fn external_sort_fixed_records<T: FixedSortRecord>(
     output_path: &Path,
     temporary_directory: &Path,
     in_memory_record_limit: usize,
+    dedupe: bool,
 ) -> io::Result<MultiFileSortStats> {
     if in_memory_record_limit == 0 {
         return Err(io::Error::new(
@@ -1892,8 +2149,34 @@ fn external_sort_fixed_records<T: FixedSortRecord>(
     }
     fs::create_dir_all(temporary_directory)?;
     let mut temporary_files = TemporaryFiles::default();
-    let mut records = Vec::with_capacity(in_memory_record_limit.min(8192));
-    let mut run_paths = Vec::new();
+    let allocation_bytes = in_memory_record_limit
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fixed-record sort allocation size overflow",
+            )
+        })?;
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(in_memory_record_limit)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "unable to reserve {allocation_bytes} bytes for fixed-record sorting: {error}"
+                ),
+            )
+        })?;
+    let mut runs = BoundedRunAccumulator::new(DEFAULT_SORT_MERGE_FAN_IN);
+    let mut merger = FixedRunMerger::<T> {
+        temporary_directory,
+        temporary_files: &mut temporary_files,
+        dedupe,
+        duplicate_records: 0,
+        spill_bytes: 0,
+        record: std::marker::PhantomData,
+    };
     let mut input_records = 0u64;
     let mut input_bytes = 0u64;
     for input_path in input_paths {
@@ -1914,40 +2197,38 @@ fn external_sort_fixed_records<T: FixedSortRecord>(
             input_records = input_records.saturating_add(1);
             records.push(record);
             if records.len() == in_memory_record_limit {
-                run_paths.push(spill_fixed_sort_run(
+                let path = spill_fixed_sort_run(
                     &mut records,
                     temporary_directory,
-                    &mut temporary_files,
-                )?);
+                    merger.temporary_files,
+                )?;
+                merger.record_initial_spill(&path)?;
+                runs.push_initial(path, &mut merger)?;
             }
         }
     }
     if !records.is_empty() {
-        run_paths.push(spill_fixed_sort_run(
-            &mut records,
-            temporary_directory,
-            &mut temporary_files,
-        )?);
+        let path = spill_fixed_sort_run(&mut records, temporary_directory, merger.temporary_files)?;
+        merger.record_initial_spill(&path)?;
+        runs.push_initial(path, &mut merger)?;
     }
-    let initial_chunk_count = run_paths.len() as u64;
-    let mut spill_bytes = run_paths.iter().try_fold(0u64, |total, path| {
-        path.metadata()
-            .map(|metadata| total.saturating_add(metadata.len()))
-    })?;
-    let (run_paths, intermediate_duplicates, intermediate_spill_bytes) =
-        reduce_fixed_sort_runs::<T>(run_paths, temporary_directory, &mut temporary_files)?;
-    spill_bytes = spill_bytes.saturating_add(intermediate_spill_bytes);
+    drop(records);
+    let initial_chunk_count = runs.initial_run_count();
+    let run_paths = runs.finish(&mut merger)?;
+    let intermediate_duplicates = merger.duplicate_records;
+    let spill_bytes = merger.spill_bytes;
     fs::create_dir_all(usable_parent(output_path))?;
     let (staged_path, staged_file) =
         create_unique_file(usable_parent(output_path), "dense-output")?;
     temporary_files.track(staged_path.clone());
     let mut writer = BufWriter::with_capacity(DEFAULT_SORT_BUFFER_BYTES, staged_file);
     let (unique_records, final_duplicates) =
-        merge_fixed_sort_runs::<T, _>(&run_paths, &mut writer)?;
+        merge_fixed_sort_runs::<T, _>(&run_paths, &mut writer, dedupe)?;
     let duplicate_records = intermediate_duplicates.saturating_add(final_duplicates);
     writer.flush()?;
     writer.get_ref().sync_all()?;
     drop(writer);
+    temporary_files.remove_all(&run_paths)?;
     if unique_records.saturating_add(duplicate_records) != input_records {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1958,6 +2239,7 @@ fn external_sort_fixed_records<T: FixedSortRecord>(
         .checked_mul(T::BYTE_COUNT as u64)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "output byte count overflow"))?;
     fs::rename(&staged_path, output_path)?;
+    temporary_files.release(&staged_path);
     Ok(MultiFileSortStats {
         input_file_count: input_paths.len() as u64,
         input_records,
@@ -1990,6 +2272,7 @@ fn spill_fixed_sort_run<T: FixedSortRecord>(
 fn merge_fixed_sort_runs<T: FixedSortRecord, W: Write>(
     run_paths: &[PathBuf],
     writer: &mut W,
+    dedupe: bool,
 ) -> io::Result<(u64, u64)> {
     let mut readers = run_paths
         .iter()
@@ -2006,7 +2289,7 @@ fn merge_fixed_sort_runs<T: FixedSortRecord, W: Write>(
     let mut duplicate_records = 0u64;
     while let Some(Reverse((record, reader_index))) = heap.pop() {
         if let Some(previous_record) = previous {
-            if record == previous_record {
+            if dedupe && record == previous_record {
                 previous_record.validate_duplicate(&record)?;
                 duplicate_records = duplicate_records.saturating_add(1);
             } else {
@@ -2026,35 +2309,37 @@ fn merge_fixed_sort_runs<T: FixedSortRecord, W: Write>(
     Ok((unique_records, duplicate_records))
 }
 
-fn reduce_fixed_sort_runs<T: FixedSortRecord>(
-    mut run_paths: Vec<PathBuf>,
-    temporary_directory: &Path,
-    temporary_files: &mut TemporaryFiles,
-) -> io::Result<(Vec<PathBuf>, u64, u64)> {
-    let mut duplicate_records = 0u64;
-    let mut spill_bytes = 0u64;
-    while run_paths.len() > DEFAULT_SORT_MERGE_FAN_IN {
-        let mut next_paths =
-            Vec::with_capacity(run_paths.len().div_ceil(DEFAULT_SORT_MERGE_FAN_IN));
-        for group in run_paths.chunks(DEFAULT_SORT_MERGE_FAN_IN) {
-            if group.len() == 1 {
-                next_paths.push(group[0].clone());
-                continue;
-            }
-            let (path, file) = create_unique_file(temporary_directory, "fixed-merge")?;
-            temporary_files.track(path.clone());
-            let mut writer = BufWriter::with_capacity(DEFAULT_SORT_BUFFER_BYTES, file);
-            let (_output_records, group_duplicates) =
-                merge_fixed_sort_runs::<T, _>(group, &mut writer)?;
-            writer.flush()?;
-            drop(writer);
-            duplicate_records = duplicate_records.saturating_add(group_duplicates);
-            spill_bytes = spill_bytes.saturating_add(path.metadata()?.len());
-            next_paths.push(path);
-        }
-        run_paths = next_paths;
+struct FixedRunMerger<'a, T> {
+    temporary_directory: &'a Path,
+    temporary_files: &'a mut TemporaryFiles,
+    dedupe: bool,
+    duplicate_records: u64,
+    spill_bytes: u64,
+    record: std::marker::PhantomData<T>,
+}
+
+impl<T: FixedSortRecord> FixedRunMerger<'_, T> {
+    fn record_initial_spill(&mut self, path: &Path) -> io::Result<()> {
+        self.spill_bytes = self.spill_bytes.saturating_add(path.metadata()?.len());
+        Ok(())
     }
-    Ok((run_paths, duplicate_records, spill_bytes))
+}
+
+impl<T: FixedSortRecord> TemporaryRunMerger for FixedRunMerger<'_, T> {
+    fn merge_runs(&mut self, run_paths: Vec<PathBuf>) -> io::Result<PathBuf> {
+        let (path, file) = create_unique_file(self.temporary_directory, "fixed-merge")?;
+        self.temporary_files.track(path.clone());
+        let mut writer = BufWriter::with_capacity(DEFAULT_SORT_BUFFER_BYTES, file);
+        let (_output_records, group_duplicates) =
+            merge_fixed_sort_runs::<T, _>(&run_paths, &mut writer, self.dedupe)?;
+        writer.flush()?;
+        drop(writer);
+        let output_bytes = path.metadata()?.len();
+        self.temporary_files.remove_all(&run_paths)?;
+        self.duplicate_records = self.duplicate_records.saturating_add(group_duplicates);
+        self.spill_bytes = self.spill_bytes.saturating_add(output_bytes);
+        Ok(path)
+    }
 }
 
 /// Sorts and strictly deduplicates one fixed-width partition.
@@ -2077,19 +2362,12 @@ pub fn external_sort_dedupe_partition(
     fs::create_dir_all(temporary_directory)?;
     let mut temporary_files = TemporaryFiles::default();
 
-    let (run_paths, input_records) = create_sorted_runs(
+    let (run_paths, input_records, intermediate_duplicates) = create_sorted_runs(
         input_path,
         temporary_directory,
         in_memory_record_limit,
         &mut temporary_files,
     )?;
-    let (run_paths, intermediate_duplicates, _intermediate_spill_bytes) =
-        reduce_serving_sort_runs::<ServingRunRecord>(
-            run_paths,
-            temporary_directory,
-            &mut temporary_files,
-            true,
-        )?;
 
     let output_parent = usable_parent(output_path);
     fs::create_dir_all(output_parent)?;
@@ -2101,6 +2379,7 @@ pub fn external_sort_dedupe_partition(
     let duplicate_records = intermediate_duplicates.saturating_add(final_duplicates);
     output.flush()?;
     drop(output);
+    temporary_files.remove_all(&run_paths)?;
 
     let merged_records = unique_records
         .checked_add(duplicate_records)
@@ -2118,6 +2397,7 @@ pub fn external_sort_dedupe_partition(
         .checked_mul(SERVING_RUN_RECORD_BYTES as u64)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "output byte count overflow"))?;
     fs::rename(&staged_output_path, output_path)?;
+    temporary_files.release(&staged_output_path);
 
     Ok(ExternalSortStats {
         input_records,
@@ -2132,11 +2412,19 @@ fn create_sorted_runs(
     temporary_directory: &Path,
     in_memory_record_limit: usize,
     temporary_files: &mut TemporaryFiles,
-) -> io::Result<(Vec<PathBuf>, u64)> {
+) -> io::Result<(Vec<PathBuf>, u64, u64)> {
     let input = File::open(input_path)?;
     let mut input = BufReader::with_capacity(DEFAULT_SORT_BUFFER_BYTES, input);
     let mut records = Vec::with_capacity(in_memory_record_limit.min(8192));
-    let mut run_paths = Vec::new();
+    let mut runs = BoundedRunAccumulator::new(DEFAULT_SORT_MERGE_FAN_IN);
+    let mut merger = ServingRunMerger::<ServingRunRecord> {
+        temporary_directory,
+        temporary_files,
+        dedupe: true,
+        duplicate_records: 0,
+        spill_bytes: 0,
+        record: std::marker::PhantomData,
+    };
     let mut input_records = 0u64;
 
     while let Some(record) = ServingRunRecord::read_from(&mut input)? {
@@ -2145,22 +2433,19 @@ fn create_sorted_runs(
         })?;
         records.push(record);
         if records.len() == in_memory_record_limit {
-            run_paths.push(spill_sorted_run(
-                &mut records,
-                temporary_directory,
-                temporary_files,
-            )?);
+            let path = spill_sorted_run(&mut records, temporary_directory, merger.temporary_files)?;
+            merger.record_initial_spill(&path)?;
+            runs.push_initial(path, &mut merger)?;
         }
     }
     if !records.is_empty() {
-        run_paths.push(spill_sorted_run(
-            &mut records,
-            temporary_directory,
-            temporary_files,
-        )?);
+        let path = spill_sorted_run(&mut records, temporary_directory, merger.temporary_files)?;
+        merger.record_initial_spill(&path)?;
+        runs.push_initial(path, &mut merger)?;
     }
 
-    Ok((run_paths, input_records))
+    let run_paths = runs.finish(&mut merger)?;
+    Ok((run_paths, input_records, merger.duplicate_records))
 }
 
 fn spill_sorted_run<T: ServingSortRecord>(
@@ -2237,38 +2522,39 @@ fn merge_sorted_runs<T: ServingSortRecord, W: Write>(
     Ok((output_records, duplicate_records))
 }
 
-fn reduce_serving_sort_runs<T: ServingSortRecord>(
-    mut run_paths: Vec<PathBuf>,
-    temporary_directory: &Path,
-    temporary_files: &mut TemporaryFiles,
+struct ServingRunMerger<'a, T> {
+    temporary_directory: &'a Path,
+    temporary_files: &'a mut TemporaryFiles,
     dedupe: bool,
-) -> io::Result<(Vec<PathBuf>, u64, u64)> {
-    let mut duplicate_records = 0u64;
-    let mut spill_bytes = 0u64;
-    while run_paths.len() > DEFAULT_SORT_MERGE_FAN_IN {
-        let mut next_paths =
-            Vec::with_capacity(run_paths.len().div_ceil(DEFAULT_SORT_MERGE_FAN_IN));
-        for group in run_paths.chunks(DEFAULT_SORT_MERGE_FAN_IN) {
-            if group.len() == 1 {
-                next_paths.push(group[0].clone());
-                continue;
-            }
-            let (path, file) = create_unique_file(temporary_directory, "serving-merge")?;
-            temporary_files.track(path.clone());
-            let mut writer = BufWriter::with_capacity(DEFAULT_SORT_BUFFER_BYTES, file);
-            let (_output_records, group_duplicates) =
-                merge_sorted_runs::<T, _>(group, &mut writer, dedupe)?;
-            writer.flush()?;
-            drop(writer);
-            if dedupe {
-                duplicate_records = duplicate_records.saturating_add(group_duplicates);
-            }
-            spill_bytes = spill_bytes.saturating_add(path.metadata()?.len());
-            next_paths.push(path);
-        }
-        run_paths = next_paths;
+    duplicate_records: u64,
+    spill_bytes: u64,
+    record: std::marker::PhantomData<T>,
+}
+
+impl<T: ServingSortRecord> ServingRunMerger<'_, T> {
+    fn record_initial_spill(&mut self, path: &Path) -> io::Result<()> {
+        self.spill_bytes = self.spill_bytes.saturating_add(path.metadata()?.len());
+        Ok(())
     }
-    Ok((run_paths, duplicate_records, spill_bytes))
+}
+
+impl<T: ServingSortRecord> TemporaryRunMerger for ServingRunMerger<'_, T> {
+    fn merge_runs(&mut self, run_paths: Vec<PathBuf>) -> io::Result<PathBuf> {
+        let (path, file) = create_unique_file(self.temporary_directory, "serving-merge")?;
+        self.temporary_files.track(path.clone());
+        let mut writer = BufWriter::with_capacity(DEFAULT_SORT_BUFFER_BYTES, file);
+        let (_output_records, group_duplicates) =
+            merge_sorted_runs::<T, _>(&run_paths, &mut writer, self.dedupe)?;
+        writer.flush()?;
+        drop(writer);
+        let output_bytes = path.metadata()?.len();
+        self.temporary_files.remove_all(&run_paths)?;
+        if self.dedupe {
+            self.duplicate_records = self.duplicate_records.saturating_add(group_duplicates);
+        }
+        self.spill_bytes = self.spill_bytes.saturating_add(output_bytes);
+        Ok(path)
+    }
 }
 
 fn spill_tagged_sorted_run(
@@ -2346,43 +2632,89 @@ fn merge_tagged_sorted_runs<W: Write>(
     Ok((output_records, duplicate_records))
 }
 
-fn reduce_tagged_sort_runs(
-    mut run_paths: Vec<PathBuf>,
-    temporary_directory: &Path,
-    temporary_files: &mut TemporaryFiles,
+struct TaggedRunMerger<'a> {
+    temporary_directory: &'a Path,
+    temporary_files: &'a mut TemporaryFiles,
     codec: TaggedServingRunCodec,
-) -> io::Result<(Vec<PathBuf>, u64)> {
-    let mut spill_bytes = 0u64;
-    while run_paths.len() > DEFAULT_SORT_MERGE_FAN_IN {
-        let mut next_paths =
-            Vec::with_capacity(run_paths.len().div_ceil(DEFAULT_SORT_MERGE_FAN_IN));
-        for group in run_paths.chunks(DEFAULT_SORT_MERGE_FAN_IN) {
-            if group.len() == 1 {
-                next_paths.push(group[0].clone());
-                continue;
-            }
-            let (path, file) = create_unique_file(temporary_directory, "tagged-merge")?;
-            temporary_files.track(path.clone());
-            let mut writer = BufWriter::with_capacity(DEFAULT_SORT_BUFFER_BYTES, file);
-            merge_tagged_sorted_runs(group, &mut writer, codec)?;
-            writer.flush()?;
-            drop(writer);
-            spill_bytes = spill_bytes.saturating_add(path.metadata()?.len());
-            next_paths.push(path);
-        }
-        run_paths = next_paths;
+    spill_bytes: u64,
+}
+
+impl TaggedRunMerger<'_> {
+    fn record_initial_spill(&mut self, path: &Path) -> io::Result<()> {
+        self.spill_bytes = self.spill_bytes.saturating_add(path.metadata()?.len());
+        Ok(())
     }
-    Ok((run_paths, spill_bytes))
+}
+
+impl TemporaryRunMerger for TaggedRunMerger<'_> {
+    fn merge_runs(&mut self, run_paths: Vec<PathBuf>) -> io::Result<PathBuf> {
+        let (path, file) = create_unique_file(self.temporary_directory, "tagged-merge")?;
+        self.temporary_files.track(path.clone());
+        let mut writer = BufWriter::with_capacity(DEFAULT_SORT_BUFFER_BYTES, file);
+        merge_tagged_sorted_runs(&run_paths, &mut writer, self.codec)?;
+        writer.flush()?;
+        drop(writer);
+        let output_bytes = path.metadata()?.len();
+        self.temporary_files.remove_all(&run_paths)?;
+        self.spill_bytes = self.spill_bytes.saturating_add(output_bytes);
+        Ok(path)
+    }
 }
 
 #[derive(Default)]
 struct TemporaryFiles {
     paths: Vec<PathBuf>,
+    #[cfg(test)]
+    peak_path_count: usize,
 }
 
 impl TemporaryFiles {
     fn track(&mut self, path: PathBuf) {
+        debug_assert!(!self.paths.contains(&path));
         self.paths.push(path);
+        #[cfg(test)]
+        {
+            self.peak_path_count = self.peak_path_count.max(self.paths.len());
+        }
+    }
+
+    fn untrack(&mut self, path: &Path) -> bool {
+        let Some(index) = self.paths.iter().position(|tracked| tracked == path) else {
+            return false;
+        };
+        self.paths.swap_remove(index);
+        true
+    }
+
+    fn remove_all(&mut self, paths: &[PathBuf]) -> io::Result<()> {
+        for path in paths {
+            match fs::remove_file(path) {
+                Ok(()) => {
+                    let was_tracked = self.untrack(path);
+                    debug_assert!(was_tracked);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.untrack(path);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, path: &Path) {
+        let was_tracked = self.untrack(path);
+        debug_assert!(was_tracked);
+    }
+
+    #[cfg(test)]
+    fn active_path_count(&self) -> usize {
+        self.paths.len()
+    }
+
+    #[cfg(test)]
+    fn peak_path_count(&self) -> usize {
+        self.peak_path_count
     }
 }
 
@@ -2451,6 +2783,21 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct MetadataTestRunMerger<'a> {
+        directory: &'a Path,
+        temporary_files: &'a mut TemporaryFiles,
+    }
+
+    impl TemporaryRunMerger for MetadataTestRunMerger<'_> {
+        fn merge_runs(&mut self, run_paths: Vec<PathBuf>) -> io::Result<PathBuf> {
+            let (path, file) = create_unique_file(self.directory, "metadata-merge")?;
+            drop(file);
+            self.temporary_files.track(path.clone());
+            self.temporary_files.remove_all(&run_paths)?;
+            Ok(path)
         }
     }
 
@@ -2963,7 +3310,12 @@ mod tests {
         let dictionary = output.code_dictionary_file.unwrap();
         assert_eq!(dictionary.record_count, 1);
         assert_eq!(
-            read_code_dictionary(&dictionary.path).unwrap(),
+            read_code_dictionary_exact(
+                &dictionary.path,
+                dictionary.record_count,
+                dictionary.bytes,
+            )
+            .unwrap(),
             vec![NaturalLeanCode {
                 code_id,
                 coverage_scope_id,
@@ -2988,6 +3340,32 @@ mod tests {
         trailing_bytes.push(0);
         fs::write(&trailing, trailing_bytes).unwrap();
         assert!(read_code_dictionary(&trailing).is_err());
+
+        let mut impossible_count_bytes = fs::read(&dictionary.path).unwrap();
+        impossible_count_bytes[12..20].copy_from_slice(&u64::MAX.to_be_bytes());
+        let impossible_count = base.join("impossible-count.codes");
+        fs::write(&impossible_count, &impossible_count_bytes).unwrap();
+        let count_error = read_code_dictionary_exact(
+            &impossible_count,
+            dictionary.record_count,
+            impossible_count_bytes.len() as u64,
+        )
+        .unwrap_err();
+        assert_eq!(count_error.kind(), io::ErrorKind::InvalidData);
+        assert!(count_error.to_string().contains("authenticated manifest"));
+
+        let mut impossible_text_bytes = fs::read(&dictionary.path).unwrap();
+        impossible_text_bytes[70..74].copy_from_slice(&u32::MAX.to_be_bytes());
+        let impossible_text = base.join("impossible-text.codes");
+        fs::write(&impossible_text, &impossible_text_bytes).unwrap();
+        let text_error = read_code_dictionary_exact(
+            &impossible_text,
+            dictionary.record_count,
+            impossible_text_bytes.len() as u64,
+        )
+        .unwrap_err();
+        assert_eq!(text_error.kind(), io::ErrorKind::InvalidData);
+        assert!(text_error.to_string().contains("remaining file bytes"));
     }
 
     #[test]
@@ -3183,6 +3561,74 @@ mod tests {
     }
 
     #[test]
+    fn assigned_sort_is_fixed_width_and_preserves_duplicate_multiplicity() {
+        let base = TestDirectory::new("assigned-multiset");
+        let input = base.join("assigned.bin");
+        let output = base.join("assigned.sorted");
+        let mut first = [0u8; ASSIGNED_SERVING_RECORD_BYTES];
+        first[3] = 1;
+        let mut second = [0u8; ASSIGNED_SERVING_RECORD_BYTES];
+        second[3] = 2;
+        let mut writer = BufWriter::new(File::create(&input).unwrap());
+        for record in [second, first, first, second, first] {
+            writer.write_all(&record).unwrap();
+        }
+        writer.flush().unwrap();
+
+        let stats =
+            external_sort_assigned_serving_records(&[input], &output, base.join("temporary"), 1)
+                .unwrap();
+
+        assert_eq!(stats.input_records, 5);
+        assert_eq!(stats.unique_records, 5);
+        assert_eq!(stats.duplicate_records, 0);
+        assert_eq!(stats.output_bytes, 5 * ASSIGNED_SERVING_RECORD_BYTES as u64);
+        assert_eq!(
+            fs::read(output).unwrap(),
+            [first, first, first, second, second].concat()
+        );
+    }
+
+    #[test]
+    fn provider_code_pair_sort_is_fixed_width_deduped_and_limit_exact() {
+        let base = TestDirectory::new("provider-code-pairs");
+        let input = base.join("pairs.bin");
+        let output = base.join("pairs.sorted");
+        let pair = |provider_key: i32, code_key: i32| {
+            let mut encoded = [0u8; PROVIDER_CODE_PAIR_RECORD_BYTES];
+            encoded[..4].copy_from_slice(&provider_key.to_be_bytes());
+            encoded[4..].copy_from_slice(&code_key.to_be_bytes());
+            encoded
+        };
+        let first = pair(1, 4);
+        let second = pair(1, 9);
+        let third = pair(2, 3);
+        let mut writer = BufWriter::new(File::create(&input).unwrap());
+        for record in [third, second, third, first, second] {
+            writer.write_all(&record).unwrap();
+        }
+        writer.flush().unwrap();
+
+        let stats = external_sort_provider_code_pairs(&[input], &output, base.join("temporary"), 2)
+            .unwrap();
+
+        assert_eq!(stats.input_records, 5);
+        assert_eq!(stats.unique_records, 3);
+        assert_eq!(stats.duplicate_records, 2);
+        assert_eq!(stats.chunk_count, 3);
+        assert_eq!(
+            stats.input_bytes,
+            5 * PROVIDER_CODE_PAIR_RECORD_BYTES as u64
+        );
+        assert_eq!(stats.spill_bytes, stats.input_bytes);
+        assert_eq!(
+            stats.output_bytes,
+            3 * PROVIDER_CODE_PAIR_RECORD_BYTES as u64
+        );
+        assert_eq!(fs::read(output).unwrap(), [first, second, third].concat());
+    }
+
+    #[test]
     fn external_sorts_use_bounded_fan_in_across_many_spills() {
         let base = TestDirectory::new("bounded-fan-in");
         let serving_input = base.join("serving.run");
@@ -3258,6 +3704,49 @@ mod tests {
             .collect::<Vec<_>>()
             .windows(2)
             .all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn leveled_run_accumulator_bounds_and_releases_path_metadata() {
+        const FAN_IN: usize = 4;
+        const INITIAL_RUNS: usize = 1024;
+
+        let base = TestDirectory::new("bounded-run-metadata");
+        let mut temporary_files = TemporaryFiles::default();
+        let mut runs = BoundedRunAccumulator::new(FAN_IN);
+        let mut merger = MetadataTestRunMerger {
+            directory: &base.path,
+            temporary_files: &mut temporary_files,
+        };
+
+        for _ in 0..INITIAL_RUNS {
+            let (path, mut file) = create_unique_file(&base.path, "metadata-run").unwrap();
+            file.write_all(&[0]).unwrap();
+            drop(file);
+            merger.temporary_files.track(path.clone());
+            runs.push_initial(path, &mut merger).unwrap();
+        }
+
+        assert_eq!(runs.initial_run_count(), INITIAL_RUNS as u64);
+        assert!(
+            runs.peak_active_path_count()
+                <= BoundedRunAccumulator::maximum_active_path_metadata(FAN_IN)
+        );
+        let final_paths = runs.finish(&mut merger).unwrap();
+        assert!(final_paths.len() <= FAN_IN);
+        assert!(
+            merger.temporary_files.peak_path_count()
+                <= BoundedRunAccumulator::maximum_active_path_metadata(FAN_IN) + 1
+        );
+        assert!(merger.temporary_files.peak_path_count() < INITIAL_RUNS);
+        assert_eq!(
+            merger.temporary_files.active_path_count(),
+            final_paths.len()
+        );
+        assert!(final_paths.iter().all(|path| path.exists()));
+
+        merger.temporary_files.remove_all(&final_paths).unwrap();
+        assert_eq!(merger.temporary_files.active_path_count(), 0);
     }
 
     #[test]

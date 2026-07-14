@@ -289,14 +289,14 @@ async def _insert_validated_shared_dataset(
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_dataset_scope_expands_aliases_materializes_and_cleans(monkeypatch):
+async def test_real_postgres_dataset_scope_keeps_explicit_sources_and_cleans(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
         explicit_fence = await importer._resolve_provider_directory_artifact_datasets(
             ["source_primary"]
         )
         all_source_fence = await importer._resolve_provider_directory_artifact_datasets(None)
 
-        assert explicit_fence.source_ids == ["source_primary", "source_sibling"]
+        assert explicit_fence.source_ids == ["source_primary"]
         assert all_source_fence.source_ids == ["source_primary", "source_sibling"]
         artifact_scope_metrics_by_name = {}
         async with importer._provider_directory_artifact_dataset_scope(
@@ -319,7 +319,6 @@ async def test_real_postgres_dataset_scope_expands_aliases_materializes_and_clea
             ]
             assert [location_row_by_field["source_id"] for location_row_by_field in materialized_location_row_list] == [
                 "source_primary",
-                "source_sibling",
             ]
             assert {location_row_by_field["resource_id"] for location_row_by_field in materialized_location_row_list} == {"location-1"}
             assert {location_row_by_field["status"] for location_row_by_field in materialized_location_row_list} == {"active"}
@@ -340,9 +339,9 @@ async def test_real_postgres_dataset_scope_expands_aliases_materializes_and_clea
             ) == 0
 
         assert artifact_scope_metrics_by_name["artifact_scope_dataset_count"] == 1
-        assert artifact_scope_metrics_by_name["artifact_scope_alias_count"] == 2
+        assert artifact_scope_metrics_by_name["artifact_scope_alias_count"] == 1
         assert artifact_scope_metrics_by_name["artifact_scope_dataset_rows"] == 1
-        assert artifact_scope_metrics_by_name["artifact_scope_projected_rows"] == 2
+        assert artifact_scope_metrics_by_name["artifact_scope_projected_rows"] == 1
         assert await _scope_table_names(database, schema) == []
 
 
@@ -352,7 +351,7 @@ async def test_real_postgres_dataset_fence_rejects_alias_repoint_and_current_cha
         fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
         await database.status(
             f"UPDATE {schema}.provider_directory_source "
-            "SET endpoint_id = 'endpoint_repoint' WHERE source_id = 'source_sibling';"
+            "SET endpoint_id = 'endpoint_repoint' WHERE source_id = 'source_primary';"
         )
         with pytest.raises(
             importer.ProviderDirectoryArtifactBuildStale,
@@ -362,7 +361,7 @@ async def test_real_postgres_dataset_fence_rejects_alias_repoint_and_current_cha
 
         await database.status(
             f"UPDATE {schema}.provider_directory_source "
-            "SET endpoint_id = 'endpoint_shared' WHERE source_id = 'source_sibling';"
+            "SET endpoint_id = 'endpoint_shared' WHERE source_id = 'source_primary';"
         )
         await _insert_next_shared_dataset(database, schema)
         await database.status(
@@ -395,7 +394,7 @@ async def test_real_postgres_dataset_fence_reads_live_alias_during_artifact_scop
             await database.status(
                 f"UPDATE {schema}.provider_directory_source "
                 "SET endpoint_id = 'endpoint_repoint' "
-                "WHERE source_id = 'source_sibling';"
+                "WHERE source_id = 'source_primary';"
             )
             with pytest.raises(
                 importer.ProviderDirectoryArtifactBuildStale,
@@ -405,7 +404,7 @@ async def test_real_postgres_dataset_fence_reads_live_alias_during_artifact_scop
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_dataset_fence_rejects_alias_joined_after_selection(monkeypatch):
+async def test_real_postgres_explicit_dataset_fence_ignores_unselected_alias_join(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
         fence = await importer._resolve_provider_directory_artifact_datasets(
             ["source_primary"]
@@ -416,12 +415,8 @@ async def test_real_postgres_dataset_fence_rejects_alias_joined_after_selection(
             "WHERE source_id = 'source_catalog_only';"
         )
 
-        with pytest.raises(
-            importer.ProviderDirectoryArtifactBuildStale,
-            match="provider_directory_source_endpoint_dataset_changed",
-        ):
-            async with database.transaction():
-                await importer._lock_and_verify_artifact_dataset_fence(fence)
+        async with database.transaction():
+            await importer._lock_and_verify_artifact_dataset_fence(fence)
 
 
 @pytest.mark.asyncio

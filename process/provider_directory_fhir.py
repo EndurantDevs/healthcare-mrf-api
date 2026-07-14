@@ -9199,22 +9199,12 @@ def _artifact_dataset_projection_sql() -> str:
 
 
 def _artifact_dataset_explicit_selection_sql(source_ref: str) -> str:
+    """Select only caller-requested aliases while retaining endpoint datasets."""
     return f"""
-        requested_sources AS MATERIALIZED (
+        selected_sources AS MATERIALIZED (
             SELECT source_id, endpoint_id, to_jsonb(source) AS source_record_json
               FROM {source_ref} AS source
              WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
-        ), selected_sources AS MATERIALIZED (
-            SELECT source_id, endpoint_id, source_record_json
-              FROM requested_sources
-            UNION
-            SELECT sibling.source_id,
-                   sibling.endpoint_id,
-                   to_jsonb(sibling) AS source_record_json
-              FROM {source_ref} AS sibling
-              JOIN requested_sources AS requested
-                ON requested.endpoint_id IS NOT NULL
-               AND sibling.endpoint_id = requested.endpoint_id
         )
     """
 
@@ -9522,11 +9512,10 @@ def _artifact_dataset_source_ids(
             "provider_directory_artifact_source_alias_missing:"
             + ",".join(missing_requested_aliases)
         )
-    selected_source_ids = list(requested_source_ids)
-    selected_source_ids.extend(
-        source_id
-        for source_id in sorted(rows_by_source_id)
-        if source_id not in requested_source_ids
+    selected_source_ids = (
+        list(requested_source_ids)
+        if requested_source_ids
+        else sorted(rows_by_source_id)
     )
     if not selected_source_ids:
         raise RuntimeError("provider_directory_artifact_source_aliases_empty")
@@ -10188,7 +10177,7 @@ async def _lock_artifact_fence_aliases(
     fence: ProviderDirectoryArtifactDatasetFence,
     executor: Any,
 ) -> list[Any]:
-    """Lock and return every alias currently attached to selected endpoints."""
+    """Lock and return the source aliases explicitly selected by the fence."""
     source_ref = _unscoped_qt(_schema(), ProviderDirectorySource.__tablename__)
     await executor.status(f"LOCK TABLE {source_ref} IN SHARE MODE;")
     return await executor.all(
@@ -10197,11 +10186,11 @@ async def _lock_artifact_fence_aliases(
                source.endpoint_id,
                to_jsonb(source) AS source_record_json
           FROM {source_ref} AS source
-         WHERE source.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))
+         WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
          ORDER BY source.source_id, source.endpoint_id
          FOR SHARE OF source;
         """,
-        endpoint_ids=fence.endpoint_ids,
+        source_ids=fence.source_ids,
     )
 
 
@@ -10209,7 +10198,7 @@ def _assert_locked_artifact_fence_aliases(
     fence: ProviderDirectoryArtifactDatasetFence,
     locked_alias_rows: list[Any],
 ) -> None:
-    """Ensure the complete held alias family remains exact."""
+    """Ensure the held publication source scope remains exact."""
     alias_rows_by_source_id = {
         source_id: alias_row_map
         for alias_row in locked_alias_rows
@@ -30550,10 +30539,50 @@ async def _clear_finalized_endpoint_dataset_pagination_checkpoints(
     )
     if not is_finalized:
         return
-    await _clear_pagination_checkpoints(
-        candidate.checkpoint_context,
-        list(candidate.selected_resources),
-    )
+    await _clear_finalized_dataset_checkpoints(candidate)
+
+
+async def _clear_finalized_dataset_checkpoints(
+    candidate: EndpointDatasetCandidate,
+) -> int:
+    """Retire every checkpoint attached to an immutable finalized dataset."""
+    async with db.acquire() as connection:
+        deleted_status = await connection.status(
+            f"""
+            DELETE FROM {_pagination_checkpoint_table_ref()} AS checkpoint
+             USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+             WHERE checkpoint.dataset_id = :dataset_id
+               AND checkpoint.acquisition_root_run_id = :acquisition_root_run_id
+               AND dataset.dataset_id = checkpoint.dataset_id
+               AND dataset.endpoint_id = :endpoint_id
+               AND dataset.acquisition_root_run_id IS NOT DISTINCT FROM
+                   :acquisition_root_run_id
+               AND dataset.status IN (:validated_status, :published_status);
+            """,
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=candidate.acquisition_root_run_id,
+            validated_status=ENDPOINT_DATASET_VALIDATED,
+            published_status=ENDPOINT_DATASET_PUBLISHED,
+        )
+        remaining_count = int(
+            await connection.scalar(
+                f"""
+                SELECT count(*)
+                  FROM {_pagination_checkpoint_table_ref()}
+                 WHERE dataset_id = :dataset_id
+                   AND acquisition_root_run_id = :acquisition_root_run_id;
+                """,
+                dataset_id=candidate.dataset_id,
+                acquisition_root_run_id=candidate.acquisition_root_run_id,
+            )
+            or 0
+        )
+        if remaining_count:
+            raise RuntimeError(
+                "provider_directory_finalized_dataset_checkpoint_cleanup_incomplete"
+            )
+    return _coerce_rowcount(deleted_status)
 
 
 async def _prepare_resource_import_source_group(
