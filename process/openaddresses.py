@@ -78,13 +78,13 @@ class OpenAddressesBackfillShard:
 
     @property
     def label(self) -> str:
+        """Return a compact label for this backfill shard."""
         parts = []
         if self.state_code:
             parts.append(self.state_code)
         if self.zip_prefix:
             parts.append(f"ZIP {self.zip_prefix}*")
         return " ".join(parts) or "all"
-
 
 @dataclass(frozen=True)
 class _RecordBatch:
@@ -93,11 +93,9 @@ class _RecordBatch:
     zip_recovery_rows: list[dict[str, Any]]
     rejection_counts: dict[str, int]
 
-
 def _env_positive_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     return _positive_int_value(raw, default)
-
 
 def _positive_int_value(raw: Any, default: int) -> int:
     if not raw:
@@ -107,7 +105,6 @@ def _positive_int_value(raw: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return value if value > 0 else default
-
 
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -119,13 +116,11 @@ def _env_float(name: str, default: float) -> float:
         return default
     return value if value > 0 else default
 
-
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
 
 def _normalize_backfill_match_modes(value: Any = None) -> frozenset[str]:
     if value is None:
@@ -147,7 +142,6 @@ def _normalize_backfill_match_modes(value: Any = None) -> frozenset[str]:
     if invalid:
         raise ValueError(f"Invalid OpenAddresses backfill match mode(s): {', '.join(invalid)}")
     return modes
-
 
 def _validate_schema_name(schema: str) -> str:
     cleaned = (schema or "").strip()
@@ -414,6 +408,7 @@ def _feature_parts(
 
 
 def lookup_params_from_address(address: dict[str, Any]) -> dict[str, Any] | None:
+    """Build normalized lookup parameters for a US address."""
     first_line = _safe_text(address.get("first_line"))
     if not first_line:
         return None
@@ -448,6 +443,7 @@ def lookup_params_from_address(address: dict[str, Any]) -> dict[str, Any] | None
 
 
 def exact_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> str:
+    """Build the exact OpenAddresses lookup query."""
     table = _qtable(schema, table_name)
     qschema = _quote_ident(schema)
     return f"""
@@ -487,6 +483,7 @@ def exact_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> str:
 
 
 def fuzzy_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> str:
+    """Build the ZIP-scoped fuzzy OpenAddresses lookup query."""
     table = _qtable(schema, table_name)
     return f"""
         WITH grouped AS (
@@ -537,6 +534,7 @@ def fuzzy_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> str:
 
 
 def relaxed_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> str:
+    """Build the city-and-ZIP relaxed OpenAddresses lookup query."""
     table = _qtable(schema, table_name)
     qschema = _quote_ident(schema)
     return f"""
@@ -601,6 +599,7 @@ def _record_from_feature(
     job_id: int | None,
     updated: Any,
 ) -> dict[str, Any] | None:
+    """Convert one GeoJSON feature into an import record."""
     parts, reason = _feature_parts(feature, source=source, updated=updated)
     if reason or not parts:
         return None
@@ -858,6 +857,7 @@ async def _download_file(
     ctx: dict[str, Any] | None = None,
     task: dict[str, Any] | None = None,
 ) -> None:
+    """Download one OpenAddresses artifact with bounded retries."""
     await _maybe_raise_if_cancelled(ctx, task)
     headers = {"Authorization": f"Bearer {token}"}
     retry_task = task or {}
@@ -1182,8 +1182,8 @@ async def _load_source_item(
         pass
     return source, file_processed, file_accepted, file_zip_recovery, rejection_counts
 
-
 async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], stage_cls, recovery_cls) -> dict[str, int]:
+    """Load configured OpenAddresses sources into staging tables."""
     await _maybe_raise_if_cancelled(ctx, task)
     test_mode = bool(ctx["context"].get("test_mode"))
     batch_size = _task_or_env_positive_int(task, "batch_size", "HLTHPRT_OPENADDRESSES_BATCH_SIZE", DEFAULT_BATCH_SIZE)
@@ -1246,8 +1246,8 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
         queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
         for source_index, path in enumerate(local_files, start=1):
             queue.put_nowait((source_index, path))
-
         async def local_worker(worker_id: int) -> None:
+            """Consume local source files until the queue is empty."""
             nonlocal processed_files, processed_rows, accepted_rows, zip_recovery_rows, rejection_counts
             while True:
                 await _maybe_raise_if_cancelled(ctx, task)
@@ -1387,8 +1387,8 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
             queue: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue()
             for source_index, item in enumerate(items, start=first_source_index):
                 queue.put_nowait((source_index, item))
-
             async def worker(worker_id: int) -> None:
+                """Consume remote source items until the queue is empty."""
                 nonlocal processed_files, processed_rows, accepted_rows, zip_recovery_rows, rejection_counts
                 while True:
                     await _maybe_raise_if_cancelled(ctx, task)
@@ -1565,6 +1565,7 @@ def _emit_zip_restore_progress(
 
 
 def _openaddresses_zip_restore_insert_sql(schema: str, stage_table: str, recovery_table: str) -> str:
+    """Build the spatial ZIP restoration insert query."""
     stage = _qtable(schema, stage_table)
     recovery = _qtable(schema, recovery_table)
     qschema = _quote_ident(schema)
@@ -1684,6 +1685,7 @@ async def restore_openaddresses_zip5_from_tiger_zcta(
     concurrency: int,
     run_id: str | None = None,
 ) -> OpenAddressesZipRestoreStats:
+    """Restore missing ZIP codes from TIGER ZCTA polygons."""
     if not await _table_exists(schema, recovery_table):
         return OpenAddressesZipRestoreStats()
     if not await _table_exists("tiger", "zcta5"):
@@ -1732,6 +1734,7 @@ async def restore_openaddresses_zip5_from_tiger_zcta(
     )
 
     async def run_bucket(bucket: int) -> tuple[int, int]:
+        """Restore one deterministic recovery bucket."""
         async with semaphore:
             inserted = _status_count(await db.status(insert_sql, restore_bucket=bucket))
             return bucket, inserted
@@ -1989,6 +1992,7 @@ async def _plan_openaddresses_backfill_shards(
     zip_prefix: str | None = None,
     zip_prefix_length: int = DEFAULT_BACKFILL_ZIP_PREFIX_LENGTH,
 ) -> list[OpenAddressesBackfillShard]:
+    """Plan bounded state and ZIP-prefix backfill shards."""
     if zip_prefix:
         return [OpenAddressesBackfillShard(state_code=state_code, zip_prefix=zip_prefix)]
 
@@ -2077,6 +2081,7 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
     run_id: str | None = None,
     sharded: bool = True,
 ) -> OpenAddressesBackfillStats:
+    """Refresh archive geocodes through bounded concurrent shards."""
     schema = _validate_schema_name(schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     archive_table = archive_table or os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
     state_code = _normalize_backfill_state_code(
@@ -2198,6 +2203,7 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
     semaphore = asyncio.Semaphore(min(concurrency, total_shards))
 
     async def run_shard(index: int, shard: OpenAddressesBackfillShard):
+        """Run one planned archive backfill shard."""
         async with semaphore:
             stats = await refresh_archive_geocodes_from_openaddresses(
                 schema=schema,
@@ -2250,6 +2256,7 @@ async def refresh_archive_geocodes_from_openaddresses(
     zip_prefix: str | None = None,
     match_modes: Any = None,
 ) -> OpenAddressesBackfillStats:
+    """Refresh missing archive geocodes from OpenAddresses."""
     schema = _validate_schema_name(schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     archive_table = archive_table or os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
     state_code = _normalize_backfill_state_code(
@@ -2568,6 +2575,7 @@ async def refresh_archive_geocodes_from_openaddresses(
 
 
 async def process_data(ctx, task=None):  # pragma: no cover
+    """Run the OpenAddresses load or backfill task."""
     task = task or {}
     await _maybe_raise_if_cancelled(ctx, task)
     ctx.setdefault("context", {})
@@ -2667,6 +2675,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
 
 
 async def startup(ctx):  # pragma: no cover
+    """Initialize OpenAddresses worker state and schema."""
     await my_init_db(db)
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()
@@ -2683,6 +2692,7 @@ async def startup(ctx):  # pragma: no cover
 
 
 async def shutdown(ctx):  # pragma: no cover
+    """Publish staged OpenAddresses data after a completed load."""
     context = ctx.get("context") or {}
     if not context.get("run") or context.get("backfill_only"):
         return
@@ -2779,6 +2789,7 @@ async def main(
     backfill_only: bool = False,
     **params: Any,
 ):  # pragma: no cover
+    """Queue an OpenAddresses load or backfill run."""
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,

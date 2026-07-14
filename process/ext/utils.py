@@ -271,6 +271,7 @@ async def _download_parallel_by_ranges(
     size_bytes: int,
     request_timeout: aiohttp.ClientTimeout,
 ) -> None:
+    """Download a remote file into deterministic byte ranges."""
     effective_range_size = PARALLEL_DOWNLOAD_RANGE_SIZE
     # Auto-tune to keep request count bounded for very large files.
     if size_bytes > 0:
@@ -286,10 +287,8 @@ async def _download_parallel_by_ranges(
         end = min(start + effective_range_size - 1, size_bytes - 1)
         ranges.append((start, end))
         start = end + 1
-
     with open(filepath, "wb") as fp:
         fp.truncate(size_bytes)
-
     semaphore = asyncio.Semaphore(PARALLEL_DOWNLOAD_WORKERS)
     progress_lock = asyncio.Lock()
     downloaded_bytes = 0
@@ -303,6 +302,7 @@ async def _download_parallel_by_ranges(
         os.pwrite(fd, payload, offset)
 
     async def _download_range(start_byte: int, end_byte: int) -> None:
+        """Download and persist one inclusive byte range."""
         nonlocal downloaded_bytes, last_progress_time
         headers_local = {
             "Range": f"bytes={start_byte}-{end_byte}",
@@ -390,6 +390,7 @@ _DYNAMIC_CLASS_CACHE = {}
 
 
 async def get_http_client(use_proxy: bool = True):
+    """Create an HTTP client with the configured optional proxy."""
     client = None
     proxy_raw = os.environ.get("HLTHPRT_SOCKS_PROXY") if use_proxy else None
     if proxy_raw:
@@ -417,6 +418,7 @@ async def get_http_client(use_proxy: bool = True):
 
 
 async def download_it(url, local_timeout=None):
+    """Download a URL and return its decoded text body."""
     client = await get_http_client()
     res = None
     async with client:
@@ -430,6 +432,7 @@ async def download_it(url, local_timeout=None):
 
 
 async def download_it_and_save_nostream(url, filepath):
+    """Download a response body to disk without streaming."""
     client = await get_http_client()
     async with client:
         async with async_open(filepath, "wb+") as afp:
@@ -442,6 +445,7 @@ async def download_it_and_save_nostream(url, filepath):
 
 
 async def db_startup(ctx):
+    """Initialize the shared database and import-run schema."""
     await my_init_db(db)
     from api.control_imports import (
         ensure_import_run_table,
@@ -459,6 +463,7 @@ async def download_it_and_save(
     cache_dir=None,
     prefer_stream: bool = False,
 ):
+    """Download a URL to disk with caching and retry support."""
     print(f"Downloading {url}")
     parsed_url = urlparse(str(url))
     if parsed_url.scheme == "file":
@@ -666,6 +671,7 @@ async def download_it_and_save(
 
 
 def make_class(model_cls, table_suffix, schema_override=None):
+    """Build or reuse a concrete model for a suffixed table."""
     table_suffix = str(table_suffix)
     cache_key = (model_cls, table_suffix, schema_override)
     if cache_key in _DYNAMIC_CLASS_CACHE:
@@ -721,6 +727,7 @@ err_obj_key = {}
 
 
 def return_checksum(arr: list, crc=32):
+    """Return a stable CRC checksum for the supplied values."""
     for i in range(0, len(arr)):
         arr[i] = str(arr[i])
     checksum = "|".join(arr)
@@ -731,6 +738,7 @@ def return_checksum(arr: list, crc=32):
 
 
 async def log_error(type, error, issuer_array, url, source, level, cls):
+    """Buffer a deduplicated import error for each issuer."""
     for issuer_id in issuer_array:
         checksum = return_checksum(
             [type, str(error), str(issuer_id), str(url), source, level]
@@ -755,6 +763,7 @@ async def log_error(type, error, issuer_array, url, source, level, cls):
 
 
 async def flush_error_log(cls):
+    """Persist buffered import errors and restore them on failure."""
     if not err_obj_list:
         return
     payload = err_obj_list.copy()
@@ -770,6 +779,7 @@ async def flush_error_log(cls):
 
 
 async def push_objects_slow(obj_list, cls):
+    """Insert objects with a row-by-row fallback on batch failure."""
     if obj_list:
         try:
             if hasattr(cls, "__my_index_elements__"):
@@ -815,6 +825,7 @@ class IterateList:
 
 
 async def my_init_db(db):
+    """Initialize the database on the current event loop."""
     loop = asyncio.get_event_loop()
     await init_db(db, loop)
 
@@ -835,11 +846,13 @@ async def ensure_database(test_mode: bool) -> None:
 
 
 def get_import_schema(env_var: str, default: str, test_mode: bool) -> str:
+    """Resolve an import schema from environment configuration."""
     schema = os.getenv(env_var) or default
     return schema
 
 
 def deduplicate_dicts(dict_list, key_fields):
+    """Keep the last dictionary for each composite key."""
     seen = {}
     for dict_entry in dict_list:
         key = tuple(dict_entry.get(field) for field in key_fields)
@@ -848,6 +861,7 @@ def deduplicate_dicts(dict_list, key_fields):
 
 
 def order_dicts_by_fields(dict_list, key_fields):
+    """Sort dictionaries deterministically by selected fields."""
     def _stable_value(value):
         return (value is None, type(value).__name__, repr(value))
 
@@ -862,6 +876,7 @@ def order_dicts_by_fields(dict_list, key_fields):
 async def push_objects(
     obj_list, cls, rewrite=False, _missing_table_attempt: int = 0, use_copy: bool = True
 ):
+    """Persist objects in bounded batches with retry safeguards."""
     if obj_list:
         max_missing_table_retries = 5
         default_max_params = 30000
@@ -1236,6 +1251,7 @@ def _coerce_datetime(value):
 
 
 def print_time_info(start):
+    """Print elapsed import time from a supported timestamp."""
     now = datetime.datetime.utcnow()
     start_dt = _coerce_datetime(start)
     if start_dt is None:
