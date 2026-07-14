@@ -602,6 +602,69 @@ async def test_bounded_code_prefix_matches_eager_rank_and_reads_selected_refs(
 
 
 @pytest.mark.asyncio
+async def test_same_provider_continuations_preserve_exact_occurrences(monkeypatch):
+    fragments = (
+        _fragment(
+            _grouped_payload(2, [(5, [(1, 0), (2, 1)])]),
+            fragment_no=0,
+            entry_count=1,
+        ),
+        _fragment(
+            _grouped_payload(2, [(5, [(2, 1), (3, 0)])]),
+            fragment_no=1,
+            entry_count=1,
+        ),
+    )
+    expected_occurrences = [(5, 1, 0), (5, 2, 1), (5, 2, 1), (5, 3, 0)]
+
+    eager_occurrences = ptg2_db_sidecars._decode_serving_binary_code_records(
+        [_fragment_row(fragment) for fragment in fragments],
+        provider_set_keys=None,
+        expected_source_count=2,
+    )
+    prefix_rows, provider_count_lookup, price_dictionary_lookup = await _prefix_rows(
+        monkeypatch,
+        fragments=fragments,
+        limit=len(expected_occurrences),
+        descending=False,
+    )
+
+    assert eager_occurrences == expected_occurrences
+    assert [
+        (prefix_row.provider_set_key, prefix_row.price_key, prefix_row.source_key)
+        for prefix_row in prefix_rows
+    ] == expected_occurrences
+    provider_count_lookup.assert_awaited_once()
+    price_dictionary_lookup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_same_provider_continuation_rejects_decreasing_occurrences(
+    monkeypatch,
+):
+    fragments = (
+        _fragment(
+            _grouped_payload(2, [(5, [(8, 1)])]),
+            fragment_no=0,
+            entry_count=1,
+        ),
+        _fragment(
+            _grouped_payload(2, [(5, [(7, 0)])]),
+            fragment_no=1,
+            entry_count=1,
+        ),
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="not ordered"):
+        await _prefix_rows(
+            monkeypatch,
+            fragments=fragments,
+            limit=1,
+            descending=False,
+        )
+
+
+@pytest.mark.asyncio
 async def test_bounded_code_prefix_validates_later_fragments_after_heap_is_full(
     monkeypatch,
 ):

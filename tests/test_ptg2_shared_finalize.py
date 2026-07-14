@@ -2,101 +2,133 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
 from process.ptg_parts.ptg2_shared_finalize import (
+    attach_v3_dictionary_contract,
     attach_v3_source_run_contract,
-    parse_v3_finalizer_stdout,
     write_v3_finalizer_input_manifest,
+)
+from tests.ptg2_shared_finalize_test_support import (
+    _canonical_sha256,
+    _contracted_dictionary_entries,
+    _contracted_entries,
+    _entry,
+    _identity,
+    _one_source_contracted_inputs,
 )
 
 
-def _entry(path, **values):
-    path.write_bytes(b"x" * int(values.get("bytes") or 1))
-    return {"path": str(path), **values}
+def _assert_serving_run_manifest(manifest_payload):
+    serving_entry = manifest_payload["serving_run_partition_files"][0]
+    assert serving_entry["path"].endswith("run.ready")
+    assert serving_entry["source_key"] == 0
+    assert serving_entry["source_count"] == 1
+    assert serving_entry["sha256"] == hashlib.sha256(b"x" * 52).hexdigest()
+    assert manifest_payload["source_count"] == 1
+    assert manifest_payload["expected_serving_run_files"] == 1
+    assert manifest_payload["expected_serving_run_rows"] == 1
+    assert manifest_payload["expected_serving_run_bytes"] == 52
+    assert manifest_payload["source_run_contracts"][0]["partition_rows"] == [1]
+    assert len(manifest_payload["source_run_contract_set_sha256"]) == 64
 
 
-def _identity(value):
+def _expected_dictionary_contract(manifest_payload, dictionary_entries, identity):
     return {
-        "source_type": "in_network",
-        "identity_kind": "logical_json_sha256_v1",
-        "identity_sha256": value * 64,
+        "source_key": 0,
+        "contract_sha256": dictionary_entries[0][
+            "code_dictionary_contract_sha256"
+        ],
+        "version": 1,
+        "source_identity": identity,
+        "source_run_contract_sha256": manifest_payload["source_run_contracts"][0][
+            "contract_sha256"
+        ],
+        "file_count": 1,
+        "row_count": 1,
+        "byte_count": 64,
+        "files": [
+            {
+                "row_count": 1,
+                "bytes": 64,
+                "sha256": hashlib.sha256(b"x" * 64).hexdigest(),
+            }
+        ],
     }
 
 
-def _contracted_entries(entries, identity, *, partition_count):
-    return attach_v3_source_run_contract(
-        entries,
-        source_identity=identity,
-        scanner_summary={
-            "serving_run_files": len(entries),
-            "serving_run_rows": sum(entry["row_count"] for entry in entries),
-            "serving_run_bytes": sum(entry["bytes"] for entry in entries),
-        },
-        scanner_config={"serving_run_partition_count": partition_count},
+def _assert_dictionary_manifest(manifest_payload, expected_dictionary_contract):
+    dictionary_entry = manifest_payload["serving_run_code_dictionary_files"][0]
+    assert dictionary_entry["path"].endswith("codes.ready")
+    assert dictionary_entry["source_key"] == 0
+    assert dictionary_entry["source_count"] == 1
+    assert dictionary_entry["sha256"] == hashlib.sha256(b"x" * 64).hexdigest()
+    assert manifest_payload["expected_code_dictionary_files"] == 1
+    assert manifest_payload["expected_code_dictionary_rows"] == 1
+    assert manifest_payload["expected_code_dictionary_bytes"] == 64
+    assert (
+        manifest_payload["code_dictionary_source_contracts"][0]
+        == expected_dictionary_contract
+    )
+    assert dictionary_entry["code_dictionary_contract_sha256"] == (
+        expected_dictionary_contract["contract_sha256"]
     )
 
 
-def _summary_payload():
-    return {
-        "format": "ptg2_v3_direct_finalizer_v3",
-        "storage_generation": "shared_blocks_v3",
-        "cold_lookup_contract": "ptg_v3_cold_v2",
-        "shared_block_layout": "dense_shared_blocks_v3",
-        "source_count": 1,
-        "output_directory": "/tmp/out",
-        "price_key_map": {
-            "copy_format": "postgresql_binary_copy",
-            "row_count": 1,
-            "dense_price_ordering": (
-                "minimum_negotiated_rate_then_global_id_128_v1"
-            ),
-            "keys_unique_dense_contiguous": True,
-            "source_ids_exact_match": True,
-        },
-        "dense_keys": {
-            "price": {
-                "count": 1,
-                "ordering": "minimum_negotiated_rate_then_global_id_128_v1",
+def _assert_dictionary_contract_digests(
+    manifest_payload,
+    expected_dictionary_contract,
+):
+    dictionary_entry = manifest_payload["serving_run_code_dictionary_files"][0]
+    assert manifest_payload["code_dictionary_contract_set_sha256"] == (
+        _canonical_sha256(
+            {
+                "code_dictionary_contracts": [
+                    {
+                        key: dictionary_entry[key]
+                        for key in (
+                            "source_key",
+                            "row_count",
+                            "bytes",
+                            "sha256",
+                            "source_run_contract_sha256",
+                            "code_dictionary_contract_sha256",
+                        )
+                    }
+                ]
             }
-        },
-        "blocks": {
-            "serving": {
-                "artifact_record_counts": {
-                    "by_code_provider_shard_v1": 1,
-                    "by_code_price_page_v4": 1,
-                    "provider_set_count_dictionary": 1,
-                    "provider_set_codes_v3": 1,
-                    "provider_set_page_v3_s2": 1,
-                }
-            },
-            "price_dictionary": {
-                "artifact_record_counts": {"by_code_price_dictionary": 1}
-            },
-        },
-    }
+        )
+    )
+    assert manifest_payload["code_dictionary_source_contract_set_sha256"] == (
+        _canonical_sha256(
+            {"code_dictionary_source_contracts": [expected_dictionary_contract]}
+        )
+    )
 
 
 def test_finalizer_input_manifest_is_explicit_and_path_validated(tmp_path):
-    manifest = write_v3_finalizer_input_manifest(
-        tmp_path / "input.json",
-        serving_run_entries=_contracted_entries(
-            [
-                _entry(
-                    tmp_path / "run.ready",
-                    row_count=1,
-                    bytes=52,
-                    partition=0,
-                    partition_count=1,
-                    format="ptg2_v3_serving_run",
-                    version=1,
-                )
-            ],
-            _identity("a"),
-            partition_count=1,
-        ),
-        code_dictionary_entries=[
+    """Authenticate every explicit finalizer path and source-bound contract."""
+
+    identity = _identity("a")
+    serving_entries = _contracted_entries(
+        [
+            _entry(
+                tmp_path / "run.ready",
+                row_count=1,
+                bytes=52,
+                partition=0,
+                partition_count=1,
+                format="ptg2_v3_serving_run",
+                version=1,
+            )
+        ],
+        identity,
+        partition_count=1,
+    )
+    dictionary_entries = _contracted_dictionary_entries(
+        [
             _entry(
                 tmp_path / "codes.ready",
                 row_count=1,
@@ -105,316 +137,325 @@ def test_finalizer_input_manifest_is_explicit_and_path_validated(tmp_path):
                 version=4,
             )
         ],
-        expected_source_identities=[_identity("a")],
+        identity,
+        serving_entries,
+    )
+    manifest = write_v3_finalizer_input_manifest(
+        tmp_path / "input.json",
+        serving_run_entries=serving_entries,
+        code_dictionary_entries=dictionary_entries,
+        expected_source_identities=[identity],
     )
 
-    payload = json.loads(manifest.read_text(encoding="ascii"))
-    assert payload["serving_run_partition_files"][0]["path"].endswith("run.ready")
-    assert payload["serving_run_partition_files"][0]["source_key"] == 0
-    assert payload["serving_run_partition_files"][0]["source_count"] == 1
-    assert payload["source_count"] == 1
-    assert payload["expected_serving_run_files"] == 1
-    assert payload["expected_serving_run_rows"] == 1
-    assert payload["expected_serving_run_bytes"] == 52
-    assert payload["source_run_contracts"][0]["partition_rows"] == [1]
-    assert len(payload["source_run_contract_set_sha256"]) == 64
-    assert payload["serving_run_code_dictionary_files"][0]["path"].endswith(
-        "codes.ready"
+    manifest_payload = json.loads(manifest.read_text(encoding="ascii"))
+    expected_dictionary_contract = _expected_dictionary_contract(
+        manifest_payload, dictionary_entries, identity
+    )
+    _assert_serving_run_manifest(manifest_payload)
+    _assert_dictionary_manifest(manifest_payload, expected_dictionary_contract)
+    _assert_dictionary_contract_digests(
+        manifest_payload, expected_dictionary_contract
     )
 
 
-def test_finalizer_input_manifest_rejects_duplicate_paths(tmp_path):
-    entry = _entry(
-        tmp_path / "run.ready",
+def test_finalizer_accepts_multiple_dictionary_shards_for_one_source(tmp_path):
+    identity = _identity("a")
+    serving_entries = _contracted_entries(
+        [
+            _entry(
+                tmp_path / "run.ready",
+                row_count=1,
+                bytes=52,
+                partition=0,
+                partition_count=1,
+                format="ptg2_v3_serving_run",
+                version=1,
+            )
+        ],
+        identity,
+        partition_count=1,
+    )
+    dictionary_entries = _contracted_dictionary_entries(
+        [
+            _entry(
+                tmp_path / f"codes-{shard}.ready",
+                row_count=1,
+                bytes=64,
+                format="ptg2_v3_serving_code_dictionary",
+                version=4,
+            )
+            for shard in range(2)
+        ],
+        identity,
+        serving_entries,
+    )
+    manifest = write_v3_finalizer_input_manifest(
+        tmp_path / "multi-dictionary.json",
+        serving_run_entries=serving_entries,
+        code_dictionary_entries=dictionary_entries,
+        expected_source_identities=[identity],
+    )
+
+    dictionary_entries = json.loads(manifest.read_text(encoding="ascii"))[
+        "serving_run_code_dictionary_files"
+    ]
+    assert len(dictionary_entries) == 2
+    assert {entry["source_key"] for entry in dictionary_entries} == {0}
+    assert len({entry["sha256"] for entry in dictionary_entries}) == 1
+    manifest_payload = json.loads(manifest.read_text(encoding="ascii"))
+    assert manifest_payload["code_dictionary_source_contracts"][0]["file_count"] == 2
+    assert len(manifest_payload["code_dictionary_source_contracts"][0]["files"]) == 2
+
+
+def test_dictionary_contract_attachment_requires_scanner_aggregates(tmp_path):
+    identity, serving_entries, _dictionary_entries = _one_source_contracted_inputs(
+        tmp_path,
+        dictionary_file_count=1,
+    )
+    raw_entry = _entry(
+        tmp_path / "uncontracted.ready",
         row_count=1,
+        bytes=64,
+        format="ptg2_v3_serving_code_dictionary",
+        version=4,
+    )
+
+    with pytest.raises(RuntimeError, match="serving_code_dictionary_files"):
+        attach_v3_dictionary_contract(
+            [raw_entry],
+            source_identity=identity,
+            source_run_contract_sha256=serving_entries[0][
+                "source_run_contract_sha256"
+            ],
+            scanner_summary={
+                "serving_code_dictionary_rows": 1,
+                "serving_code_dictionary_bytes": 64,
+            },
+        )
+
+
+def test_dictionary_contract_attachment_rejects_omitted_scanner_shard(tmp_path):
+    identity = _identity("a")
+    serving_entries = _contracted_entries(
+        [
+            _entry(
+                tmp_path / "run.ready",
+                row_count=1,
+                bytes=52,
+                partition=0,
+                partition_count=1,
+                format="ptg2_v3_serving_run",
+                version=1,
+            )
+        ],
+        identity,
+        partition_count=1,
+    )
+    raw_entries = [
+        _entry(
+            tmp_path / f"codes-{index}.ready",
+            row_count=1,
+            bytes=64,
+            format="ptg2_v3_serving_code_dictionary",
+            version=4,
+        )
+        for index in range(2)
+    ]
+
+    with pytest.raises(RuntimeError, match="scanner aggregate summary"):
+        _contracted_dictionary_entries(
+            raw_entries[:1],
+            identity,
+            serving_entries,
+            files=2,
+            rows=2,
+            bytes=128,
+        )
+
+
+def test_finalizer_rejects_dictionary_shard_omitted_after_attachment(tmp_path):
+    identity, serving_entries, dictionary_entries = _one_source_contracted_inputs(
+        tmp_path
+    )
+
+    with pytest.raises(RuntimeError, match="aggregates|file digests"):
+        write_v3_finalizer_input_manifest(
+            tmp_path / "omitted-dictionary.json",
+            serving_run_entries=serving_entries,
+            code_dictionary_entries=dictionary_entries[:1],
+            expected_source_identities=[identity],
+        )
+
+
+def test_finalizer_rejects_dictionary_shard_mutated_after_attachment(tmp_path):
+    identity, serving_entries, dictionary_entries = _one_source_contracted_inputs(
+        tmp_path,
+        dictionary_file_count=1,
+    )
+    Path(dictionary_entries[0]["path"]).write_bytes(b"m" * 64)
+
+    with pytest.raises(RuntimeError, match="file digests"):
+        write_v3_finalizer_input_manifest(
+            tmp_path / "mutated-dictionary.json",
+            serving_run_entries=serving_entries,
+            code_dictionary_entries=dictionary_entries,
+            expected_source_identities=[identity],
+        )
+
+
+def test_finalizer_rejects_duplicate_dictionary_contract_identity(tmp_path):
+    identity, serving_entries, dictionary_entries = _one_source_contracted_inputs(
+        tmp_path
+    )
+    dictionary_entries[1]["code_dictionary_source_contract"] = dict(
+        dictionary_entries[0]["code_dictionary_source_contract"]
+    )
+
+    with pytest.raises(RuntimeError, match="repeat physical identity"):
+        write_v3_finalizer_input_manifest(
+            tmp_path / "duplicate-dictionary-contract.json",
+            serving_run_entries=serving_entries,
+            code_dictionary_entries=dictionary_entries,
+            expected_source_identities=[identity],
+        )
+
+
+def test_finalizer_requires_one_dictionary_contract_per_dense_source(tmp_path):
+    identity, serving_entries, dictionary_entries = _one_source_contracted_inputs(
+        tmp_path,
+        dictionary_file_count=1,
+    )
+    dictionary_entries[0].pop("code_dictionary_source_contract")
+
+    with pytest.raises(RuntimeError, match="missing a complete code-dictionary"):
+        write_v3_finalizer_input_manifest(
+            tmp_path / "missing-dictionary-contract.json",
+            serving_run_entries=serving_entries,
+            code_dictionary_entries=dictionary_entries,
+            expected_source_identities=[identity],
+        )
+
+
+def test_finalizer_rejects_extra_dictionary_contract_fields(tmp_path):
+    identity, serving_entries, dictionary_entries = _one_source_contracted_inputs(
+        tmp_path,
+        dictionary_file_count=1,
+    )
+    contract = dictionary_entries[0]["code_dictionary_source_contract"]
+    contract["unexpected"] = True
+    contract_sha256 = _canonical_sha256(contract)
+    dictionary_entries[0]["code_dictionary_contract_sha256"] = contract_sha256
+
+    with pytest.raises(RuntimeError, match="fields are incompatible"):
+        write_v3_finalizer_input_manifest(
+            tmp_path / "extra-dictionary-contract-field.json",
+            serving_run_entries=serving_entries,
+            code_dictionary_entries=dictionary_entries,
+            expected_source_identities=[identity],
+        )
+
+
+@pytest.mark.parametrize("invalid_version", ["1", 1.0, True, (1 << 64)])
+def test_finalizer_rejects_non_integer_source_contract_version(
+    tmp_path,
+    invalid_version,
+):
+    identity, serving_entries, dictionary_entries = _one_source_contracted_inputs(
+        tmp_path,
+        dictionary_file_count=1,
+    )
+    contract = serving_entries[0]["source_run_contract"]
+    contract["version"] = invalid_version
+    serving_entries[0]["source_run_contract_sha256"] = _canonical_sha256(contract)
+
+    with pytest.raises(RuntimeError, match="source-run contract version"):
+        write_v3_finalizer_input_manifest(
+            tmp_path / "invalid-source-contract-version.json",
+            serving_run_entries=serving_entries,
+            code_dictionary_entries=dictionary_entries,
+            expected_source_identities=[identity],
+        )
+
+
+def test_finalizer_rejects_extra_source_contract_identity_fields(tmp_path):
+    identity, serving_entries, dictionary_entries = _one_source_contracted_inputs(
+        tmp_path,
+        dictionary_file_count=1,
+    )
+    contract = serving_entries[0]["source_run_contract"]
+    contract["source_identity"]["unexpected"] = "accepted-by-old-python"
+    serving_entries[0]["source_run_contract_sha256"] = _canonical_sha256(contract)
+
+    with pytest.raises(RuntimeError, match="bound to another physical source"):
+        write_v3_finalizer_input_manifest(
+            tmp_path / "extra-source-identity-field.json",
+            serving_run_entries=serving_entries,
+            code_dictionary_entries=dictionary_entries,
+            expected_source_identities=[identity],
+        )
+
+
+def test_source_contract_attachment_rejects_string_file_counts(tmp_path):
+    identity = _identity("a")
+    entry = _entry(
+        tmp_path / "string-count.ready",
+        row_count="1",
         bytes=52,
         partition=0,
         partition_count=1,
         format="ptg2_v3_serving_run",
         version=1,
     )
-    with pytest.raises(RuntimeError, match="repeats path"):
-        write_v3_finalizer_input_manifest(
-            tmp_path / "input.json",
-            serving_run_entries=[entry, entry],
-            code_dictionary_entries=[
-                _entry(
-                    tmp_path / "codes.ready",
-                    row_count=1,
-                    bytes=64,
-                    format="ptg2_v3_serving_code_dictionary",
-                    version=4,
-                )
-            ],
-            expected_source_identities=[_identity("a")],
+
+    with pytest.raises(RuntimeError, match="serving-run row_count"):
+        attach_v3_source_run_contract(
+            [entry],
+            source_identity=identity,
+            scanner_summary={
+                "serving_run_files": 1,
+                "serving_run_rows": 1,
+                "serving_run_bytes": 52,
+            },
+            scanner_config={"serving_run_partition_count": 1},
         )
 
 
-def test_finalizer_summary_frame_is_strict():
-    payload = json.dumps(_summary_payload(), separators=(",", ":")).encode("ascii")
-    frame = b"v3_finalizer_summary\t" + str(len(payload)).encode("ascii") + b"\n" + payload + b"\n"
-
-    assert parse_v3_finalizer_stdout(frame)["output_directory"] == "/tmp/out"
-    with pytest.raises(RuntimeError, match="trailing"):
-        parse_v3_finalizer_stdout(frame + b"unexpected")
-
-
-def test_identical_run_rows_from_distinct_artifacts_keep_distinct_source_keys(tmp_path):
-    first = _contracted_entries(
-        [
-            _entry(
-                tmp_path / "first.run",
-                row_count=1,
-                bytes=52,
-                partition=0,
-                partition_count=1,
-                format="ptg2_v3_serving_run",
-                version=1,
-            )
-        ],
-        _identity("a"),
-        partition_count=1,
-    )[0]
-    second = _contracted_entries(
-        [
-            _entry(
-                tmp_path / "second.run",
-                row_count=1,
-                bytes=52,
-                partition=0,
-                partition_count=1,
-                format="ptg2_v3_serving_run",
-                version=1,
-            )
-        ],
-        _identity("b"),
-        partition_count=1,
-    )[0]
-    assert (tmp_path / "first.run").read_bytes() == (tmp_path / "second.run").read_bytes()
-    manifest = write_v3_finalizer_input_manifest(
-        tmp_path / "two-sources.json",
-        serving_run_entries=[second, first],
-        code_dictionary_entries=[
-            _entry(
-                tmp_path / "codes.ready",
-                row_count=1,
-                bytes=64,
-                format="ptg2_v3_serving_code_dictionary",
-                version=4,
-            )
-        ],
-        expected_source_identities=[_identity("b"), _identity("a")],
+def test_finalizer_rejects_unsorted_dictionary_contract_descriptors(tmp_path):
+    identity, serving_entries, dictionary_entries = _one_source_contracted_inputs(
+        tmp_path
     )
-    rows = json.loads(manifest.read_text(encoding="ascii"))[
-        "serving_run_partition_files"
-    ]
-
-    assert [(row["path"], row["source_key"], row["source_count"]) for row in rows] == [
-        (str((tmp_path / "second.run").resolve()), 1, 2),
-        (str((tmp_path / "first.run").resolve()), 0, 2),
-    ]
-
-
-def test_finalizer_rejects_missing_nonempty_source_partition_file(tmp_path):
-    identity = _identity("a")
-    entries = _contracted_entries(
-        [
-            _entry(
-                tmp_path / "part-0.ready",
-                row_count=1,
-                bytes=52,
-                partition=0,
-                partition_count=2,
-                format="ptg2_v3_serving_run",
-                version=1,
-            ),
-            _entry(
-                tmp_path / "part-1.ready",
-                row_count=1,
-                bytes=52,
-                partition=1,
-                partition_count=2,
-                format="ptg2_v3_serving_run",
-                version=1,
-            ),
-        ],
-        identity,
-        partition_count=2,
-    )
-
-    with pytest.raises(RuntimeError, match="partition rows|aggregates|file digests"):
-        write_v3_finalizer_input_manifest(
-            tmp_path / "missing-nonempty.json",
-            serving_run_entries=entries[:1],
-            code_dictionary_entries=[
-                _entry(
-                    tmp_path / "codes.ready",
-                    row_count=1,
-                    bytes=64,
-                    format="ptg2_v3_serving_code_dictionary",
-                    version=4,
-                )
-            ],
-            expected_source_identities=[identity],
-        )
-
-
-def test_finalizer_rejects_contract_missing_empty_partition_slot(tmp_path):
-    identity = _identity("a")
-    entries = _contracted_entries(
-        [
-            _entry(
-                tmp_path / "part-0.ready",
-                row_count=1,
-                bytes=52,
-                partition=0,
-                partition_count=2,
-                format="ptg2_v3_serving_run",
-                version=1,
-            )
-        ],
-        identity,
-        partition_count=2,
-    )
-    contract = entries[0]["source_run_contract"]
-    contract["partition_rows"] = [1]
-    entries[0]["source_run_contract_sha256"] = hashlib.sha256(
-        json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("ascii")
-    ).hexdigest()
-
-    with pytest.raises(RuntimeError, match="incomplete partition coverage"):
-        write_v3_finalizer_input_manifest(
-            tmp_path / "missing-empty.json",
-            serving_run_entries=entries,
-            code_dictionary_entries=[
-                _entry(
-                    tmp_path / "codes.ready",
-                    row_count=1,
-                    bytes=64,
-                    format="ptg2_v3_serving_code_dictionary",
-                    version=4,
-                )
-            ],
-            expected_source_identities=[identity],
-        )
-
-
-def test_finalizer_rejects_swapped_source_paths(tmp_path):
-    first_path = tmp_path / "first.ready"
-    second_path = tmp_path / "second.ready"
-    first_path.write_bytes(b"a" * 52)
-    second_path.write_bytes(b"b" * 52)
-    first = _contracted_entries(
+    second_path = Path(dictionary_entries[1]["path"])
+    second_path.write_bytes(b"z" * 64)
+    dictionary_entries = _contracted_dictionary_entries(
         [
             {
-                "path": str(first_path),
-                "row_count": 1,
-                "bytes": 52,
-                "partition": 0,
-                "partition_count": 1,
-                "format": "ptg2_v3_serving_run",
-                "version": 1,
+                key: descriptor_value
+                for key, descriptor_value in entry.items()
+                if key
+                not in {
+                    "source_type",
+                    "identity_kind",
+                    "identity_sha256",
+                    "source_run_contract_sha256",
+                    "code_dictionary_contract_sha256",
+                    "code_dictionary_source_contract",
+                }
             }
+            for entry in dictionary_entries
         ],
-        _identity("a"),
-        partition_count=1,
-    )[0]
-    second = _contracted_entries(
-        [
-            {
-                "path": str(second_path),
-                "row_count": 1,
-                "bytes": 52,
-                "partition": 0,
-                "partition_count": 1,
-                "format": "ptg2_v3_serving_run",
-                "version": 1,
-            }
-        ],
-        _identity("b"),
-        partition_count=1,
-    )[0]
-    first["path"], second["path"] = second["path"], first["path"]
+        identity,
+        serving_entries,
+    )
+    contract = dictionary_entries[0]["code_dictionary_source_contract"]
+    contract["files"].reverse()
+    contract_sha256 = _canonical_sha256(contract)
+    for entry in dictionary_entries:
+        entry["code_dictionary_contract_sha256"] = contract_sha256
 
-    with pytest.raises(RuntimeError, match="content digest"):
+    with pytest.raises(RuntimeError, match="file order is incompatible"):
         write_v3_finalizer_input_manifest(
-            tmp_path / "swapped.json",
-            serving_run_entries=[first, second],
-            code_dictionary_entries=[
-                _entry(
-                    tmp_path / "codes.ready",
-                    row_count=1,
-                    bytes=64,
-                    format="ptg2_v3_serving_code_dictionary",
-                    version=4,
-                )
-            ],
-            expected_source_identities=[_identity("a"), _identity("b")],
+            tmp_path / "unsorted-dictionary-contract.json",
+            serving_run_entries=serving_entries,
+            code_dictionary_entries=dictionary_entries,
+            expected_source_identities=[identity],
         )
-
-
-def test_finalizer_rejects_swapped_source_identity_metadata(tmp_path):
-    first = _contracted_entries(
-        [
-            _entry(
-                tmp_path / "first.ready",
-                row_count=1,
-                bytes=52,
-                partition=0,
-                partition_count=1,
-                format="ptg2_v3_serving_run",
-                version=1,
-            )
-        ],
-        _identity("a"),
-        partition_count=1,
-    )[0]
-    second = _contracted_entries(
-        [
-            _entry(
-                tmp_path / "second.ready",
-                row_count=1,
-                bytes=52,
-                partition=0,
-                partition_count=1,
-                format="ptg2_v3_serving_run",
-                version=1,
-            )
-        ],
-        _identity("b"),
-        partition_count=1,
-    )[0]
-    for field_name in ("source_type", "identity_kind", "identity_sha256"):
-        first[field_name], second[field_name] = second[field_name], first[field_name]
-
-    with pytest.raises(RuntimeError, match="bound to another physical source"):
-        write_v3_finalizer_input_manifest(
-            tmp_path / "swapped-identities.json",
-            serving_run_entries=[first, second],
-            code_dictionary_entries=[
-                _entry(
-                    tmp_path / "codes.ready",
-                    row_count=1,
-                    bytes=64,
-                    format="ptg2_v3_serving_code_dictionary",
-                    version=4,
-                )
-            ],
-            expected_source_identities=[_identity("a"), _identity("b")],
-        )
-
-
-def test_finalizer_summary_rejects_legacy_object_markers():
-    payload = _summary_payload()
-    payload["blocks"]["serving"]["artifact_record_counts"] = {
-        "by_code_grouped": 1,
-        "by_code_page_v3_f2": 1,
-        "provider_set_count_dictionary": 1,
-        "provider_set_codes_v3": 1,
-        "provider_set_page_v3_s1": 1,
-    }
-    encoded = json.dumps(payload, separators=(",", ":")).encode("ascii")
-    frame = b"v3_finalizer_summary\t" + str(len(encoded)).encode() + b"\n" + encoded
-
-    with pytest.raises(RuntimeError, match="object markers"):
-        parse_v3_finalizer_stdout(frame)

@@ -13,6 +13,7 @@ from process.ptg_parts.config import (
 )
 from process.ptg_parts.ptg2_shared_finalize import (
     PTG2_V3_FINALIZER_RESOURCE_CONTRACT,
+    attach_v3_dictionary_contract,
     attach_v3_source_run_contract,
     run_v3_direct_finalizer,
     validate_v3_finalizer_summary,
@@ -157,15 +158,26 @@ def _finalizer_inputs(tmp_path):
     )
     code_path = tmp_path / "codes.ready"
     code_path.write_bytes(b"c" * 64)
-    code_entries = [
-        {
-            "path": str(code_path),
-            "row_count": 1,
-            "bytes": 64,
-            "format": "ptg2_v3_serving_code_dictionary",
-            "version": 4,
-        }
-    ]
+    code_entries = attach_v3_dictionary_contract(
+        [
+            {
+                "path": str(code_path),
+                "row_count": 1,
+                "bytes": 64,
+                "format": "ptg2_v3_serving_code_dictionary",
+                "version": 4,
+            }
+        ],
+        source_identity=_physical_identity(),
+        source_run_contract_sha256=serving_entries[0][
+            "source_run_contract_sha256"
+        ],
+        scanner_summary={
+            "serving_code_dictionary_files": 1,
+            "serving_code_dictionary_rows": 1,
+            "serving_code_dictionary_bytes": 64,
+        },
+    )
     price_key_map_path = tmp_path / "price-key-map.copy"
     price_key_map_path.write_bytes(b"map")
     return serving_entries, code_entries, price_key_map_path

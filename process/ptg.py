@@ -165,7 +165,10 @@ from process.ptg_parts.ptg2_shared_blocks import (
     is_shared_layout_build_abandoned,
     reserve_shared_layout,
 )
-from process.ptg_parts.ptg2_shared_finalize import attach_v3_source_run_contract
+from process.ptg_parts.ptg2_shared_finalize import (
+    attach_v3_dictionary_contract,
+    attach_v3_source_run_contract,
+)
 from process.ptg_parts.ptg2_shared_reuse import (
     SharedPhysicalArtifactIdentity,
     normalized_physical_artifact_identity,
@@ -2433,6 +2436,28 @@ def _reused_shared_v3_serving_index(
     return serving_index
 
 
+def _bind_v3_entry_identity(
+    entries: Any,
+    *,
+    identity_payload: Mapping[str, str],
+    label: str,
+) -> list[dict[str, Any]]:
+    """Bind one homogeneous V3 metadata list to a physical source identity."""
+
+    if not isinstance(entries, list):
+        raise RuntimeError(f"strict V3 {label} metadata must be a list")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"strict V3 {label} metadata must contain objects")
+        for field_name, identity_value in identity_payload.items():
+            previous = entry.setdefault(field_name, identity_value)
+            if previous != identity_value:
+                raise RuntimeError(
+                    f"strict V3 {label} entry has conflicting physical identity"
+                )
+    return entries
+
+
 def _annotate_v3_result_identity(
     file_result: PTG2FileProcessResult,
     identity: SharedPhysicalArtifactIdentity,
@@ -2453,18 +2478,11 @@ def _annotate_v3_result_identity(
         if file_result.skipped:
             return file_result
         raise RuntimeError("strict V3 successful scan is missing deferred COPY files")
-    serving_entries = copy_files.get("serving_run") or []
-    if not isinstance(serving_entries, list):
-        raise RuntimeError("strict V3 serving-run metadata must be a list")
-    for entry in serving_entries:
-        if not isinstance(entry, dict):
-            raise RuntimeError("strict V3 serving-run metadata must contain objects")
-        for field_name, identity_value in identity_payload.items():
-            previous = entry.setdefault(field_name, identity_value)
-            if previous != identity_value:
-                raise RuntimeError(
-                    "strict V3 serving-run entry has conflicting physical identity"
-                )
+    serving_entries = _bind_v3_entry_identity(
+        copy_files.get("serving_run") or [],
+        identity_payload=identity_payload,
+        label="serving-run",
+    )
     scanner = file_result.summary.get("scanner")
     scanner_summary = scanner.get("summary") if isinstance(scanner, Mapping) else None
     scanner_config = scanner.get("config") if isinstance(scanner, Mapping) else None
@@ -2474,11 +2492,21 @@ def _annotate_v3_result_identity(
         # Synthetic callers may annotate before scanner metadata is assembled. The
         # strict finalizer still rejects these entries because they lack a contract.
         return file_result
-    copy_files["serving_run"] = attach_v3_source_run_contract(
+    contracted_serving_entries = attach_v3_source_run_contract(
         serving_entries,
         source_identity=identity,
         scanner_summary=scanner_summary,
         scanner_config=scanner_config,
+    )
+    copy_files["serving_run"] = contracted_serving_entries
+    source_run_contract_sha256 = str(
+        contracted_serving_entries[0].get("source_run_contract_sha256") or ""
+    )
+    copy_files["serving_code_dictionary"] = attach_v3_dictionary_contract(
+        copy_files.get("serving_code_dictionary") or [],
+        source_identity=identity,
+        source_run_contract_sha256=source_run_contract_sha256,
+        scanner_summary=scanner_summary,
     )
     return file_result
 

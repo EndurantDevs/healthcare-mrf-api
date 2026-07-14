@@ -42,7 +42,10 @@ from process.ptg_parts.ptg2_shared_blocks import (
     reserve_shared_layout,
     shared_semantic_fingerprint,
 )
-from process.ptg_parts.ptg2_shared_finalize import attach_v3_source_run_contract
+from process.ptg_parts.ptg2_shared_finalize import (
+    attach_v3_dictionary_contract,
+    attach_v3_source_run_contract,
+)
 from process.ptg_parts.ptg2_shared_gc import sweep_ptg2_shared_blocks
 from process.ptg_parts.ptg2_shared_reuse import (
     SharedPhysicalArtifactIdentity,
@@ -424,7 +427,7 @@ def _release_report(
         "schema_version": 2,
         "harness": {
             "name": "ptg2_v3_source_api_audit",
-            "version": "2.6.0",
+            "version": "2.9.0",
         },
         "status": "pass",
         "profile": "release",
@@ -850,17 +853,26 @@ async def test_v3_lifecycle_fails_closed(
             provider_set_id=provider_set_id,
             provider_group_id=bytes.fromhex("00112233445566778899aabbccddeeff"),
         )
+        scanner_summary = scanner_support._single_frame(
+            scan["frames"],
+            "scanner_summary",
+        )
         serving_run_entries = attach_v3_source_run_contract(
             scan["partition_frames"],
             source_identity=identity,
-            scanner_summary=scanner_support._single_frame(
-                scan["frames"],
-                "scanner_summary",
-            ),
+            scanner_summary=scanner_summary,
             scanner_config=scanner_support._single_frame(
                 scan["frames"],
                 "scanner_config",
             ),
+        )
+        code_dictionary_entries = attach_v3_dictionary_contract(
+            scan["code_dictionary_frames"],
+            source_identity=identity,
+            source_run_contract_sha256=serving_run_entries[0][
+                "source_run_contract_sha256"
+            ],
+            scanner_summary=scanner_summary,
         )
         publication = await publish_strict_shared_v3_layout(
             schema_name=SCHEMA_NAME,
@@ -871,7 +883,7 @@ async def test_v3_lifecycle_fails_closed(
             logical_snapshot_id=snapshot_a,
             expected_source_identities=[identity],
             serving_run_entries=serving_run_entries,
-            code_dictionary_entries=scan["code_dictionary_frames"],
+            code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=(
                 {
                     "path": str(provider_set_metadata_path),

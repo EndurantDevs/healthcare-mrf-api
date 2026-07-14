@@ -48,10 +48,17 @@ impl DenseIdentityMap {
     pub fn with_capacity(expected_len: usize) -> io::Result<Self> {
         let memory_bytes = Self::estimated_memory_bytes(expected_len)?;
         let slot_count = memory_bytes / std::mem::size_of::<Slot>();
-        Ok(Self {
-            slots: vec![Slot::default(); slot_count],
-            len: 0,
-        })
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(slot_count).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "unable to reserve {memory_bytes} bytes for immutable identity map: {error}"
+                ),
+            )
+        })?;
+        slots.resize(slot_count, Slot::default());
+        Ok(Self { slots, len: 0 })
     }
 
     pub fn insert(

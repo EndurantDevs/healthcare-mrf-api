@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from process.ptg_parts.ptg2_shared_finalize import (
+    attach_v3_dictionary_contract,
     attach_v3_source_run_contract,
     write_v3_finalizer_input_manifest,
 )
@@ -33,6 +34,7 @@ _parse_scanner_frames = _SUPPORT_MODULE._parse_scanner_frames
 
 _SERVING_RECORD = struct.Struct(">16s16s16sI")
 _AUDIT_CANDIDATE_RECORD = struct.Struct(">IIIII")
+_MIB = 1024 * 1024
 _STRICT_SCANNER_FRAME_KINDS = {
     "dedupe_summary",
     "manifest_price_atom_copy_file",
@@ -45,6 +47,17 @@ _STRICT_SCANNER_FRAME_KINDS = {
     "v3_serving_code_dictionary_file",
     "v3_serving_run_partition_file",
 }
+
+
+def _v3_finalizer_test_resource_args() -> tuple[str, ...]:
+    return (
+        "--workers",
+        "1",
+        "--identity-map-max-bytes",
+        str(64 * _MIB),
+        "--total-sort-memory-bytes",
+        str(64 * _MIB),
+    )
 
 
 def _read_pg_binary_rows(payload: bytes, expected_fields: int) -> list[list[bytes | None]]:
@@ -85,7 +98,7 @@ def _pg_binary_copy_rows(rows: list[list[bytes | None]]) -> bytes:
 
 
 @pytest.mark.parametrize(
-    ("kind", "rows"),
+    ("kind", "input_copy_rows"),
     [
         (
             "price_set_atom_memberships_v3",
@@ -109,27 +122,27 @@ def _pg_binary_copy_rows(rows: list[list[bytes | None]]) -> bytes:
         ),
     ],
 )
-def test_release_scanner_exposes_only_strict_v3_price_streams(kind, rows):
-    result = subprocess.run(
+def test_release_scanner_exposes_only_strict_v3_price_streams(kind, input_copy_rows):
+    conversion_process = subprocess.run(
         [
             str(_built_scanner_binary()),
             "--serving-binary-copy-from-key-copy-stdio",
             kind,
             "24",
         ],
-        input=_pg_binary_copy_rows(rows),
+        input=_pg_binary_copy_rows(input_copy_rows),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=True,
         timeout=30,
     )
 
-    output_rows = _read_pg_binary_rows(result.stdout, 10)
+    output_rows = _read_pg_binary_rows(conversion_process.stdout, 10)
     assert len(output_rows) == 1
     assert output_rows[0][2] == kind.encode("ascii")
     summary_line = next(
         line
-        for line in result.stderr.splitlines()
+        for line in conversion_process.stderr.splitlines()
         if line.startswith(b"PTG2_SERVING_BINARY_COPY\t")
     )
     summary = json.loads(summary_line.split(b"\t", 1)[1])
@@ -166,24 +179,24 @@ def _read_uvarint(payload: bytes, offset: int) -> tuple[int, int]:
 
 
 def _decode_by_code_groups(
-    payload: bytes, entry_count: int
+    encoded_group_bytes: bytes, entry_count: int
 ) -> list[tuple[int, list[int], list[int]]]:
-    assert payload[0] == 2
-    source_count, offset = _read_uvarint(payload, 1)
-    source_bits = payload[offset]
+    assert encoded_group_bytes[0] == 2
+    source_count, offset = _read_uvarint(encoded_group_bytes, 1)
+    source_bits = encoded_group_bytes[offset]
     offset += 1
     provider_set_key = 0
     groups = []
     for _entry_index in range(entry_count):
-        provider_delta, offset = _read_uvarint(payload, offset)
+        provider_delta, offset = _read_uvarint(encoded_group_bytes, offset)
         provider_set_key += provider_delta
-        price_count, offset = _read_uvarint(payload, offset)
+        price_count, offset = _read_uvarint(encoded_group_bytes, offset)
         price_keys = []
         for _price_index in range(price_count):
-            price_key, offset = _read_uvarint(payload, offset)
+            price_key, offset = _read_uvarint(encoded_group_bytes, offset)
             price_keys.append(price_key)
         source_bytes = (price_count * source_bits + 7) // 8
-        packed_sources = payload[offset : offset + source_bytes]
+        packed_sources = encoded_group_bytes[offset : offset + source_bytes]
         offset += source_bytes
         if source_bits == 0:
             source_keys = [0] * price_count
@@ -196,7 +209,7 @@ def _decode_by_code_groups(
             ]
         assert all(source_key < source_count for source_key in source_keys)
         groups.append((provider_set_key, price_keys, source_keys))
-    assert offset == len(payload)
+    assert offset == len(encoded_group_bytes)
     return groups
 
 
@@ -231,7 +244,7 @@ def _fixture_payload(
                 ],
             }
         )
-    in_network = [
+    in_network_entries = [
         {
             "billing_code_type": "CPT",
             "billing_code_type_version": "2026",
@@ -253,11 +266,11 @@ def _fixture_payload(
         }
     ]
     if duplicate_first_price:
-        prices = in_network[0]["negotiated_rates"][0]["negotiated_prices"]
+        prices = in_network_entries[0]["negotiated_rates"][0]["negotiated_prices"]
         prices.append(dict(prices[0]))
     if repeated_rate_occurrences:
-        first_rate = in_network[0]["negotiated_rates"][0]
-        in_network[0]["negotiated_rates"].extend(
+        first_rate = in_network_entries[0]["negotiated_rates"][0]
+        in_network_entries[0]["negotiated_rates"].extend(
             [
                 json.loads(json.dumps(first_rate)),
                 {
@@ -267,7 +280,7 @@ def _fixture_payload(
             ]
         )
     if multiple_prices:
-        in_network.append(
+        in_network_entries.append(
             {
                 "billing_code_type": "CPT",
                 "billing_code_type_version": "2026",
@@ -289,8 +302,14 @@ def _fixture_payload(
             }
         )
     if provider_references_first:
-        return {"provider_references": provider_references, "in_network": in_network}
-    return {"in_network": in_network, "provider_references": provider_references}
+        return {
+            "provider_references": provider_references,
+            "in_network": in_network_entries,
+        }
+    return {
+        "in_network": in_network_entries,
+        "provider_references": provider_references,
+    }
 
 
 def _single_frame(frames: list[tuple[str, dict]], record_kind: str) -> dict:
@@ -312,18 +331,20 @@ def _load_isolated_shared_blocks():
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    replacements = {
+    replacement_modules_by_name = {
         "process": process_package,
         "process.ptg_parts": ptg_parts_package,
         "process.ptg_parts.db_tables": db_tables,
         module_name: module,
     }
-    previous = {name: sys.modules.get(name) for name in replacements}
+    previous_modules_by_name = {
+        name: sys.modules.get(name) for name in replacement_modules_by_name
+    }
     try:
-        sys.modules.update(replacements)
+        sys.modules.update(replacement_modules_by_name)
         spec.loader.exec_module(module)
     finally:
-        for name, prior_module in previous.items():
+        for name, prior_module in previous_modules_by_name.items():
             if prior_module is None:
                 sys.modules.pop(name, None)
             else:
@@ -369,14 +390,14 @@ def _run_scanner(
     provider_forward_path = run_directory / "provider-forward.sidecar"
     provider_inverted_path = run_directory / "provider-inverted.sidecar"
     serving_run_directory = run_directory / "serving-runs"
-    env = dict(os.environ)
+    scanner_environment_map = dict(os.environ)
     for output_env in (
         *_SUPPORT_MODULE.COPY_ENV_BY_KIND.values(),
         *_SUPPORT_MODULE.SIDECAR_ENV_BY_KIND.values(),
         "HLTHPRT_PTG2_V3_SERVING_RUN_DIR",
     ):
-        env.pop(output_env, None)
-    env.update(
+        scanner_environment_map.pop(output_env, None)
+    scanner_environment_map.update(
         {
             "HLTHPRT_PTG2_SNAPSHOT_ARCH": arch,
             "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID": (b"\xcc" * 32).hex(),
@@ -417,31 +438,35 @@ def _run_scanner(
     completed = subprocess.run(
         [str(scanner_binary), "--compact-serving", str(artifact)],
         check=True,
-        env=env,
+        env=scanner_environment_map,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=120,
     )
     frames = _parse_scanner_frames(completed.stdout)
     partition_frames = [
-        payload for kind, payload in frames if kind == "v3_serving_run_partition_file"
+        frame_payload
+        for kind, frame_payload in frames
+        if kind == "v3_serving_run_partition_file"
     ]
     code_dictionary_frames = [
-        payload
-        for kind, payload in frames
+        frame_payload
+        for kind, frame_payload in frames
         if kind == "v3_serving_code_dictionary_file"
     ]
     price_atom_frames = [
-        payload for kind, payload in frames if kind == "manifest_price_atom_copy_file"
+        frame_payload
+        for kind, frame_payload in frames
+        if kind == "manifest_price_atom_copy_file"
     ]
     price_set_atom_frames = [
-        payload
-        for kind, payload in frames
+        frame_payload
+        for kind, frame_payload in frames
         if kind == "manifest_price_set_atom_copy_file"
     ]
     provider_group_member_frames = [
-        payload
-        for kind, payload in frames
+        frame_payload
+        for kind, frame_payload in frames
         if kind == "manifest_provider_group_member_copy_file"
     ]
     partition_bytes = b"".join(
@@ -470,7 +495,7 @@ def _run_scanner(
 def test_v3_all_scanner_paths_emit_identical_fixed_width_records(tmp_path):
     """Verify v3 all scanner paths emit identical fixed width records."""
     scanner_binary = _built_scanner_binary()
-    runs = {
+    scanner_runs_by_mode = {
         "worker_ungrouped": _run_scanner(
             scanner_binary,
             tmp_path,
@@ -479,30 +504,41 @@ def test_v3_all_scanner_paths_emit_identical_fixed_width_records(tmp_path):
             provider_references_first=True,
             grouped=False,
         ),
-        "serial": _run_scanner(
+        "late_reordered": _run_scanner(
             scanner_binary,
             tmp_path,
-            "serial",
+            "late-reordered",
             arch="postgres_binary_v3",
             provider_references_first=False,
             grouped=False,
         ),
     }
 
-    baseline = runs["worker_ungrouped"]["partition_bytes"]
+    baseline = scanner_runs_by_mode["worker_ungrouped"]["partition_bytes"]
     assert len(baseline) == _SERVING_RECORD.size
-    assert runs["serial"]["partition_bytes"] == baseline
+    assert scanner_runs_by_mode["late_reordered"]["partition_bytes"] == baseline
     assert _SERVING_RECORD.unpack(baseline)[3] == 2
 
-    assert _single_frame(runs["worker_ungrouped"]["frames"], "scanner_config")["execution_mode"] == (
-        "parallel_top_level_bytes"
-    )
+    assert _single_frame(
+        scanner_runs_by_mode["worker_ungrouped"]["frames"], "scanner_config"
+    )["execution_mode"] == ("parallel_top_level_bytes")
     assert (
-        _single_frame(runs["serial"]["frames"], "scanner_config")["execution_mode"]
-        == "serial_struson"
+        _single_frame(
+            scanner_runs_by_mode["late_reordered"]["frames"], "scanner_config"
+        )["execution_mode"]
+        == "parallel_top_level_bytes_plain_range_reorder"
     )
+    late_config = _single_frame(
+        scanner_runs_by_mode["late_reordered"]["frames"], "scanner_config"
+    )
+    assert late_config["provider_reference_order"] == "after_in_network"
+    assert late_config["plain_range_reorder"] is True
+    assert late_config["plain_provider_range_bytes"] > 0
+    assert late_config["plain_in_network_range_bytes"] > 0
+    assert late_config["plain_in_network_object_count"] == 1
+    assert late_config["order_probe_partial_pass"] is True
 
-    for run in runs.values():
+    for run in scanner_runs_by_mode.values():
         frame_kinds = {kind for kind, _payload in run["frames"]}
         assert frame_kinds - {"dedupe_summary"} == (
             _STRICT_SCANNER_FRAME_KINDS - {"dedupe_summary"}
@@ -570,17 +606,22 @@ def test_v3_worker_and_serial_paths_preserve_source_rate_occurrences(tmp_path):
     ]
 
     for run in runs:
-        payload = run["partition_bytes"]
-        assert len(payload) == 3 * _SERVING_RECORD.size
-        records = [
-            _SERVING_RECORD.unpack(payload[offset : offset + _SERVING_RECORD.size])
-            for offset in range(0, len(payload), _SERVING_RECORD.size)
+        partition_bytes = run["partition_bytes"]
+        assert len(partition_bytes) == 3 * _SERVING_RECORD.size
+        serving_records = [
+            _SERVING_RECORD.unpack(
+                partition_bytes[offset : offset + _SERVING_RECORD.size]
+            )
+            for offset in range(0, len(partition_bytes), _SERVING_RECORD.size)
         ]
-        assert sorted(Counter(records).values()) == [1, 2]
-        assert len({record[0] for record in records}) == 1
-        assert len({record[1] for record in records}) == 2
-        assert len({record[2] for record in records}) == 1
-        assert sorted({record[3] for record in records}) == [1, 2]
+        assert sorted(Counter(serving_records).values()) == [1, 2]
+        assert len({serving_record[0] for serving_record in serving_records}) == 1
+        assert len({serving_record[1] for serving_record in serving_records}) == 2
+        assert len({serving_record[2] for serving_record in serving_records}) == 1
+        assert sorted({serving_record[3] for serving_record in serving_records}) == [
+            1,
+            2,
+        ]
         assert sum(frame["row_count"] for frame in run["partition_frames"]) == 3
         assert _single_frame(run["frames"], "scanner_summary")["serving_run_rows"] == 3
         assert sum(
@@ -589,7 +630,7 @@ def test_v3_worker_and_serial_paths_preserve_source_rate_occurrences(tmp_path):
 
 
 def test_strict_v3_rejects_negotiated_rate_grouping_before_input_open(tmp_path):
-    env = {
+    scanner_environment_map = {
         **os.environ,
         "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v3",
         "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS": "true",
@@ -599,7 +640,7 @@ def test_strict_v3_rejects_negotiated_rate_grouping_before_input_open(tmp_path):
     completed = subprocess.run(
         [str(_built_scanner_binary()), "--compact-serving", str(tmp_path / "missing.json")],
         check=False,
-        env=env,
+        env=scanner_environment_map,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=120,
@@ -625,17 +666,19 @@ def test_strict_v3_rejects_negotiated_rate_grouping_before_input_open(tmp_path):
 def test_scanner_requires_exact_postgres_binary_v3_arch_before_input_open(
     tmp_path, arch
 ):
-    env = dict(os.environ)
+    scanner_environment_map = dict(os.environ)
     if arch is None:
-        env.pop("HLTHPRT_PTG2_SNAPSHOT_ARCH", None)
+        scanner_environment_map.pop("HLTHPRT_PTG2_SNAPSHOT_ARCH", None)
     else:
-        env["HLTHPRT_PTG2_SNAPSHOT_ARCH"] = arch
-    env["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"] = str(tmp_path / "serving-runs")
+        scanner_environment_map["HLTHPRT_PTG2_SNAPSHOT_ARCH"] = arch
+    scanner_environment_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"] = str(
+        tmp_path / "serving-runs"
+    )
 
     completed = subprocess.run(
         [str(_built_scanner_binary()), "--compact-serving", str(tmp_path / "missing.json")],
         check=False,
-        env=env,
+        env=scanner_environment_map,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=120,
@@ -653,17 +696,17 @@ def test_scanner_requires_explicit_v3_run_directory_without_legacy_derivation(
     tmp_path,
 ):
     legacy_lean_path = tmp_path / "legacy-lean.copy"
-    env = {
+    scanner_environment_map = {
         **os.environ,
         "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v3",
         "HLTHPRT_PTG2_MANIFEST_LEAN_SERVING_COPY_PATH": str(legacy_lean_path),
     }
-    env.pop("HLTHPRT_PTG2_V3_SERVING_RUN_DIR", None)
+    scanner_environment_map.pop("HLTHPRT_PTG2_V3_SERVING_RUN_DIR", None)
 
     completed = subprocess.run(
         [str(_built_scanner_binary()), "--compact-serving", str(tmp_path / "missing.json")],
         check=False,
-        env=env,
+        env=scanner_environment_map,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=120,
@@ -690,7 +733,7 @@ def test_python_bridge_collects_partition_paths_in_scanner_summary(tmp_path, mon
     lean_copy_path = tmp_path / "bridge-manifest-lean.copy"
     serving_run_directory = tmp_path / "bridge-serving-runs"
 
-    records = list(
+    scanner_frames = list(
         rust_scanner._iter_compact_serving_records_rust(
             artifact,
             snapshot_id="snapshot-bridge-v3",
@@ -704,12 +747,12 @@ def test_python_bridge_collects_partition_paths_in_scanner_summary(tmp_path, mon
         )
     )
 
-    summary = _single_frame(records, "scanner_summary")
-    config = _single_frame(records, "scanner_config")
+    summary = _single_frame(scanner_frames, "scanner_summary")
+    config = _single_frame(scanner_frames, "scanner_config")
     assert summary["serving_run_partition_files"]
     assert summary["serving_run_partition_files"] == [
         {
-            key: payload[key]
+            key: frame_payload[key]
             for key in (
                 "path",
                 "partition",
@@ -720,24 +763,25 @@ def test_python_bridge_collects_partition_paths_in_scanner_summary(tmp_path, mon
                 "version",
             )
         }
-        for kind, payload in records
+        for kind, frame_payload in scanner_frames
         if kind == "v3_serving_run_partition_file"
     ]
     assert summary["serving_run_code_dictionary_files"] == [
         {
-            key: payload[key]
+            key: frame_payload[key]
             for key in ("path", "row_count", "bytes", "format", "version")
         }
-        for kind, payload in records
+        for kind, frame_payload in scanner_frames
         if kind == "v3_serving_code_dictionary_file"
     ]
+    source_identity_map = {
+        "source_type": "in_network",
+        "identity_kind": "logical_json_sha256_v1",
+        "identity_sha256": "a" * 64,
+    }
     contracted = attach_v3_source_run_contract(
         summary["serving_run_partition_files"],
-        source_identity={
-            "source_type": "in_network",
-            "identity_kind": "logical_json_sha256_v1",
-            "identity_sha256": "a" * 64,
-        },
+        source_identity=source_identity_map,
         scanner_summary=summary,
         scanner_config=config,
     )
@@ -747,6 +791,28 @@ def test_python_bridge_collects_partition_paths_in_scanner_summary(tmp_path, mon
     assert contract["byte_count"] == summary["serving_run_bytes"]
     assert len(contract["partition_rows"]) == config["serving_run_partition_count"]
     assert sum(contract["partition_rows"]) == summary["serving_run_rows"]
+    contracted_dictionaries = attach_v3_dictionary_contract(
+        summary["serving_run_code_dictionary_files"],
+        source_identity=source_identity_map,
+        source_run_contract_sha256=contracted[0]["source_run_contract_sha256"],
+        scanner_summary=summary,
+    )
+    dictionary_contract = contracted_dictionaries[0][
+        "code_dictionary_source_contract"
+    ]
+    assert dictionary_contract["file_count"] == summary[
+        "serving_code_dictionary_files"
+    ]
+    assert dictionary_contract["row_count"] == summary[
+        "serving_code_dictionary_rows"
+    ]
+    assert dictionary_contract["byte_count"] == summary[
+        "serving_code_dictionary_bytes"
+    ]
+    assert dictionary_contract["files"] == sorted(
+        dictionary_contract["files"],
+        key=lambda value: (value["sha256"], value["row_count"], value["bytes"]),
+    )
     assert not lean_copy_path.exists()
 
 
@@ -763,23 +829,32 @@ def test_direct_v3_finalizer_cli_emits_shared_block_staging_copy(tmp_path):
         repeated_rate_occurrences=True,
     )
     manifest_path = tmp_path / "scanner-summary.json"
-    source_identity = {
+    source_identity_dict = {
         "source_type": "in_network",
         "identity_kind": "logical_json_sha256_v1",
         "identity_sha256": "d" * 64,
     }
     scanner_summary = _single_frame(scan["frames"], "scanner_summary")
     scanner_config = _single_frame(scan["frames"], "scanner_config")
+    serving_run_entries = attach_v3_source_run_contract(
+        scan["partition_frames"],
+        source_identity=source_identity_dict,
+        scanner_summary=scanner_summary,
+        scanner_config=scanner_config,
+    )
+    code_dictionary_entries = attach_v3_dictionary_contract(
+        scan["code_dictionary_frames"],
+        source_identity=source_identity_dict,
+        source_run_contract_sha256=serving_run_entries[0][
+            "source_run_contract_sha256"
+        ],
+        scanner_summary=scanner_summary,
+    )
     write_v3_finalizer_input_manifest(
         manifest_path,
-        serving_run_entries=attach_v3_source_run_contract(
-            scan["partition_frames"],
-            source_identity=source_identity,
-            scanner_summary=scanner_summary,
-            scanner_config=scanner_config,
-        ),
-        code_dictionary_entries=scan["code_dictionary_frames"],
-        expected_source_identities=[source_identity],
+        serving_run_entries=serving_run_entries,
+        code_dictionary_entries=code_dictionary_entries,
+        expected_source_identities=[source_identity_dict],
     )
     membership_input = tmp_path / "future-memberships.copy"
     atom_input = tmp_path / "future-atoms.copy"
@@ -802,7 +877,7 @@ def test_direct_v3_finalizer_cli_emits_shared_block_staging_copy(tmp_path):
         )
     )
     output_directory = tmp_path / "finalized"
-    env = {
+    finalizer_environment_map = {
         **os.environ,
         "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION": "none",
         "HLTHPRT_PTG2_SERVING_BINARY_BLOCK_BYTES": "65536",
@@ -812,8 +887,7 @@ def test_direct_v3_finalizer_cli_emits_shared_block_staging_copy(tmp_path):
             str(scanner_binary),
             "--finalize-v3-runs",
             str(output_directory),
-            "--memory-records",
-            "1",
+            *_v3_finalizer_test_resource_args(),
             "--price-key-map-input",
             str(price_key_map_input),
             "--price-membership-input",
@@ -823,7 +897,7 @@ def test_direct_v3_finalizer_cli_emits_shared_block_staging_copy(tmp_path):
             str(manifest_path),
         ],
         check=True,
-        env=env,
+        env=finalizer_environment_map,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=120,
@@ -867,8 +941,12 @@ def test_direct_v3_finalizer_cli_emits_shared_block_staging_copy(tmp_path):
         for offset in range(0, len(audit_candidate_bytes), _AUDIT_CANDIDATE_RECORD.size)
     ]
     assert sorted(Counter(audit_candidate_rows).values()) == [1, 2]
-    assert {row[3] for row in audit_candidate_rows} == {0}
-    assert sorted({row[4] for row in audit_candidate_rows}) == [1, 2]
+    assert {audit_candidate_row[3] for audit_candidate_row in audit_candidate_rows} == {
+        0
+    }
+    assert sorted(
+        {audit_candidate_row[4] for audit_candidate_row in audit_candidate_rows}
+    ) == [1, 2]
     assert summary["audit_candidates"] == {
         "path": "audit_candidates.bin",
         "record_format": "ptg2_v3_audit_candidates_v2",
@@ -936,7 +1014,9 @@ def test_direct_v3_finalizer_cli_emits_shared_block_staging_copy(tmp_path):
     )
     assert shared_rows
     shard_rows = [
-        row for row in shared_rows if row[2] == b"by_code_provider_shard_v1"
+        shared_block_row
+        for shared_block_row in shared_rows
+        if shared_block_row[2] == b"by_code_provider_shard_v1"
     ]
     assert len(shard_rows) == 1
     shard_row = shard_rows[0]

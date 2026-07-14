@@ -236,6 +236,51 @@ def test_unknown_physical_identity_kind_fails_closed():
         )
 
 
+@pytest.mark.parametrize(
+    ("source_type", "expected"),
+    [
+        (" IN_NETWORK ", "in_network"),
+        ("a" + ".-_0" * 15 + "xyz", "a" + ".-_0" * 15 + "xyz"),
+    ],
+)
+def test_physical_source_type_normalizes_to_lowercase_ascii_token(
+    source_type,
+    expected,
+):
+    identity = normalized_physical_artifact_identity(
+        {
+            "source_type": source_type,
+            "identity_kind": "logical_json_sha256_v1",
+            "identity_sha256": "a" * 64,
+        }
+    )
+
+    assert identity.source_type == expected
+    assert len(identity.source_type.encode("ascii")) <= 64
+
+
+@pytest.mark.parametrize(
+    "source_type",
+    [
+        "",
+        "_in_network",
+        "in/network",
+        "a" * 65,
+        "caf\u00e9",
+        "\u212a_network",
+    ],
+)
+def test_physical_source_type_rejects_non_ascii_or_invalid_tokens(source_type):
+    with pytest.raises(ValueError, match="source_type"):
+        normalized_physical_artifact_identity(
+            {
+                "source_type": source_type,
+                "identity_kind": "raw_container_sha256_v1",
+                "identity_sha256": "a" * 64,
+            }
+        )
+
+
 def test_duplicate_urls_for_one_physical_artifact_combine_trace_rows():
     downloaded = _downloaded()
     identity = shared_physical_artifact_identity(downloaded)

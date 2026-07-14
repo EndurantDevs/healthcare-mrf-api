@@ -65,6 +65,24 @@ class _ForwardBatchOptions:
     schema_name: str = "mrf"
 
 
+@dataclass(frozen=True)
+class _ForwardFragmentCursor:
+    """Ordering state carried across adjacent physical fragments."""
+
+    provider_set_key: int | None = None
+    occurrence: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class _ForwardFragmentValidation:
+    """Bounds required to validate one authoritative forward fragment."""
+
+    expected_source_count: int | None
+    price_item_count: int | None = None
+    provider_key_min: int | None = None
+    provider_key_max: int | None = None
+
+
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND = "by_code_provider_shard_v1"
 _SERVING_BINARY_BY_CODE_DICTIONARY_KIND = "by_code_price_dictionary"
@@ -654,7 +672,8 @@ def _visit_forward_occurrences(
     source_bits: int,
     occurrence_consumer: Callable[[int, int], None],
     price_item_count: int | None = None,
-) -> int:
+    previous_occurrence: tuple[int, int] | None = None,
+) -> tuple[int, tuple[int, int]]:
     """Validate occurrences with constant temporary memory."""
 
     price_key_count, cursor = read_strict_uvarint(fragment_bytes, cursor)
@@ -679,7 +698,6 @@ def _visit_forward_occurrences(
         source_bits=source_bits,
     )
     price_cursor = price_vector_offset
-    previous_occurrence: tuple[int, int] | None = None
     for occurrence_index in range(price_key_count):
         price_key, price_cursor = read_strict_uvarint(
             fragment_bytes, price_cursor
@@ -701,20 +719,21 @@ def _visit_forward_occurrences(
         raise PTG2ManifestArtifactError(
             "PTG2 v3 grouped by-code price vector is malformed"
         )
-    return source_vector_end
+    if previous_occurrence is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 grouped by-code occurrence vector is empty"
+        )
+    return source_vector_end, previous_occurrence
 
 
 def _visit_forward_fragment_unchecked(
     fragment_row: Mapping[str, Any],
     *,
     provider_filter: set[int] | None,
-    expected_source_count: int | None,
-    previous_provider_set_key: int | None,
+    fragment_cursor: _ForwardFragmentCursor,
+    validation: _ForwardFragmentValidation,
     occurrence_consumer: Callable[[int, int, int], None],
-    price_item_count: int | None = None,
-    provider_key_min: int | None = None,
-    provider_key_max: int | None = None,
-) -> tuple[int, int]:
+) -> tuple[_ForwardFragmentCursor, int]:
     """Validate one grouped fragment and visit selected occurrences."""
 
     fragment_bytes = _decode_serving_binary_payload(fragment_row)
@@ -722,8 +741,10 @@ def _visit_forward_fragment_unchecked(
         fragment_bytes,
         0,
         format_version=2,
-        expected_source_count=expected_source_count,
+        expected_source_count=validation.expected_source_count,
     )
+    previous_provider_set_key = fragment_cursor.provider_set_key
+    previous_occurrence = fragment_cursor.occurrence
     provider_set_key = 0
     entry_count = int(fragment_row.get("entry_count") or 0)
     if entry_count <= 0:
@@ -735,17 +756,17 @@ def _visit_forward_fragment_unchecked(
         provider_set_key += provider_delta
         if (
             previous_provider_set_key is not None
-            and provider_set_key <= previous_provider_set_key
+            and provider_set_key < previous_provider_set_key
         ) or provider_set_key > 2**31 - 1:
             raise PTG2ManifestArtifactError(
-                "PTG2 v3 grouped by-code provider sets are not strictly ordered"
+                "PTG2 v3 grouped by-code provider sets are not ordered"
             )
         if (
-            provider_key_min is not None
-            and provider_set_key < int(provider_key_min)
+            validation.provider_key_min is not None
+            and provider_set_key < int(validation.provider_key_min)
         ) or (
-            provider_key_max is not None
-            and provider_set_key >= int(provider_key_max)
+            validation.provider_key_max is not None
+            and provider_set_key >= int(validation.provider_key_max)
         ):
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 provider set is outside its forward shard"
@@ -755,20 +776,36 @@ def _visit_forward_fragment_unchecked(
             if provider_filter is None or provider_set_key in provider_filter:
                 occurrence_consumer(provider_set_key, price_key, source_key)
 
-        cursor = _visit_forward_occurrences(
+        is_provider_continuation = (
+            previous_provider_set_key == provider_set_key
+        )
+        cursor, previous_occurrence = _visit_forward_occurrences(
             fragment_bytes,
             cursor,
             source_count=source_count,
             source_bits=source_bits,
             occurrence_consumer=_consume,
-            price_item_count=price_item_count,
+            price_item_count=validation.price_item_count,
+            previous_occurrence=(
+                previous_occurrence if is_provider_continuation else None
+            ),
         )
         previous_provider_set_key = provider_set_key
     if cursor != len(fragment_bytes):
         raise PTG2ManifestArtifactError(
             "PTG2 v3 grouped by-code fragment has trailing bytes"
         )
-    return provider_set_key, source_count
+    if previous_occurrence is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 grouped by-code fragment has no occurrences"
+        )
+    return (
+        _ForwardFragmentCursor(
+            provider_set_key=provider_set_key,
+            occurrence=previous_occurrence,
+        ),
+        source_count,
+    )
 
 
 def _decode_forward_fragment_unchecked(
@@ -777,26 +814,41 @@ def _decode_forward_fragment_unchecked(
     provider_filter: set[int] | None,
     expected_source_count: int | None,
     previous_provider_set_key: int | None,
+    previous_occurrence: tuple[int, int] | None,
     provider_key_min: int | None = None,
     provider_key_max: int | None = None,
     price_item_count: int | None = None,
-) -> tuple[list[tuple[int, int, int]], int, int]:
+) -> tuple[list[tuple[int, int, int]], int, tuple[int, int], int]:
     """Decode one grouped strict V3 forward fragment."""
 
     decoded_keys: list[tuple[int, int, int]] = []
-    provider_set_key, source_count = _visit_forward_fragment_unchecked(
+    fragment_cursor, source_count = _visit_forward_fragment_unchecked(
         fragment_row,
         provider_filter=provider_filter,
-        expected_source_count=expected_source_count,
-        previous_provider_set_key=previous_provider_set_key,
+        fragment_cursor=_ForwardFragmentCursor(
+            provider_set_key=previous_provider_set_key,
+            occurrence=previous_occurrence,
+        ),
+        validation=_ForwardFragmentValidation(
+            expected_source_count=expected_source_count,
+            price_item_count=price_item_count,
+            provider_key_min=provider_key_min,
+            provider_key_max=provider_key_max,
+        ),
         occurrence_consumer=lambda provider_key, price_key, source_key: (
             decoded_keys.append((provider_key, price_key, source_key))
         ),
-        provider_key_min=provider_key_min,
-        provider_key_max=provider_key_max,
-        price_item_count=price_item_count,
     )
-    return decoded_keys, provider_set_key, source_count
+    if fragment_cursor.provider_set_key is None or fragment_cursor.occurrence is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 grouped by-code fragment has no ordering state"
+        )
+    return (
+        decoded_keys,
+        fragment_cursor.provider_set_key,
+        fragment_cursor.occurrence,
+        source_count,
+    )
 
 
 _decode_serving_binary_by_code_record_unchecked = _decode_forward_fragment_unchecked
@@ -808,16 +860,18 @@ def _decode_serving_binary_by_code_record(
     provider_filter: set[int] | None,
     expected_source_count: int | None,
     previous_provider_set_key: int | None,
+    previous_occurrence: tuple[int, int] | None,
     provider_key_min: int | None = None,
     provider_key_max: int | None = None,
     price_item_count: int | None = None,
-) -> tuple[list[tuple[int, int, int]], int, int]:
+) -> tuple[list[tuple[int, int, int]], int, tuple[int, int], int]:
     try:
         return _decode_serving_binary_by_code_record_unchecked(
             fragment_row,
             provider_filter=provider_filter,
             expected_source_count=expected_source_count,
             previous_provider_set_key=previous_provider_set_key,
+            previous_occurrence=previous_occurrence,
             provider_key_min=provider_key_min,
             provider_key_max=provider_key_max,
             price_item_count=price_item_count,
@@ -834,23 +888,17 @@ def _visit_serving_binary_by_code_record(
     fragment_row: Mapping[str, Any],
     *,
     provider_filter: set[int] | None,
-    expected_source_count: int | None,
-    previous_provider_set_key: int | None,
+    fragment_cursor: _ForwardFragmentCursor,
+    validation: _ForwardFragmentValidation,
     occurrence_consumer: Callable[[int, int, int], None],
-    price_item_count: int,
-    provider_key_min: int,
-    provider_key_max: int,
-) -> tuple[int, int]:
+) -> tuple[_ForwardFragmentCursor, int]:
     try:
         return _visit_forward_fragment_unchecked(
             fragment_row,
             provider_filter=provider_filter,
-            expected_source_count=expected_source_count,
-            previous_provider_set_key=previous_provider_set_key,
+            fragment_cursor=fragment_cursor,
+            validation=validation,
             occurrence_consumer=occurrence_consumer,
-            price_item_count=price_item_count,
-            provider_key_min=provider_key_min,
-            provider_key_max=provider_key_max,
         )
     except PTG2ManifestArtifactError:
         raise
@@ -911,14 +959,21 @@ def _decode_serving_binary_code_records_with_source_count(
         )
     decoded_keys: list[tuple[int, int, int]] = []
     previous_provider_set_key: int | None = None
+    previous_occurrence: tuple[int, int] | None = None
     observed_source_count: int | None = None
     for fragment_row in ordered_fragments:
-        decoded, previous_provider_set_key, fragment_source_count = (
+        (
+            decoded,
+            previous_provider_set_key,
+            previous_occurrence,
+            fragment_source_count,
+        ) = (
             _decode_serving_binary_by_code_record(
                 fragment_row,
                 provider_filter=provider_filter,
                 expected_source_count=expected_source_count,
                 previous_provider_set_key=previous_provider_set_key,
+                previous_occurrence=previous_occurrence,
                 provider_key_min=provider_key_min,
                 provider_key_max=provider_key_max,
                 price_item_count=price_item_count,
@@ -1282,6 +1337,7 @@ async def lookup_serving_binary_by_code_prefix_from_db(
 
     current_block_key: int | None = None
     previous_provider_set_key: int | None = None
+    previous_occurrence: tuple[int, int] | None = None
     provider_key_min = 0
     provider_key_max = 0
     observed_source_count: int | None = None
@@ -1312,6 +1368,7 @@ async def lookup_serving_binary_by_code_prefix_from_db(
                 current_block_key = fragment.block_key
                 expected_fragment_no = 0
                 previous_provider_set_key = None
+                previous_occurrence = None
                 provider_key_min, provider_key_max = (
                     _forward_provider_range_for_block(
                         normalized_code_key,
@@ -1323,7 +1380,7 @@ async def lookup_serving_binary_by_code_prefix_from_db(
                     "PTG2 v3 provider-shard fragments are not contiguous"
                 )
             expected_fragment_no += 1
-            previous_provider_set_key, fragment_source_count = (
+            fragment_cursor, fragment_source_count = (
                 _visit_serving_binary_by_code_record(
                     {
                         "block_no": fragment.fragment_no,
@@ -1331,14 +1388,21 @@ async def lookup_serving_binary_by_code_prefix_from_db(
                         "_decoded_payload": fragment.payload,
                     },
                     provider_filter=provider_filter,
-                    expected_source_count=options.source_count,
-                    previous_provider_set_key=previous_provider_set_key,
+                    fragment_cursor=_ForwardFragmentCursor(
+                        provider_set_key=previous_provider_set_key,
+                        occurrence=previous_occurrence,
+                    ),
+                    validation=_ForwardFragmentValidation(
+                        expected_source_count=options.source_count,
+                        price_item_count=price_item_count,
+                        provider_key_min=provider_key_min,
+                        provider_key_max=provider_key_max,
+                    ),
                     occurrence_consumer=_retain,
-                    price_item_count=price_item_count,
-                    provider_key_min=provider_key_min,
-                    provider_key_max=provider_key_max,
                 )
             )
+            previous_provider_set_key = fragment_cursor.provider_set_key
+            previous_occurrence = fragment_cursor.occurrence
             if observed_source_count not in (None, fragment_source_count):
                 raise PTG2ManifestArtifactError(
                     "PTG2 v3 grouped by-code fragments disagree on source_count"

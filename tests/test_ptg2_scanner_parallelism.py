@@ -77,7 +77,7 @@ def _parse_scanner_frames(stdout: bytes) -> list[tuple[str, dict]]:
     return frames
 
 
-def _scanner_fixture_payload() -> dict:
+def _scanner_fixture_payload(*, procedure_count: int = 24) -> dict:
     provider_references = [
         {
             "provider_group_id": provider_id,
@@ -91,7 +91,7 @@ def _scanner_fixture_payload() -> dict:
         for provider_id in range(1, 33)
     ]
     in_network_entries = []
-    for procedure_index in range(24):
+    for procedure_index in range(procedure_count):
         negotiated_rates = []
         for rate_index in range(8):
             provider_id = (procedure_index * 3 + rate_index) % len(provider_references) + 1
@@ -368,19 +368,29 @@ def test_scanner_queue_and_buffer_metrics_stay_bounded(scanner_parallelism_runs)
     summary = _single_frame(scanner_parallelism_runs[1], "scanner_summary")
 
     assert summary["work_queue_high_water"] <= summary["work_queue"]
-    # The sender accounts the candidate chunk before try_send(), so the peak
-    # can contain a full queue plus the one pending send attempt.
+    # A sender accounts its candidate before try_send(), while a receiver can
+    # own a chunk briefly before decrementing the shared metric. The transient
+    # peak therefore includes the queue, one candidate, and at most one chunk
+    # per worker. Final zero values prove that this conservative accounting does
+    # not leak across the completed scan.
     assert summary["peak_queued_bytes"] <= (
-        (summary["work_queue_high_water"] + 1) * summary["raw_chunk_max_bytes"]
+        (summary["work_queue_high_water"] + len(summary["workers"]) + 1)
+        * summary["raw_chunk_max_bytes"]
     )
+    assert summary["queued_bytes_at_finish"] == 0
     assert summary["raw_buffer_allocations"] <= summary["raw_chunk_count"] + 1
     assert summary["raw_buffer_reuses"] > 0
     assert summary["producer_byte_capture_bytes"] == summary["raw_chunk_total_bytes"]
     assert summary["provider_ref_queue_high_water"] <= 2
     assert summary["provider_ref_peak_queued_bytes"] <= (
-        (summary["provider_ref_queue_high_water"] + 1)
+        (
+            summary["provider_ref_queue_high_water"]
+            + len(summary["provider_workers"])
+            + 1
+        )
         * summary["provider_ref_raw_chunk_max_bytes"]
     )
+    assert summary["provider_ref_queued_bytes_at_finish"] == 0
     assert sum(worker["raw_bytes"] for worker in summary["workers"]) == summary["raw_chunk_total_bytes"]
 
 

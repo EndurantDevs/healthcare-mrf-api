@@ -228,10 +228,16 @@ async def test_native_shared_graph_bridge_writes_manifest_and_validates_result(
         "--convert-shared-graph",
         str(capture["manifest_path"]),
     )
-    assert capture["kwargs"] == {
+    expected_spawn_option_map = {
         "stdout": rust_scanner.asyncio.subprocess.PIPE,
         "stderr": rust_scanner.asyncio.subprocess.PIPE,
     }
+    expected_spawn_option_map.update(
+        rust_scanner._subprocess_session_options(
+            rust_scanner.asyncio.create_subprocess_exec
+        )
+    )
+    assert capture["kwargs"] == expected_spawn_option_map
     manifest = capture["manifest"]
     assert Path(manifest["provider_set_key_map_path"]) == provider_map.resolve()
     assert Path(manifest["output_directory"]) == output_directory.resolve()
@@ -248,6 +254,7 @@ async def test_native_shared_graph_bridge_writes_manifest_and_validates_result(
     assert result.owner_count == 4
     assert result.support_digest == bytes.fromhex("ab" * 32)
     assert result.scratch_directory == output_directory.resolve()
+    assert not capture["manifest_path"].exists()
     result.cleanup()
     assert not output_directory.exists()
 

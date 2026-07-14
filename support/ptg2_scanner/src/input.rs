@@ -3,7 +3,7 @@
 use crate::config::READ_BUF_SIZE;
 use flate2::read::MultiGzDecoder;
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -204,6 +204,40 @@ pub fn open_json_reader(
         path,
         compressed_bytes_read,
     )?))
+}
+
+pub fn open_plain_range_json_reader(
+    path: &Path,
+    offset: u64,
+    length: u64,
+    bytes_read: Arc<AtomicU64>,
+) -> io::Result<Box<dyn Read>> {
+    if is_gzip(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "plain JSON range reads do not support gzip input",
+        ));
+    }
+    let mut file = File::open(path)?;
+    let file_bytes = file.metadata()?.len();
+    let end = offset.checked_add(length).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "plain JSON range overflows u64",
+        )
+    })?;
+    if length == 0 || end > file_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("plain JSON range {offset}+{length} exceeds {file_bytes} bytes"),
+        ));
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let reader = CountingReader::new(
+        BufReader::with_capacity(READ_BUF_SIZE, file.take(length)),
+        bytes_read,
+    );
+    Ok(strict_utf8_reader_preserving_bom(reader))
 }
 
 pub fn strict_utf8_reader<R: Read + 'static>(inner: R) -> Box<dyn Read> {

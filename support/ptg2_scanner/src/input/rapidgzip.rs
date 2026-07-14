@@ -5,7 +5,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::thread::{self, JoinHandle};
@@ -15,6 +15,7 @@ const MAX_STDERR_BYTES: usize = 16 * 1024;
 // CI and atomic executable replacement can delay an ETXTBSY release beyond one scheduler tick.
 const SPAWN_BUSY_RETRIES: usize = 40;
 const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(25);
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RapidgzipConfig {
@@ -31,6 +32,55 @@ impl Default for RapidgzipConfig {
             decoder_threads: 1,
         }
     }
+}
+
+impl RapidgzipConfig {
+    pub fn open_indexed_ranges_reader_cancellable(
+        &self,
+        path: &Path,
+        compressed_bytes_read: Arc<AtomicU64>,
+        index_path: &Path,
+        ranges: &str,
+        cancelled: Arc<AtomicBool>,
+    ) -> io::Result<Box<dyn Read>> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indexed_range_cancellation_error(path, None));
+        }
+        if !self.enabled || !is_gzip(path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "indexed range scans require rapidgzip and gzip input",
+            ));
+        }
+        let reader = open_rapidgzip_reader(
+            path,
+            compressed_bytes_read,
+            self,
+            RapidgzipReadOptions {
+                import_index: Some(index_path),
+                ranges: Some(ranges),
+                ..RapidgzipReadOptions::default()
+            },
+            Some(Arc::clone(&cancelled)),
+        );
+        match reader {
+            Err(error) if cancelled.load(Ordering::Acquire) => {
+                Err(indexed_range_cancellation_error(path, Some(error)))
+            }
+            result => result,
+        }
+    }
+}
+
+fn indexed_range_cancellation_error(path: &Path, cause: Option<io::Error>) -> io::Error {
+    let suffix = cause.map(|error| format!(": {error}")).unwrap_or_default();
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        format!(
+            "rapidgzip indexed range cancelled before reader startup completed for {}{suffix}",
+            path.display()
+        ),
+    )
 }
 
 #[derive(Default)]
@@ -88,7 +138,50 @@ struct RapidgzipReader {
     stderr_drain: Option<JoinHandle<io::Result<StderrCapture>>>,
     compressed_bytes_read: Arc<AtomicU64>,
     compressed_total: u64,
+    cancellation_watchdog: Option<CancellationWatchdog>,
+    cancelled: Option<Arc<AtomicBool>>,
     state: ReaderState,
+}
+
+struct CancellationWatchdog {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CancellationWatchdog {
+    fn start(process_group_id: u32, cancelled: Arc<AtomicBool>) -> io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name(format!("rapidgzip-cancel-{process_group_id}"))
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    if cancelled.load(Ordering::Acquire) {
+                        let _ = terminate_process_group(process_group_id);
+                        return;
+                    }
+                    thread::park_timeout(CANCELLATION_POLL_INTERVAL);
+                }
+            })?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for CancellationWatchdog {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 #[derive(Default)]
@@ -100,6 +193,18 @@ struct RapidgzipReadOptions<'a> {
 }
 
 impl RapidgzipReader {
+    fn was_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+    }
+
+    fn stop_cancellation_watchdog(&mut self) {
+        if let Some(mut watchdog) = self.cancellation_watchdog.take() {
+            watchdog.stop();
+        }
+    }
+
     fn error(&mut self, error: io::Error) -> io::Error {
         let kind = error.kind();
         let message = error.to_string();
@@ -122,21 +227,26 @@ impl RapidgzipReader {
     fn kill_and_wait(&mut self) {
         self.stdout.take();
         if let Some(mut child) = self.child.take() {
+            let _ = terminate_process_group(child.id());
             let _ = child.kill();
             let _ = child.wait();
         }
+        self.stop_cancellation_watchdog();
         let _ = self.join_stderr();
     }
 
     fn finish(&mut self) -> io::Result<usize> {
         self.stdout.take();
+        let cancelled_before_wait = self.was_cancelled();
         let status = match self.child.as_mut() {
             Some(child) => child.wait(),
             None => Err(io::Error::other("rapidgzip child process is unavailable")),
         };
+        let was_cancelled = cancelled_before_wait || self.was_cancelled();
         match status {
             Ok(status) => {
                 self.child.take();
+                self.stop_cancellation_watchdog();
                 let stderr = self.join_stderr().map_err(|error| self.error(error))?;
                 if !status.success() {
                     let stderr_message = stderr.message();
@@ -145,6 +255,15 @@ impl RapidgzipReader {
                     } else {
                         format!(": {stderr_message}")
                     };
+                    if was_cancelled {
+                        return Err(self.error(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            format!(
+                                "rapidgzip cancelled for {} with {status}{suffix}",
+                                self.path.display()
+                            ),
+                        )));
+                    }
                     return Err(self.error(io::Error::other(format!(
                         "rapidgzip failed for {} with {status}{suffix}",
                         self.path.display()
@@ -157,6 +276,15 @@ impl RapidgzipReader {
             }
             Err(error) => {
                 self.kill_and_wait();
+                if was_cancelled {
+                    return Err(self.error(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        format!(
+                            "rapidgzip cancelled while waiting for {}: {error}",
+                            self.path.display()
+                        ),
+                    )));
+                }
                 Err(self.error(io::Error::new(
                     error.kind(),
                     format!(
@@ -205,8 +333,50 @@ impl Drop for RapidgzipReader {
 }
 
 fn stop_spawned_child(mut child: Child) {
+    let _ = terminate_process_group(child.id());
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_process_group(process_group_id: u32) -> io::Result<()> {
+    unsafe extern "C" {
+        #[link_name = "killpg"]
+        fn kill_process_group(process_group: i32, signal: i32) -> i32;
+    }
+
+    const SIGKILL: i32 = 9;
+    let process_group = i32::try_from(process_group_id).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("rapidgzip process id {process_group_id} exceeds i32"),
+        )
+    })?;
+    // SAFETY: the child is spawned as leader of its own process group and killpg does not retain
+    // the integer arguments. Killing the group also terminates helper descendants inherited by it.
+    if unsafe { kill_process_group(process_group, SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(3) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_process_group_id: u32) -> io::Result<()> {
+    Ok(())
 }
 
 fn spawn_rapidgzip(
@@ -238,6 +408,7 @@ fn spawn_rapidgzip(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_process_group(&mut command);
 
     for retry_no in 0..=SPAWN_BUSY_RETRIES {
         match command.spawn() {
@@ -267,6 +438,7 @@ fn open_rapidgzip_reader(
     compressed_bytes_read: Arc<AtomicU64>,
     config: &RapidgzipConfig,
     options: RapidgzipReadOptions<'_>,
+    cancelled: Option<Arc<AtomicBool>>,
 ) -> io::Result<Box<dyn Read>> {
     if config.decoder_threads == 0 {
         return Err(io::Error::new(
@@ -307,6 +479,21 @@ fn open_rapidgzip_reader(
             ));
         }
     };
+    let cancellation_watchdog = match cancelled.as_ref() {
+        Some(cancelled) => match CancellationWatchdog::start(child_id, Arc::clone(cancelled)) {
+            Ok(watchdog) => Some(watchdog),
+            Err(error) => {
+                drop(stdout);
+                stop_spawned_child(child);
+                let _ = stderr_drain.join();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("failed to start rapidgzip cancellation watchdog: {error}"),
+                ));
+            }
+        },
+        None => None,
+    };
 
     Ok(Box::new(RapidgzipReader {
         path: path.to_path_buf(),
@@ -315,6 +502,8 @@ fn open_rapidgzip_reader(
         stderr_drain: Some(stderr_drain),
         compressed_bytes_read,
         compressed_total,
+        cancellation_watchdog,
+        cancelled,
         state: ReaderState::Reading,
     }))
 }
@@ -332,6 +521,7 @@ pub fn open_full_scan_reader(
         compressed_bytes_read,
         rapidgzip,
         RapidgzipReadOptions::default(),
+        None,
     )
 }
 
@@ -356,6 +546,7 @@ pub fn open_full_scan_reader_exporting_index(
             index_format: Some("gztool"),
             ..RapidgzipReadOptions::default()
         },
+        None,
     )
 }
 
@@ -381,6 +572,7 @@ pub fn open_indexed_ranges_reader(
             ranges: Some(ranges),
             ..RapidgzipReadOptions::default()
         },
+        None,
     )
 }
 
