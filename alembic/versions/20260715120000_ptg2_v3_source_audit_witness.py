@@ -40,7 +40,11 @@ def upgrade() -> None:
     op.execute(
         f"""
         ALTER TABLE {_qt(schema, "ptg2_v3_candidate_audit_attestation")}
-            ADD COLUMN source_witness_digest bytea;
+            ADD COLUMN source_witness_digest bytea
+        """
+    )
+    op.execute(
+        f"""
         ALTER TABLE {_qt(schema, "ptg2_v3_candidate_audit_attestation")}
             ADD CONSTRAINT
                 {_q("ptg2_v3_candidate_audit_attestation_witness_check")}
@@ -104,8 +108,12 @@ def downgrade() -> None:
         f"""
         ALTER TABLE {_qt(schema, "ptg2_v3_candidate_audit_attestation")}
             DROP CONSTRAINT IF EXISTS
-                {_q("ptg2_v3_candidate_audit_attestation_witness_check")};
+                {_q("ptg2_v3_candidate_audit_attestation_witness_check")}
+        """
+    )
+    op.execute(
+        f"""
         ALTER TABLE {_qt(schema, "ptg2_v3_candidate_audit_attestation")}
-            DROP COLUMN IF EXISTS source_witness_digest;
+            DROP COLUMN IF EXISTS source_witness_digest
         """
     )

@@ -107,6 +107,7 @@ REQUIRED_TABLES = {
     "ptg2_v3_snapshot_layout",
     "ptg2_v3_snapshot_scope",
     "ptg2_v3_snapshot_source",
+    "ptg2_v3_source_audit_witness",
 }
 
 EMPTY_BEFORE_WRITE_TABLES = (
@@ -121,6 +122,7 @@ EMPTY_BEFORE_WRITE_TABLES = (
     "ptg2_v3_snapshot_layout",
     "ptg2_v3_snapshot_scope",
     "ptg2_v3_snapshot_source",
+    "ptg2_v3_source_audit_witness",
 )
 
 FINAL_EMPTY_TABLES = (
@@ -144,6 +146,7 @@ FINAL_EMPTY_TABLES = (
     "ptg2_v3_snapshot_layout",
     "ptg2_v3_snapshot_scope",
     "ptg2_v3_snapshot_source",
+    "ptg2_v3_source_audit_witness",
 )
 
 
@@ -416,6 +419,8 @@ def _release_report(
     source_key: str,
     plan_id: str,
     sample_digest: str,
+    source_set: Mapping[str, Any],
+    source_witness: Mapping[str, Any],
     provider_identifier_quarantine: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build a passing release-audit report for one logical snapshot."""
@@ -423,20 +428,26 @@ def _release_report(
     completed_at = datetime.datetime.now(datetime.timezone.utc).replace(
         microsecond=0
     )
-    started_at = completed_at - datetime.timedelta(minutes=1)
+    started_at = completed_at - datetime.timedelta(seconds=30)
+    source_witness_map = dict(source_witness)
+    occurrence_count = int(source_witness_map["occurrence_witness_count"])
+    provider_count = int(source_witness_map["provider_witness_count"])
+    total_count = int(source_witness_map["record_count"])
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "harness": {
-            "name": "ptg2_v3_source_api_audit",
-            "version": "2.11.0",
+            "name": "ptg2_v3_fast_source_witness_audit",
+            "version": "2.0.0",
+            "contract": "ptg2_v3_fast_source_witness_audit_v2",
         },
+        "runtime": {"http_client": "aiohttp", "event_loop": "uvloop"},
         "status": "pass",
         "profile": "release",
         "release_profile_enforced": True,
         "release_gate_eligible": True,
         "started_at": started_at.isoformat(),
         "completed_at": completed_at.isoformat(),
-        "duration_seconds": 60.0,
+        "duration_seconds": 30.0,
         "target": {
             "expected_architecture": "postgres_binary_v3",
             "expected_storage_generation": "shared_blocks_v3",
@@ -460,19 +471,47 @@ def _release_report(
         },
         "reproducibility": {},
         "source": {
+            "source_count": int(source_set["source_count"]),
+            "source_set_digest": source_set["raw_container_sha256_digest"],
+            "witness": source_witness_map,
             "provider_identifier_quarantine": dict(
                 provider_identifier_quarantine
             )
         },
-        "coverage": {"failures": []},
-        "checks": {
-            "source_occurrence_ids": 2_500,
-            "api_occurrence_ids": 2_500,
-            "negative_queries": 250,
-            "random_api_requests_executed": 2_500,
+        "coverage": {
+            "failures": [],
+            "selection_method": source_witness_map["selection_method"],
+            "queryable_occurrence_population_count": source_witness_map[
+                "queryable_occurrence_population_count"
+            ],
+            "emitted_rate_row_count": source_witness_map[
+                "emitted_rate_row_count"
+            ],
+            "unqueryable_rate_row_count": source_witness_map[
+                "unqueryable_rate_row_count"
+            ],
+            "unqueryable_rate_policy": source_witness_map[
+                "unqueryable_rate_policy"
+            ],
+            "occurrence_sample_count": occurrence_count,
+            "provider_sample_count": provider_count,
         },
-        "http": {"standard_api_actual_http_requests": 3_000},
-        "random_api_requests": {},
+        "checks": {
+            "source_witnesses": total_count,
+            "api_witnesses_matched": occurrence_count,
+            "api_challenges_executed": occurrence_count,
+            "provider_witnesses_validated": provider_count,
+            "api_audit_occurrences_validated": 1,
+        },
+        "http": {
+            "standard_api_actual_http_requests": occurrence_count + 1,
+            "retry_count": 0,
+            "max_concurrency": 32,
+        },
+        "random_api_requests": {
+            "requested": occurrence_count,
+            "executed": occurrence_count,
+        },
         "latency": {},
         "api_audit_sample": {
             "sample_digest": sample_digest,
@@ -1013,6 +1052,8 @@ async def test_v3_lifecycle_fails_closed(
             source_key=SOURCE_A,
             plan_id=PLAN_A,
             sample_digest=candidate_audit["audit_sample"]["sample_digest"],
+            source_set=source_set,
+            source_witness=publication.serving_index["source_witness"],
             provider_identifier_quarantine=publication.serving_index[
                 "provider_identifier_quarantine"
             ],
