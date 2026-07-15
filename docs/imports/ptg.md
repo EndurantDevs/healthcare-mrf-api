@@ -439,12 +439,21 @@ owner that happens to share physical bytes.
 After a passing release audit, the authenticated operator API stores the canonical redacted
 report in `ptg2_v3_candidate_audit_attestation`. Attestation rechecks the sealed
 layout binding, logical scope, complete PostgreSQL source-set digest, sealed
-audit-sample digest, exact candidate selectors, audit-tool version, TLS use,
+audit-sample digest, exact candidate selectors, audit-tool version, transport,
 sample floors, and zero failures. A report must have completed within
 `HLTHPRT_PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES` (120 minutes by default)
 when it is accepted. The resulting single-use attestation expires after
 `HLTHPRT_PTG2_CANDIDATE_ATTESTATION_TTL_HOURS` (24 hours by default); submitting
 an old report cannot refresh that window.
+
+Release audits use verified HTTPS by default. The validated-candidate lane may
+instead use explicit authenticated cluster HTTP only when the configured
+origin is a Kubernetes service DNS name and
+`HLTHPRT_PTG2_CANDIDATE_AUDIT_TRUSTED_CLUSTER_HTTP=true`. That exception is
+recorded in the attestation as `authenticated_cluster_service_v1`; it is not
+available to published/public audit targets and does not permit arbitrary
+private IPs, localhost, or external HTTP hosts. The deployment must restrict
+the candidate Service with a NetworkPolicy to the audit workers.
 
 Activation then holds the shared pointer/GC advisory lock and, in one database
 transaction, locks and rereads the authoritative candidate, revalidates the

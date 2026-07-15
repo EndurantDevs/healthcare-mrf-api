@@ -8,6 +8,7 @@ import hashlib
 import logging
 import os
 from contextlib import suppress
+from functools import lru_cache
 from inspect import signature
 from importlib import import_module
 from typing import Any
@@ -29,7 +30,6 @@ from process.redis_config import build_redis_settings
 
 
 _TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
-_control_run_db_throttle_redis: redis.Redis | None = None
 logger = logging.getLogger(__name__)
 
 
@@ -343,6 +343,8 @@ async def mark_control_run(
     snapshot_id: str | None = None,
     preserve_finished_at: bool = False,
 ) -> None:
+    """Persist and publish one authoritative control-run lifecycle transition."""
+
     if not run_id:
         return
     now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
@@ -449,19 +451,17 @@ def _claim_control_run_db_update_slot(slot_key: str, throttle_seconds: float) ->
         return True
 
 
+@lru_cache(maxsize=1)
 def _control_run_db_throttle_client() -> redis.Redis:
-    global _control_run_db_throttle_redis
-    if _control_run_db_throttle_redis is None:
-        settings = build_redis_settings()
-        _control_run_db_throttle_redis = redis.Redis(
-            host=settings.host,
-            port=settings.port,
-            db=settings.database,
-            password=settings.password,
-            socket_connect_timeout=settings.conn_timeout,
-            socket_timeout=settings.conn_timeout,
-        )
-    return _control_run_db_throttle_redis
+    settings = build_redis_settings()
+    return redis.Redis(
+        host=settings.host,
+        port=settings.port,
+        db=settings.database,
+        password=settings.password,
+        socket_connect_timeout=settings.conn_timeout,
+        socket_timeout=settings.conn_timeout,
+    )
 
 
 async def _execute_control_run_update(stmt: Any) -> None:

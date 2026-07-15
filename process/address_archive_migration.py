@@ -75,6 +75,8 @@ async def main(
     enqueue: bool = False,
     test_mode: bool = False,
 ) -> dict[str, Any] | None:
+    """Run or enqueue the verified legacy address-archive migration."""
+
     payload = {
         "dry_run": dry_run,
         "legacy_table": legacy_table,

@@ -52,6 +52,7 @@ python scripts/readability_budget.py
 
 Pull-request CI also compares the synchronized snapshot with the base branch.
 New syntax errors, suppressions, placeholder bodies, global state, or builtin
-shadowing always fail. Other replacement findings are allowed only when the
-complete branch does not increase total readability debt. Dedicated cleanup
-changes can still pass a positive `--required-reduction-percent` target.
+shadowing always fail. A branch that changes Python must reduce total readability
+debt by at least 1% until the repository reaches zero findings. Branches without
+Python changes use a zero-growth check so documentation, workflow, and metadata
+updates do not force unrelated Python edits.

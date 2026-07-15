@@ -296,6 +296,8 @@ async def process_data(ctx, task=None):
 
 
 async def startup(ctx):
+    """Initialize database and control-run context for CMS Doctors workers."""
+
     await my_init_db(db)
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()
@@ -319,6 +321,8 @@ async def startup(ctx):
 
 
 async def shutdown(ctx):
+    """Publish a completed CMS Doctors stage or record its terminal failure."""
+
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
@@ -427,6 +431,8 @@ async def shutdown(ctx):
 
 
 async def main(test_mode: bool = False):
+    """Queue the CMS Doctors import with the requested bounded test mode."""
+
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,
