@@ -11442,6 +11442,8 @@ def _azure_mrf_listing_targets_from_xml(
     listing_url: str,
     resolver: dict[str, Any],
 ) -> list[CrawlTarget]:
+    """Convert one S3 XML listing into filtered crawl targets."""
+
     root = ElementTree.fromstring((xml_text or "").lstrip("\ufeff"))
     container_url = _clean_text(root.attrib.get("ContainerName"))
     target_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
@@ -12697,6 +12699,8 @@ async def _resolve_providence_mrf_api(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve configured plan targets from the Providence MRF API."""
+
     resolver_type = str(resolver.get("type") or "providence_mrf_api")
     config_url = urljoin(url, str(resolver.get("config_path") or "/config.json"))
     config = await _fetch_json(

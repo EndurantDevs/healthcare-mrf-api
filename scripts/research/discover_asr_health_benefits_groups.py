@@ -238,6 +238,8 @@ async def _async_main() -> int:
 
 
 def main() -> int:
+    """Run the bounded group discovery report from command-line arguments."""
+
     return asyncio.run(_async_main())
 
 

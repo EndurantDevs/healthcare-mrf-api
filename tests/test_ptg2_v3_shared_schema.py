@@ -350,7 +350,7 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
         PTG2V3CandidateAuditAttestation,
         PTG2V3GCCandidate,
     )
-    expected_columns = {
+    expected_columns_by_table = {
         "ptg2_v3_snapshot_layout": (
             "snapshot_key",
             "storage_shard_id",
@@ -495,11 +495,11 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
     expected_schema = (
         os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
     )
-    assert {model.__tablename__ for model in models} == set(expected_columns)
+    assert {model.__tablename__ for model in models} == set(expected_columns_by_table)
     for model in models:
         table = model.__table__
         assert table.schema == expected_schema
-        assert tuple(table.columns.keys()) == expected_columns[table.name]
+        assert tuple(table.columns.keys()) == expected_columns_by_table[table.name]
 
     layout = PTG2V3SnapshotLayout.__table__
     assert isinstance(layout.c.snapshot_key.type, sa.BigInteger)
@@ -581,7 +581,7 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
 def test_v3_shared_models_define_keys_foreign_keys_and_uniqueness():
     """Ensure shared models define required keys, references, and uniqueness."""
 
-    expected_primary_keys = {
+    expected_primary_keys_by_model = {
         PTG2V3SnapshotLayout: ("snapshot_key",),
         PTG2V3LayoutFingerprint: ("semantic_fingerprint",),
         PTG2V3SnapshotBinding: ("snapshot_id",),
@@ -608,8 +608,8 @@ def test_v3_shared_models_define_keys_foreign_keys_and_uniqueness():
         PTG2V3CandidateAuditAttestation: ("snapshot_id",),
         PTG2V3GCCandidate: ("block_hash",),
     }
-    for model, expected_columns in expected_primary_keys.items():
-        assert _primary_key(model.__table__) == expected_columns
+    for model, expected_key_columns in expected_primary_keys_by_model.items():
+        assert _primary_key(model.__table__) == expected_key_columns
 
     schema = PTG2V3SnapshotLayout.__table__.schema
     layout_target = f"{schema}.ptg2_v3_snapshot_layout.snapshot_key"
@@ -617,7 +617,7 @@ def test_v3_shared_models_define_keys_foreign_keys_and_uniqueness():
     scope_target = f"{schema}.ptg2_v3_snapshot_scope.snapshot_id"
     snapshot_target = f"{schema}.ptg2_snapshot.snapshot_id"
     trace_set_target = f"{schema}.ptg2_source_trace_set.source_trace_set_hash"
-    expected_foreign_keys = {
+    expected_foreign_keys_by_model = {
         PTG2V3LayoutFingerprint: {
             "ptg2_v3_layout_fingerprint_snapshot_key_fkey": (
                 ("snapshot_key",),
@@ -688,7 +688,7 @@ def test_v3_shared_models_define_keys_foreign_keys_and_uniqueness():
             ),
         },
     }
-    for model, expected_shapes in expected_foreign_keys.items():
+    for model, expected_shapes in expected_foreign_keys_by_model.items():
         assert _foreign_key_shapes(model.__table__) == expected_shapes
     for dense_model in (
         PTG2V3GraphOwner,
@@ -839,7 +839,7 @@ def test_v3_shared_models_define_checks_indexes_and_partition_intent():
         ),
     }
 
-    expected_check_names = {
+    expected_check_names_by_model = {
         PTG2V3SnapshotLayout: {
             "ptg2_v3_snapshot_layout_state_check",
             "ptg2_v3_snapshot_layout_mapping_digest_check",
@@ -916,7 +916,7 @@ def test_v3_shared_models_define_checks_indexes_and_partition_intent():
             "ptg2_v3_candidate_audit_attestation_expiry_check",
         },
     }
-    for model, expected_names in expected_check_names.items():
+    for model, expected_names in expected_check_names_by_model.items():
         assert set(_constraints(model.__table__, sa.CheckConstraint)) == expected_names
 
 
@@ -1012,7 +1012,7 @@ def test_v3_shared_migration_emits_tables_constraints_and_32_way_partitions(
         marker = f'PARTITION OF {schema}."{parent}"'
         partitions = [statement for statement in statements if marker in statement]
         assert len(partitions) == 32
-        observed = {}
+        observed_remainders_by_partition = {}
         pattern = re.compile(
             rf'CREATE TABLE {schema}\."{parent}_p(\d{{2}})" '
             rf'PARTITION OF {schema}\."{parent}" FOR VALUES WITH '
@@ -1021,8 +1021,10 @@ def test_v3_shared_migration_emits_tables_constraints_and_32_way_partitions(
         for statement in partitions:
             match = pattern.fullmatch(statement)
             assert match is not None
-            observed[int(match.group(1))] = int(match.group(2))
-        assert observed == {remainder: remainder for remainder in range(32)}
+            observed_remainders_by_partition[int(match.group(1))] = int(match.group(2))
+        assert observed_remainders_by_partition == {
+            remainder: remainder for remainder in range(32)
+        }
 
     joined = "\n".join(statements)
     required_fragments = (

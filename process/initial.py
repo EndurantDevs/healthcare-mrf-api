@@ -2539,6 +2539,8 @@ async def process_json_index(ctx, task):
 
 
 async def import_unknown_state_issuers_data(test_mode: bool = False):
+    """Load issuer and plan metadata for states without indexed sources."""
+
     plan_list = {}
     issuer_list = {}
 
@@ -2620,6 +2622,8 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
             tmp_filename = csv_files[0] if csv_files else glob.glob(f"{tmpdirname}/*.csv")[0]
 
             def to_camel_case(s):
+                """Convert a whitespace-delimited source heading to camel case."""
+
                 parts = s.split()
                 return "".join(word.capitalize() for word in parts)
 
@@ -2709,6 +2713,8 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
 
 
 async def update_issuer_names_data(test_mode: bool = False):
+    """Refresh issuer display names from configured rate-review sources."""
+
     issuer_list = {}
     my_files = json.loads(os.environ["HLTHPRT_CMSGOV_RATE_REVIEW_URL_PUF"])
     processed_rows = 0
@@ -3039,6 +3045,8 @@ async def init_file(ctx, task=None):
 
 
 async def startup(ctx):
+    """Initialize the legacy MRF worker context and publication tables."""
+
     await my_init_db(db)
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()

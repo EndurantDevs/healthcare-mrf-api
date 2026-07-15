@@ -296,6 +296,8 @@ async def process_data(ctx, task=None):
 
 
 async def startup(ctx):
+    """Prepare the CMS clinician-address staging table and worker context."""
+
     await my_init_db(db)
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()
@@ -319,6 +321,8 @@ async def startup(ctx):
 
 
 async def shutdown(ctx):
+    """Validate and publish the staged CMS clinician-address snapshot."""
+
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
@@ -427,6 +431,8 @@ async def shutdown(ctx):
 
 
 async def main(test_mode: bool = False):
+    """Queue the CMS clinician-address import worker."""
+
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,

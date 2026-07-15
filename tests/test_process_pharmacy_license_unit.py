@@ -53,6 +53,8 @@ async def test_materialize_snapshot_aborts_on_canonical_address_failure(monkeypa
 
 @pytest.mark.asyncio
 async def test_start_marks_run_failed_on_canonical_address_failure(monkeypatch):
+    """Ensure canonical-address collisions fail both run and snapshot state."""
+
     run_updates = []
     snapshot_updates = []
     coverage_updates = []
@@ -86,7 +88,7 @@ async def test_start_marks_run_failed_on_canonical_address_failure(monkeypatch):
 
     class FakeClientSession:
         def __init__(self, *_args, **_kwargs):
-            pass
+            return None
 
         async def __aenter__(self):
             return self
