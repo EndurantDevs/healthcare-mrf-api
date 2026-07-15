@@ -46,6 +46,18 @@ FAST_AUDIT_CONCURRENCY = 32
 FAST_AUDIT_PAGE_SIZE = 100
 FAST_AUDIT_MAX_PAGES = 8
 FAST_AUDIT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+FAST_AUDIT_PUBLIC_SAMPLE_FIELDS = (
+    "contract",
+    "format_version",
+    "method",
+    "sample_count",
+    "maximum_rows",
+    "sample_digest",
+    "source_count",
+    "occurrence_identity",
+    "complete_population",
+    "serving_multiplicity_semantics",
+)
 _RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
 
 
@@ -74,6 +86,16 @@ def _strict_int(value: Any, *, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise FastCandidateAuditError(f"{field_name}_invalid")
     return value
+
+
+def _public_audit_sample(sample: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        return {
+            field_name: sample[field_name]
+            for field_name in FAST_AUDIT_PUBLIC_SAMPLE_FIELDS
+        }
+    except KeyError as exc:
+        raise FastCandidateAuditError("candidate_audit_sample_invalid") from exc
 
 
 async def _bounded_response_body(response: aiohttp.ClientResponse) -> bytes:
@@ -344,9 +366,10 @@ async def _validate_audit_sample_preflight(
         response_fields.get("audit_sample"),
         field_name="api_audit_sample",
     )
-    for field_name, expected_value in dict(audit_target.audit_sample).items():
-        if audit_sample.get(field_name) != expected_value:
-            raise FastCandidateAuditError("api_audit_sample_mismatch")
+    if _public_audit_sample(audit_sample) != _public_audit_sample(
+        audit_target.audit_sample
+    ):
+        raise FastCandidateAuditError("api_audit_sample_mismatch")
     response_items = response_fields.get("items")
     if not isinstance(response_items, list) or len(response_items) != 1:
         raise FastCandidateAuditError("api_audit_preflight_item_missing")
