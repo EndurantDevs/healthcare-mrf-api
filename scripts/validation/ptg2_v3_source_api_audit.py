@@ -69,7 +69,7 @@ if str(_REPOSITORY_ROOT) not in sys.path:
 from api import ptg2_capacity_evidence as capacity_evidence
 
 
-SCRIPT_VERSION = "2.10.0"
+SCRIPT_VERSION = "2.11.0"
 EXPECTED_ARCHITECTURE = "postgres_binary_v3"
 EXPECTED_STORAGE_GENERATION = "shared_blocks_v3"
 EXPECTED_DATABASE_BACKEND = "postgresql"
@@ -80,6 +80,8 @@ DEFAULT_API_PATH = "/api/v1/pricing/providers/search-by-procedure"
 DEFAULT_CANDIDATE_API_PATH = "/api/v1/pricing/providers/audit-search-by-procedure"
 DEFAULT_API_AUDIT_PATH = "/api/v1/pricing/providers/audit-occurrences"
 CANDIDATE_AUDIT_HEADER = "X-HealthPorta-PTG-Candidate-Audit"
+VERIFIED_HTTPS_TRANSPORT = "verified_https_v1"
+TRUSTED_CLUSTER_HTTP_TRANSPORT = "authenticated_cluster_service_v1"
 AUDIT_SAMPLE_CONTRACT = "persisted_served_occurrence_sample_v2"
 AUDIT_SAMPLE_METHOD = "publish_time_stratified_v1"
 AUDIT_SAMPLE_FORMAT_VERSION = 2
@@ -5223,6 +5225,43 @@ def _is_https_api_origin(api_base_url: str) -> bool:
     )
 
 
+def _is_cluster_http_api_origin(api_base_url: str) -> bool:
+    """Accept only Kubernetes service DNS names for explicit cluster HTTP."""
+
+    try:
+        parsed_origin = urlsplit(api_base_url)
+    except ValueError:
+        return False
+    hostname = str(parsed_origin.hostname or "").rstrip(".").lower()
+    has_origin_shape = (
+        parsed_origin.scheme == "http"
+        and bool(parsed_origin.netloc)
+        and parsed_origin.path in {"", "/"}
+        and not parsed_origin.query
+        and not parsed_origin.fragment
+        and parsed_origin.username is None
+        and parsed_origin.password is None
+    )
+    if not has_origin_shape or not hostname:
+        return False
+    labels = hostname.split(".")
+    if len(labels) == 1:
+        return _is_dns_label(labels[0])
+    if hostname.endswith(".svc") or hostname.endswith(".svc.cluster.local"):
+        return all(_is_dns_label(label) for label in labels)
+    return False
+
+
+def _is_dns_label(value: str) -> bool:
+    return (
+        0 < len(value) <= 63
+        and value.isascii()
+        and value[0].isalnum()
+        and value[-1].isalnum()
+        and all(character.isalnum() or character == "-" for character in value)
+    )
+
+
 @dataclass(frozen=True)
 class AuditConfig:
     profile: str
@@ -5257,6 +5296,7 @@ class AuditConfig:
     failure_example_limit: int
     verify_tls: bool
     validated_candidate: bool = False
+    trusted_cluster_http: bool = False
     max_first_page_first_observation_p95_ms: float = RELEASE_MAX_FIRST_PAGE_P95_MS
     max_logical_query_p95_ms: float = RELEASE_MAX_LOGICAL_QUERY_P95_MS
     capacity_evidence_trust: CapacityEvidenceTrust | None = None
@@ -5373,14 +5413,14 @@ class AuditConfig:
     def _release_rules_by_reason(self) -> dict[str, bool]:
         """Return release constraints keyed by their stable failure reason."""
 
-        is_https_origin = _is_https_api_origin(self.api_base_url)
+        origin_rules_by_reason = self._release_origin_rules_by_reason()
         return {
+            **origin_rules_by_reason,
             "release_published_capacity_evidence_required": (
                 not self.validated_candidate
                 and self.capacity_evidence_trust is None
             ),
             "release_tls_verification_required": not self.verify_tls,
-            "release_api_base_url_must_be_https_origin": not is_https_origin,
             "release_standard_api_path_required": self.api_path
             != (
                 DEFAULT_CANDIDATE_API_PATH
@@ -5422,6 +5462,28 @@ class AuditConfig:
                 )
             )
             or (not self.validated_candidate and self.max_invalid_npis != 0),
+        }
+
+    def _release_origin_rules_by_reason(self) -> dict[str, bool]:
+        """Keep public HTTPS strict while allowing an explicit cluster service."""
+
+        is_https_origin = _is_https_api_origin(self.api_base_url)
+        is_cluster_http_origin = _is_cluster_http_api_origin(self.api_base_url)
+        is_trusted_cluster_origin = (
+            self.validated_candidate
+            and self.trusted_cluster_http
+            and is_cluster_http_origin
+        )
+        return {
+            "release_api_base_url_must_be_https_origin": not (
+                is_https_origin or is_trusted_cluster_origin
+            ),
+            "release_cluster_http_requires_validated_candidate": (
+                self.trusted_cluster_http and not self.validated_candidate
+            ),
+            "release_cluster_http_origin_required": (
+                self.trusted_cluster_http and not is_cluster_http_origin
+            ),
         }
 
     def api_params(self, query: QueryKey) -> dict[str, Any]:
@@ -5469,6 +5531,12 @@ class AuditConfig:
 
         parsed = urlsplit(self.api_base_url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
+        is_https_origin = _is_https_api_origin(self.api_base_url)
+        is_trusted_cluster_origin = (
+            self.validated_candidate
+            and self.trusted_cluster_http
+            and _is_cluster_http_api_origin(self.api_base_url)
+        )
         return {
             "expected_architecture": EXPECTED_ARCHITECTURE,
             "expected_storage_generation": EXPECTED_STORAGE_GENERATION,
@@ -5486,7 +5554,14 @@ class AuditConfig:
             "expected_snapshot_lifecycle": (
                 "validated" if self.validated_candidate else "published"
             ),
-            "tls_verified": self.verify_tls,
+            "tls_verified": self.verify_tls and is_https_origin,
+            "transport_contract": (
+                VERIFIED_HTTPS_TRANSPORT
+                if is_https_origin
+                else TRUSTED_CLUSTER_HTTP_TRANSPORT
+                if is_trusted_cluster_origin
+                else None
+            ),
             "capacity_evidence_enabled": self.capacity_evidence_trust is not None,
         }
 
@@ -8020,6 +8095,14 @@ def _add_target_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--trusted-cluster-http",
+        action="store_true",
+        help=(
+            "Allow authenticated candidate audit traffic over a Kubernetes "
+            "service origin; never valid for published/public release audits"
+        ),
+    )
+    parser.add_argument(
         "--seed",
         default=None,
         help="Diagnostic-only sampling seed; release profiles use authoritative precommitment",
@@ -8158,6 +8241,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ConfigurationError(
             "validated_candidate_requires_auth_source_and_market"
         )
+    if args.trusted_cluster_http and not args.validated_candidate:
+        raise ConfigurationError(
+            "trusted_cluster_http_requires_validated_candidate"
+        )
 
 
 def _capacity_evidence_trust(
@@ -8240,6 +8327,7 @@ def _audit_config(args: argparse.Namespace) -> AuditConfig:
         failure_example_limit=args.failure_example_limit,
         verify_tls=not args.insecure,
         validated_candidate=bool(args.validated_candidate),
+        trusted_cluster_http=bool(args.trusted_cluster_http),
         max_first_page_first_observation_p95_ms=(
             args.max_first_page_first_observation_p95_ms
         ),
@@ -8274,6 +8362,12 @@ def fatal_report(
 
     completed_at = dt.datetime.now(dt.timezone.utc)
     code = exc.code if isinstance(exc, AuditError) else "internal_error"
+    failure_example_by_field = {
+        "category": code,
+        "exception_type": type(exc).__name__,
+    }
+    if isinstance(exc, ConfigurationError):
+        failure_example_by_field["reason"] = str(exc)
     return {
         "schema_version": 2,
         "harness": {"name": "ptg2_v3_source_api_audit", "version": SCRIPT_VERSION},
@@ -8308,7 +8402,7 @@ def fatal_report(
         },
         "failures": {
             "counts": {code: 1},
-            "examples": [{"category": code, "exception_type": type(exc).__name__}],
+            "examples": [failure_example_by_field],
         },
         "redaction": {"policy": "sensitive_identifiers_excluded"},
     }

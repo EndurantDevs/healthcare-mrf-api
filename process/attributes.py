@@ -455,6 +455,8 @@ async def process_benefits(ctx, task):
 
 
 async def process_rating_areas(ctx):
+    """Load the bundled rating-area reference rows into staging."""
+
     print("Importing Rating Areas")
     import_date = ctx["import_date"]
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
@@ -481,6 +483,8 @@ async def process_rating_areas(ctx):
 
 
 async def process_prices(ctx, task):
+    """Download and stage one federal plan-pricing CSV source."""
+
     redis = ctx["redis"]
     if "context" in task:
         ctx.setdefault("context", {}).update(task["context"])
@@ -711,6 +715,8 @@ async def process_prices(ctx, task):
 
 
 async def process_state_attributes(ctx, task):
+    """Download and stage one state-marketplace plan-attributes source."""
+
     redis = ctx["redis"]
 
     print("Downloading data from: ", task["url"])
@@ -784,6 +790,8 @@ async def process_state_attributes(ctx, task):
 
 
 async def main(test_mode: bool = False):
+    """Queue all configured plan attribute, benefit, and pricing sources."""
+
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,
@@ -859,6 +867,8 @@ def _attribute_source_groups():
 
 
 async def plan_attributes_control_start(ctx, task=None):
+    """Run bounded plan-attribute ingestion under the control-plane adapter."""
+
     task = task or {}
     ctx.setdefault("context", {})
     ctx["context"]["test_mode"] = bool(task.get("test_mode", task.get("test", False)))

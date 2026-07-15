@@ -10,6 +10,7 @@ import logging
 import os
 import time
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
 
 ENGINE_NAME = "healthcare-mrf-api"
@@ -38,8 +39,13 @@ def isoformat_utc(value: Any) -> Any:
         return value.astimezone(dt.UTC).isoformat()
     return value
 
-_queue: asyncio.Queue[dict[str, Any]] | None = None
-_worker: asyncio.Task | None = None
+@dataclass
+class _PublisherState:
+    queue: asyncio.Queue[dict[str, Any]] | None = None
+    worker: asyncio.Task | None = None
+
+
+_publisher_state = _PublisherState()
 _last_sent_by_run: dict[str, tuple[float, str, str]] = {}
 
 
@@ -71,7 +77,7 @@ def enqueue_status_event(payload: dict[str, Any]) -> None:
             queue.get_nowait()
             queue.task_done()
         except asyncio.QueueEmpty:
-            pass
+            logger.debug("status event queue drained before oldest-event eviction")
     try:
         queue.put_nowait(event)
     except asyncio.QueueFull:
@@ -79,7 +85,9 @@ def enqueue_status_event(payload: dict[str, Any]) -> None:
 
 
 async def flush_status_events(timeout_seconds: float = 2.0) -> None:
-    queue = _queue
+    """Wait briefly for queued status events without blocking shutdown forever."""
+
+    queue = _publisher_state.queue
     if queue is None:
         return
     try:
@@ -101,12 +109,15 @@ def _event_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ensure_queue(loop: asyncio.AbstractEventLoop) -> asyncio.Queue[dict[str, Any]]:
-    global _queue, _worker
-    if _queue is None:
-        _queue = asyncio.Queue(maxsize=max(int(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_QUEUE_SIZE", "256")), 1))
-    if _worker is None or _worker.done():
-        _worker = loop.create_task(_publisher_worker(_queue))
-    return _queue
+    if _publisher_state.queue is None:
+        _publisher_state.queue = asyncio.Queue(
+            maxsize=max(int(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_QUEUE_SIZE", "256")), 1)
+        )
+    if _publisher_state.worker is None or _publisher_state.worker.done():
+        _publisher_state.worker = loop.create_task(
+            _publisher_worker(_publisher_state.queue)
+        )
+    return _publisher_state.queue
 
 
 async def _publisher_worker(queue: asyncio.Queue[dict[str, Any]]) -> None:

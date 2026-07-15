@@ -25,7 +25,9 @@ from process.ptg_parts.ptg2_provider_quarantine import (
 
 PTG2_CANDIDATE_ATTESTATION_CONTRACT = "ptg2_v3_release_audit_attestation_v1"
 PTG2_CANDIDATE_AUDIT_TOOL = "ptg2_v3_source_api_audit"
-PTG2_CANDIDATE_AUDIT_TOOL_VERSION = "2.10.0"
+PTG2_CANDIDATE_AUDIT_TOOL_VERSION = "2.11.0"
+PTG2_VERIFIED_HTTPS_TRANSPORT = "verified_https_v1"
+PTG2_TRUSTED_CLUSTER_HTTP_TRANSPORT = "authenticated_cluster_service_v1"
 PTG2_CANDIDATE_API_PATH = "/api/v1/pricing/providers/audit-search-by-procedure"
 PTG2_CANDIDATE_OCCURRENCE_API_PATH = "/api/v1/pricing/providers/audit-occurrences"
 PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_ENV = (
@@ -283,8 +285,19 @@ def validate_candidate_release_audit_report(
     for key, expected_value in expected_target.items():
         if target.get(key) != expected_value:
             raise ValueError(f"audit report target {key} does not match the candidate")
-    if target.get("tls_verified") is not True:
-        raise ValueError("audit report did not verify API TLS")
+    transport_contract = target.get("transport_contract")
+    tls_verified = target.get("tls_verified")
+    if not (
+        (
+            transport_contract == PTG2_VERIFIED_HTTPS_TRANSPORT
+            and tls_verified is True
+        )
+        or (
+            transport_contract == PTG2_TRUSTED_CLUSTER_HTTP_TRANSPORT
+            and tls_verified is False
+        )
+    ):
+        raise ValueError("audit report transport contract is invalid")
     if (
         redaction.get("policy") != "sensitive_identifiers_excluded"
         or not isinstance(redaction.get("excluded"), list)
