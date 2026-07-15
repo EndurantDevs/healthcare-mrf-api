@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import importlib
+import struct
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,11 @@ import pytest
 
 
 process_ptg = importlib.import_module("process.ptg")
+
+
+def _write_empty_dense_graph(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(struct.pack("<8sIQQ", b"PTG2MNDS", 1, 0, 0))
 
 
 def _run_parse(tmp_path: Path):
@@ -110,8 +116,7 @@ def test_fresh_layout_collects_all_four_graph_directions(tmp_path, monkeypatch):
             "manifest_provider_inverted_sidecar_path",
         ):
             graph_path = Path(kwargs[argument_name])
-            graph_path.parent.mkdir(parents=True, exist_ok=True)
-            graph_path.write_bytes(b"synthetic graph")
+            _write_empty_dense_graph(graph_path)
         yield "scanner_summary", {
             "serving_run_rows": 1,
             "serving_run_partition_files": [],
@@ -119,8 +124,8 @@ def test_fresh_layout_collects_all_four_graph_directions(tmp_path, monkeypatch):
         }
 
     async def build_reverse_graphs(**kwargs):
-        Path(kwargs["provider_group_npi_path"]).write_bytes(b"synthetic graph")
-        Path(kwargs["provider_npi_group_path"]).write_bytes(b"synthetic graph")
+        _write_empty_dense_graph(Path(kwargs["provider_group_npi_path"]))
+        _write_empty_dense_graph(Path(kwargs["provider_npi_group_path"]))
         return {"graph_directions": 2}
 
     monkeypatch.setattr(process_ptg, "_aiter_compact_serving_records_rust", scanner)

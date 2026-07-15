@@ -6133,8 +6133,9 @@ def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, mon
         input_paths,
     ):
         graph_input_paths.extend(input_paths)
-        provider_group_npi_path.write_bytes(b"group-to-npi")
-        provider_npi_group_path.write_bytes(b"npi-to-group")
+        empty_dense_graph = struct.pack("<8sIQQ", b"PTG2MNDS", 1, 0, 0)
+        provider_group_npi_path.write_bytes(empty_dense_graph)
+        provider_npi_group_path.write_bytes(empty_dense_graph)
         provider_npi_scope_copy_path.write_text("scope-1\n")
         return {"edge_count": 1}
 
