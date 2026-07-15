@@ -5,7 +5,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from process.ptg_parts.canonical import _canonicalize_for_json, hash_prefix, semantic_hash
+from process.ptg_parts.canonical import (
+    _canonicalize_for_json,
+    hash_prefix,
+    semantic_hash,
+    semantic_sha256,
+)
 from process.ptg_parts.config import PTG2_PROVIDER_BUCKET_COUNT_ENV, _env_int
 from process.ptg_parts.domain import (
     PTG2PriceAtomEvent,
@@ -87,7 +92,7 @@ def build_source_trace_set(source_trace_hashes: list[str] | tuple[str, ...]) -> 
     """Build a canonical, hashed set of unique source-trace hashes."""
     normalized_hashes = tuple(sorted({str(value) for value in source_trace_hashes if value}))
     payload = PTG2SourceTraceSetValue(source_trace_hashes=normalized_hashes)
-    source_trace_set_hash = semantic_hash(payload, domain="source_trace_set")
+    source_trace_set_hash = semantic_sha256(payload, domain="source_trace_set")
     return {
         "source_trace_set_hash": source_trace_set_hash,
         "source_trace_hashes": list(normalized_hashes),
