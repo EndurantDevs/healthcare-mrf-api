@@ -100,7 +100,7 @@ async def test_address_sql_is_parallel_safe():
     """Verify address canonical sql functions are immutable parallel safe and pub28 backed."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
-    rows = await db.all(
+    source_rows = await db.all(
         """
         SELECT p.proname, p.provolatile::text AS provolatile, p.proparallel::text AS proparallel
           FROM pg_proc p
@@ -125,10 +125,10 @@ async def test_address_sql_is_parallel_safe():
             "addr_unit_value_valid_v1",
         ],
     )
-    flags = {row.proname: (row.provolatile, row.proparallel) for row in rows}
+    flags = {source_row.proname: (source_row.provolatile, source_row.proparallel) for source_row in source_rows}
 
     assert flags
-    assert all(value == ("i", "s") for value in flags.values())
+    assert all(canonical_value == ("i", "s") for canonical_value in flags.values())
     assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('Puerto Rico');") == "PR"
     assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('Armed Forces Pacific');") == "AP"
     assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('calif');") is None
@@ -457,7 +457,7 @@ async def test_stamp_and_resolve_addresses_into_archive_v2(monkeypatch):
     assert stats.reason_buckets["missing_zip"] == 0
     assert stats.reason_buckets["missing_state"] == 0
     assert stats.reason_buckets["unit_conflicts"] == 1
-    assert [row[0] for row in source_bits] == [2]
+    assert [source_row[0] for source_row in source_bits] == [2]
 
     premise_keys = int(
         await db.scalar(
@@ -510,9 +510,9 @@ async def test_stamp_and_resolve_addresses_into_archive_v2(monkeypatch):
     assert rerun_stats.inserted == 0
     assert rerun_stats.provenance_updates == 2
     assert len(rerun_stats.gate_sample_rows) == 2
-    assert {row["source_bits"] for row in rerun_stats.gate_sample_rows} == {6}
-    assert {row["unit_norm"] for row in rerun_stats.gate_sample_rows} == {"ste200", "ste310"}
-    assert [row[0] for row in source_bits_after] == [6]
+    assert {source_row["source_bits"] for source_row in rerun_stats.gate_sample_rows} == {6}
+    assert {source_row["unit_norm"] for source_row in rerun_stats.gate_sample_rows} == {"ste200", "ste310"}
+    assert [source_row[0] for source_row in source_bits_after] == [6]
     assert display_priority == 0
     assert "address key stamping" in {event.get("phase") for event in progress_events}
     assert "address archive resolve" in {event.get("phase") for event in progress_events}
@@ -771,8 +771,8 @@ async def test_migrate_legacy_archive_to_v2_builds_bridge_and_verifies_geocodes(
     collision_rows = await db.all(
         f"SELECT checksum, count(*) AS n FROM {schema}.address_checksum_collision GROUP BY checksum;"
     )
-    assert [int(row.checksum) for row in map_rows] == [10, 11]
-    assert [(int(row.checksum), int(row.n)) for row in collision_rows] == [(20, 2)]
+    assert [int(source_row.checksum) for source_row in map_rows] == [10, 11]
+    assert [(int(source_row.checksum), int(source_row.n)) for source_row in collision_rows] == [(20, 2)]
 
     rerun_stats = await migrate_legacy_archive_to_v2(
         schema=schema,
@@ -859,7 +859,7 @@ async def test_python_and_sql_address_canonical_golden_corpus_match():
 
     group_keys: dict[str, tuple[str | None, str | None]] = {}
     for case in cases:
-        values = {
+        canonical_value_by_field = {
             "first_line": case.get("first_line"),
             "second_line": case.get("second_line"),
             "city": case.get("city"),
@@ -868,32 +868,32 @@ async def test_python_and_sql_address_canonical_golden_corpus_match():
             "country": case.get("country"),
         }
         py_identity = address_canon.identity_key_v1(
-            values["first_line"],
-            values["second_line"],
-            values["city"],
-            values["state"],
-            values["zip"],
-            values["country"],
+            canonical_value_by_field["first_line"],
+            canonical_value_by_field["second_line"],
+            canonical_value_by_field["city"],
+            canonical_value_by_field["state"],
+            canonical_value_by_field["zip"],
+            canonical_value_by_field["country"],
         )
         py_key = address_canon.address_key_v1(
-            values["first_line"],
-            values["second_line"],
-            values["city"],
-            values["state"],
-            values["zip"],
-            values["country"],
+            canonical_value_by_field["first_line"],
+            canonical_value_by_field["second_line"],
+            canonical_value_by_field["city"],
+            canonical_value_by_field["state"],
+            canonical_value_by_field["zip"],
+            canonical_value_by_field["country"],
         )
         py_premise_identity = address_canon.premise_identity_key_v1(
-            values["first_line"],
-            values["second_line"],
-            values["city"],
-            values["state"],
-            values["zip"],
-            values["country"],
+            canonical_value_by_field["first_line"],
+            canonical_value_by_field["second_line"],
+            canonical_value_by_field["city"],
+            canonical_value_by_field["state"],
+            canonical_value_by_field["zip"],
+            canonical_value_by_field["country"],
         )
         py_premise_key = address_canon.key_from_identity(py_premise_identity)
 
-        row = await db.first(
+        source_row = await db.first(
             f"""
             SELECT
                 {schema}.addr_identity_key_v1(
@@ -914,22 +914,22 @@ async def test_python_and_sql_address_canonical_golden_corpus_match():
                     :first_line, :second_line, :city, :state, :zip, :country
                 )::text AS premise_key;
             """,
-            **values,
+            **canonical_value_by_field,
         )
-        data = row._mapping
+        canonical_data_by_case = source_row._mapping
 
-        assert data["identity_key"] == py_identity, case["id"]
-        assert data["address_key"] == (str(py_key) if py_key else None), case["id"]
-        assert data["address_key_from_identity"] == data["address_key"], case["id"]
-        assert data["premise_identity_key"] == py_premise_identity, case["id"]
-        assert data["premise_key"] == (str(py_premise_key) if py_premise_key else None), case["id"]
-        assert data["identity_key"] == case["expected_identity_key"], case["id"]
-        assert data["address_key"] == case["expected_address_key"], case["id"]
-        assert data["premise_identity_key"] == case["expected_premise_identity_key"], case["id"]
-        assert data["premise_key"] == case["expected_premise_key"], case["id"]
+        assert canonical_data_by_case["identity_key"] == py_identity, case["id"]
+        assert canonical_data_by_case["address_key"] == (str(py_key) if py_key else None), case["id"]
+        assert canonical_data_by_case["address_key_from_identity"] == canonical_data_by_case["address_key"], case["id"]
+        assert canonical_data_by_case["premise_identity_key"] == py_premise_identity, case["id"]
+        assert canonical_data_by_case["premise_key"] == (str(py_premise_key) if py_premise_key else None), case["id"]
+        assert canonical_data_by_case["identity_key"] == case["expected_identity_key"], case["id"]
+        assert canonical_data_by_case["address_key"] == case["expected_address_key"], case["id"]
+        assert canonical_data_by_case["premise_identity_key"] == case["expected_premise_identity_key"], case["id"]
+        assert canonical_data_by_case["premise_key"] == case["expected_premise_key"], case["id"]
 
         if group := case.get("equivalence_group"):
-            current = (data["identity_key"], data["address_key"])
+            current = (canonical_data_by_case["identity_key"], canonical_data_by_case["address_key"])
             group_keys.setdefault(group, current)
             assert group_keys[group] == current, case["id"]
 
@@ -1375,7 +1375,7 @@ async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
     updated = await facility_anchors._refresh_archive_geocodes_from_facility_anchors(stage_table, schema)
     assert updated == 1
 
-    row = await db.first(
+    source_row = await db.first(
         f"""
         SELECT lat, long, geo_source, geocode_source, geocode_quality
           FROM {schema}.address_archive_v2
@@ -1383,11 +1383,11 @@ async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
         """,
         address_key=address_key,
     )
-    assert float(row.lat) == pytest.approx(30.2672)
-    assert float(row.long) == pytest.approx(-97.7431)
-    assert row.geo_source == "manual"
-    assert row.geocode_source == "facility_anchor"
-    assert row.geocode_quality == "facility_anchor"
+    assert float(source_row.lat) == pytest.approx(30.2672)
+    assert float(source_row.long) == pytest.approx(-97.7431)
+    assert source_row.geo_source == "manual"
+    assert source_row.geocode_source == "facility_anchor"
+    assert source_row.geocode_quality == "facility_anchor"
 
     await db.status(
         f"""
@@ -1478,7 +1478,7 @@ async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_k
         )
     )
 
-    rows = await db.all(
+    source_rows = await db.all(
         f"""
         SELECT entity_type, entity_id, type, address_sources, first_line,
                city_name, state_name, postal_code, address_key::text
@@ -1487,14 +1487,14 @@ async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_k
         """
     )
 
-    assert len(rows) == 1
-    row = rows[0]._mapping
-    assert row["entity_type"] == "npi"
-    assert row["entity_id"] == "1234567890"
-    assert row["type"] == "practice"
-    assert row["first_line"] == "10 Market Street"
-    assert row["city_name"] == "Boston"
-    assert row["address_key"] == str(
+    assert len(source_rows) == 1
+    source_row = source_rows[0]._mapping
+    assert source_row["entity_type"] == "npi"
+    assert source_row["entity_id"] == "1234567890"
+    assert source_row["type"] == "practice"
+    assert source_row["first_line"] == "10 Market Street"
+    assert source_row["city_name"] == "Boston"
+    assert source_row["address_key"] == str(
         address_canon.address_key_v1("10 Market Street", "Suite 5", "Boston", "MA", "02108", "US")
     )
 
