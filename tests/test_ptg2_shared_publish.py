@@ -442,6 +442,7 @@ async def test_finalizer_provider_metadata_join_decodes_the_smaller_stage(
     tmp_path,
     monkeypatch,
 ):
+    status = AsyncMock()
     session = SimpleNamespace(
         execute=AsyncMock(
             side_effect=[
@@ -460,7 +461,7 @@ async def test_finalizer_provider_metadata_join_decodes_the_smaller_stage(
         yield session
 
     monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
-    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", status)
     monkeypatch.setattr(
         ptg2_shared_publish,
         "_copy_binary_file_to_stage",
@@ -485,4 +486,8 @@ async def test_finalizer_provider_metadata_join_decodes_the_smaller_stage(
     provider_metadata_sql = "\n".join(executed_statements[2:4])
     assert "decode(metadata.provider_set_global_id_128, 'hex')" in provider_metadata_sql
     assert "encode(provider_stage.provider_set_global_id_128, 'hex')" not in provider_metadata_sql
+    stage_index_sql = "\n".join(str(call.args[0]) for call in status.await_args_list)
+    assert "CREATE UNIQUE INDEX" in stage_index_sql
+    assert "((decode(provider_set_global_id_128, 'hex')))" in stage_index_sql
+    assert stage_index_sql.count("ANALYZE") == 2
     assert publication.provider_set_count == 1

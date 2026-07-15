@@ -448,6 +448,17 @@ async def publish_shared_finalizer_dictionaries(
                 stage_table=provider_metadata_stage,
                 columns=("provider_set_global_id_128", "network_names"),
             )
+        if provider_count > 0:
+            await db.status(
+                f"""
+                CREATE UNIQUE INDEX ON {schema}.{quoted_provider_stage}
+                    (provider_set_global_id_128);
+                CREATE INDEX ON {schema}.{quoted_provider_metadata_stage}
+                    ((decode(provider_set_global_id_128, 'hex')));
+                ANALYZE {schema}.{quoted_provider_stage};
+                ANALYZE {schema}.{quoted_provider_metadata_stage};
+                """
+            )
         async with db.transaction() as session:
             await lock_shared_layout_for_dense_write(
                 session,
