@@ -97,6 +97,8 @@ def _fast_module() -> Any | None:
 
 
 def canonicalize_batch(rows: Iterable[Sequence[Any]]) -> list[dict[str, str | None]]:
+    """Canonicalize address rows with the compatible fast path or fallback."""
+
     prepared = [_row_tuple(row) for row in rows]
     module = _fast_module()
     if module is not None:
@@ -108,4 +110,6 @@ def canonicalize_batch(rows: Iterable[Sequence[Any]]) -> list[dict[str, str | No
 
 
 def canonicalize_one(row: Sequence[Any]) -> dict[str, str | None]:
+    """Canonicalize one six-field address row using the batch contract."""
+
     return canonicalize_batch([row])[0]

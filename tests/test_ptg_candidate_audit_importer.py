@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import json
@@ -26,6 +27,31 @@ EMPTY_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload({}
 NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload(
     {123456789: 2}
 )
+
+
+def _assert_isolated_subprocess_contract(
+    subprocess_invocation_by_field: dict[str, object],
+) -> None:
+    spawn_arguments = subprocess_invocation_by_field["arguments"]
+    spawn_options = subprocess_invocation_by_field["kwargs"]
+    assert isinstance(spawn_arguments, tuple)
+    assert isinstance(spawn_options, dict)
+    assert spawn_arguments == (
+        ptg_candidate_audit.sys.executable,
+        "-m",
+        "process.ptg_candidate_audit",
+    )
+    assert "public-control-token" not in spawn_arguments
+    assert "HLTHPRT_CONTROL_API_TOKEN" not in spawn_options["env"]
+    assert (
+        spawn_options["env"][ptg_candidate_audit._ISOLATED_AUDIT_TOKEN_ENV]
+        == "public-control-token"
+    )
+    request_fields = json.loads(
+        spawn_options["env"][ptg_candidate_audit._ISOLATED_AUDIT_REQUEST_ENV]
+    )
+    assert request_fields["lease_id"] == "test-lease"
+    assert request_fields["target"]["raw_container_sha256"] == [RAW_DIGEST]
 
 
 def _candidate_row(
@@ -293,7 +319,11 @@ def test_release_audit_uses_validated_candidate_and_unmodified_release_defaults(
 
     monkeypatch.setenv(
         "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
-        "https://public-api.internal.example",
+        "http://candidate-api:8080",
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_TRUSTED_CLUSTER_HTTP",
+        "true",
     )
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
     monkeypatch.setattr(ptg_candidate_audit.ptg2_v3_source_api_audit, "run_audit_cli", run_cli)
@@ -307,9 +337,10 @@ def test_release_audit_uses_validated_candidate_and_unmodified_release_defaults(
     assert "--validated-candidate" in captured_list
     assert captured_list[captured_list.index("--max-invalid-npis") + 1] == "0"
     assert captured_list[captured_list.index("--profile") + 1] == "release"
-    assert captured_list[captured_list.index("--api-base-url") + 1] == "https://public-api.internal.example"
+    assert captured_list[captured_list.index("--api-base-url") + 1] == "http://candidate-api:8080"
     assert captured_list[captured_list.index("--auth-header") + 1] == "Authorization"
     assert captured_list[captured_list.index("--auth-scheme") + 1] == "Bearer"
+    assert "--trusted-cluster-http" in captured_list
     assert "--source-occurrence-samples" not in captured_list
     assert "--api-occurrence-samples" not in captured_list
     assert "--negative-samples" not in captured_list
@@ -382,7 +413,285 @@ def test_release_audit_failure_is_deterministic_and_not_retryable(monkeypatch, t
             (tmp_path / "source.json.gz",),
         )
 
+    assert str(exc_info.value) == "candidate release audit did not pass the release gate"
     assert exc_info.value.control_error_code == "ptg_candidate_audit_release_gate_failed"
+    assert exc_info.value.retryable is False
+
+
+def test_release_audit_preserves_safe_fatal_configuration_reason(
+    monkeypatch,
+    tmp_path,
+):
+    def run_cli(argv):
+        report_path = type(tmp_path)(argv[argv.index("--report") + 1])
+        report_path.write_text(
+            json.dumps(
+                {
+                    "status": "error",
+                    "failures": {
+                        "counts": {"configuration": 1},
+                        "examples": [
+                            {
+                                "category": "configuration",
+                                "exception_type": "ConfigurationError",
+                                "reason": "release_api_base_url_must_be_https_origin",
+                            }
+                        ],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return 2
+
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
+        "https://public-api.internal.example",
+    )
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
+    monkeypatch.setattr(
+        ptg_candidate_audit.ptg2_v3_source_api_audit,
+        "run_audit_cli",
+        run_cli,
+    )
+
+    with pytest.raises(
+        ptg_candidate_audit.CandidateAuditReleaseGateError,
+        match="release_api_base_url_must_be_https_origin",
+    ):
+        ptg_candidate_audit.run_release_audit(
+            _target(),
+            (tmp_path / "source.json.gz",),
+        )
+
+
+@pytest.mark.asyncio
+async def test_isolated_audit_subprocess_returns_validated_report_without_token_argv(
+    monkeypatch,
+    tmp_path,
+):
+    """The child receives its target and secret through its private environment."""
+
+    report = _passing_report()
+    subprocess_invocation_by_field: dict[str, object] = {}
+
+    class SuccessfulProcess:
+        pid = 12345
+        returncode = 0
+
+        async def wait(self):
+            return self.returncode
+
+    async def create_subprocess_exec(*arguments, **kwargs):
+        subprocess_invocation_by_field["arguments"] = arguments
+        subprocess_invocation_by_field["kwargs"] = kwargs
+        request_fields = json.loads(
+            kwargs["env"][ptg_candidate_audit._ISOLATED_AUDIT_REQUEST_ENV]
+        )
+        report_path = type(tmp_path)(request_fields["report_path"])
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        return SuccessfulProcess()
+
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
+        "https://public-api.internal.example",
+    )
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "current_artifact_lease_id",
+        Mock(return_value="test-lease"),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit.asyncio,
+        "create_subprocess_exec",
+        create_subprocess_exec,
+    )
+
+    observed = await ptg_candidate_audit.run_isolated_release_audit(
+        _target(),
+        PTG2ArtifactStore(tmp_path / "store"),
+    )
+
+    assert observed == report
+    _assert_isolated_subprocess_contract(subprocess_invocation_by_field)
+
+
+@pytest.mark.asyncio
+async def test_isolated_audit_cancellation_terminates_process_group(
+    monkeypatch,
+    tmp_path,
+):
+    """Cancellation must reap the isolated audit before the worker can retry."""
+
+    class HangingProcess:
+        pid = 12345
+        returncode = None
+
+        def __init__(self):
+            self.exited = asyncio.Event()
+            self.signals = []
+
+        async def wait(self):
+            await self.exited.wait()
+            self.returncode = -15
+            return self.returncode
+
+    process = HangingProcess()
+    subprocess_invocation_by_field: dict[str, object] = {}
+
+    async def create_subprocess_exec(*arguments, **kwargs):
+        subprocess_invocation_by_field["arguments"] = arguments
+        subprocess_invocation_by_field["kwargs"] = kwargs
+        return process
+
+    def signal_process_group(observed_process, observed_signal):
+        assert observed_process is process
+        process.signals.append(observed_signal)
+        process.exited.set()
+
+    monkeypatch.setattr(
+        ptg_candidate_audit.asyncio,
+        "create_subprocess_exec",
+        create_subprocess_exec,
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_signal_process_group",
+        signal_process_group,
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
+        "https://public-api.internal.example",
+    )
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "current_artifact_lease_id",
+        Mock(return_value="test-lease"),
+    )
+    task = asyncio.create_task(
+        ptg_candidate_audit.run_isolated_release_audit(
+            _target(),
+            PTG2ArtifactStore(tmp_path / "store"),
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert process.signals == [ptg_candidate_audit.signal.SIGTERM]
+    arguments = subprocess_invocation_by_field["arguments"]
+    kwargs = subprocess_invocation_by_field["kwargs"]
+    assert isinstance(arguments, tuple)
+    assert isinstance(kwargs, dict)
+    assert "public-control-token" not in arguments
+    assert kwargs["start_new_session"] is True
+
+
+@pytest.mark.asyncio
+async def test_isolated_audit_requires_active_artifact_lease(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
+        "https://public-api.internal.example",
+    )
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "current_artifact_lease_id",
+        Mock(return_value=None),
+    )
+
+    with pytest.raises(RuntimeError, match="active artifact lease"):
+        await ptg_candidate_audit.run_isolated_release_audit(
+            _target(),
+            PTG2ArtifactStore(tmp_path / "store"),
+        )
+
+
+def test_isolated_child_resolves_and_verifies_sources_before_audit(
+    monkeypatch,
+    tmp_path,
+):
+    artifact_store = PTG2ArtifactStore(tmp_path / "store")
+    report_path = tmp_path / "report.json"
+    retained_source_path = tmp_path / "retained-source.json.gz"
+    expected_report = _passing_report()
+
+    def resolve_sources_inside_lease(_artifact_store, _raw_digests):
+        assert ptg_candidate_audit.current_artifact_lease_id() == "test-lease"
+        return (retained_source_path,)
+
+    resolve_sources = Mock(side_effect=resolve_sources_inside_lease)
+    run_release_audit = Mock(return_value=expected_report)
+    monkeypatch.setenv(
+        ptg_candidate_audit._ISOLATED_AUDIT_REQUEST_ENV,
+        ptg_candidate_audit._isolated_audit_request(
+            _target(),
+            artifact_store,
+            report_path,
+            "test-lease",
+        ),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "resolve_retained_raw_files",
+        resolve_sources,
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "run_release_audit",
+        run_release_audit,
+    )
+
+    assert ptg_candidate_audit.run_isolated_audit_child() == 0
+
+    resolved_store, resolved_digests = resolve_sources.call_args.args
+    assert resolved_store.root == artifact_store.root
+    assert resolved_digests == (RAW_DIGEST,)
+    run_release_audit.assert_called_once()
+    assert run_release_audit.call_args.args[1] == (retained_source_path,)
+    assert json.loads(report_path.read_text(encoding="utf-8")) == expected_report
+
+
+def test_isolated_child_source_failure_writes_redacted_release_gate_report(
+    monkeypatch,
+    tmp_path,
+):
+    artifact_store = PTG2ArtifactStore(tmp_path / "store")
+    report_path = tmp_path / "report.json"
+    monkeypatch.setenv(
+        ptg_candidate_audit._ISOLATED_AUDIT_REQUEST_ENV,
+        ptg_candidate_audit._isolated_audit_request(
+            _target(),
+            artifact_store,
+            report_path,
+            "test-lease",
+        ),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "resolve_retained_raw_files",
+        Mock(side_effect=ValueError("private retained source path")),
+    )
+
+    exit_code = ptg_candidate_audit.run_isolated_audit_child()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 2
+    assert "private retained source path" not in json.dumps(report)
+    with pytest.raises(
+        ptg_candidate_audit.CandidateAuditReleaseGateError,
+        match="isolated_audit_failed",
+    ) as exc_info:
+        ptg_candidate_audit._validate_release_audit_report(
+            _target(),
+            exit_code=exit_code,
+            report=report,
+        )
     assert exc_info.value.retryable is False
 
 
@@ -395,10 +704,9 @@ async def test_passing_audit_attests_then_activates(monkeypatch, tmp_path):
     monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
     monkeypatch.setattr(
         ptg_candidate_audit,
-        "resolve_retained_raw_files",
-        Mock(return_value=(tmp_path / "source.json.gz",)),
+        "run_isolated_release_audit",
+        AsyncMock(return_value=report),
     )
-    monkeypatch.setattr(ptg_candidate_audit, "run_release_audit", Mock(return_value=report))
 
     async def attest(**kwargs):
         events.append("attest")
@@ -439,13 +747,12 @@ async def test_failing_audit_never_attests_or_activates(monkeypatch, tmp_path):
     monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
     monkeypatch.setattr(
         ptg_candidate_audit,
-        "resolve_retained_raw_files",
-        Mock(return_value=(tmp_path / "source.json.gz",)),
-    )
-    monkeypatch.setattr(
-        ptg_candidate_audit,
-        "run_release_audit",
-        Mock(side_effect=RuntimeError("candidate release audit did not pass the release gate")),
+        "run_isolated_release_audit",
+        AsyncMock(
+            side_effect=RuntimeError(
+                "candidate release audit did not pass the release gate"
+            )
+        ),
     )
     attest = AsyncMock()
     promote = AsyncMock()

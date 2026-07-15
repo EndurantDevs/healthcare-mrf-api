@@ -172,6 +172,8 @@ async def test_strict_v3_snapshot_validation_accepts_one_sealed_complete_binding
         "shared_snapshot_key": 17,
         "row_limit": 2561,
     }
+    audit_query = query.await_args_list[1].args[0]
+    assert "source_key, npi, atom_ordinal" in audit_query
 
 
 @pytest.mark.asyncio

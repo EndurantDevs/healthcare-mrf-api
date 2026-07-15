@@ -1157,6 +1157,46 @@ def test_validated_candidate_release_allows_exact_nonempty_npi_quarantine():
     assert config.max_invalid_npis == 3
 
 
+def test_validated_candidate_release_allows_explicit_cluster_http_transport():
+    config = replace(
+        _release_audit_config(),
+        api_base_url="http://candidate-api:8080",
+        trusted_cluster_http=True,
+    )
+
+    target = config.redacted_target()
+    assert target["tls_verified"] is False
+    assert target["transport_contract"] == audit.TRUSTED_CLUSTER_HTTP_TRANSPORT
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"api_base_url": "http://candidate-api:8080"},
+        {
+            "api_base_url": "http://candidate.example.com:8080",
+            "trusted_cluster_http": True,
+        },
+        {
+            "api_base_url": "http://127.0.0.1:8080",
+            "trusted_cluster_http": True,
+        },
+        {
+            "api_base_url": "http://candidate-api:8080/prefix",
+            "trusted_cluster_http": True,
+        },
+        {
+            "api_base_url": "http://candidate-api:8080",
+            "trusted_cluster_http": True,
+            "validated_candidate": False,
+        },
+    ],
+)
+def test_release_rejects_implicit_or_noncluster_http_transport(changes):
+    with pytest.raises(audit.ConfigurationError):
+        replace(_release_audit_config(), **changes)
+
+
 def test_published_release_cannot_relax_invalid_npi_ceiling():
     config = _audit_config(max_invalid_npis=1, validated_candidate=False)
 
@@ -2691,7 +2731,7 @@ def test_validated_candidate_cli_adds_bound_header_and_requires_exact_scope():
             "--report",
             "report.json",
             "--api-base-url",
-            "https://api.example.invalid",
+            "http://candidate-api:8080",
             "--api-path",
             audit.DEFAULT_CANDIDATE_API_PATH,
             "--plan-id",
@@ -2705,6 +2745,7 @@ def test_validated_candidate_cli_adds_bound_header_and_requires_exact_scope():
             "--auth-token",
             "operator-secret",
             "--validated-candidate",
+            "--trusted-cluster-http",
         ]
     )
 
@@ -2712,6 +2753,7 @@ def test_validated_candidate_cli_adds_bound_header_and_requires_exact_scope():
     config = audit._audit_config(args)
     headers = audit._request_headers(args)
     assert config.validated_candidate is True
+    assert config.trusted_cluster_http is True
     assert config.api_path == audit.DEFAULT_CANDIDATE_API_PATH
     assert config.redacted_target()["expected_snapshot_lifecycle"] == "validated"
     assert headers[audit.CANDIDATE_AUDIT_HEADER] == "snapshot-value"
@@ -2799,3 +2841,20 @@ def test_fatal_report_contains_only_safe_error_metadata(tmp_path):
     assert config.snapshot_id not in serialized
     assert str(source) not in serialized
     assert raw_source_sha256 not in serialized
+
+
+def test_fatal_report_preserves_only_stable_configuration_reason(tmp_path):
+    source = _write_source_fixture(
+        tmp_path / "configuration-source.json.gz",
+        references_before=True,
+    )
+    report = audit.fatal_report(
+        started_at=dt.datetime.now(dt.timezone.utc),
+        exc=audit.ConfigurationError("release_api_base_url_must_be_https_origin"),
+        config=_audit_config(),
+        specs=audit.source_specs([source]),
+    )
+
+    assert report["failures"]["examples"][0]["reason"] == (
+        "release_api_base_url_must_be_https_origin"
+    )

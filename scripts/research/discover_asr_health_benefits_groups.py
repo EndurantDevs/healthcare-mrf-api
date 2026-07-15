@@ -238,6 +238,8 @@ async def _async_main() -> int:
 
 
 def main() -> int:
+    """Run the bounded ASR Health Benefits discovery research command."""
+
     return asyncio.run(_async_main())
 
 

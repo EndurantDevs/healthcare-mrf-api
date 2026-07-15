@@ -9,6 +9,7 @@ import datetime as dt
 import json
 import math
 import os
+from functools import lru_cache
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -31,7 +32,6 @@ IMPORT_LIVE_PROGRESS_STALE_SECONDS = int(
 )
 
 _context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("import_live_progress_context", default={})
-_redis_client: redis.Redis | None = None
 _HEARTBEAT_SOURCE = "engine-heartbeat"
 _PROGRESS_FIELDS = (
     "unit",
@@ -48,23 +48,33 @@ _PROGRESS_FIELDS = (
 
 
 def live_progress_key(run_id: str) -> str:
+    """Return the Redis key for one controlled import's live progress."""
+
     return f"import:progress:{run_id}"
 
 
 def set_live_progress_context(**payload: Any) -> contextvars.Token:
+    """Bind nonempty progress defaults to the current asynchronous context."""
+
     data = {key: value for key, value in payload.items() if value not in (None, "")}
     return _context.set(data)
 
 
 def reset_live_progress_context(token: contextvars.Token) -> None:
+    """Restore the progress context represented by a prior context token."""
+
     _context.reset(token)
 
 
 def current_live_progress_context() -> dict[str, Any]:
+    """Return a detached copy of the current import progress context."""
+
     return dict(_context.get() or {})
 
 
 def write_live_progress(**payload: Any) -> None:
+    """Persist normalized progress and emit its best-effort status event."""
+
     context = current_live_progress_context()
     run_id = str(payload.get("run_id") or context.get("run_id") or "").strip()
     if not run_id:
@@ -122,6 +132,8 @@ def write_live_progress(**payload: Any) -> None:
 
 
 def enqueue_live_progress(**payload: Any) -> None:
+    """Schedule a nonblocking live-progress write from sync or async callers."""
+
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -134,6 +146,8 @@ def enqueue_live_progress(**payload: Any) -> None:
 
 
 def read_live_progress(run_id: str) -> dict[str, Any] | None:
+    """Return fresh persisted progress, excluding missing or stale payloads."""
+
     run_id = str(run_id or "").strip()
     if not run_id:
         return None
@@ -165,6 +179,8 @@ def _read_live_progress_payload(run_id: str) -> dict[str, Any] | None:
 
 
 def progress_payload_from_live(live: dict[str, Any]) -> dict[str, Any]:
+    """Project live state into the stable control-plane progress contract."""
+
     payload = {
         "unit": live.get("unit") or "run",
         "done": live.get("done"),
@@ -179,6 +195,8 @@ def progress_payload_from_live(live: dict[str, Any]) -> dict[str, Any]:
 
 
 def estimate_payload_from_live(live: dict[str, Any]) -> dict[str, Any]:
+    """Project live state into the stable runtime-estimate contract."""
+
     payload = {
         "eta_seconds": live.get("eta_seconds"),
         "estimated_finish_at": live.get("estimated_finish_at"),
@@ -189,19 +207,17 @@ def estimate_payload_from_live(live: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
 
+@lru_cache(maxsize=1)
 def _redis() -> redis.Redis:
-    global _redis_client
-    if _redis_client is None:
-        settings = build_redis_settings()
-        _redis_client = redis.Redis(
-            host=settings.host,
-            port=settings.port,
-            password=settings.password,
-            db=settings.database,
-            socket_connect_timeout=1.0,
-            socket_timeout=1.0,
-        )
-    return _redis_client
+    settings = build_redis_settings()
+    return redis.Redis(
+        host=settings.host,
+        port=settings.port,
+        password=settings.password,
+        db=settings.database,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+    )
 
 
 def _normalize_progress_fields(merged: dict[str, Any], *, terminal: bool) -> None:

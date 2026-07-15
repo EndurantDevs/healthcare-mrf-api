@@ -11981,6 +11981,8 @@ def _s3_xml_listing_targets_from_xml(
     listing_url: str,
     resolver: dict[str, Any],
 ) -> list[CrawlTarget]:
+    """Parse one S3 XML page into bounded crawl targets and continuation state."""
+
     root = ElementTree.fromstring((xml_text or "").lstrip("\ufeff"))
     resolver_type = str(resolver.get("type") or "s3_xml_listing")
     public_base_url = str(resolver.get("public_base_url") or listing_url).rstrip("/")
@@ -12697,6 +12699,8 @@ async def _resolve_providence_mrf_api(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve Providence configuration and API responses into MRF targets."""
+
     resolver_type = str(resolver.get("type") or "providence_mrf_api")
     config_url = urljoin(url, str(resolver.get("config_path") or "/config.json"))
     config = await _fetch_json(
