@@ -85,7 +85,7 @@ def test_concurrent_identical_artifact_has_one_logical_file_and_two_safe_leases(
 
     monkeypatch.setattr(source_download, "download_raw_artifact", fake_download)
     barrier = threading.Barrier(3)
-    results = []
+    download_results = []
 
     def run_import(owner: str) -> None:
         with artifact_lease_context(
@@ -103,14 +103,17 @@ def test_concurrent_identical_artifact_has_one_logical_file_and_two_safe_leases(
                 )
             )
             assert downloaded.error is None
-            results.append(downloaded)
+            download_results.append(downloaded)
             barrier.wait(timeout=10)
             barrier.wait(timeout=10)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(run_import, f"import-{index}") for index in range(2)]
         barrier.wait(timeout=10)
-        logical_paths = {Path(result.logical_artifact.logical_path) for result in results}
+        logical_paths = {
+            Path(download_result.logical_artifact.logical_path)
+            for download_result in download_results
+        }
         assert len(logical_paths) == 1
         logical_path = logical_paths.pop()
         assert logical_path.read_text(encoding="utf-8") == json.dumps(
@@ -120,9 +123,9 @@ def test_concurrent_identical_artifact_has_one_logical_file_and_two_safe_leases(
         for path in (raw_path, logical_path):
             old = (NOW - datetime.timedelta(hours=48)).timestamp()
             os.utime(path, (old, old))
-        result = _collect(root)
-        assert set(result.protected_files) == {raw_path, logical_path}
-        assert result.deleted_files == ()
+        retention_result = _collect(root)
+        assert set(retention_result.protected_files) == {raw_path, logical_path}
+        assert retention_result.deleted_files == ()
         barrier.wait(timeout=10)
         for future in futures:
             future.result(timeout=10)
@@ -135,15 +138,17 @@ def test_url_validation_failure_does_not_unlink_shared_raw_artifact(
     """Verify url validation failure does not unlink shared raw artifact."""
     root = tmp_path / "artifacts"
     store = PTG2ArtifactStore(root)
-    payload = b'{"in_network":[]}'
-    plain_source = _make_file(tmp_path / "rates.json", payload, age_hours=0)
-    gzip_named_source = _make_file(tmp_path / "rates.json.gz", payload, age_hours=0)
+    source_bytes = b'{"in_network":[]}'
+    plain_source = _make_file(tmp_path / "rates.json", source_bytes, age_hours=0)
+    gzip_named_source = _make_file(
+        tmp_path / "rates.json.gz", source_bytes, age_hours=0
+    )
 
     async def fake_head(url: str):
         return source_download.PTG2HeadMetadata(
             url=url,
             status=200,
-            content_length=len(payload),
+            content_length=len(source_bytes),
             supports_head=False,
         )
 
@@ -185,10 +190,10 @@ def test_url_validation_failure_does_not_unlink_shared_raw_artifact(
                     )
                 )
 
-        assert raw_path.read_bytes() == payload
-        result = _collect(root)
-        assert result.protected_files == (raw_path,)
-        assert result.deleted_files == ()
+        assert raw_path.read_bytes() == source_bytes
+        retention_result = _collect(root)
+        assert retention_result.protected_files == (raw_path,)
+        assert retention_result.deleted_files == ()
     finally:
         gzip_lease.release()
         plain_lease.release()
@@ -585,7 +590,7 @@ def test_gc_compacts_manifest_and_drops_missing_artifact_records(tmp_path):
         orphan_temp.parent.mkdir(parents=True, exist_ok=True)
         orphan_temp.write_text("partial", encoding="utf-8")
 
-    result = _collect(
+    retention_result = _collect(
         root,
         retention_hours=24,
         min_age_hours=1,
@@ -596,9 +601,9 @@ def test_gc_compacts_manifest_and_drops_missing_artifact_records(tmp_path):
         for line in store.manifest_path.read_text(encoding="utf-8").splitlines()
     ]
 
-    assert result.manifest_entries_before == 5
-    assert result.manifest_entries_after == 2
-    assert result.manifest_invalid_lines == 0
+    assert retention_result.manifest_entries_before == 5
+    assert retention_result.manifest_entries_after == 2
+    assert retention_result.manifest_invalid_lines == 0
     assert compacted[0] == {
         **base_record,
         "etag": '"new"',
@@ -936,10 +941,10 @@ def test_gc_is_idempotent_after_explicit_unleased_grace(tmp_path):
 def test_identical_raw_bytes_from_different_suffixes_share_one_file(tmp_path, monkeypatch):
     root = tmp_path / "artifacts"
     store = PTG2ArtifactStore(root)
-    payload = gzip.compress(b'{"in_network":[]}', mtime=0)
+    compressed_source = gzip.compress(b'{"in_network":[]}', mtime=0)
     source_paths = [tmp_path / "first.json.gz", tmp_path / "second.gz"]
     for path in source_paths:
-        path.write_bytes(payload)
+        path.write_bytes(compressed_source)
 
     async def safe_url(_url):
         return None

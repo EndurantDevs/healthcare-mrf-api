@@ -349,14 +349,14 @@ async def test_shared_payload_reads_have_no_binary_cache(monkeypatch):
     assert not hasattr(ptg2_db_sidecars, "_BINARY_DICTIONARY_CACHE")
 
     for _ in range(2):
-        rows = await ptg2_db_sidecars._serving_binary_payload_rows(
+        payload_rows = await ptg2_db_sidecars._serving_binary_payload_rows(
             object(),
             shared_snapshot_key=41,
             artifact_kind="by_code_provider_shard_v1",
             block_key=block_key,
             schema_name="mrf",
         )
-        assert rows[0]["_decoded_payload"] == b"payload"
+        assert payload_rows[0]["_decoded_payload"] == b"payload"
 
     assert fetch.await_count == 2
     assert all(call.kwargs["snapshot_key"] == 41 for call in fetch.await_args_list)
@@ -368,12 +368,17 @@ async def test_shared_payload_reads_have_no_binary_cache(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_shared_dictionary_read_passes_snapshot_key_and_never_caches(monkeypatch):
-    payload = bytes.fromhex("00" * 15 + "01") + bytes.fromhex("00" * 15 + "02")
+    dictionary_bytes = bytes.fromhex("00" * 15 + "01") + bytes.fromhex(
+        "00" * 15 + "02"
+    )
     fetch = AsyncMock(
         return_value={
             0: (
                 SharedBlockPayload(
-                    block_key=0, fragment_no=0, entry_count=2, payload=payload
+                    block_key=0,
+                    fragment_no=0,
+                    entry_count=2,
+                    payload=dictionary_bytes,
                 ),
             )
         }
@@ -417,9 +422,9 @@ async def test_large_shared_dictionary_reads_only_the_requested_tail_fragment(
     fragment_start = fragment_no * entries_per_fragment
     fragment_entries = item_count - fragment_start
     expected = bytes.fromhex("0123456789abcdef0123456789abcdef")
-    payload = bytearray(fragment_entries * 16)
+    dictionary_fragment = bytearray(fragment_entries * 16)
     offset = (item_key - fragment_start) * 16
-    payload[offset : offset + 16] = expected
+    dictionary_fragment[offset : offset + 16] = expected
     fetch = AsyncMock(
         return_value={
             0: (
@@ -427,14 +432,14 @@ async def test_large_shared_dictionary_reads_only_the_requested_tail_fragment(
                     block_key=0,
                     fragment_no=fragment_no,
                     entry_count=fragment_entries,
-                    payload=bytes(payload),
+                    payload=bytes(dictionary_fragment),
                 ),
             )
         }
     )
     monkeypatch.setattr(ptg2_db_sidecars, "fetch_shared_blocks", fetch)
 
-    values = await ptg2_db_sidecars._serving_binary_dictionary_values_for_keys(
+    dictionary_values = await ptg2_db_sidecars._serving_binary_dictionary_values_for_keys(
         object(),
         shared_snapshot_key=41,
         artifact_kind="by_code_price_dictionary",
@@ -444,10 +449,10 @@ async def test_large_shared_dictionary_reads_only_the_requested_tail_fragment(
         schema_name="mrf",
     )
 
-    assert values == {item_key: expected.hex()}
+    assert dictionary_values == {item_key: expected.hex()}
     assert fetch.await_args.kwargs["block_keys"] == (0,)
     assert fetch.await_args.kwargs["fragment_nos"] == (fragment_no,)
-    assert len(payload) <= entries_per_fragment * 16
+    assert len(dictionary_fragment) <= entries_per_fragment * 16
 
 
 @pytest.mark.asyncio
@@ -912,11 +917,11 @@ async def test_multi_file_forward_rows_keep_per_artifact_source_provenance(
     assert response is not None
     assert {
         (
-            item["source_artifact_key"],
-            item["raw_container_sha256"],
-            item["source_trace"][0]["source_file_version_id"],
+            response_item["source_artifact_key"],
+            response_item["raw_container_sha256"],
+            response_item["source_trace"][0]["source_file_version_id"],
         )
-        for item in response["items"]
+        for response_item in response["items"]
     } == {
         (1, "1" * 64, "source-file-1"),
         (2, "2" * 64, "source-file-2"),
@@ -931,7 +936,7 @@ def test_shared_v3_response_rows_preserve_negotiation_arrangement():
         "reported_code": "99213",
         "negotiation_arrangement": "BUNDLE",
     }
-    row = ptg2_serving._shared_forward_response_row(
+    response_row = ptg2_serving._shared_forward_response_row(
         SimpleNamespace(
             code_key=7,
             provider_set_key=3,
@@ -946,15 +951,17 @@ def test_shared_v3_response_rows_preserve_negotiation_arrangement():
         [],
     )
 
-    assert row["negotiation_arrangement"] == "BUNDLE"
+    assert response_row["negotiation_arrangement"] == "BUNDLE"
     assert (
-        ptg2_serving._compact_item_from_row(row, {})["negotiation_arrangement"]
+        ptg2_serving._compact_item_from_row(response_row, {})[
+            "negotiation_arrangement"
+        ]
         == "BUNDLE"
     )
 
     provider_item = ptg2_serving._ptg2_manifest_provider_procedure_item(
         npi=1234567890,
-        data=row,
+        data=response_row,
         prices=[],
         procedure_detail={},
         provider_context={},
@@ -981,7 +988,7 @@ def test_reverse_provider_items_keep_exact_source_identity_and_do_not_premerge()
         "source_trace_set_hash": "4" * 64,
         "source_trace": [{"source_file_version_id": "source-file-1"}],
     }
-    items = [
+    provider_items = [
         ptg2_serving._ptg2_manifest_provider_procedure_item(
             npi=1234567890,
             data={**base_data, "source_key": source_key},
@@ -993,13 +1000,13 @@ def test_reverse_provider_items_keep_exact_source_identity_and_do_not_premerge()
         for source_key in (0, 1)
     ]
 
-    assert items[0]["source_key"] == "logical-source"
-    assert items[0]["source_artifact_key"] == 0
-    assert items[0]["identity_sha256"] == "1" * 64
-    assert items[0]["source_trace"] == [
+    assert provider_items[0]["source_key"] == "logical-source"
+    assert provider_items[0]["source_artifact_key"] == 0
+    assert provider_items[0]["identity_sha256"] == "1" * 64
+    assert provider_items[0]["source_trace"] == [
         {"source_file_version_id": "source-file-1"}
     ]
-    assert len(ptg2_serving._merge_ptg2_provider_rate_items(items)) == 2
+    assert len(ptg2_serving._merge_ptg2_provider_rate_items(provider_items)) == 2
 
 
 @pytest.mark.asyncio
@@ -1271,7 +1278,7 @@ async def test_shared_dispatch_has_no_filesystem_manifest_loader(monkeypatch):
     pagination = object()
     tables = _strict_tables()
 
-    result = await ptg2_serving.search_ptg2_serving_table(
+    search_result = await ptg2_serving.search_ptg2_serving_table(
         session,
         "snapshot-id",
         {"plan_id": "plan", "code": "99213"},
@@ -1279,7 +1286,7 @@ async def test_shared_dispatch_has_no_filesystem_manifest_loader(monkeypatch):
         serving_tables=tables,
     )
 
-    assert result == {"items": []}
+    assert search_result == {"items": []}
     db_search.assert_awaited_once_with(
         session,
         "snapshot-id",
@@ -1305,7 +1312,7 @@ async def test_exact_source_mode_uses_the_strict_shared_dispatch(monkeypatch):
         "code": "99213",
     }
 
-    result = await ptg2_serving.search_ptg2_serving_table(
+    search_result = await ptg2_serving.search_ptg2_serving_table(
         session,
         "snapshot-id",
         args,
@@ -1313,7 +1320,7 @@ async def test_exact_source_mode_uses_the_strict_shared_dispatch(monkeypatch):
         serving_tables=tables,
     )
 
-    assert result == {"items": []}
+    assert search_result == {"items": []}
     db_search.assert_awaited_once_with(
         session,
         "snapshot-id",

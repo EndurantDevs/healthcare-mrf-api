@@ -179,13 +179,13 @@ def test_scanner_indexes_reversed_top_level_arrays_for_parallel_workers(tmp_path
 
 def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
     """Verify indexed range producers preserve rows and digests."""
-    payload = _mixed_inline_referenced_payload()
+    fixture_document = _mixed_inline_referenced_payload()
     artifact = tmp_path / "mixed-reversed.json.gz"
     _write_gzip_json(
         artifact,
         {
-            "in_network": payload["in_network"],
-            "provider_references": payload["provider_references"],
+            "in_network": fixture_document["in_network"],
+            "provider_references": fixture_document["provider_references"],
         },
     )
     fake_rapidgzip = tmp_path / "rapidgzip-ranges"
@@ -215,12 +215,16 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
     assert runs[4]["copy_rows"] == runs[1]["copy_rows"]
     assert runs[4]["copy_digests"] == runs[1]["copy_digests"]
     assert runs[4]["serving_records"] == runs[1]["serving_records"]
-    assert {kind: len(rows) for kind, rows in runs[4]["copy_rows"].items()} == {
+    assert {
+        kind: len(copy_rows)
+        for kind, copy_rows in runs[4]["copy_rows"].items()
+    } == {
         "price_atom": 168,
         "provider_group_member": 64,
     }
     source_rate_occurrences = sum(
-        len(procedure["negotiated_rates"]) for procedure in payload["in_network"]
+        len(procedure["negotiated_rates"])
+        for procedure in fixture_document["in_network"]
     )
     assert source_rate_occurrences == 192
     assert len(runs[4]["serving_records"]) == source_rate_occurrences
@@ -232,28 +236,49 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
         assert config["indexed_range_decoder_threads_selected"] == 4
         assert config["indexed_range_count"] == producer_count
         assert len(config["indexed_ranges"]) == producer_count
-        assert sum(item["decoder_threads"] for item in config["indexed_ranges"]) == 4
+        assert sum(
+            range_info["decoder_threads"]
+            for range_info in config["indexed_ranges"]
+        ) == 4
         assert summary["indexed_range_producers_requested"] == producer_count
         assert summary["indexed_range_producers_selected"] == producer_count
         assert summary["indexed_range_decoder_threads_selected"] == 4
         assert len(summary["indexed_ranges"]) == producer_count
-        assert sum(item["decoder_threads"] for item in summary["indexed_ranges"]) == 4
+        assert sum(
+            range_info["decoder_threads"]
+            for range_info in summary["indexed_ranges"]
+        ) == 4
         assert summary[
             "indexed_range_peer_cancellation_can_interrupt_external_read"
         ] is False
         assert "cannot interrupt" in summary["indexed_range_cancellation_limitation"]
-        assert sum(item["object_count"] for item in summary["indexed_ranges"]) == 24
-        assert sum(item["rate_count"] for item in summary["indexed_ranges"]) == 24 * 8
-        assert sum(item["length"] for item in summary["indexed_ranges"]) == summary[
+        assert sum(
+            range_info["object_count"] for range_info in summary["indexed_ranges"]
+        ) == 24
+        assert sum(
+            range_info["rate_count"] for range_info in summary["indexed_ranges"]
+        ) == 24 * 8
+        assert sum(
+            range_info["length"] for range_info in summary["indexed_ranges"]
+        ) == summary[
             "indexed_range_coverage_bytes"
         ]
         assert summary["indexed_range_coverage_object_count"] == 24
         assert summary["indexed_range_completed_object_count"] == 24
         assert summary["indexed_range_completed_rate_count"] == 24 * 8
         assert summary["indexed_range_completed_raw_bytes"] > 0
-        assert all(item["length"] > 0 for item in summary["indexed_ranges"])
-        assert all(item["elapsed_seconds"] >= 0 for item in summary["indexed_ranges"])
-        assert all(item["blocked_seconds"] >= 0 for item in summary["indexed_ranges"])
+        assert all(
+            range_info["length"] > 0
+            for range_info in summary["indexed_ranges"]
+        )
+        assert all(
+            range_info["elapsed_seconds"] >= 0
+            for range_info in summary["indexed_ranges"]
+        )
+        assert all(
+            range_info["blocked_seconds"] >= 0
+            for range_info in summary["indexed_ranges"]
+        )
         assert all(
             left["offset"] + left["length"] < right["offset"]
             for left, right in zip(
@@ -264,13 +289,13 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
 
 def test_delayed_indexed_range_emits_object_coverage_progress(tmp_path):
     """Verify delayed indexed range emits object coverage progress."""
-    payload = _mixed_inline_referenced_payload()
+    fixture_document = _mixed_inline_referenced_payload()
     artifact = tmp_path / "delayed-reversed.json.gz"
     _write_gzip_json(
         artifact,
         {
-            "in_network": payload["in_network"],
-            "provider_references": payload["provider_references"],
+            "in_network": fixture_document["in_network"],
+            "provider_references": fixture_document["provider_references"],
         },
     )
     fake_rapidgzip = tmp_path / "rapidgzip-delayed"
@@ -321,25 +346,32 @@ def test_delayed_indexed_range_emits_object_coverage_progress(tmp_path):
 
     assert progress_lines
     assert all("progress_basis=indexed_objects" in line for line in progress_lines)
-    intermediate = [payload for payload in progress_payloads if payload["done"] == "false"]
+    intermediate = [
+        progress_fields
+        for progress_fields in progress_payloads
+        if progress_fields["done"] == "false"
+    ]
     assert intermediate
-    assert all(payload["indexed_objects_total"] == "24" for payload in intermediate)
+    assert all(
+        progress_fields["indexed_objects_total"] == "24"
+        for progress_fields in intermediate
+    )
     assert any(
-        0 < float(payload["percent"]) < 100
-        and 0 < int(payload["indexed_objects_completed"]) < 24
-        and payload["eta_seconds"] != "unknown"
-        for payload in intermediate
+        0 < float(progress_fields["percent"]) < 100
+        and 0 < int(progress_fields["indexed_objects_completed"]) < 24
+        and progress_fields["eta_seconds"] != "unknown"
+        for progress_fields in intermediate
     )
 
 
 def test_decoder_budget_caps_selected_range_producers(tmp_path):
-    payload = _mixed_inline_referenced_payload()
+    fixture_document = _mixed_inline_referenced_payload()
     artifact = tmp_path / "budget-capped-reversed.json.gz"
     _write_gzip_json(
         artifact,
         {
-            "in_network": payload["in_network"],
-            "provider_references": payload["provider_references"],
+            "in_network": fixture_document["in_network"],
+            "provider_references": fixture_document["provider_references"],
         },
     )
     fake_rapidgzip = tmp_path / "rapidgzip-budget-capped"
@@ -365,20 +397,24 @@ def test_decoder_budget_caps_selected_range_producers(tmp_path):
     assert config["indexed_range_producers_requested"] == 4
     assert config["indexed_range_producers_selected"] == 2
     assert config["indexed_range_decoder_threads_selected"] == 2
-    assert [item["decoder_threads"] for item in config["indexed_ranges"]] == [1, 1]
+    assert [
+        range_info["decoder_threads"] for range_info in config["indexed_ranges"]
+    ] == [1, 1]
     assert summary["indexed_range_producers_selected"] == 2
     assert summary["indexed_range_decoder_threads_selected"] == 2
-    assert sum(item["rate_count"] for item in summary["indexed_ranges"]) == 24 * 8
+    assert sum(
+        range_info["rate_count"] for range_info in summary["indexed_ranges"]
+    ) == 24 * 8
 
 
 def test_indexed_range_producers_fall_back_for_one_object(tmp_path):
-    payload = _mixed_inline_referenced_payload()
+    fixture_document = _mixed_inline_referenced_payload()
     artifact = tmp_path / "one-object-reversed.json.gz"
     _write_gzip_json(
         artifact,
         {
-            "in_network": payload["in_network"][:1],
-            "provider_references": payload["provider_references"],
+            "in_network": fixture_document["in_network"][:1],
+            "provider_references": fixture_document["provider_references"],
         },
     )
     fake_rapidgzip = tmp_path / "rapidgzip-one-object"
@@ -418,13 +454,13 @@ def test_indexed_range_producers_fall_back_for_one_object(tmp_path):
 def test_scanner_rejects_inexact_indexed_object_range_data(
     tmp_path, mutation, expected_error
 ):
-    payload = _mixed_inline_referenced_payload()
+    fixture_document = _mixed_inline_referenced_payload()
     artifact = tmp_path / f"{mutation}-reversed.json.gz"
     _write_gzip_json(
         artifact,
         {
-            "in_network": payload["in_network"],
-            "provider_references": payload["provider_references"],
+            "in_network": fixture_document["in_network"],
+            "provider_references": fixture_document["provider_references"],
         },
     )
     fake_rapidgzip = tmp_path / f"rapidgzip-{mutation}"
@@ -514,8 +550,8 @@ def test_indexed_workers_drain_bounded_rotation_events_before_join(tmp_path):
     assert sum(worker["rates_seen"] for worker in scanner_summary_frame["workers"]) == 24 * 8
     assert scanner_summary_frame["event_queue_unbounded"] is False
     artifact_event_paths = [
-        payload["path"]
-        for record_kind, payload in scanner_run["frames"]
+        artifact_event["path"]
+        for record_kind, artifact_event in scanner_run["frames"]
         if record_kind
         in {
             "v3_serving_run_partition_file",

@@ -73,9 +73,9 @@ def _write_artifact(path: Path, mapping: dict[bytes, list[bytes]], *, dense: boo
     entries = sorted((owner, sorted(set(members))) for owner, members in mapping.items())
     member_count = sum(len(members) for _owner, members in entries)
     member_dictionary = sorted({member for _owner, members in entries for member in members})
-    payload = bytearray()
+    encoded_artifact = bytearray()
     if dense:
-        payload.extend(
+        encoded_artifact.extend(
             _DENSE_HEADER.pack(
                 PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC,
                 1,
@@ -84,23 +84,27 @@ def _write_artifact(path: Path, mapping: dict[bytes, list[bytes]], *, dense: boo
             )
         )
     else:
-        payload.extend(_STANDARD_HEADER.pack(PTG2_MANIFEST_MEMBERSHIP_MAGIC, 1, len(entries)))
+        encoded_artifact.extend(
+            _STANDARD_HEADER.pack(
+                PTG2_MANIFEST_MEMBERSHIP_MAGIC, 1, len(entries)
+            )
+        )
     offset = 0
     for owner, members in entries:
-        payload.extend(_OWNER.pack(owner, offset, len(members)))
+        encoded_artifact.extend(_OWNER.pack(owner, offset, len(members)))
         offset += len(members)
     if dense:
         for member in member_dictionary:
-            payload.extend(member)
+            encoded_artifact.extend(member)
         local_ids = {member: key for key, member in enumerate(member_dictionary)}
         for _owner, members in entries:
             for member in members:
-                payload.extend(_U32.pack(local_ids[member]))
+                encoded_artifact.extend(_U32.pack(local_ids[member]))
     else:
         for _owner, members in entries:
             for member in members:
-                payload.extend(member)
-    path.write_bytes(payload)
+                encoded_artifact.extend(member)
+    path.write_bytes(encoded_artifact)
     return MembershipArtifact(
         path=path,
         metadata=_metadata(
@@ -243,30 +247,35 @@ def test_converter_emits_all_directions_for_standard_and_dense_sources(tmp_path,
         tmp_path, dense_directions=dense_directions
     )
 
-    result = _convert(artifacts, provider_keys, external_sort_chunk_bytes=32)
+    graph_result = _convert(artifacts, provider_keys, external_sort_chunk_bytes=32)
 
-    assert dict(result.iter_group_key_items()) == {groups[0]: 0, groups[1]: 1, groups[2]: 2}
-    assert [metric.object_kind for metric in result.direction_metrics] == [
+    assert dict(graph_result.iter_group_key_items()) == {
+        groups[0]: 0,
+        groups[1]: 1,
+        groups[2]: 2,
+    }
+    assert [metric.object_kind for metric in graph_result.direction_metrics] == [
         "graph_npi_groups_v1",
         "graph_group_npis_v1",
         "graph_group_provider_sets_v1",
         "graph_provider_set_groups_v1",
     ]
-    assert [metric.member_width for metric in result.direction_metrics] == [4, 8, 4, 4]
-    assert [metric.member_count for metric in result.direction_metrics] == [4, 4, 3, 3]
-    assert [metric.owner_count for metric in result.direction_metrics] == [3, 3, 3, 2]
-    assert [metric.empty_owner_count for metric in result.direction_metrics] == [0, 1, 1, 0]
-    assert result.integrity.reciprocal_edge_count == 7
-    assert result.integrity.input_edge_count == 7
-    assert result.integrity.unique_edge_count == 7
-    assert result.integrity.duplicate_edge_count == 0
-    assert result.integrity.shard_count == 1
-    assert result.integrity.artifact_count == 4
-    assert result.input_byte_count == result.integrity.checksum_byte_count
-    assert result.raw_block_byte_count == result.stored_block_byte_count
-    assert all(block.codec == "none" for block in result.iter_shared_blocks())
+    assert [metric.member_width for metric in graph_result.direction_metrics] == [4, 8, 4, 4]
+    assert [metric.member_count for metric in graph_result.direction_metrics] == [4, 4, 3, 3]
+    assert [metric.owner_count for metric in graph_result.direction_metrics] == [3, 3, 3, 2]
+    assert [metric.empty_owner_count for metric in graph_result.direction_metrics] == [0, 1, 1, 0]
+    assert graph_result.integrity.reciprocal_edge_count == 7
+    assert graph_result.integrity.input_edge_count == 7
+    assert graph_result.integrity.unique_edge_count == 7
+    assert graph_result.integrity.duplicate_edge_count == 0
+    assert graph_result.integrity.shard_count == 1
+    assert graph_result.integrity.artifact_count == 4
+    assert graph_result.input_byte_count == graph_result.integrity.checksum_byte_count
+    assert graph_result.raw_block_byte_count == graph_result.stored_block_byte_count
+    assert all(block.codec == "none" for block in graph_result.iter_shared_blocks())
     assert all(
-        block.raw_byte_count <= 64 * 1024 for block in result.iter_shared_blocks()
+        block.raw_byte_count <= 64 * 1024
+        for block in graph_result.iter_shared_blocks()
     )
 
 
@@ -275,21 +284,25 @@ def test_boundary_spanning_owner_has_fetch_compatible_locator(tmp_path):
         tmp_path, dense_directions=frozenset({0, 1, 2, 3}), boundary=True
     )
 
-    result = _convert(artifacts, provider_keys, external_sort_chunk_bytes=1024)
+    graph_result = _convert(artifacts, provider_keys, external_sort_chunk_bytes=1024)
 
     group_npi_blocks = [
         block
-        for block in result.iter_shared_blocks()
+        for block in graph_result.iter_shared_blocks()
         if block.object_kind == "graph_group_npis_v1"
     ]
     owner = next(
-        row for row in result.iter_owner_rows() if row.direction == 2 and row.owner_key == 1
+        owner_row
+        for owner_row in graph_result.iter_owner_rows()
+        if owner_row.direction == 2 and owner_row.owner_key == 1
     )
-    payload = b"".join(
+    member_bytes = b"".join(
         block.payload
         for block in group_npi_blocks[owner.first_chunk : owner.first_chunk + 2]
     )
-    selected = payload[owner.member_offset : owner.member_offset + owner.member_count * 8]
+    selected = member_bytes[
+        owner.member_offset : owner.member_offset + owner.member_count * 8
+    ]
 
     assert owner.member_count == 8193
     assert owner.first_chunk == 0
@@ -299,10 +312,12 @@ def test_boundary_spanning_owner_has_fetch_compatible_locator(tmp_path):
     assert int.from_bytes(selected[:8], "little") == int.from_bytes(npis[0][8:], "big")
     assert int.from_bytes(selected[-8:], "little") == int.from_bytes(npis[-1][8:], "big")
     empty_owner = next(
-        row for row in result.iter_owner_rows() if row.direction == 2 and row.owner_key == 2
+        owner_row
+        for owner_row in graph_result.iter_owner_rows()
+        if owner_row.direction == 2 and owner_row.owner_key == 2
     )
     assert empty_owner.member_count == 0
-    assert dict(result.iter_group_key_items())[groups[2]] == 2
+    assert dict(graph_result.iter_group_key_items())[groups[2]] == 2
 
 
 def test_output_is_deterministic_across_formats_and_spill_sizes(tmp_path):
@@ -407,26 +422,30 @@ def test_invalid_npi_global_id_fails_closed(tmp_path):
 def test_multi_shard_merge_deduplicates_overlapping_graphs(tmp_path):
     bundles, provider_keys, groups = _overlapping_bundles(tmp_path)
 
-    result = convert_v3_provider_membership_shards_to_shared_graph(
+    graph_result = convert_v3_provider_membership_shards_to_shared_graph(
         shards=bundles,
         provider_set_key_by_global_id=provider_keys,
         external_sort_chunk_bytes=32,
     )
 
-    assert dict(result.iter_group_key_items()) == {groups[0]: 0, groups[1]: 1, groups[2]: 2}
-    assert [metric.member_count for metric in result.direction_metrics] == [4, 4, 3, 3]
-    assert [metric.owner_count for metric in result.direction_metrics] == [4, 3, 3, 2]
-    assert [metric.empty_owner_count for metric in result.direction_metrics] == [0, 1, 1, 0]
-    assert result.edge_metrics == (
+    assert dict(graph_result.iter_group_key_items()) == {
+        groups[0]: 0,
+        groups[1]: 1,
+        groups[2]: 2,
+    }
+    assert [metric.member_count for metric in graph_result.direction_metrics] == [4, 4, 3, 3]
+    assert [metric.owner_count for metric in graph_result.direction_metrics] == [4, 3, 3, 2]
+    assert [metric.empty_owner_count for metric in graph_result.direction_metrics] == [0, 1, 1, 0]
+    assert graph_result.edge_metrics == (
         shared_graph_module.SharedGraphEdgeMetrics("group_npi", 5, 4, 1),
         shared_graph_module.SharedGraphEdgeMetrics("group_provider_set", 4, 3, 1),
     )
-    assert result.integrity.shard_count == 2
-    assert result.integrity.artifact_count == 8
-    assert result.integrity.input_edge_count == 9
-    assert result.integrity.unique_edge_count == 7
-    assert result.integrity.duplicate_edge_count == 2
-    assert result.integrity.reciprocal_edge_count == 7
+    assert graph_result.integrity.shard_count == 2
+    assert graph_result.integrity.artifact_count == 8
+    assert graph_result.integrity.input_edge_count == 9
+    assert graph_result.integrity.unique_edge_count == 7
+    assert graph_result.integrity.duplicate_edge_count == 2
+    assert graph_result.integrity.reciprocal_edge_count == 7
 
 
 def test_duplicate_only_shard_contributes_no_new_edges(tmp_path):
@@ -447,19 +466,19 @@ def test_duplicate_only_shard_contributes_no_new_edges(tmp_path):
         dense_directions=frozenset({0, 1, 2, 3}),
     )
 
-    result = convert_v3_provider_membership_shards_to_shared_graph(
+    graph_result = convert_v3_provider_membership_shards_to_shared_graph(
         shards=(first, duplicate),
         provider_set_key_by_global_id={provider: 0},
     )
 
-    assert [metric.member_count for metric in result.direction_metrics] == [2, 2, 1, 1]
-    assert result.edge_metrics == (
+    assert [metric.member_count for metric in graph_result.direction_metrics] == [2, 2, 1, 1]
+    assert graph_result.edge_metrics == (
         shared_graph_module.SharedGraphEdgeMetrics("group_npi", 4, 2, 2),
         shared_graph_module.SharedGraphEdgeMetrics("group_provider_set", 2, 1, 1),
     )
-    assert result.integrity.input_edge_count == 6
-    assert result.integrity.unique_edge_count == 3
-    assert result.integrity.duplicate_edge_count == 3
+    assert graph_result.integrity.input_edge_count == 6
+    assert graph_result.integrity.unique_edge_count == 3
+    assert graph_result.integrity.duplicate_edge_count == 3
 
 
 def test_incomplete_multi_shard_bundle_fails_closed(tmp_path):
@@ -533,26 +552,26 @@ def test_conversion_keeps_cardinality_dependent_outputs_on_disk(tmp_path):
     bundles, provider_keys, _groups = _overlapping_bundles(tmp_path)
     spill = tmp_path / "spill"
 
-    result = convert_v3_provider_membership_shards_to_shared_graph(
+    graph_result = convert_v3_provider_membership_shards_to_shared_graph(
         shards=bundles,
         provider_set_key_by_global_id=provider_keys,
         spill_directory=spill,
         external_sort_chunk_bytes=32,
     )
 
-    assert result.block_count > 0
-    assert result.owner_count > 0
-    assert result.block_copy_path.stat().st_size > 0
-    assert result.owner_copy_path.stat().st_size > 0
-    assert result.group_copy_path.stat().st_size > 0
-    assert result.npi_copy_path.stat().st_size > 0
-    assert result.reference_path.stat().st_size > 0
-    assert _postgres_copy_row_count(result.block_copy_path) == result.block_count
-    assert _postgres_copy_row_count(result.owner_copy_path) == result.owner_count
-    assert _postgres_copy_row_count(result.group_copy_path) == result.provider_group_count
-    assert _postgres_copy_row_count(result.npi_copy_path) == result.npi_count
-    scratch = result.scratch_directory
-    result.cleanup()
+    assert graph_result.block_count > 0
+    assert graph_result.owner_count > 0
+    assert graph_result.block_copy_path.stat().st_size > 0
+    assert graph_result.owner_copy_path.stat().st_size > 0
+    assert graph_result.group_copy_path.stat().st_size > 0
+    assert graph_result.npi_copy_path.stat().st_size > 0
+    assert graph_result.reference_path.stat().st_size > 0
+    assert _postgres_copy_row_count(graph_result.block_copy_path) == graph_result.block_count
+    assert _postgres_copy_row_count(graph_result.owner_copy_path) == graph_result.owner_count
+    assert _postgres_copy_row_count(graph_result.group_copy_path) == graph_result.provider_group_count
+    assert _postgres_copy_row_count(graph_result.npi_copy_path) == graph_result.npi_count
+    scratch = graph_result.scratch_directory
+    graph_result.cleanup()
     assert not scratch.exists()
     assert list(spill.iterdir()) == []
 
@@ -614,20 +633,20 @@ def test_multi_shard_external_runs_respect_spill_bound(monkeypatch, tmp_path):
     monkeypatch.setattr(shared_graph_module, "_write_sorted_run", tracking_write)
     monkeypatch.setattr(shared_graph_module, "_merge_runs", tracking_merge)
 
-    result = convert_v3_provider_membership_shards_to_shared_graph(
+    graph_result = convert_v3_provider_membership_shards_to_shared_graph(
         shards=bundles,
         provider_set_key_by_global_id={provider: 0},
         spill_directory=spill_dir,
         external_sort_chunk_bytes=32,
     )
 
-    assert result.integrity.input_edge_count == 70
-    assert result.integrity.unique_edge_count == 2
-    assert result.integrity.duplicate_edge_count == 68
+    assert graph_result.integrity.input_edge_count == 70
+    assert graph_result.integrity.unique_edge_count == 2
+    assert graph_result.integrity.duplicate_edge_count == 68
     assert len(observed_run_bytes) > 100
     assert max(observed_run_bytes) <= 32
     assert max(observed_merge_fan_in) <= 32
-    result.cleanup()
+    graph_result.cleanup()
     assert list(spill_dir.iterdir()) == []
 
 

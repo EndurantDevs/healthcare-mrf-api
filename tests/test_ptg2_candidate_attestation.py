@@ -447,7 +447,7 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
         AsyncMock(return_value=datetime.datetime.now(datetime.timezone.utc)),
     )
 
-    result = asyncio.run(
+    attestation_result = asyncio.run(
         ptg2_candidate_attestation.record_candidate_audit_attestation(
             snapshot_id="snap_new",
             source_key="SOURCE_A",
@@ -457,8 +457,8 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
         )
     )
 
-    assert result["status"] == "attested"
-    assert len(result["report_digest"]) == 64
+    assert attestation_result["status"] == "attested"
+    assert len(attestation_result["report_digest"]) == 64
     sql, params = session.calls[0]
     assert "ptg2_v3_candidate_audit_attestation" in sql
     assert params["snapshot_key"] == 17
@@ -834,7 +834,7 @@ def test_generic_publish_uses_locked_database_candidate_not_caller_attributes(mo
         source_plan_rows,
     )
 
-    result = asyncio.run(
+    publication_result = asyncio.run(
         source_pointers._publish_ptg2_source_pointers(
             source_key="source_a",
             snapshot_id="snap_new",
@@ -849,7 +849,7 @@ def test_generic_publish_uses_locked_database_candidate_not_caller_attributes(mo
         )
     )
 
-    assert result == {"status": "promoted"}
+    assert publication_result == {"status": "promoted"}
     locked_snapshot.assert_awaited_once_with(
         session,
         schema_name="mrf",
@@ -1016,7 +1016,7 @@ def test_strict_candidate_activation_verifies_and_consumes_attestation_atomicall
         lambda _session, **_kwargs: record("consume"),
     )
 
-    result = asyncio.run(
+    activation_result = asyncio.run(
         source_pointers.activate_ptg2_source_candidate(
             source_key="source_a",
             snapshot_id="snap_new",
@@ -1024,7 +1024,7 @@ def test_strict_candidate_activation_verifies_and_consumes_attestation_atomicall
         )
     )
 
-    assert result["status"] == "promoted"
+    assert activation_result["status"] == "promoted"
     assert events == [
         "lock",
         "candidate",

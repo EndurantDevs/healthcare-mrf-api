@@ -336,6 +336,10 @@ def test_default_compact_hash_mode_produces_valid_shared_source_trace(monkeypatc
     assert assignments[0].source_trace_hashes == (
         source_trace["source_trace_hash"],
     )
+    assert len(assignments[0].source_trace_set_hash) == 64
+    assert assignments[0].source_trace_set_hash == _trace_sets[0][
+        "source_trace_set_hash"
+    ]
 
 
 def test_cross_wrapper_reuse_keeps_logical_identity_but_records_current_raw_sha():
