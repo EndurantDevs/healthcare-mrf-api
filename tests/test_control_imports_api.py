@@ -42,144 +42,144 @@ def authed_request(**kwargs):
 
 def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     """Verify importer registry exposes ptg and finish lifecycle."""
-    items = {entry["name"]: entry for entry in importer_registry()}
+    importer_by_name = {entry["name"]: entry for entry in importer_registry()}
 
-    assert "ptg" in items
-    assert items["ptg"]["kind"] == "discovered"
-    assert items["claims-pricing"]["lifecycle"] == "start_finish"
-    assert items["claims-pricing"]["enqueue_adapter"] == "arq_single_job"
-    assert items["ptg"]["enqueue_adapter"] == "arq_single_job"
-    assert items["mrf-source-discovery"]["family"] == "mrf"
-    assert items["mrf-source-discovery"]["enqueue_adapter"] == "arq_single_job"
-    assert items["mrf-source-discovery"]["schedulable"] is True
-    assert items["mrf-source-discovery"]["cancelable"] is True
-    assert items["address-archive-v2-migrate"]["family"] == "provider"
-    assert items["address-archive-v2-migrate"]["enqueue_adapter"] == "arq_single_job"
-    assert items["address-archive-v2-migrate"]["queue"] == "arq:AddressArchive"
-    assert items["address-archive-v2-migrate"]["cancelable"] is True
-    assert items["provider-directory-fhir"]["family"] == "provider"
-    assert items["provider-directory-fhir"]["enqueue_adapter"] == "arq_single_job"
-    assert items["provider-directory-fhir"]["queue"] == "arq:ProviderDirectoryFHIR"
-    assert items["provider-directory-fhir"]["schedulable"] is True
-    assert items["provider-directory-fhir"]["cancelable"] is True
+    assert "ptg" in importer_by_name
+    assert importer_by_name["ptg"]["kind"] == "discovered"
+    assert importer_by_name["claims-pricing"]["lifecycle"] == "start_finish"
+    assert importer_by_name["claims-pricing"]["enqueue_adapter"] == "arq_single_job"
+    assert importer_by_name["ptg"]["enqueue_adapter"] == "arq_single_job"
+    assert importer_by_name["mrf-source-discovery"]["family"] == "mrf"
+    assert importer_by_name["mrf-source-discovery"]["enqueue_adapter"] == "arq_single_job"
+    assert importer_by_name["mrf-source-discovery"]["schedulable"] is True
+    assert importer_by_name["mrf-source-discovery"]["cancelable"] is True
+    assert importer_by_name["address-archive-v2-migrate"]["family"] == "provider"
+    assert importer_by_name["address-archive-v2-migrate"]["enqueue_adapter"] == "arq_single_job"
+    assert importer_by_name["address-archive-v2-migrate"]["queue"] == "arq:AddressArchive"
+    assert importer_by_name["address-archive-v2-migrate"]["cancelable"] is True
+    assert importer_by_name["provider-directory-fhir"]["family"] == "provider"
+    assert importer_by_name["provider-directory-fhir"]["enqueue_adapter"] == "arq_single_job"
+    assert importer_by_name["provider-directory-fhir"]["queue"] == "arq:ProviderDirectoryFHIR"
+    assert importer_by_name["provider-directory-fhir"]["schedulable"] is True
+    assert importer_by_name["provider-directory-fhir"]["cancelable"] is True
     resources_param = next(
         param
-        for param in items["provider-directory-fhir"]["params_schema"]
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
         if param["name"] == "resources"
     )
     assert resources_param["type"] == "text"
     assert "JSON array" in resources_param["help"]
-    assert any(param["name"] == "source_query" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "retest_results_path" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "retest_results_url" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "credential_config_file" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "source_query" and param["type"] == "text" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "retest_results_path" and param["type"] == "text" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "retest_results_url" and param["type"] == "text" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "credential_config_file" and param["type"] == "text" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     provider_directory_refresh_preset = next(
         param
-        for param in items["provider-directory-fhir"]["params_schema"]
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
         if param["name"] == "refresh_preset"
     )
     assert provider_directory_refresh_preset["type"] == "choice"
     assert "monthly-full" in provider_directory_refresh_preset["choices"]
-    assert any(param["name"] == "include_supplemental_catalogs" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "resource_limit" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "resource_deadline_seconds" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "linked_resource_deadline_seconds" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "full_refresh" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "stale_cleanup" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "publish_artifacts" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "publish_after_acquisition" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "canonical_backfill_only" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "contact_backfill_only" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "publish_artifacts_only" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "publish_artifacts_targets" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "publish_corroboration" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "stream_batch_size" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "bulk_export" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "source_concurrency" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "concurrency" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "timeout" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "open_only" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "include_auth_required" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
-    assert items["code-sets"]["enqueue_adapter"] == "arq_single_job"
-    assert items["ms-drg"]["family"] == "reference"
-    assert items["ms-drg"]["enqueue_adapter"] == "arq_single_job"
-    assert items["clinical-reference"]["enqueue_adapter"] == "arq_single_job"
-    assert items["terminology-synonyms"]["family"] == "reference"
-    assert items["terminology-synonyms"]["enqueue_adapter"] == "arq_single_job"
-    assert items["terminology-synonyms"]["queue"] == "arq:TerminologySynonyms"
-    assert items["terminology-synonyms"]["depends_on"] == [
+    assert any(param["name"] == "include_supplemental_catalogs" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "resource_limit" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "resource_deadline_seconds" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "linked_resource_deadline_seconds" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "full_refresh" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "stale_cleanup" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "publish_artifacts" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "publish_after_acquisition" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "canonical_backfill_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "contact_backfill_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "publish_artifacts_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "publish_artifacts_targets" and param["type"] == "text" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "publish_corroboration" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "stream_batch_size" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "bulk_export" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "source_concurrency" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "concurrency" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "timeout" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "open_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "include_auth_required" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert importer_by_name["code-sets"]["enqueue_adapter"] == "arq_single_job"
+    assert importer_by_name["ms-drg"]["family"] == "reference"
+    assert importer_by_name["ms-drg"]["enqueue_adapter"] == "arq_single_job"
+    assert importer_by_name["clinical-reference"]["enqueue_adapter"] == "arq_single_job"
+    assert importer_by_name["terminology-synonyms"]["family"] == "reference"
+    assert importer_by_name["terminology-synonyms"]["enqueue_adapter"] == "arq_single_job"
+    assert importer_by_name["terminology-synonyms"]["queue"] == "arq:TerminologySynonyms"
+    assert importer_by_name["terminology-synonyms"]["depends_on"] == [
         "nucc",
         "code-sets",
         "clinical-reference",
         "claims-pricing",
         "drug-claims",
     ]
-    assert items["geo"]["enqueue_adapter"] == "arq_single_job"
-    assert items["geo-census"]["enqueue_adapter"] == "arq_single_job"
-    assert items["plan-attributes"]["enqueue_adapter"] == "arq_single_job"
-    assert items["npi"]["schedulable"] is True
-    assert items["npi"]["depends_on"] == ["nucc"]
-    assert items["ptg"]["cancelable"] is True
-    assert items["npi"]["cancelable"] is True
-    assert items["claims-pricing"]["cancelable"] is False
-    assert any(param["name"] == "toc_url" and param["multiple"] for param in items["ptg"]["params_schema"])
-    assert any(param["name"] == "check_urls" and param["is_flag"] for param in items["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "concurrency" and param["type"] == "integer" for param in items["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "crawl_target_limit" and param["type"] == "integer" for param in items["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "source_entity_types" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "source_payer_query" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "probe_files" and param["is_flag"] for param in items["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "file_probe_limit" and param["type"] == "integer" for param in items["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "file_probe_types" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "file_probe_entity_types" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "file_probe_payer_query" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "include_relationships" and param["type"] == "boolean" for param in items["ms-drg"]["params_schema"])
-    assert any(param["name"] == "relationship_page_limit" and param["type"] == "integer" for param in items["ms-drg"]["params_schema"])
-    assert any(param["name"] == "dry_run" and param["is_flag"] for param in items["address-archive-v2-migrate"]["params_schema"])
-    assert any(param["name"] == "sample_limit" and param["type"] == "integer" for param in items["address-archive-v2-migrate"]["params_schema"])
-    assert any(param["name"] == "source_concurrency" and param["type"] == "integer" for param in items["openaddresses"]["params_schema"])
-    assert any(param["name"] == "backfill_concurrency" and param["type"] == "integer" for param in items["openaddresses"]["params_schema"])
-    assert any(param["name"] == "backfill_zip_prefix_length" and param["type"] == "integer" for param in items["openaddresses"]["params_schema"])
-    assert any(param["name"] == "zip_restore_concurrency" and param["type"] == "integer" for param in items["openaddresses"]["params_schema"])
-    assert any(param["name"] == "zip_restore_shards" and param["type"] == "integer" for param in items["openaddresses"]["params_schema"])
-    assert items["openaddresses"]["family"] == "geo"
-    assert any(param["name"] == "import_id" and param["type"] == "text" for param in items["openaddresses"]["params_schema"])
-    assert any(param["name"] == "local_files" and param["multiple"] for param in items["openaddresses"]["params_schema"])
-    assert any(param["name"] == "resume_stage" and param["is_flag"] for param in items["openaddresses"]["params_schema"])
+    assert importer_by_name["geo"]["enqueue_adapter"] == "arq_single_job"
+    assert importer_by_name["geo-census"]["enqueue_adapter"] == "arq_single_job"
+    assert importer_by_name["plan-attributes"]["enqueue_adapter"] == "arq_single_job"
+    assert importer_by_name["npi"]["schedulable"] is True
+    assert importer_by_name["npi"]["depends_on"] == ["nucc"]
+    assert importer_by_name["ptg"]["cancelable"] is True
+    assert importer_by_name["npi"]["cancelable"] is True
+    assert importer_by_name["claims-pricing"]["cancelable"] is False
+    assert any(param["name"] == "toc_url" and param["multiple"] for param in importer_by_name["ptg"]["params_schema"])
+    assert any(param["name"] == "check_urls" and param["is_flag"] for param in importer_by_name["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "concurrency" and param["type"] == "integer" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "crawl_target_limit" and param["type"] == "integer" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "source_entity_types" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "source_payer_query" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "probe_files" and param["is_flag"] for param in importer_by_name["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "file_probe_limit" and param["type"] == "integer" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "file_probe_types" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "file_probe_entity_types" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "file_probe_payer_query" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "include_relationships" and param["type"] == "boolean" for param in importer_by_name["ms-drg"]["params_schema"])
+    assert any(param["name"] == "relationship_page_limit" and param["type"] == "integer" for param in importer_by_name["ms-drg"]["params_schema"])
+    assert any(param["name"] == "dry_run" and param["is_flag"] for param in importer_by_name["address-archive-v2-migrate"]["params_schema"])
+    assert any(param["name"] == "sample_limit" and param["type"] == "integer" for param in importer_by_name["address-archive-v2-migrate"]["params_schema"])
+    assert any(param["name"] == "source_concurrency" and param["type"] == "integer" for param in importer_by_name["openaddresses"]["params_schema"])
+    assert any(param["name"] == "backfill_concurrency" and param["type"] == "integer" for param in importer_by_name["openaddresses"]["params_schema"])
+    assert any(param["name"] == "backfill_zip_prefix_length" and param["type"] == "integer" for param in importer_by_name["openaddresses"]["params_schema"])
+    assert any(param["name"] == "zip_restore_concurrency" and param["type"] == "integer" for param in importer_by_name["openaddresses"]["params_schema"])
+    assert any(param["name"] == "zip_restore_shards" and param["type"] == "integer" for param in importer_by_name["openaddresses"]["params_schema"])
+    assert importer_by_name["openaddresses"]["family"] == "geo"
+    assert any(param["name"] == "import_id" and param["type"] == "text" for param in importer_by_name["openaddresses"]["params_schema"])
+    assert any(param["name"] == "local_files" and param["multiple"] for param in importer_by_name["openaddresses"]["params_schema"])
+    assert any(param["name"] == "resume_stage" and param["is_flag"] for param in importer_by_name["openaddresses"]["params_schema"])
     assert any(
         param["name"] == "limit_per_source" and param["type"] == "integer"
-        for param in items["entity-address-unified"]["params_schema"]
+        for param in importer_by_name["entity-address-unified"]["params_schema"]
     )
     assert any(
         param["name"] == "publish" and param["type"] == "boolean"
-        for param in items["entity-address-unified"]["params_schema"]
+        for param in importer_by_name["entity-address-unified"]["params_schema"]
     )
     assert any(
         param["name"] == "serving_only_refresh" and param["type"] == "boolean"
-        for param in items["entity-address-unified"]["params_schema"]
+        for param in importer_by_name["entity-address-unified"]["params_schema"]
     )
     assert any(
         param["name"] == "refresh_mode" and param["type"] == "choice"
-        for param in items["entity-address-unified"]["params_schema"]
+        for param in importer_by_name["entity-address-unified"]["params_schema"]
     )
     entity_provider_directory_scope = next(
         param
-        for param in items["entity-address-unified"]["params_schema"]
+        for param in importer_by_name["entity-address-unified"]["params_schema"]
         if param["name"] == "provider_directory_partial_scope"
     )
     assert entity_provider_directory_scope["type"] == "choice"
     assert entity_provider_directory_scope["choices"] == ["latest-run", "all"]
     assert any(
         param["name"] == "provider_directory_source_batch_size" and param["type"] == "integer"
-        for param in items["entity-address-unified"]["params_schema"]
+        for param in importer_by_name["entity-address-unified"]["params_schema"]
     )
     entity_refresh_mode = next(
-        param for param in items["entity-address-unified"]["params_schema"] if param["name"] == "refresh_mode"
+        param for param in importer_by_name["entity-address-unified"]["params_schema"] if param["name"] == "refresh_mode"
     )
     assert "full" in entity_refresh_mode["choices"]
     assert "provider-directory-partial" in entity_refresh_mode["choices"]
     assert "ptg-partial" not in entity_refresh_mode["choices"]
-    assert not any(param["name"] == "ptg_source_key" for param in items["entity-address-unified"]["params_schema"])
+    assert not any(param["name"] == "ptg_source_key" for param in importer_by_name["entity-address-unified"]["params_schema"])
 
 
 def test_provider_directory_runtime_contract_preflight_passes():
@@ -405,7 +405,7 @@ async def test_provider_directory_retry_replaces_stale_param_lineage(monkeypatch
 
 
 def test_openaddresses_adapter_preserves_parallel_load_params():
-    payload = control_imports._adapter_payload(
+    response_by_field = control_imports._adapter_payload(
         control_imports._SINGLE_JOB_ADAPTERS["openaddresses"],
         {"run_id": "run_openaddresses", "importer": "openaddresses", "family": "provider"},
         {
@@ -424,8 +424,8 @@ def test_openaddresses_adapter_preserves_parallel_load_params():
         },
     )
 
-    assert payload["run_shutdown"] is True
-    assert payload["task"] == {
+    assert response_by_field["run_shutdown"] is True
+    assert response_by_field["task"] == {
         "test_mode": True,
         "source_concurrency": 8,
         "max_files": 20,
@@ -975,9 +975,9 @@ async def test_remove_queued_job_removes_arq_job(monkeypatch):
 
     monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
 
-    result = await _remove_queued_job({"metrics": {"queue": "arq:NPI", "job_id": "job_1"}})
+    outcome_by_field = await _remove_queued_job({"metrics": {"queue": "arq:NPI", "job_id": "job_1"}})
 
-    assert result == {
+    assert outcome_by_field == {
         "redis": True,
         "queue": "arq:NPI",
         "job_id": "job_1",
@@ -1204,12 +1204,12 @@ async def test_import_run_ensure_is_memoized_and_uses_advisory_lock(monkeypatch)
 
     assert calls.count(("connect",)) == 1
     assert any(
-        item[0] == "execute"
-        and "pg_advisory_xact_lock" in item[1]
-        and item[2] == {"lock_key": control_imports._IMPORT_RUN_ADVISORY_LOCK_KEY}
-        for item in calls
+        import_item[0] == "execute"
+        and "pg_advisory_xact_lock" in import_item[1]
+        and import_item[2] == {"lock_key": control_imports._IMPORT_RUN_ADVISORY_LOCK_KEY}
+        for import_item in calls
     )
-    assert len([item for item in calls if item[0] == "run_sync"]) == 1
+    assert len([import_item for import_item in calls if import_item[0] == "run_sync"]) == 1
 
 
 @pytest.mark.asyncio
@@ -1250,11 +1250,11 @@ async def test_import_run_request_paths_do_not_run_ddl(monkeypatch):
         async def execute(self, _statement):
             return FakeResult()
 
-    async def fake_enqueue(row):
+    async def fake_enqueue(source_row):
         return {
             "status": "queued",
             "phase_detail": "enqueued",
-            "heartbeat_at": row["heartbeat_at"],
+            "heartbeat_at": source_row["heartbeat_at"],
             "progress": {"message": "queued"},
             "metrics": {"enqueue_adapter": "arq_single_job", "queue": "arq:NPI"},
             "error": None,
@@ -1267,11 +1267,11 @@ async def test_import_run_request_paths_do_not_run_ddl(monkeypatch):
     assert await control_imports.list_import_runs() == []
     assert await control_imports.get_import_run("run_missing") is None
     assert await control_imports.find_active_run_by_idempotency_key("idem-1") is None
-    row, created = await control_imports.create_import_run(
+    source_row, created = await control_imports.create_import_run(
         {"importer": "npi", "params": {}, "idempotency_key": "idem-1"}
     )
     assert created is True
-    assert row["status"] == "queued"
+    assert source_row["status"] == "queued"
 
 
 def test_normalize_triggered_by_bounds_database_value():
@@ -1286,7 +1286,7 @@ def test_normalize_triggered_by_bounds_database_value():
 @pytest.mark.asyncio
 async def test_list_import_runs_page_returns_next_cursor(monkeypatch):
     now = control_imports.utc_now()
-    rows = [
+    source_rows = [
         types.SimpleNamespace(
             run_id=f"run_{idx}",
             engine="healthcare-mrf-api",
@@ -1317,7 +1317,7 @@ async def test_list_import_runs_page_returns_next_cursor(monkeypatch):
 
     class FakeScalars:
         def all(self):
-            return rows
+            return source_rows
 
     class FakeResult:
         def scalars(self):
@@ -1332,9 +1332,9 @@ async def test_list_import_runs_page_returns_next_cursor(monkeypatch):
     page = await control_imports.list_import_runs_page(limit=2)
     cursor_created_at, cursor_run_id = control_imports._decode_import_run_cursor(page["next_cursor"])
 
-    assert [item["run_id"] for item in page["items"]] == ["run_0", "run_1"]
+    assert [import_item["run_id"] for import_item in page["items"]] == ["run_0", "run_1"]
     assert cursor_run_id == "run_1"
-    assert cursor_created_at == rows[1].created_at
+    assert cursor_created_at == source_rows[1].created_at
 
 
 @pytest.mark.asyncio
@@ -1382,11 +1382,11 @@ async def test_create_import_run_persists_enqueued_state(monkeypatch):
     async def fake_find_importer(_importer):
         return None
 
-    async def fake_enqueue(row):
+    async def fake_enqueue(source_row):
         return {
             "status": "queued",
             "phase_detail": "enqueued",
-            "heartbeat_at": row["heartbeat_at"],
+            "heartbeat_at": source_row["heartbeat_at"],
             "progress": {"message": "queued"},
             "metrics": {"enqueue_adapter": "arq_single_job", "queue": "arq:NPI"},
             "error": None,
@@ -1397,7 +1397,7 @@ async def test_create_import_run_persists_enqueued_state(monkeypatch):
     monkeypatch.setattr(control_imports, "find_active_run_by_importer", fake_find_importer)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fake_enqueue)
 
-    row, created = await create_import_run(
+    source_row, created = await create_import_run(
         {
             "run_id": "run_create",
             "importer": "npi",
@@ -1407,9 +1407,9 @@ async def test_create_import_run_persists_enqueued_state(monkeypatch):
     )
 
     assert created is True
-    assert row["run_id"] == "run_create"
-    assert row["phase_detail"] == "enqueued"
-    assert row["metrics"]["queue"] == "arq:NPI"
+    assert source_row["run_id"] == "run_create"
+    assert source_row["phase_detail"] == "enqueued"
+    assert source_row["metrics"]["queue"] == "arq:NPI"
     assert len(statements) == 2
 
 
@@ -1484,11 +1484,11 @@ async def test_create_import_run_allows_parallel_source_file_ptg(monkeypatch):
         importer_checks.append(importer)
         raise AssertionError("source-file PTG runs should not use the importer-wide singleton")
 
-    async def fake_enqueue(row):
+    async def fake_enqueue(source_row):
         return {
             "status": "queued",
             "phase_detail": "enqueued",
-            "heartbeat_at": row["heartbeat_at"],
+            "heartbeat_at": source_row["heartbeat_at"],
             "progress": {"message": "queued"},
             "metrics": {"enqueue_adapter": "arq_single_job", "queue": "arq:PTG"},
             "error": None,
@@ -1499,7 +1499,7 @@ async def test_create_import_run_allows_parallel_source_file_ptg(monkeypatch):
     monkeypatch.setattr(control_imports, "find_active_run_by_importer", fail_find_importer)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fake_enqueue)
 
-    row, created = await create_import_run(
+    source_row, created = await create_import_run(
         {
             "run_id": "run_ptg_source_file",
             "importer": "ptg",
@@ -1509,9 +1509,9 @@ async def test_create_import_run_allows_parallel_source_file_ptg(monkeypatch):
     )
 
     assert created is True
-    assert row["run_id"] == "run_ptg_source_file"
-    assert row["metrics"]["queue"] == "arq:PTG"
-    assert row["source_file_import_id"] == "source-file-1"
+    assert source_row["run_id"] == "run_ptg_source_file"
+    assert source_row["metrics"]["queue"] == "arq:PTG"
+    assert source_row["source_file_import_id"] == "source-file-1"
     assert importer_checks == []
     assert len(statements) == 2
 
@@ -2524,10 +2524,10 @@ async def test_control_ptg_source_snapshot_attest_endpoint(monkeypatch):
             }
         )
     )
-    payload = json.loads(response.body)
+    response_by_field = json.loads(response.body)
 
     assert response.status == 200
-    assert payload["status"] == "attested"
+    assert response_by_field["status"] == "attested"
     assert calls == [
         {
             "snapshot_id": "snap_new",
@@ -2563,11 +2563,11 @@ async def test_control_ptg_source_snapshot_promote_endpoint(monkeypatch):
     )
 
     response = await control.control_ptg_source_snapshot_promote(request)
-    payload = json.loads(response.body)
+    response_by_field = json.loads(response.body)
 
     assert response.status == 200
-    assert payload["snapshot_id"] == "snap_new"
-    assert payload["previous_snapshot_id"] == "snap_old"
+    assert response_by_field["snapshot_id"] == "snap_new"
+    assert response_by_field["previous_snapshot_id"] == "snap_old"
     assert calls == [
         {
             "source_key": "source_a",
@@ -2593,9 +2593,9 @@ async def test_control_ptg_source_snapshot_promote_endpoint_can_enqueue_address_
             "plan_source_count": 2,
         }
 
-    async def fake_create_import_run(payload):
-        import_calls.append(payload)
-        return {"run_id": "run_refresh", "importer": payload["importer"], "params": payload["params"]}, True
+    async def fake_create_import_run(response_by_field):
+        import_calls.append(response_by_field)
+        return {"run_id": "run_refresh", "importer": response_by_field["importer"], "params": response_by_field["params"]}, True
 
     monkeypatch.setattr(control, "promote_ptg2_source_snapshot", fake_promote)
     monkeypatch.setattr(control, "create_import_run", fake_create_import_run)
@@ -2615,12 +2615,12 @@ async def test_control_ptg_source_snapshot_promote_endpoint_can_enqueue_address_
     )
 
     response = await control.control_ptg_source_snapshot_promote(request)
-    payload = json.loads(response.body)
+    response_by_field = json.loads(response.body)
 
     assert response.status == 200
-    assert payload["snapshot_id"] == "snap_new"
-    assert payload["address_refresh"]["created"] is True
-    assert payload["address_refresh"]["run"]["run_id"] == "run_refresh"
+    assert response_by_field["snapshot_id"] == "snap_new"
+    assert response_by_field["address_refresh"]["created"] is True
+    assert response_by_field["address_refresh"]["run"]["run_id"] == "run_refresh"
     assert promote_calls == [
         {
             "source_key": "source_a",

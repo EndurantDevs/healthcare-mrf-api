@@ -615,9 +615,9 @@ async def test_mrf_shutdown_requeues_while_parser_jobs_run(monkeypatch):
         },
     }
 
-    result = await process_initial.shutdown(ctx, {"context": ctx["context"], "test_mode": True})
+    outcome_by_field = await process_initial.shutdown(ctx, {"context": ctx["context"], "test_mode": True})
 
-    assert result == 1
+    assert outcome_by_field == 1
     assert ctx["redis"].enqueued
     args, kwargs = ctx["redis"].enqueued[0]
     assert args[0] == "shutdown"
@@ -715,9 +715,9 @@ async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(mo
         },
     }
 
-    result = await process_initial.shutdown(ctx, {"context": ctx["context"], "test_mode": True})
+    outcome_by_field = await process_initial.shutdown(ctx, {"context": ctx["context"], "test_mode": True})
 
-    assert result == 1
+    assert outcome_by_field == 1
     assert set(ctx["redis"].zrem_calls) == {
         (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626"),
         (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626_wait_12"),
@@ -1251,18 +1251,18 @@ async def test_push_objects_rewrite_respects_parameter_limit(monkeypatch):
         __my_initial_indexes__=[{"index_elements": ["id"]}],
     )
 
-    records = []
+    import_rows = []
     for idx in range(8):
-        row = {"id": idx, "value": f"v{idx}"}
+        import_row_by_field = {"id": idx, "value": f"v{idx}"}
         for extra in range(38):
-            row[f"c{extra}"] = extra
-        records.append(row)
+            import_row_by_field[f"c{extra}"] = extra
+        import_rows.append(import_row_by_field)
 
     monkeypatch.setattr(utils_module.db, "insert", _fake_insert)
     monkeypatch.setenv("HLTHPRT_MAX_INSERT_PARAMETERS", "120")
     monkeypatch.setenv("HLTHPRT_DRIVER_PARAM_LIMIT", "32767")
 
-    await utils_module.push_objects(records, fake_cls, rewrite=True, use_copy=False)
+    await utils_module.push_objects(import_rows, fake_cls, rewrite=True, use_copy=False)
 
     assert status_calls == [3, 3, 2]
 
@@ -1273,15 +1273,15 @@ async def test_push_objects_rewrite_prefers_copy_first(monkeypatch):
 
     class _FakeDriver:
         async def copy_records_to_table(self, table_name, schema_name=None, columns=None, records=None):
-            rows = []
+            source_rows = []
             async for row in records:
-                rows.append(row)
+                source_rows.append(row)
             copy_calls.append(
                 {
                     "table_name": table_name,
                     "schema_name": schema_name,
                     "columns": list(columns or []),
-                    "row_count": len(rows),
+                    "row_count": len(source_rows),
                 }
             )
 
@@ -1309,12 +1309,12 @@ async def test_push_objects_rewrite_prefers_copy_first(monkeypatch):
         __table__=fake_table,
         __my_initial_indexes__=[{"index_elements": ["id"]}],
     )
-    rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
+    source_rows = [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]
 
     monkeypatch.setattr(utils_module.db, "acquire", lambda: _AcquireCtx())
     monkeypatch.setattr(utils_module.db, "insert", _fail_insert)
 
-    await utils_module.push_objects(rows, fake_cls, rewrite=True)
+    await utils_module.push_objects(source_rows, fake_cls, rewrite=True)
 
     assert len(copy_calls) == 1
     assert copy_calls[0]["table_name"] == "copy_first_table"
@@ -1364,7 +1364,7 @@ async def test_push_objects_falls_back_when_copy_rejects_json_payload(monkeypatc
         __table__=fake_table,
         __my_index_elements__=["id"],
     )
-    rows = [
+    source_rows = [
         {"id": 1, "payload": {"telemedicine": True}},
         {"id": 2, "payload": {"telemedicine": False}},
     ]
@@ -1372,9 +1372,9 @@ async def test_push_objects_falls_back_when_copy_rejects_json_payload(monkeypatc
     monkeypatch.setattr(utils_module.db, "acquire", lambda: _AcquireCtx())
     monkeypatch.setattr(utils_module.db, "insert", lambda _table: _FakeStmt())
 
-    await utils_module.push_objects(rows, fake_cls)
+    await utils_module.push_objects(source_rows, fake_cls)
 
-    assert status_calls == [rows]
+    assert status_calls == [source_rows]
 
 
 @pytest.mark.asyncio
@@ -1691,7 +1691,7 @@ def test_build_mrf_address_rows_batches_contact_normalization(monkeypatch):
             ("512-555-0001 x12", None, "US"),
         ]
     ]
-    assert [row["phone_number"] for row in address_rows] == ["5125550000", "5125550001"]
+    assert [source_row["phone_number"] for source_row in address_rows] == ["5125550000", "5125550001"]
     assert address_rows[1]["phone_extension"] == "12"
 
 
@@ -1717,14 +1717,14 @@ async def test_push_mrf_address_rows_skips_aggregate_ingest_by_default(monkeypat
 async def test_push_mrf_address_rows_uses_insert_do_nothing_when_enabled(monkeypatch):
     calls = []
 
-    async def fake_push_objects(rows, cls, **kwargs):
-        calls.append((rows, cls, kwargs))
+    async def fake_push_objects(source_rows, cls, **kwargs):
+        calls.append((source_rows, cls, kwargs))
 
     monkeypatch.setenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST", "1")
     monkeypatch.setattr(process_initial, "push_objects", fake_push_objects)
 
     cls = SimpleNamespace(__tablename__="mrf_address_20260612")
-    rows = [
+    source_rows = [
         {
             "npi": 1234567890,
             "type": "practice",
@@ -1735,7 +1735,7 @@ async def test_push_mrf_address_rows_uses_insert_do_nothing_when_enabled(monkeyp
             "source_urls": ["https://issuer.example/providers.json"],
         }
     ]
-    await process_initial._push_mrf_address_rows(rows, cls)
+    await process_initial._push_mrf_address_rows(source_rows, cls)
 
     assert calls == [
         (

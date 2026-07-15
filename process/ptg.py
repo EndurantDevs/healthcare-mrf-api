@@ -2283,6 +2283,7 @@ async def _resume_validated_candidate(
     )
     return {
         "status": "succeeded",
+        "arch_version": "postgres_binary_v3",
         "publish_status": (
             "candidate_activated" if auto_activate else "candidate_validated"
         ),
@@ -4177,6 +4178,7 @@ async def _main_with_artifact_lease(
         )
         return {
             "status": "succeeded",
+            "arch_version": "postgres_binary_v3",
             "activation_status": activation_status,
             "snapshot_status": snapshot_status,
             "import_run_id": import_run_id,
