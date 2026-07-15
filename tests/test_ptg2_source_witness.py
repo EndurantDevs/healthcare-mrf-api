@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import struct
 import zlib
 
 import pytest
 
 from process.ptg_parts import ptg2_source_witness as witness
+from process.ptg_parts import ptg2_source_witness_codec as witness_codec
 from process.ptg_parts import ptg2_source_witness_store as witness_store
 
 
@@ -282,6 +284,41 @@ def test_persisted_witness_is_deterministic_and_preserves_exact_raw_tokens(tmp_p
         witness_record.priority
         for witness_record in loaded.occurrence_records
     ) == 2_047
+
+
+def test_source_witness_accepts_large_exact_record_within_aggregate_budget():
+    raw_json = json.dumps(
+        {"source_noise": random.Random(7).randbytes(700 * 1024).hex()},
+        separators=(",", ":"),
+    ).encode()
+    compressed_record = _record(
+        kind="provider_reference",
+        priority=1,
+        item_ordinal=1,
+        raw_json=raw_json,
+    )
+
+    assert 512 * 1024 < len(compressed_record)
+    assert len(compressed_record) < witness.PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES
+    decoded_record = witness.decode_record(compressed_record, SOURCE_A)
+    assert decoded_record.raw_json == raw_json
+
+
+def test_source_witness_decode_limit_is_enforced_before_flush(monkeypatch):
+    compressed_record = _record(
+        kind="provider_reference",
+        priority=1,
+        item_ordinal=1,
+        raw_json=json.dumps({"source_noise": "x" * 4_096}).encode(),
+    )
+    monkeypatch.setattr(
+        witness_codec,
+        "PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES",
+        512,
+    )
+
+    with pytest.raises(RuntimeError, match="exceeds or violates"):
+        witness_codec.decode_record(compressed_record, SOURCE_A)
 
 
 def test_exact_total_budget_reserves_provider_quota_and_backfills(tmp_path):

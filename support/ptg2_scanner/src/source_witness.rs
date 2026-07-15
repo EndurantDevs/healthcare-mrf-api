@@ -22,7 +22,7 @@ pub const SOURCE_WITNESS_UNQUERYABLE_POLICY: &str = "count_but_exclude_from_npi_
 const SOURCE_WITNESS_LOCAL_CANDIDATE_TARGET: usize = SOURCE_WITNESS_TOTAL_TARGET;
 const SOURCE_WITNESS_MAGIC: &[u8; 8] = b"PTG2SW02";
 const SOURCE_WITNESS_RECORD_MAGIC: &[u8; 8] = b"PTG2SWR2";
-const SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES: usize = 512 * 1024;
+const SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const SOURCE_WITNESS_MAX_COMPRESSED_COHORT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -198,7 +198,11 @@ impl SourceWitnessSampler {
             self.oversized.fetch_add(1, AtomicOrdering::Relaxed);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "selected source witness record exceeds the fail-closed size limit",
+                format!(
+                    "selected source witness record is {} bytes, exceeding the fail-closed {}-byte limit",
+                    compressed_record.len(),
+                    SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES,
+                ),
             ));
         }
         let evicted_bytes = if state.selected.len() >= self.target {
@@ -265,6 +269,7 @@ impl SourceWitnessSampler {
             "oversized_record_count": self.oversized.load(AtomicOrdering::Relaxed),
             "selected_count": selected_count,
             "compressed_bytes": compressed_bytes,
+            "compressed_record_byte_limit": SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES,
             "compressed_byte_limit": SOURCE_WITNESS_MAX_COMPRESSED_COHORT_BYTES,
         })
     }
@@ -985,5 +990,20 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeding the fail-closed"));
+    }
+
+    #[test]
+    fn selected_record_above_the_old_limit_remains_bounded_and_is_accepted() {
+        let sampler = SourceWitnessSampler::new(1);
+        let compressed_record = vec![0; 512 * 1024 + 1];
+
+        sampler
+            .insert(1, [0; 32], compressed_record.clone())
+            .unwrap();
+
+        let selected = sampler.take_sorted().unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].compressed_record, compressed_record);
     }
 }

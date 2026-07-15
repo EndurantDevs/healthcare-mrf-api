@@ -49,7 +49,18 @@ def _decompress_record(compressed_record: bytes) -> bytes:
             compressed_record,
             PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES + 1,
         )
-        decoded_record += decompressor.flush()
+        if (
+            len(decoded_record) > PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES
+            or decompressor.unconsumed_tail
+        ):
+            raise RuntimeError(
+                "strict V3 source witness record exceeds or violates its zlib framing"
+            )
+        decoded_record += decompressor.flush(
+            PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES
+            - len(decoded_record)
+            + 1
+        )
     except zlib.error as exc:
         raise RuntimeError(
             "strict V3 source witness record has invalid zlib framing"
