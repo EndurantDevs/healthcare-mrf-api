@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import json
@@ -440,6 +441,128 @@ def test_release_audit_preserves_safe_fatal_configuration_reason(
 
 
 @pytest.mark.asyncio
+async def test_isolated_audit_subprocess_returns_validated_report_without_token_argv(
+    monkeypatch,
+    tmp_path,
+):
+    report = _passing_report()
+    invocation: dict[str, object] = {}
+
+    class SuccessfulProcess:
+        pid = 12345
+        returncode = 0
+
+        async def wait(self):
+            return self.returncode
+
+    async def create_subprocess_exec(*arguments, **kwargs):
+        invocation["arguments"] = arguments
+        invocation["kwargs"] = kwargs
+        report_path = type(tmp_path)(
+            arguments[arguments.index("--report") + 1]
+        )
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        return SuccessfulProcess()
+
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
+        "https://public-api.internal.example",
+    )
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
+    monkeypatch.setattr(
+        ptg_candidate_audit.asyncio,
+        "create_subprocess_exec",
+        create_subprocess_exec,
+    )
+
+    observed = await ptg_candidate_audit.run_isolated_release_audit(
+        _target(),
+        (tmp_path / "source.json.gz",),
+    )
+
+    assert observed == report
+    arguments = invocation["arguments"]
+    kwargs = invocation["kwargs"]
+    assert isinstance(arguments, tuple)
+    assert isinstance(kwargs, dict)
+    assert arguments[:3] == (
+        ptg_candidate_audit.sys.executable,
+        "-m",
+        "scripts.validation.ptg2_v3_source_api_audit",
+    )
+    assert "public-control-token" not in arguments
+    assert kwargs["env"]["PTG_AUDIT_AUTH_TOKEN"] == "public-control-token"
+
+
+@pytest.mark.asyncio
+async def test_isolated_audit_cancellation_terminates_process_group(
+    monkeypatch,
+    tmp_path,
+):
+    class HangingProcess:
+        pid = 12345
+        returncode = None
+
+        def __init__(self):
+            self.exited = asyncio.Event()
+            self.signals = []
+
+        async def wait(self):
+            await self.exited.wait()
+            self.returncode = -15
+            return self.returncode
+
+    process = HangingProcess()
+    invocation: dict[str, object] = {}
+
+    async def create_subprocess_exec(*arguments, **kwargs):
+        invocation["arguments"] = arguments
+        invocation["kwargs"] = kwargs
+        return process
+
+    def signal_process_group(observed_process, observed_signal):
+        assert observed_process is process
+        process.signals.append(observed_signal)
+        process.exited.set()
+
+    monkeypatch.setattr(
+        ptg_candidate_audit.asyncio,
+        "create_subprocess_exec",
+        create_subprocess_exec,
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_signal_process_group",
+        signal_process_group,
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
+        "https://public-api.internal.example",
+    )
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
+    task = asyncio.create_task(
+        ptg_candidate_audit.run_isolated_release_audit(
+            _target(),
+            (tmp_path / "source.json.gz",),
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert process.signals == [ptg_candidate_audit.signal.SIGTERM]
+    arguments = invocation["arguments"]
+    kwargs = invocation["kwargs"]
+    assert isinstance(arguments, tuple)
+    assert isinstance(kwargs, dict)
+    assert "public-control-token" not in arguments
+    assert kwargs["start_new_session"] is True
+
+
+@pytest.mark.asyncio
 async def test_passing_audit_attests_then_activates(monkeypatch, tmp_path):
     events: list[str] = []
     report = _passing_report(
@@ -451,7 +574,11 @@ async def test_passing_audit_attests_then_activates(monkeypatch, tmp_path):
         "resolve_retained_raw_files",
         Mock(return_value=(tmp_path / "source.json.gz",)),
     )
-    monkeypatch.setattr(ptg_candidate_audit, "run_release_audit", Mock(return_value=report))
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "run_isolated_release_audit",
+        AsyncMock(return_value=report),
+    )
 
     async def attest(**kwargs):
         events.append("attest")
@@ -497,8 +624,12 @@ async def test_failing_audit_never_attests_or_activates(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         ptg_candidate_audit,
-        "run_release_audit",
-        Mock(side_effect=RuntimeError("candidate release audit did not pass the release gate")),
+        "run_isolated_release_audit",
+        AsyncMock(
+            side_effect=RuntimeError(
+                "candidate release audit did not pass the release gate"
+            )
+        ),
     )
     attest = AsyncMock()
     promote = AsyncMock()
