@@ -452,13 +452,17 @@ async def publish_shared_finalizer_dictionaries(
             await db.status(
                 f"""
                 CREATE UNIQUE INDEX ON {schema}.{quoted_provider_stage}
-                    (provider_set_global_id_128);
-                CREATE INDEX ON {schema}.{quoted_provider_metadata_stage}
-                    ((decode(provider_set_global_id_128, 'hex')));
-                ANALYZE {schema}.{quoted_provider_stage};
-                ANALYZE {schema}.{quoted_provider_metadata_stage};
+                    (provider_set_global_id_128)
                 """
             )
+            await db.status(
+                f"""
+                CREATE INDEX ON {schema}.{quoted_provider_metadata_stage}
+                    ((decode(provider_set_global_id_128, 'hex')))
+                """
+            )
+            await db.status(f"ANALYZE {schema}.{quoted_provider_stage}")
+            await db.status(f"ANALYZE {schema}.{quoted_provider_metadata_stage}")
         async with db.transaction() as session:
             await lock_shared_layout_for_dense_write(
                 session,
