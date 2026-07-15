@@ -24,6 +24,8 @@ from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.domain import PTG2_ARTIFACT_RAW, PTG2_CANDIDATE_ACTIVATION_CONTRACT
 from process.ptg_parts.input_artifact_retention import (
     artifact_lease_context,
+    bind_artifact_lease,
+    current_artifact_lease_id,
     guard_artifact_lease,
     protect_existing_artifact,
 )
@@ -47,6 +49,8 @@ TRUSTED_CLUSTER_HTTP_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_TRUSTED_CLUSTER_HTTP"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_FAILURE_REASON_RE = re.compile(r"^[a-z0-9_]{1,128}$")
 _ISOLATED_AUDIT_TERM_SECONDS = 10.0
+_ISOLATED_AUDIT_REQUEST_ENV = "PTG_CANDIDATE_AUDIT_REQUEST"
+_ISOLATED_AUDIT_TOKEN_ENV = "PTG_AUDIT_AUTH_TOKEN"
 
 
 @dataclass(frozen=True)
@@ -364,7 +368,11 @@ def _audit_configuration() -> tuple[str, str, str, str, bool]:
     api_base_url = str(
         os.getenv(API_BASE_URL_ENV) or os.getenv("PTG_AUDIT_API_BASE_URL") or ""
     ).strip().rstrip("/")
-    token = str(os.getenv("HLTHPRT_CONTROL_API_TOKEN") or "").strip()
+    token = str(
+        os.getenv("HLTHPRT_CONTROL_API_TOKEN")
+        or os.getenv(_ISOLATED_AUDIT_TOKEN_ENV)
+        or ""
+    ).strip()
     auth_header = str(os.getenv(AUTH_HEADER_ENV) or "Authorization").strip()
     default_scheme = "Bearer" if auth_header.lower() == "authorization" else ""
     auth_scheme = str(os.getenv(AUTH_SCHEME_ENV, default_scheme)).strip()
@@ -515,32 +523,177 @@ def run_release_audit(
     )
 
 
+def _isolated_audit_target_payload(
+    audit_target: CandidateAuditTarget,
+) -> dict[str, Any]:
+    return {
+        "candidate_run_id": audit_target.candidate_run_id,
+        "snapshot_id": audit_target.snapshot_id,
+        "source_key": audit_target.source_key,
+        "plan_id": audit_target.plan_id,
+        "plan_market_type": audit_target.plan_market_type,
+        "raw_container_sha256": list(audit_target.raw_container_sha256),
+        "provider_identifier_quarantine": dict(
+            audit_target.provider_identifier_quarantine
+        ),
+    }
+
+
+def _required_request_text(request_fields: Mapping[str, Any], field_name: str) -> str:
+    field_text = str(request_fields.get(field_name) or "").strip()
+    if not field_text:
+        raise ValueError(f"isolated audit request {field_name} is required")
+    return field_text
+
+
+def _isolated_audit_target(
+    target_fields: Mapping[str, Any],
+) -> CandidateAuditTarget:
+    raw_digest_values = target_fields.get("raw_container_sha256")
+    if not isinstance(raw_digest_values, list) or not raw_digest_values:
+        raise ValueError("isolated audit request raw sources are required")
+    raw_digests = tuple(
+        _normalized_digest(raw_digest, field="raw container digest")
+        for raw_digest in raw_digest_values
+    )
+    if len(raw_digests) != len(set(raw_digests)):
+        raise ValueError("isolated audit request raw sources are ambiguous")
+    provider_quarantine = validate_provider_identifier_quarantine(
+        target_fields.get("provider_identifier_quarantine")
+    )
+    return CandidateAuditTarget(
+        candidate_run_id=_required_request_text(
+            target_fields,
+            "candidate_run_id",
+        ),
+        snapshot_id=_required_request_text(target_fields, "snapshot_id"),
+        snapshot_status="validated",
+        source_key=_required_request_text(target_fields, "source_key"),
+        plan_id=_required_request_text(target_fields, "plan_id"),
+        plan_market_type=_required_request_text(
+            target_fields,
+            "plan_market_type",
+        ),
+        expected_current_snapshot_id=None,
+        current_snapshot_id=None,
+        raw_container_sha256=raw_digests,
+        provider_identifier_quarantine=provider_quarantine,
+        activated=False,
+    )
+
+
+def _isolated_audit_request(
+    audit_target: CandidateAuditTarget,
+    artifact_store: PTG2ArtifactStore,
+    report_path: Path,
+    lease_id: str,
+) -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "artifact_root": str(artifact_store.root.resolve()),
+            "lease_id": lease_id,
+            "report_path": str(report_path.resolve()),
+            "target": _isolated_audit_target_payload(audit_target),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _write_isolated_audit_failure(report_path: Path) -> None:
+    failure_report_by_section = {
+        "status": "error",
+        "release_gate_eligible": False,
+        "failures": {
+            "counts": {"isolated_audit": 1},
+            "examples": [
+                {
+                    "category": "isolated_audit",
+                    "reason": "isolated_audit_failed",
+                }
+            ],
+        },
+    }
+    report_path.write_text(
+        json.dumps(failure_report_by_section, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def run_isolated_audit_child() -> int:
+    """Resolve, verify, and audit retained sources inside the killable child."""
+
+    report_path: Path | None = None
+    try:
+        request_fields = json.loads(
+            _required_request_text(
+                os.environ,
+                _ISOLATED_AUDIT_REQUEST_ENV,
+            )
+        )
+        if not isinstance(request_fields, dict) or request_fields.get(
+            "schema_version"
+        ) != 1:
+            raise ValueError("isolated audit request schema is invalid")
+        report_path = Path(_required_request_text(request_fields, "report_path"))
+        target_fields = request_fields.get("target")
+        if not isinstance(target_fields, dict):
+            raise ValueError("isolated audit target is invalid")
+        audit_target = _isolated_audit_target(target_fields)
+        artifact_store = PTG2ArtifactStore(
+            _required_request_text(request_fields, "artifact_root")
+        )
+        lease_id = _required_request_text(request_fields, "lease_id")
+        with bind_artifact_lease(lease_id):
+            retained_source_paths = resolve_retained_raw_files(
+                artifact_store,
+                audit_target.raw_container_sha256,
+            )
+            audit_report = run_release_audit(audit_target, retained_source_paths)
+        report_path.write_text(
+            json.dumps(audit_report, sort_keys=True),
+            encoding="utf-8",
+        )
+        return 0
+    except Exception:
+        if report_path is not None:
+            with contextlib.suppress(OSError):
+                _write_isolated_audit_failure(report_path)
+        return 2
+
+
 async def run_isolated_release_audit(
     audit_target: CandidateAuditTarget,
-    source_paths: Sequence[Path],
+    artifact_store: PTG2ArtifactStore,
 ) -> dict[str, Any]:
-    """Run the long release audit in a subprocess that cancellation can stop."""
+    """Run retained-source verification and audit in one supervised child."""
 
     with tempfile.TemporaryDirectory(prefix="ptg-candidate-audit-") as temp_dir:
         work_dir = Path(temp_dir)
         report_path = work_dir / "report.json"
-        audit_arguments, token = _release_audit_arguments(
-            audit_target,
-            source_paths,
-            report_path=report_path,
-            work_dir=work_dir,
-            include_auth_token=False,
+        _api_base_url, token, _auth_header, _auth_scheme, _trusted_http = (
+            _audit_configuration()
         )
+        lease_id = current_artifact_lease_id()
+        if not lease_id:
+            raise RuntimeError("candidate audit requires an active artifact lease")
         child_env = os.environ.copy()
-        child_env["PTG_AUDIT_AUTH_TOKEN"] = token
+        child_env.pop("HLTHPRT_CONTROL_API_TOKEN", None)
+        child_env[_ISOLATED_AUDIT_TOKEN_ENV] = token
+        child_env[_ISOLATED_AUDIT_REQUEST_ENV] = _isolated_audit_request(
+            audit_target,
+            artifact_store,
+            report_path,
+            lease_id,
+        )
         session_options = {"start_new_session": True} if os.name == "posix" else {}
         process: asyncio.subprocess.Process | None = None
         spawn_task = asyncio.create_task(
             asyncio.create_subprocess_exec(
                 sys.executable,
                 "-m",
-                "scripts.validation.ptg2_v3_source_api_audit",
-                *audit_arguments,
+                "process.ptg_candidate_audit",
                 env=child_env,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=None,
@@ -755,20 +908,16 @@ async def _audit_and_activate(
         message="verifying retained source artifacts",
         pct=20,
     )
-    source_paths = resolve_retained_raw_files(
-        store,
-        candidate_target.raw_container_sha256,
-    )
     await _progress(
         control_run_id,
         snapshot_id=candidate_target.snapshot_id,
         phase="candidate release audit",
-        message="verifying sources and auditing public API responses",
+        message="resolving, hashing, and auditing retained sources",
         pct=35,
     )
     report = await run_isolated_release_audit(
         candidate_target,
-        source_paths,
+        store,
     )
     await _progress(
         control_run_id,
@@ -874,3 +1023,7 @@ __all__ = [
     "run_isolated_release_audit",
     "run_release_audit",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_isolated_audit_child())

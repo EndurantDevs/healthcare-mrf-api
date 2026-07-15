@@ -200,13 +200,15 @@ def load_suite(path: Path | str = DEFAULT_SUITE_PATH) -> dict[str, Any]:
         if not case_id:
             raise ValueError("every case needs an id")
         selected = case.get("variants") or list(variant_ids)
-        missing = [
+        missing_variant_ids = [
             selected_variant_id
             for selected_variant_id in selected
             if selected_variant_id not in variant_ids
         ]
-        if missing:
-            raise ValueError(f"case {case_id} references missing variants: {missing}")
+        if missing_variant_ids:
+            raise ValueError(
+                f"case {case_id} references missing variants: {missing_variant_ids}"
+            )
     return suite
 
 
@@ -231,28 +233,33 @@ def selected_cases(suite: dict[str, Any], case_ids: set[str] | None = None) -> l
 
 def env_for_variant(case: dict[str, Any], variant: dict[str, Any]) -> dict[str, str]:
     """Build the scanner environment for one experiment variant."""
-    result: dict[str, str] = {}
+    environment_by_name: dict[str, str] = {}
     for source in (case.get("env") or {}, variant.get("env") or {}):
         for key, value in source.items():
             if value is None:
                 continue
-            result[str(key)] = str(value)
-    if "split_negotiated_rates" in case and "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES" not in result:
-        result["HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES"] = str(case["split_negotiated_rates"])
-    return result
+            environment_by_name[str(key)] = str(value)
+    if (
+        "split_negotiated_rates" in case
+        and "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES" not in environment_by_name
+    ):
+        environment_by_name["HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES"] = str(
+            case["split_negotiated_rates"]
+        )
+    return environment_by_name
 
 
 def parse_sized_frames(stdout: bytes | str) -> list[dict[str, Any]]:
     """Parse length-prefixed JSON frames emitted by the scanner."""
-    data = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
+    framed_output_bytes = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
     frames: list[dict[str, Any]] = []
     offset = 0
-    length = len(data)
+    length = len(framed_output_bytes)
     while offset < length:
-        line_end = data.find(b"\n", offset)
+        line_end = framed_output_bytes.find(b"\n", offset)
         if line_end < 0:
             break
-        header = data[offset:line_end]
+        header = framed_output_bytes[offset:line_end]
         offset = line_end + 1
         if b"\t" not in header:
             continue
@@ -261,15 +268,22 @@ def parse_sized_frames(stdout: bytes | str) -> list[dict[str, Any]]:
             size = int(size_raw)
         except ValueError:
             continue
-        payload = data[offset : offset + size]
+        frame_bytes = framed_output_bytes[offset : offset + size]
         offset += size
-        if offset < length and data[offset : offset + 1] == b"\n":
+        if offset < length and framed_output_bytes[offset : offset + 1] == b"\n":
             offset += 1
         try:
-            parsed_payload = json.loads(payload.decode("utf-8"))
+            frame_payload_by_field = json.loads(frame_bytes.decode("utf-8"))
         except json.JSONDecodeError:
-            parsed_payload = {"raw": payload.decode("utf-8", errors="replace")}
-        frames.append({"name": name_raw.decode("utf-8", errors="replace"), "payload": parsed_payload})
+            frame_payload_by_field = {
+                "raw": frame_bytes.decode("utf-8", errors="replace")
+            }
+        frames.append(
+            {
+                "name": name_raw.decode("utf-8", errors="replace"),
+                "payload": frame_payload_by_field,
+            }
+        )
     return frames
 
 
@@ -283,14 +297,14 @@ def first_frame_payload(frames: list[dict[str, Any]], name: str) -> dict[str, An
 
 def parse_key_value_line(line: str) -> dict[str, Any]:
     """Parse one tab-delimited scanner metric line."""
-    values: dict[str, Any] = {}
+    values_by_key: dict[str, Any] = {}
     parts = line.strip().split("\t")
     for part in parts[1:]:
         if "=" not in part:
             continue
         key, value = part.split("=", 1)
-        values[key] = coerce_scalar(value)
-    return values
+        values_by_key[key] = coerce_scalar(value)
+    return values_by_key
 
 
 def parse_scanner_progress(stderr: bytes | str) -> list[dict[str, Any]]:
@@ -349,9 +363,9 @@ def coerce_scalar(value: str) -> Any:
 
 def read_proc_status(status_path: Path) -> dict[str, int]:
     """Read Linux process counters for resource sampling."""
-    metrics: dict[str, int] = {}
+    metrics_by_name: dict[str, int] = {}
     if not status_path.exists():
-        return metrics
+        return metrics_by_name
     for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.startswith(("VmRSS:", "VmHWM:", "VmSize:")):
             continue
@@ -360,10 +374,10 @@ def read_proc_status(status_path: Path) -> dict[str, int]:
         if not parts:
             continue
         try:
-            metrics[f"{key.lower()}_kb"] = int(parts[0])
+            metrics_by_name[f"{key.lower()}_kb"] = int(parts[0])
         except ValueError:
             continue
-    return metrics
+    return metrics_by_name
 
 
 def parse_ps_memory(output: str) -> dict[str, int]:
@@ -547,7 +561,7 @@ def write_ptg_toc_fixture(case: dict[str, Any], output_dir: Path, *, base_url: s
         fp.write(json.dumps(build_fixture_payload(case), separators=(",", ":")).encode("utf-8"))
     plan_id = str(case.get("plan_id") or "LOCAL-PTG2-SMOKE")
     plan_market_type = str(case.get("plan_market_type") or "group")
-    index = {
+    toc_index_by_field = {
         "reporting_entity_name": case.get("reporting_entity_name") or "HealthPorta Local Fixture",
         "reporting_entity_type": case.get("reporting_entity_type") or "test",
         "last_updated_on": case.get("last_updated_on") or "2026-06-20",
@@ -573,15 +587,18 @@ def write_ptg_toc_fixture(case: dict[str, Any], output_dir: Path, *, base_url: s
         ],
     }
     index_path = output_dir / "index.json"
-    index_path.write_text(json.dumps(index, separators=(",", ":")), encoding="utf-8")
+    index_path.write_text(
+        json.dumps(toc_index_by_field, separators=(",", ":")),
+        encoding="utf-8",
+    )
     return index_path
 
 
 def expected_original_file_summary(path: Path) -> dict[str, Any]:
     """Summarize source-fixture values expected after import."""
-    payload = load_json_file(path)
+    source_document_by_field = load_json_file(path)
     provider_npis_by_ref: dict[int, set[str]] = {}
-    for ref in payload.get("provider_references") or []:
+    for ref in source_document_by_field.get("provider_references") or []:
         ref_id = ref.get("provider_group_id")
         if ref_id is None:
             continue
@@ -591,14 +608,19 @@ def expected_original_file_summary(path: Path) -> dict[str, Any]:
                 npis.add(str(npi))
         provider_npis_by_ref[int(ref_id)] = npis
 
-    in_network_items = payload.get("in_network") or []
+    in_network_items = source_document_by_field.get("in_network") or []
     price_keys: list[str] = []
     serving_keys: set[str] = set()
     used_npis: set[str] = set()
     negotiated_rate_count = 0
-    for item in in_network_items:
-        code_key = "\t".join([normalize_text(item.get("billing_code_type")), normalize_text(item.get("billing_code"))])
-        for rate in item.get("negotiated_rates") or []:
+    for network_item in in_network_items:
+        code_key = "\t".join(
+            [
+                normalize_text(network_item.get("billing_code_type")),
+                normalize_text(network_item.get("billing_code")),
+            ]
+        )
+        for rate in network_item.get("negotiated_rates") or []:
             negotiated_rate_count += 1
             provider_refs = tuple(sorted(str(ref_id) for ref_id in rate.get("provider_references") or []))
             for ref_id in rate.get("provider_references") or []:
@@ -668,7 +690,7 @@ def psql_json(env_overrides: dict[str, str], sql: str) -> dict[str, Any]:
     database = env_overrides["HLTHPRT_DB_DATABASE"]
     suffix = env_overrides.get("HLTHPRT_TEST_DATABASE_SUFFIX") or ""
     db_name = f"{database}{suffix}"
-    cmd = [
+    command_args = [
         "psql",
         "-X",
         "-q",
@@ -688,7 +710,14 @@ def psql_json(env_overrides: dict[str, str], sql: str) -> dict[str, Any]:
     process_env = os.environ.copy()
     if "HLTHPRT_DB_PASSWORD" in env_overrides:
         process_env["PGPASSWORD"] = env_overrides["HLTHPRT_DB_PASSWORD"]
-    completed = subprocess.run(cmd, cwd=str(ROOT), env=process_env, check=True, capture_output=True, text=True)
+    completed = subprocess.run(
+        command_args,
+        cwd=str(ROOT),
+        env=process_env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     output = completed.stdout.strip()
     if not output:
         return {}
@@ -700,7 +729,7 @@ def psql_exec(env_overrides: dict[str, str], sql: str) -> None:
     database = env_overrides["HLTHPRT_DB_DATABASE"]
     suffix = env_overrides.get("HLTHPRT_TEST_DATABASE_SUFFIX") or ""
     db_name = f"{database}{suffix}"
-    cmd = [
+    command_args = [
         "psql",
         "-X",
         "-q",
@@ -718,7 +747,14 @@ def psql_exec(env_overrides: dict[str, str], sql: str) -> None:
     process_env = os.environ.copy()
     if "HLTHPRT_DB_PASSWORD" in env_overrides:
         process_env["PGPASSWORD"] = env_overrides["HLTHPRT_DB_PASSWORD"]
-    subprocess.run(cmd, cwd=str(ROOT), env=process_env, check=True, capture_output=True, text=True)
+    subprocess.run(
+        command_args,
+        cwd=str(ROOT),
+        env=process_env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def explain_json(env_overrides: dict[str, str], sql: str) -> list[dict[str, Any]]:
@@ -806,7 +842,7 @@ def serving_index_table(serving_index: dict[str, Any], *keys: str) -> str:
     """Return the serving relation named in a snapshot manifest."""
     materialized = serving_index.get("materialized_tables")
     materialized_tables = materialized if isinstance(materialized, dict) else {}
-    role_aliases = {
+    role_by_key = {
         "table": "serving",
         "serving_table": "serving",
         "price_atom_table": "price_atom",
@@ -817,7 +853,7 @@ def serving_index_table(serving_index: dict[str, Any], *keys: str) -> str:
         value = serving_index.get(key)
         if value:
             return validate_qualified_table_name(str(value))
-        role = role_aliases.get(key, key)
+        role = role_by_key.get(key, key)
         value = materialized_tables.get(role)
         if value:
             return validate_qualified_table_name(str(value))
@@ -1364,7 +1400,7 @@ def verify_local_import_against_original(
     skipped_checks = []
     if not can_digest_price_atoms:
         skipped_checks.append("price_atom_digest")
-    checks = {
+    checks_by_name = {
         "run_status": run_payload.get("status") == "validated",
         "serving_rows": int(db_counts.get("serving_rows") or 0) == expected["unique_serving_rates"],
         "price_atom_rows": int(db_counts.get("price_atom_rows") or 0) == expected["unique_price_atoms"],
@@ -1377,10 +1413,10 @@ def verify_local_import_against_original(
         "report_serving_rates": int(report.get("serving_rates") or 0) == expected["unique_serving_rates"],
         "report_files_processed": int(report.get("files_processed") or 0) == 1,
     }
-    failed = [name for name, passed in checks.items() if not passed]
+    failed_checks = [name for name, passed in checks_by_name.items() if not passed]
     return {
-        "status": "failed" if failed else "passed",
-        "failed": failed,
+        "status": "failed" if failed_checks else "passed",
+        "failed": failed_checks,
         "expected": expected,
         "db": db_counts,
         "skipped_checks": skipped_checks,
@@ -1390,7 +1426,7 @@ def verify_local_import_against_original(
             "price_atom": price_atom_table,
             "provider_group_member": provider_group_member_table,
         },
-        "checks": checks,
+        "checks": checks_by_name,
     }
 
 
@@ -1422,7 +1458,7 @@ def psql_copy_lines(env_overrides: dict[str, str], sql: str):
     database = env_overrides["HLTHPRT_DB_DATABASE"]
     suffix = env_overrides.get("HLTHPRT_TEST_DATABASE_SUFFIX") or ""
     db_name = f"{database}{suffix}"
-    cmd = [
+    command_args = [
         "psql",
         "-X",
         "-q",
@@ -1443,7 +1479,7 @@ def psql_copy_lines(env_overrides: dict[str, str], sql: str):
     if "HLTHPRT_DB_PASSWORD" in env_overrides:
         process_env["PGPASSWORD"] = env_overrides["HLTHPRT_DB_PASSWORD"]
     process = subprocess.Popen(
-        cmd,
+        command_args,
         cwd=str(ROOT),
         env=process_env,
         stdout=subprocess.PIPE,
@@ -1520,12 +1556,15 @@ def _serving_row_digest_update(
     digest.update(f"{code_key}\t{provider_set_key}\t{provider_count}\t{price_set_id.lower()}\n".encode("utf-8"))
 
 
-def write_serving_by_code_candidate(rows: Any, output_path: Path) -> dict[str, Any]:
+def write_serving_by_code_candidate(
+    serving_rows: Any,
+    output_path: Path,
+) -> dict[str, Any]:
     """Write and round-trip a harness-only compressed serving-by-code artifact."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     body_path = output_path.with_suffix(output_path.suffix + ".body.tmp")
-    price_set_to_key: dict[str, int] = {}
+    price_key_by_set_id: dict[str, int] = {}
     price_set_values: list[str] = []
     blocks: list[dict[str, int]] = []
     row_count = 0
@@ -1536,7 +1575,7 @@ def write_serving_by_code_candidate(rows: Any, output_path: Path) -> dict[str, A
     source_digest = hashlib.sha256()
 
     with body_path.open("wb") as body:
-        for raw_row in rows:
+        for raw_row in serving_rows:
             code_key = int(raw_row[0])
             provider_set_key = int(raw_row[1])
             provider_count = int(raw_row[2])
@@ -1548,10 +1587,10 @@ def write_serving_by_code_candidate(rows: Any, output_path: Path) -> dict[str, A
                 current_code = code_key
                 current_block_count = 0
                 previous_provider_set_key = 0
-            price_set_key = price_set_to_key.get(price_set_id)
+            price_set_key = price_key_by_set_id.get(price_set_id)
             if price_set_key is None:
                 price_set_key = len(price_set_values)
-                price_set_to_key[price_set_id] = price_set_key
+                price_key_by_set_id[price_set_id] = price_set_key
                 price_set_values.append(price_set_id)
             provider_set_delta = provider_set_key - previous_provider_set_key
             before = body.tell()
@@ -1590,8 +1629,12 @@ def write_serving_by_code_candidate(rows: Any, output_path: Path) -> dict[str, A
     body_path.unlink(missing_ok=True)
 
     gzip_path = output_path.with_suffix(output_path.suffix + ".gz")
-    with output_path.open("rb") as source, gzip.open(gzip_path, "wb", compresslevel=6) as compressed:
-        shutil.copyfileobj(source, compressed)
+    with output_path.open("rb") as artifact_source, gzip.open(
+        gzip_path,
+        "wb",
+        compresslevel=6,
+    ) as compressed:
+        shutil.copyfileobj(artifact_source, compressed)
     decoded_digest = digest_serving_by_code_candidate(output_path)
     metadata.update(
         {
@@ -1608,32 +1651,38 @@ def write_serving_by_code_candidate(rows: Any, output_path: Path) -> dict[str, A
 
 def digest_serving_by_code_candidate(path: Path) -> str:
     """Compute a stable digest of serving by code candidate."""
-    data = path.read_bytes()
-    if data[:8] != b"PTG2SBC1":
+    artifact_bytes = path.read_bytes()
+    if artifact_bytes[:8] != b"PTG2SBC1":
         raise ValueError("unexpected serving-by-code artifact magic")
-    header_len = struct.unpack("<I", data[8:12])[0]
+    header_len = struct.unpack("<I", artifact_bytes[8:12])[0]
     header_start = 12
     header_end = header_start + header_len
-    metadata = json.loads(data[header_start:header_end].decode("utf-8"))
+    metadata = json.loads(artifact_bytes[header_start:header_end].decode("utf-8"))
     price_count = int(metadata["price_set_count"])
     code_count = int(metadata["code_count"])
     price_start = header_end
     index_start = price_start + price_count * 16
     body_start = index_start + code_count * 16
     price_sets = [
-        _uuid_text(data[price_start + index * 16 : price_start + (index + 1) * 16])
+        _uuid_text(
+            artifact_bytes[
+                price_start + index * 16 : price_start + (index + 1) * 16
+            ]
+        )
         for index in range(price_count)
     ]
     digest = hashlib.sha256()
     for index in range(code_count):
-        raw = data[index_start + index * 16 : index_start + (index + 1) * 16]
+        raw = artifact_bytes[
+            index_start + index * 16 : index_start + (index + 1) * 16
+        ]
         code_key, body_offset, count = struct.unpack("<iQI", raw)
         cursor = body_start + body_offset
         provider_set_key = 0
         for _ in range(count):
-            provider_delta, cursor = _read_uvarint(data, cursor)
-            provider_count, cursor = _read_uvarint(data, cursor)
-            price_key, cursor = _read_uvarint(data, cursor)
+            provider_delta, cursor = _read_uvarint(artifact_bytes, cursor)
+            provider_count, cursor = _read_uvarint(artifact_bytes, cursor)
+            price_key, cursor = _read_uvarint(artifact_bytes, cursor)
             provider_set_key += provider_delta
             _serving_row_digest_update(digest, code_key, provider_set_key, provider_count, price_sets[price_key])
     return digest.hexdigest()
@@ -1651,7 +1700,10 @@ def _provider_set_pattern_digest_update(
             _serving_row_digest_update(digest, code_key, provider_set_key, provider_count, price_sets[price_key])
 
 
-def write_serving_by_provider_set_candidate(rows: Any, output_path: Path) -> dict[str, Any]:
+def write_serving_by_provider_set_candidate(
+    serving_rows: Any,
+    output_path: Path,
+) -> dict[str, Any]:
     """Write and round-trip a harness-only reverse serving artifact.
 
     The reverse path is for "all prices for one NPI": NPI -> provider groups ->
@@ -1660,23 +1712,25 @@ def write_serving_by_provider_set_candidate(rows: Any, output_path: Path) -> dic
     """
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    price_set_to_key: dict[str, int] = {}
+    price_key_by_set_id: dict[str, int] = {}
     price_set_values: list[str] = []
-    code_keys_seen: set[int] = set()
+    seen_code_keys: set[int] = set()
     row_count = 0
     current_provider_set: int | None = None
     current_code: int | None = None
     current_code_entries: list[tuple[int, int]] = []
-    patterns_by_provider: list[tuple[int, dict[tuple[tuple[int, int], ...], list[int]]]] = []
-    current_patterns: dict[tuple[tuple[int, int], ...], list[int]] = {}
+    provider_patterns: list[
+        tuple[int, dict[tuple[tuple[int, int], ...], list[int]]]
+    ] = []
+    code_keys_by_pattern: dict[tuple[tuple[int, int], ...], list[int]] = {}
 
     def price_key_for(value: str) -> int:
         """Intern a normalized price-set ID and return its dense integer key."""
         price_set_id = str(value).strip().lower()
-        price_set_key = price_set_to_key.get(price_set_id)
+        price_set_key = price_key_by_set_id.get(price_set_id)
         if price_set_key is None:
             price_set_key = len(price_set_values)
-            price_set_to_key[price_set_id] = price_set_key
+            price_key_by_set_id[price_set_id] = price_set_key
             price_set_values.append(price_set_id)
         return price_set_key
 
@@ -1684,8 +1738,8 @@ def write_serving_by_provider_set_candidate(rows: Any, output_path: Path) -> dic
         """Group the buffered code under its shared serving-entry pattern."""
         if current_code is None:
             return
-        vector = tuple(current_code_entries)
-        current_patterns.setdefault(vector, []).append(current_code)
+        pattern_entries = tuple(current_code_entries)
+        code_keys_by_pattern.setdefault(pattern_entries, []).append(current_code)
         current_code_entries.clear()
 
     def flush_provider() -> None:
@@ -1693,10 +1747,12 @@ def write_serving_by_provider_set_candidate(rows: Any, output_path: Path) -> dic
         if current_provider_set is None:
             return
         flush_code()
-        patterns_by_provider.append((current_provider_set, current_patterns.copy()))
-        current_patterns.clear()
+        provider_patterns.append(
+            (current_provider_set, code_keys_by_pattern.copy())
+        )
+        code_keys_by_pattern.clear()
 
-    for raw_row in rows:
+    for raw_row in serving_rows:
         provider_set_key = int(raw_row[0])
         code_key = int(raw_row[1])
         provider_count = int(raw_row[2])
@@ -1709,7 +1765,7 @@ def write_serving_by_provider_set_candidate(rows: Any, output_path: Path) -> dic
             flush_code()
             current_code = code_key
         current_code_entries.append((provider_count, price_set_key))
-        code_keys_seen.add(code_key)
+        seen_code_keys.add(code_key)
         row_count += 1
     flush_provider()
 
@@ -1719,7 +1775,7 @@ def write_serving_by_provider_set_candidate(rows: Any, output_path: Path) -> dic
     source_digest = hashlib.sha256()
     pattern_count = 0
     with body_path.open("wb") as body:
-        for provider_set_key, pattern_map in patterns_by_provider:
+        for provider_set_key, pattern_map in provider_patterns:
             block_pattern_count = 0
             blocks.append({"provider_set_key": provider_set_key, "offset": body_offset, "count": 0})
             ordered_patterns = sorted(
@@ -1757,7 +1813,7 @@ def write_serving_by_provider_set_candidate(rows: Any, output_path: Path) -> dic
         "format": "research_serving_by_provider_set_v1",
         "row_count": row_count,
         "provider_set_count": len(blocks),
-        "code_count": len(code_keys_seen),
+        "code_count": len(seen_code_keys),
         "price_set_count": len(price_set_values),
         "pattern_count": pattern_count,
         "body_bytes": body_offset,
@@ -1779,8 +1835,12 @@ def write_serving_by_provider_set_candidate(rows: Any, output_path: Path) -> dic
     body_path.unlink(missing_ok=True)
 
     gzip_path = output_path.with_suffix(output_path.suffix + ".gz")
-    with output_path.open("rb") as source, gzip.open(gzip_path, "wb", compresslevel=6) as compressed:
-        shutil.copyfileobj(source, compressed)
+    with output_path.open("rb") as artifact_source, gzip.open(
+        gzip_path,
+        "wb",
+        compresslevel=6,
+    ) as compressed:
+        shutil.copyfileobj(artifact_source, compressed)
     decoded_digest = digest_serving_by_provider_set_candidate(output_path)
     metadata.update(
         {
@@ -1797,41 +1857,47 @@ def write_serving_by_provider_set_candidate(rows: Any, output_path: Path) -> dic
 
 def digest_serving_by_provider_set_candidate(path: Path) -> str:
     """Compute a stable digest of serving by provider set candidate."""
-    data = path.read_bytes()
-    if data[:8] != b"PTG2SBP1":
+    artifact_bytes = path.read_bytes()
+    if artifact_bytes[:8] != b"PTG2SBP1":
         raise ValueError("unexpected serving-by-provider-set artifact magic")
-    header_len = struct.unpack("<I", data[8:12])[0]
+    header_len = struct.unpack("<I", artifact_bytes[8:12])[0]
     header_start = 12
     header_end = header_start + header_len
-    metadata = json.loads(data[header_start:header_end].decode("utf-8"))
+    metadata = json.loads(artifact_bytes[header_start:header_end].decode("utf-8"))
     price_count = int(metadata["price_set_count"])
     provider_set_count = int(metadata["provider_set_count"])
     price_start = header_end
     index_start = price_start + price_count * 16
     body_start = index_start + provider_set_count * 16
     price_sets = [
-        _uuid_text(data[price_start + index * 16 : price_start + (index + 1) * 16])
+        _uuid_text(
+            artifact_bytes[
+                price_start + index * 16 : price_start + (index + 1) * 16
+            ]
+        )
         for index in range(price_count)
     ]
     digest = hashlib.sha256()
     for index in range(provider_set_count):
-        raw = data[index_start + index * 16 : index_start + (index + 1) * 16]
+        raw = artifact_bytes[
+            index_start + index * 16 : index_start + (index + 1) * 16
+        ]
         provider_set_key, body_offset, pattern_count = struct.unpack("<iQI", raw)
         cursor = body_start + body_offset
         for _ in range(pattern_count):
-            code_count, cursor = _read_uvarint(data, cursor)
+            code_count, cursor = _read_uvarint(artifact_bytes, cursor)
             code_keys: list[int] = []
             previous_code_key = 0
             for code_index in range(code_count):
-                encoded_code, cursor = _read_uvarint(data, cursor)
+                encoded_code, cursor = _read_uvarint(artifact_bytes, cursor)
                 code_key = encoded_code if code_index == 0 else previous_code_key + encoded_code
                 code_keys.append(code_key)
                 previous_code_key = code_key
-            entry_count, cursor = _read_uvarint(data, cursor)
+            entry_count, cursor = _read_uvarint(artifact_bytes, cursor)
             entries: list[tuple[int, int]] = []
             for _ in range(entry_count):
-                provider_count, cursor = _read_uvarint(data, cursor)
-                price_key, cursor = _read_uvarint(data, cursor)
+                provider_count, cursor = _read_uvarint(artifact_bytes, cursor)
+                price_key, cursor = _read_uvarint(artifact_bytes, cursor)
                 entries.append((provider_count, price_key))
             _provider_set_pattern_digest_update(
                 digest,
@@ -1847,10 +1913,10 @@ def _price_dictionary_payload(price_set_values: list[str]) -> bytes:
     return b"".join(_uuid_bytes(price_set_id) for price_set_id in price_set_values)
 
 
-def build_serving_by_code_db_records(rows: Any) -> dict[str, Any]:
+def build_serving_by_code_db_records(serving_rows: Any) -> dict[str, Any]:
     """Build database records for the code-oriented serving candidate."""
-    records: list[tuple[str, int, int, int, bytes]] = []
-    price_set_to_key: dict[str, int] = {}
+    binary_records: list[tuple[str, int, int, int, bytes]] = []
+    price_key_by_set_id: dict[str, int] = {}
     price_set_values: list[str] = []
     row_count = 0
     current_code: int | None = None
@@ -1862,10 +1928,10 @@ def build_serving_by_code_db_records(rows: Any) -> dict[str, Any]:
     def price_key_for(value: str) -> int:
         """Intern a normalized price-set ID and return its dense integer key."""
         price_set_id = str(value).strip().lower()
-        price_set_key = price_set_to_key.get(price_set_id)
+        price_set_key = price_key_by_set_id.get(price_set_id)
         if price_set_key is None:
             price_set_key = len(price_set_values)
-            price_set_to_key[price_set_id] = price_set_key
+            price_key_by_set_id[price_set_id] = price_set_key
             price_set_values.append(price_set_id)
         return price_set_key
 
@@ -1876,10 +1942,10 @@ def build_serving_by_code_db_records(rows: Any) -> dict[str, Any]:
     ) -> tuple[bytearray, int]:
         """Append the buffered code record, then return an empty payload and count."""
         if code_key is not None:
-            records.append(("by_code", code_key, 0, count, bytes(payload)))
+            binary_records.append(("by_code", code_key, 0, count, bytes(payload)))
         return bytearray(), 0
 
-    for raw_row in rows:
+    for raw_row in serving_rows:
         code_key = int(raw_row[0])
         provider_set_key = int(raw_row[1])
         provider_count = int(raw_row[2])
@@ -1901,7 +1967,7 @@ def build_serving_by_code_db_records(rows: Any) -> dict[str, Any]:
         row_count += 1
         _serving_row_digest_update(source_digest, code_key, provider_set_key, provider_count, price_set_id)
     current_payload, current_count = flush_code(current_code, current_payload, current_count)
-    records.insert(
+    binary_records.insert(
         0,
         (
             "by_code_price_dictionary",
@@ -1911,14 +1977,16 @@ def build_serving_by_code_db_records(rows: Any) -> dict[str, Any]:
             _price_dictionary_payload(price_set_values),
         ),
     )
-    decoded_digest = digest_serving_by_code_db_records(records)
+    decoded_digest = digest_serving_by_code_db_records(binary_records)
     return {
         "format": "research_postgres_serving_by_code_binary_v1",
-        "records": records,
+        "records": binary_records,
         "row_count": row_count,
-        "code_count": len(records) - 1,
+        "code_count": len(binary_records) - 1,
         "price_set_count": len(price_set_values),
-        "payload_bytes": sum(len(record[4]) for record in records),
+        "payload_bytes": sum(
+            len(binary_record[4]) for binary_record in binary_records
+        ),
         "source_sha256": source_digest.hexdigest(),
         "decoded_sha256": decoded_digest,
         "roundtrip": "passed" if decoded_digest == source_digest.hexdigest() else "failed",
@@ -1953,26 +2021,26 @@ def digest_serving_by_code_db_records(records: list[tuple[str, int, int, int, by
     return digest.hexdigest()
 
 
-def build_serving_by_provider_set_db_records(rows: Any) -> dict[str, Any]:
+def build_serving_by_provider_set_db_records(serving_rows: Any) -> dict[str, Any]:
     """Build database records for the provider-set serving candidate."""
-    price_set_to_key: dict[str, int] = {}
+    price_key_by_set_id: dict[str, int] = {}
     price_set_values: list[str] = []
-    code_keys_seen: set[int] = set()
+    seen_code_keys: set[int] = set()
     row_count = 0
     current_provider_set: int | None = None
     current_code: int | None = None
     current_code_entries: list[tuple[int, int]] = []
-    current_patterns: dict[tuple[tuple[int, int], ...], list[int]] = {}
-    records: list[tuple[str, int, int, int, bytes]] = []
+    code_keys_by_pattern: dict[tuple[tuple[int, int], ...], list[int]] = {}
+    binary_records: list[tuple[str, int, int, int, bytes]] = []
     source_digest = hashlib.sha256()
 
     def price_key_for(value: str) -> int:
         """Intern a normalized price-set ID and return its dense integer key."""
         price_set_id = str(value).strip().lower()
-        price_set_key = price_set_to_key.get(price_set_id)
+        price_set_key = price_key_by_set_id.get(price_set_id)
         if price_set_key is None:
             price_set_key = len(price_set_values)
-            price_set_to_key[price_set_id] = price_set_key
+            price_key_by_set_id[price_set_id] = price_set_key
             price_set_values.append(price_set_id)
         return price_set_key
 
@@ -2015,38 +2083,50 @@ def build_serving_by_provider_set_db_records(rows: Any) -> dict[str, Any]:
                 _append_uvarint(binary_payload, provider_count)
                 _append_uvarint(binary_payload, price_key)
             provider_row_count += len(sorted_code_keys) * len(entries)
-        records.append(("by_provider_set", provider_set_key, 0, provider_row_count, bytes(binary_payload)))
+        binary_records.append(
+            (
+                "by_provider_set",
+                provider_set_key,
+                0,
+                provider_row_count,
+                bytes(binary_payload),
+            )
+        )
         return remaining_code_entries, {}
 
-    for raw_row in rows:
+    for raw_row in serving_rows:
         provider_set_key = int(raw_row[0])
         code_key = int(raw_row[1])
         provider_count = int(raw_row[2])
         price_set_id = str(raw_row[3]).strip().lower()
         price_set_key = price_key_for(price_set_id)
         if current_provider_set != provider_set_key:
-            current_code_entries, current_patterns = append_provider_binary_block(
+            current_code_entries, code_keys_by_pattern = append_provider_binary_block(
                 current_provider_set,
                 current_code,
                 current_code_entries,
-                current_patterns,
+                code_keys_by_pattern,
             )
             current_provider_set = provider_set_key
             current_code = None
         if current_code != code_key:
-            current_code_entries = flush_code(current_code, current_code_entries, current_patterns)
+            current_code_entries = flush_code(
+                current_code,
+                current_code_entries,
+                code_keys_by_pattern,
+            )
             current_code = code_key
         current_code_entries.append((provider_count, price_set_key))
-        code_keys_seen.add(code_key)
+        seen_code_keys.add(code_key)
         row_count += 1
         _serving_row_digest_update(source_digest, code_key, provider_set_key, provider_count, price_set_id)
-    current_code_entries, current_patterns = append_provider_binary_block(
+    current_code_entries, code_keys_by_pattern = append_provider_binary_block(
         current_provider_set,
         current_code,
         current_code_entries,
-        current_patterns,
+        code_keys_by_pattern,
     )
-    records.insert(
+    binary_records.insert(
         0,
         (
             "by_provider_set_price_dictionary",
@@ -2056,25 +2136,33 @@ def build_serving_by_provider_set_db_records(rows: Any) -> dict[str, Any]:
             _price_dictionary_payload(price_set_values),
         ),
     )
-    decoded_digest = digest_serving_by_provider_set_db_records(records)
+    decoded_digest = digest_serving_by_provider_set_db_records(binary_records)
     source_sha256 = source_digest.hexdigest()
     return {
         "format": "research_postgres_serving_by_provider_set_binary_v1",
-        "records": records,
+        "records": binary_records,
         "row_count": row_count,
-        "provider_set_count": len(records) - 1,
-        "code_count": len(code_keys_seen),
+        "provider_set_count": len(binary_records) - 1,
+        "code_count": len(seen_code_keys),
         "price_set_count": len(price_set_values),
-        "payload_bytes": sum(len(record[4]) for record in records),
+        "payload_bytes": sum(
+            len(binary_record[4]) for binary_record in binary_records
+        ),
         "source_sha256": source_sha256,
         "decoded_sha256": decoded_digest,
         "roundtrip": "passed" if decoded_digest == source_sha256 else "failed",
     }
 
 
-def digest_serving_by_provider_set_db_records(records: list[tuple[str, int, int, int, bytes]]) -> str:
+def digest_serving_by_provider_set_db_records(
+    binary_records: list[tuple[str, int, int, int, bytes]],
+) -> str:
     """Compute a stable digest of serving by provider set db records."""
-    dictionaries = [record for record in records if record[0] == "by_provider_set_price_dictionary"]
+    dictionaries = [
+        binary_record
+        for binary_record in binary_records
+        if binary_record[0] == "by_provider_set_price_dictionary"
+    ]
     if not dictionaries:
         raise ValueError("missing by-provider-set price dictionary")
     dictionary_payload = dictionaries[0][4]
@@ -2085,26 +2173,30 @@ def digest_serving_by_provider_set_db_records(records: list[tuple[str, int, int,
         for index in range(0, len(dictionary_payload), 16)
     ]
     digest = hashlib.sha256()
-    for _kind, provider_set_key, _block_no, _row_count, payload in sorted(
-        (record for record in records if record[0] == "by_provider_set"),
-        key=lambda record: (record[1], record[2]),
+    for _kind, provider_set_key, _block_no, _row_count, binary_payload in sorted(
+        (
+            binary_record
+            for binary_record in binary_records
+            if binary_record[0] == "by_provider_set"
+        ),
+        key=lambda binary_record: (binary_record[1], binary_record[2]),
     ):
         cursor = 0
-        pattern_count, cursor = _read_uvarint(payload, cursor)
+        pattern_count, cursor = _read_uvarint(binary_payload, cursor)
         for _ in range(pattern_count):
-            code_count, cursor = _read_uvarint(payload, cursor)
+            code_count, cursor = _read_uvarint(binary_payload, cursor)
             code_keys: list[int] = []
             previous_code_key = 0
             for index in range(code_count):
-                encoded_code, cursor = _read_uvarint(payload, cursor)
+                encoded_code, cursor = _read_uvarint(binary_payload, cursor)
                 code_key = encoded_code if index == 0 else previous_code_key + encoded_code
                 code_keys.append(code_key)
                 previous_code_key = code_key
-            entry_count, cursor = _read_uvarint(payload, cursor)
+            entry_count, cursor = _read_uvarint(binary_payload, cursor)
             entries: list[tuple[int, int]] = []
             for _ in range(entry_count):
-                provider_count, cursor = _read_uvarint(payload, cursor)
-                price_key, cursor = _read_uvarint(payload, cursor)
+                provider_count, cursor = _read_uvarint(binary_payload, cursor)
+                price_key, cursor = _read_uvarint(binary_payload, cursor)
                 entries.append((provider_count, price_key))
             _provider_set_pattern_digest_update(
                 digest,
@@ -2371,8 +2463,12 @@ def analyze_postgres_binary_candidate(
     readback_reverse_digest = None
     if include_reverse:
         readback_reverse_digest = digest_serving_by_provider_set_db_records(readback_records)
-    forward_roundtrip = forward.get("source_sha256") == readback_forward_digest
-    reverse_roundtrip = True if reverse is None else reverse.get("source_sha256") == readback_reverse_digest
+    has_forward_roundtrip = forward.get("source_sha256") == readback_forward_digest
+    has_reverse_roundtrip = (
+        True
+        if reverse is None
+        else reverse.get("source_sha256") == readback_reverse_digest
+    )
     storage = psql_json(
         env_overrides,
         "SELECT json_build_object("
@@ -2429,9 +2525,13 @@ def analyze_postgres_binary_candidate(
             "plan": plan[0].get("Plan", {}) if isinstance(plan, list) and plan and isinstance(plan[0], dict) else {},
         }
     combined_rows = int(forward.get("row_count") or 0) + int((reverse or {}).get("row_count") or 0)
-    roundtrip_passed = forward_roundtrip and reverse_roundtrip and int(forward.get("row_count") or 0) == source_rows
+    has_complete_roundtrip = (
+        has_forward_roundtrip
+        and has_reverse_roundtrip
+        and int(forward.get("row_count") or 0) == source_rows
+    )
     return {
-        "status": "passed" if roundtrip_passed else "failed",
+        "status": "passed" if has_complete_roundtrip else "failed",
         "layout": "postgres_binary_v1",
         "tables": table_names,
         "storage": storage,
@@ -2447,7 +2547,7 @@ def analyze_postgres_binary_candidate(
         "build_elapsed_seconds": round(build_elapsed_seconds, 3),
         "benchmarks": benchmarks,
         "candidate": {
-            "roundtrip": "passed" if roundtrip_passed else "failed",
+            "roundtrip": "passed" if has_complete_roundtrip else "failed",
             "candidate_total_bytes": artifact_total_bytes,
             "source_total_bytes": source_total_bytes,
         },
@@ -2543,9 +2643,9 @@ def analyze_postgres_posting_candidate(
                 "execution_ms": _explain_execution_ms(plan),
                 "plan": plan[0].get("Plan", {}) if isinstance(plan, list) and plan and isinstance(plan[0], dict) else {},
             }
-    roundtrip_passed = source_rows == posting_rows
+    is_roundtrip_valid = source_rows == posting_rows
     return {
-        "status": "passed" if roundtrip_passed else "failed",
+        "status": "passed" if is_roundtrip_valid else "failed",
         "layout": "postgres_posting_v1",
         "block_rows": max(int(block_rows), 1),
         "tables": table_names,
@@ -2553,7 +2653,7 @@ def analyze_postgres_posting_candidate(
         "build_elapsed_seconds": round(build_elapsed_seconds, 3),
         "benchmarks": benchmarks,
         "candidate": {
-            "roundtrip": "passed" if roundtrip_passed else "failed",
+            "roundtrip": "passed" if is_roundtrip_valid else "failed",
             "candidate_total_bytes": candidate_total_bytes,
             "source_total_bytes": source_total_bytes,
         },
@@ -2654,12 +2754,15 @@ def analyze_local_serving_sidecar_candidate(
     gzip_bytes = int(candidate.get("gzip_bytes") or 0)
     combined_artifact_bytes = artifact_bytes
     combined_gzip_bytes = gzip_bytes
-    combined_roundtrip = candidate.get("roundtrip") == "passed"
+    has_complete_roundtrip = candidate.get("roundtrip") == "passed"
     if reverse_candidate is not None:
         combined_artifact_bytes += int(reverse_candidate.get("artifact_bytes") or 0)
         combined_gzip_bytes += int(reverse_candidate.get("gzip_bytes") or 0)
-        combined_roundtrip = combined_roundtrip and reverse_candidate.get("roundtrip") == "passed"
-    combined_candidate = {
+        has_complete_roundtrip = (
+            has_complete_roundtrip
+            and reverse_candidate.get("roundtrip") == "passed"
+        )
+    combined_candidate_by_metric = {
         "format": (
             "research_serving_bidirectional_v1"
             if reverse_candidate is not None
@@ -2667,15 +2770,15 @@ def analyze_local_serving_sidecar_candidate(
         ),
         "artifact_bytes": combined_artifact_bytes,
         "gzip_bytes": combined_gzip_bytes,
-        "roundtrip": "passed" if combined_roundtrip else "failed",
+        "roundtrip": "passed" if has_complete_roundtrip else "failed",
     }
-    status = "passed" if combined_roundtrip else "failed"
-    result = {
+    status = "passed" if has_complete_roundtrip else "failed"
+    analysis_by_section = {
         "status": status,
         "serving_table": serving_table,
         "storage": storage,
         "candidate": candidate,
-        "combined_candidate": combined_candidate,
+        "combined_candidate": combined_candidate_by_metric,
         "forward_reduction_ratio_vs_pg_total": round(total_bytes / artifact_bytes, 3) if artifact_bytes else None,
         "forward_gzip_reduction_ratio_vs_pg_total": round(total_bytes / gzip_bytes, 3) if gzip_bytes else None,
         "reduction_ratio_vs_pg_total": round(total_bytes / combined_artifact_bytes, 3) if combined_artifact_bytes else None,
@@ -2684,7 +2787,7 @@ def analyze_local_serving_sidecar_candidate(
     if reverse_candidate is not None:
         reverse_artifact_bytes = int(reverse_candidate.get("artifact_bytes") or 0)
         reverse_gzip_bytes = int(reverse_candidate.get("gzip_bytes") or 0)
-        result.update(
+        analysis_by_section.update(
             {
                 "reverse_candidate": reverse_candidate,
                 "reverse_reduction_ratio_vs_pg_total": (
@@ -2696,17 +2799,17 @@ def analyze_local_serving_sidecar_candidate(
             }
         )
     if postgres_posting_candidate is not None:
-        result["postgres_posting_candidate"] = postgres_posting_candidate
-        result["preferred_candidate"] = "postgres_posting"
+        analysis_by_section["postgres_posting_candidate"] = postgres_posting_candidate
+        analysis_by_section["preferred_candidate"] = "postgres_posting"
         if postgres_posting_candidate.get("status") == "failed":
-            result["status"] = "failed"
+            analysis_by_section["status"] = "failed"
     if postgres_binary_candidate is not None:
-        result["postgres_binary_candidate"] = postgres_binary_candidate
-        result["preferred_candidate"] = "postgres_binary"
+        analysis_by_section["postgres_binary_candidate"] = postgres_binary_candidate
+        analysis_by_section["preferred_candidate"] = "postgres_binary"
         if postgres_binary_candidate.get("status") == "failed":
-            result["status"] = "failed"
+            analysis_by_section["status"] = "failed"
     return {
-        **result,
+        **analysis_by_section,
     }
 
 
@@ -2782,7 +2885,7 @@ def sql_literal(value: str) -> str:
 
 
 class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
-    def log_message(self, format: str, *args: Any) -> None:
+    def log_message(self, message_format: str, *args: Any) -> None:
         """Suppress fixture-server request logging."""
         return
 
@@ -2886,13 +2989,13 @@ def run_scanner_fixture(
 
 def run_with_sampling(command: list[str], env_overrides: dict[str, str], *, cwd: Path) -> tuple[subprocess.CompletedProcess, float, dict[str, Any]]:
     """Run a command while sampling its process resources."""
-    env = {**os.environ, **env_overrides}
+    environment_by_name = {**os.environ, **env_overrides}
     sampler = ProcSampler()
     started = time.monotonic()
     proc = subprocess.Popen(
         command,
         cwd=str(cwd),
-        env=env,
+        env=environment_by_name,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -2911,7 +3014,7 @@ def run_with_sampling(command: list[str], env_overrides: dict[str, str], *, cwd:
 
 def collect_copy_outputs(run_dir: Path) -> dict[str, Any]:
     """Collect COPY artifacts emitted by an experiment run."""
-    outputs: dict[str, Any] = {}
+    outputs_by_label: dict[str, Any] = {}
     for label, pattern in {
         "serving": "manifest_serving.copy*",
         "price_atom": "price_atom.copy*",
@@ -2928,12 +3031,12 @@ def collect_copy_outputs(run_dir: Path) -> dict[str, Any]:
                 continue
             files.append(str(path))
             lines.extend(path.read_text(encoding="utf-8", errors="replace").splitlines())
-        outputs[label] = {
+        outputs_by_label[label] = {
             "files": files,
             "rows": len(lines),
             "sha256": digest_lines(lines),
         }
-    return outputs
+    return outputs_by_label
 
 
 def digest_lines(lines: list[str]) -> str:
