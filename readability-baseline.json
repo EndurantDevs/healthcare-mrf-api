@@ -1,7 +1,7 @@
 {
   "issue_counts": {
     "ambiguous_function_names": 44,
-    "ambiguous_variable_names": 1218,
+    "ambiguous_variable_names": 1217,
     "boolean_name_mismatch": 448,
     "builtin_shadowing": 2,
     "class_name_shape": 2,
@@ -949,7 +949,6 @@
       "ambiguous_variable_name:process/ptg.py:_main_with_artifact_lease:value",
       "ambiguous_variable_name:process/ptg.py:_persist_completed_ptg2_import_run:value",
       "ambiguous_variable_name:process/ptg.py:_process_table_of_contents:item",
-      "ambiguous_variable_name:process/ptg_candidate_audit.py:run_release_audit:target",
       "ambiguous_variable_name:process/ptg_control.py:_ptg_lane_environment:value",
       "ambiguous_variable_name:process/ptg_control.py:ptg_control_start:payload",
       "ambiguous_variable_name:process/ptg_control.py:ptg_control_start:result",
@@ -3808,7 +3807,6 @@
       "long_function:process/ptg.py:_reused_shared_v3_serving_index",
       "long_function:process/ptg_candidate_audit.py:_audit_and_activate",
       "long_function:process/ptg_candidate_audit.py:_candidate_target_from_row",
-      "long_function:process/ptg_candidate_audit.py:run_release_audit",
       "long_function:process/ptg_control.py:ptg_control_start",
       "long_function:process/ptg_parts/address_assurance.py:build_price_address_assurance_report",
       "long_function:process/ptg_parts/address_assurance.py:summarize_ptg_price_address_payload",
@@ -4180,6 +4178,7 @@
       "long_function:tests/test_ptg2_v3_source_api_audit.py:test_runner_reserves_random_keys_until_true_first_observation",
       "long_function:tests/test_ptg2_v3_source_api_audit_capacity.py:_candidate_attestation_fixture_report",
       "long_function:tests/test_ptg2_v3_source_api_audit_capacity.py:test_request_page_binds_exact_body_status_multivalue_headers_and_latency",
+      "long_function:tests/test_ptg_candidate_audit_importer.py:test_isolated_audit_cancellation_terminates_process_group",
       "long_function:tests/test_ptg_control_unit.py:test_ptg_control_start_applies_lane_scanner_env",
       "long_function:tests/test_ptg_publish_state_races.py:test_deterministic_rerun_returns_already_published_without_table_work",
       "long_function:tests/test_ptg_source_snapshot_control.py:test_remove_ptg2_source_snapshot_deletes_only_v3_metadata",

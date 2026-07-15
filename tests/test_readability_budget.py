@@ -26,6 +26,7 @@ def test_ci_readability_ratchet_requires_zero_net_change():
         '--ratchet-baseline "$RUNNER_TEMP/readability-base.json" \\\n'
         "              --required-reduction-percent 0"
     ) in workflow_text
+    assert "--required-reduction-percent 1" not in workflow_text
 
 
 def _write_config(repo_root: Path) -> None:

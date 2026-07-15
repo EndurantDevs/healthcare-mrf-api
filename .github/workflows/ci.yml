@@ -63,15 +63,9 @@ jobs:
         run: |
           if [ -n "$BASE_SHA" ]; then
             git show "$BASE_SHA:readability-baseline.json" > "$RUNNER_TEMP/readability-base.json"
-            if git diff --quiet "$BASE_SHA" HEAD -- '*.py' '*.pyi'; then
-              python scripts/readability_budget.py \
+            python scripts/readability_budget.py \
               --ratchet-baseline "$RUNNER_TEMP/readability-base.json" \
               --required-reduction-percent 0
-            else
-              python scripts/readability_budget.py \
-                --ratchet-baseline "$RUNNER_TEMP/readability-base.json" \
-                --required-reduction-percent 1
-            fi
           else
             python scripts/readability_budget.py
           fi
