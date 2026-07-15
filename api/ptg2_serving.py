@@ -5417,14 +5417,16 @@ async def _graph_candidates_for_request(
     plan_id: str,
     candidate_limit: int,
     provider_set_keys: Iterable[int] | None = None,
+    explicit_npi_scope: _ExplicitNpiGraphScope | None = None,
 ) -> _GraphLocationCandidates | None:
     """Resolve a code scope, preferring exact-NPI traversal for v3 snapshots."""
 
-    explicit_npi_scope = await _version_three_explicit_npi_graph_scope(
-        session,
-        serving_tables,
-        args,
-    )
+    if explicit_npi_scope is None:
+        explicit_npi_scope = await _version_three_explicit_npi_graph_scope(
+            session,
+            serving_tables,
+            args,
+        )
     if explicit_npi_scope is not None and not explicit_npi_scope.provider_set_keys:
         return _GraphLocationCandidates([], {})
     scoped_provider_set_keys = (
@@ -5476,6 +5478,7 @@ async def _graph_location_matches(
     snapshot_id: str | None = None,
     source_key: str | None = None,
     provider_set_keys: Iterable[int] | None = None,
+    explicit_npi_scope: _ExplicitNpiGraphScope | None = None,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
     """Resolve geo-filtered provider sets through normalized membership artifacts."""
     requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
@@ -5495,6 +5498,7 @@ async def _graph_location_matches(
         plan_id=plan_id,
         candidate_limit=candidate_limit,
         provider_set_keys=provider_set_keys,
+        explicit_npi_scope=explicit_npi_scope,
     )
     if candidates is None:
         return None
@@ -5521,6 +5525,7 @@ async def _ptg2_manifest_location_provider_matches(
     snapshot_id: str | None = None,
     source_key: str | None = None,
     provider_set_keys: Iterable[int] | None = None,
+    explicit_npi_scope: _ExplicitNpiGraphScope | None = None,
     require_exhaustive: bool = False,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
     """Resolve location-filtered provider sets through the strict shared graph."""
@@ -5546,6 +5551,7 @@ async def _ptg2_manifest_location_provider_matches(
         snapshot_id=snapshot_id,
         source_key=source_key,
         provider_set_keys=provider_set_keys,
+        explicit_npi_scope=explicit_npi_scope,
     )
     if matches is None or not require_exhaustive:
         return matches
@@ -6184,6 +6190,15 @@ async def _search_ptg2_manifest_db_serving_table(
     location_selection_exhausted = False
     location_candidate_count = 0
     provider_set_keys: list[int] | None = None
+    explicit_npi_scope = await _version_three_explicit_npi_graph_scope(
+        session,
+        serving_tables,
+        args,
+    )
+    if explicit_npi_scope is not None:
+        if not explicit_npi_scope.provider_set_keys:
+            return no_match_response()
+        provider_set_keys = list(explicit_npi_scope.provider_set_keys)
     if location_filter_requested and not deferred_location_selection:
         location_matches = await _ptg2_manifest_location_provider_matches(
             session,
@@ -6193,6 +6208,8 @@ async def _search_ptg2_manifest_db_serving_table(
             plan_id=requested_plan,
             snapshot_id=snapshot_id,
             source_key=serving_tables.source_key or args.get("source_key"),
+            provider_set_keys=provider_set_keys,
+            explicit_npi_scope=explicit_npi_scope,
             require_exhaustive=location_requires_exhaustive,
         )
         if location_matches is None:
@@ -6399,6 +6416,7 @@ async def _search_ptg2_manifest_db_serving_table(
             snapshot_id=snapshot_id,
             source_key=serving_tables.source_key or args.get("source_key"),
             provider_set_keys=filtered_provider_set_keys,
+            explicit_npi_scope=explicit_npi_scope,
             require_exhaustive=location_requires_exhaustive,
         )
         if location_matches is None:

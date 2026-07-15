@@ -83,7 +83,7 @@ async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(mo
 
         await process_initial._refresh_mrf_address_summary(suffix, schema)
 
-        rows = await db.all(
+        summary_rows = await db.all(
             f"""
             SELECT
                 npi, type, checksum, first_line, second_line, city_name,
@@ -97,9 +97,12 @@ async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(mo
             ORDER BY type, checksum;
             """
         )
-        result = {row.type: dict(row._mapping) for row in rows}
+        summaries_by_type = {
+            summary_row.type: dict(summary_row._mapping)
+            for summary_row in summary_rows
+        }
 
-        practice = result["practice"]
+        practice = summaries_by_type["practice"]
         assert practice["npi"] == 3000000059
         assert practice["checksum"] == 9001
         assert practice["first_line"] == "22 Main Street"
@@ -116,13 +119,15 @@ async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(mo
         assert practice["address_sources"] == ["marketplace_provider", "network"]
         assert practice["source_record_ids"] == ["rec-a", "rec-b"]
         assert practice["source_import_ids"] == ["import-a", "import-b"]
-        assert [str(value) for value in practice["source_import_dates"]] == ["2026-06-15", "2026-06-16"]
+        assert [
+            str(import_date) for import_date in practice["source_import_dates"]
+        ] == ["2026-06-15", "2026-06-16"]
         assert practice["source_issuer_ids"] == [3, 7]
         assert practice["source_issuer_names"] == ["Issuer A", "Issuer B"]
         assert practice["source_urls"] == ["https://example.test/a", "https://example.test/b"]
         assert practice["source_count"] == 2
 
-        billing = result["billing"]
+        billing = summaries_by_type["billing"]
         assert billing["first_line"] == "PO Box 9"
         assert billing["source_count"] == 1
         assert billing["address_key"] is None

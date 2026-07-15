@@ -26,7 +26,7 @@ def test_openaddresses_record_uses_us_source_state_and_canonical_keys():
         "geometry": {"type": "Point", "coordinates": [-97.7431, 30.2672]},
     }
 
-    record = openaddresses._record_from_feature(
+    address_record = openaddresses._record_from_feature(
         feature,
         source="us/tx/austin",
         data_id=10,
@@ -34,14 +34,14 @@ def test_openaddresses_record_uses_us_source_state_and_canonical_keys():
         updated=1781288662893,
     )
 
-    assert record is not None
-    assert record["house_number"] == "123"
-    assert record["street_match_key"] == "mainst"
-    assert record["state_code"] == "TX"
-    assert record["zip5"] == "78701"
-    assert record["address_key"] is not None
-    assert record["zip5_source"] == "openaddresses_postcode"
-    assert record["zip5_restored_at"] is None
+    assert address_record is not None
+    assert address_record["house_number"] == "123"
+    assert address_record["street_match_key"] == "mainst"
+    assert address_record["state_code"] == "TX"
+    assert address_record["zip5"] == "78701"
+    assert address_record["address_key"] is not None
+    assert address_record["zip5_source"] == "openaddresses_postcode"
+    assert address_record["zip5_restored_at"] is None
 
 
 def test_openaddresses_missing_zip_point_is_staged_for_zip_recovery():
@@ -59,7 +59,7 @@ def test_openaddresses_missing_zip_point_is_staged_for_zip_recovery():
         "geometry": {"type": "Point", "coordinates": [-97.7431, 30.2672]},
     }
 
-    record, reason = openaddresses._zip_recovery_record_from_feature(
+    recovery_record, reason = openaddresses._zip_recovery_record_from_feature(
         feature,
         source="us/tx/austin",
         data_id=10,
@@ -69,13 +69,13 @@ def test_openaddresses_missing_zip_point_is_staged_for_zip_recovery():
     )
 
     assert reason == "missing_zip5"
-    assert record is not None
-    assert record["house_number"] == "123"
-    assert record["street_match_key"] == "mainst"
-    assert record["state_code"] == "TX"
-    assert record["lat"] == 30.2672
-    assert record["long"] == -97.7431
-    assert 0 <= record["restore_bucket"] < 16
+    assert recovery_record is not None
+    assert recovery_record["house_number"] == "123"
+    assert recovery_record["street_match_key"] == "mainst"
+    assert recovery_record["state_code"] == "TX"
+    assert recovery_record["lat"] == 30.2672
+    assert recovery_record["long"] == -97.7431
+    assert 0 <= recovery_record["restore_bucket"] < 16
 
 
 def test_openaddresses_record_rejects_non_us_coordinates():
@@ -649,7 +649,7 @@ async def test_openaddresses_local_files_load_in_parallel(monkeypatch, tmp_path)
 
 @pytest.mark.asyncio
 async def test_openaddresses_remote_sources_load_in_parallel(monkeypatch):
-    items = [
+    source_entries = [
         {"source": f"us/tx/source-{index}", "layer": "addresses", "output": {"output": True}, "id": index, "job": index}
         for index in range(1, 4)
     ]
@@ -657,7 +657,7 @@ async def test_openaddresses_remote_sources_load_in_parallel(monkeypatch):
     max_active = 0
 
     async def fake_fetch_json(_client, _url, _token):
-        return items
+        return source_entries
 
     async def fake_load_source_item(**kwargs):
         nonlocal active, max_active
@@ -695,7 +695,15 @@ async def test_openaddresses_remote_sources_load_in_parallel(monkeypatch):
 @pytest.mark.asyncio
 async def test_openaddresses_remote_tempdir_ignores_cleanup_errors(monkeypatch, tmp_path):
     tempdir_kwargs = []
-    items = [{"source": "us/tx/source-1", "layer": "addresses", "output": {"output": True}, "id": 1, "job": 1}]
+    source_entries = [
+        {
+            "source": "us/tx/source-1",
+            "layer": "addresses",
+            "output": {"output": True},
+            "id": 1,
+            "job": 1,
+        }
+    ]
 
     class FakeTemporaryDirectory:
         def __init__(self, **kwargs):
@@ -708,7 +716,7 @@ async def test_openaddresses_remote_tempdir_ignores_cleanup_errors(monkeypatch, 
             return False
 
     async def fake_fetch_json(_client, _url, _token):
-        return items
+        return source_entries
 
     async def fake_load_source_item(**kwargs):
         return kwargs["item"]["source"], 10, 5, 1, {"missing_zip5": 1, "not_point": 4}
@@ -741,7 +749,7 @@ async def test_openaddresses_remote_tempdir_ignores_cleanup_errors(monkeypatch, 
 
 @pytest.mark.asyncio
 async def test_openaddresses_remote_test_mode_honors_source_concurrency(monkeypatch):
-    items = [
+    source_entries = [
         {"source": f"us/ca/test-{index}", "layer": "addresses", "output": {"output": True}, "id": index, "job": index}
         for index in range(1, 4)
     ]
@@ -749,7 +757,7 @@ async def test_openaddresses_remote_test_mode_honors_source_concurrency(monkeypa
     max_active = 0
 
     async def fake_fetch_json(_client, _url, _token):
-        return items
+        return source_entries
 
     async def fake_load_source_item(**kwargs):
         nonlocal active, max_active
