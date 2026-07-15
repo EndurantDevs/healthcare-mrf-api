@@ -107,6 +107,7 @@ REQUIRED_TABLES = {
     "ptg2_v3_snapshot_layout",
     "ptg2_v3_snapshot_scope",
     "ptg2_v3_snapshot_source",
+    "ptg2_v3_source_audit_witness",
 }
 
 EMPTY_BEFORE_WRITE_TABLES = (
@@ -121,6 +122,7 @@ EMPTY_BEFORE_WRITE_TABLES = (
     "ptg2_v3_snapshot_layout",
     "ptg2_v3_snapshot_scope",
     "ptg2_v3_snapshot_source",
+    "ptg2_v3_source_audit_witness",
 )
 
 FINAL_EMPTY_TABLES = (
@@ -144,6 +146,7 @@ FINAL_EMPTY_TABLES = (
     "ptg2_v3_snapshot_layout",
     "ptg2_v3_snapshot_scope",
     "ptg2_v3_snapshot_source",
+    "ptg2_v3_source_audit_witness",
 )
 
 
@@ -204,8 +207,8 @@ async def _assert_migrated_empty_target(database_name: str) -> None:
     alembic_config = Config(str(ROOT / "alembic.ini"))
     expected_heads = set(ScriptDirectory.from_config(alembic_config).get_heads())
     observed_heads = {
-        str(row[0])
-        for row in await db.all(
+        str(version_record[0])
+        for version_record in await db.all(
             f"SELECT version_num FROM {_quoted(SCHEMA_NAME)}.alembic_version"
         )
     }
@@ -215,8 +218,8 @@ async def _assert_migrated_empty_target(database_name: str) -> None:
     )
 
     observed_tables = {
-        str(row[0])
-        for row in await db.all(
+        str(table_record[0])
+        for table_record in await db.all(
             """
             SELECT table_name
               FROM information_schema.tables
@@ -243,8 +246,8 @@ async def _assert_migrated_empty_target(database_name: str) -> None:
         schema_name=SCHEMA_NAME,
     )
     jsonb_columns = {
-        (str(row[0]), str(row[1]))
-        for row in await db.all(
+        (str(column_record[0]), str(column_record[1]))
+        for column_record in await db.all(
             """
             SELECT table_name, column_name
               FROM information_schema.columns
@@ -416,6 +419,8 @@ def _release_report(
     source_key: str,
     plan_id: str,
     sample_digest: str,
+    source_set: Mapping[str, Any],
+    source_witness: Mapping[str, Any],
     provider_identifier_quarantine: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build a passing release-audit report for one logical snapshot."""
@@ -423,20 +428,26 @@ def _release_report(
     completed_at = datetime.datetime.now(datetime.timezone.utc).replace(
         microsecond=0
     )
-    started_at = completed_at - datetime.timedelta(minutes=1)
+    started_at = completed_at - datetime.timedelta(seconds=30)
+    source_witness_map = dict(source_witness)
+    occurrence_count = int(source_witness_map["occurrence_witness_count"])
+    provider_count = int(source_witness_map["provider_witness_count"])
+    total_count = int(source_witness_map["record_count"])
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "harness": {
-            "name": "ptg2_v3_source_api_audit",
-            "version": "2.11.0",
+            "name": "ptg2_v3_fast_source_witness_audit",
+            "version": "2.0.0",
+            "contract": "ptg2_v3_fast_source_witness_audit_v2",
         },
+        "runtime": {"http_client": "aiohttp", "event_loop": "uvloop"},
         "status": "pass",
         "profile": "release",
         "release_profile_enforced": True,
         "release_gate_eligible": True,
         "started_at": started_at.isoformat(),
         "completed_at": completed_at.isoformat(),
-        "duration_seconds": 60.0,
+        "duration_seconds": 30.0,
         "target": {
             "expected_architecture": "postgres_binary_v3",
             "expected_storage_generation": "shared_blocks_v3",
@@ -460,19 +471,47 @@ def _release_report(
         },
         "reproducibility": {},
         "source": {
+            "source_count": int(source_set["source_count"]),
+            "source_set_digest": source_set["raw_container_sha256_digest"],
+            "witness": source_witness_map,
             "provider_identifier_quarantine": dict(
                 provider_identifier_quarantine
             )
         },
-        "coverage": {"failures": []},
-        "checks": {
-            "source_occurrence_ids": 2_500,
-            "api_occurrence_ids": 2_500,
-            "negative_queries": 250,
-            "random_api_requests_executed": 2_500,
+        "coverage": {
+            "failures": [],
+            "selection_method": source_witness_map["selection_method"],
+            "queryable_occurrence_population_count": source_witness_map[
+                "queryable_occurrence_population_count"
+            ],
+            "emitted_rate_row_count": source_witness_map[
+                "emitted_rate_row_count"
+            ],
+            "unqueryable_rate_row_count": source_witness_map[
+                "unqueryable_rate_row_count"
+            ],
+            "unqueryable_rate_policy": source_witness_map[
+                "unqueryable_rate_policy"
+            ],
+            "occurrence_sample_count": occurrence_count,
+            "provider_sample_count": provider_count,
         },
-        "http": {"standard_api_actual_http_requests": 3_000},
-        "random_api_requests": {},
+        "checks": {
+            "source_witnesses": total_count,
+            "api_witnesses_matched": occurrence_count,
+            "api_challenges_executed": occurrence_count,
+            "provider_witnesses_validated": provider_count,
+            "api_audit_occurrences_validated": 1,
+        },
+        "http": {
+            "standard_api_actual_http_requests": occurrence_count + 1,
+            "retry_count": 0,
+            "max_concurrency": 32,
+        },
+        "random_api_requests": {
+            "requested": occurrence_count,
+            "executed": occurrence_count,
+        },
         "latency": {},
         "api_audit_sample": {
             "sample_digest": sample_digest,
@@ -752,7 +791,7 @@ async def test_v3_lifecycle_fails_closed(
         multiple_prices=True,
         duplicate_first_price=False,
     )
-    records = [
+    serving_records = [
         SERVING_RECORD.unpack_from(scan["partition_bytes"], offset)
         for offset in range(
             0,
@@ -760,8 +799,10 @@ async def test_v3_lifecycle_fails_closed(
             SERVING_RECORD.size,
         )
     ]
-    assert len(records) == 2
-    provider_set_ids = {record[1] for record in records}
+    assert len(serving_records) == 2
+    provider_set_ids = {
+        serving_record[1] for serving_record in serving_records
+    }
     assert len(provider_set_ids) == 1
     provider_set_id = next(iter(provider_set_ids))
 
@@ -897,6 +938,13 @@ async def test_v3_lifecycle_fails_closed(
                 },
             ),
             graph_artifact_entries=graph_entries,
+            source_audit_witness_entries=(
+                scanner_support._single_frame(
+                    scan["frames"],
+                    "source_audit_witness_file",
+                ),
+            ),
+            expected_raw_source_sha256=(artifact_digest,),
             provider_identifier_quarantine=scanner_summary[
                 "provider_identifier_quarantine"
             ],
@@ -967,11 +1015,12 @@ async def test_v3_lifecycle_fails_closed(
             candidate_audit["items"]
         )
         assert {
-            int(item["tuple"]["npi"]) for item in candidate_audit["items"]
+            int(audit_item["tuple"]["npi"])
+            for audit_item in candidate_audit["items"]
         } <= set(NPIS)
         assert {
-            item["tuple"]["negotiated_rate"]
-            for item in candidate_audit["items"]
+            audit_item["tuple"]["negotiated_rate"]
+            for audit_item in candidate_audit["items"]
         } == {125.5, 250}
         assert candidate_audit["provenance"]["snapshot_id"] == snapshot_a
         assert candidate_audit["source_set"] == source_set
@@ -1003,6 +1052,8 @@ async def test_v3_lifecycle_fails_closed(
             source_key=SOURCE_A,
             plan_id=PLAN_A,
             sample_digest=candidate_audit["audit_sample"]["sample_digest"],
+            source_set=source_set,
+            source_witness=publication.serving_index["source_witness"],
             provider_identifier_quarantine=publication.serving_index[
                 "provider_identifier_quarantine"
             ],
@@ -1146,7 +1197,7 @@ async def test_v3_lifecycle_fails_closed(
              ORDER BY snapshot_id
             """
         )
-        assert [tuple(row) for row in bindings] == sorted(
+        assert [tuple(binding_record) for binding_record in bindings] == sorted(
             [
                 (snapshot_a, publication.snapshot_key),
                 (snapshot_b, publication.snapshot_key),
@@ -1270,7 +1321,8 @@ async def test_v3_lifecycle_fails_closed(
             """
         )
         expected_block_sizes = {
-            bytes(row[0]): int(row[1]) for row in block_rows
+            bytes(block_record[0]): int(block_record[1])
+            for block_record in block_rows
         }
         assert expected_block_sizes
 

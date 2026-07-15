@@ -116,9 +116,9 @@ total is not yet known; a false `total_is_exact` marks `total` and
 | Source and dictionary completeness | Implemented in repository | Per-source run and dictionary contracts bind exact file descriptors to canonical physical identities; Python/Rust parity and coherent-omission tests fail closed. |
 | Exact multiplicity | Implemented in repository | Duplicate source candidates and duplicate atom ordinals survive publication and audit. |
 | Persisted audit sample | Implemented in repository | Publish-time sample metadata, digest, row bound, and API readback tests. |
-| Independent release audit | Tooling implemented | A qualifying release report must meet the fixed sample and latency floors. |
+| Bounded candidate release audit | Implemented in repository | Import-time exact source witnesses are sealed in PostgreSQL; activation reparses them and runs up to 2,048 concurrent source-to-API challenges plus one served-sample preflight within a 55-second deadline. |
 | Candidate attestation and atomic activation | Implemented in repository | Fresh report and sealed-sample binding, immutable validated row, exact predecessor CAS, wall-clock expiry, single-use receipt, and transaction rollback tests. |
-| Automatic candidate audit orchestration | Implemented in repository | The generic `ptg-candidate-audit` job resolves one validated candidate, leases and verifies retained inputs, runs the release audit, records the attestation, and atomically promotes the exact predecessor. |
+| Automatic candidate audit orchestration | Implemented in repository | The generic `ptg-candidate-audit` job resolves one validated candidate, loads and verifies its sealed PostgreSQL witness, runs the bounded `aiohttp`/`uvloop` audit, records the attestation, and atomically promotes the exact predecessor. |
 | Class-specific cold first-page p95 <= 40 ms | Pending release measurement | Fresh API processes, distinct keys, and complete first-page observations measured separately for matched-positive, negative, and deterministic-random requests. |
 | Unique large import in 10-15 minutes | Pending dev measurement | Complete fresh build, logged PostgreSQL publication, audit, seal, and resource report. |
 | 2,000 imports/month | Authenticated schema-v7 gate implemented; measurement pending | `ptg2_v3_capacity_gate.py` requires a fresh Ed25519 collector receipt, committed per-import end-to-end timings, 30 qualifying large builds and reuse samples, reconciled retry and audit HTTP cost, signed raw import and audit arrivals behind gap-free seven-day peaks, independently server-signed fully contended cold API samples, zero errors, and raw contention-bound resource telemetry. |
@@ -136,6 +136,9 @@ python -m pytest -q \
   tests/test_ptg2_v3_cross_plan_reuse.py \
   tests/test_ptg2_strict_v3_import_scratch.py \
   tests/test_ptg2_shared_audit.py \
+  tests/test_ptg2_source_witness.py \
+  tests/test_ptg2_fast_candidate_audit.py \
+  tests/test_ptg_candidate_audit_importer.py \
   tests/test_ptg2_shared_gc.py \
   tests/test_ptg2_candidate_attestation.py \
   tests/test_ptg2_strict_v3_snapshot_validation.py \
@@ -149,63 +152,68 @@ PostgreSQL-backed cases that are environment-gated must be run in a disposable
 test database before release. A skipped database case is not evidence that the
 database behavior passed.
 
-The independent audit tool documents its release invocation and privacy model
-in [the validation guide](../../scripts/validation/README.md). Inspect its
-arguments without recording target details:
+The bounded PostgreSQL witness audit is the sole automated release verifier.
+Activation never rereads or decompresses complete source files. Stored witnesses preserve
+authenticated raw source fragments captured at V3 emission, which keeps the
+comparison independent of serving storage without adding a second scan.
 
-```bash
-python scripts/validation/ptg2_v3_source_api_audit.py --help
-```
-
-## Correctness Measurement
+## Candidate Activation Correctness
 
 Correctness is occurrence-based, not set-based. The canonical comparison tuple
 contains code system, code, NPI, negotiation arrangement, negotiated type and
 rate, expiration date, service codes, billing class, setting, modifiers, and
 additional information. Counts must match for otherwise identical tuples.
 
-The release profile requires all of these floors:
+The bounded activation gate requires all of these floors:
 
 | Check | Floor or ceiling |
 | --- | ---: |
-| Source-selected exact occurrences | default 2,500; minimum 2,500 |
-| Independently API-selected persisted occurrences | default 2,500; minimum 2,500 |
-| Deterministic pseudo-random complete pricing requests | default 2,500; minimum 2,500 |
-| Observed standard-API HTTP requests | minimum 3,000 |
-| Negative code/NPI recombinations | default 500; hard minimum 250 |
-| Cold first-page p95 per request class | at most 40 ms |
+| Deterministic source witnesses | exactly 2,048 total for a large combined population |
+| Queryable occurrence witnesses | normally 2,000 after the provider reserve |
+| Provider-reference witnesses | all sealed witnesses; at most 48 |
+| Persisted served-sample preflight | exactly 1 |
+| Standard-API challenges | one per selected rate witness |
+| No-retry HTTP baseline | selected rate witnesses plus 1 preflight |
+| Complete audit wall time | at most 55 seconds |
+| Per-request timeout | at most 4 seconds, one transient retry |
+| Async runtime | `aiohttp` on `uvloop` |
 | Resolved-rate fraction | exactly 1.0 |
 | Unresolved provider references | 0 |
 | Invalid prices | 0 |
 | Unattested or mismatched malformed NPI integers | 0 |
 | Invalid field types | 0 |
 
-The source-selected sample is derived independently from original in-network
-files and includes the exact raw container SHA in occurrence identity. The
-API-selected sample comes from the persisted publish-time served
-occurrences and receives no source-selected query keys. Negative checks combine
-individually positive codes and NPIs that must not produce a false membership.
+The source-selected sample is captured at the actual V3 emission point during
+the normal Rust scan and includes the exact original rate token, selected price
+and provider ordinals, linked provider token, and raw-container SHA in
+occurrence identity. Emitted rows without a queryable NPI are counted under the
+sealed `count_but_exclude_from_npi_api_challenges_v1` policy.
+Publication merges deterministic per-source bottom-k sets and stores the
+bounded payload only in PostgreSQL. Activation never rereads or decompresses a
+source file. It verifies one persisted served occurrence as a source-set and
+sample-digest preflight, then challenges the standard pricing API with each
+source witness.
+
 TIN-only provider groups use only the schema-defined singleton `[0]` marker and
 never create a fake NPI. Zero mixed with another value or repeated zero values
-are rejected. The audit reports TIN-only groups separately from NPI-addressable
-rates and the release profile fails if any are present until a TIN-addressed API
-audit is available.
+are rejected.
 
 Out-of-range nonzero integral values found in NPI arrays follow a separate strict
 quarantine contract. They are excluded from NPI membership without discarding
 valid members or negotiated prices, remain part of provider-group identity,
 and are summarized in the immutable PostgreSQL layout manifest. The summary is
 bounded to 1,024 distinct malformed values and contains exact occurrence
-counts plus a domain-separated SHA-256 digest. The source-side release audit
-recomputes this summary independently and must match it exactly; a numeric
-tolerance alone cannot authorize activation. Mixed TIN plus valid-NPI groups
-are fully NPI-verifiable and do not fail solely because a TIN is also present.
+counts plus a domain-separated SHA-256 digest. Publication validates the
+complete cross-run aggregate; activation reparses its selected provider
+witnesses and binds the same aggregate into the attestation. Mixed TIN plus
+valid-NPI groups are fully NPI-verifiable and do not fail solely because a TIN
+is also present.
 
 The physical layout itself stores a deterministic, stratified publication
 sample of at most 2,560 occurrences. It is generated before sealing and includes
 source-candidate and atom ordinals, so `source_multiset_v1` and `multiset_v1`
-multiplicity can be checked. This sample supports the API-selected release
-floor but does not replace source-side validation.
+multiplicity can be checked. This sample supports the one-row served preflight
+but does not replace the exact source-witness challenges.
 
 ## Latency Measurement
 
@@ -255,13 +263,14 @@ A qualifying dev measurement must:
    path.
 5. Exercise bounded temporary scratch and prove cleanup after completion.
 6. Persist and validate the publish-time audit sample.
-7. Run the independent release audit at 2,500 source occurrences, 2,500 API
-   occurrences, 2,500 pseudo-random complete pricing requests, at least 3,000
-   observed standard-API HTTP requests, and 500 negative checks by default with
-   a hard minimum of 250.
+7. Run the bounded candidate audit over the exact 2,048-record combined source
+   sample (normally 2,000 occurrence and 48 provider witnesses) and
+   one served-sample preflight. Require `aiohttp` on `uvloop`, a 55-second hard
+   deadline, and a reconciled 2,001-request normal no-retry baseline (2,049
+   absolute maximum when the provider cohort is empty).
 8. Collect at least 30 successful candidate audits with zero errors. Record
-   audit lane count and availability, duration, queue age, at least 3,000 HTTP
-   requests per activation, attestation, and exact-predecessor activation.
+   audit lane count and availability, duration, queue age, actual HTTP and retry
+   counts per activation, attestation, and exact-predecessor activation.
 9. Start fresh API processes and pass cold first-page p95 <= 40 ms separately
    for matched-positive, negative, and deterministic-random requests.
 10. Run at least 30 minutes of simultaneous configured import lanes,
@@ -378,8 +387,11 @@ Schema-v7 release evidence uses these fixed representativeness policies:
 - Simultaneous configured build lanes, audit lanes, and API traffic run for at
   least 30 minutes with at least 3,000 normal requests and 1 request/second.
   Candidate-audit request totals, duration, and derived rate reconcile both in
-  the sample population and contention interval, covering at least 3,000 HTTP
-  calls per active audit and 6,000,000 projected calls per 2,000 activations.
+  the sample population and contention interval, covering the observed
+  occurrence-witness count plus one preflight per audit. The normal dense
+  baseline is 2,001 calls per audit and 4,002,000 per 2,000 activations; the
+  provider-empty maximum is 2,049 and 4,098,000. Add measured retries and
+  bounded pagination.
   The signed raw timestamps cover at least 99 percent of the contention interval
   with no import, audit, or HTTP observation gap above five seconds.
 - Fresh-process cold first-page p95 is at most 40 ms independently for at

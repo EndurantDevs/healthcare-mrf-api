@@ -190,6 +190,9 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
     publish_strict_shared_v3_layout,
     validate_reused_shared_v3_snapshot_sources,
 )
+from process.ptg_parts.ptg2_source_witness_contract import (
+    validate_source_witness_manifest,
+)
 from process.ptg_parts.row_helpers import (_as_int_list, _as_list,
                                            _coerce_date, _make_checksum,
                                            _normalize_code_component,
@@ -1026,6 +1029,7 @@ async def _parse_strict_v3_file(
     deferred_copy_entries_by_kind: dict[str, list[dict[str, Any]]] = {
         "serving_run": [],
         "serving_code_dictionary": [],
+        "source_audit_witness": [],
         "price_atom": [],
         "price_set_atom": [],
         "provider_group_member": [],
@@ -1134,8 +1138,19 @@ async def _parse_strict_v3_file(
         _record_deferred_copy_file_once(kind, copy_file, copied_rows)
 
     try:
+        raw_source_sha256 = str(
+            source_version.raw_sha256 if source_version is not None else ""
+        ).strip().lower()
+        if len(raw_source_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in raw_source_sha256
+        ):
+            raise RuntimeError(
+                "strict V3 scanner requires the verified raw source SHA-256"
+            )
         async for record_kind, record_row in _aiter_compact_serving_records_rust(
             file_path,
+            raw_source_sha256=raw_source_sha256,
             snapshot_id=snapshot_id,
             plan_id=str(plan_fields.get("plan_id") or ""),
             coverage_scope_id=coverage_scope_id,
@@ -1172,6 +1187,19 @@ async def _parse_strict_v3_file(
                     rust_scanner_summary_by_name,
                     deferred_copy_entries_by_kind,
                     manifest_copy_row_counter_by_name,
+                )
+                continue
+            if record_kind == "source_audit_witness_file":
+                witness_entry_by_field = dict(record_row or {})
+                if witness_entry_by_field.get("raw_source_sha256") != raw_source_sha256:
+                    raise RuntimeError(
+                        "strict V3 source witness digest does not match its input"
+                    )
+                witness_path = Path(str(witness_entry_by_field.get("path") or ""))
+                if not witness_path.is_file():
+                    raise RuntimeError("strict V3 source witness file is missing")
+                deferred_copy_entries_by_kind["source_audit_witness"].append(
+                    witness_entry_by_field
                 )
                 continue
             rust_records += 1
@@ -2380,6 +2408,7 @@ _SHARED_V3_PHYSICAL_SERVING_INDEX_KEYS = frozenset(
         "storage_bytes",
         "timings",
         "audit_sample",
+        "source_witness",
     }
 )
 
@@ -2422,6 +2451,16 @@ def _reused_shared_v3_serving_index(
         raise RuntimeError("reusable strict V3 layout is missing source_count") from exc
     if source_count <= 0:
         raise RuntimeError("reusable strict V3 layout has an invalid source_count")
+    serving_index["source_count"] = source_count
+    try:
+        serving_index["source_witness"] = validate_source_witness_manifest(
+            serving_index.get("source_witness"),
+            expected_source_count=source_count,
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "reusable strict V3 layout has incompatible source witness evidence"
+        ) from exc
     try:
         serving_index["provider_identifier_quarantine"] = (
             validate_provider_identifier_quarantine(
@@ -2688,6 +2727,9 @@ def _shared_v3_scanner_identity() -> dict[str, Any]:
         source_root / "ptg_parts" / "ptg2_shared_price.py",
         source_root / "ptg_parts" / "ptg2_shared_publish.py",
         source_root / "ptg_parts" / "ptg2_shared_snapshot_publish.py",
+        source_root / "ptg_parts" / "ptg2_source_witness.py",
+        source_root / "ptg_parts" / "ptg2_source_witness_codec.py",
+        source_root / "ptg_parts" / "ptg2_source_witness_contract.py",
     )
     publisher_digest = hashlib.sha256()
     publisher_byte_count = 0
@@ -2700,7 +2742,7 @@ def _shared_v3_scanner_identity() -> dict[str, Any]:
         publisher_digest.update(source_bytes)
         publisher_byte_count += len(source_bytes)
     return {
-        "contract_version": 2,
+        "contract_version": 3,
         "scanner_binary_sha256": digest,
         "scanner_binary_bytes": int(byte_count),
         "publisher_source_sha256": publisher_digest.hexdigest(),
@@ -3813,6 +3855,7 @@ async def _main_with_artifact_lease(
             (
                 "serving_run",
                 "serving_code_dictionary",
+                "source_audit_witness",
                 "provider_set_metadata",
             ),
         )
@@ -3918,6 +3961,9 @@ async def _main_with_artifact_lease(
             provider_set_metadata_entries = strict_v3_copy_entries.get(
                 "provider_set_metadata"
             ) or []
+            source_audit_witness_entries = strict_v3_copy_entries.get(
+                "source_audit_witness"
+            ) or []
             try:
                 shared_publication = await publish_strict_shared_v3_layout(
                     schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
@@ -3934,6 +3980,11 @@ async def _main_with_artifact_lease(
                     serving_run_entries=run_entries,
                     code_dictionary_entries=code_dictionary_entries,
                     provider_set_metadata_entries=provider_set_metadata_entries,
+                    source_audit_witness_entries=source_audit_witness_entries,
+                    expected_raw_source_sha256=tuple(
+                        str(pair.get("raw_container_sha256") or "")
+                        for pair in source_identity_traces
+                    ),
                     graph_artifact_entries=list(manifest_artifacts.get("sidecars") or []),
                     provider_identifier_quarantine=provider_identifier_quarantine,
                     scratch_parent=ptg2_temp_parent(),

@@ -37,18 +37,19 @@ def test_strict_ptg_docs_define_sharded_writer_and_bounded_cost_pages():
         assert "`total_lower_bound`" in text
 
 
-def test_strict_ptg_docs_define_release_audit_defaults_and_floors():
+def test_strict_ptg_docs_define_bounded_candidate_audit_contract():
     for path in PTG_DOCS:
         text = _normalized_text(path)
-        assert "2,500 source" in text
-        assert "2,500 API" in text
-        assert "2,500 deterministic" in text or "2,500 pseudo-random" in text
-        assert "3,000" in text
-        assert re.search(
-            r"500 negative .*hard (?:release )?min(?:imum)?(?: of)? 250",
-            text,
-            re.IGNORECASE,
-        )
+        assert "2,048" in text
+        assert "2,049" in text
+        assert "2,000" in text
+        assert "48" in text
+        assert re.search(r"55[- ]second", text, re.IGNORECASE)
+        assert "`aiohttp`" in text
+        assert "`uvloop`" in text
+        assert "PostgreSQL" in text
+        assert "never rereads or decompresses complete source files" in text
+        assert "sole automated release verifier" in text
         assert "`ptg-candidate-audit`" in text
         assert "Automatic job orchestration remains pending" not in text
         assert "matched-positive" in text

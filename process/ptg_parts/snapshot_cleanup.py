@@ -53,6 +53,7 @@ _STRICT_V3_SHARED_TABLE_NAMES = (
     "ptg2_v3_price_attr",
     "ptg2_v3_npi_scope",
     "ptg2_v3_audit_occurrence",
+    "ptg2_v3_source_audit_witness",
 )
 _COVERAGE_SCOPE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 PTG2_IN_FLIGHT_SNAPSHOT_STATUSES = frozenset(
@@ -127,13 +128,13 @@ def is_strict_ptg2_v3_shared_blocks_manifest(
 
 
 def _dedupe_preserve_table_names(seq: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in seq:
-        if item not in seen:
-            seen.add(item)
-            result.append(item)
-    return result
+    seen_table_names: set[str] = set()
+    unique_table_names: list[str] = []
+    for table_name in seq:
+        if table_name not in seen_table_names:
+            seen_table_names.add(table_name)
+            unique_table_names.append(table_name)
+    return unique_table_names
 
 
 def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list[str]:
@@ -184,16 +185,17 @@ def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list
         "ptg2_provider_group_location_",
         "ptg2_provider_group_rate_scope_",
     )
-    result: list[str] = []
-    for value in table_values:
-        if not value:
+    manifest_table_names: list[str] = []
+    for table_value in table_values:
+        if not table_value:
             continue
-        table_name = str(value).split(".", 1)[1] if "." in str(value) else str(value)
+        table_text = str(table_value)
+        table_name = table_text.split(".", 1)[1] if "." in table_text else table_text
         if table_name.startswith(allowed_prefixes) and re.fullmatch(
             r"[a-z0-9_]{1,63}", table_name
         ):
-            result.append(table_name)
-    return _dedupe_preserve_table_names(result)
+            manifest_table_names.append(table_name)
+    return _dedupe_preserve_table_names(manifest_table_names)
 
 
 def _required_snapshot_table_names(serving_index: dict[str, Any]) -> list[str]:
@@ -412,7 +414,7 @@ async def _missing_snapshot_serving_resources(
         return missing_table_names, contract_errors
 
     schema = _quote_ident(schema_name)
-    rows = await db.all(
+    resource_records = await db.all(
         f"""
         SELECT layout.state,
                layout.generation,
@@ -479,36 +481,45 @@ async def _missing_snapshot_serving_resources(
         shared_snapshot_key=shared_snapshot_key,
         coverage_scope_id=coverage_scope_id,
     )
-    if len(rows) != 1:
+    if len(resource_records) != 1:
         return missing_table_names, ["snapshot_binding"]
-    row = rows[0] if isinstance(rows[0], dict) else dict(rows[0]._mapping)
-    if str(row.get("state") or "").strip().lower() != "sealed":
+    resource_record = (
+        resource_records[0]
+        if isinstance(resource_records[0], dict)
+        else dict(resource_records[0]._mapping)
+    )
+    if str(resource_record.get("state") or "").strip().lower() != "sealed":
         contract_errors.append("layout_state")
-    if str(row.get("generation") or "").strip().lower() != PTG2_V3_SHARED_GENERATION:
+    if (
+        str(resource_record.get("generation") or "").strip().lower()
+        != PTG2_V3_SHARED_GENERATION
+    ):
         contract_errors.append("layout_generation")
-    if len(bytes(row.get("mapping_digest") or b"")) != 32:
+    if len(bytes(resource_record.get("mapping_digest") or b"")) != 32:
         contract_errors.append("mapping_digest")
-    if len(bytes(row.get("support_digest") or b"")) != 32:
+    if len(bytes(resource_record.get("support_digest") or b"")) != 32:
         contract_errors.append("support_digest")
-    mapping_count = int(row.get("mapping_count") or 0)
+    mapping_count = int(resource_record.get("mapping_count") or 0)
     if mapping_count <= 0:
         contract_errors.append("snapshot_blocks")
-    if int(row.get("resolved_mapping_count") or 0) != mapping_count:
+    if int(resource_record.get("resolved_mapping_count") or 0) != mapping_count:
         contract_errors.append("unresolved_snapshot_blocks")
-    if int(row.get("scope_count") or 0) != 1:
+    if int(resource_record.get("scope_count") or 0) != 1:
         contract_errors.append("snapshot_scope")
-    if int(row.get("matching_scope_count") or 0) != 1:
+    if int(resource_record.get("matching_scope_count") or 0) != 1:
         contract_errors.append("coverage_scope_binding")
-    code_count = int(row.get("code_count") or 0)
-    code_scope_count = int(row.get("code_scope_count") or 0)
-    matching_code_scope_count = int(row.get("matching_code_scope_count") or 0)
+    code_count = int(resource_record.get("code_count") or 0)
+    code_scope_count = int(resource_record.get("code_scope_count") or 0)
+    matching_code_scope_count = int(
+        resource_record.get("matching_code_scope_count") or 0
+    )
     if code_count == 0:
         if code_scope_count != 0 or matching_code_scope_count != 0:
             contract_errors.append("coverage_scope_code")
     elif code_scope_count != 1 or matching_code_scope_count != code_count:
         contract_errors.append("coverage_scope_code")
 
-    layout_manifest = row.get("layout_manifest")
+    layout_manifest = resource_record.get("layout_manifest")
     if isinstance(layout_manifest, str):
         try:
             layout_manifest = json.loads(layout_manifest)
@@ -561,17 +572,21 @@ async def _missing_snapshot_serving_resources(
     serving_rate_count = int(serving_index.get("serving_rates") or 0)
     provider_graph = serving_index.get("provider_graph")
     provider_graph = provider_graph if isinstance(provider_graph, dict) else {}
-    required_dense_flags = {
+    required_dense_count_by_name = {
         "graph_owner": int(provider_graph.get("owner_count") or 0),
         "provider_group": int(provider_graph.get("provider_group_count") or 0),
         "provider_set": serving_rate_count,
         "price_attr": serving_rate_count,
         "npi_scope": int(provider_graph.get("npi_count") or 0),
     }
-    for dense_name, expected_count in required_dense_flags.items():
-        if expected_count > 0 and not bool(row.get(f"has_{dense_name}")):
+    for dense_name, expected_count in required_dense_count_by_name.items():
+        if expected_count > 0 and not bool(
+            resource_record.get(f"has_{dense_name}")
+        ):
             contract_errors.append(f"dense:{dense_name}")
-    if serving_rate_count > 0 and (code_count <= 0 or not bool(row.get("has_code"))):
+    if serving_rate_count > 0 and (
+        code_count <= 0 or not bool(resource_record.get("has_code"))
+    ):
         contract_errors.append("dense:code")
     return missing_table_names, contract_errors
 

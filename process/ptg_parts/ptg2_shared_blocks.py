@@ -41,6 +41,7 @@ PTG2_V3_DENSE_LAYOUT_TABLES = (
     "ptg2_v3_price_attr",
     "ptg2_v3_npi_scope",
     "ptg2_v3_audit_occurrence",
+    "ptg2_v3_source_audit_witness",
 )
 _BLOCK_HASH_DOMAIN = b"PTG2V3BLOCK\x01"
 _MAPPING_HASH_DOMAIN = b"PTG2V3MAP\x02"
@@ -469,7 +470,7 @@ async def touch_shared_layout_build(
     """Extend ownership of a live build at bounded publication checkpoints."""
 
     schema = _quote_ident(schema_name)
-    result = await session.execute(
+    heartbeat_result = await session.execute(
         text(
             f"""
             UPDATE {schema}.ptg2_v3_snapshot_layout
@@ -490,7 +491,7 @@ async def touch_shared_layout_build(
             "lease_until": _lease_deadline(),
         },
     )
-    if result.scalar() is None:
+    if heartbeat_result.scalar() is None:
         raise RuntimeError("shared PTG build heartbeat lost ownership of the reserved layout")
 
 
@@ -559,7 +560,7 @@ async def reserve_shared_layout(
         ):
             return SharedLayoutReservation(int(existing["snapshot_key"]), False, None)
         raise RuntimeError("matching shared PTG layout is already building or uses another generation")
-    result = await session.execute(
+    reservation_result = await session.execute(
         text(
             f"""
             INSERT INTO {schema}.ptg2_v3_snapshot_layout
@@ -580,7 +581,7 @@ async def reserve_shared_layout(
             "lease_until": _lease_deadline(),
         },
     )
-    snapshot_key = result.scalar()
+    snapshot_key = reservation_result.scalar()
     if snapshot_key is None:
         raise RuntimeError("shared PTG layout reservation did not return a key")
     await session.execute(
@@ -633,10 +634,10 @@ async def insert_shared_blocks(
     shared_mapping_digest(blocks)
     schema = _quote_ident(schema_name)
     block_rows_by_hash: dict[bytes, dict[str, Any]] = {}
-    for row in _block_insert_rows(blocks):
-        existing = block_rows_by_hash.get(row["block_hash"])
+    for block_row in _block_insert_rows(blocks):
+        existing = block_rows_by_hash.get(block_row["block_hash"])
         if existing is not None and any(
-            existing[field_name] != row[field_name]
+            existing[field_name] != block_row[field_name]
             for field_name in (
                 "format_version",
                 "object_kind",
@@ -648,7 +649,7 @@ async def insert_shared_blocks(
             )
         ):
             raise ValueError("shared PTG content hash has inconsistent block metadata")
-        block_rows_by_hash[row["block_hash"]] = row
+        block_rows_by_hash[block_row["block_hash"]] = block_row
     await session.execute(
         text(
             f"""
@@ -772,7 +773,7 @@ async def seal_shared_layout(
     )
     if owner_result.scalar() is None:
         raise RuntimeError("shared PTG seal lost ownership of its building layout")
-    result = await session.execute(
+    mapping_result = await session.execute(
         text(
             f"""
             SELECT mapping.object_kind, mapping.block_key, mapping.fragment_no,
@@ -787,7 +788,7 @@ async def seal_shared_layout(
         ),
         {"snapshot_key": int(snapshot_key)},
     )
-    observed_rows = [_row_mapping(row) for row in result]
+    observed_rows = [_row_mapping(mapping_row) for mapping_row in mapping_result]
     expected_by_key = {
         (block.object_kind, int(block.block_key), int(block.fragment_no)): block
         for block in expected_blocks
@@ -798,18 +799,22 @@ async def seal_shared_layout(
             f"observed {len(observed_rows)}"
         )
     logical_byte_count = 0
-    for row in observed_rows:
-        key = (str(row["object_kind"]), int(row["block_key"]), int(row["fragment_no"]))
+    for observed_row in observed_rows:
+        key = (
+            str(observed_row["object_kind"]),
+            int(observed_row["block_key"]),
+            int(observed_row["fragment_no"]),
+        )
         expected = expected_by_key.get(key)
         if expected is None:
             raise RuntimeError(f"unexpected shared PTG mapping: {key!r}")
-        if bytes(row["block_hash"]) != expected.block_hash or int(row["entry_count"]) != int(
-            expected.entry_count
-        ):
+        if bytes(observed_row["block_hash"]) != expected.block_hash or int(
+            observed_row["entry_count"]
+        ) != int(expected.entry_count):
             raise RuntimeError(f"shared PTG mapping mismatch: {key!r}")
-        if int(row["format_version"]) != PTG2_V3_SHARED_FORMAT_VERSION:
+        if int(observed_row["format_version"]) != PTG2_V3_SHARED_FORMAT_VERSION:
             raise RuntimeError(f"shared PTG mapping uses an incompatible block version: {key!r}")
-        logical_byte_count += int(row["raw_byte_count"])
+        logical_byte_count += int(observed_row["raw_byte_count"])
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:lock_key)"),
         {"lock_key": _advisory_lock_key(expected_digest)},
@@ -943,7 +948,7 @@ async def bind_snapshot_to_shared_layout(
     """Bind one logical published snapshot to one sealed physical layout."""
 
     schema = _quote_ident(schema_name)
-    result = await session.execute(
+    binding_result = await session.execute(
         text(
             f"""
             INSERT INTO {schema}.ptg2_v3_snapshot_binding
@@ -964,7 +969,7 @@ async def bind_snapshot_to_shared_layout(
             "created_at": _utcnow(),
         },
     )
-    if result.scalar() is not None:
+    if binding_result.scalar() is not None:
         return
     existing_result = await session.execute(
         text(

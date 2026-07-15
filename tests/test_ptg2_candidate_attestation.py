@@ -25,12 +25,37 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _source_witness(source_set):
+    return {
+        "contract": "ptg2_v3_source_witness_payload_v2",
+        "format_version": 2,
+        "selection_method": "bottom_k_atomic_occurrence_exponential_priority_v2",
+        "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
+        "unqueryable_rate_policy": "count_but_exclude_from_npi_api_challenges_v1",
+        "source_count": source_set["source_count"],
+        "source_set_digest": source_set["raw_container_sha256_digest"],
+        "total_target": 2_048,
+        "provider_quota": 48,
+        "queryable_occurrence_population_count": 5_000,
+        "provider_population_count": 100,
+        "emitted_rate_row_count": 1_000,
+        "unqueryable_rate_row_count": 0,
+        "occurrence_witness_count": 2_000,
+        "provider_witness_count": 48,
+        "record_count": 2_048,
+        "sample_digest": "cd" * 32,
+        "payload_sha256": (b"w" * 32).hex(),
+        "payload_bytes": 1024,
+        "compression": "per_record_zlib",
+    }
+
+
 def _release_report(**target_overrides):
     """Support the release report test fixture."""
     completed_at = datetime.datetime.now(datetime.timezone.utc).replace(
         microsecond=0
     )
-    started_at = completed_at - datetime.timedelta(minutes=10)
+    started_at = completed_at - datetime.timedelta(seconds=30)
     target_map = {
         "expected_architecture": "postgres_binary_v3",
         "expected_storage_generation": "shared_blocks_v3",
@@ -54,29 +79,56 @@ def _release_report(**target_overrides):
     }
     target_map.update(target_overrides)
     return {
-        "schema_version": 2,
-        "harness": {"name": "ptg2_v3_source_api_audit", "version": "2.11.0"},
+        "schema_version": 3,
+        "harness": {
+            "name": "ptg2_v3_fast_source_witness_audit",
+            "version": "2.0.0",
+            "contract": "ptg2_v3_fast_source_witness_audit_v2",
+        },
+        "runtime": {"http_client": "aiohttp", "event_loop": "uvloop"},
         "status": "pass",
         "profile": "release",
         "release_profile_enforced": True,
         "release_gate_eligible": True,
         "started_at": started_at.isoformat(),
         "completed_at": completed_at.isoformat(),
-        "duration_seconds": 600.0,
+        "duration_seconds": 30.0,
         "target": target_map,
         "reproducibility": {},
         "source": {
+            "source_count": 1,
+            "source_set_digest": (b"s" * 32).hex(),
+            "witness": _source_witness(
+                {
+                    "source_count": 1,
+                    "raw_container_sha256_digest": (b"s" * 32).hex(),
+                }
+            ),
             "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
         },
-        "coverage": {"failures": []},
-        "checks": {
-            "source_occurrence_ids": 2_500,
-            "api_occurrence_ids": 2_500,
-            "negative_queries": 250,
-            "random_api_requests_executed": 2_500,
+        "coverage": {
+            "failures": [],
+            "selection_method": "bottom_k_atomic_occurrence_exponential_priority_v2",
+            "queryable_occurrence_population_count": 5_000,
+            "emitted_rate_row_count": 1_000,
+            "unqueryable_rate_row_count": 0,
+            "unqueryable_rate_policy": "count_but_exclude_from_npi_api_challenges_v1",
+            "occurrence_sample_count": 2_000,
+            "provider_sample_count": 48,
         },
-        "http": {"standard_api_actual_http_requests": 3_000},
-        "random_api_requests": {},
+        "checks": {
+            "source_witnesses": 2_048,
+            "api_witnesses_matched": 2_000,
+            "api_challenges_executed": 2_000,
+            "provider_witnesses_validated": 48,
+            "api_audit_occurrences_validated": 1,
+        },
+        "http": {
+            "standard_api_actual_http_requests": 2_001,
+            "retry_count": 0,
+            "max_concurrency": 32,
+        },
+        "random_api_requests": {"requested": 2_000, "executed": 2_000},
         "latency": {},
         "api_audit_sample": {
             "sample_digest": "ab" * 32,
@@ -121,8 +173,22 @@ def test_release_report_validation_is_exact_and_deterministic():
 
     assert len(first["report_digest"]) == 32
     assert first["report_digest"] == second["report_digest"]
-    assert first["checks"]["source_occurrence_ids"] == 2_500
-    assert first["standard_api_actual_http_requests"] == 3_000
+    assert first["checks"]["source_witnesses"] == 2_048
+    assert first["standard_api_actual_http_requests"] == 2_001
+
+
+def test_release_report_rejects_non_uvloop_or_non_aiohttp_runtime():
+    report = _release_report()
+    report["runtime"] = {"http_client": "httpx", "event_loop": "asyncio"}
+
+    with pytest.raises(ValueError, match="async runtime"):
+        ptg2_candidate_attestation.validate_candidate_release_audit_report(
+            report,
+            snapshot_id="snap_new",
+            source_key="source_a",
+            plan_id="12-3456789",
+            plan_market_type="group",
+        )
 
 
 def test_release_report_accepts_explicit_authenticated_cluster_transport():
@@ -146,10 +212,11 @@ def test_release_report_accepts_explicit_authenticated_cluster_transport():
     ("mutation", "message"),
     [
         (lambda report: report["target"].update(expected_snapshot_lifecycle="published"), "target"),
-        (lambda report: report["checks"].update(source_occurrence_ids=2_499), "below"),
+        (lambda report: report["checks"].update(source_witnesses=2_047), "below"),
         (lambda report: report["failures"]["counts"].update(altered=1), "release gate"),
-        (lambda report: report["api_audit_sample"].update(source_set_validated=False), "source set"),
-        (lambda report: report["checks"].update(source_occurrence_ids="2500"), "invalid"),
+        (lambda report: report["api_audit_sample"].update(source_set_validated=False), "coverage"),
+        (lambda report: report["random_api_requests"].update(executed=2_047), "coverage"),
+        (lambda report: report["checks"].update(source_witnesses="2048"), "invalid"),
         (lambda report: report["api_audit_sample"].update(sample_digest="bad"), "sample_digest"),
         (lambda report: report["redaction"]["excluded"].pop(), "redaction"),
         (lambda report: report["target"].update(transport_contract=None), "transport"),
@@ -241,12 +308,14 @@ def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
         "audit_sample": {"sample_digest": audit_sample_digest},
+        "source_witness": _source_witness(source_set),
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
     layout_serving_index = {
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_count": 1,
         "audit_sample": {"sample_digest": audit_sample_digest},
+        "source_witness": _source_witness(source_set),
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
 
@@ -286,6 +355,7 @@ def test_candidate_identity_rejects_snapshot_layout_sample_mismatch():
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
         "audit_sample": {"sample_digest": "ab" * 32},
+        "source_witness": _source_witness(source_set),
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
 
@@ -306,6 +376,7 @@ def test_candidate_identity_rejects_snapshot_layout_sample_mismatch():
                         "coverage_scope_id": coverage_scope_id.hex(),
                         "source_count": 1,
                         "audit_sample": {"sample_digest": "cd" * 32},
+                        "source_witness": _source_witness(source_set),
                         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
                     }
                 },
@@ -328,6 +399,7 @@ def test_candidate_identity_rejects_snapshot_layout_quarantine_mismatch():
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
         "audit_sample": {"sample_digest": "ab" * 32},
+        "source_witness": _source_witness(source_set),
         "provider_identifier_quarantine": MALFORMED_PROVIDER_IDENTIFIER_QUARANTINE,
     }
 
@@ -348,6 +420,7 @@ def test_candidate_identity_rejects_snapshot_layout_quarantine_mismatch():
                         "coverage_scope_id": coverage_scope_id.hex(),
                         "source_count": 1,
                         "audit_sample": {"sample_digest": "ab" * 32},
+                        "source_witness": _source_witness(source_set),
                         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
                     }
                 },
@@ -370,6 +443,7 @@ def test_candidate_identity_rejects_snapshot_layout_physical_scope_mismatch():
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
         "audit_sample": {"sample_digest": "ab" * 32},
+        "source_witness": _source_witness(source_set),
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
 
@@ -390,6 +464,7 @@ def test_candidate_identity_rejects_snapshot_layout_physical_scope_mismatch():
                         "coverage_scope_id": (b"d" * 32).hex(),
                         "source_count": 1,
                         "audit_sample": {"sample_digest": "ab" * 32},
+                        "source_witness": _source_witness(source_set),
                         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
                     }
                 },
@@ -444,6 +519,7 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
         "coverage_scope_id": b"c" * 32,
         "source_set_digest": b"s" * 32,
         "audit_sample_digest": bytes.fromhex("ab" * 32),
+        "source_witness_digest": b"w" * 32,
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
     monkeypatch.setattr(
@@ -486,6 +562,7 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
     assert params["coverage_scope_id"] == b"c" * 32
     assert params["source_set_digest"] == b"s" * 32
     assert params["audit_sample_digest"] == bytes.fromhex("ab" * 32)
+    assert params["source_witness_digest"] == b"w" * 32
     assert params["expires_at"] > params["attested_at"]
 
 
@@ -499,6 +576,7 @@ def test_record_candidate_attestation_rejects_report_quarantine_mismatch(monkeyp
         "coverage_scope_id": b"c" * 32,
         "source_set_digest": b"s" * 32,
         "audit_sample_digest": bytes.fromhex("ab" * 32),
+        "source_witness_digest": b"w" * 32,
         "provider_identifier_quarantine": MALFORMED_PROVIDER_IDENTIFIER_QUARANTINE,
     }
     monkeypatch.setattr(
@@ -537,6 +615,8 @@ def test_record_candidate_attestation_rejects_report_quarantine_mismatch(monkeyp
 
 
 def test_attestation_expiry_is_capped_by_report_freshness(monkeypatch):
+    """Keep attestation expiry within the already-running report freshness window."""
+
     report = _release_report()
     completed_at = datetime.datetime.fromisoformat(report["completed_at"])
     database_now = completed_at + datetime.timedelta(minutes=10)
@@ -549,6 +629,7 @@ def test_attestation_expiry_is_capped_by_report_freshness(monkeypatch):
         "coverage_scope_id": b"c" * 32,
         "source_set_digest": b"s" * 32,
         "audit_sample_digest": bytes.fromhex("ab" * 32),
+        "source_witness_digest": b"w" * 32,
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
     monkeypatch.setenv(
@@ -611,6 +692,7 @@ def test_activation_rechecks_attestation_expiry_against_wall_clock(monkeypatch):
         "coverage_scope_id": b"c" * 32,
         "source_set_digest": b"s" * 32,
         "audit_sample_digest": bytes.fromhex("ab" * 32),
+        "source_witness_digest": b"w" * 32,
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
     monkeypatch.setattr(
@@ -638,6 +720,7 @@ def test_activation_rechecks_attestation_expiry_against_wall_clock(monkeypatch):
     assert "expires_at > now()" not in sql
     assert "source_set_digest = :source_set_digest" in sql
     assert params["audit_sample_digest"] == bytes.fromhex("ab" * 32)
+    assert params["source_witness_digest"] == b"w" * 32
 
 
 def test_activation_rejects_report_quarantine_changed_after_attestation(monkeypatch):
@@ -661,6 +744,7 @@ def test_activation_rejects_report_quarantine_changed_after_attestation(monkeypa
                 "coverage_scope_id": b"c" * 32,
                 "source_set_digest": b"s" * 32,
                 "audit_sample_digest": bytes.fromhex("ab" * 32),
+                "source_witness_digest": b"w" * 32,
                 "provider_identifier_quarantine": (
                     EMPTY_PROVIDER_IDENTIFIER_QUARANTINE
                 ),
@@ -702,6 +786,7 @@ def test_activation_rejects_stored_report_changed_after_attestation(monkeypatch)
                 "coverage_scope_id": b"c" * 32,
                 "source_set_digest": b"s" * 32,
                 "audit_sample_digest": bytes.fromhex("ab" * 32),
+                "source_witness_digest": b"w" * 32,
                 "provider_identifier_quarantine": (
                     EMPTY_PROVIDER_IDENTIFIER_QUARANTINE
                 ),

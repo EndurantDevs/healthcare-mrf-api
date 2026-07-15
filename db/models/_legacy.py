@@ -2301,6 +2301,11 @@ class PTG2V3CandidateAuditAttestation(Base, JSONOutputMixin):
             name="ptg2_v3_candidate_audit_attestation_sample_check",
         ),
         CheckConstraint(
+            "source_witness_digest IS NULL "
+            "OR octet_length(source_witness_digest) = 32",
+            name="ptg2_v3_candidate_audit_attestation_witness_check",
+        ),
+        CheckConstraint(
             "octet_length(report_digest) = 32",
             name="ptg2_v3_candidate_audit_attestation_report_check",
         ),
@@ -2331,6 +2336,7 @@ class PTG2V3CandidateAuditAttestation(Base, JSONOutputMixin):
     coverage_scope_id = Column(LargeBinary, nullable=False)
     source_set_digest = Column(LargeBinary, nullable=False)
     audit_sample_digest = Column(LargeBinary, nullable=False)
+    source_witness_digest = Column(LargeBinary, nullable=True)
     contract = Column(String(64), nullable=False)
     tool_name = Column(String(64), nullable=False)
     tool_version = Column(String(32), nullable=False)
@@ -2849,6 +2855,74 @@ class PTG2V3AuditOccurrence(Base, JSONOutputMixin):
     npi = Column(BigInteger, nullable=False)
     atom_ordinal = Column(BigInteger, nullable=False)
     atom_key = Column(BigInteger, nullable=False)
+
+
+class PTG2V3SourceAuditWitness(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_source_audit_witness"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            name="ptg2_v3_source_audit_witness_pkey",
+        ),
+        CheckConstraint(
+            "octet_length(source_set_digest) = 32",
+            name="ptg2_v3_source_audit_witness_source_set_digest_check",
+        ),
+        CheckConstraint(
+            "octet_length(sample_digest) = 32",
+            name="ptg2_v3_source_audit_witness_sample_digest_check",
+        ),
+        CheckConstraint(
+            "octet_length(payload_sha256) = 32",
+            name="ptg2_v3_source_audit_witness_payload_sha256_check",
+        ),
+        CheckConstraint(
+            "queryable_occurrence_population_count >= occurrence_witness_count",
+            name="ptg2_v3_source_audit_witness_occurrence_population_check",
+        ),
+        CheckConstraint(
+            "provider_population_count >= provider_witness_count",
+            name="ptg2_v3_source_audit_witness_provider_population_check",
+        ),
+        CheckConstraint(
+            "occurrence_witness_count BETWEEN 1 AND 2048",
+            name="ptg2_v3_source_audit_witness_occurrence_count_check",
+        ),
+        CheckConstraint(
+            "provider_witness_count BETWEEN 0 AND 2048",
+            name="ptg2_v3_source_audit_witness_provider_count_check",
+        ),
+        CheckConstraint(
+            "occurrence_witness_count + provider_witness_count <= 2048",
+            name="ptg2_v3_source_audit_witness_total_count_check",
+        ),
+        CheckConstraint(
+            "octet_length(payload) > 0",
+            name="ptg2_v3_source_audit_witness_payload_check",
+        ),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    contract = Column(String(64), nullable=False)
+    selection_method = Column(String(64), nullable=False)
+    source_set_digest = Column(LargeBinary(32), nullable=False)
+    sample_digest = Column(LargeBinary(32), nullable=False)
+    queryable_occurrence_population_count = Column(BigInteger, nullable=False)
+    provider_population_count = Column(BigInteger, nullable=False)
+    occurrence_witness_count = Column(Integer, nullable=False)
+    provider_witness_count = Column(Integer, nullable=False)
+    payload_sha256 = Column(LargeBinary(32), nullable=False)
+    payload = Column(LargeBinary, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("transaction_timestamp()"),
+    )
 
 
 class PTG2V3GCCandidate(Base, JSONOutputMixin):

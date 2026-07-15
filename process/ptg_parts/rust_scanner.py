@@ -1486,6 +1486,7 @@ def _iter_top_level_object_bytes_rust(
 def _iter_compact_serving_records_rust(
     path: str | Path,
     *,
+    raw_source_sha256: str,
     snapshot_id: str,
     plan_id: str,
     coverage_scope_id: str,
@@ -1532,6 +1533,7 @@ def _iter_compact_serving_records_rust(
     scanner_environment_map = {
         **os.environ,
         "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v3",
+        "HLTHPRT_PTG2_RAW_SOURCE_SHA256": raw_source_sha256,
         "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": snapshot_id,
         "HLTHPRT_PTG2_COMPACT_PLAN_ID": plan_id,
         "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID": coverage_scope_id,
@@ -1817,6 +1819,7 @@ def _iter_compact_serving_records_rust(
 async def _aiter_compact_serving_records_rust(
     path: str | Path,
     *,
+    raw_source_sha256: str,
     snapshot_id: str,
     plan_id: str,
     coverage_scope_id: str,
@@ -1853,6 +1856,7 @@ async def _aiter_compact_serving_records_rust(
     process_control = _ScannerProcessControl()
     iterator = _iter_compact_serving_records_rust(
         path,
+        raw_source_sha256=raw_source_sha256,
         snapshot_id=snapshot_id,
         plan_id=plan_id,
         coverage_scope_id=coverage_scope_id,

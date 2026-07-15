@@ -45,6 +45,7 @@ PTG2_V3_MIGRATION_OWNED_TABLE_NAMES = (
     "ptg2_v3_price_attr",
     "ptg2_v3_npi_scope",
     "ptg2_v3_audit_occurrence",
+    "ptg2_v3_source_audit_witness",
     "ptg2_v3_candidate_audit_attestation",
     "ptg2_v3_gc_candidate",
 )
@@ -138,7 +139,7 @@ async def missing_ptg2_v3_migration_owned_tables(
 ) -> tuple[str, ...]:
     """Return strict V3 tables that must have been created by Alembic."""
 
-    rows = await executor.all(
+    table_records = await executor.all(
         """
         SELECT table_name
           FROM information_schema.tables
@@ -148,13 +149,13 @@ async def missing_ptg2_v3_migration_owned_tables(
         schema_name=schema_name,
         table_names=list(PTG2_V3_MIGRATION_OWNED_TABLE_NAMES),
     )
-    present = {
-        str(_row_mapping(row).get("table_name") or "")
-        for row in rows
-        if _row_mapping(row).get("table_name")
+    present_table_names = {
+        str(_row_mapping(table_record).get("table_name") or "")
+        for table_record in table_records
+        if _row_mapping(table_record).get("table_name")
     }
     return tuple(
-        sorted(set(PTG2_V3_MIGRATION_OWNED_TABLE_NAMES) - present)
+        sorted(set(PTG2_V3_MIGRATION_OWNED_TABLE_NAMES) - present_table_names)
     )
 
 
@@ -252,8 +253,8 @@ def is_shared_blocks_v1_manifest(serving_index: dict[str, Any] | None) -> bool:
     return is_shared_blocks_cleanup_manifest(serving_index)
 
 
-async def _shared_manifest_exists(executor: Any, schema_name: str) -> bool:
-    rows = await executor.all(
+async def _has_shared_manifest(executor: Any, schema_name: str) -> bool:
+    existence_records = await executor.all(
         f"""
         SELECT EXISTS (
             SELECT 1
@@ -268,11 +269,15 @@ async def _shared_manifest_exists(executor: Any, schema_name: str) -> bool:
         """,
         cleanup_generations=list(PTG2_V3_CLEANUP_GENERATIONS),
     )
-    return bool(_row_mapping(rows[0]).get("involved")) if rows else False
+    return (
+        bool(_row_mapping(existence_records[0]).get("involved"))
+        if existence_records
+        else False
+    )
 
 
-async def _shared_binding_exists(executor: Any, schema_name: str) -> bool:
-    rows = await executor.all(
+async def _has_shared_binding(executor: Any, schema_name: str) -> bool:
+    existence_records = await executor.all(
         f"""
         SELECT EXISTS (
             SELECT 1
@@ -280,11 +285,15 @@ async def _shared_binding_exists(executor: Any, schema_name: str) -> bool:
         ) AS involved
         """
     )
-    return bool(_row_mapping(rows[0]).get("involved")) if rows else False
+    return (
+        bool(_row_mapping(existence_records[0]).get("involved"))
+        if existence_records
+        else False
+    )
 
 
-async def _shared_scope_exists(executor: Any, schema_name: str) -> bool:
-    rows = await executor.all(
+async def _has_shared_scope(executor: Any, schema_name: str) -> bool:
+    existence_records = await executor.all(
         f"""
         SELECT EXISTS (
             SELECT 1
@@ -292,17 +301,21 @@ async def _shared_scope_exists(executor: Any, schema_name: str) -> bool:
         ) AS involved
         """
     )
-    return bool(_row_mapping(rows[0]).get("involved")) if rows else False
+    return (
+        bool(_row_mapping(existence_records[0]).get("involved"))
+        if existence_records
+        else False
+    )
 
 
-async def _shared_tables_available(
+async def _has_shared_tables(
     executor: Any,
     schema_name: str,
     *,
     require_shared: bool,
 ) -> bool:
     table_names = ["ptg2_snapshot", *_SHARED_TABLE_NAMES]
-    rows = await executor.all(
+    table_records = await executor.all(
         """
         SELECT table_name
           FROM information_schema.tables
@@ -312,25 +325,25 @@ async def _shared_tables_available(
         schema_name=schema_name,
         table_names=table_names,
     )
-    present = {
-        str(_row_mapping(row).get("table_name") or "")
-        for row in rows
-        if _row_mapping(row).get("table_name")
+    present_table_names = {
+        str(_row_mapping(table_record).get("table_name") or "")
+        for table_record in table_records
+        if _row_mapping(table_record).get("table_name")
     }
-    missing = sorted(set(_SHARED_TABLE_NAMES) - present)
+    missing = sorted(set(_SHARED_TABLE_NAMES) - present_table_names)
     if not missing:
         return True
 
     manifest_involved = require_shared
-    if not manifest_involved and "ptg2_snapshot" in present:
-        manifest_involved = await _shared_manifest_exists(executor, schema_name)
-    binding_involved = False
-    if "ptg2_v3_snapshot_binding" in present:
-        binding_involved = await _shared_binding_exists(executor, schema_name)
-    scope_involved = False
-    if "ptg2_v3_snapshot_scope" in present:
-        scope_involved = await _shared_scope_exists(executor, schema_name)
-    if manifest_involved or binding_involved or scope_involved:
+    if not manifest_involved and "ptg2_snapshot" in present_table_names:
+        manifest_involved = await _has_shared_manifest(executor, schema_name)
+    has_shared_binding = False
+    if "ptg2_v3_snapshot_binding" in present_table_names:
+        has_shared_binding = await _has_shared_binding(executor, schema_name)
+    has_shared_scope = False
+    if "ptg2_v3_snapshot_scope" in present_table_names:
+        has_shared_scope = await _has_shared_scope(executor, schema_name)
+    if manifest_involved or has_shared_binding or has_shared_scope:
         raise RuntimeError(
             "shared-block cleanup requires the complete shared schema; "
             f"missing tables: {', '.join(missing)}"
@@ -407,18 +420,18 @@ async def _build_layout_release_plan_ready(
     building_max_age_seconds: int,
     layout_limit: int | None,
 ) -> PTG2SharedLayoutGCStats:
-    rows = await executor.all(
+    aggregate_records = await executor.all(
         _layout_plan_sql(schema_name),
         cleanup_generations=list(PTG2_V3_CLEANUP_GENERATIONS),
         removing_snapshot_ids=list(dict.fromkeys(str(value) for value in removing_snapshot_ids)),
         building_max_age_seconds=building_max_age_seconds,
         layout_limit=layout_limit,
     )
-    row = _row_mapping(rows[0]) if rows else {}
+    aggregate_record = _row_mapping(aggregate_records[0]) if aggregate_records else {}
     return PTG2SharedLayoutGCStats(
-        logical_layout_count=int(row.get("logical_layout_count") or 0),
-        candidate_hash_count=int(row.get("candidate_hash_count") or 0),
-        stored_bytes=int(row.get("stored_bytes") or 0),
+        logical_layout_count=int(aggregate_record.get("logical_layout_count") or 0),
+        candidate_hash_count=int(aggregate_record.get("candidate_hash_count") or 0),
+        stored_bytes=int(aggregate_record.get("stored_bytes") or 0),
     )
 
 
@@ -436,7 +449,7 @@ async def build_ptg2_shared_layout_release_plan(
 
     schema_name = resolve_ptg2_schema(schema_name)
     executor = executor or db
-    if not await _shared_tables_available(
+    if not await _has_shared_tables(
         executor,
         schema_name,
         require_shared=require_shared,
@@ -606,18 +619,18 @@ async def _release_layouts_ready(
     ]
     if not layout_keys:
         return PTG2SharedLayoutGCStats()
-    rows = await executor.all(
+    aggregate_records = await executor.all(
         _release_layouts_sql(schema_name),
         layout_keys=layout_keys,
         cleanup_generations=list(PTG2_V3_CLEANUP_GENERATIONS),
         building_max_age_seconds=building_max_age_seconds,
         grace_seconds=grace_seconds,
     )
-    row = _row_mapping(rows[0]) if rows else {}
+    aggregate_record = _row_mapping(aggregate_records[0]) if aggregate_records else {}
     return PTG2SharedLayoutGCStats(
-        logical_layout_count=int(row.get("logical_layout_count") or 0),
-        candidate_hash_count=int(row.get("candidate_hash_count") or 0),
-        stored_bytes=int(row.get("stored_bytes") or 0),
+        logical_layout_count=int(aggregate_record.get("logical_layout_count") or 0),
+        candidate_hash_count=int(aggregate_record.get("candidate_hash_count") or 0),
+        stored_bytes=int(aggregate_record.get("stored_bytes") or 0),
     )
 
 
@@ -639,7 +652,7 @@ async def release_unbound_ptg2_shared_layouts(
     layout_limit = _layout_batch_rows(max_layouts)
 
     async def _run(connection: Any) -> PTG2SharedLayoutGCStats:
-        if not await _shared_tables_available(
+        if not await _has_shared_tables(
             connection,
             schema_name,
             require_shared=require_shared,
@@ -734,7 +747,7 @@ async def build_ptg2_shared_block_sweep_plan(
 
     schema_name = resolve_ptg2_schema(schema_name)
     executor = executor or db
-    if not await _shared_tables_available(
+    if not await _has_shared_tables(
         executor,
         schema_name,
         require_shared=require_shared,
@@ -840,7 +853,7 @@ async def sweep_ptg2_shared_blocks(
     row_limit = _block_gc_max_rows(max_rows)
 
     async def _run(connection: Any) -> PTG2SharedBlockSweepPlan:
-        if not await _shared_tables_available(
+        if not await _has_shared_tables(
             connection,
             schema_name,
             require_shared=require_shared,
@@ -874,7 +887,7 @@ async def build_ptg2_shared_gc_plan(
 
     schema_name = resolve_ptg2_schema(schema_name)
     executor = executor or db
-    if not await _shared_tables_available(
+    if not await _has_shared_tables(
         executor,
         schema_name,
         require_shared=require_shared,

@@ -561,6 +561,7 @@ def test_indexed_workers_drain_bounded_rotation_events_before_join(tmp_path):
             "manifest_provider_group_member_copy_file",
             "manifest_provider_forward_sidecar_file",
             "manifest_provider_inverted_sidecar_file",
+            "source_audit_witness_file",
         }
     ]
     assert len(artifact_event_paths) == len(set(artifact_event_paths))
@@ -604,8 +605,21 @@ def test_scanner_rejects_late_indexed_range_process_failure(tmp_path):
     assert b"late indexed failure" in error_info.value.stderr
 
 
-@pytest.mark.parametrize("worker_parse_setting", ["true", "false"])
-def test_scanner_rejects_late_full_scan_process_failure(tmp_path, worker_parse_setting):
+@pytest.mark.parametrize(
+    ("worker_parse_setting", "expected_error"),
+    [
+        ("true", b"late full-scan failure"),
+        (
+            "false",
+            b"strict V3 source attestation requires worker-side raw rate parsing",
+        ),
+    ],
+)
+def test_scanner_rejects_late_full_scan_process_failure(
+    tmp_path,
+    worker_parse_setting,
+    expected_error,
+):
     scanner_binary = _built_scanner_binary()
     normal_artifact = tmp_path / "late-full-scan-failure.json.gz"
     _write_gzip_json(normal_artifact, _scanner_fixture_payload())
@@ -628,4 +642,4 @@ def test_scanner_rejects_late_full_scan_process_failure(tmp_path, worker_parse_s
             },
         )
 
-    assert b"late full-scan failure" in error_info.value.stderr
+    assert expected_error in error_info.value.stderr

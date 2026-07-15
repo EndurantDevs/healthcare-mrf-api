@@ -46,6 +46,21 @@ ptg_provider_quarantine = importlib.import_module(
 )
 
 
+def test_candidate_audit_worker_requires_uvloop_before_startup(monkeypatch):
+    if process_pkg.uvloop is None:
+        pytest.fail("uvloop is a required runtime dependency")
+    startup = AsyncMock()
+    monkeypatch.setattr(process_pkg, "db_startup", startup)
+
+    async def run_startup():
+        await process_pkg._ptg_candidate_audit_startup({})
+
+    process_pkg.uvloop.run(run_startup())
+
+    startup.assert_awaited_once_with({})
+    assert process_pkg.PTGCandidateAudit.on_startup is process_pkg._ptg_candidate_audit_startup
+
+
 def _write_deflate64_zip(path: Path, member_name: str, member_payload: bytes) -> None:
     inflate64 = pytest.importorskip("inflate64")
     name_bytes = member_name.encode("utf-8")
@@ -996,6 +1011,7 @@ def test_async_rust_scanner_close_suppresses_generator_already_executing(monkeyp
     async def run():
         records = ptg_rust_scanner._aiter_compact_serving_records_rust(
             tmp_path / "rates.json.gz",
+            raw_source_sha256="a" * 64,
             snapshot_id="snap",
             plan_id="plan",
             coverage_scope_id="c" * 64,
@@ -1140,6 +1156,7 @@ def test_async_rust_scanner_passes_live_progress_context(monkeypatch, tmp_path):
         try:
             async for _record in ptg_rust_scanner._aiter_compact_serving_records_rust(
                 tmp_path / "rates.json.gz",
+                raw_source_sha256="a" * 64,
                 snapshot_id="snap",
                 plan_id="plan",
                 coverage_scope_id="c" * 64,
@@ -4210,6 +4227,7 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
     list(
         process_ptg._iter_compact_serving_records_rust(
             tmp_path / "rates.json.gz",
+            raw_source_sha256="a" * 64,
             snapshot_id="snap",
             plan_id="plan",
             coverage_scope_id="c" * 64,
@@ -4247,6 +4265,7 @@ def test_ptg2_rust_compact_retries_short_pipe_reads(monkeypatch, tmp_path):
     framed_records = list(
         process_ptg._iter_compact_serving_records_rust(
             tmp_path / "rates.json.gz",
+            raw_source_sha256="a" * 64,
             snapshot_id="snap",
             plan_id="plan",
             coverage_scope_id="c" * 64,
@@ -4297,6 +4316,7 @@ def test_ptg2_rust_compact_reports_truncated_frame_process_status(monkeypatch, t
         list(
             process_ptg._iter_compact_serving_records_rust(
                 tmp_path / "rates.json.gz",
+                raw_source_sha256="a" * 64,
                 snapshot_id="snap",
                 plan_id="plan",
                 coverage_scope_id="c" * 64,
@@ -5417,7 +5437,29 @@ def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
 
 
 def _reusable_v3_layout_manifest(provider_identifier_quarantine):
-    serving_index = {
+    source_witness_by_field = {
+        "contract": "ptg2_v3_source_witness_payload_v2",
+        "format_version": 2,
+        "selection_method": "bottom_k_atomic_occurrence_exponential_priority_v2",
+        "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
+        "unqueryable_rate_policy": "count_but_exclude_from_npi_api_challenges_v1",
+        "source_count": 1,
+        "source_set_digest": "11" * 32,
+        "total_target": 2_048,
+        "provider_quota": 48,
+        "queryable_occurrence_population_count": 5_000,
+        "provider_population_count": 100,
+        "emitted_rate_row_count": 1_000,
+        "unqueryable_rate_row_count": 0,
+        "occurrence_witness_count": 2_000,
+        "provider_witness_count": 48,
+        "record_count": 2_048,
+        "sample_digest": "22" * 32,
+        "payload_sha256": "33" * 32,
+        "payload_bytes": 1_024,
+        "compression": "per_record_zlib",
+    }
+    serving_index_by_field = {
         "storage": "manifest_snapshot",
         "type": "ptg2_shared_blocks_v3",
         "snapshot_scoped": True,
@@ -5432,16 +5474,17 @@ def _reusable_v3_layout_manifest(provider_identifier_quarantine):
         "shared_snapshot_key": 7,
         "serving_rates": 123,
         "provider_graph": {"owner_count": 4},
+        "source_witness": source_witness_by_field,
         "plan_id": "stale-plan",
         "source_file_versions": [{"source": "stale"}],
         "future_logical_provenance": {"owner": "stale"},
         "table": "mrf.retired_table",
     }
     if provider_identifier_quarantine is not None:
-        serving_index["provider_identifier_quarantine"] = (
+        serving_index_by_field["provider_identifier_quarantine"] = (
             provider_identifier_quarantine
         )
-    return {"serving_index": serving_index}
+    return {"serving_index": serving_index_by_field}
 
 
 def test_reused_v3_serving_index_copies_only_physical_contract_fields():
@@ -5488,6 +5531,55 @@ def test_reused_v3_serving_index_rejects_invalid_quarantine_evidence(
             source_key="current-source",
             shared_snapshot_key=9,
         )
+
+
+@pytest.mark.parametrize("witness_failure", ["missing", "incompatible"])
+def test_reused_v3_serving_index_rejects_invalid_source_witness(
+    witness_failure,
+):
+    quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload({})
+    manifest = _reusable_v3_layout_manifest(quarantine)
+    serving_index = manifest["serving_index"]
+    if witness_failure == "missing":
+        serving_index.pop("source_witness")
+    else:
+        serving_index["source_witness"]["contract"] = (
+            "ptg2_v3_source_witness_payload_v1"
+        )
+
+    with pytest.raises(RuntimeError, match="incompatible source witness evidence"):
+        process_ptg._reused_shared_v3_serving_index(
+            manifest,
+            source_key="current-source",
+            shared_snapshot_key=9,
+        )
+
+
+def test_shared_v3_physical_identity_binds_source_witness_publisher(
+    tmp_path,
+    monkeypatch,
+):
+    scanner_binary = tmp_path / "ptg2_scanner"
+    scanner_binary.write_bytes(b"scanner")
+    monkeypatch.setattr(
+        process_ptg,
+        "_ptg2_rust_scanner_binary",
+        lambda: scanner_binary,
+    )
+    baseline = process_ptg._shared_v3_scanner_identity()
+    original_read_bytes = Path.read_bytes
+
+    def changed_witness_source(path):
+        source_bytes = original_read_bytes(path)
+        if path.name == "ptg2_source_witness.py":
+            return source_bytes + b"\n# physical-contract-change\n"
+        return source_bytes
+
+    monkeypatch.setattr(Path, "read_bytes", changed_witness_source)
+    changed = process_ptg._shared_v3_scanner_identity()
+
+    assert baseline["contract_version"] == 3
+    assert changed["publisher_source_sha256"] != baseline["publisher_source_sha256"]
 
 
 def _strict_v3_downloaded_job(job):
@@ -6274,7 +6366,13 @@ def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, mon
             test_mode=True,
             import_log_cls=SimpleNamespace(__name__="ImportLog"),
             source_url="https://example.test/rates.json.gz",
-            source_version=None,
+            source_version=ptg_domain.PTG2SourceVersion(
+                source_identity_hash="source-identity",
+                source_file_version_id="source-version",
+                original_url="https://example.test/rates.json.gz",
+                canonical_url="https://example.test/rates.json.gz",
+                raw_sha256="a" * 64,
+            ),
             snapshot_id="ptg2:test",
             coverage_scope_id="a" * 64,
             import_month=process_ptg.normalize_import_month("2026-07"),

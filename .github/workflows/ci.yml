@@ -152,6 +152,8 @@ jobs:
           tests/test_ptg2_source_snapshot_gc.py
           tests/test_ptg_devops_scripts.py
           tests/test_ptg2_shared_audit.py
+          tests/test_ptg2_source_witness.py
+          tests/test_ptg2_fast_candidate_audit.py
           tests/test_ptg2_shared_blocks.py
           tests/test_ptg2_shared_finalize.py
           tests/test_ptg2_shared_finalize_source_contracts.py

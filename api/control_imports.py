@@ -221,10 +221,12 @@ _PTG_CONTROL_QUEUES = frozenset({"arq:PTG", "arq:PTGSmall", "arq:PTGNormal", "ar
 
 _CANCELABLE_IMPORTERS = {
     "ptg",
+    "ptg-candidate-audit",
     "npi",
     "nucc",
     "places-zcta",
-    "cms-doctors", "mrf-source-discovery",
+    "cms-doctors",
+    "mrf-source-discovery",
     "provider-directory-fhir",
     "address-archive-v2-migrate",
     "openaddresses",

@@ -1,5 +1,8 @@
 #![recursion_limit = "512"]
 
+mod source_witness;
+mod source_witness_spool;
+
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -64,6 +67,8 @@ use ptg2_scanner::v3_runs::{natural_lean_code_identity, read_code_dictionary};
 use rayon::prelude::*;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use source_witness::{RateOccurrenceWitnessInput, SourceWitnessCollector, SourceWitnessCoordinate};
+use source_witness_spool::ProviderSourceLocator;
 use std::any::Any;
 use std::cell::Cell;
 use std::cmp::Ordering as CmpOrdering;
@@ -96,6 +101,7 @@ const REQUIRED_STORAGE_GENERATION: &str = "shared_blocks_v3";
 const REQUIRED_COLD_LOOKUP_CONTRACT: &str = "ptg_v3_cold_v2";
 const REQUIRED_SHARED_BLOCK_LAYOUT: &str = "dense_shared_blocks_v3";
 const V3_COVERAGE_SCOPE_ID_ENV: &str = "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID";
+const V3_RAW_SOURCE_SHA256_ENV: &str = "HLTHPRT_PTG2_RAW_SOURCE_SHA256";
 const GROUP_NEGOTIATED_RATE_CHUNKS_ENV: &str = "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS";
 
 thread_local! {
@@ -333,7 +339,7 @@ fn scan(path: &Path, requested: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct ProviderEntry {
     entry_hash: i64,
     provider_count: i64,
@@ -341,7 +347,21 @@ struct ProviderEntry {
     npi: Vec<i64>,
     quarantined_npi: Vec<i64>,
     network_names: Vec<String>,
+    source_locator: Option<ProviderSourceLocator>,
 }
+
+impl PartialEq for ProviderEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry_hash == other.entry_hash
+            && self.provider_count == other.provider_count
+            && self.provider_group_hashes == other.provider_group_hashes
+            && self.npi == other.npi
+            && self.quarantined_npi == other.quarantined_npi
+            && self.network_names == other.network_names
+    }
+}
+
+impl Eq for ProviderEntry {}
 
 enum ProviderEntryView<'a> {
     Borrowed(&'a ProviderEntry),
@@ -1140,6 +1160,7 @@ fn build_provider_entry(provider_ref: &Value) -> io::Result<ProviderEntry> {
         npi: provider_npis,
         quarantined_npi: quarantined_npis,
         network_names,
+        source_locator: None,
     })
 }
 
@@ -1260,6 +1281,7 @@ fn provider_set_from_ref_keys(
         npi: sorted_provider_npis,
         quarantined_npi: quarantined_npis,
         network_names: sorted_network_names,
+        source_locator: None,
     }))
 }
 
@@ -1300,6 +1322,7 @@ fn combine_provider_entries(first: ProviderEntry, second: ProviderEntry) -> Prov
         npi: provider_npis,
         quarantined_npi: quarantined_npis,
         network_names,
+        source_locator: None,
     }
 }
 
@@ -4340,6 +4363,7 @@ struct CompactContext {
     plan_month_id: String,
     source_trace_set_hash: String,
     confidence_code: String,
+    source_witness: Arc<SourceWitnessCollector>,
 }
 
 fn rate_network_names(
@@ -4350,6 +4374,189 @@ fn rate_network_names(
     let mut network_names = rate.network_names.clone();
     network_names.extend_from_slice(provider_network_names);
     canonical_text_list(network_names, false)
+}
+
+fn source_rate_witness_expected() -> Value {
+    json!({
+        "contract": "ptg2_v3_source_rate_occurrence_expected_v2",
+    })
+}
+
+fn npi_source_coordinate(groups: &[Value], selected_npi: i64) -> Option<(usize, usize)> {
+    for (group_ordinal, group) in groups.iter().enumerate() {
+        let npi_values = group.get("npi")?.as_array()?;
+        for (npi_ordinal, raw_npi) in npi_values.iter().enumerate() {
+            if raw_npi.as_i64() == Some(selected_npi) {
+                return Some((group_ordinal, npi_ordinal));
+            }
+        }
+    }
+    None
+}
+
+fn linked_provider_source_evidence(
+    rate: &RateLite,
+    provider_map: &HashMap<String, ProviderEntry>,
+    context: &CompactContext,
+    selected_npi: i64,
+) -> io::Result<(Value, Option<Vec<u8>>)> {
+    if let Some((group_ordinal, npi_ordinal)) =
+        npi_source_coordinate(&rate.provider_groups, selected_npi)
+    {
+        return Ok((
+            json!({
+                "source_kind": "inline_provider_group",
+                "provider_group_ordinal": group_ordinal,
+                "npi_ordinal": npi_ordinal,
+            }),
+            None,
+        ));
+    }
+    for provider_reference in &rate.provider_refs {
+        let provider_entry = provider_map.get(provider_reference).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unresolved provider reference: {provider_reference}"),
+            )
+        })?;
+        if provider_entry.npi.binary_search(&selected_npi).is_err() {
+            continue;
+        }
+        let locator = provider_entry.source_locator.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "queryable source occurrence is missing linked provider evidence",
+            )
+        })?;
+        let raw_provider = context.source_witness.read_provider_source(locator)?;
+        let provider_value = parse_json_value_from_raw_bytes(&raw_provider)?;
+        let provider_group_id = provider_value.get("provider_group_id").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "linked provider evidence is missing provider_group_id",
+            )
+        })?;
+        if provider_ref_key(provider_group_id)? != *provider_reference {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "linked provider evidence has a mismatched provider_group_id",
+            ));
+        }
+        let groups = provider_value
+            .get("provider_groups")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "linked provider evidence is missing provider_groups",
+                )
+            })?;
+        let (group_ordinal, npi_ordinal) =
+            npi_source_coordinate(groups, selected_npi).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "linked provider evidence does not contain the selected NPI",
+                )
+            })?;
+        return Ok((
+            json!({
+                "source_kind": "provider_reference",
+                "provider_reference_id": provider_reference,
+                "provider_group_ordinal": group_ordinal,
+                "npi_ordinal": npi_ordinal,
+            }),
+            Some(raw_provider),
+        ));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "selected source occurrence NPI has no raw provider evidence",
+    ))
+}
+
+struct EmittedSourceRateWitnessInput<'a> {
+    procedure: &'a Map<String, Value>,
+    rate: &'a RateLite,
+    emitted_provider_npis: &'a [i64],
+    emitted_price_count: usize,
+    provider_map: &'a HashMap<String, ProviderEntry>,
+    context: &'a CompactContext,
+    coordinate: SourceWitnessCoordinate,
+    procedure_json: &'a [u8],
+    raw_rate: &'a [u8],
+}
+
+fn capture_emitted_source_rate_occurrences(
+    input: EmittedSourceRateWitnessInput<'_>,
+) -> io::Result<()> {
+    let EmittedSourceRateWitnessInput {
+        procedure,
+        rate,
+        emitted_provider_npis,
+        emitted_price_count,
+        provider_map,
+        context,
+        coordinate,
+        procedure_json,
+        raw_rate,
+    } = input;
+    if emitted_price_count != rate.prices.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source witness price population differs from emitted V3 prices",
+        ));
+    }
+    if normalize_code(procedure.get("billing_code_type")).is_none()
+        || normalize_code(procedure.get("billing_code")).is_none()
+        || emitted_provider_npis.is_empty()
+        || emitted_price_count == 0
+    {
+        return context
+            .source_witness
+            .rate_occurrence_candidates(coordinate, procedure_json, raw_rate, 0)
+            .map(|_| ());
+    }
+    let provider_count = u64::try_from(emitted_provider_npis.len()).map_err(to_io_error)?;
+    let price_count = u64::try_from(emitted_price_count).map_err(to_io_error)?;
+    let occurrence_count = provider_count.checked_mul(price_count).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "queryable source occurrence population overflow",
+        )
+    })?;
+    for candidate in context.source_witness.rate_occurrence_candidates(
+        coordinate,
+        procedure_json,
+        raw_rate,
+        occurrence_count,
+    )? {
+        let price_ordinal = candidate.occurrence_index / provider_count;
+        let provider_ordinal = candidate.occurrence_index % provider_count;
+        let selected_npi = emitted_provider_npis[provider_ordinal as usize];
+        let (provider_evidence, linked_provider_raw) =
+            linked_provider_source_evidence(rate, provider_map, context, selected_npi)?;
+        context
+            .source_witness
+            .commit_rate_occurrence(RateOccurrenceWitnessInput {
+                candidate,
+                coordinate,
+                price_ordinal,
+                provider_ordinal,
+                provider_evidence: &provider_evidence,
+                procedure,
+                raw_rate,
+                linked_provider_raw: linked_provider_raw.as_deref(),
+                expected: &source_rate_witness_expected(),
+            })?;
+    }
+    Ok(())
+}
+
+fn source_provider_witness_expected(key: &str, _entry: &ProviderEntry) -> Value {
+    json!({
+        "contract": "ptg2_v3_source_provider_expected_v2",
+        "provider_group_id": key,
+    })
 }
 
 fn provider_set_scope_hash(
@@ -4380,6 +4587,13 @@ enum WorkerJob {
 struct RawRateSpan {
     start: usize,
     end: usize,
+    coordinate: SourceWitnessCoordinate,
+}
+
+#[derive(Clone, Copy)]
+struct SourceRateWitnessInput<'a> {
+    coordinate: SourceWitnessCoordinate,
+    raw_rate: &'a [u8],
 }
 
 struct RawRateChunk {
@@ -4407,17 +4621,31 @@ impl RawRateChunk {
         self.bytes.len()
     }
 
+    #[cfg(test)]
     fn push_current_value_span(&mut self, start: usize) {
+        let item_ordinal = self.spans.len() as u64;
+        self.push_current_value_span_at(start, SourceWitnessCoordinate::new(0, item_ordinal));
+    }
+
+    fn push_current_value_span_at(&mut self, start: usize, coordinate: SourceWitnessCoordinate) {
         self.spans.push(RawRateSpan {
             start,
             end: self.bytes.len(),
+            coordinate,
         });
     }
 
+    #[cfg(test)]
     fn iter(&self) -> impl Iterator<Item = &[u8]> {
         self.spans
             .iter()
             .map(|span| &self.bytes[span.start..span.end])
+    }
+
+    fn iter_with_coordinates(&self) -> impl Iterator<Item = (SourceWitnessCoordinate, &[u8])> {
+        self.spans
+            .iter()
+            .map(|span| (span.coordinate, &self.bytes[span.start..span.end]))
     }
 
     fn clear_for_recycle(&mut self) {
@@ -4686,9 +4914,12 @@ fn process_provider_ref_raw_batch_with_metrics(
     provider_map: &mut HashMap<String, ProviderEntry>,
     dictionary_copy_sinks: &mut DictionaryCopySinks,
     dedupe: &SharedDedupe,
+    source_witness: &SourceWitnessCollector,
     metrics: &mut ProviderRefWorkerMetrics,
 ) -> io::Result<()> {
-    for raw_ref in raw_refs.iter() {
+    for (coordinate, raw_ref) in raw_refs.iter_with_coordinates() {
+        let witness_priority =
+            source_witness.provider_priority_if_candidate(coordinate, raw_ref)?;
         let parse_started_at = Instant::now();
         let value = parse_json_value_from_raw_bytes(raw_ref)?;
         metrics.parse_micros = metrics
@@ -4701,7 +4932,17 @@ fn process_provider_ref_raw_batch_with_metrics(
             .transform_micros
             .saturating_add(transform_started_at.elapsed().as_micros());
 
-        let (key, entry) = provider_entry;
+        let (key, mut entry) = provider_entry;
+        entry.source_locator =
+            Some(source_witness.store_provider_source(metrics.worker_id, raw_ref)?);
+        if let Some(priority) = witness_priority {
+            source_witness.commit_provider_reference(
+                priority,
+                coordinate,
+                raw_ref,
+                &source_provider_witness_expected(&key, &entry),
+            )?;
+        }
         insert_provider_definition(provider_map, key, entry)?;
         let write_started_at = Instant::now();
         dictionary_copy_sinks.write_provider_group_members_shared(&value, dedupe)?;
@@ -4721,11 +4962,14 @@ fn process_provider_ref_raw_batch(
     dedupe: &SharedDedupe,
 ) -> io::Result<u64> {
     let mut metrics = ProviderRefWorkerMetrics::default();
+    let source_witness = SourceWitnessCollector::new(&"00".repeat(32))?;
+    source_witness.configure_provider_spools(1)?;
     process_provider_ref_raw_batch_with_metrics(
         raw_refs,
         provider_map,
         dictionary_copy_sinks,
         dedupe,
+        &source_witness,
         &mut metrics,
     )?;
     Ok(metrics.provider_refs)
@@ -4734,6 +4978,7 @@ fn process_provider_ref_raw_batch(
 #[derive(Clone)]
 struct ProviderRefWorkerConfig {
     dedupe: Arc<SharedDedupe>,
+    source_witness: Arc<SourceWitnessCollector>,
     copy_paths: CopyPathConfig,
     rotate_bytes: u64,
     queue_bytes: Arc<QueueByteMetrics>,
@@ -4765,6 +5010,7 @@ fn provider_ref_worker_loop(
             &mut provider_map,
             &mut dictionary_copy_sinks,
             &config.dedupe,
+            &config.source_witness,
             &mut metrics,
         )?;
         let write_started_at = Instant::now();
@@ -5372,14 +5618,46 @@ fn process_compact_rate_lites_worker<W: Write>(
     rates: &[RateLite],
     procedure_value: &Value,
 ) -> io::Result<()> {
-    process_compact_rate_lites_worker_with_grouping(state, rates, procedure_value, false)
+    process_compact_rate_lites_worker_inner(state, rates, procedure_value, false, None)
 }
 
+fn process_compact_rate_lites_worker_with_source<W: Write>(
+    state: &mut SharedCompactState<'_, W>,
+    rates: &[RateLite],
+    procedure_value: &Value,
+    source_inputs: &[SourceRateWitnessInput<'_>],
+) -> io::Result<()> {
+    process_compact_rate_lites_worker_inner(
+        state,
+        rates,
+        procedure_value,
+        false,
+        Some(source_inputs),
+    )
+}
+
+#[cfg(test)]
 fn process_compact_rate_lites_worker_with_grouping<W: Write>(
     state: &mut SharedCompactState<'_, W>,
     rates: &[RateLite],
     procedure_value: &Value,
     group_negotiated_rate_chunks: bool,
+) -> io::Result<()> {
+    process_compact_rate_lites_worker_inner(
+        state,
+        rates,
+        procedure_value,
+        group_negotiated_rate_chunks,
+        None,
+    )
+}
+
+fn process_compact_rate_lites_worker_inner<W: Write>(
+    state: &mut SharedCompactState<'_, W>,
+    rates: &[RateLite],
+    procedure_value: &Value,
+    group_negotiated_rate_chunks: bool,
+    source_inputs: Option<&[SourceRateWitnessInput<'_>]>,
 ) -> io::Result<()> {
     if group_negotiated_rate_chunks {
         return Err(io::Error::new(
@@ -5387,6 +5665,31 @@ fn process_compact_rate_lites_worker_with_grouping<W: Write>(
             "strict V3 negotiated-rate grouping would lose exact source multiplicity",
         ));
     }
+    if source_inputs.is_some_and(|inputs| inputs.len() != rates.len()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source witness evidence is not aligned with parsed rates",
+        ));
+    }
+    if source_inputs.is_some() && state.manifest_serving_copy_writer.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source witness evidence requires the strict V3 serving writer",
+        ));
+    }
+    let source_procedure = source_inputs
+        .map(|_| {
+            procedure_value.as_object().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "source witness procedure must be a JSON object",
+                )
+            })
+        })
+        .transpose()?;
+    let source_procedure_json = source_inputs
+        .map(|_| serde_json::to_vec(procedure_value).map_err(to_io_error))
+        .transpose()?;
     let writer = &mut state.writer;
     let compact_copy_writer = &mut state.compact_copy_writer;
     let manifest_serving_copy_writer = &mut state.manifest_serving_copy_writer;
@@ -5439,7 +5742,7 @@ fn process_compact_rate_lites_worker_with_grouping<W: Write>(
 
     if !group_negotiated_rate_chunks {
         let mut code_count_rows = 0usize;
-        for rate in rates {
+        for (rate_index, rate) in rates.iter().enumerate() {
             let Some(provider_entry) = provider_entry_view_for_worker_rate(
                 provider_map,
                 rate,
@@ -5629,6 +5932,21 @@ fn process_compact_rate_lites_worker_with_grouping<W: Write>(
                     },
                     manifest_global_id_cache,
                 )?;
+                if let Some(source_input) = source_inputs.map(|inputs| inputs[rate_index]) {
+                    capture_emitted_source_rate_occurrences(EmittedSourceRateWitnessInput {
+                        procedure: source_procedure.expect("source procedure validated above"),
+                        rate,
+                        emitted_provider_npis: provider_entry.npi(),
+                        emitted_price_count: price_set.atoms.len(),
+                        provider_map,
+                        context,
+                        coordinate: source_input.coordinate,
+                        procedure_json: source_procedure_json
+                            .as_deref()
+                            .expect("source procedure JSON created above"),
+                        raw_rate: source_input.raw_rate,
+                    })?;
+                }
             } else if unique_for_legacy {
                 code_count_rows += 1;
             }
@@ -6275,6 +6593,7 @@ struct InNetworkEnqueueOptions {
     chunk_size: usize,
     raw_chunk_byte_limit: usize,
     parse_in_workers: bool,
+    object_ordinal: u64,
 }
 
 struct InNetworkEnqueueIo<'a, W: Write> {
@@ -6342,7 +6661,13 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
                         raw_rate_chunk.byte_len().saturating_sub(raw_start),
                         capture_started_at.elapsed().as_micros(),
                     );
-                    raw_rate_chunk.push_current_value_span(raw_start);
+                    raw_rate_chunk.push_current_value_span_at(
+                        raw_start,
+                        SourceWitnessCoordinate::new(
+                            options.object_ordinal,
+                            rate_count.saturating_sub(1),
+                        ),
+                    );
                     if raw_rate_chunk.len() >= chunk_size
                         || raw_rate_chunk.byte_len() >= raw_chunk_byte_limit
                     {
@@ -6449,7 +6774,13 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
                             raw_rate_chunk.byte_len().saturating_sub(raw_start),
                             capture_started_at.elapsed().as_micros(),
                         );
-                        raw_rate_chunk.push_current_value_span(raw_start);
+                        raw_rate_chunk.push_current_value_span_at(
+                            raw_start,
+                            SourceWitnessCoordinate::new(
+                                options.object_ordinal,
+                                rate_count.saturating_sub(1),
+                            ),
+                        );
                         if raw_rate_chunk.len() >= chunk_size
                             || raw_rate_chunk.byte_len() >= raw_chunk_byte_limit
                         {
@@ -6701,9 +7032,14 @@ fn compact_worker_loop(
                     .saturating_add(raw_rates.byte_len() as u64);
                 let parse_started_at = Instant::now();
                 let mut rates = Vec::with_capacity(raw_rates.len());
-                for raw_rate in raw_rates.iter() {
+                let mut source_inputs = Vec::with_capacity(raw_rates.len());
+                for (coordinate, raw_rate) in raw_rates.iter_with_coordinates() {
                     if let Some(rate) = read_rate_lite_bytes(raw_rate)? {
                         rates.push(rate);
+                        source_inputs.push(SourceRateWitnessInput {
+                            coordinate,
+                            raw_rate,
+                        });
                     }
                 }
                 metrics.parse_micros = metrics
@@ -6734,7 +7070,12 @@ fn compact_worker_loop(
                     manifest_global_id_cache: &mut manifest_global_id_cache,
                     context: &config.context,
                 };
-                process_compact_rate_lites_worker(&mut state, &rates, &procedure_value)?;
+                process_compact_rate_lites_worker_with_source(
+                    &mut state,
+                    &rates,
+                    &procedure_value,
+                    &source_inputs,
+                )?;
                 let transform_micros = transform_started_at.elapsed().as_micros();
                 let write_micros = compact_sink_write_micros(
                     &compact_copy_writer,
@@ -6752,6 +7093,7 @@ fn compact_worker_loop(
                         .saturating_sub(write_micros)
                         .saturating_sub(sidecar_lock_wait_micros),
                 );
+                drop(source_inputs);
                 if let Some(recycle_tx) = config.recycle_tx.as_ref() {
                     raw_rates.clear_for_recycle();
                     let _ = recycle_tx.try_send(raw_rates);
@@ -7035,6 +7377,7 @@ struct IndexedRangeProducerConfig {
     index_path: PathBuf,
     range_id: usize,
     range: IndexedInNetworkRange,
+    object_ordinal_base: u64,
     tx: Sender<WorkerJob>,
     cancelled: Arc<AtomicBool>,
     queue_bytes: Arc<QueueByteMetrics>,
@@ -7200,7 +7543,10 @@ fn produce_indexed_in_network_range(
             let object_rate_count = enqueue_in_network_raw_byte_scan(
                 &mut byte_reader,
                 &mut enqueue_io,
-                config.enqueue_options,
+                InNetworkEnqueueOptions {
+                    object_ordinal: config.object_ordinal_base.saturating_add(object_count),
+                    ..config.enqueue_options
+                },
             )?;
             rate_count = rate_count.saturating_add(object_rate_count);
             object_count = object_count.saturating_add(1);
@@ -7227,7 +7573,10 @@ fn produce_indexed_in_network_range(
             let object_rate_count = enqueue_in_network_struson(
                 &mut json_reader,
                 &mut enqueue_io,
-                config.enqueue_options,
+                InNetworkEnqueueOptions {
+                    object_ordinal: config.object_ordinal_base.saturating_add(object_count),
+                    ..config.enqueue_options
+                },
             )?;
             rate_count = rate_count.saturating_add(object_rate_count);
             object_count = object_count.saturating_add(1);
@@ -7411,6 +7760,9 @@ fn scan_compact_byte_top_level_parallel(
         env_usize("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES", DEFAULT_RAW_CHUNK_BYTES);
     let provider_ref_worker_count =
         env_usize("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS", worker_count).max(1);
+    context
+        .source_witness
+        .configure_provider_spools(provider_ref_worker_count)?;
     let provider_ref_queue_size = env_usize(
         "HLTHPRT_PTG2_RUST_PROVIDER_REF_QUEUE",
         provider_ref_worker_count.max(queue_size).max(1),
@@ -7559,6 +7911,7 @@ fn scan_compact_byte_top_level_parallel(
         provider_ref_queue_size,
         ProviderRefWorkerConfig {
             dedupe: Arc::clone(&dedupe),
+            source_witness: Arc::clone(&context.source_witness),
             copy_paths: provider_ref_paths,
             rotate_bytes: compact_copy_rotate_bytes,
             queue_bytes: Arc::clone(&provider_ref_raw_chunk_stats.queue_bytes),
@@ -7710,6 +8063,7 @@ fn scan_compact_byte_top_level_parallel(
                         &mut writer,
                         std::mem::take(&mut provider_handles),
                     )?;
+                    context.source_witness.seal_provider_sources()?;
                     provider_worker_join_seconds += joined_provider_refs.worker_join_seconds;
                     provider_map_merge_seconds += joined_provider_refs.map_merge_seconds;
                     provider_refs_seconds += provider_capture_seconds
@@ -7790,6 +8144,7 @@ fn scan_compact_byte_top_level_parallel(
                             Vec::with_capacity(reorder.in_network_ranges.len());
                         let (producer_result_tx, producer_result_rx) =
                             unbounded::<(usize, io::Result<IndexedRangeProducerOutput>)>();
+                        let mut object_ordinal_base = 0u64;
                         for (range_id, range) in
                             reorder.in_network_ranges.iter().copied().enumerate()
                         {
@@ -7802,6 +8157,7 @@ fn scan_compact_byte_top_level_parallel(
                                 index_path: reorder.index.path.clone(),
                                 range_id,
                                 range,
+                                object_ordinal_base,
                                 tx: tx.clone(),
                                 cancelled: Arc::clone(&indexed_cancelled),
                                 queue_bytes: Arc::clone(&raw_chunk_stats.queue_bytes),
@@ -7810,8 +8166,11 @@ fn scan_compact_byte_top_level_parallel(
                                     chunk_size: negotiated_rate_chunk_size,
                                     raw_chunk_byte_limit,
                                     parse_in_workers,
+                                    object_ordinal: 0,
                                 },
                             };
+                            object_ordinal_base =
+                                object_ordinal_base.saturating_add(range.object_count);
                             let producer_cancelled = Arc::clone(&indexed_cancelled);
                             let range_result_tx = producer_result_tx.clone();
                             producer_handles.push((
@@ -7989,6 +8348,9 @@ fn scan_compact_byte_top_level_parallel(
                                         chunk_size: negotiated_rate_chunk_size,
                                         raw_chunk_byte_limit,
                                         parse_in_workers,
+                                        object_ordinal: *object_counts
+                                            .get("in_network")
+                                            .unwrap_or(&0),
                                     },
                                 )?;
                                 drain_copy_file_events(&event_rx, &mut writer)?;
@@ -8059,6 +8421,9 @@ fn scan_compact_byte_top_level_parallel(
                                         chunk_size: negotiated_rate_chunk_size,
                                         raw_chunk_byte_limit,
                                         parse_in_workers,
+                                        object_ordinal: *object_counts
+                                            .get("in_network")
+                                            .unwrap_or(&0),
                                     },
                                 )?;
                                 drain_copy_file_events(&event_rx, &mut writer)?;
@@ -8387,7 +8752,13 @@ fn scan_compact_byte_top_level_parallel(
                     if capture_depth > 0 {
                         capture_depth -= 1;
                         if capture_depth == 0 {
-                            raw_refs.push_current_value_span(capture_start);
+                            raw_refs.push_current_value_span_at(
+                                capture_start,
+                                SourceWitnessCoordinate::new(
+                                    *object_counts.get("provider_references").unwrap_or(&0),
+                                    0,
+                                ),
+                            );
                             provider_ref_raw_chunk_stats.record_capture(
                                 raw_refs.byte_len().saturating_sub(capture_start),
                                 provider_capture_started_at
@@ -8637,6 +9008,7 @@ fn scan_compact_struson_parallel(
                         provider_ref_queue_size,
                         ProviderRefWorkerConfig {
                             dedupe: Arc::clone(&dedupe),
+                            source_witness: Arc::clone(&context.source_witness),
                             copy_paths: provider_ref_paths.clone(),
                             rotate_bytes: compact_copy_rotate_bytes,
                             queue_bytes: Arc::clone(&provider_ref_raw_chunk_stats.queue_bytes),
@@ -8657,7 +9029,13 @@ fn scan_compact_struson_parallel(
                             raw_refs.byte_len().saturating_sub(raw_start),
                             capture_started_at.elapsed().as_micros(),
                         );
-                        raw_refs.push_current_value_span(raw_start);
+                        raw_refs.push_current_value_span_at(
+                            raw_start,
+                            SourceWitnessCoordinate::new(
+                                *object_counts.get("provider_references").unwrap_or(&0),
+                                0,
+                            ),
+                        );
                         *object_counts
                             .entry("provider_references".to_string())
                             .or_insert(0) += 1;
@@ -8840,6 +9218,9 @@ fn scan_compact_struson_parallel(
                                         chunk_size: negotiated_rate_chunk_size,
                                         raw_chunk_byte_limit,
                                         parse_in_workers,
+                                        object_ordinal: *object_counts
+                                            .get("in_network")
+                                            .unwrap_or(&0),
                                     },
                                 )?;
                                 drain_copy_file_events(&event_rx, &mut writer)?;
@@ -9767,7 +10148,8 @@ impl Drop for ServingRunScanGuard {
             let file_name = file_name.to_string_lossy();
             if self.baseline_paths.contains(&path)
                 || !(file_name.starts_with(".ptg2-v3-serving-")
-                    || file_name.starts_with("ptg2-v3-serving-"))
+                    || file_name.starts_with("ptg2-v3-serving-")
+                    || file_name.starts_with("ptg2-v3-source-witness-"))
             {
                 continue;
             }
@@ -9779,14 +10161,39 @@ impl Drop for ServingRunScanGuard {
 fn scan_compact_struson(path: &Path) -> io::Result<()> {
     let copy_paths = CopyPathConfig::from_env()?;
     let mut serving_run_guard = ServingRunScanGuard::from_config(&copy_paths);
-    let result = scan_compact_struson_inner(path, copy_paths);
+    let source_witness_directory =
+        copy_paths.v3_serving_run_directory.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "strict V3 scan is missing its source-witness output directory",
+            )
+        })?;
+    let raw_source_sha256 = env::var(V3_RAW_SOURCE_SHA256_ENV).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("strict V3 scan requires {V3_RAW_SOURCE_SHA256_ENV}"),
+        )
+    })?;
+    let source_witness = Arc::new(SourceWitnessCollector::new(&raw_source_sha256)?);
+    let result = scan_compact_struson_inner(path, copy_paths, Arc::clone(&source_witness))
+        .and_then(|()| {
+            let summary = source_witness.write_bundle(Path::new(&source_witness_directory))?;
+            let stdout = io::stdout();
+            let mut writer = BufWriter::new(stdout.lock());
+            emit_json_record(&mut writer, "source_audit_witness_file", &summary)?;
+            writer.flush()
+        });
     if result.is_ok() {
         serving_run_guard.commit();
     }
     result
 }
 
-fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Result<()> {
+fn scan_compact_struson_inner(
+    path: &Path,
+    copy_paths: CopyPathConfig,
+    source_witness: Arc<SourceWitnessCollector>,
+) -> io::Result<()> {
     let snapshot_id = env::var("HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID").unwrap_or_default();
     let plan_id = env::var("HLTHPRT_PTG2_COMPACT_PLAN_ID").unwrap_or_default();
     let plan_month_id = env::var("HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID").unwrap_or_default();
@@ -9805,6 +10212,15 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
         "HLTHPRT_PTG2_RUST_WORK_QUEUE",
         DEFAULT_COMPACT_RUST_WORK_QUEUE,
     );
+    if !env_bool(
+        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS",
+        DEFAULT_PARSE_IN_WORKERS,
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "strict V3 source attestation requires worker-side raw rate parsing",
+        ));
+    }
     let top_level_byte_scan_requested = env_bool(
         "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN",
         DEFAULT_TOP_LEVEL_BYTE_SCAN,
@@ -9858,14 +10274,27 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
     let provider_reference_order_label = provider_reference_preflight.order.label();
     let parallel_top_level_order_supported = matches!(
         &provider_reference_preflight.order,
-        CompactProviderReferenceOrder::BeforeInNetwork
+        CompactProviderReferenceOrder::None
+            | CompactProviderReferenceOrder::BeforeInNetwork
             | CompactProviderReferenceOrder::AfterInNetworkIndexed(_)
             | CompactProviderReferenceOrder::AfterInNetworkPlain(_)
     );
+    if !top_level_byte_scan_requested
+        || !provider_refs_in_workers_requested
+        || !parallel_top_level_order_supported
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "strict V3 source attestation requires the parallel top-level byte scanner; provider_reference_order={provider_reference_order_label}"
+            ),
+        ));
+    }
     if copy_paths.has_file_paths() && parallel_top_level_order_supported {
         if top_level_byte_scan_requested && provider_refs_in_workers_requested {
             let (indexed_reorder, plain_reorder) = match provider_reference_preflight.order {
-                CompactProviderReferenceOrder::BeforeInNetwork => (None, None),
+                CompactProviderReferenceOrder::None
+                | CompactProviderReferenceOrder::BeforeInNetwork => (None, None),
                 CompactProviderReferenceOrder::AfterInNetworkIndexed(indexed_reorder) => {
                     (Some(indexed_reorder), None)
                 }
@@ -9882,6 +10311,7 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
                     plan_month_id,
                     source_trace_set_hash,
                     confidence_code,
+                    source_witness: Arc::clone(&source_witness),
                 },
                 rust_worker_count,
                 rust_queue_size,
@@ -9908,6 +10338,7 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
                 plan_month_id,
                 source_trace_set_hash,
                 confidence_code,
+                source_witness: Arc::clone(&source_witness),
             },
             rust_worker_count,
             rust_queue_size,
@@ -10160,6 +10591,7 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
                             plan_month_id: plan_month_id.clone(),
                             source_trace_set_hash: source_trace_set_hash.clone(),
                             confidence_code: confidence_code.clone(),
+                            source_witness: Arc::clone(&source_witness),
                         },
                         chunk_size: negotiated_rate_chunk_size,
                     };
@@ -19288,7 +19720,137 @@ mod tests {
             plan_month_id: "2026-07".to_string(),
             source_trace_set_hash: "trace-test".to_string(),
             confidence_code: "test".to_string(),
+            source_witness: Arc::new(SourceWitnessCollector::new(&"00".repeat(32)).unwrap()),
         }
+    }
+
+    fn source_witness_record_metadata(bundle: &[u8]) -> Vec<Value> {
+        assert_eq!(&bundle[..8], b"PTG2SW02");
+        let header_length = u32::from_be_bytes(bundle[8..12].try_into().unwrap()) as usize;
+        let mut offset = 12 + header_length;
+        let record_count =
+            u32::from_be_bytes(bundle[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        let mut metadata = Vec::with_capacity(record_count);
+        for _ in 0..record_count {
+            let compressed_length =
+                u32::from_be_bytes(bundle[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            let compressed_end = offset + compressed_length;
+            let mut decoded = Vec::new();
+            ZlibDecoder::new(&bundle[offset..compressed_end])
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(&decoded[..8], b"PTG2SWR2");
+            let metadata_length = u32::from_be_bytes(decoded[8..12].try_into().unwrap()) as usize;
+            metadata.push(serde_json::from_slice(&decoded[12..12 + metadata_length]).unwrap());
+            offset = compressed_end;
+        }
+        assert_eq!(offset, bundle.len());
+        metadata
+    }
+
+    #[test]
+    fn v3_emission_captures_every_atomic_price_provider_occurrence() {
+        let directory = tempfile::tempdir().unwrap();
+        let raw_provider = br#"{"provider_group_id":7,"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890,1234567891]}]}"#;
+        let raw_rate = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_type":"negotiated","negotiated_rate":100,"service_code":["11"]},{"negotiated_type":"negotiated","negotiated_rate":200,"service_code":["22"]}]}"#;
+        let source_witness = Arc::new(SourceWitnessCollector::new(&"ab".repeat(32)).unwrap());
+        source_witness.configure_provider_spools(1).unwrap();
+        let source_locator = source_witness
+            .store_provider_source(0, raw_provider)
+            .unwrap();
+        source_witness.seal_provider_sources().unwrap();
+
+        let provider_value: Value = serde_json::from_slice(raw_provider).unwrap();
+        let mut provider_entry = build_provider_entry(&provider_value).unwrap();
+        provider_entry.source_locator = Some(source_locator);
+        let provider_map = HashMap::from([("7".to_string(), provider_entry)]);
+        let rate = read_rate_lite_bytes(raw_rate).unwrap().unwrap();
+        let procedure = json!({
+            "billing_code_type": "CPT",
+            "billing_code": "99213",
+            "negotiation_arrangement": "ffs"
+        });
+        let context = CompactContext {
+            snapshot_id: "snapshot-test".to_string(),
+            plan_id: "plan-test".to_string(),
+            plan_month_id: "2026-07".to_string(),
+            source_trace_set_hash: "trace-test".to_string(),
+            confidence_code: "test".to_string(),
+            source_witness: Arc::clone(&source_witness),
+        };
+        let paths = CopyPathConfig::default();
+        let mut writer = io::sink();
+        let mut compact_copy_writer = None;
+        let mut manifest_serving_copy_writer = Some(
+            V3ServingRunSink::new(
+                directory.path().to_str().unwrap(),
+                "witness-test",
+                [0; COVERAGE_SCOPE_ID_BYTES],
+            )
+            .unwrap(),
+        );
+        let mut dictionary_copy_sinks = DictionaryCopySinks::from_paths(&paths, 0).unwrap();
+        let dedupe = SharedDedupe::new(1);
+        let mut price_code_set_hash_cache = PriceCodeSetHashCache::new();
+        let mut manifest_global_id_cache = ManifestGlobalIdCache::default();
+        let rates = [rate];
+        let source_inputs = [SourceRateWitnessInput {
+            coordinate: SourceWitnessCoordinate::new(9, 17),
+            raw_rate,
+        }];
+        let mut state = SharedCompactState {
+            writer: &mut writer,
+            compact_copy_writer: &mut compact_copy_writer,
+            manifest_serving_copy_writer: &mut manifest_serving_copy_writer,
+            dictionary_copy_sinks: &mut dictionary_copy_sinks,
+            manifest_sidecars: None,
+            record_price_forward_sidecar: false,
+            suppress_legacy_row_output: true,
+            provider_map: &provider_map,
+            dedupe: &dedupe,
+            price_code_set_hash_cache: &mut price_code_set_hash_cache,
+            manifest_global_id_cache: &mut manifest_global_id_cache,
+            context: &context,
+        };
+
+        process_compact_rate_lites_worker_with_source(
+            &mut state,
+            &rates,
+            &procedure,
+            &source_inputs,
+        )
+        .unwrap();
+        manifest_serving_copy_writer
+            .take()
+            .unwrap()
+            .finish_silent()
+            .unwrap();
+        dictionary_copy_sinks.finish_silent().unwrap();
+        let summary = source_witness.write_bundle(directory.path()).unwrap();
+        assert_eq!(summary["queryable_occurrence_population_count"], 4);
+        assert_eq!(summary["occurrence_witness_count"], 4);
+
+        let bundle = std::fs::read(summary["path"].as_str().unwrap()).unwrap();
+        let mut coordinates = source_witness_record_metadata(&bundle)
+            .into_iter()
+            .filter(|metadata| metadata["kind"] == "rate_occurrence")
+            .map(|metadata| {
+                (
+                    metadata["coordinate"]["price_ordinal"].as_u64().unwrap(),
+                    metadata["coordinate"]["provider_ordinal"].as_u64().unwrap(),
+                    metadata["provider_evidence"]["npi_ordinal"]
+                        .as_u64()
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        coordinates.sort_unstable();
+        assert_eq!(
+            coordinates,
+            vec![(0, 0, 0), (0, 1, 1), (1, 0, 0), (1, 1, 1)]
+        );
     }
 
     #[test]
@@ -19366,7 +19928,7 @@ mod tests {
         .is_empty());
     }
 
-    fn strict_scan_env(serving_run_directory: &Path) -> [TestEnvVar; 4] {
+    fn strict_scan_env(serving_run_directory: &Path) -> [TestEnvVar; 5] {
         [
             TestEnvVar::set("HLTHPRT_PTG2_SNAPSHOT_ARCH", REQUIRED_SNAPSHOT_ARCH),
             TestEnvVar::set(
@@ -19377,6 +19939,7 @@ mod tests {
                 V3_COVERAGE_SCOPE_ID_ENV,
                 &"11".repeat(COVERAGE_SCOPE_ID_BYTES),
             ),
+            TestEnvVar::set(V3_RAW_SOURCE_SHA256_ENV, &"22".repeat(32)),
             TestEnvVar::set(GROUP_NEGOTIATED_RATE_CHUNKS_ENV, "false"),
         ]
     }
@@ -19703,6 +20266,7 @@ mod tests {
                 npi: vec![1234567890, 1234567891],
                 quarantined_npi: Vec::new(),
                 network_names: Vec::new(),
+                source_locator: None,
             },
         );
         provider_map.insert(
@@ -19714,6 +20278,7 @@ mod tests {
                 npi: vec![1234567891, 1234567892],
                 quarantined_npi: Vec::new(),
                 network_names: Vec::new(),
+                source_locator: None,
             },
         );
 
@@ -20888,27 +21453,23 @@ mod tests {
     #[test]
     fn normal_order_byte_scan_rejects_duplicate_rate_array_suffix() {
         let _env_lock = scanner_env_lock().lock().unwrap();
-        for parse_in_workers in [true, false] {
-            assert_normal_order_suffix_rejected(
-                "duplicate-array",
-                r#", "in_network":[]}"#,
-                parse_in_workers,
-                "duplicate PTG top-level array",
-            );
-        }
+        assert_normal_order_suffix_rejected(
+            "duplicate-array",
+            r#", "in_network":[]}"#,
+            true,
+            "duplicate PTG top-level array",
+        );
     }
 
     #[test]
     fn normal_order_byte_scan_rejects_malformed_json_suffix() {
         let _env_lock = scanner_env_lock().lock().unwrap();
-        for parse_in_workers in [true, false] {
-            assert_normal_order_suffix_rejected(
-                "malformed-json",
-                r#", "invalid":not_json}"#,
-                parse_in_workers,
-                "JSON",
-            );
-        }
+        assert_normal_order_suffix_rejected(
+            "malformed-json",
+            r#", "invalid":not_json}"#,
+            true,
+            "JSON",
+        );
     }
 
     #[test]
@@ -25411,6 +25972,7 @@ mod tests {
                 chunk_size: 100,
                 raw_chunk_byte_limit: 1,
                 parse_in_workers: true,
+                object_ordinal: 0,
             },
         )
         .unwrap();

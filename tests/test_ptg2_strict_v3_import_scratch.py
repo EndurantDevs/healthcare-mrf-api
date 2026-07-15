@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from process.ptg_parts.domain import PTG2SourceVersion
+
 
 process_ptg = importlib.import_module("process.ptg")
 
@@ -33,7 +35,13 @@ def _run_parse(tmp_path: Path):
         test_mode=True,
         import_log_cls=SimpleNamespace(__name__="ImportLog"),
         source_url="https://example.test/source.json.gz",
-        source_version=None,
+        source_version=PTG2SourceVersion(
+            source_identity_hash="source-identity",
+            source_file_version_id="source-version",
+            original_url="https://example.test/source.json.gz",
+            canonical_url="https://example.test/source.json.gz",
+            raw_sha256="a" * 64,
+        ),
         snapshot_id="ptg2:synthetic",
         import_month=datetime.date(2026, 7, 1),
         coverage_scope_id=(b"\xcc" * 32).hex(),

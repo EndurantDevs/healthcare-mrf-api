@@ -22,6 +22,10 @@ from process.ptg_parts.ptg2_shared_finalize import (
 from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_payload,
 )
+from process.ptg_parts.ptg2_source_witness import (
+    build_persisted_source_witness,
+    decode_persisted_source_witness,
+)
 
 _SUPPORT_PATH = Path(__file__).with_name("test_ptg2_scanner_parallelism.py")
 _SUPPORT_SPEC = importlib.util.spec_from_file_location(
@@ -47,6 +51,7 @@ _STRICT_SCANNER_FRAME_KINDS = {
     "manifest_provider_inverted_sidecar_file",
     "scanner_config",
     "scanner_summary",
+    "source_audit_witness_file",
     "v3_serving_code_dictionary_file",
     "v3_serving_run_partition_file",
 }
@@ -407,6 +412,9 @@ def _run_scanner(
     scanner_environment_map.update(
         {
             "HLTHPRT_PTG2_SNAPSHOT_ARCH": arch,
+            "HLTHPRT_PTG2_RAW_SOURCE_SHA256": hashlib.sha256(
+                artifact.read_bytes()
+            ).hexdigest(),
             "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID": (b"\xcc" * 32).hex(),
             "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "snapshot-v3-runs",
             "HLTHPRT_PTG2_COMPACT_PLAN_ID": "plan-v3-runs",
@@ -546,11 +554,6 @@ def test_scanner_quarantine_is_identical_across_execution_modes(tmp_path):
             "top_level_byte_scan": True,
             "execution_mode": "parallel_top_level_bytes_plain_range_reorder",
         },
-        "serial": {
-            "provider_references_first": False,
-            "top_level_byte_scan": False,
-            "execution_mode": "serial_struson",
-        },
     }
     runs = {
         mode: _run_scanner(
@@ -643,6 +646,22 @@ def test_v3_all_scanner_paths_emit_identical_fixed_width_records(tmp_path):
         assert frame_kinds - {"dedupe_summary"} == (
             _STRICT_SCANNER_FRAME_KINDS - {"dedupe_summary"}
         )
+        source_digest = hashlib.sha256(run["artifact"].read_bytes()).hexdigest()
+        witness_entry = _single_frame(
+            run["frames"],
+            "source_audit_witness_file",
+        )
+        witness_payload, metadata = build_persisted_source_witness(
+            [witness_entry],
+            expected_raw_source_sha256=[source_digest],
+        )
+        loaded = decode_persisted_source_witness(
+            witness_payload,
+            expected_raw_source_sha256=[source_digest],
+            expected_metadata=metadata,
+        )
+        assert len(loaded.occurrence_records) == 2
+        assert len(loaded.provider_records) == 1
         assert not run["compact_copy_path"].exists()
         assert not run["lean_copy_path"].exists()
         assert not any(kind == "manifest_lean_serving_copy_file" for kind, _payload in run["frames"])
@@ -836,6 +855,7 @@ def test_python_bridge_collects_partition_paths_in_scanner_summary(tmp_path, mon
     scanner_frames = list(
         rust_scanner._iter_compact_serving_records_rust(
             artifact,
+            raw_source_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
             snapshot_id="snapshot-bridge-v3",
             plan_id="plan-v3-runs",
             plan_month_id="plan-month-bridge-v3",

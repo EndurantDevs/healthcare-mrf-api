@@ -21,6 +21,15 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+async def _ptg_candidate_audit_startup(ctx):
+    """Fail before DB/network work if the audit worker lost uvloop."""
+
+    loop = asyncio.get_running_loop()
+    if uvloop is None or not isinstance(loop, uvloop.Loop):
+        raise RuntimeError("PTG candidate audit requires uvloop")
+    await db_startup(ctx)
+
+
 from process.attributes import main as initiate_plan_attributes
 from process.attributes import (process_attributes, process_benefits,
                                 plan_attributes_control_start,
@@ -266,7 +275,7 @@ class PTGHuge:
 
 class PTGCandidateAudit:
     functions = [control_single_job_start]
-    on_startup = db_startup
+    on_startup = _ptg_candidate_audit_startup
     max_jobs = max(
         _worker_int_env("HLTHPRT_MAX_PTG_CANDIDATE_AUDIT_JOBS", 1),
         1,
