@@ -102,6 +102,12 @@ pub fn strict_integer_text(value: &Value, field_name: &str) -> io::Result<String
             format!("{field_name} must be a JSON integer"),
         ));
     };
+    if let Some(integer) = number.as_i64() {
+        return Ok(integer.to_string());
+    }
+    if let Some(integer) = number.as_u64() {
+        return Ok(integer.to_string());
+    }
     let canonical = canonical_decimal_text(&number.to_string()).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -118,6 +124,23 @@ pub fn strict_integer_text(value: &Value, field_name: &str) -> io::Result<String
 }
 
 pub fn strict_integer(value: &Value, field_name: &str) -> io::Result<i64> {
+    let Value::Number(number) = value else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field_name} must be a JSON integer"),
+        ));
+    };
+    if let Some(integer) = number.as_i64() {
+        return Ok(integer);
+    }
+    if let Some(integer) = number.as_u64() {
+        return i64::try_from(integer).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{field_name} is outside the supported integer range"),
+            )
+        });
+    }
     strict_integer_text(value, field_name)?
         .parse()
         .map_err(|_| {
@@ -465,6 +488,10 @@ mod tests {
     fn strict_provider_identifiers_reject_coercion_and_invalid_npis() {
         assert_eq!(strict_integer(&json!(7), "id").unwrap(), 7);
         assert_eq!(strict_integer(&json!(7.0), "id").unwrap(), 7);
+        assert_eq!(
+            strict_integer(&serde_json::from_str("7e0").unwrap(), "id").unwrap(),
+            7
+        );
         assert_eq!(
             strict_integer_text(&json!(121591448686103182592848195376305442061u128), "id").unwrap(),
             "121591448686103182592848195376305442061"

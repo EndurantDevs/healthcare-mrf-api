@@ -38,7 +38,7 @@ use ptg2_scanner::manifest::{
 use ptg2_scanner::normalize::{
     canonical_text_list, normalize_code, normalize_string, normalize_tin_type, normalize_tin_value,
     strict_integer_text, strict_money_number_from_reader, strict_npi_list, strict_npi_partition,
-    strict_string_array_from_reader,
+    strict_string_array_from_reader, StrictNpiList,
 };
 use ptg2_scanner::output::{emit_json_record, emit_object};
 use ptg2_scanner::progress::emit_progress;
@@ -978,14 +978,14 @@ fn validate_optional_string_value(value: Option<&Value>, field_name: &str) -> io
     ))
 }
 
-fn validate_provider_group(group: &Value) -> io::Result<()> {
+fn validate_provider_group(group: &Value) -> io::Result<StrictNpiList> {
     let group = group.as_object().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "provider_groups elements must be JSON objects",
         )
     })?;
-    strict_npi_list(group.get("npi"))?;
+    let npi_partition = strict_npi_partition(group.get("npi"))?;
     let tin = group.get("tin").and_then(Value::as_object).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1003,7 +1003,8 @@ fn validate_provider_group(group: &Value) -> io::Result<()> {
             }
         }
     }
-    validate_optional_string_value(tin.get("business_name"), "provider group tin.business_name")
+    validate_optional_string_value(tin.get("business_name"), "provider group tin.business_name")?;
+    Ok(npi_partition)
 }
 
 fn validate_provider_reference_metadata(provider_ref: &Value) -> io::Result<()> {
@@ -1099,9 +1100,8 @@ fn build_provider_entry(provider_ref: &Value) -> io::Result<ProviderEntry> {
     let mut provider_npis: Vec<i64> = Vec::new();
     let mut quarantined_npis: Vec<i64> = Vec::new();
     for group in groups {
-        validate_provider_group(group)?;
+        let npi_partition = validate_provider_group(group)?;
         let tin = group.get("tin").unwrap_or(&Value::Null);
-        let npi_partition = strict_npi_partition(group.get("npi"))?;
         let npi = npi_partition.valid;
         let quarantined_npi = npi_partition.quarantined;
         let tin_type = normalize_tin_type(tin.get("type"));
