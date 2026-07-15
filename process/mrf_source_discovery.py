@@ -253,10 +253,10 @@ def _source_config_path() -> Path:
 @lru_cache(maxsize=1)
 def _default_ssl_context() -> ssl.SSLContext:
     try:
-        import certifi  # pylint: disable=import-outside-toplevel
+        import certifi
 
         return ssl.create_default_context(cafile=certifi.where())
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:
         return ssl.create_default_context()
 
 
@@ -2775,7 +2775,7 @@ async def _head_url(
                 "final_url": str(resp.url),
                 "checked_at": checked_at,
             }
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return {"status": "failed", "error": str(exc), "checked_at": checked_at}
 
 
@@ -4740,7 +4740,7 @@ async def _resolve_viva_health_mrf(
                 resolver=resolver,
                 session=session,
             )
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             employer_targets = []
         targets.extend(employer_targets)
     targets = _dedupe_crawl_targets_by_url(targets)
@@ -5525,7 +5525,7 @@ def _auxiant_direct_target(
 
 
 def _auxiant_landing_target(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     *,
     network_name: str,
     page_url: str,
@@ -5537,7 +5537,7 @@ def _auxiant_landing_target(
     nested_error: str | None = None,
 ) -> CrawlTarget:
     return CrawlTarget(
-        source=source,
+        source=source_record,
         url=landing_url,
         label=_auxiant_display_label(network_name),
         resolved_from_url=page_url,
@@ -5558,16 +5558,16 @@ def _auxiant_landing_target(
 
 
 def _auxiant_annotated_target(
-    target: CrawlTarget,
+    nested_target: CrawlTarget,
     *,
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     network_name: str,
     page_url: str,
     directory_url: str,
     external_url: str,
     resolver_type: str,
 ) -> CrawlTarget:
-    metadata = dict(target.metadata or {})
+    metadata = dict(nested_target.metadata or {})
     nested_resolver = metadata.get("resolver")
     metadata.update(
         {
@@ -5578,14 +5578,14 @@ def _auxiant_annotated_target(
             "auxiant_directory_url": directory_url,
             "external_source_url": external_url,
             "external_hosting_platform": classify_hosting_platform(external_url),
-            "nested_target_label": target.label,
+            "nested_target_label": nested_target.label,
         }
     )
     return CrawlTarget(
-        source=source,
-        url=target.url,
+        source=source_record,
+        url=nested_target.url,
         label=_auxiant_display_label(network_name),
-        resolved_from_url=target.resolved_from_url or external_url,
+        resolved_from_url=nested_target.resolved_from_url or external_url,
         metadata=metadata,
     )
 
@@ -5659,14 +5659,14 @@ async def _resolve_auxiant_wordpress_directory(
                 nested_targets = await _crawl_targets_for_source(
                     nested_source, external_url, session
                 )
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 nested_targets = []
                 nested_error = f"{type(exc).__name__}: {exc}"
             for nested_target in nested_targets:
                 targets.append(
                     _auxiant_annotated_target(
                         nested_target,
-                        source=source,
+                        source_record=source,
                         network_name=network_name,
                         page_url=page_url,
                         directory_url=directory_url,
@@ -6165,7 +6165,7 @@ async def _resolve_anthem_s3_mrf(
             )
             if script_text:
                 break
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             continue
     bases = _anthem_s3_bases_from_script(script_text)
     for status_url in _anthem_s3_status_urls_from_script(script_text):
@@ -6233,7 +6233,7 @@ async def _resolve_hcsc_asomrf_landing(
                         metadata=metadata,
                     )
                 )
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             continue
     crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     crawl_targets = _limit_crawl_targets_round_robin(
@@ -6359,7 +6359,7 @@ async def _resolve_html_delegated_mrf_links(
                 session,
                 target_limit=_as_int(resolver.get("max_targets")),
             )
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             continue
         for delegated_target in delegated_targets:
             metadata = {
@@ -6454,7 +6454,7 @@ async def _resolve_html_mrf_links(
                     max_bytes=directory_max_bytes,
                     session=session,
                 )
-            except Exception:  # pylint: disable=broad-exception-caught
+            except Exception:
                 continue
             directory_targets = _crawl_targets_from_html_mrf_links(
                 source,
@@ -6479,7 +6479,7 @@ async def _resolve_html_mrf_links(
                             max_bytes=directory_max_bytes,
                             session=session,
                         )
-                    except Exception:  # pylint: disable=broad-exception-caught
+                    except Exception:
                         continue
                     for target in _crawl_targets_from_html_mrf_links(
                         source,
@@ -6533,7 +6533,7 @@ async def _resolve_html_mrf_links(
                     max_bytes=frame_max_bytes,
                     session=session,
                 )
-            except Exception:  # pylint: disable=broad-exception-caught
+            except Exception:
                 continue
             frame_targets = _crawl_targets_from_html_mrf_links(
                 source,
@@ -6640,7 +6640,7 @@ def _wordpress_elfinder_hash_path(hash_value: str | None) -> str | None:
     encoded += "=" * (-len(encoded) % 4)
     try:
         decoded = base64.urlsafe_b64decode(encoded.encode("ascii"))
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:
         return None
     return decoded.decode("utf-8", errors="replace")
 
@@ -6806,7 +6806,7 @@ async def _resolve_wordpress_elfinder_mrf_links(
                     max_bytes=ajax_max_bytes,
                     session=browser_session,
                 )
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 last_error = exc
                 continue
             if not isinstance(root_payload, dict):
@@ -6838,7 +6838,7 @@ async def _resolve_wordpress_elfinder_mrf_links(
                         max_bytes=ajax_max_bytes,
                         session=browser_session,
                     )
-                except Exception as exc:  # pylint: disable=broad-exception-caught
+                except Exception as exc:
                     last_error = exc
                     continue
                 if not isinstance(directory_payload, dict):
@@ -6961,7 +6961,7 @@ async def _resolve_ebms_caa_directory(
                 client_label=client_label,
                 nested_url=None,
             )
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             continue
         targets.extend(client_targets)
         if not client_targets:
@@ -6969,7 +6969,7 @@ async def _resolve_ebms_caa_directory(
                 client_html = await _fetch_text(
                     client_url, max_bytes=client_page_max_bytes, session=session
                 )
-            except Exception:  # pylint: disable=broad-exception-caught
+            except Exception:
                 client_html = ""
             for nested_url, _nested_label in _ebms_index_page_urls(
                 client_html, base_url=client_url
@@ -6983,7 +6983,7 @@ async def _resolve_ebms_caa_directory(
                             nested_url=nested_url,
                         )
                     )
-                except Exception:  # pylint: disable=broad-exception-caught
+                except Exception:
                     continue
                 if len(targets) >= max_targets:
                     break
@@ -7434,14 +7434,14 @@ def _fchn_payor_detail_urls_from_html(html_text: str, *, base_url: str) -> list[
 
 
 def _fchn_targets_from_detail_html(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     html_text: str,
     *,
     detail_url: str,
     resolver_type: str,
 ) -> list[CrawlTarget]:
     crawl_targets = _crawl_targets_from_html_mrf_links(
-        source,
+        source_record,
         html_text,
         base_url=detail_url,
         resolver=resolver_type,
@@ -7464,7 +7464,7 @@ def _fchn_targets_from_detail_html(
         }
         enriched_targets.append(
             CrawlTarget(
-                source=source,
+                source=source_record,
                 url=crawl_target.url,
                 label=crawl_target.label,
                 resolved_from_url=crawl_target.resolved_from_url or detail_url,
@@ -7508,7 +7508,7 @@ async def _resolve_fchn_payor_search(
                 max_bytes=detail_max_bytes,
                 session=session,
             )
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             continue
         if _html_looks_cloudflare_challenge(detail_html):
             continue
@@ -7846,7 +7846,7 @@ async def _enrich_payercompass_targets_with_index_plan_info(
                 max_bytes=index_fetch_max_bytes,
                 session=session,
             )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             logging.getLogger(__name__).debug(
                 "failed to fetch PayerCompass index %s: %s", crawl_target.url, exc
             )
@@ -8135,7 +8135,7 @@ async def _resolve_webtpa_mrf_api(
                             max_bytes=1024 * 1024,
                             session=session,
                         )
-                    except Exception:  # pylint: disable=broad-exception-caught
+                    except Exception:
                         location_by_field = {}
                     if isinstance(location_by_field, dict):
                         file_url = _webtpa_record_location(location_by_field)
@@ -8234,7 +8234,7 @@ def _looks_cmstic_keyed_toc_url(url: str | None) -> bool:
 
 
 def _cmstic_keyed_toc_crawl_target(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     *,
     final_url: str,
@@ -8253,14 +8253,14 @@ def _cmstic_keyed_toc_crawl_target(
         "target_file_type": "table-of-contents",
         "cmstic_source_id": source_id,
         "file_name": f"{source_id}_index.json" if source_id else None,
-        "payer_name": source.get("display_name"),
+        "payer_name": source_record.get("display_name"),
     }
     if toc_max_bytes:
         metadata["target_max_bytes"] = toc_max_bytes
     return CrawlTarget(
-        source=source,
+        source=source_record,
         url=final_url,
-        label=str(source.get("display_name") or source_id or ""),
+        label=str(source_record.get("display_name") or source_id or ""),
         resolved_from_url=url,
         metadata=metadata,
     )
@@ -8413,18 +8413,18 @@ def _github_mrf_plan_label(path: str) -> str | None:
 
 
 def _github_tree_mrf_target(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     *,
     owner: str,
     repo: str,
     branch: str,
-    item: dict[str, Any],
+    tree_entry: dict[str, Any],
     tree_url: str,
     resolver_type: str,
 ) -> CrawlTarget | None:
-    if str(item.get("type") or "").lower() != "blob":
+    if str(tree_entry.get("type") or "").lower() != "blob":
         return None
-    path = str(item.get("path") or "").strip()
+    path = str(tree_entry.get("path") or "").strip()
     if not path:
         return None
     raw_url = _github_raw_url(owner, repo, branch, path)
@@ -8441,7 +8441,7 @@ def _github_tree_mrf_target(
         return None
     plan_info = _plan_info_from_label(label)
     return CrawlTarget(
-        source=source,
+        source=source_record,
         url=raw_url,
         label=label,
         resolved_from_url=tree_url,
@@ -8454,8 +8454,8 @@ def _github_tree_mrf_target(
             "github_repo": repo,
             "github_branch": branch,
             "github_path": path,
-            "github_sha": item.get("sha"),
-            "blob_size": item.get("size"),
+            "github_sha": tree_entry.get("sha"),
+            "blob_size": tree_entry.get("size"),
             "plan_info": plan_info,
         },
     )
@@ -8501,7 +8501,7 @@ async def _resolve_github_repo_mrf(
             owner=owner,
             repo=repo,
             branch=branch,
-            item=tree_entry,
+            tree_entry=tree_entry,
             tree_url=tree_url,
             resolver_type=resolver_type,
         )
@@ -10080,7 +10080,7 @@ def _anthem_s3_toc_patterns_from_script(
 
 
 def _anthem_s3_toc_targets(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     base_url: str,
     patterns: list[tuple[str, str, str]],
     resolver: dict[str, Any],
@@ -10091,7 +10091,7 @@ def _anthem_s3_toc_targets(
     month_offsets = resolver.get("month_offsets")
     if not isinstance(month_offsets, list) or not month_offsets:
         month_offsets = [0]
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     current = now or _utc_now()
     for raw_offset in month_offsets:
         offset = _as_int(raw_offset)
@@ -10104,9 +10104,9 @@ def _anthem_s3_toc_targets(
             target_url = urljoin(
                 base_url.rstrip("/") + "/", f"{prefix.strip('/')}/{file_name}"
             )
-            targets.append(
+            crawl_targets.append(
                 CrawlTarget(
-                    source=source,
+                    source=source_record,
                     url=target_url,
                     label=file_name,
                     resolved_from_url=source_url,
@@ -10120,7 +10120,7 @@ def _anthem_s3_toc_targets(
                     },
                 )
             )
-    return _dedupe_crawl_targets_by_url(targets)
+    return _dedupe_crawl_targets_by_url(crawl_targets)
 
 
 def _parse_html_mrf_metadata_links(
@@ -10362,7 +10362,7 @@ def _html_enclosing_fragment(html_text: str, start: int, end: int) -> str:
 def _healthcarebluebook_link_items_from_context(
     html_text: str, *, base_url: str
 ) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
+    link_item_list: list[dict[str, Any]] = []
     seen: set[str] = set()
     for candidate in _html_link_candidates(html_text or "", base_url=base_url):
         link_url = str(candidate.get("url") or "").strip()
@@ -10392,9 +10392,11 @@ def _healthcarebluebook_link_items_from_context(
             or label == path_label
         ):
             label = context_text or Path(urlsplit(link_url).path).name
-        items.append({"url": link_url, "label": label, "text": label})
-        items.append({"url": None, "label": context_text, "text": context_text})
-    return items
+        link_item_list.append({"url": link_url, "label": label, "text": label})
+        link_item_list.append(
+            {"url": None, "label": context_text, "text": context_text}
+        )
+    return link_item_list
 
 
 def _healthcarebluebook_grid_items(
@@ -10478,16 +10480,16 @@ def _healthcarebluebook_item_matches_query(
 
 
 def _healthcarebluebook_nested_target(
-    target: CrawlTarget,
+    nested_target: CrawlTarget,
     *,
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     listing_url: str,
     link_url: str,
     label: str,
     file_type: str | None,
     resolver_type: str,
 ) -> CrawlTarget:
-    metadata = dict(target.metadata or {})
+    metadata = dict(nested_target.metadata or {})
     nested_resolver = metadata.get("resolver")
     metadata.update(
         {
@@ -10497,14 +10499,14 @@ def _healthcarebluebook_nested_target(
             "healthcarebluebook_link_url": link_url,
             "healthcarebluebook_link_label": label,
             "healthcarebluebook_file_type": file_type,
-            "nested_target_label": target.label,
+            "nested_target_label": nested_target.label,
         }
     )
     return CrawlTarget(
-        source=source,
-        url=target.url,
-        label=target.label or label,
-        resolved_from_url=target.resolved_from_url or link_url,
+        source=source_record,
+        url=nested_target.url,
+        label=nested_target.label or label,
+        resolved_from_url=nested_target.resolved_from_url or link_url,
         metadata=metadata,
     )
 
@@ -10602,12 +10604,12 @@ async def _resolve_healthcarebluebook_mrf(
                 session,
                 target_limit=nested_target_limit,
             )
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             nested_targets = []
         for nested_target in nested_targets:
             annotated = _healthcarebluebook_nested_target(
                 nested_target,
-                source=source_record,
+                source_record=source_record,
                 listing_url=url,
                 link_url=link_url,
                 label=label,
@@ -10694,7 +10696,7 @@ async def _resolve_html_mrf_with_healthcarebluebook(
             nested_targets = await _resolve_healthcarebluebook_mrf(
                 nested_source, link_url, nested_resolver, session
             )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             logging.getLogger(__name__).debug(
                 "failed to resolve nested Healthcare Bluebook MRF %s from %s: %s",
                 link_url,
@@ -11336,7 +11338,7 @@ async def _resolve_bcbs_global_solutions_mrf(
                 max_bytes=toc_max_bytes,
                 session=session,
             )
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             continue
         if not _bcbs_global_solutions_toc_has_in_network(toc_payload):
             continue
@@ -11429,7 +11431,7 @@ def _add_months(value: dt.datetime, offset: int) -> dt.datetime:
 
 
 def _bcbsma_monthly_toc_targets(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     *,
@@ -11467,7 +11469,7 @@ def _bcbsma_monthly_toc_targets(
             seen_urls.add(key)
             crawl_targets.append(
                 CrawlTarget(
-                    source=source,
+                    source=source_record,
                     url=target_url,
                     label=file_name,
                     resolved_from_url=url,
@@ -11556,7 +11558,7 @@ def _monthly_toc_targets(
 
 
 def _azure_mrf_listing_targets_from_xml(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     xml_text: str,
     *,
     listing_url: str,
@@ -11592,7 +11594,7 @@ def _azure_mrf_listing_targets_from_xml(
         seen_urls.add(key)
         crawl_targets.append(
             CrawlTarget(
-                source=source,
+                source=source_record,
                 url=file_url,
                 label=label,
                 resolved_from_url=listing_url,
@@ -12032,7 +12034,7 @@ def _healthez_plan_label(url: str, label: str | None) -> str:
 
 
 def _healthez_targets_from_html(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     html_text: str,
     *,
     base_url: str,
@@ -12054,7 +12056,7 @@ def _healthez_targets_from_html(
         label = _healthez_plan_label(url, str(candidate.get("label") or ""))
         crawl_targets.append(
             CrawlTarget(
-                source=source,
+                source=source_record,
                 url=url,
                 label=label,
                 resolved_from_url=base_url,
@@ -12639,7 +12641,7 @@ async def _resolve_healthsparq_direct_metadata(
             max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
             session=session,
         )
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:
         return [_healthsparq_target(source, url, url, params)]
     targets = _healthsparq_targets_from_metadata(
         source,
@@ -13587,7 +13589,7 @@ async def _resolve_crawl_targets(
             probe_targets = await _sapphire_query_probe_targets(
                 source, url_text, query, session
             )
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             return []
         return [
             matched
@@ -13645,7 +13647,7 @@ async def _resolve_crawl_targets(
                 return await resolve_body()
             except TimeoutError as exc:
                 return idx, [], [_crawl_failed_observation(source, url_text, exc, run_id)]
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 probe_targets = await query_probe_targets(
                     source, url_text, target_query
                 )
@@ -14585,7 +14587,7 @@ async def _crawl_toc_metadata(
                 ],
                 target.url,
             )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             return (
                 [],
                 [],
@@ -15441,7 +15443,7 @@ async def main(
                         provider_name, test_mode=test_mode, limit=provider_load_limit
                     )
                 )
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 discovery_result.errors.append(
                     {"provider": provider_name, "message": str(exc)}
                 )
