@@ -540,7 +540,7 @@ async def _missing_snapshot_serving_resources(
     audit_rows = await db.all(
         f"""
         SELECT occurrence_id, code_key, provider_set_key, price_key,
-               npi, atom_ordinal, atom_key
+               source_key, npi, atom_ordinal, atom_key
           FROM {schema}.ptg2_v3_audit_occurrence
          WHERE snapshot_key = :shared_snapshot_key
          ORDER BY occurrence_id
