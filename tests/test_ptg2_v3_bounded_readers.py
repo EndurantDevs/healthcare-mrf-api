@@ -145,7 +145,7 @@ async def _prefix_rows(
         "_discover_forward_shard_keys",
         AsyncMock(return_value={7: block_keys}),
     )
-    rows = await lookup_serving_binary_by_code_prefix_from_db(
+    prefix_rows = await lookup_serving_binary_by_code_prefix_from_db(
         object(),
         7,
         limit=limit,
@@ -155,7 +155,7 @@ async def _prefix_rows(
         price_dictionary_item_count=item_count,
         price_dictionary_block_bytes=2048,
     )
-    return rows, provider_counts, dictionary
+    return prefix_rows, provider_counts, dictionary
 
 
 @pytest.mark.asyncio
@@ -177,7 +177,9 @@ async def test_full_code_read_discovers_and_decodes_every_provider_shard(
         ),
     )
     discover = AsyncMock(return_value={7: (block_zero, block_one)})
-    fetch = AsyncMock(return_value=[_fragment_row(item) for item in fragments])
+    fetch = AsyncMock(
+        return_value=[_fragment_row(fragment) for fragment in fragments]
+    )
     monkeypatch.setattr(
         ptg2_db_sidecars,
         "_discover_forward_shard_keys",
@@ -190,7 +192,7 @@ async def test_full_code_read_discovers_and_decodes_every_provider_shard(
     )
     _patch_reference_lookups(monkeypatch)
 
-    rows = await ptg2_db_sidecars.lookup_serving_binary_by_code_from_db(
+    decoded_rows = await ptg2_db_sidecars.lookup_serving_binary_by_code_from_db(
         object(),
         7,
         shared_snapshot_key=41,
@@ -200,7 +202,8 @@ async def test_full_code_read_discovers_and_decodes_every_provider_shard(
     )
 
     assert [
-        (row.provider_set_key, row.price_key, row.source_key) for row in rows
+        (decoded_row.provider_set_key, decoded_row.price_key, decoded_row.source_key)
+        for decoded_row in decoded_rows
     ] == [(5, 8, 0), (1025, 2, 1)]
     discover.assert_awaited_once()
     assert fetch.await_args.kwargs["artifact_kind"] == (
@@ -242,7 +245,7 @@ async def test_provider_filtered_read_computes_only_exact_sparse_shards(
     )
     _patch_reference_lookups(monkeypatch)
 
-    rows = await ptg2_db_sidecars.lookup_serving_binary_by_code_from_db(
+    filtered_rows = await ptg2_db_sidecars.lookup_serving_binary_by_code_from_db(
         object(),
         7,
         provider_set_keys=(5, 2050),
@@ -252,7 +255,10 @@ async def test_provider_filtered_read_computes_only_exact_sparse_shards(
         price_dictionary_block_bytes=2048,
     )
 
-    assert [(row.provider_set_key, row.price_key) for row in rows] == [(5, 8)]
+    assert [
+        (filtered_row.provider_set_key, filtered_row.price_key)
+        for filtered_row in filtered_rows
+    ] == [(5, 8)]
     discover.assert_not_awaited()
     assert fetch.await_args.kwargs["block_keys"] == (block_zero, block_two)
     assert fetch.await_args.kwargs["require_all"] is False
@@ -315,10 +321,16 @@ async def test_sparse_batch_reads_multiple_codes_from_exact_provider_shards(
         price_dictionary_block_bytes=2048,
     )
 
-    assert [(row.provider_set_key, row.price_key) for row in rows_by_code[7]] == [
+    assert [
+        (decoded_row.provider_set_key, decoded_row.price_key)
+        for decoded_row in rows_by_code[7]
+    ] == [
         (5, 8)
     ]
-    assert [(row.provider_set_key, row.price_key) for row in rows_by_code[8]] == [
+    assert [
+        (decoded_row.provider_set_key, decoded_row.price_key)
+        for decoded_row in rows_by_code[8]
+    ] == [
         (1025, 2)
     ]
     assert fetch.await_args.kwargs["block_keys"] == expected_block_keys
@@ -370,8 +382,8 @@ async def test_full_batch_discovers_multiple_code_ranges_once(monkeypatch):
         price_dictionary_block_bytes=2048,
     )
 
-    assert [row.provider_set_key for row in rows_by_code[7]] == [5]
-    assert [row.provider_set_key for row in rows_by_code[8]] == [1025]
+    assert [decoded_row.provider_set_key for decoded_row in rows_by_code[7]] == [5]
+    assert [decoded_row.provider_set_key for decoded_row in rows_by_code[8]] == [1025]
     assert discover.await_args.kwargs["code_keys"] == (7, 8)
     assert fetch.await_args.kwargs["block_keys"] == (block_7, block_8)
     assert fetch.await_args.kwargs["require_all"] is True
@@ -415,7 +427,7 @@ async def test_full_reader_accepts_provider_delta_reset_in_each_fragment(
     )
     _patch_reference_lookups(monkeypatch)
 
-    rows = await ptg2_db_sidecars.lookup_serving_binary_by_code_from_db(
+    decoded_rows = await ptg2_db_sidecars.lookup_serving_binary_by_code_from_db(
         object(),
         7,
         shared_snapshot_key=41,
@@ -424,7 +436,7 @@ async def test_full_reader_accepts_provider_delta_reset_in_each_fragment(
         price_dictionary_block_bytes=2048,
     )
 
-    assert [row.provider_set_key for row in rows] == [3, 5]
+    assert [decoded_row.provider_set_key for decoded_row in decoded_rows] == [3, 5]
 
 
 @pytest.mark.asyncio
@@ -555,16 +567,18 @@ async def test_bounded_code_prefix_matches_eager_rank_and_reads_selected_refs(
     descending,
     expected,
 ):
+    """Verify bounded reads match eager ranking and resolve selected references."""
+
     entries = [
         (5, [(8, 0), (100, 1)]),
         (6, [(100, 0)]),
         (7, [(2, 0), (9, 1)]),
         (9, [(5, 0)]),
     ]
-    payload = _grouped_payload(2, entries)
-    fragments = (_fragment(payload, entry_count=len(entries)),)
+    encoded_payload = _grouped_payload(2, entries)
+    fragments = (_fragment(encoded_payload, entry_count=len(entries)),)
 
-    rows, provider_counts, dictionary = await _prefix_rows(
+    bounded_rows, provider_counts, dictionary = await _prefix_rows(
         monkeypatch,
         fragments=fragments,
         limit=3,
@@ -572,7 +586,13 @@ async def test_bounded_code_prefix_matches_eager_rank_and_reads_selected_refs(
     )
 
     eager = ptg2_db_sidecars._decode_serving_binary_code_records(
-        [{"block_no": 0, "entry_count": len(entries), "_decoded_payload": payload}],
+        [
+            {
+                "block_no": 0,
+                "entry_count": len(entries),
+                "_decoded_payload": encoded_payload,
+            }
+        ],
         provider_set_keys=None,
         expected_source_count=2,
     )
@@ -586,7 +606,12 @@ async def test_bounded_code_prefix_matches_eager_rank_and_reads_selected_refs(
         ),
     )[:3]
     actual = [
-        (row.provider_set_key, row.price_key, row.source_key) for row in rows
+        (
+            bounded_row.provider_set_key,
+            bounded_row.price_key,
+            bounded_row.source_key,
+        )
+        for bounded_row in bounded_rows
     ]
 
     assert actual == expected == eager_prefix
@@ -868,13 +893,13 @@ def _stored_row(
 
 @pytest.mark.asyncio
 async def test_shared_block_stream_uses_server_side_iteration():
-    row = _stored_row(
+    stream_row = _stored_row(
         object_kind="by_code_provider_shard_v1",
         block_key=_shard_block_key(7, 0),
         fragment_no=0,
         payload=b"payload",
     )
-    session = _StreamingSession([row])
+    session = _StreamingSession([stream_row])
 
     fragments = [
         fragment
@@ -897,7 +922,7 @@ async def test_graph_member_limit_bounds_generate_series_and_decoded_bytes():
     payload = b"".join(
         member.to_bytes(4, "little", signed=False) for member in all_members
     )
-    row = _stored_row(
+    graph_row = _stored_row(
         object_kind="graph_npi_groups_v1",
         block_key=4,
         fragment_no=0,
@@ -910,7 +935,7 @@ async def test_graph_member_limit_bounds_generate_series_and_decoded_bytes():
             "selected_member_count": 2,
         },
     )
-    session = _Session([row])
+    session = _Session([graph_row])
 
     members = await fetch_shared_graph_members(
         session,

@@ -170,6 +170,15 @@ def semantic_hash(value: Any, domain: str | None = None) -> str:
     return f"{checksum:016x}"
 
 
+def semantic_sha256(value: Any, domain: str | None = None) -> str:
+    """Return a full semantic SHA-256 independent of the compact hash mode."""
+    payload = _canonicalize_for_json(value)
+    if domain:
+        payload = {"domain": domain, "payload": payload}
+    payload_bytes = canonical_json_dumps(payload).encode("utf-8")
+    return sha256_bytes(payload_bytes)
+
+
 def canonicalize_url(url: str) -> str:
     """Return a normalized URL with tracking parameters and fragments removed."""
     parsed = urlsplit(str(url).strip())

@@ -113,7 +113,7 @@ def _compact_item(**overrides):
 
 
 def test_shared_forward_window_follows_dense_cost_rank_not_provider_count():
-    rows = [
+    forward_rows = [
         SimpleNamespace(
             provider_set_key=2,
             provider_count=10_000,
@@ -129,22 +129,22 @@ def test_shared_forward_window_follows_dense_cost_rank_not_provider_count():
     ]
 
     ascending = ptg2_serving._shared_forward_row_window(
-        rows,
+        forward_rows,
         {1: "01", 2: "02"},
         limit=2,
         offset=0,
         descending=False,
     )
     descending = ptg2_serving._shared_forward_row_window(
-        rows,
+        forward_rows,
         {1: "01", 2: "02"},
         limit=2,
         offset=0,
         descending=True,
     )
 
-    assert [row.price_key for row in ascending] == [0, 1]
-    assert [row.price_key for row in descending] == [1, 0]
+    assert [forward_row.price_key for forward_row in ascending] == [0, 1]
+    assert [forward_row.price_key for forward_row in descending] == [1, 0]
 
 
 def test_provider_expansion_candidate_window_includes_deep_offset():
@@ -204,7 +204,7 @@ async def test_location_provider_window_fails_closed_above_exactness_bound(
 
 
 def test_provider_expansion_prefix_continues_past_duplicate_cheapest_rows():
-    rows = [
+    rate_rows = [
         {
             "provider_set_global_id_128": "01" * 16,
             "serving_content_hash_128": f"{index + 1:032x}",
@@ -215,7 +215,7 @@ def test_provider_expansion_prefix_continues_past_duplicate_cheapest_rows():
         }
         for index in range(20)
     ]
-    rows.append(
+    rate_rows.append(
         {
             "provider_set_global_id_128": "02" * 16,
             "serving_content_hash_128": "ff" * 16,
@@ -227,12 +227,12 @@ def test_provider_expansion_prefix_continues_past_duplicate_cheapest_rows():
     )
 
     first_rank, _, _ = ptg2_serving._rank_provider_expansion_prefix(
-        rows[:20],
+        rate_rows[:20],
         {"01" * 16: (1000000001, 1000000002)},
         target_count=5,
     )
     complete_rank, selected_npis, _ = ptg2_serving._rank_provider_expansion_prefix(
-        rows,
+        rate_rows,
         {
             "01" * 16: (1000000001, 1000000002),
             "02" * 16: (1000000003, 1000000004, 1000000005),
@@ -277,7 +277,7 @@ def test_provider_expansion_prefix_matches_exhaustive_overlap_order(target_count
     first_set = "01" * 16
     second_set = "02" * 16
     third_set = "03" * 16
-    rows = [
+    rate_rows = [
         {
             "provider_set_global_id_128": first_set,
             "serving_content_hash_128": "11" * 16,
@@ -310,21 +310,24 @@ def test_provider_expansion_prefix_matches_exhaustive_overlap_order(target_count
     }
     exhaustive_keys = []
     exhaustive_provider_set_ids = []
-    for row in rows:
-        for npi in npis_by_set[row["provider_set_global_id_128"]]:
+    for rate_row in rate_rows:
+        for npi in npis_by_set[rate_row["provider_set_global_id_128"]]:
             key = (
                 "npi",
                 str(npi),
-                row["reported_code_system"],
-                row["reported_code"],
-                row["negotiation_arrangement"],
-                str(row["source_key"]),
+                rate_row["reported_code_system"],
+                rate_row["reported_code"],
+                rate_row["negotiation_arrangement"],
+                str(rate_row["source_key"]),
             )
             if key not in exhaustive_keys:
                 exhaustive_keys.append(key)
-                if row["provider_set_global_id_128"] not in exhaustive_provider_set_ids:
+                if (
+                    rate_row["provider_set_global_id_128"]
+                    not in exhaustive_provider_set_ids
+                ):
                     exhaustive_provider_set_ids.append(
-                        row["provider_set_global_id_128"]
+                        rate_row["provider_set_global_id_128"]
                     )
             if len(exhaustive_keys) >= target_count:
                 break
@@ -333,7 +336,7 @@ def test_provider_expansion_prefix_matches_exhaustive_overlap_order(target_count
 
     rank_by_key, selected_npis, selected_provider_set_ids = (
         ptg2_serving._rank_provider_expansion_prefix(
-            rows,
+            rate_rows,
             npis_by_set,
             target_count=target_count,
         )
@@ -349,7 +352,7 @@ def test_provider_expansion_prefix_matches_exhaustive_overlap_order(target_count
 
 
 def test_descending_forward_rank_keeps_immutable_ties_ascending():
-    rows = [
+    rate_rows = [
         SimpleNamespace(
             provider_set_key=2,
             provider_count=1,
@@ -365,7 +368,7 @@ def test_descending_forward_rank_keeps_immutable_ties_ascending():
     ]
 
     descending = ptg2_serving._shared_forward_row_window(
-        rows,
+        rate_rows,
         {1: "01", 2: "02"},
         limit=2,
         offset=0,
@@ -382,7 +385,7 @@ async def test_strict_cost_provider_selection_grows_until_page_is_contained(
     """Verify cost selection widens until the requested provider page is complete."""
     first_set = "01" * 16
     second_set = "02" * 16
-    rows = [
+    rate_rows = [
         {
             "provider_set_global_id_128": first_set if index < 64 else second_set,
             "serving_content_hash_128": f"{index + 1:032x}",
@@ -399,9 +402,9 @@ async def test_strict_cost_provider_selection_grows_until_page_is_contained(
     async def fake_merge(*_args, limit, provider_set_keys, **_kwargs):
         if provider_set_keys is None:
             prefix_limits.append(limit)
-            return rows[:limit]
+            return rate_rows[:limit]
         completion_filters.append(tuple(sorted(provider_set_keys)))
-        return rows
+        return rate_rows
 
     async def fake_npis(_session, _tables, provider_set_global_ids, **_kwargs):
         return {
@@ -560,7 +563,7 @@ async def test_strict_shared_v3_reverse_lookup_matches_revenue_code_forms():
         ]
     )
 
-    rows = await ptg2_serving._ptg2_manifest_code_rows_for_provider_reverse(
+    code_rows = await ptg2_serving._ptg2_manifest_code_rows_for_provider_reverse(
         session,
         _strict_v3_tables(),
         requested_plan="SYNTHETIC-PLAN",
@@ -571,7 +574,7 @@ async def test_strict_shared_v3_reverse_lookup_matches_revenue_code_forms():
         plan_market_type="group",
     )
 
-    assert rows[0]["reported_code"] == "110"
+    assert code_rows[0]["reported_code"] == "110"
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
     assert "mrf.ptg2_v3_code" in sql
@@ -949,12 +952,12 @@ async def test_knn_duplicate_addresses_do_not_signal_location_exhaustion(monkeyp
         seen_npis,
     ):
         before = len(matched_rows)
-        for row in candidate_rows:
-            npi = int(row["npi"])
+        for candidate_row in candidate_rows:
+            npi = int(candidate_row["npi"])
             if npi in seen_npis:
                 continue
             seen_npis.add(npi)
-            matched_rows.append(row)
+            matched_rows.append(candidate_row)
             groups_by_npi[npi].add("01" * 16)
         return len(matched_rows) - before
 
@@ -970,7 +973,7 @@ async def test_knn_duplicate_addresses_do_not_signal_location_exhaustion(monkeyp
     )
 
     assert candidates is not None
-    assert [row["npi"] for row in candidates.location_rows] == [
+    assert [candidate_row["npi"] for candidate_row in candidates.location_rows] == [
         1000000001,
         1000000002,
     ]
@@ -1020,7 +1023,7 @@ async def test_provider_directory_overlay_prefers_corroborated_contact():
             ),
         ]
     )
-    rows = [
+    provider_rows = [
         {
             "npi": 1234567890,
             "network_names": ["Synthetic Network"],
@@ -1036,19 +1039,22 @@ async def test_provider_directory_overlay_prefers_corroborated_contact():
 
     overlaid = await ptg2_serving._overlay_provider_directory_corroboration(
         session,
-        rows,
+        provider_rows,
         plan_id="SYNTHETIC-PLAN",
         snapshot_id="ptg2:209901:synthetic",
         source_key="synthetic-source",
     )
-    item = ptg2_serving._compact_item_from_row({**overlaid[0], "prices": []}, {})
+    provider_item = ptg2_serving._compact_item_from_row(
+        {**overlaid[0], "prices": []},
+        {},
+    )
 
-    assert item["phone_number"] == "3125550100"
-    assert item["phone_extension"] == "45"
-    assert item["address_verification"]["address_evidence_level"] == (
+    assert provider_item["phone_number"] == "3125550100"
+    assert provider_item["phone_extension"] == "45"
+    assert provider_item["address_verification"]["address_evidence_level"] == (
         "payer_directory_network_location"
     )
-    assert item["address_verification"]["provider_directory_org_name"] == (
+    assert provider_item["address_verification"]["provider_directory_org_name"] == (
         "Synthetic Health"
     )
 
@@ -1077,7 +1083,7 @@ def test_provider_directory_network_name_match_uses_synthetic_context_without_mu
         },
     }
     original = copy.deepcopy(address_payload)
-    item = {
+    provider_item = {
         "network_names": ["Synthetic Network"],
         "address": {
             "first_line": "100 Example Street",
@@ -1087,8 +1093,16 @@ def test_provider_directory_network_name_match_uses_synthetic_context_without_mu
         },
     }
 
-    first = ptg2_serving._address_verification_payload(item, {}, address_payload)
-    second = ptg2_serving._address_verification_payload(item, {}, address_payload)
+    first = ptg2_serving._address_verification_payload(
+        provider_item,
+        {},
+        address_payload,
+    )
+    second = ptg2_serving._address_verification_payload(
+        provider_item,
+        {},
+        address_payload,
+    )
 
     assert address_payload == original
     assert first["address_network_binding"] == "payer_directory_corroborated_location"
@@ -1131,7 +1145,7 @@ def test_provider_directory_marker_without_plan_or_network_match_is_inferred():
 
 
 def test_compact_item_normalizes_provider_directory_boolean_and_list_fields():
-    item = ptg2_serving._compact_item_from_row(
+    provider_item = ptg2_serving._compact_item_from_row(
         {
             "npi": 1234567890,
             "provider_name": "Example Clinician",
@@ -1158,7 +1172,7 @@ def test_compact_item_normalizes_provider_directory_boolean_and_list_fields():
         {},
     )
 
-    verification = item["address_verification"]
+    verification = provider_item["address_verification"]
     assert verification["provider_directory_plan_context_matched"] is False
     assert verification["provider_directory_network_context_present"] is True
     assert verification["provider_directory_network_refs"] == ["Organization/network-1"]
@@ -1329,12 +1343,12 @@ def test_manifest_response_keeps_address_verification_in_public_shape():
         },
     )
 
-    item = shaped["items"][0]
-    assert "service_code" not in item
-    assert "service_code_system" not in item
-    assert "network_names" not in item
-    assert "source_trace" not in item
-    assert item["address_verification"]["address_network_binding"] == (
+    provider_item = shaped["items"][0]
+    assert "service_code" not in provider_item
+    assert "service_code_system" not in provider_item
+    assert "network_names" not in provider_item
+    assert "source_trace" not in provider_item
+    assert provider_item["address_verification"]["address_network_binding"] == (
         "payer_directory_corroborated_location"
     )
     assert "result_granularity" not in shaped["query"]
@@ -1345,7 +1359,7 @@ def test_manifest_response_keeps_address_verification_in_public_shape():
 
 
 def test_manifest_provider_procedure_item_shapes_address_and_prices():
-    item = ptg2_serving._ptg2_manifest_provider_procedure_item(
+    provider_item = ptg2_serving._ptg2_manifest_provider_procedure_item(
         npi=1234567890,
         data={
             "serving_content_hash_128": "rate-pack",
@@ -1381,11 +1395,11 @@ def test_manifest_provider_procedure_item_shapes_address_and_prices():
         args={"snapshot_id": "ptg2:209901:synthetic"},
     )
 
-    assert item["npi"] == 1234567890
-    assert item["procedure_code"] == "29888"
-    assert item["prices"][0]["negotiated_rate"] == 1138.57
-    assert item["address"]["first_line"] == "100 Example Street"
-    assert item["address_verification"]["address_evidence_level"] == (
+    assert provider_item["npi"] == 1234567890
+    assert provider_item["procedure_code"] == "29888"
+    assert provider_item["prices"][0]["negotiated_rate"] == 1138.57
+    assert provider_item["address"]["first_line"] == "100 Example Street"
+    assert provider_item["address_verification"]["address_evidence_level"] == (
         "nppes_provider_address"
     )
 
@@ -1399,7 +1413,7 @@ def test_provider_rate_items_merge_duplicate_location_and_code_prices():
         "reported_code_system": "CPT",
         "address": {"first_line": "100 Example Street"},
     }
-    items = [
+    rate_items = [
         {
             **base,
             "provider_set_hash": "provider-set-1",
@@ -1416,7 +1430,7 @@ def test_provider_rate_items_merge_duplicate_location_and_code_prices():
         },
     ]
 
-    merged = ptg2_serving._merge_ptg2_provider_rate_items(items)
+    merged = ptg2_serving._merge_ptg2_provider_rate_items(rate_items)
 
     assert len(merged) == 1
     assert {price["negotiated_rate"] for price in merged[0]["prices"]} == {100, 200}
@@ -1437,7 +1451,7 @@ def test_provider_rate_items_do_not_merge_different_arrangements():
         "price_set_hash": "price-set-1",
         "rate_pack_hash": "rate-pack-1",
     }
-    items = [
+    rate_items = [
         {
             **base,
             "negotiation_arrangement": "FFS",
@@ -1450,12 +1464,15 @@ def test_provider_rate_items_do_not_merge_different_arrangements():
         },
     ]
 
-    merged = ptg2_serving._merge_ptg2_provider_rate_items(items)
+    merged = ptg2_serving._merge_ptg2_provider_rate_items(rate_items)
 
     assert len(merged) == 2
     assert {
-        (item["negotiation_arrangement"], item["prices"][0]["negotiated_rate"])
-        for item in merged
+        (
+            rate_item["negotiation_arrangement"],
+            rate_item["prices"][0]["negotiated_rate"],
+        )
+        for rate_item in merged
     } == {("FFS", 100), ("BUNDLE", 200)}
 
 
@@ -1487,7 +1504,7 @@ def test_provider_search_never_caps_rate_rows_before_merge():
 
 
 def test_default_provider_sort_prioritizes_network_bound_address():
-    items = [
+    provider_items = [
         {
             "provider_name": "No Address",
             "prices": [],
@@ -1515,12 +1532,12 @@ def test_default_provider_sort_prioritizes_network_bound_address():
     ]
 
     sorted_items = ptg2_serving._sort_ptg2_manifest_provider_items(
-        items,
+        provider_items,
         {},
         location_filter_requested=False,
     )
 
-    assert [item["provider_name"] for item in sorted_items] == [
+    assert [provider_item["provider_name"] for provider_item in sorted_items] == [
         "Verified Address",
         "Inferred Address",
         "No Address",
@@ -1528,7 +1545,7 @@ def test_default_provider_sort_prioritizes_network_bound_address():
 
 
 def test_provider_sort_supports_cost_and_distance():
-    items = [
+    provider_items = [
         {
             "provider_name": "Far Low Cost",
             "distance_miles": 8,
@@ -1542,21 +1559,21 @@ def test_provider_sort_supports_cost_and_distance():
     ]
 
     by_cost = ptg2_serving._sort_ptg2_manifest_provider_items(
-        items,
+        provider_items,
         {"order_by": "cost"},
         location_filter_requested=True,
     )
     by_distance = ptg2_serving._sort_ptg2_manifest_provider_items(
-        items,
+        provider_items,
         {"order_by": "distance"},
         location_filter_requested=True,
     )
 
-    assert [item["provider_name"] for item in by_cost] == [
+    assert [provider_item["provider_name"] for provider_item in by_cost] == [
         "Far Low Cost",
         "Near High Cost",
     ]
-    assert [item["provider_name"] for item in by_distance] == [
+    assert [provider_item["provider_name"] for provider_item in by_distance] == [
         "Near High Cost",
         "Far Low Cost",
     ]
@@ -1611,7 +1628,7 @@ def test_provider_cost_sort_parses_exponent_tokens_without_float_rounding():
 
 
 def test_descending_provider_cost_sort_keeps_missing_last_and_ties_ascending():
-    items = [
+    provider_items = [
         {
             "provider_name": "B",
             "npi": 2,
@@ -1633,12 +1650,12 @@ def test_descending_provider_cost_sort_keeps_missing_last_and_ties_ascending():
     ]
 
     sorted_items = ptg2_serving._sort_ptg2_manifest_provider_items(
-        items,
+        provider_items,
         {"order_by": "rate", "order": "desc"},
         location_filter_requested=False,
     )
 
-    assert [item["provider_name"] for item in sorted_items] == [
+    assert [provider_item["provider_name"] for provider_item in sorted_items] == [
         "A",
         "B",
         "Missing",
@@ -1768,7 +1785,7 @@ async def test_reverse_price_filter_scans_past_old_candidate_guess(monkeypatch):
         limit=2,
     )
 
-    assert [row["price_key"] for row in selection.rows] == [502]
+    assert [selected_row["price_key"] for selected_row in selection.rows] == [502]
     assert selection.exhausted
     assert selection.total_row_count == 1
     assert selection.matched_rows_seen == 1
@@ -1901,7 +1918,9 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
 
     assert location_call["provider_set_keys"] == {4}
     assert location_call["require_exhaustive"] is False
-    assert [item["npi"] for item in response["items"]] == [1234567890]
+    assert [provider_item["npi"] for provider_item in response["items"]] == [
+        1234567890
+    ]
     assert response["items"][0]["prices"] == [
         {"negotiated_rate": 20, "service_code": ["22"]}
     ]
@@ -1946,7 +1965,7 @@ async def test_geo_cost_order_requires_exhaustive_location_selection(monkeypatch
 @pytest.mark.asyncio
 async def test_provider_reverse_response_uses_page_sentinel_and_honest_total(monkeypatch):
     """Verify reverse pagination uses a sentinel and reports a lower-bound total."""
-    rows = tuple(
+    reverse_rows = tuple(
         {
             "reported_code_system": "CPT",
             "reported_code": f"{99210 + index}",
@@ -1969,7 +1988,7 @@ async def test_provider_reverse_response_uses_page_sentinel_and_honest_total(mon
         assert query.limit == 3
         assert query.offset == 0
         return ptg2_serving._VersionThreeReverseSelection(
-            rows=rows,
+            rows=reverse_rows,
             exhausted=False,
         )
 
@@ -2025,7 +2044,9 @@ async def test_provider_reverse_response_uses_page_sentinel_and_honest_total(mon
         serving_tables=_strict_v3_tables(),
     )
 
-    assert [item["reported_code"] for item in response["items"]] == ["99210", "99211"]
+    assert [
+        procedure_item["reported_code"] for procedure_item in response["items"]
+    ] == ["99210", "99211"]
     assert response["pagination"] == {
         "total": 3,
         "limit": 2,

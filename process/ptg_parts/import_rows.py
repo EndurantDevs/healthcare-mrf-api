@@ -13,6 +13,7 @@ from process.ptg_parts.canonical import (
     hash_prefix,
     normalize_money,
     semantic_hash,
+    semantic_sha256,
 )
 from process.ptg_parts.config import (
     PTG2_FAST_PROVIDER_UNION_ENV,
@@ -371,7 +372,7 @@ def _ptg2_source_trace_rows(source_version: PTG2SourceVersion | None, source_url
         "json_pointer": None,
         "statement": "Published negotiated rate from Transparency in Coverage source file.",
     }
-    source_trace_hash = semantic_hash(payload, domain="source_trace")
+    source_trace_hash = semantic_sha256(payload, domain="source_trace")
     source_trace_row = {
         "source_trace_hash": source_trace_hash,
         "source_file_version_id": payload["source_file_version_id"],
