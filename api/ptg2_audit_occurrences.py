@@ -169,13 +169,13 @@ def _exact_scalar_or_text_array(value: Any, *, field_name: str) -> list[str]:
 
 
 def _audit_tuple(
-    row: Mapping[str, Any],
+    occurrence: Mapping[str, Any],
     *,
     price_atom: Any,
     dictionary_values: Mapping[tuple[str, int], Any],
     constant_values: Mapping[str, Any],
 ) -> dict[str, Any]:
-    code_system, code, arrangement = _canonical_identity(row)
+    code_system, code, arrangement = _canonical_identity(occurrence)
     raw_price_payload = _version_three_price_payload(
         price_atom,
         dictionary_values,
@@ -193,15 +193,15 @@ def _audit_tuple(
     price_payload["service_code"] = sorted(
         {
             canonical_code
-            for value in service_codes
-            if (canonical_code := canonical_catalog_code("POS", value))
+            for service_code_value in service_codes
+            if (canonical_code := canonical_catalog_code("POS", service_code_value))
         }
     )
     price_payload["billing_code_modifier"] = sorted(
         {
             modifier
-            for value in modifiers
-            if (modifier := value.strip().upper())
+            for modifier_value in modifiers
+            if (modifier := modifier_value.strip().upper())
         }
     )
     price_payload["negotiated_rate"] = _numeric_json_fragment(
@@ -210,14 +210,14 @@ def _audit_tuple(
     return {
         "code_system": code_system,
         "code": code,
-        "npi": int(row["npi"]),
+        "npi": int(occurrence["npi"]),
         "negotiation_arrangement": arrangement,
         "billing_code_type_version": _optional_exact_text(
-            row, "billing_code_type_version"
+            occurrence, "billing_code_type_version"
         ),
-        "name": _optional_exact_text(row, "source_name"),
-        "description": _optional_exact_text(row, "source_description"),
-        "network_names": _exact_network_names(row),
+        "name": _optional_exact_text(occurrence, "source_name"),
+        "description": _optional_exact_text(occurrence, "source_description"),
+        "network_names": _exact_network_names(occurrence),
         "negotiated_type": price_payload.get("negotiated_type"),
         "negotiated_rate": price_payload["negotiated_rate"],
         "expiration_date": price_payload.get("expiration_date"),
@@ -419,7 +419,7 @@ async def audit_occurrences_payload(
             "PTG2 audit occurrences require a sealed persisted audit sample"
         )
 
-    result = await session.execute(
+    query_result = await session.execute(
         text(_audit_page_sql(filter_market_type=bool(plan_market_type))),
         {
             "snapshot_id": resolved_snapshot_id,
@@ -430,7 +430,10 @@ async def audit_occurrences_payload(
             "offset": offset,
         },
     )
-    result_rows = [_row_mapping(row) for row in result]
+    result_rows = [
+        _row_mapping(result_row_by_field)
+        for result_row_by_field in query_result
+    ]
     if not result_rows:
         raise PTG2ManifestArtifactError(
             "PTG2 v3 audit sample query returned no contract row"
@@ -457,7 +460,10 @@ async def audit_occurrences_payload(
         ),
         {"shared_snapshot_key": int(shared_snapshot_key)},
     )
-    digest_rows = [_row_mapping(row) for row in digest_result]
+    digest_rows = [
+        _row_mapping(digest_row_by_field)
+        for digest_row_by_field in digest_result
+    ]
     if len(digest_rows) != total:
         raise PTG2ManifestArtifactError(
             "PTG2 v3 persisted audit rows disagree with the sealed sample count"
@@ -468,29 +474,34 @@ async def audit_occurrences_payload(
             "PTG2 v3 persisted audit rows disagree with the sealed sample digest"
         )
     digest_rows_by_occurrence_id = {
-        bytes(row["occurrence_id"]): row for row in digest_rows
+        bytes(digest_row_by_field["occurrence_id"]): digest_row_by_field
+        for digest_row_by_field in digest_rows
     }
     if len(digest_rows_by_occurrence_id) != total:
         raise PTG2ManifestArtifactError(
             "PTG2 v3 persisted audit rows contain duplicate occurrence ids"
         )
-    page_rows = [row for row in result_rows if row.get("occurrence_id") is not None]
-    for row in page_rows:
-        occurrence_id = bytes(row.get("occurrence_id") or b"")
+    page_rows = [
+        result_row_by_field
+        for result_row_by_field in result_rows
+        if result_row_by_field.get("occurrence_id") is not None
+    ]
+    for page_row_by_field in page_rows:
+        occurrence_id = bytes(page_row_by_field.get("occurrence_id") or b"")
         sealed_row = digest_rows_by_occurrence_id.get(occurrence_id)
         if (
             sealed_row is None
-            or _audit_digest_coordinates(row)
+            or _audit_digest_coordinates(page_row_by_field)
             != _audit_digest_coordinates(sealed_row)
         ):
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 audit page rows disagree with the validated sample digest"
             )
-        if not row.get("code_scope_matches"):
+        if not page_row_by_field.get("code_scope_matches"):
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 audit occurrence references missing or out-of-scope code metadata"
             )
-        if not row.get("provider_set_scope_matches"):
+        if not page_row_by_field.get("provider_set_scope_matches"):
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 audit occurrence references missing provider-set metadata"
             )
@@ -498,7 +509,7 @@ async def audit_occurrences_payload(
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 audit occurrence id must contain exactly 32 bytes"
             )
-        source_key = row.get("source_key")
+        source_key = page_row_by_field.get("source_key")
         if (
             isinstance(source_key, bool)
             or source_key is None
@@ -508,13 +519,16 @@ async def audit_occurrences_payload(
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 audit occurrence has an invalid source key"
             )
-        npi = int(row.get("npi") or 0)
+        npi = int(page_row_by_field.get("npi") or 0)
         if not 1_000_000_000 <= npi <= 9_999_999_999:
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 audit occurrence has an invalid NPI"
             )
 
-    atom_keys = {int(row["atom_key"]) for row in page_rows}
+    atom_keys = {
+        int(page_row_by_field["atom_key"])
+        for page_row_by_field in page_rows
+    }
     price_atoms_by_key = await lookup_shared_price_atoms_from_db(
         session,
         int(shared_snapshot_key),
@@ -538,7 +552,10 @@ async def audit_occurrences_payload(
         if isinstance(serving_tables.price_atom_constant_values, dict)
         else {}
     )
-    selected_source_keys = {int(row["source_key"]) for row in page_rows}
+    selected_source_keys = {
+        int(page_row_by_field["source_key"])
+        for page_row_by_field in page_rows
+    }
     try:
         source_provenance_by_key = (
             await fetch_snapshot_source_provenance(
@@ -557,25 +574,29 @@ async def audit_occurrences_payload(
         raise PTG2ManifestArtifactError(
             "PTG2 v3 audit occurrence source mapping is missing"
         )
-    items = [
+    occurrence_items = [
         {
-            "occurrence_id": bytes(row["occurrence_id"]).hex(),
-            "digest_coordinates": _audit_digest_coordinates(row),
+            "occurrence_id": bytes(page_row_by_field["occurrence_id"]).hex(),
+            "digest_coordinates": _audit_digest_coordinates(page_row_by_field),
             **_audit_source_payload(
-                source_artifact_key=int(row["source_key"]),
+                source_artifact_key=int(page_row_by_field["source_key"]),
                 logical_source_key=serving_tables.source_key,
-                provenance=source_provenance_by_key[int(row["source_key"])],
+                provenance=source_provenance_by_key[
+                    int(page_row_by_field["source_key"])
+                ],
             ),
             "tuple": _audit_tuple(
-                row,
-                price_atom=price_atoms_by_key[int(row["atom_key"])],
+                page_row_by_field,
+                price_atom=price_atoms_by_key[
+                    int(page_row_by_field["atom_key"])
+                ],
                 dictionary_values=dictionary_values,
                 constant_values=constant_values,
             ),
         }
-        for row in page_rows
+        for page_row_by_field in page_rows
     ]
-    query = {
+    query_by_name = {
         "plan_id": plan_id,
         "snapshot_id": requested_snapshot_id,
         "mode": mode,
@@ -585,10 +606,10 @@ async def audit_occurrences_payload(
         "offset": offset,
     }
     if plan_market_type:
-        query["plan_market_type"] = plan_market_type
+        query_by_name["plan_market_type"] = plan_market_type
     if requested_source_key:
-        query["source_key"] = requested_source_key
-    provenance = {
+        query_by_name["source_key"] = requested_source_key
+    provenance_by_field = {
         "arch_version": "postgres_binary_v3",
         "storage_generation": PTG2_V3_SHARED_GENERATION,
         "database_backend": "postgresql",
@@ -599,20 +620,20 @@ async def audit_occurrences_payload(
         "database_evidence": dict(database_evidence),
     }
     if requested_source_key:
-        provenance["source_key"] = logical_source_key
+        provenance_by_field["source_key"] = logical_source_key
     return {
         "result_state": "matched" if total else "no_matching_rates",
         "pricing_scope": AUDIT_PRICING_SCOPE,
         "resolved_snapshot_id": resolved_snapshot_id,
-        "items": items,
+        "items": occurrence_items,
         "pagination": {
             "total": total,
             "limit": limit,
             "offset": offset,
-            "has_more": offset + len(items) < total,
+            "has_more": offset + len(occurrence_items) < total,
         },
-        "query": query,
-        "provenance": provenance,
+        "query": query_by_name,
+        "provenance": provenance_by_field,
         "source_set": dict(observed_source_set),
         "audit_sample": {
             "contract": PTG2_V3_AUDIT_CONTRACT,

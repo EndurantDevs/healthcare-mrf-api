@@ -45,7 +45,7 @@ def test_shared_v3_object_kinds_and_block_format_are_fail_closed():
 
 
 def _strict_serving_index(snapshot_key=41):
-    audit_sample = {
+    audit_sample_by_field = {
         "contract": "persisted_served_occurrence_sample_v2",
         "format_version": 2,
         "method": "publish_time_stratified_v1",
@@ -81,7 +81,7 @@ def _strict_serving_index(snapshot_key=41):
         "shared_block_layout": "dense_shared_blocks_v3",
         "atom_key_bits": 24,
         "materialized_tables": {},
-        "audit_sample": audit_sample,
+        "audit_sample": audit_sample_by_field,
         "serving_binary": {
             "format": "postgres_binary_v3",
             "price_dictionary": {
@@ -646,7 +646,7 @@ async def test_default_forward_response_skips_exact_provenance_query(monkeypatch
 
     price_set_id = "01" * 16
     provider_set_id = "02" * 16
-    row_data = {
+    response_row_by_field = {
         "serving_content_hash_128": "03" * 16,
         "plan_id": "plan-a",
         "plan_market_type": "group",
@@ -666,7 +666,7 @@ async def test_default_forward_response_skips_exact_provenance_query(monkeypatch
     monkeypatch.setattr(
         ptg2_serving,
         "_merge_manifest_code_variant_rows",
-        AsyncMock(return_value=[row_data]),
+        AsyncMock(return_value=[response_row_by_field]),
     )
     monkeypatch.setattr(
         ptg2_serving,
@@ -729,7 +729,7 @@ async def test_source_enabled_forward_response_separates_logical_and_artifact_ke
     """Ensure source-enabled rows distinguish logical and artifact source keys."""
 
     price_set_id = "01" * 16
-    row_data = {
+    response_row_by_field = {
         "serving_content_hash_128": "03" * 16,
         "plan_id": "plan-a",
         "plan_market_type": "group",
@@ -746,7 +746,7 @@ async def test_source_enabled_forward_response_separates_logical_and_artifact_ke
     monkeypatch.setattr(
         ptg2_serving,
         "_merge_manifest_code_variant_rows",
-        AsyncMock(return_value=[row_data]),
+        AsyncMock(return_value=[response_row_by_field]),
     )
     monkeypatch.setattr(
         ptg2_serving,
@@ -795,7 +795,7 @@ async def test_source_enabled_forward_response_separates_logical_and_artifact_ke
             }
         ]
     )
-    args = {
+    query_by_name = {
         "plan_id": "plan-a",
         "plan_market_type": "group",
         "code_system": "CPT",
@@ -807,7 +807,7 @@ async def test_source_enabled_forward_response_separates_logical_and_artifact_ke
     response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
         "logical-plan-a",
-        args,
+        query_by_name,
         SimpleNamespace(limit=10, offset=0),
         _strict_tables(snapshot_id="logical-plan-a", snapshot_key=41),
         "product_search",
@@ -825,7 +825,7 @@ async def test_multi_file_forward_rows_keep_per_artifact_source_provenance(
     """Ensure multi-file rows retain provenance for their exact source artifact."""
 
     price_set_ids = ("01" * 16, "02" * 16)
-    row_data = [
+    response_rows = [
         {
             "serving_content_hash_128": f"0{source_key}" * 16,
             "plan_id": "plan-a",
@@ -845,7 +845,7 @@ async def test_multi_file_forward_rows_keep_per_artifact_source_provenance(
     monkeypatch.setattr(
         ptg2_serving,
         "_merge_manifest_code_variant_rows",
-        AsyncMock(return_value=row_data),
+        AsyncMock(return_value=response_rows),
     )
     monkeypatch.setattr(
         ptg2_serving,
@@ -929,7 +929,7 @@ async def test_multi_file_forward_rows_keep_per_artifact_source_provenance(
 
 
 def test_shared_v3_response_rows_preserve_negotiation_arrangement():
-    code_data = {
+    code_by_field = {
         "plan_id": "plan-a",
         "plan_market_type": "group",
         "reported_code_system": "CPT",
@@ -946,7 +946,7 @@ def test_shared_v3_response_rows_preserve_negotiation_arrangement():
             source_key=0,
         ),
         "02" * 16,
-        code_data,
+        code_by_field,
         None,
         [],
     )
@@ -971,7 +971,7 @@ def test_shared_v3_response_rows_preserve_negotiation_arrangement():
 
 
 def test_reverse_provider_items_keep_exact_source_identity_and_do_not_premerge():
-    base_data = {
+    base_by_field = {
         "serving_content_hash_128": "01" * 16,
         "provider_set_global_id_128": "02" * 16,
         "price_set_global_id_128": "03" * 16,
@@ -991,7 +991,7 @@ def test_reverse_provider_items_keep_exact_source_identity_and_do_not_premerge()
     provider_items = [
         ptg2_serving._ptg2_manifest_provider_procedure_item(
             npi=1234567890,
-            data={**base_data, "source_key": source_key},
+            data={**base_by_field, "source_key": source_key},
             prices=[],
             procedure_detail={},
             provider_context={},
@@ -1306,7 +1306,7 @@ async def test_exact_source_mode_uses_the_strict_shared_dispatch(monkeypatch):
     session = object()
     pagination = object()
     tables = _strict_tables()
-    args = {
+    query_by_name = {
         "mode": "exact_source",
         "snapshot_id": "snapshot-id",
         "code": "99213",
@@ -1315,7 +1315,7 @@ async def test_exact_source_mode_uses_the_strict_shared_dispatch(monkeypatch):
     search_result = await ptg2_serving.search_ptg2_serving_table(
         session,
         "snapshot-id",
-        args,
+        query_by_name,
         pagination,
         serving_tables=tables,
     )
@@ -1324,7 +1324,7 @@ async def test_exact_source_mode_uses_the_strict_shared_dispatch(monkeypatch):
     db_search.assert_awaited_once_with(
         session,
         "snapshot-id",
-        args,
+        query_by_name,
         pagination,
         tables,
         "exact_source",

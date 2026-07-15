@@ -74,7 +74,7 @@ class ConcurrentSessionFactory:
 
 
 def _strict_v3_tables(**overrides):
-    values = {
+    table_values_by_field = {
         "snapshot_id": "ptg2:209901:synthetic",
         "arch_version": "postgres_binary_v3",
         "storage": "manifest_snapshot",
@@ -87,12 +87,12 @@ def _strict_v3_tables(**overrides):
         "network_names": ["Synthetic Network"],
         "source_key": "synthetic-source",
     }
-    values.update(overrides)
-    return ptg2_serving.PTG2ServingTables(**values)
+    table_values_by_field.update(overrides)
+    return ptg2_serving.PTG2ServingTables(**table_values_by_field)
 
 
 def _compact_item(**overrides):
-    row = {
+    compact_row_by_field = {
         "npi": 1234567890,
         "provider_name": "Example Clinician",
         "reported_code": "70551",
@@ -108,8 +108,8 @@ def _compact_item(**overrides):
         },
         "prices": [],
     }
-    row.update(overrides)
-    return ptg2_serving._compact_item_from_row(row, {})
+    compact_row_by_field.update(overrides)
+    return ptg2_serving._compact_item_from_row(compact_row_by_field, {})
 
 
 def test_shared_forward_window_follows_dense_cost_rank_not_provider_count():
@@ -252,7 +252,7 @@ def test_provider_expansion_prefix_continues_past_duplicate_cheapest_rows():
 
 
 def test_provider_expansion_prefix_preserves_graph_member_ordinal():
-    row = {
+    provider_row_by_field = {
         "provider_set_global_id_128": "01" * 16,
         "serving_content_hash_128": "02" * 16,
         "reported_code_system": "CPT",
@@ -262,7 +262,7 @@ def test_provider_expansion_prefix_preserves_graph_member_ordinal():
     }
 
     rank_by_key, selected_npis, _ = ptg2_serving._rank_provider_expansion_prefix(
-        [row],
+        [provider_row_by_field],
         {"01" * 16: (1000000009, 1000000001, 1000000005)},
         target_count=3,
     )
@@ -493,10 +493,10 @@ async def test_taxonomy_enrichment_is_optional_when_reference_tables_are_absent(
 ):
     session = FakeSession()
 
-    async def relation_available(_session, _table_name):
+    async def is_relation_available(_session, _table_name):
         return False
 
-    monkeypatch.setattr(ptg2_serving, "_relation_available", relation_available)
+    monkeypatch.setattr(ptg2_serving, "_relation_available", is_relation_available)
 
     assert await ptg2_serving._ptg2_manifest_taxonomy_rows_for_npis(
         session,
@@ -536,12 +536,12 @@ async def test_strict_shared_v3_search_scopes_code_lookup_to_shared_snapshot():
 
     assert response is None
     sql = str(session.calls[0][0][0])
-    params = session.calls[0][0][1]
+    params_by_name = session.calls[0][0][1]
     assert "mrf.ptg2_v3_code" in sql
     assert "mrf.ptg2_v3_snapshot_scope" in sql
     assert "code_metadata.snapshot_key = :shared_snapshot_key" in sql
-    assert params["logical_snapshot_id"] == "ptg2:209901:synthetic"
-    assert params["shared_snapshot_key"] == 41
+    assert params_by_name["logical_snapshot_id"] == "ptg2:209901:synthetic"
+    assert params_by_name["shared_snapshot_key"] == 41
 
 
 @pytest.mark.asyncio
@@ -576,15 +576,15 @@ async def test_strict_shared_v3_reverse_lookup_matches_revenue_code_forms():
 
     assert code_rows[0]["reported_code"] == "110"
     sql = str(session.calls[0][0][0])
-    params = session.calls[0][0][1]
+    params_by_name = session.calls[0][0][1]
     assert "mrf.ptg2_v3_code" in sql
     assert "mrf.ptg2_v3_snapshot_scope" in sql
     assert "code_metadata.snapshot_key = :shared_snapshot_key" in sql
     assert "reported_code = :reported_code_0" in sql
     assert "reported_code = :reported_code_1" in sql
-    assert params["reported_code_0"] == "0110"
-    assert params["reported_code_1"] == "110"
-    assert params["shared_snapshot_key"] == 41
+    assert params_by_name["reported_code_0"] == "0110"
+    assert params_by_name["reported_code_1"] == "110"
+    assert params_by_name["shared_snapshot_key"] == 41
 
 
 # Code normalization and crosswalk context
@@ -683,11 +683,11 @@ async def test_code_context_expands_internal_crosswalk():
 
 def test_manifest_code_filter_matches_revenue_code_forms():
     filters = []
-    params = {}
+    params_by_name = {}
 
     ptg2_serving._append_manifest_reported_code_filter(
         filters,
-        params,
+        params_by_name,
         code="0110",
         code_system="RC",
     )
@@ -695,18 +695,18 @@ def test_manifest_code_filter_matches_revenue_code_forms():
     assert "reported_code_system = :reported_code_system_0" in filters[0]
     assert "reported_code = :reported_code_0" in filters[0]
     assert "reported_code = :reported_code_1" in filters[0]
-    assert params["reported_code_system_0"] == "RC"
-    assert params["reported_code_0"] == "0110"
-    assert params["reported_code_1"] == "110"
+    assert params_by_name["reported_code_system_0"] == "RC"
+    assert params_by_name["reported_code_0"] == "0110"
+    assert params_by_name["reported_code_1"] == "110"
 
 
 def test_manifest_code_filter_uses_resolved_external_context():
     filters = []
-    params = {}
+    params_by_name = {}
 
     ptg2_serving._append_manifest_reported_code_filter(
         filters,
-        params,
+        params_by_name,
         code="70551",
         code_system="CPT",
         code_context={
@@ -718,13 +718,13 @@ def test_manifest_code_filter_uses_resolved_external_context():
         },
     )
 
-    assert set(value for key, value in params.items() if "system" in key) == {
+    assert set(value for key, value in params_by_name.items() if "system" in key) == {
         "CPT",
         "HCPCS",
     }
     assert set(
         value
-        for key, value in params.items()
+        for key, value in params_by_name.items()
         if key.startswith("reported_code_") and "system" not in key
     ) == {"70551"}
 
@@ -745,11 +745,11 @@ async def test_taxonomy_filter_uses_primary_specialty_codes():
 
     assert filtered == (1234567890,)
     sql = str(session.calls[0][0][0])
-    params = session.calls[0][0][1]
+    params_by_name = session.calls[0][0][1]
     assert "manifest_provider_specialty_nt.npi = source_npis.npi" in sql
     assert "healthcare_provider_primary_taxonomy_switch" in sql
-    assert params["manifest_provider_specialty_taxonomy_code_0"] == "207Q00000X"
-    assert params["manifest_provider_specialty_taxonomy_code_1"] == "208D00000X"
+    assert params_by_name["manifest_provider_specialty_taxonomy_code_0"] == "207Q00000X"
+    assert params_by_name["manifest_provider_specialty_taxonomy_code_1"] == "208D00000X"
 
 
 @pytest.mark.asyncio
@@ -765,10 +765,10 @@ async def test_inferred_taxonomy_filter_requires_individual_npi():
 
     assert filtered == (1234567890,)
     sql = str(session.calls[0][0][0])
-    params = session.calls[0][0][1]
+    params_by_name = session.calls[0][0][1]
     assert "FROM mrf.npi_taxonomy nt WHERE nt.npi = source_npis.npi" in sql
     assert "n_entity.entity_type_code" in sql
-    assert "207X00000X" in str(params)
+    assert "207X00000X" in str(params_by_name)
 
 
 @pytest.mark.parametrize(
@@ -787,16 +787,16 @@ def test_inferred_taxonomy_sql_for_high_confidence_cpt_families(
     code,
     expected_taxonomy,
 ):
-    params = {}
+    params_by_name = {}
     sql = ptg2_serving._inferred_provider_taxonomy_code_sql(
         {"code": code, "code_system": "CPT"},
         nt_alias="nt",
         schema="mrf",
-        params=params,
+        params=params_by_name,
         param_prefix="inferred",
     )
 
-    assert expected_taxonomy in params.values()
+    assert expected_taxonomy in params_by_name.values()
     assert "nt.healthcare_provider_taxonomy_code IN" in sql
 
 
@@ -814,7 +814,7 @@ def test_inferred_taxonomy_sql_ignores_mixed_use_cpt_families(code):
 
 
 def test_membership_taxonomy_filters_use_uncorrelated_semijoins():
-    params = {}
+    params_by_name = {}
 
     filters = ptg2_serving._membership_taxonomy_filters(
         {
@@ -822,40 +822,40 @@ def test_membership_taxonomy_filters_use_uncorrelated_semijoins():
             "code": "29888",
             "code_system": "CPT",
         },
-        params,
+        params_by_name,
     )
 
     sql = " ".join(filters)
     assert "addr.npi IN (SELECT" in sql
     assert "FROM mrf.npi_taxonomy" in sql
     assert "n_entity.entity_type_code" in sql
-    assert "207Q00000X" in params.values()
-    assert "207X00000X" in params.values()
+    assert "207Q00000X" in params_by_name.values()
+    assert "207X00000X" in params_by_name.values()
 
 
 def test_membership_geo_sql_uses_postgis_for_unified_addresses():
-    params = {}
+    params_by_name = {}
 
     distance_sql, filters = ptg2_serving._membership_geo_sql(
         {"lat": "41.90", "long": "-87.65", "radius_miles": "12"},
         uses_unified_addresses=True,
-        parameter_map=params,
+        parameter_map=params_by_name,
     )
 
     assert "3958.7613" in distance_sql
     assert "asin" in distance_sql
     assert any("ST_DWithin" in sql for sql in filters)
     assert "COALESCE(addr.address_precision, '') <> 'city_zip'" in filters
-    assert params["geo_radius_miles"] == 12.0
+    assert params_by_name["geo_radius_miles"] == 12.0
 
 
 def test_membership_geo_sql_uses_bounded_non_unified_predicates():
-    params = {}
+    params_by_name = {}
 
     distance_sql, filters = ptg2_serving._membership_geo_sql(
         {"lat": "41.90", "long": "-87.65", "radius_miles": "12"},
         uses_unified_addresses=False,
-        parameter_map=params,
+        parameter_map=params_by_name,
     )
 
     assert "3958.7613" in distance_sql
@@ -866,7 +866,7 @@ def test_membership_geo_sql_uses_bounded_non_unified_predicates():
 
 
 def test_membership_filter_preserves_zip_or_radius_semantics():
-    params = {"address_types": ["practice", "primary"]}
+    params_by_name = {"address_types": ["practice", "primary"]}
 
     filter_sql, distance_sql = ptg2_serving._membership_filter_sql(
         {
@@ -879,7 +879,7 @@ def test_membership_filter_preserves_zip_or_radius_semantics():
         candidate_npis=(1234567890, 1234567891),
         uses_unified_addresses=True,
         address_zip5_sql="LEFT(addr.postal_code, 5)",
-        parameter_map=params,
+        parameter_map=params_by_name,
     )
 
     assert "LEFT(addr.postal_code, 5) = :zip5 OR" in filter_sql
@@ -891,17 +891,17 @@ def test_membership_filter_preserves_zip_or_radius_semantics():
 
 
 def test_knn_order_requires_unscoped_first_page_coordinate_search():
-    args = {"lat": "41.90", "long": "-87.65"}
+    query_by_name = {"lat": "41.90", "long": "-87.65"}
 
     assert ptg2_serving._membership_knn_order_sql(
-        args,
+        query_by_name,
         candidate_npis=None,
         uses_unified_addresses=True,
         offset=0,
     ) == ptg2_serving._ptg2_geo_knn_meters_sql("addr.lat", "addr.long")
     assert (
         ptg2_serving._membership_knn_order_sql(
-            {**args, "zip5": "60601"},
+            {**query_by_name, "zip5": "60601"},
             candidate_npis=None,
             uses_unified_addresses=True,
             offset=0,
@@ -910,7 +910,7 @@ def test_knn_order_requires_unscoped_first_page_coordinate_search():
     )
     assert (
         ptg2_serving._membership_knn_order_sql(
-            args,
+            query_by_name,
             candidate_npis=(1234567890,),
             uses_unified_addresses=True,
             offset=0,
@@ -930,17 +930,17 @@ def test_knn_query_carries_bounded_raw_probe_exhaustion_marker():
 @pytest.mark.asyncio
 async def test_knn_duplicate_addresses_do_not_signal_location_exhaustion(monkeypatch):
     location_calls = []
-    first_prefix = [
+    first_prefix_rows = [
         {"npi": 1000000001, "_ptg_source_exhausted": False},
     ]
-    complete_prefix = [
+    complete_prefix_rows = [
         {"npi": 1000000001, "_ptg_source_exhausted": True},
         {"npi": 1000000002, "_ptg_source_exhausted": True},
     ]
 
     async def fake_location_rows(*_args, limit, **_kwargs):
         location_calls.append(limit)
-        return first_prefix if len(location_calls) == 1 else complete_prefix
+        return first_prefix_rows if len(location_calls) == 1 else complete_prefix_rows
 
     async def fake_append(
         _session,
@@ -1044,23 +1044,23 @@ async def test_provider_directory_overlay_prefers_corroborated_contact():
         snapshot_id="ptg2:209901:synthetic",
         source_key="synthetic-source",
     )
-    provider_item = ptg2_serving._compact_item_from_row(
+    provider_by_field = ptg2_serving._compact_item_from_row(
         {**overlaid[0], "prices": []},
         {},
     )
 
-    assert provider_item["phone_number"] == "3125550100"
-    assert provider_item["phone_extension"] == "45"
-    assert provider_item["address_verification"]["address_evidence_level"] == (
+    assert provider_by_field["phone_number"] == "3125550100"
+    assert provider_by_field["phone_extension"] == "45"
+    assert provider_by_field["address_verification"]["address_evidence_level"] == (
         "payer_directory_network_location"
     )
-    assert provider_item["address_verification"]["provider_directory_org_name"] == (
+    assert provider_by_field["address_verification"]["provider_directory_org_name"] == (
         "Synthetic Health"
     )
 
 
 def test_provider_directory_network_name_match_uses_synthetic_context_without_mutation():
-    address_payload = {
+    address_by_field = {
         "first_line": "100 Example Street",
         "city": "Example City",
         "state": "IL",
@@ -1082,8 +1082,8 @@ def test_provider_directory_network_name_match_uses_synthetic_context_without_mu
             "matched_on": "npi_address_key_role_location"
         },
     }
-    original = copy.deepcopy(address_payload)
-    provider_item = {
+    original = copy.deepcopy(address_by_field)
+    provider_by_field = {
         "network_names": ["Synthetic Network"],
         "address": {
             "first_line": "100 Example Street",
@@ -1094,17 +1094,17 @@ def test_provider_directory_network_name_match_uses_synthetic_context_without_mu
     }
 
     first = ptg2_serving._address_verification_payload(
-        provider_item,
+        provider_by_field,
         {},
-        address_payload,
+        address_by_field,
     )
     second = ptg2_serving._address_verification_payload(
-        provider_item,
+        provider_by_field,
         {},
-        address_payload,
+        address_by_field,
     )
 
-    assert address_payload == original
+    assert address_by_field == original
     assert first["address_network_binding"] == "payer_directory_corroborated_location"
     assert first["provider_directory_network_name_matched"] is True
     assert first["provider_directory_network_matches"] == second[
@@ -1145,7 +1145,7 @@ def test_provider_directory_marker_without_plan_or_network_match_is_inferred():
 
 
 def test_compact_item_normalizes_provider_directory_boolean_and_list_fields():
-    provider_item = ptg2_serving._compact_item_from_row(
+    provider_by_field = ptg2_serving._compact_item_from_row(
         {
             "npi": 1234567890,
             "provider_name": "Example Clinician",
@@ -1172,7 +1172,7 @@ def test_compact_item_normalizes_provider_directory_boolean_and_list_fields():
         {},
     )
 
-    verification = provider_item["address_verification"]
+    verification = provider_by_field["address_verification"]
     assert verification["provider_directory_plan_context_matched"] is False
     assert verification["provider_directory_network_context_present"] is True
     assert verification["provider_directory_network_refs"] == ["Organization/network-1"]
@@ -1343,12 +1343,12 @@ def test_manifest_response_keeps_address_verification_in_public_shape():
         },
     )
 
-    provider_item = shaped["items"][0]
-    assert "service_code" not in provider_item
-    assert "service_code_system" not in provider_item
-    assert "network_names" not in provider_item
-    assert "source_trace" not in provider_item
-    assert provider_item["address_verification"]["address_network_binding"] == (
+    provider_by_field = shaped["items"][0]
+    assert "service_code" not in provider_by_field
+    assert "service_code_system" not in provider_by_field
+    assert "network_names" not in provider_by_field
+    assert "source_trace" not in provider_by_field
+    assert provider_by_field["address_verification"]["address_network_binding"] == (
         "payer_directory_corroborated_location"
     )
     assert "result_granularity" not in shaped["query"]
@@ -1359,7 +1359,7 @@ def test_manifest_response_keeps_address_verification_in_public_shape():
 
 
 def test_manifest_provider_procedure_item_shapes_address_and_prices():
-    provider_item = ptg2_serving._ptg2_manifest_provider_procedure_item(
+    provider_by_field = ptg2_serving._ptg2_manifest_provider_procedure_item(
         npi=1234567890,
         data={
             "serving_content_hash_128": "rate-pack",
@@ -1395,17 +1395,17 @@ def test_manifest_provider_procedure_item_shapes_address_and_prices():
         args={"snapshot_id": "ptg2:209901:synthetic"},
     )
 
-    assert provider_item["npi"] == 1234567890
-    assert provider_item["procedure_code"] == "29888"
-    assert provider_item["prices"][0]["negotiated_rate"] == 1138.57
-    assert provider_item["address"]["first_line"] == "100 Example Street"
-    assert provider_item["address_verification"]["address_evidence_level"] == (
+    assert provider_by_field["npi"] == 1234567890
+    assert provider_by_field["procedure_code"] == "29888"
+    assert provider_by_field["prices"][0]["negotiated_rate"] == 1138.57
+    assert provider_by_field["address"]["first_line"] == "100 Example Street"
+    assert provider_by_field["address_verification"]["address_evidence_level"] == (
         "nppes_provider_address"
     )
 
 
 def test_provider_rate_items_merge_duplicate_location_and_code_prices():
-    base = {
+    base_by_field = {
         "npi": 1234567890,
         "provider_name": "Example Clinician",
         "location_hash": "synthetic-location",
@@ -1415,14 +1415,14 @@ def test_provider_rate_items_merge_duplicate_location_and_code_prices():
     }
     rate_items = [
         {
-            **base,
+            **base_by_field,
             "provider_set_hash": "provider-set-1",
             "price_set_hash": "price-set-1",
             "rate_pack_hash": "rate-pack-1",
             "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
         },
         {
-            **base,
+            **base_by_field,
             "provider_set_hash": "provider-set-2",
             "price_set_hash": "price-set-2",
             "rate_pack_hash": "rate-pack-2",
@@ -1440,7 +1440,7 @@ def test_provider_rate_items_merge_duplicate_location_and_code_prices():
 
 
 def test_provider_rate_items_do_not_merge_different_arrangements():
-    base = {
+    base_by_field = {
         "npi": 1234567890,
         "provider_name": "Example Clinician",
         "location_hash": "synthetic-location",
@@ -1453,12 +1453,12 @@ def test_provider_rate_items_do_not_merge_different_arrangements():
     }
     rate_items = [
         {
-            **base,
+            **base_by_field,
             "negotiation_arrangement": "FFS",
             "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
         },
         {
-            **base,
+            **base_by_field,
             "negotiation_arrangement": "BUNDLE",
             "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 200}],
         },
@@ -1537,7 +1537,7 @@ def test_default_provider_sort_prioritizes_network_bound_address():
         location_filter_requested=False,
     )
 
-    assert [provider_item["provider_name"] for provider_item in sorted_items] == [
+    assert [provider_by_field["provider_name"] for provider_by_field in sorted_items] == [
         "Verified Address",
         "Inferred Address",
         "No Address",
@@ -1569,11 +1569,11 @@ def test_provider_sort_supports_cost_and_distance():
         location_filter_requested=True,
     )
 
-    assert [provider_item["provider_name"] for provider_item in by_cost] == [
+    assert [provider_by_field["provider_name"] for provider_by_field in by_cost] == [
         "Far Low Cost",
         "Near High Cost",
     ]
-    assert [provider_item["provider_name"] for provider_item in by_distance] == [
+    assert [provider_by_field["provider_name"] for provider_by_field in by_distance] == [
         "Near High Cost",
         "Far Low Cost",
     ]
@@ -1655,7 +1655,7 @@ def test_descending_provider_cost_sort_keeps_missing_last_and_ties_ascending():
         location_filter_requested=False,
     )
 
-    assert [provider_item["provider_name"] for provider_item in sorted_items] == [
+    assert [provider_by_field["provider_name"] for provider_by_field in sorted_items] == [
         "A",
         "B",
         "Missing",
@@ -1721,7 +1721,7 @@ async def test_reverse_price_filter_scans_past_old_candidate_guess(monkeypatch):
         }
         for price_key in range(1, 502)
     ]
-    matching_row = {
+    matching_row_by_field = {
         "price_set_global_id_128": f"{502:032x}",
         "price_key": 502,
     }
@@ -1745,7 +1745,7 @@ async def test_reverse_price_filter_scans_past_old_candidate_guess(monkeypatch):
         if metadata_offset == 0:
             return [nonmatching_rows], 128
         if metadata_offset == 128:
-            return [[matching_row]], 1
+            return [[matching_row_by_field]], 1
         raise AssertionError(f"unexpected metadata offset {metadata_offset}")
 
     async def fake_prices(_session, _tables, price_set_ids, **_kwargs):
@@ -1831,7 +1831,7 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
             "network_names": [],
         },
     ]
-    location_call = {}
+    location_call_by_field = {}
 
     async def fake_merge(*_args, **_kwargs):
         return list(serving_rows)
@@ -1850,7 +1850,7 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
         }
 
     async def fake_location(*_args, **kwargs):
-        location_call.update(kwargs)
+        location_call_by_field.update(kwargs)
         return (
             {matching_provider_set_id},
             {
@@ -1916,9 +1916,9 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
         "product_search",
     )
 
-    assert location_call["provider_set_keys"] == {4}
-    assert location_call["require_exhaustive"] is False
-    assert [provider_item["npi"] for provider_item in response["items"]] == [
+    assert location_call_by_field["provider_set_keys"] == {4}
+    assert location_call_by_field["require_exhaustive"] is False
+    assert [provider_by_field["npi"] for provider_by_field in response["items"]] == [
         1234567890
     ]
     assert response["items"][0]["prices"] == [
@@ -1930,10 +1930,10 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
 
 @pytest.mark.asyncio
 async def test_geo_cost_order_requires_exhaustive_location_selection(monkeypatch):
-    location_call = {}
+    location_call_by_field = {}
 
     async def fake_location(*_args, **kwargs):
-        location_call.update(kwargs)
+        location_call_by_field.update(kwargs)
         return set(), {}
 
     monkeypatch.setattr(
@@ -1959,7 +1959,7 @@ async def test_geo_cost_order_requires_exhaustive_location_selection(monkeypatch
     )
 
     assert response["items"] == []
-    assert location_call["require_exhaustive"] is True
+    assert location_call_by_field["require_exhaustive"] is True
 
 
 @pytest.mark.asyncio

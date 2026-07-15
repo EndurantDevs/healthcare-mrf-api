@@ -117,7 +117,7 @@ def _serving_tables(*, sample_count=2, sample_digest=None) -> PTG2ServingTables:
 
 
 def _args(**overrides):
-    values = {
+    query_by_name = {
         "plan_id": PLAN_ID,
         "snapshot_id": SNAPSHOT_ID,
         "mode": "exact_source",
@@ -127,8 +127,8 @@ def _args(**overrides):
         "offset": "0",
         "source_key": "logical-source",
     }
-    values.update(overrides)
-    return values
+    query_by_name.update(overrides)
+    return query_by_name
 
 
 def _row(occurrence_id, *, atom_ordinal, atom_key=9, total=2):
@@ -221,11 +221,14 @@ async def test_audit_page_is_exact_ordered_and_preserves_duplicate_occurrences(
     )
     atom_lookup = _patch_resolution(monkeypatch)
 
-    payload = await audit_api.audit_occurrences_payload(session, _args())
-    encoded = orjson.dumps(payload)
+    response_by_field = await audit_api.audit_occurrences_payload(session, _args())
+    encoded = orjson.dumps(response_by_field)
     decoded = json.loads(encoded, parse_float=Decimal, parse_int=int)
 
-    assert [item["occurrence_id"] for item in decoded["items"]] == [
+    assert [
+        occurrence_by_field["occurrence_id"]
+        for occurrence_by_field in decoded["items"]
+    ] == [
         OCCURRENCE_ONE.hex(),
         OCCURRENCE_TWO.hex(),
     ]
@@ -265,18 +268,19 @@ async def test_audit_page_is_exact_ordered_and_preserves_duplicate_occurrences(
         "atom_ordinal": 0,
         "atom_key": 9,
     }
-    expected_source_payload = {
+    expected_source_by_field = {
         **{
-            key: value
-            for key, value in SOURCE_PROVENANCE.items()
-            if key != "source_key"
+            source_field_name: source_field_value
+            for source_field_name, source_field_value in SOURCE_PROVENANCE.items()
+            if source_field_name != "source_key"
         },
         "source_key": "logical-source",
         "source_artifact_key": 1,
     }
     assert {
-        key: decoded["items"][0][key] for key in expected_source_payload
-    } == expected_source_payload
+        source_field_name: decoded["items"][0][source_field_name]
+        for source_field_name in expected_source_by_field
+    } == expected_source_by_field
     assert decoded["pagination"] == {
         "total": 2,
         "limit": 100,
@@ -335,19 +339,19 @@ async def test_empty_page_keeps_persisted_sample_total(monkeypatch):
     )
     atom_lookup = _patch_resolution(monkeypatch, atoms={}, sample_count=2560)
 
-    payload = await audit_api.audit_occurrences_payload(
+    response_by_field = await audit_api.audit_occurrences_payload(
         session,
         _args(limit="50", offset="2600"),
     )
 
-    assert payload["items"] == []
-    assert payload["pagination"] == {
+    assert response_by_field["items"] == []
+    assert response_by_field["pagination"] == {
         "total": 2560,
         "limit": 50,
         "offset": 2600,
         "has_more": False,
     }
-    assert payload["result_state"] == "matched"
+    assert response_by_field["result_state"] == "matched"
     assert atom_lookup.await_args.kwargs["atom_keys"] == set()
 
 
@@ -378,12 +382,12 @@ async def test_audit_endpoint_rejects_same_count_tampered_sample_digest(monkeypa
 
 @pytest.mark.asyncio
 async def test_audit_endpoint_rejects_page_row_outside_validated_digest(monkeypatch):
-    tampered_page_row = {
+    tampered_row_by_field = {
         **_row(OCCURRENCE_ONE, atom_ordinal=0),
         "price_key": 999,
     }
     session = RecordingSession(
-        [tampered_page_row, _row(OCCURRENCE_TWO, atom_ordinal=1)],
+        [tampered_row_by_field, _row(OCCURRENCE_TWO, atom_ordinal=1)],
         digest_rows=_audit_digest_rows(2),
     )
     _patch_resolution(monkeypatch)
@@ -530,7 +534,7 @@ async def test_audit_endpoint_rejects_container_valued_price_lists(
 
 @pytest.mark.asyncio
 async def test_pricing_route_uses_dedicated_audit_path(monkeypatch):
-    payload = {
+    response_by_field = {
         "result_state": "no_matching_rates",
         "pricing_scope": "plan_scoped_ptg",
         "resolved_snapshot_id": SNAPSHOT_ID,
@@ -557,7 +561,7 @@ async def test_pricing_route_uses_dedicated_audit_path(monkeypatch):
             "complete_population": False,
         },
     }
-    dedicated = AsyncMock(return_value=payload)
+    dedicated = AsyncMock(return_value=response_by_field)
     search = AsyncMock()
     monkeypatch.setattr(pricing, "audit_occurrences_payload", dedicated)
     monkeypatch.setattr(pricing, "search_current_ptg2_index", search)
@@ -568,7 +572,7 @@ async def test_pricing_route_uses_dedicated_audit_path(monkeypatch):
 
     response = await pricing.list_ptg2_audit_occurrences(request)
 
-    assert json.loads(response.body) == payload
+    assert json.loads(response.body) == response_by_field
     dedicated.assert_awaited_once_with(
         request.ctx.sa_session,
         {**request.args, "plan_market_type": None},

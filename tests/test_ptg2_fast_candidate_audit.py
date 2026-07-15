@@ -175,7 +175,16 @@ def _target() -> audit.FastAuditTarget:
         source_set_digest=SOURCE_SET_DIGEST,
         audit_sample={
             "contract": "persisted_served_occurrence_sample_v2",
+            "format_version": 2,
+            "method": "publish_time_stratified_v1",
+            "sample_count": 1,
+            "maximum_rows": 2_560,
             "sample_digest": AUDIT_SAMPLE_DIGEST,
+            "source_count": 1,
+            "occurrence_identity": "sha256_candidate_ordinal_source_key_v2",
+            "complete_population": False,
+            "serving_multiplicity_semantics": "source_multiset_v1",
+            "work": {"combination_attempts": 2_560},
         },
         provider_identifier_quarantine=provider_identifier_quarantine_payload({}),
     )
@@ -376,7 +385,9 @@ async def test_source_challenge_uses_candidate_api_with_exact_filters(
             "source_count": audit_target.source_count,
             "raw_container_sha256_digest": audit_target.source_set_digest,
         }
-        response_fields["audit_sample"] = dict(audit_target.audit_sample)
+        response_fields["audit_sample"] = audit.public_audit_sample_projection(
+            audit_target.audit_sample
+        )
         response_fields["pagination"] = {"offset": 0, "limit": 1, "total": 1}
         return web.json_response(response_fields)
 
@@ -412,7 +423,9 @@ async def test_source_challenge_uses_candidate_api_with_exact_filters(
     finally:
         await runner.cleanup()
 
-    assert observed_sample == dict(audit_target.audit_sample)
+    assert observed_sample == audit.public_audit_sample_projection(
+        audit_target.audit_sample
+    )
     assert len(requests) == 2
     assert metrics.request_count == 2
 
