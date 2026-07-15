@@ -174,19 +174,19 @@ async def test_site_intelligence_returns_trade_area_metrics(monkeypatch, site_in
     request = SimpleNamespace(args={"lat": "41.892", "lng": "-87.635"}, ctx=SimpleNamespace())
 
     resp = await site_intel_module.get_site_score(request)
-    payload = json.loads(resp.body)
+    response_payload = json.loads(resp.body)
 
-    assert payload["trade_areas"]["15"]["metrics"]["total_seniors"] == 10100
-    assert payload["trade_areas"]["15"]["metrics"]["np_pa_count"] == 2
-    assert payload["supply_metrics"]["provider_count"] == 3
-    assert payload["supply_metrics"]["np_pa_count"] == 2
-    assert payload["demand_metrics"]["chronic_disease_rate"].endswith("% avg")
-    assert payload["confidence"] != "85%"
-    assert payload["methodology"]["state_used_for_economics"] == "IL"
-    assert payload["expected_volume"]["daily"] >= 10
-    assert payload["score_components"]["total"] == payload["score_value"]
-    assert payload["target_assessment"]["target_daily"] == 100
-    assert payload["recommendation"]["final_decision"] in (
+    assert response_payload["trade_areas"]["15"]["metrics"]["total_seniors"] == 10100
+    assert response_payload["trade_areas"]["15"]["metrics"]["np_pa_count"] == 2
+    assert response_payload["supply_metrics"]["provider_count"] == 3
+    assert response_payload["supply_metrics"]["np_pa_count"] == 2
+    assert response_payload["demand_metrics"]["chronic_disease_rate"].endswith("% avg")
+    assert response_payload["confidence"] != "85%"
+    assert response_payload["methodology"]["state_used_for_economics"] == "IL"
+    assert response_payload["expected_volume"]["daily"] >= 10
+    assert response_payload["score_components"]["total"] == response_payload["score_value"]
+    assert response_payload["target_assessment"]["target_daily"] == 100
+    assert response_payload["recommendation"]["final_decision"] in (
         "Recommend",
         "Conditional",
         "Not Recommended",
@@ -285,15 +285,15 @@ async def test_site_intelligence_target_scripts_gates_recommendation(monkeypatch
         ctx=SimpleNamespace(),
     )
     resp = await site_intel_module.get_site_score(request)
-    payload = json.loads(resp.body)
+    response_payload = json.loads(resp.body)
 
-    assert payload["target_assessment"]["target_daily"] == 250
-    assert payload["target_assessment"]["target_met"] is False
-    assert payload["recommendation"]["base_decision"] in (
+    assert response_payload["target_assessment"]["target_daily"] == 250
+    assert response_payload["target_assessment"]["target_met"] is False
+    assert response_payload["recommendation"]["base_decision"] in (
         "Recommend",
         "Conditional",
         "Not Recommended",
     )
-    assert payload["recommendation"]["final_decision"] != "Recommend"
-    if payload["recommendation"]["base_decision"] == "Recommend":
-        assert payload["recommendation"]["target_adjusted"] is True
+    assert response_payload["recommendation"]["final_decision"] != "Recommend"
+    if response_payload["recommendation"]["base_decision"] == "Recommend":
+        assert response_payload["recommendation"]["target_adjusted"] is True

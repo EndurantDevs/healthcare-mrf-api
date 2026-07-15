@@ -531,8 +531,8 @@ async def publish_shared_finalizer_dictionaries(
                                 SELECT DISTINCT provider_set_global_id_128, network_names
                                   FROM {schema}.{quoted_provider_metadata_stage}
                                ) metadata
-                         WHERE encode(provider_stage.provider_set_global_id_128, 'hex') =
-                               metadata.provider_set_global_id_128
+                         WHERE provider_stage.provider_set_global_id_128 =
+                               decode(metadata.provider_set_global_id_128, 'hex')
                         """
                     )
                 )
@@ -549,8 +549,8 @@ async def publish_shared_finalizer_dictionaries(
                              WHERE NOT EXISTS (
                                    SELECT 1
                                      FROM {schema}.{quoted_provider_stage} provider_stage
-                                    WHERE encode(provider_stage.provider_set_global_id_128, 'hex') =
-                                          metadata.provider_set_global_id_128
+                                    WHERE provider_stage.provider_set_global_id_128 =
+                                          decode(metadata.provider_set_global_id_128, 'hex')
                                )
                         )
                         """

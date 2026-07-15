@@ -80,11 +80,11 @@ async def test_get_import_status_returns_aggregates(monkeypatch):
     )
 
     response = await pharmacy_license.get_pharmacy_license_import_status(request)
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert payload["run_id"] == "run_1"
-    assert payload["snapshots"]["count"] == 3
-    assert payload["snapshots"]["matched_rows"] == 80
+    assert response_payload["run_id"] == "run_1"
+    assert response_payload["snapshots"]["count"] == 3
+    assert response_payload["snapshots"]["matched_rows"] == 80
 
 
 @pytest.mark.asyncio
@@ -137,11 +137,11 @@ async def test_get_coverage_returns_items(monkeypatch):
     )
 
     response = await pharmacy_license.get_pharmacy_license_coverage(request)
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert payload["total_states"] == 2
-    assert payload["supported_states"] == 1
-    assert payload["unsupported_states"] == 1
+    assert response_payload["total_states"] == 2
+    assert response_payload["supported_states"] == 1
+    assert response_payload["unsupported_states"] == 1
 
 
 @pytest.mark.asyncio
@@ -209,10 +209,10 @@ async def test_get_pharmacy_license_by_npi_returns_summary_and_history(monkeypat
     )
 
     response = await pharmacy_license.get_pharmacy_license_by_npi(request, "1518379601")
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert payload["npi"] == 1518379601
-    assert payload["summary"]["total_licenses"] == 1
-    assert payload["summary"]["active_license_count"] == 1
-    assert payload["summary"]["active_states"] == ["TX"]
-    assert len(payload["history"]) == 1
+    assert response_payload["npi"] == 1518379601
+    assert response_payload["summary"]["total_licenses"] == 1
+    assert response_payload["summary"]["active_license_count"] == 1
+    assert response_payload["summary"]["active_states"] == ["TX"]
+    assert len(response_payload["history"]) == 1
