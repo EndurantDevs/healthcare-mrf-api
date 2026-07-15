@@ -25,6 +25,7 @@ DISPOSABLE_DATABASE_PATTERN = re.compile(
     r"^ptg2_v3_lifecycle_test_[a-z0-9][a-z0-9_]{7,}$"
 )
 TEST_ROOT_RUN_ID = "mrf_discovery_checkpoint_test_root"
+LARGE_TEST_ROOT_RUN_ID = "mrf_discovery_checkpoint_large_batch_test_root"
 
 
 def _database_url():
@@ -52,14 +53,14 @@ async def _connect(database_url):
     )
 
 
-async def _clear_test_batch(database_url) -> None:
+async def _clear_test_batch(database_url, root_run_id=TEST_ROOT_RUN_ID) -> None:
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     connection = await _connect(database_url)
     try:
         await connection.execute(
             f'DELETE FROM "{schema}"."mrf_discovery_batch" '
             "WHERE root_run_id = $1",
-            TEST_ROOT_RUN_ID,
+            root_run_id,
         )
     finally:
         await connection.close()
@@ -200,6 +201,39 @@ async def test_postgres_retry_replays_only_unfinished_sources_and_fences_owner()
     finally:
         await db.disconnect()
         await _clear_test_batch(database_url)
+
+
+@pytest.mark.asyncio
+async def test_postgres_checkpoint_reservation_chunks_full_catalog():
+    """Reserve the observed full-catalog source count below driver bind limits."""
+
+    database_url = _database_url()
+    source_records = [
+        {
+            "source_id": f"source_{source_index:04d}",
+            "index_url": f"https://example.test/{source_index:04d}/index.json",
+        }
+        for source_index in range(3_320)
+    ]
+    checkpoint_store = DatabaseDiscoveryCheckpointStore()
+    await db.disconnect()
+    await _clear_test_batch(database_url, LARGE_TEST_ROOT_RUN_ID)
+    try:
+        frozen_records = await checkpoint_store.initialize_batch(
+            LARGE_TEST_ROOT_RUN_ID,
+            LARGE_TEST_ROOT_RUN_ID,
+            source_records,
+        )
+        assert frozen_records == source_records
+        summary = await checkpoint_store.summarize_batch(
+            LARGE_TEST_ROOT_RUN_ID,
+            LARGE_TEST_ROOT_RUN_ID,
+        )
+        assert summary.source_set_count == len(source_records)
+        assert summary.completed_source_count == 0
+    finally:
+        await db.disconnect()
+        await _clear_test_batch(database_url, LARGE_TEST_ROOT_RUN_ID)
 
 
 @pytest.mark.asyncio

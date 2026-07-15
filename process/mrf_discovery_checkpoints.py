@@ -21,6 +21,7 @@ DISCOVERY_PROOF_VERSION = 2
 SOURCE_SET_CONTRACT = "hp-mrf-discovery-source-set-v1"
 SOURCE_PAYLOAD_SET_CONTRACT = "hp-mrf-discovery-source-payload-set-v1"
 CHECKPOINT_STRATEGY_VERSION = "mrf-discovery-source-checkpoint-v1"
+CHECKPOINT_INSERT_CHUNK_SIZE = 1_000
 
 
 @dataclass(frozen=True)
@@ -264,6 +265,24 @@ def _unique_source_payloads(
     ]
 
 
+async def _insert_source_checkpoints(
+    session: Any,
+    checkpoint_values: list[dict[str, Any]],
+) -> None:
+    """Insert frozen checkpoints without exceeding driver bind limits."""
+
+    for chunk_start in range(0, len(checkpoint_values), CHECKPOINT_INSERT_CHUNK_SIZE):
+        checkpoint_chunk = checkpoint_values[
+            chunk_start : chunk_start + CHECKPOINT_INSERT_CHUNK_SIZE
+        ]
+        checkpoint_statement = (
+            pg_insert(MRFDiscoverySourceCheckpoint)
+            .values(checkpoint_chunk)
+            .on_conflict_do_nothing(index_elements=["root_run_id", "source_id"])
+        )
+        await session.execute(checkpoint_statement)
+
+
 class DatabaseDiscoveryCheckpointStore:
     """Persist frozen source batches and retry-safe source checkpoints."""
 
@@ -327,15 +346,7 @@ class DatabaseDiscoveryCheckpointStore:
             reservation_result = await session.execute(reservation_statement)
             reserved_root_run_id = reservation_result.scalar_one_or_none()
             if reserved_root_run_id:
-                if checkpoint_values:
-                    checkpoint_statement = (
-                        pg_insert(MRFDiscoverySourceCheckpoint)
-                        .values(checkpoint_values)
-                        .on_conflict_do_nothing(
-                            index_elements=["root_run_id", "source_id"]
-                        )
-                    )
-                    await session.execute(checkpoint_statement)
+                await _insert_source_checkpoints(session, checkpoint_values)
             existing_batch = await session.get(MRFDiscoveryBatch, root_run_id)
             if existing_batch is None:
                 raise DiscoverySourceBatchMismatch(
