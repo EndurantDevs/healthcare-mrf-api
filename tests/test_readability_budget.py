@@ -11,6 +11,7 @@ readability_budget = util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = readability_budget
 SPEC.loader.exec_module(readability_budget)
+readability_cli = sys.modules["readability.cli"]
 
 NOQA_FIXTURE = "# no" + "qa: E123"
 COMMENT_NOISE_FIXTURE = "# return" + " result"
@@ -421,3 +422,42 @@ def test_readability_ratchet_zero_percent_prevents_net_growth(tmp_path):
     )
     assert readability_budget.main(["--repo-root", str(repo_root), "--write-baseline"]) == 0
     assert readability_budget.main(ratchet_args) == 1
+
+
+def test_protected_issue_comparison_ignores_line_only_relocations():
+    baseline_by_field = {
+        "issue_ids": {
+            "global_state_usage": [
+                "global_state_usage:process/example.py:load_rows:global:10:cache"
+            ],
+            "pass_placeholders": [
+                "pass_placeholder:process/example.py:load_rows:pass:20"
+            ],
+        }
+    }
+    current_by_field = {
+        "issues": {
+            "global_state_usage": [
+                {
+                    "id": "global_state_usage:process/example.py:load_rows:global:14:cache"
+                }
+            ],
+            "pass_placeholders": [
+                {
+                    "id": "pass_placeholder:process/example.py:load_rows:pass:24"
+                }
+            ],
+        }
+    }
+
+    assert readability_cli._new_issues(current_by_field, baseline_by_field) == {}
+
+    new_global_issue_by_field = {
+        "id": "global_state_usage:process/example.py:load_rows:global:14:new_cache"
+    }
+    current_by_field["issues"]["global_state_usage"] = [
+        new_global_issue_by_field
+    ]
+    assert readability_cli._new_issues(current_by_field, baseline_by_field) == {
+        "global_state_usage": [new_global_issue_by_field]
+    }

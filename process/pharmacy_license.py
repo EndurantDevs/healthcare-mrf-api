@@ -1742,6 +1742,8 @@ async def _load_rows_from_configured_source(
     session: aiohttp.ClientSession,
     state_source: StateSource,
 ) -> tuple[bool, list[dict[str, Any]], str | None, dict[str, Any], str | None]:
+    """Load one state's configured license source with explicit evidence."""
+
     static_reason = _STATE_STATIC_UNSUPPORTED_CONFIG.get(state_source.state_code)
     if static_reason:
         return (

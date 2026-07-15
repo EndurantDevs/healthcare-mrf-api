@@ -50,11 +50,12 @@ def _release_report(**target_overrides):
         "plan_id_sha256": _sha256("12-3456789"),
         "market_type_sha256": _sha256("group"),
         "tls_verified": True,
+        "transport_contract": "verified_https_v1",
     }
     target_map.update(target_overrides)
     return {
         "schema_version": 2,
-        "harness": {"name": "ptg2_v3_source_api_audit", "version": "2.10.0"},
+        "harness": {"name": "ptg2_v3_source_api_audit", "version": "2.11.0"},
         "status": "pass",
         "profile": "release",
         "release_profile_enforced": True,
@@ -124,6 +125,23 @@ def test_release_report_validation_is_exact_and_deterministic():
     assert first["standard_api_actual_http_requests"] == 3_000
 
 
+def test_release_report_accepts_explicit_authenticated_cluster_transport():
+    report = _release_report(
+        tls_verified=False,
+        transport_contract="authenticated_cluster_service_v1",
+    )
+
+    result = ptg2_candidate_attestation.validate_candidate_release_audit_report(
+        report,
+        snapshot_id="snap_new",
+        source_key="source_a",
+        plan_id="12-3456789",
+        plan_market_type="group",
+    )
+
+    assert len(result["report_digest"]) == 32
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -134,6 +152,8 @@ def test_release_report_validation_is_exact_and_deterministic():
         (lambda report: report["checks"].update(source_occurrence_ids="2500"), "invalid"),
         (lambda report: report["api_audit_sample"].update(sample_digest="bad"), "sample_digest"),
         (lambda report: report["redaction"]["excluded"].pop(), "redaction"),
+        (lambda report: report["target"].update(transport_contract=None), "transport"),
+        (lambda report: report["target"].update(tls_verified=False), "transport"),
         (lambda report: report.update(unexpected_sensitive_value="no"), "fields"),
     ],
 )

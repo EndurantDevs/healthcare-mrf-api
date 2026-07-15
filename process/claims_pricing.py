@@ -1327,6 +1327,8 @@ async def _load_geo_service_rows(
     year: int,
     test_mode: bool,
 ) -> None:
+    """Materialize procedure and geographic benchmark rows from one source."""
+
     procedure_rows_map: dict[int, tuple[int, float, dict[str, Any]]] = {}
     geo_benchmark_map: dict[tuple[int, int, str, str], tuple[float, dict[str, Any]]] = {}
     accepted = 0
@@ -1419,6 +1421,8 @@ async def _load_geo_service_rows(
 
 
 async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema: str) -> None:
+    """Build procedure code dimensions and observed crosswalk edges."""
+
     procedure_table = classes["PricingProcedure"].__tablename__
     code_catalog_table = CodeCatalog.__tablename__
     code_crosswalk_table = CodeCrosswalk.__tablename__
@@ -1670,6 +1674,8 @@ async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema:
 
 
 async def _materialize_cost_level_rows(classes: dict[str, type], schema: str) -> None:
+    """Build provider cost profiles and peer statistics from staged claims."""
+
     provider_table = classes["PricingProvider"].__tablename__
     provider_procedure_table = classes["PricingProviderProcedure"].__tablename__
     provider_cost_profile_table = classes["PricingProviderProcedureCostProfile"].__tablename__
@@ -1982,6 +1988,8 @@ async def _materialize_cost_level_rows(classes: dict[str, type], schema: str) ->
 
 
 async def _collect_cost_level_diagnostics(classes: dict[str, type], schema: str) -> dict[str, Any]:
+    """Return publication-gate coverage diagnostics for cost-level tables."""
+
     provider_cost_profile_table = classes["PricingProviderProcedureCostProfile"].__tablename__
     procedure_peer_table = classes["PricingProcedurePeerStats"].__tablename__
 
@@ -2141,6 +2149,8 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
 
 
 async def claims_pricing_start(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Prepare staging, split sources, and enqueue claims-pricing chunks."""
+
     task = task or {}
     test_mode = bool(task.get("test_mode", False))
     import_id_val = _normalize_import_id(task.get("import_id"))
@@ -2323,6 +2333,8 @@ async def claims_pricing_start(ctx, task: dict[str, Any] | None = None) -> dict[
 
 
 async def claims_pricing_process_chunk(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Process one validated claims-pricing chunk and record progress."""
+
     task = task or {}
     dataset_key = str(task.get("dataset_key") or "")
     chunk_id = str(task.get("chunk_id") or "")
@@ -2387,6 +2399,8 @@ async def claims_pricing_process_chunk(ctx, task: dict[str, Any] | None = None) 
 
 
 async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Wait for all chunks, validate staging, and publish claims pricing."""
+
     task = task or {}
     import_id_val = _normalize_import_id(task.get("import_id"))
     run_id = str(task.get("run_id") or "")
@@ -2504,6 +2518,8 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
 
 
 async def main(test_mode: bool = False, import_id: str | None = None) -> dict[str, Any]:
+    """Queue a new claims-pricing control run and return its identifiers."""
+
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
     run_id = _normalize_run_id(None)
     payload = {
@@ -2539,6 +2555,8 @@ async def finish_main(
     test_mode: bool = False,
     manifest_path: str | None = None,
 ) -> dict[str, Any]:
+    """Queue explicit finalization for an existing claims-pricing run."""
+
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
     stage_suffix = _build_stage_suffix(_normalize_import_id(import_id), run_id)
     payload = {

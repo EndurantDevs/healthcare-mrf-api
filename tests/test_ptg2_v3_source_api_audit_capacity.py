@@ -1333,7 +1333,7 @@ def _candidate_attestation_fixture_report():
     started_at = completed_at - dt.timedelta(minutes=10)
     candidate_fixture_map = {
         "schema_version": 2,
-        "harness": {"name": "ptg2_v3_source_api_audit", "version": "2.10.0"},
+        "harness": {"name": "ptg2_v3_source_api_audit", "version": "2.11.0"},
         "status": "pass",
         "profile": "release",
         "release_profile_enforced": True,
@@ -1356,6 +1356,7 @@ def _candidate_attestation_fixture_report():
             "plan_id_sha256": _sha256("12-3456789"),
             "market_type_sha256": _sha256("group"),
             "tls_verified": True,
+            "transport_contract": "verified_https_v1",
         },
         "reproducibility": {},
         "source": {

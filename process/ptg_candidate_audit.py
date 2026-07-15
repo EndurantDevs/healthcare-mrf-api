@@ -41,7 +41,9 @@ STORAGE_GENERATION = "shared_blocks_v3"
 API_BASE_URL_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL"
 AUTH_HEADER_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_AUTH_HEADER"
 AUTH_SCHEME_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_AUTH_SCHEME"
+TRUSTED_CLUSTER_HTTP_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_TRUSTED_CLUSTER_HTTP"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SAFE_FAILURE_REASON_RE = re.compile(r"^[a-z0-9_]{1,128}$")
 
 
 @dataclass(frozen=True)
@@ -355,7 +357,7 @@ def resolve_retained_raw_files(
     return tuple(resolved_paths)
 
 
-def _audit_configuration() -> tuple[str, str, str, str]:
+def _audit_configuration() -> tuple[str, str, str, str, bool]:
     api_base_url = str(
         os.getenv(API_BASE_URL_ENV) or os.getenv("PTG_AUDIT_API_BASE_URL") or ""
     ).strip().rstrip("/")
@@ -363,13 +365,34 @@ def _audit_configuration() -> tuple[str, str, str, str]:
     auth_header = str(os.getenv(AUTH_HEADER_ENV) or "Authorization").strip()
     default_scheme = "Bearer" if auth_header.lower() == "authorization" else ""
     auth_scheme = str(os.getenv(AUTH_SCHEME_ENV, default_scheme)).strip()
+    trusted_cluster_http_text = str(
+        os.getenv(TRUSTED_CLUSTER_HTTP_ENV, "false")
+    ).strip().lower()
     if not api_base_url:
         raise ValueError(f"{API_BASE_URL_ENV} is required")
     if not token:
         raise ValueError("HLTHPRT_CONTROL_API_TOKEN is required")
     if not auth_header or any(character in auth_header for character in "\r\n"):
         raise ValueError("candidate audit auth header is invalid")
-    return api_base_url, token, auth_header, auth_scheme
+    if trusted_cluster_http_text not in {"true", "false"}:
+        raise ValueError(f"{TRUSTED_CLUSTER_HTTP_ENV} must be true or false")
+    return (
+        api_base_url,
+        token,
+        auth_header,
+        auth_scheme,
+        trusted_cluster_http_text == "true",
+    )
+
+
+def _fatal_audit_reason(report: Mapping[str, Any]) -> str | None:
+    failures = _mapping(report.get("failures"))
+    examples = failures.get("examples")
+    if not isinstance(examples, list) or not examples:
+        return None
+    example = examples[0]
+    reason = str(example.get("reason") or "") if isinstance(example, Mapping) else ""
+    return reason if _SAFE_FAILURE_REASON_RE.fullmatch(reason) else None
 
 
 def run_release_audit(
@@ -378,7 +401,13 @@ def run_release_audit(
 ) -> dict[str, Any]:
     """Invoke the independent release audit directly using temporary-only work."""
 
-    api_base_url, token, auth_header, auth_scheme = _audit_configuration()
+    (
+        api_base_url,
+        token,
+        auth_header,
+        auth_scheme,
+        trusted_cluster_http,
+    ) = _audit_configuration()
     with tempfile.TemporaryDirectory(prefix="ptg-candidate-audit-") as temp_dir:
         work_dir = Path(temp_dir)
         report_path = work_dir / "report.json"
@@ -412,6 +441,8 @@ def run_release_audit(
             "--work-dir",
             str(work_dir),
         ]
+        if trusted_cluster_http:
+            audit_arguments.append("--trusted-cluster-http")
         exit_code = ptg2_v3_source_api_audit.run_audit_cli(audit_arguments)
         try:
             report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -419,6 +450,12 @@ def run_release_audit(
             raise RuntimeError("candidate release audit did not produce a valid report") from exc
     if not isinstance(report, dict):
         raise RuntimeError("candidate release audit report is not an object")
+    if exit_code != 0 or report.get("status") == "error":
+        failure_reason = _fatal_audit_reason(report)
+        suffix = f": {failure_reason}" if failure_reason else ""
+        raise CandidateAuditReleaseGateError(
+            f"candidate release audit did not pass the release gate{suffix}"
+        )
     report_source = _mapping(report.get("source"))
     try:
         observed_quarantine = validate_provider_identifier_quarantine(
@@ -432,7 +469,7 @@ def run_release_audit(
         raise CandidateAuditReleaseGateError(
             "candidate release audit provider identifier quarantine does not match publication"
         )
-    if exit_code != 0 or report.get("status") != "pass" or report.get("release_gate_eligible") is not True:
+    if report.get("status") != "pass" or report.get("release_gate_eligible") is not True:
         raise CandidateAuditReleaseGateError(
             "candidate release audit did not pass the release gate"
         )
