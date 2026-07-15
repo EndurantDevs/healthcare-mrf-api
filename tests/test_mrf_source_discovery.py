@@ -99,8 +99,10 @@ def test_discovery_result_exposes_public_catalog_metrics():
         "file_probe_ok",
         "crawl_run_id",
         "errors",
+        "process_workers",
     }
     assert result["catalog_export_version"] == 1
+    assert result["process_workers"] == 1
 
 
 def test_discovery_command_exposes_public_options():
@@ -13789,12 +13791,39 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
     async def fake_flush(timeout_seconds):
         flush_timeouts.append(timeout_seconds)
 
+    async def fake_execute_checkpointed_source_batch(**kwargs):
+        assert kwargs["root_run_id"].startswith("mrfcrawl_")
+        assert kwargs["owner_run_id"] == kwargs["root_run_id"]
+        assert kwargs["source_records"] == [
+            {
+                "source_id": "source_1",
+                "index_url": "https://example.com/index.json",
+            }
+        ]
+        return discovery.SourceBatchSummary(
+            root_run_id=kwargs["root_run_id"],
+            source_set_count=1,
+            source_set_sha256="a" * 64,
+            completed_source_count=1,
+            completed_source_set_sha256="a" * 64,
+            failed_source_count=0,
+            urls_checked=0,
+            plans_discovered=0,
+            files_discovered=0,
+            bytes_streamed=0,
+        )
+
     monkeypatch.setattr(discovery, "_load_candidates", fake_load_candidates)
     monkeypatch.setattr(discovery, "init_db", fake_noop)
     monkeypatch.setattr(discovery, "ensure_database", fake_noop)
     monkeypatch.setattr(discovery, "_ensure_catalog_tables", fake_noop)
     monkeypatch.setattr(discovery, "push_objects", fake_push_objects)
     monkeypatch.setattr(discovery, "_store_candidates", fake_store_candidates)
+    monkeypatch.setattr(
+        discovery,
+        "execute_checkpointed_source_batch",
+        fake_execute_checkpointed_source_batch,
+    )
     monkeypatch.setattr(
         discovery, "enqueue_status_event", lambda payload: events.append(payload)
     )
@@ -13820,6 +13849,10 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
     assert events[1]["metrics"]["crawl_run_id"] == control_run_id
     assert events[1]["metrics"]["crawl_status"] == "succeeded"
     assert events[1]["metrics"]["catalog_export_version"] == 1
+    assert events[1]["metrics"]["process_workers"] == 1
+    assert events[1]["metrics"]["discovery_proof_version"] == 2
+    assert events[1]["metrics"]["source_set_count"] == 1
+    assert events[1]["metrics"]["completed_source_count"] == 1
     assert events[1]["metrics"]["sources"] in {1}
     assert [crawl_row["run_id"] for crawl_row in crawl_rows] == [control_run_id, control_run_id]
     assert [progress_update["run_id"] for progress_update in progress] == [

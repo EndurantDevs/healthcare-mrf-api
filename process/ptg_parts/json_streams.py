@@ -212,6 +212,8 @@ def _iter_top_level_objects_jsondecoder(
     bytes_since_progress = 0
 
     def read_more() -> bool:
+        """Decode the next source block into the parser buffer."""
+
         nonlocal buffer, eof, bytes_since_progress
         if eof:
             return False
@@ -230,6 +232,8 @@ def _iter_top_level_objects_jsondecoder(
         return True
 
     def compact_buffer(force: bool = False) -> None:
+        """Discard parsed text while preserving unread JSON content."""
+
         nonlocal buffer, pos
         if pos <= 0:
             return

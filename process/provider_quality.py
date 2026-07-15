@@ -493,6 +493,8 @@ async def _split_source_into_chunks(
     chunks_dir: Path,
     test_mode: bool,
 ) -> list[dict[str, Any]]:
+    """Split a provider-quality CSV into bounded import chunks."""
+
     chunks_dir.mkdir(parents=True, exist_ok=True)
     dataset = DATASET_BY_KEY.get(dataset_key)
     row_limit = dataset.row_limit_test if dataset else 5000
@@ -510,6 +512,8 @@ async def _split_source_into_chunks(
         accepted = 0
 
         def flush_chunk() -> None:
+            """Write the active provider-quality chunk to disk."""
+
             nonlocal chunk_rows, chunk_bytes, chunk_index
             if not chunk_rows:
                 return

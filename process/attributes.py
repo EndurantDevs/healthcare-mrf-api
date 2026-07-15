@@ -46,6 +46,8 @@ class _InlineAttributeRedis:
         self.count = 0
 
     async def enqueue_job(self, function_name, payload, **_kwargs):
+        """Execute a supported attribute job in the current process."""
+
         if function_name != "save_attributes":
             raise RuntimeError(f"Unsupported inline attributes job: {function_name}")
         self.count += 1
@@ -150,6 +152,8 @@ def _normalize_plan_ids(standard_id, full_id):
 
 
 async def startup(ctx):
+    """Initialize attribute-worker context and database access."""
+
     loop = asyncio.get_event_loop()
     ctx.setdefault("context", {})
     ctx["context"]["start"] = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)
@@ -160,6 +164,8 @@ async def startup(ctx):
 
 
 async def shutdown(ctx):
+    """Finalize staged attribute tables after worker shutdown."""
+
     import_date = ctx["import_date"]
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     await ensure_database(test_mode)
@@ -260,6 +266,8 @@ async def shutdown(ctx):
 
 
 async def save_attributes(ctx, task):
+    """Persist one queued batch of plan attributes or benefits."""
+
     if "context" in task:
         ctx.setdefault("context", {}).update(task["context"])
     await _prepare_attribute_tables(ctx)
@@ -277,6 +285,8 @@ async def save_attributes(ctx, task):
 
 
 async def process_attributes(ctx, task):
+    """Download and stream plan attributes into dated staging tables."""
+
     redis = ctx["redis"]
 
     print("Downloading data from: ", task["url"])
@@ -347,6 +357,8 @@ async def process_attributes(ctx, task):
 
 
 async def process_benefits(ctx, task):
+    """Download and stream plan benefits into dated staging tables."""
+
     redis = ctx["redis"]
     print("Downloading data from: ", task["url"])
 

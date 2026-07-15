@@ -156,6 +156,8 @@ async def _discover(args: argparse.Namespace) -> list[dict[str, Any]]:
     ) as session:
 
         async def worker() -> None:
+            """Probe queued ASR group identifiers until the queue drains."""
+
             nonlocal checked
             while True:
                 try:
@@ -165,21 +167,27 @@ async def _discover(args: argparse.Namespace) -> list[dict[str, Any]]:
                 try:
                     if args.delay_seconds > 0:
                         await asyncio.sleep(args.delay_seconds)
-                    result = await _probe_head(
+                    probe_result = await _probe_head(
                         session,
                         base_url=args.base_url,
                         toc_path=args.toc_path,
                         group_number=group_number,
                     )
-                    if result["ok"] and not args.skip_json_validation:
-                        json_ok, error = await _validate_json(session, str(result["url"]), max_bytes=args.max_json_bytes)
-                        result["ok"] = json_ok
-                        result["json_validated"] = json_ok
-                        result["json_error"] = error
-                    results.append(result)
+                    if probe_result["ok"] and not args.skip_json_validation:
+                        json_ok, error = await _validate_json(
+                            session,
+                            str(probe_result["url"]),
+                            max_bytes=args.max_json_bytes,
+                        )
+                        probe_result["ok"] = json_ok
+                        probe_result["json_validated"] = json_ok
+                        probe_result["json_error"] = error
+                    results.append(probe_result)
                     checked += 1
                     if args.progress_every and checked % args.progress_every == 0:
-                        found = len([item for item in results if item["ok"]])
+                        found = len(
+                            [probe_result for probe_result in results if probe_result["ok"]]
+                        )
                         print(f"checked={checked} found={found}", file=sys.stderr)
                 finally:
                     queue.task_done()

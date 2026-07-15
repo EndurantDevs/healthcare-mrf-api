@@ -1345,6 +1345,7 @@ def _ptg_lane_metrics(params: dict[str, Any]) -> dict[str, Any]:
 
 
 _TASK_LINEAGE_FIELDS_BY_IMPORTER = {
+    "mrf-source-discovery": ("retry_of_run_id",),
     "provider-directory-fhir": ("retry_of_run_id",),
 }
 
@@ -1583,6 +1584,15 @@ def _retry_child_params(
         else {}
     )
     child_params_by_name = {**current_params_by_name, **retry_params_by_name}
+    if current_run_map.get("importer") == "mrf-source-discovery":
+        root_run_id = str(
+            current_params_by_name.get("mrf_discovery_root_run_id")
+            or retry_params_by_name.get("mrf_discovery_root_run_id")
+            or run_id
+        ).strip()
+        child_params_by_name["retry_of_run_id"] = run_id
+        child_params_by_name["mrf_discovery_root_run_id"] = root_run_id
+        return child_params_by_name
     if current_run_map.get("importer") != "provider-directory-fhir":
         return child_params_by_name
     root_run_id = str(

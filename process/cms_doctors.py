@@ -174,6 +174,8 @@ async def _fetch_doctors_download_url(client) -> str:
 
 
 async def process_data(ctx, task=None):
+    """Download and import the current CMS doctors address dataset."""
+
     task = task or {}
     await raise_if_cancelled(ctx, task)
     ctx.setdefault("context", {})
@@ -209,6 +211,8 @@ async def process_data(ctx, task=None):
                         fh.write(chunk)
 
             async def _consume_reader(reader):
+                """Normalize reader rows and persist bounded batches."""
+
                 nonlocal accepted_rows
                 batch = []
                 seen_keys: set[int] = set()
