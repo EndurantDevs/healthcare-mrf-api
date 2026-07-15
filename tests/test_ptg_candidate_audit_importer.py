@@ -446,7 +446,7 @@ async def test_isolated_audit_subprocess_returns_validated_report_without_token_
     tmp_path,
 ):
     report = _passing_report()
-    invocation: dict[str, object] = {}
+    subprocess_invocation_by_field: dict[str, object] = {}
 
     class SuccessfulProcess:
         pid = 12345
@@ -456,8 +456,8 @@ async def test_isolated_audit_subprocess_returns_validated_report_without_token_
             return self.returncode
 
     async def create_subprocess_exec(*arguments, **kwargs):
-        invocation["arguments"] = arguments
-        invocation["kwargs"] = kwargs
+        subprocess_invocation_by_field["arguments"] = arguments
+        subprocess_invocation_by_field["kwargs"] = kwargs
         report_path = type(tmp_path)(
             arguments[arguments.index("--report") + 1]
         )
@@ -481,8 +481,8 @@ async def test_isolated_audit_subprocess_returns_validated_report_without_token_
     )
 
     assert observed == report
-    arguments = invocation["arguments"]
-    kwargs = invocation["kwargs"]
+    arguments = subprocess_invocation_by_field["arguments"]
+    kwargs = subprocess_invocation_by_field["kwargs"]
     assert isinstance(arguments, tuple)
     assert isinstance(kwargs, dict)
     assert arguments[:3] == (
@@ -499,6 +499,8 @@ async def test_isolated_audit_cancellation_terminates_process_group(
     monkeypatch,
     tmp_path,
 ):
+    """Cancellation must reap the isolated audit before the worker can retry."""
+
     class HangingProcess:
         pid = 12345
         returncode = None
@@ -513,11 +515,11 @@ async def test_isolated_audit_cancellation_terminates_process_group(
             return self.returncode
 
     process = HangingProcess()
-    invocation: dict[str, object] = {}
+    subprocess_invocation_by_field: dict[str, object] = {}
 
     async def create_subprocess_exec(*arguments, **kwargs):
-        invocation["arguments"] = arguments
-        invocation["kwargs"] = kwargs
+        subprocess_invocation_by_field["arguments"] = arguments
+        subprocess_invocation_by_field["kwargs"] = kwargs
         return process
 
     def signal_process_group(observed_process, observed_signal):
@@ -554,8 +556,8 @@ async def test_isolated_audit_cancellation_terminates_process_group(
         await task
 
     assert process.signals == [ptg_candidate_audit.signal.SIGTERM]
-    arguments = invocation["arguments"]
-    kwargs = invocation["kwargs"]
+    arguments = subprocess_invocation_by_field["arguments"]
+    kwargs = subprocess_invocation_by_field["kwargs"]
     assert isinstance(arguments, tuple)
     assert isinstance(kwargs, dict)
     assert "public-control-token" not in arguments

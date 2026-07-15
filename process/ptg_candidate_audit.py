@@ -399,7 +399,7 @@ def _fatal_audit_reason(report: Mapping[str, Any]) -> str | None:
 
 
 def _release_audit_arguments(
-    target: CandidateAuditTarget,
+    audit_target: CandidateAuditTarget,
     source_paths: Sequence[Path],
     *,
     report_path: Path,
@@ -424,20 +424,20 @@ def _release_audit_arguments(
         "--api-path",
         ptg2_v3_source_api_audit.DEFAULT_CANDIDATE_API_PATH,
         "--plan-id",
-        target.plan_id,
+        audit_target.plan_id,
         "--snapshot-id",
-        target.snapshot_id,
+        audit_target.snapshot_id,
         "--plan-market-type",
-        target.plan_market_type,
+        audit_target.plan_market_type,
         "--source-key",
-        target.source_key,
+        audit_target.source_key,
         "--auth-header",
         auth_header,
         "--auth-scheme",
         auth_scheme,
         "--validated-candidate",
         "--max-invalid-npis",
-        str(target.provider_identifier_quarantine["occurrence_count"]),
+        str(audit_target.provider_identifier_quarantine["occurrence_count"]),
         "--work-dir",
         str(work_dir),
     ]
@@ -459,7 +459,7 @@ def _read_release_audit_report(report_path: Path) -> dict[str, Any]:
 
 
 def _validate_release_audit_report(
-    target: CandidateAuditTarget,
+    audit_target: CandidateAuditTarget,
     *,
     exit_code: int,
     report: dict[str, Any],
@@ -479,7 +479,7 @@ def _validate_release_audit_report(
         raise CandidateAuditReleaseGateError(
             "candidate release audit has invalid provider identifier quarantine evidence"
         ) from exc
-    if observed_quarantine != dict(target.provider_identifier_quarantine):
+    if observed_quarantine != dict(audit_target.provider_identifier_quarantine):
         raise CandidateAuditReleaseGateError(
             "candidate release audit provider identifier quarantine does not match publication"
         )
@@ -516,7 +516,7 @@ def run_release_audit(
 
 
 async def run_isolated_release_audit(
-    target: CandidateAuditTarget,
+    audit_target: CandidateAuditTarget,
     source_paths: Sequence[Path],
 ) -> dict[str, Any]:
     """Run the long release audit in a subprocess that cancellation can stop."""
@@ -525,7 +525,7 @@ async def run_isolated_release_audit(
         work_dir = Path(temp_dir)
         report_path = work_dir / "report.json"
         audit_arguments, token = _release_audit_arguments(
-            target,
+            audit_target,
             source_paths,
             report_path=report_path,
             work_dir=work_dir,
@@ -552,7 +552,7 @@ async def run_isolated_release_audit(
             exit_code = await process.wait()
             report = _read_release_audit_report(report_path)
             return _validate_release_audit_report(
-                target,
+                audit_target,
                 exit_code=exit_code,
                 report=report,
             )
