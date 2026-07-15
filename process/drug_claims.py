@@ -1011,6 +1011,8 @@ async def _load_provider_drug_rows(
     year: int,
     test_mode: bool,
 ) -> None:
+    """Aggregate provider prescription rows into a staging table."""
+
     provider_rx_map: dict[tuple[int, int, str, str], dict[str, Any]] = {}
     accepted = 0
     progress_start = time.monotonic()
@@ -1112,6 +1114,8 @@ async def _load_drug_spending_rows(
     year: int,
     test_mode: bool,
 ) -> None:
+    """Aggregate drug spending rows into prescription staging records."""
+
     prescription_map: dict[tuple[str, str], dict[str, Any]] = {}
     accepted = 0
     progress_start = time.monotonic()
@@ -1178,6 +1182,8 @@ async def _load_drug_spending_rows(
 
 
 async def _materialize_prescription_and_code_rows(classes: dict[str, type], schema: str) -> None:
+    """Build prescription dimensions, code entries, and crosswalk edges."""
+
     prescription_table = classes["PricingPrescription"].__tablename__
     provider_prescription_table = classes["PricingProviderPrescription"].__tablename__
     code_catalog_table = CodeCatalog.__tablename__
@@ -1355,6 +1361,8 @@ async def _enrich_rx_crosswalk_from_snapshot(
     code_catalog_table: str,
     code_crosswalk_table: str,
 ) -> dict[str, int]:
+    """Add normalized NDC and RxNorm edges from maintained snapshot tables."""
+
     snapshot_schema = RX_CROSSWALK_SNAPSHOT_SCHEMA
     product_table = RX_CROSSWALK_SNAPSHOT_PRODUCT_TABLE
     package_table = RX_CROSSWALK_SNAPSHOT_PACKAGE_TABLE
@@ -1787,6 +1795,8 @@ async def _resolve_live_external_codes_for_entry(
     timeout: aiohttp.ClientTimeout,
     entry: dict[str, Any],
 ) -> dict[str, Any]:
+    """Resolve one internal prescription code through the bounded drug API."""
+
     rx_code = str(entry.get("rx_code") or "").strip()
     if not rx_code:
         return {"rx_code": "", "rxnorm_codes": [], "ndc_codes": [], "display_name": None}
@@ -1861,6 +1871,8 @@ async def _upsert_external_code_and_edges(
     confidence: float,
     source: str,
 ) -> int:
+    """Upsert one external code and symmetric normalized crosswalk edges."""
+
     if not hp_code or not to_system or not to_code:
         return 0
 
@@ -1978,6 +1990,8 @@ async def _enrich_rx_crosswalk_from_live(
     code_catalog_table: str,
     code_crosswalk_table: str,
 ) -> dict[str, int]:
+    """Resolve bounded unresolved prescription codes through the live API."""
+
     unresolved_rows = await _collect_unresolved_hp_rx_codes(
         schema=schema,
         prescription_table=prescription_table,
@@ -2099,6 +2113,8 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
 
 
 async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Prepare staging, split sources, and enqueue drug-claims chunks."""
+
     task = task or {}
     test_mode = bool(task.get("test_mode", False))
     import_id_val = _normalize_import_id(task.get("import_id"))
@@ -2281,6 +2297,8 @@ async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str
 
 
 async def drug_claims_process_chunk(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Process one validated drug-claims chunk and record progress."""
+
     task = task or {}
     dataset_key = str(task.get("dataset_key") or "")
     chunk_id = str(task.get("chunk_id") or "")
@@ -2340,6 +2358,8 @@ async def drug_claims_process_chunk(ctx, task: dict[str, Any] | None = None) -> 
 
 
 async def drug_claims_finalize(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Wait for all chunks, validate staging, and publish drug claims."""
+
     task = task or {}
     import_id_val = _normalize_import_id(task.get("import_id"))
     run_id = str(task.get("run_id") or "")
@@ -2452,6 +2472,8 @@ async def drug_claims_finalize(ctx, task: dict[str, Any] | None = None) -> dict[
 
 
 async def main(test_mode: bool = False, import_id: str | None = None) -> dict[str, Any]:
+    """Queue a new drug-claims control run and return its identifiers."""
+
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
     run_id = _normalize_run_id(None)
     payload = {
@@ -2487,6 +2509,8 @@ async def finish_main(
     test_mode: bool = False,
     manifest_path: str | None = None,
 ) -> dict[str, Any]:
+    """Queue explicit finalization for an existing drug-claims run."""
+
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
     stage_suffix = _build_stage_suffix(_normalize_import_id(import_id), run_id)
     payload = {

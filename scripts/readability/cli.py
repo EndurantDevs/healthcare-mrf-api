@@ -229,11 +229,33 @@ def _issue_ids(snapshot: dict[str, Any], category: str) -> set[str]:
     return {issue["id"] for issue in snapshot.get("issues", {}).get(category, [])}
 
 
+def _comparison_issue_id(category: str, issue_id: str) -> str:
+    """Return a stable issue identity for protected line-based findings."""
+
+    if category == "global_state_usage":
+        prefix, separator, names = issue_id.rpartition(":")
+        identity, line_separator, line = prefix.rpartition(":")
+        if separator and line_separator and line.isdigit():
+            return f"{identity}:{names}"
+    elif category == "pass_placeholders":
+        identity, separator, line = issue_id.rpartition(":")
+        if separator and line.isdigit():
+            return identity
+    return issue_id
+
+
 def _new_issues(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     new_by_category: dict[str, list[dict[str, Any]]] = {}
     for category, current_issues in current.get("issues", {}).items():
-        baseline_ids = _issue_ids(baseline, category)
-        new_items = [issue for issue in current_issues if issue["id"] not in baseline_ids]
+        baseline_ids = {
+            _comparison_issue_id(category, issue_id)
+            for issue_id in _issue_ids(baseline, category)
+        }
+        new_items = [
+            issue
+            for issue in current_issues
+            if _comparison_issue_id(category, issue["id"]) not in baseline_ids
+        ]
         if new_items:
             new_by_category[category] = new_items
     return new_by_category

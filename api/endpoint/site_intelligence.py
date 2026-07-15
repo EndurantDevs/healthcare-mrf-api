@@ -534,6 +534,8 @@ def _pharmacy_geo_stmt(
 
 @blueprint.get("/score")
 async def get_site_score(request):
+    """Return validated site-intelligence metrics for one coordinate pair."""
+
     lat_str = request.args.get("lat")
     lng_str = request.args.get("lng")
 

@@ -151,6 +151,8 @@ def _resource_baseline() -> dict[str, object]:
 def _maintenance_evidence(
     first_import_sha256: str, second_import_sha256: str
 ) -> dict[str, object]:
+    """Build deterministic two-import maintenance evidence for capacity tests."""
+
     return {
         "scratch_cleanup_events": [
             {

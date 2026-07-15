@@ -48,7 +48,7 @@ jobs:
     steps:
       - name: Authorize exact tested source SHA
         id: authorize
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const owner = context.repo.owner
