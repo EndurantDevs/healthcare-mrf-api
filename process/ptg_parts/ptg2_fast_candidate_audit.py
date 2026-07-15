@@ -22,6 +22,7 @@ from process.ptg_parts.ptg2_candidate_audit_contract import (
     FastAuditHttpConfig,
     FastAuditTarget,
     FastCandidateAuditError,
+    public_audit_sample_projection,
 )
 from process.ptg_parts.ptg2_candidate_audit_evidence import (
     SourceChallenge,
@@ -344,14 +345,20 @@ async def _validate_audit_sample_preflight(
         response_fields.get("audit_sample"),
         field_name="api_audit_sample",
     )
-    for field_name, expected_value in dict(audit_target.audit_sample).items():
-        if audit_sample.get(field_name) != expected_value:
-            raise FastCandidateAuditError("api_audit_sample_mismatch")
+    try:
+        expected_audit_sample = public_audit_sample_projection(
+            audit_target.audit_sample
+        )
+        observed_audit_sample = public_audit_sample_projection(audit_sample)
+    except ValueError as exc:
+        raise FastCandidateAuditError("api_audit_sample_mismatch") from exc
+    if observed_audit_sample != expected_audit_sample:
+        raise FastCandidateAuditError("api_audit_sample_mismatch")
     response_items = response_fields.get("items")
     if not isinstance(response_items, list) or len(response_items) != 1:
         raise FastCandidateAuditError("api_audit_preflight_item_missing")
     source_audit.extract_api_occurrence(response_items[0])
-    return audit_sample
+    return observed_audit_sample
 
 
 async def _cancel_incomplete_tasks(audit_tasks: Sequence[asyncio.Task[None]]) -> None:

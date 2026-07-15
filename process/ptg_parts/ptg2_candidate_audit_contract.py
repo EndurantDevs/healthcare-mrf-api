@@ -8,6 +8,38 @@ PTG2_FAST_AUDIT_CONTRACT = "ptg2_v3_fast_source_witness_audit_v2"
 PTG2_FAST_AUDIT_TOOL = "ptg2_v3_fast_source_witness_audit"
 PTG2_FAST_AUDIT_TOOL_VERSION = "2.0.0"
 PTG2_FAST_AUDIT_DEADLINE_SECONDS = 55.0
+PTG2_PUBLIC_AUDIT_SAMPLE_FIELDS = (
+    "contract",
+    "format_version",
+    "method",
+    "sample_count",
+    "maximum_rows",
+    "sample_digest",
+    "source_count",
+    "occurrence_identity",
+    "complete_population",
+    "serving_multiplicity_semantics",
+)
+
+
+def public_audit_sample_projection(
+    audit_sample: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the stable audit fields exposed by the candidate API."""
+
+    missing_fields = [
+        field_name
+        for field_name in PTG2_PUBLIC_AUDIT_SAMPLE_FIELDS
+        if field_name not in audit_sample
+    ]
+    if missing_fields:
+        raise ValueError(
+            "audit sample is missing public field(s): " + ", ".join(missing_fields)
+        )
+    return {
+        field_name: audit_sample[field_name]
+        for field_name in PTG2_PUBLIC_AUDIT_SAMPLE_FIELDS
+    }
 
 
 @dataclass(frozen=True)
@@ -52,5 +84,7 @@ __all__ = [
     "PTG2_FAST_AUDIT_DEADLINE_SECONDS",
     "PTG2_FAST_AUDIT_TOOL",
     "PTG2_FAST_AUDIT_TOOL_VERSION",
+    "PTG2_PUBLIC_AUDIT_SAMPLE_FIELDS",
     "FastCandidateAuditError",
+    "public_audit_sample_projection",
 ]
