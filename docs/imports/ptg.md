@@ -249,6 +249,15 @@ and PostgreSQL COPY inputs. Worker queues, input limits, decompression limits,
 and finalizer record limits bound the work; capacity planning must still
 reserve scratch for every concurrent unique physical build.
 
+The finalizer extracts and sorts provider identities inside the same bounded
+nonempty-partition worker pool used for the source scan. It then performs a
+sorted merge of those partition-local unique streams instead of globally
+sorting one provider-identity record per source row. After dense assignment,
+the block encoder consumes the fixed-width assigned records directly; it does
+not synthesize a PostgreSQL COPY stream only to parse it again. The committed
+block output remains PostgreSQL binary COPY and is byte-identical to the
+reference encoder.
+
 Gzip scanning uses `rapidgzip` by default. When `provider_references` appears
 after `in_network`, the scanner builds a temporary seek index, reads the
 provider range first, and then processes indexed in-network ranges in parallel.

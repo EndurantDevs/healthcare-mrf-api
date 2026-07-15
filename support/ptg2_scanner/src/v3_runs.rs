@@ -1863,6 +1863,74 @@ pub fn external_sort_provider_identities(
     )
 }
 
+/// Merge provider-identity files that were independently sorted and deduplicated.
+///
+/// The finalizer uses this after partition-local sorting. It avoids sorting the
+/// complete source-row population a second time while still deduplicating
+/// provider identities that occur in more than one code partition.
+pub fn merge_sorted_provider_identities(
+    input_paths: &[PathBuf],
+    output_path: impl AsRef<Path>,
+) -> io::Result<MultiFileSortStats> {
+    let output_path = output_path.as_ref();
+    let output_parent = usable_parent(output_path);
+    fs::create_dir_all(output_parent)?;
+
+    let mut input_records = 0u64;
+    let mut input_bytes = 0u64;
+    for input_path in input_paths {
+        let bytes = input_path.metadata()?.len();
+        if bytes % PROVIDER_IDENTITY_RECORD_BYTES as u64 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sorted provider identity file {} is not aligned to {} bytes",
+                    input_path.display(),
+                    PROVIDER_IDENTITY_RECORD_BYTES
+                ),
+            ));
+        }
+        input_bytes = input_bytes.saturating_add(bytes);
+        input_records = input_records.saturating_add(bytes / PROVIDER_IDENTITY_RECORD_BYTES as u64);
+    }
+
+    let mut temporary_files = TemporaryFiles::default();
+    let (staged_path, staged_file) = create_unique_file(output_parent, "provider-output")?;
+    temporary_files.track(staged_path.clone());
+    let mut writer = BufWriter::with_capacity(DEFAULT_SORT_BUFFER_BYTES, staged_file);
+    let (unique_records, duplicate_records) =
+        merge_fixed_sort_runs::<ProviderIdentityRecord, _>(input_paths, &mut writer, true)?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+    if unique_records.saturating_add(duplicate_records) != input_records {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sorted provider identity merge count mismatch",
+        ));
+    }
+    let output_bytes = unique_records
+        .checked_mul(PROVIDER_IDENTITY_RECORD_BYTES as u64)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider identity output byte count overflow",
+            )
+        })?;
+    fs::rename(&staged_path, output_path)?;
+    temporary_files.release(&staged_path);
+    Ok(MultiFileSortStats {
+        input_file_count: input_paths.len() as u64,
+        input_records,
+        unique_records,
+        duplicate_records,
+        input_bytes,
+        spill_bytes: 0,
+        chunk_count: 0,
+        output_bytes,
+    })
+}
+
 /// Sorts and deduplicates fixed-width provider/code key pairs by encoded byte order.
 pub fn external_sort_provider_code_pairs(
     input_paths: &[PathBuf],
@@ -2303,6 +2371,12 @@ fn merge_fixed_sort_runs<T: FixedSortRecord, W: Write>(
             previous = Some(record);
         }
         if let Some(next_record) = T::read_from(&mut readers[reader_index])? {
+            if next_record < record {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fixed-record merge input is not sorted",
+                ));
+            }
             heap.push(Reverse((next_record, reader_index)));
         }
     }
@@ -3626,6 +3700,60 @@ mod tests {
             3 * PROVIDER_CODE_PAIR_RECORD_BYTES as u64
         );
         assert_eq!(fs::read(output).unwrap(), [first, second, third].concat());
+    }
+
+    #[test]
+    fn sorted_provider_identity_merge_dedupes_across_partitions() {
+        let base = TestDirectory::new("provider-identity-merge");
+        let input_a = base.join("providers-a.sorted");
+        let input_b = base.join("providers-b.sorted");
+        let output = base.join("providers.sorted");
+        let provider = |identity_byte: u8, provider_count: u32| {
+            let mut encoded = [0u8; PROVIDER_IDENTITY_RECORD_BYTES];
+            encoded[..16].fill(identity_byte);
+            encoded[16..].copy_from_slice(&provider_count.to_be_bytes());
+            encoded
+        };
+        let first = provider(1, 2);
+        let second = provider(2, 3);
+        let third = provider(3, 4);
+        fs::write(&input_a, [first, second].concat()).unwrap();
+        fs::write(&input_b, [first, third].concat()).unwrap();
+
+        let stats = merge_sorted_provider_identities(&[input_a, input_b], &output).unwrap();
+
+        assert_eq!(stats.input_file_count, 2);
+        assert_eq!(stats.input_records, 4);
+        assert_eq!(stats.unique_records, 3);
+        assert_eq!(stats.duplicate_records, 1);
+        assert_eq!(stats.spill_bytes, 0);
+        assert_eq!(
+            stats.output_bytes,
+            3 * PROVIDER_IDENTITY_RECORD_BYTES as u64
+        );
+        assert_eq!(fs::read(output).unwrap(), [first, second, third].concat());
+    }
+
+    #[test]
+    fn sorted_provider_identity_merge_rejects_unsorted_or_partial_inputs() {
+        let base = TestDirectory::new("provider-identity-merge-invalid");
+        let provider = |identity_byte: u8| {
+            let mut encoded = [0u8; PROVIDER_IDENTITY_RECORD_BYTES];
+            encoded[..16].fill(identity_byte);
+            encoded[16..].copy_from_slice(&1u32.to_be_bytes());
+            encoded
+        };
+        let unsorted = base.join("unsorted.bin");
+        fs::write(&unsorted, [provider(2), provider(1)].concat()).unwrap();
+        let error = merge_sorted_provider_identities(&[unsorted], base.join("unsorted-output.bin"))
+            .unwrap_err();
+        assert!(error.to_string().contains("not sorted"));
+
+        let partial = base.join("partial.bin");
+        fs::write(&partial, [0u8; PROVIDER_IDENTITY_RECORD_BYTES - 1]).unwrap();
+        let error = merge_sorted_provider_identities(&[partial], base.join("partial-output.bin"))
+            .unwrap_err();
+        assert!(error.to_string().contains("not aligned"));
     }
 
     #[test]
