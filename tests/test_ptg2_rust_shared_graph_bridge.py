@@ -215,7 +215,7 @@ async def test_native_shared_graph_bridge_writes_manifest_and_validates_result(
     capture: dict[str, Any] = {}
     _install_fake_converter(monkeypatch, binary=binary, capture=capture)
 
-    result = (
+    conversion_result = (
         await rust_scanner.convert_v3_provider_membership_shards_to_shared_graph_rust(
             shards=(bundle,),
             provider_set_key_map_path=provider_map,
@@ -250,12 +250,12 @@ async def test_native_shared_graph_bridge_writes_manifest_and_validates_result(
         "group_provider_set",
         "provider_set_group",
     }
-    assert result.block_count == 4
-    assert result.owner_count == 4
-    assert result.support_digest == bytes.fromhex("ab" * 32)
-    assert result.scratch_directory == output_directory.resolve()
+    assert conversion_result.block_count == 4
+    assert conversion_result.owner_count == 4
+    assert conversion_result.support_digest == bytes.fromhex("ab" * 32)
+    assert conversion_result.scratch_directory == output_directory.resolve()
     assert not capture["manifest_path"].exists()
-    result.cleanup()
+    conversion_result.cleanup()
     assert not output_directory.exists()
 
 
@@ -336,7 +336,7 @@ async def test_native_shared_graph_bridge_matches_real_cli_when_built(
     output_directory = tmp_path / "native-output"
     monkeypatch.setattr(rust_scanner, "_ptg2_rust_scanner_binary", lambda: binary)
 
-    result = (
+    conversion_result = (
         await rust_scanner.convert_v3_provider_membership_shards_to_shared_graph_rust(
             shards=shared_graph_bundles_from_artifacts(artifact_entries),
             provider_set_key_map_path=provider_map,
@@ -344,13 +344,13 @@ async def test_native_shared_graph_bridge_matches_real_cli_when_built(
         )
     )
 
-    assert result.block_count == 4
-    assert result.owner_count == 4
-    assert result.provider_group_count == 1
-    assert result.npi_count == 1
-    assert len(result.support_digest) == 32
-    assert len(tuple(result.iter_references())) == 4
-    result.cleanup()
+    assert conversion_result.block_count == 4
+    assert conversion_result.owner_count == 4
+    assert conversion_result.provider_group_count == 1
+    assert conversion_result.npi_count == 1
+    assert len(conversion_result.support_digest) == 32
+    assert len(tuple(conversion_result.iter_references())) == 4
+    conversion_result.cleanup()
 
 
 @pytest.mark.asyncio
@@ -393,13 +393,13 @@ async def test_snapshot_publish_passes_bundles_and_key_map_to_native_bridge(
         native_bridge,
     )
 
-    result = await ptg2_shared_snapshot_publish._convert_shared_graph_natively(
+    native_conversion_result = await ptg2_shared_snapshot_publish._convert_shared_graph_natively(
         graph_artifact_entries=entries,
         provider_set_key_map_path=provider_map,
         work_directory=tmp_path,
     )
 
-    assert result is sentinel
+    assert native_conversion_result is sentinel
     assert isinstance(observed["shards"], tuple)
     assert len(observed["shards"]) == 1
     assert observed["shards"][0].shard_id == bundle.shard_id
@@ -438,9 +438,10 @@ def test_compact_scanner_never_exports_source_network_labels(tmp_path, monkeypat
         '["ambient-label"]',
     )
 
-    records = list(
+    scanner_records = list(
         rust_scanner._iter_compact_serving_records_rust(
             tmp_path / "input.json",
+            raw_source_sha256="a" * 64,
             snapshot_id="snapshot",
             plan_id="plan",
             coverage_scope_id="cc" * 32,
@@ -451,7 +452,7 @@ def test_compact_scanner_never_exports_source_network_labels(tmp_path, monkeypat
         )
     )
 
-    assert [record_kind for record_kind, _payload in records] == [
+    assert [record_kind for record_kind, _payload in scanner_records] == [
         "scanner_config",
         "scanner_summary",
     ]

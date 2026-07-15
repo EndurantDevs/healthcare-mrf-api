@@ -37,6 +37,14 @@ async def _wait_for_file(path: Path, timeout: float = 5.0) -> None:
         await asyncio.sleep(0.01)
 
 
+async def _wait_for_pid_file(path: Path, timeout: float = 5.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not path.exists() or not path.read_text().strip():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"timed out waiting for process id in {path}")
+        await asyncio.sleep(0.01)
+
+
 def _is_pid_alive(process_id: int) -> bool:
     try:
         os.kill(process_id, 0)
@@ -55,6 +63,7 @@ def _assert_pid_exits(process_id: int, timeout: float = 5.0) -> None:
 def _scanner_invocation(tmp_path: Path) -> dict[str, object]:
     return {
         "path": tmp_path / "rates.json.gz",
+        "raw_source_sha256": "a" * 64,
         "snapshot_id": "snapshot",
         "plan_id": "plan",
         "coverage_scope_id": "c" * 64,
@@ -100,8 +109,8 @@ async def _cancel_twice_after_term_signal(
     child_pid_path: Path,
     term_seen_path: Path,
 ) -> tuple[int, int]:
-    await _wait_for_file(parent_pid_path)
-    await _wait_for_file(child_pid_path)
+    await _wait_for_pid_file(parent_pid_path)
+    await _wait_for_pid_file(child_pid_path)
     parent_pid = int(parent_pid_path.read_text())
     child_pid = int(child_pid_path.read_text())
     task.cancel()
@@ -132,8 +141,8 @@ async def test_async_scanner_cancellation_reaps_executing_reader_process_group(
         **_scanner_invocation(tmp_path)
     )
     next_record = asyncio.create_task(scanner_records.__anext__())
-    await _wait_for_file(parent_pid_path)
-    await _wait_for_file(child_pid_path)
+    await _wait_for_pid_file(parent_pid_path)
+    await _wait_for_pid_file(child_pid_path)
     parent_pid = int(parent_pid_path.read_text())
     child_pid = int(child_pid_path.read_text())
 

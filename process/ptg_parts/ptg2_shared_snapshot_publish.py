@@ -59,6 +59,7 @@ from process.ptg_parts.ptg2_shared_reuse import (
     SharedSnapshotSourceAssignment,
     deterministic_source_key_assignments,
 )
+from process.ptg_parts.ptg2_source_witness_store import publish_shared_source_witness
 
 
 _REQUIRED_OBJECT_KINDS = frozenset(
@@ -106,7 +107,7 @@ def _snapshot_source_rows(
     normalized_snapshot_id = str(snapshot_id or "").strip()
     if not normalized_snapshot_id or len(normalized_snapshot_id) > 96:
         raise ValueError("strict V3 source publication requires a valid snapshot_id")
-    rows = [
+    source_records = [
         {
             "snapshot_id": normalized_snapshot_id,
             "source_key": int(assignment.source_key),
@@ -118,26 +119,30 @@ def _snapshot_source_rows(
         }
         for assignment in assignments
     ]
-    if not rows or [row["source_key"] for row in rows] != list(range(len(rows))):
+    if not source_records or [
+        source_record["source_key"] for source_record in source_records
+    ] != list(range(len(source_records))):
         raise ValueError("strict V3 snapshot source keys must be complete and dense")
     expected_dense = deterministic_source_key_assignments(
         {
-            field_name: row[field_name]
+            field_name: source_record[field_name]
             for field_name in ("source_type", "identity_kind", "identity_sha256")
         }
-        for row in rows
+        for source_record in source_records
     )
     if any(
-        source_key != row["source_key"] or identity.as_dict() != {
-            field_name: row[field_name]
+        source_key != source_record["source_key"] or identity.as_dict() != {
+            field_name: source_record[field_name]
             for field_name in ("source_type", "identity_kind", "identity_sha256")
         }
-        for row, (source_key, identity) in zip(rows, expected_dense)
+        for source_record, (source_key, identity) in zip(
+            source_records, expected_dense
+        )
     ):
         raise ValueError(
             "strict V3 snapshot source keys do not match physical artifact ordinals"
         )
-    return rows
+    return source_records
 
 
 async def publish_shared_v3_snapshot_sources(
@@ -151,7 +156,10 @@ async def publish_shared_v3_snapshot_sources(
 ) -> tuple[dict[str, Any], ...]:
     """Publish one immutable logical source dictionary without overwrite semantics."""
 
-    rows = _snapshot_source_rows(snapshot_id=snapshot_id, assignments=assignments)
+    source_records = _snapshot_source_rows(
+        snapshot_id=snapshot_id,
+        assignments=assignments,
+    )
     scope_id = _validated_coverage_scope_id(coverage_scope_id)
     normalized_plan_id = str(plan_id or "").strip()
     normalized_market = str(plan_market_type or "").strip().lower()
@@ -210,7 +218,7 @@ async def publish_shared_v3_snapshot_sources(
                 ON CONFLICT (snapshot_id, source_key) DO NOTHING
                 """
             ),
-            rows,
+            source_records,
         )
         observed_result = await session.execute(
             db.text(
@@ -225,12 +233,14 @@ async def publish_shared_v3_snapshot_sources(
             ),
             {"snapshot_id": str(snapshot_id)},
         )
-        observed = [_row_mapping(row) for row in observed_result]
-        if observed != rows:
+        observed_source_records = [
+            _row_mapping(source_record) for source_record in observed_result
+        ]
+        if observed_source_records != source_records:
             raise RuntimeError(
                 f"PTG snapshot {snapshot_id} already has a conflicting source-key mapping"
             )
-    return tuple(rows)
+    return tuple(source_records)
 
 
 async def delete_unpublished_shared_v3_snapshot_sources(
@@ -402,6 +412,7 @@ def _physical_serving_index(
     graph_publication: Any,
     code_count: int,
     audit_sample: Mapping[str, Any],
+    source_witness: Mapping[str, Any],
     provider_identifier_quarantine: Mapping[str, Any],
     stored_byte_count: int,
 ) -> dict[str, Any]:
@@ -478,6 +489,7 @@ def _physical_serving_index(
         },
         "provider_identifier_quarantine": quarantine,
         "audit_sample": dict(audit_sample),
+        "source_witness": dict(source_witness),
         "storage_bytes": int(stored_byte_count),
         "timings": dict(finalizer_summary.get("timings") or {}),
     }
@@ -497,6 +509,8 @@ async def _publish_strict_shared_v3_layout_prepared(
     serving_run_entries: Iterable[Mapping[str, Any]],
     code_dictionary_entries: Iterable[Mapping[str, Any]],
     provider_set_metadata_entries: Iterable[Mapping[str, Any]],
+    source_audit_witness_entries: Iterable[Mapping[str, Any]],
+    expected_raw_source_sha256: Iterable[str],
     graph_artifact_entries: Iterable[dict[str, Any]],
     provider_identifier_quarantine: Mapping[str, Any],
     prepared_price: PreparedSharedPriceArtifacts,
@@ -649,6 +663,18 @@ async def _publish_strict_shared_v3_layout_prepared(
         )
         record_stage("price_publish", stage_started_at)
         await touch_build()
+        stage_started_at = time.monotonic()
+        source_witness_publication = await publish_shared_source_witness(
+            schema_name=schema_name,
+            build_ownership=SharedLayoutBuildOwnership(
+                snapshot_key=int(reserved_snapshot_key),
+                build_token=build_token,
+            ),
+            entries=tuple(source_audit_witness_entries),
+            expected_raw_source_sha256=tuple(expected_raw_source_sha256),
+        )
+        record_stage("source_witness_publish", stage_started_at)
+        await touch_build()
         references = tuple(
             [
                 *finalizer_block_publication.references,
@@ -668,6 +694,7 @@ async def _publish_strict_shared_v3_layout_prepared(
             "finalizer_dictionaries": dictionary_publication.support_digest.hex(),
             "provider_graph": graph_publication.support_digest.hex(),
             "price_attributes": price_publication.support_digest.hex(),
+            "source_witness": source_witness_publication.support_digest.hex(),
             "provider_identifier_quarantine": quarantine["sha256"],
         }
         core_support_digest = shared_support_digest(core_support)
@@ -701,12 +728,14 @@ async def _publish_strict_shared_v3_layout_prepared(
             {
                 **core_support,
                 "audit_sample": dict(audit_publication.metadata),
+                "source_witness": dict(source_witness_publication.metadata),
             }
         )
         stored_byte_count = (
             int(finalizer_block_publication.stored_byte_count)
             + int(graph_publication.stored_byte_count)
             + int(price_publication.stored_byte_count)
+            + int(source_witness_publication.stored_byte_count)
         )
         provisional_serving_index = _physical_serving_index(
             snapshot_key=int(reserved_snapshot_key),
@@ -716,6 +745,7 @@ async def _publish_strict_shared_v3_layout_prepared(
             graph_publication=graph_publication,
             code_count=dictionary_publication.code_count,
             audit_sample=audit_publication.metadata,
+            source_witness=source_witness_publication.metadata,
             provider_identifier_quarantine=quarantine,
             stored_byte_count=stored_byte_count,
         )
@@ -779,6 +809,8 @@ async def publish_strict_shared_v3_layout(
     serving_run_entries: Iterable[Mapping[str, Any]],
     code_dictionary_entries: Iterable[Mapping[str, Any]],
     provider_set_metadata_entries: Iterable[Mapping[str, Any]],
+    source_audit_witness_entries: Iterable[Mapping[str, Any]],
+    expected_raw_source_sha256: Iterable[str],
     graph_artifact_entries: Iterable[dict[str, Any]],
     provider_identifier_quarantine: Mapping[str, Any],
     scratch_parent: str | Path | None = None,
@@ -816,6 +848,8 @@ async def publish_strict_shared_v3_layout(
             serving_run_entries=serving_run_entries,
             code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
+            source_audit_witness_entries=source_audit_witness_entries,
+            expected_raw_source_sha256=expected_raw_source_sha256,
             graph_artifact_entries=graph_artifact_entries,
             provider_identifier_quarantine=provider_identifier_quarantine,
             prepared_price=prepared_price,

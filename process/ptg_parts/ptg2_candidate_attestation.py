@@ -13,6 +13,12 @@ from typing import Any, Mapping
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
+from process.ptg_parts.ptg2_candidate_audit_contract import (
+    PTG2_FAST_AUDIT_CONTRACT,
+    PTG2_FAST_AUDIT_DEADLINE_SECONDS,
+    PTG2_FAST_AUDIT_TOOL,
+    PTG2_FAST_AUDIT_TOOL_VERSION,
+)
 from process.ptg_parts.ptg2_shared_reuse import (
     PTG2_V3_SOURCE_SET_CONTRACT,
     shared_source_set_metadata,
@@ -21,11 +27,15 @@ from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 from process.ptg_parts.ptg2_provider_quarantine import (
     validate_provider_identifier_quarantine,
 )
+from process.ptg_parts.ptg2_source_witness_contract import (
+    PTG2_V3_SOURCE_WITNESS_SELECTION,
+    validate_source_witness_manifest,
+)
 
 
-PTG2_CANDIDATE_ATTESTATION_CONTRACT = "ptg2_v3_release_audit_attestation_v1"
-PTG2_CANDIDATE_AUDIT_TOOL = "ptg2_v3_source_api_audit"
-PTG2_CANDIDATE_AUDIT_TOOL_VERSION = "2.11.0"
+PTG2_CANDIDATE_ATTESTATION_CONTRACT = "ptg2_v3_release_audit_attestation_v2"
+PTG2_CANDIDATE_AUDIT_TOOL = PTG2_FAST_AUDIT_TOOL
+PTG2_CANDIDATE_AUDIT_TOOL_VERSION = PTG2_FAST_AUDIT_TOOL_VERSION
 PTG2_VERIFIED_HTTPS_TRANSPORT = "verified_https_v1"
 PTG2_TRUSTED_CLUSTER_HTTP_TRANSPORT = "authenticated_cluster_service_v1"
 PTG2_CANDIDATE_API_PATH = "/api/v1/pricing/providers/audit-search-by-procedure"
@@ -40,12 +50,6 @@ PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_ENV = (
 PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_DEFAULT = 120
 PTG2_CANDIDATE_AUDIT_REPORT_FUTURE_SKEW_SECONDS = 300
 
-_REQUIRED_CHECKS = {
-    "source_occurrence_ids": 2_500,
-    "api_occurrence_ids": 2_500,
-    "negative_queries": 250,
-    "random_api_requests_executed": 2_500,
-}
 _REQUIRED_REPORT_TOP_LEVEL_KEYS = {
     "api_audit_sample",
     "checks",
@@ -63,6 +67,7 @@ _REQUIRED_REPORT_TOP_LEVEL_KEYS = {
     "release_gate_eligible",
     "release_profile_enforced",
     "reproducibility",
+    "runtime",
     "schema_version",
     "source",
     "started_at",
@@ -208,17 +213,22 @@ def validate_candidate_release_audit_report(
             )
         raise ValueError(f"audit report fields are invalid ({detail})")
     harness = _required_report_mapping(report_map, "harness")
-    target = _required_report_mapping(report_map, "target")
+    runtime = _required_report_mapping(report_map, "runtime")
+    target_mapping = _required_report_mapping(report_map, "target")
     failures = _required_report_mapping(report_map, "failures")
     failure_counts = _required_report_mapping(failures, "counts")
     coverage = _required_report_mapping(report_map, "coverage")
     checks = _required_report_mapping(report_map, "checks")
     http = _required_report_mapping(report_map, "http")
+    random_api_requests = _required_report_mapping(
+        report_map,
+        "random_api_requests",
+    )
     audit_sample = _required_report_mapping(report_map, "api_audit_sample")
     redaction = _required_report_mapping(report_map, "redaction")
-    source = _required_report_mapping(report_map, "source")
+    source_mapping = _required_report_mapping(report_map, "source")
     provider_identifier_quarantine = validate_provider_identifier_quarantine(
-        source.get("provider_identifier_quarantine")
+        source_mapping.get("provider_identifier_quarantine")
     )
     evaluation_time = evaluated_at or datetime.datetime.now(datetime.timezone.utc)
     if evaluation_time.tzinfo is None or evaluation_time.utcoffset() is None:
@@ -234,6 +244,7 @@ def validate_candidate_release_audit_report(
         or not isinstance(duration_seconds, (int, float))
         or not math.isfinite(float(duration_seconds))
         or float(duration_seconds) < 0
+        or float(duration_seconds) > PTG2_FAST_AUDIT_DEADLINE_SECONDS
         or started_at > completed_at
         or abs(
             (completed_at - started_at).total_seconds()
@@ -248,13 +259,17 @@ def validate_candidate_release_audit_report(
         raise ValueError("audit report completion time is in the future")
     if completed_at <= evaluation_time - _audit_report_max_age():
         raise ValueError("audit report is too old for candidate activation")
-    if report_map.get("schema_version") != 2:
+    if report_map.get("schema_version") != 3:
         raise ValueError("audit report schema is unsupported")
     if harness.get("name") != PTG2_CANDIDATE_AUDIT_TOOL:
         raise ValueError("audit report tool is unsupported")
+    if harness.get("contract") != PTG2_FAST_AUDIT_CONTRACT:
+        raise ValueError("audit report contract is unsupported")
     tool_version = str(harness.get("version") or "").strip()
     if tool_version != PTG2_CANDIDATE_AUDIT_TOOL_VERSION:
         raise ValueError("audit report tool version is invalid")
+    if runtime != {"http_client": "aiohttp", "event_loop": "uvloop"}:
+        raise ValueError("audit report async runtime is invalid")
     if (
         report_map.get("status") != "pass"
         or report_map.get("profile") != "release"
@@ -267,7 +282,7 @@ def validate_candidate_release_audit_report(
         or coverage["failures"]
     ):
         raise ValueError("audit report did not pass the release gate")
-    expected_target = {
+    expected_target_by_field = {
         "expected_architecture": "postgres_binary_v3",
         "expected_storage_generation": "shared_blocks_v3",
         "expected_database_backend": "postgresql",
@@ -282,11 +297,11 @@ def validate_candidate_release_audit_report(
         "plan_id_sha256": _sha256_text(plan_id),
         "market_type_sha256": _sha256_text(plan_market_type),
     }
-    for key, expected_value in expected_target.items():
-        if target.get(key) != expected_value:
+    for key, expected_value in expected_target_by_field.items():
+        if target_mapping.get(key) != expected_value:
             raise ValueError(f"audit report target {key} does not match the candidate")
-    transport_contract = target.get("transport_contract")
-    tls_verified = target.get("tls_verified")
+    transport_contract = target_mapping.get("transport_contract")
+    tls_verified = target_mapping.get("tls_verified")
     if not (
         (
             transport_contract == PTG2_VERIFIED_HTTPS_TRANSPORT
@@ -304,20 +319,93 @@ def validate_candidate_release_audit_report(
         or tuple(redaction["excluded"]) != _REQUIRED_REDACTION_EXCLUSIONS
     ):
         raise ValueError("audit report redaction contract is invalid")
-    observed_checks = {
-        key: _required_count(checks, key, minimum)
-        for key, minimum in _REQUIRED_CHECKS.items()
+    source_count = _required_count(source_mapping, "source_count", 1)
+    try:
+        source_witness = validate_source_witness_manifest(
+            source_mapping.get("witness"),
+            expected_source_count=source_count,
+        )
+    except ValueError as exc:
+        raise ValueError("audit report source-witness coverage is invalid") from exc
+    expected_challenge_count = int(source_witness["occurrence_witness_count"])
+    provider_witness_count = int(source_witness["provider_witness_count"])
+    total_witness_count = int(source_witness["record_count"])
+    observed_check_by_name = {
+        "source_witnesses": _required_count(
+            checks,
+            "source_witnesses",
+            total_witness_count,
+        ),
+        "api_witnesses_matched": _required_count(
+            checks,
+            "api_witnesses_matched",
+            expected_challenge_count,
+        ),
+        "api_challenges_executed": _required_count(
+            checks,
+            "api_challenges_executed",
+            expected_challenge_count,
+        ),
+        "provider_witnesses_validated": _required_count(
+            checks,
+            "provider_witnesses_validated",
+            provider_witness_count,
+        ),
+        "api_audit_occurrences_validated": _required_count(
+            checks,
+            "api_audit_occurrences_validated",
+            1,
+        ),
     }
+    expected_check_by_name = {
+        "source_witnesses": total_witness_count,
+        "api_witnesses_matched": expected_challenge_count,
+        "api_challenges_executed": expected_challenge_count,
+        "provider_witnesses_validated": provider_witness_count,
+        "api_audit_occurrences_validated": 1,
+    }
+    if observed_check_by_name != expected_check_by_name:
+        raise ValueError("audit report source-witness coverage is invalid")
+    source_set_digest = _sha256_digest(
+        source_mapping.get("source_set_digest"),
+        field="source.source_set_digest",
+    )
+    if source_witness["source_set_digest"] != source_mapping.get("source_set_digest"):
+        raise ValueError("audit report source-witness source set is invalid")
+    source_witness_digest = _sha256_digest(
+        source_witness.get("payload_sha256"),
+        field="source.witness.payload_sha256",
+    )
+    _sha256_digest(
+        source_witness.get("sample_digest"),
+        field="source.witness.sample_digest",
+    )
     standard_http_requests = _required_count(
         http,
         "standard_api_actual_http_requests",
-        3_000,
+        expected_challenge_count + 1,
     )
     if (
-        audit_sample.get("sample_digest_validated") is not True
+        coverage.get("selection_method") != PTG2_V3_SOURCE_WITNESS_SELECTION
+        or coverage.get("queryable_occurrence_population_count")
+        != source_witness["queryable_occurrence_population_count"]
+        or coverage.get("emitted_rate_row_count")
+        != source_witness["emitted_rate_row_count"]
+        or coverage.get("unqueryable_rate_row_count")
+        != source_witness["unqueryable_rate_row_count"]
+        or coverage.get("unqueryable_rate_policy")
+        != source_witness["unqueryable_rate_policy"]
+        or coverage.get("occurrence_sample_count") != expected_challenge_count
+        or coverage.get("provider_sample_count") != provider_witness_count
+        or random_api_requests.get("requested") != expected_challenge_count
+        or random_api_requests.get("executed") != expected_challenge_count
+        or http.get("max_concurrency") != 32
+        or _required_count(http, "retry_count", 0) > standard_http_requests
+        or standard_http_requests > expected_challenge_count * 16 + 2
+        or audit_sample.get("sample_digest_validated") is not True
         or audit_sample.get("source_set_validated") is not True
     ):
-        raise ValueError("audit report did not validate its persisted sample and source set")
+        raise ValueError("audit report bounded coverage is invalid")
     audit_sample_digest = _sha256_digest(
         audit_sample.get("sample_digest"),
         field="api_audit_sample.sample_digest",
@@ -331,8 +419,10 @@ def validate_candidate_release_audit_report(
         "report_json": report_bytes.decode("utf-8"),
         "completed_at": completed_at,
         "audit_sample_digest": audit_sample_digest,
+        "source_set_digest": source_set_digest,
+        "source_witness_digest": source_witness_digest,
         "provider_identifier_quarantine": provider_identifier_quarantine,
-        "checks": observed_checks,
+        "checks": observed_check_by_name,
         "standard_api_actual_http_requests": standard_http_requests,
     }
 
@@ -348,23 +438,27 @@ def _attestation_ttl_hours() -> int:
     return min(value, 168)
 
 
-def _candidate_identity(row: Mapping[str, Any]) -> dict[str, Any]:
+def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
     """Validate candidate bindings and return their immutable audit identity."""
 
-    snapshot = _mapping(row.get("manifest"))
+    snapshot = _mapping(database_row.get("manifest"))
     activation = _mapping(snapshot.get("activation"))
-    layout_manifest = _mapping(row.get("layout_manifest"))
+    layout_manifest = _mapping(database_row.get("layout_manifest"))
     serving_index = _mapping(snapshot.get("serving_index"))
     if (
-        str(row.get("status") or "") != "validated"
+        str(database_row.get("status") or "") != "validated"
         or activation.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT
         or activation.get("state") != "validated"
     ):
         raise ValueError("snapshot is not a strict V3 validated candidate")
     source_set = _mapping(serving_index.get("source_set"))
     snapshot_audit_sample = _mapping(serving_index.get("audit_sample"))
+    snapshot_source_witness = _mapping(serving_index.get("source_witness"))
     layout_serving_index = _mapping(layout_manifest.get("serving_index"))
     layout_audit_sample = _mapping(layout_serving_index.get("audit_sample"))
+    layout_source_witness = _mapping(
+        layout_serving_index.get("source_witness")
+    )
     snapshot_quarantine = validate_provider_identifier_quarantine(
         serving_index.get("provider_identifier_quarantine")
     )
@@ -376,8 +470,8 @@ def _candidate_identity(row: Mapping[str, Any]) -> dict[str, Any]:
             "candidate provider identifier quarantine changed after layout sealing"
         )
     raw_container_hashes = [
-        _sha256_hex(value, field="candidate raw container digest")
-        for value in list(row.get("raw_container_sha256_values") or [])
+        _sha256_hex(raw_digest, field="candidate raw container digest")
+        for raw_digest in list(database_row.get("raw_container_sha256_values") or [])
     ]
     observed_source_set = shared_source_set_metadata(raw_container_hashes)
     source_set_digest_hex = str(
@@ -397,7 +491,7 @@ def _candidate_identity(row: Mapping[str, Any]) -> dict[str, Any]:
         != int(observed_source_set["source_count"])
         or source_set_digest
         != bytes.fromhex(observed_source_set["raw_container_sha256_digest"])
-        or coverage_scope_id != bytes(row.get("coverage_scope_id") or b"")
+        or coverage_scope_id != bytes(database_row.get("coverage_scope_id") or b"")
     ):
         raise ValueError("candidate manifest disagrees with its PostgreSQL bindings")
     layout_coverage_scope_hex = str(
@@ -419,13 +513,29 @@ def _candidate_identity(row: Mapping[str, Any]) -> dict[str, Any]:
     )
     if snapshot_audit_sample_digest != layout_audit_sample_digest:
         raise ValueError("candidate audit sample changed after layout sealing")
+    if snapshot_source_witness != layout_source_witness:
+        raise ValueError("candidate source witness changed after layout sealing")
+    try:
+        snapshot_source_witness = validate_source_witness_manifest(
+            snapshot_source_witness,
+            expected_source_count=int(observed_source_set["source_count"]),
+        )
+    except ValueError as exc:
+        raise ValueError("candidate source witness is incompatible") from exc
+    if snapshot_source_witness.get("source_set_digest") != source_set_digest_hex:
+        raise ValueError("candidate source witness changed after layout sealing")
+    source_witness_digest = _sha256_digest(
+        snapshot_source_witness.get("payload_sha256"),
+        field="candidate source witness payload digest",
+    )
     return {
-        "snapshot_key": int(row["snapshot_key"]),
+        "snapshot_key": int(database_row["snapshot_key"]),
         "source_key": str(activation.get("source_key") or "").strip().lower(),
-        "plan_id": str(row.get("plan_id") or "").strip(),
-        "plan_market_type": str(row.get("plan_market_type") or "").strip().lower(),
+        "plan_id": str(database_row.get("plan_id") or "").strip(),
+        "plan_market_type": str(database_row.get("plan_market_type") or "").strip().lower(),
         "coverage_scope_id": coverage_scope_id,
         "source_set_digest": source_set_digest,
+        "source_witness_digest": source_witness_digest,
         "audit_sample_digest": layout_audit_sample_digest,
         "provider_identifier_quarantine": layout_quarantine,
     }
@@ -437,7 +547,7 @@ async def _locked_candidate_identity(
     schema_name: str,
     snapshot_id: str,
 ) -> dict[str, Any]:
-    result = await session.execute(
+    query_result = await session.execute(
         db.text(
             f"""
             SELECT snapshot.status,
@@ -468,10 +578,10 @@ async def _locked_candidate_identity(
         ),
         {"snapshot_id": snapshot_id},
     )
-    row = result.one_or_none()
-    if row is None:
+    candidate_row = query_result.one_or_none()
+    if candidate_row is None:
         raise ValueError("validated candidate is unavailable")
-    return _candidate_identity(_row_mapping(row))
+    return _candidate_identity(_row_mapping(candidate_row))
 
 
 async def _database_timestamp(session: Any) -> datetime.datetime:
@@ -547,6 +657,10 @@ async def record_candidate_audit_attestation(
             raise ValueError("audit target does not match the candidate bindings")
         if evidence["audit_sample_digest"] != identity["audit_sample_digest"]:
             raise ValueError("audit report does not match the sealed candidate sample")
+        if evidence["source_set_digest"] != identity["source_set_digest"]:
+            raise ValueError("audit report does not match the sealed candidate sources")
+        if evidence["source_witness_digest"] != identity["source_witness_digest"]:
+            raise ValueError("audit report does not match the sealed source witnesses")
         if (
             evidence["provider_identifier_quarantine"]
             != identity["provider_identifier_quarantine"]
@@ -554,19 +668,19 @@ async def record_candidate_audit_attestation(
             raise ValueError(
                 "audit report provider identifier quarantine does not match the sealed candidate"
             )
-        result = await session.execute(
+        insert_result = await session.execute(
             db.text(
                 f"""
                 INSERT INTO {_quote_ident(schema_name)}.ptg2_v3_candidate_audit_attestation AS attestation
                     (snapshot_id, snapshot_key, source_key, plan_id,
                      plan_market_type, coverage_scope_id, source_set_digest,
-                     audit_sample_digest,
+                     audit_sample_digest, source_witness_digest,
                      contract, tool_name, tool_version, report_digest, report,
                      attested_at, expires_at, activated_at)
                 VALUES
                     (:snapshot_id, :snapshot_key, :source_key, :plan_id,
                      :plan_market_type, :coverage_scope_id, :source_set_digest,
-                     :audit_sample_digest,
+                     :audit_sample_digest, :source_witness_digest,
                      :contract, :tool_name, :tool_version, :report_digest,
                      CAST(:report_json AS jsonb), :attested_at, :expires_at, NULL)
                 ON CONFLICT (snapshot_id) DO UPDATE SET
@@ -582,6 +696,7 @@ async def record_candidate_audit_attestation(
                   AND attestation.coverage_scope_id = EXCLUDED.coverage_scope_id
                   AND attestation.source_set_digest = EXCLUDED.source_set_digest
                   AND attestation.audit_sample_digest = EXCLUDED.audit_sample_digest
+                  AND attestation.source_witness_digest = EXCLUDED.source_witness_digest
                   AND attestation.contract = EXCLUDED.contract
                   AND attestation.tool_name = EXCLUDED.tool_name
                   AND attestation.activated_at IS NULL
@@ -597,11 +712,12 @@ async def record_candidate_audit_attestation(
                 "report_digest": evidence["report_digest"],
                 "report_json": evidence["report_json"],
                 "audit_sample_digest": evidence["audit_sample_digest"],
+                "source_witness_digest": evidence["source_witness_digest"],
                 "attested_at": now,
                 "expires_at": expires_at,
             },
         )
-        if result.first() is None:
+        if insert_result.first() is None:
             raise ValueError("candidate audit attestation conflicts with existing evidence")
     return {
         "status": "attested",
@@ -635,16 +751,19 @@ async def verify_candidate_audit_attestation_in_transaction(
         schema_name=schema_name,
         snapshot_id=snapshot_id,
     )
-    expected_identity = {
+    expected_identity_by_field = {
         "snapshot_key": int(snapshot_key),
         "source_key": str(source_key).strip().lower(),
         "plan_id": str(plan_id).strip(),
         "plan_market_type": str(plan_market_type).strip().lower(),
         "coverage_scope_id": bytes(coverage_scope_id),
     }
-    if any(identity[key] != value for key, value in expected_identity.items()):
+    if any(
+        identity[key] != expected_value
+        for key, expected_value in expected_identity_by_field.items()
+    ):
         raise ValueError("candidate identity changed after its release audit")
-    result = await session.execute(
+    query_result = await session.execute(
         db.text(
             f"""
             SELECT report_digest, report
@@ -657,6 +776,7 @@ async def verify_candidate_audit_attestation_in_transaction(
                AND coverage_scope_id = :coverage_scope_id
                AND source_set_digest = :source_set_digest
                AND audit_sample_digest = :audit_sample_digest
+               AND source_witness_digest = :source_witness_digest
                AND contract = :contract
                AND activated_at IS NULL
                AND expires_at > clock_timestamp()
@@ -672,10 +792,11 @@ async def verify_candidate_audit_attestation_in_transaction(
             "coverage_scope_id": bytes(coverage_scope_id),
             "source_set_digest": identity["source_set_digest"],
             "audit_sample_digest": identity["audit_sample_digest"],
+            "source_witness_digest": identity["source_witness_digest"],
             "contract": PTG2_CANDIDATE_ATTESTATION_CONTRACT,
         },
     )
-    attestation_row = result.first()
+    attestation_row = query_result.first()
     if attestation_row is None:
         raise ValueError("candidate has no current passing release audit attestation")
     report_digest = bytes(attestation_row[0])
@@ -695,6 +816,14 @@ async def verify_candidate_audit_attestation_in_transaction(
         raise ValueError(
             "candidate provider identifier quarantine changed after its release audit"
         )
+    report_witness = _required_report_mapping(report_source, "witness")
+    if _sha256_digest(
+        report_witness.get("payload_sha256"),
+        field="source.witness.payload_sha256",
+    ) != identity["source_witness_digest"]:
+        raise ValueError(
+            "candidate source witness changed after its release audit"
+        )
     return report_digest
 
 
@@ -711,7 +840,7 @@ async def consume_candidate_audit_attestation_in_transaction(
     if activated_at.tzinfo is None:
         activated_at = activated_at.replace(tzinfo=datetime.timezone.utc)
 
-    result = await session.execute(
+    update_result = await session.execute(
         db.text(
             f"""
             UPDATE {_quote_ident(schema_name)}.ptg2_v3_candidate_audit_attestation
@@ -729,5 +858,5 @@ async def consume_candidate_audit_attestation_in_transaction(
             "activated_at": activated_at,
         },
     )
-    if result.first() is None:
+    if update_result.first() is None:
         raise RuntimeError("candidate audit attestation changed during activation")

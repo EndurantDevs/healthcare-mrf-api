@@ -32,6 +32,7 @@ from db.models import (
     PTG2V3SnapshotLayout,
     PTG2V3SnapshotScope,
     PTG2V3SnapshotSource,
+    PTG2V3SourceAuditWitness,
 )
 from process.ptg_parts.ptg2_shared_gc import (
     require_ptg2_v3_migration_owned_tables,
@@ -177,7 +178,7 @@ def test_v3_followup_is_the_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260714160000_provider_directory_dataset_rehydration"
+        "20260715120000_ptg2_v3_source_audit_witness"
     ]
 
 
@@ -347,6 +348,7 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
         PTG2V3PriceAttr,
         PTG2V3NPIScope,
         PTG2V3AuditOccurrence,
+        PTG2V3SourceAuditWitness,
         PTG2V3CandidateAuditAttestation,
         PTG2V3GCCandidate,
     )
@@ -467,16 +469,31 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
             "atom_ordinal",
             "atom_key",
         ),
+        "ptg2_v3_source_audit_witness": (
+            "snapshot_key",
+            "contract",
+            "selection_method",
+            "source_set_digest",
+            "sample_digest",
+            "queryable_occurrence_population_count",
+            "provider_population_count",
+            "occurrence_witness_count",
+            "provider_witness_count",
+            "payload_sha256",
+            "payload",
+            "created_at",
+        ),
         "ptg2_v3_candidate_audit_attestation": (
             "snapshot_id",
             "snapshot_key",
             "source_key",
             "plan_id",
             "plan_market_type",
-                "coverage_scope_id",
-                "source_set_digest",
-                "audit_sample_digest",
-                "contract",
+            "coverage_scope_id",
+            "source_set_digest",
+            "audit_sample_digest",
+            "source_witness_digest",
+            "contract",
             "tool_name",
             "tool_version",
             "report_digest",
@@ -553,10 +570,17 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
     ):
         assert isinstance(column.type, sa.BigInteger)
     attestation = PTG2V3CandidateAuditAttestation.__table__
+    source_witness = PTG2V3SourceAuditWitness.__table__
     for column in (
         attestation.c.coverage_scope_id,
         attestation.c.source_set_digest,
+        attestation.c.audit_sample_digest,
+        attestation.c.source_witness_digest,
         attestation.c.report_digest,
+        source_witness.c.source_set_digest,
+        source_witness.c.sample_digest,
+        source_witness.c.payload_sha256,
+        source_witness.c.payload,
     ):
         assert isinstance(column.type, sa.LargeBinary)
     assert isinstance(attestation.c.report.type, JSONB)
@@ -573,6 +597,7 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
         attestation.c.attested_at,
         attestation.c.expires_at,
         attestation.c.activated_at,
+        source_witness.c.created_at,
     )
     assert all(isinstance(column.type, sa.DateTime) for column in timezone_columns)
     assert all(column.type.timezone is True for column in timezone_columns)
@@ -605,6 +630,7 @@ def test_v3_shared_models_define_keys_foreign_keys_and_uniqueness():
         ),
         PTG2V3NPIScope: ("snapshot_key", "npi"),
         PTG2V3AuditOccurrence: ("snapshot_key", "occurrence_id"),
+        PTG2V3SourceAuditWitness: ("snapshot_key",),
         PTG2V3CandidateAuditAttestation: ("snapshot_id",),
         PTG2V3GCCandidate: ("block_hash",),
     }
@@ -698,6 +724,7 @@ def test_v3_shared_models_define_keys_foreign_keys_and_uniqueness():
         PTG2V3PriceAttr,
         PTG2V3NPIScope,
         PTG2V3AuditOccurrence,
+        PTG2V3SourceAuditWitness,
     ):
         assert _foreign_key_shapes(dense_model.__table__) == {}
 
@@ -838,6 +865,7 @@ def test_v3_shared_models_define_checks_indexes_and_partition_intent():
             (),
         ),
     }
+    assert _index_shapes(PTG2V3SourceAuditWitness.__table__) == {}
 
     expected_check_names = {
         PTG2V3SnapshotLayout: {
@@ -908,11 +936,23 @@ def test_v3_shared_models_define_checks_indexes_and_partition_intent():
             "ptg2_v3_audit_occurrence_atom_ordinal_check",
             "ptg2_v3_audit_occurrence_atom_key_check",
         },
+        PTG2V3SourceAuditWitness: {
+            "ptg2_v3_source_audit_witness_source_set_digest_check",
+            "ptg2_v3_source_audit_witness_sample_digest_check",
+            "ptg2_v3_source_audit_witness_payload_sha256_check",
+            "ptg2_v3_source_audit_witness_occurrence_population_check",
+            "ptg2_v3_source_audit_witness_provider_population_check",
+            "ptg2_v3_source_audit_witness_occurrence_count_check",
+            "ptg2_v3_source_audit_witness_provider_count_check",
+            "ptg2_v3_source_audit_witness_total_count_check",
+            "ptg2_v3_source_audit_witness_payload_check",
+        },
         PTG2V3CandidateAuditAttestation: {
             "ptg2_v3_candidate_audit_attestation_scope_check",
-                "ptg2_v3_candidate_audit_attestation_source_set_check",
-                "ptg2_v3_candidate_audit_attestation_sample_check",
-                "ptg2_v3_candidate_audit_attestation_report_check",
+            "ptg2_v3_candidate_audit_attestation_source_set_check",
+            "ptg2_v3_candidate_audit_attestation_sample_check",
+            "ptg2_v3_candidate_audit_attestation_witness_check",
+            "ptg2_v3_candidate_audit_attestation_report_check",
             "ptg2_v3_candidate_audit_attestation_expiry_check",
         },
     }

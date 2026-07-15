@@ -353,12 +353,13 @@ Publication proceeds in this order:
    exact malformed-provider-identifier quarantine evidence.
 6. Finalize dense blocks, dictionaries, prices, and all provider-graph
    directions.
-7. Build and persist the publication audit sample.
+7. Build and persist the served-occurrence audit sample and exact source
+   witnesses captured during the normal scanner pass.
 8. Validate every block mapping and support digest, then atomically seal the
    immutable layout.
 9. Bind the logical snapshot and scope as a `validated` candidate without
    changing source, plan, or global serving pointers.
-10. Queue the independent source-to-API release audit.
+10. Queue the bounded PostgreSQL-witness-to-API release audit.
 11. Persist a fresh passing attestation and atomically activate the candidate.
 12. Remove temporary files and stages.
 
@@ -367,7 +368,48 @@ domain-separated SHA-256, independent of the compact semantic-hash mode used by
 other PTG values. This keeps source provenance acceptable to the shared-source
 dictionary and release attestation without widening compact serving keys.
 
-## Persisted Audit Sample
+## Persisted Source Witnesses
+
+The scanner captures exact source evidence while bytes are already being
+parsed. It does not reopen, seek, decompress, or reparse an input after the
+build. Selection happens only after the strict V3 writer accepts a rate, so the
+authoritative population is the emitted, API-queryable price/provider
+occurrence population rather than raw JSON row count. Each source contributes
+deterministic local bottom-k candidates with contract
+`bottom_k_atomic_occurrence_exponential_priority_v2`:
+
+- negotiated-rate JSON plus its procedure fields, exact emitted price ordinal,
+  exact provider-set NPI ordinal, and linked raw provider evidence;
+- independently selected provider-reference JSON for provider parsing checks;
+  and
+- the verified raw-container SHA-256 and source-stable object/rate coordinate
+  for every token. Worker identity and partition layout are not part of the
+  selection key.
+
+Publication selects exactly `min(total_population, 2,048)` records across all
+sources. Up to 48 records are reserved for provider references; queryable
+occurrences fill the remainder, and either cohort deterministically backfills
+unused capacity. Both local and global population-derived counts are checked,
+so an omitted queryable occurrence or provider candidate fails publication.
+
+The exact raw JSON token is preserved, individually zlib-compressed, and
+protected by its own SHA-256. Publication merges all per-source bottom-k sets
+deterministically, verifies complete source coverage and framing, then stores
+one bounded payload in `ptg2_v3_source_audit_witness`. The layout and logical
+snapshot manifests bind the payload digest, source-set digest, sample digest,
+counts, and selection contract before sealing. Scanner bundle files are
+temporary publication scratch and are deleted; PostgreSQL is the only durable
+copy and API pods do not materialize a filesystem cache.
+
+This witness is intentionally independent of the compact serving encoding.
+The source half contains the exact original rate token and, for referenced
+providers, the cryptographically linked provider token. Scanner metadata
+retains only coordinates and contract identifiers. The release audit derives
+the code, selected price, selected NPI, and required network names again from
+the raw evidence before making an API request; it does not trust a
+scanner-authored expected tuple.
+
+## Persisted Served Audit Sample
 
 Every new physical layout persists a deterministic publish-time sample in
 PostgreSQL before sealing. The contract is
@@ -380,21 +422,29 @@ records the sample count, maximum, digest, method, format, and
 `source_multiset_v1` marker. Reused logical snapshots expose the same physical
 sample through their independent binding.
 
-This bounded sample is publication evidence, not the release gate by itself.
-Release promotion requires an independent source-to-API audit that reads the
-original sources and the standard pricing handler, not scanner output, staging
-tables, or serving blocks. A completed import is first stored as a `validated`
-candidate; public pricing resolution remains `published`-only. The auditor may
-read exactly one candidate through the control-authenticated audit alias only
-when snapshot, source, plan, and market selectors all match. The release
-profile must complete at least:
+This served sample is publication evidence and a one-row preflight for the
+release gate. A completed import is first stored as a `validated` candidate;
+public pricing resolution remains `published`-only. The auditor may read
+exactly one candidate through the control-authenticated audit aliases only when
+snapshot, source, plan, and market selectors all match.
 
-- 2,500 source-selected occurrence checks;
-- 2,500 independently API-selected persisted occurrence checks;
-- 2,500 deterministic pseudo-random complete pricing requests and at least
-  3,000 observed standard-API HTTP requests; and
-- 500 negative code/NPI recombination checks by default, with a hard release
-  minimum of 250.
+The activation audit loads the sealed source-witness payload from PostgreSQL,
+checks all framing and manifest digests, reparses every selected raw token,
+validates provider evidence, and then runs one exact standard pricing challenge
+for every selected occurrence witness. With the normal 48-record provider
+quota, a dense import runs 2,000 pricing challenges plus one served-sample
+preflight: 2,001 no-retry HTTP requests. The absolute maximum is 2,049 when no
+provider-reference records exist. Exact filters normally resolve in one page;
+pagination is bounded to eight pages and all retries and extra requests are
+counted rather than hidden.
+
+One `aiohttp.ClientSession` and connection pool serves 32 concurrent requests
+(hard maximum 64). Each request has a four-second timeout and one transient
+retry. The complete audit has a fail-closed 55-second deadline that cancels all
+unfinished requests. The candidate-audit ARQ worker and audit core both require
+`uvloop`; the canonical attestation accepts only runtime evidence declaring
+`aiohttp` on `uvloop`. A timeout, cancellation, source mismatch, API mismatch,
+or unsupported runtime leaves the prior snapshot active.
 
 Run the exact audit once for every pinned physical snapshot participating in a
 multi-network plan. Then run an additional unpinned plan-level probe that checks
@@ -405,14 +455,12 @@ failed network read fails the whole request rather than returning a partial
 union.
 
 The exact tuple includes the source artifact's raw container SHA, so a correct
-price attributed to the wrong input file still fails. The audit must preserve
-full pagination and exact tuple counts, reject source integrity errors, and
-pass cold first-page p95 at or below 40 ms independently for matched-positive,
-negative, and deterministic-random request classes; one fast class must never
-hide a slow one. Complete multi-page logical-query latency is also gated per
-class rather than as one mixed percentile. Run the cold gate from fresh API
-processes with distinct matched-positive sampled keys. It does not imply
-database or operating-system cache eviction.
+price attributed to the wrong input file still fails. The bounded activation
+audit records request p50, p95, maximum, retries, and actual HTTP count, but it
+does not claim the separate cold-process 40 ms capacity gate. Run that gate
+from fresh API processes with distinct keys under representative concurrent
+import and API load; it does not imply database or operating-system cache
+eviction.
 
 An out-of-range nonzero integral value in an NPI array is never padded, coerced, or
 published as an NPI. The scanner excludes it from NPI membership, includes it
@@ -421,11 +469,11 @@ stores a bounded canonical quarantine summary in the immutable PostgreSQL
 manifest. The summary records exact occurrence counts for at most 1,024
 distinct malformed integer values plus a domain-separated SHA-256 digest. A
 strict import fails if that bound is exceeded or if any scanner omits the
-evidence. The independent source audit rebuilds the summary from the original
-containers and activation fails unless it matches the sealed manifest exactly.
-Mixed groups retain their valid NPI memberships and remain auditable through
-the NPI API; TIN-only groups remain preserved but cannot pass the current
-NPI-addressed release gate.
+evidence. Publication validates the complete aggregate across scanner runs,
+and the bounded release audit reparses the selected provider-reference tokens
+against that sealed evidence. Mixed groups retain their valid NPI memberships
+and remain auditable through the NPI API; TIN-only groups remain preserved but
+do not create a fake NPI challenge.
 
 Only the singleton array `[0]` is accepted as the schema-defined TIN-only
 marker. Zero mixed with another value or repeated zero values are rejected so
@@ -468,13 +516,17 @@ Routine orchestration is asynchronous and implemented by the generic
 `ptg-candidate-audit` job: validation queues the authenticated audit, a passing
 audit records the attestation, and promotion consumes it. These are generic
 HTTP/control contracts; this repository neither knows nor depends on the
-product operating the worker. Until an audit run has a durable lease and
-heartbeat, generic age-based GC deliberately excludes every `validated`
-candidate. Abandoned candidates require explicit authenticated removal rather
-than an unsafe time-only guess.
+product operating the worker. Until an audit run has a durable control-run
+record and heartbeat, generic age-based GC deliberately excludes every `validated`
+candidate. Source-artifact leases are not part of activation because the audit
+reads only the sealed PostgreSQL witness. Abandoned candidates require
+explicit authenticated removal rather than an unsafe time-only guess.
 
-See [the source-to-API audit guide](../../scripts/validation/README.md) for the
-redacted report contract and invocation.
+The bounded PostgreSQL witness audit is the sole automated release verifier.
+Activation never rereads or decompresses complete source files. The witness
+contains authenticated raw source fragments captured at the actual V3 emission
+point, so source-to-API comparison remains independent of serving storage while
+its work stays fixed.
 
 ## Performance And Capacity Gates
 
@@ -516,8 +568,11 @@ For 2,000 logical imports per 30-day month:
 - One build lane therefore has little burst, retry, and maintenance headroom
   near that bound even though its theoretical steady-state capacity is 2,880
   builds per 30-day month. Candidate audits use separately measured lanes and
-  availability, and every logical activation consumes at least 3,000 standard
-  API HTTP calls, or 6,000,000 calls at the monthly objective.
+  availability. A full 2,048-record activation normally has 2,000 occurrence
+  challenges plus one preflight, or 4,002,000 calls at the monthly objective.
+  The provider-empty maximum is 2,049 calls per activation and 4,098,000 per
+  month; measured retries and bounded pagination must be added rather than
+  projected away.
 - Physical reuse reduces build work only when the complete-set fingerprint
   matches. Capacity models must measure the reuse hit rate and keep an
   unreused scenario.
@@ -536,7 +591,8 @@ capacity.
 The contention run lasts at least 30 minutes with every configured build and
 audit lane active. It includes at least 3,000 requests and 1 request/second of
 normal API traffic plus observed candidate-audit request totals whose duration
-and derived rate reconcile with the 3,000-request-per-audit floor. It must use
+and derived rate reconcile with each audit's occurrence-witness count plus one
+preflight (normally 2,001 requests) and actual retry/page counts. It must use
 fresh API processes and separate error-free cold p95 measurements at or below
 40 ms for at least 100 distinct matched-positive, 250 distinct negative, and
 2,500 distinct deterministic-random requests. Every cold sample must fall
@@ -592,12 +648,16 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
   manifest.
 - No release import used truncation or partial-source options.
 - Temporary scanner/finalizer files and disposable stages are gone.
+- The PostgreSQL source-witness payload exists, validates against the sealed
+  manifests and complete source set, contains exactly 2,048 combined witnesses
+  for a large population (normally 2,000 queryable rate occurrences and 48
+  provider references), and has no API-pod filesystem copy.
 - The persisted audit sample exists, validates, and contains no more than 2,560
   rows.
-- The independent release audit passed 2,500 source, 2,500 API-selected, and
-  2,500 deterministic-random checks, observed at least 3,000 standard-API HTTP
-  requests, and used 500 negative checks by default without dropping below the
-  hard minimum of 250.
+- The bounded candidate audit reparsed every sealed source witness, passed all
+  selected API challenges and its served-sample preflight, ran on
+  `aiohttp`/`uvloop`, completed within 55 seconds, and recorded its actual HTTP
+  and retry counts.
 - Cold first-page p95 is at or below 40 ms separately for matched-positive,
   negative, and deterministic-random requests.
 - The authenticated schema-v7 monthly capacity report passes with at least 30

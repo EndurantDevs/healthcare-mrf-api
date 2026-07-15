@@ -204,8 +204,8 @@ async def _assert_migrated_empty_target(database_name: str) -> None:
     alembic_config = Config(str(ROOT / "alembic.ini"))
     expected_heads = set(ScriptDirectory.from_config(alembic_config).get_heads())
     observed_heads = {
-        str(row[0])
-        for row in await db.all(
+        str(version_record[0])
+        for version_record in await db.all(
             f"SELECT version_num FROM {_quoted(SCHEMA_NAME)}.alembic_version"
         )
     }
@@ -215,8 +215,8 @@ async def _assert_migrated_empty_target(database_name: str) -> None:
     )
 
     observed_tables = {
-        str(row[0])
-        for row in await db.all(
+        str(table_record[0])
+        for table_record in await db.all(
             """
             SELECT table_name
               FROM information_schema.tables
@@ -243,8 +243,8 @@ async def _assert_migrated_empty_target(database_name: str) -> None:
         schema_name=SCHEMA_NAME,
     )
     jsonb_columns = {
-        (str(row[0]), str(row[1]))
-        for row in await db.all(
+        (str(column_record[0]), str(column_record[1]))
+        for column_record in await db.all(
             """
             SELECT table_name, column_name
               FROM information_schema.columns
@@ -752,7 +752,7 @@ async def test_v3_lifecycle_fails_closed(
         multiple_prices=True,
         duplicate_first_price=False,
     )
-    records = [
+    serving_records = [
         SERVING_RECORD.unpack_from(scan["partition_bytes"], offset)
         for offset in range(
             0,
@@ -760,8 +760,10 @@ async def test_v3_lifecycle_fails_closed(
             SERVING_RECORD.size,
         )
     ]
-    assert len(records) == 2
-    provider_set_ids = {record[1] for record in records}
+    assert len(serving_records) == 2
+    provider_set_ids = {
+        serving_record[1] for serving_record in serving_records
+    }
     assert len(provider_set_ids) == 1
     provider_set_id = next(iter(provider_set_ids))
 
@@ -897,6 +899,13 @@ async def test_v3_lifecycle_fails_closed(
                 },
             ),
             graph_artifact_entries=graph_entries,
+            source_audit_witness_entries=(
+                scanner_support._single_frame(
+                    scan["frames"],
+                    "source_audit_witness_file",
+                ),
+            ),
+            expected_raw_source_sha256=(artifact_digest,),
             provider_identifier_quarantine=scanner_summary[
                 "provider_identifier_quarantine"
             ],
@@ -967,11 +976,12 @@ async def test_v3_lifecycle_fails_closed(
             candidate_audit["items"]
         )
         assert {
-            int(item["tuple"]["npi"]) for item in candidate_audit["items"]
+            int(audit_item["tuple"]["npi"])
+            for audit_item in candidate_audit["items"]
         } <= set(NPIS)
         assert {
-            item["tuple"]["negotiated_rate"]
-            for item in candidate_audit["items"]
+            audit_item["tuple"]["negotiated_rate"]
+            for audit_item in candidate_audit["items"]
         } == {125.5, 250}
         assert candidate_audit["provenance"]["snapshot_id"] == snapshot_a
         assert candidate_audit["source_set"] == source_set
@@ -1146,7 +1156,7 @@ async def test_v3_lifecycle_fails_closed(
              ORDER BY snapshot_id
             """
         )
-        assert [tuple(row) for row in bindings] == sorted(
+        assert [tuple(binding_record) for binding_record in bindings] == sorted(
             [
                 (snapshot_a, publication.snapshot_key),
                 (snapshot_b, publication.snapshot_key),
@@ -1270,7 +1280,8 @@ async def test_v3_lifecycle_fails_closed(
             """
         )
         expected_block_sizes = {
-            bytes(row[0]): int(row[1]) for row in block_rows
+            bytes(block_record[0]): int(block_record[1])
+            for block_record in block_rows
         }
         assert expected_block_sizes
 

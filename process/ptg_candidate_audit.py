@@ -3,38 +3,38 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
-import hashlib
 import json
 import os
 import re
-import signal
-import sys
-import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, AsyncIterator, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from db.connection import db
 from process.control_lifecycle import mark_control_run
-from process.ptg_parts.artifacts import PTG2ArtifactStore, sha256_file
 from process.ptg_parts.db_tables import _quote_ident
-from process.ptg_parts.domain import PTG2_ARTIFACT_RAW, PTG2_CANDIDATE_ACTIVATION_CONTRACT
-from process.ptg_parts.input_artifact_retention import (
-    artifact_lease_context,
-    bind_artifact_lease,
-    current_artifact_lease_id,
-    guard_artifact_lease,
-    protect_existing_artifact,
+from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
+from process.ptg_parts.ptg2_fast_candidate_audit import (
+    FastAuditHttpConfig,
+    FastAuditTarget,
+    FastCandidateAuditError,
+    run_fast_candidate_audit,
 )
 from process.ptg_parts.ptg2_candidate_attestation import (
+    PTG2_TRUSTED_CLUSTER_HTTP_TRANSPORT,
+    PTG2_VERIFIED_HTTPS_TRANSPORT,
     record_candidate_audit_attestation,
 )
 from process.ptg_parts.ptg2_provider_quarantine import (
     validate_provider_identifier_quarantine,
 )
+from process.ptg_parts.ptg2_source_witness import (
+    PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
+    source_set_digest,
+)
+from process.ptg_parts.ptg2_source_witness_store import load_shared_source_witness
 from process.ptg_parts.source_snapshot_control import promote_ptg2_source_snapshot
 from scripts.validation import ptg2_v3_source_api_audit
 
@@ -47,10 +47,6 @@ AUTH_HEADER_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_AUTH_HEADER"
 AUTH_SCHEME_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_AUTH_SCHEME"
 TRUSTED_CLUSTER_HTTP_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_TRUSTED_CLUSTER_HTTP"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_SAFE_FAILURE_REASON_RE = re.compile(r"^[a-z0-9_]{1,128}$")
-_ISOLATED_AUDIT_TERM_SECONDS = 10.0
-_ISOLATED_AUDIT_REQUEST_ENV = "PTG_CANDIDATE_AUDIT_REQUEST"
-_ISOLATED_AUDIT_TOKEN_ENV = "PTG_AUDIT_AUTH_TOKEN"
 
 
 @dataclass(frozen=True)
@@ -58,6 +54,7 @@ class CandidateAuditTarget:
     candidate_run_id: str
     snapshot_id: str
     snapshot_status: str
+    snapshot_key: int
     source_key: str
     plan_id: str
     plan_market_type: str
@@ -65,6 +62,8 @@ class CandidateAuditTarget:
     current_snapshot_id: str | None
     raw_container_sha256: tuple[str, ...]
     provider_identifier_quarantine: Mapping[str, Any]
+    source_witness: Mapping[str, Any]
+    audit_sample: Mapping[str, Any]
     activated: bool
     audit_report: Mapping[str, Any] | None = None
     audit_report_digest: str | None = None
@@ -136,6 +135,7 @@ async def _candidate_rows(candidate_run_id: str) -> list[dict[str, Any]]:
                snapshot.status,
                snapshot.previous_snapshot_id,
                snapshot.manifest,
+               binding.snapshot_key,
                scope.plan_id,
                scope.plan_market_type,
                layout.state AS layout_state,
@@ -212,6 +212,13 @@ def _candidate_target_from_row(
     activation = _mapping(manifest.get("activation"))
     layout_manifest = _mapping(candidate_row.get("layout_manifest"))
     layout_serving_index = _mapping(layout_manifest.get("serving_index"))
+    source_set = _mapping(serving_index.get("source_set"))
+    source_witness = _mapping(serving_index.get("source_witness"))
+    layout_source_witness = _mapping(
+        layout_serving_index.get("source_witness")
+    )
+    audit_sample = _mapping(serving_index.get("audit_sample"))
+    layout_audit_sample = _mapping(layout_serving_index.get("audit_sample"))
     try:
         provider_identifier_quarantine = (
             validate_provider_identifier_quarantine(
@@ -230,6 +237,21 @@ def _candidate_target_from_row(
     if provider_identifier_quarantine != layout_provider_identifier_quarantine:
         raise ValueError(
             "candidate provider identifier quarantine changed after layout sealing"
+        )
+    expected_source_set_digest = source_set_digest(raw_container_sha256)
+    if (
+        source_witness != layout_source_witness
+        or audit_sample != layout_audit_sample
+        or source_witness.get("contract")
+        != PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT
+        or int(source_witness.get("source_count") or -1)
+        != len(raw_container_sha256)
+        or source_witness.get("source_set_digest") != expected_source_set_digest
+        or source_set.get("raw_container_sha256_digest")
+        != expected_source_set_digest
+    ):
+        raise ValueError(
+            "candidate source witness changed after layout sealing"
         )
     if (
         not snapshot_id
@@ -288,6 +310,7 @@ def _candidate_target_from_row(
         candidate_run_id=candidate_run_id,
         snapshot_id=snapshot_id,
         snapshot_status=status,
+        snapshot_key=int(candidate_row["snapshot_key"]),
         source_key=source_key,
         plan_id=plan_id,
         plan_market_type=plan_market_type,
@@ -295,6 +318,8 @@ def _candidate_target_from_row(
         current_snapshot_id=current_snapshot,
         raw_container_sha256=raw_container_sha256,
         provider_identifier_quarantine=provider_identifier_quarantine,
+        source_witness=source_witness,
+        audit_sample=audit_sample,
         activated=is_activated,
         audit_report=report,
         audit_report_digest=report_digest,
@@ -332,47 +357,11 @@ async def load_candidate_audit_target(
     )
 
 
-def resolve_retained_raw_files(
-    store: PTG2ArtifactStore,
-    raw_container_sha256: Sequence[str],
-) -> tuple[Path, ...]:
-    """Resolve and lease exactly one verified content-addressed file per digest."""
-
-    resolved_paths: list[Path] = []
-    for raw_digest in raw_container_sha256:
-        digest = _normalized_digest(raw_digest, field="raw container digest")
-        expected_path = store.artifact_path(digest, kind=PTG2_ARTIFACT_RAW)
-        parent = expected_path.parent
-        candidates = sorted(
-            path
-            for path in parent.glob(f"{digest}*")
-            if (path.name == digest or path.name.startswith(f"{digest}."))
-            and path.is_file()
-            and not path.is_symlink()
-        ) if parent.is_dir() else []
-        if len(candidates) != 1:
-            raise ValueError(
-                f"candidate raw artifact {digest} resolved to {len(candidates)} retained files"
-            )
-        path = candidates[0]
-        if not protect_existing_artifact(store, path):
-            raise ValueError(f"candidate raw artifact {digest} is unavailable")
-        observed_digest, _byte_count = sha256_file(path)
-        if observed_digest != digest:
-            raise ValueError(f"candidate raw artifact {digest} failed SHA-256 verification")
-        resolved_paths.append(path)
-    return tuple(resolved_paths)
-
-
-def _audit_configuration() -> tuple[str, str, str, str, bool]:
+def _audit_configuration(snapshot_id: str) -> FastAuditHttpConfig:
     api_base_url = str(
         os.getenv(API_BASE_URL_ENV) or os.getenv("PTG_AUDIT_API_BASE_URL") or ""
     ).strip().rstrip("/")
-    token = str(
-        os.getenv("HLTHPRT_CONTROL_API_TOKEN")
-        or os.getenv(_ISOLATED_AUDIT_TOKEN_ENV)
-        or ""
-    ).strip()
+    token = str(os.getenv("HLTHPRT_CONTROL_API_TOKEN") or "").strip()
     auth_header = str(os.getenv(AUTH_HEADER_ENV) or "Authorization").strip()
     default_scheme = "Bearer" if auth_header.lower() == "authorization" else ""
     auth_scheme = str(os.getenv(AUTH_SCHEME_ENV, default_scheme)).strip()
@@ -387,98 +376,65 @@ def _audit_configuration() -> tuple[str, str, str, str, bool]:
         raise ValueError("candidate audit auth header is invalid")
     if trusted_cluster_http_text not in {"true", "false"}:
         raise ValueError(f"{TRUSTED_CLUSTER_HTTP_ENV} must be true or false")
-    return (
-        api_base_url,
-        token,
-        auth_header,
-        auth_scheme,
-        trusted_cluster_http_text == "true",
+    parsed = urlsplit(api_base_url)
+    is_trusted_cluster_http = trusted_cluster_http_text == "true"
+    if parsed.scheme == "https" and parsed.netloc:
+        should_verify_tls = True
+        transport_contract = PTG2_VERIFIED_HTTPS_TRANSPORT
+    elif (
+        is_trusted_cluster_http
+        and ptg2_v3_source_api_audit._is_cluster_http_api_origin(api_base_url)
+    ):
+        should_verify_tls = False
+        transport_contract = PTG2_TRUSTED_CLUSTER_HTTP_TRANSPORT
+    else:
+        raise ValueError(
+            "candidate audit requires verified HTTPS or explicit cluster HTTP"
+        )
+    token_value = f"{auth_scheme} {token}".strip()
+    return FastAuditHttpConfig(
+        api_base_url=api_base_url,
+        headers={
+            auth_header: token_value,
+            ptg2_v3_source_api_audit.CANDIDATE_AUDIT_HEADER: snapshot_id,
+            "Accept": "application/json",
+            "User-Agent": "ptg2-v3-fast-candidate-audit/1.0",
+        },
+        verify_tls=should_verify_tls,
+        transport_contract=transport_contract,
     )
 
 
-def _fatal_audit_reason(report: Mapping[str, Any]) -> str | None:
-    failures = _mapping(report.get("failures"))
-    examples = failures.get("examples")
-    if not isinstance(examples, list) or not examples:
-        return None
-    example = examples[0]
-    reason = str(example.get("reason") or "") if isinstance(example, Mapping) else ""
-    return reason if _SAFE_FAILURE_REASON_RE.fullmatch(reason) else None
-
-
-def _release_audit_arguments(
-    audit_target: CandidateAuditTarget,
-    source_paths: Sequence[Path],
-    *,
-    report_path: Path,
-    work_dir: Path,
-    include_auth_token: bool,
-) -> tuple[list[str], str]:
-    (
-        api_base_url,
-        token,
-        auth_header,
-        auth_scheme,
-        trusted_cluster_http,
-    ) = _audit_configuration()
-    audit_arguments = [
-        *(str(path) for path in source_paths),
-        "--report",
-        str(report_path),
-        "--profile",
-        "release",
-        "--api-base-url",
-        api_base_url,
-        "--api-path",
-        ptg2_v3_source_api_audit.DEFAULT_CANDIDATE_API_PATH,
-        "--plan-id",
-        audit_target.plan_id,
-        "--snapshot-id",
-        audit_target.snapshot_id,
-        "--plan-market-type",
-        audit_target.plan_market_type,
-        "--source-key",
-        audit_target.source_key,
-        "--auth-header",
-        auth_header,
-        "--auth-scheme",
-        auth_scheme,
-        "--validated-candidate",
-        "--max-invalid-npis",
-        str(audit_target.provider_identifier_quarantine["occurrence_count"]),
-        "--work-dir",
-        str(work_dir),
-    ]
-    if include_auth_token:
-        audit_arguments.extend(("--auth-token", token))
-    if trusted_cluster_http:
-        audit_arguments.append("--trusted-cluster-http")
-    return audit_arguments, token
-
-
-def _read_release_audit_report(report_path: Path) -> dict[str, Any]:
-    try:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError("candidate release audit did not produce a valid report") from exc
-    if not isinstance(report, dict):
-        raise RuntimeError("candidate release audit report is not an object")
-    return report
-
-
-def _validate_release_audit_report(
-    audit_target: CandidateAuditTarget,
-    *,
-    exit_code: int,
-    report: dict[str, Any],
+async def run_release_audit(
+    candidate_target: CandidateAuditTarget,
+    witness: Any,
 ) -> dict[str, Any]:
-    if exit_code != 0 or report.get("status") == "error":
-        failure_reason = _fatal_audit_reason(report)
-        suffix = f": {failure_reason}" if failure_reason else ""
-        raise CandidateAuditReleaseGateError(
-            f"candidate release audit did not pass the release gate{suffix}"
+    """Run the bounded PostgreSQL witness audit without opening source files."""
+
+    try:
+        audit_report = await run_fast_candidate_audit(
+            witness=witness,
+            audit_target=FastAuditTarget(
+                snapshot_id=candidate_target.snapshot_id,
+                source_key=candidate_target.source_key,
+                plan_id=candidate_target.plan_id,
+                plan_market_type=candidate_target.plan_market_type,
+                source_count=len(candidate_target.raw_container_sha256),
+                source_set_digest=source_set_digest(
+                    candidate_target.raw_container_sha256
+                ),
+                audit_sample=candidate_target.audit_sample,
+                provider_identifier_quarantine=(
+                    candidate_target.provider_identifier_quarantine
+                ),
+            ),
+            http=_audit_configuration(candidate_target.snapshot_id),
         )
-    report_source = _mapping(report.get("source"))
+    except FastCandidateAuditError as exc:
+        raise CandidateAuditReleaseGateError(
+            f"candidate release audit failed: {exc.reason}"
+        ) from exc
+    report_source = _mapping(audit_report.get("source"))
     try:
         observed_quarantine = validate_provider_identifier_quarantine(
             report_source.get("provider_identifier_quarantine")
@@ -487,288 +443,20 @@ def _validate_release_audit_report(
         raise CandidateAuditReleaseGateError(
             "candidate release audit has invalid provider identifier quarantine evidence"
         ) from exc
-    if observed_quarantine != dict(audit_target.provider_identifier_quarantine):
+    if observed_quarantine != dict(
+        candidate_target.provider_identifier_quarantine
+    ):
         raise CandidateAuditReleaseGateError(
             "candidate release audit provider identifier quarantine does not match publication"
         )
-    if report.get("status") != "pass" or report.get("release_gate_eligible") is not True:
+    if (
+        audit_report.get("status") != "pass"
+        or audit_report.get("release_gate_eligible") is not True
+    ):
         raise CandidateAuditReleaseGateError(
             "candidate release audit did not pass the release gate"
         )
-    return report
-
-
-def run_release_audit(
-    target: CandidateAuditTarget,
-    source_paths: Sequence[Path],
-) -> dict[str, Any]:
-    """Invoke the independent release audit directly using temporary-only work."""
-
-    with tempfile.TemporaryDirectory(prefix="ptg-candidate-audit-") as temp_dir:
-        work_dir = Path(temp_dir)
-        report_path = work_dir / "report.json"
-        audit_arguments, _token = _release_audit_arguments(
-            target,
-            source_paths,
-            report_path=report_path,
-            work_dir=work_dir,
-            include_auth_token=True,
-        )
-        exit_code = ptg2_v3_source_api_audit.run_audit_cli(audit_arguments)
-        report = _read_release_audit_report(report_path)
-    return _validate_release_audit_report(
-        target,
-        exit_code=exit_code,
-        report=report,
-    )
-
-
-def _isolated_audit_target_payload(
-    audit_target: CandidateAuditTarget,
-) -> dict[str, Any]:
-    return {
-        "candidate_run_id": audit_target.candidate_run_id,
-        "snapshot_id": audit_target.snapshot_id,
-        "source_key": audit_target.source_key,
-        "plan_id": audit_target.plan_id,
-        "plan_market_type": audit_target.plan_market_type,
-        "raw_container_sha256": list(audit_target.raw_container_sha256),
-        "provider_identifier_quarantine": dict(
-            audit_target.provider_identifier_quarantine
-        ),
-    }
-
-
-def _required_request_text(request_fields: Mapping[str, Any], field_name: str) -> str:
-    field_text = str(request_fields.get(field_name) or "").strip()
-    if not field_text:
-        raise ValueError(f"isolated audit request {field_name} is required")
-    return field_text
-
-
-def _isolated_audit_target(
-    target_fields: Mapping[str, Any],
-) -> CandidateAuditTarget:
-    raw_digest_values = target_fields.get("raw_container_sha256")
-    if not isinstance(raw_digest_values, list) or not raw_digest_values:
-        raise ValueError("isolated audit request raw sources are required")
-    raw_digests = tuple(
-        _normalized_digest(raw_digest, field="raw container digest")
-        for raw_digest in raw_digest_values
-    )
-    if len(raw_digests) != len(set(raw_digests)):
-        raise ValueError("isolated audit request raw sources are ambiguous")
-    provider_quarantine = validate_provider_identifier_quarantine(
-        target_fields.get("provider_identifier_quarantine")
-    )
-    return CandidateAuditTarget(
-        candidate_run_id=_required_request_text(
-            target_fields,
-            "candidate_run_id",
-        ),
-        snapshot_id=_required_request_text(target_fields, "snapshot_id"),
-        snapshot_status="validated",
-        source_key=_required_request_text(target_fields, "source_key"),
-        plan_id=_required_request_text(target_fields, "plan_id"),
-        plan_market_type=_required_request_text(
-            target_fields,
-            "plan_market_type",
-        ),
-        expected_current_snapshot_id=None,
-        current_snapshot_id=None,
-        raw_container_sha256=raw_digests,
-        provider_identifier_quarantine=provider_quarantine,
-        activated=False,
-    )
-
-
-def _isolated_audit_request(
-    audit_target: CandidateAuditTarget,
-    artifact_store: PTG2ArtifactStore,
-    report_path: Path,
-    lease_id: str,
-) -> str:
-    return json.dumps(
-        {
-            "schema_version": 1,
-            "artifact_root": str(artifact_store.root.resolve()),
-            "lease_id": lease_id,
-            "report_path": str(report_path.resolve()),
-            "target": _isolated_audit_target_payload(audit_target),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def _write_isolated_audit_failure(report_path: Path) -> None:
-    failure_report_by_section = {
-        "status": "error",
-        "release_gate_eligible": False,
-        "failures": {
-            "counts": {"isolated_audit": 1},
-            "examples": [
-                {
-                    "category": "isolated_audit",
-                    "reason": "isolated_audit_failed",
-                }
-            ],
-        },
-    }
-    report_path.write_text(
-        json.dumps(failure_report_by_section, sort_keys=True),
-        encoding="utf-8",
-    )
-
-
-def run_isolated_audit_child() -> int:
-    """Resolve, verify, and audit retained sources inside the killable child."""
-
-    report_path: Path | None = None
-    try:
-        request_fields = json.loads(
-            _required_request_text(
-                os.environ,
-                _ISOLATED_AUDIT_REQUEST_ENV,
-            )
-        )
-        if not isinstance(request_fields, dict) or request_fields.get(
-            "schema_version"
-        ) != 1:
-            raise ValueError("isolated audit request schema is invalid")
-        report_path = Path(_required_request_text(request_fields, "report_path"))
-        target_fields = request_fields.get("target")
-        if not isinstance(target_fields, dict):
-            raise ValueError("isolated audit target is invalid")
-        audit_target = _isolated_audit_target(target_fields)
-        artifact_store = PTG2ArtifactStore(
-            _required_request_text(request_fields, "artifact_root")
-        )
-        lease_id = _required_request_text(request_fields, "lease_id")
-        with bind_artifact_lease(lease_id):
-            retained_source_paths = resolve_retained_raw_files(
-                artifact_store,
-                audit_target.raw_container_sha256,
-            )
-            audit_report = run_release_audit(audit_target, retained_source_paths)
-        report_path.write_text(
-            json.dumps(audit_report, sort_keys=True),
-            encoding="utf-8",
-        )
-        return 0
-    except Exception:
-        if report_path is not None:
-            with contextlib.suppress(OSError):
-                _write_isolated_audit_failure(report_path)
-        return 2
-
-
-async def run_isolated_release_audit(
-    audit_target: CandidateAuditTarget,
-    artifact_store: PTG2ArtifactStore,
-) -> dict[str, Any]:
-    """Run retained-source verification and audit in one supervised child."""
-
-    with tempfile.TemporaryDirectory(prefix="ptg-candidate-audit-") as temp_dir:
-        work_dir = Path(temp_dir)
-        report_path = work_dir / "report.json"
-        _api_base_url, token, _auth_header, _auth_scheme, _trusted_http = (
-            _audit_configuration()
-        )
-        lease_id = current_artifact_lease_id()
-        if not lease_id:
-            raise RuntimeError("candidate audit requires an active artifact lease")
-        child_env = os.environ.copy()
-        child_env.pop("HLTHPRT_CONTROL_API_TOKEN", None)
-        child_env[_ISOLATED_AUDIT_TOKEN_ENV] = token
-        child_env[_ISOLATED_AUDIT_REQUEST_ENV] = _isolated_audit_request(
-            audit_target,
-            artifact_store,
-            report_path,
-            lease_id,
-        )
-        session_options = {"start_new_session": True} if os.name == "posix" else {}
-        process: asyncio.subprocess.Process | None = None
-        spawn_task = asyncio.create_task(
-            asyncio.create_subprocess_exec(
-                sys.executable,
-                "-m",
-                "process.ptg_candidate_audit",
-                env=child_env,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=None,
-                **session_options,
-            )
-        )
-        try:
-            process = await asyncio.shield(spawn_task)
-            exit_code = await process.wait()
-            report = _read_release_audit_report(report_path)
-            return _validate_release_audit_report(
-                audit_target,
-                exit_code=exit_code,
-                report=report,
-            )
-        except BaseException:
-            cleanup_task = asyncio.create_task(
-                _cleanup_isolated_audit(process, spawn_task)
-            )
-            await _await_cleanup(cleanup_task)
-            raise
-
-
-def _signal_process_group(
-    process: asyncio.subprocess.Process,
-    sig: signal.Signals,
-) -> None:
-    with contextlib.suppress(ProcessLookupError):
-        if os.name == "posix":
-            os.killpg(int(process.pid), sig)
-        else:
-            process.send_signal(sig)
-
-
-async def _terminate_isolated_audit(
-    process: asyncio.subprocess.Process,
-) -> None:
-    if process.returncode is not None:
-        await process.wait()
-        return
-    _signal_process_group(process, signal.SIGTERM)
-    try:
-        await asyncio.wait_for(
-            process.wait(),
-            timeout=_ISOLATED_AUDIT_TERM_SECONDS,
-        )
-    except TimeoutError:
-        _signal_process_group(process, signal.SIGKILL)
-        await process.wait()
-
-
-async def _await_cleanup(cleanup_task: asyncio.Task[Any]) -> Any:
-    pending_cancellation: asyncio.CancelledError | None = None
-    while not cleanup_task.done():
-        try:
-            await asyncio.shield(cleanup_task)
-        except asyncio.CancelledError as exc:
-            pending_cancellation = exc
-    result = cleanup_task.result()
-    if pending_cancellation is not None:
-        raise pending_cancellation
-    return result
-
-
-async def _cleanup_isolated_audit(
-    process: asyncio.subprocess.Process | None,
-    spawn_task: asyncio.Task[asyncio.subprocess.Process],
-) -> None:
-    if process is None:
-        try:
-            process = await asyncio.shield(spawn_task)
-        except BaseException:
-            process = None
-    if process is not None:
-        await _terminate_isolated_audit(process)
+    return audit_report
 
 
 def _integer_metrics(mapping: Mapping[str, Any], keys: Sequence[str]) -> dict[str, int]:
@@ -785,10 +473,11 @@ def _audit_summary(report: Mapping[str, Any], report_digest: str) -> dict[str, A
     counts = _integer_metrics(
         checks,
         (
-            "source_occurrence_ids",
-            "api_occurrence_ids",
-            "negative_queries",
-            "random_api_requests_executed",
+            "source_witnesses",
+            "api_witnesses_matched",
+            "api_challenges_executed",
+            "provider_witnesses_validated",
+            "api_audit_occurrences_validated",
         ),
     )
     counts.update(_integer_metrics(http, ("standard_api_actual_http_requests",)))
@@ -797,12 +486,12 @@ def _audit_summary(report: Mapping[str, Any], report_digest: str) -> dict[str, A
     if isinstance(duration, (int, float)) and not isinstance(duration, bool):
         audit_timings_by_metric["duration_seconds"] = float(duration)
     latency = _mapping(report.get("latency"))
-    cold = _mapping(latency.get("cold"))
     for output_key, source_key in (
-        ("cold_first_page_p95_ms", "first_page_first_observation"),
-        ("cold_logical_query_p95_ms", "logical_query"),
+        ("request_p50_ms", "request_p50_ms"),
+        ("request_p95_ms", "request_p95_ms"),
+        ("request_max_ms", "request_max_ms"),
     ):
-        p95_milliseconds = _mapping(cold.get(source_key)).get("p95_ms")
+        p95_milliseconds = latency.get(source_key)
         if isinstance(p95_milliseconds, (int, float)) and not isinstance(
             p95_milliseconds, bool
         ):
@@ -897,28 +586,33 @@ async def _audit_and_activate(
     candidate_target: CandidateAuditTarget,
     *,
     control_run_id: str | None,
-    store: PTG2ArtifactStore,
 ) -> dict[str, Any]:
-    """Audit retained sources, attest the report, and promote the candidate."""
+    """Audit sealed source witnesses, attest the report, and promote."""
 
     await _progress(
         control_run_id,
         snapshot_id=candidate_target.snapshot_id,
         phase="candidate source validation",
-        message="verifying retained source artifacts",
+        message="loading sealed source witnesses from PostgreSQL",
         pct=20,
+    )
+    witness = await load_shared_source_witness(
+        schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+        snapshot_key=candidate_target.snapshot_key,
+        expected_raw_source_sha256=candidate_target.raw_container_sha256,
+        expected_metadata=candidate_target.source_witness,
     )
     await _progress(
         control_run_id,
         snapshot_id=candidate_target.snapshot_id,
         phase="candidate release audit",
-        message="resolving, hashing, and auditing retained sources",
+        message=(
+            f"auditing {len(witness.occurrence_records):,} sealed source occurrences "
+            "through concurrent public API requests"
+        ),
         pct=35,
     )
-    report = await run_isolated_release_audit(
-        candidate_target,
-        store,
-    )
+    report = await run_release_audit(candidate_target, witness)
     await _progress(
         control_run_id,
         snapshot_id=candidate_target.snapshot_id,
@@ -996,20 +690,11 @@ async def main(
                 idempotent=True,
             )
 
-        _audit_configuration()
-        store = PTG2ArtifactStore()
-        lease_owner = hashlib.sha256(
-            f"{IMPORTER_NAME}:{normalized_candidate_run_id}".encode("utf-8")
-        ).hexdigest()[:32]
-        with artifact_lease_context(owner=f"{IMPORTER_NAME}:{lease_owner}", store=store) as lease:
-            return await guard_artifact_lease(
-                lease,
-                _audit_and_activate(
-                    candidate_target,
-                    control_run_id=run_id,
-                    store=store,
-                ),
-            )
+        _audit_configuration(candidate_target.snapshot_id)
+        return await _audit_and_activate(
+            candidate_target,
+            control_run_id=run_id,
+        )
 
 
 __all__ = [
@@ -1019,11 +704,5 @@ __all__ = [
     "candidate_audit_guard",
     "load_candidate_audit_target",
     "main",
-    "resolve_retained_raw_files",
-    "run_isolated_release_audit",
     "run_release_audit",
 ]
-
-
-if __name__ == "__main__":
-    raise SystemExit(run_isolated_audit_child())

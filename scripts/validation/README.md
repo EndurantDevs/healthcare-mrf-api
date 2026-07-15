@@ -46,9 +46,15 @@ and `--api-audit-path` when calling the service directly. `--header NAME=VALUE`
 supports API keys or other non-Bearer auth. Values from auth arguments and
 headers are never emitted to the report.
 
-New imports are not public until this audit passes. To audit a `validated`
-candidate, also provide its exact logical source and market selectors and use
-`--validated-candidate`:
+This full-source harness is a qualification and forensic gate after scanner,
+publisher, or serving changes. It is deliberately slower and is not the
+synchronous activation gate for every import. Automatic activation uses the
+bounded PostgreSQL source-witness audit documented in
+`docs/imports/ptg.md`; that path performs up to 2,048 exact source challenges
+plus one served-sample preflight and completes or fails within 55 seconds.
+
+To exercise this deep audit against a still-`validated` candidate, provide its
+exact logical source and market selectors and use `--validated-candidate`:
 
 ```bash
 export PTG_AUDIT_SOURCE_KEY='...'
@@ -68,21 +74,22 @@ python3 scripts/validation/ptg2_v3_source_api_audit.py \
 
 Candidate mode forces the control-authenticated
 `/api/v1/pricing/providers/audit-search-by-procedure` path. Supplying the same
-header to a public pricing route does not grant candidate access. After a
-passing run, submit the parsed report object to
-`POST /control/v1/ptg/source-snapshots/attest` with the exact four selectors,
-then call `POST /control/v1/ptg/source-snapshots/promote`. Promotion rechecks
-and consumes the attestation in the same PostgreSQL transaction as all pointer
-changes; it does not accept a report path or local cache file. Routine
-deployments should have an authenticated, bounded audit worker perform these
-steps asynchronously. The contract does not depend on a particular
+header to a public pricing route does not grant candidate access. The deep
+audit report is evidence but is not accepted by the automatic activation
+attestation. The generic `ptg-candidate-audit` worker loads the import-time
+source witness from PostgreSQL, runs the bounded `aiohttp` client on enforced
+`uvloop`, stores its canonical redacted report, and atomically promotes the
+exact predecessor. No report path, retained source path, or local cache file is
+accepted by promotion. The contract does not depend on a particular
 orchestration product.
 
-Attestation accepts only the configured audit tool/version and a report whose
+Activation attestation accepts only the bounded audit tool/version, explicit
+`aiohttp`/`uvloop` runtime evidence, and a report whose
 completion time is within
 `HLTHPRT_PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES` (120 minutes by default).
-It binds the report to the candidate's sealed persisted-sample digest and
-complete source-set digest. The resulting single-use PostgreSQL receipt is
+It binds the report to the candidate's sealed source-witness digest,
+persisted-sample digest, and complete source-set digest. The resulting
+single-use PostgreSQL receipt is
 eligible for promotion for
 `HLTHPRT_PTG2_CANDIDATE_ATTESTATION_TTL_HOURS` (24 hours by default). These are
 separate windows: an old report cannot be resubmitted to renew an attestation.
@@ -96,7 +103,7 @@ echo that logical key and the audit endpoint rejects another logical snapshot
 owner. The endpoint recomputes the complete bounded persisted-sample digest
 from PostgreSQL before returning each page.
 
-The release profile requires at least 2,500 independently selected source
+This deep audit's release profile requires at least 2,500 independently selected source
 occurrences, 2,500 independently selected persisted API occurrences, 2,500
 positive pseudo-random standard-pricing API requests, and 250 negative code/NPI
 recombinations. Defaults request 500 negative candidates. Release mode rejects
@@ -321,11 +328,13 @@ The release profile requires all of the following:
 - Candidate audits have at least 30 successful samples and zero errors. Their
   lane count and availability are independent from build lanes, monthly and
   peak utilization must stay at or below 70 percent, maximum queue age is 30
-  minutes, and every activation is charged at least 3,000 standard-API HTTP
-  requests. Observed request totals, observation duration, and derived request
-  rate must reconcile with per-activation floors and the contention interval.
-  At the release objective that floor is 6,000,000 audit HTTP requests per
-  month.
+  minutes, and every full 2,048-record activation is charged its observed
+  occurrence-witness count plus one preflight. The normal 48-provider-reserve
+  baseline is 2,001 requests; 2,049 is the provider-empty maximum. Observed
+  request totals, duration, and derived request rate must reconcile with each
+  activation and the contention interval. At the release objective the
+  normal no-retry baseline is 4,002,000 audit HTTP requests per month, with
+  4,098,000 as the absolute maximum.
 - Peak evidence is a gap-free, fully covered sequence of individually
   timestamped windows spanning at least seven days; every window is at least 30
   minutes. Each window's logical, unique-build, reuse, audit, and queue counts
@@ -339,7 +348,9 @@ The release profile requires all of the following:
 - Simultaneous import, candidate-audit, and normal API contention lasts at
   least 30 minutes. It covers every configured import and audit lane, at least
   3,000 API requests, at least 1 request/second, and enough audit request rate
-  to deliver 3,000 HTTP calls per active audit within its measured duration.
+  to deliver each audit's occurrence-witness count plus one preflight within
+  its measured duration (normally 2,001 calls), plus observed retries and
+  bounded pagination.
   Redacted timestamps must cover at least 99 percent of the contention interval
   with no import, audit, or HTTP observation gap greater than five seconds.
 - Fresh processes produce separate cold first-page p95 values at or below 40

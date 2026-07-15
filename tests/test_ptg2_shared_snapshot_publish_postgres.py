@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -201,6 +202,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
     schema_name = f"ptg2_shared_publish_{uuid.uuid4().hex[:16]}"
     quoted_schema = '"' + schema_name + '"'
     snapshot_id = f"shared-smoke-{uuid.uuid4().hex}"
+    artifact_digest = hashlib.sha256(scan["artifact"].read_bytes()).hexdigest()
     source_identity = SharedPhysicalArtifactIdentity(
         "in_network",
         "logical_json_sha256_v1",
@@ -211,7 +213,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         identity=source_identity,
         source_trace_set_hash="b" * 64,
         source_trace_hashes=("c" * 64,),
-        raw_container_sha256="d" * 64,
+        raw_container_sha256=artifact_digest,
         logical_json_sha256="a" * 64,
         logical_hash_deferred=False,
     )
@@ -331,6 +333,13 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
             graph_artifact_entries=graph_entries,
+            source_audit_witness_entries=(
+                scanner_tests._single_frame(
+                    scan["frames"],
+                    "source_audit_witness_file",
+                ),
+            ),
+            expected_raw_source_sha256=(artifact_digest,),
             provider_identifier_quarantine=scanner_summary[
                 "provider_identifier_quarantine"
             ],
@@ -447,7 +456,16 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
                    FROM {quoted_schema}.ptg2_v3_code)
             """
         )
-        assert tuple(int(value) for value in row_counts) == (2, 1, 1, 1, 1, 1, 3, 1)
+        assert tuple(int(table_count) for table_count in row_counts) == (
+            2,
+            1,
+            1,
+            1,
+            1,
+            1,
+            3,
+            1,
+        )
         provider_set_key = int(
             await db.scalar(
                 f"SELECT provider_set_key FROM {quoted_schema}.ptg2_v3_provider_set"
@@ -465,9 +483,14 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
              ORDER BY reported_code
             """
         )
-        code_keys = {str(row[0]): int(row[1]) for row in code_key_rows}
+        code_keys = {
+            str(code_key_record[0]): int(code_key_record[1])
+            for code_key_record in code_key_rows
+        }
         assert set(code_keys) == {"99213", "99214"}
-        assert {str(row[2]) for row in code_key_rows} == {"FFS"}
+        assert {str(code_key_record[2]) for code_key_record in code_key_rows} == {
+            "FFS"
+        }
         audit_rows = await db.all(
             f"""
             SELECT occurrence_id, atom_ordinal, atom_key
@@ -752,6 +775,13 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
             graph_artifact_entries=graph_entries,
+            source_audit_witness_entries=(
+                scanner_tests._single_frame(
+                    scan["frames"],
+                    "source_audit_witness_file",
+                ),
+            ),
+            expected_raw_source_sha256=(artifact_digest,),
             provider_identifier_quarantine=scanner_summary[
                 "provider_identifier_quarantine"
             ],

@@ -150,6 +150,7 @@ def _scanner_environment(
     env = {
         **os.environ,
         "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v3",
+        "HLTHPRT_PTG2_RAW_SOURCE_SHA256": "00" * 32,
         "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID": (b"\xcc" * 32).hex(),
         "HLTHPRT_PTG2_V3_SERVING_RUN_DIR": str(serving_run_directory),
         "HLTHPRT_PTG2_V3_SERVING_RUN_PARTITIONS": "4",
@@ -248,6 +249,9 @@ def _run_parallel_scanner(
     scanner_env_map = _scanner_environment(
         workers, queue_size, run_dir / "serving-runs"
     )
+    scanner_env_map["HLTHPRT_PTG2_RAW_SOURCE_SHA256"] = hashlib.sha256(
+        artifact.read_bytes()
+    ).hexdigest()
     scanner_env_map.update(
         {COPY_ENV_BY_KIND[kind]: str(copy_path) for kind, copy_path in copy_path_by_kind.items()}
     )

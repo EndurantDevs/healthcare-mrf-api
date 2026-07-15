@@ -55,14 +55,18 @@ A representative dev import is required before broad deployment. Record:
 - no pod-local serving cache files before or after requests;
 - exact source/API audit results from the original JSON or gzip inputs.
 
-The release audit is `scripts/validation/ptg2_v3_source_api_audit.py`. In its
-release profile it enforces at least 2,500 source-selected occurrences, 2,500
-independently API-selected occurrences, 2,500 deterministic random pricing
-requests, 3,000 observed standard API HTTP requests, and 250 negative checks.
-It compares exact fields, duplicate multiplicity, and raw-container SHA-256
-source attribution. The report must be freshly attested against the sealed
-sample/source-set digests, and activation must consume that receipt through an
-exact-predecessor transaction before the run counts as published evidence.
+Automatic activation uses the bounded PostgreSQL source-witness audit. It
+reparses exactly 2,048 combined witnesses for a large population (normally
+2,000 emitted price/provider occurrences and 48 provider references), runs one
+served-sample preflight plus one standard API challenge per occurrence,
+requires `aiohttp` on `uvloop`, and fails closed at 55 seconds. The report must
+be freshly attested against the sealed witness,
+sample, and source-set digests, and activation must consume that receipt
+through an exact-predecessor transaction.
+
+No complete-file audit is required for activation. The bounded PostgreSQL
+witness verifier is the authoritative release gate and compares authenticated
+raw source fragments with standard API responses without a second source scan.
 
 Do not claim the 10-15 minute import target or a cold p95 below 40 ms until the
 representative dev run satisfies those gates.

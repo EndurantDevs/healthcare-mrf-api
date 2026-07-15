@@ -1393,14 +1393,14 @@ def _candidate_attestation_fixture_report():
     return candidate_fixture_map
 
 
-def test_capacity_section_preserves_candidate_attestation_fixture_contract():
-    """Capacity evidence remains valid for the candidate attestation fixture."""
+def test_candidate_attestation_rejects_legacy_full_source_report():
+    """Only the bounded witness report may authorize candidate activation."""
 
-    evidence = ptg2_candidate_attestation.validate_candidate_release_audit_report(
-        _candidate_attestation_fixture_report(),
-        snapshot_id="snap_new",
-        source_key="source_a",
-        plan_id="12-3456789",
-        plan_market_type="group",
-    )
-    assert evidence["standard_api_actual_http_requests"] == 3_000
+    with pytest.raises(ValueError, match="missing=runtime"):
+        ptg2_candidate_attestation.validate_candidate_release_audit_report(
+            _candidate_attestation_fixture_report(),
+            snapshot_id="snap_new",
+            source_key="source_a",
+            plan_id="12-3456789",
+            plan_market_type="group",
+        )
