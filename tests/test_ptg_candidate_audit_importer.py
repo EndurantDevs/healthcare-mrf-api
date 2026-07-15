@@ -23,9 +23,16 @@ ptg_candidate_audit = importlib.import_module("process.ptg_candidate_audit")
 
 RAW_DIGEST = "ab" * 32
 EMPTY_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload({})
+NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload(
+    {123456789: 2}
+)
 
 
-def _candidate_row(*, activated: bool = False) -> dict[str, object]:
+def _candidate_row(
+    *,
+    activated: bool = False,
+    provider_identifier_quarantine=EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+) -> dict[str, object]:
     snapshot_id = "candidate-snapshot"
     activation_map = {
         "contract": "ptg2_candidate_activation_v1",
@@ -38,7 +45,7 @@ def _candidate_row(*, activated: bool = False) -> dict[str, object]:
     serving_index = {
         "arch_version": "postgres_binary_v3",
         "storage_generation": "shared_blocks_v3",
-        "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+        "provider_identifier_quarantine": provider_identifier_quarantine,
     }
     return {
         "snapshot_id": snapshot_id,
@@ -53,12 +60,21 @@ def _candidate_row(*, activated: bool = False) -> dict[str, object]:
         "layout_manifest": {"serving_index": serving_index},
         "current_snapshot_id": snapshot_id if activated else "previous-snapshot",
         "audit_report_digest": bytes.fromhex("cd" * 32) if activated else None,
-        "audit_report": _passing_report() if activated else None,
+        "audit_report": (
+            _passing_report(
+                provider_identifier_quarantine=provider_identifier_quarantine
+            )
+            if activated
+            else None
+        ),
         "audit_activated_at": "2026-07-13T12:00:00+00:00" if activated else None,
     }
 
 
-def _passing_report() -> dict[str, object]:
+def _passing_report(
+    *,
+    provider_identifier_quarantine=EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+) -> dict[str, object]:
     return {
         "status": "pass",
         "release_gate_eligible": True,
@@ -78,13 +94,17 @@ def _passing_report() -> dict[str, object]:
         },
         "source": {
             "private_detail": "must-not-leak",
-            "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+            "provider_identifier_quarantine": provider_identifier_quarantine,
         },
         "failures": {"examples": [{"body": "must-not-leak"}]},
     }
 
 
-def _target(*, activated: bool = False) -> ptg_candidate_audit.CandidateAuditTarget:
+def _target(
+    *,
+    activated: bool = False,
+    provider_identifier_quarantine=EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+) -> ptg_candidate_audit.CandidateAuditTarget:
     return ptg_candidate_audit.CandidateAuditTarget(
         candidate_run_id="ptg2:derived-import",
         snapshot_id="candidate-snapshot",
@@ -95,9 +115,15 @@ def _target(*, activated: bool = False) -> ptg_candidate_audit.CandidateAuditTar
         expected_current_snapshot_id="previous-snapshot",
         current_snapshot_id="candidate-snapshot" if activated else "previous-snapshot",
         raw_container_sha256=(RAW_DIGEST,),
-        provider_identifier_quarantine=EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+        provider_identifier_quarantine=provider_identifier_quarantine,
         activated=activated,
-        audit_report=_passing_report() if activated else None,
+        audit_report=(
+            _passing_report(
+                provider_identifier_quarantine=provider_identifier_quarantine
+            )
+            if activated
+            else None
+        ),
         audit_report_digest="cd" * 32 if activated else None,
     )
 
@@ -291,6 +317,49 @@ def test_release_audit_uses_validated_candidate_and_unmodified_release_defaults(
     assert work_dir_list[0] is not None and not work_dir_list[0].exists()
 
 
+def test_release_audit_accepts_exact_nonempty_provider_quarantine(
+    monkeypatch,
+    tmp_path,
+):
+    captured_arguments: list[str] = []
+    expected_report = _passing_report(
+        provider_identifier_quarantine=NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
+    )
+
+    def run_cli(audit_arguments):
+        captured_arguments.extend(audit_arguments)
+        report_path = type(tmp_path)(
+            audit_arguments[audit_arguments.index("--report") + 1]
+        )
+        report_path.write_text(json.dumps(expected_report), encoding="utf-8")
+        return 0
+
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
+        "https://public-api.internal.example",
+    )
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
+    monkeypatch.setattr(
+        ptg_candidate_audit.ptg2_v3_source_api_audit,
+        "run_audit_cli",
+        run_cli,
+    )
+
+    report = ptg_candidate_audit.run_release_audit(
+        _target(
+            provider_identifier_quarantine=(
+                NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
+            )
+        ),
+        (tmp_path / "source.json.gz",),
+    )
+
+    assert report == expected_report
+    assert captured_arguments[
+        captured_arguments.index("--max-invalid-npis") + 1
+    ] == "2"
+
+
 def test_release_audit_failure_is_deterministic_and_not_retryable(monkeypatch, tmp_path):
     def run_cli(argv):
         report_path = type(tmp_path)(argv[argv.index("--report") + 1])
@@ -320,7 +389,9 @@ def test_release_audit_failure_is_deterministic_and_not_retryable(monkeypatch, t
 @pytest.mark.asyncio
 async def test_passing_audit_attests_then_activates(monkeypatch, tmp_path):
     events: list[str] = []
-    report = _passing_report()
+    report = _passing_report(
+        provider_identifier_quarantine=NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
+    )
     monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
     monkeypatch.setattr(
         ptg_candidate_audit,
@@ -345,7 +416,11 @@ async def test_passing_audit_attests_then_activates(monkeypatch, tmp_path):
     monkeypatch.setattr(ptg_candidate_audit, "promote_ptg2_source_snapshot", promote)
 
     result = await ptg_candidate_audit._audit_and_activate(
-        _target(),
+        _target(
+            provider_identifier_quarantine=(
+                NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
+            )
+        ),
         control_run_id="control-run",
         store=PTG2ArtifactStore(tmp_path / "store"),
     )

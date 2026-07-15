@@ -11,7 +11,7 @@
     "function_name_shape": 126,
     "global_state_usage": 26,
     "inline_suppressions": 33,
-    "long_files": 131,
+    "long_files": 132,
     "long_functions": 755,
     "missing_contract_docstrings": 77,
     "pass_placeholders": 14,
@@ -3735,6 +3735,7 @@
       "long_file:tests/test_ptg2_v3_shared_schema.py",
       "long_file:tests/test_ptg2_v3_source_api_audit.py",
       "long_file:tests/test_ptg2_v3_source_api_audit_capacity.py",
+      "long_file:tests/test_ptg_candidate_audit_importer.py",
       "long_file:tests/test_reports_api.py"
     ],
     "long_functions": [

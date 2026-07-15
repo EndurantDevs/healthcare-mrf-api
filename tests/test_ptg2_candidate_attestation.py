@@ -663,6 +663,49 @@ def test_activation_rejects_report_quarantine_changed_after_attestation(monkeypa
         )
 
 
+def test_activation_rejects_stored_report_changed_after_attestation(monkeypatch):
+    report = _release_report()
+    report_digest = hashlib.sha256(
+        ptg2_candidate_attestation._canonical_report_bytes(report)
+    ).digest()
+    report["duration_seconds"] = 601.0
+    session = _Session(_Result((report_digest, report)))
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "_locked_candidate_identity",
+        AsyncMock(
+            return_value={
+                "snapshot_key": 17,
+                "source_key": "source_a",
+                "plan_id": "12-3456789",
+                "plan_market_type": "group",
+                "coverage_scope_id": b"c" * 32,
+                "source_set_digest": b"s" * 32,
+                "audit_sample_digest": bytes.fromhex("ab" * 32),
+                "provider_identifier_quarantine": (
+                    EMPTY_PROVIDER_IDENTIFIER_QUARANTINE
+                ),
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="report changed after validation"):
+        asyncio.run(
+            ptg2_candidate_attestation.verify_candidate_audit_attestation_in_transaction(
+                session,
+                schema_name="mrf",
+                snapshot_id="snap_new",
+                snapshot_key=17,
+                source_key="source_a",
+                plan_id="12-3456789",
+                plan_market_type="group",
+                coverage_scope_id=b"c" * 32,
+            )
+        )
+
+    assert len(session.calls) == 1
+
+
 def test_strict_candidate_publication_preserves_locked_manifest():
     session = _Session()
     asyncio.run(

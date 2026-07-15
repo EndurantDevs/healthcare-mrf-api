@@ -105,9 +105,6 @@ ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_rust_stage = importlib.import_module("process.ptg_parts.rust_stage")
 ptg_manifest_publish = importlib.import_module("process.ptg_parts.ptg2_manifest_publish")
-ptg_provider_quarantine = importlib.import_module(
-    "process.ptg_parts.ptg2_provider_quarantine"
-)
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
 
 
