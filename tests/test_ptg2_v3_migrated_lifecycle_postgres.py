@@ -427,7 +427,7 @@ def _release_report(
         "schema_version": 2,
         "harness": {
             "name": "ptg2_v3_source_api_audit",
-            "version": "2.9.0",
+            "version": "2.10.0",
         },
         "status": "pass",
         "profile": "release",
@@ -891,6 +891,9 @@ async def test_v3_lifecycle_fails_closed(
                 },
             ),
             graph_artifact_entries=graph_entries,
+            provider_identifier_quarantine=scanner_summary[
+                "provider_identifier_quarantine"
+            ],
             scratch_parent=tmp_path,
         )
         assert publication.snapshot_key == first_reservation.snapshot_key

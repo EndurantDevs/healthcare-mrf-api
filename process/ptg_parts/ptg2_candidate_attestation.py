@@ -18,11 +18,14 @@ from process.ptg_parts.ptg2_shared_reuse import (
     shared_source_set_metadata,
 )
 from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
+from process.ptg_parts.ptg2_provider_quarantine import (
+    validate_provider_identifier_quarantine,
+)
 
 
 PTG2_CANDIDATE_ATTESTATION_CONTRACT = "ptg2_v3_release_audit_attestation_v1"
 PTG2_CANDIDATE_AUDIT_TOOL = "ptg2_v3_source_api_audit"
-PTG2_CANDIDATE_AUDIT_TOOL_VERSION = "2.9.0"
+PTG2_CANDIDATE_AUDIT_TOOL_VERSION = "2.10.0"
 PTG2_CANDIDATE_API_PATH = "/api/v1/pricing/providers/audit-search-by-procedure"
 PTG2_CANDIDATE_OCCURRENCE_API_PATH = "/api/v1/pricing/providers/audit-occurrences"
 PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_ENV = (
@@ -211,6 +214,10 @@ def validate_candidate_release_audit_report(
     http = _required_report_mapping(report_map, "http")
     audit_sample = _required_report_mapping(report_map, "api_audit_sample")
     redaction = _required_report_mapping(report_map, "redaction")
+    source = _required_report_mapping(report_map, "source")
+    provider_identifier_quarantine = validate_provider_identifier_quarantine(
+        source.get("provider_identifier_quarantine")
+    )
     evaluation_time = evaluated_at or datetime.datetime.now(datetime.timezone.utc)
     if evaluation_time.tzinfo is None or evaluation_time.utcoffset() is None:
         evaluation_time = evaluation_time.replace(tzinfo=datetime.timezone.utc)
@@ -311,6 +318,7 @@ def validate_candidate_release_audit_report(
         "report_json": report_bytes.decode("utf-8"),
         "completed_at": completed_at,
         "audit_sample_digest": audit_sample_digest,
+        "provider_identifier_quarantine": provider_identifier_quarantine,
         "checks": observed_checks,
         "standard_api_actual_http_requests": standard_http_requests,
     }
@@ -344,6 +352,16 @@ def _candidate_identity(row: Mapping[str, Any]) -> dict[str, Any]:
     snapshot_audit_sample = _mapping(serving_index.get("audit_sample"))
     layout_serving_index = _mapping(layout_manifest.get("serving_index"))
     layout_audit_sample = _mapping(layout_serving_index.get("audit_sample"))
+    snapshot_quarantine = validate_provider_identifier_quarantine(
+        serving_index.get("provider_identifier_quarantine")
+    )
+    layout_quarantine = validate_provider_identifier_quarantine(
+        layout_serving_index.get("provider_identifier_quarantine")
+    )
+    if snapshot_quarantine != layout_quarantine:
+        raise ValueError(
+            "candidate provider identifier quarantine changed after layout sealing"
+        )
     raw_container_hashes = [
         _sha256_hex(value, field="candidate raw container digest")
         for value in list(row.get("raw_container_sha256_values") or [])
@@ -396,6 +414,7 @@ def _candidate_identity(row: Mapping[str, Any]) -> dict[str, Any]:
         "coverage_scope_id": coverage_scope_id,
         "source_set_digest": source_set_digest,
         "audit_sample_digest": layout_audit_sample_digest,
+        "provider_identifier_quarantine": layout_quarantine,
     }
 
 
@@ -515,6 +534,13 @@ async def record_candidate_audit_attestation(
             raise ValueError("audit target does not match the candidate bindings")
         if evidence["audit_sample_digest"] != identity["audit_sample_digest"]:
             raise ValueError("audit report does not match the sealed candidate sample")
+        if (
+            evidence["provider_identifier_quarantine"]
+            != identity["provider_identifier_quarantine"]
+        ):
+            raise ValueError(
+                "audit report provider identifier quarantine does not match the sealed candidate"
+            )
         result = await session.execute(
             db.text(
                 f"""
@@ -608,7 +634,7 @@ async def verify_candidate_audit_attestation_in_transaction(
     result = await session.execute(
         db.text(
             f"""
-            SELECT report_digest
+            SELECT report_digest, report
               FROM {_quote_ident(schema_name)}.ptg2_v3_candidate_audit_attestation
              WHERE snapshot_id = :snapshot_id
                AND snapshot_key = :snapshot_key
@@ -636,13 +662,27 @@ async def verify_candidate_audit_attestation_in_transaction(
             "contract": PTG2_CANDIDATE_ATTESTATION_CONTRACT,
         },
     )
-    row = result.first()
-    if row is None:
+    attestation_row = result.first()
+    if attestation_row is None:
         raise ValueError("candidate has no current passing release audit attestation")
-    digest = bytes(row[0])
-    if len(digest) != 32:
+    report_digest = bytes(attestation_row[0])
+    if len(report_digest) != 32:
         raise ValueError("candidate audit attestation digest is invalid")
-    return digest
+    stored_report = _mapping(attestation_row[1])
+    observed_report_digest = hashlib.sha256(
+        _canonical_report_bytes(stored_report)
+    ).digest()
+    if observed_report_digest != report_digest:
+        raise ValueError("candidate audit attestation report changed after validation")
+    report_source = _required_report_mapping(stored_report, "source")
+    report_quarantine = validate_provider_identifier_quarantine(
+        report_source.get("provider_identifier_quarantine")
+    )
+    if report_quarantine != identity["provider_identifier_quarantine"]:
+        raise ValueError(
+            "candidate provider identifier quarantine changed after its release audit"
+        )
+    return report_digest
 
 
 async def consume_candidate_audit_attestation_in_transaction(

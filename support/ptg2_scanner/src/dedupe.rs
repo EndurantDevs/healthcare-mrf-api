@@ -4,7 +4,9 @@ use crate::hashing::{
     provider_set_component_key, provider_set_entry_key, shard_for_u128, shard_for_u64,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
@@ -57,6 +59,108 @@ struct DedupeCounter {
     unique: AtomicU64,
 }
 
+const PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT: &str = "ptg2_provider_identifier_quarantine_v1";
+const PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN: &[u8] =
+    b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V1\0";
+const MAX_QUARANTINED_PROVIDER_IDENTIFIERS: usize = 1024;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProviderIdentifierQuarantine {
+    occurrences_by_value: BTreeMap<i64, u64>,
+}
+
+impl ProviderIdentifierQuarantine {
+    fn digest_hex(digest: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
+    }
+
+    pub fn record(&mut self, values: &[i64]) -> io::Result<()> {
+        for value in values {
+            if *value == 0 || (1_000_000_000..=9_999_999_999).contains(value) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider identifier quarantine contains a non-malformed value",
+                ));
+            }
+            if !self.occurrences_by_value.contains_key(value)
+                && self.occurrences_by_value.len() >= MAX_QUARANTINED_PROVIDER_IDENTIFIERS
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider identifier quarantine exceeds 1024 distinct values",
+                ));
+            }
+            let count = self.occurrences_by_value.entry(*value).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider identifier quarantine occurrence count overflow",
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn merge(&mut self, other: &Self) -> io::Result<()> {
+        for (value, count) in &other.occurrences_by_value {
+            if !self.occurrences_by_value.contains_key(value)
+                && self.occurrences_by_value.len() >= MAX_QUARANTINED_PROVIDER_IDENTIFIERS
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider identifier quarantine exceeds 1024 distinct values",
+                ));
+            }
+            let current = self.occurrences_by_value.entry(*value).or_default();
+            *current = current.checked_add(*count).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider identifier quarantine occurrence count overflow",
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn payload(&self) -> io::Result<Value> {
+        let mut digest = Sha256::new();
+        digest.update(PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN);
+        let mut occurrence_count = 0u64;
+        let entries = self
+            .occurrences_by_value
+            .iter()
+            .map(|(value, count)| -> io::Result<Value> {
+                occurrence_count = occurrence_count.checked_add(*count).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "provider identifier quarantine occurrence count overflow",
+                    )
+                })?;
+                digest.update(value.to_string().as_bytes());
+                digest.update([0]);
+                digest.update(count.to_be_bytes());
+                Ok(json!({
+                    "value": value.to_string(),
+                    "occurrence_count": count,
+                }))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(json!({
+            "contract": PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT,
+            "occurrence_count": occurrence_count,
+            "distinct_value_count": entries.len(),
+            "entries": entries,
+            "sha256": Self::digest_hex(&digest.finalize()),
+        }))
+    }
+}
+
 impl DedupeCounter {
     fn new() -> Self {
         Self {
@@ -105,6 +209,7 @@ pub struct SharedDedupe {
     provider_entry_component_counter: DedupeCounter,
     provider_group_counter: DedupeCounter,
     provider_group_member_counter: DedupeCounter,
+    provider_identifier_quarantine: Mutex<ProviderIdentifierQuarantine>,
 }
 
 impl SharedDedupe {
@@ -139,6 +244,7 @@ impl SharedDedupe {
             provider_entry_component_counter: DedupeCounter::new(),
             provider_group_counter: DedupeCounter::new(),
             provider_group_member_counter: DedupeCounter::new(),
+            provider_identifier_quarantine: Mutex::new(ProviderIdentifierQuarantine::default()),
         }
     }
 
@@ -240,6 +346,20 @@ impl SharedDedupe {
         let inserted = self.provider_group_member.insert(key);
         self.provider_group_member_counter.record(inserted);
         inserted
+    }
+
+    pub fn record_quarantined_provider_identifiers(&self, values: &[i64]) -> io::Result<()> {
+        self.provider_identifier_quarantine
+            .lock()
+            .map_err(|_| io::Error::other("provider identifier quarantine lock poisoned"))?
+            .record(values)
+    }
+
+    pub fn provider_identifier_quarantine(&self) -> io::Result<ProviderIdentifierQuarantine> {
+        self.provider_identifier_quarantine
+            .lock()
+            .map_err(|_| io::Error::other("provider identifier quarantine lock poisoned"))
+            .map(|quarantine| quarantine.clone())
     }
 }
 

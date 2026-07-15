@@ -128,7 +128,13 @@ pub fn strict_integer(value: &Value, field_name: &str) -> io::Result<i64> {
         })
 }
 
-pub fn strict_npi_list(value: Option<&Value>) -> io::Result<Vec<i64>> {
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StrictNpiList {
+    pub valid: Vec<i64>,
+    pub quarantined: Vec<i64>,
+}
+
+pub fn strict_npi_partition(value: Option<&Value>) -> io::Result<StrictNpiList> {
     let Some(Value::Array(items)) = value else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -142,22 +148,31 @@ pub fn strict_npi_list(value: Option<&Value>) -> io::Result<Vec<i64>> {
         ));
     }
     if items.len() == 1 && strict_integer(&items[0], "provider group npi element")? == 0 {
-        return Ok(Vec::new());
+        return Ok(StrictNpiList::default());
     }
-    let mut out = Vec::with_capacity(items.len());
+    let mut valid = Vec::with_capacity(items.len());
+    let mut quarantined = Vec::new();
     for item in items {
         let npi = strict_integer(item, "provider group npi element")?;
-        if !is_valid_npi(npi) {
+        if npi == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("provider group npi element is outside the 10-digit range: {npi}"),
+                "provider group zero NPI marker must be the sole array element",
             ));
+        } else if is_valid_npi(npi) {
+            valid.push(npi);
+        } else {
+            quarantined.push(npi);
         }
-        out.push(npi);
     }
-    out.sort_unstable();
-    out.dedup();
-    Ok(out)
+    valid.sort_unstable();
+    valid.dedup();
+    quarantined.sort_unstable();
+    Ok(StrictNpiList { valid, quarantined })
+}
+
+pub fn strict_npi_list(value: Option<&Value>) -> io::Result<Vec<i64>> {
+    Ok(strict_npi_partition(value)?.valid)
 }
 
 pub fn normalize_money_text(text: String) -> Option<String> {
@@ -402,7 +417,7 @@ mod tests {
         normalize_tin_type, normalize_tin_value, normalized_money_from_reader,
         normalized_scalar_from_reader, normalized_string_list_from_reader, npi_list,
         strict_integer, strict_integer_text, strict_money_number_from_reader, strict_npi_list,
-        strict_string_array_from_reader,
+        strict_npi_partition, strict_string_array_from_reader, StrictNpiList,
     };
     use serde_json::json;
     use struson::reader::JsonStreamReader;
@@ -434,7 +449,7 @@ mod tests {
     fn normalizes_npi_lists_to_ten_digit_values() {
         assert_eq!(
             npi_list(Some(&json!([
-                "114911247",
+                "123456789",
                 "1234567890",
                 1234567890.0,
                 1.23456789e9,
@@ -466,6 +481,13 @@ mod tests {
             strict_npi_list(Some(&json!([0]))).unwrap(),
             Vec::<i64>::new()
         );
+        assert_eq!(
+            strict_npi_partition(Some(&json!([123456789, 1234567890, 123456789]))).unwrap(),
+            StrictNpiList {
+                valid: vec![1234567890],
+                quarantined: vec![123456789, 123456789],
+            }
+        );
         for invalid in [
             json!(1234567890_i64),
             json!([]),
@@ -473,7 +495,6 @@ mod tests {
             json!([true]),
             json!([{}]),
             json!([[]]),
-            json!([123456789]),
             json!([0, 1234567890]),
             json!([1234567890, 0]),
             json!([0, 0]),

@@ -182,6 +182,8 @@ jobs:
           tests/test_ptg2_v3_shared_schema.py
           tests/test_ptg2_v3_source_api_audit.py
           tests/test_ptg2_v3_source_api_audit_capacity.py
+          tests/test_ptg2_provider_quarantine.py
+          tests/test_ptg_candidate_audit_importer.py
           tests/test_pricing_api.py
           tests/test_ptg_control_unit.py
           tests/test_ptg_snapshot_claim_race.py

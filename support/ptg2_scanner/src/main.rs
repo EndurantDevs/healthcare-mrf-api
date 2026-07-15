@@ -15,7 +15,9 @@ use ptg2_scanner::copy_format::{
     emit_compact_copy_row, pg_text_array_copy_field, pg_text_copy_field, write_copy_fields,
     CompactCopyRow,
 };
-use ptg2_scanner::dedupe::{dedupe_summary_payload, emit_dedupe_summary, SharedDedupe};
+use ptg2_scanner::dedupe::{
+    dedupe_summary_payload, emit_dedupe_summary, ProviderIdentifierQuarantine, SharedDedupe,
+};
 use ptg2_scanner::hashing::{
     checksum_i64_list, finish_hash_hex, hash_i64_list, hash_string_list, hash_text, make_checksum,
     semantic_hash, update_hash_optional_str, update_hash_string_list, xxh3_63,
@@ -35,7 +37,7 @@ use ptg2_scanner::manifest::{
 };
 use ptg2_scanner::normalize::{
     canonical_text_list, normalize_code, normalize_string, normalize_tin_type, normalize_tin_value,
-    strict_integer_text, strict_money_number_from_reader, strict_npi_list,
+    strict_integer_text, strict_money_number_from_reader, strict_npi_list, strict_npi_partition,
     strict_string_array_from_reader,
 };
 use ptg2_scanner::output::{emit_json_record, emit_object};
@@ -336,6 +338,7 @@ struct ProviderEntry {
     provider_count: i64,
     provider_group_hashes: Vec<i64>,
     npi: Vec<i64>,
+    quarantined_npi: Vec<i64>,
     network_names: Vec<String>,
 }
 
@@ -942,13 +945,23 @@ fn log_worker_failure(worker_id: usize, failure_type: &str, message: &str) {
     );
 }
 
-fn provider_group_hash(tin: &Value, npi: &[i64]) -> i64 {
-    make_checksum(vec![
+fn provider_group_hash(tin: &Value, npi: &[i64], quarantined_npi: &[i64]) -> i64 {
+    let mut payload = vec![
         json!("provider_group"),
         json!(normalize_tin_type(tin.get("type"))),
         json!(normalize_tin_value(tin.get("value"))),
         json!(npi),
-    ])
+    ];
+    if !quarantined_npi.is_empty() {
+        let mut distinct_quarantined_npi = quarantined_npi.to_vec();
+        distinct_quarantined_npi.sort_unstable();
+        distinct_quarantined_npi.dedup();
+        payload.push(json!({
+            "quarantined_npi": distinct_quarantined_npi,
+            "contract": "provider_group_quarantined_npi_v1",
+        }));
+    }
+    make_checksum(payload)
 }
 
 fn validate_optional_string_value(value: Option<&Value>, field_name: &str) -> io::Result<()> {
@@ -1014,13 +1027,25 @@ fn provider_group_payload_canonical_json(
     tin_type: &str,
     tin_value: &str,
     npi: &[i64],
+    quarantined_npi: &[i64],
 ) -> String {
     let tin_type_json = serde_json::to_string(tin_type).unwrap_or_else(|_| "\"\"".to_string());
     let tin_value_json = serde_json::to_string(tin_value).unwrap_or_else(|_| "\"\"".to_string());
     let npi_json = serde_json::to_string(npi).unwrap_or_else(|_| "[]".to_string());
-    format!(
-        "{{\"npi\":{npi_json},\"provider_group_hash\":{provider_group_hash},\"tin_type\":{tin_type_json},\"tin_value\":{tin_value_json}}}"
-    )
+    if quarantined_npi.is_empty() {
+        format!(
+            "{{\"npi\":{npi_json},\"provider_group_hash\":{provider_group_hash},\"tin_type\":{tin_type_json},\"tin_value\":{tin_value_json}}}"
+        )
+    } else {
+        let mut distinct_quarantined_npi = quarantined_npi.to_vec();
+        distinct_quarantined_npi.sort_unstable();
+        distinct_quarantined_npi.dedup();
+        let quarantined_json =
+            serde_json::to_string(&distinct_quarantined_npi).unwrap_or_else(|_| "[]".to_string());
+        format!(
+            "{{\"npi\":{npi_json},\"provider_group_hash\":{provider_group_hash},\"quarantined_npi\":{quarantined_json},\"tin_type\":{tin_type_json},\"tin_value\":{tin_value_json}}}"
+        )
+    }
 }
 
 fn provider_set_checksum_from_group_payloads(mut group_payload_jsons: Vec<String>) -> i64 {
@@ -1068,23 +1093,26 @@ fn build_provider_entry(provider_ref: &Value) -> io::Result<ProviderEntry> {
     let mut group_payload_jsons: Vec<String> = Vec::new();
     let mut group_hashes: Vec<i64> = Vec::new();
     let mut provider_npis: Vec<i64> = Vec::new();
+    let mut quarantined_npis: Vec<i64> = Vec::new();
     for group in groups {
         validate_provider_group(group)?;
         let tin = group.get("tin").unwrap_or(&Value::Null);
-        let npi = strict_npi_list(group.get("npi"))?;
+        let npi_partition = strict_npi_partition(group.get("npi"))?;
+        let npi = npi_partition.valid;
+        let quarantined_npi = npi_partition.quarantined;
         let tin_type = normalize_tin_type(tin.get("type"));
         let tin_value = normalize_tin_value(tin.get("value"));
-        let group_hash = make_checksum(vec![
-            json!("provider_group"),
-            json!(tin_type.clone()),
-            json!(tin_value.clone()),
-            json!(npi),
-        ]);
+        let group_hash = provider_group_hash(tin, &npi, &quarantined_npi);
         group_hashes.push(group_hash);
         provider_npis.extend(npi.iter().copied());
+        quarantined_npis.extend(quarantined_npi.iter().copied());
         if build_provider_set_payload {
             group_payload_jsons.push(provider_group_payload_canonical_json(
-                group_hash, &tin_type, &tin_value, &npi,
+                group_hash,
+                &tin_type,
+                &tin_value,
+                &npi,
+                &quarantined_npi,
             ));
         }
     }
@@ -1094,6 +1122,8 @@ fn build_provider_entry(provider_ref: &Value) -> io::Result<ProviderEntry> {
     provider_npis.sort_unstable();
     provider_npis.dedup();
     provider_npis.shrink_to_fit();
+    quarantined_npis.sort_unstable();
+    quarantined_npis.shrink_to_fit();
     let entry_hash = if build_provider_set_payload {
         provider_set_checksum_from_group_payloads(group_payload_jsons)
     } else {
@@ -1104,6 +1134,7 @@ fn build_provider_entry(provider_ref: &Value) -> io::Result<ProviderEntry> {
         provider_count: i64::try_from(provider_npis.len()).unwrap_or(i64::MAX),
         provider_group_hashes: group_hashes,
         npi: provider_npis,
+        quarantined_npi: quarantined_npis,
         network_names,
     })
 }
@@ -1120,6 +1151,17 @@ fn provider_ref_definition(value: &Value) -> io::Result<(String, ProviderEntry)>
         )
     })?;
     Ok((provider_ref_key(key_value)?, build_provider_entry(value)?))
+}
+
+fn provider_identifier_quarantine_payload(
+    provider_map: &HashMap<String, ProviderEntry>,
+    inline_quarantine: ProviderIdentifierQuarantine,
+) -> io::Result<Value> {
+    let mut quarantine = inline_quarantine;
+    for entry in provider_map.values() {
+        quarantine.record(&entry.quarantined_npi)?;
+    }
+    quarantine.payload()
 }
 
 fn insert_provider_definition(
@@ -1170,6 +1212,7 @@ fn provider_set_from_ref_keys(
     let mut entry_hashes: HashSet<i64> = HashSet::new();
     let mut group_hashes: HashSet<i64> = HashSet::new();
     let mut provider_npis: HashSet<i64> = HashSet::new();
+    let mut quarantined_npis: Vec<i64> = Vec::new();
     let mut network_names: HashSet<String> = HashSet::new();
     for key in refs {
         let entry = provider_map.get(key).ok_or_else(|| {
@@ -1185,6 +1228,7 @@ fn provider_set_from_ref_keys(
         for npi in &entry.npi {
             provider_npis.insert(*npi);
         }
+        quarantined_npis.extend(entry.quarantined_npi.iter().copied());
         network_names.extend(entry.network_names.iter().cloned());
     }
     if entry_hashes.is_empty() {
@@ -1196,6 +1240,7 @@ fn provider_set_from_ref_keys(
     sorted_group_hashes.sort_unstable();
     let mut sorted_provider_npis: Vec<i64> = provider_npis.into_iter().collect();
     sorted_provider_npis.sort_unstable();
+    quarantined_npis.sort_unstable();
     let mut sorted_network_names: Vec<String> = network_names.into_iter().collect();
     sorted_network_names.sort_unstable();
     let provider_count = i64::try_from(sorted_provider_npis.len()).unwrap_or(i64::MAX);
@@ -1209,6 +1254,7 @@ fn provider_set_from_ref_keys(
         provider_count,
         provider_group_hashes: sorted_group_hashes,
         npi: sorted_provider_npis,
+        quarantined_npi: quarantined_npis,
         network_names: sorted_network_names,
     }))
 }
@@ -1224,6 +1270,12 @@ fn combine_provider_entries(first: ProviderEntry, second: ProviderEntry) -> Prov
     let mut provider_npis: Vec<i64> = first.npi.into_iter().chain(second.npi).collect();
     provider_npis.sort_unstable();
     provider_npis.dedup();
+    let mut quarantined_npis: Vec<i64> = first
+        .quarantined_npi
+        .into_iter()
+        .chain(second.quarantined_npi)
+        .collect();
+    quarantined_npis.sort_unstable();
     let mut network_names: Vec<String> = first
         .network_names
         .into_iter()
@@ -1242,6 +1294,7 @@ fn combine_provider_entries(first: ProviderEntry, second: ProviderEntry) -> Prov
         provider_count,
         provider_group_hashes: group_hashes,
         npi: provider_npis,
+        quarantined_npi: quarantined_npis,
         network_names,
     }
 }
@@ -3703,8 +3756,10 @@ impl DictionaryCopySinks {
         let mut manifest_rows_written = 0u64;
         for group in groups {
             let tin = group.get("tin").unwrap_or(&Value::Null);
-            let npi = strict_npi_list(group.get("npi"))?;
-            let group_hash = provider_group_hash(tin, &npi);
+            let npi_partition = strict_npi_partition(group.get("npi"))?;
+            let group_hash =
+                provider_group_hash(tin, &npi_partition.valid, &npi_partition.quarantined);
+            let npi = npi_partition.valid;
             let provider_group_global_id = provider_group_global_id_from_hash(group_hash).to_hex();
             for npi_value in &npi {
                 if !emitted_members.insert((group_hash, *npi_value)) {
@@ -3768,8 +3823,10 @@ impl DictionaryCopySinks {
         let mut manifest_rows_written = 0u64;
         for group in groups {
             let tin = group.get("tin").unwrap_or(&Value::Null);
-            let npi = strict_npi_list(group.get("npi"))?;
-            let group_hash = provider_group_hash(tin, &npi);
+            let npi_partition = strict_npi_partition(group.get("npi"))?;
+            let group_hash =
+                provider_group_hash(tin, &npi_partition.valid, &npi_partition.quarantined);
+            let npi = npi_partition.valid;
             if !dedupe.insert_provider_group(group_hash) {
                 continue;
             }
@@ -3890,6 +3947,7 @@ struct LocalCompactDedupe<'a> {
     provider_entry_components: &'a mut HashSet<(i64, i64)>,
     procedures: &'a mut HashSet<String>,
     provider_group_members: &'a mut HashSet<(i64, i64)>,
+    provider_identifier_quarantine: &'a mut ProviderIdentifierQuarantine,
 }
 
 struct CompactRateBatch<'a> {
@@ -3986,6 +4044,9 @@ fn process_compact_rate_lites<W: Write>(
             dictionary_copy_sinks
                 .write_provider_group_members(&provider_ref, dedupe.provider_group_members)?;
             let inline_entry = build_provider_entry(&provider_ref)?;
+            dedupe
+                .provider_identifier_quarantine
+                .record(&inline_entry.quarantined_npi)?;
             if rate.provider_refs.is_empty() {
                 inline_entry
             } else {
@@ -5288,6 +5349,7 @@ fn provider_entry_view_for_worker_rate<'a>(
     let provider_ref = json!({"provider_groups": rate.provider_groups});
     dictionary_copy_sinks.write_provider_group_members_shared(&provider_ref, dedupe)?;
     let inline_entry = build_provider_entry(&provider_ref)?;
+    dedupe.record_quarantined_provider_identifiers(&inline_entry.quarantined_npi)?;
     if rate.provider_refs.is_empty() {
         return Ok(Some(ProviderEntryView::Owned(inline_entry)));
     }
@@ -8153,6 +8215,10 @@ fn scan_compact_byte_top_level_parallel(
                         &mut writer,
                         "scanner_summary",
                         &json!({
+                            "provider_identifier_quarantine": provider_identifier_quarantine_payload(
+                                &provider_map,
+                                dedupe.provider_identifier_quarantine()?,
+                            )?,
                             "worker_count": worker_count,
                             "work_queue": bounded_queue_size,
                             "event_queue": event_queue_size,
@@ -8912,6 +8978,10 @@ fn scan_compact_struson_parallel(
                     &mut writer,
                     "scanner_summary",
                     &json!({
+                        "provider_identifier_quarantine": provider_identifier_quarantine_payload(
+                            &provider_map,
+                            dedupe.provider_identifier_quarantine()?,
+                        )?,
                         "worker_count": worker_count,
                         "work_queue": bounded_queue_size,
                         "event_queue": event_queue_size,
@@ -9956,6 +10026,7 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
     let mut emitted_provider_entry_components: HashSet<(i64, i64)> = HashSet::new();
     let mut emitted_procedures: HashSet<String> = HashSet::new();
     let mut emitted_provider_group_members: HashSet<(i64, i64)> = HashSet::new();
+    let mut provider_identifier_quarantine = ProviderIdentifierQuarantine::default();
     let mut price_code_set_hash_cache: PriceCodeSetHashCache = HashMap::new();
     let mut manifest_global_id_cache = ManifestGlobalIdCache::default();
     let negotiated_rate_chunk_size = split_interval(
@@ -10075,6 +10146,7 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
                             provider_entry_components: &mut emitted_provider_entry_components,
                             procedures: &mut emitted_procedures,
                             provider_group_members: &mut emitted_provider_group_members,
+                            provider_identifier_quarantine: &mut provider_identifier_quarantine,
                         },
                         price_code_set_hash_cache: &mut price_code_set_hash_cache,
                         manifest_global_id_cache: &mut manifest_global_id_cache,
@@ -10156,6 +10228,10 @@ fn scan_compact_struson_inner(path: &Path, copy_paths: CopyPathConfig) -> io::Re
         &mut writer,
         "scanner_summary",
         &json!({
+            "provider_identifier_quarantine": provider_identifier_quarantine_payload(
+                &provider_map,
+                provider_identifier_quarantine,
+            )?,
             "worker_count": 1,
             "requested_worker_count": rust_worker_count,
             "execution_mode": "serial_struson",
@@ -19481,6 +19557,7 @@ mod tests {
                 provider_count: 2,
                 provider_group_hashes: vec![101],
                 npi: vec![1234567890, 1234567891],
+                quarantined_npi: Vec::new(),
                 network_names: Vec::new(),
             },
         );
@@ -19491,6 +19568,7 @@ mod tests {
                 provider_count: 2,
                 provider_group_hashes: vec![202],
                 npi: vec![1234567891, 1234567892],
+                quarantined_npi: Vec::new(),
                 network_names: Vec::new(),
             },
         );
@@ -19678,17 +19756,41 @@ mod tests {
             json!([{}]),
             json!([[]]),
             json!([null]),
-            json!([123456789]),
             json!([1234567890.5]),
-            json!([0, 1234567890]),
-            json!([1234567890, 0]),
-            json!([0, 0]),
         ] {
             let mut provider_ref = valid_provider_reference();
             provider_ref["provider_groups"][0]["npi"] = invalid_npi;
             let error = provider_ref_definition(&provider_ref).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
+    }
+
+    #[test]
+    fn malformed_integer_npi_is_quarantined_without_losing_valid_membership() {
+        let mut mixed = valid_provider_reference();
+        mixed["provider_groups"][0]["npi"] = json!([1234567890_i64, 123456789_i64, 123456789_i64]);
+        let mixed_entry = build_provider_entry(&mixed).unwrap();
+        assert_eq!(mixed_entry.provider_count, 1);
+        assert_eq!(mixed_entry.npi, vec![1234567890]);
+        assert_eq!(mixed_entry.quarantined_npi, vec![123456789, 123456789]);
+
+        let valid_entry = build_provider_entry(&valid_provider_reference()).unwrap();
+        assert_ne!(mixed_entry.entry_hash, valid_entry.entry_hash);
+
+        let provider_map = HashMap::from([("7".to_string(), mixed_entry)]);
+        let payload = provider_identifier_quarantine_payload(
+            &provider_map,
+            ProviderIdentifierQuarantine::default(),
+        )
+        .unwrap();
+        assert_eq!(payload["occurrence_count"], 2);
+        assert_eq!(payload["distinct_value_count"], 1);
+        assert_eq!(payload["entries"][0]["value"], "123456789");
+        assert_eq!(payload["entries"][0]["occurrence_count"], 2);
+        assert_eq!(
+            payload["sha256"],
+            "6b01033baec61d1e9d4738f0f12cf2f48cefbd6a801fd0bd4a9b76d1b570624b"
+        );
     }
 
     #[test]
@@ -20153,7 +20255,7 @@ mod tests {
         );
         let inline_tin = inline_group.get("tin").unwrap();
         let inline_npis = strict_npi_list(inline_group.get("npi")).unwrap();
-        let inline_group_hash = provider_group_hash(inline_tin, &inline_npis);
+        let inline_group_hash = provider_group_hash(inline_tin, &inline_npis, &[]);
         let member_rows = std::fs::read_to_string(&member_path).unwrap();
         assert_eq!(member_rows.lines().count(), 2);
         assert!(member_rows
@@ -20181,6 +20283,7 @@ mod tests {
         let referenced_group_id = provider_group_global_id_from_hash(provider_group_hash(
             referenced_group.get("tin").unwrap(),
             &strict_npi_list(referenced_group.get("npi")).unwrap(),
+            &[],
         ));
         assert!(provider_forward_entries.iter().any(|entry| {
             entry.members.contains(&inline_group_id) && entry.members.contains(&referenced_group_id)
@@ -20237,6 +20340,7 @@ mod tests {
         let mut emitted_provider_entry_components = HashSet::new();
         let mut emitted_procedures = HashSet::new();
         let mut emitted_provider_group_members = HashSet::new();
+        let mut provider_identifier_quarantine = ProviderIdentifierQuarantine::default();
         let mut serial_price_code_set_hash_cache = PriceCodeSetHashCache::new();
         let mut serial_manifest_global_id_cache = ManifestGlobalIdCache::default();
         let context = test_compact_context();
@@ -20260,6 +20364,7 @@ mod tests {
             provider_entry_components: &mut emitted_provider_entry_components,
             procedures: &mut emitted_procedures,
             provider_group_members: &mut emitted_provider_group_members,
+            provider_identifier_quarantine: &mut provider_identifier_quarantine,
         };
         let mut batch = CompactRateBatch {
             provider_map: &provider_map,
@@ -20755,7 +20860,7 @@ mod tests {
         {
             let tin = group.get("tin").unwrap_or(&Value::Null);
             let npi = strict_npi_list(group.get("npi")).unwrap();
-            let group_hash = provider_group_hash(tin, &npi);
+            let group_hash = provider_group_hash(tin, &npi, &[]);
             group_payloads.push(json!({
                 "provider_group_hash": group_hash,
                 "tin_type": normalize_tin_type(tin.get("type")),

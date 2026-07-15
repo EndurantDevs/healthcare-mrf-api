@@ -18,6 +18,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from api import ptg2_capacity_evidence as capacity
 from process.ptg_parts import ptg2_candidate_attestation
+from process.ptg_parts.ptg2_provider_quarantine import (
+    provider_identifier_quarantine_payload,
+)
 from scripts.validation import ptg2_v3_source_api_audit as audit
 
 
@@ -1330,7 +1333,7 @@ def _candidate_attestation_fixture_report():
     started_at = completed_at - dt.timedelta(minutes=10)
     candidate_fixture_map = {
         "schema_version": 2,
-        "harness": {"name": "ptg2_v3_source_api_audit", "version": "2.9.0"},
+        "harness": {"name": "ptg2_v3_source_api_audit", "version": "2.10.0"},
         "status": "pass",
         "profile": "release",
         "release_profile_enforced": True,
@@ -1355,7 +1358,11 @@ def _candidate_attestation_fixture_report():
             "tls_verified": True,
         },
         "reproducibility": {},
-        "source": {},
+        "source": {
+            "provider_identifier_quarantine": (
+                provider_identifier_quarantine_payload({})
+            )
+        },
         "coverage": {"failures": []},
         "checks": {
             "source_occurrence_ids": 2_500,

@@ -414,7 +414,7 @@ def test_source_index_counts_inline_mixed_tin_and_valid_npi_group(tmp_path):
         )
 
 
-def test_source_index_does_not_treat_zero_npi_as_tin_marker(tmp_path):
+def test_source_index_does_not_publish_or_quarantine_zero_npi(tmp_path):
     payload = _source_document(references_before=True, duplicate_price=False)
     payload["provider_references"][0]["provider_groups"] = [{"npi": [0]}]
     source_path = _write_source_fixture(
@@ -425,9 +425,72 @@ def test_source_index_does_not_treat_zero_npi_as_tin_marker(tmp_path):
     )
 
     with _open_source_index(tmp_path, source_path) as index:
-        assert index.metrics["invalid_provider_npis"] == 1
+        assert index.metrics.get("invalid_provider_npis", 0) == 0
         assert index.metrics.get("provider_reference_tin_markers", 0) == 0
         assert index.metrics.get("rates_with_tin_markers", 0) == 0
+        quarantine = index.source_report()["provider_identifier_quarantine"]
+        assert quarantine["occurrence_count"] == 0
+        assert quarantine["entries"] == []
+
+
+@pytest.mark.parametrize("provider_form", ["referenced", "inline"])
+@pytest.mark.parametrize(
+    "npi_values",
+    [[0, NPIS[0]], [NPIS[0], 0], [0, 0]],
+    ids=["zero-first", "zero-last", "zero-repeated"],
+)
+def test_source_index_rejects_non_singleton_zero_npi_marker(
+    tmp_path,
+    provider_form,
+    npi_values,
+):
+    payload = _source_document(references_before=True, duplicate_price=False)
+    provider_groups = [
+        {
+            "npi": npi_values,
+            "tin": {"type": "ein", "value": "000000001"},
+        }
+    ]
+    if provider_form == "referenced":
+        payload["provider_references"][0]["provider_groups"] = provider_groups
+    else:
+        payload["in_network"][1]["negotiated_rates"][0][
+            "provider_groups"
+        ] = provider_groups
+    source_path = _write_source_fixture(
+        tmp_path / f"{provider_form}-invalid-zero.json",
+        references_before=True,
+        gzip_encoded=False,
+        source_document=payload,
+    )
+
+    with pytest.raises(audit.SourceFormatError, match="zero_npi_marker_must_be_singleton"):
+        _open_source_index(tmp_path, source_path)
+
+
+def test_source_index_quarantines_malformed_integer_but_keeps_valid_npi(tmp_path):
+    payload = _source_document(references_before=True, duplicate_price=False)
+    payload["provider_references"][0]["provider_groups"] = [
+        {
+            "npi": [NPIS[0], 123456789],
+            "tin": {"type": "ein", "value": "000000001"},
+        }
+    ]
+    source_path = _write_source_fixture(
+        tmp_path / "mixed-valid-malformed-npi.json",
+        references_before=True,
+        gzip_encoded=False,
+        source_document=payload,
+    )
+
+    with _open_source_index(tmp_path, source_path) as index:
+        assert index.metrics["invalid_provider_npis"] == 1
+        assert index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0]))
+        quarantine = index.source_report()["provider_identifier_quarantine"]
+        assert quarantine["occurrence_count"] == 1
+        assert quarantine["entries"] == [
+            {"value": "123456789", "occurrence_count": 1}
+        ]
 
 
 def test_source_index_does_not_mask_complementary_incomplete_rates(tmp_path):
@@ -1087,6 +1150,19 @@ def test_release_profile_cannot_relax_gate_requirements(changes):
         replace(_release_audit_config(), **changes)
 
 
+def test_validated_candidate_release_allows_exact_nonempty_npi_quarantine():
+    config = replace(_release_audit_config(), max_invalid_npis=3)
+
+    assert config.validated_candidate is True
+    assert config.max_invalid_npis == 3
+
+
+def test_published_release_cannot_relax_invalid_npi_ceiling():
+    config = _audit_config(max_invalid_npis=1, validated_candidate=False)
+
+    assert config._release_rules_by_reason()["release_source_integrity_ceiling"] is True
+
+
 def test_release_cli_rejects_caller_seed_search_and_uses_fixed_precommitment():
     parser = audit.build_argument_parser()
     required_arguments = [
@@ -1623,17 +1699,17 @@ def test_runner_reserves_random_keys_until_true_first_observation(tmp_path):
             if request.query.stable_key == query_key
             and request.phase == "cold"
         )
-        calls_for_key = [
+        calls_for_key_list = [
             (position, phase, page_size)
             for position, (query, phase, page_size) in enumerate(
                 fetcher.detailed_calls
             )
             if query.stable_key == query_key
         ]
-        assert calls_for_key[0][1:] == ("cold", cold_request.page_size)
+        assert calls_for_key_list[0][1:] == ("cold", cold_request.page_size)
         assert any(
             phase == "warm" and page_size is None
-            for _position, phase, page_size in calls_for_key
+            for _position, phase, page_size in calls_for_key_list
         )
 
     assert report["status"] == "pass"
@@ -1760,7 +1836,7 @@ def test_release_runner_enforces_observed_http_request_floor(tmp_path):
         ),
     ],
 )
-def test_release_runner_rejects_any_rate_with_tin(
+def test_release_runner_rejects_only_tin_only_rates(
     tmp_path,
     provider_form,
     npi_values,
@@ -1803,10 +1879,11 @@ def test_release_runner_rejects_any_rate_with_tin(
     assert report["source"]["totals"][marker_metric] == 1
     assert report["source"]["totals"].get("tin_only_rates", 0) == expected_tin_only
     assert report["source"]["totals"]["rates_with_tin_markers"] == 1
-    assert "tin_marker_rates_not_fully_npi_verifiable" in report["coverage"][
-        "failures"
-    ]
-    assert report["release_gate_eligible"] is False
+    assert (
+        "tin_only_rates_not_npi_verifiable" in report["coverage"]["failures"]
+    ) is bool(expected_tin_only)
+    if expected_tin_only:
+        assert report["release_gate_eligible"] is False
 
 
 def test_api_only_tuple_is_detected_outside_source_sample(tmp_path):
