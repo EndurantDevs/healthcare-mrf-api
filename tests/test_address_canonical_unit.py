@@ -343,7 +343,7 @@ def test_non_us_addresses_are_not_keyed():
 
 
 def test_python_address_canonical_golden_corpus_matches_frozen_expected_values():
-    group_keys: dict[str, tuple[str | None, str | None]] = {}
+    keys_by_group: dict[str, tuple[str | None, str | None]] = {}
     cases = _golden_cases()
     assert len(cases) >= 270
     for case in cases:
@@ -360,8 +360,8 @@ def test_python_address_canonical_golden_corpus_matches_frozen_expected_values()
 
         if group := case.get("equivalence_group"):
             current = (case["expected_identity_key"], case["expected_address_key"])
-            group_keys.setdefault(group, current)
-            assert group_keys[group] == current, case["id"]
+            keys_by_group.setdefault(group, current)
+            assert keys_by_group[group] == current, case["id"]
 
 
 def test_address_fast_python_fallback_matches_reference(monkeypatch):
@@ -459,13 +459,13 @@ def test_pub28_suffix_directional_and_unit_tables_are_used():
 
 
 def test_pub28_raw_maps_are_single_application_idempotent():
-    maps = {
+    mapping_by_type = {
         "suffix": PUB28_STREET_SUFFIX_MAP,
         "directional": PUB28_DIRECTIONAL_MAP,
         "unit": PUB28_UNIT_DESIGNATOR_MAP,
     }
 
-    for map_name, mapping in maps.items():
+    for map_name, mapping in mapping_by_type.items():
         for source, mapped in mapping.items():
             assert mapping.get(mapped, mapped) == mapped, f"{map_name}: {source!r} -> {mapped!r}"
 
@@ -1740,10 +1740,10 @@ async def test_entity_address_unified_sql_phase_uses_scoped_bulk_settings(monkey
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
     monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", lambda **payload: events.append(payload))
 
-    context = {}
+    phase_context_map = {}
     rowcount = await entity_address_unified._run_sql_phase(
         "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;",
-        context=context,
+        context=phase_context_map,
         run_id="run_eau",
         phase="entity-address-unified test phase",
         unit="shards",
@@ -1766,7 +1766,7 @@ async def test_entity_address_unified_sql_phase_uses_scoped_bulk_settings(monkey
         "SET LOCAL jit = 'off';",
     ]
     assert statements[-1] == "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;"
-    timing = context["phase_timings"]["entity-address-unified test phase"]
+    timing = phase_context_map["phase_timings"]["entity-address-unified test phase"]
     assert timing["count"] in {1}
     assert timing["rows"] in {7}
     assert timing["first_started_at"] is not None
@@ -1799,10 +1799,10 @@ async def test_entity_address_unified_sql_phase_skips_unprivileged_bulk_setting(
 
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    context = {}
+    phase_context_map = {}
     rowcount = await entity_address_unified._run_sql_phase(
         "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;",
-        context=context,
+        context=phase_context_map,
         phase="entity-address-unified test phase",
     )
 
@@ -1810,7 +1810,7 @@ async def test_entity_address_unified_sql_phase_skips_unprivileged_bulk_setting(
     assert "SET LOCAL temp_file_limit = '32GB';" in statements
     assert any(statement.startswith("ROLLBACK TO SAVEPOINT") for statement in statements)
     assert statements[-1] == "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;"
-    assert context["phase_timings"]["entity-address-unified test phase"]["rows"] == 5
+    assert phase_context_map["phase_timings"]["entity-address-unified test phase"]["rows"] == 5
 
 
 @pytest.mark.asyncio
@@ -1864,7 +1864,7 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
     )
     monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", lambda **payload: events.append(payload))
 
-    context = {}
+    support_context_map = {}
     counts = await entity_address_unified._populate_support_stage_tables(
         "mrf",
         "entity_address_unified_stage",
@@ -1872,15 +1872,15 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
         source_run_id="run_1",
         node_id="node_a",
         run_id="run_eau",
-        context=context,
+        context=support_context_map,
     )
 
     assert counts == {"entity_address_evidence": 3}
     assert "SET LOCAL work_mem = '32MB';" in statements
     assert "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;" in statements
-    assert context["phase_timings"]["entity-address-unified building support tables"]["count"] in {1}
-    assert context["phase_timings"]["entity-address-unified building evidence"]["count"] in {1}
-    assert context["phase_timings"]["entity-address-unified building evidence"]["rows"] == 11
+    assert support_context_map["phase_timings"]["entity-address-unified building support tables"]["count"] in {1}
+    assert support_context_map["phase_timings"]["entity-address-unified building evidence"]["count"] in {1}
+    assert support_context_map["phase_timings"]["entity-address-unified building evidence"]["rows"] == 11
     assert events[0]["phase"] == "entity-address-unified building support tables"
     assert events[-1]["phase"] == "entity-address-unified built evidence"
 
@@ -1889,7 +1889,7 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
 async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkeypatch):
     """Independent unified support inserts execute concurrently."""
     concurrency_map = {"active": 0, "max_active": 0}
-    order = []
+    operation_order_list = []
 
     class FakeModel:
         __tablename__ = "entity_address_evidence"
@@ -1900,9 +1900,9 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
     class FakeDB:
         async def status(self, statement):
             if "TRUNCATE TABLE" in statement:
-                order.append("truncate")
+                operation_order_list.append("truncate")
                 return None
-            order.append(statement)
+            operation_order_list.append(statement)
             concurrency_map["active"] += 1
             concurrency_map["max_active"] = max(concurrency_map["max_active"], concurrency_map["active"])
             await asyncio.sleep(0.01)
@@ -1941,19 +1941,19 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
         fake_support_stage_statements,
     )
 
-    context = {}
+    support_context_map = {}
     await entity_address_unified._populate_support_stage_tables(
         "mrf",
         "entity_address_unified_stage",
         {FakeModel: FakeStage},
         source_run_id="run_1",
         node_id="node_a",
-        context=context,
+        context=support_context_map,
     )
 
-    assert order[0] == "truncate"
+    assert operation_order_list[0] == "truncate"
     assert concurrency_map["max_active"] in {2}
-    assert context["support_stage_concurrency"] == 2
+    assert support_context_map["support_stage_concurrency"] == 2
 
 
 @pytest.mark.asyncio
@@ -1996,7 +1996,7 @@ async def test_entity_address_unified_support_stage_indexes_run_parallel(monkeyp
     )
     monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", lambda **payload: events.append(payload))
 
-    context = {}
+    index_context_map = {}
     await entity_address_unified._create_support_stage_indexes(
         {
             FakeModelA: FakeStageA,
@@ -2004,13 +2004,13 @@ async def test_entity_address_unified_support_stage_indexes_run_parallel(monkeyp
             FakeModelC: FakeStageC,
         },
         "mrf",
-        context=context,
+        context=index_context_map,
         run_id="run_eau",
     )
 
     assert concurrency_map["max_active"] in {2}
-    assert context["support_stage_index_concurrency"] == 2
-    assert context["indexed"] == 3
+    assert index_context_map["support_stage_index_concurrency"] == 2
+    assert index_context_map["indexed"] == 3
     assert events[-1]["done"] == 3
 
 
@@ -2101,7 +2101,7 @@ def test_entity_address_unified_support_primary_key_sql_restores_constraint():
 
 @pytest.mark.asyncio
 async def test_entity_address_unified_support_indexes_restore_primary_before_secondary(monkeypatch):
-    order = []
+    operation_order_list = []
 
     class FakeModelA:
         __tablename__ = "entity_address_procedure_bridge"
@@ -2117,11 +2117,11 @@ async def test_entity_address_unified_support_indexes_restore_primary_before_sec
 
     async def fake_ensure_stage_primary_key(stage_cls, _db_schema, *, context=None):
         del context
-        order.append(f"pk:{stage_cls.__tablename__}")
+        operation_order_list.append(f"pk:{stage_cls.__tablename__}")
 
     async def fake_create_stage_indexes(stage_cls, _db_schema, *, context=None):
         del context
-        order.append(f"idx:{stage_cls.__tablename__}")
+        operation_order_list.append(f"idx:{stage_cls.__tablename__}")
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_INDEX_CONCURRENCY", "1")
     monkeypatch.setattr(
@@ -2140,7 +2140,7 @@ async def test_entity_address_unified_support_indexes_restore_primary_before_sec
         "mrf",
     )
 
-    assert order == [
+    assert operation_order_list == [
         "pk:entity_address_procedure_bridge_20260614",
         "idx:entity_address_procedure_bridge_20260614",
         "pk:entity_address_medication_bridge_20260614",
@@ -2221,10 +2221,12 @@ def test_entity_address_unified_support_statements_shard_facility_candidates(mon
     )
 
     facility_statements = [
-        item for item in statements if item.label.startswith("facility anchor npi candidate")
+        statement
+        for statement in statements
+        if statement.label.startswith("facility anchor npi candidate")
     ]
 
-    assert [item.label for item in facility_statements] == [
+    assert [statement.label for statement in facility_statements] == [
         "facility anchor npi candidate shard 1/3",
         "facility anchor npi candidate shard 2/3",
         "facility anchor npi candidate shard 3/3",
@@ -2263,15 +2265,19 @@ def test_entity_address_unified_support_statements_shard_code_bridges(monkeypatc
         available={},
     )
 
-    procedure_statements = [item for item in statements if item.label.startswith("procedure bridge")]
-    medication_statements = [item for item in statements if item.label.startswith("medication bridge")]
+    procedure_statements = [
+        statement for statement in statements if statement.label.startswith("procedure bridge")
+    ]
+    medication_statements = [
+        statement for statement in statements if statement.label.startswith("medication bridge")
+    ]
 
-    assert [item.label for item in procedure_statements] == [
+    assert [statement.label for statement in procedure_statements] == [
         "procedure bridge shard 1/3",
         "procedure bridge shard 2/3",
         "procedure bridge shard 3/3",
     ]
-    assert [item.label for item in medication_statements] == [
+    assert [statement.label for statement in medication_statements] == [
         "medication bridge shard 1/2",
         "medication bridge shard 2/2",
     ]
@@ -2320,7 +2326,7 @@ def test_entity_address_unified_support_statements_can_skip_optional_serving_tab
         },
     )
 
-    labels = [item.label for item in statements]
+    labels = [statement.label for statement in statements]
 
     assert "evidence" in labels
     assert "plan bridge" in labels
@@ -2544,7 +2550,7 @@ def test_entity_address_unified_partial_support_patch_sql_offsets_evidence_ids()
 @pytest.mark.asyncio
 async def test_entity_address_unified_shutdown_rejects_live_main_patch_publish(monkeypatch):
     monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
-    ctx = {
+    shutdown_context_map = {
         "import_date": "20260614",
         "context": {
             "run": 1,
@@ -2554,7 +2560,7 @@ async def test_entity_address_unified_shutdown_rejects_live_main_patch_publish(m
     }
 
     with pytest.raises(RuntimeError, match="live main-table patch publishing is disabled"):
-        await entity_address_unified.shutdown(ctx)
+        await entity_address_unified.shutdown(shutdown_context_map)
 
 
 def test_entity_address_unified_provider_directory_replacement_copies_unaffected_live_rows():
@@ -2685,7 +2691,7 @@ def test_provider_directory_replacement_stage_rebuilds_indexes_after_promote():
 @pytest.mark.asyncio
 async def test_provider_directory_shutdown_rejects_support_patch_publish(monkeypatch):
     monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
-    ctx = {
+    shutdown_context_map = {
         "import_date": "20260614",
         "context": {
             "run": 1,
@@ -2695,7 +2701,7 @@ async def test_provider_directory_shutdown_rejects_support_patch_publish(monkeyp
     }
 
     with pytest.raises(RuntimeError, match="replacement-stage table swap"):
-        await entity_address_unified.shutdown(ctx)
+        await entity_address_unified.shutdown(shutdown_context_map)
 
 
 def _partial_shutdown_payload():
@@ -2904,12 +2910,12 @@ async def test_entity_address_unified_compacts_source_record_ids_by_metadata_res
     )
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    rows = await entity_address_unified._compact_hot_row_source_record_ids(
+    compacted_row_count = await entity_address_unified._compact_hot_row_source_record_ids(
         "mrf",
         "entity_address_unified_stage",
     )
 
-    assert rows == 42
+    assert compacted_row_count == 42
     joined = "\n".join(statements)
     assert "pg_class" in statements[0]
     assert "DROP COLUMN IF EXISTS source_record_ids_compact" in joined
@@ -2937,12 +2943,12 @@ async def test_entity_address_unified_can_compact_source_record_ids_by_rewrite(m
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE", "1")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    rows = await entity_address_unified._compact_hot_row_source_record_ids(
+    compacted_row_count = await entity_address_unified._compact_hot_row_source_record_ids(
         "mrf",
         "entity_address_unified_stage",
     )
 
-    assert rows == 42
+    assert compacted_row_count == 42
     assert statements[0] == "DROP TABLE IF EXISTS mrf.entity_address_unified_stage_compact;"
     assert (
         statements[1]
@@ -2988,7 +2994,7 @@ async def test_entity_address_unified_stage_indexes_do_not_duplicate_primary(mon
 @pytest.mark.asyncio
 async def test_entity_address_unified_skips_support_code_location_indexes_by_default(monkeypatch):
     statements = []
-    context = {}
+    index_context_map = {}
 
     class FakeDB:
         async def status(self, statement):
@@ -3005,9 +3011,11 @@ async def test_entity_address_unified_skips_support_code_location_indexes_by_def
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CODE_LOCATION_INDEXES", raising=False)
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=context)
+    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=index_context_map)
 
-    assert "entity_address_medication_bridge_20260614.code_location" in context["skipped_stage_indexes"]
+    assert "entity_address_medication_bridge_20260614.code_location" in index_context_map[
+        "skipped_stage_indexes"
+    ]
     assert not any("idx_code_location" in statement for statement in statements)
     assert any("idx_npi" in statement for statement in statements)
 
@@ -3015,7 +3023,7 @@ async def test_entity_address_unified_skips_support_code_location_indexes_by_def
 @pytest.mark.asyncio
 async def test_entity_address_unified_support_code_location_indexes_can_be_enabled(monkeypatch):
     statements = []
-    context = {}
+    index_context_map = {}
 
     class FakeDB:
         async def status(self, statement):
@@ -3031,9 +3039,9 @@ async def test_entity_address_unified_support_code_location_indexes_can_be_enabl
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CODE_LOCATION_INDEXES", "1")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=context)
+    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=index_context_map)
 
-    assert context.get("skipped_stage_indexes") in (None, [])
+    assert index_context_map.get("skipped_stage_indexes") in (None, [])
     assert any("idx_code_location" in statement for statement in statements)
 
 
@@ -3041,7 +3049,7 @@ async def test_entity_address_unified_support_code_location_indexes_can_be_enabl
 async def test_entity_address_unified_serving_stage_index_profile_skips_debug_indexes(monkeypatch):
     """Serving-stage index creation omits diagnostic-only indexes."""
     statements = []
-    context = {}
+    index_context_map = {}
 
     class FakeDB:
         async def status(self, statement):
@@ -3128,10 +3136,10 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE", "serving")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=context)
+    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=index_context_map)
 
     joined = "\n".join(statements)
-    assert context["stage_index_profile"] == "serving"
+    assert index_context_map["stage_index_profile"] == "serving"
     assert "idx_npi" in joined
     assert "idx_procedures_array" in joined
     assert "idx_geo_bbox" in joined
@@ -3149,18 +3157,24 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
     assert "idx_row_origin" not in joined
     assert "idx_zip5" not in joined
     assert "idx_ptg_plan_array" not in joined
-    assert "entity_address_unified_20260614.inferred_npi" in context["skipped_stage_indexes"]
-    assert "entity_address_unified_20260614.entity_type_coalesced_npi" in context["skipped_stage_indexes"]
-    assert "entity_address_unified_20260614.primary_phone_digits_npi" in context["skipped_stage_indexes"]
-    assert "entity_address_unified_20260614.row_origin" in context["skipped_stage_indexes"]
-    assert "entity_address_unified_20260614.zip5" in context["skipped_stage_indexes"]
-    assert "entity_address_unified_20260614.ptg_plan_array" in context["skipped_stage_indexes"]
+    assert "entity_address_unified_20260614.inferred_npi" in index_context_map["skipped_stage_indexes"]
+    assert "entity_address_unified_20260614.entity_type_coalesced_npi" in index_context_map[
+        "skipped_stage_indexes"
+    ]
+    assert "entity_address_unified_20260614.primary_phone_digits_npi" in index_context_map[
+        "skipped_stage_indexes"
+    ]
+    assert "entity_address_unified_20260614.row_origin" in index_context_map["skipped_stage_indexes"]
+    assert "entity_address_unified_20260614.zip5" in index_context_map["skipped_stage_indexes"]
+    assert "entity_address_unified_20260614.ptg_plan_array" in index_context_map[
+        "skipped_stage_indexes"
+    ]
 
 
 @pytest.mark.asyncio
 async def test_entity_address_unified_can_defer_all_additional_stage_indexes(monkeypatch):
     statements = []
-    context = {}
+    index_context_map = {}
 
     class FakeDB:
         async def status(self, statement):
@@ -3177,11 +3191,11 @@ async def test_entity_address_unified_can_defer_all_additional_stage_indexes(mon
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_ADDITIONAL_INDEXES", "1")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=context)
+    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=index_context_map)
 
     assert statements == []
-    assert context["stage_index_profile"] == "none"
-    assert context["skipped_stage_indexes"] == [
+    assert index_context_map["stage_index_profile"] == "none"
+    assert index_context_map["skipped_stage_indexes"] == [
         "entity_address_unified_20260614.npi",
         "entity_address_unified_20260614.address_key",
     ]
@@ -3190,7 +3204,7 @@ async def test_entity_address_unified_can_defer_all_additional_stage_indexes(mon
 @pytest.mark.asyncio
 async def test_entity_address_unified_post_publish_serving_indexes_use_live_table(monkeypatch):
     statements = []
-    context = {}
+    index_context_map = {}
 
     class FakeDB:
         async def scalar(self, _statement):
@@ -3205,11 +3219,11 @@ async def test_entity_address_unified_post_publish_serving_indexes_use_live_tabl
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE", "serving")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    await entity_address_unified._create_post_publish_indexes("mrf", context=context)
+    await entity_address_unified._create_post_publish_indexes("mrf", context=index_context_map)
 
     joined = "\n".join(statements)
-    assert context["post_publish_index_profile"] == "serving"
-    assert context["post_publish_index_concurrently"] is True
+    assert index_context_map["post_publish_index_profile"] == "serving"
+    assert index_context_map["post_publish_index_concurrently"] is True
     assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_address_unified_idx_npi" in joined
     assert "ON mrf.entity_address_unified (npi)" in joined
     assert "entity_address_unified_idx_geo_bbox" in joined
@@ -3227,8 +3241,8 @@ async def test_entity_address_unified_post_publish_serving_indexes_use_live_tabl
     assert "ON mrf.entity_address_unified (address_key, npi)" in joined
     assert "entity_address_unified_idx_service_premise_key_npi" in joined
     assert "ON mrf.entity_address_unified (premise_key, npi)" in joined
-    assert "entity_address_unified.zip5" in context["post_publish_skipped_indexes"]
-    assert context["post_publish_index_concurrency"] in {1}
+    assert "entity_address_unified.zip5" in index_context_map["post_publish_skipped_indexes"]
+    assert index_context_map["post_publish_index_concurrency"] in {1}
     index_statements = [
         s
         for s in statements
@@ -3236,11 +3250,11 @@ async def test_entity_address_unified_post_publish_serving_indexes_use_live_tabl
     ]
     assert "CREATE EXTENSION IF NOT EXISTS btree_gin" in statements
     assert "ANALYZE mrf.entity_address_unified;" in statements
-    assert context["post_publish_index_total"] == len(index_statements)
-    assert context["post_publish_index_completed"] == len(index_statements)
-    assert context["post_publish_index_pending"] is False
-    assert context["post_publish_analyzed"] is True
-    assert len(context["post_publish_index_timings"]) == len(index_statements)
+    assert index_context_map["post_publish_index_total"] == len(index_statements)
+    assert index_context_map["post_publish_index_completed"] == len(index_statements)
+    assert index_context_map["post_publish_index_pending"] is False
+    assert index_context_map["post_publish_analyzed"] is True
+    assert len(index_context_map["post_publish_index_timings"]) == len(index_statements)
 
 
 @pytest.mark.asyncio
@@ -3272,7 +3286,7 @@ async def test_entity_address_unified_swap_renames_model_serving_indexes(monkeyp
 @pytest.mark.asyncio
 async def test_entity_address_unified_post_publish_non_concurrent_indexes_can_fan_out(monkeypatch):
     statements = []
-    context = {}
+    index_context_map = {}
 
     class FakeDB:
         async def scalar(self, _statement):
@@ -3290,12 +3304,12 @@ async def test_entity_address_unified_post_publish_non_concurrent_indexes_can_fa
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_CONCURRENCY", "6")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    await entity_address_unified._create_post_publish_indexes("mrf", context=context)
+    await entity_address_unified._create_post_publish_indexes("mrf", context=index_context_map)
 
     joined = "\n".join(statements)
-    assert context["post_publish_index_profile"] == "serving"
-    assert context["post_publish_index_concurrently"] is False
-    assert context["post_publish_index_concurrency"] == 6
+    assert index_context_map["post_publish_index_profile"] == "serving"
+    assert index_context_map["post_publish_index_concurrently"] is False
+    assert index_context_map["post_publish_index_concurrency"] == 6
     assert "CREATE INDEX IF NOT EXISTS entity_address_unified_idx_npi" in joined
     assert "entity_address_unified_idx_service_premise_key_npi" in joined
     assert "CREATE INDEX CONCURRENTLY" not in joined
@@ -3306,10 +3320,10 @@ async def test_entity_address_unified_post_publish_non_concurrent_indexes_can_fa
     ]
     assert "CREATE EXTENSION IF NOT EXISTS btree_gin" in statements
     assert "ANALYZE mrf.entity_address_unified;" in statements
-    assert context["post_publish_index_total"] == len(index_statements)
-    assert context["post_publish_index_completed"] == len(index_statements)
-    assert context["post_publish_index_pending"] is False
-    assert context["post_publish_analyzed"] is True
+    assert index_context_map["post_publish_index_total"] == len(index_statements)
+    assert index_context_map["post_publish_index_completed"] == len(index_statements)
+    assert index_context_map["post_publish_index_pending"] is False
+    assert index_context_map["post_publish_analyzed"] is True
 
 
 @pytest.mark.asyncio
@@ -3336,16 +3350,16 @@ async def test_entity_address_unified_post_publish_drops_invalid_index_before_re
         [{"index_elements": ("npi",), "name": "npi"}],
     )
 
-    context = {}
-    await entity_address_unified._create_post_publish_indexes("mrf", context=context)
+    index_context_map = {}
+    await entity_address_unified._create_post_publish_indexes("mrf", context=index_context_map)
 
     assert statements[0] == "DROP INDEX CONCURRENTLY IF EXISTS mrf.entity_address_unified_idx_npi;"
     assert statements[1].startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_address_unified_idx_npi")
     assert "ix.indisvalid IS FALSE" in invalid_checks[0]
-    assert context["post_publish_index_total"] in {1}
-    assert context["post_publish_index_completed"] in {1}
-    assert context["post_publish_index_pending"] is False
-    assert context["post_publish_index_timings"][0]["index"] == "npi"
+    assert index_context_map["post_publish_index_total"] in {1}
+    assert index_context_map["post_publish_index_completed"] in {1}
+    assert index_context_map["post_publish_index_pending"] is False
+    assert index_context_map["post_publish_index_timings"][0]["index"] == "npi"
 
 
 @pytest.mark.asyncio
@@ -3412,7 +3426,7 @@ async def test_entity_address_unified_stage_summary_counts_use_single_scan(monke
 
 
 def test_entity_address_unified_phase_timing_rows_reads_insert_rowcount():
-    context = {
+    phase_context_map = {
         "phase_timings": {
             "entity-address-unified aggregating": {
                 "rows": 35553296,
@@ -3421,18 +3435,18 @@ def test_entity_address_unified_phase_timing_rows_reads_insert_rowcount():
     }
 
     assert (
-        entity_address_unified._phase_timing_rows(
-            context,
+            entity_address_unified._phase_timing_rows(
+            phase_context_map,
             "entity-address-unified aggregating",
         )
         == 35553296
     )
-    assert not entity_address_unified._phase_timing_rows(context, "missing")
+    assert not entity_address_unified._phase_timing_rows(phase_context_map, "missing")
 
 
 def test_entity_address_unified_fallback_summary_counts_prefer_replacement_rows():
     fallback_summary_counts = getattr(entity_address_unified, "_fallback_summary_counts")
-    context = {
+    summary_context_map = {
         "partial_provider_directory_replacement_rows": 35506247,
         "phase_timings": {
             "entity-address-unified aggregating": {
@@ -3441,7 +3455,7 @@ def test_entity_address_unified_fallback_summary_counts_prefer_replacement_rows(
         },
     }
 
-    assert fallback_summary_counts(context) == {
+    assert fallback_summary_counts(summary_context_map) == {
         "staged_rows": 35506247,
         "npi_rows": 0,
         "inferred_rows": 0,
@@ -3615,19 +3629,21 @@ def test_entity_address_unified_keep_raw_stage_is_opt_in(monkeypatch):
 
 def test_entity_address_unified_indexes_cover_primary_serving_queries():
     """Unified address indexes cover the primary API lookup predicates."""
-    indexes = {index["name"]: index for index in EntityAddressUnified.__my_additional_indexes__}
+    index_by_name = {
+        index["name"]: index for index in EntityAddressUnified.__my_additional_indexes__
+    }
 
-    assert indexes["primary_npi"] == {
+    assert index_by_name["primary_npi"] == {
         "index_elements": ("npi",),
         "name": "primary_npi",
         "where": "type='primary'",
     }
-    assert indexes["primary_zip5_npi"] == {
+    assert index_by_name["primary_zip5_npi"] == {
         "index_elements": ("zip5", "npi"),
         "name": "primary_zip5_npi",
         "where": "type='primary'",
     }
-    assert indexes["primary_phone_digits_npi"] == {
+    assert index_by_name["primary_phone_digits_npi"] == {
         "index_elements": (
             "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
             "npi",
@@ -3635,12 +3651,12 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
         "name": "primary_phone_digits_npi",
         "where": "type='primary'",
     }
-    assert indexes["primary_phone_npi"] == {
+    assert index_by_name["primary_phone_npi"] == {
         "index_elements": ("telephone_number", "npi"),
         "name": "primary_phone_npi",
         "where": "type='primary' AND telephone_number IS NOT NULL AND telephone_number <> ''",
     }
-    assert indexes["service_phone_lookup_npi"] == {
+    assert index_by_name["service_phone_lookup_npi"] == {
         "index_elements": (
             "COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g'))",
             "npi",
@@ -3651,7 +3667,7 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
             "AND COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')) <> ''"
         ),
     }
-    assert indexes["service_phone_digits_npi"] == {
+    assert index_by_name["service_phone_digits_npi"] == {
         "index_elements": (
             "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
             "npi",
@@ -3662,7 +3678,7 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
             "AND regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g') <> ''"
         ),
     }
-    assert indexes["service_phone_number_npi"] == {
+    assert index_by_name["service_phone_number_npi"] == {
         "index_elements": ("phone_number", "npi"),
         "name": "service_phone_number_npi",
         "where": (
@@ -3670,30 +3686,30 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
             "AND phone_number IS NOT NULL AND phone_number <> ''"
         ),
     }
-    assert indexes["service_address_key_npi"] == {
+    assert index_by_name["service_address_key_npi"] == {
         "index_elements": ("address_key", "npi"),
         "name": "service_address_key_npi",
         "where": "type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL",
     }
-    assert indexes["service_premise_key_npi"] == {
+    assert index_by_name["service_premise_key_npi"] == {
         "index_elements": ("premise_key", "npi"),
         "name": "service_premise_key_npi",
         "where": "type IN ('primary', 'secondary', 'practice', 'site') AND premise_key IS NOT NULL",
     }
-    assert indexes["primary_state_city_npi"] == {
+    assert index_by_name["primary_state_city_npi"] == {
         "index_elements": ("state_name", "city_name", "npi"),
         "name": "primary_state_city_npi",
         "where": "type='primary'",
     }
-    assert indexes["taxonomy_plans_network"]["where"] == "type='primary'"
-    assert indexes["procedures_array"]["where"] == "type='primary'"
-    assert indexes["medications_array"]["where"] == "type='primary'"
-    assert indexes["geo_idx"]["where"] == (
+    assert index_by_name["taxonomy_plans_network"]["where"] == "type='primary'"
+    assert index_by_name["procedures_array"]["where"] == "type='primary'"
+    assert index_by_name["medications_array"]["where"] == "type='primary'"
+    assert index_by_name["geo_idx"]["where"] == (
         "type IN ('primary', 'secondary', 'practice', 'site') "
         "AND COALESCE(address_precision, '') <> 'city_zip' "
         "AND lat IS NOT NULL AND long IS NOT NULL"
     )
-    assert indexes["geo_bbox"] == {
+    assert index_by_name["geo_bbox"] == {
         "index_elements": ("lat", "long"),
         "name": "geo_bbox",
         "where": (
@@ -3768,12 +3784,12 @@ async def test_push_objects_rewrite_dedupes_mrf_address_on_full_unique_key(monke
 
     monkeypatch.setattr(utils, "db", _FakeDB())
 
-    rows = [
+    address_rows = [
         {"npi": 1, "type": "practice", "checksum": 42, "first_line": "1 Main St"},
         {"npi": 2, "type": "practice", "checksum": 42, "first_line": "1 Main St"},
     ]
 
-    await utils.push_objects(rows, MRFAddress, rewrite=True, use_copy=False)
+    await utils.push_objects(address_rows, MRFAddress, rewrite=True, use_copy=False)
 
     assert len(captured_chunks) in {1}
     assert len(captured_chunks[0]) in {2}

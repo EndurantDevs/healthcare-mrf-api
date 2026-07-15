@@ -1862,28 +1862,46 @@ def test_ptg2_toc_parser_accepts_flat_carrier_file_lists():
     ]
     assert catalog_entries[1].description == "region-in-network-rates.json.gz"
     assert catalog_entries[1].original_url.endswith("Signature=random-rx-oon-token")
+    assert catalog_entries[1].plan_info == ()
     assert catalog_entries[2].domain == process_ptg.PTG2_DOMAIN_ALLOWED_AMOUNT
     assert catalog_entries[3].domain == process_ptg.PTG2_DOMAIN_IN_NETWORK
 
 
+def test_ptg2_flat_toc_derives_group_scope_from_ein_index():
+    """Treat a numeric EIN index filename as its logical group-plan scope."""
+
+    catalog_entries = process_ptg.parse_toc_catalog_entries(
+        {
+            "In-Network Negotiated Rates Files": [
+                {"url": "https://cdn.example.test/in-network-rates.json.gz"}
+            ]
+        },
+        "https://payer.example.test/12-3456789.json",
+    )
+
+    assert catalog_entries[1].plan_info == (
+        {
+            "plan_id": "123456789",
+            "plan_id_type": "EIN",
+            "plan_market_type": "group",
+        },
+    )
+
+
 def test_ptg2_toc_jobs_target_flat_carrier_file_lists(monkeypatch, tmp_path):
+    """Carry flat-index EIN scope into selected jobs and persisted file rows."""
+
     target_file_name = "region-target-in-network-rates.json.gz"
     toc_document_path = tmp_path / "employer-index.json"
+    toc_items = [
+        {"url": "https://cdn.example.test/unused-in-network-rates.json.gz"},
+        {
+            "url": f"https://cdn.example.test/{target_file_name}?Signature=random-rx-oon-token",
+            "displayname": target_file_name,
+        },
+    ]
     toc_document_path.write_text(
-        json.dumps(
-            {
-                "In-Network Negotiated Rates Files": [
-                    {
-                        "url": "https://cdn.example.test/unused-in-network-rates.json.gz",
-                        "displayname": "unused-in-network-rates.json.gz",
-                    },
-                    {
-                        "url": f"https://cdn.example.test/{target_file_name}?Signature=random-rx-oon-token",
-                        "displayname": target_file_name,
-                    },
-                ]
-            }
-        ),
+        json.dumps({"In-Network Negotiated Rates Files": toc_items}),
         encoding="utf-8",
     )
     pushed_file_rows = []
@@ -1901,7 +1919,7 @@ def test_ptg2_toc_jobs_target_flat_carrier_file_lists(monkeypatch, tmp_path):
 
     selected_jobs = asyncio.run(
         process_ptg._process_table_of_contents(
-            "https://payer.example.test/employer-index.json",
+            "https://payer.example.test/123456789.json",
             {"PTGFile": object, "ImportLog": object},
             test_mode=False,
             file_url_contains=[target_file_name],
@@ -1914,10 +1932,12 @@ def test_ptg2_toc_jobs_target_flat_carrier_file_lists(monkeypatch, tmp_path):
         f"https://cdn.example.test/{target_file_name}?Signature=random-rx-oon-token"
     )
     assert selected_jobs[0]["description"] == target_file_name
+    assert selected_jobs[0]["plan_info"][0]["plan_id"] == "123456789"
     assert [file_row["file_type"] for file_row in pushed_file_rows] == [
         "table-of-contents",
         "in-network",
     ]
+    assert pushed_file_rows[1]["plan_id"] == "123456789"
 
 
 def test_ptg2_toc_parser_normalizes_asr_download_links():

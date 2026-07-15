@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from process.ptg_parts.canonical import canonicalize_url, normalize_tic_source_url
 from process.ptg_parts.domain import (
@@ -56,6 +57,10 @@ _FLAT_TOC_IN_NETWORK_SECTION_TOKENS = (
     "in-network",
     "negotiated rate",
     "out-of-area",
+)
+_FLAT_TOC_EIN_INDEX_RE = re.compile(
+    r"(?P<prefix>\d{2})-?(?P<suffix>\d{7})\.json",
+    re.IGNORECASE,
 )
 
 
@@ -116,12 +121,31 @@ def _flat_toc_section_type(section_name: str) -> tuple[str, str] | None:
     return None
 
 
+def _flat_toc_plan_info(toc_url: str) -> tuple[dict[str, str], ...]:
+    """Derive the group scope encoded by an employer-specific EIN index."""
+
+    file_name = unquote(urlsplit(str(toc_url or "")).path.rsplit("/", 1)[-1])
+    match = _FLAT_TOC_EIN_INDEX_RE.fullmatch(file_name)
+    if match is None:
+        return ()
+    return (
+        {
+            "plan_id": f"{match.group('prefix')}{match.group('suffix')}",
+            "plan_id_type": "EIN",
+            "plan_market_type": "group",
+        },
+    )
+
+
 def _flat_toc_catalog_entry(
     file_item: dict[str, Any],
     section_type: tuple[str, str],
     toc_url: str,
     toc_meta: dict[str, Any],
+    plan_info: tuple[dict[str, str], ...],
 ) -> PTG2SourceCatalogEntry | None:
+    """Build one validated source entry from a flat TOC file item."""
+
     location = file_item.get("location") or file_item.get("url")
     description = file_item.get("description") or file_item.get("displayname")
     if not _is_toc_body_file_location(location):
@@ -137,7 +161,7 @@ def _flat_toc_catalog_entry(
         description=description,
         reporting_entity_name=toc_meta["reporting_entity_name"],
         reporting_entity_type=toc_meta["reporting_entity_type"],
-        plan_info=(),
+        plan_info=plan_info,
     )
 
 
@@ -148,6 +172,7 @@ def flat_toc_catalog_entries(
 ) -> list[PTG2SourceCatalogEntry]:
     """Parse non-standard top-level file lists without binding private plan data."""
     catalog_entries: list[PTG2SourceCatalogEntry] = []
+    plan_info = _flat_toc_plan_info(toc_url)
     for section_name, section_items in toc_content.items():
         section_type = _flat_toc_section_type(section_name)
         if section_type is None or not isinstance(section_items, list):
@@ -160,6 +185,7 @@ def flat_toc_catalog_entries(
                 section_type,
                 toc_url,
                 toc_meta,
+                plan_info,
             )
             if catalog_entry is not None:
                 catalog_entries.append(catalog_entry)
