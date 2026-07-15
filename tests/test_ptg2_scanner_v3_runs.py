@@ -45,6 +45,7 @@ _STRICT_SCANNER_FRAME_KINDS = {
     "manifest_provider_forward_sidecar_file",
     "manifest_provider_group_member_copy_file",
     "manifest_provider_inverted_sidecar_file",
+    "manifest_provider_set_dictionary_copy_file",
     "scanner_config",
     "scanner_summary",
     "v3_serving_code_dictionary_file",
@@ -394,6 +395,7 @@ def _run_scanner(
     price_atom_copy_path = run_directory / "manifest-price-atom.copy"
     price_set_atom_copy_path = run_directory / "manifest-price-set-atom.copy"
     provider_group_member_copy_path = run_directory / "provider-group-member.copy"
+    provider_set_metadata_copy_path = run_directory / "provider-set-metadata.copy"
     provider_forward_path = run_directory / "provider-forward.sidecar"
     provider_inverted_path = run_directory / "provider-inverted.sidecar"
     serving_run_directory = run_directory / "serving-runs"
@@ -421,6 +423,9 @@ def _run_scanner(
             ),
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH": str(
                 provider_group_member_copy_path
+            ),
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COPY_PATH": str(
+                provider_set_metadata_copy_path
             ),
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH": str(
                 provider_forward_path
@@ -478,6 +483,11 @@ def _run_scanner(
         for kind, frame_payload in frames
         if kind == "manifest_provider_group_member_copy_file"
     ]
+    provider_set_metadata_frames = [
+        frame_payload
+        for kind, frame_payload in frames
+        if kind == "manifest_provider_set_dictionary_copy_file"
+    ]
     partition_bytes = b"".join(
         Path(frame["path"]).read_bytes()
         for frame in sorted(partition_frames, key=lambda frame: (frame["partition"], frame["path"]))
@@ -497,6 +507,7 @@ def _run_scanner(
         "price_atom_frames": price_atom_frames,
         "price_set_atom_frames": price_set_atom_frames,
         "provider_group_member_frames": provider_group_member_frames,
+        "provider_set_metadata_frames": provider_set_metadata_frames,
         "partition_bytes": partition_bytes,
     }
 
@@ -657,6 +668,14 @@ def test_v3_all_scanner_paths_emit_identical_fixed_width_records(tmp_path):
         assert all(
             Path(frame["path"]).exists()
             for frame in run["provider_group_member_frames"]
+        )
+        assert run["provider_set_metadata_frames"]
+        assert sum(
+            frame["row_count"] for frame in run["provider_set_metadata_frames"]
+        ) == 1
+        assert all(
+            Path(frame["path"]).exists()
+            for frame in run["provider_set_metadata_frames"]
         )
         assert run["provider_forward_path"].exists()
         assert run["provider_inverted_path"].exists()
