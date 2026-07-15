@@ -23,6 +23,13 @@ final summary. A missing or different echo fails publication. The validated
 contract is retained in finalizer progress/report metadata so an import timing
 can be interpreted against the resources that produced it.
 
+During identity extraction, every active partition worker uses only its share
+to sort and deduplicate provider identities. The later global provider phase is
+a bounded merge of those sorted streams and does not reacquire the full budget
+as a second source-population sort. The assignment phase reuses the same worker
+shares after identity extraction has completed; the phases do not multiply the
+declared process-wide budget.
+
 The summary also records the conservative encoder-workspace estimate and
 observed continuation/provider-code high-water counts. The estimate covers
 forward payload/chunk/compression buffers, bounded provider-code container

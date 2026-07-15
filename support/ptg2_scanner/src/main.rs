@@ -49,14 +49,15 @@ use ptg2_scanner::shared_graph::{
 use ptg2_scanner::v3_dense::{DenseIdentityMap, DenseIdentityValue};
 use ptg2_scanner::v3_runs::{
     external_sort_assigned_serving_records, external_sort_provider_code_pairs,
-    external_sort_provider_identities, parse_coverage_scope_id, partition_for_record,
-    read_code_dictionary_exact, source_key_bits, source_key_bytes, write_audit_candidate_file,
-    AuditCandidateSelector, MultiFileSortStats, NaturalLeanCode, NaturalLeanCodeFields,
-    ServingRunPartitionWriter, ServingRunRecord, TaggedServingRunCodec, AUDIT_CANDIDATE_FORMAT,
-    AUDIT_CANDIDATE_FORMAT_VERSION, AUDIT_CANDIDATE_MAX_RECORDS, AUDIT_CANDIDATE_RECORD_BYTES,
-    AUDIT_CANDIDATE_SELECTION, CODE_DICTIONARY_FORMAT, CODE_DICTIONARY_FORMAT_VERSION,
-    COVERAGE_SCOPE_ID_BYTES, PROVIDER_CODE_PAIR_RECORD_BYTES, PROVIDER_IDENTITY_RECORD_BYTES,
-    SERVING_RUN_FORMAT, SERVING_RUN_FORMAT_VERSION, SERVING_RUN_RECORD_BYTES,
+    external_sort_provider_identities, merge_sorted_provider_identities, parse_coverage_scope_id,
+    partition_for_record, read_code_dictionary_exact, source_key_bits, source_key_bytes,
+    write_audit_candidate_file, AuditCandidateSelector, MultiFileSortStats, NaturalLeanCode,
+    NaturalLeanCodeFields, ServingRunPartitionWriter, ServingRunRecord, TaggedServingRunCodec,
+    AUDIT_CANDIDATE_FORMAT, AUDIT_CANDIDATE_FORMAT_VERSION, AUDIT_CANDIDATE_MAX_RECORDS,
+    AUDIT_CANDIDATE_RECORD_BYTES, AUDIT_CANDIDATE_SELECTION, CODE_DICTIONARY_FORMAT,
+    CODE_DICTIONARY_FORMAT_VERSION, COVERAGE_SCOPE_ID_BYTES, PROVIDER_CODE_PAIR_RECORD_BYTES,
+    PROVIDER_IDENTITY_RECORD_BYTES, SERVING_RUN_FORMAT, SERVING_RUN_FORMAT_VERSION,
+    SERVING_RUN_RECORD_BYTES,
 };
 #[cfg(test)]
 use ptg2_scanner::v3_runs::{natural_lean_code_identity, read_code_dictionary};
@@ -13302,7 +13303,6 @@ struct AssignedV3EncoderOptions {
     hot_payload_bytes: usize,
     provider_code_sort_chunk_bytes: usize,
     source: SourceEncoding,
-    source_field_present: bool,
 }
 
 fn validate_source_encoding(source_count: u64, source_bits: u8) -> io::Result<()> {
@@ -14230,6 +14230,83 @@ fn provider_code_merge_pass_count(mut chunk_count: u64) -> usize {
 }
 
 #[cfg(test)]
+struct PgBinaryAssignedV3RowSource<'a, R> {
+    reader: &'a mut R,
+    field_count: i16,
+    source_field_present: bool,
+}
+
+#[cfg(test)]
+impl<'a, R: Read> PgBinaryAssignedV3RowSource<'a, R> {
+    fn new(reader: &'a mut R, source_field_present: bool) -> io::Result<Self> {
+        read_pg_binary_copy_header(reader)?;
+        Ok(Self {
+            reader,
+            field_count: if source_field_present { 5 } else { 4 },
+            source_field_present,
+        })
+    }
+}
+
+#[cfg(test)]
+impl<R: Read> AssignedV3RowSource for PgBinaryAssignedV3RowSource<'_, R> {
+    fn next_row(&mut self) -> io::Result<Option<AssignedV3Row>> {
+        let Some(fields) =
+            read_pg_binary_copy_row(self.reader, self.field_count, "PTG2 v3 assigned by-code")?
+        else {
+            return Ok(None);
+        };
+        let code_key = pg_binary_nonnegative_i32(
+            required_pg_binary_field(&fields, 0, "code_key")?,
+            "code_key",
+        )?;
+        let provider_set_key = pg_binary_nonnegative_i32(
+            required_pg_binary_field(&fields, 1, "provider_set_key")?,
+            "provider_set_key",
+        )?;
+        let provider_count = pg_binary_u64(
+            required_pg_binary_field(&fields, 2, "provider_count")?,
+            "provider_count",
+        )?;
+        let price_key = u32::try_from(pg_binary_nonnegative_i64(
+            required_pg_binary_field(&fields, 3, "price_key")?,
+            "price_key",
+        )?)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTG2 v3 assigned price_key exceeds u32",
+            )
+        })?;
+        let source_key = if self.source_field_present {
+            u32::try_from(pg_binary_nonnegative_i64(
+                required_pg_binary_field(&fields, 4, "source_key")?,
+                "source_key",
+            )?)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PTG2 v3 assigned source_key exceeds u32",
+                )
+            })?
+        } else {
+            0
+        };
+        Ok(Some(AssignedV3Row {
+            code_key,
+            provider_set_key,
+            provider_count,
+            price_key,
+            source_key,
+        }))
+    }
+
+    fn source_copy_format(&self) -> &'static str {
+        "postgres_binary"
+    }
+}
+
+#[cfg(test)]
 fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut CountingWriter<W>,
@@ -14269,16 +14346,33 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_limi
                 key_bits: 0,
                 tagged_codec: TaggedServingRunCodec::new(1, 0)?,
             },
-            source_field_present: false,
         },
+        false,
     )
 }
 
+#[cfg(test)]
 fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_provenance<
     R: Read,
     W: Write,
 >(
     reader: &mut R,
+    writer: &mut CountingWriter<W>,
+    target_format: ServingBinaryTargetCopyFormat,
+    options: AssignedV3EncoderOptions,
+    source_field_present: bool,
+) -> io::Result<Value> {
+    let mut rows = PgBinaryAssignedV3RowSource::new(reader, source_field_present)?;
+    write_serving_binary_v3_assigned_rows_copy_with_provenance(
+        &mut rows,
+        writer,
+        target_format,
+        options,
+    )
+}
+
+fn write_serving_binary_v3_assigned_rows_copy_with_provenance<R: AssignedV3RowSource, W: Write>(
+    rows: &mut R,
     writer: &mut CountingWriter<W>,
     target_format: ServingBinaryTargetCopyFormat,
     options: AssignedV3EncoderOptions,
@@ -14288,7 +14382,6 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_prov
         hot_payload_bytes,
         provider_code_sort_chunk_bytes,
         source,
-        source_field_present,
     } = options;
     let source_count = source.count;
     let source_bits = source.key_bits;
@@ -14308,8 +14401,8 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_prov
             "source_key_bytes does not match source_count",
         ));
     }
-    read_pg_binary_copy_header(reader)?;
     write_serving_binary_copy_header(writer, target_format)?;
+    let source_copy_format = rows.source_copy_format();
     let mut provider_projection_by_key: BTreeMap<i32, ServingBinaryV3ProviderProjection> =
         BTreeMap::new();
     let mut provider_shard_state = ServingBinaryByCodeProviderShardState::new(
@@ -14326,46 +14419,14 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_prov
     let mut provider_code_spool = ServingBinaryV3ProviderCodeSpool::new()?;
     let mut previous_provider_code_pair: Option<(i32, i32)> = None;
 
-    let assigned_field_count = if source_field_present { 5 } else { 4 };
-    while let Some(fields) =
-        read_pg_binary_copy_row(reader, assigned_field_count, "PTG2 v3 assigned by-code")?
+    while let Some(AssignedV3Row {
+        code_key,
+        provider_set_key,
+        provider_count,
+        price_key,
+        source_key,
+    }) = rows.next_row()?
     {
-        let code_key = pg_binary_nonnegative_i32(
-            required_pg_binary_field(&fields, 0, "code_key")?,
-            "code_key",
-        )?;
-        let provider_set_key = pg_binary_nonnegative_i32(
-            required_pg_binary_field(&fields, 1, "provider_set_key")?,
-            "provider_set_key",
-        )?;
-        let provider_count = pg_binary_u64(
-            required_pg_binary_field(&fields, 2, "provider_count")?,
-            "provider_count",
-        )?;
-        let price_key = u32::try_from(pg_binary_nonnegative_i64(
-            required_pg_binary_field(&fields, 3, "price_key")?,
-            "price_key",
-        )?)
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "PTG2 v3 assigned price_key exceeds u32",
-            )
-        })?;
-        let source_key = if source_field_present {
-            u32::try_from(pg_binary_nonnegative_i64(
-                required_pg_binary_field(&fields, 4, "source_key")?,
-                "source_key",
-            )?)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "PTG2 v3 assigned source_key exceeds u32",
-                )
-            })?
-        } else {
-            0
-        };
         if u64::from(source_key) >= source_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -14659,7 +14720,7 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_prov
         "byte_count": writer.byte_count(),
         "block_bytes": grouped_payload_bytes,
         "hot_block_bytes": hot_payload_bytes,
-        "source_copy_format": "postgres_binary",
+        "source_copy_format": source_copy_format,
         "target_copy_format": target_format.label(),
     }))
 }
@@ -16792,20 +16853,31 @@ fn v3_support_digest(
     Ok(digest.finalize().into())
 }
 
-struct AssignedPgBinaryStream {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AssignedV3Row {
+    code_key: i32,
+    provider_set_key: i32,
+    provider_count: u64,
+    price_key: u32,
+    source_key: u32,
+}
+
+trait AssignedV3RowSource {
+    fn next_row(&mut self) -> io::Result<Option<AssignedV3Row>>;
+    fn source_copy_format(&self) -> &'static str;
+}
+
+struct AssignedFixedRecordStream {
     paths: Vec<PathBuf>,
     path_index: usize,
     reader: Option<BufReader<File>>,
     previous_record: Option<[u8; V3_FINALIZER_ASSIGNED_BYTES]>,
-    pending: Vec<u8>,
-    pending_offset: usize,
-    phase: u8,
     audit_candidates: AuditCandidateSelector,
     distinct_record_count: u64,
     duplicate_record_count: u64,
 }
 
-impl AssignedPgBinaryStream {
+impl AssignedFixedRecordStream {
     fn new_many(paths: Vec<PathBuf>, population_count: u64) -> io::Result<Self> {
         if paths.iter().any(|path| !path.is_file()) {
             return Err(io::Error::new(
@@ -16818,9 +16890,6 @@ impl AssignedPgBinaryStream {
             path_index: 0,
             reader: None,
             previous_record: None,
-            pending: Vec::new(),
-            pending_offset: 0,
-            phase: 0,
             audit_candidates: AuditCandidateSelector::new(population_count),
             distinct_record_count: 0,
             duplicate_record_count: 0,
@@ -16838,107 +16907,85 @@ impl AssignedPgBinaryStream {
     fn duplicate_record_count(&self) -> u64 {
         self.duplicate_record_count
     }
-
-    fn fill_pending(&mut self) -> io::Result<bool> {
-        self.pending.clear();
-        self.pending_offset = 0;
-        match self.phase {
-            0 => {
-                write_pg_binary_copy_header(&mut self.pending)?;
-                self.phase = 1;
-            }
-            1 => {
-                let mut record = [0u8; V3_FINALIZER_ASSIGNED_BYTES];
-                let has_record = loop {
-                    if self.reader.is_none() {
-                        let Some(path) = self.paths.get(self.path_index) else {
-                            break false;
-                        };
-                        self.reader = Some(BufReader::new(File::open(path)?));
-                        self.path_index += 1;
-                    }
-                    if read_exact_optional(self.reader.as_mut().unwrap(), &mut record)? {
-                        break true;
-                    }
-                    self.reader = None;
-                };
-                if has_record {
-                    if self
-                        .previous_record
-                        .is_some_and(|previous| record < previous)
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "assigned partition files are not globally ordered",
-                        ));
-                    }
-                    if self.previous_record == Some(record) {
-                        self.duplicate_record_count = self.duplicate_record_count.saturating_add(1);
-                    } else {
-                        self.distinct_record_count = self.distinct_record_count.saturating_add(1);
-                    }
-                    self.previous_record = Some(record);
-                    let code_key =
-                        i32::from_be_bytes(record[0..4].try_into().map_err(to_io_error)?);
-                    let provider_key =
-                        i32::from_be_bytes(record[4..8].try_into().map_err(to_io_error)?);
-                    let price_key =
-                        u32::from_be_bytes(record[8..12].try_into().map_err(to_io_error)?);
-                    let source_key =
-                        u32::from_be_bytes(record[12..16].try_into().map_err(to_io_error)?);
-                    let provider_count =
-                        u32::from_be_bytes(record[16..20].try_into().map_err(to_io_error)?);
-                    self.audit_candidates.observe(
-                        u32::try_from(code_key).map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "assigned code_key cannot be negative",
-                            )
-                        })?,
-                        u32::try_from(provider_key).map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "assigned provider_set_key cannot be negative",
-                            )
-                        })?,
-                        price_key,
-                        source_key,
-                        provider_count,
-                    )?;
-                    self.pending.write_all(&5i16.to_be_bytes())?;
-                    write_pg_binary_copy_i32_field(&mut self.pending, code_key)?;
-                    write_pg_binary_copy_i32_field(&mut self.pending, provider_key)?;
-                    write_pg_binary_copy_i64_field(&mut self.pending, i64::from(provider_count))?;
-                    write_pg_binary_copy_i64_field(&mut self.pending, i64::from(price_key))?;
-                    write_pg_binary_copy_i64_field(&mut self.pending, i64::from(source_key))?;
-                } else {
-                    self.phase = 2;
-                    return self.fill_pending();
-                }
-            }
-            2 => {
-                write_pg_binary_copy_trailer(&mut self.pending)?;
-                self.phase = 3;
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
 }
 
-impl Read for AssignedPgBinaryStream {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
+impl AssignedV3RowSource for AssignedFixedRecordStream {
+    fn next_row(&mut self) -> io::Result<Option<AssignedV3Row>> {
+        let mut record = [0u8; V3_FINALIZER_ASSIGNED_BYTES];
+        let has_record = loop {
+            if self.reader.is_none() {
+                let Some(path) = self.paths.get(self.path_index) else {
+                    break false;
+                };
+                self.reader = Some(BufReader::new(File::open(path)?));
+                self.path_index += 1;
+            }
+            match read_exact_optional(self.reader.as_mut().unwrap(), &mut record) {
+                Ok(true) => break true,
+                Ok(false) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "assigned partition file ends with a partial {V3_FINALIZER_ASSIGNED_BYTES}-byte record"
+                        ),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+            self.reader = None;
+        };
+        if !has_record {
+            return Ok(None);
         }
-        if self.pending_offset >= self.pending.len() && !self.fill_pending()? {
-            return Ok(0);
+        if self
+            .previous_record
+            .is_some_and(|previous| record < previous)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "assigned partition files are not globally ordered",
+            ));
         }
-        let available = &self.pending[self.pending_offset..];
-        let copied = available.len().min(output.len());
-        output[..copied].copy_from_slice(&available[..copied]);
-        self.pending_offset += copied;
-        Ok(copied)
+        if self.previous_record == Some(record) {
+            self.duplicate_record_count = self.duplicate_record_count.saturating_add(1);
+        } else {
+            self.distinct_record_count = self.distinct_record_count.saturating_add(1);
+        }
+        self.previous_record = Some(record);
+        let code_key = i32::from_be_bytes(record[0..4].try_into().map_err(to_io_error)?);
+        let provider_set_key = i32::from_be_bytes(record[4..8].try_into().map_err(to_io_error)?);
+        let price_key = u32::from_be_bytes(record[8..12].try_into().map_err(to_io_error)?);
+        let source_key = u32::from_be_bytes(record[12..16].try_into().map_err(to_io_error)?);
+        let provider_count = u32::from_be_bytes(record[16..20].try_into().map_err(to_io_error)?);
+        self.audit_candidates.observe(
+            u32::try_from(code_key).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "assigned code_key cannot be negative",
+                )
+            })?,
+            u32::try_from(provider_set_key).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "assigned provider_set_key cannot be negative",
+                )
+            })?,
+            price_key,
+            source_key,
+            provider_count,
+        )?;
+        Ok(Some(AssignedV3Row {
+            code_key,
+            provider_set_key,
+            provider_count: u64::from(provider_count),
+            price_key,
+            source_key,
+        }))
+    }
+
+    fn source_copy_format(&self) -> &'static str {
+        "assigned_fixed_v1"
     }
 }
 
@@ -17051,6 +17098,7 @@ struct V3PreparedPartition {
     partition: usize,
     inputs: Vec<V3FinalizerPartitionInput>,
     provider_spool_path: PathBuf,
+    provider_sort_stats: MultiFileSortStats,
     row_count: u64,
     code_key_start: u32,
     code_rate_counts: Vec<u64>,
@@ -17076,6 +17124,7 @@ struct V3PartitionScanContext<'a> {
     code_partition_ranges: &'a [(u32, usize)],
     price_map: &'a DenseIdentityMap,
     combined_price_seen_words: &'a Mutex<Vec<u64>>,
+    provider_sort_record_limit: usize,
 }
 
 fn build_v3_code_partition_ranges(
@@ -17158,8 +17207,9 @@ fn prepare_v3_partition(
     let started_at = Instant::now();
     let partition_directory = context.work_root.join(format!("partition-{partition:03}"));
     std::fs::create_dir_all(&partition_directory)?;
-    let provider_spool_path = partition_directory.join("providers.unsorted");
-    let mut provider_spool = BufWriter::new(File::create(&provider_spool_path)?);
+    let provider_unsorted_path = partition_directory.join("providers.unsorted");
+    let provider_spool_path = partition_directory.join("providers.sorted");
+    let mut provider_spool = BufWriter::new(File::create(&provider_unsorted_path)?);
     let &(code_key_start, partition_code_count) = context
         .code_partition_ranges
         .get(partition)
@@ -17279,6 +17329,7 @@ fn prepare_v3_partition(
     }
     provider_spool.flush()?;
     provider_spool.get_ref().sync_all()?;
+    drop(provider_spool);
     let expected_rows = inputs.iter().map(|input| input.row_count).sum::<u64>();
     if row_count != expected_rows {
         return Err(io::Error::new(
@@ -17302,9 +17353,28 @@ fn prepare_v3_partition(
         }
     }
     let provider_bytes = row_count.saturating_mul(PROVIDER_IDENTITY_RECORD_BYTES as u64);
+    let provider_sort_stats = external_sort_provider_identities(
+        std::slice::from_ref(&provider_unsorted_path),
+        &provider_spool_path,
+        &partition_directory,
+        context.provider_sort_record_limit,
+    )?;
+    if provider_sort_stats.input_records != row_count
+        || provider_sort_stats.input_bytes != provider_bytes
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partition provider-identity prefold changed its source population",
+        ));
+    }
+    std::fs::remove_file(&provider_unsorted_path)?;
     let scratch = V3ScratchBytes {
-        read: source_bytes_read,
-        written: provider_bytes,
+        read: source_bytes_read
+            .saturating_add(provider_sort_stats.input_bytes)
+            .saturating_add(provider_sort_stats.spill_bytes),
+        written: provider_bytes
+            .saturating_add(provider_sort_stats.spill_bytes)
+            .saturating_add(provider_sort_stats.output_bytes),
     };
     let elapsed_seconds = started_at.elapsed().as_secs_f64();
     emit_v3_partition_progress(
@@ -17319,6 +17389,7 @@ fn prepare_v3_partition(
         partition,
         inputs,
         provider_spool_path,
+        provider_sort_stats,
         row_count,
         code_key_start,
         code_rate_counts,
@@ -17854,7 +17925,6 @@ struct V3SortMemoryBudget {
     bytes_per_active_worker: usize,
     single_sort_payload_bytes: usize,
     assigned_records_per_worker: usize,
-    provider_identity_records: usize,
 }
 
 fn v3_sort_memory_budget(
@@ -17895,8 +17965,7 @@ fn v3_sort_memory_budget(
             )
         })?;
     let assigned_records_per_worker = bytes_per_active_worker / V3_FINALIZER_ASSIGNED_BYTES;
-    let provider_identity_records = single_sort_payload_bytes / PROVIDER_IDENTITY_RECORD_BYTES;
-    if assigned_records_per_worker == 0 || provider_identity_records == 0 {
+    if assigned_records_per_worker == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -17912,7 +17981,6 @@ fn v3_sort_memory_budget(
         bytes_per_active_worker,
         single_sort_payload_bytes,
         assigned_records_per_worker,
-        provider_identity_records,
     })
 }
 
@@ -18104,6 +18172,7 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             code_partition_ranges: &code_partition_ranges,
             price_map: price_map.as_ref(),
             combined_price_seen_words: combined_price_seen_words.as_ref(),
+            provider_sort_record_limit: sort_memory.assigned_records_per_worker,
         };
         worker_pool.install(|| {
             partition_jobs
@@ -18151,12 +18220,49 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         .iter()
         .map(|partition| partition.provider_spool_path.clone())
         .collect::<Vec<_>>();
-    let provider_sort_stats = external_sort_provider_identities(
-        &provider_spool_paths,
-        &provider_sorted_path,
-        work_directory.path(),
-        sort_memory.provider_identity_records,
-    )?;
+    let provider_merge_stats =
+        merge_sorted_provider_identities(&provider_spool_paths, &provider_sorted_path)?;
+    let provider_prefold_input_records = prepared_partitions
+        .iter()
+        .map(|partition| partition.provider_sort_stats.input_records)
+        .sum::<u64>();
+    let provider_prefold_input_bytes = prepared_partitions
+        .iter()
+        .map(|partition| partition.provider_sort_stats.input_bytes)
+        .sum::<u64>();
+    let provider_prefold_spill_bytes = prepared_partitions
+        .iter()
+        .map(|partition| partition.provider_sort_stats.spill_bytes)
+        .sum::<u64>();
+    let provider_prefold_chunk_count = prepared_partitions
+        .iter()
+        .map(|partition| partition.provider_sort_stats.chunk_count)
+        .sum::<u64>();
+    if provider_prefold_input_records != source_record_count
+        || provider_prefold_input_bytes
+            != source_record_count.saturating_mul(PROVIDER_IDENTITY_RECORD_BYTES as u64)
+        || provider_merge_stats.input_records
+            != prepared_partitions
+                .iter()
+                .map(|partition| partition.provider_sort_stats.unique_records)
+                .sum::<u64>()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partition provider-identity prefold did not preserve its complete source contract",
+        ));
+    }
+    let provider_sort_stats = MultiFileSortStats {
+        input_file_count: prepared_partitions.len() as u64,
+        input_records: provider_prefold_input_records,
+        unique_records: provider_merge_stats.unique_records,
+        duplicate_records: provider_prefold_input_records
+            .saturating_sub(provider_merge_stats.unique_records),
+        input_bytes: provider_prefold_input_bytes,
+        spill_bytes: provider_prefold_spill_bytes,
+        chunk_count: provider_prefold_chunk_count,
+        output_bytes: provider_merge_stats.output_bytes,
+    };
     let provider_map_entries =
         usize::try_from(provider_sort_stats.unique_records).map_err(|_| {
             io::Error::new(
@@ -18278,21 +18384,19 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         .map(|partition| partition.assigned_path.clone())
         .collect::<Vec<_>>();
     let mut assigned_stream =
-        AssignedPgBinaryStream::new_many(assigned_paths, assigned_sort_stats.unique_records)?;
-    let assigned_summary =
-        write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_provenance(
-            &mut assigned_stream,
-            &mut serving_blocks_writer,
-            ServingBinaryTargetCopyFormat::SharedBinary,
-            AssignedV3EncoderOptions {
-                grouped_payload_bytes,
-                hot_payload_bytes: V3_FINALIZER_HOT_BLOCK_BYTES,
-                provider_code_sort_chunk_bytes: serving_binary_v3_provider_code_sort_chunk_bytes()
-                    .min(sort_memory.single_sort_payload_bytes),
-                source: source_encoding,
-                source_field_present: true,
-            },
-        )?;
+        AssignedFixedRecordStream::new_many(assigned_paths, assigned_sort_stats.unique_records)?;
+    let assigned_summary = write_serving_binary_v3_assigned_rows_copy_with_provenance(
+        &mut assigned_stream,
+        &mut serving_blocks_writer,
+        ServingBinaryTargetCopyFormat::SharedBinary,
+        AssignedV3EncoderOptions {
+            grouped_payload_bytes,
+            hot_payload_bytes: V3_FINALIZER_HOT_BLOCK_BYTES,
+            provider_code_sort_chunk_bytes: serving_binary_v3_provider_code_sort_chunk_bytes()
+                .min(sort_memory.single_sort_payload_bytes),
+            source: source_encoding,
+        },
+    )?;
     sync_counting_writer(&mut serving_blocks_writer)?;
 
     let audit_candidate_path = output.path("audit_candidates.bin");
@@ -18383,15 +18487,13 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         .row_count
         .saturating_mul(V3_FINALIZER_PRICE_KEY_MAP_RECORD_BYTES as u64);
     let identity_scratch = V3ScratchBytes {
-        read: provider_sort_stats
+        read: provider_merge_stats
             .input_bytes
-            .saturating_add(provider_sort_stats.spill_bytes)
-            .saturating_add(provider_sort_stats.output_bytes.saturating_mul(2))
+            .saturating_add(provider_merge_stats.output_bytes.saturating_mul(2))
             .saturating_add(price_key_map_stage.input_bytes)
             .saturating_add(price_map_stage_bytes),
-        written: provider_sort_stats
-            .spill_bytes
-            .saturating_add(provider_sort_stats.output_bytes)
+        written: provider_merge_stats
+            .output_bytes
             .saturating_add(price_map_stage_bytes.saturating_mul(2)),
     };
     let provider_code_scratch_read = assigned_summary
@@ -18463,6 +18565,23 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "tagged_partition_sort": false,
         },
         "provider_identity_sort": sort_stats_payload(provider_sort_stats),
+        "provider_identity_prefold": {
+            "strategy": "parallel_partition_sort_dedupe_then_global_merge_v1",
+            "partition_count": prepared_partitions.len(),
+            "source_records": provider_prefold_input_records,
+            "partition_unique_records": provider_merge_stats.input_records,
+            "global_unique_records": provider_merge_stats.unique_records,
+            "global_merge_input_bytes": provider_merge_stats.input_bytes,
+            "global_merge_output_bytes": provider_merge_stats.output_bytes,
+            "partitions": prepared_partitions.iter().map(|partition| json!({
+                "partition": partition.partition,
+                "input_records": partition.provider_sort_stats.input_records,
+                "unique_records": partition.provider_sort_stats.unique_records,
+                "duplicate_records": partition.provider_sort_stats.duplicate_records,
+                "spill_bytes": partition.provider_sort_stats.spill_bytes,
+                "chunk_count": partition.provider_sort_stats.chunk_count,
+            })).collect::<Vec<_>>(),
+        },
         "price_identity_assignment": {
             "strategy": "authoritative_dense_map_lookup_with_source_coverage_bitmap_v1",
             "source_identity_spool": false,
@@ -18598,7 +18717,7 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         "sort_memory_bytes_per_active_worker": sort_memory.bytes_per_active_worker,
         "single_sort_payload_bytes": sort_memory.single_sort_payload_bytes,
         "assigned_sort_record_limit_per_worker": sort_memory.assigned_records_per_worker,
-        "provider_identity_sort_record_limit": sort_memory.provider_identity_records,
+        "provider_identity_prefold_record_limit_per_worker": sort_memory.assigned_records_per_worker,
         "identity_map_max_bytes": options.identity_map_max_bytes,
         "scratch_io": {
             "definition": "all finalizer input and temporary-file IO; committed output writes excluded",
@@ -21821,8 +21940,8 @@ mod tests {
                     )
                     .unwrap(),
                 },
-                source_field_present: true,
             },
+            true,
         )
         .unwrap();
 
@@ -22984,6 +23103,7 @@ mod tests {
                 code_partition_ranges: &code_partition_ranges,
                 price_map: &price_map,
                 combined_price_seen_words: &combined_price_seen_words,
+                provider_sort_record_limit: 2,
             },
         )
         .unwrap();
@@ -23032,6 +23152,7 @@ mod tests {
                 code_partition_ranges: &code_partition_ranges,
                 price_map: &price_map,
                 combined_price_seen_words: &identity_mismatch_seen,
+                provider_sort_record_limit: 2,
             },
         )
         .unwrap_err();
@@ -23432,10 +23553,6 @@ mod tests {
             total - V3_FINALIZER_SORT_OVERHEAD_BYTES_PER_ACTIVE_WORKER
         );
         assert_eq!(budget.assigned_records_per_worker, 2);
-        assert_eq!(
-            budget.provider_identity_records,
-            budget.single_sort_payload_bytes / PROVIDER_IDENTITY_RECORD_BYTES
-        );
         assert!(v3_sort_memory_budget(
             4 * V3_FINALIZER_SORT_OVERHEAD_BYTES_PER_ACTIVE_WORKER - 1,
             4
@@ -23655,6 +23772,143 @@ mod tests {
         assert!(maximum_key < (1i64 << 62));
         assert!(serving_binary_by_code_provider_shard_block_key(-1, 0).is_err());
         assert!(serving_binary_by_code_provider_shard_block_key(0, -1).is_err());
+    }
+
+    fn assigned_fixed_record(row: AssignedV3Row) -> [u8; V3_FINALIZER_ASSIGNED_BYTES] {
+        let mut record = [0u8; V3_FINALIZER_ASSIGNED_BYTES];
+        record[0..4].copy_from_slice(&row.code_key.to_be_bytes());
+        record[4..8].copy_from_slice(&row.provider_set_key.to_be_bytes());
+        record[8..12].copy_from_slice(&row.price_key.to_be_bytes());
+        record[12..16].copy_from_slice(&row.source_key.to_be_bytes());
+        record[16..20].copy_from_slice(&u32::try_from(row.provider_count).unwrap().to_be_bytes());
+        record
+    }
+
+    fn write_assigned_fixed_records(path: &Path, rows: &[AssignedV3Row]) {
+        let mut writer = BufWriter::new(File::create(path).unwrap());
+        for row in rows {
+            writer.write_all(&assigned_fixed_record(*row)).unwrap();
+        }
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn serving_binary_v3_fixed_assigned_stream_matches_pg_binary_exactly() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("assigned-000.bin");
+        let second_path = directory.path().join("assigned-001.bin");
+        let rows = [
+            AssignedV3Row {
+                code_key: 1,
+                provider_set_key: 2,
+                provider_count: 3,
+                price_key: 0,
+                source_key: 0,
+            },
+            AssignedV3Row {
+                code_key: 1,
+                provider_set_key: 2,
+                provider_count: 3,
+                price_key: 1,
+                source_key: 1,
+            },
+            AssignedV3Row {
+                code_key: 2,
+                provider_set_key: 4,
+                provider_count: 7,
+                price_key: 2,
+                source_key: 2,
+            },
+        ];
+        write_assigned_fixed_records(&first_path, &rows[..2]);
+        write_assigned_fixed_records(&second_path, &rows[2..]);
+        let options = AssignedV3EncoderOptions {
+            grouped_payload_bytes: 1024,
+            hot_payload_bytes: 1024,
+            provider_code_sort_chunk_bytes: 1024,
+            source: SourceEncoding {
+                count: 3,
+                key_bits: 2,
+                tagged_codec: TaggedServingRunCodec::new(3, 1).unwrap(),
+            },
+        };
+
+        let pg_rows = rows
+            .iter()
+            .map(|row| {
+                vec![
+                    pg_i32_field(row.code_key),
+                    pg_i32_field(row.provider_set_key),
+                    pg_i64_field(row.provider_count as i64),
+                    pg_i64_field(i64::from(row.price_key)),
+                    pg_i64_field(i64::from(row.source_key)),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut pg_reader = Cursor::new(pg_binary_copy_rows(&pg_rows));
+        let mut pg_output = CountingWriter::new(Vec::new());
+        let pg_summary =
+            write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_provenance(
+                &mut pg_reader,
+                &mut pg_output,
+                ServingBinaryTargetCopyFormat::SharedBinary,
+                options,
+                true,
+            )
+            .unwrap();
+
+        let mut fixed_reader =
+            AssignedFixedRecordStream::new_many(vec![first_path, second_path], rows.len() as u64)
+                .unwrap();
+        let mut fixed_output = CountingWriter::new(Vec::new());
+        let fixed_summary = write_serving_binary_v3_assigned_rows_copy_with_provenance(
+            &mut fixed_reader,
+            &mut fixed_output,
+            ServingBinaryTargetCopyFormat::SharedBinary,
+            options,
+        )
+        .unwrap();
+
+        assert_eq!(fixed_output.inner, pg_output.inner);
+        assert_eq!(fixed_summary["row_count"], pg_summary["row_count"]);
+        assert_eq!(
+            fixed_summary["copy_record_count"],
+            pg_summary["copy_record_count"]
+        );
+        assert_eq!(fixed_summary["source_copy_format"], "assigned_fixed_v1");
+        assert_eq!(fixed_reader.distinct_record_count(), rows.len() as u64);
+        assert_eq!(fixed_reader.duplicate_record_count(), 0);
+        assert!(!fixed_reader.audit_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn assigned_fixed_stream_rejects_unordered_and_partial_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let unordered_path = directory.path().join("unordered.bin");
+        let later = AssignedV3Row {
+            code_key: 2,
+            provider_set_key: 0,
+            provider_count: 1,
+            price_key: 0,
+            source_key: 0,
+        };
+        let earlier = AssignedV3Row {
+            code_key: 1,
+            ..later
+        };
+        write_assigned_fixed_records(&unordered_path, &[later, earlier]);
+        let mut unordered = AssignedFixedRecordStream::new_many(vec![unordered_path], 2).unwrap();
+        assert_eq!(unordered.next_row().unwrap(), Some(later));
+        let error = unordered.next_row().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not globally ordered"));
+
+        let partial_path = directory.path().join("partial.bin");
+        std::fs::write(&partial_path, [0u8; V3_FINALIZER_ASSIGNED_BYTES - 1]).unwrap();
+        let mut partial = AssignedFixedRecordStream::new_many(vec![partial_path], 1).unwrap();
+        let error = partial.next_row().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(error.to_string().contains("partial 20-byte record"));
     }
 
     #[test]
@@ -23887,8 +24141,8 @@ mod tests {
                     hot_payload_bytes: 1024,
                     provider_code_sort_chunk_bytes: 1024,
                     source,
-                    source_field_present: true,
                 },
+                true,
             )
             .unwrap();
         let records = read_test_shared_binary_records(writer.inner);

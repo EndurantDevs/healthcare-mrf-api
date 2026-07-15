@@ -74,7 +74,13 @@ The release scanner enables indexed `rapidgzip` decompression by default. A
 late `provider_references` array is sought and decoded first, after which 1, 8,
 or 16 parser workers consume indexed in-network ranges with byte-identical
 results. The finalizer schedules only nonempty partitions, so sparse layouts do
-not dilute the process-wide sort-memory budget across idle workers.
+not dilute the process-wide sort-memory budget across idle workers. Each
+nonempty partition also sorts and deduplicates its provider identities before
+the global phase; the global phase is therefore a sorted merge of unique
+partition streams rather than another sort of the complete source-row
+population. Dense assigned rows feed the block encoder in their native
+fixed-width representation, removing a synthetic PostgreSQL-COPY encode/decode
+loop while retaining byte-identical committed block output.
 
 The authoritative by-code writer emits only `by_code_provider_shard_v1`.
 Provider-set keys are partitioned into 1,024-key shards, where
