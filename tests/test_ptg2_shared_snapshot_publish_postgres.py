@@ -56,8 +56,12 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = (
-    ROOT / "alembic" / "versions" / "20260712120000_ptg2_v3_shared_schema.py"
+MIGRATION_PATHS = (
+    ROOT / "alembic" / "versions" / "20260712120000_ptg2_v3_shared_schema.py",
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260715120000_ptg2_v3_source_audit_witness.py",
 )
 SCANNER_TEST_PATH = Path(__file__).with_name("test_ptg2_scanner_v3_runs.py")
 SERVING_RECORD = struct.Struct(">16s16s16sI")
@@ -110,11 +114,15 @@ def _graph_artifacts(
 
 
 async def _create_shared_schema(schema_name: str) -> None:
-    migration = _load_module(MIGRATION_PATH, f"ptg2_shared_schema_{schema_name}")
     recorder = _OpRecorder()
-    migration.op = recorder
-    migration._schema = lambda: schema_name
-    migration.upgrade()
+    for migration_index, migration_path in enumerate(MIGRATION_PATHS):
+        migration = _load_module(
+            migration_path,
+            f"ptg2_shared_schema_{migration_index}_{schema_name}",
+        )
+        migration.op = recorder
+        migration._schema = lambda: schema_name
+        migration.upgrade()
     quoted_schema = '"' + schema_name.replace('"', '""') + '"'
     await db.execute_ddl(f"CREATE SCHEMA {quoted_schema}")
     for statement in recorder.executed:
