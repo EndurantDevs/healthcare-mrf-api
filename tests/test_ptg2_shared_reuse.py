@@ -9,6 +9,7 @@ from process.ptg_parts.domain import (
     PTG2LogicalArtifact,
     PTG2RawArtifact,
 )
+from process.ptg_parts.import_rows import _ptg2_source_trace_rows
 from process.ptg_parts.ptg2_shared_reuse import (
     deterministic_source_key_assignments,
     normalized_physical_artifact_identity,
@@ -306,6 +307,35 @@ def test_duplicate_urls_for_one_physical_artifact_combine_trace_rows():
     assert assignments[0].source_key == 0
     assert assignments[0].source_trace_hashes == ("1" * 64, "2" * 64)
     assert trace_sets[0]["source_trace_hashes"] == ["1" * 64, "2" * 64]
+
+
+def test_default_compact_hash_mode_produces_valid_shared_source_trace(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG2_HASH_MODE", raising=False)
+    downloaded = _downloaded(
+        logical_hash_deferred=True,
+        logical_sha="a" * 64,
+        logical_bytes=100,
+    )
+    identity = shared_physical_artifact_identity(downloaded)
+    source_trace, _source_trace_set = _ptg2_source_trace_rows(
+        None,
+        str(downloaded.job["url"]),
+    )
+
+    assignments, _trace_sets = shared_snapshot_source_assignments(
+        [
+            {
+                **identity.as_dict(),
+                **shared_logical_artifact_metadata(downloaded),
+                "source_trace_hash": source_trace["source_trace_hash"],
+            }
+        ],
+        expected_identities=[identity],
+    )
+
+    assert assignments[0].source_trace_hashes == (
+        source_trace["source_trace_hash"],
+    )
 
 
 def test_cross_wrapper_reuse_keeps_logical_identity_but_records_current_raw_sha():

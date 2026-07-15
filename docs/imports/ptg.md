@@ -353,6 +353,11 @@ Publication proceeds in this order:
 11. Persist a fresh passing attestation and atomically activate the candidate.
 12. Remove temporary files and stages.
 
+Logical source traces always use the full domain-separated SHA-256 identity,
+independent of the compact semantic-hash mode used by other PTG values. This
+keeps source provenance acceptable to the shared-source dictionary and release
+attestation without widening compact serving keys.
+
 ## Persisted Audit Sample
 
 Every new physical layout persists a deterministic publish-time sample in

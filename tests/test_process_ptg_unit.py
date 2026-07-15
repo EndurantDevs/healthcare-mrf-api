@@ -611,6 +611,24 @@ def test_import_row_split_keeps_facade_helpers_stable():
     assert process_ptg._ptg2_plan_rows is ptg_import_rows._ptg2_plan_rows
 
 
+def test_source_trace_uses_full_sha256_independent_of_compact_hash_mode(monkeypatch):
+    source_url = "https://example.test/in-network-rates.json.gz"
+
+    monkeypatch.setenv("HLTHPRT_PTG2_HASH_MODE", "checksum64")
+    compact_row, _compact_set = ptg_import_rows._ptg2_source_trace_rows(
+        None,
+        source_url,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_HASH_MODE", "sha256")
+    sha256_row, _sha256_set = ptg_import_rows._ptg2_source_trace_rows(
+        None,
+        source_url,
+    )
+
+    assert compact_row["source_trace_hash"] == sha256_row["source_trace_hash"]
+    assert re.fullmatch(r"[0-9a-f]{64}", compact_row["source_trace_hash"])
+
+
 def test_snapshot_table_split_keeps_facade_helpers_stable():
     assert process_ptg._normalize_source_key is ptg_snapshot_tables._normalize_source_key
     assert process_ptg._ptg2_snapshot_table_token is ptg_snapshot_tables._ptg2_snapshot_table_token
