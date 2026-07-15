@@ -41,6 +41,9 @@ ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_live_progress = importlib.import_module("process.ptg_parts.live_progress")
 ptg_progress = importlib.import_module("process.ptg_parts.progress")
 ptg_config = importlib.import_module("process.ptg_parts.config")
+ptg_provider_quarantine = importlib.import_module(
+    "process.ptg_parts.ptg2_provider_quarantine"
+)
 
 
 def _write_deflate64_zip(path: Path, member_name: str, member_payload: bytes) -> None:
@@ -103,6 +106,76 @@ ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_rust_stage = importlib.import_module("process.ptg_parts.rust_stage")
 ptg_manifest_publish = importlib.import_module("process.ptg_parts.ptg2_manifest_publish")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
+
+
+def _empty_provider_identifier_quarantine_scanner_summary():
+    return {
+        "scanner": {
+            "summary": {
+                "provider_identifier_quarantine": (
+                    ptg_provider_quarantine.provider_identifier_quarantine_payload({})
+                )
+            }
+        }
+    }
+
+
+def test_shared_v3_provider_identifier_quarantine_combines_active_scanners_and_skips_duplicate():
+    first_quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload(
+        {-17: 1, 123_456_789: 2}
+    )
+    second_quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload(
+        {123_456_789: 3, 10_000_000_000: 4}
+    )
+    file_results = [
+        {
+            "summary": {
+                "scanner": {
+                    "summary": {
+                        "provider_identifier_quarantine": first_quarantine,
+                    }
+                }
+            }
+        },
+        {
+            "summary": {
+                "scanner": {
+                    "summary": {
+                        "provider_identifier_quarantine": second_quarantine,
+                    }
+                }
+            }
+        },
+        {
+            "skipped": True,
+            "summary": {
+                "scanner": {
+                    "summary": {
+                        "provider_identifier_quarantine": first_quarantine,
+                    }
+                }
+            },
+        },
+    ]
+
+    combined = process_ptg._shared_v3_provider_identifier_quarantine(file_results)
+
+    assert combined == ptg_provider_quarantine.provider_identifier_quarantine_payload(
+        {-17: 1, 123_456_789: 5, 10_000_000_000: 4}
+    )
+
+
+def test_shared_v3_provider_identifier_quarantine_fails_closed_when_active_result_omits_evidence():
+    file_results = [
+        _empty_provider_identifier_quarantine_scanner_summary(),
+        {"summary": {"scanner": {"summary": {}}}},
+    ]
+
+    with pytest.raises(
+        RuntimeError,
+        match="scanner omitted provider identifier quarantine evidence",
+    ):
+        process_ptg._shared_v3_provider_identifier_quarantine(file_results)
 
 
 def test_default_ptg2_import_id_includes_source_inputs():
@@ -367,7 +440,7 @@ def test_ptg_live_progress_uses_redis_ttl_and_enqueues_status_event(monkeypatch)
 
 def test_live_progress_preserves_earliest_started_at(monkeypatch):
     writes = []
-    previous = {
+    previous_map = {
         "run_id": "run_any",
         "importer": "npi",
         "status": "running",
@@ -378,7 +451,7 @@ def test_live_progress_preserves_earliest_started_at(monkeypatch):
     class FakeRedis:
         def get(self, key):
             assert key == "import:progress:run_any"
-            return json.dumps(previous).encode("utf-8")
+            return json.dumps(previous_map).encode("utf-8")
 
         def setex(self, key, ttl, value):
             writes.append((key, ttl, value))
@@ -398,18 +471,18 @@ def test_live_progress_preserves_earliest_started_at(monkeypatch):
     )
 
     progress_payload = json.loads(writes[0][2])
-    assert progress_payload["started_at"] == previous["started_at"]
+    assert progress_payload["started_at"] == previous_map["started_at"]
 
 
 def test_live_progress_heartbeat_preserves_recent_importer_progress(monkeypatch):
-    store = {}
+    store_map = {}
 
     class FakeRedis:
         def get(self, key):
-            return store.get(key)
+            return store_map.get(key)
 
         def setex(self, key, _ttl, value):
-            store[key] = value
+            store_map[key] = value
 
     monkeypatch.setattr(live_progress, "_redis", lambda: FakeRedis())
     monkeypatch.setattr(live_progress, "enqueue_status_event", lambda _event: None)
@@ -442,7 +515,7 @@ def test_live_progress_heartbeat_preserves_recent_importer_progress(monkeypatch)
         confidence="heartbeat",
     )
 
-    progress_payload = json.loads(store["import:progress:run_any"])
+    progress_payload = json.loads(store_map["import:progress:run_any"])
     assert progress_payload["phase"] == "entity-address-unified building medication bridge"
     assert progress_payload["message"] == "building support table 5/7: medication bridge"
     assert progress_payload["unit"] == "steps"
@@ -510,13 +583,13 @@ def test_copy_load_split_keeps_facade_helpers_stable():
 
 
 def test_copy_load_strips_postgres_nuls_from_text_values():
-    row = {
+    row_map = {
         "plain": "ab\0cd",
         "array": ["ef\0gh"],
         "payload": {"ij\0": ["kl\0mn"]},
     }
 
-    record = ptg_copy_load._ptg2_copy_record(row, ["plain", "array", "payload"], {"payload"})
+    record = ptg_copy_load._ptg2_copy_record(row_map, ["plain", "array", "payload"], {"payload"})
 
     assert record[0] == "abcd"
     assert record[1] == ["efgh"]
@@ -608,10 +681,10 @@ def test_source_download_progress_scales_to_overall_run_progress(monkeypatch):
 
 
 def test_download_worker_propagates_live_progress_context(monkeypatch):
-    captured = {}
+    captured_map = {}
 
     def fake_downloader(job, **_kwargs):
-        captured.update(ptg_live_progress.current_live_progress_context())
+        captured_map.update(ptg_live_progress.current_live_progress_context())
         return ptg_domain.PTG2DownloadedJob(job=dict(job), error="stubbed")
 
     monkeypatch.setattr(process_ptg, "_download_ptg_job_artifact_sync", fake_downloader)
@@ -629,8 +702,8 @@ def test_download_worker_propagates_live_progress_context(monkeypatch):
     )
 
     assert result.error == "stubbed"
-    assert captured["run_id"] == "run_ptg"
-    assert captured["overall_progress_start_pct"] == 5
+    assert captured_map["run_id"] == "run_ptg"
+    assert captured_map["overall_progress_start_pct"] == 5
 
 
 def test_source_download_tls_override_is_host_scoped(monkeypatch):
@@ -1034,10 +1107,10 @@ def test_rust_scanner_progress_uses_object_throughput_when_bytes_are_deferred(mo
 
 
 def test_async_rust_scanner_passes_live_progress_context(monkeypatch, tmp_path):
-    captured = {}
+    captured_map = {}
 
     def fake_iter(*_args, **kwargs):
-        captured.update(kwargs)
+        captured_map.update(kwargs)
         return iter(())
 
     monkeypatch.setattr(ptg_rust_scanner, "_iter_compact_serving_records_rust", fake_iter)
@@ -1053,14 +1126,14 @@ def test_async_rust_scanner_passes_live_progress_context(monkeypatch, tmp_path):
                 plan_month_id="month",
                 source_trace_set_hash="trace",
             ):
-                captured["records_seen"] = captured.get("records_seen", 0) + 1
+                captured_map["records_seen"] = captured_map.get("records_seen", 0) + 1
         finally:
             ptg_live_progress.reset_live_progress_context(token)
 
     asyncio.run(run())
 
-    assert captured["live_progress_context"]["run_id"] == "run_ptg"
-    assert captured["live_progress_context"]["snapshot_id"] == "snap_1"
+    assert captured_map["live_progress_context"]["run_id"] == "run_ptg"
+    assert captured_map["live_progress_context"]["snapshot_id"] == "snap_1"
 
 
 
@@ -1188,7 +1261,7 @@ def test_ptg2_fast_object_iterator_yields_selected_top_level_arrays():
         b'"negotiated_rates":[{"negotiated_prices":[{"negotiated_rate":1.2}]}]}]}'
     )
 
-    result = list(
+    result_list = list(
         process_ptg._iter_top_level_objects_fast(
             io.BytesIO(payload),
             {
@@ -1198,9 +1271,9 @@ def test_ptg2_fast_object_iterator_yields_selected_top_level_arrays():
         )
     )
 
-    assert [name for name, _ in result] == ["provider_reference", "in_network"]
-    assert result[0][1]["provider_group_id"] == 7
-    assert result[1][1]["billing_code"] == "001"
+    assert [name for name, _ in result_list] == ["provider_reference", "in_network"]
+    assert result_list[0][1]["provider_group_id"] == 7
+    assert result_list[1][1]["billing_code"] == "001"
 
 
 def test_filter_reporting_plans_matches_name_contains_case_insensitive():
@@ -1261,7 +1334,7 @@ def test_as_int_list_normalizes_npi_strings():
 
 def test_normalized_npi_list_keeps_only_ten_digit_npis():
     assert process_ptg._normalized_npi_list(
-        ["114911247", "1053488122", 1093228306, "", None, "bad", "10000000000"]
+        ["123456789", "1053488122", 1093228306, "", None, "bad", "10000000000"]
     ) == [
         1053488122,
         1093228306,
@@ -1270,7 +1343,7 @@ def test_normalized_npi_list_keeps_only_ten_digit_npis():
 
 
 def test_ptg2_semantic_hash_ignores_set_like_array_order():
-    first = {
+    first_map = {
         "npi": [1093228306, 1053488122],
         "service_code": ["02", "01"],
         "billing_code_modifier": ["TC", "26"],
@@ -1280,7 +1353,7 @@ def test_ptg2_semantic_hash_ignores_set_like_array_order():
         ],
         "negotiated_rate": Decimal("12.3400"),
     }
-    second = {
+    second_map = {
         "npi": [1053488122, 1093228306],
         "service_code": ["01", "02"],
         "billing_code_modifier": ["26", "TC"],
@@ -1291,7 +1364,7 @@ def test_ptg2_semantic_hash_ignores_set_like_array_order():
         "negotiated_rate": "12.34",
     }
 
-    assert process_ptg.semantic_hash(first, domain="rate") == process_ptg.semantic_hash(second, domain="rate")
+    assert process_ptg.semantic_hash(first_map, domain="rate") == process_ptg.semantic_hash(second_map, domain="rate")
 
 
 @pytest.mark.parametrize(
@@ -1304,16 +1377,16 @@ def test_ptg2_semantic_hash_ignores_set_like_array_order():
     ],
 )
 def test_ptg2_semantic_hash_changes_for_rate_context_modifier_and_setting(changed):
-    base = {
+    base_map = {
         "negotiated_rate": Decimal("12.34"),
         "billing_code_modifier": ["26", "TC"],
         "setting": "outpatient",
         "context": {"plan_id": "TESTPLAN001"},
     }
-    modified = dict(base)
-    modified.update(changed)
+    modified_map = dict(base_map)
+    modified_map.update(changed)
 
-    assert process_ptg.semantic_hash(base, domain="rate") != process_ptg.semantic_hash(modified, domain="rate")
+    assert process_ptg.semantic_hash(base_map, domain="rate") != process_ptg.semantic_hash(modified_map, domain="rate")
 
 
 def test_ptg2_rejects_float_money_values():
@@ -1345,32 +1418,32 @@ def test_ptg2_runtime_checksum_uses_bigint_hash_space():
 
 
 def test_ptg2_provider_group_identity_is_source_independent_and_order_insensitive():
-    tin_a = {"type": "EIN", "value": "12-3456789"}
-    tin_b = {"type": "ein", "value": "123456789"}
+    tin_a_map = {"type": "EIN", "value": "12-3456789"}
+    tin_b_map = {"type": "ein", "value": "123456789"}
 
-    first = process_ptg._provider_group_identity_hash(tin_a, [1053488122, 114911247, 1093228306])
-    second = process_ptg._provider_group_identity_hash(tin_b, [1093228306, 1053488122])
+    first = process_ptg._provider_group_identity_hash(tin_a_map, [1053488122, 123456789, 1093228306])
+    second = process_ptg._provider_group_identity_hash(tin_b_map, [1093228306, 1053488122])
 
     assert first == second
 
 
 def test_ptg2_provider_set_entry_packs_groups_order_insensitively():
-    groups_a = [
+    groups_a_list = [
         {"tin": {"type": "ein", "value": "111"}, "npi": [1000000003, 1000000001]},
         {"tin": {"type": "ein", "value": "222"}, "npi": [1000000002]},
     ]
-    groups_b = list(reversed(groups_a))
+    groups_b_list = list(reversed(groups_a_list))
 
     entry_a, row_a = process_ptg._build_provider_set_entry(
         file_id=1,
         provider_group_ref=10,
-        provider_groups=groups_a,
+        provider_groups=groups_a_list,
         network_names=["A"],
     )
     entry_b, row_b = process_ptg._build_provider_set_entry(
         file_id=2,
         provider_group_ref=20,
-        provider_groups=groups_b,
+        provider_groups=groups_b_list,
         network_names=["B"],
     )
 
@@ -1432,11 +1505,11 @@ def test_ptg2_combined_provider_set_entry_packs_rate_provider_refs():
 
 
 def test_ptg2_provider_group_rows_are_canonical_and_source_independent():
-    groups_a = [{"tin": {"type": "ein", "value": "12-3456789"}, "npi": [1000000003, 1000000001, 1000000002]}]
-    groups_b = [{"tin": {"type": "EIN", "value": "123456789"}, "npi": [1000000002, 1000000003, 1000000001]}]
+    groups_a_list = [{"tin": {"type": "ein", "value": "12-3456789"}, "npi": [1000000003, 1000000001, 1000000002]}]
+    groups_b_list = [{"tin": {"type": "EIN", "value": "123456789"}, "npi": [1000000002, 1000000003, 1000000001]}]
 
-    row_a = process_ptg._ptg2_provider_group_rows(provider_groups=groups_a)[0]
-    row_b = process_ptg._ptg2_provider_group_rows(provider_groups=groups_b)[0]
+    row_a = process_ptg._ptg2_provider_group_rows(provider_groups=groups_a_list)[0]
+    row_b = process_ptg._ptg2_provider_group_rows(provider_groups=groups_b_list)[0]
 
     assert row_a["provider_group_hash"] == row_b["provider_group_hash"]
     assert row_a["npi"] == [1000000001, 1000000002, 1000000003]
@@ -1445,7 +1518,7 @@ def test_ptg2_provider_group_rows_are_canonical_and_source_independent():
 
 
 def test_ptg2_procedure_identity_groups_display_text_variants():
-    base = {
+    base_map = {
         "billing_code_type": "CPT",
         "billing_code_type_version": "2026",
         "billing_code": "99213",
@@ -1453,13 +1526,13 @@ def test_ptg2_procedure_identity_groups_display_text_variants():
         "name": "Office visit",
         "description": "First description",
     }
-    variant = {**base, "name": "Established patient visit", "description": "Different description"}
-    changed_arrangement = {**base, "negotiation_arrangement": "bundle"}
+    variant_map = {**base_map, "name": "Established patient visit", "description": "Different description"}
+    changed_arrangement_map = {**base_map, "negotiation_arrangement": "bundle"}
 
-    assert process_ptg._ptg2_procedure_row(base)["procedure_hash"] == process_ptg._ptg2_procedure_row(variant)["procedure_hash"]
+    assert process_ptg._ptg2_procedure_row(base_map)["procedure_hash"] == process_ptg._ptg2_procedure_row(variant_map)["procedure_hash"]
     assert (
-        process_ptg._ptg2_procedure_row(base)["procedure_hash"]
-        != process_ptg._ptg2_procedure_row(changed_arrangement)["procedure_hash"]
+        process_ptg._ptg2_procedure_row(base_map)["procedure_hash"]
+        != process_ptg._ptg2_procedure_row(changed_arrangement_map)["procedure_hash"]
     )
 
 
@@ -1479,7 +1552,7 @@ def test_ptg2_normalize_tic_source_url_unescapes_html_query_separators():
 
 
 def test_toc_parser_handles_uhc_duplicates():
-    toc = {
+    toc_map = {
         "reporting_entity_name": "UHC",
         "reporting_entity_type": "payer",
         "reporting_structure": [
@@ -1501,7 +1574,7 @@ def test_toc_parser_handles_uhc_duplicates():
     }
 
     entries = process_ptg.parse_toc_catalog_entries(
-        toc,
+        toc_map,
         "https://payer.test/toc.json",
         plan_ids=["TESTPLAN001"],
     )
@@ -1619,7 +1692,7 @@ def test_ptg2_toc_parser_merges_shared_file_plans_in_linear_work(monkeypatch):
 
 
 def test_ptg2_toc_parser_accepts_list_shaped_file_fields():
-    toc = {
+    toc_map = {
         "reporting_entity_name": "BCBS",
         "reporting_entity_type": "third-party administrator",
         "reporting_structure": [
@@ -1634,7 +1707,7 @@ def test_ptg2_toc_parser_accepts_list_shaped_file_fields():
         ],
     }
 
-    entries = process_ptg.parse_toc_catalog_entries(toc, "https://payer.test/toc.json")
+    entries = process_ptg.parse_toc_catalog_entries(toc_map, "https://payer.test/toc.json")
 
     assert [entry.source_type for entry in entries] == [
         "table-of-contents",
@@ -1708,7 +1781,7 @@ def test_ptg2_toc_parser_rejects_non_pricing_payload():
 
 
 def test_ptg2_toc_parser_accepts_plural_allowed_amount_files():
-    toc = {
+    toc_map = {
         "reporting_entity_name": "BCBS",
         "reporting_entity_type": "third-party administrator",
         "reporting_structure": [
@@ -1722,7 +1795,7 @@ def test_ptg2_toc_parser_accepts_plural_allowed_amount_files():
         ],
     }
 
-    entries = process_ptg.parse_toc_catalog_entries(toc, "https://payer.test/toc.json")
+    entries = process_ptg.parse_toc_catalog_entries(toc_map, "https://payer.test/toc.json")
 
     assert [entry.source_type for entry in entries] == [
         "table-of-contents",
@@ -1734,7 +1807,7 @@ def test_ptg2_toc_parser_accepts_plural_allowed_amount_files():
 
 
 def test_ptg2_toc_parser_normalizes_asr_download_links():
-    toc = {
+    toc_map = {
         "reporting_entity_name": "ASR Health Benefits",
         "reporting_entity_type": "Third Party Administrator",
         "reporting_structure": [
@@ -1758,7 +1831,7 @@ def test_ptg2_toc_parser_normalizes_asr_download_links():
         ],
     }
 
-    entries = process_ptg.parse_toc_catalog_entries(toc, "https://payer.test/toc.json")
+    entries = process_ptg.parse_toc_catalog_entries(toc_map, "https://payer.test/toc.json")
     in_network_entries = [entry for entry in entries if entry.source_type == "in-network"]
 
     assert len(in_network_entries) == 1
@@ -1773,7 +1846,7 @@ def test_ptg2_toc_parser_normalizes_asr_download_links():
 
 
 def test_ptg2_toc_jobs_normalize_asr_download_links(monkeypatch):
-    toc = {
+    toc_map = {
         "reporting_entity_name": "ASR Health Benefits",
         "reporting_entity_type": "Third Party Administrator",
         "reporting_structure": [
@@ -1806,7 +1879,7 @@ def test_ptg2_toc_jobs_normalize_asr_download_links(monkeypatch):
         pushed_file_rows.extend(rows)
 
     monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
-    monkeypatch.setattr(process_ptg, "load_json_artifact", lambda _path: toc)
+    monkeypatch.setattr(process_ptg, "load_json_artifact", lambda _path: toc_map)
     monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
 
@@ -2169,7 +2242,7 @@ def test_ptg2_artifact_reuse_by_strong_etag_and_length(tmp_path):
     raw_path.write_text('{"ok": true}', encoding="utf-8")
     raw_sha, byte_count = process_ptg.sha256_file(raw_path)
     store = process_ptg.PTG2ArtifactStore(tmp_path)
-    candidate = {
+    candidate_map = {
         "artifact_kind": process_ptg.PTG2_ARTIFACT_RAW,
         "canonical_url": "https://example.test/raw.json",
         "raw_storage_uri": raw_path.resolve().as_uri(),
@@ -2185,16 +2258,16 @@ def test_ptg2_artifact_reuse_by_strong_etag_and_length(tmp_path):
         supports_head=True,
     )
 
-    reused, mode = process_ptg.choose_reusable_raw_artifact([candidate], head, store=store)
+    reused, mode = process_ptg.choose_reusable_raw_artifact([candidate_map], head, store=store)
 
-    assert reused == candidate
+    assert reused == candidate_map
     assert mode == "strong_etag_length"
 
 
 def test_ptg2_artifact_reuse_skips_missing_metadata_candidate(tmp_path):
     missing_path = tmp_path / "missing.json.gz"
     store = process_ptg.PTG2ArtifactStore(tmp_path / "store")
-    candidate = {
+    candidate_map = {
         "artifact_kind": process_ptg.PTG2_ARTIFACT_RAW,
         "canonical_url": "https://example.test/raw.json.gz",
         "raw_storage_uri": missing_path.resolve().as_uri(),
@@ -2211,7 +2284,7 @@ def test_ptg2_artifact_reuse_skips_missing_metadata_candidate(tmp_path):
         supports_head=True,
     )
 
-    reused, mode = process_ptg.choose_reusable_raw_artifact([candidate], head, store=store)
+    reused, mode = process_ptg.choose_reusable_raw_artifact([candidate_map], head, store=store)
 
     assert reused is None
     assert mode is None
@@ -2606,7 +2679,7 @@ def test_ptg2_in_memory_provider_reference_cache_tracks_hits():
 
 def test_ptg2_provider_combo_cache_is_order_insensitive_and_bounded():
     cache = process_ptg.OrderedDict()
-    stats = {
+    stats_map = {
         "provider_combo_cache_gets": 0,
         "provider_combo_cache_hits": 0,
         "provider_combo_cache_misses": 0,
@@ -2617,14 +2690,14 @@ def test_ptg2_provider_combo_cache_is_order_insensitive_and_bounded():
     key_b = process_ptg._provider_combo_cache_key(["1", 2])
 
     assert key_a == key_b
-    assert process_ptg._provider_combo_cache_get(cache, key_a, stats) is None
-    process_ptg._provider_combo_cache_put(cache, key_a, {"__hash__": 1}, stats, limit=1)
-    assert process_ptg._provider_combo_cache_get(cache, key_b, stats)["__hash__"] == 1
-    process_ptg._provider_combo_cache_put(cache, ("3",), {"__hash__": 3}, stats, limit=1)
+    assert process_ptg._provider_combo_cache_get(cache, key_a, stats_map) is None
+    process_ptg._provider_combo_cache_put(cache, key_a, {"__hash__": 1}, stats_map, limit=1)
+    assert process_ptg._provider_combo_cache_get(cache, key_b, stats_map)["__hash__"] == 1
+    process_ptg._provider_combo_cache_put(cache, ("3",), {"__hash__": 3}, stats_map, limit=1)
 
     assert key_a not in cache
-    assert stats["provider_combo_cache_hits"] == 1
-    assert stats["provider_combo_cache_misses"] == 1
+    assert stats_map["provider_combo_cache_hits"] == 1
+    assert stats_map["provider_combo_cache_misses"] == 1
 
 
 
@@ -2839,7 +2912,7 @@ def test_ptg2_materialize_json_source_extracts_zip_when_logical_deferral_request
 
 
 def test_ptg2_ensure_tables_uses_existing_db_create_table(monkeypatch):
-    created = []
+    created_list = []
 
     async def fake_status(_statement):
         return None
@@ -2851,7 +2924,7 @@ def test_ptg2_ensure_tables_uses_existing_db_create_table(monkeypatch):
         ]
 
     async def fake_create_table(table, **_kwargs):
-        created.append(table.name)
+        created_list.append(table.name)
 
     monkeypatch.setattr(process_ptg.db, "status", fake_status)
     monkeypatch.setattr(process_ptg.db, "all", fake_all)
@@ -2859,25 +2932,25 @@ def test_ptg2_ensure_tables_uses_existing_db_create_table(monkeypatch):
 
     asyncio.run(process_ptg.ensure_ptg2_tables())
 
-    assert "ptg2_import_run" in created
-    assert "ptg2_current_snapshot" in created
-    assert "ptg2_source_file_version" in created
-    expected = {cls.__table__.name for cls in process_ptg.PTG2_MODEL_CLASSES}
-    assert expected.issubset(set(created))
+    assert "ptg2_import_run" in created_list
+    assert "ptg2_current_snapshot" in created_list
+    assert "ptg2_source_file_version" in created_list
+    expected_set = {cls.__table__.name for cls in process_ptg.PTG2_MODEL_CLASSES}
+    assert expected_set.issubset(set(created_list))
 
 
 def test_runtime_setup_ignores_v3_migrations():
-    runtime_owned = {
+    runtime_owned_set = {
         model.__table__.name for model in process_ptg.PTG2_MODEL_CLASSES
     }
 
     assert not {
-        table_name for table_name in runtime_owned if table_name.startswith("ptg2_v3_")
+        table_name for table_name in runtime_owned_set if table_name.startswith("ptg2_v3_")
     }
 
 
 def test_ptg2_ensure_tables_requires_v3_migration_before_runtime_ddl(monkeypatch):
-    created = []
+    created_list = []
 
     async def fake_status(_statement):
         return None
@@ -2890,7 +2963,7 @@ def test_ptg2_ensure_tables_requires_v3_migration_before_runtime_ddl(monkeypatch
         ]
 
     async def fake_create_table(table, **_kwargs):
-        created.append(table.name)
+        created_list.append(table.name)
 
     monkeypatch.setattr(process_ptg.db, "status", fake_status)
     monkeypatch.setattr(process_ptg.db, "all", fake_all)
@@ -2902,7 +2975,7 @@ def test_ptg2_ensure_tables_requires_v3_migration_before_runtime_ddl(monkeypatch
     ):
         asyncio.run(process_ptg.ensure_ptg2_tables())
 
-    assert created == []
+    assert created_list == []
 
 
 def test_ptg2_ensure_tables_fails_fast_on_create_error(monkeypatch):
@@ -3077,10 +3150,10 @@ def test_ptg2_in_network_serving_only_zero_rows_returns_skipped_result(monkeypat
 
 
 def test_ptg2_downloaded_jobs_are_prefetched_concurrently(monkeypatch):
-    started = []
+    started_list = []
 
     def fake_download(job, **_kwargs):
-        started.append(job["url"])
+        started_list.append(job["url"])
         if "slow" in job["url"]:
             time.sleep(0.05)
         return process_ptg.PTG2DownloadedJob(job=job)
@@ -3104,7 +3177,7 @@ def test_ptg2_downloaded_jobs_are_prefetched_concurrently(monkeypatch):
 
     yielded = asyncio.run(collect())
 
-    assert started[:2] == [
+    assert started_list[:2] == [
         "https://example.test/slow.json.gz",
         "https://example.test/fast.json.gz",
     ]
@@ -3140,12 +3213,12 @@ def test_cancel_and_wait_tasks_joins_cancelled_children():
 
 def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypatch):
     """Verify this PTG import regression contract."""
-    pushed = []
+    pushed_list = []
     concurrency_map = {"active": 0, "max_active": 0}
     processed_jobs = []
 
     async def fake_push(rows, cls, **_kwargs):
-        pushed.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
+        pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
 
     async def fake_toc(*_args, **_kwargs):
         return [
@@ -3174,6 +3247,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
                         "copy_files": {},
                         "source_trace_hash": "a" * 64,
                     },
+                    **_empty_provider_identifier_quarantine_scanner_summary(),
                 },
         )
 
@@ -3261,7 +3335,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     assert refresh_kwargs["has_serving_files"] is True
     assert refresh_kwargs["source_scoped_compact"] is True
     assert refresh_kwargs["test_mode"] is False
-    import_run_rows = [import_row for cls_name, import_row in pushed if cls_name == "PTG2ImportRun"]
+    import_run_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2ImportRun"]
     assert import_run_rows[-1]["report"]["files_processed"] == 2
     assert import_run_rows[-1]["report"]["address_refresh"] == {"status": "queued", "run_id": "run-refresh"}
 
@@ -3375,10 +3449,10 @@ def test_ptg2_main_cleans_complete_stage_family_when_stage_creation_fails(monkey
 
 
 def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
-    pushed = []
+    pushed_list = []
 
     async def fake_push(rows, cls, **_kwargs):
-        pushed.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
+        pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -3412,9 +3486,9 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
             )
         )
 
-    import_run_rows = [import_row for cls_name, import_row in pushed if cls_name == "PTG2ImportRun"]
-    snapshot_rows = [import_row for cls_name, import_row in pushed if cls_name == "PTG2Snapshot"]
-    current_rows = [import_row for cls_name, import_row in pushed if cls_name == "PTG2CurrentSnapshot"]
+    import_run_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2ImportRun"]
+    snapshot_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2Snapshot"]
+    current_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2CurrentSnapshot"]
 
     assert import_run_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
     assert import_run_rows[-1]["report"]["files_processed"] in {0}
@@ -3541,10 +3615,10 @@ def test_parse_allowed_amounts_persists_in_network_metadata(monkeypatch, tmp_pat
 
 def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
     """One failed in-network file prevents strict V3 publication."""
-    pushed = []
+    pushed_list = []
 
     async def fake_push(rows, cls, **_kwargs):
-        pushed.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
+        pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -3597,8 +3671,8 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
             )
         )
 
-    import_run_rows = [import_row for cls_name, import_row in pushed if cls_name == "PTG2ImportRun"]
-    current_rows = [import_row for cls_name, import_row in pushed if cls_name == "PTG2CurrentSnapshot"]
+    import_run_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2ImportRun"]
+    current_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2CurrentSnapshot"]
 
     assert import_run_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
     assert "failed 1 of 2 attempted" in import_run_rows[-1]["error"]
@@ -3608,10 +3682,10 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
 
 
 def test_ptg2_main_marks_failed_when_toc_download_fails(monkeypatch):
-    pushed = []
+    pushed_list = []
 
     async def fake_push(rows, cls, **_kwargs):
-        pushed.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
+        pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
 
     async def fake_toc(*_args, **_kwargs):
         raise RuntimeError("409 public access denied")
@@ -3635,9 +3709,9 @@ def test_ptg2_main_marks_failed_when_toc_download_fails(monkeypatch):
             )
         )
 
-    import_run_rows = [import_row for cls_name, import_row in pushed if cls_name == "PTG2ImportRun"]
-    snapshot_rows = [import_row for cls_name, import_row in pushed if cls_name == "PTG2Snapshot"]
-    current_rows = [import_row for cls_name, import_row in pushed if cls_name == "PTG2CurrentSnapshot"]
+    import_run_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2ImportRun"]
+    snapshot_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2Snapshot"]
+    current_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2CurrentSnapshot"]
 
     assert import_run_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
     assert import_run_rows[-1]["report"]["jobs_discovered"] in {0}
@@ -3979,7 +4053,7 @@ def _strict_v3_scanner_frame_stream(*, summary: dict | None = None) -> bytes:
 
 
 def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_path):
-    captured_env = {}
+    captured_env_map = {}
 
     class FakeProcess:
         stdout = io.BytesIO(_strict_v3_scanner_frame_stream())
@@ -3992,7 +4066,7 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
             return 0
 
     def fake_popen(_args, stdout, stderr, env):
-        captured_env.update(env)
+        captured_env_map.update(env)
         return FakeProcess()
 
     monkeypatch.delenv(process_ptg.PTG2_RUST_EVENT_QUEUE_ENV, raising=False)
@@ -4012,10 +4086,10 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
         )
     )
 
-    assert captured_env[process_ptg.PTG2_RUST_EVENT_QUEUE_ENV] == "128"
-    assert captured_env["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"].endswith("v3-runs")
-    assert "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH" not in captured_env
-    assert captured_env["HLTHPRT_PTG2_MANIFEST_ONLY"] == "true"
+    assert captured_env_map[process_ptg.PTG2_RUST_EVENT_QUEUE_ENV] == "128"
+    assert captured_env_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"].endswith("v3-runs")
+    assert "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH" not in captured_env_map
+    assert captured_env_map["HLTHPRT_PTG2_MANIFEST_ONLY"] == "true"
 
 
 def test_ptg2_rust_compact_retries_short_pipe_reads(monkeypatch, tmp_path):
@@ -4335,11 +4409,11 @@ async def test_ptg2_manifest_publish_uploads_base_artifact_sidecars_to_db(monkey
         sidecar_artifacts=stored,
     )
 
-    sidecars = {sidecar["name"]: sidecar for sidecar in manifest["sidecars"]}
+    sidecars_map = {sidecar["name"]: sidecar for sidecar in manifest["sidecars"]}
     assert manifest["source_trace_set_hash"] == "trace-set"
-    assert set(sidecars) == {"provider_forward", "price_forward"}
-    assert sidecars["provider_forward"]["storage_uri"] == "db://ptg2_artifact/provider_forward"
-    assert sidecars["price_forward"]["storage_uri"] == "db://ptg2_artifact/price_forward"
+    assert set(sidecars_map) == {"provider_forward", "price_forward"}
+    assert sidecars_map["provider_forward"]["storage_uri"] == "db://ptg2_artifact/provider_forward"
+    assert sidecars_map["price_forward"]["storage_uri"] == "db://ptg2_artifact/price_forward"
     assert [call[0] for call in calls] == [provider_path, price_path]
     assert [event["artifact_name"] for event in progress_events if event["publish_step"] == "artifact upload complete"] == [
         "provider_forward",
@@ -4350,12 +4424,12 @@ async def test_ptg2_manifest_publish_uploads_base_artifact_sidecars_to_db(monkey
 @pytest.mark.asyncio
 async def test_ptg2_manifest_serving_sidecars_use_rust_copy_fast_path(monkeypatch, tmp_path):
     artifact_helpers = importlib.import_module("process.ptg_parts.ptg2_manifest_artifacts")
-    copied_sql = []
+    copied_sql_list = []
     runner_calls = []
     progress_events = []
 
     async def fake_copy_query_to_file(sql, output_path):
-        copied_sql.append(sql)
+        copied_sql_list.append(sql)
         if "ORDER BY code_key" in sql:
             output_path.write_text(
                 "1\t2\t5\t11111111111111111111111111111111\n"
@@ -4395,7 +4469,7 @@ async def test_ptg2_manifest_serving_sidecars_use_rust_copy_fast_path(monkeypatc
     assert sidecars["serving_by_code"]["row_count"] == 3
     assert sidecars["serving_by_provider_set"]["row_count"] == 3
     assert [call[0] for call in runner_calls] == ["by_code", "by_provider_set"]
-    assert len(copied_sql) == 2
+    assert len(copied_sql_list) == 2
     assert not any(path.name.startswith("serving_by_code_") and path.suffix == ".copy" for path in tmp_path.iterdir())
     assert "serving sidecars export by code" in [event["publish_step"] for event in progress_events]
     assert "serving sidecars encode reverse" in [event["publish_step"] for event in progress_events]
@@ -4697,7 +4771,7 @@ def test_manifest_copy_entry_cleanup_removes_registered_v3_runs(tmp_path):
 
 def test_source_import_lock_serializes_different_snapshots_for_one_source(monkeypatch):
     """Verify source import lock serializes different snapshots for one source."""
-    lock_state = {"held": False}
+    lock_state_map = {"held": False}
     real_sleep = asyncio.sleep
 
     class _Result:
@@ -4711,13 +4785,13 @@ def test_source_import_lock_serializes_different_snapshots_for_one_source(monkey
         async def execute(self, statement, _params):
             sql = str(statement)
             if "pg_try_advisory_lock" in sql:
-                if lock_state["held"]:
+                if lock_state_map["held"]:
                     return _Result(False)
-                lock_state["held"] = True
+                lock_state_map["held"] = True
                 return _Result(True)
             if "pg_advisory_unlock" in sql:
-                assert lock_state["held"]
-                lock_state["held"] = False
+                assert lock_state_map["held"]
+                lock_state_map["held"] = False
                 return _Result(True)
             raise AssertionError(sql)
 
@@ -4751,28 +4825,28 @@ def test_source_import_lock_serializes_different_snapshots_for_one_source(monkey
     async def scenario():
         first_entered = asyncio.Event()
         release_first = asyncio.Event()
-        entered: list[str] = []
+        entered_list: list[str] = []
 
         async def first_import():
             async with process_ptg._ptg2_source_import_lock("source-a"):
-                entered.append("first")
+                entered_list.append("first")
                 first_entered.set()
                 await release_first.wait()
 
         async def second_import():
             await first_entered.wait()
             async with process_ptg._ptg2_source_import_lock("source-a"):
-                entered.append("second")
+                entered_list.append("second")
 
         first_task = asyncio.create_task(first_import())
         second_task = asyncio.create_task(second_import())
         await first_entered.wait()
         await real_sleep(0.01)
-        assert entered == ["first"]
+        assert entered_list == ["first"]
         release_first.set()
         await asyncio.gather(first_task, second_task)
-        assert entered == ["first", "second"]
-        assert lock_state["held"] is False
+        assert entered_list == ["first", "second"]
+        assert lock_state_map["held"] is False
 
     asyncio.run(scenario())
 
@@ -4835,7 +4909,7 @@ def _build_published_snapshot_fields(import_month, updated_at):
 
 def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkeypatch):
     """Verify ptg2 candidate stage binds layout without mutating live pointers."""
-    executed = []
+    executed_list = []
     updated_at = process_ptg._utcnow()
     import_month = process_ptg.normalize_import_month("2026-04")
     base_snapshot = _build_published_snapshot_fields(import_month, updated_at)
@@ -4857,10 +4931,10 @@ def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkey
 
     class FakeSession:
         async def execute(self, statement, params=None):
-            executed.append((str(statement), params or {}))
+            executed_list.append((str(statement), params or {}))
 
         async def scalar(self, statement, params=None):
-            executed.append((str(statement), params or {}))
+            executed_list.append((str(statement), params or {}))
             return 1
 
     class FakeTransaction:
@@ -4900,7 +4974,7 @@ def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkey
         "expected_previous_snapshot_id": "prev",
     }
     bind_layout.assert_awaited_once()
-    joined = "\n".join(statement for statement, _params in executed)
+    joined = "\n".join(statement for statement, _params in executed_list)
     assert "ptg2_v3_snapshot_scope" in joined
     assert "UPDATE \"mrf\".ptg2_snapshot" in joined
     assert "ptg2_current_source_snapshot" not in joined
@@ -4909,7 +4983,7 @@ def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkey
 
 
 def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionally(monkeypatch):
-    executed = []
+    executed_list = []
     updated_at = process_ptg._utcnow()
     import_month = process_ptg.normalize_import_month("2026-04")
 
@@ -4930,7 +5004,7 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
     class FakeSession:
         async def execute(self, statement, params=None):
             sql = str(statement)
-            executed.append((sql, params or {}))
+            executed_list.append((sql, params or {}))
             if "FOR UPDATE OF snapshot" in sql:
                 return SimpleNamespace(first=lambda: snapshot_by_field)
 
@@ -4956,7 +5030,7 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
         )
     )
 
-    joined = "\n".join(statement for statement, _params in executed)
+    joined = "\n".join(statement for statement, _params in executed_list)
     assert promotion_result["global_pointer"] == "reconciled"
     assert "INSERT INTO \"mrf\".ptg2_current_source_snapshot" in joined
     assert "UPDATE \"mrf\".ptg2_snapshot" in joined
@@ -4964,8 +5038,8 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
     assert "incumbent.published_at >=" in joined
     assert "DELETE FROM \"mrf\".ptg2_current_plan_source WHERE source_key = :source_key" in joined
     assert "INSERT INTO \"mrf\".ptg2_current_plan_source" in joined
-    assert len(executed) == 7
-    assert "FOR UPDATE OF snapshot" in executed[1][0]
+    assert len(executed_list) == 7
+    assert "FOR UPDATE OF snapshot" in executed_list[1][0]
 
 
 def test_pointer_stays_on_plan_failure(monkeypatch):
@@ -5194,30 +5268,41 @@ def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
     return publish
 
 
+def _reusable_v3_layout_manifest(provider_identifier_quarantine):
+    serving_index = {
+        "storage": "manifest_snapshot",
+        "type": "ptg2_shared_blocks_v3",
+        "snapshot_scoped": True,
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v3",
+        "shared_block_layout": "dense_shared_blocks_v3",
+        "source_count": 1,
+        "code_count": 17,
+        "cold_lookup_contract": "ptg_v3_cold_v2",
+        "price_membership_semantics": "multiset_v1",
+        "serving_multiplicity_semantics": "source_multiset_v1",
+        "shared_snapshot_key": 7,
+        "serving_rates": 123,
+        "provider_graph": {"owner_count": 4},
+        "plan_id": "stale-plan",
+        "source_file_versions": [{"source": "stale"}],
+        "future_logical_provenance": {"owner": "stale"},
+        "table": "mrf.retired_table",
+    }
+    if provider_identifier_quarantine is not None:
+        serving_index["provider_identifier_quarantine"] = (
+            provider_identifier_quarantine
+        )
+    return {"serving_index": serving_index}
+
+
 def test_reused_v3_serving_index_copies_only_physical_contract_fields():
+    quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload(
+        {-17: 2, 123_456_789: 3}
+    )
+
     serving_result = process_ptg._reused_shared_v3_serving_index(
-        {
-            "serving_index": {
-                "storage": "manifest_snapshot",
-                "type": "ptg2_shared_blocks_v3",
-                "snapshot_scoped": True,
-                "arch_version": "postgres_binary_v3",
-                "storage_generation": "shared_blocks_v3",
-                "shared_block_layout": "dense_shared_blocks_v3",
-                "source_count": 1,
-                "code_count": 17,
-                "cold_lookup_contract": "ptg_v3_cold_v2",
-                "price_membership_semantics": "multiset_v1",
-                "serving_multiplicity_semantics": "source_multiset_v1",
-                "shared_snapshot_key": 7,
-                "serving_rates": 123,
-                "provider_graph": {"owner_count": 4},
-                "plan_id": "stale-plan",
-                "source_file_versions": [{"source": "stale"}],
-                "future_logical_provenance": {"owner": "stale"},
-                "table": "mrf.retired_table",
-            }
-        },
+        _reusable_v3_layout_manifest(quarantine),
         source_key="current-source",
         shared_snapshot_key=9,
     )
@@ -5227,15 +5312,39 @@ def test_reused_v3_serving_index_copies_only_physical_contract_fields():
     assert serving_result["code_count"] == 17
     assert serving_result["serving_rates"] == 123
     assert serving_result["provider_graph"] == {"owner_count": 4}
+    assert serving_result["provider_identifier_quarantine"] == quarantine
     assert serving_result["table"] is None
     assert "plan_id" not in serving_result
     assert "source_file_versions" not in serving_result
     assert "future_logical_provenance" not in serving_result
 
 
+@pytest.mark.parametrize("evidence_failure", ["missing", "tampered"])
+def test_reused_v3_serving_index_rejects_invalid_quarantine_evidence(
+    evidence_failure,
+):
+    quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload(
+        {123_456_789: 2}
+    )
+    if evidence_failure == "missing":
+        quarantine = None
+    else:
+        quarantine["occurrence_count"] += 1
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid provider identifier quarantine evidence",
+    ):
+        process_ptg._reused_shared_v3_serving_index(
+            _reusable_v3_layout_manifest(quarantine),
+            source_key="current-source",
+            shared_snapshot_key=9,
+        )
+
+
 def _strict_v3_downloaded_job(job):
     artifact_digest = hashlib.sha256(str(job.get("url") or "").encode()).hexdigest()
-    scoped_job = {
+    scoped_job_map = {
         **job,
         "meta": {
             "plan_id": "TEST-PLAN-001",
@@ -5244,7 +5353,7 @@ def _strict_v3_downloaded_job(job):
         },
     }
     return process_ptg.PTG2DownloadedJob(
-        job=scoped_job,
+        job=scoped_job_map,
         raw_artifact=SimpleNamespace(
             raw_sha256=artifact_digest,
             raw_storage_uri=f"/tmp/{artifact_digest}.json.gz",
@@ -5260,11 +5369,11 @@ def _strict_v3_downloaded_job(job):
 
 def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch):
     """Verify this PTG import regression contract."""
-    pushed = []
+    pushed_list = []
     publish_source_pointers = AsyncMock()
 
     async def fake_push(rows, cls, **_kwargs):
-        pushed.extend((getattr(cls, "__name__", str(cls)), report_row) for report_row in rows)
+        pushed_list.extend((getattr(cls, "__name__", str(cls)), report_row) for report_row in rows)
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -5281,6 +5390,7 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
                     "copy_files": {},
                     "source_trace_hash": "a" * 64,
                 },
+                **_empty_provider_identifier_quarantine_scanner_summary(),
             },
         )
 
@@ -5316,7 +5426,7 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
         )
     )
 
-    import_run_rows = [report_row for cls_name, report_row in pushed if cls_name == "PTG2ImportRun"]
+    import_run_rows = [report_row for cls_name, report_row in pushed_list if cls_name == "PTG2ImportRun"]
     final_report = import_run_rows[-1]["report"]
     assert final_report["serving_rates"] == 987
     assert final_report["rate_count"] == 987
@@ -5340,13 +5450,13 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
 
 def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
     """Verify ptg2 import defers live pointer mutation by default."""
-    pushed = []
+    pushed_list = []
     publish_source_pointers = AsyncMock()
     cleanup_old_source_tables = AsyncMock()
     address_refresh = AsyncMock()
 
     async def fake_push(rows, cls, **_kwargs):
-        pushed.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
+        pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -5363,6 +5473,7 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
                     "copy_files": {},
                     "source_trace_hash": "a" * 64,
                 },
+                **_empty_provider_identifier_quarantine_scanner_summary(),
             },
         )
 
@@ -5428,7 +5539,7 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
     publish_source_pointers.assert_not_awaited()
     cleanup_old_source_tables.assert_not_awaited()
     address_refresh.assert_not_awaited()
-    import_run_rows = [import_row for cls_name, import_row in pushed if cls_name == "PTG2ImportRun"]
+    import_run_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2ImportRun"]
     final_report = import_run_rows[-1]["report"]
     assert final_report["activation_status"] == "deferred"
     assert final_report["address_refresh"] == {
@@ -5439,13 +5550,13 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
 
 def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
     """Verify ptg2 completion timing ends after post publish work."""
-    clock = {"seconds": 0.0}
-    pushed: list[tuple[str, dict]] = []
+    clock_map = {"seconds": 0.0}
+    pushed_list: list[tuple[str, dict]] = []
     completion_events: list[tuple[str, float]] = []
-    validated_write_count = [0]
+    validated_write_count_list = [0]
 
     def advance(seconds: float) -> None:
-        clock["seconds"] += seconds
+        clock_map["seconds"] += seconds
 
     async def fake_push(rows, cls, **_kwargs):
         class_name = getattr(cls, "__name__", str(cls))
@@ -5454,12 +5565,12 @@ def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
                 class_name == "PTG2ImportRun"
                 and import_row.get("status") == process_ptg.PTG2_STATUS_VALIDATED
             ):
-                validated_write_count[0] += 1
-                advance(13.0 if validated_write_count[0] == 1 else 2.0)
+                validated_write_count_list[0] += 1
+                advance(13.0 if validated_write_count_list[0] == 1 else 2.0)
                 completion_events.append(
-                    (f"validated_write_{validated_write_count[0]}", clock["seconds"])
+                    (f"validated_write_{validated_write_count_list[0]}", clock_map["seconds"])
                 )
-            pushed.append((class_name, copy.deepcopy(import_row)))
+            pushed_list.append((class_name, copy.deepcopy(import_row)))
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -5477,6 +5588,7 @@ def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
                     "copy_files": {},
                     "source_trace_hash": "a" * 64,
                 },
+                **_empty_provider_identifier_quarantine_scanner_summary(),
             },
         )
 
@@ -5490,7 +5602,7 @@ def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
         advance(7.0)
         return {"status": "disabled"}
 
-    monkeypatch.setattr(process_ptg, "_ptg2_monotonic", lambda: clock["seconds"])
+    monkeypatch.setattr(process_ptg, "_ptg2_monotonic", lambda: clock_map["seconds"])
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
@@ -5540,7 +5652,7 @@ def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
     monkeypatch.setattr(
         process_ptg,
         "_emit_screen_line",
-        lambda line: completion_events.append((line, clock["seconds"])),
+        lambda line: completion_events.append((line, clock_map["seconds"])),
     )
 
     import_result = asyncio.run(
@@ -5554,7 +5666,7 @@ def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
 
     validated_rows = [
         import_row
-        for class_name, import_row in pushed
+        for class_name, import_row in pushed_list
         if class_name == "PTG2ImportRun"
         and import_row["status"] == process_ptg.PTG2_STATUS_VALIDATED
     ]
@@ -5616,6 +5728,7 @@ def _install_ptg2_publish_failure_mocks(monkeypatch):
                     "copy_files": {},
                     "source_trace_hash": "a" * 64,
                 },
+                **_empty_provider_identifier_quarantine_scanner_summary(),
             },
         )
 
@@ -5722,10 +5835,10 @@ def test_failed_shared_layout_abandonment_retries_transient_database_errors(monk
 
 def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
     """Verify ptg2 test mode uses manifest source scoped import."""
-    pushed = []
+    pushed_list = []
 
     async def fake_push(rows, cls, **_kwargs):
-        pushed.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
+        pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -5744,6 +5857,7 @@ def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
                     "copy_files": {},
                     "source_trace_hash": "a" * 64,
                 },
+                **_empty_provider_identifier_quarantine_scanner_summary(),
             },
         )
 
@@ -5780,7 +5894,7 @@ def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
 
     create_stage_mock.assert_awaited_once()
     publish_mock.assert_awaited_once()
-    import_run_rows = [import_row for cls_name, import_row in pushed if cls_name == "PTG2ImportRun"]
+    import_run_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2ImportRun"]
     assert import_run_rows[-1]["options"]["snapshot_arch"] == "postgres_binary_v3"
     assert import_run_rows[-1]["options"]["storage_generation"] == "shared_blocks_v3"
     assert import_run_rows[-1]["options"]["test_mode"] is True

@@ -31,6 +31,9 @@ from process.ptg_parts.ptg2_shared_audit import (
 from process.ptg_parts.ptg2_shared_finalize import run_v3_direct_finalizer
 from process.ptg_parts.ptg2_shared_graph import SharedGraphConversionResult
 from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
+from process.ptg_parts.ptg2_provider_quarantine import (
+    validate_provider_identifier_quarantine,
+)
 from process.ptg_parts.rust_scanner import (
     convert_v3_provider_membership_shards_to_shared_graph_rust,
 )
@@ -399,6 +402,7 @@ def _physical_serving_index(
     graph_publication: Any,
     code_count: int,
     audit_sample: Mapping[str, Any],
+    provider_identifier_quarantine: Mapping[str, Any],
     stored_byte_count: int,
 ) -> dict[str, Any]:
     """Build the physical serving index from validated publication summaries."""
@@ -424,6 +428,9 @@ def _physical_serving_index(
     source_count = _integer(finalizer_summary.get("source_count"), "source_count")
     if source_count <= 0:
         raise RuntimeError("strict V3 source_count must be positive")
+    quarantine = validate_provider_identifier_quarantine(
+        provider_identifier_quarantine
+    )
     price_dictionary = {
         **price_encoder,
         "price_set_count": _integer(price_dense.get("count"), "price key count"),
@@ -469,6 +476,7 @@ def _physical_serving_index(
             "npi_count": int(graph_publication.npi_count),
             "block_count": int(graph_publication.block_count),
         },
+        "provider_identifier_quarantine": quarantine,
         "audit_sample": dict(audit_sample),
         "storage_bytes": int(stored_byte_count),
         "timings": dict(finalizer_summary.get("timings") or {}),
@@ -490,6 +498,7 @@ async def _publish_strict_shared_v3_layout_prepared(
     code_dictionary_entries: Iterable[Mapping[str, Any]],
     provider_set_metadata_entries: Iterable[Mapping[str, Any]],
     graph_artifact_entries: Iterable[dict[str, Any]],
+    provider_identifier_quarantine: Mapping[str, Any],
     prepared_price: PreparedSharedPriceArtifacts,
     publication_started_at: float,
     price_prepare_seconds: float,
@@ -512,6 +521,9 @@ async def _publish_strict_shared_v3_layout_prepared(
             "strict V3 publication must use the configured PostgreSQL schema"
         )
     coverage_scope_id = _validated_coverage_scope_id(expected_coverage_scope_id)
+    quarantine = validate_provider_identifier_quarantine(
+        provider_identifier_quarantine
+    )
 
     async def touch_build() -> None:
         """Refresh the reserved layout's build heartbeat transactionally."""
@@ -656,6 +668,7 @@ async def _publish_strict_shared_v3_layout_prepared(
             "finalizer_dictionaries": dictionary_publication.support_digest.hex(),
             "provider_graph": graph_publication.support_digest.hex(),
             "price_attributes": price_publication.support_digest.hex(),
+            "provider_identifier_quarantine": quarantine["sha256"],
         }
         core_support_digest = shared_support_digest(core_support)
         price_membership_summary = _mapping(
@@ -703,6 +716,7 @@ async def _publish_strict_shared_v3_layout_prepared(
             graph_publication=graph_publication,
             code_count=dictionary_publication.code_count,
             audit_sample=audit_publication.metadata,
+            provider_identifier_quarantine=quarantine,
             stored_byte_count=stored_byte_count,
         )
         provisional_serving_index["timings"] = {
@@ -766,6 +780,7 @@ async def publish_strict_shared_v3_layout(
     code_dictionary_entries: Iterable[Mapping[str, Any]],
     provider_set_metadata_entries: Iterable[Mapping[str, Any]],
     graph_artifact_entries: Iterable[dict[str, Any]],
+    provider_identifier_quarantine: Mapping[str, Any],
     scratch_parent: str | Path | None = None,
 ) -> SharedSnapshotPublication:
     """Prepare exact price ranks once, then publish and clean every temporary map."""
@@ -802,6 +817,7 @@ async def publish_strict_shared_v3_layout(
             code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
             graph_artifact_entries=graph_artifact_entries,
+            provider_identifier_quarantine=provider_identifier_quarantine,
             prepared_price=prepared_price,
             publication_started_at=publication_started_at,
             price_prepare_seconds=price_prepare_seconds,

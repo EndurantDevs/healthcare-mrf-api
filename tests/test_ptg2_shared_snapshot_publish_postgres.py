@@ -331,6 +331,9 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
             graph_artifact_entries=graph_entries,
+            provider_identifier_quarantine=scanner_summary[
+                "provider_identifier_quarantine"
+            ],
             scratch_parent=tmp_path,
         )
         assert publication.snapshot_key == reservation.snapshot_key
@@ -342,6 +345,9 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         assert publication.serving_index["cold_lookup_contract"] == "ptg_v3_cold_v2"
         assert publication.serving_index["serving_multiplicity_semantics"] == (
             "source_multiset_v1"
+        )
+        assert publication.serving_index["provider_identifier_quarantine"] == (
+            scanner_summary["provider_identifier_quarantine"]
         )
         assert publication.serving_index["coverage_scope_id"] == coverage_scope_id.hex()
         assert publication.serving_index["serving_binary_table"] is None
@@ -746,6 +752,9 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
             graph_artifact_entries=graph_entries,
+            provider_identifier_quarantine=scanner_summary[
+                "provider_identifier_quarantine"
+            ],
             scratch_parent=tmp_path,
         )
         assert reused_publication.layout_reused_at_seal is True

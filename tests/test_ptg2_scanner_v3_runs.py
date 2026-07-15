@@ -19,6 +19,9 @@ from process.ptg_parts.ptg2_shared_finalize import (
     attach_v3_source_run_contract,
     write_v3_finalizer_input_manifest,
 )
+from process.ptg_parts.ptg2_provider_quarantine import (
+    provider_identifier_quarantine_payload,
+)
 
 _SUPPORT_PATH = Path(__file__).with_name("test_ptg2_scanner_parallelism.py")
 _SUPPORT_SPEC = importlib.util.spec_from_file_location(
@@ -363,6 +366,8 @@ def _run_scanner(
     multiple_prices: bool = False,
     duplicate_first_price: bool = False,
     repeated_rate_occurrences: bool = False,
+    fixture_payload: dict | None = None,
+    top_level_byte_scan: bool = True,
 ) -> dict:
     """Support the run scanner test fixture."""
     run_directory = tmp_path / label
@@ -370,16 +375,18 @@ def _run_scanner(
     artifact = run_directory / "input.json"
     # Keep the default scanner parity fixture one-record wide; the PostgreSQL
     # publication smoke opts into multiple dense price keys.
+    payload = (
+        fixture_payload
+        if fixture_payload is not None
+        else _fixture_payload(
+            provider_references_first=provider_references_first,
+            multiple_prices=multiple_prices,
+            duplicate_first_price=duplicate_first_price,
+            repeated_rate_occurrences=repeated_rate_occurrences,
+        )
+    )
     artifact.write_text(
-        json.dumps(
-            _fixture_payload(
-                provider_references_first=provider_references_first,
-                multiple_prices=multiple_prices,
-                duplicate_first_price=duplicate_first_price,
-                repeated_rate_occurrences=repeated_rate_occurrences,
-            ),
-            separators=(",", ":"),
-        ),
+        json.dumps(payload, separators=(",", ":")),
         encoding="utf-8",
     )
     lean_copy_path = run_directory / "manifest-lean.copy"
@@ -428,7 +435,9 @@ def _run_scanner(
             "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
             "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "8",
             "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES": "1",
-            "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN": "true",
+            "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN": (
+                "true" if top_level_byte_scan else "false"
+            ),
             "HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS": "true",
             "HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS": "2",
             "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS": "true" if grouped else "false",
@@ -490,6 +499,97 @@ def _run_scanner(
         "provider_group_member_frames": provider_group_member_frames,
         "partition_bytes": partition_bytes,
     }
+
+
+def _malformed_provider_identifier_payload(
+    *, provider_references_first: bool
+) -> dict:
+    payload = _fixture_payload(
+        provider_references_first=provider_references_first
+    )
+    payload["provider_references"][0]["provider_groups"][0]["npi"] = [
+        1234567890,
+        123456789,
+        123456789,
+    ]
+    payload["in_network"][0]["negotiated_rates"].append(
+        {
+            "provider_groups": [
+                {
+                    "npi": [1234567891, 123456787],
+                    "tin": {"type": "ein", "value": "12-3456789"},
+                }
+            ],
+            "negotiated_prices": [
+                {
+                    "negotiated_type": "negotiated",
+                    "negotiated_rate": 126,
+                    "service_code": ["11"],
+                    "billing_class": "professional",
+                }
+            ],
+        }
+    )
+    return payload
+
+
+def test_scanner_quarantine_is_identical_across_execution_modes(tmp_path):
+    scanner_binary = _built_scanner_binary()
+    mode_specs = {
+        "parallel": {
+            "provider_references_first": True,
+            "top_level_byte_scan": True,
+            "execution_mode": "parallel_top_level_bytes",
+        },
+        "late_reordered": {
+            "provider_references_first": False,
+            "top_level_byte_scan": True,
+            "execution_mode": "parallel_top_level_bytes_plain_range_reorder",
+        },
+        "serial": {
+            "provider_references_first": False,
+            "top_level_byte_scan": False,
+            "execution_mode": "serial_struson",
+        },
+    }
+    runs = {
+        mode: _run_scanner(
+            scanner_binary,
+            tmp_path,
+            f"provider-identifier-quarantine-{mode}",
+            arch="postgres_binary_v3",
+            provider_references_first=spec["provider_references_first"],
+            grouped=False,
+            fixture_payload=_malformed_provider_identifier_payload(
+                provider_references_first=spec["provider_references_first"]
+            ),
+            top_level_byte_scan=spec["top_level_byte_scan"],
+        )
+        for mode, spec in mode_specs.items()
+    }
+
+    expected_quarantine = provider_identifier_quarantine_payload(
+        {123456787: 1, 123456789: 2}
+    )
+    quarantine_evidence = []
+    malformed_npis = {123456787, 123456789}
+    for mode, run in runs.items():
+        config = _single_frame(run["frames"], "scanner_config")
+        summary = _single_frame(run["frames"], "scanner_summary")
+        assert config["execution_mode"] == mode_specs[mode]["execution_mode"]
+        assert summary["serving_run_rows"] == 2
+        quarantine_evidence.append(summary["provider_identifier_quarantine"])
+
+        member_rows = _SUPPORT_MODULE._sorted_copy_rows(
+            run["provider_group_member_copy_path"]
+        )
+        member_npis = tuple(
+            sorted(int(row.rsplit(b"\t", 1)[1]) for row in member_rows)
+        )
+        assert member_npis == (1234567890, 1234567891)
+        assert malformed_npis.isdisjoint(member_npis)
+
+    assert quarantine_evidence == [expected_quarantine] * len(mode_specs)
 
 
 def test_v3_all_scanner_paths_emit_identical_fixed_width_records(tmp_path):

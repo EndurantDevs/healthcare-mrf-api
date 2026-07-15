@@ -129,8 +129,11 @@ exceeds 1,000 ms. "Cold" does not imply database or operating-system cache
 eviction, so the release run must start from fresh API pods and use sampled
 distinct keys rather than one warmed fixture.
 Unresolved provider references, invalid prices, and invalid NPIs default to a
-maximum of zero; the corresponding `--max-*` options can relax those gates only
-when the source exception is understood.
+maximum of zero. A candidate audit may set `--max-invalid-npis` from the sealed
+snapshot's bounded quarantine count, but activation also requires the
+source-derived values, counts, and digest to match that snapshot exactly. The
+numeric ceiling alone does not authorize publication. Other `--max-*` options
+can relax their gates only when the source exception is understood.
 
 Exit status is `0` for a passing audit, `1` for completed audit failures, and
 `2` for configuration, source, HTTP setup, or internal fatal errors. A JSON
@@ -165,9 +168,15 @@ The report embeds the canonicalization version and rules. Version 2 applies:
 * Code systems, billing codes, arrangements, and modifiers are upper-cased.
   Public API aliases and catalog widths are applied to code fields.
 * NPIs must be integral decimals from `1000000000` through `9999999999`.
-  The schema-defined TIN-only marker `[0]` is counted separately and never
-  becomes an API NPI. The release profile fails when any TIN-only rate is
-  present because the current NPI-addressed API cannot verify it exactly.
+  Out-of-range nonzero integral values are excluded from NPI membership and reported
+  through the bounded provider-identifier quarantine contract; they are never
+  padded or coerced into synthetic NPIs. Valid NPIs in the same provider group
+  remain eligible for exact API verification.
+  Only the singleton array `[0]` is the schema-defined TIN-only marker; zero
+  mixed with another value or repeated zero values are rejected. The marker is
+  counted separately and never becomes an API NPI. The release profile fails
+  when any TIN-only rate is present because the current NPI-addressed API cannot
+  verify it exactly.
 * Negotiated rates are finite base-10 decimals. Exponents are expanded,
   insignificant zeroes are removed, and negative zero becomes zero.
 * Expiration dates must be exact ISO calendar dates (`YYYY-MM-DD`).

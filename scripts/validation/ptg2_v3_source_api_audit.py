@@ -69,7 +69,7 @@ if str(_REPOSITORY_ROOT) not in sys.path:
 from api import ptg2_capacity_evidence as capacity_evidence
 
 
-SCRIPT_VERSION = "2.9.0"
+SCRIPT_VERSION = "2.10.0"
 EXPECTED_ARCHITECTURE = "postgres_binary_v3"
 EXPECTED_STORAGE_GENERATION = "shared_blocks_v3"
 EXPECTED_DATABASE_BACKEND = "postgresql"
@@ -86,6 +86,12 @@ AUDIT_SAMPLE_FORMAT_VERSION = 2
 AUDIT_SAMPLE_OCCURRENCE_IDENTITY = "sha256_candidate_ordinal_source_key_v2"
 AUDIT_SAMPLE_MULTIPLICITY = "source_multiset_v1"
 SOURCE_SET_CONTRACT = "sorted_raw_container_sha256_bytes_v1"
+PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT = (
+    "ptg2_provider_identifier_quarantine_v1"
+)
+PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN = (
+    b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V1\0"
+)
 AUDIT_SAMPLE_DIGEST_DOMAIN = b"PTG2V3AUDITROWS\x02"
 AUDIT_SAMPLE_DIGEST_COORDINATE_FIELDS = (
     "code_key",
@@ -2061,6 +2067,37 @@ def strict_source_npi(event: str, value: Any) -> int | None:
     return integer if 1_000_000_000 <= integer <= 9_999_999_999 else None
 
 
+def provider_identifier_quarantine_payload(
+    counts: Mapping[int, int],
+) -> dict[str, Any]:
+    """Return redacted exact evidence for malformed integer NPI occurrences."""
+
+    if len(counts) > 1_024:
+        raise ValueError("provider identifier quarantine exceeds 1024 distinct values")
+    digest = hashlib.sha256(PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN)
+    entries: list[dict[str, Any]] = []
+    occurrence_count = 0
+    for value, count in sorted(counts.items()):
+        if value == 0 or 1_000_000_000 <= value <= 9_999_999_999:
+            raise ValueError("provider identifier quarantine contains a non-malformed value")
+        if count <= 0 or count >= 2**64:
+            raise ValueError("provider identifier quarantine count is invalid")
+        occurrence_count += count
+        if occurrence_count >= 2**64:
+            raise ValueError("provider identifier quarantine count overflows uint64")
+        digest.update(str(value).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(int(count).to_bytes(8, "big"))
+        entries.append({"value": str(value), "occurrence_count": count})
+    return {
+        "contract": PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT,
+        "occurrence_count": occurrence_count,
+        "distinct_value_count": len(entries),
+        "entries": entries,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def canonical_list(
     values: Any,
     *,
@@ -2581,6 +2618,8 @@ class ProviderReferenceState:
     current_ordinal: int | None = None
     reference_id: str | None = None
     network_name_values_seen: int = 0
+    npi_values_seen: int = 0
+    has_zero_npi_marker: bool = False
 
 
 @dataclass
@@ -2602,6 +2641,8 @@ class InNetworkState:
     price_fields: dict[str, Any] | None = None
     has_valid_price_types: bool = True
     rate_network_name_values_seen: int = 0
+    npi_values_seen: int = 0
+    has_zero_npi_marker: bool = False
 
 
 IN_NETWORK_ITEM_PREFIX = "in_network.item"
@@ -2649,6 +2690,9 @@ class SourceIndex:
         self.connection.execute(f"PRAGMA cache_size={-max(sqlite_cache_mb, 1) * 1024}")
         self._writes_since_commit = 0
         self.metrics: dict[str, int] = collections.defaultdict(int)
+        self.quarantined_provider_identifiers: collections.Counter[int] = (
+            collections.Counter()
+        )
         self.file_metrics: dict[int, dict[str, Any]] = {}
         self.raw_container_sha256_by_file_id: dict[int, str] = {}
         self._occurrence_sample_prepared = False
@@ -2678,6 +2722,40 @@ class SourceIndex:
     @staticmethod
     def _is_provider_npi_prefix(prefix: str, base: str) -> bool:
         return prefix == f"{base}.npi" or prefix == f"{base}.npi.item"
+
+    @staticmethod
+    def _consume_zero_npi_marker_event(
+        state: ProviderReferenceState | InNetworkState,
+        *,
+        prefix: str,
+        provider_group_prefix: str,
+        event: str,
+        raw_npi: Any,
+    ) -> bool:
+        """Accept `[0]` only as a singleton non-member marker."""
+
+        npi_array_prefix = f"{provider_group_prefix}.npi"
+        if prefix == npi_array_prefix and event == "start_array":
+            state.npi_values_seen = 0
+            state.has_zero_npi_marker = False
+            return True
+        if prefix == npi_array_prefix and event == "end_array":
+            state.npi_values_seen = 0
+            state.has_zero_npi_marker = False
+            return True
+        if prefix != f"{npi_array_prefix}.item" or event not in SCALAR_EVENTS:
+            return False
+        integer_npi = strict_source_integer(event, raw_npi)
+        if integer_npi == 0:
+            if state.npi_values_seen:
+                raise SourceFormatError("zero_npi_marker_must_be_singleton")
+            state.npi_values_seen = 1
+            state.has_zero_npi_marker = True
+            return True
+        if state.has_zero_npi_marker:
+            raise SourceFormatError("zero_npi_marker_must_be_singleton")
+        state.npi_values_seen += 1
+        return False
 
     @staticmethod
     def _is_provider_tin_event(prefix: str, base: str, event: str) -> bool:
@@ -2748,7 +2826,12 @@ class SourceIndex:
         assert state.current_ordinal is not None
         npi = strict_source_npi(event, raw_npi)
         if npi is None:
+            invalid_integer = strict_source_integer(event, raw_npi)
+            if invalid_integer == 0:
+                return
             self.metrics["invalid_provider_npis"] += 1
+            if invalid_integer is not None:
+                self.quarantined_provider_identifiers[invalid_integer] += 1
             if event != "number":
                 self.metrics["invalid_field_types"] += 1
             return
@@ -2929,6 +3012,14 @@ class SourceIndex:
             self._capture_provider_reference_id(state, event, raw_value)
             return
         provider_group_prefix = f"{base_prefix}.provider_groups.item"
+        if self._consume_zero_npi_marker_event(
+            state,
+            prefix=prefix,
+            provider_group_prefix=provider_group_prefix,
+            event=event,
+            raw_npi=raw_value,
+        ):
+            return
         if self._is_provider_tin_event(prefix, provider_group_prefix, event):
             self._mark_provider_reference_tin(spec, state)
             return
@@ -2978,7 +3069,12 @@ class SourceIndex:
     ) -> None:
         npi = strict_source_npi(event, value)
         if npi is None:
+            invalid_integer = strict_source_integer(event, value)
+            if invalid_integer == 0:
+                return
             self.metrics["invalid_inline_npis"] += 1
+            if invalid_integer is not None:
+                self.quarantined_provider_identifiers[invalid_integer] += 1
             if event != "number":
                 self.metrics["invalid_field_types"] += 1
             return
@@ -3492,6 +3588,14 @@ class SourceIndex:
                     self.metrics["invalid_field_types"] += 1
                 return True
         inline_prefix = f"{NEGOTIATED_RATE_PREFIX}.provider_groups.item"
+        if self._consume_zero_npi_marker_event(
+            state,
+            prefix=prefix,
+            provider_group_prefix=inline_prefix,
+            event=event,
+            raw_npi=raw_value,
+        ):
+            return True
         if self._is_provider_tin_event(prefix, inline_prefix, event):
             self._mark_inline_rate_tin(state.rate_id)
             return True
@@ -3776,6 +3880,11 @@ class SourceIndex:
             "source_set": source_set_evidence(
                 list(self.raw_container_sha256_by_file_id.values())
             ).payload,
+            "provider_identifier_quarantine": (
+                provider_identifier_quarantine_payload(
+                    self.quarantined_provider_identifiers
+                )
+            ),
             "sqlite_storage_bytes": sqlite_bytes,
             "max_canonical_tuples_per_query": self.max_tuples_per_query,
             "source_occurrence_sampler_capacity": self.occurrence_sampler.capacity,
@@ -5309,10 +5418,10 @@ class AuditConfig:
                 for configured_value in (
                     self.max_unresolved_provider_references,
                     self.max_invalid_prices,
-                    self.max_invalid_npis,
                     self.max_invalid_field_types,
                 )
-            ),
+            )
+            or (not self.validated_candidate and self.max_invalid_npis != 0),
         }
 
     def api_params(self, query: QueryKey) -> dict[str, Any]:
@@ -7162,11 +7271,9 @@ class AuditRunner:
             progress.coverage_reasons.append("invalid_field_types_above_maximum")
         if source_totals.get("invalid_rate_provider_references", 0):
             progress.coverage_reasons.append("invalid_rate_provider_references")
-        if self.config.profile == "release" and source_totals.get(
-            "rates_with_tin_markers", 0
-        ):
+        if self.config.profile == "release" and source_totals.get("tin_only_rates", 0):
             progress.coverage_reasons.append(
-                "tin_marker_rates_not_fully_npi_verifiable"
+                "tin_only_rates_not_npi_verifiable"
             )
         if source_totals.get("items_without_valid_code", 0):
             progress.coverage_reasons.append("source_items_without_valid_code")

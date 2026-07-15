@@ -340,7 +340,8 @@ Publication proceeds in this order:
 4. For a new layout, scan to bounded runs and disposable PostgreSQL stages.
 5. Validate every source-bound scanner run and code-dictionary contract,
    including complete partition and shard vectors, aggregate rows and bytes,
-   file hashes, deterministic dense source keys, and physical source identity.
+   file hashes, deterministic dense source keys, physical source identity, and
+   exact malformed-provider-identifier quarantine evidence.
 6. Finalize dense blocks, dictionaries, prices, and all provider-graph
    directions.
 7. Build and persist the publication audit sample.
@@ -398,6 +399,23 @@ hide a slow one. Complete multi-page logical-query latency is also gated per
 class rather than as one mixed percentile. Run the cold gate from fresh API
 processes with distinct matched-positive sampled keys. It does not imply
 database or operating-system cache eviction.
+
+An out-of-range nonzero integral value in an NPI array is never padded, coerced, or
+published as an NPI. The scanner excludes it from NPI membership, includes it
+in provider-group identity so anomalous and clean groups cannot collapse, and
+stores a bounded canonical quarantine summary in the immutable PostgreSQL
+manifest. The summary records exact occurrence counts for at most 1,024
+distinct malformed integer values plus a domain-separated SHA-256 digest. A
+strict import fails if that bound is exceeded or if any scanner omits the
+evidence. The independent source audit rebuilds the summary from the original
+containers and activation fails unless it matches the sealed manifest exactly.
+Mixed groups retain their valid NPI memberships and remain auditable through
+the NPI API; TIN-only groups remain preserved but cannot pass the current
+NPI-addressed release gate.
+
+Only the singleton array `[0]` is accepted as the schema-defined TIN-only
+marker. Zero mixed with another value or repeated zero values are rejected so
+an ambiguous provider identifier cannot silently become a TIN-only group.
 
 The audit endpoint recomputes the complete bounded sample digest from
 PostgreSQL before returning a page. A supplied logical `source_key` must match

@@ -157,6 +157,10 @@ from process.ptg_parts.ptg2_manifest_publish import (
     _create_ptg2_manifest_serving_stage_table,
     _ptg2_manifest_stage_table_name,
     _ptg2_manifest_support_stage_table)
+from process.ptg_parts.ptg2_provider_quarantine import (
+    combine_provider_identifier_quarantines,
+    validate_provider_identifier_quarantine,
+)
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_COLD_LOOKUP_CONTRACT,
     PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS,
@@ -2369,6 +2373,7 @@ _SHARED_V3_PHYSICAL_SERVING_INDEX_KEYS = frozenset(
         "price_stage",
         "serving_binary",
         "provider_graph",
+        "provider_identifier_quarantine",
         "storage_bytes",
         "timings",
         "audit_sample",
@@ -2414,6 +2419,16 @@ def _reused_shared_v3_serving_index(
         raise RuntimeError("reusable strict V3 layout is missing source_count") from exc
     if source_count <= 0:
         raise RuntimeError("reusable strict V3 layout has an invalid source_count")
+    try:
+        serving_index["provider_identifier_quarantine"] = (
+            validate_provider_identifier_quarantine(
+                serving_index.get("provider_identifier_quarantine")
+            )
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "reusable strict V3 layout has invalid provider identifier quarantine evidence"
+        ) from exc
     try:
         code_count = int(serving_index.get("code_count"))
     except (TypeError, ValueError) as exc:
@@ -2547,6 +2562,33 @@ def _shared_v3_identity_traces(
 _shared_v3_identity_trace_pairs_from_results = _shared_v3_identity_traces
 
 
+def _shared_v3_provider_identifier_quarantine(
+    file_results: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    payloads: list[Mapping[str, Any]] = []
+    for file_result in file_results:
+        if file_result.get("skipped"):
+            continue
+        summary = file_result.get("summary")
+        scanner = summary.get("scanner") if isinstance(summary, Mapping) else None
+        scanner_summary = scanner.get("summary") if isinstance(scanner, Mapping) else None
+        payload = (
+            scanner_summary.get("provider_identifier_quarantine")
+            if isinstance(scanner_summary, Mapping)
+            else None
+        )
+        if not isinstance(payload, Mapping):
+            raise RuntimeError(
+                "strict V3 scanner omitted provider identifier quarantine evidence"
+            )
+        payloads.append(payload)
+    if not payloads:
+        raise RuntimeError(
+            "strict V3 publication has no provider identifier quarantine evidence"
+        )
+    return combine_provider_identifier_quarantines(payloads)
+
+
 def _shared_v3_source_set_metadata(
     identity_trace_pairs: Iterable[Mapping[str, Any]],
     *,
@@ -2631,6 +2673,7 @@ def _shared_v3_scanner_identity() -> dict[str, Any]:
         source_root / "ptg.py",
         source_root / "ptg_parts" / "rust_scanner.py",
         source_root / "ptg_parts" / "ptg2_manifest_publish.py",
+        source_root / "ptg_parts" / "ptg2_provider_quarantine.py",
         source_root / "ptg_parts" / "ptg2_serving_binary_v3.py",
         source_root / "ptg_parts" / "ptg2_serving_binary_v3_code_sets.py",
         source_root / "ptg_parts" / "ptg2_serving_binary_v3_primitives.py",
@@ -3789,6 +3832,9 @@ async def _main_with_artifact_lease(
             source_identity_traces,
             expected_source_count=shared_input_identity.source_count,
         )
+        provider_identifier_quarantine = (
+            _shared_v3_provider_identifier_quarantine(successful_files)
+        )
         await _publish_shared_v3_source_dictionary(
             shared_input_identity=shared_input_identity,
             identity_trace_pairs=source_identity_traces,
@@ -3886,6 +3932,7 @@ async def _main_with_artifact_lease(
                     code_dictionary_entries=code_dictionary_entries,
                     provider_set_metadata_entries=provider_set_metadata_entries,
                     graph_artifact_entries=list(manifest_artifacts.get("sidecars") or []),
+                    provider_identifier_quarantine=provider_identifier_quarantine,
                     scratch_parent=ptg2_temp_parent(),
                 )
             finally:
@@ -3898,6 +3945,7 @@ async def _main_with_artifact_lease(
                 "source_key": source_key_val,
                 "coverage_scope_id": shared_input_identity.coverage_scope_hex,
                 "source_set": source_set,
+                "provider_identifier_quarantine": provider_identifier_quarantine,
                 "source_trace_set_hash": manifest_artifacts.get(
                     "source_trace_set_hash"
                 ),

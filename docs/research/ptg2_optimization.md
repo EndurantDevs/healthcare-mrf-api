@@ -171,7 +171,7 @@ The release profile requires all of these floors:
 | Resolved-rate fraction | exactly 1.0 |
 | Unresolved provider references | 0 |
 | Invalid prices | 0 |
-| Invalid NPIs | 0 |
+| Unattested or mismatched malformed NPI integers | 0 |
 | Invalid field types | 0 |
 
 The source-selected sample is derived independently from original in-network
@@ -179,10 +179,21 @@ files and includes the exact raw container SHA in occurrence identity. The
 API-selected sample comes from the persisted publish-time served
 occurrences and receives no source-selected query keys. Negative checks combine
 individually positive codes and NPIs that must not produce a false membership.
-TIN-only provider groups use the schema-defined `[0]` marker and never create
-a fake NPI. The audit reports them separately from NPI-addressable rates and
-the release profile fails if any are present until a TIN-addressed API audit is
-available.
+TIN-only provider groups use only the schema-defined singleton `[0]` marker and
+never create a fake NPI. Zero mixed with another value or repeated zero values
+are rejected. The audit reports TIN-only groups separately from NPI-addressable
+rates and the release profile fails if any are present until a TIN-addressed API
+audit is available.
+
+Out-of-range nonzero integral values found in NPI arrays follow a separate strict
+quarantine contract. They are excluded from NPI membership without discarding
+valid members or negotiated prices, remain part of provider-group identity,
+and are summarized in the immutable PostgreSQL layout manifest. The summary is
+bounded to 1,024 distinct malformed values and contains exact occurrence
+counts plus a domain-separated SHA-256 digest. The source-side release audit
+recomputes this summary independently and must match it exactly; a numeric
+tolerance alone cannot authorize activation. Mixed TIN plus valid-NPI groups
+are fully NPI-verifiable and do not fail solely because a TIN is also present.
 
 The physical layout itself stores a deterministic, stratified publication
 sample of at most 2,560 occurrences. It is generated before sealing and includes
