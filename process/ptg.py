@@ -2786,7 +2786,7 @@ async def _publish_reused_shared_v3_snapshot(
     manifest_stage_table: str | None,
     test_mode: bool,
     import_started_monotonic: float,
-    candidate_stage_flags: dict[str, bool] | None = None,
+    candidate_stage_flags_by_name: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """Publish a logical snapshot binding without rescanning identical content."""
 
@@ -2935,8 +2935,8 @@ async def _publish_reused_shared_v3_snapshot(
         coverage_plan_id=coverage_plan_id,
         coverage_plan_market_type=coverage_plan_market_type,
     )
-    if candidate_stage_flags is not None:
-        candidate_stage_flags["staged"] = True
+    if candidate_stage_flags_by_name is not None:
+        candidate_stage_flags_by_name["staged"] = True
     candidate_attributes_by_field = dict(candidate_result["candidate_attributes"])
     auto_activate = bool(options.get("auto_activate_candidates", False))
     if auto_activate:
@@ -3297,7 +3297,7 @@ async def _main_with_artifact_lease(
         str(observed_source_snapshot_id) if observed_source_snapshot_id else None
     )
     is_current_pointer_published = False
-    candidate_stage_flags = {"staged": False}
+    candidate_stage_flags_by_name = {"staged": False}
 
     async def mark_import_failed(error: BaseException | str, *, progress_message: str | None = None) -> None:
         """Persist import failure state and drop unpublished source-scoped staging tables."""
@@ -3311,7 +3311,7 @@ async def _main_with_artifact_lease(
         serving_index = failure_report_by_field.get("serving_index")
         is_snapshot_known_published = is_current_pointer_published
         should_preserve_candidate_tables = (
-            is_current_pointer_published or candidate_stage_flags["staged"]
+            is_current_pointer_published or candidate_stage_flags_by_name["staged"]
         )
         if not should_preserve_candidate_tables and isinstance(serving_index, dict):
             try:
@@ -3354,7 +3354,7 @@ async def _main_with_artifact_lease(
             report=failure_report_by_field,
             options=options_by_name,
             should_preserve_published_snapshot=(
-                is_snapshot_known_published or candidate_stage_flags["staged"]
+                is_snapshot_known_published or candidate_stage_flags_by_name["staged"]
             ),
             import_started_monotonic=import_started_monotonic,
             failure_handling_started_monotonic=failure_handling_started_monotonic,
@@ -3748,7 +3748,7 @@ async def _main_with_artifact_lease(
                     manifest_stage_table=ptg2_manifest_stage_table,
                     test_mode=test_mode,
                     import_started_monotonic=import_started_monotonic,
-                    candidate_stage_flags=candidate_stage_flags,
+                    candidate_stage_flags_by_name=candidate_stage_flags_by_name,
                 )
 
             async def iter_downloaded_jobs():
@@ -4126,7 +4126,7 @@ async def _main_with_artifact_lease(
                 shared_input_identity.logical_plan.plan_market_type
             ),
         )
-        candidate_stage_flags["staged"] = True
+        candidate_stage_flags_by_name["staged"] = True
         candidate_attributes_by_field = dict(candidate_result["candidate_attributes"])
         if auto_activate_candidates:
             activated_at = _utcnow()
