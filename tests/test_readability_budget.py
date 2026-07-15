@@ -17,16 +17,14 @@ NOQA_FIXTURE = "# no" + "qa: E123"
 COMMENT_NOISE_FIXTURE = "# return" + " result"
 
 
-def test_ci_readability_ratchet_requires_zero_net_change():
+def test_ci_readability_ratchet_requires_python_debt_reduction():
     workflow_text = (
         Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
     ).read_text(encoding="utf-8")
 
-    assert (
-        '--ratchet-baseline "$RUNNER_TEMP/readability-base.json" \\\n'
-        "              --required-reduction-percent 0"
-    ) in workflow_text
-    assert "--required-reduction-percent 1" not in workflow_text
+    assert 'git diff --quiet "$BASE_SHA" HEAD -- \'*.py\' \'*.pyi\'' in workflow_text
+    assert "--required-reduction-percent 0" in workflow_text
+    assert "--required-reduction-percent 1" in workflow_text
 
 
 def _write_config(repo_root: Path) -> None:
