@@ -566,6 +566,9 @@ impl CopyPathConfig {
             manifest_provider_group_member: env_path(
                 "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH",
             ),
+            manifest_provider_set_dictionary: env_path(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COPY_PATH",
+            ),
             manifest_only: true,
             ..Self::default()
         })
@@ -19312,6 +19315,28 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             drop(scope);
         }
+    }
+
+    #[test]
+    fn strict_v3_config_keeps_provider_set_dictionary_path() {
+        let _lock = scanner_env_lock().lock().unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "ptg2-v3-provider-set-config-{}",
+            std::process::id()
+        ));
+        let metadata_path = directory.join("provider-set-metadata.copy");
+        let _strict_env = strict_scan_env(&directory);
+        let _metadata = TestEnvVar::set(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COPY_PATH",
+            metadata_path.to_str().unwrap(),
+        );
+
+        assert_eq!(
+            CopyPathConfig::from_env()
+                .unwrap()
+                .manifest_provider_set_dictionary,
+            Some(metadata_path.display().to_string())
+        );
     }
 
     #[test]
