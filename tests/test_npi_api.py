@@ -57,9 +57,9 @@ async def test_npi_index(monkeypatch):
     )
 
     response = await npi_index_status(request)
-    payload = json.loads(response.body)
-    assert payload["product_count"] == 10
-    assert payload["import_log_errors"] == 5
+    response_payload = json.loads(response.body)
+    assert response_payload["product_count"] == 10
+    assert response_payload["import_log_errors"] == 5
 
 
 @pytest.mark.asyncio
@@ -93,10 +93,10 @@ async def test_get_npi_includes_other_names(monkeypatch):
 
     request = types.SimpleNamespace(args={})
     response = await npi_module.get_npi(request, "1518379601")
-    payload = json.loads(response.body)
-    assert "other_name_list" in payload
-    assert payload["other_name_list"][0]["other_provider_identifier"] == "ALT NAME"
-    assert payload["do_business_as"] == ["DBA"]
+    response_payload = json.loads(response.body)
+    assert "other_name_list" in response_payload
+    assert response_payload["other_name_list"][0]["other_provider_identifier"] == "ALT NAME"
+    assert response_payload["do_business_as"] == ["DBA"]
 
 
 @pytest.mark.asyncio
@@ -136,16 +136,16 @@ async def test_get_npi_uses_other_names_for_dba(monkeypatch):
 
     request = types.SimpleNamespace(args={})
     response = await npi_module.get_npi(request, "1518379601")
-    payload = json.loads(response.body)
-    assert payload["do_business_as"] == ["Name One", "Name Two"]
-    assert payload["other_name_list"] == other_names
+    response_payload = json.loads(response.body)
+    assert response_payload["do_business_as"] == ["Name One", "Name Two"]
+    assert response_payload["other_name_list"] == other_names
 
 
 @pytest.mark.asyncio
 async def test_fetch_other_names_deduplicates(monkeypatch):
     class FakeRow:
-        def __init__(self, payload):
-            self._payload = payload
+        def __init__(self, response_payload):
+            self._payload = response_payload
 
         def to_json_dict(self):
             return dict(self._payload)

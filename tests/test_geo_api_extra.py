@@ -62,10 +62,10 @@ async def test_geo_index_handler():
         app=types.SimpleNamespace(config={"RELEASE": "test", "ENVIRONMENT": "dev"}),
     )
     response = await handler(request)
-    payload = json.loads(response.body)
-    assert payload["release"] == "test"
-    assert payload["environment"] == "dev"
-    assert "date" in payload
+    response_payload = json.loads(response.body)
+    assert response_payload["release"] == "test"
+    assert response_payload["environment"] == "dev"
+    assert "date" in response_payload
 
 
 class FakeResult:
@@ -126,11 +126,11 @@ async def test_geo_by_zip_success():
         app=types.SimpleNamespace(),
     )
     response = await geo_module.get_geo(request, "12345")
-    payload = json.loads(response.body)
-    assert payload["zip_code"] == "12345"
-    assert payload["lat"] == 41.1
-    assert payload["city"] == "Chicago"
-    assert payload["census_profile"] is None
+    response_payload = json.loads(response.body)
+    assert response_payload["zip_code"] == "12345"
+    assert response_payload["lat"] == 41.1
+    assert response_payload["city"] == "Chicago"
+    assert response_payload["census_profile"] is None
 
 
 @pytest.mark.asyncio
@@ -206,10 +206,10 @@ async def test_geo_by_zip_missing_census_table_falls_back_to_geo():
         app=types.SimpleNamespace(),
     )
     response = await geo_module.get_geo(request, "60654")
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
     assert response.status == 200
-    assert payload["zip_code"] == "60654"
-    assert payload["census_profile"] is None
+    assert response_payload["zip_code"] == "60654"
+    assert response_payload["census_profile"] is None
 
 
 @pytest.mark.asyncio
@@ -239,10 +239,10 @@ async def test_geo_by_zip_missing_census_column_falls_back_to_geo():
         app=types.SimpleNamespace(),
     )
     response = await geo_module.get_geo(request, "60654")
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
     assert response.status == 200
-    assert payload["zip_code"] == "60654"
-    assert payload["census_profile"] is None
+    assert response_payload["zip_code"] == "60654"
+    assert response_payload["census_profile"] is None
 
 
 @pytest.mark.asyncio
@@ -273,10 +273,10 @@ async def test_geo_by_zip_census_runtime_error_falls_back_to_geo(monkeypatch):
         app=types.SimpleNamespace(),
     )
     response = await geo_module.get_geo(request, "07666")
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
     assert response.status == 200
-    assert payload["zip_code"] == "07666"
-    assert payload["census_profile"] is None
+    assert response_payload["zip_code"] == "07666"
+    assert response_payload["census_profile"] is None
 
 
 @pytest.mark.asyncio
@@ -387,11 +387,11 @@ async def test_geo_by_zip_local_lat_long_fallback():
         app=types.SimpleNamespace(),
     )
     response = await geo_module.get_geo(request, "11111")
-    payload = json.loads(response.body)
-    assert payload["zip_code"] == "11111"
-    assert payload["lat"] is None
-    assert payload["long"] is None
-    assert payload["census_profile"] is None
+    response_payload = json.loads(response.body)
+    assert response_payload["zip_code"] == "11111"
+    assert response_payload["lat"] is None
+    assert response_payload["long"] is None
+    assert response_payload["census_profile"] is None
 
 
 @pytest.mark.asyncio
@@ -407,8 +407,8 @@ async def test_geo_by_zip_tiger_fallback():
         app=types.SimpleNamespace(),
     )
     response = await geo_module.get_geo(request, "22222")
-    payload = json.loads(response.body)
-    assert payload == {
+    response_payload = json.loads(response.body)
+    assert response_payload == {
         "zip_code": "22222",
         "lat": 41.0,
         "long": -87.0,
@@ -501,16 +501,16 @@ async def test_geo_by_zip_with_census_profile():
         app=types.SimpleNamespace(),
     )
     response = await geo_module.get_geo(request, "60654")
-    payload = json.loads(response.body)
-    assert payload["zip_code"] == "60654"
-    assert payload["census_profile"]["median_household_income"] == 147357
-    assert payload["census_profile"]["total_employer_establishments"] == 2224
-    assert payload["census_profile"]["business_employment"] == 52832
-    assert payload["census_profile"]["svi_overall"] == 0.402
-    assert payload["census_profile"]["provider_count"] == 800
-    assert "pharmacy_count" not in payload["census_profile"]
-    assert "pharmacy_density_per_1000" not in payload["census_profile"]
-    assert payload["census_profile"]["provider_density_per_1000"] == pytest.approx(33.4868, rel=1e-4)
+    response_payload = json.loads(response.body)
+    assert response_payload["zip_code"] == "60654"
+    assert response_payload["census_profile"]["median_household_income"] == 147357
+    assert response_payload["census_profile"]["total_employer_establishments"] == 2224
+    assert response_payload["census_profile"]["business_employment"] == 52832
+    assert response_payload["census_profile"]["svi_overall"] == 0.402
+    assert response_payload["census_profile"]["provider_count"] == 800
+    assert "pharmacy_count" not in response_payload["census_profile"]
+    assert "pharmacy_density_per_1000" not in response_payload["census_profile"]
+    assert response_payload["census_profile"]["provider_density_per_1000"] == pytest.approx(33.4868, rel=1e-4)
 
 
 @pytest.mark.asyncio
@@ -531,8 +531,8 @@ async def test_geo_city_with_state_filter():
         ctx=types.SimpleNamespace(sa_session=FakeSession([FakeResult(rows=rows)])),
     )
     response = await geo_module.get_geo_by_city(request)
-    payload = json.loads(response.body)
-    assert payload["state"] == "TX"
+    response_payload = json.loads(response.body)
+    assert response_payload["state"] == "TX"
 
 
 @pytest.mark.asyncio
@@ -572,12 +572,12 @@ async def test_geo_places_by_zip_success_defaults_latest_year():
         ),
     )
     response = await geo_module.get_places_by_zip(request, "60654")
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
     assert response.status == 200
-    assert payload["zip_code"] == "60654"
-    assert payload["zcta"] == "60654"
-    assert payload["year"] == 2025
-    assert payload["measures"][0]["measure_id"] == "CSMOKING"
+    assert response_payload["zip_code"] == "60654"
+    assert response_payload["zcta"] == "60654"
+    assert response_payload["year"] == 2025
+    assert response_payload["measures"][0]["measure_id"] == "CSMOKING"
 
 
 @pytest.mark.asyncio
@@ -653,11 +653,11 @@ async def test_geo_states_sorted_asc_with_limit_and_skip_missing_top_zip():
         ),
     )
     response = await geo_module.list_geo_states(request)
-    payload = json.loads(response.body)
-    assert payload["total_states"] == 1
-    assert payload["limit"] == 1
-    assert payload["states"][0]["state"] == "TX"
-    assert payload["states"][0]["top_zips"][0]["zip_code"] == "73301"
+    response_payload = json.loads(response.body)
+    assert response_payload["total_states"] == 1
+    assert response_payload["limit"] == 1
+    assert response_payload["states"][0]["state"] == "TX"
+    assert response_payload["states"][0]["top_zips"][0]["zip_code"] == "73301"
 
 
 @pytest.mark.asyncio

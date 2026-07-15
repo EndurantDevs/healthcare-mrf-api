@@ -149,7 +149,8 @@ from process.ptg_parts.provider_cache import (
 from process.ptg_parts.provider_references import (
     _load_provider_references_from_file, _process_provider_reference_file)
 from process.ptg_parts.ptg2_manifest_artifacts import (
-    PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT, PTG2_MANIFEST_MEMBERSHIP_FORMAT)
+    PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT, PTG2_MANIFEST_MEMBERSHIP_FORMAT,
+    membership_index_fence_metadata)
 from process.ptg_parts.ptg2_manifest_publish import (
     PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     _copy_price_atom_member_file,
@@ -515,6 +516,7 @@ def _collect_ptg2_manifest_sidecar_artifacts(
             "record_format": record_format,
             "sha256": digest,
             "byte_count": byte_count,
+            **membership_index_fence_metadata(artifact_path),
         }
     return artifacts
 

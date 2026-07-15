@@ -68,9 +68,9 @@ async def test_coverage_statistics_success(monkeypatch):
     )
 
     response = await coverage_statistics(request)
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert payload == {
+    assert response_payload == {
         "snapshot_date": "2026-03-05T11:58:22",
         "marketplace_plans": 14311,
         "marketplace_issuers": 735,
@@ -98,7 +98,7 @@ async def test_coverage_statistics_missing_tables_return_zero(monkeypatch):
 
     request = make_request([])
     response = await coverage_statistics(request)
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
     int_fields = {
         "marketplace_plans",
@@ -117,8 +117,8 @@ async def test_coverage_statistics_missing_tables_return_zero(monkeypatch):
         "prescription_codes_tracked",
     }
 
-    assert isinstance(payload.get("snapshot_date"), str)
-    assert payload["snapshot_date"]
+    assert isinstance(response_payload.get("snapshot_date"), str)
+    assert response_payload["snapshot_date"]
     for field in int_fields:
-        assert payload[field] == 0
-        assert isinstance(payload[field], int)
+        assert response_payload[field] == 0
+        assert isinstance(response_payload[field], int)

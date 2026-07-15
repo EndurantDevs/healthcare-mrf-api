@@ -97,8 +97,8 @@ async def test_get_network_by_checksum(monkeypatch):
 
     request = make_request([])
     response = await get_network_by_checksum(request, "123")
-    payload = json.loads(response.body)
-    assert payload["checksum"] == 123
+    response_payload = json.loads(response.body)
+    assert response_payload["checksum"] == 123
 
 
 @pytest.mark.asyncio
@@ -110,8 +110,8 @@ async def test_get_networks_by_checksums(monkeypatch):
 
     request = make_request([])
     response = await get_networks_by_checksums(request, "1,2,1")
-    payload = json.loads(response.body)
-    assert [entry["checksum"] for entry in payload] == [1, 2]
+    response_payload = json.loads(response.body)
+    assert [entry["checksum"] for entry in response_payload] == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -136,18 +136,18 @@ async def test_plan_index_status():
         ]
     )
     response = await index_status(request)
-    payload = json.loads(response.body)
-    assert payload["plan_count"] == 5
-    assert payload["import_log_errors"] == 3
-    assert payload["plans_network_count"] == 2
+    response_payload = json.loads(response.body)
+    assert response_payload["plan_count"] == 5
+    assert response_payload["import_log_errors"] == 3
+    assert response_payload["plans_network_count"] == 2
 
 
 @pytest.mark.asyncio
 async def test_plan_all_plans():
     request = make_request([FakeResult(rows=[{"plan_id": "123"}])])
     response = await all_plans(request)
-    payload = json.loads(response.body)
-    assert payload == [{"plan_id": "123"}]
+    response_payload = json.loads(response.body)
+    assert response_payload == [{"plan_id": "123"}]
 
 
 @pytest.mark.asyncio
@@ -168,8 +168,8 @@ async def test_plan_all_plans_variants():
         args={"limit": "10", "offset": "5"},
     )
     response = await all_plans_variants(request)
-    payload = json.loads(response.body)
-    assert payload == [
+    response_payload = json.loads(response.body)
+    assert response_payload == [
         {"marketing_name": "Plan", "plan_id": "123", "full_plan_id": "123-00", "year": 2024}
     ]
 
@@ -178,8 +178,8 @@ async def test_plan_all_plans_variants():
 async def test_plan_get_autocomplete_empty():
     request = make_request([FakeResult(rows=[])], args={"query": "Silver"})
     response = await get_autocomplete_list(request)
-    payload = json.loads(response.body)
-    assert payload == {"plans": []}
+    response_payload = json.loads(response.body)
+    assert response_payload == {"plans": []}
 
 
 @pytest.mark.asyncio
@@ -197,8 +197,8 @@ async def test_plan_get_autocomplete_success():
         args={"query": "plan"},
     )
     response = await get_autocomplete_list(request)
-    payload = json.loads(response.body)
-    lookup = {item["plan_id"]: item for item in payload["plans"]}
+    response_payload = json.loads(response.body)
+    lookup = {item["plan_id"]: item for item in response_payload["plans"]}
     assert lookup["P123"]["network_checksum"] == {"111": "GOLD"}
     assert lookup["P456"]["network_checksum"] == {"222": "SILVER"}
 
@@ -244,8 +244,8 @@ async def test_plan_get_price_plan_success():
         args={"age": "30", "rating_area": "A"},
     )
     response = await get_price_plan(request, "P123", year="2024")
-    payload = json.loads(response.body)
-    assert payload == [
+    response_payload = json.loads(response.body)
+    assert response_payload == [
         {
             "plan_id": "P123",
             "year": 2024,
@@ -276,15 +276,15 @@ async def test_plan_get_plan_success():
         ]
     )
     response = await get_plan(request, "P123")
-    payload = json.loads(response.body)
-    assert payload["plan_id"] == "P123"
-    assert payload["rate_effective_date"] == "2025-03-25 00:00:00"
-    assert payload["network_checksum"] == {"77777": "PREFERRED"}
-    assert payload["issuer_name"] == "Sample Issuer"
-    assert payload["formulary"][0]["drug_tier"] == "Tier 1"
-    assert payload["formulary_drug_count"] == 1
-    assert payload["formulary_has_drug_data"] is True
-    assert payload["formulary_uri"] == "P123/2024"
+    response_payload = json.loads(response.body)
+    assert response_payload["plan_id"] == "P123"
+    assert response_payload["rate_effective_date"] == "2025-03-25 00:00:00"
+    assert response_payload["network_checksum"] == {"77777": "PREFERRED"}
+    assert response_payload["issuer_name"] == "Sample Issuer"
+    assert response_payload["formulary"][0]["drug_tier"] == "Tier 1"
+    assert response_payload["formulary_drug_count"] == 1
+    assert response_payload["formulary_has_drug_data"] is True
+    assert response_payload["formulary_uri"] == "P123/2024"
 
 
 @pytest.mark.asyncio
@@ -343,10 +343,10 @@ async def test_plan_find_plan_success():
         args={"year": "2024", "age": "30", "rating_area": "A", "limit": "1", "page": "1"},
     )
     response = await find_a_plan(request)
-    payload = json.loads(response.body)
-    assert payload["total"] == 1
-    assert payload["facets"]["plan_types"] == []
-    result = payload["results"][0]
+    response_payload = json.loads(response.body)
+    assert response_payload["total"] == 1
+    assert response_payload["facets"]["plan_types"] == []
+    result = response_payload["results"][0]
     assert result["price_range"] == {"min": 100.0, "max": 200.0}
     assert result["attributes"]["Coverage"]["attr_value"] == "Standard"
     assert result["plan_benefits"]["Primary Care Visit"]["benefit_name"] == "Primary Care Visit"
@@ -561,8 +561,8 @@ async def test_plan_get_autocomplete_with_state():
         args={"query": "plan", "state": "tx"},
     )
     response = await get_autocomplete_list(request)
-    payload = json.loads(response.body)
-    assert payload["plans"][0]["network_checksum"] == {"222": "PLATINUM"}
+    response_payload = json.loads(response.body)
+    assert response_payload["plans"][0]["network_checksum"] == {"222": "PLATINUM"}
 
 
 @pytest.mark.asyncio
@@ -588,8 +588,8 @@ async def test_plan_get_autocomplete_with_zip(monkeypatch):
         args={"query": "plan", "zip_code": "02110"},
     )
     response = await get_autocomplete_list(request)
-    payload = json.loads(response.body)
-    assert payload["plans"][0]["network_checksum"] == {"333": "GOLD"}
+    response_payload = json.loads(response.body)
+    assert response_payload["plans"][0]["network_checksum"] == {"333": "GOLD"}
 
 
 @pytest.mark.asyncio
@@ -641,17 +641,17 @@ async def test_find_a_plan_success():
         args={"age": "30", "year": "2024", "order": "invalid"},
     )
     response = await find_a_plan(request)
-    payload = json.loads(response.body)
-    assert payload["total"] == 5
-    assert "facets" in payload
-    assert payload["issuers"][0]["issuer_id"] == 42
-    assert payload["applied_filters"]["age"] == 30
-    assert payload["results"][0]["has_adult_dental"] is True
-    assert payload["results"][0]["deductible_inn_individual"] == 500.0
-    assert payload["results"][0]["attributes"]["FormularyId"]["attr_value"] == "val"
-    assert payload["results"][0]["plan_benefits"]["benefit_name"]["copay_inn_tier1"] == "10"
-    assert payload["results"][0]["price_range"] == {"min": 10.0, "max": 20.0}
-    assert payload["warnings"] == []
+    response_payload = json.loads(response.body)
+    assert response_payload["total"] == 5
+    assert "facets" in response_payload
+    assert response_payload["issuers"][0]["issuer_id"] == 42
+    assert response_payload["applied_filters"]["age"] == 30
+    assert response_payload["results"][0]["has_adult_dental"] is True
+    assert response_payload["results"][0]["deductible_inn_individual"] == 500.0
+    assert response_payload["results"][0]["attributes"]["FormularyId"]["attr_value"] == "val"
+    assert response_payload["results"][0]["plan_benefits"]["benefit_name"]["copay_inn_tier1"] == "10"
+    assert response_payload["results"][0]["price_range"] == {"min": 10.0, "max": 20.0}
+    assert response_payload["warnings"] == []
 
 
 @pytest.mark.asyncio
@@ -664,14 +664,14 @@ async def test_find_a_plan_no_results():
         args={},
     )
     response = await find_a_plan(request)
-    payload = json.loads(response.body)
-    assert payload["total"] == 0
-    assert payload["results"] == []
-    assert payload["issuers"] == []
-    assert payload["facets"]["plan_types"] == []
-    assert payload["warnings"] == []
-    assert payload["applied_filters"]["limit"] == 100
-    assert payload["facets"]["plan_types"] == []
+    response_payload = json.loads(response.body)
+    assert response_payload["total"] == 0
+    assert response_payload["results"] == []
+    assert response_payload["issuers"] == []
+    assert response_payload["facets"]["plan_types"] == []
+    assert response_payload["warnings"] == []
+    assert response_payload["applied_filters"]["limit"] == 100
+    assert response_payload["facets"]["plan_types"] == []
 
 
 @pytest.mark.asyncio
@@ -720,11 +720,11 @@ async def test_find_a_plan_with_new_filters():
         },
     )
     response = await find_a_plan(request)
-    payload = json.loads(response.body)
-    assert payload["results"][0]["plan_type"] == "HMO"
-    assert payload["applied_filters"]["plan_types"] == ["HMO"]
-    assert payload["applied_filters"].get("issuer_ids") in (None, [42])
-    assert payload["applied_filters"]["issuer_id"] == 42
+    response_payload = json.loads(response.body)
+    assert response_payload["results"][0]["plan_type"] == "HMO"
+    assert response_payload["applied_filters"]["plan_types"] == ["HMO"]
+    assert response_payload["applied_filters"].get("issuer_ids") in (None, [42])
+    assert response_payload["applied_filters"]["issuer_id"] == 42
 
 
 @pytest.mark.asyncio
@@ -762,11 +762,11 @@ async def test_find_a_plan_returns_facets():
         args={},
     )
     response = await find_a_plan(request)
-    payload = json.loads(response.body)
-    assert payload["facets"]["plan_types"][0] == {"value": "HMO", "count": 2}
-    assert payload["facets"]["metal_levels"][0] == {"value": "BRONZE", "count": 2}
-    assert payload["facets"]["boolean_filters"]["has_adult_dental"]["true"] == 1
-    assert payload["facets"]["boolean_filters"]["is_hsa"]["true"] == 2
+    response_payload = json.loads(response.body)
+    assert response_payload["facets"]["plan_types"][0] == {"value": "HMO", "count": 2}
+    assert response_payload["facets"]["metal_levels"][0] == {"value": "BRONZE", "count": 2}
+    assert response_payload["facets"]["boolean_filters"]["has_adult_dental"]["true"] == 1
+    assert response_payload["facets"]["boolean_filters"]["is_hsa"]["true"] == 2
 
 
 @pytest.mark.asyncio
@@ -780,11 +780,11 @@ async def test_find_a_plan_zip_warning():
         args={"zip_code": "99999"},
     )
     response = await find_a_plan(request)
-    payload = json.loads(response.body)
-    assert payload["total"] == 0
-    assert payload["warnings"][0]["code"] == "zip_not_found"
-    assert payload["applied_filters"]["zip_code"] == "99999"
-    assert payload["facets"]["plan_types"] == []
+    response_payload = json.loads(response.body)
+    assert response_payload["total"] == 0
+    assert response_payload["warnings"][0]["code"] == "zip_not_found"
+    assert response_payload["applied_filters"]["zip_code"] == "99999"
+    assert response_payload["facets"]["plan_types"] == []
 
 
 @pytest.mark.asyncio
@@ -801,8 +801,8 @@ async def test_get_price_plan_with_year():
         args={"age": "30", "year": "2024"},
     )
     response = await get_price_plan(request, "P1")
-    payload = json.loads(response.body)
-    assert payload == [{"plan_id": "P1", "year": 2024, "individual_rate": 100}]
+    response_payload = json.loads(response.body)
+    assert response_payload == [{"plan_id": "P1", "year": 2024, "individual_rate": 100}]
 
 
 @pytest.mark.asyncio
@@ -819,10 +819,10 @@ async def test_get_price_plans_bulk_success():
         json_data={"plan_ids": ["P1", "P2", "P3"], "year": 2024, "age": 30, "rating_area": "A"},
     )
     response = await get_price_plans_bulk(request)
-    payload = json.loads(response.body)
-    assert payload["results"]["P1"][0]["plan_id"] == "P1"
-    assert payload["results"]["P2"][0]["plan_id"] == "P2"
-    assert payload["missing"] == ["P3"]
+    response_payload = json.loads(response.body)
+    assert response_payload["results"]["P1"][0]["plan_id"] == "P1"
+    assert response_payload["results"]["P2"][0]["plan_id"] == "P2"
+    assert response_payload["missing"] == ["P3"]
 
 
 @pytest.mark.asyncio
@@ -877,8 +877,8 @@ async def test_get_price_plans_bulk_rating_area_trimmed():
         json_data={"plan_ids": ["P1"], "rating_area": "  "},
     )
     response = await get_price_plans_bulk(request)
-    payload = json.loads(response.body)
-    assert payload["results"]["P1"][0]["rate"] == 100
+    response_payload = json.loads(response.body)
+    assert response_payload["results"]["P1"][0]["rate"] == 100
 
 
 @pytest.mark.asyncio
@@ -911,14 +911,14 @@ async def test_get_plan_with_variant(monkeypatch):
         ]
     )
     response = await get_plan(request, "P1", year="2024", variant="P1-01")
-    payload = json.loads(response.body)
-    assert payload["issuer_name"] == "Issuer"
-    assert payload["variant_attributes"]["FormularyId"]["attr_value"] == "val"
-    assert payload["variant_attributes"]["FormularyId"]["human_attr_name"] == "Formulary ID"
-    assert payload["variant_benefits"]["benefit_name"]["in_network_tier1"] == "5, 10"
-    assert payload["variant_benefits"]["benefit_name"]["human_attr_name"] == "Benefit Name"
-    assert payload["formulary_has_drug_data"] is True
-    assert payload["formulary_uri"] == "P1/2024"
+    response_payload = json.loads(response.body)
+    assert response_payload["issuer_name"] == "Issuer"
+    assert response_payload["variant_attributes"]["FormularyId"]["attr_value"] == "val"
+    assert response_payload["variant_attributes"]["FormularyId"]["human_attr_name"] == "Formulary ID"
+    assert response_payload["variant_benefits"]["benefit_name"]["in_network_tier1"] == "5, 10"
+    assert response_payload["variant_benefits"]["benefit_name"]["human_attr_name"] == "Benefit Name"
+    assert response_payload["formulary_has_drug_data"] is True
+    assert response_payload["formulary_uri"] == "P1/2024"
 
 
 @pytest.mark.asyncio
@@ -982,14 +982,14 @@ async def test_get_plan_normalizes_variant_identifiers():
         ]
     )
     response = await get_plan(request, "P1", year="2024")
-    payload = json.loads(response.body)
-    assert payload["variants"] == ["P1-01", "P1-02", "P1-03", "P1-04"]
-    assert payload["attributes"]["SomeAttr"]["attr_value"] == "value"
-    assert payload["plan_benefits"]["GeneralBenefit"]["in_network_tier1"] == "$5, 25%"
-    assert payload["variant_attributes"]["VariantAttr"]["attr_value"] == "X"
-    assert payload["variant_benefits"]["VariantBenefit"]["in_network_tier1"] == "$10, 50%"
-    assert payload["formulary_has_drug_data"] is False
-    assert payload["formulary_uri"] == "P1/2024"
+    response_payload = json.loads(response.body)
+    assert response_payload["variants"] == ["P1-01", "P1-02", "P1-03", "P1-04"]
+    assert response_payload["attributes"]["SomeAttr"]["attr_value"] == "value"
+    assert response_payload["plan_benefits"]["GeneralBenefit"]["in_network_tier1"] == "$5, 25%"
+    assert response_payload["variant_attributes"]["VariantAttr"]["attr_value"] == "X"
+    assert response_payload["variant_benefits"]["VariantBenefit"]["in_network_tier1"] == "$10, 50%"
+    assert response_payload["formulary_has_drug_data"] is False
+    assert response_payload["formulary_uri"] == "P1/2024"
 
 
 @pytest.mark.asyncio
@@ -1029,13 +1029,13 @@ async def test_get_plan_uses_fallback_variants_when_missing():
         ]
     )
     response = await get_plan(request, "P2", year="2024")
-    payload = json.loads(response.body)
-    assert payload["variants"] == ["P2-09"]
-    assert payload["active_variant"] == "P2-09"
-    assert payload["variant_attributes"]["FormularyId"]["attr_value"] == "PlanLevelValue"
-    assert payload["variant_benefits"]["GeneralBenefit"]["in_network_tier1"] == "$15, 75%"
-    assert payload["formulary_has_drug_data"] is False
-    assert payload["formulary_uri"] == "P2/2024"
+    response_payload = json.loads(response.body)
+    assert response_payload["variants"] == ["P2-09"]
+    assert response_payload["active_variant"] == "P2-09"
+    assert response_payload["variant_attributes"]["FormularyId"]["attr_value"] == "PlanLevelValue"
+    assert response_payload["variant_benefits"]["GeneralBenefit"]["in_network_tier1"] == "$15, 75%"
+    assert response_payload["formulary_has_drug_data"] is False
+    assert response_payload["formulary_uri"] == "P2/2024"
 
 
 @pytest.mark.asyncio
@@ -1105,10 +1105,10 @@ async def test_plan_variants_unique_and_clean():
         ]
     )
     response = await get_plan(request, "P1", year="2024")
-    payload = json.loads(response.body)
-    assert payload["variants"] == ["P1-00", "P1-01", "P1-02"]
-    assert payload["formulary_has_drug_data"] is False
-    assert payload["formulary_uri"] == "P1/2024"
+    response_payload = json.loads(response.body)
+    assert response_payload["variants"] == ["P1-00", "P1-01", "P1-02"]
+    assert response_payload["formulary_has_drug_data"] is False
+    assert response_payload["formulary_uri"] == "P1/2024"
 
 def test_result_rows_handles_typeerror():
     class BadAll:
@@ -1134,8 +1134,8 @@ async def test_get_networks_by_checksums_skips_invalid(monkeypatch):
     session = FakeSession([])
     request = types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=session))
     response = await get_networks_by_checksums(request, "bad,1")
-    payload = json.loads(response.body)
-    assert [entry["checksum"] for entry in payload] == [1]
+    response_payload = json.loads(response.body)
+    assert [entry["checksum"] for entry in response_payload] == [1]
 
 
 @pytest.mark.asyncio
@@ -1148,10 +1148,10 @@ async def test_find_a_plan_skips_missing_plan_id():
         args={},
     )
     response = await find_a_plan(request)
-    payload = json.loads(response.body)
-    assert payload["total"] == 0
-    assert payload["results"] == []
-    assert payload["issuers"] == []
+    response_payload = json.loads(response.body)
+    assert response_payload["total"] == 0
+    assert response_payload["results"] == []
+    assert response_payload["issuers"] == []
 
 
 @pytest.mark.asyncio
@@ -1212,11 +1212,11 @@ async def test_find_a_plan_boolean_filter_without_metadata():
         args={"has_adult_dental": "true"},
     )
     response = await find_a_plan(request)
-    payload = json.loads(response.body)
-    assert payload["total"] == 0
-    assert payload["warnings"] == []
-    assert payload["applied_filters"]["has_adult_dental"] is True
-    assert "facets" in payload
+    response_payload = json.loads(response.body)
+    assert response_payload["total"] == 0
+    assert response_payload["warnings"] == []
+    assert response_payload["applied_filters"]["has_adult_dental"] is True
+    assert "facets" in response_payload
 
 
 @pytest.mark.asyncio
@@ -1229,9 +1229,9 @@ async def test_find_a_plan_include_facets_false_hides_facets_payload():
         args={"include_facets": "false"},
     )
     response = await find_a_plan(request)
-    payload = json.loads(response.body)
-    assert payload["facets"] == {}
-    assert payload["applied_filters"]["include_facets"] is False
+    response_payload = json.loads(response.body)
+    assert response_payload["facets"] == {}
+    assert response_payload["applied_filters"]["include_facets"] is False
 
 
 @pytest.mark.asyncio
@@ -1244,9 +1244,9 @@ async def test_find_a_plan_include_aggregations_alias_controls_facets():
         args={"include_aggregations": "0"},
     )
     response = await find_a_plan(request)
-    payload = json.loads(response.body)
-    assert payload["facets"] == {}
-    assert payload["applied_filters"]["include_facets"] is False
+    response_payload = json.loads(response.body)
+    assert response_payload["facets"] == {}
+    assert response_payload["applied_filters"]["include_facets"] is False
 
 
 @pytest.mark.asyncio
@@ -1266,10 +1266,10 @@ async def test_find_a_plan_returns_pagination_metadata():
         args={"page": "3", "limit": "20"},
     )
     response = await find_a_plan(request)
-    payload = json.loads(response.body)
-    assert payload["page"] == 3
-    assert payload["limit"] == 20
-    assert payload["offset"] == 40
+    response_payload = json.loads(response.body)
+    assert response_payload["page"] == 3
+    assert response_payload["limit"] == 20
+    assert response_payload["offset"] == 40
 
 
 def test_result_scalar_empty_iterable():

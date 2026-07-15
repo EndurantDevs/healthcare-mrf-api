@@ -15,8 +15,8 @@ from process.ptg_parts.address_assurance import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _write_json(path, payload):
-    path.write_text(json.dumps(payload), encoding="utf-8")
+def _write_json(path, assurance_by_field):
+    path.write_text(json.dumps(assurance_by_field), encoding="utf-8")
 
 
 def _load_cli_module():
@@ -32,7 +32,7 @@ def _load_cli_module():
 
 
 def test_price_address_assurance_accepts_plan_context_provider_directory_address():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -61,7 +61,7 @@ def test_price_address_assurance_accepts_plan_context_provider_directory_address
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is True
     assert summary["item_count"] == 1
@@ -75,7 +75,7 @@ def test_price_address_assurance_accepts_plan_context_provider_directory_address
 
 
 def test_price_address_assurance_accepts_network_name_provider_directory_address():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -111,14 +111,14 @@ def test_price_address_assurance_accepts_network_name_provider_directory_address
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is True
     assert summary["issues"] == []
 
 
 def test_network_name_proof_must_match():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -153,7 +153,7 @@ def test_network_name_proof_must_match():
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -164,7 +164,7 @@ def test_network_name_proof_must_match():
 
 
 def test_price_address_assurance_rejects_network_name_proof_without_served_network_names():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -198,7 +198,7 @@ def test_price_address_assurance_rejects_network_name_proof_without_served_netwo
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -209,7 +209,7 @@ def test_price_address_assurance_rejects_network_name_proof_without_served_netwo
 
 
 def test_price_address_assurance_rejects_network_name_marker_without_evidence():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -233,7 +233,7 @@ def test_price_address_assurance_rejects_network_name_marker_without_evidence():
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -244,7 +244,7 @@ def test_price_address_assurance_rejects_network_name_marker_without_evidence():
 
 
 def test_price_address_assurance_rejects_malformed_provider_directory_network_match():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -270,7 +270,7 @@ def test_price_address_assurance_rejects_malformed_provider_directory_network_ma
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -310,7 +310,7 @@ def test_price_address_assurance_rejects_malformed_provider_directory_network_ke
         ),
     )
     for overrides, expected_message in cases:
-        payload = {
+        assurance_by_field = {
             "data": {
                 "items": [
                     {
@@ -336,7 +336,7 @@ def test_price_address_assurance_rejects_malformed_provider_directory_network_ke
             }
         }
 
-        summary = summarize_ptg_price_address_payload(payload)
+        summary = summarize_ptg_price_address_payload(assurance_by_field)
 
         messages = [issue["message"] for issue in summary["issues"]]
         assert summary["ok"] is False
@@ -344,7 +344,7 @@ def test_price_address_assurance_rejects_malformed_provider_directory_network_ke
 
 
 def test_price_address_assurance_rejects_network_binding_without_plan_context():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -364,7 +364,7 @@ def test_price_address_assurance_rejects_network_binding_without_plan_context():
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     messages = [issue["message"] for issue in summary["issues"]]
@@ -407,7 +407,7 @@ def test_price_address_assurance_requires_address_verification_on_every_row():
 
 
 def test_price_address_assurance_requires_displayed_address_present_boolean():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -423,7 +423,7 @@ def test_price_address_assurance_requires_displayed_address_present_boolean():
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -434,7 +434,7 @@ def test_price_address_assurance_requires_displayed_address_present_boolean():
 
 
 def test_price_address_assurance_requires_network_bound_address_boolean():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -451,7 +451,7 @@ def test_price_address_assurance_requires_network_bound_address_boolean():
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -462,7 +462,7 @@ def test_price_address_assurance_requires_network_bound_address_boolean():
 
 
 def test_price_address_assurance_rejects_provider_directory_string_booleans():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -483,7 +483,7 @@ def test_price_address_assurance_rejects_provider_directory_string_booleans():
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     messages = [issue["message"] for issue in summary["issues"]]
     assert "provider_directory_plan_context_matched must be boolean when present" in messages
@@ -492,7 +492,7 @@ def test_price_address_assurance_rejects_provider_directory_string_booleans():
 
 
 def test_price_address_assurance_rejects_provider_directory_non_list_fields():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -516,7 +516,7 @@ def test_price_address_assurance_rejects_provider_directory_non_list_fields():
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     messages = [issue["message"] for issue in summary["issues"]]
     assert "address_sources must be a string list when present" in messages
@@ -528,7 +528,7 @@ def test_price_address_assurance_rejects_provider_directory_non_list_fields():
 
 
 def test_price_address_assurance_rejects_unknown_evidence_for_displayed_address():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -546,7 +546,7 @@ def test_price_address_assurance_rejects_unknown_evidence_for_displayed_address(
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -557,7 +557,7 @@ def test_price_address_assurance_rejects_unknown_evidence_for_displayed_address(
 
 
 def test_price_address_assurance_rejects_price_address_source_without_payer_confirmed_binding():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -576,7 +576,7 @@ def test_price_address_assurance_rejects_price_address_source_without_payer_conf
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -587,7 +587,7 @@ def test_price_address_assurance_rejects_price_address_source_without_payer_conf
 
 
 def test_price_address_assurance_accepts_payer_confirmed_with_direct_location_source():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -612,14 +612,14 @@ def test_price_address_assurance_accepts_payer_confirmed_with_direct_location_so
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is True
     assert summary["issues"] == []
 
 
 def test_price_address_assurance_rejects_payer_confirmed_without_source_trace():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -643,7 +643,7 @@ def test_price_address_assurance_rejects_payer_confirmed_without_source_trace():
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -654,7 +654,7 @@ def test_price_address_assurance_rejects_payer_confirmed_without_source_trace():
 
 
 def test_price_address_assurance_rejects_payer_confirmed_without_source_record_evidence():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -673,7 +673,7 @@ def test_price_address_assurance_rejects_payer_confirmed_without_source_record_e
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -684,7 +684,7 @@ def test_price_address_assurance_rejects_payer_confirmed_without_source_record_e
 
 
 def test_price_address_assurance_rejects_payer_confirmed_without_direct_location_source():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -702,7 +702,7 @@ def test_price_address_assurance_rejects_payer_confirmed_without_direct_location
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -713,7 +713,7 @@ def test_price_address_assurance_rejects_payer_confirmed_without_direct_location
 
 
 def test_price_address_assurance_rejects_payer_confirmed_with_only_tic_address_source():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -732,7 +732,7 @@ def test_price_address_assurance_rejects_payer_confirmed_with_only_tic_address_s
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -743,7 +743,7 @@ def test_price_address_assurance_rejects_payer_confirmed_with_only_tic_address_s
 
 
 def test_price_address_assurance_rejects_address_key_only_as_displayed_address():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -761,7 +761,7 @@ def test_price_address_assurance_rejects_address_key_only_as_displayed_address()
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert summary["displayed_address_rows"] == 0
@@ -773,7 +773,7 @@ def test_price_address_assurance_rejects_address_key_only_as_displayed_address()
 
 
 def test_price_address_assurance_schema_mode_accepts_explicit_no_address_row():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -792,8 +792,8 @@ def test_price_address_assurance_schema_mode_accepts_explicit_no_address_row():
         }
     }
 
-    strict_summary = summarize_ptg_price_address_payload(payload)
-    schema_summary = summarize_ptg_price_address_payload(payload, require_displayed_address=False)
+    strict_summary = summarize_ptg_price_address_payload(assurance_by_field)
+    schema_summary = summarize_ptg_price_address_payload(assurance_by_field, require_displayed_address=False)
 
     assert strict_summary["ok"] is False
     assert {
@@ -808,7 +808,7 @@ def test_price_address_assurance_schema_mode_accepts_explicit_no_address_row():
 
 
 def test_price_address_assurance_schema_mode_rejects_false_displayed_address_with_fields():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -826,7 +826,7 @@ def test_price_address_assurance_schema_mode_rejects_false_displayed_address_wit
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload, require_displayed_address=False)
+    summary = summarize_ptg_price_address_payload(assurance_by_field, require_displayed_address=False)
 
     assert summary["ok"] is False
     assert {
@@ -843,7 +843,7 @@ def test_price_address_assurance_schema_mode_rejects_false_displayed_address_wit
 
 
 def test_phone_only_cannot_display_address():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -865,7 +865,7 @@ def test_phone_only_cannot_display_address():
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload, require_displayed_address=False)
+    summary = summarize_ptg_price_address_payload(assurance_by_field, require_displayed_address=False)
 
     assert summary["ok"] is False
     assert {
@@ -879,7 +879,7 @@ def test_phone_only_cannot_display_address():
 
 
 def test_price_address_assurance_schema_mode_rejects_no_display_verification_evidence_fields():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -900,7 +900,7 @@ def test_price_address_assurance_schema_mode_rejects_no_display_verification_evi
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload, require_displayed_address=False)
+    summary = summarize_ptg_price_address_payload(assurance_by_field, require_displayed_address=False)
 
     assert summary["ok"] is False
     assert {
@@ -914,7 +914,7 @@ def test_price_address_assurance_schema_mode_rejects_no_display_verification_evi
 
 
 def test_price_address_assurance_rejects_city_only_as_displayed_address():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -932,7 +932,7 @@ def test_price_address_assurance_rejects_city_only_as_displayed_address():
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert summary["displayed_address_rows"] == 0
@@ -944,7 +944,7 @@ def test_price_address_assurance_rejects_city_only_as_displayed_address():
 
 
 def test_price_address_assurance_accepts_city_state_fallback_as_displayable_but_unconfirmed():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -962,7 +962,7 @@ def test_price_address_assurance_accepts_city_state_fallback_as_displayable_but_
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is True
     assert summary["displayed_address_rows"] == 1
@@ -1031,7 +1031,7 @@ def test_price_address_assurance_combines_raw_artifact_and_api_payload(tmp_path)
 
 
 def test_price_address_assurance_can_require_network_bound_address():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -1055,7 +1055,7 @@ def test_price_address_assurance_can_require_network_bound_address():
     }
 
     report = build_price_address_assurance_report(
-        api_payload=payload,
+        api_payload=assurance_by_field,
         require_network_bound_address=True,
     )
 
@@ -1069,7 +1069,7 @@ def test_price_address_assurance_can_require_network_bound_address():
 
 
 def test_price_address_assurance_accepts_network_bound_address_when_required():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -1106,7 +1106,7 @@ def test_price_address_assurance_accepts_network_bound_address_when_required():
     }
 
     report = build_price_address_assurance_report(
-        api_payload=payload,
+        api_payload=assurance_by_field,
         require_network_bound_address=True,
     )
 
@@ -1116,7 +1116,7 @@ def test_price_address_assurance_accepts_network_bound_address_when_required():
 
 
 def test_price_address_assurance_network_bound_requirement_implies_source_context():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -1144,7 +1144,7 @@ def test_price_address_assurance_network_bound_requirement_implies_source_contex
     }
 
     report = build_price_address_assurance_report(
-        api_payload=payload,
+        api_payload=assurance_by_field,
         require_network_bound_address=True,
     )
 
@@ -1162,7 +1162,7 @@ def test_price_address_assurance_network_bound_requirement_implies_source_contex
 
 
 def test_price_address_assurance_rejects_mismatched_network_bound_address():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -1185,7 +1185,7 @@ def test_price_address_assurance_rejects_mismatched_network_bound_address():
         }
     }
 
-    summary = summarize_ptg_price_address_payload(payload)
+    summary = summarize_ptg_price_address_payload(assurance_by_field)
 
     assert summary["ok"] is False
     assert {
@@ -1421,7 +1421,7 @@ def test_price_address_assurance_report_exposes_raw_displayable_location_fields(
 
 
 def test_ptg_payload_extracts_trace_ids():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -1442,11 +1442,11 @@ def test_ptg_payload_extracts_trace_ids():
         }
     }
 
-    assert source_file_version_ids_from_ptg_payload(payload) == ["version-a", "version-b"]
+    assert source_file_version_ids_from_ptg_payload(assurance_by_field) == ["version-a", "version-b"]
 
 
 def test_price_address_assurance_report_includes_api_source_file_version_ids():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -1467,7 +1467,7 @@ def test_price_address_assurance_report_includes_api_source_file_version_ids():
     }
 
     report = build_price_address_assurance_report(
-        api_payload=payload,
+        api_payload=assurance_by_field,
         require_displayed_address=False,
     )
 
@@ -1480,7 +1480,7 @@ def test_price_address_assurance_report_includes_api_source_file_version_ids():
 
 
 def test_price_address_assurance_report_can_require_source_context():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -1501,7 +1501,7 @@ def test_price_address_assurance_report_can_require_source_context():
     }
 
     report = build_price_address_assurance_report(
-        api_payload=payload,
+        api_payload=assurance_by_field,
         require_displayed_address=False,
         require_network_names=True,
         require_source_file_version_id=True,
@@ -1513,7 +1513,7 @@ def test_price_address_assurance_report_can_require_source_context():
 
 
 def test_price_address_assurance_report_rejects_missing_required_source_context():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -1533,7 +1533,7 @@ def test_price_address_assurance_report_rejects_missing_required_source_context(
     }
 
     report = build_price_address_assurance_report(
-        api_payload=payload,
+        api_payload=assurance_by_field,
         require_displayed_address=False,
         require_network_names=True,
         require_source_file_version_id=True,
@@ -1553,7 +1553,7 @@ def test_price_address_assurance_report_rejects_missing_required_source_context(
 
 
 def test_price_address_assurance_report_rejects_partial_missing_required_source_context():
-    payload = {
+    assurance_by_field = {
         "data": {
             "items": [
                 {
@@ -1586,7 +1586,7 @@ def test_price_address_assurance_report_rejects_partial_missing_required_source_
     }
 
     report = build_price_address_assurance_report(
-        api_payload=payload,
+        api_payload=assurance_by_field,
         require_displayed_address=False,
         require_network_names=True,
         require_source_file_version_id=True,
@@ -1898,9 +1898,9 @@ def test_price_address_assurance_cli_fetches_api_url(monkeypatch):
 
     monkeypatch.setattr(script.urllib.request, "urlopen", fake_urlopen)
 
-    payload = script._load_api_payload(None, "https://api.example.test/ptg", "secret-token", 2.5)
+    assurance_by_field = script._load_api_payload(None, "https://api.example.test/ptg", "secret-token", 2.5)
 
-    assert payload == {"data": {"items": []}}
+    assert assurance_by_field == {"data": {"items": []}}
     assert captured == {
         "url": "https://api.example.test/ptg",
         "authorization": "Bearer secret-token",

@@ -67,7 +67,7 @@ def _build_result_row(npi_value: int):
 
 
 def test_serialize_ffs_reassignment_row_keeps_counterparty_only():
-    payload = npi_module._serialize_ffs_reassignment_row(
+    response_payload = npi_module._serialize_ffs_reassignment_row(
         {
             "reassigning_enrollment_id": "I20241030000487",
             "receiving_enrollment_id": "O20031121000089",
@@ -78,14 +78,14 @@ def test_serialize_ffs_reassignment_row_keeps_counterparty_only():
         }
     )
 
-    assert payload["counterparty_npi"] == 1609838473
-    assert payload["reporting_year"] == 2025
-    assert "reassigning_npi" not in payload
-    assert "receiving_npi" not in payload
+    assert response_payload["counterparty_npi"] == 1609838473
+    assert response_payload["reporting_year"] == 2025
+    assert "reassigning_npi" not in response_payload
+    assert "receiving_npi" not in response_payload
 
 
 def test_serialize_ffs_reassignment_row_handles_missing_npis():
-    payload = npi_module._serialize_ffs_reassignment_row(
+    response_payload = npi_module._serialize_ffs_reassignment_row(
         {
             "reassigning_enrollment_id": "I20241030000487",
             "receiving_enrollment_id": "O20031121000089",
@@ -96,7 +96,7 @@ def test_serialize_ffs_reassignment_row_handles_missing_npis():
         }
     )
 
-    assert payload["counterparty_npi"] is None
+    assert response_payload["counterparty_npi"] is None
 
 
 def test_normalize_provider_enrichment_view_defaults_to_full():
@@ -153,13 +153,13 @@ async def test_fetch_provider_enrichment_detail_moves_chain_flags_to_visibility(
     monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=False))
     monkeypatch.setattr(npi_module.db, "session", lambda: FakeSessionContext())
 
-    payload = await npi_module._fetch_provider_enrichment_detail(1518379601)
+    response_payload = await npi_module._fetch_provider_enrichment_detail(1518379601)
 
-    assert payload["summary"]["status"] == "enriched"
-    assert "ffs_chain_hidden" not in payload["summary"]
-    assert "ffs_chain_enrollment_count" not in payload["summary"]
-    assert payload["ffs_visibility"]["chain_hidden"] is True
-    assert payload["ffs_visibility"]["chain_enrollment_count"] == 2
+    assert response_payload["summary"]["status"] == "enriched"
+    assert "ffs_chain_hidden" not in response_payload["summary"]
+    assert "ffs_chain_enrollment_count" not in response_payload["summary"]
+    assert response_payload["ffs_visibility"]["chain_hidden"] is True
+    assert response_payload["ffs_visibility"]["chain_enrollment_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -184,10 +184,10 @@ async def test_get_npi_includes_provider_enrichment(monkeypatch):
 
     request = types.SimpleNamespace(args={})
     response = await npi_module.get_npi(request, "1518379601")
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert "provider_enrichment" in payload
-    assert payload["provider_enrichment"]["summary"]["status"] == "enriched"
+    assert "provider_enrichment" in response_payload
+    assert response_payload["provider_enrichment"]["summary"]["status"] == "enriched"
     fetch_detail.assert_awaited_once_with(1518379601, include_chain=False)
 
 
@@ -282,9 +282,9 @@ async def test_get_npi_can_include_chain_provider_enrichment(monkeypatch):
 
     request = types.SimpleNamespace(args={"show": "chain"})
     response = await npi_module.get_npi(request, "1518379601")
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert payload["provider_enrichment"]["summary"]["status"] == "enriched"
+    assert response_payload["provider_enrichment"]["summary"]["status"] == "enriched"
     fetch_detail.assert_awaited_once_with(1518379601, include_chain=True)
 
 
@@ -312,9 +312,9 @@ async def test_get_npi_can_return_summary_view(monkeypatch):
 
     request = types.SimpleNamespace(args={"view": "summary"})
     response = await npi_module.get_npi(request, "1518379601")
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert payload["provider_enrichment"] == {
+    assert response_payload["provider_enrichment"] == {
         "summary": {"status": "enriched"},
         "ffs_visibility": {"show_mode": "default", "chain_hidden": False},
     }
@@ -350,10 +350,10 @@ async def test_get_all_attaches_provider_enrichment_summary(monkeypatch):
 
     request = types.SimpleNamespace(args={"limit": "1"}, app=types.SimpleNamespace())
     response = await npi_module.get_all(request)
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert payload["total"] == 1
-    assert payload["rows"][0]["provider_enrichment_summary"]["status"] == "enriched"
+    assert response_payload["total"] == 1
+    assert response_payload["rows"][0]["provider_enrichment_summary"]["status"] == "enriched"
     fetch_summary.assert_awaited_once_with([1234567890], include_chain=False, session=None)
 
 
@@ -382,7 +382,7 @@ async def test_get_all_can_include_chain_provider_enrichment(monkeypatch):
 
     request = types.SimpleNamespace(args={"limit": "1", "show": "chain"}, app=types.SimpleNamespace())
     response = await npi_module.get_all(request)
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert payload["rows"][0]["provider_enrichment_summary"]["status"] == "enriched"
+    assert response_payload["rows"][0]["provider_enrichment_summary"]["status"] == "enriched"
     fetch_summary.assert_awaited_once_with([1234567890], include_chain=True, session=None)

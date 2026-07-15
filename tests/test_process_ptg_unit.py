@@ -4201,7 +4201,14 @@ def test_ptg2_rust_compact_reports_truncated_frame_process_status(monkeypatch, t
 
 def test_ptg2_manifest_artifacts_skip_disabled_provider_npi_sidecar(tmp_path):
     provider_forward = tmp_path / "provider_forward.ptg2sc"
-    provider_forward.write_bytes(struct.pack("<8sIQQ", b"PTG2MNDS", 1, 0, 0))
+    owner_global_id = (1).to_bytes(16, "big")
+    member_global_id = (2).to_bytes(16, "big")
+    provider_forward.write_bytes(
+        struct.pack("<8sIQQ", b"PTG2MNDS", 1, 1, 1)
+        + struct.pack("<16sQI", owner_global_id, 0, 1)
+        + member_global_id
+        + struct.pack("<I", 0)
+    )
     empty_price_forward = tmp_path / "price_forward.ptg2sc"
     empty_price_forward.touch()
 
@@ -4217,7 +4224,12 @@ def test_ptg2_manifest_artifacts_skip_disabled_provider_npi_sidecar(tmp_path):
     assert artifacts["provider_forward"]["name"] == "provider_forward"
     assert artifacts["provider_forward"]["record_format"] == process_ptg.PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
     assert artifacts["provider_forward"]["path"] == str(provider_forward)
-    assert "owner_index_fence_owners" not in artifacts["provider_forward"]
+    assert artifacts["provider_forward"]["owner_count"] == 1
+    assert artifacts["provider_forward"]["member_count"] == 1
+    assert artifacts["provider_forward"]["member_global_count"] == 1
+    assert artifacts["provider_forward"]["owner_index_fence_owners"] == [
+        owner_global_id.hex()
+    ]
 
 
 def test_ptg2_manifest_artifacts_fallback_collects_from_summary_paths(tmp_path):
@@ -4248,6 +4260,8 @@ def test_ptg2_manifest_artifacts_fallback_collects_from_summary_paths(tmp_path):
     assert sidecar_map["price_forward"]["record_format"] == process_ptg.PTG2_MANIFEST_MEMBERSHIP_FORMAT
     assert sidecar_map["provider_forward"]["record_format"] == process_ptg.PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
     assert sidecar_map["provider_forward"]["path"] == str(provider_forward)
+    assert sidecar_map["provider_forward"]["owner_count"] == 0
+    assert sidecar_map["provider_forward"]["member_count"] == 0
     assert sidecar_map["provider_forward"]["source_shard_id"] == "manifest:logical-shard-a"
 
 

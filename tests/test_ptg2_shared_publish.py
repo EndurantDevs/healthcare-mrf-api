@@ -435,3 +435,54 @@ async def test_finalizer_dictionary_preserves_empty_scope_semantics(tmp_path, mo
 
     assert publication.code_count == 0
     assert publication.serving_rate_count == 0
+
+
+@pytest.mark.asyncio
+async def test_finalizer_provider_metadata_join_decodes_the_smaller_stage(
+    tmp_path,
+    monkeypatch,
+):
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                _OneRowResult((7,)),
+                _OneRowResult((1, 1, 1, 1)),
+                None,
+                None,
+                None,
+            ]
+        ),
+        scalar=AsyncMock(side_effect=[1, 1, False, False]),
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_copy_binary_file_to_stage",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_copy_text_file_to_stage",
+        AsyncMock(),
+    )
+
+    publication = await publish_shared_finalizer_dictionaries(
+        _dictionary_summary(tmp_path, row_count=1),
+        schema_name="mrf",
+        snapshot_key=7,
+        build_token="attempt-7",
+        expected_coverage_scope_id=b"e" * 32,
+        provider_set_metadata_entries=_provider_set_metadata_entries(tmp_path),
+    )
+
+    executed_statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    provider_metadata_sql = "\n".join(executed_statements[2:4])
+    assert "decode(metadata.provider_set_global_id_128, 'hex')" in provider_metadata_sql
+    assert "encode(provider_stage.provider_set_global_id_128, 'hex')" not in provider_metadata_sql
+    assert publication.provider_set_count == 1
