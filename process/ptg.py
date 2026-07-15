@@ -1087,12 +1087,18 @@ async def _parse_strict_v3_file(
     v3_serving_run_directory = Path(
         tempfile.mkdtemp(prefix="ptg2-v3-runs-", dir=copy_tmp_dir)
     )
-    manifest_artifact_dir = resolve_ptg2_artifact_dir() / "serving" / _ptg2_snapshot_table_token(
-        str(plan_fields.get("plan_id") or "plan"),
-        snapshot_id,
-    )
-    manifest_artifact_dir.mkdir(parents=True, exist_ok=True)
     manifest_file_token = hashlib.sha256(str(Path(file_path).resolve()).encode("utf-8")).hexdigest()[:16]
+    manifest_artifact_parent = resolve_ptg2_artifact_dir() / "serving"
+    manifest_artifact_parent.mkdir(parents=True, exist_ok=True)
+    manifest_artifact_dir = Path(
+        tempfile.mkdtemp(
+            prefix=(
+                f"{_ptg2_snapshot_table_token(str(plan_fields.get('plan_id') or 'plan'), snapshot_id)}-"
+                f"{manifest_file_token}-"
+            ),
+            dir=manifest_artifact_parent,
+        )
+    )
     manifest_sidecar_paths_by_kind = {
         "provider_forward": manifest_artifact_dir
         / f"provider_forward_{manifest_file_token}.ptg2sc",

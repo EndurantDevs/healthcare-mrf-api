@@ -1595,6 +1595,9 @@ def _iter_compact_serving_records_rust(
     scanner_environment_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"] = str(
         v3_serving_run_directory
     )
+    scanner_environment_map["HLTHPRT_PTG2_MANIFEST_SPILL_DIR"] = str(
+        v3_serving_run_directory
+    )
     if manifest_provider_forward_sidecar_path is not None:
         scanner_environment_map[
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH"

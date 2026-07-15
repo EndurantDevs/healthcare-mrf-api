@@ -154,3 +154,46 @@ def test_fresh_layout_collects_all_four_graph_directions(tmp_path, monkeypatch):
         "provider_npi_group",
     }
     assert all(entry["byte_count"] > 0 for entry in graph_entries.values())
+
+
+def test_repeated_snapshot_scans_use_attempt_owned_sidecar_directories(
+    tmp_path,
+    monkeypatch,
+):
+    artifact_root = _install_scratch_test_environment(tmp_path, monkeypatch)
+    sidecar_directories: list[Path] = []
+
+    async def scanner(*_args, **kwargs):
+        provider_forward = Path(kwargs["manifest_provider_forward_sidecar_path"])
+        provider_inverted = Path(kwargs["manifest_provider_inverted_sidecar_path"])
+        sidecar_directories.append(provider_forward.parent)
+        _write_empty_dense_graph(provider_forward)
+        _write_empty_dense_graph(provider_inverted)
+        yield "scanner_summary", {
+            "serving_run_rows": 1,
+            "serving_run_partition_files": [],
+            "serving_run_code_dictionary_files": [],
+        }
+
+    async def build_reverse_graphs(**kwargs):
+        _write_empty_dense_graph(Path(kwargs["provider_group_npi_path"]))
+        _write_empty_dense_graph(Path(kwargs["provider_npi_group_path"]))
+        return {"graph_directions": 2}
+
+    monkeypatch.setattr(process_ptg, "_aiter_compact_serving_records_rust", scanner)
+    monkeypatch.setattr(
+        process_ptg,
+        "_build_ptg2_provider_membership_sidecars",
+        build_reverse_graphs,
+    )
+    monkeypatch.setattr(process_ptg, "flush_error_log", lambda *_args: asyncio.sleep(0))
+
+    asyncio.run(_run_parse(tmp_path))
+    asyncio.run(_run_parse(tmp_path))
+
+    assert len(sidecar_directories) == 2
+    assert sidecar_directories[0] != sidecar_directories[1]
+    assert all(
+        directory.parent == artifact_root / "serving"
+        for directory in sidecar_directories
+    )

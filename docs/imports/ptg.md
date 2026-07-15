@@ -249,6 +249,13 @@ and PostgreSQL COPY inputs. Worker queues, input limits, decompression limits,
 and finalizer record limits bound the work; capacity planning must still
 reserve scratch for every concurrent unique physical build.
 
+Each source-file scan owns a unique scratch directory. Manifest spill files
+and late sidecar outputs use that same attempt scope, and the scanner recreates
+an output parent immediately before finalization. Recovery cleanup applies its
+retention age to empty directories as well as files: an empty but fresh
+directory can be the reserved destination of a long-running scan and must not
+be pruned.
+
 The finalizer extracts and sorts provider identities inside the same bounded
 nonempty-partition worker pool used for the source scan. It then performs a
 sorted merge of those partition-local unique streams instead of globally

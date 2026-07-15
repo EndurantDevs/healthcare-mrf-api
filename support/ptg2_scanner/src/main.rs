@@ -1563,6 +1563,7 @@ impl ManifestPairSpool {
         let entry_count = count_pair_owners(&pairs);
         let member_count = pairs.len() as u64;
 
+        ensure_manifest_sidecar_parent(path)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -1633,6 +1634,7 @@ impl ManifestPairSpool {
         member_ids.sort_unstable();
         member_ids.dedup();
 
+        ensure_manifest_sidecar_parent(path)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -1889,6 +1891,7 @@ fn write_dense_sidecar_from_sorted_pairs(
     output_path: &str,
     merged: &MergedManifestPairs,
 ) -> io::Result<(u64, u64)> {
+    ensure_manifest_sidecar_parent(output_path)?;
     let file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -2355,12 +2358,44 @@ fn write_manifest_sidecar_jobs(
 fn write_manifest_sidecar_job(
     mut job: ManifestSidecarWriteJob,
 ) -> io::Result<ManifestSidecarWriteResult> {
-    let (entry_count, _member_count) = job.spool.write_dense_sidecar(&job.path)?;
+    ensure_manifest_sidecar_parent(&job.path)?;
+    let spool_path = job.spool.path.display().to_string();
+    let (entry_count, _member_count) =
+        job.spool.write_dense_sidecar(&job.path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to finalize {} from manifest spool {} into {}: {}",
+                    job.record_kind, spool_path, job.path, error
+                ),
+            )
+        })?;
     Ok(ManifestSidecarWriteResult {
         order: job.order,
         record_kind: job.record_kind,
         path: job.path,
         entry_count,
+    })
+}
+
+fn ensure_manifest_sidecar_parent(path: &str) -> io::Result<()> {
+    let output_path = Path::new(path);
+    let Some(parent) = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to create manifest sidecar directory {} for {}: {}",
+                parent.display(),
+                output_path.display(),
+                error
+            ),
+        )
     })
 }
 
@@ -2371,6 +2406,7 @@ fn emit_manifest_sidecar_file<W: Write>(
     entries: &[SidecarEntry],
     dense_members: bool,
 ) -> io::Result<()> {
+    ensure_manifest_sidecar_parent(path)?;
     let file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -2407,7 +2443,14 @@ fn emit_manifest_sidecar_path<W: Write>(
     path: &str,
     entry_count: u64,
 ) -> io::Result<()> {
-    let bytes = std::fs::metadata(path)?.len();
+    let bytes = std::fs::metadata(path)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("manifest sidecar output {path} is unavailable before emission: {error}"),
+            )
+        })?
+        .len();
     emit_copy_file_event(
         writer,
         &CopyFileEvent {
@@ -25741,6 +25784,91 @@ mod tests {
         assert_eq!(&std::fs::read(&inverted_path).unwrap()[..8], b"PTG2MNDS");
         let _ = std::fs::remove_file(forward_path);
         let _ = std::fs::remove_file(inverted_path);
+    }
+
+    #[test]
+    fn configured_manifest_sidecars_recreate_attempt_output_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-sidecar-parent-test-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let output_path = base.join("nested/provider-forward.ptg2sc");
+        let paths = CopyPathConfig {
+            manifest_provider_forward_sidecar: Some(output_path.display().to_string()),
+            ..CopyPathConfig::default()
+        };
+        let mut collector = ManifestSidecarCollector {
+            spools: Some(ManifestSidecarSpools::for_paths(&paths).unwrap()),
+            ..ManifestSidecarCollector::default()
+        };
+        collector
+            .record_provider_set(GlobalId128([5; GLOBAL_ID_BYTES]), &[20], &[1003002106])
+            .unwrap();
+
+        let results = configured_spooled_manifest_sidecars(&paths, &mut collector)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(&std::fs::read(&output_path).unwrap()[..8], b"PTG2MNDS");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn external_manifest_sidecar_sort_recreates_attempt_output_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-external-sidecar-parent-test-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let output_path = base.join("nested/provider-forward.ptg2sc");
+        let mut spool = ManifestPairSpool::new("external_parent_recovery").unwrap();
+        let owner = GlobalId128([5; GLOBAL_ID_BYTES]);
+        spool
+            .push(owner, GlobalId128([6; GLOBAL_ID_BYTES]))
+            .unwrap();
+        spool
+            .push(owner, GlobalId128([7; GLOBAL_ID_BYTES]))
+            .unwrap();
+
+        spool
+            .write_dense_sidecar_with_chunk_bytes(
+                &output_path.display().to_string(),
+                MANIFEST_PAIR_RECORD_BYTES,
+            )
+            .unwrap();
+
+        assert_eq!(&std::fs::read(&output_path).unwrap()[..8], b"PTG2MNDS");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn manifest_sidecar_spool_failure_names_source_and_output_paths() {
+        let output_path = std::env::temp_dir().join(format!(
+            "ptg2-missing-spool-output-{}-{:?}.ptg2sc",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let spool = ManifestPairSpool::new("missing_spool_diagnostic").unwrap();
+        let spool_path = spool.path.clone();
+        std::fs::remove_file(&spool_path).unwrap();
+
+        let error = match write_manifest_sidecar_job(ManifestSidecarWriteJob {
+            order: 0,
+            record_kind: "manifest_provider_forward_sidecar_file",
+            path: output_path.display().to_string(),
+            spool,
+        }) {
+            Ok(_) => panic!("missing manifest spool unexpectedly finalized"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("manifest_provider_forward_sidecar_file"));
+        assert!(message.contains(&spool_path.display().to_string()));
+        assert!(message.contains(&output_path.display().to_string()));
+        let _ = std::fs::remove_file(output_path);
     }
 
     #[test]

@@ -4240,6 +4240,10 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
 
     assert captured_env_map[process_ptg.PTG2_RUST_EVENT_QUEUE_ENV] == "128"
     assert captured_env_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"].endswith("v3-runs")
+    assert (
+        captured_env_map["HLTHPRT_PTG2_MANIFEST_SPILL_DIR"]
+        == captured_env_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"]
+    )
     assert "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH" not in captured_env_map
     assert captured_env_map["HLTHPRT_PTG2_MANIFEST_ONLY"] == "true"
 
