@@ -558,8 +558,8 @@ def test_same_rate_from_two_raw_source_containers_remains_two_occurrences(tmp_pa
 
 
 def test_rate_network_names_keep_otherwise_equal_occurrences_distinct(tmp_path):
-    payload = _source_document(references_before=True, duplicate_price=False)
-    in_network_item = payload["in_network"][0]
+    source_document = _source_document(references_before=True, duplicate_price=False)
+    in_network_item = source_document["in_network"][0]
     first_rate = in_network_item["negotiated_rates"][0]
     second_rate = json.loads(json.dumps(first_rate))
     first_rate["network_name"] = ["Network One"]
@@ -570,7 +570,7 @@ def test_rate_network_names_keep_otherwise_equal_occurrences_distinct(tmp_path):
         references_before=True,
         duplicate_price=False,
         gzip_encoded=False,
-        source_document=payload,
+        source_document=source_document,
     )
 
     with _open_source_index(tmp_path, source_path) as index:
@@ -621,8 +621,8 @@ def test_referenced_network_names_are_unioned_with_rate_names(tmp_path):
 
 
 def test_procedure_source_metadata_mismatch_fails_exact_comparison(tmp_path):
-    payload = _source_document(references_before=True, duplicate_price=False)
-    payload["in_network"][0].update(
+    source_document = _source_document(references_before=True, duplicate_price=False)
+    source_document["in_network"][0].update(
         {
             "billing_code_type_version": "2026",
             "name": "Source Procedure Label",
@@ -634,7 +634,7 @@ def test_procedure_source_metadata_mismatch_fails_exact_comparison(tmp_path):
         references_before=True,
         duplicate_price=False,
         gzip_encoded=False,
-        source_document=payload,
+        source_document=source_document,
     )
     query = audit.QueryKey("CPT", "99213", NPIS[0])
 
@@ -643,12 +643,12 @@ def test_procedure_source_metadata_mismatch_fails_exact_comparison(tmp_path):
 
     tuple_key = next(iter(expected))
     tuple_payload = json.loads(tuple_key)
-    item = _api_item_for_tuple(
+    api_item = _api_item_for_tuple(
         _tuple_from_key(tuple_key),
         raw_sha256=tuple_payload["raw_container_sha256"],
     )
-    item["procedure_description"] = "Different Procedure Detail"
-    extracted = audit.extract_api_tuples([item])
+    api_item["procedure_description"] = "Different Procedure Detail"
+    extracted = audit.extract_api_tuples([api_item])
     comparison = audit.compare_tuple_counters(query, expected, extracted.counter)
 
     assert comparison.failure_counts == {"altered": 1}
@@ -1843,7 +1843,7 @@ def test_release_runner_rejects_only_tin_only_rates(
     expected_tin_only,
     marker_metric,
 ):
-    payload = _source_document(references_before=True, duplicate_price=False)
+    source_document = _source_document(references_before=True, duplicate_price=False)
     provider_groups = [
         {
             "npi": npi_values,
@@ -1851,16 +1851,16 @@ def test_release_runner_rejects_only_tin_only_rates(
         }
     ]
     if provider_form == "referenced":
-        payload["provider_references"][0]["provider_groups"] = provider_groups
+        source_document["provider_references"][0]["provider_groups"] = provider_groups
     else:
-        payload["in_network"][1]["negotiated_rates"][0][
+        source_document["in_network"][1]["negotiated_rates"][0][
             "provider_groups"
         ] = provider_groups
     source_path = _write_source_fixture(
         tmp_path / f"{provider_form}-tin.json.gz",
         references_before=True,
         duplicate_price=False,
-        source_document=payload,
+        source_document=source_document,
     )
     with _open_source_index(tmp_path, source_path, target=2_500) as index:
         config = _release_audit_config()
@@ -2360,7 +2360,10 @@ def test_release_auditor_digest_matches_sealed_v2_contract_vector():
 
 def test_http_api_occurrence_source_streams_all_pages_with_bounded_calls():
     config = _audit_config(api_audit_page_size=2, api_audit_max_pages=3)
-    items = sorted((_persisted_occurrence_item(index) for index in range(5)), key=lambda item: item["occurrence_id"])
+    occurrence_items = sorted(
+        (_persisted_occurrence_item(index) for index in range(5)),
+        key=lambda occurrence: occurrence["occurrence_id"],
+    )
     offsets = []
 
     def handler(request):
@@ -2368,15 +2371,18 @@ def test_http_api_occurrence_source_streams_all_pages_with_bounded_calls():
         offset = int(query["offset"][0])
         limit = int(query["limit"][0])
         offsets.append(offset)
-        page = items[offset : offset + limit]
+        page = occurrence_items[offset : offset + limit]
         return httpx.Response(
             200,
             json=_api_page_document(
                 page,
                 offset=offset,
                 limit=limit,
-                total=len(items),
-                audit_sample=_persisted_audit_sample(len(items), items=items),
+                total=len(occurrence_items),
+                audit_sample=_persisted_audit_sample(
+                    len(occurrence_items),
+                    items=occurrence_items,
+                ),
             ),
         )
 
@@ -2397,7 +2403,9 @@ def test_http_api_occurrence_source_streams_all_pages_with_bounded_calls():
     assert sample.sample_count == 5
     assert sample.pages == math.ceil(5 / 2)
     assert len(sample.occurrences) == 2
-    assert len({item.occurrence_id for item in sample.occurrences}) == 2
+    assert len(
+        {occurrence.occurrence_id for occurrence in sample.occurrences}
+    ) == 2
     assert sample.contract == audit.AUDIT_SAMPLE_CONTRACT
     assert sample.method == audit.AUDIT_SAMPLE_METHOD
     assert sample.sample_count == 5
@@ -2417,18 +2425,21 @@ def test_http_api_occurrence_source_rejects_omitted_or_extra_source_files(
     published_source_set,
 ):
     config = _audit_config(api_audit_page_size=1, api_audit_max_pages=1)
-    item = _persisted_occurrence_item(0)
+    occurrence_item = _persisted_occurrence_item(0)
     expected_source_set = audit.source_set_evidence(["b" * 64, "c" * 64])
 
     def handler(_request):
         return httpx.Response(
             200,
             json=_api_page_document(
-                [item],
+                [occurrence_item],
                 offset=0,
                 limit=1,
                 total=1,
-                audit_sample=_persisted_audit_sample(1, items=[item]),
+                audit_sample=_persisted_audit_sample(
+                    1,
+                    items=[occurrence_item],
+                ),
                 source_set=published_source_set,
             ),
         )
@@ -2505,22 +2516,22 @@ def test_source_set_preflight_precedes_local_occurrence_sampling(tmp_path):
 
 def test_http_api_occurrence_source_rejects_same_count_digest_tampering():
     config = _audit_config(api_audit_page_size=2, api_audit_max_pages=1)
-    items = sorted(
+    occurrence_items = sorted(
         (_persisted_occurrence_item(index) for index in range(2)),
-        key=lambda item: item["occurrence_id"],
+        key=lambda occurrence: occurrence["occurrence_id"],
     )
 
     def handler(_request):
         return httpx.Response(
             200,
             json=_api_page_document(
-                items,
+                occurrence_items,
                 offset=0,
                 limit=2,
                 total=2,
                 audit_sample=_persisted_audit_sample(
                     2,
-                    items=items,
+                    items=occurrence_items,
                     sample_digest="00" * 32,
                 ),
             ),
@@ -2579,16 +2590,16 @@ def test_http_api_occurrence_source_requires_persisted_sample_contract(
     error,
 ):
     config = _audit_config(api_audit_page_size=2, api_audit_max_pages=1)
-    items = sorted(
+    occurrence_items = sorted(
         (_persisted_occurrence_item(index) for index in range(2)),
-        key=lambda item: item["occurrence_id"],
+        key=lambda occurrence: occurrence["occurrence_id"],
     )
 
     def handler(_request):
         return httpx.Response(
             200,
             json=_api_page_document(
-                items,
+                occurrence_items,
                 offset=0,
                 limit=2,
                 total=2,
@@ -2613,9 +2624,9 @@ def test_http_api_occurrence_source_requires_persisted_sample_contract(
 
 def test_http_api_occurrence_source_rejects_non_monotonic_ids():
     config = _audit_config(api_audit_page_size=2, api_audit_max_pages=1)
-    items = sorted(
+    occurrence_items = sorted(
         (_persisted_occurrence_item(index) for index in range(2)),
-        key=lambda item: item["occurrence_id"],
+        key=lambda occurrence: occurrence["occurrence_id"],
         reverse=True,
     )
 
@@ -2623,7 +2634,7 @@ def test_http_api_occurrence_source_rejects_non_monotonic_ids():
         return httpx.Response(
             200,
             json=_api_page_document(
-                items,
+                occurrence_items,
                 offset=0,
                 limit=2,
                 total=2,
