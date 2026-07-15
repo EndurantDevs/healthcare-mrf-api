@@ -375,7 +375,7 @@ def _run_scanner(
     artifact = run_directory / "input.json"
     # Keep the default scanner parity fixture one-record wide; the PostgreSQL
     # publication smoke opts into multiple dense price keys.
-    payload = (
+    source_document = (
         fixture_payload
         if fixture_payload is not None
         else _fixture_payload(
@@ -386,7 +386,7 @@ def _run_scanner(
         )
     )
     artifact.write_text(
-        json.dumps(payload, separators=(",", ":")),
+        json.dumps(source_document, separators=(",", ":")),
         encoding="utf-8",
     )
     lean_copy_path = run_directory / "manifest-lean.copy"
@@ -504,15 +504,15 @@ def _run_scanner(
 def _malformed_provider_identifier_payload(
     *, provider_references_first: bool
 ) -> dict:
-    payload = _fixture_payload(
+    source_document = _fixture_payload(
         provider_references_first=provider_references_first
     )
-    payload["provider_references"][0]["provider_groups"][0]["npi"] = [
+    source_document["provider_references"][0]["provider_groups"][0]["npi"] = [
         1234567890,
         123456789,
         123456789,
     ]
-    payload["in_network"][0]["negotiated_rates"].append(
+    source_document["in_network"][0]["negotiated_rates"].append(
         {
             "provider_groups": [
                 {
@@ -530,7 +530,7 @@ def _malformed_provider_identifier_payload(
             ],
         }
     )
-    return payload
+    return source_document
 
 
 def test_scanner_quarantine_is_identical_across_execution_modes(tmp_path):
@@ -584,7 +584,7 @@ def test_scanner_quarantine_is_identical_across_execution_modes(tmp_path):
             run["provider_group_member_copy_path"]
         )
         member_npis = tuple(
-            sorted(int(row.rsplit(b"\t", 1)[1]) for row in member_rows)
+            sorted(int(member_row.rsplit(b"\t", 1)[1]) for member_row in member_rows)
         )
         assert member_npis == (1234567890, 1234567891)
         assert malformed_npis.isdisjoint(member_npis)

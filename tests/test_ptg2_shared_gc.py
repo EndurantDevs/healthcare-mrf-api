@@ -175,7 +175,7 @@ class _SharedGCExecutor:
             )
             if params.get("restrict_layout_keys"):
                 allowed_layout_keys = {
-                    int(value) for value in params.get("layout_keys", ())
+                    int(layout_key) for layout_key in params.get("layout_keys", ())
                 }
                 layout_keys = [
                     snapshot_key
@@ -223,7 +223,7 @@ class _SharedGCExecutor:
             return [stats]
         if "SELECT candidate.block_hash" in statement:
             assert "payload" not in statement
-            rows = []
+            eligible_block_rows = []
             mapped_hashes = {block_hash for _snapshot_key, block_hash in self.mappings}
             for block_hash, eligible_at in sorted(
                 self.candidates.items(), key=lambda item: (item[1], item[0])
@@ -235,14 +235,14 @@ class _SharedGCExecutor:
                     and block_hash not in mapped_hashes
                     and stored_bytes <= int(params["max_bytes"])
                 ):
-                    rows.append(
+                    eligible_block_rows.append(
                         {
                             "block_hash": block_hash,
                             "stored_byte_count": stored_bytes,
                             "eligible_at": eligible_at,
                         }
                     )
-            return rows[: int(params["max_rows"])]
+            return eligible_block_rows[: int(params["max_rows"])]
         if "DELETE FROM \"mrf\".ptg2_v3_block AS block" in statement:
             assert "NOT EXISTS" in statement
             if self.rereference_on_delete is not None:
@@ -748,9 +748,9 @@ async def test_source_snapshot_gc_releases_unbound_layout_in_same_transaction(mo
         "release_unbound_ptg2_shared_layouts",
         release,
     )
-    result = await source_snapshot_gc.execute_ptg2_source_snapshot_gc_plan(max_bytes=100)
+    gc_result = await source_snapshot_gc.execute_ptg2_source_snapshot_gc_plan(max_bytes=100)
 
-    assert result is plan
+    assert gc_result is plan
     assert events == ["binding-delete", "logical-delete"]
     release.assert_awaited_once_with(
         schema_name="mrf",
@@ -801,11 +801,11 @@ async def test_source_snapshot_gc_skips_layout_release_without_deleted_binding(m
         release,
     )
 
-    result = await source_snapshot_gc.execute_ptg2_source_snapshot_gc_plan(
+    gc_result = await source_snapshot_gc.execute_ptg2_source_snapshot_gc_plan(
         max_bytes=100
     )
 
-    assert result is plan
+    assert gc_result is plan
     release.assert_not_awaited()
 
 

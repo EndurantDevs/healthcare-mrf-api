@@ -290,7 +290,7 @@ def test_decode_shared_block_payload_is_strict():
 
 @pytest.mark.asyncio
 async def test_fetch_shared_blocks_uses_one_stable_query_without_process_cache():
-    rows = [
+    stored_rows = [
         _stored_row(object_kind="page_v4", block_key=7, fragment_no=0, raw_payload=b"first"),
         _stored_row(
             object_kind="page_v4",
@@ -300,7 +300,7 @@ async def test_fetch_shared_blocks_uses_one_stable_query_without_process_cache()
             codec="zlib",
         ),
     ]
-    session = _Session(rows)
+    session = _Session(stored_rows)
 
     first = await fetch_shared_blocks(
         session,
@@ -342,13 +342,13 @@ async def test_fetch_shared_blocks_fails_on_corrupt_content_hash():
 
 @pytest.mark.asyncio
 async def test_fetch_shared_blocks_filters_exact_fragments():
-    row = _stored_row(
+    stored_row = _stored_row(
         object_kind="by_code_price_dictionary",
         block_key=0,
         fragment_no=7080,
         raw_payload=b"tail",
     )
-    session = _Session([row])
+    session = _Session([stored_row])
 
     result = await fetch_shared_blocks(
         session,
@@ -370,7 +370,7 @@ async def test_fetch_shared_blocks_filters_exact_fragments():
 async def test_graph_members_are_resolved_in_one_query_and_integer_space():
     members = (3, 9, 17)
     encoded = b"xx" + b"".join(member.to_bytes(4, "little") for member in members)
-    row = _stored_row(
+    stored_row = _stored_row(
         object_kind="graph_npi_groups_v1",
         block_key=4,
         fragment_no=0,
@@ -383,9 +383,9 @@ async def test_graph_members_are_resolved_in_one_query_and_integer_space():
             "member_count": len(members),
         },
     )
-    session = _Session([row])
+    session = _Session([stored_row])
 
-    result = await fetch_shared_graph_members(
+    member_map = await fetch_shared_graph_members(
         session,
         schema_name="mrf",
         snapshot_key=12,
@@ -393,7 +393,7 @@ async def test_graph_members_are_resolved_in_one_query_and_integer_space():
         owner_keys=[1234567890, 9999999999],
     )
 
-    assert result == {1234567890: members, 9999999999: ()}
+    assert member_map == {1234567890: members, 9999999999: ()}
     assert len(session.calls) == 1
     sql, params = session.calls[0]
     assert "ptg2_v3_graph_owner" in sql

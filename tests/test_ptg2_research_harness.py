@@ -194,10 +194,13 @@ def test_gate_evaluation_accepts_matching_correctness_and_fast_candidate():
         ]
     }
 
-    result = harness.evaluate_gates(report, {"min_improvement_pct": 15.0, "max_memory_growth_pct": 20.0})
+    gate_result = harness.evaluate_gates(
+        report,
+        {"min_improvement_pct": 15.0, "max_memory_growth_pct": 20.0},
+    )
 
-    assert result["overall"] == "passed"
-    candidate = result["cases"]["case-a"][0]
+    assert gate_result["overall"] == "passed"
+    candidate = gate_result["cases"]["case-a"][0]
     assert candidate["checks"]["performance"]["improvement_pct"] == 20.0
     assert candidate["checks"]["memory"]["growth_pct"] == 10.0
 
@@ -242,14 +245,16 @@ def test_gate_evaluation_can_skip_case_performance_gate():
         ]
     }
 
-    result = harness.evaluate_gates(
+    gate_result = harness.evaluate_gates(
         report,
         {"min_improvement_pct": 15.0, "max_memory_growth_pct": 20.0},
         case_gates={"case-a": {"performance": False}},
     )
 
-    assert result["overall"] == "passed"
-    assert result["cases"]["case-a"][0]["checks"]["performance"] == {"status": "skipped"}
+    assert gate_result["overall"] == "passed"
+    assert gate_result["cases"]["case-a"][0]["checks"]["performance"] == {
+        "status": "skipped"
+    }
 
 
 def test_gate_evaluation_can_require_import_total_not_slower():
@@ -362,14 +367,14 @@ def test_gate_evaluation_accepts_case_baseline_variant():
         ]
     }
 
-    result = harness.evaluate_gates(
+    gate_result = harness.evaluate_gates(
         report,
         {"min_improvement_pct": 15.0},
         case_gates={"case-a": {"baseline_variant": "current", "performance": False}},
     )
 
-    assert result["overall"] == "passed"
-    assert result["cases"]["case-a"][0]["variant_id"] == "smaller_chunks"
+    assert gate_result["overall"] == "passed"
+    assert gate_result["cases"]["case-a"][0]["variant_id"] == "smaller_chunks"
 
 
 def test_gate_evaluation_accepts_storage_only_case():
@@ -797,7 +802,7 @@ def test_original_file_summary_counts_unique_prices(tmp_path):
 
 
 def test_large_fixture_can_add_bulky_rate_payload():
-    payload = harness.build_fixture_payload(
+    fixture_document = harness.build_fixture_payload(
         {
             "fixture": "large_in_network",
             "negotiated_rates": 1,
@@ -805,7 +810,9 @@ def test_large_fixture_can_add_bulky_rate_payload():
         }
     )
 
-    price = payload["in_network"][0]["negotiated_rates"][0]["negotiated_prices"][0]
+    price = fixture_document["in_network"][0]["negotiated_rates"][0][
+        "negotiated_prices"
+    ][0]
     assert len(price["additional_information"]) == 128
 
 
@@ -844,7 +851,7 @@ def test_original_file_summary_distinguishes_declared_and_used_provider_npis(tmp
 
 
 def test_large_fixture_can_shape_codes_and_reused_prices(tmp_path):
-    payload = harness.build_fixture_payload(
+    fixture_document = harness.build_fixture_payload(
         {
             "fixture": "large_in_network",
             "negotiated_rates": 8,
@@ -854,13 +861,16 @@ def test_large_fixture_can_shape_codes_and_reused_prices(tmp_path):
         }
     )
 
-    assert len(payload["provider_references"]) == 2
-    assert len(payload["in_network"]) == 4
-    assert [len(item["negotiated_rates"]) for item in payload["in_network"]] == [2, 2, 2, 2]
+    assert len(fixture_document["provider_references"]) == 2
+    assert len(fixture_document["in_network"]) == 4
+    assert [
+        len(procedure["negotiated_rates"])
+        for procedure in fixture_document["in_network"]
+    ] == [2, 2, 2, 2]
     rates = [
         price["negotiated_rate"]
-        for item in payload["in_network"]
-        for rate in item["negotiated_rates"]
+        for procedure in fixture_document["in_network"]
+        for rate in procedure["negotiated_rates"]
         for price in rate["negotiated_prices"]
     ]
     assert rates == [100, 101, 100, 101, 100, 101, 100, 101]
@@ -940,7 +950,7 @@ def test_serving_index_expectations_check_tableless_postgres_binary(monkeypatch)
         "artifacts": {"provider_npi": {"name": "provider_npi"}},
     }
 
-    result = harness.check_serving_index_expectations(
+    expectation_result = harness.check_serving_index_expectations(
         {"HLTHPRT_DB_SCHEMA": "mrf"},
         serving_index,
         {
@@ -962,8 +972,10 @@ def test_serving_index_expectations_check_tableless_postgres_binary(monkeypatch)
         },
     )
 
-    assert result["status"] == "passed"
-    assert all(check["passed"] for check in result["checks"].values())
+    assert expectation_result["status"] == "passed"
+    assert all(
+        check["passed"] for check in expectation_result["checks"].values()
+    )
 
 
 def test_serving_index_expectations_detect_serving_sidecar_artifacts(monkeypatch):
