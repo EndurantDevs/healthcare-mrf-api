@@ -108,6 +108,8 @@ async def _mark_mrf_provider_file_progress(ctx: dict, *, url: str | None, proces
 
 
 def is_test_mode(ctx: dict) -> bool:
+    """Return whether the import context requests bounded test behavior."""
+
     return bool(ctx.get("context", {}).get("test_mode"))
 
 
@@ -472,6 +474,8 @@ def _write_mrf_chunk(chunks: list[dict], path: Path, records: list[bytes]) -> No
 
 
 def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: str, target_bytes: int) -> list[dict]:
+    """Split a top-level JSON array into bounded valid array files."""
+
     chunk_dir.mkdir(parents=True, exist_ok=True)
     chunks: list[dict] = []
     records: list[bytes] = []
@@ -485,6 +489,8 @@ def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: st
     array_done = False
 
     def flush_record() -> None:
+        """Flush the buffered record into the active output chunk."""
+
         nonlocal chunk_bytes, record
         if not record:
             return

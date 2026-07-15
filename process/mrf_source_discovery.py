@@ -13,11 +13,13 @@ import io
 import ipaddress
 import json
 import logging
+import multiprocessing as mp
 import os
 import re
 import socket
 import ssl
 import zipfile
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from html.parser import HTMLParser
@@ -35,11 +37,13 @@ from urllib.parse import (
 from xml.etree import ElementTree
 
 import aiohttp
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import bindparam, func, or_, select, update
 
 from db.connection import init_db
 from db.models import (
     MRFCrawlRun,
+    MRFDiscoveryBatch,
+    MRFDiscoverySourceCheckpoint,
     MRFFile,
     MRFPayer,
     MRFPayerScorecard,
@@ -51,6 +55,13 @@ from db.models import (
 from process.ext.utils import ensure_database, push_objects
 from process.import_status_events import enqueue_status_event, flush_status_events
 from process.live_progress import enqueue_live_progress
+from process.mrf_discovery_checkpoints import (
+    DatabaseDiscoveryCheckpointStore,
+    DiscoverySourceBatchIncomplete,
+    SourceBatchSummary,
+    SourceProcessResult,
+    execute_checkpointed_source_batch,
+)
 from process.ptg_parts.canonical import canonicalize_url, semantic_hash
 from process.ptg_parts.source_jobs import parse_toc_catalog_entries
 
@@ -65,6 +76,8 @@ DISCOVERY_TABLES = (
     MRFPlan,
     MRFFile,
     MRFCrawlRun,
+    MRFDiscoveryBatch,
+    MRFDiscoverySourceCheckpoint,
     MRFPayerScorecard,
     MRFUrlObservation,
 )
@@ -80,6 +93,8 @@ HTTP_READ_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_READ_TIMEOUT", "120
 DEFAULT_FILE_PROBE_TYPES = ("in-network", "allowed-amounts")
 DISCOVERY_CATALOG_EXPORT_VERSION = 1
 USER_AGENT = "HealthPorta mrf-source-discovery/1.0"
+DISCOVERY_PROCESS_WORKERS_ENV = "HLTHPRT_MRF_DISCOVERY_PROCESS_WORKERS"
+MAX_DISCOVERY_PROCESS_WORKERS = 8
 BROWSER_FALLBACK_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -187,10 +202,12 @@ class DiscoveryResult:
     file_probe_ok: int = 0
     crawl_run_id: str | None = None
     errors: list[dict[str, Any]] = field(default_factory=list)
+    source_batch_summary: SourceBatchSummary | None = None
+    process_workers: int = 1
 
     def as_dict(self) -> dict[str, Any]:
         """Serialize discovery counters, errors, and run identity."""
-        return {
+        result_by_field = {
             "catalog_export_version": DISCOVERY_CATALOG_EXPORT_VERSION,
             "providers": self.providers,
             "candidates": self.candidates,
@@ -203,7 +220,11 @@ class DiscoveryResult:
             "file_probe_ok": self.file_probe_ok,
             "crawl_run_id": self.crawl_run_id,
             "errors": self.errors,
+            "process_workers": self.process_workers,
         }
+        if self.source_batch_summary is not None:
+            result_by_field.update(self.source_batch_summary.proof_metrics())
+        return result_by_field
 
 
 @dataclass(frozen=True)
@@ -246,6 +267,28 @@ def _tcp_connector(limit: int) -> aiohttp.TCPConnector:
         ttl_dns_cache=300,
         ssl=_default_ssl_context(),
     )
+
+
+@asynccontextmanager
+async def _discovery_http_session(
+    *,
+    existing_session: aiohttp.ClientSession | None,
+    timeout: aiohttp.ClientTimeout,
+    connector_limit: int,
+):
+    """Yield a borrowed session or own one shared by the current operation."""
+
+    if existing_session is not None:
+        yield existing_session
+        return
+    connector = _tcp_connector(limit=connector_limit)
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": USER_AGENT},
+        timeout=timeout,
+        connector=connector,
+        trust_env=False,
+    ) as owned_session:
+        yield owned_session
 
 
 def _incomplete_tls_chain_hosts() -> set[str]:
@@ -807,11 +850,11 @@ def _truncate_text(value: Any, limit: int) -> str | None:
     return text[:limit]
 
 
-def _parse_size_bytes(value: Any) -> int | None:
-    parsed = _as_int(value)
+def _parse_size_bytes(size_value: Any) -> int | None:
+    parsed = _as_int(size_value)
     if parsed is not None:
         return parsed
-    text = str(value or "").strip().replace(",", "")
+    text = str(size_value or "").strip().replace(",", "")
     if not text:
         return None
     match = re.match(
@@ -2938,6 +2981,37 @@ async def _store_candidates(
     return payer_rows, source_rows
 
 
+async def _retag_sources_for_discovery_run(
+    source_rows: list[dict[str, Any]], discovery_run_id: str
+) -> None:
+    """Expose a resumed frozen source set through the current catalog run."""
+
+    updated_at = _utc_now()
+    retag_parameters: list[dict[str, Any]] = []
+    for source_row in source_rows:
+        source_metadata_by_key = dict(source_row.get("metadata_json") or {})
+        source_metadata_by_key["discovery_run_id"] = discovery_run_id
+        retag_parameters.append(
+            {
+                "retag_source_id": source_row["source_id"],
+                "retag_metadata_json": source_metadata_by_key,
+                "retag_updated_at": updated_at,
+            }
+        )
+    if not retag_parameters:
+        return
+    retag_statement = (
+        update(MRFSource.__table__)
+        .where(MRFSource.source_id == bindparam("retag_source_id"))
+        .values(
+            metadata_json=bindparam("retag_metadata_json"),
+            updated_at=bindparam("retag_updated_at"),
+        )
+    )
+    async with db.session() as session:
+        await session.execute(retag_statement, retag_parameters)
+
+
 async def _store_observations(
     source_rows: list[dict[str, Any]],
     *,
@@ -2945,6 +3019,7 @@ async def _store_observations(
     run_id: str | None,
     progress_run_id: str | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
+    session: aiohttp.ClientSession | None = None,
 ) -> list[dict[str, Any]]:
     """Check source URLs and build normalized URL observations."""
     observations: list[dict[str, Any]] = []
@@ -2956,9 +3031,6 @@ async def _store_observations(
     total = len(items)
     semaphore = asyncio.Semaphore(max(1, int(concurrency or DEFAULT_CONCURRENCY)))
     timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
-    connector = _tcp_connector(
-        limit=max(1, int(concurrency or DEFAULT_CONCURRENCY)) * 2
-    )
 
     async def check_one(
         source: dict[str, Any], url: Any, session: aiohttp.ClientSession
@@ -2994,14 +3066,13 @@ async def _store_observations(
                 "metadata_json": {"run_id": run_id},
             }
 
-    async with aiohttp.ClientSession(
-        headers={"User-Agent": USER_AGENT},
+    async with _discovery_http_session(
+        existing_session=session,
         timeout=timeout,
-        connector=connector,
-        trust_env=False,
-    ) as session:
+        connector_limit=max(1, int(concurrency or DEFAULT_CONCURRENCY)) * 2,
+    ) as active_session:
         tasks = [
-            asyncio.create_task(check_one(source, url, session))
+            asyncio.create_task(check_one(source, url, active_session))
             for source, url in items
         ]
         for done, task in enumerate(asyncio.as_completed(tasks), start=1):
@@ -4834,14 +4905,14 @@ def _magnacare_search_terms(source: dict[str, Any], resolver: dict[str, Any]) ->
 
 
 async def _resolve_magnacare_transparency_mrf(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     """Resolve MagnaCare transparency search results into crawl targets."""
     resolver_type = str(resolver.get("type") or "magnacare_transparency_mrf")
-    search_terms = _magnacare_search_terms(source, resolver)
+    search_terms = _magnacare_search_terms(source_record, resolver)
     max_bytes = int(resolver.get("max_bytes") or 5 * 1024 * 1024)
     ip_address = str(resolver.get("download_ip_address") or "127.0.0.1")
     grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -4849,23 +4920,23 @@ async def _resolve_magnacare_transparency_mrf(
     for search_term in search_terms:
         results_url = _magnacare_results_url(url, search_term)
         html_text = await _fetch_text(results_url, max_bytes=max_bytes, session=session)
-        for row in _magnacare_result_rows(html_text):
-            run_history_id = _clean_text(row.get("run_history_id"))
+        for result_row in _magnacare_result_rows(html_text):
+            run_history_id = _clean_text(result_row.get("run_history_id"))
             if not run_history_id or run_history_id == "0":
                 continue
-            file_name = _clean_text(row.get("file_name"))
+            file_name = _clean_text(result_row.get("file_name"))
             file_type = _magnacare_file_type(
-                row.get("file_type_label"),
-                row.get("network_name"),
+                result_row.get("file_type_label"),
+                result_row.get("network_name"),
                 file_name,
             )
             if not file_name or not file_type:
                 continue
-            key = _magnacare_target_key(row)
-            item = grouped.setdefault(
+            key = _magnacare_target_key(result_row)
+            grouped_result = grouped.setdefault(
                 key,
                 {
-                    "row": row,
+                    "row": result_row,
                     "search_terms": set(),
                     "plan_info": [],
                     "plan_keys": set(),
@@ -4873,48 +4944,58 @@ async def _resolve_magnacare_transparency_mrf(
                     "file_type": file_type,
                 },
             )
-            item["search_terms"].add(search_term)
-            item["results_urls"].add(results_url)
-            for plan in _magnacare_row_plan_info(row):
+            grouped_result["search_terms"].add(search_term)
+            grouped_result["results_urls"].add(results_url)
+            for plan in _magnacare_row_plan_info(result_row):
                 plan_key = (
                     plan.get("plan_id"),
                     plan.get("plan_id_type"),
                     plan.get("plan_market_type"),
                     plan.get("plan_name"),
                 )
-                if plan_key in item["plan_keys"]:
+                if plan_key in grouped_result["plan_keys"]:
                     continue
-                item["plan_keys"].add(plan_key)
-                item["plan_info"].append(plan)
+                grouped_result["plan_keys"].add(plan_key)
+                grouped_result["plan_info"].append(plan)
         if max_targets and len(grouped) >= max_targets:
             break
     if not grouped:
         raise ValueError(f"no MagnaCare transparency MRF rows found for {url}")
 
-    targets: list[CrawlTarget] = []
-    for item in list(grouped.values())[: max_targets or len(grouped)]:
-        row = item["row"]
-        run_history_id = _clean_text(row.get("run_history_id"))
+    crawl_targets: list[CrawlTarget] = []
+    for grouped_result in list(grouped.values())[: max_targets or len(grouped)]:
+        result_row = grouped_result["row"]
+        run_history_id = _clean_text(result_row.get("run_history_id"))
         dynamic_download_url = _magnacare_download_url(url, run_history_id, ip_address)
-        payload = await _fetch_json(dynamic_download_url, max_bytes=max_bytes, session=session)
-        file_url = _clean_text(payload.get("Data") if isinstance(payload, dict) else "")
+        download_payload = await _fetch_json(
+            dynamic_download_url,
+            max_bytes=max_bytes,
+            session=session,
+        )
+        file_url = _clean_text(
+            download_payload.get("Data")
+            if isinstance(download_payload, dict)
+            else ""
+        )
         if not file_url.startswith(("http://", "https://")):
             continue
-        file_name = _clean_text(row.get("file_name")) or Path(urlsplit(file_url).path).name
-        network_name = _clean_text(row.get("network_name"))
-        file_type = item["file_type"]
+        file_name = _clean_text(result_row.get("file_name")) or Path(
+            urlsplit(file_url).path
+        ).name
+        network_name = _clean_text(result_row.get("network_name"))
+        file_type = grouped_result["file_type"]
         label = " - ".join(
             part
             for part in (
                 network_name,
-                _clean_text(row.get("file_type_label")) or file_type,
+                _clean_text(result_row.get("file_type_label")) or file_type,
                 file_name,
             )
             if part
         )
-        targets.append(
+        crawl_targets.append(
             CrawlTarget(
-                source=source,
+                source=source_record,
                 url=file_url,
                 label=label,
                 resolved_from_url=url,
@@ -4923,24 +5004,25 @@ async def _resolve_magnacare_transparency_mrf(
                     "target_kind": "file_reference",
                     "target_file_type": file_type,
                     "container_format": _container_format(file_url),
-                    "plan_info": item["plan_info"],
+                    "plan_info": grouped_result["plan_info"],
                     "network_name": network_name or None,
                     "file_name": file_name,
-                    "file_size": _clean_text(row.get("file_size")) or None,
-                    "size_bytes": _parse_size_bytes(row.get("file_size")),
-                    "schema_version": _clean_text(row.get("file_version")) or None,
+                    "file_size": _clean_text(result_row.get("file_size")) or None,
+                    "size_bytes": _parse_size_bytes(result_row.get("file_size")),
+                    "schema_version": _clean_text(result_row.get("file_version"))
+                    or None,
                     "run_history_id": run_history_id,
                     "dynamic_download_url": dynamic_download_url,
-                    "search_terms": sorted(item["search_terms"]),
-                    "results_urls": sorted(item["results_urls"]),
+                    "search_terms": sorted(grouped_result["search_terms"]),
+                    "results_urls": sorted(grouped_result["results_urls"]),
                     "reporting_entity_name": "MagnaCare and Brighton administered plans",
                     "reporting_entity_type": "third_party_administrator",
                 },
             )
         )
-    if not targets:
+    if not crawl_targets:
         raise ValueError(f"no downloadable MagnaCare transparency MRF files found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _asr_group_number_from_url(url: str | None) -> str | None:
@@ -5158,10 +5240,13 @@ def _asr_group_targets_for_source(url: str, resolver: dict[str, Any]) -> list[di
         group_targets.append(target)
 
     add_group(_asr_group_number_from_url(url))
-    for row in _asr_seed_rows_from_seed_list(
+    for seed_row in _asr_seed_rows_from_seed_list(
         str(resolver.get("seed_list") or "").strip() or None
     ):
-        add_group(row.get("group_number"), _asr_seed_context_metadata(row))
+        add_group(
+            seed_row.get("group_number"),
+            _asr_seed_context_metadata(seed_row),
+        )
     for group_number in resolver.get("group_numbers") or ():
         if group_number and not re.fullmatch(r"\d{4}", str(group_number).strip()):
             raise ValueError("ASR configured group numbers must be 4 digits")
@@ -5183,18 +5268,21 @@ def _asr_toc_url(base_url: str, resolver: dict[str, Any], group_number: str) -> 
 
 
 def _resolve_asr_health_benefits_mrf(
-    source: dict[str, Any], url: str, resolver: dict[str, Any]
+    source_record: dict[str, Any], url: str, resolver: dict[str, Any]
 ) -> list[CrawlTarget]:
     resolver_type = str(resolver.get("type") or "asr_health_benefits_mrf")
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     for group_target in _asr_group_targets_for_source(url, resolver):
         group_number = str(group_target["group_number"])
         context_metadata = {
-            key: value
-            for key, value in group_target.items()
-            if key != "group_number" and value not in (None, "")
+            metadata_key: metadata_value
+            for metadata_key, metadata_value in group_target.items()
+            if metadata_key != "group_number" and metadata_value not in (None, "")
         }
-        label = f"{source.get('display_name') or 'ASR Health Benefits'} group {group_number}"
+        label = (
+            f"{source_record.get('display_name') or 'ASR Health Benefits'} "
+            f"group {group_number}"
+        )
         employer_label = (
             context_metadata.get("company_name")
             or context_metadata.get("employer_name")
@@ -5202,9 +5290,9 @@ def _resolve_asr_health_benefits_mrf(
         )
         if employer_label:
             label = f"{label} - {employer_label}"
-        targets.append(
+        crawl_targets.append(
             CrawlTarget(
-                source=source,
+                source=source_record,
                 url=_asr_toc_url(url, resolver, group_number),
                 label=label,
                 resolved_from_url=url,
@@ -5216,9 +5304,9 @@ def _resolve_asr_health_benefits_mrf(
                 },
             )
         )
-    if not targets:
+    if not crawl_targets:
         raise ValueError("no ASR Health Benefits group numbers configured")
-    return targets
+    return crawl_targets
 
 
 def _wordpress_entry_content(html_text: str) -> str:
@@ -5936,7 +6024,7 @@ def _parse_healthgram_network_pages(
 
 
 async def _resolve_healthgram_network_index(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -5951,7 +6039,10 @@ async def _resolve_healthgram_network_index(
     network_pages = _parse_healthgram_network_pages(html_text, base_url=url)
     if not network_pages:
         network_pages = [
-            {"url": url, "label": source.get("display_name") or "Healthgram"}
+            {
+                "url": url,
+                "label": source_record.get("display_name") or "Healthgram",
+            }
         ]
     max_pages = _as_int(resolver.get("max_network_pages")) or 50
     targets_by_url: dict[str, CrawlTarget] = {}
@@ -5959,7 +6050,7 @@ async def _resolve_healthgram_network_index(
         page_url = str(network_page.get("url") or "").strip()
         page_label = (
             _clean_text(network_page.get("label"))
-            or source.get("display_name")
+            or source_record.get("display_name")
             or "Healthgram"
         )
         page_html = (
@@ -5975,35 +6066,35 @@ async def _resolve_healthgram_network_index(
                 session=session,
             )
         )
-        for target in _parse_html_mrf_links(page_html, base_url=page_url):
-            if target.get("target_file_type") != "table-of-contents":
+        for parsed_target in _parse_html_mrf_links(page_html, base_url=page_url):
+            if parsed_target.get("target_file_type") != "table-of-contents":
                 continue
-            target_url = str(target.get("url") or "").strip()
+            target_url = str(parsed_target.get("url") or "").strip()
             if not target_url:
                 continue
-            index_label = _clean_text(target.get("label"))
+            index_label = _clean_text(parsed_target.get("label"))
             key = _canonical_or_none(target_url) or target_url
             targets_by_url[key] = CrawlTarget(
-                source=source,
+                source=source_record,
                 url=target_url,
                 label=page_label,
                 resolved_from_url=page_url,
                 metadata={
                     "resolver": resolver_type,
-                    "target_kind": target.get("target_kind"),
+                    "target_kind": parsed_target.get("target_kind"),
                     "target_file_type": "table-of-contents",
-                    "container_format": target.get("container_format"),
-                    "html_attr": target.get("html_attr"),
+                    "container_format": parsed_target.get("container_format"),
+                    "html_attr": parsed_target.get("html_attr"),
                     "healthgram_index_label": index_label,
                     "healthgram_landing_url": url,
                     "healthgram_network_page_url": page_url,
                     "healthgram_network_name": page_label,
                 },
             )
-    targets = list(targets_by_url.values())
-    if not targets:
+    crawl_targets = list(targets_by_url.values())
+    if not crawl_targets:
         raise ValueError(f"no Healthgram network index links found for {url}")
-    return targets
+    return crawl_targets
 
 
 async def _resolve_anthem_s3_context_files(
@@ -6103,7 +6194,7 @@ async def _resolve_anthem_s3_mrf(
 
 
 async def _resolve_hcsc_asomrf_landing(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -6118,37 +6209,41 @@ async def _resolve_hcsc_asomrf_landing(
     nested_resolver = dict(resolver)
     nested_resolver["type"] = "bcbs_asomrf_filelist"
     nested_resolver.pop("max_targets", None)
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     for state_url in state_urls[:max_state_pages]:
         try:
-            for target in await _resolve_bcbs_asomrf_filelist(
-                source, state_url, nested_resolver, session
+            for delegated_target in await _resolve_bcbs_asomrf_filelist(
+                source_record, state_url, nested_resolver, session
             ):
                 metadata = {
-                    **dict(target.metadata or {}),
+                    **dict(delegated_target.metadata or {}),
                     "resolver": "hcsc_asomrf_landing",
-                    "delegated_resolver": (target.metadata or {}).get("resolver"),
+                    "delegated_resolver": (delegated_target.metadata or {}).get(
+                        "resolver"
+                    ),
                     "delegated_source_url": state_url,
                     "hcsc_landing_url": url,
                 }
-                targets.append(
+                crawl_targets.append(
                     CrawlTarget(
-                        source=source,
-                        url=target.url,
-                        label=target.label,
-                        resolved_from_url=target.resolved_from_url,
+                        source=source_record,
+                        url=delegated_target.url,
+                        label=delegated_target.label,
+                        resolved_from_url=delegated_target.resolved_from_url,
                         metadata=metadata,
                     )
                 )
         except Exception:  # pylint: disable=broad-exception-caught
             continue
-    targets = _dedupe_crawl_targets_by_url(targets)
-    targets = _limit_crawl_targets_round_robin(
-        targets, "state", _as_int(resolver.get("max_targets"))
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
+    crawl_targets = _limit_crawl_targets_round_robin(
+        crawl_targets,
+        "state",
+        _as_int(resolver.get("max_targets")),
     )
-    if not targets:
+    if not crawl_targets:
         raise ValueError(f"no HCSC ASO MRF targets found for {url}")
-    return targets
+    return crawl_targets
 
 
 async def _resolve_point32_azure_mrf_directory(
@@ -6228,18 +6323,23 @@ async def _resolve_point32_azure_mrf_directory(
 
 
 async def _resolve_html_delegated_mrf_links(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve direct and delegated links from an MRF landing page."""
+
     html_text = await _fetch_text(
         url,
         max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
         session=session,
     )
-    targets = _crawl_targets_from_html_mrf_links(
-        source, html_text, base_url=url, resolver="html_delegated_mrf_links"
+    crawl_targets = _crawl_targets_from_html_mrf_links(
+        source_record,
+        html_text,
+        base_url=url,
+        resolver="html_delegated_mrf_links",
     )
     max_links = _as_int(resolver.get("max_links")) or 40
     for delegated_url in _delegated_mrf_source_urls_from_html(html_text, base_url=url)[
@@ -6247,7 +6347,7 @@ async def _resolve_html_delegated_mrf_links(
     ]:
         platform = classify_hosting_platform(delegated_url)
         nested_source = {
-            **source,
+            **source_record,
             "hosting_platform": platform,
             "index_url": delegated_url,
             "human_url": delegated_url,
@@ -6261,29 +6361,30 @@ async def _resolve_html_delegated_mrf_links(
             )
         except Exception:  # pylint: disable=broad-exception-caught
             continue
-        for target in delegated_targets:
+        for delegated_target in delegated_targets:
             metadata = {
-                **dict(target.metadata or {}),
+                **dict(delegated_target.metadata or {}),
                 "delegated_source_url": delegated_url,
                 "delegated_source_platform": platform,
                 "delegated_landing_url": url,
             }
-            targets.append(
+            crawl_targets.append(
                 CrawlTarget(
-                    source=source,
-                    url=target.url,
-                    label=target.label,
-                    resolved_from_url=target.resolved_from_url or delegated_url,
+                    source=source_record,
+                    url=delegated_target.url,
+                    label=delegated_target.label,
+                    resolved_from_url=delegated_target.resolved_from_url
+                    or delegated_url,
                     metadata=metadata,
                 )
             )
-    targets = _dedupe_crawl_targets_by_url(targets)
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no delegated MRF links found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _target_url_matches_any_pattern(target: CrawlTarget, patterns: Iterable[Any]) -> bool:
@@ -9138,40 +9239,46 @@ def _dedupe_crawl_targets_by_url(targets: list[CrawlTarget]) -> list[CrawlTarget
 
 
 def _crawl_targets_from_html_mrf_links(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     html_text: str,
     *,
     base_url: str,
     resolver: str,
     target_max_bytes: int | None = None,
 ) -> list[CrawlTarget]:
-    targets: list[CrawlTarget] = []
-    for target in _parse_html_mrf_links(html_text, base_url=base_url):
+    crawl_targets: list[CrawlTarget] = []
+    for parsed_target in _parse_html_mrf_links(html_text, base_url=base_url):
         metadata = {
-            "resolver": target.get("resolver") or resolver,
-            "target_kind": target.get("target_kind"),
-            "target_file_type": target.get("target_file_type"),
-            "container_format": target.get("container_format"),
-            "html_attr": target.get("html_attr"),
-            "plan_info": target.get("plan_info"),
+            "resolver": parsed_target.get("resolver") or resolver,
+            "target_kind": parsed_target.get("target_kind"),
+            "target_file_type": parsed_target.get("target_file_type"),
+            "container_format": parsed_target.get("container_format"),
+            "html_attr": parsed_target.get("html_attr"),
+            "plan_info": parsed_target.get("plan_info"),
             "target_max_bytes": (
-                target_max_bytes if target.get("target_kind") == "toc_json" else None
+                target_max_bytes
+                if parsed_target.get("target_kind") == "toc_json"
+                else None
             ),
         }
-        targets.append(
+        crawl_targets.append(
             CrawlTarget(
-                source=source,
-                url=str(target["url"]),
-                label=str(target.get("label") or source.get("display_name") or ""),
+                source=source_record,
+                url=str(parsed_target["url"]),
+                label=str(
+                    parsed_target.get("label")
+                    or source_record.get("display_name")
+                    or ""
+                ),
                 resolved_from_url=base_url,
                 metadata={
-                    key: value
-                    for key, value in metadata.items()
-                    if value not in (None, "", [])
+                    metadata_key: metadata_value
+                    for metadata_key, metadata_value in metadata.items()
+                    if metadata_value not in (None, "", [])
                 },
             )
         )
-    return targets
+    return crawl_targets
 
 
 def _embedded_mrf_host_urls(raw_html_text: str | None) -> list[str]:
@@ -10403,7 +10510,7 @@ def _healthcarebluebook_nested_target(
 
 
 async def _resolve_healthcarebluebook_mrf(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -10415,27 +10522,31 @@ async def _resolve_healthcarebluebook_mrf(
         max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
         session=session,
     )
-    items = _healthcarebluebook_grid_items(html_text, base_url=url)
+    listing_items = _healthcarebluebook_grid_items(html_text, base_url=url)
     targets_by_url: dict[str, CrawlTarget] = {}
     max_targets = _as_int(resolver.get("max_targets"))
-    target_query = _source_target_payer_query(source)
-    for index, item in enumerate(items):
+    target_query = _source_target_payer_query(source_record)
+    for index, listing_item in enumerate(listing_items):
         if max_targets and len(targets_by_url) >= max_targets:
             break
-        link_url = str(item.get("url") or "").strip()
+        link_url = str(listing_item.get("url") or "").strip()
         if not link_url:
             continue
         label = (
-            _clean_text(item.get("label"))
+            _clean_text(listing_item.get("label"))
             or Path(urlsplit(link_url).path).name
             or "MRF file"
         )
-        type_text = items[index + 1].get("text") if index + 1 < len(items) else ""
+        type_text = (
+            listing_items[index + 1].get("text")
+            if index + 1 < len(listing_items)
+            else ""
+        )
         file_type = _healthcarebluebook_file_type(type_text, label, link_url)
         if not file_type:
             continue
         if not _healthcarebluebook_item_matches_query(
-            item,
+            listing_item,
             link_url=link_url,
             label=label,
             type_text=type_text,
@@ -10466,21 +10577,21 @@ async def _resolve_healthcarebluebook_mrf(
             }
             key = _canonical_or_none(link_url) or link_url
             targets_by_url[key] = CrawlTarget(
-                source=source,
+                source=source_record,
                 url=link_url,
                 label=label,
                 resolved_from_url=url,
                 metadata={
-                    key: value
-                    for key, value in metadata.items()
-                    if value not in (None, "", [])
+                    metadata_key: metadata_value
+                    for metadata_key, metadata_value in metadata.items()
+                    if metadata_value not in (None, "", [])
                 },
             )
             continue
         nested_platform = classify_hosting_platform(link_url)
         if not nested_platform:
             continue
-        nested_source = {**source, "hosting_platform": nested_platform}
+        nested_source = {**source_record, "hosting_platform": nested_platform}
         try:
             nested_target_limit = (
                 max_targets - len(targets_by_url) if max_targets else None
@@ -10496,7 +10607,7 @@ async def _resolve_healthcarebluebook_mrf(
         for nested_target in nested_targets:
             annotated = _healthcarebluebook_nested_target(
                 nested_target,
-                source=source,
+                source=source_record,
                 listing_url=url,
                 link_url=link_url,
                 label=label,
@@ -10507,16 +10618,16 @@ async def _resolve_healthcarebluebook_mrf(
             targets_by_url[key] = annotated
             if max_targets and len(targets_by_url) >= max_targets:
                 break
-    targets = list(targets_by_url.values())
+    crawl_targets = list(targets_by_url.values())
     if max_targets:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no Healthcare Bluebook MRF links found for {url}")
-    return targets
+    return crawl_targets
 
 
 async def _resolve_html_mrf_with_healthcarebluebook(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -10529,36 +10640,45 @@ async def _resolve_html_mrf_with_healthcarebluebook(
         session=session,
     )
     targets_by_url: dict[str, CrawlTarget] = {}
-    for target in _parse_html_mrf_links(html_text, base_url=url):
-        target_url = str(target["url"])
+    for parsed_target in _parse_html_mrf_links(html_text, base_url=url):
+        target_url = str(parsed_target["url"])
         source_format = (
             "csv" if urlsplit(target_url).path.lower().endswith(".csv") else None
         )
         metadata = {
-            "resolver": target.get("resolver") or resolver_type,
-            "target_kind": target.get("target_kind"),
-            "target_file_type": target.get("target_file_type"),
-            "container_format": target.get("container_format"),
+            "resolver": parsed_target.get("resolver") or resolver_type,
+            "target_kind": parsed_target.get("target_kind"),
+            "target_file_type": parsed_target.get("target_file_type"),
+            "container_format": parsed_target.get("container_format"),
             "source_format": source_format,
-            "html_attr": target.get("html_attr"),
+            "html_attr": parsed_target.get("html_attr"),
             "landing_url": url,
-            "plan_info": target.get("plan_info"),
+            "plan_info": parsed_target.get("plan_info"),
         }
         key = _canonical_or_none(target_url) or target_url
         targets_by_url[key] = CrawlTarget(
-            source=source,
+            source=source_record,
             url=target_url,
-            label=str(target.get("label") or source.get("display_name") or ""),
+            label=str(
+                parsed_target.get("label")
+                or source_record.get("display_name")
+                or ""
+            ),
             resolved_from_url=url,
             metadata={
-                key: value for key, value in metadata.items() if value not in (None, "")
+                metadata_key: metadata_value
+                for metadata_key, metadata_value in metadata.items()
+                if metadata_value not in (None, "")
             },
         )
     for candidate in _html_link_candidates(html_text, base_url=url):
         link_url = str(candidate.get("url") or "").strip()
         if _domain(link_url) != "mrf.healthcarebluebook.com":
             continue
-        nested_source = {**source, "hosting_platform": "healthcarebluebook_mrf"}
+        nested_source = {
+            **source_record,
+            "hosting_platform": "healthcarebluebook_mrf",
+        }
         nested_resolver = _platform_resolver_config("healthcarebluebook_mrf") or {
             "type": "healthcarebluebook_mrf"
         }
@@ -10593,7 +10713,7 @@ async def _resolve_html_mrf_with_healthcarebluebook(
                 }
             )
             annotated = CrawlTarget(
-                source=source,
+                source=source_record,
                 url=nested_target.url,
                 label=nested_target.label,
                 resolved_from_url=nested_target.resolved_from_url or link_url,
@@ -10601,13 +10721,13 @@ async def _resolve_html_mrf_with_healthcarebluebook(
             )
             key = _canonical_or_none(annotated.url) or annotated.url
             targets_by_url[key] = annotated
-    targets = list(targets_by_url.values())
+    crawl_targets = list(targets_by_url.values())
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no HTML or Healthcare Bluebook MRF links found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _regex_matches_config(value: Any, pattern: Any) -> bool:
@@ -13584,12 +13704,15 @@ def _crawl_target_rank(target: CrawlTarget) -> tuple[int, str]:
 
 
 def _direct_mrf_body_crawl_target(
-    source: dict[str, Any], url: str, *, resolver: str = "direct_mrf_body"
+    source_record: dict[str, Any],
+    url: str,
+    *,
+    resolver: str = "direct_mrf_body",
 ) -> CrawlTarget | None:
     if not _looks_direct_mrf_body_url(url):
         return None
     file_type = _mrf_body_file_type_from_text(
-        url, str(source.get("display_name") or "")
+        url, str(source_record.get("display_name") or "")
     )
     if file_type == "table-of-contents":
         return None
@@ -13597,12 +13720,12 @@ def _direct_mrf_body_crawl_target(
         return None
     label = (
         _mrf_file_plan_label(urlsplit(str(url or "")).path)
-        or str(source.get("display_name") or "").strip()
+        or str(source_record.get("display_name") or "").strip()
         or Path(urlsplit(str(url or "")).path).name
         or "MRF file"
     )
     return CrawlTarget(
-        source=source,
+        source=source_record,
         url=url,
         label=label,
         metadata={
@@ -14079,20 +14202,20 @@ async def _load_file_probe_targets(
     if payer_query:
         payer_value = func.lower(func.coalesce(MRFPayer.canonical_name, ""))
         stmt = stmt.where(payer_value.like(f"%{payer_query.lower()}%"))
-    rows = await db.all(stmt)
-    targets = [
+    file_rows = await db.all(stmt)
+    probe_targets = [
         {
-            "mrf_file_id": row[0],
-            "url": row[1],
-            "file_type": row[2],
-            "payer_id": row[3],
-            "payer_name": row[4],
-            "entity_type": row[5],
+            "mrf_file_id": file_row[0],
+            "url": file_row[1],
+            "file_type": file_row[2],
+            "payer_id": file_row[3],
+            "payer_name": file_row[4],
+            "entity_type": file_row[5],
         }
-        for row in rows
+        for file_row in file_rows
     ]
-    targets = _interleave_file_probe_targets_by_host(targets)
-    return targets[: max(1, int(limit))] if limit else targets
+    probe_targets = _interleave_file_probe_targets_by_host(probe_targets)
+    return probe_targets[: max(1, int(limit))] if limit else probe_targets
 
 
 def _file_probe_target_host(target: dict[str, Any]) -> str:
@@ -14120,21 +14243,21 @@ def _interleave_file_probe_targets_by_host(
 
 
 def _file_probe_observation(
-    target: dict[str, Any], head: dict[str, Any], run_id: str | None
+    probe_target: dict[str, Any], head: dict[str, Any], run_id: str | None
 ) -> dict[str, Any]:
     checked_at = head["checked_at"]
     return {
         "observation_id": _id(
             "mrfurlobs",
             {
-                "file_id": target["mrf_file_id"],
-                "url": target["url"],
+                "file_id": probe_target["mrf_file_id"],
+                "url": probe_target["url"],
                 "body_file_head": checked_at.isoformat(),
             },
         ),
         "source_id": None,
-        "url": str(target["url"]),
-        "canonical_url": _canonical_or_none(str(target["url"])),
+        "url": str(probe_target["url"]),
+        "canonical_url": _canonical_or_none(str(probe_target["url"])),
         "url_type": "body_file_head",
         "status": str(head.get("status") or "unknown"),
         "http_status": head.get("http_status"),
@@ -14147,11 +14270,11 @@ def _file_probe_observation(
         "error": head.get("error"),
         "metadata_json": {
             "run_id": run_id,
-            "mrf_file_id": target["mrf_file_id"],
-            "file_type": target.get("file_type"),
-            "payer_id": target.get("payer_id"),
-            "payer_name": target.get("payer_name"),
-            "entity_type": target.get("entity_type"),
+            "mrf_file_id": probe_target["mrf_file_id"],
+            "file_type": probe_target.get("file_type"),
+            "payer_id": probe_target.get("payer_id"),
+            "payer_name": probe_target.get("payer_name"),
+            "entity_type": probe_target.get("entity_type"),
         },
     }
 
@@ -14306,6 +14429,7 @@ async def _crawl_toc_metadata(
     max_toc_bytes: int,
     concurrency: int = DEFAULT_CONCURRENCY,
     crawl_target_limit: int | None = None,
+    session: aiohttp.ClientSession | None = None,
 ) -> tuple[int, int, list[dict[str, Any]]]:
     """Crawl TOC targets, derive rows, and persist crawl observations."""
     if test_mode:
@@ -14317,7 +14441,6 @@ async def _crawl_toc_metadata(
     timeout = aiohttp.ClientTimeout(
         total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
     )
-    connector = _tcp_connector(limit=worker_count * 2)
     crawl_source_rows = _dedupe_source_rows_for_crawl(source_rows)
     try:
         target_crawl_timeout = float(
@@ -14470,15 +14593,14 @@ async def _crawl_toc_metadata(
                 target.url,
             )
 
-    async with aiohttp.ClientSession(
-        headers={"User-Agent": USER_AGENT},
+    async with _discovery_http_session(
+        existing_session=session,
         timeout=timeout,
-        connector=connector,
-        trust_env=False,
-    ) as session:
+        connector_limit=worker_count * 2,
+    ) as active_session:
         targets, resolver_observations = await _resolve_crawl_targets(
             crawl_source_rows,
-            session=session,
+            session=active_session,
             run_id=run_id,
             progress_run_id=progress_run_id,
             concurrency=concurrency,
@@ -14527,10 +14649,10 @@ async def _crawl_toc_metadata(
                 try:
                     if target_crawl_timeout > 0:
                         return await asyncio.wait_for(
-                            crawl_one(crawl_target, session),
+                            crawl_one(crawl_target, active_session),
                             timeout=target_crawl_timeout,
                         )
-                    return await crawl_one(crawl_target, session)
+                    return await crawl_one(crawl_target, active_session)
                 except TimeoutError:
                     return (
                         [],
@@ -14658,6 +14780,8 @@ def _discovery_run_params(
     max_toc_bytes: int,
     concurrency: int,
     crawl_target_limit: int | None,
+    retry_of_run_id: str | None,
+    mrf_discovery_root_run_id: str | None,
 ) -> dict[str, Any]:
     return {
         "test_mode": test_mode,
@@ -14675,6 +14799,8 @@ def _discovery_run_params(
         "max_toc_bytes": max_toc_bytes,
         "concurrency": concurrency,
         "crawl_target_limit": crawl_target_limit,
+        "retry_of_run_id": retry_of_run_id,
+        "mrf_discovery_root_run_id": mrf_discovery_root_run_id,
     }
 
 
@@ -14690,7 +14816,7 @@ def _discovery_control_metrics(
     run_mode: str,
     bytes_streamed: int = 0,
 ) -> dict[str, Any]:
-    return {
+    metrics_by_name = {
         "catalog_export_version": DISCOVERY_CATALOG_EXPORT_VERSION,
         "crawl_run_id": crawl_run_id,
         "crawl_status": crawl_status,
@@ -14703,9 +14829,13 @@ def _discovery_control_metrics(
         "files_discovered": result.files,
         "files_probed": result.files_probed,
         "file_probe_ok": result.file_probe_ok,
+        "process_workers": result.process_workers,
         "bytes_streamed": bytes_streamed,
         "error_count": len(result.errors),
     }
+    if result.source_batch_summary is not None:
+        metrics_by_name.update(result.source_batch_summary.proof_metrics())
+    return metrics_by_name
 
 
 def _discovery_crawl_run_row(
@@ -14841,7 +14971,7 @@ def _emit_discovery_control_event(
     if not control_run_id:
         return
     heartbeat_at = finished_at or _utc_now()
-    payload = {
+    event_by_field = {
         "run_id": control_run_id,
         "importer": "mrf-source-discovery",
         "status": status,
@@ -14855,10 +14985,10 @@ def _emit_discovery_control_event(
         "heartbeat_at": heartbeat_at,
     }
     if finished_at is not None:
-        payload["finished_at"] = finished_at
+        event_by_field["finished_at"] = finished_at
     if triggered_by:
-        payload["triggered_by"] = triggered_by
-    enqueue_status_event(payload)
+        event_by_field["triggered_by"] = triggered_by
+    enqueue_status_event(event_by_field)
 
 
 async def _flush_discovery_control_events() -> None:
@@ -14868,6 +14998,264 @@ async def _flush_discovery_control_events() -> None:
     if timeout <= 0:
         return
     await flush_status_events(timeout_seconds=timeout)
+
+
+@dataclass(frozen=True)
+class DiscoverySourceProcessingOptions:
+    """Hold serializable options used to process one discovery source."""
+
+    test_mode: bool
+    check_urls: bool
+    crawl: bool
+    observation_run_id: str
+    max_toc_bytes: int
+    crawl_target_limit: int | None
+
+
+@dataclass(frozen=True)
+class DiscoverySourceBatchContext:
+    """Hold the frozen identity and execution settings for one source batch."""
+
+    root_run_id: str
+    owner_run_id: str
+    source_records: list[dict[str, Any]]
+    concurrency: int
+    process_workers: int
+    processing_options: DiscoverySourceProcessingOptions
+
+
+def _discovery_process_worker_count(concurrency: int) -> int:
+    """Return the bounded number of CPU processes configured for discovery."""
+
+    raw_worker_count = os.getenv(DISCOVERY_PROCESS_WORKERS_ENV, "1")
+    try:
+        requested_worker_count = int(raw_worker_count)
+    except ValueError:
+        requested_worker_count = 1
+    return min(
+        max(requested_worker_count, 1),
+        max(int(concurrency), 1),
+        MAX_DISCOVERY_PROCESS_WORKERS,
+    )
+
+
+async def _process_discovery_source_record(
+    source_record: dict[str, Any],
+    processing_options: DiscoverySourceProcessingOptions,
+    *,
+    session: aiohttp.ClientSession | None = None,
+) -> SourceProcessResult:
+    """Check and crawl one source, returning only its durable output counts."""
+
+    timeout = aiohttp.ClientTimeout(
+        total=HTTP_TOTAL_TIMEOUT,
+        connect=15,
+        sock_read=HTTP_READ_TIMEOUT,
+    )
+    async with _discovery_http_session(
+        existing_session=session,
+        timeout=timeout,
+        connector_limit=2,
+    ) as active_session:
+        source_observations: list[dict[str, Any]] = []
+        if processing_options.check_urls:
+            source_observations = await _store_observations(
+                [source_record],
+                test_mode=processing_options.test_mode,
+                run_id=processing_options.observation_run_id,
+                concurrency=1,
+                session=active_session,
+            )
+        plans_discovered = 0
+        files_discovered = 0
+        if processing_options.crawl and _source_row_is_importable(source_record):
+            (
+                plans_discovered,
+                files_discovered,
+                _crawl_observations,
+            ) = await _crawl_toc_metadata(
+                [source_record],
+                test_mode=processing_options.test_mode,
+                run_id=processing_options.observation_run_id,
+                max_toc_bytes=processing_options.max_toc_bytes,
+                concurrency=1,
+                crawl_target_limit=processing_options.crawl_target_limit,
+                session=active_session,
+            )
+        return SourceProcessResult(
+            urls_checked=len(source_observations),
+            plans_discovered=plans_discovered,
+            files_discovered=files_discovered,
+            bytes_streamed=sum(
+                int(source_observation.get("content_length") or 0)
+                for source_observation in source_observations
+            ),
+        )
+
+
+def _run_discovery_source_process(
+    source_record: dict[str, Any],
+    processing_options: DiscoverySourceProcessingOptions,
+) -> SourceProcessResult:
+    """Run one source in an isolated process with its own event loop and pool."""
+
+    async def run_source() -> SourceProcessResult:
+        """Process one source inside a fresh child-process event loop."""
+
+        should_connect_database = bool(
+            processing_options.check_urls
+            or (processing_options.crawl and not processing_options.test_mode)
+        )
+        try:
+            if should_connect_database:
+                await ensure_database(processing_options.test_mode)
+            return await _process_discovery_source_record(
+                source_record,
+                processing_options,
+            )
+        finally:
+            if should_connect_database:
+                await db.disconnect()
+
+    return asyncio.run(run_source())
+
+
+class DiscoverySourceProcessPool:
+    """Bridge cancellable asyncio source tasks to reusable spawned processes."""
+
+    def __init__(self, process_workers: int) -> None:
+        process_context = mp.get_context("spawn")
+        self._process_pool = process_context.Pool(processes=process_workers)
+        self._is_closed = False
+
+    async def process_source(
+        self,
+        source_record: dict[str, Any],
+        processing_options: DiscoverySourceProcessingOptions,
+    ) -> SourceProcessResult:
+        """Submit one source and await its process result without blocking asyncio."""
+
+        process_result = self._process_pool.apply_async(
+            _run_discovery_source_process,
+            (source_record, processing_options),
+        )
+        return await asyncio.to_thread(process_result.get)
+
+    async def close(self) -> None:
+        """Finish submitted source work and stop the process pool cleanly."""
+
+        if self._is_closed:
+            return
+        self._is_closed = True
+        self._process_pool.close()
+        await asyncio.to_thread(self._process_pool.join)
+
+    async def terminate(self) -> None:
+        """Kill process work before canceled source claims become retryable."""
+
+        if self._is_closed:
+            return
+        self._is_closed = True
+        self._process_pool.terminate()
+        await asyncio.to_thread(self._process_pool.join)
+
+
+def _source_checkpoint_progress_reporter(control_run_id: str):
+    """Build the live progress callback used by the checkpoint executor."""
+
+    def report_checkpoint(
+        completed_count: int,
+        total_count: int,
+        source_id: str,
+        checkpoint_status: str,
+    ) -> None:
+        """Publish durable source progress to control-plane observers."""
+
+        enqueue_live_progress(
+            run_id=control_run_id,
+            importer="mrf-source-discovery",
+            status="running",
+            phase="checkpointing discovery sources",
+            unit="sources",
+            done=completed_count,
+            total=total_count,
+            message=f"checkpointed {completed_count}/{total_count} discovery sources",
+            label=source_id,
+            detail={"source_status": checkpoint_status},
+        )
+
+    return report_checkpoint
+
+
+async def _execute_discovery_source_batch(
+    batch_context: DiscoverySourceBatchContext,
+    checkpoint_store: DatabaseDiscoveryCheckpointStore,
+) -> SourceBatchSummary:
+    """Execute one source batch in-process or across configured CPU workers."""
+
+    checkpoint_reporter = _source_checkpoint_progress_reporter(
+        batch_context.owner_run_id
+    )
+    executor_arguments_by_name = {
+        "root_run_id": batch_context.root_run_id,
+        "owner_run_id": batch_context.owner_run_id,
+        "source_records": batch_context.source_records,
+        "concurrency": batch_context.concurrency,
+        "checkpoint_store": checkpoint_store,
+        "on_source_checkpoint": checkpoint_reporter,
+    }
+    if batch_context.process_workers > 1:
+        source_process_pool = DiscoverySourceProcessPool(
+            batch_context.process_workers
+        )
+
+        async def process_in_worker(
+            source_record: dict[str, Any],
+        ) -> SourceProcessResult:
+            """Submit one frozen source to the child-process pool."""
+
+            return await source_process_pool.process_source(
+                source_record,
+                batch_context.processing_options,
+            )
+
+        try:
+            batch_summary = await execute_checkpointed_source_batch(
+                **executor_arguments_by_name,
+                process_source=process_in_worker,
+            )
+        except BaseException:
+            await source_process_pool.terminate()
+            raise
+        await source_process_pool.close()
+        return batch_summary
+
+    shared_timeout = aiohttp.ClientTimeout(
+        total=HTTP_TOTAL_TIMEOUT,
+        connect=15,
+        sock_read=HTTP_READ_TIMEOUT,
+    )
+    async with _discovery_http_session(
+        existing_session=None,
+        timeout=shared_timeout,
+        connector_limit=batch_context.concurrency * 2,
+    ) as shared_session:
+
+        async def process_in_event_loop(
+            source_record: dict[str, Any],
+        ) -> SourceProcessResult:
+            """Process one frozen source in the current event loop."""
+
+            return await _process_discovery_source_record(
+                source_record,
+                batch_context.processing_options,
+                session=shared_session,
+            )
+
+        return await execute_checkpointed_source_batch(
+            **executor_arguments_by_name,
+            process_source=process_in_event_loop,
+        )
 
 
 async def main(
@@ -14888,6 +15276,8 @@ async def main(
     concurrency: int = DEFAULT_CONCURRENCY,
     crawl_target_limit: int | None = None,
     run_id: str | None = None,
+    retry_of_run_id: str | None = None,
+    mrf_discovery_root_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Run source discovery with optional crawling and file probing."""
     max_toc_bytes = max_toc_bytes or MAX_TOC_BYTES_DEFAULT
@@ -14901,7 +15291,15 @@ async def main(
     parsed_file_probe_payer_query = _normalize_text_query(file_probe_payer_query)
     providers = _parse_provider_list(provider, test_mode=test_mode)
     bounded_limit = max(1, int(limit)) if limit else (25 if test_mode else None)
-    result = DiscoveryResult(providers=providers)
+    process_workers = (
+        1
+        if test_mode or dry_run
+        else _discovery_process_worker_count(concurrency)
+    )
+    discovery_result = DiscoveryResult(
+        providers=providers,
+        process_workers=process_workers,
+    )
     started_at = _utc_now()
     crawl_run_id = _id(
         "mrfcrawl",
@@ -14914,7 +15312,7 @@ async def main(
     run_mode = _discovery_run_mode(
         crawl=crawl, check_urls=check_urls, probe_files=probe_files
     )
-    result.crawl_run_id = crawl_run_id
+    discovery_result.crawl_run_id = crawl_run_id
     control_run_id = run_id or crawl_run_id
     run_params = _discovery_run_params(
         test_mode=test_mode,
@@ -14932,7 +15330,10 @@ async def main(
         max_toc_bytes=max_toc_bytes,
         concurrency=concurrency,
         crawl_target_limit=crawl_target_limit,
+        retry_of_run_id=retry_of_run_id,
+        mrf_discovery_root_run_id=mrf_discovery_root_run_id,
     )
+    run_params["process_workers"] = process_workers
     run_context_dict = {
         "crawl_run_id": crawl_run_id,
         "control_run_id": control_run_id,
@@ -14972,9 +15373,62 @@ async def main(
             message="loading source providers",
         )
 
+    retry_parent_run_id = str(retry_of_run_id or "").strip() or None
+    requested_root_run_id = str(
+        mrf_discovery_root_run_id or retry_parent_run_id or control_run_id
+    ).strip()
+    checkpoint_root_run_id = requested_root_run_id
+    checkpoint_store = DatabaseDiscoveryCheckpointStore()
+    resumed_source_rows: list[dict[str, Any]] | None = None
+    recorded_failure_run_ids: set[str] = set()
+
+    async def record_discovery_failure(exc: BaseException) -> None:
+        """Persist and publish a terminal failure without suppressing the original exception."""
+        if control_run_id in recorded_failure_run_ids:
+            return
+        recorded_failure_run_ids.add(control_run_id)
+        finished_at = _utc_now()
+        message = str(exc).strip() or exc.__class__.__name__
+        error_dict = {"code": "source_discovery_failed", "message": message}
+        await _record_failed_discovery_state(
+            {
+                "run_context_dict": run_context_dict,
+                "result": discovery_result,
+                "message": message,
+                "error_dict": error_dict,
+                "finished_at": finished_at,
+                "emit_standalone_control_events": emit_standalone_control_events,
+                "triggered_by": "direct_cli" if not run_id else None,
+            }
+        )
+
+    if not dry_run:
+        try:
+            await init_db(db, asyncio.get_event_loop())
+            await ensure_database(test_mode)
+            await _ensure_catalog_tables()
+            await push_objects(
+                [_discovery_crawl_run_row(run_context_dict, status="running")],
+                MRFCrawlRun,
+                rewrite=True,
+                use_copy=False,
+            )
+            if retry_parent_run_id:
+                resumed_source_rows = await checkpoint_store.resume_batch(
+                    requested_root_run_id,
+                    control_run_id,
+                    retry_parent_run_id,
+                )
+                if resumed_source_rows is None:
+                    checkpoint_root_run_id = control_run_id
+        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+            await record_discovery_failure(exc)
+            raise
+    run_params["mrf_discovery_root_run_id"] = checkpoint_root_run_id
+
     needs_source_load = bool(dry_run or check_urls or crawl or not probe_files)
     candidates: list[SourceCandidate] = []
-    if needs_source_load:
+    if needs_source_load and resumed_source_rows is None:
         provider_load_limit = (
             None
             if parsed_source_entity_types or parsed_source_payer_query
@@ -14988,7 +15442,9 @@ async def main(
                     )
                 )
             except Exception as exc:  # pylint: disable=broad-exception-caught
-                result.errors.append({"provider": provider_name, "message": str(exc)})
+                discovery_result.errors.append(
+                    {"provider": provider_name, "message": str(exc)}
+                )
             if control_run_id and not dry_run:
                 enqueue_live_progress(
                     run_id=control_run_id,
@@ -15033,102 +15489,99 @@ async def main(
     ]
     if bounded_limit:
         candidates = candidates[:bounded_limit]
-    result.candidates = len(candidates)
+    discovery_result.candidates = len(candidates)
 
     if dry_run:
-        result.payers = len(
+        discovery_result.payers = len(
             {_clean_text(candidate.payer_name).lower() for candidate in candidates}
         )
-        result.sources = len(
+        discovery_result.sources = len(
             [
                 candidate
                 for candidate in candidates
                 if candidate.index_url or candidate.human_url
             ]
         )
-        return result.as_dict()
+        return discovery_result.as_dict()
 
-    recorded_failure_run_ids: set[str] = set()
+    if discovery_result.errors:
+        provider_error = RuntimeError(
+            "MRF discovery provider loading failed; source set was not frozen"
+        )
+        await record_discovery_failure(provider_error)
+        raise provider_error
 
-    async def record_discovery_failure(exc: BaseException) -> None:
-        """Persist and publish a terminal failure without suppressing the original exception."""
-        if control_run_id in recorded_failure_run_ids:
-            return
-        recorded_failure_run_ids.add(control_run_id)
-        finished_at = _utc_now()
-        message = str(exc).strip() or exc.__class__.__name__
-        error_dict = {"code": "source_discovery_failed", "message": message}
-        await _record_failed_discovery_state(
+    if resumed_source_rows is None:
+        try:
+            payer_rows, source_rows = await _store_candidates(
+                candidates,
+                discovery_run_id=control_run_id,
+            )
+        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+            await record_discovery_failure(exc)
+            raise
+        discovery_result.payers = len(payer_rows)
+    else:
+        source_rows = resumed_source_rows
+        discovery_result.candidates = len(source_rows)
+        discovery_result.payers = len(
             {
-                "run_context_dict": run_context_dict,
-                "result": result,
-                "message": message,
-                "error_dict": error_dict,
-                "finished_at": finished_at,
-                "emit_standalone_control_events": emit_standalone_control_events,
-                "triggered_by": "direct_cli" if not run_id else None,
+                str(source_row.get("payer_id") or "").strip()
+                for source_row in source_rows
+                if str(source_row.get("payer_id") or "").strip()
             }
         )
-
-    try:
-        await init_db(db, asyncio.get_event_loop())
-        await ensure_database(test_mode)
-        await _ensure_catalog_tables()
-        await push_objects(
-            [_discovery_crawl_run_row(run_context_dict, status="running")],
-            MRFCrawlRun,
-            rewrite=True,
-            use_copy=False,
+        try:
+            await _retag_sources_for_discovery_run(source_rows, control_run_id)
+        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+            await record_discovery_failure(exc)
+            raise
+    if (
+        needs_source_load
+        and not source_rows
+        and bounded_limit is None
+        and not parsed_source_entity_types
+        and not parsed_source_payer_query
+    ):
+        empty_source_error = RuntimeError(
+            "unbounded MRF discovery resolved an empty source set"
         )
-    except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
-        await record_discovery_failure(exc)
-        raise
-
-    try:
-        payer_rows, source_rows = await _store_candidates(
-            candidates,
-            discovery_run_id=control_run_id,
-        )
-    except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
-        await record_discovery_failure(exc)
-        raise
-    result.payers = len(payer_rows)
-    result.sources = len(source_rows)
+        await record_discovery_failure(empty_source_error)
+        raise empty_source_error
+    discovery_result.sources = len(source_rows)
     observations: list[dict[str, Any]] = []
     observation_run_id = control_run_id
     progress_run_id = control_run_id
-    if check_urls:
+
+    if needs_source_load:
         try:
-            observations = await _store_observations(
-                source_rows,
-                test_mode=test_mode,
-                run_id=observation_run_id,
-                progress_run_id=progress_run_id,
-                concurrency=concurrency,
-            )
-        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
-            await record_discovery_failure(exc)
-            raise
-        result.urls_checked = len(observations)
-    if crawl:
-        try:
-            plans_discovered, files_discovered, crawl_observations = (
-                await _crawl_toc_metadata(
-                    [row for row in source_rows if _source_row_is_importable(row)],
-                    test_mode=test_mode,
-                    run_id=observation_run_id,
-                    progress_run_id=progress_run_id,
-                    max_toc_bytes=max_toc_bytes,
+            source_batch_summary = await _execute_discovery_source_batch(
+                DiscoverySourceBatchContext(
+                    root_run_id=checkpoint_root_run_id,
+                    owner_run_id=control_run_id,
+                    source_records=source_rows,
                     concurrency=concurrency,
-                    crawl_target_limit=crawl_target_limit,
-                )
+                    process_workers=process_workers,
+                    processing_options=DiscoverySourceProcessingOptions(
+                        test_mode=test_mode,
+                        check_urls=check_urls,
+                        crawl=crawl,
+                        observation_run_id=observation_run_id,
+                        max_toc_bytes=max_toc_bytes,
+                        crawl_target_limit=crawl_target_limit,
+                    ),
+                ),
+                checkpoint_store,
             )
         except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+            if isinstance(exc, DiscoverySourceBatchIncomplete):
+                discovery_result.source_batch_summary = exc.summary
             await record_discovery_failure(exc)
             raise
-        observations.extend(crawl_observations)
-        result.plans = plans_discovered
-        result.files = files_discovered
+        discovery_result.source_batch_summary = source_batch_summary
+        discovery_result.urls_checked = source_batch_summary.urls_checked
+        discovery_result.plans = source_batch_summary.plans_discovered
+        discovery_result.files = source_batch_summary.files_discovered
     if probe_files:
         try:
             probe_observations, ok_count = await _probe_mrf_file_heads(
@@ -15144,22 +15597,28 @@ async def main(
             await record_discovery_failure(exc)
             raise
         observations.extend(probe_observations)
-        result.files_probed = len(probe_observations)
-        result.file_probe_ok = ok_count
-        result.urls_checked += len(probe_observations)
-    crawl_status = "succeeded" if not result.errors else "succeeded_with_errors"
+        discovery_result.files_probed = len(probe_observations)
+        discovery_result.file_probe_ok = ok_count
+        discovery_result.urls_checked += len(probe_observations)
+    crawl_status = (
+        "succeeded" if not discovery_result.errors else "succeeded_with_errors"
+    )
     finished_at = _utc_now()
-    bytes_streamed = sum(int(item.get("content_length") or 0) for item in observations)
+    bytes_streamed = sum(
+        int(observation.get("content_length") or 0) for observation in observations
+    )
+    if discovery_result.source_batch_summary is not None:
+        bytes_streamed += discovery_result.source_batch_summary.bytes_streamed
     try:
         await push_objects(
             [
                 _discovery_crawl_run_row(
                     run_context_dict,
                     status=crawl_status,
-                    result=result,
+                    result=discovery_result,
                     finished_at=finished_at,
                     bytes_streamed=bytes_streamed,
-                    error_dicts=result.errors,
+                    error_dicts=discovery_result.errors,
                 )
             ],
             MRFCrawlRun,
@@ -15176,8 +15635,8 @@ async def main(
             status="succeeded",
             phase="mrf source discovery complete",
             unit="sources",
-            done=result.sources,
-            total=result.sources,
+            done=discovery_result.sources,
+            total=discovery_result.sources,
             pct=100,
             message="mrf source discovery complete",
         )
@@ -15189,15 +15648,15 @@ async def main(
                 phase_detail="mrf source discovery complete",
                 progress={
                     "unit": "sources",
-                    "done": result.sources,
-                    "total": result.sources,
+                    "done": discovery_result.sources,
+                    "total": discovery_result.sources,
                     "pct": 100,
                     "message": "mrf source discovery complete",
                     "phase": "mrf source discovery complete",
                 },
                 params=run_params,
                 metrics=_discovery_control_metrics(
-                    result,
+                    discovery_result,
                     crawl_status=crawl_status,
                     crawl_run_id=crawl_run_id,
                     run_mode=run_mode,
@@ -15207,7 +15666,7 @@ async def main(
                 finished_at=finished_at,
             )
             await _flush_discovery_control_events()
-    return result.as_dict()
+    return discovery_result.as_dict()
 
 
 async def process_data(
@@ -15242,6 +15701,12 @@ async def process_data(
         concurrency=int(task.get("concurrency") or DEFAULT_CONCURRENCY),
         crawl_target_limit=_as_int(task.get("crawl_target_limit")),
         run_id=run_id,
+        retry_of_run_id=(
+            str(task.get("retry_of_run_id") or "").strip() or None
+        ),
+        mrf_discovery_root_run_id=(
+            str(task.get("mrf_discovery_root_run_id") or "").strip() or None
+        ),
     )
 
 

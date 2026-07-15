@@ -837,6 +837,8 @@ async def _split_provider_drug_into_chunks(
     chunks_dir: Path,
     test_mode: bool,
 ) -> list[dict[str, Any]]:
+    """Partition provider-drug rows by NPI for parallel loading."""
+
     chunks_dir.mkdir(parents=True, exist_ok=True)
     total_size = max(Path(source_path).stat().st_size, 1)
     est_chunks = max(1, int(math.ceil(total_size / max(DRUG_CLAIMS_CHUNK_TARGET_BYTES, 1))))
@@ -922,6 +924,8 @@ async def _split_source_into_chunks(
     chunks_dir: Path,
     test_mode: bool,
 ) -> list[dict[str, Any]]:
+    """Split one drug-claims source into bounded import chunks."""
+
     if dataset_key == "provider_drug":
         return await _split_provider_drug_into_chunks(source_path, chunks_dir, test_mode)
 

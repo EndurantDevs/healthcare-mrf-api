@@ -27,6 +27,8 @@ __all__ = (
     "ImportLog",
     "ImportRun",
     "MRFCrawlRun",
+    "MRFDiscoveryBatch",
+    "MRFDiscoverySourceCheckpoint",
     "MRFFile",
     "MRFPayer",
     "MRFPayerScorecard",
@@ -116,6 +118,12 @@ class ImportRun(Base, JSONOutputMixin):
             "name": "import_run_provider_directory_retry_child_idx",
             "unique": True,
             "where": "importer = 'provider-directory-fhir' AND retry_of_run_id IS NOT NULL",
+        },
+        {
+            "index_elements": ("retry_of_run_id",),
+            "name": "import_run_mrf_discovery_retry_child_idx",
+            "unique": True,
+            "where": "importer = 'mrf-source-discovery' AND retry_of_run_id IS NOT NULL",
         },
     ]
 
@@ -322,6 +330,83 @@ class MRFCrawlRun(Base, JSONOutputMixin):
     files_discovered = Column(Integer, nullable=False, default=0)
     bytes_streamed = Column(BigInteger, nullable=False, default=0)
     errors = Column(JSON)
+
+
+class MRFDiscoveryBatch(Base, JSONOutputMixin):
+    __tablename__ = "mrf_discovery_batch"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("root_run_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["root_run_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("latest_run_id",), "name": "mrf_discovery_batch_latest_run_idx"},
+        {"index_elements": ("status", "updated_at"), "name": "mrf_discovery_batch_status_idx"},
+    ]
+
+    root_run_id = Column(String(64), nullable=False)
+    latest_run_id = Column(String(64), nullable=False)
+    retry_of_run_id = Column(String(64))
+    strategy_version = Column(String(64), nullable=False)
+    status = Column(String(32), nullable=False)
+    source_set_count = Column(Integer, nullable=False)
+    source_set_sha256 = Column(String(64), nullable=False)
+    source_payload_set_sha256 = Column(String(64), nullable=False)
+    completed_source_count = Column(Integer, nullable=False, default=0)
+    failed_source_count = Column(Integer, nullable=False, default=0)
+    urls_checked = Column(Integer, nullable=False, default=0)
+    plans_discovered = Column(Integer, nullable=False, default=0)
+    files_discovered = Column(Integer, nullable=False, default=0)
+    bytes_streamed = Column(BigInteger, nullable=False, default=0)
+    lease_expires_at = Column(TIMESTAMP)
+    started_at = Column(TIMESTAMP, nullable=False)
+    updated_at = Column(TIMESTAMP, nullable=False)
+    completed_at = Column(TIMESTAMP)
+
+
+class MRFDiscoverySourceCheckpoint(Base, JSONOutputMixin):
+    __tablename__ = "mrf_discovery_source_checkpoint"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("root_run_id", "source_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["root_run_id", "source_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("root_run_id", "status", "source_id"),
+            "name": "mrf_discovery_source_checkpoint_pending_idx",
+        },
+        {
+            "index_elements": ("owner_run_id",),
+            "name": "mrf_discovery_source_checkpoint_owner_idx",
+        },
+    ]
+
+    root_run_id = Column(
+        String(64),
+        ForeignKey(
+            f"{os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'}.mrf_discovery_batch.root_run_id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    source_id = Column(String(64), nullable=False)
+    owner_run_id = Column(String(64), nullable=False)
+    status = Column(String(32), nullable=False)
+    source_payload = Column(JSON, nullable=False)
+    source_payload_sha256 = Column(String(64), nullable=False)
+    lease_expires_at = Column(TIMESTAMP)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    urls_checked = Column(Integer, nullable=False, default=0)
+    plans_discovered = Column(Integer, nullable=False, default=0)
+    files_discovered = Column(Integer, nullable=False, default=0)
+    bytes_streamed = Column(BigInteger, nullable=False, default=0)
+    error = Column(JSON)
+    started_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP, nullable=False)
+    completed_at = Column(TIMESTAMP)
 
 
 class MRFPayerScorecard(Base, JSONOutputMixin):

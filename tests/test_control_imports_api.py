@@ -278,6 +278,65 @@ def test_provider_directory_adapter_scopes_retry_lineage():
     }
 
 
+def test_mrf_discovery_adapter_scopes_retry_lineage():
+    adapter = control_imports._SINGLE_JOB_ADAPTERS["mrf-source-discovery"]
+    retry_payload = control_imports._adapter_payload(
+        adapter,
+        {
+            "run_id": "run_retry",
+            "importer": "mrf-source-discovery",
+            "family": "mrf",
+            "retry_of_run_id": "run_parent",
+        },
+        {
+            "crawl": True,
+            "mrf_discovery_root_run_id": "run_root",
+        },
+    )
+
+    assert retry_payload["task"] == {
+        "test_mode": False,
+        "crawl": True,
+        "mrf_discovery_root_run_id": "run_root",
+        "retry_of_run_id": "run_parent",
+    }
+
+
+@pytest.mark.asyncio
+async def test_retry_import_run_preserves_mrf_discovery_root(monkeypatch):
+    current_run_map = {
+        "run_id": "run_parent",
+        "importer": "mrf-source-discovery",
+        "params": {
+            "crawl": True,
+            "mrf_discovery_root_run_id": "run_root",
+        },
+    }
+    created_payloads = []
+
+    async def fake_get(_run_id):
+        return current_run_map
+
+    async def fake_create(payload):
+        created_payloads.append(payload)
+        return payload, True
+
+    monkeypatch.setattr(control_imports, "get_import_run", fake_get)
+    monkeypatch.setattr(control_imports, "create_import_run", fake_create)
+
+    _child, created = await control_imports.retry_import_run(
+        "run_parent", {"triggered_by": "api"}
+    )
+
+    assert created is True
+    assert created_payloads[0]["retry_of_run_id"] == "run_parent"
+    assert created_payloads[0]["params"] == {
+        "crawl": True,
+        "retry_of_run_id": "run_parent",
+        "mrf_discovery_root_run_id": "run_root",
+    }
+
+
 @pytest.mark.asyncio
 async def test_retry_import_run_merges_provider_directory_retry_params_into_child(monkeypatch):
     current_run_map = {
@@ -1044,7 +1103,11 @@ def test_import_run_migration_mirrors_model(monkeypatch):
     assert {name for name in recorder.indexes} == {
         spec["name"]
         for spec in ImportRun.__my_additional_indexes__
-        if spec["name"] != "import_run_provider_directory_retry_child_idx"
+        if spec["name"]
+        not in {
+            "import_run_provider_directory_retry_child_idx",
+            "import_run_mrf_discovery_retry_child_idx",
+        }
     }
     idempotency_idx = recorder.indexes["import_run_active_idempotency_idx"]
     assert idempotency_idx["table"] == "import_run"

@@ -884,6 +884,8 @@ async def _split_provider_service_into_chunks(
     chunks_dir: Path,
     test_mode: bool,
 ) -> list[dict[str, Any]]:
+    """Partition provider-service rows by NPI for parallel loading."""
+
     chunks_dir.mkdir(parents=True, exist_ok=True)
     total_size = max(Path(source_path).stat().st_size, 1)
     est_chunks = max(1, int(math.ceil(total_size / max(CLAIMS_CHUNK_TARGET_BYTES, 1))))
@@ -969,6 +971,8 @@ async def _split_source_into_chunks(
     chunks_dir: Path,
     test_mode: bool,
 ) -> list[dict[str, Any]]:
+    """Split one claims source into bounded import chunks."""
+
     if dataset_key == "provider_service":
         return await _split_provider_service_into_chunks(source_path, chunks_dir, test_mode)
 
@@ -1077,6 +1081,8 @@ async def _split_sources_to_chunks(
 
 
 async def _load_provider_rows(path: str, provider_cls: type, year: int, test_mode: bool) -> None:
+    """Load normalized provider rows from a claims source file."""
+
     rows: list[dict[str, Any]] = []
     accepted = 0
     skipped_invalid_state = 0
@@ -1155,6 +1161,8 @@ async def _load_provider_service_rows(
     year: int,
     test_mode: bool,
 ) -> None:
+    """Load provider procedure and location rows from claims data."""
+
     provider_procedure_map: dict[tuple[int, int, int], dict[str, Any]] = {}
     location_rows: list[dict[str, Any]] = []
     seen_location_keys: set[int] = set()

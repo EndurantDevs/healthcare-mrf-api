@@ -173,12 +173,12 @@ def test_v3_followup_migration_repairs_attestation_snapshot_index(monkeypatch):
     ]
 
 
-def test_v3_followup_is_the_single_alembic_head():
+def test_repository_has_single_alembic_head():
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260715120000_ptg2_v3_source_audit_witness"
+        "20260715160000_mrf_discovery_source_checkpoints"
     ]
 
 
