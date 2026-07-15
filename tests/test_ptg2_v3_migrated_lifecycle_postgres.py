@@ -416,6 +416,7 @@ def _release_report(
     source_key: str,
     plan_id: str,
     sample_digest: str,
+    provider_identifier_quarantine: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build a passing release-audit report for one logical snapshot."""
 
@@ -457,7 +458,11 @@ def _release_report(
             "tls_verified": True,
         },
         "reproducibility": {},
-        "source": {},
+        "source": {
+            "provider_identifier_quarantine": dict(
+                provider_identifier_quarantine
+            )
+        },
         "coverage": {"failures": []},
         "checks": {
             "source_occurrence_ids": 2_500,
@@ -997,6 +1002,9 @@ async def test_v3_lifecycle_fails_closed(
             source_key=SOURCE_A,
             plan_id=PLAN_A,
             sample_digest=candidate_audit["audit_sample"]["sample_digest"],
+            provider_identifier_quarantine=publication.serving_index[
+                "provider_identifier_quarantine"
+            ],
         )
         attestation_response = await _asgi_request(
             client,
