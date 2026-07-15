@@ -1826,6 +1826,100 @@ def test_ptg2_toc_parser_accepts_plural_allowed_amount_files():
     assert entries[2].description == "Allowed 2"
 
 
+def test_ptg2_toc_parser_accepts_flat_carrier_file_lists():
+    toc_payload_by_key = {
+        "lastupdated": "2026-07-01",
+        "In-Network Negotiated Rates Files": [
+            {
+                "url": "https://cdn.example.test/region-in-network-rates.json.gz?Signature=random-rx-oon-token",
+                "displayname": "region-in-network-rates.json.gz",
+            }
+        ],
+        "Out-of-Network Allowed Amounts Files": [
+            {
+                "url": "https://cdn.example.test/allowed-amounts.json.gz?Signature=temporary",
+                "displayname": "allowed-amounts.json.gz",
+            }
+        ],
+        "Association Out-of-Area Rates Files": [
+            {
+                "url": "https://cdn.example.test/out-of-area-rates.json.gz?Signature=temporary",
+                "displayname": "out-of-area-rates.json.gz",
+            }
+        ],
+    }
+
+    catalog_entries = process_ptg.parse_toc_catalog_entries(
+        toc_payload_by_key,
+        "https://payer.example.test/employer-index.json",
+    )
+
+    assert [entry.source_type for entry in catalog_entries] == [
+        "table-of-contents",
+        "in-network",
+        "allowed-amounts",
+        "in-network",
+    ]
+    assert catalog_entries[1].description == "region-in-network-rates.json.gz"
+    assert catalog_entries[1].original_url.endswith("Signature=random-rx-oon-token")
+    assert catalog_entries[2].domain == process_ptg.PTG2_DOMAIN_ALLOWED_AMOUNT
+    assert catalog_entries[3].domain == process_ptg.PTG2_DOMAIN_IN_NETWORK
+
+
+def test_ptg2_toc_jobs_target_flat_carrier_file_lists(monkeypatch, tmp_path):
+    target_file_name = "region-target-in-network-rates.json.gz"
+    toc_document_path = tmp_path / "employer-index.json"
+    toc_document_path.write_text(
+        json.dumps(
+            {
+                "In-Network Negotiated Rates Files": [
+                    {
+                        "url": "https://cdn.example.test/unused-in-network-rates.json.gz",
+                        "displayname": "unused-in-network-rates.json.gz",
+                    },
+                    {
+                        "url": f"https://cdn.example.test/{target_file_name}?Signature=random-rx-oon-token",
+                        "displayname": target_file_name,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    pushed_file_rows = []
+
+    async def fake_materialize(*_args, **_kwargs):
+        toc_artifact = SimpleNamespace(logical_path=toc_document_path)
+        return toc_artifact, toc_artifact
+
+    async def fake_push_objects(file_rows, _model, **_kwargs):
+        pushed_file_rows.extend(file_rows)
+
+    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    selected_jobs = asyncio.run(
+        process_ptg._process_table_of_contents(
+            "https://payer.example.test/employer-index.json",
+            {"PTGFile": object, "ImportLog": object},
+            test_mode=False,
+            file_url_contains=[target_file_name],
+            max_files=1,
+        )
+    )
+
+    assert [job["type"] for job in selected_jobs] == ["in_network"]
+    assert selected_jobs[0]["url"] == (
+        f"https://cdn.example.test/{target_file_name}?Signature=random-rx-oon-token"
+    )
+    assert selected_jobs[0]["description"] == target_file_name
+    assert [file_row["file_type"] for file_row in pushed_file_rows] == [
+        "table-of-contents",
+        "in-network",
+    ]
+
+
 def test_ptg2_toc_parser_normalizes_asr_download_links():
     toc_map = {
         "reporting_entity_name": "ASR Health Benefits",
