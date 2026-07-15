@@ -164,9 +164,9 @@ async def test_get_pharmacy_market_context_returns_market(monkeypatch):
     )
 
     response = await reports.get_pharmacy_market_context(make_request(), "1518379601")
-    payload = json.loads(response.body)
-    assert payload["npi"] == 1518379601
-    assert payload["market"]["market_id"] == "city:TX:austin"
+    response_payload = json.loads(response.body)
+    assert response_payload["npi"] == 1518379601
+    assert response_payload["market"]["market_id"] == "city:TX:austin"
 
 
 @pytest.mark.asyncio
@@ -199,13 +199,13 @@ async def test_fetch_pharmacy_context_uses_legacy_address_table_by_default(monke
             )
 
     session = Session()
-    result = await reports._fetch_pharmacy_context(
+    pharmacy_context = await reports._fetch_pharmacy_context(
         session,
         npi=1518379601,
         as_of=reports.datetime.date(2026, 6, 14),
     )
 
-    assert result["npi"] == 1518379601
+    assert pharmacy_context["npi"] == 1518379601
     assert "FROM mrf.npi_address a" in session.sql
     assert "FROM mrf.entity_address_unified a" not in session.sql
 
@@ -244,13 +244,13 @@ async def test_fetch_pharmacy_context_uses_unified_address_table_by_default_when
             )
 
     session = Session()
-    result = await reports._fetch_pharmacy_context(
+    pharmacy_context = await reports._fetch_pharmacy_context(
         session,
         npi=1518379601,
         as_of=reports.datetime.date(2026, 6, 14),
     )
 
-    assert result["npi"] == 1518379601
+    assert pharmacy_context["npi"] == 1518379601
     assert "FROM mrf.entity_address_unified a" in session.sql
     assert "FROM mrf.npi_address a" not in session.sql
     assert "a.zip5 AS zip_code" in session.sql
@@ -261,7 +261,7 @@ async def test_query_market_summaries_avoids_count_query_when_data_present(monke
     monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
     monkeypatch.setattr(reports, "_build_market_sql", lambda **_: ("SELECT count", "SELECT data", {}))
 
-    row = {
+    market_summary = {
         "market_id": "city:TX:austin",
         "market_scope": "city",
         "market_name": "Austin",
@@ -292,10 +292,10 @@ async def test_query_market_summaries_avoids_count_query_when_data_present(monke
     class Session:
         async def execute(self, stmt, _params):
             if stmt.text == "SELECT data":
-                return _FakeMappingsResult([row])
+                return _FakeMappingsResult([market_summary])
             raise AssertionError("count query should not run when data rows are present")
 
-    total, items = await reports._query_market_summaries(
+    total, market_summaries = await reports._query_market_summaries(
         Session(),
         scope="city",
         sort="access_score",
@@ -306,7 +306,7 @@ async def test_query_market_summaries_avoids_count_query_when_data_present(monke
         offset=0,
     )
     assert total == 123
-    assert items and items[0]["market_id"] == "city:TX:austin"
+    assert market_summaries and market_summaries[0]["market_id"] == "city:TX:austin"
 
 
 @pytest.mark.asyncio
@@ -441,11 +441,13 @@ async def test_query_pharmacy_state_stats_normalizes_and_zero_fills_states(monke
                 ]
             )
 
-    rows, has_helper = await reports._query_pharmacy_state_stats(Session())
-    by_state = {row["state"]: row for row in rows}
+    state_summaries, has_helper = await reports._query_pharmacy_state_stats(Session())
+    by_state = {
+        state_summary["state"]: state_summary for state_summary in state_summaries
+    }
 
     assert has_helper is False
-    assert len(rows) == 51
+    assert len(state_summaries) == 51
     assert by_state["CA"]["nppes_pharmacies"] == 13
     assert by_state["CA"]["nppes_pharmacists"] == 24
     assert by_state["DC"]["active_pharmacies"] == 3

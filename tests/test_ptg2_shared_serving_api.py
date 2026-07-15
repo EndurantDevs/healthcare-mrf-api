@@ -587,24 +587,16 @@ async def test_forward_search_scopes_shared_layout_rows_to_each_logical_plan(
     ] == ["FFS", "FFS"]
 
 
-@pytest.mark.asyncio
-async def test_explicit_npi_search_reads_all_rows_before_provider_pagination(
-    monkeypatch,
-):
-    merge_rows = AsyncMock(return_value=[])
-    monkeypatch.setattr(ptg2_serving, "_merge_manifest_code_variant_rows", merge_rows)
-    provider_set_id = "03" * 16
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_ptg2_manifest_location_provider_matches",
-        AsyncMock(return_value=({provider_set_id}, {provider_set_id: []})),
+def _exact_npi_graph_scope():
+    return ptg2_serving._ExplicitNpiGraphScope(
+        1234567890,
+        ("04" * 16,),
+        (3,),
     )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_ptg2_manifest_provider_set_keys_for_ids",
-        AsyncMock(return_value={provider_set_id: 3}),
-    )
-    session = _Session(
+
+
+def _single_code_metadata_session():
+    return _Session(
         [
             {
                 "code_key": 7,
@@ -617,6 +609,108 @@ async def test_explicit_npi_search_reads_all_rows_before_provider_pagination(
             }
         ]
     )
+
+
+def _stub_exact_npi_graph(monkeypatch, provider_set_id):
+    match_provider_locations = AsyncMock(
+        return_value=(
+            {provider_set_id},
+            {
+                provider_set_id: [
+                    {"npi": 1234567890, "provider_name": "Selected provider"}
+                ]
+            },
+        )
+    )
+    expand_provider_members = AsyncMock(
+        side_effect=AssertionError("explicit NPI lookup must not expand all members")
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_version_three_explicit_npi_graph_scope",
+        AsyncMock(return_value=_exact_npi_graph_scope()),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_location_provider_matches",
+        match_provider_locations,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_provider_rows_for_provider_sets",
+        expand_provider_members,
+    )
+    return match_provider_locations, expand_provider_members
+
+
+def _stub_exact_npi_price_rows(monkeypatch, provider_set_id, price_set_id):
+    merge_code_rows = AsyncMock(
+        return_value=[
+            {
+                "serving_content_hash_128": "06" * 16,
+                "plan_id": "plan-a",
+                "plan_market_type": "group",
+                "reported_code_system": "CPT",
+                "reported_code": "99213",
+                "negotiation_arrangement": "FFS",
+                "provider_set_global_id_128": provider_set_id,
+                "provider_count": 50_000,
+                "price_set_global_id_128": price_set_id,
+                "price_key": 9,
+                "source_key": 0,
+                "network_names": [],
+                "_ptg_provider_set_key": 3,
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_merge_manifest_code_variant_rows",
+        merge_code_rows,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_hydrate_provider_set_network_names",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_prices_for_price_sets",
+        AsyncMock(return_value={price_set_id: [{"negotiated_rate": "125.00"}]}),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_procedure_details_for_rows",
+        AsyncMock(return_value={}),
+    )
+    return merge_code_rows
+
+
+@pytest.mark.asyncio
+async def test_explicit_npi_search_intersects_provider_sets_before_reading_rows(
+    monkeypatch,
+):
+    """Intersect exact NPI membership before decoding the by-code row blocks."""
+
+    merge_rows = AsyncMock(return_value=[])
+    monkeypatch.setattr(ptg2_serving, "_merge_manifest_code_variant_rows", merge_rows)
+    provider_set_id = "03" * 16
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_version_three_explicit_npi_graph_scope",
+        AsyncMock(return_value=_exact_npi_graph_scope()),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_location_provider_matches",
+        AsyncMock(return_value=({provider_set_id}, {provider_set_id: []})),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_provider_set_keys_for_ids",
+        AsyncMock(return_value={provider_set_id: 3}),
+    )
+    session = _single_code_metadata_session()
 
     response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
@@ -636,8 +730,50 @@ async def test_explicit_npi_search_reads_all_rows_before_provider_pagination(
 
     assert response is None
     merge_rows.assert_awaited_once()
+    assert merge_rows.await_args.kwargs["provider_set_keys"] == [3]
     assert merge_rows.await_args.kwargs["limit"] is None
     assert merge_rows.await_args.kwargs["offset"] == 0
+
+
+@pytest.mark.asyncio
+async def test_explicit_npi_search_does_not_expand_other_provider_set_members(
+    monkeypatch,
+):
+    """Keep exact NPI responses independent of broad provider-set cardinality."""
+
+    provider_set_id = "03" * 16
+    price_set_id = "05" * 16
+    merge_rows = _stub_exact_npi_price_rows(monkeypatch, provider_set_id, price_set_id)
+    location_matches, broad_rows = _stub_exact_npi_graph(
+        monkeypatch,
+        provider_set_id,
+    )
+    session = _single_code_metadata_session()
+
+    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "logical-plan-a",
+        {
+            "plan_id": "plan-a",
+            "plan_market_type": "group",
+            "code_system": "CPT",
+            "code": "99213",
+            "npi": "1234567890",
+            "negotiated_rate": "125.00",
+            "include_providers": True,
+        },
+        SimpleNamespace(limit=100, offset=0),
+        _strict_tables(snapshot_id="logical-plan-a", snapshot_key=41),
+        "exact_source",
+    )
+
+    assert response is not None
+    assert [provider_record["npi"] for provider_record in response["items"]] == [
+        1234567890
+    ]
+    assert merge_rows.await_args.kwargs["provider_set_keys"] == [3]
+    assert location_matches.await_args.kwargs["provider_set_keys"] == {3}
+    broad_rows.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -134,7 +134,7 @@ def test_wait_for_activity_chunks_emits_live_progress_and_fallback(monkeypatch):
     monkeypatch.setattr(module, "PARTD_CHUNK_STALL_SECONDS", 0)
     monkeypatch.setattr(module, "enqueue_live_progress", lambda **payload: events.append(payload))
 
-    rows, done_chunks = asyncio.run(
+    processed_row_count, done_chunks = asyncio.run(
         module._wait_for_activity_chunks(
             FakeRedis(),
             "run_partd",
@@ -143,7 +143,7 @@ def test_wait_for_activity_chunks_emits_live_progress_and_fallback(monkeypatch):
         )
     )
 
-    assert rows == 0
+    assert processed_row_count == 0
     assert done_chunks == set()
     assert [event["phase"] for event in events] == [
         "partd activity chunks running",
@@ -159,8 +159,8 @@ def test_wait_for_activity_chunks_emits_live_progress_and_fallback(monkeypatch):
 
 
 def test_process_activity_file_emits_byte_progress(tmp_path, monkeypatch):
-    source = tmp_path / "activity.csv"
-    source.write_text(
+    activity_path = tmp_path / "activity.csv"
+    activity_path.write_text(
         "NPI|Contract ID|Plan ID|Segment ID|Pharmacy Name|Pharmacy Retail\n"
         "1518379601|S1234|001|000|Test Pharmacy|Y\n"
         "1518379602|S1234|001|000|Other Pharmacy|Y\n",
@@ -179,7 +179,7 @@ def test_process_activity_file_emits_byte_progress(tmp_path, monkeypatch):
 
     accepted = asyncio.run(
         module._process_activity_file(
-            source,
+            activity_path,
             snapshot_id="quarterly:20260428:test",
             source_type="quarterly",
             default_date=datetime.date(2026, 4, 1),
@@ -192,8 +192,8 @@ def test_process_activity_file_emits_byte_progress(tmp_path, monkeypatch):
     assert progress
     assert progress[-1][0] == 2
     assert progress[-1][1] == 2
-    assert progress[-1][2] == source.stat().st_size
-    assert progress[-1][3] == source.stat().st_size
+    assert progress[-1][2] == activity_path.stat().st_size
+    assert progress[-1][3] == activity_path.stat().st_size
 
 
 def test_test_mode_skips_full_table_index_maintenance():
@@ -224,11 +224,11 @@ def test_materialize_pricing_snapshot_analyzes_stage_and_uses_single_aggregate(m
 def test_flush_batches_dedupes_exact_pricing_rows_before_copy(monkeypatch):
     captured: list[tuple[type, list[dict]]] = []
 
-    async def fake_push_objects(rows, model, **_kwargs):
-        captured.append((model, rows))
+    async def fake_push_objects(pricing_rows, model, **_kwargs):
+        captured.append((model, pricing_rows))
 
     monkeypatch.setattr(module, "push_objects", fake_push_objects)
-    row = {
+    pricing_row = {
         "snapshot_id": "monthly:20260520:test",
         "plan_id": "S1234001000",
         "year": 2026,
@@ -248,14 +248,19 @@ def test_flush_batches_dedupes_exact_pricing_rows_before_copy(monkeypatch):
         "effective_to": None,
         "source_type": "monthly",
     }
-    other_plan = dict(row, plan_id="S1234002000")
+    other_plan = dict(pricing_row, plan_id="S1234002000")
 
-    asyncio.run(module._flush_batches([], [dict(row), dict(row), other_plan]))
+    asyncio.run(
+        module._flush_batches(
+            [],
+            [dict(pricing_row), dict(pricing_row), other_plan],
+        )
+    )
 
     assert len(captured) == 1
-    model, rows = captured[0]
+    model, published_rows = captured[0]
     assert model is module.PartDMedicationCostStage
-    assert rows == [row, other_plan]
+    assert published_rows == [pricing_row, other_plan]
 
 
 def test_ensure_columns_adds_missing_columns(monkeypatch):

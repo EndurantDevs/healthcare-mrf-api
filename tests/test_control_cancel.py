@@ -66,7 +66,7 @@ async def test_control_single_job_start_marks_success(monkeypatch):
     monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
     monkeypatch.setattr(control_lifecycle, "import_module", lambda name: FakeModule if name == "fake.module" else None)
 
-    result = await control_single_job_start(
+    run_response = await control_single_job_start(
         {"redis": object()},
         {
             "run_id": "run_1",
@@ -76,9 +76,9 @@ async def test_control_single_job_start_marks_success(monkeypatch):
         },
     )
 
-    assert result["status"] == "succeeded"
+    assert run_response["status"] == "succeeded"
     assert calls[0][1] == {"test_mode": True, "run_id": "run_1"}
-    assert [item[1]["status"] for item in marks] == ["running", "succeeded"]
+    assert [mark_entry[1]["status"] for mark_entry in marks] == ["running", "succeeded"]
     assert live_contexts == [
         {
             "run_id": "run_1",
@@ -109,7 +109,7 @@ async def test_control_single_job_start_ignores_arq_metadata_kwargs(monkeypatch)
     monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
     monkeypatch.setattr(control_lifecycle, "import_module", lambda name: FakeModule if name == "fake.module" else None)
 
-    result = await control_single_job_start(
+    run_response = await control_single_job_start(
         {"redis": object()},
         {
             "run_id": "run_1",
@@ -120,9 +120,9 @@ async def test_control_single_job_start_ignores_arq_metadata_kwargs(monkeypatch)
         _max_tries=1,
     )
 
-    assert result["status"] == "succeeded"
+    assert run_response["status"] == "succeeded"
     assert calls[0][1] == {"test_mode": True, "run_id": "run_1"}
-    assert [item[1]["status"] for item in marks] == ["running", "succeeded"]
+    assert [mark_entry[1]["status"] for mark_entry in marks] == ["running", "succeeded"]
 
 
 @pytest.mark.asyncio
@@ -174,7 +174,7 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
     monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
     monkeypatch.setattr(control_lifecycle, "import_module", lambda name: FakeModule if name == "fake.module" else None)
 
-    result = await control_single_job_start(
+    run_response = await control_single_job_start(
         {"redis": object()},
         {
             "run_id": "run_1",
@@ -184,13 +184,13 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
         },
     )
 
-    assert result["status"] == "succeeded"
+    assert run_response["status"] == "succeeded"
     assert calls == [
         ("target", {"control_run_id": "run_1"}, {"run_id": "run_1"}),
         ("shutdown", {"control_run_id": "run_1", "run": 1}, None),
     ]
-    assert result["run_id"] == "run_1"
-    assert [item[1]["status"] for item in marks] == ["running", "succeeded"]
+    assert run_response["run_id"] == "run_1"
+    assert [mark_entry[1]["status"] for mark_entry in marks] == ["running", "succeeded"]
     terminal = marks[-1][1]
     assert terminal["metrics"]["rows"] == 123
     assert terminal["metrics"]["staged_rows"] == 123

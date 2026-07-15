@@ -72,10 +72,12 @@ def test_ensure_worker_starts_registered_burst_worker(monkeypatch, tmp_path):
     monkeypatch.setattr(control_workers, "_pid_running", lambda pid: pid == FakeProcess.pid)
     monkeypatch.setattr(control_workers, "_pid_matches_spec", lambda pid, spec: True)
 
-    result = control_workers.ensure_worker({"importer": "claims-pricing", "run_id": "run_1"})
+    worker_response = control_workers.ensure_worker(
+        {"importer": "claims-pricing", "run_id": "run_1"}
+    )
 
-    assert result["status"] == "started"
-    assert result["items"][0]["worker_class"] == "process.ClaimsPricing"
+    assert worker_response["status"] == "started"
+    assert worker_response["items"][0]["worker_class"] == "process.ClaimsPricing"
     assert captured["env"]["HLTHPRT_CONTROL_RUN_ID"] == "run_1"
     assert captured["start_new_session"] is True
 
@@ -201,11 +203,11 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
     monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
 
-    result = control_workers.ensure_worker(
+    worker_response = control_workers.ensure_worker(
         {"importer": "claims-pricing", "run_id": "run_123", "import_id": "import_123"}
     )
 
-    assert result["status"] == "started"
+    assert worker_response["status"] == "started"
     post = next(call for call in calls if call[0] == "POST")
     job = post[2]
     assert post[1] == "/apis/batch/v1/namespaces/healthporta-dev/jobs"
@@ -254,11 +256,11 @@ def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
     monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
 
-    result = control_workers.ensure_worker(
+    worker_response = control_workers.ensure_worker(
         {"importer": "ptg", "queue": "arq:PTGSmall", "worker_class": "process.PTGSmall", "run_id": "run_ptg"}
     )
 
-    assert result["status"] == "started"
+    assert worker_response["status"] == "started"
     job = next(call[2] for call in calls if call[0] == "POST")
     container = job["spec"]["template"]["spec"]["containers"][0]
     assert container["resources"] == {
@@ -266,7 +268,10 @@ def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
         "limits": {"cpu": "4", "memory": "8Gi"},
     }
     assert container["command"][-2:] == ["worker-once", "process.PTGSmall"]
-    env = {item["name"]: item["value"] for item in container["env"]}
+    env = {
+        environment_entry["name"]: environment_entry["value"]
+        for environment_entry in container["env"]
+    }
     assert env["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:PTGSmall"
     assert env["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
     assert env["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "ptg_start_run_ptg"
@@ -296,9 +301,11 @@ def test_kubernetes_start_worker_replicas_use_parallel_job(monkeypatch):
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
     monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
 
-    result = control_workers.ensure_worker({"importer": "mrf", "run_id": "run_mrf"})
+    worker_response = control_workers.ensure_worker(
+        {"importer": "mrf", "run_id": "run_mrf"}
+    )
 
-    assert result["status"] == "started"
+    assert worker_response["status"] == "started"
     post = next(call for call in calls if call[0] == "POST")
     job = post[2]
     assert job["spec"]["parallelism"] == 16
@@ -331,9 +338,11 @@ def test_kubernetes_start_worker_replicas_do_not_apply_to_finish(monkeypatch):
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
     monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
 
-    result = control_workers.ensure_worker({"importer": "mrf", "run_id": "run_mrf", "status": "finalizing"})
+    worker_response = control_workers.ensure_worker(
+        {"importer": "mrf", "run_id": "run_mrf", "status": "finalizing"}
+    )
 
-    assert result["status"] == "started"
+    assert worker_response["status"] == "started"
     post = next(call for call in calls if call[0] == "POST")
     job = post[2]
     assert "parallelism" not in job["spec"]
@@ -377,9 +386,11 @@ def test_kubernetes_completed_start_job_promotes_running_import_to_finish(monkey
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
     monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
 
-    result = control_workers.ensure_worker({"importer": "mrf", "run_id": "run_mrf", "status": "running"})
+    worker_response = control_workers.ensure_worker(
+        {"importer": "mrf", "run_id": "run_mrf", "status": "running"}
+    )
 
-    assert result["status"] == "started"
+    assert worker_response["status"] == "started"
     post = next(call for call in calls if call[0] == "POST")
     job = post[2]
     assert "parallelism" not in job["spec"]

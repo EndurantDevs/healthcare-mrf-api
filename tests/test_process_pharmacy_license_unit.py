@@ -159,8 +159,12 @@ def test_normalize_stage_row_drops_missing_npi():
 
 
 def test_normalize_stage_row_maps_interesting_fields():
-    source = pharmacy_license.StateSource(state_code="TX", state_name="Texas", board_url="https://example.com/tx")
-    row = {
+    state_source = pharmacy_license.StateSource(
+        state_code="TX",
+        state_name="Texas",
+        board_url="https://example.com/tx",
+    )
+    license_fields = {
         "NPI": "1518379601",
         "License Number": "TX-PH-00001",
         "License Type": "Pharmacy",
@@ -178,22 +182,22 @@ def test_normalize_stage_row_maps_interesting_fields():
         "Last Updated": "2026-02-15",
     }
 
-    payload, reason = pharmacy_license._normalize_stage_row(
-        row,
+    stage_payload, reason = pharmacy_license._normalize_stage_row(
+        license_fields,
         run_id="run_1",
         snapshot_id="snap_1",
-        state_source=source,
+        state_source=state_source,
         source_url="https://example.com/feed.csv",
         imported_at=datetime.datetime(2026, 3, 10, 0, 0, 0),
     )
 
     assert reason is None
-    assert payload is not None
-    assert payload["npi"] == 1518379601
-    assert payload["license_number"] == "TX-PH-00001"
-    assert payload["license_status"] == "active"
-    assert payload["license_expiration_date"].isoformat() == "2027-01-31"
-    assert payload["state_code"] == "TX"
+    assert stage_payload is not None
+    assert stage_payload["npi"] == 1518379601
+    assert stage_payload["license_number"] == "TX-PH-00001"
+    assert stage_payload["license_status"] == "active"
+    assert stage_payload["license_expiration_date"].isoformat() == "2027-01-31"
+    assert stage_payload["state_code"] == "TX"
 
 
 def test_extract_candidate_file_links_filters_noise():
@@ -231,14 +235,14 @@ def test_parse_datagrid_rows_handles_nested_aspnet_cells():
     </table>
     """
 
-    rows = pharmacy_license._parse_datagrid_rows(html)
+    parsed_rows = pharmacy_license._parse_datagrid_rows(html)
 
-    assert len(rows) == 1
-    assert rows[0]["Name"] == "2200 PHARMACY INC"
-    assert rows[0]["License #"] == "60002818A"
-    assert rows[0]["Address"] == "GARY IN 46404"
+    assert len(parsed_rows) == 1
+    assert parsed_rows[0]["Name"] == "2200 PHARMACY INC"
+    assert parsed_rows[0]["License #"] == "60002818A"
+    assert parsed_rows[0]["Address"] == "GARY IN 46404"
 
-    hydrated = pharmacy_license._hydrate_row_with_address_parts(rows[0])
+    hydrated = pharmacy_license._hydrate_row_with_address_parts(parsed_rows[0])
     assert hydrated["City"] == "GARY"
     assert hydrated["State"] == "IN"
     assert hydrated["Zip"] == "46404"

@@ -121,10 +121,13 @@ async def test_v3_exact_npi_graph_filters_code_before_location_scan(monkeypatch)
     rate_scope_probe = AsyncMock(return_value=rate_scope)
     location_rows = [{"npi": 1234567890}]
     projected_result = ({"provider-set"}, {"provider-set": location_rows})
+    explicit_scope_probe = AsyncMock(
+        side_effect=AssertionError("precomputed NPI scope must not be resolved twice")
+    )
     monkeypatch.setattr(
         ptg2_serving,
         "_version_three_explicit_npi_graph_scope",
-        AsyncMock(return_value=explicit_scope),
+        explicit_scope_probe,
     )
     monkeypatch.setattr(
         ptg2_serving,
@@ -159,10 +162,12 @@ async def test_v3_exact_npi_graph_filters_code_before_location_scan(monkeypatch)
         {"npi": "1234567890", "code": "99213", "code_system": "CPT"},
         candidate_limit=5,
         plan_id="plan",
+        explicit_npi_scope=explicit_scope,
     )
 
     assert graph_result == projected_result
     assert rate_scope_probe.await_args.kwargs["provider_set_keys"] == (3,)
+    explicit_scope_probe.assert_not_awaited()
 
 
 @pytest.mark.asyncio

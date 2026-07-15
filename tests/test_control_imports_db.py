@@ -257,8 +257,8 @@ async def test_duplicate_idempotency_key_uses_real_partial_unique_index(monkeypa
 
         assert third_created is True
         assert third["run_id"] == "run_after_terminal"
-        rows = (await db.execute(select(ImportRun).order_by(ImportRun.run_id))).scalars().all()
-        assert [row.run_id for row in rows] == ["run_after_terminal", "run_first"]
+        import_runs = (await db.execute(select(ImportRun).order_by(ImportRun.run_id))).scalars().all()
+        assert [import_run.run_id for import_run in import_runs] == ["run_after_terminal", "run_first"]
     finally:
         await _drop_import_run_schema()
 
@@ -290,13 +290,13 @@ async def test_terminal_status_write_does_not_clobber_canceling_run():
             metrics={"rows": 10},
         )
 
-        row = (
+        stored_run = (
             await db.execute(select(ImportRun).where(ImportRun.run_id == "run_canceling"))
         ).scalar_one()
-        assert row.status == "canceling"
-        assert row.phase_detail == "cancel requested"
-        assert row.metrics == {"cancel_signal": {"redis": True}}
-        assert row.finished_at is None
+        assert stored_run.status == "canceling"
+        assert stored_run.phase_detail == "cancel requested"
+        assert stored_run.metrics == {"cancel_signal": {"redis": True}}
+        assert stored_run.finished_at is None
     finally:
         await _drop_import_run_schema()
 
@@ -331,10 +331,12 @@ async def test_running_status_clears_previous_finished_at(monkeypatch):
             progress_message="running",
         )
 
-        row = (await db.execute(select(ImportRun).where(ImportRun.run_id == "run_retry"))).scalar_one()
-        assert row.status == "running"
-        assert row.phase_detail == "ptg import running"
-        assert row.finished_at is None
-        assert row.error is None
+        stored_run = (
+            await db.execute(select(ImportRun).where(ImportRun.run_id == "run_retry"))
+        ).scalar_one()
+        assert stored_run.status == "running"
+        assert stored_run.phase_detail == "ptg import running"
+        assert stored_run.finished_at is None
+        assert stored_run.error is None
     finally:
         await _drop_import_run_schema()

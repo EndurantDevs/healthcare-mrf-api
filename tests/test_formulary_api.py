@@ -87,14 +87,14 @@ async def test_list_formularies_returns_rows():
     )
 
     response = await formulary.list_formularies(request)
-    data = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert data["total"] == 2
-    assert data["limit"] == 10
-    assert data["offset"] == 0
-    assert data["items"][0]["formulary_id"] == "PLAN123:2025"
-    assert data["items"][0]["formulary_uri"] == "PLAN123/2025"
-    assert data["items"][0]["issuer"]["issuer_name"] == "Issuer One"
+    assert response_payload["total"] == 2
+    assert response_payload["limit"] == 10
+    assert response_payload["offset"] == 0
+    assert response_payload["items"][0]["formulary_id"] == "PLAN123:2025"
+    assert response_payload["items"][0]["formulary_uri"] == "PLAN123/2025"
+    assert response_payload["items"][0]["issuer"]["issuer_name"] == "Issuer One"
 
 
 @pytest.mark.asyncio
@@ -123,13 +123,13 @@ async def test_get_formulary_returns_detail():
     )
 
     response = await formulary.get_formulary(request, "PLAN123:2025")
-    data = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert data["plan"]["plan_id"] == "PLAN123"
-    assert data["formulary_uri"] == "PLAN123/2025"
-    assert data["drug_count"] == 42
-    assert data["available_tiers"][0]["tier_slug"] == "tier_1"
-    assert data["available_pharmacy_types"] == ["MAIL_ORDER", "RETAIL"]
+    assert response_payload["plan"]["plan_id"] == "PLAN123"
+    assert response_payload["formulary_uri"] == "PLAN123/2025"
+    assert response_payload["drug_count"] == 42
+    assert response_payload["available_tiers"][0]["tier_slug"] == "tier_1"
+    assert response_payload["available_pharmacy_types"] == ["MAIL_ORDER", "RETAIL"]
 
 
 @pytest.mark.asyncio
@@ -189,15 +189,15 @@ async def test_list_formulary_drugs_respects_filters():
     )
 
     response = await formulary.list_formulary_drugs(request, "PLAN123:2025")
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert payload["total"] == 3
-    assert payload["limit"] == 5
-    assert payload["offset"] == 0
-    assert payload["items"][0]["rxnorm_id"] == "12345"
-    assert payload["items"][0]["drug_tier_slug"] == "tier_1"
-    assert payload["available_pharmacy_types"] == ["MAIL_ORDER", "RETAIL"]
-    assert payload["formulary_uri"] == "PLAN123/2025"
+    assert response_payload["total"] == 3
+    assert response_payload["limit"] == 5
+    assert response_payload["offset"] == 0
+    assert response_payload["items"][0]["rxnorm_id"] == "12345"
+    assert response_payload["items"][0]["drug_tier_slug"] == "tier_1"
+    assert response_payload["available_pharmacy_types"] == ["MAIL_ORDER", "RETAIL"]
+    assert response_payload["formulary_uri"] == "PLAN123/2025"
 
 
 @pytest.mark.asyncio
@@ -321,13 +321,13 @@ async def test_check_plan_drug_without_year_uses_latest():
     )
 
     response = await formulary.check_plan_drug(request, "PLAN123", "12345")
-    data = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert data["covered"] is True
-    assert data["year"] == 2026
-    assert data["details"]["drug_tier"] == "Tier 1"
-    assert data["details"]["drug_tier_slug"] == "tier_1"
-    assert data["formulary_uri"] == "PLAN123/2026"
+    assert response_payload["covered"] is True
+    assert response_payload["year"] == 2026
+    assert response_payload["details"]["drug_tier"] == "Tier 1"
+    assert response_payload["details"]["drug_tier_slug"] == "tier_1"
+    assert response_payload["formulary_uri"] == "PLAN123/2026"
 
 
 @pytest.mark.asyncio
