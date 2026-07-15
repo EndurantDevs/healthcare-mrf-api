@@ -307,21 +307,21 @@ def _ptg2_auto_address_refresh_payload(
     import_run_id: str,
     test_mode: bool,
 ) -> dict[str, Any]:
-    params: dict[str, Any] = {
+    params_by_name: dict[str, Any] = {
         "refresh_mode": "full",
         "trigger_source_key": source_key,
         "trigger_snapshot_id": snapshot_id,
         "publish": _env_bool(PTG2_AUTO_ADDRESS_REFRESH_PUBLISH_ENV, True),
     }
     if test_mode:
-        params["test_mode"] = True
+        params_by_name["test_mode"] = True
     limit_per_source = max(_env_int(PTG2_AUTO_ADDRESS_REFRESH_LIMIT_ENV, 0), 0)
     if limit_per_source:
-        params["limit_per_source"] = limit_per_source
+        params_by_name["limit_per_source"] = limit_per_source
     return {
         "run_id": None,
         "importer": "entity-address-unified",
-        "params": params,
+        "params": params_by_name,
         "idempotency_key": f"entity-address-unified:{source_key}:{snapshot_id}",
         "triggered_by": "ptg_import",
         "schedule_id": None,
@@ -348,7 +348,7 @@ async def _enqueue_ptg2_auto_address_refresh_after_import(
     enabled, reason = _ptg2_auto_address_refresh_enabled(test_mode=test_mode)
     if not enabled:
         return {"status": "skipped", "reason": reason}
-    payload = _ptg2_auto_address_refresh_payload(
+    refresh_request = _ptg2_auto_address_refresh_payload(
         source_key=source_key,
         snapshot_id=snapshot_id,
         import_run_id=import_run_id,
@@ -358,22 +358,22 @@ async def _enqueue_ptg2_auto_address_refresh_after_import(
         from api.control_imports import create_import_run, ensure_import_run_table
 
         await ensure_import_run_table()
-        run, created = await create_import_run(payload)
+        run, created = await create_import_run(refresh_request)
         return {
             "status": "queued" if created else "existing",
             "created": bool(created),
             "run_id": run.get("run_id"),
-            "importer": run.get("importer") or payload["importer"],
-            "idempotency_key": payload["idempotency_key"],
-            "params": payload["params"],
+            "importer": run.get("importer") or refresh_request["importer"],
+            "idempotency_key": refresh_request["idempotency_key"],
+            "params": refresh_request["params"],
         }
     except Exception as exc:
         logger.exception("Failed to enqueue pricing address refresh after PTG import %s", import_run_id)
         return {
             "status": "enqueue_failed",
             "error": str(exc),
-            "idempotency_key": payload["idempotency_key"],
-            "params": payload["params"],
+            "idempotency_key": refresh_request["idempotency_key"],
+            "params": refresh_request["params"],
         }
 
 
@@ -500,7 +500,7 @@ def _ptg2_copy_file_row_count(path: Path) -> int:
 def _collect_ptg2_manifest_sidecar_artifacts(
     sidecar_paths: dict[str, Path | None],
 ) -> dict[str, dict[str, Any]]:
-    artifacts: dict[str, dict[str, Any]] = {}
+    artifacts_by_kind: dict[str, dict[str, Any]] = {}
     for artifact_kind, artifact_path in sidecar_paths.items():
         if (
             artifact_path is None
@@ -513,7 +513,7 @@ def _collect_ptg2_manifest_sidecar_artifacts(
         with artifact_path.open("rb") as artifact_fp:
             if artifact_fp.read(8) == b"PTG2MNDS":
                 record_format = PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
-        artifacts[artifact_kind] = {
+        artifacts_by_kind[artifact_kind] = {
             "name": artifact_kind,
             "path": str(artifact_path),
             "record_format": record_format,
@@ -521,7 +521,7 @@ def _collect_ptg2_manifest_sidecar_artifacts(
             "byte_count": byte_count,
             **membership_index_fence_metadata(artifact_path),
         }
-    return artifacts
+    return artifacts_by_kind
 
 
 def _ptg2_existing_manifest_copy_paths(input_paths: list[Path]) -> list[Path]:
@@ -827,11 +827,11 @@ def _cleanup_strict_v3_graph_artifacts(artifacts: Mapping[str, Any]) -> None:
 async def _cancel_and_wait_tasks(tasks: set[asyncio.Task[Any]]) -> None:
     """Cancel child work and wait until it can no longer use import inputs."""
 
-    remaining = tuple(tasks)
-    for task in remaining:
+    remaining_tasks = tuple(tasks)
+    for task in remaining_tasks:
         task.cancel()
-    if remaining:
-        await asyncio.gather(*remaining, return_exceptions=True)
+    if remaining_tasks:
+        await asyncio.gather(*remaining_tasks, return_exceptions=True)
     tasks.clear()
 
 
@@ -1087,12 +1087,18 @@ async def _parse_strict_v3_file(
     v3_serving_run_directory = Path(
         tempfile.mkdtemp(prefix="ptg2-v3-runs-", dir=copy_tmp_dir)
     )
-    manifest_artifact_dir = resolve_ptg2_artifact_dir() / "serving" / _ptg2_snapshot_table_token(
-        str(plan_fields.get("plan_id") or "plan"),
-        snapshot_id,
-    )
-    manifest_artifact_dir.mkdir(parents=True, exist_ok=True)
     manifest_file_token = hashlib.sha256(str(Path(file_path).resolve()).encode("utf-8")).hexdigest()[:16]
+    manifest_artifact_parent = resolve_ptg2_artifact_dir() / "serving"
+    manifest_artifact_parent.mkdir(parents=True, exist_ok=True)
+    manifest_artifact_dir = Path(
+        tempfile.mkdtemp(
+            prefix=(
+                f"{_ptg2_snapshot_table_token(str(plan_fields.get('plan_id') or 'plan'), snapshot_id)}-"
+                f"{manifest_file_token}-"
+            ),
+            dir=manifest_artifact_parent,
+        )
+    )
     manifest_sidecar_paths_by_kind = {
         "provider_forward": manifest_artifact_dir
         / f"provider_forward_{manifest_file_token}.ptg2sc",
@@ -1454,7 +1460,7 @@ async def _process_table_of_contents(
         if catalog_rows:
             await _push_ptg2_objects(catalog_rows, PTG2SourceCatalog, rewrite=True)
 
-    toc_meta = {
+    toc_metadata_by_field = {
         "reporting_entity_name": toc_content.get("reporting_entity_name"),
         "reporting_entity_type": toc_content.get("reporting_entity_type"),
         "last_updated_on": toc_content.get("last_updated_on"),
@@ -1464,7 +1470,7 @@ async def _process_table_of_contents(
         _build_file_row(
             toc_url,
             "table-of-contents",
-            toc_meta,
+            toc_metadata_by_field,
             None,
             toc_content.get("description"),
             None,
@@ -1483,7 +1489,7 @@ async def _process_table_of_contents(
             location = normalize_tic_source_url(catalog_entry.original_url)
             if not _is_requested_toc_body_file_url(location, file_url_match_tokens):
                 continue
-            meta = {
+            file_metadata_by_field = {
                 "reporting_entity_name": catalog_entry.reporting_entity_name,
                 "reporting_entity_type": catalog_entry.reporting_entity_type,
             }
@@ -1491,7 +1497,7 @@ async def _process_table_of_contents(
             file_row = _build_file_row(
                 location,
                 file_type,
-                meta,
+                file_metadata_by_field,
                 plans,
                 catalog_entry.description,
                 catalog_entry.from_index_url or toc_url,
@@ -1506,7 +1512,7 @@ async def _process_table_of_contents(
                     "description": catalog_entry.description,
                     "plan_info": plans,
                     "from_index_url": catalog_entry.from_index_url or toc_url,
-                    "meta": meta,
+                    "meta": file_metadata_by_field,
                 }
             )
             if test_mode and len(jobs) >= TEST_TOC_JOBS:
@@ -1524,7 +1530,9 @@ async def _process_table_of_contents(
         if not plans:
             continue
         in_network_files = [
-            item for item in _as_list(structure.get("in_network_files")) if isinstance(item, dict)
+            file_entry
+            for file_entry in _as_list(structure.get("in_network_files"))
+            if isinstance(file_entry, dict)
         ]
         for entry in in_network_files:
             location = entry.get("location")
@@ -1533,8 +1541,15 @@ async def _process_table_of_contents(
             location = normalize_tic_source_url(location)
             if not _is_requested_toc_body_file_url(location, file_url_match_tokens):
                 continue
-            meta = dict(toc_meta)
-            file_row = _build_file_row(location, "in-network", meta, plans, entry.get("description"), toc_url)
+            file_metadata_by_field = dict(toc_metadata_by_field)
+            file_row = _build_file_row(
+                location,
+                "in-network",
+                file_metadata_by_field,
+                plans,
+                entry.get("description"),
+                toc_url,
+            )
             if file_row["file_id"] not in seen_files:
                 file_rows.append(file_row)
                 seen_files.add(file_row["file_id"])
@@ -1545,7 +1560,7 @@ async def _process_table_of_contents(
                     "description": entry.get("description"),
                     "plan_info": plans,
                     "from_index_url": toc_url,
-                    "meta": meta,
+                    "meta": file_metadata_by_field,
                 }
             )
             if test_mode and len(jobs) >= TEST_TOC_JOBS:
@@ -1562,7 +1577,7 @@ async def _process_table_of_contents(
     return jobs
 
 
-def _looks_tic_toc_json_text(text: str) -> bool:
+def _is_tic_toc_json_text(text: str) -> bool:
     normalized = str(text or "").lower()
     return (
         '"reporting_structure"' in normalized
@@ -1576,22 +1591,22 @@ def _looks_tic_toc_json_text(text: str) -> bool:
 
 
 def _repair_missing_array_object_commas(text: str) -> str:
-    repaired: list[str] = []
-    in_string = False
-    escaped = False
+    repaired_chars: list[str] = []
+    is_in_string = False
+    is_escaped = False
     length = len(text)
     for idx, char in enumerate(text):
-        repaired.append(char)
-        if in_string:
-            if escaped:
-                escaped = False
+        repaired_chars.append(char)
+        if is_in_string:
+            if is_escaped:
+                is_escaped = False
             elif char == "\\":
-                escaped = True
+                is_escaped = True
             elif char == '"':
-                in_string = False
+                is_in_string = False
             continue
         if char == '"':
-            in_string = True
+            is_in_string = True
             continue
         if char != "}":
             continue
@@ -1599,8 +1614,8 @@ def _repair_missing_array_object_commas(text: str) -> str:
         while lookahead < length and text[lookahead].isspace():
             lookahead += 1
         if lookahead < length and text[lookahead] == "{":
-            repaired.append(",")
-    return "".join(repaired)
+            repaired_chars.append(",")
+    return "".join(repaired_chars)
 
 
 def _load_table_of_contents_artifact(path: str | Path) -> dict[str, Any]:
@@ -1610,7 +1625,7 @@ def _load_table_of_contents_artifact(path: str | Path) -> dict[str, Any]:
         with open_json_artifact_stream(path) as fp:
             raw = fp.read()
         text = raw.decode("utf-8", errors="replace")
-        if not _looks_tic_toc_json_text(text):
+        if not _is_tic_toc_json_text(text):
             raise
         toc = json.loads(_repair_missing_array_object_commas(text))
     if not isinstance(toc, dict):
@@ -1740,25 +1755,25 @@ async def _process_in_network_file(
             source_network_names=source_network_name_values,
         )
     if not test_mode and int((parse_summary or {}).get("serving_rates") or 0) <= 0:
-        no_data_summary = dict(parse_summary or {})
-        no_data_summary["skipped_reason"] = "parsed zero serving rates"
-        no_data_summary.update(_source_version_summary(source_version))
+        no_data_summary_by_field = dict(parse_summary or {})
+        no_data_summary_by_field["skipped_reason"] = "parsed zero serving rates"
+        no_data_summary_by_field.update(_source_version_summary(source_version))
         return PTG2FileProcessResult(
             "in_network",
             url,
             True,
             file_id=file_record_map["file_id"],
-            summary=no_data_summary,
+            summary=no_data_summary_by_field,
             skipped=True,
         )
-    summary_payload = dict(parse_summary or {})
-    summary_payload.update(_source_version_summary(source_version))
+    summary_by_field = dict(parse_summary or {})
+    summary_by_field.update(_source_version_summary(source_version))
     return PTG2FileProcessResult(
         "in_network",
         url,
         True,
         file_id=file_record_map["file_id"],
-        summary=summary_payload,
+        summary=summary_by_field,
     )
 
 
@@ -1777,7 +1792,7 @@ async def _persist_completed_ptg2_import_run(
     """Persist completion only after every required import stage has finished."""
 
     provisional_finished_at = _utcnow()
-    provisional_report = {
+    provisional_report_by_field = {
         **report_payload,
         "timings": dict(timing_payload),
         "timing_contract": {
@@ -1795,7 +1810,7 @@ async def _persist_completed_ptg2_import_run(
                 "finished_at": provisional_finished_at,
                 "heartbeat_at": provisional_finished_at,
                 "options": dict(options),
-                "report": provisional_report,
+                "report": provisional_report_by_field,
                 "error": None,
             }
         ],
@@ -1805,8 +1820,8 @@ async def _persist_completed_ptg2_import_run(
     post_publish_stage_timer.mark("run_state_persistence")
 
     completed_monotonic = _ptg2_monotonic()
-    for key, value in post_publish_stage_timer.durations_by_stage.items():
-        timing_payload[f"post_publish_{key}_seconds"] = value
+    for key, stage_seconds in post_publish_stage_timer.durations_by_stage.items():
+        timing_payload[f"post_publish_{key}_seconds"] = stage_seconds
     timing_payload["post_publish_seconds"] = (
         completed_monotonic - post_publish_started_monotonic
     )
@@ -1893,11 +1908,11 @@ async def _mark_ptg2_import_failed(
     """Persist failed import state and return its report, or None on persistence failure."""
     finished = _utcnow()
     error_text = str(error)
-    report_payload = dict(report or {})
-    report_payload.setdefault("snapshot_id", snapshot_id)
-    timing_payload = dict(report_payload.get("timings") or {})
-    timing_payload.pop("total_seconds", None)
-    report_payload["timings"] = timing_payload
+    report_by_field = dict(report or {})
+    report_by_field.setdefault("snapshot_id", snapshot_id)
+    timing_by_metric = dict(report_by_field.get("timings") or {})
+    timing_by_metric.pop("total_seconds", None)
+    report_by_field["timings"] = timing_by_metric
     persistence_started_monotonic = _ptg2_monotonic()
     try:
         if not should_preserve_published_snapshot:
@@ -1913,7 +1928,7 @@ async def _mark_ptg2_import_failed(
                         "published_at": None,
                         "previous_snapshot_id": None,
                         "manifest": {
-                            **report_payload,
+                            **report_by_field,
                             "error": error_text,
                         },
                     }
@@ -1932,7 +1947,7 @@ async def _mark_ptg2_import_failed(
                     "heartbeat_at": finished,
                     "options": dict(options or {}),
                     "report": {
-                        **report_payload,
+                        **report_by_field,
                         "timing_contract": {
                             "version": 2,
                             "completion_metrics_pending": True,
@@ -1946,18 +1961,18 @@ async def _mark_ptg2_import_failed(
         )
         persisted_monotonic = _ptg2_monotonic()
         if import_started_monotonic is not None:
-            timing_payload["failure_state_persistence_seconds"] = (
+            timing_by_metric["failure_state_persistence_seconds"] = (
                 persisted_monotonic - persistence_started_monotonic
             )
             if failure_handling_started_monotonic is not None:
-                timing_payload["failure_handling_seconds"] = (
+                timing_by_metric["failure_handling_seconds"] = (
                     persisted_monotonic - failure_handling_started_monotonic
                 )
-            timing_payload["total_seconds"] = (
+            timing_by_metric["total_seconds"] = (
                 persisted_monotonic - import_started_monotonic
             )
-            report_payload["timings"] = timing_payload
-            report_payload["timing_contract"] = {
+            report_by_field["timings"] = timing_by_metric
+            report_by_field["timing_contract"] = {
                 "version": 2,
                 "total_boundary": "after_required_failure_state_persistence",
                 "completion_metrics_write_excluded": True,
@@ -1973,14 +1988,14 @@ async def _mark_ptg2_import_failed(
                         "finished_at": finished,
                         "heartbeat_at": finished,
                         "options": dict(options or {}),
-                        "report": report_payload,
+                        "report": report_by_field,
                         "error": error_text,
                     }
                 ],
                 PTG2ImportRun,
                 rewrite=True,
             )
-        return report_payload
+        return report_by_field
     except Exception as mark_exc:
         logger.error("Failed to mark PTG2 import %s as failed: %s", import_run_id, mark_exc)
         return None
@@ -2067,7 +2082,7 @@ def _source_version_summary(source_version: PTG2SourceVersion | None) -> dict[st
 
 def _ptg2_source_file_versions_from_results(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     versions: list[dict[str, Any]] = []
-    seen: set[tuple[str | None, str | None]] = set()
+    seen_version_keys: set[tuple[str | None, str | None]] = set()
     for file_result in files:
         summary = (
             file_result.get("summary")
@@ -2079,9 +2094,9 @@ def _ptg2_source_file_versions_from_results(files: list[dict[str, Any]]) -> list
         if not version_id and not identity_hash:
             continue
         key = (str(version_id) if version_id else None, str(identity_hash) if identity_hash else None)
-        if key in seen:
+        if key in seen_version_keys:
             continue
-        seen.add(key)
+        seen_version_keys.add(key)
         versions.append(
             {
                 "source_type": file_result.get("source_type"),
@@ -2103,12 +2118,12 @@ def _ptg2_source_file_versions_from_results(files: list[dict[str, Any]]) -> list
 
 def _normalize_source_network_names(value: Any) -> list[str]:
     names: list[str] = []
-    seen: set[str] = set()
+    seen_names: set[str] = set()
     for raw_value in _as_list(value):
         name = str(raw_value or "").strip()
-        if not name or name in seen:
+        if not name or name in seen_names:
             continue
-        seen.add(name)
+        seen_names.add(name)
         names.append(name)
     return names
 
@@ -2771,7 +2786,7 @@ async def _publish_reused_shared_v3_snapshot(
     manifest_stage_table: str | None,
     test_mode: bool,
     import_started_monotonic: float,
-    candidate_stage_state: dict[str, bool] | None = None,
+    candidate_stage_flags_by_name: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """Publish a logical snapshot binding without rescanning identical content."""
 
@@ -2868,9 +2883,9 @@ async def _publish_reused_shared_v3_snapshot(
         logical_snapshot_id=snapshot_id,
     )
     post_publish_started_monotonic = _ptg2_monotonic()
-    post_publish_stage_timings: dict[str, float] = {}
+    post_publish_seconds_by_stage: dict[str, float] = {}
     post_publish_stage_timer = _StageTimer(
-        post_publish_stage_timings,
+        post_publish_seconds_by_stage,
         post_publish_started_monotonic,
     )
     validated_at = _utcnow()
@@ -2920,9 +2935,9 @@ async def _publish_reused_shared_v3_snapshot(
         coverage_plan_id=coverage_plan_id,
         coverage_plan_market_type=coverage_plan_market_type,
     )
-    if candidate_stage_state is not None:
-        candidate_stage_state["staged"] = True
-    candidate_attributes = dict(candidate_result["candidate_attributes"])
+    if candidate_stage_flags_by_name is not None:
+        candidate_stage_flags_by_name["staged"] = True
+    candidate_attributes_by_field = dict(candidate_result["candidate_attributes"])
     auto_activate = bool(options.get("auto_activate_candidates", False))
     if auto_activate:
         activated_at = _utcnow()
@@ -2933,7 +2948,7 @@ async def _publish_reused_shared_v3_snapshot(
             import_month=import_month,
             updated_at=activated_at,
             snapshot_attributes=activated_snapshot_attributes(
-                candidate_attributes,
+                candidate_attributes_by_field,
                 activated_at=activated_at,
                 activation_mode="automatic",
             ),
@@ -3080,7 +3095,7 @@ async def _main_with_artifact_lease(
         key=str.casefold,
     )
     auto_activate_candidates = _ptg2_auto_activate_candidates()
-    options_payload = {
+    options_by_name = {
         "toc_urls": toc_urls or [],
         "toc_list": toc_list,
         "in_network_url": in_network_url,
@@ -3122,7 +3137,7 @@ async def _main_with_artifact_lease(
     snapshot_id = _ptg2_deterministic_snapshot_id(
         import_month=import_month_value,
         import_id=import_id_val,
-        option_by_name=options_payload,
+        option_by_name=options_by_name,
     )
     live_run_id = str(control_run_id or "").strip()
     live_token = set_live_progress_context(
@@ -3131,8 +3146,8 @@ async def _main_with_artifact_lease(
         snapshot_id=snapshot_id,
         import_run_id=import_run_id,
     )
-    setup_stage_timings: dict[str, float] = {}
-    setup_stage_timer = _StageTimer(setup_stage_timings, import_started_monotonic)
+    setup_seconds_by_stage: dict[str, float] = {}
+    setup_stage_timer = _StageTimer(setup_seconds_by_stage, import_started_monotonic)
     pending_strict_v3 = _PendingStrictV3State({}, {})
 
     # Enforce a streaming size cap on every caller-supplied URL (never None for
@@ -3272,7 +3287,7 @@ async def _main_with_artifact_lease(
             f"Refusing PTG snapshot claim for {snapshot_id}: existing status is "
             f"{existing_status}"
         )
-    failure_report: dict[str, Any] = {"snapshot_id": snapshot_id, "legacy_table_suffix": import_id_val}
+    failure_report_by_field: dict[str, Any] = {"snapshot_id": snapshot_id, "legacy_table_suffix": import_id_val}
     ptg2_manifest_stage_table: str | None = None
     ptg2_import_heartbeat_task: asyncio.Task[Any] | None = None
     shared_layout_reservation = None
@@ -3281,8 +3296,8 @@ async def _main_with_artifact_lease(
     previous_snapshot_id = (
         str(observed_source_snapshot_id) if observed_source_snapshot_id else None
     )
-    current_pointer_published = False
-    candidate_stage_state = {"staged": False}
+    is_current_pointer_published = False
+    candidate_stage_flags_by_name = {"staged": False}
 
     async def mark_import_failed(error: BaseException | str, *, progress_message: str | None = None) -> None:
         """Persist import failure state and drop unpublished source-scoped staging tables."""
@@ -3293,10 +3308,10 @@ async def _main_with_artifact_lease(
             pct=99,
             message="persisting PTG import failure state",
         )
-        serving_index = failure_report.get("serving_index")
-        is_snapshot_known_published = current_pointer_published
+        serving_index = failure_report_by_field.get("serving_index")
+        is_snapshot_known_published = is_current_pointer_published
         should_preserve_candidate_tables = (
-            current_pointer_published or candidate_stage_state["staged"]
+            is_current_pointer_published or candidate_stage_flags_by_name["staged"]
         )
         if not should_preserve_candidate_tables and isinstance(serving_index, dict):
             try:
@@ -3322,10 +3337,10 @@ async def _main_with_artifact_lease(
                 build_token=shared_layout_build_token,
             )
             if abandoned_layout is not None:
-                failure_report["shared_layout_abandoned"] = abandoned_layout
+                failure_report_by_field["shared_layout_abandoned"] = abandoned_layout
             elif shared_layout_reservation is not None and not shared_layout_reservation.reused:
-                failure_report["shared_layout_abandoned"] = False
-                failure_report["shared_layout_abandonment_deferred"] = True
+                failure_report_by_field["shared_layout_abandoned"] = False
+                failure_report_by_field["shared_layout_abandonment_deferred"] = True
         _cleanup_manifest_copy_entries(pending_strict_v3.copy_entries_by_kind)
         _cleanup_strict_v3_graph_artifacts(pending_strict_v3.graph_artifacts_map)
         pending_strict_v3.copy_entries_by_kind = {}
@@ -3336,10 +3351,10 @@ async def _main_with_artifact_lease(
             import_month_value,
             now,
             error_text,
-            report=failure_report,
-            options=options_payload,
+            report=failure_report_by_field,
+            options=options_by_name,
             should_preserve_published_snapshot=(
-                is_snapshot_known_published or candidate_stage_state["staged"]
+                is_snapshot_known_published or candidate_stage_flags_by_name["staged"]
             ),
             import_started_monotonic=import_started_monotonic,
             failure_handling_started_monotonic=failure_handling_started_monotonic,
@@ -3362,7 +3377,7 @@ async def _main_with_artifact_lease(
                     "started_at": now,
                     "finished_at": None,
                     "heartbeat_at": now,
-                    "options": options_payload,
+                    "options": options_by_name,
                     "report": {},
                     "error": None,
                 }
@@ -3393,10 +3408,12 @@ async def _main_with_artifact_lease(
 
         toc_candidates: list[str] = []
         if toc_urls:
-            toc_candidates.extend([u for u in toc_urls if u])
+            toc_candidates.extend([source_url for source_url in toc_urls if source_url])
         if toc_list:
             toc_candidates.extend(_load_toc_urls_from_file(toc_list))
-        toc_candidates = _dedupe_preserve([u.strip() for u in toc_candidates if u.strip()])
+        toc_candidates = _dedupe_preserve(
+            [source_url.strip() for source_url in toc_candidates if source_url.strip()]
+        )
 
         toc_failures: list[dict[str, Any]] = []
         for idx, toc_url in enumerate(toc_candidates):
@@ -3424,10 +3441,13 @@ async def _main_with_artifact_lease(
             jobs.extend(toc_jobs)
 
         if in_network_url:
-            job: dict[str, Any] = {"type": "in_network", "url": in_network_url}
+            direct_job_by_field: dict[str, Any] = {
+                "type": "in_network",
+                "url": in_network_url,
+            }
             if source_network_name_values:
-                job["source_network_names"] = source_network_name_values
-            jobs.append(job)
+                direct_job_by_field["source_network_names"] = source_network_name_values
+            jobs.append(direct_job_by_field)
         jobs = _filter_jobs_by_url_contains(jobs, file_url_contains)
         if source_network_name_values:
             for job in jobs:
@@ -3445,7 +3465,7 @@ async def _main_with_artifact_lease(
                 f"\tduplicates_skipped={duplicate_jobs_skipped}"
             )
         if toc_failures:
-            failure_report = {
+            failure_report_by_field = {
                 "toc_urls": toc_candidates,
                 "toc_failures": toc_failures,
                 "jobs_discovered": jobs_discovered_before_dedupe,
@@ -3462,7 +3482,7 @@ async def _main_with_artifact_lease(
                 "strict V3 never publishes partial source coverage"
             )
         if toc_candidates and not jobs and not in_network_url:
-            failure_report = {
+            failure_report_by_field = {
                 "toc_urls": toc_candidates,
                 "toc_failures": toc_failures,
                 "jobs_discovered": 0,
@@ -3521,16 +3541,16 @@ async def _main_with_artifact_lease(
             )
         processing_tasks: set[asyncio.Task[PTG2FileProcessResult | None]] = set()
 
-        async def record_file_result(result: PTG2FileProcessResult | None) -> None:
+        async def record_file_result(file_result: PTG2FileProcessResult | None) -> None:
             """Classify a file result and update completion progress."""
-            if result is None:
+            if file_result is None:
                 return
-            if result.success:
-                if result.skipped:
-                    skipped_files.append(asdict(result))
+            if file_result.success:
+                if file_result.skipped:
+                    skipped_files.append(asdict(file_result))
                 else:
                     processed_file_count_map["done"] += 1
-                    successful_files.append(asdict(result))
+                    successful_files.append(asdict(file_result))
                     if attempted_files:
                         write_live_progress(
                             phase="processing files",
@@ -3541,7 +3561,7 @@ async def _main_with_artifact_lease(
                             message=f"processed {processed_file_count_map['done']} of {attempted_files} PTG file(s)",
                         )
             else:
-                failed_files.append(asdict(result))
+                failed_files.append(asdict(file_result))
 
         async def drain_processing_tasks(*, force: bool = False) -> None:
             """Drain queued processing tasks as capacity requires and record results."""
@@ -3641,8 +3661,10 @@ async def _main_with_artifact_lease(
                         )
                     )
             if download_failures:
-                failed_files.extend(asdict(result) for result in download_failures)
-                failure_report.update(
+                failed_files.extend(
+                    asdict(failed_download) for failed_download in download_failures
+                )
+                failure_report_by_field.update(
                     {
                         "files_attempted": attempted_files,
                         "files_processed": 0,
@@ -3668,13 +3690,13 @@ async def _main_with_artifact_lease(
             )
             shared_input_identity = shared_physical_input_identity(
                 buffered_downloads,
-                options=options_payload,
+                options=options_by_name,
                 scanner_canon_version=_shared_v3_scanner_identity(),
             )
             canonical_plan_values_by_field = {
-                key: value
-                for key, value in shared_input_identity.logical_plan_fields.items()
-                if value is not None and str(value).strip()
+                key: plan_field_value
+                for key, plan_field_value in shared_input_identity.logical_plan_fields.items()
+                if plan_field_value is not None and str(plan_field_value).strip()
             }
             for downloaded in buffered_downloads:
                 job_meta = (
@@ -3693,7 +3715,7 @@ async def _main_with_artifact_lease(
                     semantic_fingerprint=shared_input_identity.semantic_fingerprint,
                     build_token=shared_layout_build_token,
                 )
-            failure_report.update(
+            failure_report_by_field.update(
                 {
                     "shared_snapshot_key": shared_layout_reservation.snapshot_key,
                     "shared_semantic_fingerprint": (
@@ -3722,11 +3744,11 @@ async def _main_with_artifact_lease(
                     import_month=import_month_value,
                     previous_snapshot_id=previous_snapshot_id,
                     started_at=now,
-                    options=options_payload,
+                    options=options_by_name,
                     manifest_stage_table=ptg2_manifest_stage_table,
                     test_mode=test_mode,
                     import_started_monotonic=import_started_monotonic,
-                    candidate_stage_state=candidate_stage_state,
+                    candidate_stage_flags_by_name=candidate_stage_flags_by_name,
                 )
 
             async def iter_downloaded_jobs():
@@ -3739,17 +3761,17 @@ async def _main_with_artifact_lease(
 
             async for downloaded in downloaded_jobs:
                 job = downloaded.job
-                result: PTG2FileProcessResult | None = None
+                file_result: PTG2FileProcessResult | None = None
                 if downloaded.error:
                     logger.warning("Failed to download %s file from %s: %s", job.get("type"), job.get("url"), downloaded.error)
-                    result = PTG2FileProcessResult(
+                    file_result = PTG2FileProcessResult(
                         str(job.get("type") or "unknown"),
                         str(job.get("url") or ""),
                         False,
                         error=downloaded.error,
                     )
                 elif downloaded.raw_artifact is None or downloaded.logical_artifact is None:
-                    result = PTG2FileProcessResult(
+                    file_result = PTG2FileProcessResult(
                         str(job.get("type") or "unknown"),
                         str(job.get("url") or ""),
                         False,
@@ -3778,7 +3800,7 @@ async def _main_with_artifact_lease(
                         f"\tlogical_sha256={downloaded.logical_artifact.logical_sha256}"
                         "\treason=duplicate_logical_artifact"
                     )
-                    result = PTG2FileProcessResult(
+                    file_result = PTG2FileProcessResult(
                         str(job.get("type") or "unknown"),
                         str(job.get("url") or ""),
                         True,
@@ -3797,8 +3819,8 @@ async def _main_with_artifact_lease(
                         },
                         skipped=True,
                     )
-                    result = _annotate_v3_file_result_source_identity(
-                        result,
+                    file_result = _annotate_v3_file_result_source_identity(
+                        file_result,
                         shared_physical_artifact_identity(downloaded),
                         shared_logical_artifact_metadata(downloaded),
                     )
@@ -3807,8 +3829,8 @@ async def _main_with_artifact_lease(
                         downloaded.logical_artifact.logical_sha256,
                         [],
                     ).append(downloaded)
-                if result is not None:
-                    await record_file_result(result)
+                if file_result is not None:
+                    await record_file_result(file_result)
                     continue
 
                 processing_tasks.add(asyncio.create_task(process_downloaded_job(downloaded)))
@@ -3817,7 +3839,7 @@ async def _main_with_artifact_lease(
         finally:
             await _cancel_and_wait_tasks(processing_tasks)
 
-        failure_report = {
+        failure_report_by_field = {
             "jobs_discovered": jobs_discovered_before_dedupe,
             "jobs_unique": len(jobs),
             "duplicate_jobs_skipped": duplicate_jobs_skipped,
@@ -3834,7 +3856,7 @@ async def _main_with_artifact_lease(
             "legacy_table_suffix": import_id_val,
         }
         if shared_layout_reservation is not None:
-            failure_report.update(
+            failure_report_by_field.update(
                 {
                     "shared_snapshot_key": shared_layout_reservation.snapshot_key,
                     "shared_semantic_fingerprint": (
@@ -3898,7 +3920,7 @@ async def _main_with_artifact_lease(
             total_steps=publish_progress_total,
             message_text="starting PTG snapshot publish",
         )
-        manifest_merge_metrics: dict[str, Any] = {"enabled": False}
+        manifest_merge_metrics_by_name: dict[str, Any] = {"enabled": False}
         manifest_precopy_merge_seconds = 0.0
         has_serving_files = any(
             file_summary.get("source_type") == "in_network" and not file_summary.get("skipped")
@@ -3917,21 +3939,21 @@ async def _main_with_artifact_lease(
                 message_text="merging manifest copy files before publish",
             )
             manifest_precopy_merge_started_monotonic = _ptg2_monotonic()
-            manifest_merge_metrics = await _merge_and_copy_ptg2_manifest_files(
+            manifest_merge_metrics_by_name = await _merge_and_copy_ptg2_manifest_files(
                 successful_files=successful_files,
                 manifest_stage_table=ptg2_manifest_stage_table,
             )
             manifest_precopy_merge_seconds = (
                 _ptg2_monotonic() - manifest_precopy_merge_started_monotonic
             )
-            manifest_merge_metrics["elapsed_seconds"] = manifest_precopy_merge_seconds
+            manifest_merge_metrics_by_name["elapsed_seconds"] = manifest_precopy_merge_seconds
             _emit_ptg2_publish_progress(
                 "pre-copy merge complete",
                 completed_steps=4,
                 total_steps=publish_progress_total,
                 message_text="manifest copy files loaded into staging tables",
-                serving_rows=manifest_merge_metrics.get("serving_rows"),
-                streamed_to_copy=manifest_merge_metrics.get("streamed_to_copy"),
+                serving_rows=manifest_merge_metrics_by_name.get("serving_rows"),
+                streamed_to_copy=manifest_merge_metrics_by_name.get("streamed_to_copy"),
             )
             for file_summary in successful_files:
                 summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
@@ -4005,10 +4027,10 @@ async def _main_with_artifact_lease(
                 ),
                 "network_names": list(manifest_artifacts.get("network_names") or []),
             }
-            manifest_merge_metrics["serving_rows"] = serving_index.get(
+            manifest_merge_metrics_by_name["serving_rows"] = serving_index.get(
                 "serving_rates"
             )
-            failure_report.update(
+            failure_report_by_field.update(
                 {
                     "shared_snapshot_key": shared_publication.snapshot_key,
                     "shared_layout_reused_at_seal": (
@@ -4021,7 +4043,7 @@ async def _main_with_artifact_lease(
                 _ptg2_manifest_stage_table_names(ptg2_manifest_stage_table)
             )
             ptg2_manifest_stage_table = None
-            failure_report["serving_index"] = serving_index
+            failure_report_by_field["serving_index"] = serving_index
             _emit_ptg2_publish_progress(
                 "snapshot tables published",
                 completed_steps=6,
@@ -4032,41 +4054,41 @@ async def _main_with_artifact_lease(
             )
         publish_seconds = _ptg2_monotonic() - publish_started_monotonic
         post_publish_started_monotonic = _ptg2_monotonic()
-        post_publish_stage_timings: dict[str, float] = {}
+        post_publish_seconds_by_stage: dict[str, float] = {}
         post_publish_stage_timer = _StageTimer(
-            post_publish_stage_timings,
+            post_publish_seconds_by_stage,
             post_publish_started_monotonic,
         )
 
         validated_at = _utcnow()
         serving_timings = serving_index.get("timings", {}) if isinstance(serving_index, dict) else {}
         setup_seconds = data_started_monotonic - import_started_monotonic
-        timing_payload = {
+        timing_by_metric = {
             "setup_seconds": setup_seconds,
             "data_seconds": data_seconds,
             "publish_seconds": publish_seconds,
             "manifest_precopy_merge_seconds": manifest_precopy_merge_seconds,
         }
-        for key, value in setup_stage_timings.items():
-            timing_payload[f"setup_{key}_seconds"] = value
+        for key, stage_seconds in setup_seconds_by_stage.items():
+            timing_by_metric[f"setup_{key}_seconds"] = stage_seconds
         if isinstance(serving_timings, dict):
-            for key, value in serving_timings.items():
+            for key, stage_seconds in serving_timings.items():
                 try:
-                    timing_key = f"serving_{key}" if key in timing_payload else key
-                    timing_payload[timing_key] = float(value)
+                    timing_key = f"serving_{key}" if key in timing_by_metric else key
+                    timing_by_metric[timing_key] = float(stage_seconds)
                 except (TypeError, ValueError):
                     continue
-        report_payload = {
-            **failure_report,
+        report_by_field = {
+            **failure_report_by_field,
             "serving_index": serving_index,
-            "timings": timing_payload,
-            "manifest_precopy_merge": manifest_merge_metrics,
+            "timings": timing_by_metric,
+            "manifest_precopy_merge": manifest_merge_metrics_by_name,
         }
         if isinstance(serving_index, dict):
             authoritative_rate_count = serving_index.get("serving_rates", serving_index.get("rate_count"))
             if authoritative_rate_count is not None:
-                report_payload["serving_rates"] = int(authoritative_rate_count)
-                report_payload["rate_count"] = int(authoritative_rate_count)
+                report_by_field["serving_rates"] = int(authoritative_rate_count)
+                report_by_field["rate_count"] = int(authoritative_rate_count)
         snapshot_publish_by_field = {
             "snapshot_id": snapshot_id,
             "import_run_id": import_run_id,
@@ -4077,8 +4099,8 @@ async def _main_with_artifact_lease(
             "published_at": None,
             "previous_snapshot_id": previous_snapshot_id,
             "manifest": {
-                **report_payload,
-                "timings": dict(timing_payload),
+                **report_by_field,
+                "timings": dict(timing_by_metric),
             },
         }
         if not isinstance(serving_index, dict) or serving_index.get("shared_snapshot_key") is None:
@@ -4104,8 +4126,8 @@ async def _main_with_artifact_lease(
                 shared_input_identity.logical_plan.plan_market_type
             ),
         )
-        candidate_stage_state["staged"] = True
-        candidate_attributes = dict(candidate_result["candidate_attributes"])
+        candidate_stage_flags_by_name["staged"] = True
+        candidate_attributes_by_field = dict(candidate_result["candidate_attributes"])
         if auto_activate_candidates:
             activated_at = _utcnow()
             await _publish_ptg2_source_pointers(
@@ -4115,12 +4137,12 @@ async def _main_with_artifact_lease(
                 import_month=import_month_value,
                 updated_at=activated_at,
                 snapshot_attributes=activated_snapshot_attributes(
-                    candidate_attributes,
+                    candidate_attributes_by_field,
                     activated_at=activated_at,
                     activation_mode="automatic",
                 ),
             )
-            current_pointer_published = True
+            is_current_pointer_published = True
             activation_status = "activated"
             snapshot_status = PTG2_STATUS_PUBLISHED
         else:
@@ -4174,15 +4196,15 @@ async def _main_with_artifact_lease(
             message_text="persisting final PTG import state",
             address_refresh_status=address_refresh_result.get("status") if isinstance(address_refresh_result, dict) else None,
         )
-        report_payload["address_refresh"] = address_refresh_result
-        report_payload["activation_status"] = activation_status
+        report_by_field["address_refresh"] = address_refresh_result
+        report_by_field["activation_status"] = activation_status
         await _persist_completed_ptg2_import_run(
             import_run_id=import_run_id,
             import_month=import_month_value,
             started_at=now,
-            options=options_payload,
-            report_payload=report_payload,
-            timing_payload=timing_payload,
+            options=options_by_name,
+            report_payload=report_by_field,
+            timing_payload=timing_by_metric,
             import_started_monotonic=import_started_monotonic,
             post_publish_started_monotonic=post_publish_started_monotonic,
             post_publish_stage_timer=post_publish_stage_timer,
@@ -4202,14 +4224,14 @@ async def _main_with_artifact_lease(
             f"\tactivation_status={activation_status}"
             f"\tfiles_processed={processed_file_count_map['done']}"
             f"\tfiles_failed={len(failed_files)}"
-            f"\tserving_rates={report_payload.get('serving_rates', 'unknown')}"
-            f"\ttotal_seconds={timing_payload['total_seconds']:.2f}"
-            f"\tsetup_seconds={timing_payload['setup_seconds']:.2f}"
-            f"\tdata_seconds={timing_payload['data_seconds']:.2f}"
-            f"\tpublish_seconds={timing_payload['publish_seconds']:.2f}"
-            f"\tpost_publish_seconds={timing_payload['post_publish_seconds']:.2f}"
-            f"\tindex_seconds={float(timing_payload.get('index_seconds', 0.0)):.2f}"
-            f"\tanalyze_seconds={float(timing_payload.get('analyze_seconds', 0.0)):.2f}"
+            f"\tserving_rates={report_by_field.get('serving_rates', 'unknown')}"
+            f"\ttotal_seconds={timing_by_metric['total_seconds']:.2f}"
+            f"\tsetup_seconds={timing_by_metric['setup_seconds']:.2f}"
+            f"\tdata_seconds={timing_by_metric['data_seconds']:.2f}"
+            f"\tpublish_seconds={timing_by_metric['publish_seconds']:.2f}"
+            f"\tpost_publish_seconds={timing_by_metric['post_publish_seconds']:.2f}"
+            f"\tindex_seconds={float(timing_by_metric.get('index_seconds', 0.0)):.2f}"
+            f"\tanalyze_seconds={float(timing_by_metric.get('analyze_seconds', 0.0)):.2f}"
         )
         _emit_screen_line(done_line)
         logger.info(done_line)
@@ -4244,11 +4266,11 @@ async def _main_with_artifact_lease(
             "files_processed": processed_file_count_map["done"],
             "files_failed": len(failed_files),
             "files_skipped": len(skipped_files),
-            "serving_rates": report_payload.get("serving_rates"),
-            "rate_count": report_payload.get("rate_count"),
+            "serving_rates": report_by_field.get("serving_rates"),
+            "rate_count": report_by_field.get("rate_count"),
             "source_file_versions": _ptg2_source_file_versions_from_results(successful_files + skipped_files),
             "address_refresh": address_refresh_result,
-            "timings": timing_payload,
+            "timings": timing_by_metric,
         }
     except asyncio.CancelledError:
         await mark_import_failed(
@@ -4340,7 +4362,7 @@ def _default_ptg2_import_id(
     month_id = import_month_value.strftime("%Y%m%d")
     if not source_key_val:
         return month_id
-    source_inputs = {
+    source_inputs_by_name = {
         "source_key": source_key_val,
         "toc_urls": toc_urls or [],
         "toc_list": toc_list or "",
@@ -4349,11 +4371,14 @@ def _default_ptg2_import_id(
         "provider_ref_url": provider_ref_url or "",
         "arch_variant": arch_variant or "",
     }
-    if not any(source_inputs[key] for key in ("toc_urls", "toc_list", "in_network_url", "allowed_url", "provider_ref_url")):
+    if not any(
+        source_inputs_by_name[key]
+        for key in ("toc_urls", "toc_list", "in_network_url", "allowed_url", "provider_ref_url")
+    ):
         return month_id
     fingerprint = hash_prefix(
         semantic_hash(
-            {"import_month": month_id, **source_inputs},
+            {"import_month": month_id, **source_inputs_by_name},
             domain="ptg2_import_identity",
         ),
         16,

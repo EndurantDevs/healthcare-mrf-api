@@ -20,19 +20,22 @@ Hot temporary files must be node-local:
 - manifest sidecar spill files
 - manifest pre-COPY merge files
 
+Strict V3 gives every file scan its own serving-run and sidecar directory. The
+Rust scanner places manifest spill files in that owned serving-run directory
+and recreates final sidecar parents immediately before finalization. Cleanup
+must age-gate both files and empty directories; a fresh empty destination can
+belong to an active scan and is never evidence that the build is abandoned.
+
 Retained raw/logical artifacts may use shared `/work`:
 
 - raw downloaded files
 - logical JSON artifacts
 - retained manifest metadata
 
-Final serving artifacts depend on the snapshot architecture:
-
-- `postgres_binary_v1`: final forward/reverse serving artifacts are copied into
-  PostgreSQL artifact tables. API pods read from PostgreSQL and must not
-  materialize a disk cache.
-- legacy or research sidecar layouts: final PTG2 sidecars may remain under the
-  configured artifact root and are cleaned by manifest-driven cleanup tools.
+For `postgres_binary_v3`, final forward/reverse serving artifacts are copied
+into PostgreSQL. API pods read from PostgreSQL and must not materialize a disk
+cache. Files under the serving scratch root are publication intermediates only
+and are removed after upload or by age-gated recovery cleanup.
 
 Default env names:
 
