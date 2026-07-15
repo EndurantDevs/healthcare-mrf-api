@@ -178,11 +178,6 @@ jobs:
           tests/test_ptg2_v3_cross_plan_reuse.py
           tests/test_ptg2_v3_audit_occurrences_api.py
           tests/test_ptg2_candidate_attestation.py
-          tests/test_ptg2_capacity_evidence.py
-          tests/test_ptg2_v3_bounded_readers.py
-          tests/test_ptg2_v3_capacity_gate.py
-          tests/test_ptg2_v3_capacity_gate_adversarial.py
-          tests/test_ptg2_v3_capacity_resources.py
           tests/test_ptg2_v3_finalizer_resources.py
           tests/test_ptg2_v3_rust_python_forward_bridge.py
           tests/test_ptg2_v3_shared_schema.py
@@ -201,6 +196,29 @@ jobs:
           tests/test_ptg_source_snapshot_control_race.py
           tests/test_ptg_source_snapshot_control_safety.py
           tests/test_ptg_source_snapshot_removal_v3.py
+
+  capacity-evidence:
+    name: ptg2 capacity evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+      - name: Run capacity evidence tests
+        run: >
+          python -m pytest -q --durations=20
+          tests/test_ptg2_capacity_evidence.py
+          tests/test_ptg2_v3_bounded_readers.py
+          tests/test_ptg2_v3_capacity_gate.py
+          tests/test_ptg2_v3_capacity_gate_adversarial.py
+          tests/test_ptg2_v3_capacity_resources.py
 
   api-contract:
     name: openapi contract
