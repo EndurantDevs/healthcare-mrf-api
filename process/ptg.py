@@ -230,7 +230,7 @@ from process.ptg_parts.source_jobs import (_dedupe_preserve, _dedupe_ptg_jobs,
                                            _filter_jobs_by_url_contains,
                                            _filter_reporting_plans,
                                            _load_toc_urls_from_file,
-                                           _looks_like_toc_body_file_location,
+                                           _is_toc_body_file_location,
                                            _merge_ptg_job,
                                            _normalize_filter_values,
                                            _normalize_plan_payload,
@@ -1500,7 +1500,7 @@ async def _process_table_of_contents(
         ]
         for entry in in_network_files:
             location = entry.get("location")
-            if not _looks_like_toc_body_file_location(location):
+            if not _is_toc_body_file_location(location):
                 continue
             location = normalize_tic_source_url(location)
             if not _is_requested_toc_body_file_url(location, file_url_match_tokens):

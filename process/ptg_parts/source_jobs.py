@@ -7,7 +7,6 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlsplit
 
 from process.ptg_parts.canonical import (
     _canonicalize_for_json,
@@ -16,13 +15,16 @@ from process.ptg_parts.canonical import (
     normalize_tic_source_url,
 )
 from process.ptg_parts.domain import (
-    PTG2_DOMAIN_ALLOWED_AMOUNT,
-    PTG2_DOMAIN_DRUG,
     PTG2_DOMAIN_IN_NETWORK,
     PTG2SourceCatalogEntry,
 )
 from process.ptg_parts.healthsparq_source_jobs import healthsparq_catalog_entries
 from process.ptg_parts.row_helpers import _as_list
+from process.ptg_parts.toc_entries import (
+    _is_toc_body_file_location,
+    _toc_body_source_type,
+    flat_toc_catalog_entries,
+)
 
 
 def _normalize_filter_values(values: list[str] | None) -> list[str]:
@@ -124,120 +126,6 @@ def _is_provider_directory_index_payload(payload: dict[str, Any]) -> bool:
     return any(key in payload for key in ("provider_urls", "plan_urls"))
 
 
-_TOC_BODY_FILE_PLACEHOLDERS = {
-    "missing file",
-    "n/a",
-    "na",
-    "none",
-    "not available",
-    "null",
-}
-_TOC_BODY_FILE_SUFFIXES = (
-    ".json",
-    ".json.gz",
-    ".gz",
-    ".zip",
-    ".csv",
-    ".txt",
-)
-_TOC_BODY_FILE_TOKENS = (
-    "allowed",
-    "download",
-    "filetype",
-    "innetwork",
-    "machine-readable",
-    "machine readable",
-    "mrf",
-    "ndc",
-    "outnetwork",
-    "outofnetwork",
-    "rate",
-    "rates",
-    "rx",
-    "transparency",
-)
-_TOC_BODY_ALLOWED_TOKENS = (
-    "allowed-amount",
-    "allowed amount",
-    "allowedamount",
-    "out-of-network",
-    "out of network",
-    "outnetwork",
-    "outofnetwork",
-    "oon",
-)
-_TOC_BODY_IN_NETWORK_TOKENS = (
-    "in-network",
-    "in network",
-    "innetwork",
-)
-_TOC_BODY_DRUG_TOKENS = (
-    "drug",
-    "ndc",
-    "pharmacy",
-    "rx",
-)
-
-
-def _looks_like_toc_body_file_location(value: Any) -> bool:
-    location = str(value or "").strip()
-    if not location:
-        return False
-    if location.lower() in _TOC_BODY_FILE_PLACEHOLDERS:
-        return False
-
-    parsed = urlsplit(location)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return False
-    if parsed.path in {"", "/"} and not parsed.query:
-        return False
-
-    path = parsed.path.lower()
-    query = parsed.query.lower()
-    if any(path.endswith(suffix) for suffix in _TOC_BODY_FILE_SUFFIXES):
-        return True
-    if any(suffix in query for suffix in _TOC_BODY_FILE_SUFFIXES):
-        return True
-
-    searchable = f"{path} {query}".replace("_", "-").replace("%20", " ")
-    compact = "".join(ch for ch in searchable if ch.isalnum())
-    return any(
-        token in searchable or token in compact for token in _TOC_BODY_FILE_TOKENS
-    )
-
-
-def _toc_body_search_text(location: Any, description: Any = None) -> tuple[str, str]:
-    parsed = urlsplit(str(location or ""))
-    searchable = (
-        f"{parsed.path} {parsed.query} {description or ''}".lower()
-        .replace("_", "-")
-        .replace("%20", " ")
-    )
-    compact = "".join(ch for ch in searchable if ch.isalnum())
-    return searchable, compact
-
-
-def _toc_body_source_type(
-    default_source_type: str, location: Any, description: Any = None
-) -> tuple[str, str]:
-    searchable, compact = _toc_body_search_text(location, description)
-    if any(token in searchable or token in compact for token in _TOC_BODY_DRUG_TOKENS):
-        return "payer-drug", PTG2_DOMAIN_DRUG
-    if any(
-        token in searchable or token in compact for token in _TOC_BODY_ALLOWED_TOKENS
-    ):
-        return "allowed-amounts", PTG2_DOMAIN_ALLOWED_AMOUNT
-    if any(
-        token in searchable or token in compact for token in _TOC_BODY_IN_NETWORK_TOKENS
-    ):
-        return "in-network", PTG2_DOMAIN_IN_NETWORK
-    if default_source_type == "allowed-amounts":
-        return default_source_type, PTG2_DOMAIN_ALLOWED_AMOUNT
-    if default_source_type == "payer-drug":
-        return default_source_type, PTG2_DOMAIN_DRUG
-    return default_source_type, PTG2_DOMAIN_IN_NETWORK
-
-
 def _merge_duplicate_catalog_entries(entries: list[PTG2SourceCatalogEntry]) -> list[PTG2SourceCatalogEntry]:
     """Merge plan metadata for duplicate file locations in linear work."""
     entries_by_key: dict[tuple[str, str, str], PTG2SourceCatalogEntry] = {}
@@ -296,6 +184,7 @@ def parse_toc_catalog_entries(
             plan_market_types=plan_market_types,
         )
     )
+    entries.extend(flat_toc_catalog_entries(toc_content, toc_url, toc_meta))
     for structure in toc_content.get("reporting_structure", []) or []:
         plans = [
             _normalize_plan_payload(plan)
@@ -315,7 +204,7 @@ def parse_toc_catalog_entries(
             if not isinstance(file_entry, dict):
                 continue
             location = file_entry.get("location")
-            if _looks_like_toc_body_file_location(location):
+            if _is_toc_body_file_location(location):
                 source_type, domain = _toc_body_source_type(
                     "in-network", location, file_entry.get("description")
                 )
@@ -339,7 +228,7 @@ def parse_toc_catalog_entries(
         for allowed_amount_file in allowed_amount_files:
             if not isinstance(allowed_amount_file, dict):
                 continue
-            if not _looks_like_toc_body_file_location(
+            if not _is_toc_body_file_location(
                 allowed_amount_file.get("location")
             ):
                 continue
@@ -376,7 +265,7 @@ def parse_toc_catalog_entries(
                 if not isinstance(drug_entry, dict):
                     continue
                 location = drug_entry.get("location")
-                if _looks_like_toc_body_file_location(location):
+                if _is_toc_body_file_location(location):
                     source_type, domain = _toc_body_source_type(
                         "payer-drug", location, drug_entry.get("description")
                     )
