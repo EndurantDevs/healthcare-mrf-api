@@ -293,7 +293,11 @@ def test_release_audit_uses_validated_candidate_and_unmodified_release_defaults(
 
     monkeypatch.setenv(
         "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
-        "https://public-api.internal.example",
+        "http://candidate-api:8080",
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_TRUSTED_CLUSTER_HTTP",
+        "true",
     )
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
     monkeypatch.setattr(ptg_candidate_audit.ptg2_v3_source_api_audit, "run_audit_cli", run_cli)
@@ -307,9 +311,10 @@ def test_release_audit_uses_validated_candidate_and_unmodified_release_defaults(
     assert "--validated-candidate" in captured_list
     assert captured_list[captured_list.index("--max-invalid-npis") + 1] == "0"
     assert captured_list[captured_list.index("--profile") + 1] == "release"
-    assert captured_list[captured_list.index("--api-base-url") + 1] == "https://public-api.internal.example"
+    assert captured_list[captured_list.index("--api-base-url") + 1] == "http://candidate-api:8080"
     assert captured_list[captured_list.index("--auth-header") + 1] == "Authorization"
     assert captured_list[captured_list.index("--auth-scheme") + 1] == "Bearer"
+    assert "--trusted-cluster-http" in captured_list
     assert "--source-occurrence-samples" not in captured_list
     assert "--api-occurrence-samples" not in captured_list
     assert "--negative-samples" not in captured_list
@@ -384,6 +389,53 @@ def test_release_audit_failure_is_deterministic_and_not_retryable(monkeypatch, t
 
     assert exc_info.value.control_error_code == "ptg_candidate_audit_release_gate_failed"
     assert exc_info.value.retryable is False
+
+
+def test_release_audit_preserves_safe_fatal_configuration_reason(
+    monkeypatch,
+    tmp_path,
+):
+    def run_cli(argv):
+        report_path = type(tmp_path)(argv[argv.index("--report") + 1])
+        report_path.write_text(
+            json.dumps(
+                {
+                    "status": "error",
+                    "failures": {
+                        "counts": {"configuration": 1},
+                        "examples": [
+                            {
+                                "category": "configuration",
+                                "exception_type": "ConfigurationError",
+                                "reason": "release_api_base_url_must_be_https_origin",
+                            }
+                        ],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return 2
+
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
+        "https://public-api.internal.example",
+    )
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
+    monkeypatch.setattr(
+        ptg_candidate_audit.ptg2_v3_source_api_audit,
+        "run_audit_cli",
+        run_cli,
+    )
+
+    with pytest.raises(
+        ptg_candidate_audit.CandidateAuditReleaseGateError,
+        match="release_api_base_url_must_be_https_origin",
+    ):
+        ptg_candidate_audit.run_release_audit(
+            _target(),
+            (tmp_path / "source.json.gz",),
+        )
 
 
 @pytest.mark.asyncio
