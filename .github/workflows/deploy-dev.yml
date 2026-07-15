@@ -179,6 +179,12 @@ jobs:
             -o UserKnownHostsFile=~/.ssh/known_hosts \
             "ubuntu@${DEV_DEPLOY_HOST}" \
             "${deploy_args}" >/tmp/dev-deploy.out 2>/tmp/dev-deploy.err; then
+            echo "::group::Remote deploy stdout"
+            tail -n 200 /tmp/dev-deploy.out || true
+            echo "::endgroup::"
+            echo "::group::Remote deploy stderr"
+            tail -n 200 /tmp/dev-deploy.err || true
+            echo "::endgroup::"
             echo "::error::Failed to queue dev deploy"
             exit 1
           fi
