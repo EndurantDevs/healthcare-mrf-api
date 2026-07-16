@@ -14,7 +14,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from sqlalchemy import exists, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from db.models import MRFDiscoveryBatch, MRFDiscoverySourceCheckpoint, db
+from db.models import ImportRun, MRFDiscoveryBatch, MRFDiscoverySourceCheckpoint, db
 
 
 DISCOVERY_PROOF_VERSION = 2
@@ -22,6 +22,7 @@ SOURCE_SET_CONTRACT = "hp-mrf-discovery-source-set-v1"
 SOURCE_PAYLOAD_SET_CONTRACT = "hp-mrf-discovery-source-payload-set-v1"
 CHECKPOINT_STRATEGY_VERSION = "mrf-discovery-source-checkpoint-v1"
 CHECKPOINT_INSERT_CHUNK_SIZE = 1_000
+MAX_RETRY_LINEAGE_DEPTH = 100
 
 
 @dataclass(frozen=True)
@@ -115,7 +116,7 @@ class DiscoveryCheckpointStoreProtocol(Protocol):
         owner_run_id: str,
         retry_of_run_id: str,
     ) -> list[dict[str, Any]] | None:
-        """Adopt an existing batch for its direct retry child."""
+        """Adopt an existing batch for a verified retry descendant."""
         raise NotImplementedError
 
     async def pending_sources(self, root_run_id: str) -> list[dict[str, Any]]:
@@ -283,6 +284,32 @@ async def _insert_source_checkpoints(
         await session.execute(checkpoint_statement)
 
 
+async def _is_retry_descendant(
+    session: Any,
+    *,
+    candidate_run_id: str,
+    ancestor_run_id: str,
+) -> bool:
+    """Return whether a persisted retry chain reaches the batch owner."""
+
+    current_run_id = str(candidate_run_id or "").strip()
+    expected_ancestor_run_id = str(ancestor_run_id or "").strip()
+    visited_run_ids: set[str] = set()
+    for _lineage_depth in range(MAX_RETRY_LINEAGE_DEPTH):
+        if not current_run_id or current_run_id in visited_run_ids:
+            return False
+        if current_run_id == expected_ancestor_run_id:
+            return True
+        visited_run_ids.add(current_run_id)
+        parent_run_id = await session.scalar(
+            select(ImportRun.retry_of_run_id).where(
+                ImportRun.run_id == current_run_id
+            )
+        )
+        current_run_id = str(parent_run_id or "").strip()
+    return False
+
+
 class DatabaseDiscoveryCheckpointStore:
     """Persist frozen source batches and retry-safe source checkpoints."""
 
@@ -370,23 +397,29 @@ class DatabaseDiscoveryCheckpointStore:
         owner_run_id: str,
         retry_of_run_id: str,
     ) -> list[dict[str, Any]] | None:
-        """Transfer unfinished checkpoints to one direct retry child."""
+        """Transfer unfinished checkpoints to one verified retry descendant."""
 
         now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
         async with db.session() as session:
             existing_batch = await session.get(MRFDiscoveryBatch, root_run_id)
             if existing_batch is None:
                 return None
-            if existing_batch.latest_run_id != retry_of_run_id:
+            checkpoint_owner_run_id = str(existing_batch.latest_run_id or "").strip()
+            if not await _is_retry_descendant(
+                session,
+                candidate_run_id=retry_of_run_id,
+                ancestor_run_id=checkpoint_owner_run_id,
+            ):
                 raise DiscoverySourceBatchMismatch(
-                    "MRF discovery retry is not the direct child of the batch owner"
+                    "MRF discovery retry does not descend from the batch owner"
                 )
             stale_owner_exists = await session.scalar(
                 select(
                     exists().where(
                         MRFDiscoverySourceCheckpoint.root_run_id == root_run_id,
                         MRFDiscoverySourceCheckpoint.status != "succeeded",
-                        MRFDiscoverySourceCheckpoint.owner_run_id != retry_of_run_id,
+                        MRFDiscoverySourceCheckpoint.owner_run_id
+                        != checkpoint_owner_run_id,
                     )
                 )
             )
@@ -397,7 +430,7 @@ class DatabaseDiscoveryCheckpointStore:
             adoption_statement = (
                 update(MRFDiscoveryBatch)
                 .where(MRFDiscoveryBatch.root_run_id == root_run_id)
-                .where(MRFDiscoveryBatch.latest_run_id == retry_of_run_id)
+                .where(MRFDiscoveryBatch.latest_run_id == checkpoint_owner_run_id)
                 .values(
                     latest_run_id=owner_run_id,
                     retry_of_run_id=retry_of_run_id,
@@ -416,7 +449,10 @@ class DatabaseDiscoveryCheckpointStore:
                 update(MRFDiscoverySourceCheckpoint)
                 .where(MRFDiscoverySourceCheckpoint.root_run_id == root_run_id)
                 .where(MRFDiscoverySourceCheckpoint.status != "succeeded")
-                .where(MRFDiscoverySourceCheckpoint.owner_run_id == retry_of_run_id)
+                .where(
+                    MRFDiscoverySourceCheckpoint.owner_run_id
+                    == checkpoint_owner_run_id
+                )
                 .values(
                     owner_run_id=owner_run_id,
                     status="pending",

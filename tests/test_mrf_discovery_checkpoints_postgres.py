@@ -191,7 +191,7 @@ async def test_postgres_retry_replays_only_unfinished_sources_and_fences_owner()
 
         with pytest.raises(
             DiscoverySourceBatchMismatch,
-            match="direct child",
+            match="does not descend",
         ):
             await checkpoint_store.resume_batch(
                 TEST_ROOT_RUN_ID,

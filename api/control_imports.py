@@ -1416,18 +1416,18 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
     current_progress = current.get("progress") if isinstance(current.get("progress"), dict) else {}
     current_metrics = current.get("metrics") if isinstance(current.get("metrics"), dict) else {}
     metrics = dict(current_metrics)
-    pending_adapter = current.get("status") == "queued" and metrics.get("enqueue_adapter") == "pending"
-    queued_arq = current.get("status") == "queued" and metrics.get("enqueue_adapter") == "arq_single_job"
-    if pending_adapter:
+    is_pending_adapter = current.get("status") == "queued" and metrics.get("enqueue_adapter") == "pending"
+    is_queued_arq = current.get("status") == "queued" and metrics.get("enqueue_adapter") == "arq_single_job"
+    if is_pending_adapter:
         cancel_signal = {"redis": False, "pending_adapter": True}
-    elif queued_arq:
+    elif is_queued_arq:
         cancel_signal = await _remove_queued_job(current)
     else:
         cancel_signal = await _set_cancel_flag(run_id)
         cancel_signal["kubernetes"] = await _delete_active_worker_jobs(current)
     metrics["cancel_signal"] = cancel_signal
     has_terminalized_active_worker = _has_terminalized_active_worker_cancel_signal(cancel_signal)
-    canceled_before_start = pending_adapter or queued_arq
+    canceled_before_start = is_pending_adapter or is_queued_arq
     canceled_now = canceled_before_start or has_terminalized_active_worker
     status = "canceled" if canceled_now else "canceling"
     phase_detail = "cancel requested"
