@@ -818,7 +818,7 @@ async def _zip_radius_rows(
     if anchor is None:
         anchor = await _lookup_zip_context(session, normalized_zip)
     if anchor is None:
-        rows = [
+        radius_zip_entries = [
             {
                 "zip5": normalized_zip,
                 "state": state_hint_normalized,
@@ -828,15 +828,15 @@ async def _zip_radius_rows(
             }
         ]
         if cache_key is not None:
-            _zip_radius_rows_cache_put(cache_key, rows)
-        return rows
+            _zip_radius_rows_cache_put(cache_key, radius_zip_entries)
+        return radius_zip_entries
 
     anchor_lat = _as_float(anchor.get("latitude"))
     anchor_long = _as_float(anchor.get("longitude"))
     anchor_state = str(anchor.get("state") or "").strip().upper() or None
     state_filter = state_hint_normalized or anchor_state
     if anchor_lat is None or anchor_long is None:
-        rows = [
+        radius_zip_entries = [
             {
                 "zip5": normalized_zip,
                 "state": state_filter,
@@ -846,8 +846,8 @@ async def _zip_radius_rows(
             }
         ]
         if cache_key is not None:
-            _zip_radius_rows_cache_put(cache_key, rows)
-        return rows
+            _zip_radius_rows_cache_put(cache_key, radius_zip_entries)
+        return radius_zip_entries
 
     distance_expr = _distance_miles_expression(anchor_lat, anchor_long).label("distance_miles")
     filters = [
@@ -858,7 +858,7 @@ async def _zip_radius_rows(
     if state_filter:
         filters.append(geo_zip_table.c.state == state_filter)
 
-    result = await session.execute(
+    radius_query_result = await session.execute(
         select(
             geo_zip_table.c.zip_code.label("zip5"),
             geo_zip_table.c.state.label("state"),
@@ -870,27 +870,27 @@ async def _zip_radius_rows(
         .limit(limit)
     )
 
-    seen: set[str] = set()
-    rows: list[dict[str, Any]] = []
-    for row in result:
-        payload = _row_to_dict(row)
-        candidate_zip = _normalize_zip5(payload.get("zip5"))
-        if candidate_zip is None or candidate_zip in seen:
+    seen_zip_codes: set[str] = set()
+    radius_zip_entries: list[dict[str, Any]] = []
+    for zip_query_row in radius_query_result:
+        zip_record = _row_to_dict(zip_query_row)
+        candidate_zip = _normalize_zip5(zip_record.get("zip5"))
+        if candidate_zip is None or candidate_zip in seen_zip_codes:
             continue
-        seen.add(candidate_zip)
-        distance_value = _as_float(payload.get("distance_miles"))
-        rows.append(
+        seen_zip_codes.add(candidate_zip)
+        distance_value = _as_float(zip_record.get("distance_miles"))
+        radius_zip_entries.append(
             {
                 "zip5": candidate_zip,
-                "state": str(payload.get("state") or "").strip().upper() or None,
-                "city_lower": str(payload.get("city_lower") or "").strip().lower() or None,
+                "state": str(zip_record.get("state") or "").strip().upper() or None,
+                "city_lower": str(zip_record.get("city_lower") or "").strip().lower() or None,
                 "distance_miles": distance_value,
                 "is_anchor": candidate_zip == normalized_zip,
             }
         )
 
-    if normalized_zip not in seen:
-        rows.insert(
+    if normalized_zip not in seen_zip_codes:
+        radius_zip_entries.insert(
             0,
             {
                 "zip5": normalized_zip,
@@ -901,8 +901,8 @@ async def _zip_radius_rows(
             },
         )
     if cache_key is not None:
-        _zip_radius_rows_cache_put(cache_key, rows)
-    return rows
+        _zip_radius_rows_cache_put(cache_key, radius_zip_entries)
+    return radius_zip_entries
 
 
 def _zip_ring_candidates(
@@ -928,10 +928,10 @@ def _zip_ring_candidates(
 
     ordered_zips: list[str] = []
     metadata: dict[str, dict[str, Any]] = {}
-    seen: set[str] = set()
+    seen_zip_codes: set[str] = set()
 
     if normalized_anchor:
-        seen.add(normalized_anchor)
+        seen_zip_codes.add(normalized_anchor)
         ordered_zips.append(normalized_anchor)
         metadata[normalized_anchor] = {
             "distance_miles": 0.0,
@@ -941,20 +941,20 @@ def _zip_ring_candidates(
         }
 
     for step in steps:
-        for row in ordered_rows:
-            candidate_zip = _normalize_zip5(row.get("zip5"))
-            if candidate_zip is None or candidate_zip in seen:
+        for zip_entry in ordered_rows:
+            candidate_zip = _normalize_zip5(zip_entry.get("zip5"))
+            if candidate_zip is None or candidate_zip in seen_zip_codes:
                 continue
-            distance_value = _as_float(row.get("distance_miles"))
+            distance_value = _as_float(zip_entry.get("distance_miles"))
             if distance_value is None or distance_value > step + 1e-6:
                 continue
-            seen.add(candidate_zip)
+            seen_zip_codes.add(candidate_zip)
             ordered_zips.append(candidate_zip)
             metadata[candidate_zip] = {
                 "distance_miles": distance_value,
                 "distance_bucket": _distance_bucket(distance_value),
                 "selected_radius_miles": float(step),
-                "is_anchor": bool(row.get("is_anchor")),
+                "is_anchor": bool(zip_entry.get("is_anchor")),
             }
 
     return ordered_zips, metadata
@@ -1148,36 +1148,36 @@ def _percentile_cont(values: list[float], percentile: float) -> float | None:
 
 
 def _trim_charge_rows_log_iqr(
-    rows: list[dict[str, Any]],
+    charge_rows: list[dict[str, Any]],
     *,
     iqr_factor: float,
 ) -> list[dict[str, Any]]:
-    if len(rows) < 4:
-        return rows
+    if len(charge_rows) < 4:
+        return charge_rows
     charge_logs = sorted(
-        math.log(max(_as_float(row.get("avg_submitted_charge")) or 0.0, 1e-9))
-        for row in rows
-        if (_as_float(row.get("avg_submitted_charge")) or 0.0) > 0
+        math.log(max(_as_float(charge_row.get("avg_submitted_charge")) or 0.0, 1e-9))
+        for charge_row in charge_rows
+        if (_as_float(charge_row.get("avg_submitted_charge")) or 0.0) > 0
     )
     if len(charge_logs) < 4:
-        return rows
+        return charge_rows
     q1 = _percentile_cont(charge_logs, 0.25)
     q3 = _percentile_cont(charge_logs, 0.75)
     if q1 is None or q3 is None or q3 <= q1:
-        return rows
+        return charge_rows
     spread = q3 - q1
     lower_bound = q1 - iqr_factor * spread
     upper_bound = q3 + iqr_factor * spread
 
-    trimmed: list[dict[str, Any]] = []
-    for row in rows:
-        charge = _as_float(row.get("avg_submitted_charge"))
+    retained_charge_rows: list[dict[str, Any]] = []
+    for charge_row in charge_rows:
+        charge = _as_float(charge_row.get("avg_submitted_charge"))
         if charge is None or charge <= 0:
             continue
         charge_ln = math.log(max(charge, 1e-9))
         if lower_bound <= charge_ln <= upper_bound:
-            trimmed.append(row)
-    return trimmed or rows
+            retained_charge_rows.append(charge_row)
+    return retained_charge_rows or charge_rows
 
 
 async def _build_dynamic_zip_peer_stats(
@@ -1226,15 +1226,18 @@ async def _build_dynamic_zip_peer_stats(
             continue
 
         charges = sorted(
-            float(_as_float(row.get("avg_submitted_charge")) or 0.0)
-            for row in trimmed_rows
-            if (_as_float(row.get("avg_submitted_charge")) or 0.0) > 0
+            float(_as_float(charge_row.get("avg_submitted_charge")) or 0.0)
+            for charge_row in trimmed_rows
+            if (_as_float(charge_row.get("avg_submitted_charge")) or 0.0) > 0
         )
         if len(charges) < min_providers:
             continue
-        claim_counts = [float(_as_float(row.get("claim_count")) or 0.0) for row in trimmed_rows]
+        claim_counts = [
+            float(_as_float(charge_row.get("claim_count")) or 0.0)
+            for charge_row in trimmed_rows
+        ]
 
-        peer_payload = {
+        peer_statistics_by_metric = {
             "provider_count": len(trimmed_rows),
             "min_claim_count": min(claim_counts) if claim_counts else None,
             "max_claim_count": max(claim_counts) if claim_counts else None,
@@ -1247,7 +1250,7 @@ async def _build_dynamic_zip_peer_stats(
             "p90": _percentile_cont(charges, 0.90),
             "specialty_key": specialty_candidate,
         }
-        return peer_payload, specialty_candidate
+        return peer_statistics_by_metric, specialty_candidate
     return None
 
 
@@ -1823,8 +1826,11 @@ async def _query_terminology(
         )
         .limit(limit)
     )
-    result = await session.execute(query)
-    return [_terminology_item(_row_to_dict(row)) for row in result]
+    terminology_result = await session.execute(query)
+    return [
+        _terminology_item(_row_to_dict(terminology_row))
+        for terminology_row in terminology_result
+    ]
 
 
 async def _resolve_provider_type_terms(
@@ -2062,7 +2068,7 @@ def _build_quality_mode_payload(
     cohort_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     evidence_profile = _build_quality_evidence_profile(score_data, cohort_context)
-    payload = {
+    quality_mode_payload_by_field = {
         "model_version": str(score_data.get("model_version") or "v2"),
         "benchmark_mode": score_data.get("benchmark_mode"),
         "tier": score_data.get("tier"),
@@ -2091,8 +2097,8 @@ def _build_quality_mode_payload(
         },
     }
     if cohort_context is not None:
-        payload["cohort_context"] = cohort_context
-    return payload
+        quality_mode_payload_by_field["cohort_context"] = cohort_context
+    return quality_mode_payload_by_field
 
 
 def _as_int(value: Any) -> int | None:
@@ -2410,11 +2416,11 @@ def _extract_peer_target_geography(payload_lower: dict[str, Any]) -> tuple[str |
         if ":" in selected_geography_text:
             prefix, suffix = selected_geography_text.split(":", 1)
             scope = _normalize_peer_geography_scope(prefix)
-            value = str(suffix or "").strip() or None
+            geography_value = str(suffix or "").strip() or None
             if scope == "national":
                 return "national", "US", "national"
             if scope is not None:
-                return scope, value, selected_geography_text
+                return scope, geography_value, selected_geography_text
         selected_scope = _normalize_peer_geography_scope(selected_geography_text)
         if selected_scope == "national":
             return "national", "US", "national"
@@ -2580,7 +2586,7 @@ def _get_cached_lowercase_payload(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _collect_peer_target_candidates(
-    rows: list[dict[str, Any]],
+    peer_target_rows: list[dict[str, Any]],
     *,
     benchmark_mode: str,
     state_key: str | None,
@@ -2597,8 +2603,8 @@ def _collect_peer_target_candidates(
     )
     candidates: list[dict[str, Any]] = []
 
-    for row in rows:
-        payload_lower = _get_cached_lowercase_payload(row)
+    for peer_target_row in peer_target_rows:
+        payload_lower = _get_cached_lowercase_payload(peer_target_row)
         row_mode = str(_pick_first_from_lowered(payload_lower, "benchmark_mode", "mode") or "").strip().lower()
         if row_mode and row_mode in QUALITY_BENCHMARK_MODE_ORDER and row_mode != benchmark_mode:
             continue
@@ -2633,7 +2639,7 @@ def _collect_peer_target_candidates(
 
         candidates.append(
             {
-                "row": row,
+                "row": peer_target_row,
                 "payload_lower": payload_lower,
                 "geography_rank": geography_rank,
                 "cohort_level": cohort_level,
@@ -2718,7 +2724,7 @@ def _collect_provider_scope_variant_candidates(
 
 
 def _select_peer_target_candidate(
-    rows: list[dict[str, Any]],
+    peer_target_rows: list[dict[str, Any]],
     *,
     benchmark_mode: str,
     state_key: str | None,
@@ -2729,7 +2735,7 @@ def _select_peer_target_candidate(
     procedure_match_threshold: float,
 ) -> dict[str, Any] | None:
     candidates = _collect_peer_target_candidates(
-        rows,
+        peer_target_rows,
         benchmark_mode=benchmark_mode,
         state_key=state_key,
         zip5=zip5,
@@ -2741,11 +2747,11 @@ def _select_peer_target_candidate(
         return None
 
     strict_candidates = [
-        item
-        for item in candidates
-        if item["specialty_match"]
-        and item["taxonomy_match"]
-        and float(item["procedure_match_ratio"]) >= procedure_match_threshold
+        candidate
+        for candidate in candidates
+        if candidate["specialty_match"]
+        and candidate["taxonomy_match"]
+        and float(candidate["procedure_match_ratio"]) >= procedure_match_threshold
     ]
     if strict_candidates:
         return strict_candidates[0]
@@ -3647,7 +3653,7 @@ def _build_live_mode_payload_for_candidate(
     selected_candidate: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Build a live quality-score payload from observed measures and a selected peer target."""
-    target_values: dict[str, float | None] = {
+    target_values_by_name: dict[str, float | None] = {
         "target_appropriateness": None,
         "target_rx_appropriateness": None,
         "target_effectiveness": None,
@@ -3662,7 +3668,7 @@ def _build_live_mode_payload_for_candidate(
     selected_cohort_level = None
     if selected_candidate is not None:
         payload_lower = selected_candidate["payload_lower"]
-        target_values = _extract_peer_target_values(payload_lower)
+        target_values_by_name = _extract_peer_target_values(payload_lower)
         selected_specialty_raw = _pick_first_from_lowered(payload_lower, "specialty_key", "specialty")
         selected_taxonomy_raw = _pick_first_from_lowered(payload_lower, "taxonomy_code", "taxonomy")
         selected_specialty_key = _parse_specialty_key(selected_specialty_raw) or specialty_key
@@ -3688,13 +3694,13 @@ def _build_live_mode_payload_for_candidate(
         "appropriateness": [
             _compute_live_measure(
                 observed=_as_float(observed_data.get("utilization_adjusted")),
-                target=target_values.get("target_appropriateness"),
+                target=target_values_by_name.get("target_appropriateness"),
                 evidence_n=evidence_n_claims,
                 reverse_ratio=False,
             ),
             _compute_live_measure(
                 observed=_as_float(observed_data.get("rx_claim_rate")),
-                target=target_values.get("target_rx_appropriateness"),
+                target=target_values_by_name.get("target_rx_appropriateness"),
                 evidence_n=evidence_n_rx,
                 reverse_ratio=False,
             ),
@@ -3702,7 +3708,7 @@ def _build_live_mode_payload_for_candidate(
         "effectiveness": [
             _compute_live_measure(
                 observed=_as_float(observed_data.get("qpp_quality_score")),
-                target=target_values.get("target_effectiveness"),
+                target=target_values_by_name.get("target_effectiveness"),
                 evidence_n=evidence_n_claims,
                 reverse_ratio=True,
             ),
@@ -3710,13 +3716,13 @@ def _build_live_mode_payload_for_candidate(
         "cost": [
             _compute_live_measure(
                 observed=_as_float(observed_data.get("qpp_cost_score")),
-                target=target_values.get("target_qpp_cost"),
+                target=target_values_by_name.get("target_qpp_cost"),
                 evidence_n=evidence_n_claims,
                 reverse_ratio=True,
             ),
             _compute_live_measure(
                 observed=_as_float(observed_data.get("cost_adjusted")),
-                target=target_values.get("target_cost"),
+                target=target_values_by_name.get("target_cost"),
                 evidence_n=evidence_n_claims,
                 reverse_ratio=False,
             ),
@@ -3766,17 +3772,17 @@ def _build_live_mode_payload_for_candidate(
         + 0.5 * math.log(max(ci90_cost_high, 0.0001))
     )
 
-    low_score_check = rr_overall >= 1.12
-    low_confidence_check = ci90_low >= 1.08
-    high_score_check = rr_overall <= 0.88
-    high_confidence_check = ci75_high < 1.0
-    if low_score_check and low_confidence_check:
+    is_low_score = rr_overall >= 1.12
+    is_low_confidence = ci90_low >= 1.08
+    is_high_score = rr_overall <= 0.88
+    is_high_confidence = ci75_high < 1.0
+    if is_low_score and is_low_confidence:
         tier = "low"
-    elif high_score_check and high_confidence_check:
+    elif is_high_score and is_high_confidence:
         tier = "high"
     else:
         tier = "acceptable"
-    borderline_status = (int(low_score_check) + int(low_confidence_check)) == 1
+    is_borderline = (int(is_low_score) + int(is_low_confidence)) == 1
     has_claims = (
         (_as_float(observed_data.get("total_services")) or 0.0) > 0
         or (_as_float(observed_data.get("total_beneficiaries")) or 0.0) > 0
@@ -3822,11 +3828,11 @@ def _build_live_mode_payload_for_candidate(
     else:
         confidence_band = "none"
 
-    score_data = {
+    quality_score_by_field = {
         "model_version": PROVIDER_QUALITY_MODEL_VERSION,
         "benchmark_mode": benchmark_mode,
         "tier": tier,
-        "borderline_status": borderline_status,
+        "borderline_status": is_borderline,
         "score_0_100": _score_from_risk_ratio(rr_overall),
         "estimated_cost_level": _estimated_cost_level_from_risk_ratio(rr_cost),
         "risk_ratio_point": rr_overall,
@@ -3834,10 +3840,10 @@ def _build_live_mode_payload_for_candidate(
         "ci75_high": ci75_high,
         "ci90_low": ci90_low,
         "ci90_high": ci90_high,
-        "low_score_threshold_failed": low_score_check,
-        "low_confidence_threshold_failed": low_confidence_check,
-        "high_score_threshold_passed": high_score_check,
-        "high_confidence_threshold_passed": high_confidence_check,
+        "low_score_threshold_failed": is_low_score,
+        "low_confidence_threshold_failed": is_low_confidence,
+        "high_score_threshold_passed": is_high_score,
+        "high_confidence_threshold_passed": is_high_confidence,
         "score_method": score_method,
         "cost_source": "direct" if has_claims else "peer_estimated",
         "confidence_0_100": confidence_0_100,
@@ -3851,7 +3857,7 @@ def _build_live_mode_payload_for_candidate(
         "has_enrollment": observed_data.get("has_enrollment"),
         "has_medicare_claims": observed_data.get("has_medicare_claims"),
     }
-    cohort_context = {
+    cohort_context_by_field = {
         "selected_geography": selected_geography,
         "selected_cohort_level": selected_cohort_level,
         "peer_count": selected_peer_count,
@@ -3861,7 +3867,11 @@ def _build_live_mode_payload_for_candidate(
         "computed_live": True,
         "procedure_match_threshold": procedure_match_threshold,
     }
-    return _build_quality_mode_payload(score_data, domains_payload, cohort_context=cohort_context)
+    return _build_quality_mode_payload(
+        quality_score_by_field,
+        domains_payload,
+        cohort_context=cohort_context_by_field,
+    )
 
 
 def _build_live_mode_payload(
@@ -4560,7 +4570,10 @@ async def _load_procedure_taxonomy_evidence(
         ),
         query_params_by_name,
     )
-    evidence_items = [_taxonomy_evidence_item(_row_to_dict(row)) for row in query_result]
+    evidence_items = [
+        _taxonomy_evidence_item(_row_to_dict(evidence_row))
+        for evidence_row in query_result
+    ]
     return _procedure_taxonomy_evidence_cache_set(cache_key, evidence_items)
 
 
@@ -4619,40 +4632,45 @@ async def _resolve_internal_rx_codes_for_request(
             )
         )
 
-    result = await session.execute(select(code_crosswalk_table).where(or_(*clauses)))
-    rows = [_row_to_dict(row) for row in result]
+    crosswalk_result = await session.execute(
+        select(code_crosswalk_table).where(or_(*clauses))
+    )
+    crosswalk_rows = [
+        _row_to_dict(crosswalk_row)
+        for crosswalk_row in crosswalk_result
+    ]
     resolved_codes: list[str] = []
-    matched_via: list[dict[str, Any]] = []
+    crosswalk_matches: list[dict[str, Any]] = []
 
-    for row in rows:
-        from_system = str(row.get("from_system") or "").upper()
-        to_system = str(row.get("to_system") or "").upper()
-        from_code = str(row.get("from_code") or "").upper()
-        to_code = str(row.get("to_code") or "").upper()
+    for crosswalk_row in crosswalk_rows:
+        from_system = str(crosswalk_row.get("from_system") or "").upper()
+        to_system = str(crosswalk_row.get("to_system") or "").upper()
+        from_code = str(crosswalk_row.get("from_code") or "").upper()
+        to_code = str(crosswalk_row.get("to_code") or "").upper()
         if to_system == INTERNAL_RX_CODE_SYSTEM:
             resolved_codes.append(to_code)
-            matched_via.append(
+            crosswalk_matches.append(
                 {
                     "from_system": from_system,
                     "from_code": from_code,
                     "to_system": to_system,
                     "to_code": to_code,
-                    "match_type": row.get("match_type"),
-                    "confidence": row.get("confidence"),
-                    "source": row.get("source"),
+                    "match_type": crosswalk_row.get("match_type"),
+                    "confidence": crosswalk_row.get("confidence"),
+                    "source": crosswalk_row.get("source"),
                 }
             )
         elif expand_codes and from_system == INTERNAL_RX_CODE_SYSTEM:
             resolved_codes.append(from_code)
-            matched_via.append(
+            crosswalk_matches.append(
                 {
                     "from_system": from_system,
                     "from_code": from_code,
                     "to_system": to_system,
                     "to_code": to_code,
-                    "match_type": row.get("match_type"),
-                    "confidence": row.get("confidence"),
-                    "source": row.get("source"),
+                    "match_type": crosswalk_row.get("match_type"),
+                    "confidence": crosswalk_row.get("confidence"),
+                    "source": crosswalk_row.get("source"),
                 }
             )
 
@@ -4662,8 +4680,11 @@ async def _resolve_internal_rx_codes_for_request(
 
     return unique_codes, {
         "input_code": {"code_system": code_system, "code": code},
-        "resolved_codes": [{"code_system": INTERNAL_RX_CODE_SYSTEM, "code": item} for item in unique_codes],
-        "matched_via": matched_via,
+        "resolved_codes": [
+            {"code_system": INTERNAL_RX_CODE_SYSTEM, "code": resolved_code}
+            for resolved_code in unique_codes
+        ],
+        "matched_via": crosswalk_matches,
         "expanded": bool(expand_codes),
     }
 
@@ -4691,15 +4712,18 @@ async def _resolve_external_rx_codes_for_internal(
             ),
         )
     )
-    result = await session.execute(query)
-    rows = [_row_to_dict(row) for row in result]
+    crosswalk_result = await session.execute(query)
+    crosswalk_rows = [
+        _row_to_dict(crosswalk_row)
+        for crosswalk_row in crosswalk_result
+    ]
 
-    mapping: dict[str, dict[str, list[str]]] = {}
-    for row in rows:
-        from_system = str(row.get("from_system") or "").strip().upper()
-        from_code = str(row.get("from_code") or "").strip().upper()
-        to_system = str(row.get("to_system") or "").strip().upper()
-        to_code = str(row.get("to_code") or "").strip().upper()
+    external_codes_by_internal: dict[str, dict[str, list[str]]] = {}
+    for crosswalk_row in crosswalk_rows:
+        from_system = str(crosswalk_row.get("from_system") or "").strip().upper()
+        from_code = str(crosswalk_row.get("from_code") or "").strip().upper()
+        to_system = str(crosswalk_row.get("to_system") or "").strip().upper()
+        to_code = str(crosswalk_row.get("to_code") or "").strip().upper()
 
         internal_code: str | None = None
         external_system: str | None = None
@@ -4717,10 +4741,13 @@ async def _resolve_external_rx_codes_for_internal(
         if not internal_code or not external_system or not external_code:
             continue
 
-        target = mapping.setdefault(internal_code, {system: [] for system in external_systems})
-        if external_code not in target[external_system]:
-            target[external_system].append(external_code)
-    return mapping
+        external_codes_by_system = external_codes_by_internal.setdefault(
+            internal_code,
+            {system: [] for system in external_systems},
+        )
+        if external_code not in external_codes_by_system[external_system]:
+            external_codes_by_system[external_system].append(external_code)
+    return external_codes_by_internal
 
 
 def _select_preferred_external_rx_code(

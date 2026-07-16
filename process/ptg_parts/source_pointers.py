@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from db.connection import db
@@ -948,15 +949,24 @@ async def activate_ptg2_source_candidate(
         )
 
 
-async def _activate_ptg2_source_candidate_in_transaction(
+@dataclass(frozen=True)
+class _CandidateActivationContext:
+    candidate: dict[str, Any]
+    activation_by_field: dict[str, Any]
+    allowed_activation_by_field: dict[str, Any] | None
+    activated_at: datetime.datetime
+    import_month: datetime.date
+    plan_pointer_entries: list[dict[str, Any]]
+
+
+async def _candidate_activation_context(
     session: Any,
     *,
     schema_name: str,
     source_key: str,
     snapshot_id: str,
     expected_current_snapshot_id: str | None,
-) -> dict[str, Any]:
-    """Activate a source candidate within its pointer transaction."""
+) -> _CandidateActivationContext:
     candidate = await _locked_candidate_activation_row(
         session,
         schema_name=schema_name,
@@ -982,12 +992,29 @@ async def _activate_ptg2_source_candidate_in_transaction(
             import_month=import_month,
             source_key=source_key,
             snapshot_id=snapshot_id,
-            previous_snapshot_id=activation_by_field[
-                "previous_snapshot_id"
-            ],
+            previous_snapshot_id=activation_by_field["previous_snapshot_id"],
             updated_at=activated_at,
         )
     ]
+    return _CandidateActivationContext(
+        candidate=candidate,
+        activation_by_field=activation_by_field,
+        allowed_activation_by_field=allowed_activation_by_field,
+        activated_at=activated_at,
+        import_month=import_month,
+        plan_pointer_entries=plan_pointer_entries,
+    )
+
+
+async def _activate_candidate_source_pointer(
+    session: Any,
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+    activation_context: _CandidateActivationContext,
+) -> bytes:
+    activation_by_field = activation_context.activation_by_field
     audit_report_digest = await verify_candidate_audit_attestation_in_transaction(
         session,
         schema_name=schema_name,
@@ -1003,37 +1030,57 @@ async def _activate_ptg2_source_candidate_in_transaction(
         schema_name=schema_name,
         source_key=source_key,
         snapshot_id=snapshot_id,
-        previous_snapshot_id=activation_by_field[
-            "previous_snapshot_id"
-        ],
-        import_month=import_month,
-        updated_at=activated_at,
+        previous_snapshot_id=activation_by_field["previous_snapshot_id"],
+        import_month=activation_context.import_month,
+        updated_at=activation_context.activated_at,
         allow_already_current=False,
     )
-    allowed_pointer_by_field = None
-    if allowed_activation_by_field is not None:
-        await _compare_and_swap_source_pointer(
-            session,
-            schema_name=schema_name,
-            source_key=allowed_activation_by_field["source_key"],
-            snapshot_id=snapshot_id,
-            previous_snapshot_id=allowed_activation_by_field[
-                "previous_snapshot_id"
-            ],
-            import_month=import_month,
-            updated_at=activated_at,
-            allow_already_current=False,
-        )
-        allowed_pointer_by_field = {
-            "status": "promoted",
-            "source_key": allowed_activation_by_field["source_key"],
-            "snapshot_id": snapshot_id,
-            "previous_snapshot_id": allowed_activation_by_field[
-                "previous_snapshot_id"
-            ],
-        }
-    candidate_attributes = {
-        key: candidate.get(key)
+    return audit_report_digest
+
+
+async def _promote_allowed_amount_pointer(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_id: str,
+    activation_context: _CandidateActivationContext,
+) -> dict[str, Any] | None:
+    allowed_activation_by_field = activation_context.allowed_activation_by_field
+    if allowed_activation_by_field is None:
+        return None
+    await _compare_and_swap_source_pointer(
+        session,
+        schema_name=schema_name,
+        source_key=allowed_activation_by_field["source_key"],
+        snapshot_id=snapshot_id,
+        previous_snapshot_id=allowed_activation_by_field[
+            "previous_snapshot_id"
+        ],
+        import_month=activation_context.import_month,
+        updated_at=activation_context.activated_at,
+        allow_already_current=False,
+    )
+    return {
+        "status": "promoted",
+        "source_key": allowed_activation_by_field["source_key"],
+        "snapshot_id": snapshot_id,
+        "previous_snapshot_id": allowed_activation_by_field[
+            "previous_snapshot_id"
+        ],
+    }
+
+
+async def _persist_candidate_activation(
+    session: Any,
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+    activation_context: _CandidateActivationContext,
+    audit_report_digest: bytes,
+) -> None:
+    candidate_attributes_by_field = {
+        key: activation_context.candidate.get(key)
         for key in (
             "snapshot_id",
             "import_run_id",
@@ -1050,8 +1097,8 @@ async def _activate_ptg2_source_candidate_in_transaction(
         session,
         schema_name=schema_name,
         snapshot_attributes=activated_snapshot_attributes(
-            candidate_attributes,
-            activated_at=activated_at,
+            candidate_attributes_by_field,
+            activated_at=activation_context.activated_at,
             activation_mode="audited_control",
         ),
     )
@@ -1059,36 +1106,88 @@ async def _activate_ptg2_source_candidate_in_transaction(
         session,
         schema_name=schema_name,
         snapshot_id=snapshot_id,
-        updated_at=activated_at,
+        updated_at=activation_context.activated_at,
     )
     await _replace_source_plan_pointers(
         session,
         schema_name=schema_name,
         source_key=source_key,
-        plan_pointer_entries=plan_pointer_entries,
+        plan_pointer_entries=activation_context.plan_pointer_entries,
     )
     await consume_candidate_audit_attestation_in_transaction(
         session,
         schema_name=schema_name,
         snapshot_id=snapshot_id,
         report_digest=audit_report_digest,
-        activated_at=activated_at,
+        activated_at=activation_context.activated_at,
     )
+
+
+def _candidate_activation_result(
+    *,
+    source_key: str,
+    snapshot_id: str,
+    activation_context: _CandidateActivationContext,
+    allowed_pointer_by_field: dict[str, Any] | None,
+) -> dict[str, Any]:
     result_by_field = {
         "status": "promoted",
         "source_key": source_key,
         "snapshot_id": snapshot_id,
-        "previous_snapshot_id": activation_by_field[
+        "previous_snapshot_id": activation_context.activation_by_field[
             "previous_snapshot_id"
         ],
         "plan_source_count": 1,
         "global_pointer": "reconciled",
     }
     if allowed_pointer_by_field is not None:
-        result_by_field["allowed_amount_pointer"] = (
-            allowed_pointer_by_field
-        )
+        result_by_field["allowed_amount_pointer"] = allowed_pointer_by_field
     return result_by_field
+
+
+async def _activate_ptg2_source_candidate_in_transaction(
+    session: Any,
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+    expected_current_snapshot_id: str | None,
+) -> dict[str, Any]:
+    """Activate a source candidate within its pointer transaction."""
+    activation_context = await _candidate_activation_context(
+        session,
+        schema_name=schema_name,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        expected_current_snapshot_id=expected_current_snapshot_id,
+    )
+    audit_report_digest = await _activate_candidate_source_pointer(
+        session,
+        schema_name=schema_name,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        activation_context=activation_context,
+    )
+    allowed_pointer_by_field = await _promote_allowed_amount_pointer(
+        session,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        activation_context=activation_context,
+    )
+    await _persist_candidate_activation(
+        session,
+        schema_name=schema_name,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        activation_context=activation_context,
+        audit_report_digest=audit_report_digest,
+    )
+    return _candidate_activation_result(
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        activation_context=activation_context,
+        allowed_pointer_by_field=allowed_pointer_by_field,
+    )
 
 
 async def _publish_ptg2_source_pointers(
