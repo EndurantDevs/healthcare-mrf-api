@@ -1144,6 +1144,200 @@ def test_strict_candidate_activation_verifies_and_consumes_attestation_atomicall
     assert cas_calls[0]["allow_already_current"] is False
 
 
+def _mixed_candidate_activation_row():
+    return {
+        "snapshot_id": "snap_new",
+        "import_run_id": "run_1",
+        "import_month": datetime.date(2026, 7, 1),
+        "status": "validated",
+        "created_at": datetime.datetime(2026, 7, 13, 8, 0, 0),
+        "validated_at": datetime.datetime(2026, 7, 13, 8, 30, 0),
+        "published_at": None,
+        "previous_snapshot_id": "snap_old",
+        "manifest": {
+            "activation": {
+                "contract": "ptg2_candidate_activation_v1",
+                "state": "validated",
+                "source_key": "source_a",
+                "expected_previous_snapshot_id": "snap_old",
+            },
+            "allowed_amount_index": {
+                "contract": "ptg2_allowed_amounts_v1",
+                "arch_version": "postgres_binary_v3",
+                "storage": "postgresql",
+                "snapshot_scoped": True,
+                "data_domain": "allowed_amounts",
+                "source_key": "source_a",
+                "current_source_key": "source_a_allowed_amounts",
+                "previous_snapshot_id": "allowed_old",
+                "allowed_amount_payments": 4,
+                "allowed_amount_evidence": True,
+            },
+        },
+        "snapshot_key": 17,
+        "plan_id": "12-3456789",
+        "plan_market_type": "group",
+        "coverage_scope_id": b"c" * 32,
+    }
+
+
+def _mixed_candidate_activation_recorders(event_names, cas_calls):
+    """Create ordered event recorders for mixed activation."""
+
+    async def record_event(name, result=None, **_kwargs):
+        event_names.append(name)
+        return result
+
+    async def compare_and_swap(_session, **kwargs):
+        event_names.append(f"cas:{kwargs['source_key']}")
+        cas_calls.append(kwargs)
+
+    return record_event, compare_and_swap
+
+
+def _install_mixed_candidate_activation_readers(
+    monkeypatch,
+    record_event,
+    transaction_session,
+    activation_time,
+):
+    """Install transaction, candidate, clock, and attestation readers."""
+
+    monkeypatch.setattr(
+        source_pointers.db,
+        "transaction",
+        lambda: _Transaction(transaction_session),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_acquire_source_pointer_gc_lock",
+        lambda _session: record_event("lock"),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_locked_candidate_activation_row",
+        lambda _session, **_kwargs: record_event(
+            "candidate",
+            _mixed_candidate_activation_row(),
+        ),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_database_utc_timestamp",
+        lambda _session: record_event("clock", activation_time),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "verify_candidate_audit_attestation_in_transaction",
+        lambda _session, **_kwargs: record_event("verify", b"r" * 32),
+    )
+
+
+def _install_mixed_candidate_activation_writers(
+    monkeypatch,
+    record_event,
+    compare_and_swap,
+):
+    """Install pointer, snapshot, plan, and attestation writers."""
+
+    monkeypatch.setattr(
+        source_pointers,
+        "_compare_and_swap_source_pointer",
+        compare_and_swap,
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_publish_snapshot_in_pointer_transaction",
+        lambda _session, **_kwargs: record_event("publish"),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_reconcile_global_snapshot_pointer",
+        lambda _session, **_kwargs: record_event("global"),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_replace_source_plan_pointers",
+        lambda _session, **_kwargs: record_event("plan_pointers"),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "consume_candidate_audit_attestation_in_transaction",
+        lambda _session, **_kwargs: record_event("consume"),
+    )
+
+
+def _install_mixed_candidate_activation_collaborators(
+    monkeypatch,
+    event_names,
+    cas_calls,
+):
+    """Install the audited mixed-candidate activation collaborators."""
+
+    transaction_session = object()
+    activation_time = datetime.datetime(2026, 7, 13, 9, 0, 0)
+    record_event, compare_and_swap = _mixed_candidate_activation_recorders(
+        event_names,
+        cas_calls,
+    )
+    _install_mixed_candidate_activation_readers(
+        monkeypatch,
+        record_event,
+        transaction_session,
+        activation_time,
+    )
+    _install_mixed_candidate_activation_writers(
+        monkeypatch,
+        record_event,
+        compare_and_swap,
+    )
+
+
+def test_audited_mixed_candidate_activates_allowed_pointer_in_same_transaction(
+    monkeypatch,
+):
+    """Advance negotiated and allowed pointers during audited activation."""
+
+    event_names = []
+    cas_calls = []
+    _install_mixed_candidate_activation_collaborators(
+        monkeypatch,
+        event_names,
+        cas_calls,
+    )
+    activation_result = asyncio.run(
+        source_pointers.activate_ptg2_source_candidate(
+            source_key="source_a",
+            snapshot_id="snap_new",
+            expected_current_snapshot_id="snap_old",
+        )
+    )
+
+    assert event_names == [
+        "lock",
+        "candidate",
+        "clock",
+        "verify",
+        "cas:source_a",
+        "cas:source_a_allowed_amounts",
+        "publish",
+        "global",
+        "plan_pointers",
+        "consume",
+    ]
+    assert [call["previous_snapshot_id"] for call in cas_calls] == [
+        "snap_old",
+        "allowed_old",
+    ]
+    assert all(call["allow_already_current"] is False for call in cas_calls)
+    assert activation_result["allowed_amount_pointer"] == {
+        "status": "promoted",
+        "source_key": "source_a_allowed_amounts",
+        "snapshot_id": "snap_new",
+        "previous_snapshot_id": "allowed_old",
+    }
+
+
 def test_attestation_consumption_failure_rolls_back_all_activation_state(monkeypatch):
     """Verify attestation consumption failure rolls back all activation state."""
     session = object()

@@ -1819,6 +1819,166 @@ class PTG2Snapshot(Base, JSONOutputMixin):
     manifest = Column(JSON)
 
 
+class PTG2AllowedAmountPlan(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_allowed_amount_plan"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("snapshot_id", "plan_hash"),
+        ForeignKeyConstraint(
+            ["snapshot_id"],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_snapshot.snapshot_id"],
+            ondelete="CASCADE",
+        ),
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
+    )
+    __my_index_elements__ = ["snapshot_id", "plan_hash"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": (
+                "snapshot_id",
+                "plan_id",
+                "plan_market_type",
+                "file_id",
+            ),
+            "name": "ptg2_allowed_plan_snapshot_lookup_idx",
+        },
+        {
+            "index_elements": ("snapshot_id", "file_id"),
+            "name": "ptg2_allowed_plan_file_idx",
+        },
+    ]
+
+    snapshot_id = Column(String(96), nullable=False)
+    plan_hash = Column(BigInteger, nullable=False)
+    source_file_version_id = Column(String(96))
+    file_id = Column(BigInteger, nullable=False)
+    plan_name = Column(String)
+    plan_id_type = Column(String(16))
+    plan_id = Column(String(64), nullable=False)
+    plan_market_type = Column(String(32))
+    issuer_name = Column(String)
+    plan_sponsor_name = Column(String)
+
+
+class PTG2AllowedAmountItem(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_allowed_amount_item"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("snapshot_id", "allowed_item_hash"),
+        ForeignKeyConstraint(
+            ["snapshot_id"],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_snapshot.snapshot_id"],
+            ondelete="CASCADE",
+        ),
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
+    )
+    __my_index_elements__ = ["snapshot_id", "allowed_item_hash"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": (
+                "snapshot_id",
+                "billing_code",
+                "plan_id",
+                "file_id",
+                "billing_code_type",
+            ),
+            "name": "ptg2_allowed_item_snapshot_code_plan_idx",
+        },
+    ]
+
+    snapshot_id = Column(String(96), nullable=False)
+    allowed_item_hash = Column(BigInteger, nullable=False)
+    source_file_version_id = Column(String(96))
+    file_id = Column(BigInteger, nullable=False)
+    name = Column(String)
+    billing_code_type = Column(String(32))
+    billing_code_type_version = Column(String(32))
+    billing_code = Column(String(64))
+    description = Column(String)
+    plan_name = Column(String)
+    plan_id_type = Column(String(16))
+    plan_id = Column(String(64))
+    plan_market_type = Column(String(32))
+    issuer_name = Column(String)
+    plan_sponsor_name = Column(String)
+
+
+class PTG2AllowedAmountPayment(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_allowed_amount_payment"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("snapshot_id", "payment_hash"),
+        ForeignKeyConstraint(
+            ["snapshot_id", "allowed_item_hash"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}.ptg2_allowed_amount_item.snapshot_id",
+                f"{_PTG2_DATABASE_SCHEMA}.ptg2_allowed_amount_item.allowed_item_hash",
+            ],
+            ondelete="CASCADE",
+        ),
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
+    )
+    __my_index_elements__ = ["snapshot_id", "payment_hash"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("snapshot_id", "allowed_item_hash"),
+            "name": "ptg2_allowed_payment_item_idx",
+        },
+        {
+            "index_elements": ("snapshot_id", "tin_value"),
+            "name": "ptg2_allowed_payment_tin_idx",
+        },
+    ]
+
+    snapshot_id = Column(String(96), nullable=False)
+    payment_hash = Column(BigInteger, nullable=False)
+    allowed_item_hash = Column(BigInteger, nullable=False)
+    tin_type = Column(String(8))
+    tin_value = Column(String(32))
+    service_code = Column(ARRAY(String))
+    billing_class = Column(String(32))
+    setting = Column(String(32))
+    allowed_amount = Column(Numeric)
+    billing_code_modifier = Column(ARRAY(String))
+    network_status = Column(String(64))
+    network_semantics = Column(String(64))
+
+
+class PTG2AllowedAmountProviderPayment(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_allowed_amount_provider_payment"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("snapshot_id", "provider_payment_hash"),
+        ForeignKeyConstraint(
+            ["snapshot_id", "payment_hash"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}.ptg2_allowed_amount_payment.snapshot_id",
+                f"{_PTG2_DATABASE_SCHEMA}.ptg2_allowed_amount_payment.payment_hash",
+            ],
+            ondelete="CASCADE",
+        ),
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
+    )
+    __my_index_elements__ = ["snapshot_id", "provider_payment_hash"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("snapshot_id", "payment_hash"),
+            "name": "ptg2_allowed_provider_payment_idx",
+        },
+        {
+            "index_elements": ("npi",),
+            "name": "ptg2_allowed_provider_npi_gin_idx",
+            "using": "gin",
+        },
+    ]
+
+    snapshot_id = Column(String(96), nullable=False)
+    provider_payment_hash = Column(BigInteger, nullable=False)
+    payment_hash = Column(BigInteger, nullable=False)
+    billed_charge = Column(Numeric)
+    npi = Column(ARRAY(BigInteger), nullable=False)
+
+
 class PTG2CurrentSnapshot(Base, JSONOutputMixin):
     __tablename__ = "ptg2_current_snapshot"
     __main_table__ = __tablename__

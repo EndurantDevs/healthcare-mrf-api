@@ -47,6 +47,11 @@ from process.ptg_parts.artifact_streams import (load_json_artifact,
                                                 logical_artifact_identity,
                                                 open_json_artifact_stream,
                                                 stream_logical_artifact)
+from process.ptg_parts.allowed_amounts import (
+    PTG2_ALLOWED_AMOUNT_CONTRACT,
+    PTG2_ALLOWED_AMOUNT_TABLE_NAMES,
+    _process_allowed_amounts_file,
+)
 from process.ptg_parts.artifacts import (PTG2ArtifactStore,
                                          _hash_existing_file_into,
                                          _load_completed_ranges,
@@ -243,6 +248,9 @@ from process.ptg_parts.source_jobs import (_dedupe_preserve, _dedupe_ptg_jobs,
                                            parse_toc_catalog_entries)
 from process.ptg_parts.source_pointers import (_current_source_snapshot_id,
                                                _acquire_source_pointer_gc_lock,
+                                               _allowed_source_pointer_key,
+                                               _activate_ptg2_source_candidate_in_transaction,
+                                               _compare_and_swap_source_pointer,
                                                _stage_ptg2_source_candidate,
                                                activated_snapshot_attributes,
                                                _ptg2_plan_source_key,
@@ -1391,6 +1399,7 @@ async def _process_table_of_contents(
     import_log_cls = classes["ImportLog"]
     jobs: list[dict[str, Any]] = []
     file_rows: list[dict[str, Any]] = []
+    allowed_job_candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
     seen_files: set[int] = set()
 
     with tempfile.TemporaryDirectory(dir=ptg2_temp_parent()) as tmpdir:
@@ -1432,7 +1441,10 @@ async def _process_table_of_contents(
     if import_run_id and not targeted_file_import:
         catalog_rows = []
         for entry in parsed_catalog_entries:
-            if entry.domain != PTG2_DOMAIN_IN_NETWORK:
+            if entry.domain not in {
+                PTG2_DOMAIN_IN_NETWORK,
+                PTG2_DOMAIN_ALLOWED_AMOUNT,
+            }:
                 continue
             first_plan = entry.plan_info[0] if len(entry.plan_info) == 1 else {}
             catalog_rows.append(
@@ -1484,6 +1496,9 @@ async def _process_table_of_contents(
             if catalog_entry.domain == PTG2_DOMAIN_IN_NETWORK:
                 job_type = "in_network"
                 file_type = "in-network"
+            elif catalog_entry.domain == PTG2_DOMAIN_ALLOWED_AMOUNT:
+                job_type = "allowed_amounts"
+                file_type = "allowed-amounts"
             else:
                 continue
             location = normalize_tic_source_url(catalog_entry.original_url)
@@ -1502,19 +1517,21 @@ async def _process_table_of_contents(
                 catalog_entry.description,
                 catalog_entry.from_index_url or toc_url,
             )
+            job_by_field = {
+                "type": job_type,
+                "url": location,
+                "description": catalog_entry.description,
+                "plan_info": plans,
+                "from_index_url": catalog_entry.from_index_url or toc_url,
+                "meta": file_metadata_by_field,
+            }
+            if job_type == "allowed_amounts":
+                allowed_job_candidates.append((job_by_field, file_row))
+                continue
             if file_row["file_id"] not in seen_files:
                 file_rows.append(file_row)
                 seen_files.add(file_row["file_id"])
-            jobs.append(
-                {
-                    "type": job_type,
-                    "url": location,
-                    "description": catalog_entry.description,
-                    "plan_info": plans,
-                    "from_index_url": catalog_entry.from_index_url or toc_url,
-                    "meta": file_metadata_by_field,
-                }
-            )
+            jobs.append(job_by_field)
             if test_mode and len(jobs) >= TEST_TOC_JOBS:
                 break
 
@@ -1568,6 +1585,54 @@ async def _process_table_of_contents(
             if _has_reached_toc_file_limit(jobs, max_files):
                 break
 
+        allowed_amount_files = _as_list(
+            structure.get("allowed_amount_file")
+        ) + _as_list(structure.get("allowed_amount_files"))
+        for entry in allowed_amount_files:
+            if not isinstance(entry, dict):
+                continue
+            location = entry.get("location")
+            if not _is_toc_body_file_location(location):
+                continue
+            location = normalize_tic_source_url(location)
+            if not _is_requested_toc_body_file_url(
+                location,
+                file_url_match_tokens,
+            ):
+                continue
+            file_metadata_by_field = dict(toc_metadata_by_field)
+            file_row = _build_file_row(
+                location,
+                "allowed-amounts",
+                file_metadata_by_field,
+                plans,
+                entry.get("description"),
+                toc_url,
+            )
+            allowed_job_candidates.append(
+                (
+                    {
+                        "type": "allowed_amounts",
+                        "url": location,
+                        "description": entry.get("description"),
+                        "plan_info": plans,
+                        "from_index_url": toc_url,
+                        "meta": file_metadata_by_field,
+                    },
+                    file_row,
+                )
+            )
+
+        if test_mode and len(jobs) >= TEST_TOC_JOBS:
+            break
+
+    for allowed_job, file_row in allowed_job_candidates:
+        if _has_reached_toc_file_limit(jobs, max_files):
+            break
+        if file_row["file_id"] not in seen_files:
+            file_rows.append(file_row)
+            seen_files.add(file_row["file_id"])
+        jobs.append(allowed_job)
         if test_mode and len(jobs) >= TEST_TOC_JOBS:
             break
 
@@ -2062,6 +2127,13 @@ async def _cleanup_failed_ptg2_source_state(
             "Failed to clean PTG2 shared source metadata for failed import",
             exc_info=True,
         )
+    try:
+        await _delete_allowed_snapshot_rows(snapshot_id)
+    except Exception:
+        logger.debug(
+            "Failed to clean PTG2 allowed-amount rows for failed import",
+            exc_info=True,
+        )
 
 
 def _source_version_summary(source_version: PTG2SourceVersion | None) -> dict[str, Any]:
@@ -2114,6 +2186,103 @@ def _ptg2_source_file_versions_from_results(files: list[dict[str, Any]]) -> list
             }
         )
     return versions
+
+
+_ALLOWED_AMOUNT_METRIC_KEYS = (
+    "allowed_amount_plans",
+    "allowed_amount_items",
+    "allowed_amount_blocks",
+    "allowed_amount_payments",
+    "allowed_amount_provider_payments",
+    "allowed_amount_npi_references",
+    "allowed_amount_unique_tins",
+)
+
+
+async def _current_allowed_snapshot_id(source_key: str) -> str | None:
+    """Resolve the current allowed-evidence snapshot for one logical source."""
+
+    return await _current_source_snapshot_id(
+        _allowed_source_pointer_key(source_key)
+    )
+
+
+def _allowed_amount_metrics_from_results(
+    file_results: Iterable[Mapping[str, Any]],
+) -> dict[str, int | bool]:
+    metrics_by_name: dict[str, int | bool] = {
+        metric_name: 0 for metric_name in _ALLOWED_AMOUNT_METRIC_KEYS
+    }
+    for file_result in file_results:
+        if str(file_result.get("source_type") or "") != "allowed_amounts":
+            continue
+        summary = file_result.get("summary")
+        if not isinstance(summary, Mapping):
+            continue
+        for metric_name in _ALLOWED_AMOUNT_METRIC_KEYS:
+            try:
+                metric_value = max(0, int(summary.get(metric_name) or 0))
+            except (TypeError, ValueError):
+                continue
+            metrics_by_name[metric_name] = (
+                int(metrics_by_name.get(metric_name) or 0) + metric_value
+            )
+    metrics_by_name["allowed_amount_evidence"] = bool(
+        int(metrics_by_name.get("allowed_amount_provider_payments") or 0) > 0
+        or int(metrics_by_name.get("allowed_amount_payments") or 0) > 0
+    )
+    return metrics_by_name
+
+
+async def _delete_allowed_snapshot_rows(snapshot_id: str) -> None:
+    """Delete all unpublished allowed-amount rows owned by one snapshot."""
+
+    schema_name = _quote_ident(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+    async with db.transaction() as session:
+        for table_name in PTG2_ALLOWED_AMOUNT_TABLE_NAMES:
+            await session.execute(
+                db.text(
+                    f"""
+                    DELETE FROM {schema_name}.{_quote_ident(table_name)}
+                     WHERE snapshot_id = :snapshot_id
+                    """
+                ),
+                {"snapshot_id": snapshot_id},
+            )
+
+
+def _allowed_amount_index_manifest(
+    allowed_metrics: Mapping[str, Any],
+    *,
+    source_key: str,
+    previous_snapshot_id: str | None,
+) -> dict[str, Any]:
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    return {
+        "contract": PTG2_ALLOWED_AMOUNT_CONTRACT,
+        "arch_version": "postgres_binary_v3",
+        "storage": "postgresql",
+        "snapshot_scoped": True,
+        "data_domain": PTG2_DOMAIN_ALLOWED_AMOUNT,
+        "source_key": source_key,
+        "current_source_key": _allowed_source_pointer_key(source_key),
+        "previous_snapshot_id": previous_snapshot_id,
+        "tables": {
+            "plans": f"{schema_name}.ptg2_allowed_amount_plan",
+            "items": f"{schema_name}.ptg2_allowed_amount_item",
+            "payments": f"{schema_name}.ptg2_allowed_amount_payment",
+            "provider_payments": (
+                f"{schema_name}.ptg2_allowed_amount_provider_payment"
+            ),
+        },
+        **{
+            metric_name: int(allowed_metrics.get(metric_name) or 0)
+            for metric_name in _ALLOWED_AMOUNT_METRIC_KEYS
+        },
+        "allowed_amount_evidence": bool(
+            allowed_metrics.get("allowed_amount_evidence")
+        ),
+    }
 
 
 def _normalize_source_network_names(value: Any) -> list[str]:
@@ -2219,9 +2388,64 @@ async def _reconcile_already_published_snapshot(
     source_key: str,
     import_month: datetime.date,
 ) -> dict[str, Any]:
+    """Repair every current pointer represented by a published manifest."""
+
+    manifest = _published_snapshot_manifest(snapshot_attributes)
     serving_index = _published_snapshot_serving_index(snapshot_attributes)
+    pointer_reconciliation_by_field = (
+        await _reconcile_serving_snapshot_pointer(
+            snapshot_attributes=snapshot_attributes,
+            snapshot_id=snapshot_id,
+            source_key=source_key,
+            import_month=import_month,
+            serving_index=serving_index,
+        )
+    )
+
+    allowed_amount_index = manifest.get("allowed_amount_index")
+    if (
+        isinstance(allowed_amount_index, Mapping)
+        and allowed_amount_index.get("contract")
+        == PTG2_ALLOWED_AMOUNT_CONTRACT
+    ):
+        allowed_previous_snapshot_id = allowed_amount_index.get(
+            "previous_snapshot_id"
+        )
+        allowed_pointer_result = await _reconcile_allowed_snapshot_pointer(
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=(
+                str(allowed_previous_snapshot_id)
+                if allowed_previous_snapshot_id
+                else None
+            ),
+            import_month=import_month,
+        )
+        if pointer_reconciliation_by_field is None:
+            return allowed_pointer_result
+        pointer_reconciliation_by_field["allowed_amount_pointer"] = (
+            allowed_pointer_result
+        )
+    if pointer_reconciliation_by_field is None:
+        return {
+            "status": "not_applicable",
+            "reason": "snapshot has no current-source lifecycle",
+        }
+    return pointer_reconciliation_by_field
+
+
+async def _reconcile_serving_snapshot_pointer(
+    *,
+    snapshot_attributes: dict[str, Any],
+    snapshot_id: str,
+    source_key: str,
+    import_month: datetime.date,
+    serving_index: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Repair the negotiated serving pointer when the snapshot owns one."""
+
     if serving_index.get("storage") != "manifest_snapshot":
-        return {"status": "not_applicable", "reason": "snapshot has no source-scoped serving tables"}
+        return None
     previous_snapshot_id = snapshot_attributes.get("previous_snapshot_id")
     current_snapshot_id = await _current_source_snapshot_id(source_key)
     allowed_current_ids = {
@@ -2239,10 +2463,12 @@ async def _reconcile_already_published_snapshot(
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     async with db.transaction() as session:
         await _acquire_source_pointer_gc_lock(session)
-        missing_tables, missing_artifacts = await _missing_snapshot_serving_resources(
-            schema_name,
-            snapshot_id,
-            serving_index,
+        missing_tables, missing_artifacts = (
+            await _missing_snapshot_serving_resources(
+                schema_name,
+                snapshot_id,
+                dict(serving_index),
+            )
         )
         if missing_tables or missing_artifacts:
             missing_resources = [*missing_tables, *missing_artifacts]
@@ -2253,11 +2479,119 @@ async def _reconcile_already_published_snapshot(
         return await _publish_ptg2_source_pointers(
             source_key=source_key,
             snapshot_id=snapshot_id,
-            previous_snapshot_id=str(previous_snapshot_id) if previous_snapshot_id else None,
+            previous_snapshot_id=(
+                str(previous_snapshot_id) if previous_snapshot_id else None
+            ),
             import_month=import_month,
             updated_at=_utcnow(),
             snapshot_attributes=snapshot_attributes,
         )
+
+
+async def _publish_allowed_current_pointer(
+    *,
+    source_key: str,
+    snapshot_id: str,
+    previous_snapshot_id: str | None,
+    import_month: datetime.date,
+    updated_at: datetime.datetime,
+) -> dict[str, Any]:
+    """Advance the isolated allowed-evidence current pointer."""
+
+    pointer_source_key = _allowed_source_pointer_key(source_key)
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    async with db.transaction() as session:
+        await _acquire_source_pointer_gc_lock(session)
+        await _compare_and_swap_source_pointer(
+            session,
+            schema_name=schema_name,
+            source_key=pointer_source_key,
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=previous_snapshot_id,
+            import_month=import_month,
+            updated_at=updated_at,
+        )
+    return {
+        "status": "promoted",
+        "source_key": pointer_source_key,
+        "snapshot_id": snapshot_id,
+        "previous_snapshot_id": previous_snapshot_id,
+    }
+
+
+async def _publish_mixed_candidate_current_pointers(
+    *,
+    source_key: str,
+    snapshot_id: str,
+    previous_snapshot_id: str | None,
+    previous_allowed_snapshot_id: str | None,
+    import_month: datetime.date,
+    updated_at: datetime.datetime,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Atomically activate negotiated and allowed pointers for one candidate."""
+
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    async with db.transaction() as session:
+        await _acquire_source_pointer_gc_lock(session)
+        negotiated_pointer_result = (
+            await _activate_ptg2_source_candidate_in_transaction(
+                session,
+                schema_name=schema_name,
+                source_key=source_key,
+                snapshot_id=snapshot_id,
+                expected_current_snapshot_id=previous_snapshot_id,
+            )
+        )
+    allowed_pointer_result = negotiated_pointer_result.get(
+        "allowed_amount_pointer"
+    )
+    if not isinstance(allowed_pointer_result, dict):
+        raise RuntimeError(
+            "mixed candidate activation did not publish its allowed pointer"
+        )
+    expected_allowed_source_key = _allowed_source_pointer_key(source_key)
+    if (
+        allowed_pointer_result.get("source_key")
+        != expected_allowed_source_key
+        or allowed_pointer_result.get("snapshot_id") != snapshot_id
+        or allowed_pointer_result.get("previous_snapshot_id")
+        != previous_allowed_snapshot_id
+    ):
+        raise RuntimeError(
+            "mixed candidate activation returned an inconsistent allowed pointer"
+        )
+    return negotiated_pointer_result, allowed_pointer_result
+
+
+async def _reconcile_allowed_snapshot_pointer(
+    *,
+    source_key: str,
+    snapshot_id: str,
+    previous_snapshot_id: str | None,
+    import_month: datetime.date,
+) -> dict[str, Any]:
+    """Repair an allowed current pointer for an idempotent published rerun."""
+
+    current_snapshot_id = await _current_allowed_snapshot_id(source_key)
+    allowed_current_ids = {
+        snapshot_id,
+        previous_snapshot_id,
+        None,
+    }
+    if current_snapshot_id not in allowed_current_ids:
+        return {
+            "status": "superseded",
+            "source_key": _allowed_source_pointer_key(source_key),
+            "snapshot_id": snapshot_id,
+            "current_snapshot_id": current_snapshot_id,
+        }
+    return await _publish_allowed_current_pointer(
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        previous_snapshot_id=previous_snapshot_id,
+        import_month=import_month,
+        updated_at=_utcnow(),
+    )
 
 
 async def _resume_validated_candidate(
@@ -2301,22 +2635,54 @@ async def _resume_validated_candidate(
 
     previous_snapshot_id = activation.get("expected_previous_snapshot_id")
     pointer_result: dict[str, Any] | None = None
+    allowed_amount_index = manifest.get("allowed_amount_index")
+    has_allowed_amount_index = (
+        isinstance(allowed_amount_index, Mapping)
+        and allowed_amount_index.get("contract")
+        == PTG2_ALLOWED_AMOUNT_CONTRACT
+    )
+    allowed_pointer_result: dict[str, Any] | None = None
     if auto_activate:
         activated_at = _utcnow()
-        pointer_result = await _publish_ptg2_source_pointers(
-            source_key=source_key,
-            snapshot_id=snapshot_id,
-            previous_snapshot_id=(
-                str(previous_snapshot_id) if previous_snapshot_id else None
-            ),
-            import_month=import_month,
-            updated_at=activated_at,
-            snapshot_attributes=activated_snapshot_attributes(
-                snapshot_attributes,
-                activated_at=activated_at,
-                activation_mode="automatic_redelivery",
-            ),
-        )
+        if has_allowed_amount_index:
+            allowed_previous_snapshot_id = allowed_amount_index.get(
+                "previous_snapshot_id"
+            )
+            pointer_result, allowed_pointer_result = (
+                await _publish_mixed_candidate_current_pointers(
+                    source_key=source_key,
+                    snapshot_id=snapshot_id,
+                    previous_snapshot_id=(
+                        str(previous_snapshot_id)
+                        if previous_snapshot_id
+                        else None
+                    ),
+                    previous_allowed_snapshot_id=(
+                        str(allowed_previous_snapshot_id)
+                        if allowed_previous_snapshot_id
+                        else None
+                    ),
+                    import_month=import_month,
+                    updated_at=activated_at,
+                )
+            )
+        else:
+            pointer_result = await _publish_ptg2_source_pointers(
+                source_key=source_key,
+                snapshot_id=snapshot_id,
+                previous_snapshot_id=(
+                    str(previous_snapshot_id)
+                    if previous_snapshot_id
+                    else None
+                ),
+                import_month=import_month,
+                updated_at=activated_at,
+                snapshot_attributes=activated_snapshot_attributes(
+                    snapshot_attributes,
+                    activated_at=activated_at,
+                    activation_mode="automatic_redelivery",
+                ),
+            )
     rate_count = manifest.get(
         "serving_rates",
         manifest.get(
@@ -2324,7 +2690,8 @@ async def _resume_validated_candidate(
             serving_index.get("serving_rates", serving_index.get("rate_count")),
         ),
     )
-    return {
+    source_file_versions = manifest.get("source_file_versions")
+    result_by_field = {
         "status": "succeeded",
         "arch_version": "postgres_binary_v3",
         "publish_status": (
@@ -2343,7 +2710,25 @@ async def _resume_validated_candidate(
         "serving_rates": rate_count,
         "rate_count": rate_count,
         "pointer_reconciliation": pointer_result,
+        "allowed_amount_pointer": allowed_pointer_result,
+        "source_file_versions": (
+            list(source_file_versions)
+            if isinstance(source_file_versions, list)
+            else []
+        ),
     }
+    if has_allowed_amount_index:
+        assert isinstance(allowed_amount_index, Mapping)
+        result_by_field["allowed_amount_index"] = dict(
+            allowed_amount_index
+        )
+        result_by_field.update(
+            _published_allowed_metrics(
+                manifest,
+                allowed_amount_index,
+            )
+        )
+    return result_by_field
 
 
 _PTG2_MANIFEST_STAGE_SUPPORT_KINDS = (
@@ -2371,6 +2756,8 @@ def _already_published_result(
     import_month: datetime.date,
     pointer_reconciliation: dict[str, Any],
 ) -> dict[str, Any]:
+    """Build an idempotent success result from one published snapshot."""
+
     manifest = _published_snapshot_manifest(snapshot_attributes)
     serving_index = manifest.get("serving_index")
     serving_index = serving_index if isinstance(serving_index, dict) else {}
@@ -2378,20 +2765,65 @@ def _already_published_result(
         "serving_rates",
         manifest.get("rate_count", serving_index.get("serving_rates", serving_index.get("rate_count"))),
     )
+    allowed_amount_index = manifest.get("allowed_amount_index")
+    allowed_amount_index = (
+        allowed_amount_index if isinstance(allowed_amount_index, dict) else {}
+    )
+    allowed_metrics_by_name = _published_allowed_metrics(
+        manifest,
+        allowed_amount_index,
+    )
+    has_allowed_amount_snapshot = (
+        allowed_amount_index.get("contract") == PTG2_ALLOWED_AMOUNT_CONTRACT
+    )
     return {
         "status": "succeeded",
         "publish_status": "already_published",
         "already_published": True,
-        "message": "PTG snapshot is already published; serving pointers were reconciled",
-        "import_run_id": str(snapshot_attributes.get("import_run_id") or import_run_id),
+        "message": (
+            "PTG allowed-amount snapshot is already published"
+            if has_allowed_amount_snapshot
+            else "PTG snapshot is already published; serving pointers were reconciled"
+        ),
+        "import_run_id": str(
+            snapshot_attributes.get("import_run_id") or import_run_id
+        ),
         "snapshot_id": snapshot_id,
         "source_key": source_key,
         "import_month": import_month.isoformat(),
         "serving_rates": rate_count,
         "rate_count": rate_count,
+        "arch_version": manifest.get("arch_version"),
+        "activation_status": manifest.get("activation_status"),
+        "snapshot_status": PTG2_STATUS_PUBLISHED,
+        "source_file_versions": manifest.get("source_file_versions") or [],
+        **allowed_metrics_by_name,
         "address_refresh": manifest.get("address_refresh"),
         "pointer_reconciliation": pointer_reconciliation,
     }
+
+
+def _published_allowed_metrics(
+    manifest: Mapping[str, Any],
+    allowed_amount_index: Mapping[str, Any],
+) -> dict[str, int | bool]:
+    allowed_metrics_by_name: dict[str, int | bool] = {
+        metric_name: int(
+            manifest.get(
+                metric_name,
+                allowed_amount_index.get(metric_name, 0),
+            )
+            or 0
+        )
+        for metric_name in _ALLOWED_AMOUNT_METRIC_KEYS
+    }
+    allowed_metrics_by_name["allowed_amount_evidence"] = bool(
+        manifest.get(
+            "allowed_amount_evidence",
+            allowed_amount_index.get("allowed_amount_evidence", False),
+        )
+    )
+    return allowed_metrics_by_name
 
 
 _SHARED_V3_PHYSICAL_SERVING_INDEX_KEYS = frozenset(
@@ -2718,6 +3150,14 @@ def _is_shared_v3_preflight_eligible(
 _shared_v3_preflight_eligible = _is_shared_v3_preflight_eligible
 
 
+@dataclass(frozen=True)
+class _ReusedSharedV3AllowedContext:
+    successful_files: Sequence[Mapping[str, Any]]
+    lane_report_by_field: Mapping[str, Any]
+    previous_snapshot_id: str | None
+    snapshot_state_by_name: dict[str, bool]
+
+
 def _shared_v3_scanner_identity() -> dict[str, Any]:
     """Bind reuse to the exact scanner/finalizer executable that defines output."""
 
@@ -2783,6 +3223,7 @@ async def _publish_reused_shared_v3_snapshot(
     previous_snapshot_id: str | None,
     started_at: datetime.datetime,
     options: Mapping[str, Any],
+    allowed_context: _ReusedSharedV3AllowedContext | None,
     manifest_stage_table: str | None,
     test_mode: bool,
     import_started_monotonic: float,
@@ -2790,6 +3231,30 @@ async def _publish_reused_shared_v3_snapshot(
 ) -> dict[str, Any]:
     """Publish a logical snapshot binding without rescanning identical content."""
 
+    allowed_successful_files = (
+        [dict(file_result) for file_result in allowed_context.successful_files]
+        if allowed_context is not None
+        else []
+    )
+    allowed_metrics_by_name: dict[str, int | bool] = {}
+    allowed_source_file_versions: list[dict[str, Any]] = []
+    if allowed_context is not None:
+        if not allowed_successful_files:
+            raise RuntimeError(
+                "reused strict V3 mixed publication is missing allowed results"
+            )
+        allowed_metrics_by_name = _allowed_amount_metrics_from_results(
+            allowed_successful_files
+        )
+        if not bool(allowed_metrics_by_name.get("allowed_amount_evidence")):
+            raise RuntimeError(
+                "reused strict V3 mixed publication has no allowed payment evidence"
+            )
+        allowed_source_file_versions = (
+            _ptg2_source_file_versions_from_results(
+                allowed_successful_files
+            )
+        )
     source_file_versions: list[dict[str, Any]] = []
     observed_plans: set[tuple[str, str]] = set()
     source_trace_hashes: set[str] = set()
@@ -2852,6 +3317,7 @@ async def _publish_reused_shared_v3_snapshot(
                 **_source_version_summary(source_version),
             }
         )
+    source_file_versions.extend(allowed_source_file_versions)
 
     serving_index = _reused_shared_v3_serving_index(
         layout_manifest,
@@ -2897,8 +3363,11 @@ async def _publish_reused_shared_v3_snapshot(
             post_publish_started_monotonic - import_started_monotonic
         ),
     }
+    auto_activate = bool(options.get("auto_activate_candidates", False))
     publish_report_map = {
         "snapshot_id": snapshot_id,
+        "source_key": source_key,
+        "import_month": import_month.isoformat(),
         "serving_index": serving_index,
         "serving_rates": rate_count,
         "rate_count": rate_count,
@@ -2907,8 +3376,33 @@ async def _publish_reused_shared_v3_snapshot(
         "shared_snapshot_key": int(shared_snapshot_key),
         "shared_semantic_fingerprint": bytes(semantic_fingerprint).hex(),
         "coverage_scope_id": bytes(coverage_scope_id).hex(),
+        "activation_status": "activated" if auto_activate else "deferred",
+        "data_domains": [
+            PTG2_DOMAIN_IN_NETWORK,
+            *(
+                [PTG2_DOMAIN_ALLOWED_AMOUNT]
+                if allowed_context is not None
+                else []
+            ),
+        ],
         "timings": timings_by_phase,
     }
+    if allowed_context is not None:
+        publish_report_map.update(
+            {
+                "allowed_amount_lane": dict(
+                    allowed_context.lane_report_by_field
+                ),
+                "allowed_amount_index": _allowed_amount_index_manifest(
+                    allowed_metrics_by_name,
+                    source_key=source_key,
+                    previous_snapshot_id=(
+                        allowed_context.previous_snapshot_id
+                    ),
+                ),
+                **allowed_metrics_by_name,
+            }
+        )
     snapshot_values_by_field = {
         "snapshot_id": snapshot_id,
         "import_run_id": import_run_id,
@@ -2938,21 +3432,36 @@ async def _publish_reused_shared_v3_snapshot(
     if candidate_stage_flags_by_name is not None:
         candidate_stage_flags_by_name["staged"] = True
     candidate_attributes_by_field = dict(candidate_result["candidate_attributes"])
-    auto_activate = bool(options.get("auto_activate_candidates", False))
     if auto_activate:
         activated_at = _utcnow()
-        await _publish_ptg2_source_pointers(
-            source_key=source_key,
-            snapshot_id=snapshot_id,
-            previous_snapshot_id=previous_snapshot_id,
-            import_month=import_month,
-            updated_at=activated_at,
-            snapshot_attributes=activated_snapshot_attributes(
-                candidate_attributes_by_field,
-                activated_at=activated_at,
-                activation_mode="automatic",
-            ),
-        )
+        if allowed_context is not None:
+            (
+                _negotiated_pointer_result,
+                publish_report_map["allowed_amount_pointer"],
+            ) = await _publish_mixed_candidate_current_pointers(
+                source_key=source_key,
+                snapshot_id=snapshot_id,
+                previous_snapshot_id=previous_snapshot_id,
+                previous_allowed_snapshot_id=(
+                    allowed_context.previous_snapshot_id
+                ),
+                import_month=import_month,
+                updated_at=activated_at,
+            )
+            allowed_context.snapshot_state_by_name["published"] = True
+        else:
+            await _publish_ptg2_source_pointers(
+                source_key=source_key,
+                snapshot_id=snapshot_id,
+                previous_snapshot_id=previous_snapshot_id,
+                import_month=import_month,
+                updated_at=activated_at,
+                snapshot_attributes=activated_snapshot_attributes(
+                    candidate_attributes_by_field,
+                    activated_at=activated_at,
+                    activation_mode="automatic",
+                ),
+            )
         activation_status = "activated"
     else:
         activation_status = "deferred"
@@ -3027,9 +3536,471 @@ async def _publish_reused_shared_v3_snapshot(
         "serving_rates": rate_count,
         "rate_count": rate_count,
         "source_file_versions": source_file_versions,
+        **(
+            {
+                "allowed_amount_lane": dict(
+                    allowed_context.lane_report_by_field
+                ),
+                **allowed_metrics_by_name,
+            }
+            if allowed_context is not None
+            else {}
+        ),
         "address_refresh": address_refresh,
         "timings": timings_by_phase,
     }
+
+
+@dataclass(frozen=True)
+class _AllowedFileProcessingContext:
+    classes: dict[str, type]
+    test_mode: bool
+    reuse_raw_artifacts: bool
+    max_bytes: int | None
+    max_items: int | None
+    import_run_id: str
+    snapshot_id: str
+    keep_partial_artifacts: bool | None
+
+
+@dataclass(frozen=True)
+class _AllowedSnapshotPublishContext:
+    snapshot_id: str
+    import_run_id: str
+    source_key: str
+    previous_snapshot_id: str | None
+    import_month: datetime.date
+    started_at: datetime.datetime
+    options_by_name: Mapping[str, Any]
+    import_started_monotonic: float
+    data_started_monotonic: float
+
+
+@dataclass(frozen=True)
+class _AllowedSnapshotPublishPreparation:
+    allowed_metrics_by_name: dict[str, int | bool]
+    report_by_field: dict[str, Any]
+    timing_by_metric: dict[str, Any]
+    published_at: datetime.datetime
+    publish_started_monotonic: float
+
+
+async def _load_allowed_file_result(
+    downloaded: PTG2DownloadedJob,
+    context: _AllowedFileProcessingContext,
+) -> PTG2FileProcessResult:
+    job_by_field = downloaded.job
+    source_url = str(job_by_field.get("url") or "")
+    if downloaded.error:
+        return PTG2FileProcessResult(
+            "allowed_amounts",
+            source_url,
+            False,
+            error=downloaded.error,
+        )
+    if downloaded.raw_artifact is None or downloaded.logical_artifact is None:
+        return PTG2FileProcessResult(
+            "allowed_amounts",
+            source_url,
+            False,
+            error="download did not produce both raw and logical artifacts",
+        )
+    try:
+        return await _process_allowed_amounts_file(
+            job_by_field,
+            context.classes,
+            context.test_mode,
+            reuse_raw_artifacts=context.reuse_raw_artifacts,
+            max_bytes=context.max_bytes,
+            max_items=context.max_items,
+            import_run_id=context.import_run_id,
+            snapshot_id=context.snapshot_id,
+            keep_partial_artifacts=context.keep_partial_artifacts,
+            raw_artifact=downloaded.raw_artifact,
+            logical_artifact=downloaded.logical_artifact,
+        )
+    except Exception as exc:
+        return PTG2FileProcessResult(
+            "allowed_amounts",
+            source_url,
+            False,
+            error=str(exc),
+        )
+
+
+def _write_allowed_file_progress(
+    successful_file_count: int,
+    attempted_file_count: int,
+) -> None:
+    write_live_progress(
+        phase="processing allowed amounts",
+        unit="files",
+        done=successful_file_count,
+        total=attempted_file_count,
+        pct=min(
+            90.0,
+            20.0
+            + (
+                successful_file_count / max(attempted_file_count, 1)
+            )
+            * 70.0,
+        ),
+        message=(
+            f"processed {successful_file_count} of {attempted_file_count} "
+            "allowed-amount file(s)"
+        ),
+    )
+
+
+def _validate_allowed_file_results(
+    successful_files: list[dict[str, Any]],
+    failed_files: list[dict[str, Any]],
+    attempted_file_count: int,
+) -> None:
+    if failed_files:
+        raise RuntimeError(
+            f"PTG2 allowed-amount import failed {len(failed_files)} of "
+            f"{attempted_file_count} attempted file(s); strict V3 never "
+            "publishes partial source coverage"
+        )
+    if not successful_files:
+        raise RuntimeError(
+            "PTG2 allowed-amount import processed zero files successfully"
+        )
+
+
+async def _process_allowed_snapshot_files(
+    selected_jobs: Sequence[dict[str, Any]],
+    context: _AllowedFileProcessingContext,
+    failure_report_by_field: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Download and parse the full allowed-only strict-V3 file set."""
+
+    await _delete_allowed_snapshot_rows(context.snapshot_id)
+    attempted_file_count = len(selected_jobs)
+    successful_files: list[dict[str, Any]] = []
+    failed_files: list[dict[str, Any]] = []
+    write_live_progress(
+        phase="processing allowed amounts",
+        unit="files",
+        done=0,
+        total=attempted_file_count,
+        pct=20,
+        message=f"processing {attempted_file_count} allowed-amount file(s)",
+    )
+    async for downloaded in _iter_downloaded_ptg_jobs(
+        selected_jobs,
+        reuse_raw_artifacts=context.reuse_raw_artifacts,
+        max_bytes=context.max_bytes,
+        keep_partial_artifacts=context.keep_partial_artifacts,
+    ):
+        file_result = await _load_allowed_file_result(downloaded, context)
+        file_by_field = asdict(file_result)
+        if file_result.success:
+            successful_files.append(file_by_field)
+            _write_allowed_file_progress(
+                len(successful_files),
+                attempted_file_count,
+            )
+        else:
+            failed_files.append(file_by_field)
+    failure_report_by_field.update(
+        {
+            "files_attempted": attempted_file_count,
+            "files_processed": len(successful_files),
+            "files_failed": len(failed_files),
+            "files_skipped": 0,
+            "successful_files": successful_files,
+            "failed_files": failed_files,
+        }
+    )
+    _validate_allowed_file_results(
+        successful_files,
+        failed_files,
+        attempted_file_count,
+    )
+    return successful_files
+
+
+def _allowed_snapshot_report(
+    successful_files: list[dict[str, Any]],
+    context: _AllowedSnapshotPublishContext,
+    allowed_metrics_by_name: Mapping[str, Any],
+    source_file_versions: list[dict[str, Any]],
+    timing_by_metric: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "snapshot_id": context.snapshot_id,
+        "source_key": context.source_key,
+        "import_month": context.import_month.isoformat(),
+        "files_attempted": len(successful_files),
+        "files_processed": len(successful_files),
+        "files_failed": 0,
+        "files_skipped": 0,
+        "successful_files": successful_files,
+        "serving_rates": 0,
+        "rate_count": 0,
+        "arch_version": "postgres_binary_v3",
+        "snapshot_status": PTG2_STATUS_PUBLISHED,
+        "activation_status": "not_applicable",
+        "data_domains": [PTG2_DOMAIN_ALLOWED_AMOUNT],
+        "allowed_amount_index": _allowed_amount_index_manifest(
+            allowed_metrics_by_name,
+            source_key=context.source_key,
+            previous_snapshot_id=context.previous_snapshot_id,
+        ),
+        "source_file_versions": source_file_versions,
+        "address_refresh": {
+            "status": "skipped",
+            "reason": (
+                "allowed-amount evidence has no provider-price serving rows"
+            ),
+        },
+        **allowed_metrics_by_name,
+        "timings": timing_by_metric,
+    }
+
+
+async def _persist_allowed_snapshot(
+    context: _AllowedSnapshotPublishContext,
+    report_by_field: dict[str, Any],
+    published_at: datetime.datetime,
+) -> None:
+    snapshot_state = await _push_ptg2_objects(
+        [
+            {
+                "snapshot_id": context.snapshot_id,
+                "import_run_id": context.import_run_id,
+                "import_month": context.import_month,
+                "status": PTG2_STATUS_PUBLISHED,
+                "created_at": context.started_at,
+                "validated_at": published_at,
+                "published_at": published_at,
+                "previous_snapshot_id": context.previous_snapshot_id,
+                "manifest": dict(report_by_field),
+            }
+        ],
+        PTG2Snapshot,
+        rewrite=True,
+    )
+    if str((snapshot_state or {}).get("status") or "") != PTG2_STATUS_PUBLISHED:
+        raise RuntimeError(
+            "PTG2 allowed-amount snapshot publication did not persist "
+            "published state"
+        )
+
+
+async def _complete_allowed_import(
+    context: _AllowedSnapshotPublishContext,
+    report_by_field: dict[str, Any],
+    timing_by_metric: dict[str, Any],
+) -> None:
+    release_current_artifact_lease()
+    post_publish_started_monotonic = _ptg2_monotonic()
+    post_publish_stage_timer = _StageTimer(
+        {},
+        post_publish_started_monotonic,
+    )
+    post_publish_stage_timer.mark("artifact_lease_release")
+    await _persist_completed_ptg2_import_run(
+        import_run_id=context.import_run_id,
+        import_month=context.import_month,
+        started_at=context.started_at,
+        options=context.options_by_name,
+        report_payload=report_by_field,
+        timing_payload=timing_by_metric,
+        import_started_monotonic=context.import_started_monotonic,
+        post_publish_started_monotonic=post_publish_started_monotonic,
+        post_publish_stage_timer=post_publish_stage_timer,
+    )
+
+
+def _emit_allowed_completion(
+    context: _AllowedSnapshotPublishContext,
+    successful_file_count: int,
+    allowed_payment_count: int,
+    total_seconds: float,
+) -> None:
+    done_line = (
+        "PTG2_IMPORT_DONE"
+        f"\timport_run_id={context.import_run_id}"
+        f"\tsnapshot_id={context.snapshot_id}"
+        "\tstatus=published"
+        "\tactivation_status=not_applicable"
+        f"\tfiles_processed={successful_file_count}"
+        "\tfiles_failed=0"
+        "\tserving_rates=0"
+        f"\tallowed_amount_payments={allowed_payment_count}"
+        f"\ttotal_seconds={total_seconds:.2f}"
+    )
+    _emit_screen_line(done_line)
+    logger.info(done_line)
+
+
+def _allowed_snapshot_result(
+    context: _AllowedSnapshotPublishContext,
+    report_by_field: Mapping[str, Any],
+    timing_by_metric: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "status": "succeeded",
+        "publish_status": "published_allowed_amounts",
+        "arch_version": "postgres_binary_v3",
+        "activation_status": "not_applicable",
+        "snapshot_status": PTG2_STATUS_PUBLISHED,
+        "import_run_id": context.import_run_id,
+        "snapshot_id": context.snapshot_id,
+        "source_key": context.source_key,
+        "import_month": context.import_month.isoformat(),
+        "files_attempted": report_by_field["files_attempted"],
+        "files_processed": report_by_field["files_processed"],
+        "files_failed": 0,
+        "files_skipped": 0,
+        "serving_rates": 0,
+        "rate_count": 0,
+        "source_file_versions": report_by_field["source_file_versions"],
+        "address_refresh": report_by_field["address_refresh"],
+        **{
+            metric_name: report_by_field[metric_name]
+            for metric_name in (*_ALLOWED_AMOUNT_METRIC_KEYS, "allowed_amount_evidence")
+        },
+        "timings": timing_by_metric,
+    }
+
+
+def _prepare_allowed_snapshot_publish(
+    successful_files: list[dict[str, Any]],
+    context: _AllowedSnapshotPublishContext,
+) -> _AllowedSnapshotPublishPreparation:
+    allowed_metrics_by_name = _allowed_amount_metrics_from_results(
+        successful_files
+    )
+    if not bool(allowed_metrics_by_name.get("allowed_amount_evidence")):
+        raise RuntimeError(
+            "PTG2 allowed-amount import produced no payment evidence"
+        )
+    source_file_versions = _ptg2_source_file_versions_from_results(
+        successful_files
+    )
+    published_at = _utcnow()
+    publish_started_monotonic = _ptg2_monotonic()
+    timing_by_metric = {
+        "setup_seconds": (
+            context.data_started_monotonic
+            - context.import_started_monotonic
+        ),
+        "data_seconds": (
+            publish_started_monotonic - context.data_started_monotonic
+        ),
+        "publish_seconds": 0.0,
+    }
+    report_by_field = _allowed_snapshot_report(
+        successful_files,
+        context,
+        allowed_metrics_by_name,
+        source_file_versions,
+        timing_by_metric,
+    )
+    return _AllowedSnapshotPublishPreparation(
+        allowed_metrics_by_name=allowed_metrics_by_name,
+        report_by_field=report_by_field,
+        timing_by_metric=timing_by_metric,
+        published_at=published_at,
+        publish_started_monotonic=publish_started_monotonic,
+    )
+
+
+async def _publish_allowed_snapshot(
+    successful_files: list[dict[str, Any]],
+    context: _AllowedSnapshotPublishContext,
+    allowed_snapshot_state_by_name: dict[str, bool],
+) -> dict[str, Any]:
+    """Publish durable allowed evidence without creating serving pointers."""
+
+    preparation = _prepare_allowed_snapshot_publish(
+        successful_files,
+        context,
+    )
+    write_live_progress(
+        phase="publishing",
+        pct=92,
+        message="publishing allowed-amount snapshot",
+    )
+    await _persist_allowed_snapshot(
+        context,
+        preparation.report_by_field,
+        preparation.published_at,
+    )
+    allowed_snapshot_state_by_name["published"] = True
+    pointer_result = await _publish_allowed_current_pointer(
+        source_key=context.source_key,
+        snapshot_id=context.snapshot_id,
+        previous_snapshot_id=context.previous_snapshot_id,
+        import_month=context.import_month,
+        updated_at=preparation.published_at,
+    )
+    preparation.report_by_field["allowed_amount_pointer"] = pointer_result
+    preparation.timing_by_metric["publish_seconds"] = (
+        _ptg2_monotonic() - preparation.publish_started_monotonic
+    )
+    await _complete_allowed_import(
+        context,
+        preparation.report_by_field,
+        preparation.timing_by_metric,
+    )
+    _emit_allowed_completion(
+        context,
+        len(successful_files),
+        int(preparation.allowed_metrics_by_name["allowed_amount_payments"]),
+        float(preparation.timing_by_metric["total_seconds"]),
+    )
+    write_live_progress(
+        status="succeeded",
+        phase="succeeded",
+        unit="files",
+        done=len(successful_files),
+        total=len(successful_files),
+        pct=100,
+        eta_seconds=0,
+        message="PTG allowed-amount import succeeded",
+    )
+    return _allowed_snapshot_result(
+        context,
+        preparation.report_by_field,
+        preparation.timing_by_metric,
+    )
+
+
+def _direct_allowed_plan_info(
+    plan_ids: Sequence[str] | None,
+    plan_market_types: Sequence[str] | None,
+) -> list[dict[str, Any]]:
+    normalized_plan_ids = _dedupe_preserve(
+        [
+            str(plan_id or "").strip()
+            for plan_id in (plan_ids or ())
+            if str(plan_id or "").strip()
+        ]
+    )
+    normalized_market_types = _dedupe_preserve(
+        [
+            str(market_type or "").strip().lower()
+            for market_type in (plan_market_types or ())
+            if str(market_type or "").strip()
+        ]
+    )
+    shared_market_type = (
+        normalized_market_types[0]
+        if len(normalized_market_types) == 1
+        else None
+    )
+    return [
+        {
+            "plan_id": plan_id,
+            "plan_market_type": shared_market_type,
+        }
+        for plan_id in normalized_plan_ids
+    ]
 
 
 async def _main_with_artifact_lease(
@@ -3064,11 +4035,6 @@ async def _main_with_artifact_lease(
         raise ValueError(
             "provider_ref_url is not supported by strict V3; provider references "
             "must come from each in-network source"
-        )
-    if allowed_url:
-        raise ValueError(
-            "allowed_url is not supported by strict V3; only in-network rate files "
-            "participate in a serving snapshot"
         )
     import_id_val = _normalize_import_id(
         import_id
@@ -3172,6 +4138,9 @@ async def _main_with_artifact_lease(
         has_source_import_lock = True
         setup_stage_timer.mark("source_import_lock")
         observed_source_snapshot_id = await _current_source_snapshot_id(source_key_val)
+        observed_allowed_snapshot_id = await _current_allowed_snapshot_id(
+            source_key_val
+        )
         setup_stage_timer.mark("source_snapshot_lookup")
     except BaseException:
         if has_source_import_lock:
@@ -3222,7 +4191,7 @@ async def _main_with_artifact_lease(
                 phase="succeeded",
                 pct=100,
                 eta_seconds=0,
-                message="PTG snapshot already published; pointers reconciled",
+                message=str(already_published_result["message"]),
             )
             return already_published_result
         finally:
@@ -3296,8 +4265,14 @@ async def _main_with_artifact_lease(
     previous_snapshot_id = (
         str(observed_source_snapshot_id) if observed_source_snapshot_id else None
     )
+    previous_allowed_snapshot_id = (
+        str(observed_allowed_snapshot_id)
+        if observed_allowed_snapshot_id
+        else None
+    )
     is_current_pointer_published = False
     candidate_stage_flags_by_name = {"staged": False}
+    allowed_snapshot_state_by_name = {"published": False}
 
     async def mark_import_failed(error: BaseException | str, *, progress_message: str | None = None) -> None:
         """Persist import failure state and drop unpublished source-scoped staging tables."""
@@ -3309,9 +4284,13 @@ async def _main_with_artifact_lease(
             message="persisting PTG import failure state",
         )
         serving_index = failure_report_by_field.get("serving_index")
-        is_snapshot_known_published = is_current_pointer_published
+        is_snapshot_known_published = (
+            is_current_pointer_published
+            or allowed_snapshot_state_by_name["published"]
+        )
         should_preserve_candidate_tables = (
-            is_current_pointer_published or candidate_stage_flags_by_name["staged"]
+            is_snapshot_known_published
+            or candidate_stage_flags_by_name["staged"]
         )
         if not should_preserve_candidate_tables and isinstance(serving_index, dict):
             try:
@@ -3354,7 +4333,8 @@ async def _main_with_artifact_lease(
             report=failure_report_by_field,
             options=options_by_name,
             should_preserve_published_snapshot=(
-                is_snapshot_known_published or candidate_stage_flags_by_name["staged"]
+                is_snapshot_known_published
+                or candidate_stage_flags_by_name["staged"]
             ),
             import_started_monotonic=import_started_monotonic,
             failure_handling_started_monotonic=failure_handling_started_monotonic,
@@ -3393,9 +4373,6 @@ async def _main_with_artifact_lease(
         assert source_key_val is not None
         write_live_progress(phase="planning", pct=3, message="planning PTG files")
         stage_token = _ptg2_snapshot_table_token(source_key_val, snapshot_id)
-        ptg2_manifest_stage_table = _ptg2_manifest_stage_table_name(stage_token)
-        ptg2_manifest_stage_table = await _create_ptg2_manifest_serving_stage_table(stage_token)
-        setup_stage_timer.mark("manifest_stage_table")
         classes = await _prepare_ptg_tables(
             import_id_val,
             test_mode,
@@ -3448,6 +4425,20 @@ async def _main_with_artifact_lease(
             if source_network_name_values:
                 direct_job_by_field["source_network_names"] = source_network_name_values
             jobs.append(direct_job_by_field)
+        if allowed_url:
+            direct_allowed_job_by_field: dict[str, Any] = {
+                "type": "allowed_amounts",
+                "url": allowed_url,
+            }
+            direct_allowed_plans = _direct_allowed_plan_info(
+                plan_ids,
+                plan_market_types,
+            )
+            if direct_allowed_plans:
+                direct_allowed_job_by_field["plan_info"] = (
+                    direct_allowed_plans
+                )
+            jobs.append(direct_allowed_job_by_field)
         jobs = _filter_jobs_by_url_contains(jobs, file_url_contains)
         if source_network_name_values:
             for job in jobs:
@@ -3481,7 +4472,7 @@ async def _main_with_artifact_lease(
                 f"PTG2 import failed {len(toc_failures)} table-of-contents file(s); "
                 "strict V3 never publishes partial source coverage"
             )
-        if toc_candidates and not jobs and not in_network_url:
+        if toc_candidates and not jobs and not in_network_url and not allowed_url:
             failure_report_by_field = {
                 "toc_urls": toc_candidates,
                 "toc_failures": toc_failures,
@@ -3495,20 +4486,94 @@ async def _main_with_artifact_lease(
             raise RuntimeError("PTG2 import processed table-of-contents input but discovered zero rate files")
 
         seen_jobs: set[tuple[str, str]] = set()
-        selected_jobs: list[dict[str, Any]] = []
+        selected_supported_jobs: list[dict[str, Any]] = []
         for job in jobs:
             job_key = _ptg_job_identity(job)
             if job_key in seen_jobs:
                 continue
             seen_jobs.add(job_key)
-            if max_files is not None and len(selected_jobs) >= max_files:
+            if (
+                max_files is not None
+                and len(selected_supported_jobs) >= max_files
+            ):
                 break
-            if job.get("type") == "in_network":
-                selected_jobs.append(job)
-        if not selected_jobs:
+            if job.get("type") in {"in_network", "allowed_amounts"}:
+                selected_supported_jobs.append(job)
+        if not selected_supported_jobs:
             raise RuntimeError(
-                "strict V3 import discovered no supported in-network rate files"
+                "strict V3 import discovered no supported PTG files"
             )
+        selected_jobs = [
+            job
+            for job in selected_supported_jobs
+            if job.get("type") == "in_network"
+        ]
+        allowed_jobs = [
+            job
+            for job in selected_supported_jobs
+            if job.get("type") == "allowed_amounts"
+        ]
+        failure_report_by_field.update(
+            {
+                "jobs_discovered": jobs_discovered_before_dedupe,
+                "jobs_unique": len(jobs),
+                "duplicate_jobs_skipped": duplicate_jobs_skipped,
+                "toc_failures": toc_failures,
+            }
+        )
+        successful_allowed_files: list[dict[str, Any]] = []
+        allowed_metrics_by_name: dict[str, int | bool] = {}
+        allowed_lane_report_by_field: dict[str, Any] = {}
+        if allowed_jobs:
+            failure_report_by_field["allowed_amount_lane"] = (
+                allowed_lane_report_by_field
+            )
+            processing_context = _AllowedFileProcessingContext(
+                classes=classes,
+                test_mode=test_mode,
+                reuse_raw_artifacts=reuse_raw_artifacts,
+                max_bytes=max_bytes,
+                max_items=max_items,
+                import_run_id=import_run_id,
+                snapshot_id=snapshot_id,
+                keep_partial_artifacts=keep_partial_artifacts,
+            )
+            successful_allowed_files = await _process_allowed_snapshot_files(
+                allowed_jobs,
+                processing_context,
+                allowed_lane_report_by_field,
+            )
+            allowed_metrics_by_name = _allowed_amount_metrics_from_results(
+                successful_allowed_files
+            )
+            if not bool(
+                allowed_metrics_by_name.get("allowed_amount_evidence")
+            ):
+                raise RuntimeError(
+                    "PTG2 allowed-amount import produced no payment evidence"
+                )
+        if not selected_jobs:
+            publish_context = _AllowedSnapshotPublishContext(
+                snapshot_id=snapshot_id,
+                import_run_id=import_run_id,
+                source_key=source_key_val,
+                previous_snapshot_id=previous_allowed_snapshot_id,
+                import_month=import_month_value,
+                started_at=now,
+                options_by_name=options_by_name,
+                import_started_monotonic=import_started_monotonic,
+                data_started_monotonic=data_started_monotonic,
+            )
+            return await _publish_allowed_snapshot(
+                successful_allowed_files,
+                publish_context,
+                allowed_snapshot_state_by_name,
+            )
+        ptg2_manifest_stage_table = _ptg2_manifest_stage_table_name(
+            stage_token
+        )
+        await _create_ptg2_manifest_serving_stage_table(stage_token)
+        setup_stage_timer.mark("manifest_stage_table")
         processed_file_count_map = {"done": 0}
         attempted_files = len(selected_jobs)
         for progress_index, job in enumerate(selected_jobs):
@@ -3745,6 +4810,22 @@ async def _main_with_artifact_lease(
                     previous_snapshot_id=previous_snapshot_id,
                     started_at=now,
                     options=options_by_name,
+                    allowed_context=(
+                        _ReusedSharedV3AllowedContext(
+                            successful_files=successful_allowed_files,
+                            lane_report_by_field=(
+                                allowed_lane_report_by_field
+                            ),
+                            previous_snapshot_id=(
+                                previous_allowed_snapshot_id
+                            ),
+                            snapshot_state_by_name=(
+                                allowed_snapshot_state_by_name
+                            ),
+                        )
+                        if successful_allowed_files
+                        else None
+                    ),
                     manifest_stage_table=ptg2_manifest_stage_table,
                     test_mode=test_mode,
                     import_started_monotonic=import_started_monotonic,
@@ -3855,6 +4936,10 @@ async def _main_with_artifact_lease(
             "snapshot_id": snapshot_id,
             "legacy_table_suffix": import_id_val,
         }
+        if allowed_jobs:
+            failure_report_by_field["allowed_amount_lane"] = (
+                allowed_lane_report_by_field
+            )
         if shared_layout_reservation is not None:
             failure_report_by_field.update(
                 {
@@ -4083,7 +5168,30 @@ async def _main_with_artifact_lease(
             "serving_index": serving_index,
             "timings": timing_by_metric,
             "manifest_precopy_merge": manifest_merge_metrics_by_name,
+            "data_domains": [
+                PTG2_DOMAIN_IN_NETWORK,
+                *(
+                    [PTG2_DOMAIN_ALLOWED_AMOUNT]
+                    if successful_allowed_files
+                    else []
+                ),
+            ],
         }
+        if successful_allowed_files:
+            report_by_field.update(
+                {
+                    "allowed_amount_index": (
+                        _allowed_amount_index_manifest(
+                            allowed_metrics_by_name,
+                            source_key=source_key_val,
+                            previous_snapshot_id=(
+                                previous_allowed_snapshot_id
+                            ),
+                        )
+                    ),
+                    **allowed_metrics_by_name,
+                }
+            )
         if isinstance(serving_index, dict):
             authoritative_rate_count = serving_index.get("serving_rates", serving_index.get("rate_count"))
             if authoritative_rate_count is not None:
@@ -4143,6 +5251,17 @@ async def _main_with_artifact_lease(
                 ),
             )
             is_current_pointer_published = True
+            if successful_allowed_files:
+                report_by_field["allowed_amount_pointer"] = (
+                    await _publish_allowed_current_pointer(
+                        source_key=source_key_val,
+                        snapshot_id=snapshot_id,
+                        previous_snapshot_id=previous_allowed_snapshot_id,
+                        import_month=import_month_value,
+                        updated_at=activated_at,
+                    )
+                )
+                allowed_snapshot_state_by_name["published"] = True
             activation_status = "activated"
             snapshot_status = PTG2_STATUS_PUBLISHED
         else:
@@ -4270,6 +5389,7 @@ async def _main_with_artifact_lease(
             "rate_count": report_by_field.get("rate_count"),
             "source_file_versions": _ptg2_source_file_versions_from_results(successful_files + skipped_files),
             "address_refresh": address_refresh_result,
+            **allowed_metrics_by_name,
             "timings": timing_by_metric,
         }
     except asyncio.CancelledError:

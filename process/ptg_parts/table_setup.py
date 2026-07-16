@@ -15,6 +15,10 @@ from db.models import (
     PTGProviderGroup,
     PTG2ArtifactBlobChunk,
     PTG2ArtifactManifest,
+    PTG2AllowedAmountItem,
+    PTG2AllowedAmountPayment,
+    PTG2AllowedAmountPlan,
+    PTG2AllowedAmountProviderPayment,
     PTG2Capability,
     PTG2Confidence,
     PTG2ContentIdentity,
@@ -96,7 +100,47 @@ PTG2_MODEL_CLASSES = (
     PTG2Plan,
     PTG2PlanAlias,
     PTG2PlanMonth,
+    PTG2AllowedAmountPlan,
+    PTG2AllowedAmountItem,
+    PTG2AllowedAmountPayment,
+    PTG2AllowedAmountProviderPayment,
 )
+
+PTG2_ALLOWED_AMOUNT_MIGRATION_TABLE_NAMES = (
+    PTG2AllowedAmountPlan.__tablename__,
+    PTG2AllowedAmountItem.__tablename__,
+    PTG2AllowedAmountPayment.__tablename__,
+    PTG2AllowedAmountProviderPayment.__tablename__,
+)
+
+
+async def _require_allowed_amount_migration_tables(db_schema: str) -> None:
+    table_records = await db.all(
+        """
+        SELECT table_name
+          FROM information_schema.tables
+         WHERE table_schema = :schema_name
+           AND table_name = ANY(CAST(:table_names AS text[]))
+        """,
+        schema_name=db_schema,
+        table_names=list(PTG2_ALLOWED_AMOUNT_MIGRATION_TABLE_NAMES),
+    )
+    present_table_names: set[str] = set()
+    for table_record in table_records:
+        table_by_field = getattr(table_record, "_mapping", table_record)
+        table_name = table_by_field.get("table_name")
+        if table_name:
+            present_table_names.add(str(table_name))
+    missing_table_names = sorted(
+        set(PTG2_ALLOWED_AMOUNT_MIGRATION_TABLE_NAMES)
+        - present_table_names
+    )
+    if missing_table_names:
+        raise RuntimeError(
+            "PTG allowed-amount migration-owned tables are missing from "
+            f"schema {db_schema}: {', '.join(missing_table_names)}; "
+            "run alembic upgrade head"
+        )
 
 
 async def _is_ptg_table_present(obj, db_schema: str) -> bool:
@@ -419,6 +463,7 @@ async def ensure_ptg2_tables() -> None:
     """Create PTG2 tables and apply their required schema migrations."""
     db_schema = resolve_ptg2_schema()
     await require_ptg2_v3_migration_owned_tables(db, db_schema)
+    await _require_allowed_amount_migration_tables(db_schema)
     try:
         await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
     except Exception as exc:
