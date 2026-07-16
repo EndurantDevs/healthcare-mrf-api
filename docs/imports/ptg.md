@@ -2,9 +2,16 @@
 
 ## Purpose
 
-The PTG importer publishes Transparency in Coverage in-network rates for the
-pricing API. The only supported architecture is `postgres_binary_v3` with the
-`shared_blocks_v3` storage generation.
+The PTG importer publishes two distinct Transparency in Coverage data domains
+for the pricing API:
+
+- negotiated in-network rates; and
+- historical allowed-amount evidence from allowed-amount files.
+
+The only supported negotiated-rate architecture is `postgres_binary_v3` with
+the `shared_blocks_v3` storage generation. Allowed-amount evidence is stored in
+fixed, snapshot-scoped PostgreSQL tables under the same strict-V3 lifecycle,
+but it is not encoded as negotiated serving blocks.
 
 The import contract is intentionally strict:
 
@@ -15,6 +22,8 @@ The import contract is intentionally strict:
 - Logical plan scope, snapshot identity, source pointers, and publication
   history remain independent even when physical bytes are shared.
 - Source and price multiplicity are preserved exactly.
+- Historical allowed amounts never replace or impersonate negotiated rates.
+- Negotiated and allowed-evidence current pointers remain independent.
 - Publication persists a bounded audit sample before sealing the layout.
 - A sealed layout is first exposed as a non-serving `validated` candidate;
   audited activation is the only operation that may change live pointers.
@@ -72,9 +81,24 @@ Useful diagnostic options include `--test`, `--max-files`, and `--max-items`.
 They are for bounded fixtures and investigations, not release publication.
 Release evidence must cover the complete selected source without truncation.
 
-Strict imports accept in-network files only. Provider references embedded in,
-or referenced by, those files are resolved by the scanner. Separate provider
-reference and allowed-amount input modes are not part of this architecture.
+Strict imports accept in-network files, allowed-amount files, or a selected
+table-of-contents set containing both. Provider references embedded in, or
+referenced by, in-network files are resolved by the scanner. A separate
+provider-reference input lane is not supported.
+
+An allowed-only import must contain payment evidence. It publishes a durable
+evidence snapshot with zero negotiated serving rates and advances only the
+isolated allowed-evidence current pointer. A mixed import writes both domains
+under one logical snapshot; activation advances the negotiated and allowed
+pointers atomically. Failure of either compare-and-swap rolls back both pointer
+changes. Reusing an existing negotiated physical layout does not discard or
+reuse the new import's allowed evidence.
+
+Allowed-amount files describe historical payments, not a current negotiated
+network contract. Their default network status is therefore
+`out_of_network_or_not_confirmed_in_network`. Only explicit source metadata may
+mark them `in_network`; the importer never infers in-network status from a
+matching plan, code, provider, or negotiated snapshot.
 
 ## Complete Input Identity
 
@@ -99,10 +123,15 @@ changing any member of the complete physical input set changes the semantic
 fingerprint.
 
 URLs, source keys, plan identifiers, and descriptive ownership fields do not
-define physical equality. They remain logical metadata. One import can contain
-only one unambiguous logical plan scope, but two logical plans may bind to the
-same sealed physical layout when their complete physical input sets and
-scanner semantics are identical.
+define physical equality. They remain logical metadata. One negotiated import
+can contain only one unambiguous logical plan scope, but two logical plans may
+bind to the same sealed physical layout when their complete physical input sets
+and scanner semantics are identical.
+
+Allowed-amount rows are snapshot-scoped logical evidence and do not contribute
+to negotiated shared-layout equality. An allowed file may cover multiple plans;
+plan coverage is stored separately from its shared file-level item rows so one
+physical source item does not need to be copied once per plan.
 
 ## Physical And Logical Ownership
 
@@ -123,6 +152,13 @@ A reused layout does not merge plans or snapshots. Each API request resolves
 the requested logical snapshot, follows its binding, and joins physical code
 metadata to that snapshot's logical scope. Source-current and plan-current
 pointers also remain logical and can move independently.
+
+Allowed evidence uses four fixed PostgreSQL relations for plan coverage,
+billable items, payments, and provider payments. Each row carries its logical
+snapshot id. The manifest binds the storage contract, counts, data domain,
+source identity, and isolated current-pointer key. The API accepts the evidence
+only when the snapshot is published and every one of those bindings agrees; it
+does not fall back to a negotiated pointer or to another plan's evidence.
 
 Reservation is serialized by semantic fingerprint. A sealed match is reused;
 a matching live build is not duplicated. Publication also deduplicates an
@@ -348,7 +384,7 @@ retention metadata receives a durable first-observed timestamp and the same
 grace instead of being deleted from an old filesystem mtime on the collector's
 first run.
 
-Publication proceeds in this order:
+Negotiated or mixed publication proceeds in this order:
 
 1. Discover, filter, download, and validate the complete selected input set.
 2. Compute physical identity and reserve or reuse a layout.
@@ -369,6 +405,37 @@ Publication proceeds in this order:
 10. Queue the bounded PostgreSQL-witness-to-API release audit.
 11. Persist a fresh passing attestation and atomically activate the candidate.
 12. Remove temporary files and stages.
+
+For a mixed import, allowed evidence is parsed and persisted before negotiated
+layout publication. Its manifest index, metrics, source-file versions, and
+predecessor pointer are retained whether the negotiated layout is newly built
+or reused. Candidate activation changes both current pointers in one database
+transaction. An allowed-only import skips the negotiated scanner, block build,
+candidate audit, and negotiated pointer entirely; it publishes the evidence
+snapshot and advances only its isolated pointer.
+
+## Allowed-Amount API Semantics
+
+The standard pricing endpoint consults allowed evidence only after the
+negotiated query has produced no priced items and only when the request can be
+represented without changing its meaning. A fallback request must identify a
+plan and billing code. Supported evidence predicates include billing-code
+system, NPI, place of service, modifier, plan market, source, and geographic
+filters. A request for a negotiated rate or rate tolerance does not use the
+fallback.
+
+The response identifies the records as historical allowed amounts and includes
+their conservative network status and semantics. Payment and provider rows
+retain source multiplicity. Plan coverage is resolved through the dedicated
+plan table, including a shared file that covers several plans; nullable
+item-level plan metadata cannot make such evidence disappear or leak it to an
+uncovered plan.
+
+Provider locations are still joined from the canonical address projection at
+request time. When `include_unverified_addresses=false`, location predicates
+may be evaluated internally, but address, city, state, postal code, contact,
+location, and distance fields are omitted from returned allowed-evidence
+items.
 
 Logical source traces and their source-trace-set identities always use full
 domain-separated SHA-256, independent of the compact semantic-hash mode used by
