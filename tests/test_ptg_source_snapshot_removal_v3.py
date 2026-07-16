@@ -205,6 +205,18 @@ async def _create_production_shaped_schema(database, schema_name):
         )
         await connection.status(
             f"""
+            CREATE TABLE {schema}.ptg2_v3_snapshot_plan_scope (
+                snapshot_id varchar(96) NOT NULL REFERENCES
+                    {schema}.ptg2_v3_snapshot_scope(snapshot_id) ON DELETE CASCADE,
+                plan_id varchar(64) NOT NULL,
+                plan_market_type varchar(32) NOT NULL DEFAULT '',
+                created_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (snapshot_id, plan_id, plan_market_type)
+            )
+            """
+        )
+        await connection.status(
+            f"""
             CREATE TABLE {schema}.ptg2_source_trace_set (
                 source_trace_set_hash varchar(64) PRIMARY KEY,
                 source_trace_hashes varchar(64)[] NOT NULL
@@ -350,6 +362,15 @@ async def _insert_shared_snapshots(database, schema_name):
             )
             await connection.status(
                 f"""
+                INSERT INTO {schema}.ptg2_v3_snapshot_plan_scope
+                    (snapshot_id, plan_id, plan_market_type)
+                VALUES (:snapshot_id, :plan_id, 'group')
+                """,
+                snapshot_id=snapshot_id,
+                plan_id=f"plan-{source_key}",
+            )
+            await connection.status(
+                f"""
                 INSERT INTO {schema}.ptg2_v3_candidate_audit_attestation
                     (snapshot_id, snapshot_key, source_key, plan_id,
                      plan_market_type, coverage_scope_id, source_set_digest,
@@ -413,10 +434,12 @@ async def test_real_postgres_remove_v3_snapshot_matches_production_fk_ddl(monkey
         assert first["released_shared_layouts"] == 0
         assert await _count(database, schema_name, "ptg2_snapshot", snapshot_id="shared-a") == 0
         assert await _count(database, schema_name, "ptg2_v3_snapshot_scope", snapshot_id="shared-a") == 0
+        assert await _count(database, schema_name, "ptg2_v3_snapshot_plan_scope", snapshot_id="shared-a") == 0
         assert await _count(database, schema_name, "ptg2_v3_snapshot_binding", snapshot_id="shared-a") == 0
         assert await _count(database, schema_name, "ptg2_v3_candidate_audit_attestation", snapshot_id="shared-a") == 0
         assert await _count(database, schema_name, "ptg2_v3_snapshot_layout") == 1
         assert await _count(database, schema_name, "ptg2_v3_snapshot_binding", snapshot_id="shared-b") == 1
+        assert await _count(database, schema_name, "ptg2_v3_snapshot_plan_scope", snapshot_id="shared-b") == 1
         assert await _count(database, schema_name, "ptg2_v3_candidate_audit_attestation", snapshot_id="shared-b") == 1
 
         second = await source_snapshot_control.remove_ptg2_source_snapshot(
@@ -429,6 +452,7 @@ async def test_real_postgres_remove_v3_snapshot_matches_production_fk_ddl(monkey
         assert second["released_shared_layouts"] == 1
         assert await _count(database, schema_name, "ptg2_snapshot") == 0
         assert await _count(database, schema_name, "ptg2_v3_snapshot_scope") == 0
+        assert await _count(database, schema_name, "ptg2_v3_snapshot_plan_scope") == 0
         assert await _count(database, schema_name, "ptg2_v3_snapshot_binding") == 0
         assert await _count(database, schema_name, "ptg2_v3_candidate_audit_attestation") == 0
         assert await _count(database, schema_name, "ptg2_v3_snapshot_layout") == 0
