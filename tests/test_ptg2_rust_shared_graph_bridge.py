@@ -174,18 +174,18 @@ def _install_fake_converter(
     monkeypatch,
     *,
     binary: Path,
-    capture: dict[str, Any],
+    capture_map: dict[str, Any],
     mutate_stdout: Callable[[bytes], bytes] | None = None,
 ) -> None:
     monkeypatch.setattr(rust_scanner, "_ptg2_rust_scanner_binary", lambda: binary)
 
     async def create_subprocess_exec(*arguments, **kwargs):
-        capture["arguments"] = arguments
-        capture["kwargs"] = kwargs
+        capture_map["arguments"] = arguments
+        capture_map["kwargs"] = kwargs
         manifest_path = Path(arguments[2])
         manifest = json.loads(manifest_path.read_text(encoding="ascii"))
-        capture["manifest_path"] = manifest_path
-        capture["manifest"] = manifest
+        capture_map["manifest_path"] = manifest_path
+        capture_map["manifest"] = manifest
         output_directory = Path(manifest["output_directory"])
         _write_converter_outputs(output_directory)
         stdout = _frame(_summary(output_directory))
@@ -212,8 +212,8 @@ async def test_native_shared_graph_bridge_writes_manifest_and_validates_result(
     provider_map = tmp_path / "provider-set-map.tsv"
     provider_map.write_text(f"{'01' * 16}\t1\n", encoding="ascii")
     output_directory = tmp_path / "native-output"
-    capture: dict[str, Any] = {}
-    _install_fake_converter(monkeypatch, binary=binary, capture=capture)
+    capture_map: dict[str, Any] = {}
+    _install_fake_converter(monkeypatch, binary=binary, capture_map=capture_map)
 
     conversion_result = (
         await rust_scanner.convert_v3_provider_membership_shards_to_shared_graph_rust(
@@ -223,10 +223,10 @@ async def test_native_shared_graph_bridge_writes_manifest_and_validates_result(
         )
     )
 
-    assert capture["arguments"] == (
+    assert capture_map["arguments"] == (
         str(binary.resolve()),
         "--convert-shared-graph",
-        str(capture["manifest_path"]),
+        str(capture_map["manifest_path"]),
     )
     expected_spawn_option_map = {
         "stdout": rust_scanner.asyncio.subprocess.PIPE,
@@ -237,11 +237,11 @@ async def test_native_shared_graph_bridge_writes_manifest_and_validates_result(
             rust_scanner.asyncio.create_subprocess_exec
         )
     )
-    assert capture["kwargs"] == expected_spawn_option_map
-    manifest = capture["manifest"]
+    assert capture_map["kwargs"] == expected_spawn_option_map
+    manifest = capture_map["manifest"]
     assert Path(manifest["provider_set_key_map_path"]) == provider_map.resolve()
     assert Path(manifest["output_directory"]) == output_directory.resolve()
-    assert capture["manifest_path"].parent == tmp_path
+    assert capture_map["manifest_path"].parent == tmp_path
     assert manifest["shards"][0]["shard_id"] == bundle.shard_id
     assert set(manifest["shards"][0]) == {
         "shard_id",
@@ -254,7 +254,7 @@ async def test_native_shared_graph_bridge_writes_manifest_and_validates_result(
     assert conversion_result.owner_count == 4
     assert conversion_result.support_digest == bytes.fromhex("ab" * 32)
     assert conversion_result.scratch_directory == output_directory.resolve()
-    assert not capture["manifest_path"].exists()
+    assert not capture_map["manifest_path"].exists()
     conversion_result.cleanup()
     assert not output_directory.exists()
 
@@ -270,11 +270,11 @@ async def test_native_shared_graph_bridge_rejects_trailing_stdout_and_cleans(
     provider_map = tmp_path / "provider-set-map.tsv"
     provider_map.write_text(f"{'01' * 16}\t1\n", encoding="ascii")
     output_directory = tmp_path / "native-output"
-    capture: dict[str, Any] = {}
+    capture_map: dict[str, Any] = {}
     _install_fake_converter(
         monkeypatch,
         binary=binary,
-        capture=capture,
+        capture_map=capture_map,
         mutate_stdout=lambda stdout: stdout + b"unexpected",
     )
 
@@ -307,7 +307,7 @@ async def test_native_shared_graph_bridge_matches_real_cli_when_built(
     provider_set_id = bytes.fromhex("10" * 16)
     provider_group_id = bytes.fromhex("20" * 16)
     npi_id = b"\0" * 8 + (1234567890).to_bytes(8, "big", signed=False)
-    mappings = {
+    graph_members_by_artifact = {
         "provider_group_npi": {provider_group_id: (npi_id,)},
         "provider_npi_group": {npi_id: (provider_group_id,)},
         "provider_inverted": {provider_group_id: (provider_set_id,)},
@@ -316,21 +316,23 @@ async def test_native_shared_graph_bridge_matches_real_cli_when_built(
     artifact_entries = []
     artifact_directory = tmp_path / "artifacts"
     artifact_directory.mkdir()
-    for artifact_name, mapping in mappings.items():
+    for artifact_name, mapping in graph_members_by_artifact.items():
         manifest = write_global_membership_sidecar(
             artifact_directory,
             artifact_name,
             mapping,
         )
-        sidecar = dict(manifest["sidecars"][0])
-        sidecar.update(
+        sidecar_metadata_map = dict(manifest["sidecars"][0])
+        sidecar_metadata_map.update(
             {
                 "name": artifact_name,
-                "path": str(artifact_directory / str(sidecar["path"])),
+                "path": str(
+                    artifact_directory / str(sidecar_metadata_map["path"])
+                ),
                 "source_shard_id": "shard-01",
             }
         )
-        artifact_entries.append(sidecar)
+        artifact_entries.append(sidecar_metadata_map)
     provider_map = tmp_path / "provider-set-map.tsv"
     provider_map.write_text(f"{provider_set_id.hex()}\t1\n", encoding="ascii")
     output_directory = tmp_path / "native-output"
@@ -361,14 +363,14 @@ async def test_snapshot_publish_passes_bundles_and_key_map_to_native_bridge(
     bundle = _graph_bundle(tmp_path)
     provider_map = tmp_path / "provider-set-map.tsv"
     provider_map.write_text(f"{'01' * 16}\t1\n", encoding="ascii")
-    field_names = {
+    artifact_field_by_name = {
         "provider_group_npi": "group_npi",
         "provider_npi_group": "npi_group",
         "provider_inverted": "group_provider_set",
         "provider_forward": "provider_set_group",
     }
     entries = []
-    for artifact_name, field_name in field_names.items():
+    for artifact_name, field_name in artifact_field_by_name.items():
         artifact = getattr(bundle, field_name)
         entries.append(
             {
@@ -379,12 +381,12 @@ async def test_snapshot_publish_passes_bundles_and_key_map_to_native_bridge(
             }
         )
     sentinel = object()
-    observed: dict[str, Any] = {}
+    observed_call_map: dict[str, Any] = {}
 
     async def native_bridge(*, shards, provider_set_key_map_path, output_directory):
-        observed["shards"] = shards
-        observed["provider_set_key_map_path"] = provider_set_key_map_path
-        observed["output_directory"] = output_directory
+        observed_call_map["shards"] = shards
+        observed_call_map["provider_set_key_map_path"] = provider_set_key_map_path
+        observed_call_map["output_directory"] = output_directory
         return sentinel
 
     monkeypatch.setattr(
@@ -400,35 +402,35 @@ async def test_snapshot_publish_passes_bundles_and_key_map_to_native_bridge(
     )
 
     assert native_conversion_result is sentinel
-    assert isinstance(observed["shards"], tuple)
-    assert len(observed["shards"]) == 1
-    assert observed["shards"][0].shard_id == bundle.shard_id
-    assert observed["shards"][0].group_npi.path == bundle.group_npi.path
-    assert observed["shards"][0].npi_group.path == bundle.npi_group.path
-    assert observed["provider_set_key_map_path"] == provider_map
-    assert isinstance(observed["provider_set_key_map_path"], Path)
-    assert observed["output_directory"] == tmp_path / "provider-graph-native"
+    assert isinstance(observed_call_map["shards"], tuple)
+    assert len(observed_call_map["shards"]) == 1
+    assert observed_call_map["shards"][0].shard_id == bundle.shard_id
+    assert observed_call_map["shards"][0].group_npi.path == bundle.group_npi.path
+    assert observed_call_map["shards"][0].npi_group.path == bundle.npi_group.path
+    assert observed_call_map["provider_set_key_map_path"] == provider_map
+    assert isinstance(observed_call_map["provider_set_key_map_path"], Path)
+    assert observed_call_map["output_directory"] == tmp_path / "provider-graph-native"
 
 
 def test_compact_scanner_never_exports_source_network_labels(tmp_path, monkeypatch):
     binary = tmp_path / "ptg2_scanner"
     binary.write_text("fake", encoding="ascii")
     binary.chmod(0o755)
-    config = {
+    scanner_config_map = {
         "snapshot_arch": "postgres_binary_v3",
         "storage_generation": "shared_blocks_v3",
         "serving_row_semantics": "source_multiset_v1",
         "serving_run_format": "ptg2_v3_serving_run",
         "serving_run_version": 1,
     }
-    framed_stdout = _frame_named("scanner_config", config) + _frame_named(
+    framed_stdout = _frame_named("scanner_config", scanner_config_map) + _frame_named(
         "scanner_summary", {}
     )
-    captured_env: dict[str, str] = {}
+    captured_env_map: dict[str, str] = {}
 
     def popen(arguments, *, stdout, stderr, env):
         del arguments, stdout, stderr
-        captured_env.update(env)
+        captured_env_map.update(env)
         return _FakeSyncProcess(stdout=framed_stdout)
 
     monkeypatch.setattr(rust_scanner, "_ptg2_rust_scanner_binary", lambda: binary)
@@ -456,7 +458,7 @@ def test_compact_scanner_never_exports_source_network_labels(tmp_path, monkeypat
         "scanner_config",
         "scanner_summary",
     ]
-    assert "HLTHPRT_PTG2_SOURCE_NETWORK_NAMES_JSON" not in captured_env
+    assert "HLTHPRT_PTG2_SOURCE_NETWORK_NAMES_JSON" not in captured_env_map
 
 
 def _frame_named(record_kind: str, payload: dict[str, Any]) -> bytes:

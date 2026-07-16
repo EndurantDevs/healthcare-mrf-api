@@ -543,7 +543,7 @@ def _malformed_provider_identifier_payload(
 
 def test_scanner_quarantine_is_identical_across_execution_modes(tmp_path):
     scanner_binary = _built_scanner_binary()
-    mode_specs = {
+    mode_specs_by_name = {
         "parallel": {
             "provider_references_first": True,
             "top_level_byte_scan": True,
@@ -555,7 +555,7 @@ def test_scanner_quarantine_is_identical_across_execution_modes(tmp_path):
             "execution_mode": "parallel_top_level_bytes_plain_range_reorder",
         },
     }
-    runs = {
+    runs_by_mode = {
         mode: _run_scanner(
             scanner_binary,
             tmp_path,
@@ -568,20 +568,20 @@ def test_scanner_quarantine_is_identical_across_execution_modes(tmp_path):
             ),
             top_level_byte_scan=spec["top_level_byte_scan"],
         )
-        for mode, spec in mode_specs.items()
+        for mode, spec in mode_specs_by_name.items()
     }
 
     expected_quarantine = provider_identifier_quarantine_payload(
         {123456787: 1, 123456789: 2}
     )
-    quarantine_evidence = []
+    quarantine_evidence_list = []
     malformed_npis = {123456787, 123456789}
-    for mode, run in runs.items():
+    for mode, run in runs_by_mode.items():
         config = _single_frame(run["frames"], "scanner_config")
         summary = _single_frame(run["frames"], "scanner_summary")
-        assert config["execution_mode"] == mode_specs[mode]["execution_mode"]
+        assert config["execution_mode"] == mode_specs_by_name[mode]["execution_mode"]
         assert summary["serving_run_rows"] == 2
-        quarantine_evidence.append(summary["provider_identifier_quarantine"])
+        quarantine_evidence_list.append(summary["provider_identifier_quarantine"])
 
         member_rows = _SUPPORT_MODULE._sorted_copy_rows(
             run["provider_group_member_copy_path"]
@@ -592,7 +592,7 @@ def test_scanner_quarantine_is_identical_across_execution_modes(tmp_path):
         assert member_npis == (1234567890, 1234567891)
         assert malformed_npis.isdisjoint(member_npis)
 
-    assert quarantine_evidence == [expected_quarantine] * len(mode_specs)
+    assert quarantine_evidence_list == [expected_quarantine] * len(mode_specs_by_name)
 
 
 def test_v3_all_scanner_paths_emit_identical_fixed_width_records(tmp_path):

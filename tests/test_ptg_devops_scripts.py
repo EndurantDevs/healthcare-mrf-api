@@ -54,10 +54,12 @@ def test_dev_deploy_workflow_requires_successful_ci_for_exact_main_sha():
 def test_cutover_requires_idle_valid_pointers():
     module = _load_script("ptg2_strict_v3_cutover_ready")
     statements = []
+    parameters = []
 
     class Executor:
-        async def all(self, statement):
+        async def all(self, statement, **params):
             statements.append(statement)
+            parameters.append(params)
             if "WITH pointers AS" in statement:
                 return [
                     {
@@ -78,25 +80,32 @@ def test_cutover_requires_idle_valid_pointers():
                 {
                     "active_import_run_count": 0,
                     "building_snapshot_count": 0,
+                    "stale_import_run_count": 2,
+                    "stale_building_snapshot_count": 2,
                 }
             ]
 
-    result = asyncio.run(
+    readiness = asyncio.run(
         module.collect_cutover_readiness(Executor(), schema_name="mrf")
     )
 
-    assert result["ready"] is True
-    assert result["pointer_count"] == 7
-    assert not any(result["failure_counts"].values())
+    assert readiness["ready"] is True
+    assert readiness["pointer_count"] == 7
+    assert readiness["stale_import_run_count"] == 2
+    assert readiness["stale_building_snapshot_count"] == 2
+    assert readiness["stale_activity_seconds"] == 21_600
+    assert not any(readiness["failure_counts"].values())
     assert "manifest::jsonb AS manifest_jsonb" in statements[0]
     assert "jsonb_typeof(snapshot.manifest_jsonb" in statements[0]
+    assert "heartbeat_at" in statements[1]
+    assert parameters[1] == {"stale_activity_seconds": 21_600}
 
 
 def test_cutover_rejects_legacy_or_active():
     module = _load_script("ptg2_strict_v3_cutover_ready")
 
     class Executor:
-        async def all(self, statement):
+        async def all(self, statement, **_params):
             if "WITH pointers AS" in statement:
                 return [
                     {
@@ -120,13 +129,64 @@ def test_cutover_rejects_legacy_or_active():
                 }
             ]
 
-    result = asyncio.run(
+    readiness = asyncio.run(
         module.collect_cutover_readiness(Executor(), schema_name="mrf")
     )
 
-    assert result["ready"] is False
-    assert result["active_import_run_count"] == 1
-    assert result["failure_counts"]["invalid_arch_count"] == 1
+    assert readiness["ready"] is False
+    assert readiness["active_import_run_count"] == 1
+    assert readiness["failure_counts"]["invalid_arch_count"] == 1
+
+
+def test_cutover_stale_activity_is_reported_without_blocking():
+    module = _load_script("ptg2_strict_v3_cutover_ready")
+
+    class Executor:
+        async def all(self, statement, **params):
+            if "WITH pointers AS" in statement:
+                return [
+                    {
+                        "pointer_count": 1,
+                        "missing_snapshot_count": 0,
+                        "unpublished_snapshot_count": 0,
+                        "invalid_arch_count": 0,
+                        "invalid_manifest_generation_count": 0,
+                        "unsealed_source_set_count": 0,
+                        "unsealed_audit_sample_count": 0,
+                        "missing_binding_count": 0,
+                        "unsealed_layout_count": 0,
+                        "invalid_layout_generation_count": 0,
+                        "mismatched_binding_count": 0,
+                    }
+                ]
+            assert params == {"stale_activity_seconds": 900}
+            return [
+                {
+                    "active_import_run_count": 0,
+                    "building_snapshot_count": 0,
+                    "stale_import_run_count": 6,
+                    "stale_building_snapshot_count": 6,
+                }
+            ]
+
+    readiness = asyncio.run(
+        module.collect_cutover_readiness(
+            Executor(),
+            schema_name="mrf",
+            stale_activity_seconds=900,
+        )
+    )
+
+    assert readiness["ready"] is True
+    assert readiness["stale_import_run_count"] == 6
+    assert readiness["stale_building_snapshot_count"] == 6
+    assert readiness["stale_activity_seconds"] == 900
+
+
+def test_cutover_stale_activity_window_cannot_disable_live_run_guard():
+    module = _load_script("ptg2_strict_v3_cutover_ready")
+
+    assert module._stale_activity_seconds(0) == 300
 
 
 def test_ptg_rebuild_expands_uhc_toc_url_candidates():

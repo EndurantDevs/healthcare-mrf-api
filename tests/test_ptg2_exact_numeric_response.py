@@ -56,7 +56,7 @@ def test_pricing_http_serializer_preserves_exact_numeric_fragment():
 
 
 def test_source_identity_fields_are_opt_in():
-    source_fields = {
+    source_field_map = {
         "source_key": "synthetic-source",
         "source_artifact_key": 1,
         "source_type": "in_network",
@@ -69,11 +69,11 @@ def test_source_identity_fields_are_opt_in():
         "source_trace": [{"source_file_version_id": "synthetic"}],
     }
 
-    hidden = _shape_ptg2_response({"items": [source_fields]}, {})
+    hidden = _shape_ptg2_response({"items": [source_field_map]}, {})
     included = _shape_ptg2_response(
-        {"items": [source_fields]},
+        {"items": [source_field_map]},
         {"include_sources": "true"},
     )
 
     assert hidden["items"] == [{}]
-    assert included["items"] == [source_fields]
+    assert included["items"] == [source_field_map]

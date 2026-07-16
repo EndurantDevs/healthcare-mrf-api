@@ -192,7 +192,7 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
     _write_fake_rapidgzip(fake_rapidgzip)
     copy_kinds = ("price_atom", "provider_group_member")
 
-    runs = {
+    runs_by_producer_count = {
         producer_count: _run_parallel_scanner(
             _built_scanner_binary(),
             artifact,
@@ -212,12 +212,12 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
         for producer_count in (1, 4)
     }
 
-    assert runs[4]["copy_rows"] == runs[1]["copy_rows"]
-    assert runs[4]["copy_digests"] == runs[1]["copy_digests"]
-    assert runs[4]["serving_records"] == runs[1]["serving_records"]
+    assert runs_by_producer_count[4]["copy_rows"] == runs_by_producer_count[1]["copy_rows"]
+    assert runs_by_producer_count[4]["copy_digests"] == runs_by_producer_count[1]["copy_digests"]
+    assert runs_by_producer_count[4]["serving_records"] == runs_by_producer_count[1]["serving_records"]
     assert {
         kind: len(copy_rows)
-        for kind, copy_rows in runs[4]["copy_rows"].items()
+        for kind, copy_rows in runs_by_producer_count[4]["copy_rows"].items()
     } == {
         "price_atom": 168,
         "provider_group_member": 64,
@@ -227,8 +227,8 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
         for procedure in fixture_document["in_network"]
     )
     assert source_rate_occurrences == 192
-    assert len(runs[4]["serving_records"]) == source_rate_occurrences
-    for producer_count, run in runs.items():
+    assert len(runs_by_producer_count[4]["serving_records"]) == source_rate_occurrences
+    for producer_count, run in runs_by_producer_count.items():
         config = _single_frame(run, "scanner_config")
         summary = _single_frame(run, "scanner_summary")
         assert config["indexed_range_producers_requested"] == producer_count
@@ -338,29 +338,29 @@ def test_delayed_indexed_range_emits_object_coverage_progress(tmp_path):
         if not line.startswith("PTG2_SCANNER_PROGRESS\t"):
             continue
         progress_lines.append(line)
-        fields = dict(
+        progress_fields_by_name = dict(
             field.split("=", 1) for field in line.split("\t")[1:] if "=" in field
         )
-        if fields.get("progress_basis") == "indexed_objects":
-            progress_payloads.append(fields)
+        if progress_fields_by_name.get("progress_basis") == "indexed_objects":
+            progress_payloads.append(progress_fields_by_name)
 
     assert progress_lines
     assert all("progress_basis=indexed_objects" in line for line in progress_lines)
-    intermediate = [
+    intermediate_progress_payloads = [
         progress_fields
         for progress_fields in progress_payloads
         if progress_fields["done"] == "false"
     ]
-    assert intermediate
+    assert intermediate_progress_payloads
     assert all(
         progress_fields["indexed_objects_total"] == "24"
-        for progress_fields in intermediate
+        for progress_fields in intermediate_progress_payloads
     )
     assert any(
         0 < float(progress_fields["percent"]) < 100
         and 0 < int(progress_fields["indexed_objects_completed"]) < 24
         and progress_fields["eta_seconds"] != "unknown"
-        for progress_fields in intermediate
+        for progress_fields in intermediate_progress_payloads
     )
 
 

@@ -94,7 +94,7 @@ async def test_strict_v3_stage_creates_only_price_inputs(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_strict_v3_precopy_loads_only_price_inputs(tmp_path, monkeypatch):
-    copy_files = {}
+    copy_files_by_kind = {}
     for kind in (
         "manifest_lean_serving",
         "price_atom",
@@ -106,7 +106,7 @@ async def test_strict_v3_precopy_loads_only_price_inputs(tmp_path, monkeypatch):
     ):
         path = tmp_path / f"{kind}.copy"
         path.write_bytes(b"copy")
-        copy_files[kind] = [{"path": str(path), "row_count": 3}]
+        copy_files_by_kind[kind] = [{"path": str(path), "row_count": 3}]
     price_atom_copy = AsyncMock()
     price_set_atom_copy = AsyncMock()
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
@@ -114,7 +114,9 @@ async def test_strict_v3_precopy_loads_only_price_inputs(tmp_path, monkeypatch):
     monkeypatch.setattr(process_ptg, "_copy_price_atom_member_file", price_set_atom_copy)
 
     metrics = await process_ptg._merge_and_copy_ptg2_manifest_files(
-        successful_files=[{"summary": {"manifest": {"copy_files": copy_files}}}],
+        successful_files=[
+            {"summary": {"manifest": {"copy_files": copy_files_by_kind}}}
+        ],
         manifest_stage_table="ptg2_manifest_stage_serving_strict",
     )
 

@@ -686,3 +686,7 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
   measured report; until then the gate remains pending.
 - Replacement and rollback bindings are retained as intended, and GC dry-run
   output is reviewed before execution.
+- The strict-reader cutover preflight blocks fresh pending/running/building
+  activity. Abandoned rows older than `HLTHPRT_PTG2_STALE_BUILD_SECONDS`
+  (six hours by default) are reported separately as stale cleanup debt; they
+  do not masquerade as live work forever.

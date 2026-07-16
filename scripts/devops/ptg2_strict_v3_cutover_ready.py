@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Any
 
 
+_STALE_ACTIVITY_SECONDS_ENV = "HLTHPRT_PTG2_STALE_BUILD_SECONDS"
+_STALE_ACTIVITY_SECONDS_DEFAULT = 21_600
+_STALE_ACTIVITY_SECONDS_MINIMUM = 300
+
+
 def _bootstrap_import_path() -> None:
     root = Path(__file__).resolve().parents[2]
     for path in (root, Path("/opt")):
@@ -39,14 +44,31 @@ def _quote_ident(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+def _stale_activity_seconds(value: int | None) -> int:
+    raw_value: Any = (
+        value
+        if value is not None
+        else os.getenv(
+            _STALE_ACTIVITY_SECONDS_ENV,
+            _STALE_ACTIVITY_SECONDS_DEFAULT,
+        )
+    )
+    try:
+        return max(int(raw_value), _STALE_ACTIVITY_SECONDS_MINIMUM)
+    except (TypeError, ValueError):
+        return _STALE_ACTIVITY_SECONDS_DEFAULT
+
+
 async def collect_cutover_readiness(
     executor: Any,
     *,
     schema_name: str,
+    stale_activity_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Collect fail-closed cutover counts for current pointers and active builds."""
 
     schema = _quote_ident(schema_name)
+    stale_seconds = _stale_activity_seconds(stale_activity_seconds)
     pointer_rows = await executor.all(
         f"""
         WITH pointers AS (
@@ -114,17 +136,54 @@ async def collect_cutover_readiness(
     )
     activity_rows = await executor.all(
         f"""
+        WITH import_activity AS (
+            SELECT import_run_id,
+                   status,
+                   COALESCE(
+                       heartbeat_at,
+                       started_at,
+                       '-infinity'::timestamp
+                   ) >= timezone('UTC', transaction_timestamp())
+                       - (:stale_activity_seconds * INTERVAL '1 second')
+                       AS is_fresh
+              FROM {schema}.ptg2_import_run
+        ), snapshot_activity AS (
+            SELECT snapshot.snapshot_id,
+                   CASE
+                       WHEN import_activity.import_run_id IS NOT NULL
+                       THEN import_activity.status IN ('pending', 'running', 'building')
+                            AND import_activity.is_fresh
+                       ELSE COALESCE(
+                           snapshot.created_at,
+                           '-infinity'::timestamp
+                       ) >= timezone('UTC', transaction_timestamp())
+                           - (:stale_activity_seconds * INTERVAL '1 second')
+                   END AS is_fresh
+              FROM {schema}.ptg2_snapshot AS snapshot
+              LEFT JOIN import_activity
+                ON import_activity.import_run_id = snapshot.import_run_id
+             WHERE snapshot.status = 'building'
+        )
         SELECT
             COUNT(*) FILTER (
-                WHERE status IN ('pending', 'running', 'building')
+                WHERE status IN ('pending', 'running', 'building') AND is_fresh
             )::bigint AS active_import_run_count,
+            COUNT(*) FILTER (
+                WHERE status IN ('pending', 'running', 'building') AND NOT is_fresh
+            )::bigint AS stale_import_run_count,
             (
                 SELECT COUNT(*)::bigint
-                  FROM {schema}.ptg2_snapshot
-                 WHERE status = 'building'
-            ) AS building_snapshot_count
-          FROM {schema}.ptg2_import_run
-        """
+                  FROM snapshot_activity
+                 WHERE is_fresh
+            ) AS building_snapshot_count,
+            (
+                SELECT COUNT(*)::bigint
+                  FROM snapshot_activity
+                 WHERE NOT is_fresh
+            ) AS stale_building_snapshot_count
+          FROM import_activity
+        """,
+        stale_activity_seconds=stale_seconds,
     )
     if len(pointer_rows) != 1 or len(activity_rows) != 1:
         raise RuntimeError("cutover readiness queries returned invalid cardinality")
@@ -147,6 +206,10 @@ async def collect_cutover_readiness(
     pointer_count = int(pointer.get("pointer_count") or 0)
     active_import_run_count = int(activity.get("active_import_run_count") or 0)
     building_snapshot_count = int(activity.get("building_snapshot_count") or 0)
+    stale_import_run_count = int(activity.get("stale_import_run_count") or 0)
+    stale_building_snapshot_count = int(
+        activity.get("stale_building_snapshot_count") or 0
+    )
     ready = (
         pointer_count > 0
         and not any(failure_counts.values())
@@ -159,30 +222,56 @@ async def collect_cutover_readiness(
         "pointer_count": pointer_count,
         "active_import_run_count": active_import_run_count,
         "building_snapshot_count": building_snapshot_count,
+        "stale_import_run_count": stale_import_run_count,
+        "stale_building_snapshot_count": stale_building_snapshot_count,
+        "stale_activity_seconds": stale_seconds,
         "failure_counts": failure_counts,
     }
 
 
-async def _run(schema_name: str) -> dict[str, Any]:
+async def _run(
+    schema_name: str,
+    stale_activity_seconds: int | None,
+) -> dict[str, Any]:
     from db.connection import db
 
     try:
-        return await collect_cutover_readiness(db, schema_name=schema_name)
+        return await collect_cutover_readiness(
+            db,
+            schema_name=schema_name,
+            stale_activity_seconds=stale_activity_seconds,
+        )
     finally:
         await db.disconnect()
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Print the cutover report and return its readiness exit code."""
-
+def _parse_arguments(argv: list[str] | None) -> argparse.Namespace:
+    """Parse the bounded cutover-readiness CLI surface."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--schema",
         default=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--stale-activity-seconds",
+        type=int,
+        help=(
+            "Heartbeat age after which abandoned import/build rows are reported as stale "
+            f"instead of active (default: {_STALE_ACTIVITY_SECONDS_ENV} or "
+            f"{_STALE_ACTIVITY_SECONDS_DEFAULT})"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Print the cutover report and return its readiness exit code."""
+
+    args = _parse_arguments(argv)
     try:
-        result = asyncio.run(_run(args.schema))
+        readiness = asyncio.run(
+            _run(args.schema, args.stale_activity_seconds)
+        )
     except Exception:
         print(
             json.dumps(
@@ -195,8 +284,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 2
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return 0 if result["ready"] else 1
+    print(json.dumps(readiness, indent=2, sort_keys=True))
+    return 0 if readiness["ready"] else 1
 
 
 if __name__ == "__main__":

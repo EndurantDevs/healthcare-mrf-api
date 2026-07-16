@@ -29,12 +29,12 @@ async def test_strict_price_stage_deduplicates_identical_cross_file_atoms(monkey
         "duplicate_rows_removed": 1,
         "conflicting_ids": 0,
     }
-    scalar_sql = [call.args[0] for call in scalar.await_args_list]
-    assert "IS DISTINCT FROM" in scalar_sql[2]
-    status_sql = [call.args[0] for call in status.await_args_list]
-    assert any("SELECT DISTINCT ON (price_atom_global_id_128)" in sql for sql in status_sql)
-    assert any("CREATE UNIQUE INDEX" in sql for sql in status_sql)
-    assert any("RENAME TO \"price_atoms\"" in sql for sql in status_sql)
+    scalar_statements = [call.args[0] for call in scalar.await_args_list]
+    assert "IS DISTINCT FROM" in scalar_statements[2]
+    status_statements = [call.args[0] for call in status.await_args_list]
+    assert any("SELECT DISTINCT ON (price_atom_global_id_128)" in sql for sql in status_statements)
+    assert any("CREATE UNIQUE INDEX" in sql for sql in status_statements)
+    assert any("RENAME TO \"price_atoms\"" in sql for sql in status_statements)
 
 
 @pytest.mark.asyncio
