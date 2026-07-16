@@ -627,17 +627,20 @@ def _single_code_metadata_session():
 
 def _stub_exact_npi_graph(monkeypatch, provider_set_id):
     match_provider_locations = AsyncMock(
-        return_value=(
-            {provider_set_id},
-            {
-                provider_set_id: [
-                    {"npi": 1234567890, "provider_name": "Selected provider"}
-                ]
-            },
+        side_effect=AssertionError(
+            "exact NPI lookup must not run generic location traversal"
         )
     )
     expand_provider_members = AsyncMock(
         side_effect=AssertionError("explicit NPI lookup must not expand all members")
+    )
+    selected_providers_by_set = {
+        provider_set_id: [
+            {"npi": 1234567890, "provider_name": "Selected provider"}
+        ]
+    }
+    enrich_selected_provider_rows = AsyncMock(
+        return_value=selected_providers_by_set
     )
     monkeypatch.setattr(
         ptg2_serving,
@@ -654,7 +657,16 @@ def _stub_exact_npi_graph(monkeypatch, provider_set_id):
         "_ptg2_manifest_provider_rows_for_provider_sets",
         expand_provider_members,
     )
-    return match_provider_locations, expand_provider_members
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_exact_npi_provider_rows_by_set",
+        enrich_selected_provider_rows,
+    )
+    return (
+        match_provider_locations,
+        expand_provider_members,
+        enrich_selected_provider_rows,
+    )
 
 
 def _stub_exact_npi_price_rows(monkeypatch, provider_set_id, price_set_id):
@@ -717,12 +729,11 @@ async def test_explicit_npi_search_intersects_provider_sets_before_reading_rows(
     monkeypatch.setattr(
         ptg2_serving,
         "_ptg2_manifest_location_provider_matches",
-        AsyncMock(return_value=({provider_set_id}, {provider_set_id: []})),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_ptg2_manifest_provider_set_keys_for_ids",
-        AsyncMock(return_value={provider_set_id: 3}),
+        AsyncMock(
+            side_effect=AssertionError(
+                "exact NPI lookup must not run generic location traversal"
+            )
+        ),
     )
     session = _single_code_metadata_session()
 
@@ -745,8 +756,103 @@ async def test_explicit_npi_search_intersects_provider_sets_before_reading_rows(
     assert response is None
     merge_rows.assert_awaited_once()
     assert merge_rows.await_args.kwargs["provider_set_keys"] == [3]
-    assert merge_rows.await_args.kwargs["limit"] is None
+    assert merge_rows.await_args.kwargs["limit"] == 101
     assert merge_rows.await_args.kwargs["offset"] == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_npi_rate_lookup_skips_generic_provider_traversal(
+    monkeypatch,
+):
+    """Use dense NPI membership directly when no geo or taxonomy filter exists."""
+
+    provider_set_id = "03" * 16
+    price_set_id = "05" * 16
+    merge_rows = _stub_exact_npi_price_rows(
+        monkeypatch,
+        provider_set_id,
+        price_set_id,
+    )
+    location_matches, broad_rows, provider_enrichment = _stub_exact_npi_graph(
+        monkeypatch,
+        provider_set_id,
+    )
+
+    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        _single_code_metadata_session(),
+        "logical-plan-a",
+        {
+            "plan_id": "plan-a",
+            "plan_market_type": "group",
+            "code_system": "CPT",
+            "code": "99213",
+            "npi": "1234567890",
+            "include_providers": False,
+        },
+        SimpleNamespace(limit=25, offset=0),
+        _strict_tables(snapshot_id="logical-plan-a", snapshot_key=41),
+        "exact_source",
+    )
+
+    assert response is not None
+    assert len(response["items"]) == 1
+    assert response["pagination"] == {
+        "total": 1,
+        "total_is_exact": True,
+        "total_lower_bound": 1,
+        "limit": 25,
+        "offset": 0,
+        "page": 1,
+        "has_more": False,
+    }
+    assert merge_rows.await_args.kwargs["provider_set_keys"] == [3]
+    assert merge_rows.await_args.kwargs["limit"] == 26
+    assert merge_rows.await_args.kwargs["offset"] == 0
+    location_matches.assert_not_awaited()
+    broad_rows.assert_not_awaited()
+    provider_enrichment.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exact_npi_with_geo_filter_keeps_location_validation(
+    monkeypatch,
+):
+    """Retain address validation when an exact NPI also carries a geo filter."""
+
+    explicit_scope = _exact_npi_graph_scope()
+    location_matches = AsyncMock(return_value=(set(), {}))
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_version_three_explicit_npi_graph_scope",
+        AsyncMock(return_value=explicit_scope),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_location_provider_matches",
+        location_matches,
+    )
+
+    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        _Session([]),
+        "logical-plan-a",
+        {
+            "plan_id": "plan-a",
+            "plan_market_type": "group",
+            "code_system": "CPT",
+            "code": "99213",
+            "npi": "1234567890",
+            "state": "TN",
+            "include_providers": False,
+        },
+        SimpleNamespace(limit=25, offset=0),
+        _strict_tables(snapshot_id="logical-plan-a", snapshot_key=41),
+        "exact_source",
+    )
+
+    assert response is not None
+    assert response["items"] == []
+    location_matches.assert_awaited_once()
+    assert location_matches.await_args.kwargs["explicit_npi_scope"] is explicit_scope
 
 
 @pytest.mark.asyncio
@@ -758,7 +864,7 @@ async def test_explicit_npi_search_does_not_expand_other_provider_set_members(
     provider_set_id = "03" * 16
     price_set_id = "05" * 16
     merge_rows = _stub_exact_npi_price_rows(monkeypatch, provider_set_id, price_set_id)
-    location_matches, broad_rows = _stub_exact_npi_graph(
+    location_matches, broad_rows, selected_provider_rows = _stub_exact_npi_graph(
         monkeypatch,
         provider_set_id,
     )
@@ -786,8 +892,9 @@ async def test_explicit_npi_search_does_not_expand_other_provider_set_members(
         1234567890
     ]
     assert merge_rows.await_args.kwargs["provider_set_keys"] == [3]
-    assert location_matches.await_args.kwargs["provider_set_keys"] == {3}
+    location_matches.assert_not_awaited()
     broad_rows.assert_not_awaited()
+    selected_provider_rows.assert_awaited_once()
 
 
 def _stub_candidate_audit_npi_without_address(
