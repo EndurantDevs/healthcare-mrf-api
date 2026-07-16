@@ -5,7 +5,8 @@
     "sapphire",
     "aetna_health1",
     "anthem_s3_mrf",
-    "kaiser_hawaii_monthly_toc",
+    "kaiser_mrf_inventory",
+    "kaiser_hawaii_mrf_inventory",
     "uhc_public_blobs",
     "mymedicalshopper_talon",
     "mymedicalshopper_talon_bounded",
@@ -88,12 +89,24 @@
       "max_name_matches": 50,
       "max_targets": 1000
     },
-    "kaiser_hawaii_monthly_toc": {
-      "type": "monthly_toc_templates",
-      "base_url": "https://healthy.kaiserpermanente.org/pricing/innetwork/hi/",
-      "file_templates": ["{month_start}_KFHP-HI_index.json"],
+    "kaiser_mrf_inventory": {
+      "type": "kaiser_monthly_inventory",
+      "base_url": "https://healthy.kaiserpermanente.org/pricing/",
       "month_offsets": [0, -1],
-      "toc_max_bytes": 5242880
+      "inventory_max_bytes": 2097152,
+      "toc_max_bytes": 5242880,
+      "max_targets": 2500,
+      "include_external_data": false
+    },
+    "kaiser_hawaii_mrf_inventory": {
+      "type": "kaiser_monthly_inventory",
+      "base_url": "https://healthy.kaiserpermanente.org/pricing/",
+      "month_offsets": [0, -1],
+      "region_codes": ["hi"],
+      "inventory_max_bytes": 2097152,
+      "toc_max_bytes": 5242880,
+      "max_targets": 100,
+      "include_external_data": false
     },
     "hcsc_asomrf_landing": {
       "type": "hcsc_asomrf_landing",

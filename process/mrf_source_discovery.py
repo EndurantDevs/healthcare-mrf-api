@@ -341,7 +341,11 @@ TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "auxiant_wordpress",
 )
 TOC_LEVEL_QUERY_EXPANSION_RESOLVERS = frozenset(
-    {"cigna_static_mrf_lookup", "monthly_toc_templates"}
+    {
+        "cigna_static_mrf_lookup",
+        "kaiser_monthly_inventory",
+        "monthly_toc_templates",
+    }
 )
 SOURCE_QUERY_EXPANSION_PLATFORM_RANK = {
     platform: rank
@@ -1248,11 +1252,10 @@ def classify_hosting_platform(url: str | None) -> str | None:
         )
     ):
         return "point32_azure_mrf_directory"
-    if (
-        host == "healthy.kaiserpermanente.org"
-        and path == "/hawaii/front-door/machine-readable"
-    ):
-        return "kaiser_hawaii_monthly_toc"
+    if host == "healthy.kaiserpermanente.org" and "machine-readable" in path:
+        if path == "/hawaii/front-door/machine-readable":
+            return "kaiser_hawaii_mrf_inventory"
+        return "kaiser_mrf_inventory"
     if (
         (host in {"www.pbaclaims.com", "pbaclaims.com"} and path.startswith("/mrfs"))
         or (
@@ -2904,7 +2907,7 @@ def _candidate_metadata(
     }
     if target_payer_query:
         metadata["target_payer_query"] = target_payer_query
-    optional_lists = {
+    optional_values_by_field = {
         "source_coverage": candidate.source_coverage,
         "vendor_names": candidate.vendor_names,
         "network_names": candidate.network_names,
@@ -2914,10 +2917,12 @@ def _candidate_metadata(
             r"supersedes[-_\s]*urls?",
         ),
     }
-    for key, values in optional_lists.items():
-        cleaned = [_clean_text(value) for value in values if _clean_text(value)]
-        if cleaned:
-            metadata[key] = list(dict.fromkeys(cleaned))
+    for key, values in optional_values_by_field.items():
+        cleaned_values = [
+            _clean_text(value) for value in values if _clean_text(value)
+        ]
+        if cleaned_values:
+            metadata[key] = list(dict.fromkeys(cleaned_values))
     return metadata
 
 
@@ -3971,17 +3976,17 @@ async def _mymedicalshopper_ddp_recv(
             ) from exc
         if frame.type == aiohttp.WSMsgType.TEXT:
             messages = _mymedicalshopper_sockjs_messages(str(frame.data))
-            returned: list[dict[str, Any]] = []
+            returned_messages: list[dict[str, Any]] = []
             for message in messages:
                 if message.get("msg") == "ping":
-                    pong: dict[str, Any] = {"msg": "pong"}
+                    pong_message_by_field: dict[str, Any] = {"msg": "pong"}
                     if message.get("id") is not None:
-                        pong["id"] = message.get("id")
-                    await _mymedicalshopper_ddp_send(ws, pong)
+                        pong_message_by_field["id"] = message.get("id")
+                    await _mymedicalshopper_ddp_send(ws, pong_message_by_field)
                     continue
-                returned.append(message)
-            if returned:
-                return returned
+                returned_messages.append(message)
+            if returned_messages:
+                return returned_messages
             continue
         if frame.type in {
             aiohttp.WSMsgType.CLOSE,
@@ -4300,7 +4305,7 @@ async def _mymedicalshopper_entity_employers_for_query(
 async def _mymedicalshopper_entity_employers(
     ws: aiohttp.ClientWebSocketResponse,
     *,
-    source: dict[str, Any] | None = None,
+    source_record: dict[str, Any] | None = None,
     entity_slug: str,
     resolver: dict[str, Any],
     timeout_seconds: float,
@@ -4323,7 +4328,7 @@ async def _mymedicalshopper_entity_employers(
     all_employers_searchable = bool(
         machine_readable_files.get("allEmployersSearchable")
     )
-    target_query = _source_target_payer_query(source or {})
+    target_query = _source_target_payer_query(source_record or {})
     base_selector = _mymedicalshopper_employer_selector(
         entity_slug, all_employers_searchable=all_employers_searchable
     )
@@ -4333,7 +4338,7 @@ async def _mymedicalshopper_entity_employers(
     selectors = _mymedicalshopper_entity_employer_selectors(
         entity_slug,
         all_employers_searchable=all_employers_searchable,
-        source=source,
+        source=source_record,
         resolver=resolver,
     )
     page_size = max(_as_int(resolver.get("page_size")) or 100, 1)
@@ -4341,7 +4346,7 @@ async def _mymedicalshopper_entity_employers(
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
         max_employers = min(max_employers, max_targets)
-    fields = {
+    fields_by_name = {
         "name": 1,
         "slug": 1,
         "tpaSlug": 1,
@@ -4350,16 +4355,16 @@ async def _mymedicalshopper_entity_employers(
         "groupId": 1,
         "ein": 1,
     }
-    employers: dict[str, dict[str, Any]] = {}
+    employers_by_slug: dict[str, dict[str, Any]] = {}
     for selector_index, selector in enumerate(selectors):
-        employers.update(
+        employers_by_slug.update(
             await _mymedicalshopper_entity_employers_for_query(
                 ws,
                 _MmsEmployerQuery(
                     entity_slug=entity_slug,
                     selector=selector,
                     selector_label=str(selector_index),
-                    fields=fields,
+                    fields=fields_by_name,
                     page_size=page_size,
                     max_employers=max_employers,
                     tpa_name=tpa_name,
@@ -4369,7 +4374,7 @@ async def _mymedicalshopper_entity_employers(
             )
         )
     if (
-        not employers
+        not employers_by_slug
         and target_query
         and search_selector is not None
         and not resolver.get("query_search_include_full_table")
@@ -4377,14 +4382,14 @@ async def _mymedicalshopper_entity_employers(
         fallback_max_employers = _mymedicalshopper_query_fallback_max_employers(
             resolver, max_employers
         )
-        employers.update(
+        employers_by_slug.update(
             await _mymedicalshopper_entity_employers_for_query(
                 ws,
                 _MmsEmployerQuery(
                     entity_slug=entity_slug,
                     selector=base_selector,
                     selector_label="query-fallback",
-                    fields=fields,
+                    fields=fields_by_name,
                     page_size=min(page_size, fallback_max_employers),
                     max_employers=fallback_max_employers,
                     tpa_name=tpa_name,
@@ -4393,7 +4398,7 @@ async def _mymedicalshopper_entity_employers(
                 ),
             )
         )
-    return list(employers.values())
+    return list(employers_by_slug.values())
 
 
 async def _mymedicalshopper_generated_for_employer(
@@ -4541,7 +4546,7 @@ def _mymedicalshopper_targets_from_generated(
 
 
 async def _resolve_mymedicalshopper_talon_mrf(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -4561,7 +4566,7 @@ async def _resolve_mymedicalshopper_talon_mrf(
         if entity_slug:
             employers = await _mymedicalshopper_entity_employers(
                 ws,
-                source=source,
+                source_record=source_record,
                 entity_slug=entity_slug,
                 resolver=resolver,
                 timeout_seconds=timeout_seconds,
@@ -4588,7 +4593,7 @@ async def _resolve_mymedicalshopper_talon_mrf(
                     ),
                 }
             ]
-        targets: list[CrawlTarget] = []
+        crawl_targets: list[CrawlTarget] = []
         for employer in employers:
             slug = str(employer.get("slug") or "").strip()
             if not slug:
@@ -4599,9 +4604,9 @@ async def _resolve_mymedicalshopper_talon_mrf(
                 timeout_seconds=timeout_seconds,
                 max_plans=max_plans,
             )
-            targets.extend(
+            crawl_targets.extend(
                 _mymedicalshopper_targets_from_generated(
-                    source,
+                    source_record,
                     entity_slug=entity_slug
                     or str(employer.get("tpaSlug") or "").strip()
                     or None,
@@ -4613,12 +4618,16 @@ async def _resolve_mymedicalshopper_talon_mrf(
                     resolved_from_url=url,
                 )
             )
-            if max_targets and max_targets > 0 and len(targets) >= max_targets:
-                targets = targets[:max_targets]
+            if (
+                max_targets
+                and max_targets > 0
+                and len(crawl_targets) >= max_targets
+            ):
+                crawl_targets = crawl_targets[:max_targets]
                 break
-        if not targets:
+        if not crawl_targets:
             raise ValueError(f"no generated MyMedicalShopper MRF links found for {url}")
-        return targets
+        return crawl_targets
     finally:
         await ws.close()
 
@@ -4746,41 +4755,41 @@ async def _viva_health_employer_landing_targets(
 
 
 async def _resolve_viva_health_mrf(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     path = urlsplit(url).path.rstrip("/").lower()
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     if path.startswith("/files/mrf/"):
-        targets.extend(_viva_health_commercial_targets(source, url))
-        if not targets:
+        crawl_targets.extend(_viva_health_commercial_targets(source_record, url))
+        if not crawl_targets:
             raise ValueError(f"no VIVA Health commercial MRF target found for {url}")
-        return targets
+        return crawl_targets
     if resolver.get("include_commercial_static", True):
-        targets.extend(_viva_health_commercial_targets(source, url))
+        crawl_targets.extend(_viva_health_commercial_targets(source_record, url))
     if resolver.get("include_employer_mrf_links", True):
         employer_url = urljoin(
             url, str(resolver.get("employer_path") or "/mrf/employers/")
         )
         try:
             employer_targets = await _viva_health_employer_landing_targets(
-                source,
+                source_record,
                 employer_page_url=employer_url,
                 resolver=resolver,
                 session=session,
             )
         except Exception:
             employer_targets = []
-        targets.extend(employer_targets)
-    targets = _dedupe_crawl_targets_by_url(targets)
+        crawl_targets.extend(employer_targets)
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no VIVA Health MRF targets found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _magnacare_results_url(base_url: str, search_term: str) -> str:
@@ -5626,7 +5635,7 @@ def _auxiant_annotated_target(
 
 
 async def _resolve_auxiant_wordpress_directory(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -5648,12 +5657,12 @@ async def _resolve_auxiant_wordpress_directory(
     if max_networks:
         networks = networks[:max_networks]
 
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     for link in _parse_auxiant_page_links(directory_html, base_url=directory_url):
         if link.get("target_kind") == "file_reference":
-            targets.append(
+            crawl_targets.append(
                 _auxiant_direct_target(
-                    source,
+                    source_record,
                     link,
                     network_name="Historical Out of Network Allowed Amounts",
                     page_url=directory_url,
@@ -5673,9 +5682,9 @@ async def _resolve_auxiant_wordpress_directory(
         page_links = _parse_auxiant_page_links(page_html, base_url=page_url)
         for link in page_links:
             if link.get("target_kind") == "file_reference":
-                targets.append(
+                crawl_targets.append(
                     _auxiant_direct_target(
-                        source,
+                        source_record,
                         link,
                         network_name=network_name,
                         page_url=page_url,
@@ -5688,20 +5697,23 @@ async def _resolve_auxiant_wordpress_directory(
             if not external_url:
                 continue
             nested_platform = classify_hosting_platform(external_url)
-            nested_source = {**source, "hosting_platform": nested_platform}
+            nested_source_record = {
+                **source_record,
+                "hosting_platform": nested_platform,
+            }
             nested_error: str | None = None
             try:
                 nested_targets = await _crawl_targets_for_source(
-                    nested_source, external_url, session
+                    nested_source_record, external_url, session
                 )
             except Exception as exc:
                 nested_targets = []
                 nested_error = f"{type(exc).__name__}: {exc}"
             for nested_target in nested_targets:
-                targets.append(
+                crawl_targets.append(
                     _auxiant_annotated_target(
                         nested_target,
-                        source_record=source,
+                        source_record=source_record,
                         network_name=network_name,
                         page_url=page_url,
                         directory_url=directory_url,
@@ -5710,9 +5722,9 @@ async def _resolve_auxiant_wordpress_directory(
                     )
                 )
             if not nested_targets:
-                targets.append(
+                crawl_targets.append(
                     _auxiant_landing_target(
-                        source,
+                        source_record,
                         network_name=network_name,
                         page_url=page_url,
                         directory_url=directory_url,
@@ -5724,9 +5736,9 @@ async def _resolve_auxiant_wordpress_directory(
                     )
                 )
         if not page_links:
-            targets.append(
+            crawl_targets.append(
                 _auxiant_landing_target(
-                    source,
+                    source_record,
                     network_name=network_name,
                     page_url=page_url,
                     directory_url=directory_url,
@@ -5736,9 +5748,9 @@ async def _resolve_auxiant_wordpress_directory(
                     landing_label=network_name,
                 )
             )
-    if not targets:
+    if not crawl_targets:
         raise ValueError(f"no Auxiant network MRF links found for {directory_url}")
-    return targets
+    return crawl_targets
 
 
 def _sapphire_toc_target(
@@ -5749,10 +5761,10 @@ def _sapphire_toc_target(
     file_name: Any = None,
     payer_name: Any = None,
 ) -> dict[str, Any] | None:
-    value = html.unescape(str(raw_url or "")).strip()
-    if not value:
+    raw_url_text = html.unescape(str(raw_url or "")).strip()
+    if not raw_url_text:
         return None
-    url = urljoin(base_url or "", value)
+    url = urljoin(base_url or "", raw_url_text)
     path = urlsplit(url).path
     path_lower = path.lower()
     if "/tocs/" not in path_lower:
@@ -5779,15 +5791,15 @@ def _sapphire_toc_target(
     )
     if not _looks_html_mrf_toc_url(url, inferred_file_name or inferred_label):
         return None
-    target: dict[str, Any] = {
+    target_by_field: dict[str, Any] = {
         "url": url,
         "label": inferred_label,
     }
     if inferred_file_name:
-        target["file_name"] = inferred_file_name
+        target_by_field["file_name"] = inferred_file_name
     if inferred_payer_name:
-        target["payer_name"] = inferred_payer_name
-    return target
+        target_by_field["payer_name"] = inferred_payer_name
+    return target_by_field
 
 
 def _parse_sapphire_toc_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
@@ -5857,7 +5869,7 @@ def _sapphire_query_slug_variants(query: str | None) -> list[str]:
 
 
 async def _sapphire_query_probe_targets(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     query: str | None,
     session: aiohttp.ClientSession,
@@ -5865,15 +5877,15 @@ async def _sapphire_query_probe_targets(
     if classify_hosting_platform(url) != "sapphire":
         return []
     origin = _sapphire_origin_url(url)
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     for slug in _sapphire_query_slug_variants(query):
         probe_url = urljoin(origin, f"tocs/current/{slug}")
         head = await _head_url(probe_url, session=session)
         if str(head.get("status") or "") != "ok":
             continue
-        targets.append(
+        crawl_targets.append(
             CrawlTarget(
-                source=source,
+                source=source_record,
                 url=probe_url,
                 label=_clean_text(query) or _label_from_index_name(slug),
                 resolved_from_url=url,
@@ -5886,7 +5898,7 @@ async def _sapphire_query_probe_targets(
                 },
             )
         )
-    return targets
+    return crawl_targets
 
 
 def _sapphire_page_data_url(url: str) -> str:
@@ -5943,41 +5955,42 @@ def _parse_sapphire_static_query_toc_links(
         return []
     urls: dict[str, dict[str, Any]] = {}
 
-    def visit(value: Any, context: dict[str, Any] | None = None) -> None:
+    def visit(node: Any, context: dict[str, Any] | None = None) -> None:
         """Recursively inspect Sapphire query values and collect labeled links."""
-        if isinstance(value, dict):
-            next_context = dict(context or {})
+        if isinstance(node, dict):
+            next_context_by_field = dict(context or {})
             for key in ("payer_name", "name", "label", "title", "file_name"):
-                if value.get(key):
-                    next_context.setdefault(key, value.get(key))
+                if node.get(key):
+                    next_context_by_field.setdefault(key, node.get(key))
             for key in ("url", "href", "publicURL", "downloadUrl", "path"):
-                if not value.get(key):
+                if not node.get(key):
                     continue
-                target = _sapphire_toc_target(
-                    value.get(key),
+                toc_target_by_field = _sapphire_toc_target(
+                    node.get(key),
                     base_url=base_url,
-                    label=next_context.get("label")
-                    or next_context.get("title")
-                    or next_context.get("name"),
-                    file_name=next_context.get("file_name"),
-                    payer_name=next_context.get("payer_name"),
+                    label=next_context_by_field.get("label")
+                    or next_context_by_field.get("title")
+                    or next_context_by_field.get("name"),
+                    file_name=next_context_by_field.get("file_name"),
+                    payer_name=next_context_by_field.get("payer_name"),
                 )
-                if not target:
+                if not toc_target_by_field:
                     continue
                 urls.setdefault(
-                    _canonical_or_none(str(target["url"])) or str(target["url"]),
-                    target
+                    _canonical_or_none(str(toc_target_by_field["url"]))
+                    or str(toc_target_by_field["url"]),
+                    toc_target_by_field,
                 )
-            for child in value.values():
-                visit(child, next_context)
+            for child in node.values():
+                visit(child, next_context_by_field)
             return
-        if isinstance(value, list):
-            for child in value:
+        if isinstance(node, list):
+            for child in node:
                 visit(child, context)
             return
-        if isinstance(value, str) and "/tocs/" in value:
-            target = _sapphire_toc_target(
-                value,
+        if isinstance(node, str) and "/tocs/" in node:
+            toc_target_by_field = _sapphire_toc_target(
+                node,
                 base_url=base_url,
                 label=(
                     context.get("label")
@@ -5989,10 +6002,11 @@ def _parse_sapphire_static_query_toc_links(
                 file_name=context.get("file_name") if context else None,
                 payer_name=context.get("payer_name") if context else None,
             )
-            if target:
+            if toc_target_by_field:
                 urls.setdefault(
-                    _canonical_or_none(str(target["url"])) or str(target["url"]),
-                    target
+                    _canonical_or_none(str(toc_target_by_field["url"]))
+                    or str(toc_target_by_field["url"]),
+                    toc_target_by_field,
                 )
 
     visit(payload)
@@ -6013,17 +6027,19 @@ async def _resolve_sapphire_static_query_toc_links(
     )
     max_queries = _as_int(resolver.get("max_static_queries")) or 8
     max_targets = _as_int(resolver.get("max_targets"))
-    targets: dict[str, dict[str, Any]] = {}
-    for target in _parse_sapphire_static_query_toc_links(page_data_text, base_url=url):
-        key = _canonical_or_none(str(target.get("url") or "")) or str(
-            target.get("url") or ""
+    targets_by_url: dict[str, dict[str, Any]] = {}
+    for target_by_field in _parse_sapphire_static_query_toc_links(
+        page_data_text, base_url=url
+    ):
+        key = _canonical_or_none(str(target_by_field.get("url") or "")) or str(
+            target_by_field.get("url") or ""
         )
         if key:
-            targets[key] = target
-        if max_targets and len(targets) >= max_targets:
-            return list(targets.values())
-    if targets:
-        return list(targets.values())
+            targets_by_url[key] = target_by_field
+        if max_targets and len(targets_by_url) >= max_targets:
+            return list(targets_by_url.values())
+    if targets_by_url:
+        return list(targets_by_url.values())
     for query_hash in _sapphire_static_query_hashes(page_data_text)[:max_queries]:
         query_text = await _fetch_text(
             _sapphire_static_query_url(url, query_hash),
@@ -6031,15 +6047,19 @@ async def _resolve_sapphire_static_query_toc_links(
             session=session,
             expect_json=True,
         )
-        for target in _parse_sapphire_static_query_toc_links(query_text, base_url=url):
-            key = _canonical_or_none(str(target.get("url") or "")) or str(
-                target.get("url") or ""
+        for target_by_field in _parse_sapphire_static_query_toc_links(
+            query_text, base_url=url
+        ):
+            key = _canonical_or_none(
+                str(target_by_field.get("url") or "")
+            ) or str(
+                target_by_field.get("url") or ""
             )
             if key:
-                targets[key] = target
-            if max_targets and len(targets) >= max_targets:
-                return list(targets.values())
-    return list(targets.values())
+                targets_by_url[key] = target_by_field
+            if max_targets and len(targets_by_url) >= max_targets:
+                return list(targets_by_url.values())
+    return list(targets_by_url.values())
 
 
 def _parse_healthgram_network_pages(
@@ -6920,7 +6940,7 @@ def _ebms_index_page_urls(html_text: str, *, base_url: str) -> list[tuple[str, s
 
 
 async def _resolve_ebms_caa_directory(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -6931,7 +6951,7 @@ async def _resolve_ebms_caa_directory(
         max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
         session=session,
     )
-    targets: list[CrawlTarget] = []
+    crawl_targets: list[CrawlTarget] = []
     target_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
     max_targets = _as_int(resolver.get("max_targets")) or 5000
     max_clients = _as_int(resolver.get("max_clients")) or 500
@@ -6957,17 +6977,17 @@ async def _resolve_ebms_caa_directory(
             max_bytes=nested_page_max_bytes if nested_url else client_page_max_bytes,
             session=session,
         )
-        page_targets = _crawl_targets_from_html_mrf_links(
-            source,
+        page_crawl_targets = _crawl_targets_from_html_mrf_links(
+            source_record,
             page_html,
             base_url=page_url,
             resolver="ebms_caa_directory",
             target_max_bytes=target_max_bytes,
         )
-        enriched: list[CrawlTarget] = []
-        for target in page_targets:
+        enriched_targets: list[CrawlTarget] = []
+        for page_target in page_crawl_targets:
             metadata = {
-                **dict(target.metadata or {}),
+                **dict(page_target.metadata or {}),
                 "resolver": "ebms_caa_directory",
                 "ebms_client_url": client_url,
             }
@@ -6975,16 +6995,16 @@ async def _resolve_ebms_caa_directory(
                 metadata["ebms_client_label"] = client_label
             if nested_url:
                 metadata["ebms_nested_url"] = nested_url
-            enriched.append(
+            enriched_targets.append(
                 CrawlTarget(
-                    source=source,
-                    url=target.url,
-                    label=target.label,
+                    source=source_record,
+                    url=page_target.url,
+                    label=page_target.label,
                     resolved_from_url=page_url,
                     metadata=metadata,
                 )
             )
-        return enriched
+        return enriched_targets
 
     for client_url, client_label in _ebms_index_page_urls(root_html, base_url=url)[
         :max_clients
@@ -6998,7 +7018,7 @@ async def _resolve_ebms_caa_directory(
             )
         except Exception:
             continue
-        targets.extend(client_targets)
+        crawl_targets.extend(client_targets)
         if not client_targets:
             try:
                 client_html = await _fetch_text(
@@ -7010,7 +7030,7 @@ async def _resolve_ebms_caa_directory(
                 client_html, base_url=client_url
             )[:max_nested]:
                 try:
-                    targets.extend(
+                    crawl_targets.extend(
                         await page_targets(
                             nested_url,
                             client_url=client_url,
@@ -7020,16 +7040,16 @@ async def _resolve_ebms_caa_directory(
                     )
                 except Exception:
                     continue
-                if len(targets) >= max_targets:
+                if len(crawl_targets) >= max_targets:
                     break
-        if len(targets) >= max_targets:
+        if len(crawl_targets) >= max_targets:
             break
-    targets = _dedupe_crawl_targets_by_url(targets)
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     if max_targets and max_targets > 0:
-        targets = targets[:max_targets]
-    if not targets:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
         raise ValueError(f"no EBMS CAA directory MRF links found for {url}")
-    return targets
+    return crawl_targets
 
 
 def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
@@ -8066,22 +8086,24 @@ def _webtpa_record_location(record: dict[str, Any]) -> str | None:
 
 
 def _webtpa_record_target(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     *,
     plan: dict[str, Any],
-    record: dict[str, Any],
+    file_record: dict[str, Any],
     file_type: str,
     file_url: str,
     resolved_from_url: str,
 ) -> CrawlTarget | None:
     plan_id = _webtpa_plan_id(plan)
     plan_name = _webtpa_plan_name(plan)
-    file_id = _webtpa_file_id(record, file_type)
-    file_name = _clean_text(record.get("fileName") or record.get("name"))
+    file_id = _webtpa_file_id(file_record, file_type)
+    file_name = _clean_text(
+        file_record.get("fileName") or file_record.get("name")
+    )
     label = " - ".join(part for part in (plan_name, file_name) if part)
-    plan_info: list[dict[str, Any]] = []
+    plan_info_rows: list[dict[str, Any]] = []
     if plan_id or plan_name:
-        plan_info.append(
+        plan_info_rows.append(
             {
                 "plan_id": plan_id,
                 "plan_id_type": "webtpa_mrf_benefitplan_id" if plan_id else None,
@@ -8089,7 +8111,7 @@ def _webtpa_record_target(
             }
         )
     return CrawlTarget(
-        source=source,
+        source=source_record,
         url=file_url,
         label=label or file_name or plan_name or Path(urlsplit(file_url).path).name,
         resolved_from_url=resolved_from_url,
@@ -8098,11 +8120,11 @@ def _webtpa_record_target(
             "target_kind": "file_reference",
             "target_file_type": file_type,
             "container_format": _container_format(file_url),
-            "plan_info": plan_info,
+            "plan_info": plan_info_rows,
             "webtpa_plan_id": plan_id,
             "webtpa_file_id": file_id,
             "webtpa_file_name": file_name,
-            "webtpa_record_type": record.get("type"),
+            "webtpa_record_type": file_record.get("type"),
         },
     )
 
@@ -8183,7 +8205,7 @@ async def _resolve_webtpa_mrf_api(
                 crawl_target = _webtpa_record_target(
                     source,
                     plan=plan,
-                    record=file_record,
+                    file_record=file_record,
                     file_type=file_type,
                     file_url=file_url,
                     resolved_from_url=resolved_from_url,
@@ -8226,15 +8248,15 @@ def _cmstic_brands_from_url(url: str, resolver: dict[str, Any]) -> list[str]:
     if isinstance(brands, str):
         brands = [brands]
     if isinstance(brands, list):
-        deduped: list[str] = []
-        seen: set[str] = set()
+        deduped_brands: list[str] = []
+        seen_brands: set[str] = set()
         for item in brands:
             item = str(item or "").strip()
-            if item and item not in seen:
-                seen.add(item)
-                deduped.append(item)
-        if deduped:
-            return deduped
+            if item and item not in seen_brands:
+                seen_brands.add(item)
+                deduped_brands.append(item)
+        if deduped_brands:
+            return deduped_brands
     if "amerihealthnj.com" in host:
         return ["ahnj", "ahnjhmo"]
     if "amerihealth.com" in host:
@@ -10290,20 +10312,20 @@ def _metadata_plan_info(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     raw_plan_info = metadata.get("plan_info")
     if not isinstance(raw_plan_info, list):
         return []
-    plan_info: list[dict[str, Any]] = []
+    plan_info_rows: list[dict[str, Any]] = []
     for item in raw_plan_info:
         if not isinstance(item, dict):
             continue
-        plan = dict(item)
-        if "plan_market_type" not in plan and plan.get("market_type"):
-            plan["plan_market_type"] = plan.get("market_type")
+        plan_row = dict(item)
+        if "plan_market_type" not in plan_row and plan_row.get("market_type"):
+            plan_row["plan_market_type"] = plan_row.get("market_type")
         if not any(
-            plan.get(key)
+            plan_row.get(key)
             for key in ("plan_id", "plan_name", "plan_sponsor_name", "issuer_name")
         ):
             continue
-        plan_info.append(plan)
-    return plan_info
+        plan_info_rows.append(plan_row)
+    return plan_info_rows
 
 
 def _plan_rows_from_target_metadata(crawl_target: CrawlTarget) -> list[dict[str, Any]]:
@@ -11696,6 +11718,163 @@ def _monthly_toc_targets(
     return crawl_targets
 
 
+def _kaiser_inventory_targets_from_text(
+    source_record: dict[str, Any],
+    inventory_text: str,
+    *,
+    inventory_url: str,
+    inventory_month: str,
+    category: str,
+    resolver: dict[str, Any],
+) -> list[CrawlTarget]:
+    """Parse one Kaiser monthly inventory into typed crawl targets."""
+    if category not in {"innetwork", "outofnetwork"}:
+        raise ValueError(f"unsupported Kaiser inventory category: {category}")
+    include_external_data = resolver.get("include_external_data") is True
+    configured_regions = {
+        str(value or "").strip().lower()
+        for value in (resolver.get("region_codes") or ())
+        if str(value or "").strip()
+    }
+    toc_max_bytes = (
+        _parse_size_bytes(resolver.get("toc_max_bytes")) or 5 * 1024 * 1024
+    )
+    inventory_base_url = inventory_url.rsplit("/", 1)[0].rstrip("/") + "/"
+    resolver_type = str(resolver.get("type") or "kaiser_monthly_inventory")
+    crawl_targets: list[CrawlTarget] = []
+    for raw_line in (inventory_text or "").splitlines():
+        columns = raw_line.strip().rsplit(None, 1)
+        if len(columns) != 2:
+            continue
+        relative_path, raw_size = columns
+        path_parts = [part for part in relative_path.strip("/").split("/") if part]
+        if len(path_parts) < 2:
+            continue
+        if path_parts[0].lower() == "externaldata" and not include_external_data:
+            continue
+        region_code = (
+            path_parts[1].lower()
+            if path_parts[0].lower() == "state" and len(path_parts) > 2
+            else path_parts[0].lower()
+        )
+        if configured_regions and region_code not in configured_regions:
+            continue
+        file_name = path_parts[-1]
+        file_type = _mrf_file_type_from_text(relative_path, file_name)
+        if category == "outofnetwork":
+            file_type = "allowed-amounts"
+        if file_type not in {
+            "table-of-contents",
+            "in-network",
+            "allowed-amounts",
+        }:
+            continue
+        try:
+            size_bytes = int(raw_size)
+        except ValueError:
+            size_bytes = None
+        target_url = urljoin(inventory_base_url, relative_path.lstrip("/"))
+        target_kind = (
+            "toc_json" if file_type == "table-of-contents" else "file_reference"
+        )
+        metadata = {
+            "resolver": resolver_type,
+            "target_kind": target_kind,
+            "target_file_type": file_type,
+            "container_format": _container_format(target_url),
+            "file_name": file_name,
+            "size_bytes": size_bytes,
+            "inventory_url": inventory_url,
+            "inventory_month": inventory_month,
+            "kaiser_region_code": region_code,
+            "kaiser_inventory_category": category,
+            "kaiser_state_file": path_parts[0].lower() == "state",
+            "kaiser_external_data": path_parts[0].lower() == "externaldata",
+            "plan_info": _plan_info_from_label(file_name),
+            "target_max_bytes": (
+                toc_max_bytes if file_type == "table-of-contents" else None
+            ),
+        }
+        crawl_targets.append(
+            CrawlTarget(
+                source=source_record,
+                url=target_url,
+                label=file_name,
+                resolved_from_url=inventory_url,
+                metadata={
+                    key: value
+                    for key, value in metadata.items()
+                    if value not in (None, "", [], False)
+                },
+            )
+        )
+    return crawl_targets
+
+
+def _kaiser_inventory_months(
+    resolver: dict[str, Any], *, now: dt.datetime | None = None
+) -> list[str]:
+    month_offsets = resolver.get("month_offsets")
+    if not isinstance(month_offsets, list) or not month_offsets:
+        month_offsets = [0, -1]
+    current = now or _utc_now()
+    months: list[str] = []
+    for raw_offset in month_offsets:
+        offset = _as_int(raw_offset)
+        if offset is None:
+            continue
+        month = _add_months(current, offset).strftime("%Y-%m")
+        if month not in months:
+            months.append(month)
+    return months
+
+
+async def _resolve_kaiser_monthly_inventory(
+    source_record: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Resolve Kaiser's current regional in-network and allowed inventories."""
+    base_url = str(
+        resolver.get("base_url")
+        or "https://healthy.kaiserpermanente.org/pricing/"
+    ).rstrip("/")
+    inventory_max_bytes = int(
+        resolver.get("inventory_max_bytes") or 2 * 1024 * 1024
+    )
+    crawl_targets: list[CrawlTarget] = []
+    for category in ("innetwork", "outofnetwork"):
+        for inventory_month in _kaiser_inventory_months(resolver):
+            inventory_url = (
+                f"{base_url}/{category}/{inventory_month}_List.txt"
+            )
+            inventory_text = await _fetch_text(
+                inventory_url,
+                max_bytes=inventory_max_bytes,
+                session=session,
+            )
+            category_targets = _kaiser_inventory_targets_from_text(
+                source_record,
+                inventory_text,
+                inventory_url=inventory_url,
+                inventory_month=inventory_month,
+                category=category,
+                resolver=resolver,
+            )
+            if category_targets:
+                crawl_targets.extend(category_targets)
+                break
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    crawl_targets = _limit_crawl_targets_round_robin(
+        crawl_targets, "kaiser_region_code", max_targets
+    )
+    if not crawl_targets:
+        raise ValueError(f"no Kaiser MRF inventory targets found for {url}")
+    return crawl_targets
+
+
 def _azure_mrf_listing_targets_from_xml(
     source_record: dict[str, Any],
     xml_text: str,
@@ -11843,17 +12022,21 @@ def _triples_mtt_latest_year_month(payload: Any) -> tuple[str | None, str | None
 
 
 def _triples_mtt_targets_from_payload(
-    source: dict[str, Any],
-    payload: Any,
+    source_record: dict[str, Any],
+    payload_by_field: Any,
     *,
     resolved_from_url: str,
     resolver: dict[str, Any],
 ) -> list[CrawlTarget]:
     """Convert a Triples MTT payload into crawl targets."""
-    if not isinstance(payload, dict):
+    if not isinstance(payload_by_field, dict):
         return []
     resolver_type = str(resolver.get("type") or "triples_mtt_api")
-    file_entries = [file_entry for file_entry in payload.get("list") or () if isinstance(file_entry, dict)]
+    file_entries = [
+        file_entry
+        for file_entry in payload_by_field.get("list") or ()
+        if isinstance(file_entry, dict)
+    ]
     if resolver.get("latest_month_only", True):
         latest = max(
             (
@@ -11892,7 +12075,7 @@ def _triples_mtt_targets_from_payload(
         )
         crawl_targets.append(
             CrawlTarget(
-                source=source,
+                source=source_record,
                 url=file_url,
                 label=label,
                 resolved_from_url=resolved_from_url,
@@ -12909,14 +13092,14 @@ async def _fetch_json_with_headers(
 
 
 def _providence_toc_targets_from_payload(
-    source: dict[str, Any],
-    payload: dict[str, Any],
+    source_record: dict[str, Any],
+    payload_by_field: dict[str, Any],
     *,
     api_url: str,
     resolver_type: str,
 ) -> list[CrawlTarget]:
     crawl_targets: list[CrawlTarget] = []
-    for group in payload.get("groups") or []:
+    for group in payload_by_field.get("groups") or []:
         if not isinstance(group, dict):
             continue
         group_id = _clean_text(group.get("group-id"))
@@ -12945,7 +13128,7 @@ def _providence_toc_targets_from_payload(
             }
             crawl_targets.append(
                 CrawlTarget(
-                    source=source,
+                    source=source_record,
                     url=toc_url,
                     label=Path(urlsplit(toc_url).path).name or group_name,
                     resolved_from_url=api_url,
@@ -13075,6 +13258,10 @@ async def _crawl_targets_for_source(
         return _bcbsma_monthly_toc_targets(source_row, url, resolver)
     if resolver_type == "monthly_toc_templates":
         return _monthly_toc_targets(source_row, url, resolver)
+    if resolver_type == "kaiser_monthly_inventory":
+        return await _resolve_kaiser_monthly_inventory(
+            source_row, url, resolver, session
+        )
     if resolver_type == "azure_mrf_listing":
         return await _resolve_azure_mrf_listing(source_row, url, resolver, session)
     if resolver_type == "triples_mtt_api":
@@ -14533,10 +14720,10 @@ async def _probe_mrf_file_heads(
     concurrency: int,
 ) -> tuple[list[dict[str, Any]], int]:
     """Probe MRF file URLs and persist their response observations."""
-    targets = await _load_file_probe_targets(
+    probe_targets = await _load_file_probe_targets(
         file_types, limit, entity_types=entity_types, payer_query=payer_query
     )
-    if not targets:
+    if not probe_targets:
         return [], 0
     worker_count = max(1, int(concurrency or DEFAULT_CONCURRENCY))
     timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
@@ -14545,21 +14732,23 @@ async def _probe_mrf_file_heads(
     result_queue: asyncio.Queue[tuple[dict[str, Any], dict[str, Any]] | None] = (
         asyncio.Queue(maxsize=max(worker_count * 4, 1))
     )
-    for target in targets:
-        target_queue.put_nowait(target)
+    for probe_target in probe_targets:
+        target_queue.put_nowait(probe_target)
     for _ in range(worker_count):
         target_queue.put_nowait(None)
 
     async def worker(session: aiohttp.ClientSession) -> None:
         """Consume file-probe targets and enqueue response heads."""
         while True:
-            target = await target_queue.get()
+            probe_target = await target_queue.get()
             try:
-                if target is None:
+                if probe_target is None:
                     await result_queue.put(None)
                     return
-                head = await _head_url(str(target["url"]), session=session)
-                await result_queue.put((target, head))
+                head = await _head_url(
+                    str(probe_target["url"]), session=session
+                )
+                await result_queue.put((probe_target, head))
             finally:
                 target_queue.task_done()
 
@@ -14569,32 +14758,35 @@ async def _probe_mrf_file_heads(
         ok_count = 0
         finished_workers = 0
         all_observations: list[dict[str, Any]] = []
-        observation_batch: list[dict[str, Any]] = []
-        update_batch: list[dict[str, Any]] = []
-        total = len(targets)
+        observation_rows: list[dict[str, Any]] = []
+        update_rows: list[dict[str, Any]] = []
+        total = len(probe_targets)
         while finished_workers < worker_count:
-            item = await result_queue.get()
-            if item is None:
+            queue_result = await result_queue.get()
+            if queue_result is None:
                 finished_workers += 1
                 continue
-            target, head = item
+            probe_target, head = queue_result
             done += 1
             if str(head.get("status") or "") == "ok":
                 ok_count += 1
-            observation = _file_probe_observation(target, head, run_id)
+            observation = _file_probe_observation(probe_target, head, run_id)
             all_observations.append(observation)
-            observation_batch.append(observation)
-            update_values = _file_probe_update_values(target, head)
+            observation_rows.append(observation)
+            update_values = _file_probe_update_values(probe_target, head)
             if update_values:
-                update_batch.append(update_values)
-            if len(observation_batch) >= WRITE_BATCH_SIZE:
+                update_rows.append(update_values)
+            if len(observation_rows) >= WRITE_BATCH_SIZE:
                 await push_objects(
-                    observation_batch, MRFUrlObservation, rewrite=True, use_copy=False
+                    observation_rows,
+                    MRFUrlObservation,
+                    rewrite=True,
+                    use_copy=False,
                 )
-                observation_batch.clear()
-            if len(update_batch) >= WRITE_BATCH_SIZE:
-                await _update_mrf_file_probe_metadata(update_batch)
-                update_batch.clear()
+                observation_rows.clear()
+            if len(update_rows) >= WRITE_BATCH_SIZE:
+                await _update_mrf_file_probe_metadata(update_rows)
+                update_rows.clear()
             if progress_run_id:
                 enqueue_live_progress(
                     run_id=progress_run_id,
@@ -14605,13 +14797,16 @@ async def _probe_mrf_file_heads(
                     done=done,
                     total=total,
                     message=f"probed {done}/{total} file headers",
-                    label=str(target.get("url") or ""),
+                    label=str(probe_target.get("url") or ""),
                 )
-        if observation_batch:
+        if observation_rows:
             await push_objects(
-                observation_batch, MRFUrlObservation, rewrite=True, use_copy=False
+                observation_rows,
+                MRFUrlObservation,
+                rewrite=True,
+                use_copy=False,
             )
-        await _update_mrf_file_probe_metadata(update_batch)
+        await _update_mrf_file_probe_metadata(update_rows)
         return all_observations, ok_count
 
     async with aiohttp.ClientSession(
