@@ -403,9 +403,9 @@ def _pre_shaped_provider_directory_network_match_payload(
     candidate_key = _canonical_network_name_payload(ptg_name)
     if not candidate_key or candidate_key not in ptg_by_key or not provider_directory_name:
         return None
-    match = dict(network)
-    match["ptg_network_name"] = ptg_by_key[candidate_key]
-    return match
+    network_match_by_field = dict(network)
+    network_match_by_field["ptg_network_name"] = ptg_by_key[candidate_key]
+    return network_match_by_field
 
 
 def _provider_directory_network_match_context_payload(
@@ -476,7 +476,7 @@ def _candidate_provider_directory_network_name_match_payload(
     network: dict[str, Any],
     context: dict[str, Any],
 ) -> dict[str, Any]:
-    network_context = {
+    network_context_by_field = {
         key: network.get(key)
         for key in (
             "provider_directory_source",
@@ -487,7 +487,7 @@ def _candidate_provider_directory_network_name_match_payload(
         )
         if network.get(key) not in (None, "", [])
     }
-    effective_context = {**network_context, **context}
+    effective_context_by_field = {**network_context_by_field, **context}
     return {
         "ptg_network_name": ptg_network_name,
         "provider_directory_network_name": provider_directory_network_name,
@@ -499,8 +499,11 @@ def _candidate_provider_directory_network_name_match_payload(
         "provider_directory_network_match_method": "canonical_network_name",
         "provider_directory_network_match_confidence": "candidate",
         "provider_directory_network_match_key": candidate_key,
-        **effective_context,
-        **_provider_directory_issuer_network_key_fields_payload(effective_context, candidate_key),
+        **effective_context_by_field,
+        **_provider_directory_issuer_network_key_fields_payload(
+            effective_context_by_field,
+            candidate_key,
+        ),
     }
 
 
@@ -590,27 +593,37 @@ def _provider_directory_address_verification_evidence(
     address_payload: dict[str, Any],
     provider_directory_network_name_matches: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    evidence = _coerce_json_payload(address_payload.get("address_verification_evidence"), {})
-    if not isinstance(evidence, dict):
-        evidence = {}
-    if not evidence and not provider_directory_network_name_matches:
+    evidence_by_field = _coerce_json_payload(
+        address_payload.get("address_verification_evidence"),
+        {},
+    )
+    if not isinstance(evidence_by_field, dict):
+        evidence_by_field = {}
+    if not evidence_by_field and not provider_directory_network_name_matches:
         return None
-    updated = dict(evidence)
+    updated_evidence_by_field = dict(evidence_by_field)
     if provider_directory_network_name_matches and not _provider_directory_plan_context_matched(address_payload):
-        matched_on = str(updated.get("matched_on") or "").strip()
+        matched_on = str(updated_evidence_by_field.get("matched_on") or "").strip()
         if matched_on and not matched_on.endswith("_network_name"):
-            updated["matched_on"] = f"{matched_on}_network_name"
+            updated_evidence_by_field["matched_on"] = f"{matched_on}_network_name"
         elif not matched_on:
-            updated["matched_on"] = "npi_address_key_role_location_network_name"
-        updated["network_name_matches"] = provider_directory_network_name_matches
-        updated["network_name_context_matched"] = True
+            updated_evidence_by_field["matched_on"] = (
+                "npi_address_key_role_location_network_name"
+            )
+        updated_evidence_by_field["network_name_matches"] = (
+            provider_directory_network_name_matches
+        )
+        updated_evidence_by_field["network_name_context_matched"] = True
     elif not provider_directory_network_name_matches and not _provider_directory_plan_context_matched(address_payload):
-        matched_on = str(updated.get("matched_on") or "").strip()
+        matched_on = str(updated_evidence_by_field.get("matched_on") or "").strip()
         if matched_on.endswith("_network_name"):
-            updated["matched_on"] = matched_on.removesuffix("_network_name") or "npi_address_key_role_location"
-        updated.pop("network_name_matches", None)
-        updated.pop("network_name_context_matched", None)
-    return updated
+            updated_evidence_by_field["matched_on"] = (
+                matched_on.removesuffix("_network_name")
+                or "npi_address_key_role_location"
+            )
+        updated_evidence_by_field.pop("network_name_matches", None)
+        updated_evidence_by_field.pop("network_name_context_matched", None)
+    return updated_evidence_by_field
 
 
 def _has_source_file_version_trace(item: dict[str, Any]) -> bool:
@@ -1292,17 +1305,21 @@ def _inferred_provider_taxonomy_code_sql(
 
 
 def _shape_ptg2_manifest_response(
-    payload: dict[str, Any],
+    response_by_field: dict[str, Any],
     args: dict[str, Any],
     *,
     database_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    manifest_payload = dict(payload)
-    manifest_payload["query"] = {
-        key: value for key, value in dict(payload.get("query") or {}).items() if key != "result_granularity"
+    manifest_response_by_field = dict(response_by_field)
+    manifest_response_by_field["query"] = {
+        key: field_value
+        for key, field_value in dict(
+            response_by_field.get("query") or {}
+        ).items()
+        if key != "result_granularity"
     }
-    query_payload = manifest_payload["query"]
-    manifest_payload["provenance"] = {
+    query_payload = manifest_response_by_field["query"]
+    manifest_response_by_field["provenance"] = {
         "arch_version": PTG2_V3_ARCH_VERSION,
         "storage_generation": PTG2_V3_SHARED_GENERATION,
         "database_backend": "postgresql",
@@ -1328,17 +1345,17 @@ def _shape_ptg2_manifest_response(
         "pricing_scope": "plan_scoped_ptg",
     }
     if isinstance(database_evidence, Mapping):
-        manifest_payload["provenance"]["database_evidence"] = dict(
+        manifest_response_by_field["provenance"]["database_evidence"] = dict(
             database_evidence
         )
-    manifest_payload["items"] = []
-    for item in payload.get("items", []):
-        shaped_item = dict(item)
-        shaped_item.pop("service_code", None)
-        shaped_item.pop("service_code_system", None)
-        shaped_item.pop("tic_prices", None)
-        manifest_payload["items"].append(shaped_item)
-    return _shape_ptg2_response(manifest_payload, args)
+    manifest_response_by_field["items"] = []
+    for response_item_by_field in response_by_field.get("items", []):
+        shaped_item_by_field = dict(response_item_by_field)
+        shaped_item_by_field.pop("service_code", None)
+        shaped_item_by_field.pop("service_code_system", None)
+        shaped_item_by_field.pop("tic_prices", None)
+        manifest_response_by_field["items"].append(shaped_item_by_field)
+    return _shape_ptg2_response(manifest_response_by_field, args)
 
 
 def _ptg2_manifest_id(value: Any) -> str:
@@ -1539,7 +1556,7 @@ def _shared_v3_code_scope_sql(
 ) -> tuple[str, list[str], dict[str, Any], str]:
     """Join physical code metadata to this snapshot's logical plan mappings."""
 
-    params: dict[str, Any] = {
+    query_params_by_name: dict[str, Any] = {
         "logical_snapshot_id": _required_logical_snapshot_id(serving_tables),
     }
     plan_filters: list[str] = []
@@ -1547,12 +1564,12 @@ def _shared_v3_code_scope_sql(
     normalized_market_type = _normalized_plan_market_type(plan_market_type)
     if normalized_plan:
         plan_filters.append("plan_scope.plan_id = :plan_id")
-        params["plan_id"] = normalized_plan
+        query_params_by_name["plan_id"] = normalized_plan
     if normalized_market_type:
         plan_filters.append(
             "plan_scope.plan_market_type = :plan_market_type"
         )
-        params["plan_market_type"] = normalized_market_type
+        query_params_by_name["plan_market_type"] = normalized_market_type
     plan_filter_sql = (
         " AND " + " AND ".join(plan_filters)
         if plan_filters
@@ -1573,7 +1590,7 @@ def _shared_v3_code_scope_sql(
     """
     filters: list[str] = []
     order_sql = f"{scope_alias}.plan_id, {scope_alias}.plan_market_type"
-    return join_sql, filters, params, order_sql
+    return join_sql, filters, query_params_by_name, order_sql
 
 
 def _shared_v3_provider_set_table() -> str:
@@ -4452,8 +4469,8 @@ def _ptg2_manifest_provider_procedure_item(
     source_procedure_description = serving_data.get(
         "source_procedure_description"
     )
-    provider_item_fields = dict(provider_context or {})
-    provider_item_fields.update(
+    provider_item_by_field = dict(provider_context or {})
+    provider_item_by_field.update(
         {
             "npi": npi,
             "plan_id": serving_data.get("plan_id"),
@@ -4506,7 +4523,7 @@ def _ptg2_manifest_provider_procedure_item(
             "source_trace": serving_data.get("source_trace"),
         }
     )
-    return _compact_item_from_row(provider_item_fields, args)
+    return _compact_item_from_row(provider_item_by_field, args)
 
 
 def _source_code_variant_group_key(
@@ -4602,14 +4619,17 @@ def _merge_unique_payload_list(target: dict[str, Any], field: str, value: Any) -
     if not isinstance(target_values, list):
         target_values = [target_values]
         target[field] = target_values
-    seen = {_price_row_key(item) if isinstance(item, dict) else str(item) for item in target_values}
+    seen_payload_keys = {
+        _price_row_key(item) if isinstance(item, dict) else str(item)
+        for item in target_values
+    }
     for item in payload:
         if item in (None, ""):
             continue
         key = _price_row_key(item) if isinstance(item, dict) else str(item)
-        if key in seen:
+        if key in seen_payload_keys:
             continue
-        seen.add(key)
+        seen_payload_keys.add(key)
         target_values.append(item)
 
 
@@ -4633,64 +4653,64 @@ def _merge_ptg2_provider_rate_items(
         if group_key is None:
             merged_provider_rates.append(provider_rate)
             continue
-        merged_provider_rate = provider_rate_by_group_key.get(group_key)
-        if merged_provider_rate is None:
-            merged_provider_rate = dict(provider_rate)
-            _ensure_provider_rate_price_fields(merged_provider_rate)
-            merged_provider_rate.setdefault("price_set_hashes", [])
-            merged_provider_rate.setdefault("rate_pack_hashes", [])
-            merged_provider_rate.setdefault("provider_set_hashes", [])
+        merged_provider_rate_by_field = provider_rate_by_group_key.get(group_key)
+        if merged_provider_rate_by_field is None:
+            merged_provider_rate_by_field = dict(provider_rate)
+            _ensure_provider_rate_price_fields(merged_provider_rate_by_field)
+            merged_provider_rate_by_field.setdefault("price_set_hashes", [])
+            merged_provider_rate_by_field.setdefault("rate_pack_hashes", [])
+            merged_provider_rate_by_field.setdefault("provider_set_hashes", [])
             _append_unique_value(
-                merged_provider_rate["price_set_hashes"],
+                merged_provider_rate_by_field["price_set_hashes"],
                 provider_rate.get("price_set_hash"),
             )
             _append_unique_value(
-                merged_provider_rate["rate_pack_hashes"],
+                merged_provider_rate_by_field["rate_pack_hashes"],
                 provider_rate.get("rate_pack_hash"),
             )
             _append_unique_value(
-                merged_provider_rate["provider_set_hashes"],
+                merged_provider_rate_by_field["provider_set_hashes"],
                 provider_rate.get("provider_set_hash"),
             )
             _merge_unique_payload_list(
-                merged_provider_rate,
+                merged_provider_rate_by_field,
                 "price_set_hashes",
                 provider_rate.get("price_set_hashes"),
             )
             _merge_unique_payload_list(
-                merged_provider_rate,
+                merged_provider_rate_by_field,
                 "rate_pack_hashes",
                 provider_rate.get("rate_pack_hashes"),
             )
             _merge_unique_payload_list(
-                merged_provider_rate,
+                merged_provider_rate_by_field,
                 "provider_set_hashes",
                 provider_rate.get("provider_set_hashes"),
             )
-            provider_rate_by_group_key[group_key] = merged_provider_rate
-            merged_provider_rates.append(merged_provider_rate)
+            provider_rate_by_group_key[group_key] = merged_provider_rate_by_field
+            merged_provider_rates.append(merged_provider_rate_by_field)
             continue
 
         combined_prices = (
-            _normalize_price_payload(merged_provider_rate.get("prices"))
+            _normalize_price_payload(merged_provider_rate_by_field.get("prices"))
             + _normalize_price_payload(provider_rate.get("prices"))
         )
-        merged_provider_rate["prices"] = combined_prices
-        merged_provider_rate["tic_prices"] = combined_prices
+        merged_provider_rate_by_field["prices"] = combined_prices
+        merged_provider_rate_by_field["tic_prices"] = combined_prices
         price_dirty_group_keys.add(group_key)
-        existing_price_key = merged_provider_rate.get("_ptg_price_key")
+        existing_price_key = merged_provider_rate_by_field.get("_ptg_price_key")
         item_price_key = provider_rate.get("_ptg_price_key")
         if item_price_key is not None and (
             existing_price_key is None or int(item_price_key) < int(existing_price_key)
         ):
-            merged_provider_rate["_ptg_price_key"] = int(item_price_key)
+            merged_provider_rate_by_field["_ptg_price_key"] = int(item_price_key)
         for hash_field in (
             "price_set_hash",
             "rate_pack_hash",
             "provider_set_hash",
         ):
             _append_unique_value(
-                merged_provider_rate.setdefault(f"{hash_field}es", []),
+                merged_provider_rate_by_field.setdefault(f"{hash_field}es", []),
                 provider_rate.get(hash_field),
             )
         for hash_list_field in (
@@ -4700,15 +4720,15 @@ def _merge_ptg2_provider_rate_items(
             "source_trace",
         ):
             _merge_unique_payload_list(
-                merged_provider_rate,
+                merged_provider_rate_by_field,
                 hash_list_field,
                 provider_rate.get(hash_list_field),
             )
-        merged_provider_rate["price_set_count"] = len(
-            merged_provider_rate.get("price_set_hashes") or []
+        merged_provider_rate_by_field["price_set_count"] = len(
+            merged_provider_rate_by_field.get("price_set_hashes") or []
         )
-        merged_provider_rate["rate_pack_count"] = len(
-            merged_provider_rate.get("rate_pack_hashes") or []
+        merged_provider_rate_by_field["rate_pack_count"] = len(
+            merged_provider_rate_by_field.get("rate_pack_hashes") or []
         )
     for group_key in price_dirty_group_keys:
         grouped_provider_rate = provider_rate_by_group_key[group_key]
@@ -6315,6 +6335,38 @@ def _candidate_audit_provider_rows_by_set(
     }
 
 
+async def _exact_npi_provider_rows_by_set(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    npi: int,
+    serving_rows: Iterable[Mapping[str, Any]],
+    args: Mapping[str, Any],
+    snapshot_id: str,
+) -> dict[str, list[dict[str, Any]]] | None:
+    """Enrich only the requested NPI for its already-proven provider sets."""
+
+    provider_set_ids = tuple(
+        dict.fromkeys(
+            provider_set_id
+            for serving_row in serving_rows
+            if (
+                provider_set_id := _ptg2_manifest_id(
+                    serving_row.get("provider_set_global_id_128")
+                )
+            )
+        )
+    )
+    return await _selected_provider_rows_by_set(
+        session,
+        serving_tables,
+        npis=(npi,),
+        provider_set_ids_by_npi={npi: provider_set_ids},
+        args=args,
+        snapshot_id=snapshot_id,
+    )
+
+
 def _next_provider_expansion_rate_window(
     current_window: int,
     *,
@@ -6358,9 +6410,9 @@ async def _strict_cost_provider_expansion_selection(
     selected_npis: tuple[int, ...] = ()
     selected_provider_set_ids: tuple[str, ...] = ()
     is_exhausted = False
-    serving_rows_prefix: list[dict[str, Any]] = []
+    serving_rows: list[dict[str, Any]] = []
     while True:
-        serving_rows_prefix = await _merge_manifest_code_variant_rows(
+        serving_rows = await _merge_manifest_code_variant_rows(
             session,
             serving_tables,
             code_rows=code_rows,
@@ -6371,12 +6423,12 @@ async def _strict_cost_provider_expansion_selection(
             offset=0,
             descending=descending,
         )
-        if serving_rows_prefix is None:
+        if serving_rows is None:
             return None
         provider_set_ids = tuple(
             dict.fromkeys(
                 provider_set_id
-                for serving_row in serving_rows_prefix
+                for serving_row in serving_rows
                 if (
                     provider_set_id := _ptg2_manifest_id(
                         serving_row.get("provider_set_global_id_128")
@@ -6392,14 +6444,14 @@ async def _strict_cost_provider_expansion_selection(
         )
         rank_by_key, selected_npis, selected_provider_set_ids = (
             _rank_provider_expansion_prefix(
-                serving_rows_prefix,
+                serving_rows,
                 npis_by_set,
                 target_count=max(int(target_count), 1),
             )
         )
         is_exhausted = (
             rate_window >= declared_rate_count
-            or len(serving_rows_prefix) < rate_window
+            or len(serving_rows) < rate_window
         )
         if len(rank_by_key) >= target_count or is_exhausted:
             break
@@ -6570,9 +6622,19 @@ async def _search_ptg2_manifest_db_serving_table(
         if candidate_audit_access_from_args(args) is not None
         else None
     )
-    location_filter_requested = _ptg2_location_filter_requested(
+    requested_npi = _normalize_npi(args.get("npi"))
+    geographic_filter_requested = _ptg2_location_filter_requested(
         args,
-        include_npi=candidate_audit_npi is None,
+        include_npi=False,
+    )
+    direct_npi_filter_requested = bool(
+        requested_npi is not None
+        and not geographic_filter_requested
+        and not _is_ptg2_provider_filter_requested(args)
+    )
+    location_filter_requested = bool(
+        geographic_filter_requested
+        or (requested_npi is not None and not direct_npi_filter_requested)
     )
     price_filter_requested = any(
         args.get(field)
@@ -6601,19 +6663,26 @@ async def _search_ptg2_manifest_db_serving_table(
     deferred_location_selection = bool(
         location_filter_requested and price_filter_requested
     )
-    rate_candidate_limit = _ptg2_manifest_rate_candidate_limit(
-        args,
-        pagination,
-        expand_providers=expand_providers,
-        location_filter_requested=location_filter_requested,
-    )
+    if direct_npi_filter_requested:
+        rate_candidate_limit = (
+            max(int(getattr(pagination, "offset", 0) or 0), 0)
+            + max(int(getattr(pagination, "limit", 25) or 25), 1)
+            + 1
+        )
+    else:
+        rate_candidate_limit = _ptg2_manifest_rate_candidate_limit(
+            args,
+            pagination,
+            expand_providers=expand_providers,
+            location_filter_requested=location_filter_requested,
+        )
     # One NPI can participate in more serving rows than the provider-page size.
     # All matching rows must reach the merge so no price occurrence becomes
     # unreachable behind a pre-merge candidate cap.
     serving_row_limit = _ptg2_manifest_serving_row_limit(
         args,
         rate_candidate_limit,
-        expand_providers=expand_providers,
+        expand_providers=expand_providers and not direct_npi_filter_requested,
     )
 
     def no_match_response() -> dict[str, Any]:
@@ -6663,7 +6732,7 @@ async def _search_ptg2_manifest_db_serving_table(
         )
 
     location_providers_by_set: dict[str, list[dict[str, Any]]] = {}
-    location_selection_exhausted = False
+    is_location_selection_exhausted = False
     location_candidate_count = 0
     provider_set_keys: list[int] | None = None
     explicit_npi_scope = await _version_three_explicit_npi_graph_scope(
@@ -6699,7 +6768,7 @@ async def _search_ptg2_manifest_db_serving_table(
                 if provider.get("npi") not in (None, "")
             }
         )
-        location_selection_exhausted = (
+        is_location_selection_exhausted = (
             location_requires_exhaustive
             or location_candidate_count < rate_candidate_limit
         )
@@ -6769,14 +6838,17 @@ async def _search_ptg2_manifest_db_serving_table(
         ),
         code_params,
     )
-    code_rows = [_canonical_code_metadata_row(row) for row in code_result]
+    code_rows = [
+        _canonical_code_metadata_row(code_record)
+        for code_record in code_result
+    ]
     if not code_rows:
         return None
     if not all(code_row.get("code_key") is not None for code_row in code_rows):
         raise PTG2ManifestArtifactError("PTG2 shared code dictionary contains an invalid key")
 
     total: int | None = None
-    if not location_filter_requested:
+    if not location_filter_requested and not direct_npi_filter_requested:
         total = sum(int(code_row.get("rate_count") or 0) for code_row in code_rows)
         if total <= 0:
             return None
@@ -6786,6 +6858,7 @@ async def _search_ptg2_manifest_db_serving_table(
     strict_cost_provider_expansion = (
         expand_providers
         and not location_filter_requested
+        and not direct_npi_filter_requested
         and not _is_ptg2_provider_filter_requested(args)
         and not price_filter_requested
         and str(args.get("order_by") or "total_allowed_amount").strip().lower()
@@ -6808,9 +6881,9 @@ async def _search_ptg2_manifest_db_serving_table(
         )
         if exact_provider_selection is None:
             return None
-        row_data = exact_provider_selection.row_data
+        serving_rows = exact_provider_selection.row_data
     else:
-        row_data = await _merge_manifest_code_variant_rows(
+        serving_rows = await _merge_manifest_code_variant_rows(
             session,
             serving_tables,
             code_rows=code_rows,
@@ -6820,39 +6893,54 @@ async def _search_ptg2_manifest_db_serving_table(
             limit=None if price_filter_requested else serving_row_limit,
             offset=(
                 0
-                if expand_providers or price_filter_requested or location_filter_requested
+                if (
+                    expand_providers
+                    or price_filter_requested
+                    or location_filter_requested
+                    or direct_npi_filter_requested
+                )
                 else int(pagination.offset)
             ),
             descending=_ptg2_cost_order_descending(args),
         )
-    if row_data is None:
+    if serving_rows is None:
         return None
-    serving_rows_exhausted = (
-        serving_row_limit is None or len(row_data) < int(serving_row_limit)
+    is_serving_row_selection_exhausted = (
+        serving_row_limit is None or len(serving_rows) < int(serving_row_limit)
     )
 
-    items: list[dict[str, Any]] = []
-    if not row_data:
+    response_items: list[dict[str, Any]] = []
+    if not serving_rows:
         return None
-    await _hydrate_provider_set_network_names(session, serving_tables, row_data)
+    await _hydrate_provider_set_network_names(
+        session,
+        serving_tables,
+        serving_rows,
+    )
     source_provenance_by_key = (
         await _ptg2_source_provenance_for_rows(
             session,
             serving_tables,
-            row_data,
+            serving_rows,
         )
         if _include_ptg2_sources(args)
         else {}
     )
     price_key_by_set_id = {
-        _ptg2_manifest_id(data.get("price_set_global_id_128")): int(data.get("price_key"))
-        for data in row_data
-        if data.get("price_key") is not None and _ptg2_manifest_id(data.get("price_set_global_id_128"))
+        _ptg2_manifest_id(serving_row.get("price_set_global_id_128")): int(
+            serving_row.get("price_key")
+        )
+        for serving_row in serving_rows
+        if serving_row.get("price_key") is not None
+        and _ptg2_manifest_id(serving_row.get("price_set_global_id_128"))
     }
     prices_by_price_set = await _ptg2_manifest_prices_for_price_sets(
         session,
         serving_tables,
-        [_ptg2_manifest_id(data.get("price_set_global_id_128")) for data in row_data],
+        [
+            _ptg2_manifest_id(serving_row.get("price_set_global_id_128"))
+            for serving_row in serving_rows
+        ],
         price_key_by_set_id=price_key_by_set_id,
     )
     if price_filter_requested:
@@ -6865,19 +6953,19 @@ async def _search_ptg2_manifest_db_serving_table(
             for price_set_id, prices in prices_by_price_set.items()
             if prices
         }
-        row_data = [
-            data
-            for data in row_data
-            if _ptg2_manifest_id(data.get("price_set_global_id_128"))
+        serving_rows = [
+            serving_row
+            for serving_row in serving_rows
+            if _ptg2_manifest_id(serving_row.get("price_set_global_id_128"))
             in matching_price_set_ids
         ]
-        if not row_data:
+        if not serving_rows:
             return no_match_response()
     if deferred_location_selection:
         filtered_provider_set_keys = {
-            int(data["_ptg_provider_set_key"])
-            for data in row_data
-            if data.get("_ptg_provider_set_key") is not None
+            int(serving_row["_ptg_provider_set_key"])
+            for serving_row in serving_rows
+            if serving_row.get("_ptg_provider_set_key") is not None
         }
         if not filtered_provider_set_keys:
             raise PTG2ManifestArtifactError(
@@ -6908,17 +6996,17 @@ async def _search_ptg2_manifest_db_serving_table(
                 if provider.get("npi") not in (None, "")
             }
         )
-        location_selection_exhausted = (
+        is_location_selection_exhausted = (
             location_requires_exhaustive
             or location_candidate_count < rate_candidate_limit
         )
-        row_data = [
-            data
-            for data in row_data
-            if _ptg2_manifest_id(data.get("provider_set_global_id_128"))
+        serving_rows = [
+            serving_row
+            for serving_row in serving_rows
+            if _ptg2_manifest_id(serving_row.get("provider_set_global_id_128"))
             in provider_set_ids
         ]
-        if not row_data:
+        if not serving_rows:
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 location projection did not retain a matching serving row"
             )
@@ -6931,10 +7019,27 @@ async def _search_ptg2_manifest_db_serving_table(
         elif candidate_audit_npi is not None:
             providers_by_set = _candidate_audit_provider_rows_by_set(
                 candidate_npi=candidate_audit_npi,
-                serving_rows=row_data,
+                serving_rows=serving_rows,
             )
+        elif direct_npi_filter_requested and explicit_npi_scope is not None:
+            exact_npi_provider_rows = await _exact_npi_provider_rows_by_set(
+                session,
+                serving_tables,
+                npi=explicit_npi_scope.npi,
+                serving_rows=serving_rows,
+                args=args,
+                snapshot_id=snapshot_id,
+            )
+            if exact_npi_provider_rows is None:
+                return None
+            providers_by_set = exact_npi_provider_rows
         else:
-            provider_set_ids = [_ptg2_manifest_id(data.get("provider_set_global_id_128")) for data in row_data]
+            provider_set_ids = [
+                _ptg2_manifest_id(
+                    serving_row.get("provider_set_global_id_128")
+                )
+                for serving_row in serving_rows
+            ]
             provider_rows_by_set = await _ptg2_manifest_provider_rows_for_provider_sets(
                 session,
                 serving_tables,
@@ -6945,41 +7050,57 @@ async def _search_ptg2_manifest_db_serving_table(
             if provider_rows_by_set is None:
                 return None
             providers_by_set = provider_rows_by_set
-    procedure_details = await _ptg2_manifest_procedure_details_for_rows(session, row_data)
-    for data in row_data:
+    procedure_details = await _ptg2_manifest_procedure_details_for_rows(
+        session,
+        serving_rows,
+    )
+    for serving_row in serving_rows:
         if (
             not expand_providers
             and not price_filter_requested
             and not location_filter_requested
-            and len(items) >= int(pagination.limit)
+            and not direct_npi_filter_requested
+            and len(response_items) >= int(pagination.limit)
         ):
             break
-        reported_code = data.get("reported_code")
-        reported_system = data.get("reported_code_system")
-        provider_set_hash = _ptg2_manifest_id(data.get("provider_set_global_id_128"))
-        price_set_hash = _ptg2_manifest_id(data.get("price_set_global_id_128"))
-        rate_pack_hash = _ptg2_manifest_id(data.get("serving_content_hash_128"))
+        reported_code = serving_row.get("reported_code")
+        reported_system = serving_row.get("reported_code_system")
+        provider_set_hash = _ptg2_manifest_id(
+            serving_row.get("provider_set_global_id_128")
+        )
+        price_set_hash = _ptg2_manifest_id(
+            serving_row.get("price_set_global_id_128")
+        )
+        rate_pack_hash = _ptg2_manifest_id(
+            serving_row.get("serving_content_hash_128")
+        )
         prices = prices_by_price_set.get(price_set_hash, [])
         procedure_detail = procedure_details.get(_catalog_key(reported_system, reported_code) or ("", ""), {})
-        source_procedure_name = data.get("source_procedure_name")
-        source_procedure_description = data.get("source_procedure_description")
+        source_procedure_name = serving_row.get("source_procedure_name")
+        source_procedure_description = serving_row.get(
+            "source_procedure_description"
+        )
         is_exact_source_mode = mode_value == PTG2_MODE_EXACT_SOURCE
-        base_item = {
-            "plan_id": data.get("plan_id"),
-            "plan_market_type": data.get("plan_market_type"),
+        base_response_by_field = {
+            "plan_id": serving_row.get("plan_id"),
+            "plan_market_type": serving_row.get("plan_market_type"),
             "provider_ordinal": provider_set_hash,
             "provider_set_hash": provider_set_hash,
             "provider_set_hashes": [provider_set_hash] if provider_set_hash else [],
             "provider_name": "TiC provider set",
             "source_key": _logical_source_key(serving_tables, args),
-            "source_artifact_key": int(data["source_key"]),
+            "source_artifact_key": int(serving_row["source_key"]),
             "snapshot_id": snapshot_id,
-            "network_names": _coerce_str_list_payload(data.get("network_names")),
-            "provider_count": data.get("provider_count") or 0,
+            "network_names": _coerce_str_list_payload(
+                serving_row.get("network_names")
+            ),
+            "provider_count": serving_row.get("provider_count") or 0,
             "provider_set_count": 1 if provider_set_hash else 0,
             "procedure_code": reported_code,
             "hp_procedure_code": reported_code,
-            "billing_code_type_version": data.get("billing_code_type_version"),
+            "billing_code_type_version": serving_row.get(
+                "billing_code_type_version"
+            ),
             "procedure_name": (
                 source_procedure_name
                 if is_exact_source_mode
@@ -6999,44 +7120,63 @@ async def _search_ptg2_manifest_db_serving_table(
             "service_code_system": reported_system or requested_system or "CPT",
             "reported_code": reported_code,
             "reported_code_system": reported_system,
-            "negotiation_arrangement": data.get("negotiation_arrangement"),
+            "negotiation_arrangement": serving_row.get(
+                "negotiation_arrangement"
+            ),
             "billing_code": reported_code,
             "billing_code_type": reported_system,
             **_price_response_fields(prices),
             "price_set_hash": price_set_hash,
             "rate_pack_hash": rate_pack_hash,
             "_ptg_price_key": (
-                int(data["price_key"]) if data.get("price_key") is not None else None
+                int(serving_row["price_key"])
+                if serving_row.get("price_key") is not None
+                else None
             ),
             "source_trace": [],
             "confidence": {"network": "tic_rate_npi_tin", "location": "nppes_practice_location"},
         }
-        source_provenance = source_provenance_by_key.get(int(data["source_key"]))
+        source_provenance = source_provenance_by_key.get(
+            int(serving_row["source_key"])
+        )
         if source_provenance is not None:
-            base_item.update(_item_source_provenance(source_provenance))
-        base_item["address_verification"] = _address_verification_payload(base_item, {}, {})
-        _apply_address_display_policy(base_item, args)
+            base_response_by_field.update(
+                _item_source_provenance(source_provenance)
+            )
+        base_response_by_field["address_verification"] = (
+            _address_verification_payload(base_response_by_field, {}, {})
+        )
+        _apply_address_display_policy(base_response_by_field, args)
         if not expand_providers:
-            items.append(base_item)
+            response_items.append(base_response_by_field)
             continue
         provider_rows = providers_by_set.get(
-            _ptg2_manifest_id(data.get("provider_set_global_id_128")),
+            _ptg2_manifest_id(
+                serving_row.get("provider_set_global_id_128")
+            ),
             [],
         )
-        if not provider_rows and not location_filter_requested and not _is_ptg2_provider_filter_requested(args):
-            item = dict(base_item)
-            item["npi"] = None
-            item["provider_expansion_status"] = "no_npi_members"
-            items.append(item)
+        if (
+            not provider_rows
+            and not location_filter_requested
+            and not _is_ptg2_provider_filter_requested(args)
+        ):
+            response_item_by_field = dict(base_response_by_field)
+            response_item_by_field["npi"] = None
+            response_item_by_field["provider_expansion_status"] = (
+                "no_npi_members"
+            )
+            response_items.append(response_item_by_field)
             continue
         for provider in provider_rows:
-            item = dict(base_item)
+            response_item_by_field = dict(base_response_by_field)
             address_payload = _coerce_json_payload(provider.get("address_payload"), {})
-            item.update(
+            response_item_by_field.update(
                 {
                     "provider_ordinal": provider.get("npi") or provider_set_hash,
                     "npi": provider.get("npi"),
-                    "provider_name": provider.get("provider_name") or base_item["provider_name"],
+                    "provider_name": provider.get("provider_name")
+                    or base_response_by_field["provider_name"],
                     "provider_sex_code": provider.get("provider_sex_code"),
                     "state": provider.get("state"),
                     "city": provider.get("city"),
@@ -7060,78 +7200,104 @@ async def _search_ptg2_manifest_db_serving_table(
                     "zip_radius_miles": provider.get("zip_radius_miles"),
                 }
             )
-            _add_location_phone_fields(item, provider, address_payload)
-            _promote_address_provenance_fields(item, address_payload)
-            item["address_verification"] = _address_verification_payload(item, provider, address_payload)
-            _apply_address_display_policy(item, args)
-            items.append(item)
-    if not items:
+            _add_location_phone_fields(
+                response_item_by_field,
+                provider,
+                address_payload,
+            )
+            _promote_address_provenance_fields(
+                response_item_by_field,
+                address_payload,
+            )
+            response_item_by_field["address_verification"] = (
+                _address_verification_payload(
+                    response_item_by_field,
+                    provider,
+                    address_payload,
+                )
+            )
+            _apply_address_display_policy(response_item_by_field, args)
+            response_items.append(response_item_by_field)
+    if not response_items:
         return None
     if expand_providers:
-        items = _merge_ptg2_provider_rate_items(items)
+        response_items = _merge_ptg2_provider_rate_items(response_items)
     if exact_provider_selection is not None:
         selected_items: list[dict[str, Any]] = []
         materialized_keys: set[_ProviderExpansionKey] = set()
-        for item in items:
+        for response_item_by_field in response_items:
             item_key = _provider_expansion_key(
-                item,
+                response_item_by_field,
                 npi=(
-                    int(item["npi"])
-                    if item.get("npi") not in (None, "")
+                    int(response_item_by_field["npi"])
+                    if response_item_by_field.get("npi") not in (None, "")
                     else None
                 ),
             )
             rank = exact_provider_selection.rank_by_key.get(item_key)
             if rank is None:
                 continue
-            item["_ptg_provider_rank"] = rank
-            selected_items.append(item)
+            response_item_by_field["_ptg_provider_rank"] = rank
+            selected_items.append(response_item_by_field)
             materialized_keys.add(item_key)
         if materialized_keys != set(exact_provider_selection.rank_by_key):
             raise PTG2ManifestArtifactError(
                 "PTG2 strict V3 provider expansion failed to materialize its selected page"
             )
-        items = selected_items
-    items = _sort_ptg2_manifest_provider_items(
-        items,
+        response_items = selected_items
+    response_items = _sort_ptg2_manifest_provider_items(
+        response_items,
         args,
         location_filter_requested=location_filter_requested and expand_providers,
     )
-    total_items = len(items)
+    total_items = len(response_items)
     requested_page_end = max(int(pagination.offset), 0) + max(
         int(pagination.limit),
         0,
     )
+    membership_filter_requested = bool(
+        location_filter_requested or direct_npi_filter_requested
+    )
+    membership_selection_exhausted = bool(
+        direct_npi_filter_requested or is_location_selection_exhausted
+    )
     if (
-        location_filter_requested
-        and not (location_selection_exhausted and serving_rows_exhausted)
+        membership_filter_requested
+        and not (
+            membership_selection_exhausted
+            and is_serving_row_selection_exhausted
+        )
         and total_items <= requested_page_end
     ):
         raise PTG2ManifestArtifactError(
-            "PTG2 location traversal could not prove the requested page boundary"
+            "PTG2 provider traversal could not prove the requested page boundary"
         )
     has_more_page_rows = False
-    if expand_providers or price_filter_requested or location_filter_requested:
+    if expand_providers or price_filter_requested or membership_filter_requested:
         start = max(int(pagination.offset), 0)
         end = start + max(int(pagination.limit), 0)
-        items = items[start:end]
+        response_items = response_items[start:end]
         has_more_page_rows = end < total_items
     elif total is not None:
-        has_more_page_rows = (int(pagination.offset) + len(items)) < int(total)
-    _hide_source_artifact_key_unless_requested(items, args)
-    for item in items:
-        item.pop("_ptg_price_key", None)
-        item.pop("_ptg_provider_rank", None)
+        has_more_page_rows = (
+            int(pagination.offset) + len(response_items)
+        ) < int(total)
+    _hide_source_artifact_key_unless_requested(response_items, args)
+    for response_item_by_field in response_items:
+        response_item_by_field.pop("_ptg_price_key", None)
+        response_item_by_field.pop("_ptg_provider_rank", None)
     return _shape_ptg2_manifest_response(
         {
-            "items": items,
+            "items": response_items,
             "pagination": {
                 "total": (
                     total_items
-                    if expand_providers or price_filter_requested or location_filter_requested
+                    if expand_providers
+                    or price_filter_requested
+                    or membership_filter_requested
                     else total
                     if total is not None
-                    else int(pagination.offset) + len(items)
+                    else int(pagination.offset) + len(response_items)
                 ),
                 **(
                     {
@@ -7142,12 +7308,12 @@ async def _search_ptg2_manifest_db_serving_table(
                     else (
                         {
                             "total_is_exact": (
-                                location_selection_exhausted
-                                and serving_rows_exhausted
+                                membership_selection_exhausted
+                                and is_serving_row_selection_exhausted
                             ),
                             "total_lower_bound": total_items,
                         }
-                        if location_filter_requested
+                        if membership_filter_requested
                         else (
                             {
                                 "total_is_exact": True,
@@ -7564,8 +7730,11 @@ async def _search_ptg2_manifest_provider_procedures(
         code=code_value,
         code_system=args.get("code_system"),
     )
-    price_filter_params: dict[str, Any] = {}
-    _, price_filter_query = _price_filter_clauses(args, price_filter_params)
+    price_filter_params_by_name: dict[str, Any] = {}
+    _, price_filter_query = _price_filter_clauses(
+        args,
+        price_filter_params_by_name,
+    )
     has_price_filter = bool(price_filter_query)
     requested_limit = max(int(getattr(pagination, "limit", 25) or 25), 1)
     requested_offset = max(int(getattr(pagination, "offset", 0) or 0), 0)
@@ -7593,7 +7762,7 @@ async def _search_ptg2_manifest_provider_procedures(
             offset=requested_offset,
             limit=sentinel_limit,
         )
-        row_data = list(filtered_selection.rows)
+        serving_rows = list(filtered_selection.rows)
         prices_by_price_set = dict(filtered_selection.prices_by_price_set)
         exact_total = filtered_selection.total_row_count
         observed_total_lower_bound = filtered_selection.matched_rows_seen
@@ -7603,33 +7772,49 @@ async def _search_ptg2_manifest_provider_procedures(
             serving_tables,
             reverse_query,
         )
-        row_data = list(reverse_selection.rows)
+        serving_rows = list(reverse_selection.rows)
         exact_total = reverse_selection.total_row_count
-        observed_total_lower_bound = requested_offset + len(row_data)
+        observed_total_lower_bound = requested_offset + len(serving_rows)
         price_key_by_set_id = {
-            _ptg2_manifest_id(data.get("price_set_global_id_128")): int(data.get("price_key"))
-            for data in row_data
-            if data.get("price_key") is not None
-            and _ptg2_manifest_id(data.get("price_set_global_id_128"))
+            _ptg2_manifest_id(
+                serving_row.get("price_set_global_id_128")
+            ): int(serving_row.get("price_key"))
+            for serving_row in serving_rows
+            if serving_row.get("price_key") is not None
+            and _ptg2_manifest_id(
+                serving_row.get("price_set_global_id_128")
+            )
         }
         prices_by_price_set = await _ptg2_manifest_prices_for_price_sets(
             session,
             serving_tables,
-            [_ptg2_manifest_id(data.get("price_set_global_id_128")) for data in row_data],
+            [
+                _ptg2_manifest_id(
+                    serving_row.get("price_set_global_id_128")
+                )
+                for serving_row in serving_rows
+            ],
             price_key_by_set_id=price_key_by_set_id,
         )
-    await _hydrate_provider_set_network_names(session, serving_tables, row_data)
+    await _hydrate_provider_set_network_names(
+        session,
+        serving_tables,
+        serving_rows,
+    )
 
     source_provenance_by_key = (
         await _ptg2_source_provenance_for_rows(
             session,
             serving_tables,
-            row_data,
+            serving_rows,
         )
         if _include_ptg2_sources(args)
         else {}
     )
-    procedure_details = await _ptg2_manifest_procedure_details_for_rows(session, row_data)
+    procedure_details = await _ptg2_manifest_procedure_details_for_rows(
+        session,
+        serving_rows,
+    )
     provider_context_rows = await _ptg2_manifest_enriched_provider_rows_for_npis(
         session,
         npis=[npi],
@@ -7639,62 +7824,71 @@ async def _search_ptg2_manifest_provider_procedures(
         source_key=args.get("source_key") or None,
     )
     provider_context = provider_context_rows[0] if provider_context_rows else {"npi": npi}
-    item_args = {
+    item_args_by_name = {
         **args,
         "snapshot_id": snapshot_id,
         "source_key": _logical_source_key(serving_tables, args),
     }
 
-    items: list[dict[str, Any]] = []
-    for data in row_data:
+    response_items: list[dict[str, Any]] = []
+    for serving_row in serving_rows:
         prices = prices_by_price_set.get(
-            _ptg2_manifest_id(data.get("price_set_global_id_128")),
+            _ptg2_manifest_id(
+                serving_row.get("price_set_global_id_128")
+            ),
             [],
         )
-        reported_code = data.get("reported_code")
-        reported_system = data.get("reported_code_system")
+        reported_code = serving_row.get("reported_code")
+        reported_system = serving_row.get("reported_code_system")
         procedure_detail = procedure_details.get(_catalog_key(reported_system, reported_code) or ("", ""), {})
-        source_provenance = source_provenance_by_key.get(int(data["source_key"]))
-        data_with_trace = {
-            **data,
+        source_provenance = source_provenance_by_key.get(
+            int(serving_row["source_key"])
+        )
+        serving_row_with_trace_by_field = {
+            **serving_row,
             **(
                 _item_source_provenance(source_provenance)
                 if source_provenance is not None
-                else {"source_artifact_key": int(data["source_key"])}
+                else {
+                    "source_artifact_key": int(serving_row["source_key"])
+                }
             ),
         }
-        items.append(
+        response_items.append(
             _ptg2_manifest_provider_procedure_item(
                 npi=npi,
-                serving_data=data_with_trace,
+                serving_data=serving_row_with_trace_by_field,
                 prices=prices,
                 procedure_detail=procedure_detail,
                 provider_context=provider_context,
-                args=item_args,
+                args=item_args_by_name,
             )
         )
-    has_more = len(items) > requested_limit
-    items = items[:requested_limit]
-    total_is_exact = exact_total is not None
+    has_more = len(response_items) > requested_limit
+    response_items = response_items[:requested_limit]
+    is_total_exact = exact_total is not None
     total_lower_bound = (
         int(exact_total)
-        if total_is_exact
-        else max(observed_total_lower_bound, requested_offset + len(items))
+        if is_total_exact
+        else max(
+            observed_total_lower_bound,
+            requested_offset + len(response_items),
+        )
     )
-    total = int(exact_total) if total_is_exact else total_lower_bound
+    total = int(exact_total) if is_total_exact else total_lower_bound
 
-    _hide_source_artifact_key_unless_requested(items, args)
+    _hide_source_artifact_key_unless_requested(response_items, args)
 
     return _shape_ptg2_response(
         {
-            "items": items,
+            "items": response_items,
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,
                 "offset": pagination.offset,
                 "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
                 "has_more": has_more,
-                "total_is_exact": total_is_exact,
+                "total_is_exact": is_total_exact,
                 "total_lower_bound": total_lower_bound,
             },
             "query": {
@@ -7823,7 +8017,7 @@ def _shape_multi_provider_procedure_response(
     combined_items: list[dict[str, Any]] = []
     matched_networks: list[dict[str, str]] = []
     total_lower_bound = 0
-    totals_are_exact = True
+    is_combined_total_exact = True
     base_query_by_field: dict[str, Any] | None = None
     for source_key, snapshot_id, network_response_by_field in network_responses:
         if not network_response_by_field:
@@ -7836,7 +8030,10 @@ def _shape_multi_provider_procedure_response(
             if network_pagination.get("total_lower_bound") is not None
             else network_pagination.get("total") or 0
         )
-        totals_are_exact = totals_are_exact and network_pagination.get("total_is_exact") is True
+        is_combined_total_exact = (
+            is_combined_total_exact
+            and network_pagination.get("total_is_exact") is True
+        )
         network_items = network_response_by_field.get("items") or []
         if network_items:
             matched_networks.append({"source_key": source_key, "snapshot_id": snapshot_id})
@@ -7869,7 +8066,7 @@ def _shape_multi_provider_procedure_response(
                 "offset": pagination.offset,
                 "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
                 "has_more": has_more,
-                "total_is_exact": totals_are_exact,
+                "total_is_exact": is_combined_total_exact,
                 "total_lower_bound": total_lower_bound,
             },
             "query": base_query_by_field,

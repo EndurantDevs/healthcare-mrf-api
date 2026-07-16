@@ -248,8 +248,11 @@ release attestation. It must not deserialize the multi-megabyte snapshot
 manifest for every request. Candidate validation may still inspect that full
 manifest before activation. Exact-NPI graph traversal should remain in dense
 integer keys across NPI-to-group, group-to-provider-set, and
-provider-set-to-group reads, converting to stable 128-bit IDs only where the
-response or rate-scope contract requires them.
+code-shard intersection. A plain exact-NPI filter must not decode the generic
+provider-page projection or round-trip through stable provider-group IDs.
+Convert to stable 128-bit IDs only where the response contract requires them;
+retain the broader traversal only when geographic or taxonomy validation is
+also requested.
 
 Bounded candidate-audit request latency is measured after semaphore admission;
 the complete audit wall clock separately includes concurrency wait and remains
