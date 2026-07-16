@@ -176,6 +176,10 @@ impl DedupeCounter {
         }
     }
 
+    fn record_attempted(&self, count: u64) {
+        self.attempted.fetch_add(count, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> (u64, u64, u64) {
         let attempted = self.attempted.load(Ordering::Relaxed);
         let unique = self.unique.load(Ordering::Relaxed);
@@ -185,7 +189,7 @@ impl DedupeCounter {
 }
 
 pub struct SharedDedupe {
-    serving_rate: ShardedDedupe64,
+    serving_rate: Option<ShardedDedupe64>,
     procedure: ShardedDedupe64,
     price_code_set: ShardedDedupe64,
     price_atom: ShardedDedupe64,
@@ -214,11 +218,18 @@ pub struct SharedDedupe {
 
 impl SharedDedupe {
     pub fn new(worker_count: usize) -> Self {
+        Self::new_with_serving_rate_dedupe(worker_count, true)
+    }
+
+    pub fn new_with_serving_rate_dedupe(
+        worker_count: usize,
+        serving_rate_dedupe_enabled: bool,
+    ) -> Self {
         let shard_count = (worker_count.max(1) * 4).max(16);
         let dedupe_high_cardinality_entries =
             env_bool("HLTHPRT_PTG2_RUST_DEDUPE_HIGH_CARDINALITY_ENTRIES", false);
         Self {
-            serving_rate: ShardedDedupe64::new(shard_count),
+            serving_rate: serving_rate_dedupe_enabled.then(|| ShardedDedupe64::new(shard_count)),
             procedure: ShardedDedupe64::new(shard_count),
             price_code_set: ShardedDedupe64::new(shard_count),
             price_atom: ShardedDedupe64::new(shard_count),
@@ -248,10 +259,15 @@ impl SharedDedupe {
         }
     }
 
-    pub fn insert_serving_rate(&self, key: &str) -> bool {
-        let inserted = self.serving_rate.insert_hash_text(key);
+    pub fn insert_serving_rate(&self, key: &str) -> Option<bool> {
+        let inserted = self.serving_rate.as_ref()?.insert_hash_text(key);
         self.serving_rate_counter.record(inserted);
-        inserted
+        Some(inserted)
+    }
+
+    pub fn record_unmeasured_serving_rates(&self, attempted: u64) {
+        debug_assert!(self.serving_rate.is_none());
+        self.serving_rate_counter.record_attempted(attempted);
     }
 
     pub fn insert_procedure(&self, key: &str) -> bool {
@@ -378,6 +394,7 @@ pub fn dedupe_summary_payload(
     let negotiated_rates = object_counts.get("negotiated_rates").copied().unwrap_or(0);
     let (serving_attempted, serving_unique, serving_duplicate) =
         dedupe.serving_rate_counter.snapshot();
+    let serving_rate_dedupe_enabled = dedupe.serving_rate.is_some();
     let (procedure_attempted, procedure_unique, procedure_duplicate) =
         dedupe.procedure_counter.snapshot();
     let (price_atom_attempted, price_atom_unique, price_atom_duplicate) =
@@ -396,9 +413,10 @@ pub fn dedupe_summary_payload(
     let mut payload = json!({
         "negotiated_rates": negotiated_rates,
         "serving_rate_attempted": serving_attempted,
-        "serving_rate_unique": serving_unique,
-        "serving_rate_duplicate": serving_duplicate,
-        "serving_rate_reduction_pct": dedupe_reduction_pct(serving_attempted, serving_duplicate),
+        "serving_rate_unique": serving_rate_dedupe_enabled.then_some(serving_unique),
+        "serving_rate_duplicate": serving_rate_dedupe_enabled.then_some(serving_duplicate),
+        "serving_rate_reduction_pct": serving_rate_dedupe_enabled.then(|| dedupe_reduction_pct(serving_attempted, serving_duplicate)),
+        "serving_rate_dedupe_enabled": serving_rate_dedupe_enabled,
         "procedure_attempted": procedure_attempted,
         "procedure_unique": procedure_unique,
         "procedure_duplicate": procedure_duplicate,
@@ -448,13 +466,29 @@ pub fn dedupe_summary_payload(
 
 pub fn emit_dedupe_summary(dedupe: &SharedDedupe, object_counts: &HashMap<String, u64>) {
     let payload = dedupe_summary_payload(dedupe, object_counts);
+    let serving_unique = payload
+        .get("serving_rate_unique")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "not_measured".to_string(), |value| value.to_string());
+    let serving_duplicate = payload
+        .get("serving_rate_duplicate")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "not_measured".to_string(), |value| value.to_string());
+    let serving_reduction_pct = payload
+        .get("serving_rate_reduction_pct")
+        .and_then(Value::as_f64)
+        .map_or_else(|| "not_measured".to_string(), |value| format!("{value:.2}"));
     eprintln!(
-        "PTG2_DEDUPE_SUMMARY\tnegotiated_rates={}\tserving_rate_attempted={}\tserving_rate_unique={}\tserving_rate_duplicate={}\tserving_rate_reduction_pct={:.2}\tprocedure_attempted={}\tprocedure_unique={}\tprocedure_duplicate={}\tprocedure_reduction_pct={:.2}\tprice_atom_attempted={}\tprice_atom_unique={}\tprice_atom_duplicate={}\tprice_atom_reduction_pct={:.2}\tprice_set_attempted={}\tprice_set_unique={}\tprice_set_duplicate={}\tprice_set_reduction_pct={:.2}\tprice_set_entry_attempted={}\tprice_set_entry_unique={}\tprice_set_entry_duplicate={}\tprice_set_entry_reduction_pct={:.2}\tprovider_set_attempted={}\tprovider_set_unique={}\tprovider_set_duplicate={}\tprovider_set_reduction_pct={:.2}\tprovider_set_entry_attempted={}\tprovider_set_entry_unique={}\tprovider_set_entry_duplicate={}\tprovider_set_entry_reduction_pct={:.2}\tprovider_entry_component_attempted={}\tprovider_entry_component_unique={}\tprovider_entry_component_duplicate={}\tprovider_entry_component_reduction_pct={:.2}\tprovider_group_member_attempted={}\tprovider_group_member_unique={}\tprovider_group_member_duplicate={}\tprovider_group_member_reduction_pct={:.2}",
+        "PTG2_DEDUPE_SUMMARY\tnegotiated_rates={}\tserving_rate_attempted={}\tserving_rate_unique={}\tserving_rate_duplicate={}\tserving_rate_reduction_pct={}\tserving_rate_dedupe_enabled={}\tprocedure_attempted={}\tprocedure_unique={}\tprocedure_duplicate={}\tprocedure_reduction_pct={:.2}\tprice_atom_attempted={}\tprice_atom_unique={}\tprice_atom_duplicate={}\tprice_atom_reduction_pct={:.2}\tprice_set_attempted={}\tprice_set_unique={}\tprice_set_duplicate={}\tprice_set_reduction_pct={:.2}\tprice_set_entry_attempted={}\tprice_set_entry_unique={}\tprice_set_entry_duplicate={}\tprice_set_entry_reduction_pct={:.2}\tprovider_set_attempted={}\tprovider_set_unique={}\tprovider_set_duplicate={}\tprovider_set_reduction_pct={:.2}\tprovider_set_entry_attempted={}\tprovider_set_entry_unique={}\tprovider_set_entry_duplicate={}\tprovider_set_entry_reduction_pct={:.2}\tprovider_entry_component_attempted={}\tprovider_entry_component_unique={}\tprovider_entry_component_duplicate={}\tprovider_entry_component_reduction_pct={:.2}\tprovider_group_member_attempted={}\tprovider_group_member_unique={}\tprovider_group_member_duplicate={}\tprovider_group_member_reduction_pct={:.2}",
         payload.get("negotiated_rates").and_then(Value::as_u64).unwrap_or(0),
         payload.get("serving_rate_attempted").and_then(Value::as_u64).unwrap_or(0),
-        payload.get("serving_rate_unique").and_then(Value::as_u64).unwrap_or(0),
-        payload.get("serving_rate_duplicate").and_then(Value::as_u64).unwrap_or(0),
-        payload.get("serving_rate_reduction_pct").and_then(Value::as_f64).unwrap_or(0.0),
+        serving_unique,
+        serving_duplicate,
+        serving_reduction_pct,
+        payload
+            .get("serving_rate_dedupe_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         payload.get("procedure_attempted").and_then(Value::as_u64).unwrap_or(0),
         payload.get("procedure_unique").and_then(Value::as_u64).unwrap_or(0),
         payload.get("procedure_duplicate").and_then(Value::as_u64).unwrap_or(0),
@@ -493,6 +527,7 @@ pub fn emit_dedupe_summary(dedupe: &SharedDedupe, object_counts: &HashMap<String
 #[cfg(test)]
 mod tests {
     use super::{dedupe_summary_payload, SharedDedupe};
+    use serde_json::Value;
     use std::collections::HashMap;
 
     #[test]
@@ -501,8 +536,8 @@ mod tests {
         let mut object_counts = HashMap::new();
         object_counts.insert("negotiated_rates".to_string(), 7);
 
-        assert!(dedupe.insert_serving_rate("rate-1"));
-        assert!(!dedupe.insert_serving_rate("rate-1"));
+        assert_eq!(dedupe.insert_serving_rate("rate-1"), Some(true));
+        assert_eq!(dedupe.insert_serving_rate("rate-1"), Some(false));
 
         let payload = dedupe_summary_payload(&dedupe, &object_counts);
         assert_eq!(payload["negotiated_rates"], 7);
@@ -510,6 +545,21 @@ mod tests {
         assert_eq!(payload["serving_rate_unique"], 1);
         assert_eq!(payload["serving_rate_duplicate"], 1);
         assert_eq!(payload["serving_rate_reduction_pct"], 50.0);
+        assert_eq!(payload["serving_rate_dedupe_enabled"], true);
+    }
+
+    #[test]
+    fn disabled_serving_rate_dedupe_reports_attempts_without_claiming_uniqueness() {
+        let dedupe = SharedDedupe::new_with_serving_rate_dedupe(2, false);
+        dedupe.record_unmeasured_serving_rates(17);
+
+        assert_eq!(dedupe.insert_serving_rate("unused"), None);
+        let payload = dedupe_summary_payload(&dedupe, &HashMap::new());
+        assert_eq!(payload["serving_rate_attempted"], 17);
+        assert_eq!(payload["serving_rate_unique"], Value::Null);
+        assert_eq!(payload["serving_rate_duplicate"], Value::Null);
+        assert_eq!(payload["serving_rate_reduction_pct"], Value::Null);
+        assert_eq!(payload["serving_rate_dedupe_enabled"], false);
     }
 
     #[test]

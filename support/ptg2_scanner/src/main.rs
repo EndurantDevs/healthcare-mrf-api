@@ -4052,6 +4052,46 @@ struct CompactRateBatch<'a> {
     context: &'a CompactContext,
 }
 
+struct LegacyServingIdentity {
+    rate_pack_hash: String,
+    serving_rate_id: String,
+}
+
+fn legacy_serving_identity(
+    suppress_legacy_row_output: bool,
+    context: &CompactContext,
+    procedure_hash: &str,
+    provider_set_hash: &str,
+    price_set_hash: &str,
+    billing_code: &str,
+) -> Option<LegacyServingIdentity> {
+    if suppress_legacy_row_output {
+        return None;
+    }
+    let rate_pack_hash = hash_text(
+        "serving_rate_pack",
+        &[
+            context.snapshot_id.clone(),
+            procedure_hash.to_string(),
+            provider_set_hash.to_string(),
+            price_set_hash.to_string(),
+        ],
+    );
+    let serving_rate_id = hash_text(
+        "serving_rate_id",
+        &[
+            context.snapshot_id.clone(),
+            context.plan_id.clone(),
+            billing_code.to_string(),
+            rate_pack_hash.clone(),
+        ],
+    );
+    Some(LegacyServingIdentity {
+        rate_pack_hash,
+        serving_rate_id,
+    })
+}
+
 fn procedure_identity_payload(procedure_value: &Value) -> Value {
     let billing_code_type = normalize_code_system(procedure_value.get("billing_code_type"));
     let billing_code = normalize_catalog_code(
@@ -4256,23 +4296,13 @@ fn process_compact_rate_lites<W: Write>(
         } else {
             i64::try_from(sorted_provider_npis.len()).unwrap_or(i64::MAX)
         };
-        let rate_pack_hash = hash_text(
-            "serving_rate_pack",
-            &[
-                context.snapshot_id.clone(),
-                procedure_hash.clone(),
-                provider_set_hash.clone(),
-                group.price_set.price_set_hash.clone(),
-            ],
-        );
-        let serving_rate_id = hash_text(
-            "serving_rate_id",
-            &[
-                context.snapshot_id.clone(),
-                context.plan_id.clone(),
-                billing_code.clone(),
-                rate_pack_hash.clone(),
-            ],
+        let legacy_identity = legacy_serving_identity(
+            outputs.suppress_legacy_row_output,
+            context,
+            &procedure_hash,
+            &provider_set_hash,
+            &group.price_set.price_set_hash,
+            &billing_code,
         );
         let price_set_hash = group.price_set.price_set_hash.clone();
         if dedupe
@@ -4373,47 +4403,47 @@ fn process_compact_rate_lites<W: Write>(
                 )?;
             }
         }
-        if outputs.suppress_legacy_row_output {
-            // Strict V3 emits only partitioned serving runs and support artifacts.
-        } else if let Some(copy_writer) = compact_copy_writer.as_mut() {
-            copy_writer.write_row(&CompactCopyRow {
-                serving_rate_id: &serving_rate_id,
-                snapshot_id: &context.snapshot_id,
-                plan_id: &context.plan_id,
-                procedure_hash: &procedure_hash,
-                procedure_code: None,
-                reported_code_system: reported_code_system.as_deref(),
-                reported_code: reported_code.as_deref(),
-                provider_set_hash: &provider_set_hash,
-                provider_count,
-                price_set_hash: &price_set_hash,
-                source_trace_set_hash: &context.source_trace_set_hash,
-                network_names: &network_names,
-            })?;
-        } else {
-            emit_json_record(
-                writer,
-                "serving_rate_compact",
-                &json!({
-                    "serving_rate_id": serving_rate_id,
-                    "snapshot_id": context.snapshot_id.clone(),
-                    "plan_id": context.plan_id.clone(),
-                    "plan_month_id": context.plan_month_id.clone(),
-                    "procedure_hash": procedure_hash,
-                    "procedure_code": Value::Null,
-                    "reported_code_system": reported_code_system.clone(),
-                    "reported_code": reported_code.clone(),
-                    "billing_code": billing_code,
-                    "billing_code_type": billing_code_type,
-                    "rate_pack_hash": rate_pack_hash,
-                    "provider_set_hash": provider_set_hash,
-                    "provider_count": provider_count,
-                    "price_set_hash": price_set_hash,
-                    "source_trace_set_hash": context.source_trace_set_hash.clone(),
-                    "network_names": network_names,
-                    "confidence_code": context.confidence_code.clone(),
-                }),
-            )?;
+        if let Some(legacy_identity) = legacy_identity {
+            if let Some(copy_writer) = compact_copy_writer.as_mut() {
+                copy_writer.write_row(&CompactCopyRow {
+                    serving_rate_id: &legacy_identity.serving_rate_id,
+                    snapshot_id: &context.snapshot_id,
+                    plan_id: &context.plan_id,
+                    procedure_hash: &procedure_hash,
+                    procedure_code: None,
+                    reported_code_system: reported_code_system.as_deref(),
+                    reported_code: reported_code.as_deref(),
+                    provider_set_hash: &provider_set_hash,
+                    provider_count,
+                    price_set_hash: &price_set_hash,
+                    source_trace_set_hash: &context.source_trace_set_hash,
+                    network_names: &network_names,
+                })?;
+            } else {
+                emit_json_record(
+                    writer,
+                    "serving_rate_compact",
+                    &json!({
+                        "serving_rate_id": legacy_identity.serving_rate_id,
+                        "snapshot_id": context.snapshot_id.clone(),
+                        "plan_id": context.plan_id.clone(),
+                        "plan_month_id": context.plan_month_id.clone(),
+                        "procedure_hash": procedure_hash,
+                        "procedure_code": Value::Null,
+                        "reported_code_system": reported_code_system.clone(),
+                        "reported_code": reported_code.clone(),
+                        "billing_code": billing_code,
+                        "billing_code_type": billing_code_type,
+                        "rate_pack_hash": legacy_identity.rate_pack_hash,
+                        "provider_set_hash": provider_set_hash,
+                        "provider_count": provider_count,
+                        "price_set_hash": price_set_hash,
+                        "source_trace_set_hash": context.source_trace_set_hash.clone(),
+                        "network_names": network_names,
+                        "confidence_code": context.confidence_code.clone(),
+                    }),
+                )?;
+            }
         }
         if let Some(copy_writer) = manifest_serving_copy_writer.as_mut() {
             write_v3_serving_output(
@@ -5921,23 +5951,13 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                 i64::try_from(sorted_provider_npis.len()).unwrap_or(i64::MAX)
             };
             let provider_set_hash = provider_set_scope_hash(sorted_provider_hashes, &network_names);
-            let rate_pack_hash = hash_text(
-                "serving_rate_pack",
-                &[
-                    context.snapshot_id.clone(),
-                    procedure_hash.clone(),
-                    provider_set_hash.clone(),
-                    price_set.price_set_hash.clone(),
-                ],
-            );
-            let serving_rate_id = hash_text(
-                "serving_rate_id",
-                &[
-                    context.snapshot_id.clone(),
-                    context.plan_id.clone(),
-                    billing_code.clone(),
-                    rate_pack_hash.clone(),
-                ],
+            let legacy_identity = legacy_serving_identity(
+                state.suppress_legacy_row_output,
+                context,
+                &procedure_hash,
+                &provider_set_hash,
+                &price_set.price_set_hash,
+                &billing_code,
             );
             let price_set_hash = price_set.price_set_hash.clone();
             if dedupe.insert_price_set(&price_set.price_set_hash) {
@@ -6024,51 +6044,61 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                     dedupe,
                 )?;
             }
-            let unique_for_legacy = dedupe.insert_serving_rate(&serving_rate_id);
-            if unique_for_legacy {
-                if state.suppress_legacy_row_output {
-                    // Strict V3 emits no legacy COPY or JSON serving rows.
-                } else if let Some(copy_writer) = compact_copy_writer.as_mut() {
-                    copy_writer.write_row(&CompactCopyRow {
-                        serving_rate_id: &serving_rate_id,
-                        snapshot_id: &context.snapshot_id,
-                        plan_id: &context.plan_id,
-                        procedure_hash: &procedure_hash,
-                        procedure_code: None,
-                        reported_code_system: reported_code_system.as_deref(),
-                        reported_code: reported_code.as_deref(),
-                        provider_set_hash: &provider_set_hash,
-                        provider_count,
-                        price_set_hash: &price_set_hash,
-                        source_trace_set_hash: &context.source_trace_set_hash,
-                        network_names: &network_names,
-                    })?;
-                } else {
-                    emit_json_record(
-                        writer,
-                        "serving_rate_compact",
-                        &json!({
-                            "serving_rate_id": serving_rate_id,
-                            "snapshot_id": context.snapshot_id.clone(),
-                            "plan_id": context.plan_id.clone(),
-                            "plan_month_id": context.plan_month_id.clone(),
-                            "procedure_hash": procedure_hash,
-                            "procedure_code": Value::Null,
-                            "reported_code_system": reported_code_system.clone(),
-                            "reported_code": reported_code.clone(),
-                            "billing_code": billing_code,
-                            "billing_code_type": billing_code_type,
-                            "rate_pack_hash": rate_pack_hash,
-                            "provider_set_hash": provider_set_hash,
-                            "provider_count": provider_count,
-                            "price_set_hash": price_set_hash,
-                            "source_trace_set_hash": context.source_trace_set_hash.clone(),
-                            "network_names": network_names.clone(),
-                            "confidence_code": context.confidence_code.clone(),
-                        }),
-                    )?;
+            let unique_for_legacy = match legacy_identity {
+                Some(legacy_identity) => {
+                    let unique = dedupe
+                        .insert_serving_rate(&legacy_identity.serving_rate_id)
+                        .ok_or_else(|| {
+                            io::Error::other(
+                                "legacy serving-rate output requires serving-rate dedupe",
+                            )
+                        })?;
+                    if unique {
+                        if let Some(copy_writer) = compact_copy_writer.as_mut() {
+                            copy_writer.write_row(&CompactCopyRow {
+                                serving_rate_id: &legacy_identity.serving_rate_id,
+                                snapshot_id: &context.snapshot_id,
+                                plan_id: &context.plan_id,
+                                procedure_hash: &procedure_hash,
+                                procedure_code: None,
+                                reported_code_system: reported_code_system.as_deref(),
+                                reported_code: reported_code.as_deref(),
+                                provider_set_hash: &provider_set_hash,
+                                provider_count,
+                                price_set_hash: &price_set_hash,
+                                source_trace_set_hash: &context.source_trace_set_hash,
+                                network_names: &network_names,
+                            })?;
+                        } else {
+                            emit_json_record(
+                                writer,
+                                "serving_rate_compact",
+                                &json!({
+                                    "serving_rate_id": legacy_identity.serving_rate_id,
+                                    "snapshot_id": context.snapshot_id.clone(),
+                                    "plan_id": context.plan_id.clone(),
+                                    "plan_month_id": context.plan_month_id.clone(),
+                                    "procedure_hash": procedure_hash,
+                                    "procedure_code": Value::Null,
+                                    "reported_code_system": reported_code_system.clone(),
+                                    "reported_code": reported_code.clone(),
+                                    "billing_code": billing_code,
+                                    "billing_code_type": billing_code_type,
+                                    "rate_pack_hash": legacy_identity.rate_pack_hash,
+                                    "provider_set_hash": provider_set_hash,
+                                    "provider_count": provider_count,
+                                    "price_set_hash": price_set_hash,
+                                    "source_trace_set_hash": context.source_trace_set_hash.clone(),
+                                    "network_names": network_names.clone(),
+                                    "confidence_code": context.confidence_code.clone(),
+                                }),
+                            )?;
+                        }
+                    }
+                    unique
                 }
-            }
+                None => false,
+            };
             if let Some(copy_writer) = manifest_serving_copy_writer.as_mut() {
                 code_count_rows += 1;
                 write_v3_serving_output(
@@ -6177,23 +6207,13 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
         } else {
             i64::try_from(sorted_provider_npis.len()).unwrap_or(i64::MAX)
         };
-        let rate_pack_hash = hash_text(
-            "serving_rate_pack",
-            &[
-                context.snapshot_id.clone(),
-                procedure_hash.clone(),
-                provider_set_hash.clone(),
-                group.price_set.price_set_hash.clone(),
-            ],
-        );
-        let serving_rate_id = hash_text(
-            "serving_rate_id",
-            &[
-                context.snapshot_id.clone(),
-                context.plan_id.clone(),
-                billing_code.clone(),
-                rate_pack_hash.clone(),
-            ],
+        let legacy_identity = legacy_serving_identity(
+            state.suppress_legacy_row_output,
+            context,
+            &procedure_hash,
+            &provider_set_hash,
+            &group.price_set.price_set_hash,
+            &billing_code,
         );
         let price_set_hash = group.price_set.price_set_hash.clone();
         if dedupe.insert_price_set(&group.price_set.price_set_hash) {
@@ -6287,51 +6307,59 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                 )?;
             }
         }
-        let unique_for_legacy = dedupe.insert_serving_rate(&serving_rate_id);
-        if unique_for_legacy {
-            if state.suppress_legacy_row_output {
-                // Strict V3 emits no legacy COPY or JSON serving rows.
-            } else if let Some(copy_writer) = compact_copy_writer.as_mut() {
-                copy_writer.write_row(&CompactCopyRow {
-                    serving_rate_id: &serving_rate_id,
-                    snapshot_id: &context.snapshot_id,
-                    plan_id: &context.plan_id,
-                    procedure_hash: &procedure_hash,
-                    procedure_code: None,
-                    reported_code_system: reported_code_system.as_deref(),
-                    reported_code: reported_code.as_deref(),
-                    provider_set_hash: &provider_set_hash,
-                    provider_count,
-                    price_set_hash: &price_set_hash,
-                    source_trace_set_hash: &context.source_trace_set_hash,
-                    network_names: &network_names,
-                })?;
-            } else {
-                emit_json_record(
-                    writer,
-                    "serving_rate_compact",
-                    &json!({
-                        "serving_rate_id": serving_rate_id,
-                        "snapshot_id": context.snapshot_id.clone(),
-                        "plan_id": context.plan_id.clone(),
-                        "plan_month_id": context.plan_month_id.clone(),
-                        "procedure_hash": procedure_hash,
-                        "procedure_code": Value::Null,
-                        "reported_code_system": reported_code_system.clone(),
-                        "reported_code": reported_code.clone(),
-                        "billing_code": billing_code,
-                        "billing_code_type": billing_code_type,
-                        "rate_pack_hash": rate_pack_hash,
-                        "provider_set_hash": provider_set_hash,
-                        "provider_count": provider_count,
-                        "price_set_hash": price_set_hash,
-                        "source_trace_set_hash": context.source_trace_set_hash.clone(),
-                        "network_names": network_names,
-                        "confidence_code": context.confidence_code.clone(),
-                    }),
-                )?;
+        let unique_for_legacy = match legacy_identity {
+            Some(legacy_identity) => {
+                let unique = dedupe
+                    .insert_serving_rate(&legacy_identity.serving_rate_id)
+                    .ok_or_else(|| {
+                        io::Error::other("legacy serving-rate output requires serving-rate dedupe")
+                    })?;
+                if unique {
+                    if let Some(copy_writer) = compact_copy_writer.as_mut() {
+                        copy_writer.write_row(&CompactCopyRow {
+                            serving_rate_id: &legacy_identity.serving_rate_id,
+                            snapshot_id: &context.snapshot_id,
+                            plan_id: &context.plan_id,
+                            procedure_hash: &procedure_hash,
+                            procedure_code: None,
+                            reported_code_system: reported_code_system.as_deref(),
+                            reported_code: reported_code.as_deref(),
+                            provider_set_hash: &provider_set_hash,
+                            provider_count,
+                            price_set_hash: &price_set_hash,
+                            source_trace_set_hash: &context.source_trace_set_hash,
+                            network_names: &network_names,
+                        })?;
+                    } else {
+                        emit_json_record(
+                            writer,
+                            "serving_rate_compact",
+                            &json!({
+                                "serving_rate_id": legacy_identity.serving_rate_id,
+                                "snapshot_id": context.snapshot_id.clone(),
+                                "plan_id": context.plan_id.clone(),
+                                "plan_month_id": context.plan_month_id.clone(),
+                                "procedure_hash": procedure_hash,
+                                "procedure_code": Value::Null,
+                                "reported_code_system": reported_code_system.clone(),
+                                "reported_code": reported_code.clone(),
+                                "billing_code": billing_code,
+                                "billing_code_type": billing_code_type,
+                                "rate_pack_hash": legacy_identity.rate_pack_hash,
+                                "provider_set_hash": provider_set_hash,
+                                "provider_count": provider_count,
+                                "price_set_hash": price_set_hash,
+                                "source_trace_set_hash": context.source_trace_set_hash.clone(),
+                                "network_names": network_names,
+                                "confidence_code": context.confidence_code.clone(),
+                            }),
+                        )?;
+                    }
+                }
+                unique
             }
-        }
+            None => false,
+        };
         if let Some(copy_writer) = manifest_serving_copy_writer.as_mut() {
             code_count_rows += 1;
             write_v3_serving_output(
@@ -7956,7 +7984,10 @@ fn scan_compact_byte_top_level_parallel(
         (bounded_queue_size * 4).max(worker_count),
     )
     .max(1);
-    let dedupe = Arc::new(SharedDedupe::new(worker_count));
+    let dedupe = Arc::new(SharedDedupe::new_with_serving_rate_dedupe(
+        worker_count,
+        !copy_paths.manifest_only,
+    ));
     let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
         Some(Arc::new(Mutex::new(ManifestSidecarCollector::for_import(
             &copy_paths,
@@ -8686,6 +8717,14 @@ fn scan_compact_byte_top_level_parallel(
                     }
                     worker_join_seconds += worker_join_started_at.elapsed().as_secs_f64();
                     compact_worker_metrics.sort_unstable_by_key(|metrics| metrics.worker_id);
+                    if copy_paths.manifest_only {
+                        dedupe.record_unmeasured_serving_rates(
+                            compact_worker_metrics
+                                .iter()
+                                .map(|metrics| metrics.serving_run_rows)
+                                .sum(),
+                        );
+                    }
                     drain_copy_file_events(&event_rx, &mut writer)?;
                     for event in copy_file_events {
                         emit_copy_file_event(&mut writer, &event)?;
@@ -9080,7 +9119,10 @@ fn scan_compact_struson_parallel(
         DEFAULT_PARSE_IN_WORKERS,
     );
     let bounded_queue_size = queue_size.max(worker_count).max(1);
-    let dedupe = Arc::new(SharedDedupe::new(worker_count));
+    let dedupe = Arc::new(SharedDedupe::new_with_serving_rate_dedupe(
+        worker_count,
+        !copy_paths.manifest_only,
+    ));
     let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
         Some(Arc::new(Mutex::new(ManifestSidecarCollector::for_import(
             &copy_paths,
@@ -9481,6 +9523,14 @@ fn scan_compact_struson_parallel(
                     return Err(err);
                 }
                 compact_worker_metrics.sort_unstable_by_key(|metrics| metrics.worker_id);
+                if copy_paths.manifest_only {
+                    dedupe.record_unmeasured_serving_rates(
+                        compact_worker_metrics
+                            .iter()
+                            .map(|metrics| metrics.serving_run_rows)
+                            .sum(),
+                    );
+                }
                 emit_dedupe_summary(&dedupe, &object_counts);
                 drain_copy_file_events(&event_rx, &mut writer)?;
                 for event in copy_file_events {

@@ -308,6 +308,15 @@ not synthesize a PostgreSQL COPY stream only to parse it again. The committed
 block output remains PostgreSQL binary COPY and is byte-identical to the
 reference encoder.
 
+Strict V3 scanner workers emit canonical partition runs directly. They do not
+construct legacy serving-row identifiers or retain a process-wide uniqueness
+set for rows that V3 never publishes. The dedupe summary still reports the
+exact attempted serving-row count from the completed worker runs, sets
+`serving_rate_dedupe_enabled` to `false`, and leaves the legacy uniqueness,
+duplicate, and reduction fields null rather than presenting unmeasured values
+as zero. Any diagnostic path that emits a serving row retains its dedupe
+invariant.
+
 Gzip scanning uses `rapidgzip` by default. When `provider_references` appears
 after `in_network`, the scanner builds a temporary seek index, reads the
 provider range first, and then processes indexed in-network ranges in parallel.
