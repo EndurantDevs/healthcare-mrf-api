@@ -11460,6 +11460,50 @@ async def test_anthem_context_uses_name_index_and_merges_shared_company_files(
 
 
 @pytest.mark.asyncio
+async def test_anthem_explicit_ein_rejects_different_name_index_employer(
+    monkeypatch,
+):
+    """An exact EIN lookup must not silently select a related organization."""
+    source_row = _example_anthem_employer_source_row()
+    source_row["metadata_json"]["raw"]["query_context_lookup_type"] = (
+        "employer_ein"
+    )
+    name_index_url = "https://files.example.test/namesearch/e.json"
+    fetched_urls = []
+
+    async def fake_fetch_json(url, **_kwargs):
+        fetched_urls.append(url)
+        if url == name_index_url:
+            return {
+                "namesearch": [
+                    {
+                        "ein": "98-7654321",
+                        "name": "example employer investment affiliate",
+                    }
+                ]
+            }
+        raise ValueError("missing configured employer object")
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    with pytest.raises(
+        ValueError,
+        match="no current Anthem employer MRF result for configured EIN",
+    ):
+        await discovery._resolve_anthem_s3_context(
+            source_row,
+            employer_ein="12-3456789",
+            employer_names=("Example Employer",),
+            lookup_context=_example_anthem_lookup_context(),
+        )
+
+    assert fetched_urls == [
+        "https://files.example.test/anthem/123456789.json",
+        name_index_url,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_anthem_name_index_failure_aborts_context_resolution(monkeypatch):
     """A failed name shard must not look like a complete empty result."""
     monkeypatch.setattr(
