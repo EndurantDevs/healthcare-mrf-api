@@ -99,7 +99,7 @@ class _SharedGCExecutor:
         building_max_age_seconds: int,
         limit: int | None,
     ) -> list[int]:
-        eligible: list[int] = []
+        eligible_layout_keys: list[int] = []
         for snapshot_key, layout in self.layouts.items():
             selected_bindings = [
                 snapshot_id
@@ -128,9 +128,15 @@ class _SharedGCExecutor:
                 and heartbeat_at
                 < self.now - timedelta(seconds=building_max_age_seconds)
             ):
-                eligible.append(snapshot_key)
-        eligible.sort(key=lambda key: (self.layouts[key]["created_at"], key))
-        return eligible if limit is None else eligible[: int(limit)]
+                eligible_layout_keys.append(snapshot_key)
+        eligible_layout_keys.sort(
+            key=lambda key: (self.layouts[key]["created_at"], key)
+        )
+        return (
+            eligible_layout_keys
+            if limit is None
+            else eligible_layout_keys[: int(limit)]
+        )
 
     def _layout_stats(self, layout_keys: list[int]) -> dict[str, int]:
         mapped_hashes = {
@@ -249,16 +255,16 @@ class _SharedGCExecutor:
                 self.mappings.add(self.rereference_on_delete)
                 self.rereference_on_delete = None
             mapped_hashes = {block_hash for _snapshot_key, block_hash in self.mappings}
-            deleted = []
+            deleted_blocks = []
             for block_hash in params["block_hashes"]:
                 if block_hash in mapped_hashes or block_hash not in self.blocks:
                     continue
                 stored_bytes = self.blocks.pop(block_hash)
                 self.candidates.pop(block_hash, None)
-                deleted.append(
+                deleted_blocks.append(
                     {"block_hash": block_hash, "stored_byte_count": stored_bytes}
                 )
-            return deleted
+            return deleted_blocks
         raise AssertionError(statement)
 
     async def status(self, statement: str, **params):
@@ -474,8 +480,8 @@ async def test_grace_period_must_elapse_before_payload_sweep():
 @pytest.mark.asyncio
 async def test_sweep_respects_aggregate_byte_cap_and_reports_exact_hashes():
     executor = _SharedGCExecutor()
-    sizes = {_hash(6): 60, _hash(7): 50, _hash(8): 40}
-    for block_hash, stored_bytes in sizes.items():
+    size_by_block_hash = {_hash(6): 60, _hash(7): 50, _hash(8): 40}
+    for block_hash, stored_bytes in size_by_block_hash.items():
         executor.add_block(block_hash, stored_bytes)
         executor.candidates[block_hash] = executor.now - timedelta(seconds=1)
 
@@ -701,7 +707,7 @@ async def test_source_snapshot_gc_does_not_project_unrelated_shared_layout_bytes
 @pytest.mark.asyncio
 async def test_source_snapshot_gc_releases_unbound_layout_in_same_transaction(monkeypatch):
     events: list[str] = []
-    state = {"connection": None}
+    connection_state_map = {"connection": None}
 
     class _Connection:
         async def all(self, statement, **_params):
@@ -718,8 +724,8 @@ async def test_source_snapshot_gc_releases_unbound_layout_in_same_transaction(mo
     class _DB:
         @asynccontextmanager
         async def acquire(self):
-            state["connection"] = _Connection()
-            yield state["connection"]
+            connection_state_map["connection"] = _Connection()
+            yield connection_state_map["connection"]
 
     plan = source_snapshot_gc.PTG2SourceSnapshotGCPlan(
         current_snapshot_ids=(),
@@ -754,7 +760,7 @@ async def test_source_snapshot_gc_releases_unbound_layout_in_same_transaction(mo
     assert events == ["binding-delete", "logical-delete"]
     release.assert_awaited_once_with(
         schema_name="mrf",
-        executor=state["connection"],
+        executor=connection_state_map["connection"],
         require_shared=True,
         layout_keys=(10,),
     )

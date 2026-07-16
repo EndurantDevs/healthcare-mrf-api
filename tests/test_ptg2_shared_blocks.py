@@ -79,7 +79,7 @@ def _stored_row(
     extra: dict | None = None,
 ):
     payload = zlib.compress(raw_payload, 1) if codec == "zlib" else raw_payload
-    row = {
+    stored_row_map = {
         "object_kind": object_kind,
         "block_key": block_key,
         "fragment_no": fragment_no,
@@ -95,8 +95,8 @@ def _stored_row(
             payload=payload,
         ),
     }
-    row.update(extra or {})
-    return row
+    stored_row_map.update(extra or {})
+    return stored_row_map
 
 
 def test_semantic_fingerprint_is_order_stable_and_context_sensitive():

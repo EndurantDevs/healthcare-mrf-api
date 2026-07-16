@@ -85,16 +85,16 @@ def test_cutover_requires_idle_valid_pointers():
                 }
             ]
 
-    result = asyncio.run(
+    readiness = asyncio.run(
         module.collect_cutover_readiness(Executor(), schema_name="mrf")
     )
 
-    assert result["ready"] is True
-    assert result["pointer_count"] == 7
-    assert result["stale_import_run_count"] == 2
-    assert result["stale_building_snapshot_count"] == 2
-    assert result["stale_activity_seconds"] == 21_600
-    assert not any(result["failure_counts"].values())
+    assert readiness["ready"] is True
+    assert readiness["pointer_count"] == 7
+    assert readiness["stale_import_run_count"] == 2
+    assert readiness["stale_building_snapshot_count"] == 2
+    assert readiness["stale_activity_seconds"] == 21_600
+    assert not any(readiness["failure_counts"].values())
     assert "manifest::jsonb AS manifest_jsonb" in statements[0]
     assert "jsonb_typeof(snapshot.manifest_jsonb" in statements[0]
     assert "heartbeat_at" in statements[1]
@@ -129,13 +129,13 @@ def test_cutover_rejects_legacy_or_active():
                 }
             ]
 
-    result = asyncio.run(
+    readiness = asyncio.run(
         module.collect_cutover_readiness(Executor(), schema_name="mrf")
     )
 
-    assert result["ready"] is False
-    assert result["active_import_run_count"] == 1
-    assert result["failure_counts"]["invalid_arch_count"] == 1
+    assert readiness["ready"] is False
+    assert readiness["active_import_run_count"] == 1
+    assert readiness["failure_counts"]["invalid_arch_count"] == 1
 
 
 def test_cutover_stale_activity_is_reported_without_blocking():
@@ -169,7 +169,7 @@ def test_cutover_stale_activity_is_reported_without_blocking():
                 }
             ]
 
-    result = asyncio.run(
+    readiness = asyncio.run(
         module.collect_cutover_readiness(
             Executor(),
             schema_name="mrf",
@@ -177,10 +177,10 @@ def test_cutover_stale_activity_is_reported_without_blocking():
         )
     )
 
-    assert result["ready"] is True
-    assert result["stale_import_run_count"] == 6
-    assert result["stale_building_snapshot_count"] == 6
-    assert result["stale_activity_seconds"] == 900
+    assert readiness["ready"] is True
+    assert readiness["stale_import_run_count"] == 6
+    assert readiness["stale_building_snapshot_count"] == 6
+    assert readiness["stale_activity_seconds"] == 900
 
 
 def test_cutover_stale_activity_window_cannot_disable_live_run_guard():

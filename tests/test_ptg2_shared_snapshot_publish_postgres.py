@@ -91,7 +91,7 @@ def _graph_artifacts(
     npi: int,
 ) -> list[dict[str, object]]:
     npi_id = b"\0" * 8 + int(npi).to_bytes(8, "big", signed=False)
-    mappings = {
+    graph_members_by_artifact = {
         "provider_group_npi": {provider_group_id: (npi_id,)},
         "provider_npi_group": {npi_id: (provider_group_id,)},
         "provider_inverted": {provider_group_id: (provider_set_id,)},
@@ -99,17 +99,19 @@ def _graph_artifacts(
     }
     entries: list[dict[str, object]] = []
     directory.mkdir(parents=True)
-    for name, mapping in mappings.items():
+    for name, mapping in graph_members_by_artifact.items():
         manifest = write_global_membership_sidecar(directory, name, mapping)
-        sidecar = dict(manifest["sidecars"][0])
-        sidecar.update(
+        sidecar_metadata_map = dict(manifest["sidecars"][0])
+        sidecar_metadata_map.update(
             {
                 "name": name,
-                "path": str((directory / str(sidecar["path"])).resolve()),
+                "path": str(
+                    (directory / str(sidecar_metadata_map["path"])).resolve()
+                ),
                 "source_shard_id": "shared-smoke-shard",
             }
         )
-        entries.append(sidecar)
+        entries.append(sidecar_metadata_map)
     return entries
 
 
@@ -491,11 +493,11 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
              ORDER BY reported_code
             """
         )
-        code_keys = {
+        code_key_by_reported_code = {
             str(code_key_record[0]): int(code_key_record[1])
             for code_key_record in code_key_rows
         }
-        assert set(code_keys) == {"99213", "99214"}
+        assert set(code_key_by_reported_code) == {"99213", "99214"}
         assert {str(code_key_record[2]) for code_key_record in code_key_rows} == {
             "FFS"
         }
@@ -508,9 +510,9 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
              ORDER BY atom_ordinal
             """,
             snapshot_key=publication.snapshot_key,
-            code_key=code_keys["99213"],
+            code_key=code_key_by_reported_code["99213"],
         )
-        assert [int(row[1]) for row in audit_rows] == [0, 1]
+        assert [int(audit_row[1]) for audit_row in audit_rows] == [0, 1]
         assert audit_rows[0][2] == audit_rows[1][2]
         assert bytes(audit_rows[0][0]) != bytes(audit_rows[1][0])
         layout_audit_sample = await db.scalar(
@@ -558,9 +560,9 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
                 ptg2_serving.PTG2_SCHEMA = original_serving_schema
             assert api_payload is not None
             assert len(api_payload["items"]) == 1
-            provenance = dict(api_payload["provenance"])
-            database_evidence = provenance.pop("database_evidence")
-            assert provenance == {
+            provenance_map = dict(api_payload["provenance"])
+            database_evidence = provenance_map.pop("database_evidence")
+            assert provenance_map == {
                 "arch_version": "postgres_binary_v3",
                 "storage_generation": "shared_blocks_v3",
                 "database_backend": "postgresql",
@@ -584,7 +586,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
 
             forward_rows = await lookup_serving_binary_by_code_from_db(
                 session,
-                code_keys["99213"],
+                code_key_by_reported_code["99213"],
                 shared_snapshot_key=publication.snapshot_key,
                 schema_name=schema_name,
                 price_dictionary_item_count=2,
@@ -602,7 +604,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             )
             second_forward_rows = await lookup_serving_binary_by_code_from_db(
                 session,
-                code_keys["99214"],
+                code_key_by_reported_code["99214"],
                 shared_snapshot_key=publication.snapshot_key,
                 schema_name=schema_name,
                 price_dictionary_item_count=2,
@@ -624,12 +626,14 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
                 publication.snapshot_key,
                 (provider_set_key,),
                 schema_name=schema_name,
-            ) == {provider_set_key: tuple(sorted(code_keys.values()))}
+            ) == {
+                provider_set_key: tuple(sorted(code_key_by_reported_code.values()))
+            }
             assert (
                 await lookup_shared_code_page_from_db(
                     session,
                     publication.snapshot_key,
-                    code_keys["99213"],
+                    code_key_by_reported_code["99213"],
                     schema_name=schema_name,
                 )
                 is not None
@@ -700,7 +704,8 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
                 snapshot_key=publication.snapshot_key,
                 object_kind="by_code_provider_shard_v1",
                 block_keys=(
-                    (code_keys["99213"] << 31) | (provider_set_key // 1024),
+                    (code_key_by_reported_code["99213"] << 31)
+                    | (provider_set_key // 1024),
                 ),
                 require_all=True,
             )

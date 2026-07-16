@@ -245,9 +245,8 @@ async def _run(
         await db.disconnect()
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Print the cutover report and return its readiness exit code."""
-
+def _parse_arguments(argv: list[str] | None) -> argparse.Namespace:
+    """Parse the bounded cutover-readiness CLI surface."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--schema",
@@ -262,9 +261,15 @@ def main(argv: list[str] | None = None) -> int:
             f"{_STALE_ACTIVITY_SECONDS_DEFAULT})"
         ),
     )
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Print the cutover report and return its readiness exit code."""
+
+    args = _parse_arguments(argv)
     try:
-        result = asyncio.run(
+        readiness = asyncio.run(
             _run(args.schema, args.stale_activity_seconds)
         )
     except Exception:
@@ -279,8 +284,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 2
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return 0 if result["ready"] else 1
+    print(json.dumps(readiness, indent=2, sort_keys=True))
+    return 0 if readiness["ready"] else 1
 
 
 if __name__ == "__main__":

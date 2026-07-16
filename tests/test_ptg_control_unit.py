@@ -26,7 +26,7 @@ async def test_ptg_control_start_maps_payload_to_ptg_main(monkeypatch):
     monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
     monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
-    result = await ptg_control.ptg_control_start(
+    control_result = await ptg_control.ptg_control_start(
         {},
         {
             "run_id": "run_ptg",
@@ -41,7 +41,7 @@ async def test_ptg_control_start_maps_payload_to_ptg_main(monkeypatch):
         },
     )
 
-    assert result == {"status": "succeeded", "run_id": "run_ptg"}
+    assert control_result == {"status": "succeeded", "run_id": "run_ptg"}
     assert calls[0]["test_mode"] is True
     assert calls[0]["in_network_url"] == "https://example.com/rates.json.gz"
     assert calls[0]["source_key"] == "example_source_a"
@@ -114,14 +114,14 @@ async def test_ptg_control_start_records_ptg2_terminal_identity(monkeypatch):
     monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
     monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
-    result = await ptg_control.ptg_control_start(
+    control_result = await ptg_control.ptg_control_start(
         {},
         {"run_id": "run_ptg", "params": {"test_mode": True, "source_key": "demo_source"}},
     )
 
-    assert result["status"] == "succeeded"
-    assert result["run_id"] == "run_ptg"
-    assert result["snapshot_id"] == "ptg2:202606:demo"
+    assert control_result["status"] == "succeeded"
+    assert control_result["run_id"] == "run_ptg"
+    assert control_result["snapshot_id"] == "ptg2:202606:demo"
     succeeded_mark = marks[-1][1]
     assert succeeded_mark["status"] == "succeeded"
     assert succeeded_mark["snapshot_id"] == "ptg2:202606:demo"
@@ -132,7 +132,7 @@ async def test_ptg_control_start_records_ptg2_terminal_identity(monkeypatch):
 @pytest.mark.asyncio
 async def test_ptg_control_start_runs_live_progress_heartbeat(monkeypatch):
     heartbeat_calls = []
-    stopped = []
+    stopped_tasks = []
 
     async def fake_ptg_main(**_kwargs):
         await ptg_control.asyncio.sleep(0)
@@ -145,7 +145,7 @@ async def test_ptg_control_start_runs_live_progress_heartbeat(monkeypatch):
         heartbeat_calls.append(args)
 
     async def fake_stop(task):
-        stopped.append(task)
+        stopped_tasks.append(task)
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
     monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
@@ -160,7 +160,7 @@ async def test_ptg_control_start_runs_live_progress_heartbeat(monkeypatch):
 
     assert heartbeat_calls
     assert heartbeat_calls[0][:3] == ("run_ptg", "ptg", "ptg_control_start")
-    assert stopped
+    assert stopped_tasks
 
 
 def test_ptg_thread_heartbeat_preserves_importer_progress_source(monkeypatch):
@@ -243,38 +243,40 @@ async def test_ptg_stale_job_check_allows_nonterminal_local_run(monkeypatch):
 @pytest.mark.asyncio
 async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
     """Verify ptg control start applies lane scanner env."""
-    observed = {}
+    observed_env_map = {}
 
     async def fake_ptg_main(**_kwargs):
-        observed["workers"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORKERS")
-        observed["parse"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS")
-        observed["top_level_byte_scan"] = ptg_control.os.environ.get(
+        observed_env_map["workers"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORKERS")
+        observed_env_map["parse"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS")
+        observed_env_map["top_level_byte_scan"] = ptg_control.os.environ.get(
             "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN"
         )
-        observed["work_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORK_QUEUE")
-        observed["event_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_EVENT_QUEUE")
-        observed["split_negotiated_rates"] = ptg_control.os.environ.get(
+        observed_env_map["work_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORK_QUEUE")
+        observed_env_map["event_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_EVENT_QUEUE")
+        observed_env_map["split_negotiated_rates"] = ptg_control.os.environ.get(
             "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES"
         )
-        observed["raw_chunk_bytes"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES")
-        observed["provider_refs_in_workers"] = ptg_control.os.environ.get(
+        observed_env_map["raw_chunk_bytes"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES")
+        observed_env_map["provider_refs_in_workers"] = ptg_control.os.environ.get(
             "HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS"
         )
-        observed["provider_ref_workers"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS")
-        observed["provider_ref_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PROVIDER_REF_QUEUE")
-        observed["provider_ref_chunk_items"] = ptg_control.os.environ.get(
+        observed_env_map["provider_ref_workers"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS")
+        observed_env_map["provider_ref_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PROVIDER_REF_QUEUE")
+        observed_env_map["provider_ref_chunk_items"] = ptg_control.os.environ.get(
             "HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS"
         )
-        observed["provider_ref_raw_chunk_bytes"] = ptg_control.os.environ.get(
+        observed_env_map["provider_ref_raw_chunk_bytes"] = ptg_control.os.environ.get(
             "HLTHPRT_PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES"
         )
-        observed["manifest_merge_chunk_bytes"] = ptg_control.os.environ.get(
+        observed_env_map["manifest_merge_chunk_bytes"] = ptg_control.os.environ.get(
             "HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES"
         )
-        observed["manifest_merge_sort_workers"] = ptg_control.os.environ.get(
+        observed_env_map["manifest_merge_sort_workers"] = ptg_control.os.environ.get(
             "HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS"
         )
-        observed["file_process_concurrency"] = ptg_control.os.environ.get("HLTHPRT_PTG2_FILE_PROCESS_CONCURRENCY")
+        observed_env_map["file_process_concurrency"] = ptg_control.os.environ.get(
+            "HLTHPRT_PTG2_FILE_PROCESS_CONCURRENCY"
+        )
         return {}
 
     async def fake_mark_control_run(*_args, **_kwargs):
@@ -312,7 +314,7 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
         },
     )
 
-    assert observed == {
+    assert observed_env_map == {
         "workers": "4",
         "parse": "true",
         "top_level_byte_scan": "true",

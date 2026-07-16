@@ -30,7 +30,7 @@ class FakeSession:
 
 
 def strict_serving_index(snapshot_key=41):
-    audit_sample = {
+    audit_sample_map = {
         "contract": "persisted_served_occurrence_sample_v2",
         "format_version": 2,
         "method": "publish_time_stratified_v1",
@@ -67,7 +67,7 @@ def strict_serving_index(snapshot_key=41):
         "materialized_tables": {},
         "serving_rates": 2,
         "atom_key_bits": 24,
-        "audit_sample": audit_sample,
+        "audit_sample": audit_sample_map,
         "serving_binary": {
             "format": "postgres_binary_v3",
             "price_set_atom_memberships_v3": {"block_span": 512},
@@ -85,7 +85,7 @@ def strict_serving_index(snapshot_key=41):
 def strict_snapshot_row(serving_index=None, **overrides):
     serving_index = dict(serving_index or strict_serving_index())
     coverage_scope_id = serving_index.get("coverage_scope_id")
-    row = {
+    snapshot_row_map = {
         "manifest": {"serving_index": serving_index},
         "layout_audit_sample": serving_index.get("audit_sample"),
         "layout_coverage_scope_id": coverage_scope_id,
@@ -98,8 +98,8 @@ def strict_snapshot_row(serving_index=None, **overrides):
         "backend_session_active": True,
         "transaction_snapshot_observed": True,
     }
-    row.update(overrides)
-    return row
+    snapshot_row_map.update(overrides)
+    return snapshot_row_map
 
 
 @pytest.mark.asyncio

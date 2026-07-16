@@ -147,7 +147,7 @@ def _canonical_rows_digest(rows: tuple[bytes, ...]) -> str:
 def _scanner_environment(
     workers: int, queue_size: int | None, serving_run_directory: Path
 ) -> dict[str, str]:
-    env = {
+    scanner_env_map = {
         **os.environ,
         "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v3",
         "HLTHPRT_PTG2_RAW_SOURCE_SHA256": "00" * 32,
@@ -179,8 +179,8 @@ def _scanner_environment(
         *SIDECAR_ENV_BY_KIND.values(),
         *LEGACY_OUTPUT_ENVS,
     ):
-        env.pop(env_name, None)
-    return env
+        scanner_env_map.pop(env_name, None)
+    return scanner_env_map
 
 
 def _serving_run_records(frames: list[tuple[str, dict]]) -> tuple[bytes, ...]:

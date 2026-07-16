@@ -389,7 +389,7 @@ def _graph_artifacts(
     npi_ids = tuple(
         b"\0" * 8 + int(npi).to_bytes(8, "big", signed=False) for npi in NPIS
     )
-    mappings = {
+    graph_members_by_artifact = {
         "provider_group_npi": {provider_group_id: npi_ids},
         "provider_npi_group": {
             npi_id: (provider_group_id,) for npi_id in npi_ids
@@ -399,17 +399,19 @@ def _graph_artifacts(
     }
     directory.mkdir(parents=True)
     entries: list[dict[str, object]] = []
-    for name, mapping in mappings.items():
+    for name, mapping in graph_members_by_artifact.items():
         manifest = write_global_membership_sidecar(directory, name, mapping)
-        sidecar = dict(manifest["sidecars"][0])
-        sidecar.update(
+        sidecar_metadata_map = dict(manifest["sidecars"][0])
+        sidecar_metadata_map.update(
             {
                 "name": name,
-                "path": str((directory / str(sidecar["path"])).resolve()),
+                "path": str(
+                    (directory / str(sidecar_metadata_map["path"])).resolve()
+                ),
                 "source_shard_id": "migrated-lifecycle-shard",
             }
         )
-        entries.append(sidecar)
+        entries.append(sidecar_metadata_map)
     return entries
 
 
@@ -1320,11 +1322,11 @@ async def test_v3_lifecycle_fails_closed(
              ORDER BY block_hash
             """
         )
-        expected_block_sizes = {
+        expected_block_size_by_hash = {
             bytes(block_record[0]): int(block_record[1])
             for block_record in block_rows
         }
-        assert expected_block_sizes
+        assert expected_block_size_by_hash
 
         final_removal_response = await _asgi_request(
             client,
@@ -1339,15 +1341,15 @@ async def test_v3_lifecycle_fails_closed(
         assert final_removal["deleted_snapshots"] == 1
         assert final_removal["released_shared_layouts"] == 1
         assert await _count("ptg2_v3_snapshot_layout") == 0
-        assert await _count("ptg2_v3_block") == len(expected_block_sizes)
+        assert await _count("ptg2_v3_block") == len(expected_block_size_by_hash)
 
         swept = await sweep_ptg2_shared_blocks(
             schema_name=SCHEMA_NAME,
-            max_bytes=sum(expected_block_sizes.values()),
-            max_rows=len(expected_block_sizes),
+            max_bytes=sum(expected_block_size_by_hash.values()),
+            max_rows=len(expected_block_size_by_hash),
         )
-        assert set(swept.selected_hashes) == set(expected_block_sizes)
-        assert swept.stored_bytes == sum(expected_block_sizes.values())
+        assert set(swept.selected_hashes) == set(expected_block_size_by_hash)
+        assert swept.stored_bytes == sum(expected_block_size_by_hash.values())
         for table_name in FINAL_EMPTY_TABLES:
             assert await _count(table_name) == 0
         assert await _count("ptg2_source_trace") == 1

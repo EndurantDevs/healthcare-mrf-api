@@ -33,19 +33,19 @@ def _candidate_access():
 
 
 def test_candidate_audit_access_requires_explicit_header_and_control_token(monkeypatch):
-    args = {
+    query_arg_map = {
         "snapshot_id": "candidate-snapshot",
         "source_key": "source-a",
         "plan_id": "12-3456789",
         "plan_market_type": "group",
     }
-    assert candidate_audit_access_from_request(_request(), args) is None
+    assert candidate_audit_access_from_request(_request(), query_arg_map) is None
 
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "operator-secret")
     with pytest.raises(Forbidden, match="control API token is invalid"):
         candidate_audit_access_from_request(
             _request({PTG2_CANDIDATE_AUDIT_HEADER: "candidate-snapshot"}),
-            args,
+            query_arg_map,
         )
 
     access = candidate_audit_access_from_request(
@@ -55,20 +55,20 @@ def test_candidate_audit_access_requires_explicit_header_and_control_token(monke
                 "Authorization": "Bearer operator-secret",
             }
         ),
-        args,
+        query_arg_map,
     )
     assert access == _candidate_access()
 
 
 def test_candidate_audit_access_is_exact_and_user_scalars_are_ignored(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "operator-secret")
-    headers = {
+    request_header_map = {
         PTG2_CANDIDATE_AUDIT_HEADER: "candidate-snapshot",
         "X-HealthPorta-Control-Token": "operator-secret",
     }
     with pytest.raises(Forbidden, match="candidate audit access is invalid"):
         candidate_audit_access_from_request(
-            _request(headers),
+            _request(request_header_map),
             {
                 "snapshot_id": "candidate-snapshot",
                 "source_key": "source-a",

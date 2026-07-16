@@ -136,7 +136,7 @@ async def test_real_postgres_graph_binary_copy_publish_and_reads(tmp_path):
             snapshot_key=snapshot_key,
         )
 
-        group_keys = dict(conversion.iter_group_key_items())
+        group_key_by_global_id = dict(conversion.iter_group_key_items())
         provider_ids = sorted(provider_keys)
         async with db.session() as session:
             assert await fetch_shared_graph_members(
@@ -145,23 +145,35 @@ async def test_real_postgres_graph_binary_copy_publish_and_reads(tmp_path):
                 snapshot_key=snapshot_key,
                 direction=PTG2_V3_GRAPH_NPI_TO_GROUP,
                 owner_keys=(int.from_bytes(npis[0][8:], "big"),),
-            ) == {int.from_bytes(npis[0][8:], "big"): (group_keys[groups[0]], group_keys[groups[1]])}
+            ) == {
+                int.from_bytes(npis[0][8:], "big"): (
+                    group_key_by_global_id[groups[0]],
+                    group_key_by_global_id[groups[1]],
+                )
+            }
             assert await fetch_shared_graph_members(
                 session,
                 schema_name=schema_name,
                 snapshot_key=snapshot_key,
                 direction=PTG2_V3_GRAPH_GROUP_TO_NPI,
-                owner_keys=(group_keys[groups[0]],),
+                owner_keys=(group_key_by_global_id[groups[0]],),
             ) == {
-                group_keys[groups[0]]: tuple(int.from_bytes(npi[8:], "big") for npi in npis)
+                group_key_by_global_id[groups[0]]: tuple(
+                    int.from_bytes(npi[8:], "big") for npi in npis
+                )
             }
             assert await fetch_shared_graph_members(
                 session,
                 schema_name=schema_name,
                 snapshot_key=snapshot_key,
                 direction=PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
-                owner_keys=(group_keys[groups[0]],),
-            ) == {group_keys[groups[0]]: (provider_keys[provider_ids[0]], provider_keys[provider_ids[1]])}
+                owner_keys=(group_key_by_global_id[groups[0]],),
+            ) == {
+                group_key_by_global_id[groups[0]]: (
+                    provider_keys[provider_ids[0]],
+                    provider_keys[provider_ids[1]],
+                )
+            }
             assert await fetch_shared_graph_members(
                 session,
                 schema_name=schema_name,
@@ -169,7 +181,10 @@ async def test_real_postgres_graph_binary_copy_publish_and_reads(tmp_path):
                 direction=PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
                 owner_keys=(provider_keys[provider_ids[1]],),
             ) == {
-                provider_keys[provider_ids[1]]: (group_keys[groups[0]], group_keys[groups[1]])
+                provider_keys[provider_ids[1]]: (
+                    group_key_by_global_id[groups[0]],
+                    group_key_by_global_id[groups[1]],
+                )
             }
     finally:
         conversion.cleanup()

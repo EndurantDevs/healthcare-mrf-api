@@ -143,21 +143,32 @@ def test_ptg2_manifest_membership_sidecar_read_rejects_checksum_failure(tmp_path
 
 def test_ptg2_manifest_membership_sidecar_read_rejects_byte_count_failure(tmp_path):
     manifest = write_global_membership_sidecar(tmp_path, "provider_sets", {GLOBAL_A: [GLOBAL_B]})
-    sidecar = dict(manifest["sidecars"][0])
-    sidecar["byte_count"] += 1
+    sidecar_metadata_map = dict(manifest["sidecars"][0])
+    sidecar_metadata_map["byte_count"] += 1
 
     with pytest.raises(PTG2ManifestArtifactError, match="byte_count mismatch"):
-        read_global_sidecar_entries(tmp_path / "provider_sets.global_membership.bin", metadata=sidecar)
+        read_global_sidecar_entries(
+            tmp_path / "provider_sets.global_membership.bin",
+            metadata=sidecar_metadata_map,
+        )
 
 
 def test_ptg2_manifest_membership_lookup_infers_format_when_metadata_omits_it(tmp_path):
     manifest = write_global_membership_sidecar(tmp_path, "provider_sets", {GLOBAL_A: [GLOBAL_B], GLOBAL_B: [GLOBAL_C]})
-    sidecar = dict(manifest["sidecars"][0])
-    sidecar.pop("record_format")
+    sidecar_metadata_map = dict(manifest["sidecars"][0])
+    sidecar_metadata_map.pop("record_format")
     sidecar_path = tmp_path / "provider_sets.global_membership.bin"
 
-    assert lookup_global_sidecar_members(sidecar_path, GLOBAL_A, metadata=sidecar) == (GLOBAL_B,)
-    assert lookup_global_sidecar_members_many(sidecar_path, [GLOBAL_A, GLOBAL_B], metadata=sidecar) == {
+    assert lookup_global_sidecar_members(
+        sidecar_path,
+        GLOBAL_A,
+        metadata=sidecar_metadata_map,
+    ) == (GLOBAL_B,)
+    assert lookup_global_sidecar_members_many(
+        sidecar_path,
+        [GLOBAL_A, GLOBAL_B],
+        metadata=sidecar_metadata_map,
+    ) == {
         GLOBAL_A: (GLOBAL_B,),
         GLOBAL_B: (GLOBAL_C,),
     }
