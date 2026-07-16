@@ -3415,6 +3415,46 @@ async def _shared_forward_entries_for_code_rows(
     return forward_entries
 
 
+async def _shared_group_ids_for_provider_set_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_keys: Iterable[int],
+) -> tuple[str, ...]:
+    """Resolve dense provider-set keys to stable provider-group IDs."""
+
+    normalized_provider_set_keys = tuple(
+        sorted({int(provider_set_key) for provider_set_key in provider_set_keys})
+    )
+    if not normalized_provider_set_keys:
+        return ()
+    groups_by_provider_set = await lookup_shared_graph_members_from_db(
+        session,
+        _required_shared_snapshot_key(serving_tables),
+        PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
+        normalized_provider_set_keys,
+        schema_name=PTG2_SCHEMA,
+    )
+    group_keys = tuple(
+        sorted(
+            {
+                int(group_key)
+                for provider_set_group_keys in groups_by_provider_set.values()
+                for group_key in provider_set_group_keys
+            }
+        )
+    )
+    group_id_by_key = await _shared_provider_group_ids_for_keys(
+        session,
+        serving_tables,
+        group_keys,
+    )
+    if set(group_id_by_key) != set(group_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 shared graph references a missing provider-group dictionary key"
+        )
+    return tuple(group_id_by_key[group_key] for group_key in group_keys)
+
+
 async def _shared_rate_provider_groups(
     session,
     serving_tables: PTG2ServingTables,
@@ -3475,24 +3515,10 @@ async def _shared_rate_provider_groups(
         code_rows,
         provider_set_keys=provider_set_keys,
     )
-    provider_set_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
+    return await _shared_group_ids_for_provider_set_keys(
         session,
         serving_tables,
         [row.provider_set_key for row in forward_rows],
-    )
-    expected_keys = {row.provider_set_key for row in forward_rows}
-    if set(provider_set_ids_by_key) != expected_keys:
-        raise PTG2ManifestArtifactError(
-            "PTG2 shared provider-set dictionary is missing a rate-referenced key"
-        )
-    groups_by_set = await _shared_graph_members_by_id(
-        session,
-        serving_tables,
-        "provider_forward",
-        tuple(provider_set_ids_by_key.values()),
-    )
-    return tuple(
-        sorted({group_id for group_ids in groups_by_set.values() for group_id in group_ids})
     )
 
 
@@ -5608,43 +5634,46 @@ async def _version_three_explicit_npi_graph_scope(
     requested_npi = _normalize_npi(args.get("npi"))
     if requested_npi is None:
         return None
-    group_ids = await _shared_graph_members_for_id(
+    shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
+    group_keys_by_npi = await lookup_shared_graph_members_from_db(
         session,
-        serving_tables,
-        "provider_npi_group",
-        _ptg2_npi_member_id(requested_npi),
+        shared_snapshot_key,
+        PTG2_V3_GRAPH_NPI_TO_GROUP,
+        (requested_npi,),
+        schema_name=PTG2_SCHEMA,
     )
-    if not group_ids:
+    group_keys = tuple(sorted(group_keys_by_npi.get(requested_npi, ())))
+    if not group_keys:
         return _ExplicitNpiGraphScope(requested_npi, (), ())
-    provider_sets_by_group = await _manifest_sets_by_group(
+    group_id_by_key = await _shared_provider_group_ids_for_keys(
         session,
         serving_tables,
-        group_ids,
+        group_keys,
     )
-    if provider_sets_by_group is None:
-        return None
-    provider_set_ids = tuple(
+    if set(group_id_by_key) != set(group_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider-group dictionary is missing an NPI-referenced group"
+        )
+    provider_set_keys_by_group = await lookup_shared_graph_members_from_db(
+        session,
+        shared_snapshot_key,
+        PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
+        group_keys,
+        schema_name=PTG2_SCHEMA,
+    )
+    provider_set_keys = tuple(
         sorted(
             {
-                provider_set_id
-                for group_provider_set_ids in provider_sets_by_group.values()
-                for provider_set_id in group_provider_set_ids
+                int(provider_set_key)
+                for group_provider_set_keys in provider_set_keys_by_group.values()
+                for provider_set_key in group_provider_set_keys
             }
         )
     )
-    provider_set_key_by_id = await _ptg2_manifest_provider_set_keys_for_ids(
-        session,
-        serving_tables,
-        provider_set_ids,
-    )
-    if set(provider_set_key_by_id) != set(provider_set_ids):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 provider-set dictionary is missing an NPI-referenced provider set"
-        )
     return _ExplicitNpiGraphScope(
         requested_npi,
-        tuple(group_ids),
-        tuple(sorted(provider_set_key_by_id.values())),
+        tuple(group_id_by_key[group_key] for group_key in group_keys),
+        provider_set_keys,
     )
 
 
@@ -6152,15 +6181,11 @@ async def _selected_provider_rows_by_set(
     }
 
 
-async def _candidate_audit_provider_rows_by_set(
-    session,
-    serving_tables: PTG2ServingTables,
+def _candidate_audit_provider_rows_by_set(
     *,
     candidate_npi: int,
     serving_rows: Iterable[Mapping[str, Any]],
-    args: Mapping[str, Any],
-    snapshot_id: str,
-) -> dict[str, list[dict[str, Any]]] | None:
+) -> dict[str, list[dict[str, Any]]]:
     """Resolve only the audited NPI, without requiring address enrichment."""
 
     candidate_provider_set_ids = tuple(
@@ -6174,16 +6199,15 @@ async def _candidate_audit_provider_rows_by_set(
             )
         )
     )
-    return await _selected_provider_rows_by_set(
-        session,
-        serving_tables,
-        npis=(candidate_npi,),
-        provider_set_ids_by_npi={
-            candidate_npi: candidate_provider_set_ids
-        },
-        args=args,
-        snapshot_id=snapshot_id,
-    )
+    return {
+        provider_set_id: [
+            {
+                "npi": candidate_npi,
+                "provider_name": "TiC provider",
+            }
+        ]
+        for provider_set_id in candidate_provider_set_ids
+    }
 
 
 def _next_provider_expansion_rate_window(
@@ -6790,16 +6814,10 @@ async def _search_ptg2_manifest_db_serving_table(
         elif location_filter_requested:
             providers_by_set = location_providers_by_set
         elif candidate_audit_npi is not None:
-            providers_by_set = await _candidate_audit_provider_rows_by_set(
-                session,
-                serving_tables,
+            providers_by_set = _candidate_audit_provider_rows_by_set(
                 candidate_npi=candidate_audit_npi,
                 serving_rows=row_data,
-                args=args,
-                snapshot_id=snapshot_id,
             )
-            if providers_by_set is None:
-                return None
         else:
             provider_set_ids = [_ptg2_manifest_id(data.get("provider_set_global_id_128")) for data in row_data]
             provider_rows_by_set = await _ptg2_manifest_provider_rows_for_provider_sets(

@@ -236,6 +236,20 @@ Warm measurements cannot satisfy the cold gate. Repeating one key cannot stand
 in for the distinct-key release distribution. Report p95 only when the release
 sample floor was completed without excluded errors.
 
+The published read path must resolve snapshots and serving metadata from the
+sealed layout, relational logical scope, dense source dictionary, and consumed
+release attestation. It must not deserialize the multi-megabyte snapshot
+manifest for every request. Candidate validation may still inspect that full
+manifest before activation. Exact-NPI graph traversal should remain in dense
+integer keys across NPI-to-group, group-to-provider-set, and
+provider-set-to-group reads, converting to stable 128-bit IDs only where the
+response or rate-scope contract requires them.
+
+Bounded candidate-audit request latency is measured after semaphore admission;
+the complete audit wall clock separately includes concurrency wait and remains
+subject to the hard deadline. This prevents local queue delay from being
+misreported as database/API execution while preserving an end-to-end timeout.
+
 For plans backed by multiple published network snapshots, measure both every
 pinned snapshot and the unpinned merged-plan API. The merged path reads
 immutable snapshots through separate PostgreSQL sessions with bounded

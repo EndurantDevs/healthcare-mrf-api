@@ -78,22 +78,22 @@ async def test_v3_sparse_counts_skip_page_reads_when_projection_is_absent(monkey
 @pytest.mark.asyncio
 async def test_v3_explicit_npi_scope_resolves_dense_provider_keys(monkeypatch):
     group_id = "00000000000000000000000000000021"
-    provider_set_id = "00000000000000000000000000000031"
     serving_tables = _version_three_tables()
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_shared_graph_members_for_id",
-        AsyncMock(return_value=(group_id,)),
+    graph_probe = AsyncMock(
+        side_effect=(
+            {1234567890: (2,)},
+            {2: (3,)},
+        )
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_manifest_sets_by_group",
-        AsyncMock(return_value={group_id: (provider_set_id,)}),
+        "lookup_shared_graph_members_from_db",
+        graph_probe,
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_set_keys_for_ids",
-        AsyncMock(return_value={provider_set_id: 3}),
+        "_shared_provider_group_ids_for_keys",
+        AsyncMock(return_value={2: group_id}),
     )
 
     scope = await ptg2_serving._version_three_explicit_npi_graph_scope(
@@ -106,6 +106,43 @@ async def test_v3_explicit_npi_scope_resolves_dense_provider_keys(monkeypatch):
         npi=1234567890,
         group_ids=(group_id,),
         provider_set_keys=(3,),
+    )
+    assert [call.args[2] for call in graph_probe.await_args_list] == [
+        ptg2_serving.PTG2_V3_GRAPH_NPI_TO_GROUP,
+        ptg2_serving.PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
+    ]
+    assert [call.args[3] for call in graph_probe.await_args_list] == [
+        (1234567890,),
+        (2,),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v3_provider_set_scope_uses_dense_graph_keys(monkeypatch):
+    group_id = "00000000000000000000000000000021"
+    serving_tables = _version_three_tables()
+    graph_probe = AsyncMock(return_value={3: (2,)})
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_shared_graph_members_from_db",
+        graph_probe,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_shared_provider_group_ids_for_keys",
+        AsyncMock(return_value={2: group_id}),
+    )
+
+    group_ids = await ptg2_serving._shared_group_ids_for_provider_set_keys(
+        object(),
+        serving_tables,
+        (3,),
+    )
+
+    assert group_ids == (group_id,)
+    assert graph_probe.await_args.args[2:] == (
+        ptg2_serving.PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
+        (3,),
     )
 
 

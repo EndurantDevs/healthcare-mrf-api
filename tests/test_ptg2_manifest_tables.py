@@ -5,6 +5,7 @@ import json
 import pytest
 
 from api import ptg2_tables
+from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
 
 
 class FakeResult:
@@ -86,13 +87,40 @@ def strict_snapshot_row(serving_index=None, **overrides):
     serving_index = dict(serving_index or strict_serving_index())
     coverage_scope_id = serving_index.get("coverage_scope_id")
     snapshot_row_map = {
-        "manifest": {"serving_index": serving_index},
-        "layout_audit_sample": serving_index.get("audit_sample"),
-        "layout_coverage_scope_id": coverage_scope_id,
+        "layout_serving_index": serving_index,
+        "bound_snapshot_key": serving_index.get("shared_snapshot_key"),
         "snapshot_plan_id": "TEST-PLAN-001",
         "snapshot_plan_market_type": "group",
         "snapshot_coverage_scope_id": coverage_scope_id,
+        "attested_source_key": "source-a",
+        "attested_coverage_scope_id": coverage_scope_id,
+        "attested_source_set_digest": "b" * 64,
+        "attested_audit_sample_digest": "a" * 64,
+        "source_row_count": serving_index.get("source_count"),
+        "distinct_source_key_count": serving_index.get("source_count"),
+        "minimum_source_key": 0,
+        "maximum_source_key": int(serving_index.get("source_count") or 0) - 1,
+        "postgres_server_version_num": 160004,
+        "database_selected": True,
+        "backend_session_active": True,
+        "transaction_snapshot_observed": True,
+    }
+    snapshot_row_map.update(overrides)
+    return snapshot_row_map
+
+
+def strict_candidate_row(serving_index=None, **overrides):
+    serving_index = dict(serving_index or strict_serving_index())
+    serving_index["source_key"] = "source-a"
+    coverage_scope_id = serving_index.get("coverage_scope_id")
+    snapshot_row_map = {
+        "manifest": {"serving_index": serving_index},
+        "layout_audit_sample": serving_index.get("audit_sample"),
+        "layout_coverage_scope_id": coverage_scope_id,
         "layout_code_count": serving_index.get("code_count"),
+        "snapshot_plan_id": "TEST-PLAN-001",
+        "snapshot_plan_market_type": "group",
+        "snapshot_coverage_scope_id": coverage_scope_id,
         "postgres_server_version_num": 160004,
         "database_selected": True,
         "backend_session_active": True,
@@ -131,6 +159,9 @@ async def test_snapshot_serving_tables_requires_published_and_never_caches_v3_me
     assert "ptg2_v3_snapshot_binding" in sql
     assert "ptg2_v3_snapshot_layout" in sql
     assert "ptg2_v3_snapshot_scope" in sql
+    assert "ptg2_v3_candidate_audit_attestation" in sql
+    assert "ptg2_v3_snapshot_source" in sql
+    assert "snapshot.manifest" not in sql
     assert "current_setting('server_version_num')" in sql
     assert "txid_current_snapshot()" in sql
     assert "COUNT(DISTINCT code.coverage_scope_id)" not in sql
@@ -161,6 +192,28 @@ async def test_snapshot_serving_tables_reads_strict_shared_v3_contract():
 
 
 @pytest.mark.asyncio
+async def test_candidate_snapshot_keeps_pre_activation_manifest_validation():
+    session = FakeSession([strict_candidate_row()])
+    tables = await ptg2_tables.snapshot_serving_tables(
+        session,
+        "candidate-v3",
+        candidate_audit_access=PTG2CandidateAuditAccess(
+            snapshot_id="candidate-v3",
+            source_key="source-a",
+            plan_id="TEST-PLAN-001",
+            plan_market_type="group",
+        ),
+    )
+
+    assert tables.source_key == "source-a"
+    assert tables.source_set == strict_serving_index()["source_set"]
+    sql = str(session.calls[0][0][0])
+    assert "snapshot.status = 'validated'" in sql
+    assert "snapshot.manifest" in sql
+    assert "ptg2_v3_candidate_audit_attestation" not in sql
+
+
+@pytest.mark.asyncio
 async def test_snapshot_serving_tables_requires_database_execution_evidence():
     row = strict_snapshot_row(backend_session_active=False)
 
@@ -175,10 +228,10 @@ async def test_snapshot_serving_tables_requires_database_execution_evidence():
 
 
 @pytest.mark.asyncio
-async def test_snapshot_serving_tables_accepts_json_string_v3_manifest():
-    manifest = json.dumps({"serving_index": strict_serving_index()})
+async def test_snapshot_serving_tables_accepts_json_string_v3_layout_metadata():
+    serving_index = json.dumps(strict_serving_index())
     tables = await ptg2_tables.snapshot_serving_tables(
-        FakeSession([strict_snapshot_row(manifest=manifest)]),
+        FakeSession([strict_snapshot_row(layout_serving_index=serving_index)]),
         "strict-v3-json",
     )
 
@@ -306,16 +359,13 @@ async def test_snapshot_serving_tables_rejects_missing_or_mismatched_binding():
 
 
 @pytest.mark.asyncio
-async def test_snapshot_serving_tables_rejects_layout_audit_sample_mismatch():
+async def test_snapshot_serving_tables_rejects_attested_audit_sample_mismatch():
     row = strict_snapshot_row()
-    row["layout_audit_sample"] = {
-        **row["layout_audit_sample"],
-        "sample_digest": "b" * 64,
-    }
+    row["attested_audit_sample_digest"] = "b" * 64
 
     with pytest.raises(
         ptg2_tables.PTG2ManifestArtifactError,
-        match="layout audit sample does not match",
+        match="audit attestation does not match",
     ):
         await ptg2_tables.snapshot_serving_tables(
             FakeSession([row]),
@@ -327,32 +377,43 @@ async def test_snapshot_serving_tables_rejects_layout_audit_sample_mismatch():
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"layout_coverage_scope_id": None}, "sealed layout coverage scope"),
-        ({"layout_coverage_scope_id": "d" * 64}, "sealed layout coverage scope"),
         (
             {"snapshot_coverage_scope_id": None},
-            "snapshot coverage scope binding",
+            "published scope",
         ),
         (
             {"snapshot_coverage_scope_id": "d" * 64},
-            "snapshot coverage scope binding",
+            "published scope",
         ),
         (
-            {"layout_code_count": 3},
-            "code count does not match",
+            {"attested_coverage_scope_id": None},
+            "published scope",
         ),
         (
-            {"layout_code_count": None},
-            "code count does not match",
+            {"attested_coverage_scope_id": "d" * 64},
+            "published scope",
+        ),
+        (
+            {"bound_snapshot_key": 99},
+            "layout binding",
+        ),
+        (
+            {"source_row_count": 1},
+            "source dictionary",
+        ),
+        (
+            {"maximum_source_key": 2},
+            "source dictionary",
         ),
     ],
     ids=[
-        "missing-layout-manifest-scope",
-        "mismatched-layout-manifest-scope",
         "missing-snapshot-scope",
         "mismatched-snapshot-scope",
-        "mismatched-code-count",
-        "missing-code-count",
+        "missing-attested-scope",
+        "mismatched-attested-scope",
+        "mismatched-binding",
+        "missing-source-row",
+        "non-dense-source-key",
     ],
 )
 async def test_snapshot_serving_tables_rejects_broken_scope_chain(

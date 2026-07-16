@@ -139,8 +139,8 @@ async def _request_json(
     params: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     for attempt in range(2):
-        started = time.perf_counter()
         async with semaphore:
+            started = time.perf_counter()
             try:
                 async with client.get(
                     url,

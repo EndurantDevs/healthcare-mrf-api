@@ -13,6 +13,9 @@ from sqlalchemy import text
 from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
 from api.ptg2_serving_utils import ein_plan_id_variants
 from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
+from process.ptg_parts.ptg2_candidate_attestation import (
+    PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+)
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_COLD_LOOKUP_CONTRACT,
@@ -387,8 +390,6 @@ async def snapshot_serving_tables(
         "snapshot_id": str(snapshot_id),
         "storage_generation": PTG2_V3_SHARED_GENERATION,
     }
-    status_sql = "snapshot.status = 'published'"
-    candidate_scope_sql = ""
     if candidate_audit_access is not None:
         if candidate_audit_access.snapshot_id != str(snapshot_id):
             raise PTG2ManifestArtifactError("PTG2 snapshot is unavailable")
@@ -398,29 +399,7 @@ async def snapshot_serving_tables(
             candidate_plan_ids=ein_plan_id_variants(candidate_audit_access.plan_id),
             candidate_plan_market_type=candidate_audit_access.plan_market_type,
         )
-        status_sql = """
-            snapshot.status = 'validated'
-            AND snapshot.manifest->'activation'->>'contract'
-                = :candidate_activation_contract
-            AND snapshot.manifest->'activation'->>'state' = 'validated'
-            AND lower(btrim(COALESCE(
-                snapshot.manifest->'activation'->>'source_key', ''
-            ))) = :candidate_source_key
-        """
-        candidate_scope_sql = f"""
-            AND EXISTS (
-                SELECT 1
-                  FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope AS candidate_plan_scope
-                 WHERE candidate_plan_scope.snapshot_id = snapshot.snapshot_id
-                   AND candidate_plan_scope.plan_id
-                       = ANY(CAST(:candidate_plan_ids AS text[]))
-                   AND candidate_plan_scope.plan_market_type
-                       = :candidate_plan_market_type
-            )
-        """
-    result = await session.execute(
-        text(
-            f"""
+        query_sql = f"""
             SELECT snapshot.manifest,
                    layout.layout_manifest->'serving_index'->'audit_sample'
                        AS layout_audit_sample,
@@ -446,18 +425,98 @@ async def snapshot_serving_tables(
               JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_scope snapshot_scope
                 ON snapshot_scope.snapshot_id = snapshot.snapshot_id
              WHERE snapshot.snapshot_id = :snapshot_id
-               AND {status_sql}
+               AND snapshot.status = 'validated'
+               AND snapshot.manifest->'activation'->>'contract'
+                   = :candidate_activation_contract
+               AND snapshot.manifest->'activation'->>'state' = 'validated'
+               AND lower(btrim(COALESCE(
+                   snapshot.manifest->'activation'->>'source_key', ''
+               ))) = :candidate_source_key
                AND layout.state = 'sealed'
                AND layout.generation = :storage_generation
-               {candidate_scope_sql}
+               AND EXISTS (
+                   SELECT 1
+                     FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope
+                          AS candidate_plan_scope
+                    WHERE candidate_plan_scope.snapshot_id = snapshot.snapshot_id
+                      AND candidate_plan_scope.plan_id
+                          = ANY(CAST(:candidate_plan_ids AS text[]))
+                      AND candidate_plan_scope.plan_market_type
+                          = :candidate_plan_market_type
+               )
                AND binding.snapshot_key = CASE
-                   WHEN snapshot.manifest->'serving_index'->>'shared_snapshot_key' ~ '^[1-9][0-9]*$'
-                   THEN (snapshot.manifest->'serving_index'->>'shared_snapshot_key')::bigint
+                   WHEN snapshot.manifest->'serving_index'->>'shared_snapshot_key'
+                        ~ '^[1-9][0-9]*$'
+                   THEN (
+                       snapshot.manifest->'serving_index'->>'shared_snapshot_key'
+                   )::bigint
                    ELSE NULL
                END
              LIMIT 1
-            """
-        ),
+        """
+    else:
+        query_params_by_name["attestation_contract"] = (
+            PTG2_CANDIDATE_ATTESTATION_CONTRACT
+        )
+        query_sql = f"""
+            SELECT layout.layout_manifest->'serving_index'
+                       AS layout_serving_index,
+                   binding.snapshot_key AS bound_snapshot_key,
+                   snapshot_scope.plan_id AS snapshot_plan_id,
+                   snapshot_scope.plan_market_type AS snapshot_plan_market_type,
+                   encode(snapshot_scope.coverage_scope_id, 'hex')
+                       AS snapshot_coverage_scope_id,
+                   attestation.source_key AS attested_source_key,
+                   encode(attestation.coverage_scope_id, 'hex')
+                       AS attested_coverage_scope_id,
+                   encode(attestation.source_set_digest, 'hex')
+                       AS attested_source_set_digest,
+                   encode(attestation.audit_sample_digest, 'hex')
+                       AS attested_audit_sample_digest,
+                   source_summary.source_row_count,
+                   source_summary.distinct_source_key_count,
+                   source_summary.minimum_source_key,
+                   source_summary.maximum_source_key,
+                   current_setting('server_version_num')::integer
+                       AS postgres_server_version_num,
+                   current_database() IS NOT NULL AS database_selected,
+                   pg_backend_pid() > 0 AS backend_session_active,
+                   txid_current_snapshot() IS NOT NULL
+                       AS transaction_snapshot_observed
+              FROM {PTG2_SCHEMA}.ptg2_snapshot snapshot
+              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_binding binding
+                ON binding.snapshot_id = snapshot.snapshot_id
+              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_layout layout
+                ON layout.snapshot_key = binding.snapshot_key
+              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_scope snapshot_scope
+                ON snapshot_scope.snapshot_id = snapshot.snapshot_id
+              JOIN {PTG2_SCHEMA}.ptg2_v3_candidate_audit_attestation attestation
+                ON attestation.snapshot_id = snapshot.snapshot_id
+               AND attestation.snapshot_key = binding.snapshot_key
+               AND attestation.coverage_scope_id
+                   = snapshot_scope.coverage_scope_id
+              CROSS JOIN LATERAL (
+                  SELECT COUNT(*)::bigint AS source_row_count,
+                         COUNT(DISTINCT source.source_key)::bigint
+                             AS distinct_source_key_count,
+                         MIN(source.source_key) AS minimum_source_key,
+                         MAX(source.source_key) AS maximum_source_key
+                    FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_source source
+                   WHERE source.snapshot_id = snapshot.snapshot_id
+              ) source_summary
+             WHERE snapshot.snapshot_id = :snapshot_id
+               AND snapshot.status = 'published'
+               AND layout.state = 'sealed'
+               AND layout.generation = :storage_generation
+               AND attestation.contract = :attestation_contract
+               AND attestation.activated_at IS NOT NULL
+               AND attestation.plan_id = snapshot_scope.plan_id
+               AND attestation.plan_market_type
+                   = snapshot_scope.plan_market_type
+             LIMIT 1
+        """
+    result = await session.execute(
+        text(query_sql),
         query_params_by_name,
     )
     row = result.one_or_none()
@@ -466,18 +525,20 @@ async def snapshot_serving_tables(
             "PTG2 snapshot is not published and bound to a sealed shared V3 layout"
         )
     row_fields = row if isinstance(row, dict) else row._mapping
-    value = row_fields.get("manifest")
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise PTG2ManifestArtifactError(
-                "PTG2 snapshot manifest is malformed"
-            ) from exc
-    if not isinstance(value, dict):
-        raise PTG2ManifestArtifactError("PTG2 snapshot manifest is malformed")
-
-    serving_index = value.get("serving_index")
+    if candidate_audit_access is not None:
+        value = row_fields.get("manifest")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 snapshot manifest is malformed"
+                ) from exc
+        if not isinstance(value, dict):
+            raise PTG2ManifestArtifactError("PTG2 snapshot manifest is malformed")
+        serving_index = value.get("serving_index")
+    else:
+        serving_index = row_fields.get("layout_serving_index")
     if isinstance(serving_index, str):
         try:
             serving_index = json.loads(serving_index)
@@ -497,39 +558,113 @@ async def snapshot_serving_tables(
         audit_sample,
     ) = _strict_v3_manifest_fields(serving_index)
     coverage_scope_id = _strict_coverage_scope_id(serving_index)
-    layout_audit_sample = row_fields.get("layout_audit_sample")
-    if isinstance(layout_audit_sample, str):
-        try:
-            layout_audit_sample = json.loads(layout_audit_sample)
-        except json.JSONDecodeError as exc:
-            raise PTG2ManifestArtifactError(
-                "PTG2 sealed layout audit sample is malformed"
-            ) from exc
-    if not isinstance(layout_audit_sample, dict) or layout_audit_sample != audit_sample:
-        raise PTG2ManifestArtifactError(
-            "PTG2 sealed layout audit sample does not match its snapshot manifest"
-        )
-    if str(row_fields.get("layout_coverage_scope_id") or "") != coverage_scope_id:
-        raise PTG2ManifestArtifactError(
-            "PTG2 sealed layout coverage scope does not match its snapshot manifest"
-        )
-    if str(row_fields.get("snapshot_coverage_scope_id") or "") != coverage_scope_id:
-        raise PTG2ManifestArtifactError(
-            "PTG2 snapshot coverage scope binding does not match its manifest"
-        )
     code_count = _optional_integer(serving_index.get("code_count"))
-    layout_code_count = _optional_integer(row_fields.get("layout_code_count"))
-    if code_count is None or code_count < 0 or layout_code_count != code_count:
-        raise PTG2ManifestArtifactError(
-            "PTG2 sealed layout code count does not match its snapshot manifest"
+    source_count = _optional_integer(serving_index.get("source_count"))
+    if candidate_audit_access is not None:
+        layout_audit_sample = row_fields.get("layout_audit_sample")
+        if isinstance(layout_audit_sample, str):
+            try:
+                layout_audit_sample = json.loads(layout_audit_sample)
+            except json.JSONDecodeError as exc:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 sealed layout audit sample is malformed"
+                ) from exc
+        if (
+            not isinstance(layout_audit_sample, dict)
+            or layout_audit_sample != audit_sample
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 sealed layout audit sample does not match its snapshot manifest"
+            )
+        if str(row_fields.get("layout_coverage_scope_id") or "") != coverage_scope_id:
+            raise PTG2ManifestArtifactError(
+                "PTG2 sealed layout coverage scope does not match its snapshot manifest"
+            )
+        if str(row_fields.get("snapshot_coverage_scope_id") or "") != coverage_scope_id:
+            raise PTG2ManifestArtifactError(
+                "PTG2 snapshot coverage scope binding does not match its manifest"
+            )
+        layout_code_count = _optional_integer(row_fields.get("layout_code_count"))
+        if code_count is None or code_count < 0 or layout_code_count != code_count:
+            raise PTG2ManifestArtifactError(
+                "PTG2 sealed layout code count does not match its snapshot manifest"
+            )
+        source_set = _strict_v3_source_set(
+            serving_index,
+            source_count=int(source_count or 0),
         )
+        source_key = str(serving_index.get("source_key") or "").strip() or None
+    else:
+        bound_snapshot_key = _optional_integer(row_fields.get("bound_snapshot_key"))
+        if bound_snapshot_key != shared_snapshot_key:
+            raise PTG2ManifestArtifactError(
+                "PTG2 sealed layout binding does not match its metadata"
+            )
+        if (
+            str(row_fields.get("snapshot_coverage_scope_id") or "")
+            != coverage_scope_id
+            or str(row_fields.get("attested_coverage_scope_id") or "")
+            != coverage_scope_id
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 published scope does not match its sealed layout"
+            )
+        if str(row_fields.get("attested_audit_sample_digest") or "") != str(
+            audit_sample.get("sample_digest") or ""
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 published audit attestation does not match its sealed sample"
+            )
+        source_row_count = _optional_integer(row_fields.get("source_row_count"))
+        distinct_source_key_count = _optional_integer(
+            row_fields.get("distinct_source_key_count")
+        )
+        minimum_source_key = _optional_integer(
+            row_fields.get("minimum_source_key")
+        )
+        maximum_source_key = _optional_integer(
+            row_fields.get("maximum_source_key")
+        )
+        if (
+            source_count is None
+            or source_count <= 0
+            or source_row_count != source_count
+            or distinct_source_key_count != source_count
+            or minimum_source_key != 0
+            or maximum_source_key != source_count - 1
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 published source dictionary is not complete and dense"
+            )
+        source_set_digest = str(
+            row_fields.get("attested_source_set_digest") or ""
+        )
+        if not _COVERAGE_SCOPE_ID_RE.fullmatch(source_set_digest):
+            raise PTG2ManifestArtifactError(
+                "PTG2 published source-set attestation is invalid"
+            )
+        source_set = {
+            "contract": PTG2_V3_SOURCE_SET_CONTRACT,
+            "source_count": source_count,
+            "raw_container_sha256_digest": source_set_digest,
+        }
+        source_key = (
+            str(row_fields.get("attested_source_key") or "").strip() or None
+        )
+        if source_key is None:
+            raise PTG2ManifestArtifactError(
+                "PTG2 published source key is missing from its attestation"
+            )
+        if code_count is None or code_count < 0:
+            raise PTG2ManifestArtifactError(
+                "PTG2 sealed layout code count is invalid"
+            )
     serving_rate_count = _optional_integer(serving_index.get("serving_rates"))
     if code_count == 0 and serving_rate_count is not None and serving_rate_count > 0:
         raise PTG2ManifestArtifactError(
             "PTG2 shared layout is missing code metadata for a non-empty snapshot"
         )
     network_names = serving_index.get("network_names")
-    source_count = _optional_integer(serving_index.get("source_count"))
     return PTG2ServingTables(
         snapshot_id=str(snapshot_id),
         arch_version=PTG2_V3_ARCH_VERSION,
@@ -546,12 +681,9 @@ async def snapshot_serving_tables(
         plan_market_type=(
             str(row_fields.get("snapshot_plan_market_type") or "").strip() or None
         ),
-        source_key=str(serving_index.get("source_key") or "").strip() or None,
+        source_key=source_key,
         audit_sample=audit_sample,
-        source_set=_strict_v3_source_set(
-            serving_index,
-            source_count=int(source_count or 0),
-        ),
+        source_set=source_set,
         database_evidence=_database_execution_evidence(row_fields),
         source_trace_set_hash=str(
             serving_index.get("source_trace_set_hash") or ""

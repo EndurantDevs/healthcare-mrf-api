@@ -365,6 +365,55 @@ def test_candidate_no_match_is_reported_as_missing_source_witness():
 
 
 @pytest.mark.asyncio
+async def test_http_latency_excludes_time_waiting_for_concurrency_slot(monkeypatch):
+    events: list[str] = []
+    clock_values = iter((10.0, 10.025))
+
+    class Semaphore:
+        async def __aenter__(self):
+            events.append("slot-acquired")
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Client:
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    def perf_counter():
+        events.append("clock-read")
+        return next(clock_values)
+
+    async def response_body(_response):
+        return b"{}"
+
+    monkeypatch.setattr(audit.time, "perf_counter", perf_counter)
+    monkeypatch.setattr(audit, "_bounded_response_body", response_body)
+    metrics = audit.FastAuditHttpMetrics()
+
+    response = await audit._request_json(
+        Client(),
+        Semaphore(),
+        metrics,
+        "/test",
+        {},
+    )
+
+    assert response == {}
+    assert events[:2] == ["slot-acquired", "clock-read"]
+    assert metrics.latencies_ms == pytest.approx([25.0])
+
+
+@pytest.mark.asyncio
 async def test_source_challenge_uses_candidate_api_with_exact_filters(
     unused_tcp_port,
 ):
