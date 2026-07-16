@@ -193,8 +193,12 @@ def test_extract_product_ndcs_from_lookup_payload():
 
 @pytest.mark.asyncio
 async def test_snapshot_crosswalk_uses_durable_stage_tables(monkeypatch):
-    monkeypatch.setattr(drug_claims, "_table_exists", AsyncMock(return_value=True))
-    monkeypatch.setattr(drug_claims, "_column_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        drug_claims, "_is_table_present", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(
+        drug_claims, "_is_column_present", AsyncMock(return_value=True)
+    )
     monkeypatch.setattr(drug_claims.secrets, "token_hex", lambda _: "abc123")
 
     statements: list[str] = []
@@ -233,11 +237,15 @@ async def test_snapshot_crosswalk_uses_durable_stage_tables(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_snapshot_crosswalk_falls_back_to_scalar_rxnorm_column(monkeypatch):
-    monkeypatch.setattr(drug_claims, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        drug_claims, "_is_table_present", AsyncMock(return_value=True)
+    )
     monkeypatch.setattr(drug_claims.secrets, "token_hex", lambda _: "abc123")
 
-    async def _fake_column_exists(schema: str, table: str, column: str) -> bool:
-        mapping = {
+    async def _is_fake_column_present(
+        schema_name: str, table_name: str, column_name: str
+    ) -> bool:
+        presence_by_column = {
             ("rx_data", "product", "rxnorm_ids"): False,
             ("rx_data", "product", "rxnorm_id"): True,
             ("rx_data", "product", "rxnorm"): False,
@@ -246,9 +254,13 @@ async def test_snapshot_crosswalk_falls_back_to_scalar_rxnorm_column(monkeypatch
             ("rx_data", "package", "ndc11"): True,
             ("rx_data", "package", "package_ndc"): True,
         }
-        return mapping.get((schema, table, column), False)
+        return presence_by_column.get(
+            (schema_name, table_name, column_name), False
+        )
 
-    monkeypatch.setattr(drug_claims, "_column_exists", _fake_column_exists)
+    monkeypatch.setattr(
+        drug_claims, "_is_column_present", _is_fake_column_present
+    )
 
     statements: list[str] = []
 

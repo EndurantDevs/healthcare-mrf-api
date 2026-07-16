@@ -77,7 +77,7 @@ ROW_PROGRESS_INTERVAL_SECONDS = max(float(os.getenv("HLTHPRT_DRUG_CLAIMS_ROW_PRO
 DRUG_CLAIMS_USE_PROXY = os.getenv("HLTHPRT_DRUG_CLAIMS_USE_PROXY", os.getenv("HLTHPRT_CLAIMS_USE_PROXY", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
+def _is_env_enabled(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -91,10 +91,16 @@ DRUG_CLAIMS_CHUNK_TARGET_BYTES = DRUG_CLAIMS_CHUNK_TARGET_MB * 1024 * 1024
 DRUG_CLAIMS_FINISH_RETRY_SECONDS = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_FINISH_RETRY_SECONDS", os.getenv("HLTHPRT_CLAIMS_FINISH_RETRY_SECONDS", "15"))), 1)
 DRUG_CLAIMS_REDIS_TTL_SECONDS = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_REDIS_TTL_SECONDS", os.getenv("HLTHPRT_CLAIMS_REDIS_TTL_SECONDS", "172800"))), 3600)
 DRUG_CLAIMS_WORKDIR = os.getenv("HLTHPRT_DRUG_CLAIMS_WORKDIR", os.getenv("HLTHPRT_CLAIMS_WORKDIR", "/tmp/healthporta_claims"))
-DRUG_CLAIMS_KEEP_WORKDIR = _env_bool("HLTHPRT_DRUG_CLAIMS_KEEP_WORKDIR", default=_env_bool("HLTHPRT_CLAIMS_KEEP_WORKDIR", default=False))
+DRUG_CLAIMS_KEEP_WORKDIR = _is_env_enabled(
+    "HLTHPRT_DRUG_CLAIMS_KEEP_WORKDIR",
+    default=_is_env_enabled("HLTHPRT_CLAIMS_KEEP_WORKDIR", default=False),
+)
 DRUG_CLAIMS_DOWNLOAD_CONCURRENCY = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_DOWNLOAD_CONCURRENCY", os.getenv("HLTHPRT_CLAIMS_DOWNLOAD_CONCURRENCY", "3"))), 1)
-DRUG_CLAIMS_PREFER_STREAM_DOWNLOAD = _env_bool("HLTHPRT_DRUG_CLAIMS_PREFER_STREAM_DOWNLOAD", default=True)
-DRUG_CLAIMS_DEFER_STAGE_INDEXES = _env_bool("HLTHPRT_DRUG_CLAIMS_DEFER_STAGE_INDEXES", default=_env_bool("HLTHPRT_CLAIMS_DEFER_STAGE_INDEXES", default=True))
+DRUG_CLAIMS_PREFER_STREAM_DOWNLOAD = _is_env_enabled("HLTHPRT_DRUG_CLAIMS_PREFER_STREAM_DOWNLOAD", default=True)
+DRUG_CLAIMS_DEFER_STAGE_INDEXES = _is_env_enabled(
+    "HLTHPRT_DRUG_CLAIMS_DEFER_STAGE_INDEXES",
+    default=_is_env_enabled("HLTHPRT_CLAIMS_DEFER_STAGE_INDEXES", default=True),
+)
 DRUG_CLAIMS_DB_DEADLOCK_RETRIES = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_DB_DEADLOCK_RETRIES", os.getenv("HLTHPRT_CLAIMS_DB_DEADLOCK_RETRIES", "6"))), 1)
 DRUG_CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS = max(
     float(os.getenv("HLTHPRT_DRUG_CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS", os.getenv("HLTHPRT_CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS", "0.25"))),
@@ -151,7 +157,7 @@ RX_CROSSWALK_SOURCE = str(os.getenv("HLTHPRT_RX_CROSSWALK_SOURCE", "hybrid")).st
 if RX_CROSSWALK_SOURCE not in {"hybrid", "snapshot", "live"}:
     logger.warning("Unsupported HLTHPRT_RX_CROSSWALK_SOURCE=%r; falling back to 'hybrid'", RX_CROSSWALK_SOURCE)
     RX_CROSSWALK_SOURCE = "hybrid"
-RX_CROSSWALK_LIVE_FALLBACK = _env_bool("HLTHPRT_RX_CROSSWALK_LIVE_FALLBACK", default=True)
+RX_CROSSWALK_LIVE_FALLBACK = _is_env_enabled("HLTHPRT_RX_CROSSWALK_LIVE_FALLBACK", default=True)
 RX_CROSSWALK_CONFIDENCE_MIN = max(
     min(float(os.getenv("HLTHPRT_RX_CROSSWALK_CONFIDENCE_MIN", "0.85")), 1.0),
     0.0,
@@ -322,7 +328,7 @@ async def _get_run_progress(redis, run_id: str, expected_default: int) -> tuple[
     return total_chunks, done_chunks
 
 
-async def _claim_finalize_lock(redis, run_id: str) -> bool:
+async def _has_claimed_finalize_lock(redis, run_id: str) -> bool:
     lock_key = _state_key(run_id, "finalize_lock")
     lock_set = await redis.set(lock_key, "1", ex=DRUG_CLAIMS_REDIS_TTL_SECONDS, nx=True)
     return bool(lock_set)
@@ -363,10 +369,10 @@ def _is_deadlock_error(exc: BaseException) -> bool:
 def _dedupe_rows(rows: list[dict[str, Any]], key_fields: tuple[str, ...]) -> list[dict[str, Any]]:
     if not rows:
         return rows
-    deduped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    deduped_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
     for row in rows:
-        deduped[tuple(row.get(field) for field in key_fields)] = row
-    return list(deduped.values())
+        deduped_by_key[tuple(row.get(field) for field in key_fields)] = row
+    return list(deduped_by_key.values())
 
 
 def _chunk_rows(rows: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
@@ -460,21 +466,21 @@ def _csv_distributions(dataset: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _select_csv_distributions_by_year(dataset: dict[str, Any], years: set[int]) -> dict[int, dict[str, Any]]:
-    selected: dict[int, dict[str, Any]] = {}
+    selected_by_year: dict[int, dict[str, Any]] = {}
     for distribution in _csv_distributions(dataset):
         url = str(distribution.get("downloadURL") or "")
         year = _extract_reporting_year(url)
         if year not in years:
             continue
-        previous = selected.get(year)
+        previous = selected_by_year.get(year)
         if previous is None:
-            selected[year] = distribution
+            selected_by_year[year] = distribution
             continue
         previous_key = (_parse_modified(previous), str(previous.get("downloadURL") or ""))
         candidate_key = (_parse_modified(distribution), url)
         if candidate_key > previous_key:
-            selected[year] = distribution
-    return selected
+            selected_by_year[year] = distribution
+    return selected_by_year
 
 
 def _find_dataset(catalog: dict[str, Any], landing_page: str) -> dict[str, Any]:
@@ -531,7 +537,7 @@ def _provider_name(last_org_name: str | None, first_name: str | None) -> str | N
     return last_org_name or first_name
 
 
-def _row_allowed_for_test(row_number: int) -> bool:
+def _is_row_allowed_for_test(row_number: int) -> bool:
     return row_number % 11 == 0
 
 
@@ -607,7 +613,7 @@ def _extract_product_ndcs(payload: Any) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
-async def _table_exists(schema: str, table: str) -> bool:
+async def _is_table_present(schema: str, table: str) -> bool:
     value = await db.scalar(
         "SELECT to_regclass(:qualified_name) IS NOT NULL;",
         qualified_name=f"{schema}.{table}",
@@ -615,7 +621,7 @@ async def _table_exists(schema: str, table: str) -> bool:
     return bool(value)
 
 
-async def _column_exists(schema: str, table: str, column: str) -> bool:
+async def _is_column_present(schema: str, table: str, column: str) -> bool:
     value = await db.scalar(
         """
         SELECT EXISTS (
@@ -666,21 +672,21 @@ async def _ensure_indexes(obj: type, db_schema: str) -> None:
 async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str, type], str]:
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
-    dynamic: dict[str, type] = {}
+    classes_by_name: dict[str, type] = {}
 
     for cls in (
         PricingPrescription,
         PricingProviderPrescription,
     ):
         obj = make_class(cls, stage_suffix, schema_override=db_schema)
-        dynamic[cls.__name__] = obj
+        classes_by_name[cls.__name__] = obj
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__tablename__};")
         await db.status(f"DROP TYPE IF EXISTS {db_schema}.{obj.__tablename__} CASCADE;")
         await db.create_table(obj.__table__, checkfirst=True)
         if not DRUG_CLAIMS_DEFER_STAGE_INDEXES:
             await _ensure_indexes(obj, db_schema)
 
-    return dynamic, db_schema
+    return classes_by_name, db_schema
 
 
 async def _build_staging_indexes(classes: dict[str, type], schema: str) -> None:
@@ -723,7 +729,7 @@ async def _fetch_catalog() -> dict[str, Any]:
 
 
 def _resolve_sources(catalog: dict[str, Any], test_mode: bool = False) -> dict[str, list[dict[str, Any]]]:
-    resolved: dict[str, list[dict[str, Any]]] = {}
+    sources_by_dataset: dict[str, list[dict[str, Any]]] = {}
     requested_years = set(DRUG_CLAIMS_YEAR_WINDOW)
     for config in DATASETS:
         dataset = _find_dataset(catalog, config.landing_page)
@@ -752,36 +758,40 @@ def _resolve_sources(catalog: dict[str, Any], test_mode: bool = False) -> dict[s
                     "dataset_title": dataset.get("title"),
                 }
             )
-        resolved[config.key] = per_dataset_sources
-    return resolved
+        sources_by_dataset[config.key] = per_dataset_sources
+    return sources_by_dataset
 
 
 async def _download_csv_head(url: str, path: str, max_bytes: int) -> None:
     client = await get_http_client(use_proxy=DRUG_CLAIMS_USE_PROXY)
-    downloaded = 0
     async with client:
         async with client.get(
             url,
             timeout=aiohttp.ClientTimeout(total=600, connect=60, sock_read=600),
         ) as response:
             response.raise_for_status()
-            async with async_open(path, "wb+") as afp:
-                async for chunk in response.content.iter_chunked(1024 * 1024):
-                    if not chunk:
-                        break
-                    remaining = max_bytes - downloaded
-                    if remaining <= 0:
-                        break
-                    data = chunk if len(chunk) <= remaining else chunk[:remaining]
-                    await afp.write(data)
-                    downloaded += len(data)
-                    if downloaded >= max_bytes:
-                        break
+            await _write_response_head(response, path, max_bytes)
+
+
+async def _write_response_head(response: Any, path: str, max_bytes: int) -> None:
+    downloaded_bytes = 0
+    async with async_open(path, "wb+") as output_file:
+        async for response_chunk in response.content.iter_chunked(1024 * 1024):
+            if not response_chunk:
+                break
+            remaining_bytes = max_bytes - downloaded_bytes
+            if remaining_bytes <= 0:
+                break
+            chunk_head = response_chunk[:remaining_bytes]
+            await output_file.write(chunk_head)
+            downloaded_bytes += len(chunk_head)
+            if downloaded_bytes >= max_bytes:
+                break
 
 
 async def _download_source_file(
     dataset_key: str,
-    source: dict[str, Any],
+    source_descriptor: dict[str, Any],
     temp_dir: str,
     test_mode: bool,
     reporting_year: int | None = None,
@@ -798,10 +808,10 @@ async def _download_source_file(
     for attempt in range(1, DOWNLOAD_RETRIES + 1):
         try:
             if test_mode:
-                await _download_csv_head(source["url"], path, TEST_MAX_DOWNLOAD_BYTES)
+                await _download_csv_head(source_descriptor["url"], path, TEST_MAX_DOWNLOAD_BYTES)
             else:
                 await download_it_and_save(
-                    source["url"],
+                    source_descriptor["url"],
                     path,
                     prefer_stream=DRUG_CLAIMS_PREFER_STREAM_DOWNLOAD,
                 )
@@ -813,7 +823,7 @@ async def _download_source_file(
                 "Retrying download (%s/%s) for %s due to %r",
                 attempt,
                 DOWNLOAD_RETRIES,
-                source["url"],
+                source_descriptor["url"],
                 exc,
             )
             await asyncio.sleep(min(5 * attempt, 20))
@@ -824,12 +834,18 @@ async def _download_source_file(
                 "Retrying download (%s/%s) for %s due to %r",
                 attempt,
                 DOWNLOAD_RETRIES,
-                source["url"],
+                source_descriptor["url"],
                 exc,
             )
             await asyncio.sleep(min(5 * attempt, 20))
 
     raise RuntimeError(f"Failed to download dataset: {dataset_key}")
+
+
+def _provider_drug_bucket_count(source_path: str) -> int:
+    total_size = max(Path(source_path).stat().st_size, 1)
+    estimated_chunk_count = max(1, int(math.ceil(total_size / max(DRUG_CLAIMS_CHUNK_TARGET_BYTES, 1))))
+    return max(1, min(estimated_chunk_count, DRUG_CLAIMS_PROVIDER_DRUG_MAX_BUCKETS))
 
 
 async def _split_provider_drug_into_chunks(
@@ -840,53 +856,50 @@ async def _split_provider_drug_into_chunks(
     """Partition provider-drug rows by NPI for parallel loading."""
 
     chunks_dir.mkdir(parents=True, exist_ok=True)
-    total_size = max(Path(source_path).stat().st_size, 1)
-    est_chunks = max(1, int(math.ceil(total_size / max(DRUG_CLAIMS_CHUNK_TARGET_BYTES, 1))))
-    bucket_count = max(1, min(est_chunks, DRUG_CLAIMS_PROVIDER_DRUG_MAX_BUCKETS))
+    bucket_count = _provider_drug_bucket_count(source_path)
     row_limit = TEST_PROVIDER_DRUG_ROW_LIMIT if test_mode else None
 
-    writers: dict[int, Any] = {}
-    handles: dict[int, Any] = {}
-    rows_per_bucket: dict[int, int] = {idx: 0 for idx in range(bucket_count)}
+    writers_by_bucket: dict[int, Any] = {}
+    handles_by_bucket: dict[int, Any] = {}
+    row_count_by_bucket: dict[int, int] = {idx: 0 for idx in range(bucket_count)}
     parsed_rows = 0
     accepted_rows = 0
 
     try:
         async with async_open(source_path, "r", encoding="utf-8-sig") as source_handle:
             reader = AsyncDictReader(source_handle)
-            async for row in reader:
+            async for claim_row in reader:
                 parsed_rows += 1
-                if test_mode:
-                    if not _row_allowed_for_test(parsed_rows):
-                        continue
-                    if row_limit is not None and accepted_rows >= row_limit:
-                        break
+                if test_mode and not _is_row_allowed_for_test(parsed_rows):
+                    continue
+                if row_limit is not None and accepted_rows >= row_limit:
+                    break
 
-                npi = _to_npi(_row_value(row, "Rndrng_NPI", "PRSCRBR_NPI", "Prscrbr_NPI"))
+                npi = _to_npi(_row_value(claim_row, "Rndrng_NPI", "PRSCRBR_NPI", "Prscrbr_NPI"))
                 if npi is None:
                     continue
                 bucket = abs(int(npi)) % bucket_count
 
-                if bucket not in writers:
+                if bucket not in writers_by_bucket:
                     chunk_path = chunks_dir / f"chunk_{bucket:05d}.csv"
                     handle = open(chunk_path, "w", encoding="utf-8", newline="")
-                    fieldnames = [key for key in row.keys() if key is not None]
+                    fieldnames = [key for key in claim_row.keys() if key is not None]
                     writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
                     writer.writeheader()
-                    handles[bucket] = handle
-                    writers[bucket] = writer
+                    handles_by_bucket[bucket] = handle
+                    writers_by_bucket[bucket] = writer
 
-                writers[bucket].writerow(row)
-                rows_per_bucket[bucket] += 1
+                writers_by_bucket[bucket].writerow(claim_row)
+                row_count_by_bucket[bucket] += 1
                 accepted_rows += 1
     finally:
-        for handle in handles.values():
+        for handle in handles_by_bucket.values():
             handle.close()
 
     chunks: list[dict[str, Any]] = []
     chunk_index = 0
     for bucket in range(bucket_count):
-        rows_in_bucket = rows_per_bucket.get(bucket, 0)
+        rows_in_bucket = row_count_by_bucket.get(bucket, 0)
         if rows_in_bucket <= 0:
             continue
         chunk_path = chunks_dir / f"chunk_{bucket:05d}.csv"
@@ -918,6 +931,14 @@ async def _split_provider_drug_into_chunks(
     return chunks
 
 
+def _open_binary_chunk(chunks_dir: Path, chunk_index: int, header_line: bytes | None) -> tuple[Any, Path, int]:
+    chunk_path = chunks_dir / f"chunk_{chunk_index:05d}.csv"
+    chunk_handle = open(chunk_path, "wb")
+    header_bytes = header_line or b""
+    chunk_handle.write(header_bytes)
+    return chunk_handle, chunk_path, len(header_bytes)
+
+
 async def _split_source_into_chunks(
     dataset_key: str,
     source_path: str,
@@ -942,15 +963,6 @@ async def _split_source_into_chunks(
     chunk_path: Path | None = None
     row_limit = dataset_config.row_limit_test if test_mode else None
 
-    def _open_chunk() -> tuple[Any, Path]:
-        nonlocal chunk_index, current_size
-        chunk_path_local = chunks_dir / f"chunk_{chunk_index:05d}.csv"
-        chunk_index += 1
-        handle = open(chunk_path_local, "wb")
-        handle.write(header_line or b"")
-        current_size = len(header_line or b"")
-        return handle, chunk_path_local
-
     try:
         async with async_open(source_path, "rb") as source_handle:
             async for line in source_handle:
@@ -958,14 +970,18 @@ async def _split_source_into_chunks(
                     header_line = line
                     continue
                 parsed_rows += 1
-                if test_mode:
-                    if not _row_allowed_for_test(parsed_rows):
-                        continue
-                    if row_limit is not None and accepted_rows >= row_limit:
-                        break
+                if test_mode and not _is_row_allowed_for_test(parsed_rows):
+                    continue
+                if row_limit is not None and accepted_rows >= row_limit:
+                    break
 
                 if chunk_handle is None:
-                    chunk_handle, chunk_path = _open_chunk()
+                    chunk_handle, chunk_path, current_size = _open_binary_chunk(
+                        chunks_dir,
+                        chunk_index,
+                        header_line,
+                    )
+                    chunk_index += 1
 
                 chunk_handle.write(line)
                 current_size += len(line)
@@ -1025,21 +1041,21 @@ async def _load_provider_drug_rows(
     async with async_open(path, "r", encoding="utf-8-sig") as handle:
         reader = AsyncDictReader(handle)
         row_number = 0
-        async for row in reader:
+        async for claim_row in reader:
             row_number += 1
             now = time.monotonic()
             if now - progress_last >= ROW_PROGRESS_INTERVAL_SECONDS:
                 _print_row_progress("provider_drug", row_number, accepted, progress_start)
                 progress_last = now
 
-            npi = _to_npi(_row_value(row, "Rndrng_NPI", "PRSCRBR_NPI", "Prscrbr_NPI"))
+            npi = _to_npi(_row_value(claim_row, "Rndrng_NPI", "PRSCRBR_NPI", "Prscrbr_NPI"))
             if npi is None:
                 continue
-            if test_mode and not _row_allowed_for_test(row_number):
+            if test_mode and not _is_row_allowed_for_test(row_number):
                 continue
 
-            generic_name = _to_str(_row_value(row, "Gnrc_Name", "GNRC_NAME", "generic_name"))
-            brand_name = _to_str(_row_value(row, "Brnd_Name", "BRND_NAME", "brand_name"))
+            generic_name = _to_str(_row_value(claim_row, "Gnrc_Name", "GNRC_NAME", "generic_name"))
+            brand_name = _to_str(_row_value(claim_row, "Brnd_Name", "BRND_NAME", "brand_name"))
             rx_name = generic_name or brand_name
             if not rx_name:
                 continue
@@ -1047,7 +1063,7 @@ async def _load_provider_drug_rows(
             rx_code = _rx_code_from_names(generic_name, brand_name)
             key = (npi, year, RX_INTERNAL_CODE_SYSTEM, rx_code)
 
-            row_payload = {
+            prescription_values_by_field = {
                 "npi": npi,
                 "year": year,
                 "rx_code_system": RX_INTERNAL_CODE_SYSTEM,
@@ -1056,29 +1072,29 @@ async def _load_provider_drug_rows(
                 "generic_name": generic_name,
                 "brand_name": brand_name,
                 "provider_name": _provider_name(
-                    _to_str(_row_value(row, "Rndrng_Prvdr_Last_Org_Name", "Prscrbr_Last_Org_Name")),
-                    _to_str(_row_value(row, "Rndrng_Prvdr_First_Name", "Prscrbr_First_Name")),
+                    _to_str(_row_value(claim_row, "Rndrng_Prvdr_Last_Org_Name", "Prscrbr_Last_Org_Name")),
+                    _to_str(_row_value(claim_row, "Rndrng_Prvdr_First_Name", "Prscrbr_First_Name")),
                 ),
-                "provider_type": _to_str(_row_value(row, "Rndrng_Prvdr_Type", "Prscrbr_Type")),
-                "city": _to_str(_row_value(row, "Rndrng_Prvdr_City", "Prscrbr_City")),
-                "state": _to_str(_row_value(row, "Rndrng_Prvdr_State_Abrvtn", "Prscrbr_State_Abrvtn")),
-                "zip5": _to_str(_row_value(row, "Rndrng_Prvdr_Zip5", "Prscrbr_Zip5", "Prscrbr_zip5")),
-                "country": _to_str(_row_value(row, "Rndrng_Prvdr_Cntry", "Prscrbr_Cntry")) or "US",
-                "total_claims": _to_float(_row_value(row, "Tot_Clms", "TOT_CLAIMS")),
-                "total_30day_fills": _to_float(_row_value(row, "Tot_30day_Fills", "TOT_30DAY_FILLS")),
-                "total_day_supply": _to_float(_row_value(row, "Tot_Day_Suply", "TOT_DAY_SUPLY", "Tot_Day_Supply")),
-                "total_drug_cost": _to_float(_row_value(row, "Tot_Drug_Cst", "TOT_DRUG_CST", "Tot_Drug_Cost")),
-                "total_benes": _to_float(_row_value(row, "Tot_Benes", "TOT_BENES")),
-                "ge65_total_claims": _to_float(_row_value(row, "GE65_Tot_Clms", "GE65_TOT_CLAIMS")),
-                "ge65_total_30day_fills": _to_float(_row_value(row, "GE65_Tot_30day_Fills", "GE65_TOT_30DAY_FILLS")),
-                "ge65_total_day_supply": _to_float(_row_value(row, "GE65_Tot_Day_Suply", "GE65_TOT_DAY_SUPLY")),
-                "ge65_total_drug_cost": _to_float(_row_value(row, "GE65_Tot_Drug_Cst", "GE65_TOT_DRUG_CST")),
-                "ge65_total_benes": _to_float(_row_value(row, "GE65_Tot_Benes", "GE65_TOT_BENES")),
+                "provider_type": _to_str(_row_value(claim_row, "Rndrng_Prvdr_Type", "Prscrbr_Type")),
+                "city": _to_str(_row_value(claim_row, "Rndrng_Prvdr_City", "Prscrbr_City")),
+                "state": _to_str(_row_value(claim_row, "Rndrng_Prvdr_State_Abrvtn", "Prscrbr_State_Abrvtn")),
+                "zip5": _to_str(_row_value(claim_row, "Rndrng_Prvdr_Zip5", "Prscrbr_Zip5", "Prscrbr_zip5")),
+                "country": _to_str(_row_value(claim_row, "Rndrng_Prvdr_Cntry", "Prscrbr_Cntry")) or "US",
+                "total_claims": _to_float(_row_value(claim_row, "Tot_Clms", "TOT_CLAIMS")),
+                "total_30day_fills": _to_float(_row_value(claim_row, "Tot_30day_Fills", "TOT_30DAY_FILLS")),
+                "total_day_supply": _to_float(_row_value(claim_row, "Tot_Day_Suply", "TOT_DAY_SUPLY", "Tot_Day_Supply")),
+                "total_drug_cost": _to_float(_row_value(claim_row, "Tot_Drug_Cst", "TOT_DRUG_CST", "Tot_Drug_Cost")),
+                "total_benes": _to_float(_row_value(claim_row, "Tot_Benes", "TOT_BENES")),
+                "ge65_total_claims": _to_float(_row_value(claim_row, "GE65_Tot_Clms", "GE65_TOT_CLAIMS")),
+                "ge65_total_30day_fills": _to_float(_row_value(claim_row, "GE65_Tot_30day_Fills", "GE65_TOT_30DAY_FILLS")),
+                "ge65_total_day_supply": _to_float(_row_value(claim_row, "GE65_Tot_Day_Suply", "GE65_TOT_DAY_SUPLY")),
+                "ge65_total_drug_cost": _to_float(_row_value(claim_row, "GE65_Tot_Drug_Cst", "GE65_TOT_DRUG_CST")),
+                "ge65_total_benes": _to_float(_row_value(claim_row, "GE65_Tot_Benes", "GE65_TOT_BENES")),
             }
 
             existing = provider_rx_map.get(key)
             if existing is None:
-                provider_rx_map[key] = row_payload
+                provider_rx_map[key] = prescription_values_by_field
             else:
                 for metric_key in (
                     "total_claims",
@@ -1092,22 +1108,27 @@ async def _load_provider_drug_rows(
                     "ge65_total_drug_cost",
                     "ge65_total_benes",
                 ):
-                    existing[metric_key] = _sum_optional(existing.get(metric_key), row_payload.get(metric_key))
-                if not existing.get("rx_name") and row_payload.get("rx_name"):
-                    existing["rx_name"] = row_payload["rx_name"]
-                if not existing.get("generic_name") and row_payload.get("generic_name"):
-                    existing["generic_name"] = row_payload["generic_name"]
-                if not existing.get("brand_name") and row_payload.get("brand_name"):
-                    existing["brand_name"] = row_payload["brand_name"]
+                    existing[metric_key] = _sum_optional(
+                        existing.get(metric_key),
+                        prescription_values_by_field.get(metric_key),
+                    )
+                if not existing.get("rx_name") and prescription_values_by_field.get("rx_name"):
+                    existing["rx_name"] = prescription_values_by_field["rx_name"]
+                if not existing.get("generic_name") and prescription_values_by_field.get("generic_name"):
+                    existing["generic_name"] = prescription_values_by_field["generic_name"]
+                if not existing.get("brand_name") and prescription_values_by_field.get("brand_name"):
+                    existing["brand_name"] = prescription_values_by_field["brand_name"]
 
             accepted += 1
             if test_mode and accepted >= TEST_PROVIDER_DRUG_ROW_LIMIT:
                 break
 
     if provider_rx_map:
-        rows = list(provider_rx_map.values())
-        rows.sort(key=lambda item: (item.get("npi"), item.get("year"), item.get("rx_code_system"), item.get("rx_code")))
-        for batch in _chunk_rows(rows, IMPORT_BATCH_SIZE):
+        provider_prescriptions = list(provider_rx_map.values())
+        provider_prescriptions.sort(
+            key=lambda item: (item.get("npi"), item.get("year"), item.get("rx_code_system"), item.get("rx_code"))
+        )
+        for batch in _chunk_rows(provider_prescriptions, IMPORT_BATCH_SIZE):
             await _push_objects_with_retry(batch, provider_prescription_cls)
     _print_row_progress("provider_drug", row_number, accepted, progress_start, final=True)
 
@@ -1128,49 +1149,52 @@ async def _load_drug_spending_rows(
     async with async_open(path, "r", encoding="utf-8-sig") as handle:
         reader = AsyncDictReader(handle)
         row_number = 0
-        async for row in reader:
+        async for spending_row in reader:
             row_number += 1
             now = time.monotonic()
             if now - progress_last >= ROW_PROGRESS_INTERVAL_SECONDS:
                 _print_row_progress("drug_spending", row_number, accepted, progress_start)
                 progress_last = now
-            if test_mode and not _row_allowed_for_test(row_number):
+            if test_mode and not _is_row_allowed_for_test(row_number):
                 continue
 
-            generic_name = _to_str(_row_value(row, "Gnrc_Name", "GNRC_NAME", "generic_name"))
-            brand_name = _to_str(_row_value(row, "Brnd_Name", "BRND_NAME", "brand_name"))
+            generic_name = _to_str(_row_value(spending_row, "Gnrc_Name", "GNRC_NAME", "generic_name"))
+            brand_name = _to_str(_row_value(spending_row, "Brnd_Name", "BRND_NAME", "brand_name"))
             rx_name = generic_name or brand_name
             if not rx_name:
                 continue
 
             rx_code = _rx_code_from_names(generic_name, brand_name)
             key = (RX_INTERNAL_CODE_SYSTEM, rx_code)
-            row_payload = {
+            prescription_values_by_field = {
                 "rx_code_system": RX_INTERNAL_CODE_SYSTEM,
                 "rx_code": rx_code,
                 "rx_name": rx_name,
                 "generic_name": generic_name,
                 "brand_name": brand_name,
-                "total_claims": _to_float(_row_value(row, "Tot_Clms", "TOT_CLAIMS", "Tot_Rx")),
-                "total_30day_fills": _to_float(_row_value(row, "Tot_30day_Fills", "TOT_30DAY_FILLS")),
-                "total_day_supply": _to_float(_row_value(row, "Tot_Day_Suply", "TOT_DAY_SUPLY", "Tot_Day_Supply")),
-                "total_drug_cost": _to_float(_row_value(row, "Tot_Drug_Cst", "TOT_DRUG_CST", "Tot_Spndng", "TOT_SPNDG")),
-                "total_benes": _to_float(_row_value(row, "Tot_Benes", "TOT_BENES", "Bene_Cnt", "BENE_CNT")),
+                "total_claims": _to_float(_row_value(spending_row, "Tot_Clms", "TOT_CLAIMS", "Tot_Rx")),
+                "total_30day_fills": _to_float(_row_value(spending_row, "Tot_30day_Fills", "TOT_30DAY_FILLS")),
+                "total_day_supply": _to_float(_row_value(spending_row, "Tot_Day_Suply", "TOT_DAY_SUPLY", "Tot_Day_Supply")),
+                "total_drug_cost": _to_float(_row_value(spending_row, "Tot_Drug_Cst", "TOT_DRUG_CST", "Tot_Spndng", "TOT_SPNDG")),
+                "total_benes": _to_float(_row_value(spending_row, "Tot_Benes", "TOT_BENES", "Bene_Cnt", "BENE_CNT")),
                 "source_year": year,
             }
 
             existing = prescription_map.get(key)
             if existing is None:
-                prescription_map[key] = row_payload
+                prescription_map[key] = prescription_values_by_field
             else:
                 for metric_key in ("total_claims", "total_30day_fills", "total_day_supply", "total_drug_cost", "total_benes"):
-                    existing[metric_key] = _sum_optional(existing.get(metric_key), row_payload.get(metric_key))
-                if not existing.get("rx_name") and row_payload.get("rx_name"):
-                    existing["rx_name"] = row_payload["rx_name"]
-                if not existing.get("generic_name") and row_payload.get("generic_name"):
-                    existing["generic_name"] = row_payload["generic_name"]
-                if not existing.get("brand_name") and row_payload.get("brand_name"):
-                    existing["brand_name"] = row_payload["brand_name"]
+                    existing[metric_key] = _sum_optional(
+                        existing.get(metric_key),
+                        prescription_values_by_field.get(metric_key),
+                    )
+                if not existing.get("rx_name") and prescription_values_by_field.get("rx_name"):
+                    existing["rx_name"] = prescription_values_by_field["rx_name"]
+                if not existing.get("generic_name") and prescription_values_by_field.get("generic_name"):
+                    existing["generic_name"] = prescription_values_by_field["generic_name"]
+                if not existing.get("brand_name") and prescription_values_by_field.get("brand_name"):
+                    existing["brand_name"] = prescription_values_by_field["brand_name"]
                 existing["source_year"] = max(_safe_int(existing.get("source_year"), year), year)
 
             accepted += 1
@@ -1178,9 +1202,9 @@ async def _load_drug_spending_rows(
                 break
 
     if prescription_map:
-        rows = list(prescription_map.values())
-        rows.sort(key=lambda item: (item.get("rx_code_system"), item.get("rx_code")))
-        for batch in _chunk_rows(rows, IMPORT_BATCH_SIZE):
+        prescriptions = list(prescription_map.values())
+        prescriptions.sort(key=lambda item: (item.get("rx_code_system"), item.get("rx_code")))
+        for batch in _chunk_rows(prescriptions, IMPORT_BATCH_SIZE):
             await _push_objects_with_retry(batch, prescription_cls, rewrite=True, use_copy=False)
     _print_row_progress("drug_spending", row_number, accepted, progress_start, final=True)
 
@@ -1316,7 +1340,7 @@ async def _enrich_external_rx_crosswalk(
     if source_mode not in {"hybrid", "snapshot", "live"}:
         source_mode = "hybrid"
 
-    summary: dict[str, Any] = {
+    enrichment_summary_by_source: dict[str, Any] = {
         "source_mode": source_mode,
         "snapshot": {"mapped_codes": 0, "edges": 0},
         "live": {"attempted": 0, "mapped_codes": 0, "edges": 0},
@@ -1326,35 +1350,35 @@ async def _enrich_external_rx_crosswalk(
     should_run_live = source_mode == "live" or (source_mode == "hybrid" and RX_CROSSWALK_LIVE_FALLBACK)
 
     if should_run_snapshot:
-        t = _step_start("enrich rx crosswalk (snapshot)")
+        snapshot_started_at = _step_start("enrich rx crosswalk (snapshot)")
         snapshot_result = await _enrich_rx_crosswalk_from_snapshot(
             schema=schema,
             prescription_table=prescription_table,
             code_catalog_table=code_catalog_table,
             code_crosswalk_table=code_crosswalk_table,
         )
-        summary["snapshot"] = snapshot_result
-        _step_end("enrich rx crosswalk (snapshot)", t)
+        enrichment_summary_by_source["snapshot"] = snapshot_result
+        _step_end("enrich rx crosswalk (snapshot)", snapshot_started_at)
 
     if should_run_live:
-        t = _step_start("enrich rx crosswalk (live fallback)")
+        live_started_at = _step_start("enrich rx crosswalk (live fallback)")
         live_result = await _enrich_rx_crosswalk_from_live(
             schema=schema,
             prescription_table=prescription_table,
             code_catalog_table=code_catalog_table,
             code_crosswalk_table=code_crosswalk_table,
         )
-        summary["live"] = live_result
-        _step_end("enrich rx crosswalk (live fallback)", t)
+        enrichment_summary_by_source["live"] = live_result
+        _step_end("enrich rx crosswalk (live fallback)", live_started_at)
 
     logger.info(
         "RX crosswalk enrichment summary: mode=%s snapshot_mapped=%s snapshot_edges=%s live_attempted=%s live_mapped=%s live_edges=%s",
-        summary["source_mode"],
-        summary["snapshot"].get("mapped_codes", 0),
-        summary["snapshot"].get("edges", 0),
-        summary["live"].get("attempted", 0),
-        summary["live"].get("mapped_codes", 0),
-        summary["live"].get("edges", 0),
+        enrichment_summary_by_source["source_mode"],
+        enrichment_summary_by_source["snapshot"].get("mapped_codes", 0),
+        enrichment_summary_by_source["snapshot"].get("edges", 0),
+        enrichment_summary_by_source["live"].get("attempted", 0),
+        enrichment_summary_by_source["live"].get("mapped_codes", 0),
+        enrichment_summary_by_source["live"].get("edges", 0),
     )
 
 
@@ -1371,8 +1395,8 @@ async def _enrich_rx_crosswalk_from_snapshot(
     product_table = RX_CROSSWALK_SNAPSHOT_PRODUCT_TABLE
     package_table = RX_CROSSWALK_SNAPSHOT_PACKAGE_TABLE
 
-    product_exists = await _table_exists(snapshot_schema, product_table)
-    package_exists = await _table_exists(snapshot_schema, package_table)
+    product_exists = await _is_table_present(snapshot_schema, product_table)
+    package_exists = await _is_table_present(snapshot_schema, package_table)
     if not (product_exists and package_exists):
         logger.warning(
             "Skipping snapshot RX crosswalk enrichment; missing source tables %s.%s or %s.%s",
@@ -1383,17 +1407,25 @@ async def _enrich_rx_crosswalk_from_snapshot(
         )
         return {"mapped_codes": 0, "edges": 0}
 
-    product_has_rxnorm_ids = await _column_exists(snapshot_schema, product_table, "rxnorm_ids")
+    product_has_rxnorm_ids = await _is_column_present(
+        snapshot_schema, product_table, "rxnorm_ids"
+    )
     product_rxnorm_scalar_column = ""
     if not product_has_rxnorm_ids:
         for candidate in ("rxnorm_id", "rxnorm", "rxcui"):
-            if await _column_exists(snapshot_schema, product_table, candidate):
+            if await _is_column_present(snapshot_schema, product_table, candidate):
                 product_rxnorm_scalar_column = candidate
                 break
 
-    package_has_product_ndc = await _column_exists(snapshot_schema, package_table, "product_ndc")
-    package_has_ndc11 = await _column_exists(snapshot_schema, package_table, "ndc11")
-    package_has_package_ndc = await _column_exists(snapshot_schema, package_table, "package_ndc")
+    package_has_product_ndc = await _is_column_present(
+        snapshot_schema, package_table, "product_ndc"
+    )
+    package_has_ndc11 = await _is_column_present(
+        snapshot_schema, package_table, "ndc11"
+    )
+    package_has_package_ndc = await _is_column_present(
+        snapshot_schema, package_table, "package_ndc"
+    )
 
     if product_has_rxnorm_ids:
         rxnorm_join_sql = "LEFT JOIN LATERAL unnest(COALESCE(p.rxnorm_ids, ARRAY[]::varchar[])) AS rx(rxnorm_id) ON TRUE"
@@ -1755,7 +1787,7 @@ async def _collect_unresolved_hp_rx_codes(
 ) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
-    rows = await db.all(
+    query_rows = await db.all(
         f"""
         SELECT
             p.rx_code,
@@ -1777,7 +1809,7 @@ async def _collect_unresolved_hp_rx_codes(
         """,
         limit=limit,
     )
-    return [_row_to_dict(row) for row in rows or []]
+    return [_row_to_dict(query_row) for query_row in query_rows or []]
 
 
 async def _live_get_json(client: aiohttp.ClientSession, url: str, timeout: aiohttp.ClientTimeout) -> Any | None:
@@ -1792,6 +1824,44 @@ async def _live_get_json(client: aiohttp.ClientSession, url: str, timeout: aioht
     except Exception as exc:
         logger.warning("Live RX crosswalk call failed url=%s error=%r", url, exc)
         return None
+
+
+async def _live_product_ndcs_for_terms(
+    client: aiohttp.ClientSession,
+    timeout: aiohttp.ClientTimeout,
+    terms: list[str],
+) -> list[str]:
+    product_ndcs: list[str] = []
+    for term in terms:
+        products_payload = await _live_get_json(
+            client,
+            _drug_api_url(f"/name/{quote(term, safe='')}/products"),
+            timeout,
+        )
+        product_ndcs.extend(_extract_product_ndcs(products_payload))
+        if len(product_ndcs) >= RX_CROSSWALK_LIVE_MAX_PRODUCTS_PER_CODE:
+            break
+    return list(dict.fromkeys(product_ndcs))[:RX_CROSSWALK_LIVE_MAX_PRODUCTS_PER_CODE]
+
+
+async def _live_package_ndcs(
+    client: aiohttp.ClientSession,
+    timeout: aiohttp.ClientTimeout,
+    encoded_ndc: str,
+) -> set[str]:
+    packages_payload = await _live_get_json(client, _drug_api_url(f"/ndc/{encoded_ndc}/packages"), timeout)
+    package_ndcs: set[str] = set()
+    if not isinstance(packages_payload, list):
+        return package_ndcs
+    for package in packages_payload:
+        if not isinstance(package, dict):
+            continue
+        normalized_ndc = _normalize_ndc11_code(package.get("ndc11")) or _normalize_ndc11_code(
+            package.get("package_ndc")
+        )
+        if normalized_ndc:
+            package_ndcs.add(normalized_ndc)
+    return package_ndcs
 
 
 async def _resolve_live_external_codes_for_entry(
@@ -1813,13 +1883,7 @@ async def _resolve_live_external_codes_for_entry(
         if _normalize_rx_name_key(text) and text not in terms:
             terms.append(text)
 
-    product_ndcs: list[str] = []
-    for term in terms:
-        payload = await _live_get_json(client, _drug_api_url(f"/name/{quote(term, safe='')}/products"), timeout)
-        product_ndcs.extend(_extract_product_ndcs(payload))
-        if len(product_ndcs) >= RX_CROSSWALK_LIVE_MAX_PRODUCTS_PER_CODE:
-            break
-    product_ndcs = list(dict.fromkeys(product_ndcs))[:RX_CROSSWALK_LIVE_MAX_PRODUCTS_PER_CODE]
+    product_ndcs = await _live_product_ndcs_for_terms(client, timeout, terms)
 
     rxnorm_codes: set[str] = set()
     ndc_codes: set[str] = set()
@@ -1846,14 +1910,7 @@ async def _resolve_live_external_codes_for_entry(
             if normalized_product_ndc:
                 ndc_codes.add(normalized_product_ndc)
 
-        packages_payload = await _live_get_json(client, _drug_api_url(f"/ndc/{encoded_ndc}/packages"), timeout)
-        if isinstance(packages_payload, list):
-            for package in packages_payload:
-                if not isinstance(package, dict):
-                    continue
-                normalized_ndc = _normalize_ndc11_code(package.get("ndc11")) or _normalize_ndc11_code(package.get("package_ndc"))
-                if normalized_ndc:
-                    ndc_codes.add(normalized_ndc)
+        ndc_codes.update(await _live_package_ndcs(client, timeout, encoded_ndc))
 
     return {
         "rx_code": rx_code,
@@ -1987,6 +2044,79 @@ async def _upsert_external_code_and_edges(
     return _safe_int(rowcount, 0) + _safe_int(reverse_rowcount, 0)
 
 
+async def _upsert_live_resolution(
+    resolution: dict[str, Any],
+    *,
+    schema: str,
+    code_catalog_table: str,
+    code_crosswalk_table: str,
+    default_confidence: float,
+    crosswalk_source: str,
+) -> tuple[int, int]:
+    hp_code = str(resolution.get("rx_code") or "").strip()
+    rxnorm_codes = resolution.get("rxnorm_codes") or []
+    ndc_codes = resolution.get("ndc_codes") or []
+    if not hp_code or (not rxnorm_codes and not ndc_codes):
+        return 0, 0
+
+    display_name = str(resolution.get("display_name") or "").strip() or None
+    inserted_edges = 0
+    for rxnorm_code in rxnorm_codes:
+        normalized_rxnorm = _normalize_rxnorm_code(rxnorm_code)
+        if not normalized_rxnorm:
+            continue
+        inserted_edges += await _upsert_external_code_and_edges(
+            schema=schema,
+            code_catalog_table=code_catalog_table,
+            code_crosswalk_table=code_crosswalk_table,
+            hp_code=hp_code,
+            to_system="RXNORM",
+            to_code=normalized_rxnorm,
+            display_name=display_name,
+            confidence=default_confidence,
+            source=crosswalk_source,
+        )
+
+    for ndc_code in ndc_codes:
+        normalized_ndc = _normalize_ndc11_code(ndc_code)
+        if not normalized_ndc:
+            continue
+        inserted_edges += await _upsert_external_code_and_edges(
+            schema=schema,
+            code_catalog_table=code_catalog_table,
+            code_crosswalk_table=code_crosswalk_table,
+            hp_code=hp_code,
+            to_system="NDC",
+            to_code=normalized_ndc,
+            display_name=display_name,
+            confidence=default_confidence,
+            source=crosswalk_source,
+        )
+
+    return 1, inserted_edges
+
+
+async def _live_crosswalk_client_and_timeout() -> tuple[Any, aiohttp.ClientTimeout]:
+    client = await get_http_client(use_proxy=DRUG_CLAIMS_USE_PROXY)
+    timeout = aiohttp.ClientTimeout(
+        total=RX_CROSSWALK_LIVE_TIMEOUT_SECONDS,
+        connect=min(5.0, RX_CROSSWALK_LIVE_TIMEOUT_SECONDS),
+        sock_read=RX_CROSSWALK_LIVE_TIMEOUT_SECONDS,
+    )
+    return client, timeout
+
+
+async def _is_live_drug_api_available(client: Any, timeout: aiohttp.ClientTimeout) -> bool:
+    healthcheck = await _live_get_json(client, _drug_api_url("/"), timeout)
+    if isinstance(healthcheck, dict):
+        return True
+    logger.warning(
+        "Skipping live RX crosswalk enrichment; drug-api unavailable at %s",
+        _drug_api_url("/"),
+    )
+    return False
+
+
 async def _enrich_rx_crosswalk_from_live(
     *,
     schema: str,
@@ -2008,23 +2138,13 @@ async def _enrich_rx_crosswalk_from_live(
 
     mapped_codes = 0
     total_edges = 0
-    source = "drug_api_live"
+    crosswalk_source = "drug_api_live"
     default_confidence = max(RX_CROSSWALK_CONFIDENCE_MIN, 0.88)
 
-    client = await get_http_client(use_proxy=DRUG_CLAIMS_USE_PROXY)
-    timeout = aiohttp.ClientTimeout(
-        total=RX_CROSSWALK_LIVE_TIMEOUT_SECONDS,
-        connect=min(5.0, RX_CROSSWALK_LIVE_TIMEOUT_SECONDS),
-        sock_read=RX_CROSSWALK_LIVE_TIMEOUT_SECONDS,
-    )
+    client, timeout = await _live_crosswalk_client_and_timeout()
 
     async with client:
-        healthcheck = await _live_get_json(client, _drug_api_url("/"), timeout)
-        if not isinstance(healthcheck, dict):
-            logger.warning(
-                "Skipping live RX crosswalk enrichment; drug-api unavailable at %s",
-                _drug_api_url("/"),
-            )
+        if not await _is_live_drug_api_available(client, timeout):
             return {"attempted": attempted, "mapped_codes": 0, "edges": 0}
 
         semaphore = asyncio.Semaphore(RX_CROSSWALK_LIVE_CONCURRENCY)
@@ -2034,51 +2154,24 @@ async def _enrich_rx_crosswalk_from_live(
                 return await _resolve_live_external_codes_for_entry(client, timeout, entry)
 
         for batch in _chunk_rows(unresolved_rows, RX_CROSSWALK_BATCH_SIZE):
-            resolved = await asyncio.gather(*[_resolve_one(entry) for entry in batch], return_exceptions=True)
-            for result in resolved:
-                if isinstance(result, Exception):
-                    logger.warning("Live RX crosswalk resolver task failed: %r", result)
+            batch_resolutions = await asyncio.gather(
+                *[_resolve_one(entry) for entry in batch],
+                return_exceptions=True,
+            )
+            for resolution in batch_resolutions:
+                if isinstance(resolution, Exception):
+                    logger.warning("Live RX crosswalk resolver task failed: %r", resolution)
                     continue
-                hp_code = str(result.get("rx_code") or "").strip()
-                rxnorm_codes = result.get("rxnorm_codes") or []
-                ndc_codes = result.get("ndc_codes") or []
-                if not hp_code or (not rxnorm_codes and not ndc_codes):
-                    continue
-
-                mapped_codes += 1
-                display_name = str(result.get("display_name") or "").strip() or None
-
-                for rxnorm_code in rxnorm_codes:
-                    normalized = _normalize_rxnorm_code(rxnorm_code)
-                    if not normalized:
-                        continue
-                    total_edges += await _upsert_external_code_and_edges(
-                        schema=schema,
-                        code_catalog_table=code_catalog_table,
-                        code_crosswalk_table=code_crosswalk_table,
-                        hp_code=hp_code,
-                        to_system="RXNORM",
-                        to_code=normalized,
-                        display_name=display_name,
-                        confidence=default_confidence,
-                        source=source,
-                    )
-
-                for ndc_code in ndc_codes:
-                    normalized = _normalize_ndc11_code(ndc_code)
-                    if not normalized:
-                        continue
-                    total_edges += await _upsert_external_code_and_edges(
-                        schema=schema,
-                        code_catalog_table=code_catalog_table,
-                        code_crosswalk_table=code_crosswalk_table,
-                        hp_code=hp_code,
-                        to_system="NDC",
-                        to_code=normalized,
-                        display_name=display_name,
-                        confidence=default_confidence,
-                        source=source,
-                    )
+                mapped_increment, edge_increment = await _upsert_live_resolution(
+                    resolution,
+                    schema=schema,
+                    code_catalog_table=code_catalog_table,
+                    code_crosswalk_table=code_crosswalk_table,
+                    default_confidence=default_confidence,
+                    crosswalk_source=crosswalk_source,
+                )
+                mapped_codes += mapped_increment
+                total_edges += edge_increment
 
     return {"attempted": attempted, "mapped_codes": mapped_codes, "edges": total_edges}
 
@@ -2091,13 +2184,14 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
 
     async with db.transaction():
         for cls in final_classes:
-            obj = classes[cls.__name__]
+            staging_class = classes[cls.__name__]
             table = cls.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {schema}.{table};")
-            await db.status(f"ALTER TABLE IF EXISTS {schema}.{obj.__tablename__} RENAME TO {table};")
+            await db.status(f"ALTER TABLE IF EXISTS {schema}.{staging_class.__tablename__} RENAME TO {table};")
 
             await db.status(
-                f"ALTER INDEX IF EXISTS {schema}.{obj.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
+                f"ALTER INDEX IF EXISTS {schema}.{staging_class.__tablename__}_idx_primary "
+                f"RENAME TO {table}_idx_primary;"
             )
 
             move_indexes = []
@@ -2112,7 +2206,7 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                     continue
                 base_name = index.get("name") or f"{table}_{'_'.join(elements)}_idx"
                 await db.status(
-                    f"ALTER INDEX IF EXISTS {schema}.{obj.__tablename__}_{base_name} RENAME TO {base_name};"
+                    f"ALTER INDEX IF EXISTS {schema}.{staging_class.__tablename__}_{base_name} RENAME TO {base_name};"
                 )
 
 
@@ -2140,42 +2234,42 @@ async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str
     )
     await ensure_database(test_mode)
 
-    t = _step_start("prepare staging tables")
+    staging_started_at = _step_start("prepare staging tables")
     _classes, schema = await _prepare_tables(stage_suffix, test_mode)
-    _step_end("prepare staging tables", t)
+    _step_end("prepare staging tables", staging_started_at)
 
-    t = _step_start("fetch CMS catalog")
+    catalog_started_at = _step_start("fetch CMS catalog")
     catalog = await _fetch_catalog()
-    _step_end("fetch CMS catalog", t)
+    _step_end("fetch CMS catalog", catalog_started_at)
 
-    t = _step_start("resolve CMS sources")
-    sources = _resolve_sources(catalog, test_mode=test_mode)
-    _step_end("resolve CMS sources", t)
+    source_resolution_started_at = _step_start("resolve CMS sources")
+    source_descriptors_by_dataset = _resolve_sources(catalog, test_mode=test_mode)
+    _step_end("resolve CMS sources", source_resolution_started_at)
 
     work_dir = _run_dir(import_id_val, run_id)
     downloads_dir = work_dir / "downloads"
     chunks_root = work_dir / "chunks"
     chunks_root.mkdir(parents=True, exist_ok=True)
-    local_paths: dict[str, list[str]] = {}
+    download_paths_by_dataset: dict[str, list[str]] = {}
     chunks: list[dict[str, Any]] = []
 
     await _init_run_state(redis, run_id, 0)
 
-    source_count = sum(len(sources.get(dataset.key, [])) for dataset in DATASETS)
+    source_count = sum(len(source_descriptors_by_dataset.get(dataset.key, [])) for dataset in DATASETS)
     semaphore = asyncio.Semaphore(min(DRUG_CLAIMS_DOWNLOAD_CONCURRENCY, max(source_count, 1)))
 
     async def _download_split_source(
         dataset_key: str,
-        source: dict[str, Any],
+        source_descriptor: dict[str, Any],
         source_index: int,
     ) -> tuple[str, str, list[dict[str, Any]]]:
         async with semaphore:
-            reporting_year = max(_safe_int(source.get("reporting_year"), 2013), 2013)
+            reporting_year = max(_safe_int(source_descriptor.get("reporting_year"), 2013), 2013)
             step = _step_start(f"download+split {dataset_key} year={reporting_year}")
             try:
                 local_path = await _download_source_file(
                     dataset_key,
-                    source,
+                    source_descriptor,
                     str(downloads_dir),
                     test_mode,
                     reporting_year=reporting_year,
@@ -2193,22 +2287,22 @@ async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str
             finally:
                 _step_end(f"download+split {dataset_key} year={reporting_year}", step)
 
-    t = _step_start("download+split+enqueue chunks (streaming)")
+    chunk_enqueue_started_at = _step_start("download+split+enqueue chunks (streaming)")
     dataset_tasks = [
-        asyncio.create_task(_download_split_source(dataset.key, source, idx))
+        asyncio.create_task(_download_split_source(dataset.key, source_descriptor, idx))
         for dataset in DATASETS
-        for idx, source in enumerate(sources.get(dataset.key, []))
+        for idx, source_descriptor in enumerate(source_descriptors_by_dataset.get(dataset.key, []))
     ]
     try:
         for completed in asyncio.as_completed(dataset_tasks):
             dataset_key, local_path, split_chunks = await completed
-            local_paths.setdefault(dataset_key, []).append(local_path)
+            download_paths_by_dataset.setdefault(dataset_key, []).append(local_path)
             for chunk in split_chunks:
                 reporting_year = max(_safe_int(chunk.get("reporting_year"), 2013), 2013)
                 source_index = max(_safe_int(chunk.get("source_index"), 0), 0)
                 chunk_index = max(_safe_int(chunk.get("chunk_index"), 0), 0)
                 unique_chunk_id = f"{chunk['dataset_key']}:{reporting_year}:{source_index}:{chunk_index}"
-                payload = {
+                chunk_job_by_field = {
                     "import_id": import_id_val,
                     "run_id": run_id,
                     "stage_suffix": stage_suffix,
@@ -2221,7 +2315,7 @@ async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str
                 }
                 await redis.enqueue_job(
                     "drug_claims_process_chunk",
-                    payload,
+                    chunk_job_by_field,
                     _queue_name=DRUG_CLAIMS_QUEUE_NAME,
                     _job_id=_chunk_job_id(
                         run_id,
@@ -2238,22 +2332,22 @@ async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str
         for task_ref in dataset_tasks:
             if not task_ref.done():
                 task_ref.cancel()
-    _step_end("download+split+enqueue chunks (streaming)", t)
+    _step_end("download+split+enqueue chunks (streaming)", chunk_enqueue_started_at)
 
-    manifest = {
+    run_manifest_by_field = {
         "import_id": import_id_val,
         "run_id": run_id,
         "stage_suffix": stage_suffix,
         "schema": schema,
         "test_mode": test_mode,
-        "sources": sources,
+        "sources": source_descriptors_by_dataset,
         "chunks": chunks,
         "total_chunks": len(chunks),
         "created_at": datetime.datetime.utcnow().isoformat(),
         "work_dir": str(work_dir),
     }
     manifest_path = _manifest_path(work_dir)
-    _write_manifest(manifest_path, manifest)
+    _write_manifest(manifest_path, run_manifest_by_field)
 
     await redis.enqueue_job(
         "drug_claims_finalize",
@@ -2410,7 +2504,7 @@ async def drug_claims_finalize(ctx, task: dict[str, Any] | None = None) -> dict[
             )
             raise Retry(defer=DRUG_CLAIMS_FINISH_RETRY_SECONDS)
 
-        if not await _claim_finalize_lock(redis, run_id):
+        if not await _has_claimed_finalize_lock(redis, run_id):
             raise Retry(defer=DRUG_CLAIMS_FINISH_RETRY_SECONDS)
         await mark_control_run(
             run_id,
@@ -2428,21 +2522,21 @@ async def drug_claims_finalize(ctx, task: dict[str, Any] | None = None) -> dict[
         )
 
     classes = _staging_classes(stage_suffix, schema)
-    t = _step_start("ensure live code tables")
+    live_tables_started_at = _step_start("ensure live code tables")
     await _ensure_live_code_tables(schema)
-    _step_end("ensure live code tables", t)
-    t = _step_start("materialize prescription/code dimensions")
+    _step_end("ensure live code tables", live_tables_started_at)
+    materialization_started_at = _step_start("materialize prescription/code dimensions")
     await _materialize_prescription_and_code_rows(classes, schema)
-    _step_end("materialize prescription/code dimensions", t)
+    _step_end("materialize prescription/code dimensions", materialization_started_at)
 
     if DRUG_CLAIMS_DEFER_STAGE_INDEXES:
-        t = _step_start("build staging indexes")
+        index_build_started_at = _step_start("build staging indexes")
         await _build_staging_indexes(classes, schema)
-        _step_end("build staging indexes", t)
+        _step_end("build staging indexes", index_build_started_at)
 
-    t = _step_start("publish staging -> final (transactional rename)")
+    publish_started_at = _step_start("publish staging -> final (transactional rename)")
     await _publish_by_table_rename(classes, schema)
-    _step_end("publish staging -> final (transactional rename)", t)
+    _step_end("publish staging -> final (transactional rename)", publish_started_at)
 
     if redis is not None and run_id:
         await redis.set(_state_key(run_id, "finalized"), "1", ex=DRUG_CLAIMS_REDIS_TTL_SECONDS)
@@ -2475,22 +2569,26 @@ async def drug_claims_finalize(ctx, task: dict[str, Any] | None = None) -> dict[
     }
 
 
+async def _enqueue_start_job(redis: Any, start_job_by_field: dict[str, Any], run_id: str) -> None:
+    await redis.enqueue_job(
+        "drug_claims_start",
+        start_job_by_field,
+        _queue_name=DRUG_CLAIMS_QUEUE_NAME,
+        _job_id=f"drug_claims_start_{run_id}",
+    )
+
+
 async def main(test_mode: bool = False, import_id: str | None = None) -> dict[str, Any]:
     """Queue a new drug-claims control run and return its identifiers."""
 
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
     run_id = _normalize_run_id(None)
-    payload = {
+    start_job_by_field = {
         "test_mode": bool(test_mode),
         "import_id": import_id,
         "run_id": run_id,
     }
-    await redis.enqueue_job(
-        "drug_claims_start",
-        payload,
-        _queue_name=DRUG_CLAIMS_QUEUE_NAME,
-        _job_id=f"drug_claims_start_{run_id}",
-    )
+    await _enqueue_start_job(redis, start_job_by_field, run_id)
     stage_suffix = _build_stage_suffix(_normalize_import_id(import_id), run_id)
     print(
         f"Queued drug-claims run: import_id={_normalize_import_id(import_id)} run_id={run_id} stage={stage_suffix} "
@@ -2517,17 +2615,17 @@ async def finish_main(
 
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
     stage_suffix = _build_stage_suffix(_normalize_import_id(import_id), run_id)
-    payload = {
+    finalize_job_by_field = {
         "import_id": import_id,
         "run_id": run_id,
         "stage_suffix": stage_suffix,
         "test_mode": bool(test_mode),
     }
     if manifest_path:
-        payload["manifest_path"] = manifest_path
+        finalize_job_by_field["manifest_path"] = manifest_path
     await redis.enqueue_job(
         "drug_claims_finalize",
-        payload,
+        finalize_job_by_field,
         _queue_name=DRUG_CLAIMS_FINISH_QUEUE_NAME,
         _job_id=f"drug_claims_finalize_{run_id}_{secrets.token_hex(4)}",
     )
@@ -2552,5 +2650,5 @@ __all__ = [
     "finish_main",
     "_find_dataset",
     "_resolve_sources",
-    "_row_allowed_for_test",
+    "_is_row_allowed_for_test",
 ]

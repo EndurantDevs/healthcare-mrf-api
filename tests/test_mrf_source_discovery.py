@@ -2012,6 +2012,43 @@ def test_toc_rows_merge_plan_info_before_filtering_shared_file_urls():
     assert file_rows[0]["plan_ids"] == ["111111111"]
 
 
+def test_toc_rows_deduplicate_repeated_plan_identity(monkeypatch):
+    repeated_plan_dict = {
+        "plan_id": "111111111",
+        "plan_id_type": "ein",
+        "plan_market_type": "group",
+        "plan_name": "Example Plan",
+    }
+    entry_list = [
+        types.SimpleNamespace(
+            source_type="in-network",
+            original_url=f"https://example.test/rates-{index}.json.gz",
+            canonical_url=f"https://example.test/rates-{index}.json.gz",
+            from_index_url="https://example.test/index.json",
+            description=f"Rates {index}",
+            domain="example.test",
+            reporting_entity_name="Example Payer",
+            reporting_entity_type="insurer",
+            plan_info=(repeated_plan_dict,),
+        )
+        for index in range(2)
+    ]
+    monkeypatch.setattr(
+        discovery,
+        "parse_toc_catalog_entries",
+        lambda *_args, **_kwargs: entry_list,
+    )
+
+    plan_row_list, file_row_list = discovery._toc_rows_from_content(
+        {"source_id": "source_1"},
+        "https://example.test/index.json",
+        {},
+    )
+
+    assert len(plan_row_list) == 1
+    assert len(file_row_list) == 2
+
+
 @pytest.mark.asyncio
 async def test_query_filtered_toc_stream_retains_only_matching_structures(monkeypatch):
     discovery_source = _synthetic_scoped_query_source()
@@ -9435,7 +9472,7 @@ def test_mrf_json_loader_repairs_missing_commas_between_toc_file_objects():
         {"source_id": "source_ucare"}, "https://example.test/ucare_toc.json", toc
     )
 
-    assert len(plan_rows) == 3
+    assert len(plan_rows) == 1
     assert [source_row["file_type"] for source_row in file_rows] == [
         "in-network",
         "in-network",
@@ -13632,6 +13669,32 @@ async def test_push_crawl_row_batches_chunks_large_model_writes(monkeypatch):
         (discovery.MRFFile, 1, True, False),
         (discovery.MRFUrlObservation, 1, True, False),
     ]
+
+
+@pytest.mark.asyncio
+async def test_push_crawl_row_batches_bounds_encoded_message_bytes(monkeypatch):
+    batch_sizes = []
+
+    async def fake_push_objects(rows, _model, *, rewrite, use_copy):
+        assert rewrite is True
+        assert use_copy is False
+        batch_sizes.append(len(rows))
+
+    monkeypatch.setattr(discovery, "push_objects", fake_push_objects)
+    monkeypatch.setattr(discovery, "WRITE_BATCH_BYTES", 10)
+    plan_rows = [
+        {"mrf_plan_id": str(index), "payload": "1234"} for index in range(5)
+    ]
+
+    await discovery._push_crawl_row_batches(
+        plan_rows,
+        [],
+        [],
+        batch_size=5,
+    )
+
+    assert plan_rows == []
+    assert batch_sizes == [2, 2, 1]
 
 
 @pytest.mark.asyncio
