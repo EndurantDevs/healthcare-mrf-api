@@ -53,6 +53,36 @@ def test_nearby_sql_filters_to_geocoded_rows_for_geo_index():
 
     assert "AND a.lat IS NOT NULL" in sql
     assert "AND a.long IS NOT NULL" in sql
+    assert ") <-> Geography(" in sql
+    assert "a.npi ASC" in sql
+    assert "a.address_key ASC" in sql
+    assert "a.location_key ASC" in sql
+    assert sql.index(") <-> Geography(") < sql.index("LIMIT :limit")
+
+
+def test_nearby_count_sql_matches_page_filters_and_identity():
+    sql = npi_module._build_nearby_count_sql(
+        "classification = :classification",
+        "\n          AND a.plans_network_array && :plan_network_array",
+        "\n            AND d.provider_organization_name ILIKE :q",
+        use_taxonomy_filter=True,
+        address_table_sql="mrf.entity_address_unified",
+        geo_precision_clause="AND COALESCE(a.address_precision, '') <> 'city_zip'",
+        bbox_clause=(
+            "AND a.lat BETWEEN :min_lat AND :max_lat "
+            "AND a.long BETWEEN :min_long AND :max_long"
+        ),
+    )
+
+    assert "COUNT(DISTINCT (a.npi, a.address_key))" in sql
+    assert "a.address_key IS NOT NULL" in sql
+    assert "classification = :classification" in sql
+    assert "a.taxonomy_array && g.codes" in sql
+    assert "a.plans_network_array && :plan_network_array" in sql
+    assert "d.provider_organization_name ILIKE :q" in sql
+    assert "a.lat BETWEEN :min_lat AND :max_lat" in sql
+    assert "LIMIT" not in sql
+    assert "ORDER BY" not in sql
 
 
 def test_npi_address_contact_fallback_derives_canonical_digits_from_raw_fields():

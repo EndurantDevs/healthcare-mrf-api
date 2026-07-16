@@ -5453,6 +5453,7 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             # serving-only refresh. The GiST geo_idx stays available in the full
             # index profile for workloads that need expression-index radius scans.
             "index_elements": ("lat", "long"),
+            "include": ("npi", "address_key"),
             "name": "geo_bbox",
             "where": (
                 "type IN ('primary', 'secondary', 'practice', 'site') "

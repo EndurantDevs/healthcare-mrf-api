@@ -2364,6 +2364,21 @@ paths:
             type: integer
             minimum: 1
           description: Maximum result count (defaults to 5)
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: |
+            Opaque keyset cursor returned by a prior paginated response. The
+            cursor is bound to the same geo and provider filters.
+        - name: include_total
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: |
+            Return the paginated response envelope with an exact
+            provider-address total, next cursor, and has-more flag.
         - name: zip_codes
           in: query
           schema:
@@ -2404,13 +2419,17 @@ paths:
           description: Optional data year used to validate procedure/medication evidence; defaults to max available year.
       responses:
         '200':
-          description: Array of nearby NPI entries
+          description: |
+            Legacy array by default. When `include_total=true` or `cursor` is
+            supplied, returns an exact cursor-paginated provider-address page.
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/NpiNearResult'
+                oneOf:
+                  - type: array
+                    items:
+                      $ref: '#/components/schemas/NpiNearResult'
+                  - $ref: '#/components/schemas/NpiNearPage'
   /npi/facilities/providers:
     get:
       operationId: getNpiFacilitiesProviders
@@ -8796,3 +8815,35 @@ components:
             distance:
               type: number
               description: Distance in miles from the reference point
+    NpiNearPage:
+      type: object
+      description: |
+        Exact cursor page of nearby results. Each item is unique by
+        `(npi, address_key)`; `address_site_key` remains a building-level
+        grouping key and is not the pagination identity.
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/NpiNearResult'
+        total_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Exact number of matching provider-address identities before pagination.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page, or null on the last page.
+        has_more:
+          type: boolean
+        result_identity:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            type: string
+            enum: [npi, address_key]
+          example: [npi, address_key]
+      required: [items, total_count, next_cursor, has_more, result_identity]
+      additionalProperties: false

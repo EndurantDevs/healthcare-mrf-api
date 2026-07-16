@@ -3227,6 +3227,7 @@ async def test_entity_address_unified_post_publish_serving_indexes_use_live_tabl
     assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_address_unified_idx_npi" in joined
     assert "ON mrf.entity_address_unified (npi)" in joined
     assert "entity_address_unified_idx_geo_bbox" in joined
+    assert "(lat, long) INCLUDE (npi, address_key)" in joined
     assert "entity_address_unified_idx_geo_idx" in joined
     assert "entity_address_unified_idx_primary_phone_npi" in joined
     assert "entity_address_unified_idx_service_phone_lookup_npi" in joined
@@ -3711,6 +3712,7 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
     )
     assert index_by_name["geo_bbox"] == {
         "index_elements": ("lat", "long"),
+        "include": ("npi", "address_key"),
         "name": "geo_bbox",
         "where": (
             "type IN ('primary', 'secondary', 'practice', 'site') "

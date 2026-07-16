@@ -407,3 +407,27 @@ def test_npi_profile_contract_is_typed_and_address_refresh_is_boolean():
     assert profile_evidence["$ref"] == (
         "#/components/schemas/ProviderDirectoryProfileEvidence"
     )
+
+
+def test_npi_near_documents_exact_cursor_page_identity():
+    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    operation = spec["paths"]["/npi/near/"]["get"]
+    parameter_names = {parameter["name"] for parameter in operation["parameters"]}
+
+    assert {"cursor", "include_total", "provider_sex_code"} <= parameter_names
+    response_schema = operation["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ]
+    assert {"$ref": "#/components/schemas/NpiNearPage"} in response_schema["oneOf"]
+    page_schema = spec["components"]["schemas"]["NpiNearPage"]
+    assert page_schema["required"] == [
+        "items",
+        "total_count",
+        "next_cursor",
+        "has_more",
+        "result_identity",
+    ]
+    assert page_schema["properties"]["result_identity"]["example"] == [
+        "npi",
+        "address_key",
+    ]

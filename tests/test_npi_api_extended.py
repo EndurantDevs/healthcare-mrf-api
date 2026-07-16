@@ -216,14 +216,15 @@ async def test_get_all_returns_rows(monkeypatch):
     _set_result_address_column(result_row, "phone_extension", None)
     _set_result_address_column(result_row, "fax_number_digits", None)
     _set_result_address_column(result_row, "country_code", "US")
-    connections = [
-        FakeConnection([[(2,)]]),
-        FakeConnection([[result_row]]),
-    ]
+    class QueryAwareConnection:
+        async def all(self, statement, **_params):
+            if "COUNT(DISTINCT" in str(statement):
+                return [(2,)]
+            return [result_row]
 
     class FakeDB:
         def acquire(self):
-            return FakeAcquire(connections.pop(0))
+            return FakeAcquire(QueryAwareConnection())
 
     monkeypatch.setattr(npi_module, "db", FakeDB())
     request = types.SimpleNamespace(
@@ -308,11 +309,12 @@ async def test_get_near_npi(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_near_npi_with_lat_long_includes_bbox_params(monkeypatch):
+async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(monkeypatch):
     captured_query_map = {}
 
     class RecordingConnection:
-        async def all(self, _sql, **params):
+        async def all(self, sql, **params):
+            captured_query_map["sql"] = str(sql)
             captured_query_map.update(params)
             return [_build_near_row(1112223334)]
 
@@ -332,10 +334,11 @@ async def test_get_near_npi_with_lat_long_includes_bbox_params(monkeypatch):
     response = await npi_module.get_near_npi(request)
     response_body = json.loads(response.body)
     assert len(response_body) == 1
-    assert "min_lat" in captured_query_map
-    assert "max_lat" in captured_query_map
-    assert "min_long" in captured_query_map
-    assert "max_long" in captured_query_map
+    assert ") <-> Geography(" in captured_query_map["sql"]
+    assert "min_lat" not in captured_query_map
+    assert "max_lat" not in captured_query_map
+    assert "min_long" not in captured_query_map
+    assert "max_long" not in captured_query_map
 
 
 @pytest.mark.asyncio
@@ -374,7 +377,8 @@ async def test_get_near_npi_uses_unified_address_table_when_compatible(monkeypat
     assert "FROM mrf.entity_address_unified AS a" in captured_query_map["sql"]
     assert "FROM mrf.npi_address AS a" not in captured_query_map["sql"]
     assert "COALESCE(a.address_precision, '') <> 'city_zip'" in captured_query_map["sql"]
-    assert "min_lat" in captured_query_map["params"]
+    assert ") <-> Geography(" in captured_query_map["sql"]
+    assert "min_lat" not in captured_query_map["params"]
 
 
 @pytest.mark.asyncio
@@ -1081,9 +1085,161 @@ async def test_get_near_npi_applies_provider_sex_before_distance_limit(monkeypat
     sql = captured_query_map["sql"]
     sex_predicate = "sex_provider.provider_sex_code = :provider_sex_code"
     assert sex_predicate in sql
-    assert sql.index(sex_predicate) < sql.index("ORDER BY distance ASC")
+    assert sql.index(sex_predicate) < sql.index("ORDER BY Geography(")
     assert sql.index(sex_predicate) < sql.index("LIMIT :limit")
     assert captured_query_map["params"]["provider_sex_code"] == "X"
+
+
+@pytest.mark.asyncio
+async def test_get_near_npi_applies_name_before_knn_limit(monkeypatch):
+    captured_query_map = {}
+
+    class RecordingConnection:
+        async def all(self, sql, **params):
+            captured_query_map["sql"] = str(sql)
+            captured_query_map["params"] = dict(params)
+            return [_build_near_row(5556667778)]
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    class FakeDB:
+        def acquire(self):
+            return FakeAcquire(RecordingConnection())
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    request = types.SimpleNamespace(
+        args={"long": "-87.0", "lat": "41.0", "q": "Clinic", "limit": "1"},
+        app=types.SimpleNamespace(),
+    )
+
+    response = await npi_module.get_near_npi(request)
+
+    assert len(json.loads(response.body)) == 1
+    sql = captured_query_map["sql"]
+    name_predicate = npi_module._name_like_clause("d", "q")
+    assert name_predicate in sql
+    assert sql.index(name_predicate) < sql.index("ORDER BY Geography(")
+    assert sql.index(name_predicate) < sql.index("LIMIT :limit")
+    assert captured_query_map["params"]["q"] == "%Clinic%"
+
+
+def _near_provider_record(npi, address_key, distance):
+    return types.SimpleNamespace(
+        _mapping={
+            "npi_code": npi,
+            "npi": npi,
+            "address_key": address_key,
+            "type": "primary",
+            "distance": round(distance / 1609.34, 2),
+            "cursor_distance_meters": distance,
+        }
+    )
+
+
+def _near_paging_db(first_address_key, second_address_key):
+    class PagingConnection:
+        async def all(self, sql, **params):
+            sql_text = str(sql)
+            if "COUNT(DISTINCT (a.npi, a.address_key))" in sql_text:
+                return [types.SimpleNamespace(_mapping={"total_count": 2})]
+            if params.get("cursor_npi") == 1112223334:
+                return [_near_provider_record(5556667778, second_address_key, 200.0)]
+            if params.get("cursor_npi") == 5556667778:
+                return []
+            return [
+                _near_provider_record(1112223334, first_address_key, 100.0),
+                _near_provider_record(1112223334, first_address_key, 100.0),
+                _near_provider_record(5556667778, second_address_key, 200.0),
+            ]
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    class PagingDB:
+        def acquire(self):
+            return FakeAcquire(PagingConnection())
+
+    return PagingDB()
+
+
+@pytest.mark.asyncio
+async def test_get_near_npi_paginates_unique_provider_addresses(monkeypatch):
+    """Page distinct provider-address identities with a stable KNN cursor."""
+
+    first_address_key = "00000000-0000-0000-0000-000000000001"
+    second_address_key = "00000000-0000-0000-0000-000000000002"
+    monkeypatch.setattr(
+        npi_module,
+        "db",
+        _near_paging_db(first_address_key, second_address_key),
+    )
+    first_request = types.SimpleNamespace(
+        args={
+            "long": "-87.0",
+            "lat": "41.0",
+            "radius": "10",
+            "limit": "1",
+            "include_total": "1",
+        },
+        app=types.SimpleNamespace(),
+    )
+
+    first_response = await npi_module.get_near_npi(first_request)
+    first_payload = json.loads(first_response.body)
+
+    assert first_payload["total_count"] == 2
+    assert first_payload["has_more"] is True
+    assert first_payload["next_cursor"]
+    assert first_payload["result_identity"] == ["npi", "address_key"]
+    assert [
+        (provider_item["npi"], provider_item["address_key"])
+        for provider_item in first_payload["items"]
+    ] == [
+        (1112223334, first_address_key)
+    ]
+
+    second_request = types.SimpleNamespace(
+        args={
+            "long": "-87.0",
+            "lat": "41.0",
+            "radius": "10",
+            "limit": "1",
+            "include_total": "1",
+            "cursor": first_payload["next_cursor"],
+        },
+        app=types.SimpleNamespace(),
+    )
+    second_response = await npi_module.get_near_npi(second_request)
+    second_payload = json.loads(second_response.body)
+
+    assert second_payload["total_count"] == 2
+    assert second_payload["has_more"] is False
+    assert second_payload["next_cursor"] is None
+    assert [
+        (provider_item["npi"], provider_item["address_key"])
+        for provider_item in second_payload["items"]
+    ] == [
+        (5556667778, second_address_key)
+    ]
+
+
+def test_nearby_cursor_rejects_different_filters():
+    first_scope = npi_module._nearby_cursor_scope(
+        {"lat": "41.0", "long": "-87.0", "radius": "10"}
+    )
+    cursor = npi_module._encode_nearby_cursor(
+        first_scope,
+        100.0,
+        1112223334,
+        "00000000-0000-0000-0000-000000000001",
+    )
+    second_scope = npi_module._nearby_cursor_scope(
+        {"lat": "41.0", "long": "-87.0", "radius": "25"}
+    )
+
+    with pytest.raises(Exception, match="cursor is invalid"):
+        npi_module._decode_nearby_cursor(cursor, second_scope)
 
 
 @pytest.mark.asyncio

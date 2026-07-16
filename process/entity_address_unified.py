@@ -1001,13 +1001,18 @@ def _post_publish_index_plan(
             skipped_indexes.append(f"{table_name}.{index_name}")
             continue
         using = f"USING {index.get('using')} " if index.get("using") else ""
+        include = (
+            f" INCLUDE ({', '.join(index.get('include') or ())})"
+            if index.get("include")
+            else ""
+        )
         where = f" WHERE {index.get('where')}" if index.get("where") else ""
         live_index_name = f"{table_name}_idx_{index_name}"
         concurrently = "CONCURRENTLY " if build_concurrently else ""
         stmt = (
             f"CREATE INDEX {concurrently}IF NOT EXISTS {live_index_name} "
             f"ON {db_schema}.{table_name} {using}"
-            f"({', '.join(index.get('index_elements'))}){where};"
+            f"({', '.join(index.get('index_elements'))}){include}{where};"
         )
         statements.append((index_name, stmt))
     return statements, skipped_indexes
@@ -1178,12 +1183,17 @@ async def _create_stage_indexes(
             skipped_indexes.append(f"{stage_cls.__tablename__}.{index_name}")
             continue
         using = f"USING {index.get('using')} " if index.get("using") else ""
+        include = (
+            f" INCLUDE ({', '.join(index.get('include') or ())})"
+            if index.get("include")
+            else ""
+        )
         where = f" WHERE {index.get('where')}" if index.get("where") else ""
         stmt = (
             f"CREATE INDEX IF NOT EXISTS "
             f"{_stage_index_name(stage_cls.__tablename__, index_name)} "
             f"ON {db_schema}.{stage_cls.__tablename__} {using}"
-            f"({', '.join(index.get('index_elements'))}){where};"
+            f"({', '.join(index.get('index_elements'))}){include}{where};"
         )
         statements.append((index_name, stmt))
 
