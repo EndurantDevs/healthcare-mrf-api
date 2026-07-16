@@ -322,17 +322,17 @@ def test_source_witness_decode_limit_is_enforced_before_flush(monkeypatch):
 
 
 def test_exact_total_budget_reserves_provider_quota_and_backfills(tmp_path):
-    occurrence_records = [_occurrence_record(index) for index in range(2_048)]
+    occurrence_records = [_occurrence_record(index) for index in range(2_000)]
     provider_records = [
-        _provider_record(index, priority=10_000 + index) for index in range(80)
+        _provider_record(index, priority=10_000 + index) for index in range(48)
     ]
     entry = _bundle(
         tmp_path,
         source_digest=SOURCE_A,
         name="quota.bin",
         compressed_records=[*occurrence_records, *provider_records],
-        occurrence_population_count=len(occurrence_records),
-        provider_population_count=len(provider_records),
+        occurrence_population_count=2_048,
+        provider_population_count=80,
     )
 
     witness_payload, witness_metadata = witness.build_persisted_source_witness(

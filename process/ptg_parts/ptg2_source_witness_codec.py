@@ -13,9 +13,10 @@ from typing import Any, Mapping
 from process.ptg_parts.ptg2_source_witness_contract import (
     CompressedSourceWitnessRecord,
     PTG2_V3_SOURCE_WITNESS_CONTRACT,
+    PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES,
     PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES,
-    PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES,
     PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES,
+    PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
     PTG2_V3_SOURCE_WITNESS_RECORD_CONTRACT,
     PTG2_V3_SOURCE_WITNESS_SELECTION,
     PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
@@ -30,7 +31,7 @@ from process.ptg_parts.ptg2_source_witness_primitives import (
     read_u32,
     sha256_hex,
 )
-
+from process.ptg_parts.ptg2_source_witness_selection import local_source_witness_targets
 
 @dataclass(frozen=True)
 class _RecordFields:
@@ -316,7 +317,7 @@ def _authenticated_bundle_payload(bundle_entry: Mapping[str, Any]) -> bytes:
     if not bundle_path.is_file() or bundle_path.is_symlink():
         raise RuntimeError("strict V3 source witness bundle is missing")
     bundle_size = bundle_path.stat().st_size
-    if bundle_size <= 0 or bundle_size > PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES:
+    if bundle_size <= 0 or bundle_size > PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES:
         raise RuntimeError("strict V3 source witness bundle size is invalid")
     bundle_payload = bundle_path.read_bytes()
     if len(bundle_payload) != bundle_size:
@@ -417,6 +418,8 @@ def _validate_bundle_header(
         or bundle_header.get("format_version") != 2
         or bundle_header.get("total_target")
         != PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET
+        or bundle_header.get("provider_quota")
+        != PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA
         or bundle_header.get("unqueryable_rate_policy")
         != PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY
     ):
@@ -435,6 +438,7 @@ def _validate_local_coverage(
     bundle_header: Mapping[str, Any],
     compressed_records: list[CompressedSourceWitnessRecord],
 ) -> None:
+    """Require each scanner bundle to carry its exact local bottom-k cohorts."""
     occurrence_metrics = bundle_header.get("rate_occurrence")
     provider_metrics = bundle_header.get("provider_reference")
     if not isinstance(occurrence_metrics, Mapping) or not isinstance(
@@ -453,6 +457,10 @@ def _validate_local_coverage(
     )
     if unqueryable_rate_rows > emitted_rate_rows:
         raise RuntimeError("strict V3 source witness unqueryable rate count is invalid")
+    occurrence_target, provider_target, _total_target = local_source_witness_targets(
+        occurrence_metrics,
+        provider_metrics,
+    )
     observed_count_by_cohort = {
         "rate_occurrence": sum(
             witness_record.kind == "rate_occurrence"
@@ -463,21 +471,15 @@ def _validate_local_coverage(
             for witness_record in compressed_records
         ),
     }
-    for cohort_name, cohort_metrics in (
-        ("rate_occurrence", occurrence_metrics),
-        ("provider_reference", provider_metrics),
+    for cohort_name, cohort_metrics, expected_count in (
+        ("rate_occurrence", occurrence_metrics, occurrence_target),
+        ("provider_reference", provider_metrics, provider_target),
     ):
-        population_count = nonnegative_int(
-            cohort_metrics,
-            "population_count",
-            error_field_name=f"{cohort_name} population",
-        )
         selected_count = nonnegative_int(
             cohort_metrics,
             "selected_count",
             error_field_name=f"{cohort_name} selected count",
         )
-        expected_count = min(population_count, PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET)
         if (
             selected_count != expected_count
             or observed_count_by_cohort[cohort_name] != expected_count

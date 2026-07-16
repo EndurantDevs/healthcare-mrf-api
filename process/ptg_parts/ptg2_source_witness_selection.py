@@ -93,6 +93,26 @@ def source_population(
     return population
 
 
+def local_source_witness_targets(
+    occurrence_metrics: Mapping[str, Any],
+    provider_metrics: Mapping[str, Any],
+) -> tuple[int, int, int]:
+    """Return the exact local cohort counts required for global bottom-k merge."""
+
+    return source_witness_targets(
+        occurrence_population=nonnegative_int(
+            occurrence_metrics,
+            "population_count",
+            error_field_name="rate_occurrence population",
+        ),
+        provider_population=nonnegative_int(
+            provider_metrics,
+            "population_count",
+            error_field_name="provider_reference population",
+        ),
+    )
+
+
 def select_source_witness_records(
     candidate_records: Sequence[CompressedSourceWitnessRecord],
     *,
@@ -142,6 +162,7 @@ def select_source_witness_records(
 
 __all__ = [
     "SourceWitnessPopulation",
+    "local_source_witness_targets",
     "select_source_witness_records",
     "source_population",
     "source_set_digest",
