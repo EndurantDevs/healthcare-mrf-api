@@ -41,8 +41,8 @@ use ptg2_scanner::manifest::{
 use ptg2_scanner::normalize::{
     canonical_modifier_list, canonical_text_list, normalize_catalog_code, normalize_code,
     normalize_code_system, normalize_string, normalize_tin_type, normalize_tin_value,
-    strict_integer_text, strict_money_number_from_reader, strict_npi_list, strict_npi_partition,
-    strict_string_array_from_reader, StrictNpiList,
+    strict_integer_text, strict_money_number, strict_money_number_from_reader, strict_npi_list,
+    strict_npi_partition, strict_string_array_from_reader, StrictNpiList,
 };
 use ptg2_scanner::output::{emit_json_record, emit_object};
 use ptg2_scanner::progress::emit_progress;
@@ -66,6 +66,7 @@ use ptg2_scanner::v3_runs::{
 #[cfg(test)]
 use ptg2_scanner::v3_runs::{natural_lean_code_identity, read_code_dictionary};
 use rayon::prelude::*;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use source_witness::{RateOccurrenceWitnessInput, SourceWitnessCollector, SourceWitnessCoordinate};
@@ -428,7 +429,7 @@ impl<'a> ProviderEntryView<'a> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RateLite {
     provider_refs: Vec<String>,
     provider_groups: Vec<Value>,
@@ -436,7 +437,7 @@ struct RateLite {
     prices: Vec<PriceLite>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PriceLite {
     negotiated_type: Option<String>,
     negotiated_rate: String,
@@ -446,6 +447,58 @@ struct PriceLite {
     setting: Option<String>,
     billing_code_modifier: Vec<String>,
     additional_information: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RateLiteWire {
+    #[serde(default)]
+    provider_references: Vec<serde_json::Number>,
+    #[serde(default)]
+    provider_groups: Vec<Value>,
+    #[serde(default)]
+    negotiated_prices: Vec<PriceLiteWire>,
+    #[serde(default)]
+    network_name: StringOrStrings,
+    #[serde(default)]
+    network_names: StringOrStrings,
+}
+
+#[derive(Deserialize)]
+struct PriceLiteWire {
+    #[serde(default)]
+    negotiated_type: Option<String>,
+    negotiated_rate: serde_json::Number,
+    #[serde(default)]
+    expiration_date: Option<String>,
+    #[serde(default)]
+    service_code: Vec<String>,
+    #[serde(default)]
+    billing_class: Option<String>,
+    #[serde(default)]
+    setting: Option<String>,
+    #[serde(default)]
+    billing_code_modifier: Vec<String>,
+    #[serde(default)]
+    additional_information: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(untagged)]
+enum StringOrStrings {
+    String(String),
+    Strings(Vec<String>),
+    #[default]
+    Missing,
+}
+
+impl StringOrStrings {
+    fn append_to(self, values: &mut Vec<String>) {
+        match self {
+            Self::String(value) => values.push(value),
+            Self::Strings(items) => values.extend(items),
+            Self::Missing => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4965,6 +5018,8 @@ struct CompactWorkerMetrics {
     jobs: u64,
     rates_seen: u64,
     rates_parsed: u64,
+    typed_rate_parses: u64,
+    streaming_rate_parse_fallbacks: u64,
     raw_bytes: u64,
     parse_micros: u128,
     transform_micros: u128,
@@ -4987,6 +5042,8 @@ impl CompactWorkerMetrics {
             "jobs": self.jobs,
             "rates_seen": self.rates_seen,
             "rates_parsed": self.rates_parsed,
+            "typed_rate_parses": self.typed_rate_parses,
+            "streaming_rate_parse_fallbacks": self.streaming_rate_parse_fallbacks,
             "raw_bytes": self.raw_bytes,
             "parse_seconds": seconds_from_micros(self.parse_micros),
             "transform_seconds": seconds_from_micros(self.transform_micros),
@@ -6485,9 +6542,82 @@ fn parse_json_value_from_raw_bytes(raw: &[u8]) -> io::Result<Value> {
     serde_json::from_slice(raw).map_err(to_io_error)
 }
 
-fn read_rate_lite_bytes(raw: &[u8]) -> io::Result<Option<RateLite>> {
+fn trim_optional_wire_text(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else if trimmed.len() == value.len() {
+        Some(value)
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn read_rate_lite_bytes_typed(raw: &[u8]) -> io::Result<Option<RateLite>> {
+    let wire: RateLiteWire = serde_json::from_slice(raw).map_err(to_io_error)?;
+    let mut provider_refs = Vec::with_capacity(wire.provider_references.len());
+    for provider_reference in wire.provider_references {
+        provider_refs.push(strict_integer_text(
+            &Value::Number(provider_reference),
+            "provider_references element",
+        )?);
+    }
+    for provider_group in &wire.provider_groups {
+        strict_npi_list(provider_group.get("npi"))?;
+    }
+    if provider_refs.is_empty() && wire.provider_groups.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiated rate must contain at least one provider reference or inline provider group",
+        ));
+    }
+    if wire.negotiated_prices.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiated rate must contain at least one negotiated price",
+        ));
+    }
+
+    let mut network_names = Vec::new();
+    wire.network_name.append_to(&mut network_names);
+    wire.network_names.append_to(&mut network_names);
+    let mut prices = Vec::with_capacity(wire.negotiated_prices.len());
+    for price in wire.negotiated_prices {
+        prices.push(PriceLite {
+            negotiated_type: trim_optional_wire_text(price.negotiated_type),
+            negotiated_rate: strict_money_number(&Value::Number(price.negotiated_rate))?,
+            expiration_date: trim_optional_wire_text(price.expiration_date),
+            service_code: canonical_text_list(price.service_code, false),
+            billing_class: trim_optional_wire_text(price.billing_class),
+            setting: trim_optional_wire_text(price.setting),
+            billing_code_modifier: canonical_modifier_list(price.billing_code_modifier),
+            additional_information: trim_optional_wire_text(price.additional_information),
+        });
+    }
+    Ok(Some(RateLite {
+        provider_refs,
+        provider_groups: wire.provider_groups,
+        network_names: canonical_text_list(network_names, false),
+        prices,
+    }))
+}
+
+fn read_rate_lite_bytes_streaming(raw: &[u8]) -> io::Result<Option<RateLite>> {
     std::str::from_utf8(raw).map_err(to_io_error)?;
     read_rate_lite_from_reader(raw)
+}
+
+fn read_rate_lite_bytes_profiled(raw: &[u8]) -> io::Result<(Option<RateLite>, bool)> {
+    match read_rate_lite_bytes_typed(raw) {
+        Ok(rate) => Ok((rate, true)),
+        Err(_) => read_rate_lite_bytes_streaming(raw).map(|rate| (rate, false)),
+    }
+}
+
+#[cfg(test)]
+fn read_rate_lite_bytes(raw: &[u8]) -> io::Result<Option<RateLite>> {
+    read_rate_lite_bytes_profiled(raw).map(|(rate, _typed)| rate)
 }
 
 fn read_rate_lite_from_reader<R: Read>(reader: R) -> io::Result<Option<RateLite>> {
@@ -7229,7 +7359,14 @@ fn compact_worker_loop(
                 let mut rates = Vec::with_capacity(raw_rates.len());
                 let mut source_inputs = Vec::with_capacity(raw_rates.len());
                 for (coordinate, raw_rate) in raw_rates.iter_with_coordinates() {
-                    if let Some(rate) = read_rate_lite_bytes(raw_rate)? {
+                    let (rate, typed) = read_rate_lite_bytes_profiled(raw_rate)?;
+                    if typed {
+                        metrics.typed_rate_parses = metrics.typed_rate_parses.saturating_add(1);
+                    } else {
+                        metrics.streaming_rate_parse_fallbacks =
+                            metrics.streaming_rate_parse_fallbacks.saturating_add(1);
+                    }
+                    if let Some(rate) = rate {
                         rates.push(rate);
                         source_inputs.push(SourceRateWitnessInput {
                             coordinate,
@@ -8855,6 +8992,8 @@ fn scan_compact_byte_top_level_parallel(
                             "worker_sidecar_lock_wait_seconds": worker_sidecar_lock_wait_seconds,
                             "sidecar_finalize_lock_wait_seconds": sidecar_finalize_lock_wait_seconds,
                             "sidecar_merge_write_seconds": sidecar_merge_write_seconds,
+                            "typed_rate_parses": compact_worker_metrics.iter().map(|metrics| metrics.typed_rate_parses).sum::<u64>(),
+                            "streaming_rate_parse_fallbacks": compact_worker_metrics.iter().map(|metrics| metrics.streaming_rate_parse_fallbacks).sum::<u64>(),
                             "serving_run_files": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_files).sum::<u64>(),
                             "serving_run_rows": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_rows).sum::<u64>(),
                             "serving_run_bytes": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_bytes).sum::<u64>(),
@@ -9644,6 +9783,8 @@ fn scan_compact_struson_parallel(
                         "worker_sidecar_lock_wait_seconds": worker_sidecar_lock_wait_seconds,
                         "sidecar_finalize_lock_wait_seconds": sidecar_finalize_lock_wait_seconds,
                         "sidecar_merge_write_seconds": sidecar_merge_write_seconds,
+                        "typed_rate_parses": compact_worker_metrics.iter().map(|metrics| metrics.typed_rate_parses).sum::<u64>(),
+                        "streaming_rate_parse_fallbacks": compact_worker_metrics.iter().map(|metrics| metrics.streaming_rate_parse_fallbacks).sum::<u64>(),
                         "serving_run_files": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_files).sum::<u64>(),
                         "serving_run_rows": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_rows).sum::<u64>(),
                         "serving_run_bytes": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_bytes).sum::<u64>(),
@@ -20559,6 +20700,89 @@ mod tests {
             let error = read_price_lite_struson(&mut reader).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
+    }
+
+    #[test]
+    fn typed_rate_parser_matches_strict_streaming_parser() {
+        let fixtures = [
+            br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_type":" negotiated ","negotiated_rate":1.2500e2,"expiration_date":" 2026-12-31 ","service_code":[" 11 ","11"],"billing_class":" professional ","setting":null,"billing_code_modifier":[" 26 ","26"],"additional_information":" note "}],"network_name":" alpha "}"#.as_slice(),
+            br#"{"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890]}],"negotiated_prices":[{"negotiated_rate":0.000001}],"network_names":["beta"," beta "]}"#.as_slice(),
+            br#"{"ignored":{"nested":[1,2,3]},"provider_references":[9007199254740993],"negotiated_prices":[{"negotiated_rate":10,"service_code":[],"billing_code_modifier":[]}]}"#.as_slice(),
+            br#"{"provider_references":[1e2],"negotiated_prices":[{"negotiated_rate":-0.0}],"network_name":null,"network_names":null}"#.as_slice(),
+        ];
+
+        for raw in fixtures {
+            assert_eq!(
+                read_rate_lite_bytes_typed(raw).unwrap(),
+                read_rate_lite_bytes_streaming(raw).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn profiled_rate_parser_preserves_streaming_parser_contract() {
+        let fixtures = [
+            br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":12.50}]}"#.as_slice(),
+            br#"{"provider_references":[7],"provider_groups":[{"npi":[1234567890],"tin":{"type":"ein","value":"123456789"}}],"negotiated_prices":[{"negotiated_rate":12.50}],"network_name":"one","network_names":["two"]}"#.as_slice(),
+            br#"{"provider_references":[1e2],"negotiated_prices":[{"negotiated_rate":1.2e10,"negotiated_type":" ffs ","service_code":[" 11 ","22"],"billing_code_modifier":[" 26 "]}]}"#.as_slice(),
+            br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":12.50,"additional_information":"escaped \\ value \" text","billing_class":"\u00e9"}]}"#.as_slice(),
+            br#"{"provider_references":[7],"provider_references":[8],"negotiated_prices":[{"negotiated_rate":12.50}]}"#.as_slice(),
+            br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":12.50,"negotiated_rate":13.50}]}"#.as_slice(),
+            br#"{"provider_references":[],"negotiated_prices":[{"negotiated_rate":12.50}]}"#.as_slice(),
+            br#"{"provider_references":[7],"negotiated_prices":[]}"#.as_slice(),
+            br#"{"provider_references":["7"],"negotiated_prices":[{"negotiated_rate":12.50}]}"#.as_slice(),
+            br#"{"provider_references":[7.5],"negotiated_prices":[{"negotiated_rate":12.50}]}"#.as_slice(),
+            br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":"12.50"}]}"#.as_slice(),
+            br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":null}]}"#.as_slice(),
+            br#"{"provider_references":[7],"negotiated_prices":[{}]}"#.as_slice(),
+            br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":12.50,"service_code":null}]}"#.as_slice(),
+            br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":12.50}],"network_name":12}"#.as_slice(),
+            br#"{"provider_groups":[{"npi":[0]}],"negotiated_prices":[{"negotiated_rate":12.50}]}"#.as_slice(),
+            br#"{"provider_groups":[{"npi":["1234567890"]}],"negotiated_prices":[{"negotiated_rate":12.50}]}"#.as_slice(),
+        ];
+
+        for raw in fixtures {
+            let profiled = read_rate_lite_bytes_profiled(raw);
+            let streaming = read_rate_lite_bytes_streaming(raw);
+            match (profiled, streaming) {
+                (Ok((profiled, _)), Ok(streaming)) => assert_eq!(profiled, streaming),
+                (Err(profiled), Err(streaming)) => {
+                    assert_eq!(profiled.kind(), streaming.kind());
+                    assert_eq!(profiled.to_string(), streaming.to_string());
+                }
+                (profiled, streaming) => {
+                    panic!(
+                        "parser contract diverged: profiled={profiled:?} streaming={streaming:?}"
+                    )
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release parser throughput probe"]
+    fn benchmark_typed_rate_parser_against_streaming_parser() {
+        let raw = std::hint::black_box(
+            br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_type":"negotiated","negotiated_rate":125.25,"expiration_date":"2026-12-31","service_code":["11"],"billing_class":"professional","billing_code_modifier":["26"]},{"negotiated_type":"negotiated","negotiated_rate":225.50,"expiration_date":"2026-12-31","service_code":["22"],"billing_class":"professional","billing_code_modifier":[]}],"network_name":"network"}"#,
+        );
+        const ITERATIONS: usize = 1_000_000;
+
+        let started_at = Instant::now();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(read_rate_lite_bytes_streaming(raw).unwrap());
+        }
+        let streaming_seconds = started_at.elapsed().as_secs_f64();
+
+        let started_at = Instant::now();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(read_rate_lite_bytes_typed(raw).unwrap());
+        }
+        let typed_seconds = started_at.elapsed().as_secs_f64();
+
+        eprintln!(
+            "parser_benchmark iterations={ITERATIONS} streaming_seconds={streaming_seconds:.6} typed_seconds={typed_seconds:.6} speedup={:.3}",
+            streaming_seconds / typed_seconds
+        );
     }
 
     #[test]
