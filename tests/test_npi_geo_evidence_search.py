@@ -346,7 +346,10 @@ async def test_match_candidates_returns_503_on_source_lookup_timeout(monkeypatch
         "_attach_match_candidate_source_details",
         slow_source_lookup,
     )
-    monkeypatch.setattr(npi_module, "_MATCH_CANDIDATES_TIMEOUT_SECONDS", 0.001)
+    # Leave enough budget for the no-op source stage to complete even when the
+    # full CI suite is under load; the mocked one-second enrichment still
+    # deterministically exceeds this endpoint deadline.
+    monkeypatch.setattr(npi_module, "_MATCH_CANDIDATES_TIMEOUT_SECONDS", 0.05)
 
     with pytest.raises(sanic.exceptions.ServiceUnavailable, match="source lookup exceeded"):
         await npi_module.match_candidates(
