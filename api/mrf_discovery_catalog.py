@@ -21,6 +21,9 @@ from api.mrf_discovery_catalog_paging import (
     plan_reference_count as _plan_reference_count,
     slice_values as _slice_values,
 )
+from api.mrf_discovery_catalog_filters import (
+    source_file_identity_scope_condition,
+)
 from db.models import MRFFile, MRFPayer, MRFSource, db
 
 DEFAULT_SOURCE_PAGE_SIZE = 100
@@ -206,6 +209,7 @@ async def list_discovery_source_files_page(
             )
         )
         .where(file_table.c.source_id == normalized_source_id)
+        .where(source_file_identity_scope_condition(file_table, source_table))
     )
     cursor_file_id, cursor_plan_offset = _parse_file_cursor(cursor)
     if cursor_file_id:

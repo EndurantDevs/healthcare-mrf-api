@@ -256,11 +256,11 @@ def _option_type_name(option: click.Option) -> str:
 
 
 def _param_schema(command: click.Command) -> list[dict[str, Any]]:
-    params: list[dict[str, Any]] = []
+    parameter_schema_list: list[dict[str, Any]] = []
     for param in command.params:
         if not isinstance(param, click.Option):
             continue
-        entry = {
+        option_schema_by_name = {
             "name": param.name,
             "opts": list(param.opts),
             "required": bool(param.required),
@@ -271,9 +271,9 @@ def _param_schema(command: click.Command) -> list[dict[str, Any]]:
             "help": param.help,
         }
         if isinstance(param.type, click.Choice):
-            entry["choices"] = list(param.type.choices)
-        params.append(entry)
-    return params
+            option_schema_by_name["choices"] = list(param.type.choices)
+        parameter_schema_list.append(option_schema_by_name)
+    return parameter_schema_list
 
 
 def _json_safe_default(value: Any) -> Any:
@@ -352,34 +352,24 @@ async def node_health() -> dict[str, Any]:
     """Collect bounded database, Redis, worker, disk, and memory health."""
 
     artifact_root = Path(os.getenv("HLTHPRT_PTG2_ARTIFACT_ROOT") or os.getenv("HLTHPRT_PTG2_ARTIFACT_DIR") or "/tmp")
-    try:
-        usage = shutil.disk_usage(artifact_root)
-        disk = {"path": str(artifact_root), "total": usage.total, "used": usage.used, "free": usage.free}
-    except OSError:
-        disk = {"path": str(artifact_root), "total": None, "used": None, "free": None}
-    ram = _ram_status()
-    checks: dict[str, dict[str, Any]] = {
+    health_checks_by_name: dict[str, dict[str, Any]] = {
         "database": await _database_check(),
         "redis": _redis_check(),
     }
-    workers: dict[str, Any] = {}
-    try:
-        workers = _worker_health()
-        checks["workers"] = {"ok": True, "running": sum(1 for item in workers.values() if item.get("running"))}
-    except Exception as exc:
-        checks["workers"] = {"ok": False, "error": str(exc)}
-    queue_depth: dict[str, int] = {}
-    try:
-        queue_depth = _queue_depths()
-        checks["queue_depth"] = {"ok": True}
-    except Exception as exc:
-        checks["queue_depth"] = {"ok": False, "error": str(exc)}
-    failing_checks = sorted(name for name, check in checks.items() if not check.get("ok"))
+    worker_checks_by_name, worker_status_by_queue, queue_depth_by_name = (
+        _worker_and_queue_health()
+    )
+    health_checks_by_name.update(worker_checks_by_name)
+    failing_checks = sorted(
+        name
+        for name, health_check in health_checks_by_name.items()
+        if not health_check.get("ok")
+    )
     return {
         "engine": ENGINE_NAME,
         "node_id": os.getenv("HLTHPRT_IMPORT_NODE_ID"),
         "status": "degraded" if failing_checks else "ok",
-        "checks": checks,
+        "checks": health_checks_by_name,
         "failing_checks": failing_checks,
         "time": dt.datetime.now(dt.UTC).isoformat(),
         "features": {
@@ -388,16 +378,66 @@ async def node_health() -> dict[str, Any]:
             "enqueue_adapters": True,
             "enqueue_adapter_count": len(_SINGLE_JOB_ADAPTERS),
         },
-        "ram": ram,
-        "disk": disk,
-        "queue_depth": queue_depth,
-        "workers": workers,
+        "ram": _ram_status(),
+        "disk": _disk_status_by_name(artifact_root),
+        "queue_depth": queue_depth_by_name,
+        "workers": worker_status_by_queue,
     }
+
+
+def _disk_status_by_name(artifact_root: Path) -> dict[str, Any]:
+    """Return bounded artifact-volume usage without failing node health."""
+
+    try:
+        usage = shutil.disk_usage(artifact_root)
+        return {
+            "path": str(artifact_root),
+            "total": usage.total,
+            "used": usage.used,
+            "free": usage.free,
+        }
+    except OSError:
+        return {
+            "path": str(artifact_root),
+            "total": None,
+            "used": None,
+            "free": None,
+        }
+
+
+def _worker_and_queue_health() -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, Any],
+    dict[str, int],
+]:
+    """Return worker and queue snapshots with independent failure states."""
+
+    health_checks_by_name: dict[str, dict[str, Any]] = {}
+    worker_status_by_queue: dict[str, Any] = {}
+    try:
+        worker_status_by_queue = _worker_health()
+        health_checks_by_name["workers"] = {
+            "ok": True,
+            "running": sum(
+                1
+                for worker_status in worker_status_by_queue.values()
+                if worker_status.get("running")
+            ),
+        }
+    except Exception as exc:
+        health_checks_by_name["workers"] = {"ok": False, "error": str(exc)}
+    queue_depth_by_name: dict[str, int] = {}
+    try:
+        queue_depth_by_name = _queue_depths()
+        health_checks_by_name["queue_depth"] = {"ok": True}
+    except Exception as exc:
+        health_checks_by_name["queue_depth"] = {"ok": False, "error": str(exc)}
+    return health_checks_by_name, worker_status_by_queue, queue_depth_by_name
 
 
 def _ram_status() -> dict[str, int | None]:
     total = available = None
-    values: dict[str, int] = {}
+    memory_values_by_name: dict[str, int] = {}
 
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as handle:
@@ -405,17 +445,25 @@ def _ram_status() -> dict[str, int | None]:
                 key, _sep, raw_value = line.partition(":")
                 parts = raw_value.strip().split()
                 if parts and parts[0].isdigit():
-                    values[key] = int(parts[0]) * 1024
-            total = values.get("MemTotal")
-            available = values.get("MemAvailable")
+                    memory_values_by_name[key] = int(parts[0]) * 1024
+            total = memory_values_by_name.get("MemTotal")
+            available = memory_values_by_name.get("MemAvailable")
     except OSError:
-        values.clear()
+        memory_values_by_name.clear()
     if total is None and hasattr(os, "sysconf"):
         try:
             total = int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
         except (OSError, ValueError, TypeError):
             total = None
-    return {"total": total, "available": available, "schedulable": None if total is None else max(total - values.get("Hugetlb", 0), 0)}
+    return {
+        "total": total,
+        "available": available,
+        "schedulable": (
+            None
+            if total is None
+            else max(total - memory_values_by_name.get("Hugetlb", 0), 0)
+        ),
+    }
 
 
 async def _database_check() -> dict[str, Any]:
@@ -522,43 +570,47 @@ def _quote_ident(value: str) -> str:
     return '"' + str(value).replace('"', '""') + '"'
 
 
-def parse_ptg_toc_preview(payload: dict[str, Any]) -> dict[str, Any]:
+def parse_ptg_toc_preview(preview_payload_map: dict[str, Any]) -> dict[str, Any]:
     """Parse and summarize an inline PTG table of contents."""
 
     from process.ptg_parts.source_jobs import parse_toc_catalog_entries
 
-    toc_content = payload.get("toc")
+    toc_content = preview_payload_map.get("toc")
     if not isinstance(toc_content, dict):
         raise ValueError("toc must be an object")
-    toc_url = str(payload.get("toc_url") or "inline://toc")
+    toc_url = str(preview_payload_map.get("toc_url") or "inline://toc")
     entries = parse_toc_catalog_entries(
         toc_content,
         toc_url=toc_url,
-        plan_ids=_string_list(payload.get("plan_ids")),
-        plan_name_contains=_string_list(payload.get("plan_name_contains")),
-        plan_market_types=_string_list(payload.get("plan_market_types")),
+        plan_ids=_string_list(preview_payload_map.get("plan_ids")),
+        plan_name_contains=_string_list(
+            preview_payload_map.get("plan_name_contains")
+        ),
+        plan_market_types=_string_list(
+            preview_payload_map.get("plan_market_types")
+        ),
     )
-    items = [asdict(entry) for entry in entries]
+    catalog_entry_list = [asdict(entry) for entry in entries]
     by_domain: dict[str, int] = {}
-    plans: dict[tuple[str, str | None], dict[str, Any]] = {}
-    for item in items:
-        domain = str(item.get("domain") or "unknown")
+    plan_by_identity: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for catalog_entry in catalog_entry_list:
+        domain = str(catalog_entry.get("domain") or "unknown")
         by_domain[domain] = by_domain.get(domain, 0) + 1
-        for plan in item.get("plan_info") or ():
+        for plan in catalog_entry.get("plan_info") or ():
             if not isinstance(plan, dict):
                 continue
             plan_id = str(plan.get("plan_id") or "").strip()
             market_type = plan.get("plan_market_type")
             if plan_id:
-                plans[(plan_id, market_type)] = plan
+                plan_by_identity[(plan_id, market_type)] = plan
     return {
         "status": "parsed",
         "counts": {
-            "entries": len(items),
-            "plans": len(plans),
+            "entries": len(catalog_entry_list),
+            "plans": len(plan_by_identity),
             "by_domain": by_domain,
         },
-        "items": items,
+        "items": catalog_entry_list,
     }
 
 
@@ -569,8 +621,10 @@ def _string_list(value: Any) -> list[str] | None:
         text = value.strip()
         return [text] if text else None
     if isinstance(value, (list, tuple)):
-        result = [str(item).strip() for item in value if str(item).strip()]
-        return result or None
+        normalized_text_list = [
+            str(item).strip() for item in value if str(item).strip()
+        ]
+        return normalized_text_list or None
     return None
 
 
@@ -617,27 +671,45 @@ def _overlay_live_progress(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def _finish_params_for(importer: str, current: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-    params = dict(current.get("params") or {})
-    overrides = payload.get("params") if isinstance(payload.get("params"), dict) else {}
-    params.update(overrides)
-    test_mode = bool(payload.get("test_mode", params.get("test_mode", params.get("test", False))))
+def _finish_params_for(
+    importer: str,
+    current: dict[str, Any],
+    finish_payload_map: dict[str, Any],
+) -> dict[str, Any]:
+    current_params_by_name = dict(current.get("params") or {})
+    overrides = (
+        finish_payload_map.get("params")
+        if isinstance(finish_payload_map.get("params"), dict)
+        else {}
+    )
+    current_params_by_name.update(overrides)
+    test_mode = bool(
+        finish_payload_map.get(
+            "test_mode",
+            current_params_by_name.get(
+                "test_mode",
+                current_params_by_name.get("test", False),
+            ),
+        )
+    )
     import_id = (
-        payload.get("import_id")
-        or params.get("import_id")
+        finish_payload_map.get("import_id")
+        or current_params_by_name.get("import_id")
         or current.get("import_id")
         or utc_now().strftime("%Y%m%d")
     )
-    result = {
+    finish_params_by_name = {
         "import_id": str(import_id),
         "test_mode": test_mode,
     }
     if importer != "mrf":
-        result["run_id"] = current["run_id"]
-    manifest_path = payload.get("manifest_path") or params.get("manifest_path")
+        finish_params_by_name["run_id"] = current["run_id"]
+    manifest_path = finish_payload_map.get(
+        "manifest_path"
+    ) or current_params_by_name.get("manifest_path")
     if manifest_path:
-        result["manifest_path"] = manifest_path
-    return result
+        finish_params_by_name["manifest_path"] = manifest_path
+    return finish_params_by_name
 
 
 def _finish_function(importer: str):
@@ -855,8 +927,10 @@ async def finalize_import_run(run_id: str, finalize_payload: dict[str, Any]) -> 
     finish_fn = _finish_function(importer)
     finalize_result = await finish_fn(**finish_params)
     now = utc_now()
-    metrics = dict(current_run.get("metrics") or {})
-    metrics["finalize"] = finalize_result if isinstance(finalize_result, dict) else {"queued": True}
+    run_metrics_by_name = dict(current_run.get("metrics") or {})
+    run_metrics_by_name["finalize"] = (
+        finalize_result if isinstance(finalize_result, dict) else {"queued": True}
+    )
     await db.execute(
         update(ImportRun)
         .where(ImportRun.run_id == run_id)
@@ -865,7 +939,7 @@ async def finalize_import_run(run_id: str, finalize_payload: dict[str, Any]) -> 
             phase_detail="finalize enqueued",
             heartbeat_at=now,
             progress={"unit": "run", "total": 1, "done": 0, "pct": 0, "message": "finalizing"},
-            metrics=metrics,
+            metrics=run_metrics_by_name,
             import_id=finish_params.get("import_id"),
         )
     )
@@ -1166,21 +1240,25 @@ async def _admit_provider_directory_run(import_row: dict[str, Any]) -> dict[str,
     return None
 
 
-async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+async def create_import_run(
+    request_payload_map: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
     """Create and enqueue an import run unless admission deduplicates it."""
 
-    importer = str(payload.get("importer") or "").strip()
+    importer = str(request_payload_map.get("importer") or "").strip()
     if importer not in importer_names():
         raise ValueError(f"unknown importer: {importer}")
 
-    idempotency_key = str(payload.get("idempotency_key") or "").strip() or None
+    idempotency_key = (
+        str(request_payload_map.get("idempotency_key") or "").strip() or None
+    )
     if idempotency_key and importer != "provider-directory-fhir":
         active = await find_active_run_by_idempotency_key(idempotency_key)
         if active:
             return active, False
     if importer != "provider-directory-fhir" and not _allows_parallel_active_importer_runs(
         importer,
-        payload,
+        request_payload_map,
         idempotency_key,
     ):
         active_importer = await find_active_run_by_importer(importer)
@@ -1188,9 +1266,11 @@ async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
             return active_importer, False
 
     now = utc_now()
-    run_id = str(payload.get("run_id") or "").strip() or _new_run_id()
-    retry_of_run_id = str(payload.get("retry_of_run_id") or "").strip() or None
-    row = {
+    run_id = str(request_payload_map.get("run_id") or "").strip() or _new_run_id()
+    retry_of_run_id = (
+        str(request_payload_map.get("retry_of_run_id") or "").strip() or None
+    )
+    import_run_values_by_name = {
         "run_id": run_id,
         "engine": ENGINE_NAME,
         "node_id": os.getenv("HLTHPRT_IMPORT_NODE_ID"),
@@ -1198,62 +1278,82 @@ async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
         "family": _importer_family(importer),
         "status": "queued",
         "phase_detail": "created",
-        "params": payload.get("params") if isinstance(payload.get("params"), dict) else {},
+        "params": (
+            request_payload_map.get("params")
+            if isinstance(request_payload_map.get("params"), dict)
+            else {}
+        ),
         "idempotency_key": idempotency_key,
-        "triggered_by": _normalize_triggered_by(payload.get("triggered_by")),
-        "schedule_id": payload.get("schedule_id"),
-        "subscription_id": payload.get("subscription_id"),
-        "source_file_import_id": payload.get("source_file_import_id"),
+        "triggered_by": _normalize_triggered_by(
+            request_payload_map.get("triggered_by")
+        ),
+        "schedule_id": request_payload_map.get("schedule_id"),
+        "subscription_id": request_payload_map.get("subscription_id"),
+        "source_file_import_id": request_payload_map.get(
+            "source_file_import_id"
+        ),
         "created_at": now,
         "heartbeat_at": now,
         "progress": {"unit": "run", "total": 1, "done": 0, "pct": 0, "message": "queued"},
         "metrics": {},
         "error": None,
         "snapshot_id": None,
-        "import_id": payload.get("import_id"),
+        "import_id": request_payload_map.get("import_id"),
         "retry_of_run_id": retry_of_run_id,
     }
     try:
         if importer == "provider-directory-fhir":
-            blocking_run = await _admit_provider_directory_run(row)
+            blocking_run = await _admit_provider_directory_run(
+                import_run_values_by_name
+            )
             if blocking_run:
                 return blocking_run, False
         else:
-            await db.execute(insert(ImportRun).values(**row))
+            await db.execute(
+                insert(ImportRun).values(**import_run_values_by_name)
+            )
     except IntegrityError:
         if idempotency_key:
             active = await find_active_run_by_idempotency_key(idempotency_key)
             if active:
                 return active, False
         raise
-    enqueue_result = await _enqueue_import_start(row)
-    row.update(enqueue_result)
+    enqueue_result = await _enqueue_import_start(import_run_values_by_name)
+    import_run_values_by_name.update(enqueue_result)
     await db.execute(
         update(ImportRun)
         .where(ImportRun.run_id == run_id)
         .values(
-            status=row["status"],
-            phase_detail=row["phase_detail"],
-            heartbeat_at=row["heartbeat_at"],
-            progress=row["progress"],
-            metrics=row["metrics"],
-            error=row["error"],
+            status=import_run_values_by_name["status"],
+            phase_detail=import_run_values_by_name["phase_detail"],
+            heartbeat_at=import_run_values_by_name["heartbeat_at"],
+            progress=import_run_values_by_name["progress"],
+            metrics=import_run_values_by_name["metrics"],
+            error=import_run_values_by_name["error"],
         )
     )
-    row = _serialize_run_timestamps(row)
-    enqueue_status_event(row)
-    _write_run_live_progress(row, publish_event=False)
-    return row, True
+    import_run_values_by_name = _serialize_run_timestamps(
+        import_run_values_by_name
+    )
+    enqueue_status_event(import_run_values_by_name)
+    _write_run_live_progress(import_run_values_by_name, publish_event=False)
+    return import_run_values_by_name, True
 
 
-async def _enqueue_import_start(row: dict[str, Any]) -> dict[str, Any]:
+async def _enqueue_import_start(
+    import_run_values_by_name: dict[str, Any],
+) -> dict[str, Any]:
     """Enqueue one importer start job and return its run-state update."""
 
-    importer = str(row.get("importer") or "")
+    importer = str(import_run_values_by_name.get("importer") or "")
     now = utc_now()
-    params = row.get("params") if isinstance(row.get("params"), dict) else {}
+    params = (
+        import_run_values_by_name.get("params")
+        if isinstance(import_run_values_by_name.get("params"), dict)
+        else {}
+    )
     try:
-        adapter = _adapter_for_import_row(row)
+        adapter = _adapter_for_import_row(import_run_values_by_name)
     except ValueError as exc:
         return {
             "status": "failed",
@@ -1273,17 +1373,27 @@ async def _enqueue_import_start(row: dict[str, Any]) -> dict[str, Any]:
             "error": None,
         }
 
-    job_payload = _adapter_payload(adapter, row, params)
-    kwargs = {"_queue_name": adapter["queue"]}
+    job_payload = _adapter_payload(
+        adapter,
+        import_run_values_by_name,
+        params,
+    )
+    enqueue_options_by_name = {"_queue_name": adapter["queue"]}
     if adapter.get("job_prefix"):
-        kwargs["_job_id"] = f"{adapter['job_prefix']}_{row['run_id']}"
+        enqueue_options_by_name["_job_id"] = (
+            f"{adapter['job_prefix']}_{import_run_values_by_name['run_id']}"
+        )
     try:
         redis = await create_pool(
             build_redis_settings(),
             job_serializer=serialize_job,
             job_deserializer=deserialize_job,
         )
-        job = await redis.enqueue_job(adapter["function"], job_payload, **kwargs)
+        job = await redis.enqueue_job(
+            adapter["function"],
+            job_payload,
+            **enqueue_options_by_name,
+        )
     except Exception as exc:
         return {
             "status": "failed",
@@ -1350,56 +1460,120 @@ _TASK_LINEAGE_FIELDS_BY_IMPORTER = {
 }
 
 
-def _adapter_payload(adapter: dict[str, Any], row: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+def _adapter_payload(
+    adapter: dict[str, Any],
+    import_run_values_by_name: dict[str, Any],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the ARQ payload for one normalized import-run row."""
+
     test_mode = bool(params.get("test_mode", params.get("test", False)))
-    if adapter["payload"] == "test_mode":
-        payload = {"test_mode": test_mode, "run_id": row["run_id"]}
-        for key in (
-            "mrf_file_chunking",
-            "mrf_chunk_target_bytes",
-            "mrf_chunk_target_mb",
-            "mrf_chunk_min_bytes",
-            "mrf_chunk_min_mb",
-        ):
-            if key in params:
-                payload[key] = params[key]
-        return payload
-    if adapter["payload"] in {"control_wrapped", "control_wrapped_kwargs"}:
-        task_payload_map = {"test_mode": test_mode, **params}
-        task_lineage_fields = _TASK_LINEAGE_FIELDS_BY_IMPORTER.get(
-            str(row.get("importer") or ""),
-            (),
+    payload_kind = adapter["payload"]
+    if payload_kind == "test_mode":
+        return _test_mode_adapter_payload(
+            import_run_values_by_name,
+            params,
+            test_mode=test_mode,
         )
-        for field in task_lineage_fields:
-            if row.get(field):
-                task_payload_map[field] = row[field]
+    if payload_kind in {"control_wrapped", "control_wrapped_kwargs"}:
+        return _control_wrapped_adapter_payload(
+            adapter,
+            import_run_values_by_name,
+            params,
+            test_mode=test_mode,
+        )
+    if payload_kind == "run_import":
+        return _run_import_adapter_payload(
+            import_run_values_by_name,
+            params,
+            test_mode=test_mode,
+        )
+    if payload_kind == "ptg_control":
         return {
-            "run_id": row["run_id"],
-            "importer": row.get("importer"),
-            "family": row.get("family"),
-            "target_module": adapter["target_module"],
-            "target_function": adapter["target_function"],
-            "call_style": "kwargs" if adapter["payload"] == "control_wrapped_kwargs" else "ctx_task",
-            "run_shutdown": bool(adapter.get("run_shutdown")),
-            "task": task_payload_map,
-        }
-    if adapter["payload"] == "run_import":
-        payload = {
-            "run_id": row["run_id"],
-            "import_id": params.get("import_id") or row.get("import_id"),
-            "test_mode": test_mode,
-        }
-        for key in ("artifacts", "source_urls", "max_records", "max_files"):
-            if key in params:
-                payload[key] = params[key]
-        return payload
-    if adapter["payload"] == "ptg_control":
-        return {
-            "run_id": row["run_id"],
-            "source_file_import_id": row.get("source_file_import_id"),
+            "run_id": import_run_values_by_name["run_id"],
+            "source_file_import_id": import_run_values_by_name.get(
+                "source_file_import_id"
+            ),
             "params": dict(params),
         }
     return dict(params)
+
+
+def _test_mode_adapter_payload(
+    import_run_values_by_name: dict[str, Any],
+    params: dict[str, Any],
+    *,
+    test_mode: bool,
+) -> dict[str, Any]:
+    """Build a legacy test-mode payload with optional MRF chunk controls."""
+
+    job_payload_map = {
+        "test_mode": test_mode,
+        "run_id": import_run_values_by_name["run_id"],
+    }
+    for key in (
+        "mrf_file_chunking",
+        "mrf_chunk_target_bytes",
+        "mrf_chunk_target_mb",
+        "mrf_chunk_min_bytes",
+        "mrf_chunk_min_mb",
+    ):
+        if key in params:
+            job_payload_map[key] = params[key]
+    return job_payload_map
+
+
+def _control_wrapped_adapter_payload(
+    adapter: dict[str, Any],
+    import_run_values_by_name: dict[str, Any],
+    params: dict[str, Any],
+    *,
+    test_mode: bool,
+) -> dict[str, Any]:
+    """Build a control-wrapped task payload with retry lineage."""
+
+    task_payload_map = {"test_mode": test_mode, **params}
+    task_lineage_fields = _TASK_LINEAGE_FIELDS_BY_IMPORTER.get(
+        str(import_run_values_by_name.get("importer") or ""),
+        (),
+    )
+    for field in task_lineage_fields:
+        if import_run_values_by_name.get(field):
+            task_payload_map[field] = import_run_values_by_name[field]
+    return {
+        "run_id": import_run_values_by_name["run_id"],
+        "importer": import_run_values_by_name.get("importer"),
+        "family": import_run_values_by_name.get("family"),
+        "target_module": adapter["target_module"],
+        "target_function": adapter["target_function"],
+        "call_style": (
+            "kwargs"
+            if adapter["payload"] == "control_wrapped_kwargs"
+            else "ctx_task"
+        ),
+        "run_shutdown": bool(adapter.get("run_shutdown")),
+        "task": task_payload_map,
+    }
+
+
+def _run_import_adapter_payload(
+    import_run_values_by_name: dict[str, Any],
+    params: dict[str, Any],
+    *,
+    test_mode: bool,
+) -> dict[str, Any]:
+    """Build an importer payload with optional artifact bounds."""
+
+    job_payload_map = {
+        "run_id": import_run_values_by_name["run_id"],
+        "import_id": params.get("import_id")
+        or import_run_values_by_name.get("import_id"),
+        "test_mode": test_mode,
+    }
+    for key in ("artifacts", "source_urls", "max_records", "max_files"):
+        if key in params:
+            job_payload_map[key] = params[key]
+    return job_payload_map
 
 
 async def request_cancel(run_id: str) -> dict[str, Any] | None:
@@ -1415,50 +1589,141 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
     now = utc_now()
     current_progress = current.get("progress") if isinstance(current.get("progress"), dict) else {}
     current_metrics = current.get("metrics") if isinstance(current.get("metrics"), dict) else {}
-    metrics = dict(current_metrics)
-    is_pending_adapter = current.get("status") == "queued" and metrics.get("enqueue_adapter") == "pending"
-    is_queued_arq = current.get("status") == "queued" and metrics.get("enqueue_adapter") == "arq_single_job"
-    if is_pending_adapter:
-        cancel_signal = {"redis": False, "pending_adapter": True}
-    elif is_queued_arq:
-        cancel_signal = await _remove_queued_job(current)
-    else:
-        cancel_signal = await _set_cancel_flag(run_id)
-        cancel_signal["kubernetes"] = await _delete_active_worker_jobs(current)
-    metrics["cancel_signal"] = cancel_signal
-    has_terminalized_active_worker = _has_terminalized_active_worker_cancel_signal(cancel_signal)
+    run_metrics_by_name = dict(current_metrics)
+    is_pending_adapter = (
+        current.get("status") == "queued"
+        and run_metrics_by_name.get("enqueue_adapter") == "pending"
+    )
+    is_queued_arq = (
+        current.get("status") == "queued"
+        and run_metrics_by_name.get("enqueue_adapter") == "arq_single_job"
+    )
+    worker_cancel_signal_map = await _cancel_signal_for_run(
+        current,
+        run_id=run_id,
+        is_pending_adapter=is_pending_adapter,
+        is_queued_arq=is_queued_arq,
+    )
+    run_metrics_by_name["cancel_signal"] = worker_cancel_signal_map
+    has_terminalized_active_worker = (
+        _has_terminalized_active_worker_cancel_signal(worker_cancel_signal_map)
+    )
     canceled_before_start = is_pending_adapter or is_queued_arq
+    cancel_state_by_name = _cancel_state_by_name(
+        canceled_before_start=canceled_before_start,
+        has_terminalized_active_worker=has_terminalized_active_worker,
+        current_progress=current_progress,
+    )
+    return await _persist_cancel_request(
+        run_id,
+        current_run=current,
+        requested_at=now,
+        cancel_state_by_name=cancel_state_by_name,
+        run_metrics_by_name=run_metrics_by_name,
+    )
+
+
+def _cancel_state_by_name(
+    *,
+    canceled_before_start: bool,
+    has_terminalized_active_worker: bool,
+    current_progress: dict[str, Any],
+) -> dict[str, Any]:
+    """Build persisted status and progress for a cancellation request."""
+
     canceled_now = canceled_before_start or has_terminalized_active_worker
-    status = "canceled" if canceled_now else "canceling"
     phase_detail = "cancel requested"
     if canceled_before_start:
         phase_detail = "canceled before start"
     elif has_terminalized_active_worker:
         phase_detail = "canceled active worker"
-    progress = {
+    return {
+        "canceled_now": canceled_now,
+        "status": "canceled" if canceled_now else "canceling",
+        "phase_detail": phase_detail,
+        "progress": _cancel_progress_by_name(
+            canceled_now=canceled_now,
+            current_progress=current_progress,
+        ),
+    }
+
+
+async def _persist_cancel_request(
+    run_id: str,
+    *,
+    current_run: dict[str, Any],
+    requested_at: dt.datetime,
+    cancel_state_by_name: dict[str, Any],
+    run_metrics_by_name: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Persist cancellation state and publish its live control event."""
+
+    cancel_progress_by_name = cancel_state_by_name["progress"]
+    canceled_now = bool(cancel_state_by_name["canceled_now"])
+    await db.execute(
+        update(ImportRun)
+        .where(ImportRun.run_id == run_id)
+        .values(
+            status=cancel_state_by_name["status"],
+            phase_detail=cancel_state_by_name["phase_detail"],
+            heartbeat_at=requested_at,
+            finished_at=(
+                requested_at if canceled_now else current_run.get("finished_at")
+            ),
+            progress=cancel_progress_by_name,
+            metrics=run_metrics_by_name,
+        )
+    )
+    updated = await get_import_run(run_id)
+    if updated:
+        _write_run_live_progress(
+            {**updated, "progress": cancel_progress_by_name},
+            publish_event=False,
+        )
+        enqueue_status_event(
+            {
+                **updated,
+                "progress": cancel_progress_by_name,
+                "metrics": run_metrics_by_name,
+            }
+        )
+    return updated
+
+
+async def _cancel_signal_for_run(
+    current_run: dict[str, Any],
+    *,
+    run_id: str,
+    is_pending_adapter: bool,
+    is_queued_arq: bool,
+) -> dict[str, Any]:
+    """Signal queued or active work through its configured control path."""
+
+    if is_pending_adapter:
+        return {"redis": False, "pending_adapter": True}
+    if is_queued_arq:
+        return await _remove_queued_job(current_run)
+    worker_cancel_signal_map = await _set_cancel_flag(run_id)
+    worker_cancel_signal_map["kubernetes"] = await _delete_active_worker_jobs(
+        current_run
+    )
+    return worker_cancel_signal_map
+
+
+def _cancel_progress_by_name(
+    *,
+    canceled_now: bool,
+    current_progress: dict[str, Any],
+) -> dict[str, Any]:
+    """Return terminal or in-progress cancellation progress."""
+
+    return {
         "unit": "run",
         "total": 1,
         "done": 1 if canceled_now else 0,
         "pct": 100 if canceled_now else current_progress.get("pct", 0),
         "message": "canceled" if canceled_now else "cancel requested",
     }
-    await db.execute(
-        update(ImportRun)
-        .where(ImportRun.run_id == run_id)
-        .values(
-            status=status,
-            phase_detail=phase_detail,
-            heartbeat_at=now,
-            finished_at=now if canceled_now else current.get("finished_at"),
-            progress=progress,
-            metrics=metrics,
-        )
-    )
-    updated = await get_import_run(run_id)
-    if updated:
-        _write_run_live_progress({**updated, "progress": progress}, publish_event=False)
-        enqueue_status_event({**updated, "progress": progress, "metrics": metrics})
-    return updated
 
 
 def _has_terminalized_active_worker_cancel_signal(cancel_signal: dict[str, Any]) -> bool:
@@ -1612,7 +1877,7 @@ async def retry_import_run(run_id: str, payload: dict[str, Any]) -> tuple[dict[s
     if not current:
         return None
     retry_params = payload.get("retry_params") if isinstance(payload.get("retry_params"), dict) else {}
-    retry_payload = {
+    child_run_payload_map = {
         "importer": current["importer"],
         "params": _retry_child_params(current, run_id, retry_params),
         "triggered_by": payload.get("triggered_by") or "api",
@@ -1623,4 +1888,4 @@ async def retry_import_run(run_id: str, payload: dict[str, Any]) -> tuple[dict[s
         "import_id": current.get("import_id"),
         "retry_of_run_id": run_id,
     }
-    return await create_import_run(retry_payload)
+    return await create_import_run(child_run_payload_map)
