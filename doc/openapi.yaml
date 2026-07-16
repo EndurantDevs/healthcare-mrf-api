@@ -2252,6 +2252,15 @@ paths:
             type: integer
             enum: [1, 2]
           description: 1 = individual provider, 2 = organization
+        - name: provider_sex_code
+          in: query
+          schema:
+            type: string
+            enum: [M, F, U, X]
+          description: |
+            Exact NPPES provider sex code. Input is case-insensitive and normalized
+            to uppercase. `M` = male, `F` = female, and `U`/`X` are distinct
+            undisclosed source codes. Conflicts with `entity_type_code=2`.
         - name: codes
           in: query
           schema:
@@ -2324,6 +2333,14 @@ paths:
           schema:
             type: string
           description: Comma-separated plan network checksums
+        - name: provider_sex_code
+          in: query
+          schema:
+            type: string
+            enum: [M, F, U, X]
+          description: |
+            Exact NPPES provider sex code applied before distance ordering and
+            limiting. Input is case-insensitive and normalized to uppercase.
         - name: classification
           in: query
           schema:

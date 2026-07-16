@@ -388,6 +388,95 @@ async def test_get_all_zip_phone_and_name_filters_are_applied(monkeypatch):
     assert "c.address_key = CAST(:address_key AS uuid)" in conn.last_sql
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_code,expected_code", [("m", "M"), ("F", "F"), ("u", "U"), ("X", "X")])
+async def test_get_all_applies_provider_sex_before_pagination(
+    monkeypatch,
+    raw_code,
+    expected_code,
+):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    response = await get_all(
+        types.SimpleNamespace(
+            args={
+                "city": "Chicago",
+                "provider_sex_code": raw_code,
+                "limit": "5",
+                "start": "0",
+                "include_total": "0",
+            }
+        )
+    )
+
+    assert json.loads(response.body)["total_source"] == "estimated_page_floor"
+    page_sql, page_params = next(
+        (sql, params)
+        for sql, params in conn.sql_calls
+        if "page_npis AS" in sql
+    )
+    sex_predicate = "sex_provider.provider_sex_code = :provider_sex_code"
+    assert sex_predicate in page_sql
+    assert page_sql.index(sex_predicate) < page_sql.index("LIMIT :limit")
+    assert page_params["provider_sex_code"] == expected_code
+
+
+@pytest.mark.asyncio
+async def test_get_all_provider_sex_filter_is_used_for_count_and_rows(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    await get_all(
+        types.SimpleNamespace(
+            args={
+                "classification": "Pharmacy",
+                "provider_sex_code": "F",
+                "limit": "5",
+                "include_total": "1",
+            }
+        )
+    )
+
+    sex_predicate = "sex_provider.provider_sex_code = :provider_sex_code"
+    assert len(conn.sql_calls) == 2
+    assert all(sex_predicate in sql for sql, _params in conn.sql_calls)
+    assert all(
+        params["provider_sex_code"] == "F"
+        for _sql, params in conn.sql_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_all_rejects_invalid_provider_sex_code():
+    with pytest.raises(
+        sanic.exceptions.InvalidUsage,
+        match="provider_sex_code must be one of",
+    ):
+        await get_all(
+            types.SimpleNamespace(
+                args={"city": "Chicago", "provider_sex_code": "female"}
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_all_rejects_provider_sex_for_organizations():
+    with pytest.raises(
+        sanic.exceptions.InvalidUsage,
+        match="cannot be combined with entity_type_code=2",
+    ):
+        await get_all(
+            types.SimpleNamespace(
+                args={
+                    "city": "Chicago",
+                    "entity_type_code": "2",
+                    "provider_sex_code": "F",
+                }
+            )
+        )
+
+
 def test_provider_list_address_type_clause_keeps_normal_lists_primary_only():
     clause = npi_module._provider_list_address_type_clause(
         "c",

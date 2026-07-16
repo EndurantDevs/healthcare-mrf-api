@@ -75,6 +75,7 @@ MEDICATION_ALLOWED_CODE_SYSTEMS = {
     "NDC",
     "RXNORM",
 }
+PROVIDER_SEX_CODES = {"M", "F", "U", "X"}
 CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
 INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
@@ -4296,6 +4297,19 @@ def _normalize_exact_npi(raw: Optional[str]) -> Optional[int]:
     return int(digits)
 
 
+def _normalize_provider_sex_code(raw: Optional[str]) -> Optional[str]:
+    if raw is None:
+        return None
+    value = str(raw).strip().upper()
+    if not value:
+        return None
+    if value not in PROVIDER_SEX_CODES:
+        raise sanic.exceptions.InvalidUsage(
+            "provider_sex_code must be one of: F, M, U, X"
+        )
+    return value
+
+
 def _normalize_code_system(raw: Optional[str], param_name: str, allowed: set[str]) -> str:
     value = str(raw or "").strip().upper()
     if not value:
@@ -7167,6 +7181,7 @@ async def get_all(request):
     request.args.get("view")
     request.args.get("npi")
     request.args.get("address_site_key")
+    request.args.get("provider_sex_code")
     include_sources = _parse_bool_arg(request.args.get("include_sources"), default=False)
     include_evidence = _parse_bool_arg(request.args.get("include_evidence"), default=False)
     if _parse_bool_arg(request.args.get("debug"), default=False):
@@ -7211,6 +7226,7 @@ async def get_all(request):
     zip_code_raw = request.args.get("zip_code")
     postal_code_raw = request.args.get("postal_code")
     entity_type_code_raw = request.args.get("entity_type_code")
+    provider_sex_code_raw = request.args.get("provider_sex_code")
     plan_network = request.args.get("plan_network")
     has_insurance = request.args.get("has_insurance")
     city = request.args.get("city")
@@ -7354,6 +7370,11 @@ async def get_all(request):
             raise sanic.exceptions.InvalidUsage(
                 "entity_type_code must be either 1 (individual) or 2 (organization)"
             )
+    provider_sex_code = _normalize_provider_sex_code(provider_sex_code_raw)
+    if entity_type_code == 2 and provider_sex_code is not None:
+        raise sanic.exceptions.InvalidUsage(
+            "provider_sex_code cannot be combined with entity_type_code=2"
+        )
 
     filters = {
         "classification": classification,
@@ -7369,6 +7390,7 @@ async def get_all(request):
         PUBLIC_ADDRESS_SITE_KEY: address_site_key,
         "zip_code": zip_code,
         "entity_type_code": entity_type_code,
+        "provider_sex_code": provider_sex_code,
         "plan_network": plan_network,
         "names_like": names_like,
         "codes": codes,
@@ -7408,6 +7430,7 @@ async def get_all(request):
             PUBLIC_ADDRESS_SITE_KEY,
             "zip_code",
             "entity_type_code",
+            "provider_sex_code",
             "plan_network",
             "names_like",
             "codes",
@@ -7431,6 +7454,7 @@ async def get_all(request):
             address_site_key,
             zip_code,
             entity_type_code,
+            provider_sex_code,
             plan_network,
             codes,
             has_insurance,
@@ -7515,6 +7539,7 @@ async def get_all(request):
         last_name = filters.get("last_name")
         organization_name = filters.get("organization_name")
         entity_type_code = filters.get("entity_type_code")
+        provider_sex_code = filters.get("provider_sex_code")
         plan_network = filters.get("plan_network")
         names_like = filters.get("names_like") or []
         codes = filters.get("codes")
@@ -7583,6 +7608,14 @@ async def get_all(request):
             address_where.append(_address_site_key_filter("c", address_table_sql))
         if exact_npi is not None:
             address_where.append(_address_npi_filter("c", address_table_sql))
+        if provider_sex_code is not None:
+            address_where.append(
+                "EXISTS ("
+                "SELECT 1 FROM mrf.npi AS sex_provider "
+                "WHERE sex_provider.npi = c.npi "
+                "AND sex_provider.provider_sex_code = :provider_sex_code"
+                ")"
+            )
         dynamic_code_params = _append_array_filters(address_where, filters)
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
@@ -7659,6 +7692,7 @@ async def get_all(request):
             "last_name": last_name,
             "organization_name": organization_name,
             "entity_type_code": entity_type_code,
+            "provider_sex_code": provider_sex_code,
             "filter_year": filters.get("filter_year"),
         }
         query_params.update(dynamic_code_params)
@@ -7701,6 +7735,7 @@ async def get_all(request):
         last_name = filters.get("last_name")
         organization_name = filters.get("organization_name")
         entity_type_code = filters.get("entity_type_code")
+        provider_sex_code = filters.get("provider_sex_code")
         plan_network = filters.get("plan_network")
         names_like = filters.get("names_like") or []
         codes = filters.get("codes")
@@ -7766,6 +7801,14 @@ async def get_all(request):
             address_where.append(_address_site_key_filter("c", address_table_sql))
         if exact_npi is not None:
             address_where.append(_address_npi_filter("c", address_table_sql))
+        if provider_sex_code is not None:
+            address_where.append(
+                "EXISTS ("
+                "SELECT 1 FROM mrf.npi AS sex_provider "
+                "WHERE sex_provider.npi = c.npi "
+                "AND sex_provider.provider_sex_code = :provider_sex_code"
+                ")"
+            )
         dynamic_code_params = _append_array_filters(address_where, filters)
         if npi_where:
             address_where.append(
@@ -7809,6 +7852,7 @@ async def get_all(request):
             "last_name": last_name,
             "organization_name": organization_name,
             "entity_type_code": entity_type_code,
+            "provider_sex_code": provider_sex_code,
             "filter_year": filters.get("filter_year"),
         }
         query_params.update(dynamic_code_params)
@@ -7927,6 +7971,7 @@ async def get_all(request):
         last_name = filters.get("last_name")
         organization_name = filters.get("organization_name")
         entity_type_code = filters.get("entity_type_code")
+        provider_sex_code = filters.get("provider_sex_code")
         plan_network = filters.get("plan_network")
         names_like = filters.get("names_like") or []
         specialization = filters.get("specialization")
@@ -7982,6 +8027,14 @@ async def get_all(request):
             address_where.append(_address_site_key_filter("c", address_table_sql))
         if exact_npi is not None:
             address_where.append(_address_npi_filter("c", address_table_sql))
+        if provider_sex_code is not None:
+            address_where.append(
+                "EXISTS ("
+                "SELECT 1 FROM mrf.npi AS sex_provider "
+                "WHERE sex_provider.npi = c.npi "
+                "AND sex_provider.provider_sex_code = :provider_sex_code"
+                ")"
+            )
         dynamic_code_params = _append_array_filters(address_where, filters)
         npi_where, npi_params = _build_npi_where_clause(
             "b",
@@ -8070,6 +8123,7 @@ async def get_all(request):
                 "address_key": address_key,
                 "address_site_key": address_site_key,
                 "npi_filter": exact_npi,
+                "provider_sex_code": provider_sex_code,
                 **npi_params,
                 **dynamic_code_params,
             }
@@ -8183,6 +8237,7 @@ async def get_all(request):
                 and len(res) < limit
                 and not npi_where
                 and not use_taxonomy_filter
+                and provider_sex_code is None
             ):
                 fallback_where = list(address_where)
                 if fallback_where:
@@ -8312,6 +8367,7 @@ async def get_all(request):
                 address_site_key,
                 zip_code,
                 entity_type_code,
+                provider_sex_code,
                 plan_network,
                 names_like,
                 codes,
@@ -8754,6 +8810,9 @@ async def get_near_npi(request):
     medication_codes_raw = request.args.get("medication_codes")
     medication_code_system_raw = request.args.get("medication_code_system")
     year_raw = request.args.get("year")
+    provider_sex_code = _normalize_provider_sex_code(
+        request.args.get("provider_sex_code")
+    )
     request.args.get("q")
     if _extract_name_filters(request):
         raise sanic.exceptions.InvalidUsage(
@@ -8893,6 +8952,14 @@ async def get_near_npi(request):
         extra_filters.append("a.npi <> :exclude_npi")
     if plan_network:
         extra_filters.append("a.plans_network_array && (:plan_network_array)")
+    if provider_sex_code is not None:
+        extra_filters.append(
+            "EXISTS ("
+            "SELECT 1 FROM mrf.npi AS sex_provider "
+            "WHERE sex_provider.npi = a.npi "
+            "AND sex_provider.provider_sex_code = :provider_sex_code"
+            ")"
+        )
     dynamic_code_params: dict[str, int] = {}
     if filter_year is not None and (procedure_internal_codes or medication_internal_codes):
         dynamic_code_params["filter_year"] = int(filter_year)
@@ -9006,6 +9073,7 @@ async def get_near_npi(request):
             codes=codes,
             zip_codes=zip_codes,
             plan_network_array=plan_network,
+            provider_sex_code=provider_sex_code,
             **dynamic_code_params,
             **bbox_params,
         )

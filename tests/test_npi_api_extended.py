@@ -1048,6 +1048,63 @@ async def test_get_near_npi_with_filters(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_near_npi_applies_provider_sex_before_distance_limit(monkeypatch):
+    captured_query_map = {}
+
+    class RecordingConnection:
+        async def all(self, sql, **params):
+            captured_query_map["sql"] = str(sql)
+            captured_query_map["params"] = dict(params)
+            return [_build_near_row(5556667778)]
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    class FakeDB:
+        def acquire(self):
+            return FakeAcquire(RecordingConnection())
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    request = types.SimpleNamespace(
+        args={
+            "long": "-87.0",
+            "lat": "41.0",
+            "provider_sex_code": "x",
+            "limit": "1",
+        },
+        app=types.SimpleNamespace(),
+    )
+
+    response = await npi_module.get_near_npi(request)
+
+    assert len(json.loads(response.body)) == 1
+    sql = captured_query_map["sql"]
+    sex_predicate = "sex_provider.provider_sex_code = :provider_sex_code"
+    assert sex_predicate in sql
+    assert sql.index(sex_predicate) < sql.index("ORDER BY distance ASC")
+    assert sql.index(sex_predicate) < sql.index("LIMIT :limit")
+    assert captured_query_map["params"]["provider_sex_code"] == "X"
+
+
+@pytest.mark.asyncio
+async def test_get_near_npi_rejects_invalid_provider_sex_code():
+    request = types.SimpleNamespace(
+        args={
+            "long": "-87.0",
+            "lat": "41.0",
+            "provider_sex_code": "unknown",
+        },
+        app=types.SimpleNamespace(),
+    )
+
+    with pytest.raises(
+        sanic.exceptions.InvalidUsage,
+        match="provider_sex_code must be one of",
+    ):
+        await npi_module.get_near_npi(request)
+
+
+@pytest.mark.asyncio
 async def test_get_near_npi_rejects_name_like_legacy_alias():
     request = types.SimpleNamespace(
         args={"name_like": "Clinic", "zip_codes": "60601"},
