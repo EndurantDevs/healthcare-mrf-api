@@ -46,6 +46,7 @@ jobs:
           github.event.workflow_run.head_repository.full_name == github.repository
         )
       }}
+    environment: dev-deploy
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -149,19 +150,24 @@ jobs:
 
       - name: Install SSH key
         env:
-          DEV_DEPLOY_SSH_KEY: ${{ secrets.DEV_DEPLOY_SSH_KEY }}
-          DEV_DEPLOY_KNOWN_HOSTS: ${{ secrets.DEV_DEPLOY_KNOWN_HOSTS }}
+          DEV_DEPLOY_SSH_KEY_B64: ${{ secrets.DEV_DEPLOY_SSH_KEY_B64 }}
+          DEV_DEPLOY_KNOWN_HOSTS_B64: ${{ secrets.DEV_DEPLOY_KNOWN_HOSTS_B64 }}
+          DEV_DEPLOY_SCOPE: ${{ secrets.DEV_DEPLOY_SCOPE }}
         run: |
-          for name in DEV_DEPLOY_SSH_KEY DEV_DEPLOY_KNOWN_HOSTS; do
+          if [ "${DEV_DEPLOY_SCOPE}" != "main-only-v1" ]; then
+            echo "::error::DEV_DEPLOY_SCOPE is invalid"
+            exit 1
+          fi
+          for name in DEV_DEPLOY_SSH_KEY_B64 DEV_DEPLOY_KNOWN_HOSTS_B64; do
             if [ -z "${!name}" ]; then
               echo "::error::${name} is not configured"
               exit 1
             fi
           done
           install -m 700 -d ~/.ssh
-          printf '%s\n' "${DEV_DEPLOY_SSH_KEY}" > ~/.ssh/dev-deploy
+          printf '%s' "${DEV_DEPLOY_SSH_KEY_B64}" | base64 --decode > ~/.ssh/dev-deploy
           chmod 600 ~/.ssh/dev-deploy
-          printf '%s\n' "${DEV_DEPLOY_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          printf '%s' "${DEV_DEPLOY_KNOWN_HOSTS_B64}" | base64 --decode > ~/.ssh/known_hosts
 
       - name: Queue build on dev node
         env:
