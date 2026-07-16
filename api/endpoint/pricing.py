@@ -13,7 +13,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import orjson
 import sanic.exceptions
@@ -31,11 +31,25 @@ from api.ptg2_capacity_evidence import (
     maybe_attach_capacity_evidence_headers,
 )
 from api.ptg2_serving import (
+    _is_unified_address_table,
+    _provider_taxonomy_summary_lateral_sql,
+    _ptg2_address_serving_table,
+    _ptg2_address_zip5_sql,
+    _ptg2_geo_distance_miles_sql,
+    _ptg2_geo_dwithin_sql,
+    _ptg2_provider_name_sql,
     normalize_ptg2_mode,
     search_current_ptg2_index,
     search_ptg2_provider_procedures,
 )
 from api.ptg2_snapshot import current_source_snapshot_id_for_plan, current_source_snapshot_ids_for_plan
+from api.ptg2_response import _normalize_filter_string_list
+from api.ptg2_address_policy import (
+    PTG2_LEGACY_ADDRESS_COLUMNS,
+    PTG_NO_DISPLAY_ADDRESS_FIELDS,
+    PTG2_UNIFIED_ADDRESS_COLUMNS,
+)
+from api.ptg2_serving_utils import ein_plan_id_variants
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.provider_specialty_filters import (
@@ -57,6 +71,7 @@ from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProviderProcedureCostProfile,
                        PricingProviderProcedureLocation,
                        PricingProcedurePeerStats, TerminologySynonym)
+from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
 
 blueprint = Blueprint("pricing", url_prefix="/pricing", version=1)
 logger = logging.getLogger(__name__)
@@ -111,6 +126,7 @@ terminology_synonym_table = TerminologySynonym.__table__
 geo_zip_table = GeoZipLookup.__table__
 provider_enrichment_summary_table = ProviderEnrichmentSummary.__table__
 npi_data_table = NPIData.__table__
+PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
 
 QUALITY_SCORE_TABLE_NAME = "pricing_provider_quality_score"
 QUALITY_DOMAIN_TABLE_NAME = "pricing_provider_quality_domain"
@@ -4818,6 +4834,1613 @@ def _ptg2_empty_result_state(status: str, *, has_location_filter: bool) -> str:
     return "no_matching_rates"
 
 
+_ALLOWED_AMOUNT_DETAIL_LIMIT = 25
+_ALLOWED_AMOUNT_EMPTY_LOCATION_SELECT_SQL = """
+    NULL::varchar AS state,
+    NULL::varchar AS city,
+    NULL::varchar AS zip5,
+    NULL::double precision AS distance_miles,
+    NULL::text AS address_payload
+"""
+_ALLOWED_AMOUNT_LOCATION_SELECT_SQL = """
+    allowed_location.state,
+    allowed_location.city,
+    allowed_location.zip5,
+    allowed_location.distance_miles,
+    allowed_location.address_payload
+"""
+ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK = "in_network"
+ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED = (
+    "out_of_network_or_not_confirmed_in_network"
+)
+ALLOWED_AMOUNT_NETWORK_STATUS_MIXED = "mixed_network_status"
+ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK = (
+    "in_network_historical_allowed_amounts"
+)
+ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK = (
+    "out_of_network_historical_allowed_amounts"
+)
+ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED = "mixed_historical_allowed_amounts"
+_ALLOWED_AMOUNT_UNVERIFIED_LOCATION_FIELD_NAMES = frozenset(
+    {
+        *PTG_NO_DISPLAY_ADDRESS_FIELDS,
+        "address_network_binding",
+        "distance_bucket",
+        "network_bound_address",
+        "requires_location_confirmation",
+    }
+)
+_ALLOWED_AMOUNT_CURRENT_SNAPSHOT_SQL = f"""
+    SELECT DISTINCT
+           allowed_index->>'source_key' AS source_key,
+           snapshot.snapshot_id
+      FROM {PTG2_SCHEMA}.ptg2_current_source_snapshot allowed_pointer
+      JOIN {PTG2_SCHEMA}.ptg2_snapshot snapshot
+        ON snapshot.snapshot_id = allowed_pointer.snapshot_id
+      CROSS JOIN LATERAL (
+           SELECT snapshot.manifest->'allowed_amount_index' AS allowed_index
+      ) manifest_contract
+      JOIN {PTG2_SCHEMA}.ptg2_allowed_amount_plan plan_coverage
+        ON plan_coverage.snapshot_id = snapshot.snapshot_id
+       AND plan_coverage.plan_id = ANY(CAST(:plan_ids AS text[]))
+       AND (
+            :market_type = ''
+            OR COALESCE(plan_coverage.plan_market_type, '') = ''
+            OR COALESCE(plan_coverage.plan_market_type, '') = :market_type
+       )
+     WHERE snapshot.status = 'published'
+       AND jsonb_typeof(allowed_index) = 'object'
+       AND allowed_index->>'contract' = :allowed_contract
+       AND allowed_index->>'arch_version' = 'postgres_binary_v3'
+       AND allowed_index->>'storage' = 'postgresql'
+       AND allowed_index->>'snapshot_scoped' = 'true'
+       AND allowed_index->>'current_source_key' = allowed_pointer.source_key
+       AND NULLIF(allowed_index->>'source_key', '') IS NOT NULL
+       AND (
+            :requested_source_key = ''
+            OR LOWER(allowed_index->>'source_key') = :requested_source_key
+            OR LOWER(allowed_pointer.source_key) = :requested_source_key
+       )
+     ORDER BY source_key, snapshot.snapshot_id
+"""
+
+
+def _has_no_ptg2_priced_items(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    items = payload.get("items")
+    if isinstance(items, list) and items:
+        return False
+    pagination_payload = payload.get("pagination")
+    if isinstance(pagination_payload, dict):
+        total = _as_int(pagination_payload.get("total"))
+        if total is not None:
+            return total == 0
+    return isinstance(items, list) and not items
+
+
+def _allowed_amount_scope_from_args(
+    args: Mapping[str, Any],
+) -> tuple[str, str, str, int | None] | None:
+    plan_id = str(
+        args.get("plan_id") or args.get("plan_external_id") or ""
+    ).strip()
+    code = str(args.get("code") or "").strip()
+    if not plan_id or not code:
+        return None
+    code_system = str(
+        args.get("code_system")
+        or _reported_procedure_code_system(code)
+        or ""
+    ).strip().upper()
+    npi_filter = _parse_int(args.get("npi") or None, "npi", minimum=1)
+    return plan_id, code, code_system, npi_filter
+
+
+def _supports_allowed_amount_fallback(
+    args: Mapping[str, Any],
+) -> bool:
+    """Return whether allowed evidence can preserve every requested predicate."""
+
+    return not any(
+        args.get(parameter_name) not in (None, "", "null")
+        for parameter_name in (
+            "rate",
+            "negotiated_rate",
+            "rate_tolerance",
+            "negotiated_rate_tolerance",
+        )
+    )
+
+
+async def _current_allowed_amount_snapshots_for_plan(
+    session,
+    args: Mapping[str, Any],
+    *,
+    plan_id: str,
+) -> list[dict[str, Any]]:
+    """Resolve published allowed snapshots from their isolated current pointers."""
+
+    query_parameter_map = {
+        "allowed_contract": PTG2_ALLOWED_AMOUNT_CONTRACT,
+        "market_type": str(
+            args.get("plan_market_type") or args.get("market_type") or ""
+        ).strip().lower(),
+        "plan_ids": list(ein_plan_id_variants(plan_id)),
+        "requested_source_key": str(
+            args.get("source_key") or ""
+        ).strip().lower(),
+    }
+    snapshot_result = await session.execute(
+        text(_ALLOWED_AMOUNT_CURRENT_SNAPSHOT_SQL),
+        query_parameter_map,
+    )
+    current_snapshots: list[dict[str, Any]] = []
+    seen_snapshot_identities: set[tuple[str, str]] = set()
+    for snapshot_row in snapshot_result:
+        snapshot_by_field = _row_to_dict(snapshot_row)
+        source_key = str(snapshot_by_field.get("source_key") or "").strip().lower()
+        snapshot_id = str(snapshot_by_field.get("snapshot_id") or "").strip()
+        if not source_key or not snapshot_id:
+            continue
+        snapshot_identity = (source_key, snapshot_id)
+        if snapshot_identity in seen_snapshot_identities:
+            continue
+        seen_snapshot_identities.add(snapshot_identity)
+        current_snapshots.append(
+            {
+                "source_key": source_key,
+                "snapshot_id": snapshot_id,
+            }
+        )
+    return current_snapshots
+
+
+async def _allowed_amount_address_table(
+    session,
+    args: Mapping[str, Any],
+) -> str | None:
+    has_geo_filter = any(
+        args.get(parameter_name) not in (None, "", "null")
+        for parameter_name in ("lat", "long")
+    )
+    required_columns = (
+        PTG2_UNIFIED_ADDRESS_COLUMNS
+        if has_geo_filter
+        else PTG2_LEGACY_ADDRESS_COLUMNS
+    )
+    return await _ptg2_address_serving_table(
+        session,
+        required_columns,
+        require_legacy_available=True,
+    )
+
+
+def _has_allowed_amount_address_filter(args: Mapping[str, Any]) -> bool:
+    return any(
+        args.get(parameter_name) not in (None, "", "null")
+        for parameter_name in (
+            "state",
+            "city",
+            "zip5",
+            "zip",
+            "lat",
+            "long",
+            "radius",
+            "radius_miles",
+        )
+    )
+
+
+def _allowed_amount_payment_filter_params(
+    args: Mapping[str, Any],
+) -> dict[str, Any]:
+    service_codes = _normalize_filter_string_list(
+        args.get("pos")
+        or args.get("place_of_service")
+        or args.get("service_code"),
+        code_system="POS",
+    )
+    modifier_codes = sorted(
+        _normalize_filter_string_list(
+            args.get("modifier")
+            or args.get("modifiers")
+            or args.get("billing_code_modifier"),
+            upper=True,
+        )
+    )
+    return {
+        "has_service_codes": bool(service_codes),
+        "service_codes": service_codes,
+        "has_modifier_codes": bool(modifier_codes),
+        "modifier_codes": modifier_codes,
+    }
+
+
+def _allowed_amount_geo_sql(
+    args: Mapping[str, Any],
+    *,
+    uses_unified_addresses: bool,
+    parameter_map: dict[str, Any],
+) -> tuple[str, list[str]]:
+    """Return distance projection and geo predicates for allowed evidence."""
+
+    has_geo_filter = all(
+        args.get(parameter_name) not in (None, "", "null")
+        for parameter_name in ("lat", "long")
+    )
+    if not has_geo_filter:
+        return "NULL::double precision", []
+    geo_latitude = _as_float(args.get("lat"))
+    geo_longitude = _as_float(args.get("long"))
+    if geo_latitude is None or geo_longitude is None:
+        return "NULL::double precision", []
+    geo_radius = _as_float(args.get("radius_miles"))
+    parameter_map.update(
+        allowed_geo_lat=geo_latitude,
+        allowed_geo_long=geo_longitude,
+        allowed_geo_radius_miles=(
+            geo_radius if geo_radius is not None else 10.0
+        ),
+    )
+    distance_sql = _ptg2_geo_distance_miles_sql(
+        "addr.lat::float8",
+        "addr.long::float8",
+    ).replace(":geo_", ":allowed_geo_")
+    if uses_unified_addresses:
+        return distance_sql, [
+            "addr.lat IS NOT NULL",
+            "addr.long IS NOT NULL",
+            "COALESCE(addr.address_precision, '') <> 'city_zip'",
+            _ptg2_geo_dwithin_sql(
+                "addr.lat",
+                "addr.long",
+            ).replace(":geo_", ":allowed_geo_"),
+        ]
+    return distance_sql, [
+        f"{distance_sql} <= "
+        "CAST(:allowed_geo_radius_miles AS double precision)"
+    ]
+
+
+def _allowed_amount_location_join_sql(
+    *,
+    address_table: str,
+    uses_unified_addresses: bool,
+    address_predicates: list[str],
+    distance_sql: str,
+) -> str:
+    """Render the indexed best-address lateral lookup."""
+
+    zip5_sql = _ptg2_address_zip5_sql(
+        "addr",
+        unified=uses_unified_addresses,
+    )
+    return f"""
+    LEFT JOIN LATERAL (
+        SELECT
+            addr.npi,
+            addr.state_name AS state,
+            addr.city_name AS city,
+            {zip5_sql} AS zip5,
+            {distance_sql} AS distance_miles,
+            jsonb_build_object(
+                'first_line', addr.first_line,
+                'second_line', addr.second_line,
+                'city', addr.city_name,
+                'state', addr.state_name,
+                'postal_code', addr.postal_code,
+                'country_code', addr.country_code,
+                'telephone_number', addr.telephone_number,
+                'fax_number', addr.fax_number,
+                'phone_number', addr.phone_number,
+                'phone_extension', addr.phone_extension,
+                'fax_number_digits', addr.fax_number_digits,
+                'fax_extension', addr.fax_extension,
+                'address_key', addr.address_key::text,
+                'lat', addr.lat,
+                'long', addr.long
+            )::text AS address_payload
+          FROM {address_table} addr
+         WHERE {' AND '.join(address_predicates)}
+         ORDER BY
+               {distance_sql} ASC NULLS LAST,
+               CASE addr.type
+                   WHEN 'practice' THEN 0
+                   WHEN 'site' THEN 1
+                   WHEN 'primary' THEN 2
+                   ELSE 3
+               END,
+               addr.checksum
+         LIMIT 1
+    ) allowed_location ON TRUE
+    """
+
+
+def _allowed_amount_location_sql(
+    args: Mapping[str, Any],
+    *,
+    address_table: str | None,
+    parameter_map: dict[str, Any],
+) -> tuple[str, str, str]:
+    """Build one indexed per-NPI address lookup and its required-match clause."""
+
+    if not address_table:
+        return "", _ALLOWED_AMOUNT_EMPTY_LOCATION_SELECT_SQL, ""
+    uses_unified_addresses = _is_unified_address_table(address_table)
+    parameter_map["allowed_address_types"] = (
+        ["practice", "primary", "secondary", "site"]
+        if uses_unified_addresses
+        else ["primary", "secondary"]
+    )
+    address_predicates = [
+        "addr.npi = provider_rollup.npi",
+        "addr.type = ANY(CAST(:allowed_address_types AS varchar[]))",
+    ]
+    _append_allowed_amount_text_location_filters(
+        args,
+        parameter_map,
+        address_predicates,
+    )
+    distance_sql, geo_predicates = _allowed_amount_geo_sql(
+        args,
+        uses_unified_addresses=uses_unified_addresses,
+        parameter_map=parameter_map,
+    )
+    zip5 = _normalize_zip5(args.get("zip5") or args.get("zip"))
+    if zip5:
+        parameter_map["allowed_zip5"] = zip5
+        zip_sql = _ptg2_address_zip5_sql(
+            "addr",
+            unified=uses_unified_addresses,
+        )
+        zip_predicate = f"{zip_sql} = :allowed_zip5"
+        address_predicates.append(
+            f"({zip_predicate} OR ({' AND '.join(geo_predicates)}))"
+            if geo_predicates
+            else zip_predicate
+        )
+    elif geo_predicates:
+        address_predicates.extend(geo_predicates)
+    join_sql = _allowed_amount_location_join_sql(
+        address_table=address_table,
+        uses_unified_addresses=uses_unified_addresses,
+        address_predicates=address_predicates,
+        distance_sql=distance_sql,
+    )
+    required_sql = (
+        "AND allowed_location.npi IS NOT NULL"
+        if _has_allowed_amount_address_filter(args)
+        else ""
+    )
+    return join_sql, _ALLOWED_AMOUNT_LOCATION_SELECT_SQL, required_sql
+
+
+def _append_allowed_amount_text_location_filters(
+    args: Mapping[str, Any],
+    parameter_map: dict[str, Any],
+    address_predicates: list[str],
+) -> None:
+    state_code = str(args.get("state") or "").strip().upper()
+    city_name = str(args.get("city") or "").strip().upper()
+    if state_code:
+        parameter_map["allowed_state"] = state_code
+        address_predicates.append(
+            "UPPER(COALESCE(addr.state_name, '')) = :allowed_state"
+        )
+    if city_name:
+        parameter_map["allowed_city"] = city_name
+        address_predicates.append(
+            "UPPER(COALESCE(addr.city_name, '')) = :allowed_city"
+        )
+
+
+def _allowed_amount_taxonomy_filter_sql(
+    args: Mapping[str, Any],
+    parameter_map: dict[str, Any],
+) -> str:
+    predicates: list[str] = []
+    specialty_filter = resolve_provider_specialty_filter(args)
+    if specialty_filter.active:
+        predicates.append(
+            provider_specialty_taxonomy_exists_sql(
+                "provider_rollup.npi",
+                parameter_map,
+                "allowed_amount_specialty",
+                specialty_filter,
+                schema=PTG2_SCHEMA,
+            )
+        )
+    exact_taxonomy_by_field = {
+        "classification": args.get("taxonomy_classification"),
+        "specialization": args.get("taxonomy_specialization"),
+        "section": args.get("taxonomy_section"),
+    }
+    exact_taxonomy_by_field = {
+        field_name: str(field_value).strip()
+        for field_name, field_value in exact_taxonomy_by_field.items()
+        if str(field_value or "").strip()
+    }
+    if exact_taxonomy_by_field:
+        exact_predicates = [
+            "allowed_exact_taxonomy.npi = provider_rollup.npi"
+        ]
+        if _parse_bool(
+            args.get("primary_only"),
+            "primary_only",
+            default=True,
+        ):
+            exact_predicates.append(
+                "UPPER(COALESCE("
+                "allowed_exact_taxonomy."
+                "healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
+            )
+        for field_name, field_value in exact_taxonomy_by_field.items():
+            parameter_name = f"allowed_taxonomy_{field_name}"
+            parameter_map[parameter_name] = field_value
+            exact_predicates.append(
+                f"LOWER(COALESCE(allowed_nucc.{field_name}, '')) "
+                f"= LOWER(:{parameter_name})"
+            )
+        predicates.append(
+            f"""EXISTS (
+                SELECT 1
+                  FROM {PTG2_SCHEMA}.npi_taxonomy allowed_exact_taxonomy
+                  JOIN {PTG2_SCHEMA}.nucc_taxonomy allowed_nucc
+                    ON allowed_nucc.code = allowed_exact_taxonomy.healthcare_provider_taxonomy_code
+                 WHERE {' AND '.join(exact_predicates)}
+            )"""
+        )
+    return "".join(f"\n          AND {predicate}" for predicate in predicates)
+
+
+_ALLOWED_AMOUNT_SCOPE_CTES_SQL = f"""
+        current_snapshots AS MATERIALIZED (
+            SELECT current_snapshot.snapshot_id,
+                   current_snapshot.source_key
+              FROM unnest(
+                       CAST(:snapshot_ids AS text[]),
+                       CAST(:source_keys AS text[])
+                   ) AS current_snapshot(snapshot_id, source_key)
+              JOIN {PTG2_SCHEMA}.ptg2_snapshot snapshot
+                ON snapshot.snapshot_id = current_snapshot.snapshot_id
+              JOIN {PTG2_SCHEMA}.ptg2_current_source_snapshot allowed_pointer
+                ON allowed_pointer.snapshot_id = snapshot.snapshot_id
+               AND allowed_pointer.source_key
+                   = snapshot.manifest
+                       ->'allowed_amount_index'->>'current_source_key'
+             WHERE snapshot.status = 'published'
+               AND snapshot.manifest->'allowed_amount_index'->>'contract'
+                   = :allowed_contract
+               AND snapshot.manifest->'allowed_amount_index'->>'arch_version'
+                   = 'postgres_binary_v3'
+               AND snapshot.manifest->'allowed_amount_index'->>'storage'
+                   = 'postgresql'
+               AND snapshot.manifest->'allowed_amount_index'->>'snapshot_scoped'
+                   = 'true'
+               AND LOWER(COALESCE(
+                       snapshot.manifest
+                           ->'allowed_amount_index'->>'source_key',
+                       ''
+                   )) = LOWER(current_snapshot.source_key)
+        ),
+        eligible_items AS MATERIALIZED (
+            SELECT DISTINCT
+                   allowed_item.snapshot_id,
+                   current_snapshot.source_key,
+                   snapshot.import_run_id,
+                   allowed_item.allowed_item_hash,
+                   plan_coverage.plan_id,
+                   plan_coverage.plan_market_type,
+                   allowed_item.billing_code_type,
+                   allowed_item.billing_code,
+                   allowed_item.name,
+                   allowed_item.description
+              FROM current_snapshots current_snapshot
+              JOIN {PTG2_SCHEMA}.ptg2_snapshot snapshot
+                ON snapshot.snapshot_id = current_snapshot.snapshot_id
+              JOIN {PTG2_SCHEMA}.ptg2_allowed_amount_plan plan_coverage
+                ON plan_coverage.snapshot_id = snapshot.snapshot_id
+               AND plan_coverage.plan_id = ANY(CAST(:plan_ids AS text[]))
+               AND (
+                    :market_type = ''
+                    OR COALESCE(plan_coverage.plan_market_type, '') = ''
+                    OR COALESCE(plan_coverage.plan_market_type, '') = :market_type
+               )
+              JOIN {PTG2_SCHEMA}.ptg2_allowed_amount_item allowed_item
+                ON allowed_item.snapshot_id = plan_coverage.snapshot_id
+               AND allowed_item.file_id = plan_coverage.file_id
+               AND allowed_item.billing_code = :code
+               AND (
+                    :code_system = ''
+                    OR UPPER(COALESCE(allowed_item.billing_code_type, ''))
+                       = :code_system
+               )
+             WHERE snapshot.status = 'published'
+               AND snapshot.manifest->'allowed_amount_index'->>'contract'
+                   = :allowed_contract
+               AND snapshot.manifest->'allowed_amount_index'->>'arch_version'
+                   = 'postgres_binary_v3'
+               AND snapshot.manifest->'allowed_amount_index'->>'storage'
+                   = 'postgresql'
+               AND snapshot.manifest->'allowed_amount_index'->>'snapshot_scoped'
+                   = 'true'
+        ),
+        matching_evidence AS MATERIALIZED (
+            SELECT
+                expanded.npi::bigint AS npi,
+                eligible_item.snapshot_id,
+                eligible_item.source_key,
+                eligible_item.import_run_id,
+                eligible_item.plan_id,
+                eligible_item.plan_market_type,
+                eligible_item.billing_code_type,
+                eligible_item.billing_code,
+                eligible_item.name,
+                eligible_item.description,
+                allowed_payment.tin_type,
+                allowed_payment.tin_value,
+                allowed_payment.service_code,
+                allowed_payment.billing_class,
+                allowed_payment.setting,
+                allowed_payment.allowed_amount::double precision
+                    AS allowed_amount,
+                allowed_payment.billing_code_modifier,
+                allowed_payment.network_status,
+                allowed_payment.network_semantics,
+                provider_payment.billed_charge::double precision
+                    AS billed_charge
+              FROM eligible_items eligible_item
+              JOIN {PTG2_SCHEMA}.ptg2_allowed_amount_payment allowed_payment
+                ON allowed_payment.snapshot_id = eligible_item.snapshot_id
+               AND allowed_payment.allowed_item_hash
+                   = eligible_item.allowed_item_hash
+              JOIN {PTG2_SCHEMA}.ptg2_allowed_amount_provider_payment
+                   provider_payment
+                ON provider_payment.snapshot_id = allowed_payment.snapshot_id
+               AND provider_payment.payment_hash
+                   = allowed_payment.payment_hash
+               AND (
+                    CAST(:npi AS bigint) IS NULL
+                    OR provider_payment.npi
+                       @> ARRAY[CAST(:npi AS bigint)]
+               )
+              CROSS JOIN LATERAL unnest(provider_payment.npi)
+                   AS expanded(npi)
+             WHERE expanded.npi > 0
+               AND (
+                    CAST(:npi AS bigint) IS NULL
+                    OR expanded.npi = CAST(:npi AS bigint)
+               )
+               AND (
+                    NOT :has_service_codes
+                    OR EXISTS (
+                        SELECT 1
+                          FROM unnest(
+                               COALESCE(
+                                   allowed_payment.service_code,
+                                   ARRAY[]::varchar[]
+                               )
+                          ) service_code(value)
+                         WHERE UPPER(BTRIM(service_code.value))
+                               = ANY(CAST(:service_codes AS text[]))
+                    )
+               )
+               AND (
+                    NOT :has_modifier_codes
+                    OR (
+                        SELECT array_agg(
+                                   DISTINCT UPPER(BTRIM(modifier.value))
+                                   ORDER BY UPPER(BTRIM(modifier.value))
+                               )
+                          FROM unnest(
+                               COALESCE(
+                                   allowed_payment.billing_code_modifier,
+                                   ARRAY[]::varchar[]
+                               )
+                          ) modifier(value)
+                         WHERE NULLIF(BTRIM(modifier.value), '') IS NOT NULL
+                    ) = CAST(:modifier_codes AS text[])
+               )
+        )
+"""
+
+
+_ALLOWED_AMOUNT_PAGE_SQL_TEMPLATE = f"""
+    WITH {_ALLOWED_AMOUNT_SCOPE_CTES_SQL},
+    provider_rollup AS MATERIALIZED (
+        SELECT
+            evidence.npi,
+            MIN(evidence.allowed_amount) AS allowed_amount_min,
+            MAX(evidence.allowed_amount) AS allowed_amount_max,
+            AVG(evidence.allowed_amount) AS allowed_amount_avg,
+            MIN(evidence.billed_charge) AS billed_charge_min,
+            MAX(evidence.billed_charge) AS billed_charge_max,
+            COUNT(*)::bigint AS evidence_count,
+            array_agg(DISTINCT evidence.network_status)
+                AS network_statuses,
+            array_agg(DISTINCT evidence.network_semantics)
+                AS network_semantics_values,
+            array_agg(DISTINCT evidence.source_key) AS source_keys,
+            array_agg(DISTINCT evidence.snapshot_id) AS snapshot_ids,
+            array_agg(DISTINCT evidence.import_run_id) AS import_run_ids
+          FROM matching_evidence evidence
+         GROUP BY evidence.npi
+    ),
+    filtered_providers AS MATERIALIZED (
+        SELECT
+            provider_rollup.*,
+            __PROVIDER_NAME_SQL__ AS provider_name,
+            __LOCATION_SELECT_SQL__
+          FROM provider_rollup
+          LEFT JOIN {PTG2_SCHEMA}.npi npi_data
+            ON npi_data.npi = provider_rollup.npi
+          __LOCATION_JOIN_SQL__
+         WHERE TRUE
+               __LOCATION_REQUIRED_SQL__
+               __TAXONOMY_FILTER_SQL__
+    ),
+    provider_page AS MATERIALIZED (
+        SELECT *
+          FROM filtered_providers
+         ORDER BY
+               distance_miles ASC NULLS LAST,
+               allowed_amount_min ASC NULLS LAST,
+               provider_name ASC NULLS LAST,
+               npi ASC
+         LIMIT :limit
+        OFFSET :offset
+    ),
+    result_summary AS (
+        SELECT
+            COUNT(DISTINCT filtered_provider.npi)::bigint AS total,
+            array_agg(DISTINCT evidence.network_status)
+                FILTER (WHERE evidence.npi IS NOT NULL)
+                AS network_statuses,
+            array_agg(DISTINCT evidence.network_semantics)
+                FILTER (WHERE evidence.npi IS NOT NULL)
+                AS network_semantics_values,
+            COALESCE(
+                jsonb_agg(
+                    DISTINCT jsonb_build_object(
+                        'source_key', evidence.source_key,
+                        'snapshot_id', evidence.snapshot_id,
+                        'source_file_import_id',
+                            regexp_replace(
+                                COALESCE(evidence.import_run_id, ''),
+                                '^ptg2:',
+                                ''
+                            )
+                    )
+                ) FILTER (WHERE evidence.npi IS NOT NULL),
+                '[]'::jsonb
+            )::text AS source_rows_json
+          FROM filtered_providers filtered_provider
+          LEFT JOIN matching_evidence evidence
+            ON evidence.npi = filtered_provider.npi
+    )
+    SELECT
+        result_summary.total,
+        result_summary.network_statuses AS result_network_statuses,
+        result_summary.network_semantics_values
+            AS result_network_semantics_values,
+        result_summary.source_rows_json,
+        provider_page.*,
+        COALESCE(
+            allowed_taxonomy.taxonomy_codes,
+            ARRAY[]::varchar[]
+        ) AS taxonomy_codes,
+        COALESCE(
+            allowed_taxonomy.specialties,
+            ARRAY[]::varchar[]
+        ) AS specialties,
+        COALESCE(
+            allowed_taxonomy.classifications,
+            ARRAY[]::varchar[]
+        ) AS classifications,
+        COALESCE(
+            allowed_taxonomy.specializations,
+            ARRAY[]::varchar[]
+        ) AS specializations,
+        allowed_taxonomy.primary_specialty,
+        allowed_taxonomy.primary_specialization
+      FROM result_summary
+      LEFT JOIN provider_page ON TRUE
+      __TAXONOMY_SUMMARY_SQL__
+     ORDER BY
+           provider_page.distance_miles ASC NULLS LAST,
+           provider_page.allowed_amount_min ASC NULLS LAST,
+           provider_page.provider_name ASC NULLS LAST,
+           provider_page.npi ASC
+"""
+
+
+def _allowed_amount_page_sql(
+    args: Mapping[str, Any],
+    *,
+    address_table: str | None,
+    parameter_map: dict[str, Any],
+) -> Any:
+    """Build the exact provider page query after adding request parameters."""
+
+    location_join_sql, location_select_sql, location_required_sql = (
+        _allowed_amount_location_sql(
+            args,
+            address_table=address_table,
+            parameter_map=parameter_map,
+        )
+    )
+    replacement_sql_by_marker = {
+        "__PROVIDER_NAME_SQL__": _ptg2_provider_name_sql("npi_data"),
+        "__LOCATION_SELECT_SQL__": location_select_sql,
+        "__LOCATION_JOIN_SQL__": location_join_sql,
+        "__LOCATION_REQUIRED_SQL__": location_required_sql,
+        "__TAXONOMY_FILTER_SQL__": _allowed_amount_taxonomy_filter_sql(
+            args,
+            parameter_map,
+        ),
+        "__TAXONOMY_SUMMARY_SQL__": (
+            _provider_taxonomy_summary_lateral_sql(
+                "provider_page.npi",
+                alias="allowed_taxonomy",
+            )
+        ),
+    }
+    page_sql = _ALLOWED_AMOUNT_PAGE_SQL_TEMPLATE
+    for marker, replacement_sql in replacement_sql_by_marker.items():
+        page_sql = page_sql.replace(marker, replacement_sql)
+    return text(page_sql)
+
+
+def _allowed_amount_detail_sql() -> Any:
+    return text(
+        f"""
+        WITH {_ALLOWED_AMOUNT_SCOPE_CTES_SQL},
+        ranked_evidence AS (
+            SELECT
+                evidence.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY evidence.npi
+                    ORDER BY
+                          evidence.allowed_amount ASC NULLS LAST,
+                          evidence.billed_charge ASC NULLS LAST,
+                          evidence.source_key,
+                          evidence.snapshot_id,
+                          evidence.tin_type,
+                          evidence.tin_value
+                ) AS evidence_rank
+              FROM matching_evidence evidence
+             WHERE evidence.npi = ANY(CAST(:page_npis AS bigint[]))
+        )
+        SELECT *
+          FROM ranked_evidence
+         WHERE evidence_rank <= :detail_limit
+         ORDER BY npi, evidence_rank
+        """
+    )
+
+
+def _allowed_amount_query_params(
+    args: Mapping[str, Any],
+    pagination,
+    *,
+    plan_id: str,
+    code: str,
+    code_system: str,
+    npi: int | None,
+    current_snapshots: list[dict[str, Any]],
+) -> dict[str, Any]:
+    parameter_map = {
+        "allowed_contract": PTG2_ALLOWED_AMOUNT_CONTRACT,
+        "snapshot_ids": [
+            snapshot_by_field["snapshot_id"]
+            for snapshot_by_field in current_snapshots
+        ],
+        "source_keys": [
+            snapshot_by_field["source_key"]
+            for snapshot_by_field in current_snapshots
+        ],
+        "plan_ids": list(ein_plan_id_variants(plan_id)),
+        "market_type": str(
+            args.get("plan_market_type") or args.get("market_type") or ""
+        ).strip().lower(),
+        "code": code,
+        "code_system": code_system,
+        "npi": npi,
+        "limit": max(int(getattr(pagination, "limit", 25) or 25), 1),
+        "offset": max(int(getattr(pagination, "offset", 0) or 0), 0),
+    }
+    parameter_map.update(_allowed_amount_payment_filter_params(args))
+    return parameter_map
+
+
+async def _allowed_amount_detail_rows_for_page(
+    session,
+    query_parameter_map: Mapping[str, Any],
+    provider_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    page_npis = [
+        int(provider_by_field["npi"])
+        for provider_by_field in provider_rows
+    ]
+    if not page_npis:
+        return []
+    detail_parameter_map = dict(query_parameter_map)
+    detail_parameter_map.update(
+        {
+            "page_npis": page_npis,
+            "detail_limit": _ALLOWED_AMOUNT_DETAIL_LIMIT,
+        }
+    )
+    detail_result = await session.execute(
+        _allowed_amount_detail_sql(),
+        detail_parameter_map,
+    )
+    return [
+        _row_to_dict(detail_by_field)
+        for detail_by_field in detail_result
+    ]
+
+
+def _allowed_amount_network_context_from_summary(
+    summary_by_field: Mapping[str, Any],
+) -> dict[str, str]:
+    return _allowed_amount_network_context(
+        [
+            {
+                "network_status": network_status,
+                "network_semantics": network_semantics,
+            }
+            for network_status in (
+                summary_by_field.get("result_network_statuses") or []
+            )
+            for network_semantics in (
+                summary_by_field.get("result_network_semantics_values")
+                or [None]
+            )
+        ]
+    )
+
+
+def _allowed_amount_provider_items_from_rows(
+    args: Mapping[str, Any],
+    provider_rows: list[dict[str, Any]],
+    detail_rows: list[dict[str, Any]],
+    *,
+    code: str,
+    code_system: str,
+) -> list[dict[str, Any]]:
+    detail_rows_by_npi = _allowed_amount_rows_by_npi(detail_rows)
+    return [
+        _allowed_amount_provider_item(
+            npi=int(provider_by_field["npi"]),
+            payment_rows=detail_rows_by_npi.get(
+                int(provider_by_field["npi"]),
+                [],
+            ),
+            provider_by_field=provider_by_field,
+            code=code,
+            code_system=code_system,
+            include_unverified_addresses=_parse_bool(
+                args.get("include_unverified_addresses"),
+                "include_unverified_addresses",
+                default=True,
+            ),
+        )
+        for provider_by_field in provider_rows
+    ]
+
+
+def _allowed_amount_search_response(
+    args: Mapping[str, Any],
+    pagination,
+    *,
+    total: int,
+    provider_items: list[dict[str, Any]],
+    evidence_sources: list[dict[str, Any]],
+    network_context: Mapping[str, str],
+    search_scope: tuple[str, str, str, int | None],
+) -> dict[str, Any]:
+    plan_id, code, code_system, _npi_filter = search_scope
+    offset = max(int(getattr(pagination, "offset", 0) or 0), 0)
+    limit = max(int(getattr(pagination, "limit", 25) or 25), 1)
+    resolved_snapshot_ids = sorted(
+        {
+            str(source_by_field.get("snapshot_id"))
+            for source_by_field in evidence_sources
+            if source_by_field.get("snapshot_id")
+        }
+    )
+    return {
+        "result_state": "allowed_amounts_found",
+        "pricing_scope": "plan_scoped_allowed_amounts",
+        "resolved": True,
+        "resolved_snapshot_id": (
+            resolved_snapshot_ids[0]
+            if len(resolved_snapshot_ids) == 1
+            else None
+        ),
+        "resolved_snapshot_ids": resolved_snapshot_ids,
+        "items": provider_items,
+        "pagination": {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "page": (offset // limit) + 1,
+            "has_more": offset + len(provider_items) < total,
+            "total_is_exact": True,
+        },
+        "query": _allowed_amount_response_query(
+            args,
+            evidence_sources=evidence_sources,
+            network_context=network_context,
+            plan_id=plan_id,
+            code=code,
+            code_system=code_system,
+        ),
+        "sources": _allowed_amount_response_sources(
+            evidence_sources,
+            network_context,
+        ),
+        "warnings": [_allowed_amount_warning(network_context)],
+    }
+
+
+async def _allowed_amount_page_rows(
+    session,
+    args: Mapping[str, Any],
+    pagination,
+    *,
+    search_scope: tuple[str, str, str, int | None],
+    current_snapshots: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    plan_id, code, code_system, npi_filter = search_scope
+    address_table = await _allowed_amount_address_table(session, args)
+    if _has_allowed_amount_address_filter(args) and not address_table:
+        return None
+    query_parameter_map = _allowed_amount_query_params(
+        args,
+        pagination,
+        plan_id=plan_id,
+        code=code,
+        code_system=code_system,
+        npi=npi_filter,
+        current_snapshots=current_snapshots,
+    )
+    page_query = _allowed_amount_page_sql(
+        args,
+        address_table=address_table,
+        parameter_map=query_parameter_map,
+    )
+    page_result = await session.execute(page_query, query_parameter_map)
+    return (
+        [_row_to_dict(page_by_field) for page_by_field in page_result],
+        query_parameter_map,
+    )
+
+
+async def _allowed_amount_response_from_page(
+    session,
+    args: Mapping[str, Any],
+    pagination,
+    *,
+    search_scope: tuple[str, str, str, int | None],
+    page_rows: list[dict[str, Any]],
+    query_parameter_map: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    _plan_id, code, code_system, _npi_filter = search_scope
+    if not page_rows:
+        return None
+    summary_by_field = page_rows[0]
+    total = _as_int(summary_by_field.get("total")) or 0
+    if total <= 0:
+        return None
+    provider_rows = [
+        provider_by_field
+        for provider_by_field in page_rows
+        if (_as_int(provider_by_field.get("npi")) or 0) > 0
+    ]
+    detail_rows = await _allowed_amount_detail_rows_for_page(
+        session,
+        query_parameter_map,
+        provider_rows,
+    )
+    provider_items = _allowed_amount_provider_items_from_rows(
+        args,
+        provider_rows,
+        detail_rows,
+        code=code,
+        code_system=code_system,
+    )
+    network_context = _allowed_amount_network_context_from_summary(
+        summary_by_field
+    )
+    evidence_sources = _allowed_amount_sources(
+        summary_by_field.get("source_rows_json")
+    )
+    return _allowed_amount_search_response(
+        args,
+        pagination,
+        total=total,
+        provider_items=provider_items,
+        evidence_sources=evidence_sources,
+        network_context=network_context,
+        search_scope=search_scope,
+    )
+
+
+async def _search_ptg_allowed_amount_evidence(
+    session,
+    args: Mapping[str, Any],
+    pagination,
+) -> dict[str, Any] | None:
+    """Search current strict-V3 allowed evidence with exact SQL pagination."""
+
+    search_scope = _allowed_amount_scope_from_args(args)
+    if (
+        search_scope is None
+        or not _supports_allowed_amount_fallback(args)
+    ):
+        return None
+    plan_id = search_scope[0]
+    current_snapshots = await _current_allowed_amount_snapshots_for_plan(
+        session,
+        args,
+        plan_id=plan_id,
+    )
+    if not current_snapshots:
+        return None
+    page_search = await _allowed_amount_page_rows(
+        session,
+        args,
+        pagination,
+        search_scope=search_scope,
+        current_snapshots=current_snapshots,
+    )
+    if page_search is None:
+        return None
+    page_rows, query_parameter_map = page_search
+    return await _allowed_amount_response_from_page(
+        session,
+        args,
+        pagination,
+        search_scope=search_scope,
+        page_rows=page_rows,
+        query_parameter_map=query_parameter_map,
+    )
+
+
+def _allowed_amount_rows_by_npi(
+    payment_rows: Iterable[dict[str, Any]],
+) -> dict[int, list[dict[str, Any]]]:
+    payment_rows_by_npi: dict[int, list[dict[str, Any]]] = {}
+    for payment_by_field in payment_rows:
+        provider_npi = _as_int(payment_by_field.get("npi"))
+        if provider_npi is None or provider_npi <= 0:
+            continue
+        payment_rows_by_npi.setdefault(provider_npi, []).append(
+            payment_by_field
+        )
+    return payment_rows_by_npi
+
+
+def _allowed_amount_sources(serialized_sources: Any) -> list[dict[str, Any]]:
+    if isinstance(serialized_sources, str):
+        try:
+            serialized_sources = json.loads(serialized_sources)
+        except (TypeError, ValueError):
+            serialized_sources = []
+    if not isinstance(serialized_sources, list):
+        return []
+    sources = [
+        dict(source_by_field)
+        for source_by_field in serialized_sources
+        if isinstance(source_by_field, Mapping)
+    ]
+    sources.sort(
+        key=lambda source_by_field: (
+            str(source_by_field.get("source_key") or ""),
+            str(source_by_field.get("snapshot_id") or ""),
+        )
+    )
+    return sources
+
+
+def _allowed_amount_response_filters(
+    args: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "specialty": args.get("specialty") or None,
+        "taxonomy_codes": (
+            args.get("taxonomy_codes") or args.get("taxonomy_code") or None
+        ),
+        "primary_only": args.get("primary_only") or None,
+        "state": args.get("state") or None,
+        "city": args.get("city") or None,
+        "zip5": args.get("zip5") or None,
+        "zip_radius_miles": (
+            args.get("zip_radius_miles") if args.get("zip5") else None
+        ),
+        "lat": args.get("lat") or None,
+        "long": args.get("long") or None,
+        "radius_miles": args.get("radius_miles") or None,
+        "npi": args.get("npi") or None,
+        "service_code": (
+            args.get("service_code")
+            or args.get("pos")
+            or args.get("place_of_service")
+            or None
+        ),
+        "billing_code_modifier": (
+            args.get("billing_code_modifier")
+            or args.get("modifier")
+            or args.get("modifiers")
+            or None
+        ),
+    }
+
+
+def _allowed_amount_response_query(
+    args: Mapping[str, Any],
+    *,
+    evidence_sources: list[dict[str, Any]],
+    network_context: Mapping[str, str],
+    plan_id: str,
+    code: str,
+    code_system: str,
+) -> dict[str, Any]:
+    """Build the response query contract for an allowed-evidence result."""
+
+    source_keys = [
+        source_by_field.get("source_key")
+        for source_by_field in evidence_sources
+        if source_by_field.get("source_key")
+    ]
+    snapshot_ids = [
+        source_by_field.get("snapshot_id")
+        for source_by_field in evidence_sources
+        if source_by_field.get("snapshot_id")
+    ]
+    query_by_field = {
+        "plan_id": plan_id,
+        "plan_market_type": (
+            args.get("plan_market_type") or args.get("market_type") or None
+        ),
+        "code": code,
+        "code_system": code_system or None,
+        "source": "ptg2_allowed_amounts",
+        "status": "allowed_amounts_found",
+        "source_keys": source_keys,
+        "snapshot_ids": snapshot_ids,
+        "source_key": source_keys[0] if len(source_keys) == 1 else None,
+        "snapshot_id": snapshot_ids[0] if len(snapshot_ids) == 1 else None,
+        "network_semantics": network_context["network_semantics"],
+    }
+    query_by_field.update(_allowed_amount_response_filters(args))
+    return query_by_field
+
+
+def _allowed_amount_response_sources(
+    evidence_sources: list[dict[str, Any]],
+    network_context: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            **source_by_field,
+            "source_system": "transparency_in_coverage_allowed_amounts",
+            "grain": (
+                "plan/code/tin/payment/provider_npi historical allowed amount"
+            ),
+            "network_status": network_context["network_status"],
+        }
+        for source_by_field in evidence_sources
+    ]
+
+
+def _normalize_allowed_amount_network_status(value: Any) -> str:
+    normalized = (
+        str(value or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    if normalized in {
+        ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK,
+        "innetwork",
+        "confirmed_in_network",
+        "covered_in_network",
+        "network",
+    }:
+        return ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK
+    if normalized in {
+        ALLOWED_AMOUNT_NETWORK_STATUS_MIXED,
+        "mixed",
+        "mixed_network",
+    }:
+        return ALLOWED_AMOUNT_NETWORK_STATUS_MIXED
+    return ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED
+
+
+def _allowed_amount_network_semantics(
+    network_status: str,
+    raw_semantics: Any = None,
+) -> str:
+    normalized_semantics = str(raw_semantics or "").strip().lower()
+    if normalized_semantics in {
+        ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK,
+        ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK,
+        ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED,
+    }:
+        return normalized_semantics
+    if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK:
+        return ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK
+    if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_MIXED:
+        return ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED
+    return ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK
+
+
+def _allowed_amount_network_context(
+    payment_rows: Iterable[Mapping[str, Any]],
+) -> dict[str, str]:
+    payment_rows = list(payment_rows)
+    statuses = {
+        _normalize_allowed_amount_network_status(
+            payment_by_field.get("network_status")
+        )
+        for payment_by_field in payment_rows
+    }
+    if statuses == {ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK}:
+        status = ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK
+    elif (
+        ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK in statuses
+        and len(statuses) > 1
+    ) or ALLOWED_AMOUNT_NETWORK_STATUS_MIXED in statuses:
+        status = ALLOWED_AMOUNT_NETWORK_STATUS_MIXED
+    else:
+        status = ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED
+    semantics_values = {
+        _allowed_amount_network_semantics(
+            _normalize_allowed_amount_network_status(
+                payment_by_field.get("network_status")
+            ),
+            payment_by_field.get("network_semantics"),
+        )
+        for payment_by_field in payment_rows
+    }
+    if semantics_values == {ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK}:
+        semantics = ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK
+    elif (
+        len(semantics_values) > 1
+        or ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED in semantics_values
+    ):
+        semantics = ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED
+    else:
+        semantics = _allowed_amount_network_semantics(status)
+    return {
+        "network_status": status,
+        "network_semantics": semantics,
+    }
+
+
+def _allowed_amount_warning(
+    network_context: Mapping[str, str],
+) -> dict[str, str]:
+    status = network_context.get("network_status")
+    if status == ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK:
+        return {
+            "code": "allowed_amounts_not_negotiated_rates",
+            "message": (
+                "Allowed amounts are historical payment evidence. The source "
+                "marks the evidence in-network, but it is not a negotiated rate."
+            ),
+        }
+    if status == ALLOWED_AMOUNT_NETWORK_STATUS_MIXED:
+        return {
+            "code": "allowed_amounts_mixed_network_status",
+            "message": (
+                "Allowed amounts include mixed or partially confirmed network "
+                "status. They are historical payment evidence, not negotiated "
+                "rates."
+            ),
+        }
+    return {
+        "code": "allowed_amounts_not_in_network_rates",
+        "message": (
+            "Allowed amounts are historical out-of-network or "
+            "not-confirmed-in-network payment evidence, not negotiated rates."
+        ),
+    }
+
+
+def _allowed_amount_price_disclaimer(network_status: str) -> str:
+    if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK:
+        return (
+            "Historical in-network allowed amount; not a contracted "
+            "negotiated rate."
+        )
+    if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_MIXED:
+        return (
+            "Historical allowed amount with mixed network status; not a "
+            "contracted negotiated rate."
+        )
+    return (
+        "Historical out-of-network or not-confirmed-in-network allowed "
+        "amount; not a negotiated rate."
+    )
+
+
+def _allowed_amount_provider_item(
+    *,
+    npi: int,
+    payment_rows: list[dict[str, Any]],
+    provider_by_field: dict[str, Any],
+    code: str,
+    code_system: str,
+    include_unverified_addresses: bool = True,
+) -> dict[str, Any]:
+    network_statuses = _normalize_string_sequence(
+        provider_by_field.get("network_statuses")
+    )
+    network_semantics_values = _normalize_string_sequence(
+        provider_by_field.get("network_semantics_values")
+    )
+    network_context = _allowed_amount_network_context(
+        [
+            {
+                "network_status": network_status,
+                "network_semantics": network_semantics,
+            }
+            for network_status in network_statuses
+            for network_semantics in (network_semantics_values or [None])
+        ]
+        or payment_rows
+    )
+    network_status = network_context["network_status"]
+    network_semantics = network_context["network_semantics"]
+    price_entries = [
+        _allowed_amount_price_payload(evidence_row)
+        for evidence_row in payment_rows[:_ALLOWED_AMOUNT_DETAIL_LIMIT]
+    ]
+    provider_item_by_field = _allowed_amount_provider_identity(
+        npi=npi,
+        provider_by_field=provider_by_field,
+        network_status=network_status,
+        network_semantics=network_semantics,
+    )
+    provider_item_by_field.update(
+        _allowed_amount_code_fields(
+            code=code,
+            code_system=code_system,
+            price_entries=price_entries,
+        )
+    )
+    provider_item_by_field.update(
+        _allowed_amount_summary_fields(
+            provider_by_field=provider_by_field,
+            network_status=network_status,
+        )
+    )
+    if not include_unverified_addresses:
+        _strip_allowed_amount_unverified_location_fields(
+            provider_item_by_field
+        )
+    return provider_item_by_field
+
+
+def _strip_allowed_amount_unverified_location_fields(
+    payload: Any,
+    *,
+    parent_field_name: str = "",
+) -> None:
+    """Recursively remove inferred location data and its verification metadata."""
+
+    if isinstance(payload, dict):
+        for field_name in _ALLOWED_AMOUNT_UNVERIFIED_LOCATION_FIELD_NAMES:
+            payload.pop(field_name, None)
+        if parent_field_name == "confidence":
+            payload.pop("location", None)
+        for field_name, nested_payload in list(payload.items()):
+            _strip_allowed_amount_unverified_location_fields(
+                nested_payload,
+                parent_field_name=field_name,
+            )
+        return
+    if isinstance(payload, list):
+        for nested_payload in payload:
+            _strip_allowed_amount_unverified_location_fields(
+                nested_payload,
+                parent_field_name=parent_field_name,
+            )
+
+
+def _allowed_amount_provider_identity(
+    *,
+    npi: int,
+    provider_by_field: Mapping[str, Any],
+    network_status: str,
+    network_semantics: str,
+) -> dict[str, Any]:
+    source_keys = _normalize_string_sequence(
+        provider_by_field.get("source_keys")
+    )
+    snapshot_ids = _normalize_string_sequence(
+        provider_by_field.get("snapshot_ids")
+    )
+    import_run_ids = _normalize_string_sequence(
+        provider_by_field.get("import_run_ids")
+    )
+    source_file_import_ids = [
+        import_run_id.removeprefix("ptg2:")
+        for import_run_id in import_run_ids
+        if import_run_id.removeprefix("ptg2:")
+    ]
+    distance_miles = _as_float(provider_by_field.get("distance_miles"))
+    return {
+        "npi": npi,
+        "provider_ordinal": npi,
+        "provider_name": (
+            provider_by_field.get("provider_name") or "TiC provider"
+        ),
+        "state": provider_by_field.get("state"),
+        "city": provider_by_field.get("city"),
+        "zip5": provider_by_field.get("zip5"),
+        "address": _allowed_amount_provider_address(provider_by_field),
+        "taxonomy_codes": provider_by_field.get("taxonomy_codes") or [],
+        "specialties": provider_by_field.get("specialties") or [],
+        "primary_specialty": provider_by_field.get("primary_specialty"),
+        "classifications": provider_by_field.get("classifications") or [],
+        "specialization": provider_by_field.get("primary_specialization"),
+        "source_keys": source_keys,
+        "snapshot_ids": snapshot_ids,
+        "source_file_import_ids": source_file_import_ids,
+        "source_key": source_keys[0] if len(source_keys) == 1 else None,
+        "snapshot_id": snapshot_ids[0] if len(snapshot_ids) == 1 else None,
+        "source_file_import_id": (
+            source_file_import_ids[0]
+            if len(source_file_import_ids) == 1
+            else None
+        ),
+        "distance_miles": distance_miles,
+        "distance_bucket": _distance_bucket(distance_miles),
+        "network_status": network_status,
+        "network_semantics": network_semantics,
+        "network_bound_address": False,
+        "requires_location_confirmation": True,
+        "address_network_binding": "not_applicable_allowed_amounts",
+    }
+
+
+def _allowed_amount_code_fields(
+    *,
+    code: str,
+    code_system: str,
+    price_entries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "procedure_code": code,
+        "hp_procedure_code": code,
+        "service_code": code,
+        "service_code_system": code_system or None,
+        "reported_code": code,
+        "reported_code_system": code_system or None,
+        "billing_code": code,
+        "billing_code_type": code_system or None,
+        "prices": price_entries,
+        "allowed_amount_prices": price_entries,
+    }
+
+
+def _allowed_amount_provider_address(
+    provider_by_field: Mapping[str, Any],
+) -> dict[str, Any]:
+    address_by_field = provider_by_field.get("address_payload")
+    if isinstance(address_by_field, str):
+        try:
+            address_by_field = json.loads(address_by_field)
+        except (TypeError, ValueError):
+            return {}
+    return address_by_field if isinstance(address_by_field, dict) else {}
+
+
+def _allowed_amount_summary_fields(
+    *,
+    provider_by_field: Mapping[str, Any],
+    network_status: str,
+) -> dict[str, Any]:
+    allowed_amount_min = _as_float(
+        provider_by_field.get("allowed_amount_min")
+    )
+    allowed_amount_max = _as_float(
+        provider_by_field.get("allowed_amount_max")
+    )
+    average_allowed_amount = _as_float(
+        provider_by_field.get("allowed_amount_avg")
+    )
+    billed_charge_min = _as_float(
+        provider_by_field.get("billed_charge_min")
+    )
+    billed_charge_max = _as_float(
+        provider_by_field.get("billed_charge_max")
+    )
+    evidence_count = _as_int(provider_by_field.get("evidence_count")) or 0
+    return {
+        "allowed_amount_min": allowed_amount_min,
+        "allowed_amount_max": allowed_amount_max,
+        "allowed_amount_avg": average_allowed_amount,
+        "billed_charge_min": billed_charge_min,
+        "billed_charge_max": billed_charge_max,
+        "evidence_count": evidence_count,
+        "price_summary": [
+            {
+                "source": "allowed_amounts",
+                "price_type": "historical_allowed_amount",
+                "network_status": network_status,
+                "min": allowed_amount_min,
+                "max": allowed_amount_max,
+                "avg": average_allowed_amount,
+                "evidence_count": evidence_count,
+            }
+        ],
+        "confidence": {
+            "network": (
+                "allowed_amounts_in_network"
+                if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK
+                else "allowed_amounts_not_confirmed_in_network"
+            ),
+            "location": "nppes_practice_location",
+        },
+    }
+
+
+def _allowed_amount_price_payload(
+    evidence_row: Mapping[str, Any],
+) -> dict[str, Any]:
+    network_status = _normalize_allowed_amount_network_status(
+        evidence_row.get("network_status")
+    )
+    return {
+        "source": "allowed_amounts",
+        "price_type": "historical_allowed_amount",
+        "network_status": network_status,
+        "network_semantics": _allowed_amount_network_semantics(
+            network_status,
+            evidence_row.get("network_semantics"),
+        ),
+        "allowed_amount": _as_float(evidence_row.get("allowed_amount")),
+        "billed_charge": _as_float(evidence_row.get("billed_charge")),
+        "tin_type": evidence_row.get("tin_type"),
+        "tin_value": evidence_row.get("tin_value"),
+        "service_code": _normalize_string_sequence(
+            evidence_row.get("service_code")
+        ),
+        "billing_class": evidence_row.get("billing_class"),
+        "setting": evidence_row.get("setting"),
+        "billing_code_modifier": _normalize_string_sequence(
+            evidence_row.get("billing_code_modifier")
+        ),
+        "match_basis": "npi",
+        "confidence": "medium",
+        "disclaimer": _allowed_amount_price_disclaimer(network_status),
+    }
+
+
+def _normalize_string_sequence(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = [value]
+    return [
+        str(item).strip()
+        for item in values
+        if str(item or "").strip()
+    ]
+
+
 def _annotate_ptg2_result_state(
     ptg2_payload: object,
     *,
@@ -8035,12 +9658,8 @@ async def list_providers_by_procedure(request):
     include_allowed_amounts = _parse_bool(
         args.get("include_allowed_amounts"),
         "include_allowed_amounts",
-        default=False,
+        default=True,
     )
-    if include_allowed_amounts:
-        raise InvalidUsage(
-            "Parameter 'include_allowed_amounts=true' is not supported by strict PTG V3"
-        )
     internal_codes: list[int] = []
     plan_id = str(args.get("plan_id", "")).strip()
     plan_external_id = str(args.get("plan_external_id", "")).strip()
@@ -8166,6 +9785,27 @@ async def list_providers_by_procedure(request):
             pagination,
         )
         if ptg2_payload is None:
+            if include_allowed_amounts:
+                allowed_amount_payload = (
+                    await _search_ptg_allowed_amount_evidence(
+                        session,
+                        ptg_args,
+                        pagination,
+                    )
+                )
+                if allowed_amount_payload is not None:
+                    _annotate_ptg2_query_payload(
+                        allowed_amount_payload,
+                        plan_id_type=plan_id_type,
+                        year=year,
+                        has_plan_scope=bool(
+                            plan_id or plan_external_id or snapshot_id
+                        ),
+                    )
+                    return _ptg_json_response(
+                        request,
+                        allowed_amount_payload,
+                    )
             ptg_empty_status = "no_match" if (source_key or snapshot_id) else "no_route"
             has_location_filter = _has_ptg2_location_filter(args)
             query_payload = {
@@ -8218,6 +9858,28 @@ async def list_providers_by_procedure(request):
                     "query": query_payload,
                 },
             )
+        if (
+            include_allowed_amounts
+            and _has_no_ptg2_priced_items(ptg2_payload)
+        ):
+            allowed_amount_payload = await _search_ptg_allowed_amount_evidence(
+                session,
+                ptg_args,
+                pagination,
+            )
+            if allowed_amount_payload is not None:
+                _annotate_ptg2_query_payload(
+                    allowed_amount_payload,
+                    plan_id_type=plan_id_type,
+                    year=year,
+                    has_plan_scope=bool(
+                        plan_id or plan_external_id or snapshot_id
+                    ),
+                )
+                return _ptg_json_response(
+                    request,
+                    allowed_amount_payload,
+                )
         _annotate_ptg2_query_payload(
             ptg2_payload,
             plan_id_type=plan_id_type,

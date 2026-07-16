@@ -312,6 +312,81 @@ def test_openapi_strict_ptg_pagination_exposes_exact_page_continuation():
     )
 
 
+def test_openapi_exposes_strict_v3_allowed_amount_fallback():
+    """Document allowed fallback routing and response states."""
+
+    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    for path in (
+        "/pricing/providers/search-by-procedure",
+        "/pricing/providers/by-procedure",
+    ):
+        parameters = spec["paths"][path]["get"]["parameters"]
+        allowed_parameter = next(
+            parameter_by_field
+            for parameter_by_field in parameters
+            if parameter_by_field["name"] == "include_allowed_amounts"
+        )
+        assert allowed_parameter["schema"] == {
+            "type": "boolean",
+            "default": True,
+        }
+        description = allowed_parameter["description"]
+        assert "strict-V3" in description
+        assert "every isolated current allowed-evidence source" in description
+        assert "covering the" in description
+        assert "requested plan" in description
+        assert "request predicates can be" in description
+        assert "preserved" in description
+        assert "rate-tolerance predicates do not fall back" in description
+        assert "not negotiated rates" in description
+
+    response_schema = spec["components"]["schemas"][
+        "PricingProcedureProviderListResponse"
+    ]
+    response_properties = response_schema["properties"]
+    assert set(response_properties["result_state"]["enum"]) == {
+        "matched",
+        "allowed_amounts_found",
+        "no_match_in_radius",
+        "no_matching_rates",
+        "no_snapshot_for_plan",
+    }
+    assert set(response_properties["pricing_scope"]["enum"]) == {
+        "plan_scoped_ptg",
+        "plan_scoped_allowed_amounts",
+    }
+    assert set(
+        response_properties["query"]["properties"]["status"]["enum"]
+    ) == {
+        "matched",
+        "allowed_amounts_found",
+        "no_match",
+        "no_route",
+    }
+
+
+def test_openapi_documents_allowed_unverified_location_suppression():
+    """Document allowed fallback output suppression without changing filtering."""
+
+    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    for path in (
+        "/pricing/providers/search-by-procedure",
+        "/pricing/providers/by-procedure",
+    ):
+        parameters = spec["paths"][path]["get"]["parameters"]
+        unverified_address_parameter = next(
+            parameter_by_field
+            for parameter_by_field in parameters
+            if parameter_by_field["name"] == "include_unverified_addresses"
+        )
+        description = unverified_address_parameter["description"]
+        assert "allowed-amount fallback results" in description
+        assert "suppresses distance" in description
+        assert "location-verification metadata" in description
+        assert "location filters" in description
+        assert "apply internally" in description
+
+
 def test_npi_profile_contract_is_typed_and_address_refresh_is_boolean():
     spec = yaml.safe_load(OPENAPI_PATH.read_text())
     npi_parameters = spec["paths"]["/npi/id/{npi}"]["get"]["parameters"]

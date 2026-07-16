@@ -4106,15 +4106,28 @@ paths:
         - name: include_unverified_addresses
           in: query
           schema: { type: boolean, default: true }
+          description: |
+            When true or omitted, returns best-known PTG provider addresses
+            when available. Set false to suppress unverified address fields.
+            For allowed-amount fallback results, this also suppresses distance
+            and location-verification metadata while requested location filters
+            still apply internally.
         - name: include_evidence
           in: query
           schema: { type: boolean }
         - name: include_allowed_amounts
           in: query
-          schema: { type: boolean, default: false, enum: [false] }
+          schema: { type: boolean, default: true }
           description: |
-            Retired compatibility parameter. Only false is accepted; true is
-            rejected before the strict PTG search runs.
+            When true or omitted for plan-scoped PTG requests, returns
+            published strict-V3 historical allowed-amount payment evidence
+            from every isolated current allowed-evidence source covering the
+            requested plan when no negotiated in-network price matches the
+            requested code and all request predicates can be preserved.
+            POS/service-code, modifier, NPI, taxonomy, and location filters are
+            applied to allowed evidence. Requests with negotiated rate or
+            rate-tolerance predicates do not fall back because allowed amounts
+            are evidence, not negotiated rates.
         - name: include_details
           in: query
           schema: { type: boolean }
@@ -4367,7 +4380,12 @@ paths:
           schema:
             type: boolean
             default: true
-          description: When true or omitted, returns best-known PTG provider addresses when available. Verified/network-bound addresses remain marked with address_verification.network_bound_address=true; inferred addresses are marked network_bound_address=false and requires_location_confirmation=true. Set false to suppress unverified address fields.
+          description: |
+            When true or omitted, returns best-known PTG provider addresses
+            when available. Set false to suppress unverified address fields.
+            For allowed-amount fallback results, this also suppresses distance
+            and location-verification metadata while requested location filters
+            still apply internally.
         - name: include_evidence
           in: query
           schema:
@@ -4376,11 +4394,17 @@ paths:
           in: query
           schema:
             type: boolean
-            default: false
-            enum: [false]
+            default: true
           description: |
-            Retired compatibility parameter. Only false is accepted; true is
-            rejected before the strict PTG search runs.
+            When true or omitted for plan-scoped PTG requests, returns
+            published strict-V3 historical allowed-amount payment evidence
+            from every isolated current allowed-evidence source covering the
+            requested plan when no negotiated in-network price matches the
+            requested code and all request predicates can be preserved.
+            POS/service-code, modifier, NPI, taxonomy, and location filters are
+            applied to allowed evidence. Requests with negotiated rate or
+            rate-tolerance predicates do not fall back because allowed amounts
+            are evidence, not negotiated rates.
         - name: include_details
           in: query
           schema:
@@ -6680,12 +6704,12 @@ components:
           type: string
           nullable: true
           description: Machine-readable outcome for plan-scoped PTG/TiC pricing lookups.
-          enum: [matched, no_match_in_radius, no_matching_rates, no_snapshot_for_plan]
+          enum: [matched, allowed_amounts_found, no_match_in_radius, no_matching_rates, no_snapshot_for_plan]
         pricing_scope:
           type: string
           nullable: true
           description: Indicates the pricing backend scope when the response came from plan-scoped PTG/TiC data.
-          enum: [plan_scoped_ptg]
+          enum: [plan_scoped_ptg, plan_scoped_allowed_amounts]
         resolved_snapshot_id:
           type: string
           nullable: true
@@ -6721,6 +6745,7 @@ components:
             status:
               type: string
               nullable: true
+              enum: [matched, allowed_amounts_found, no_match, no_route]
             state:
               type: string
               nullable: true

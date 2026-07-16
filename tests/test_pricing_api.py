@@ -334,6 +334,7 @@ async def test_plan_scoped_search_resolves_dynamic_specialty_without_legacy_cach
             "market_type": "group",
             "code": "70551",
             "specialty": "imaging specialist",
+            "include_allowed_amounts": "false",
             "limit": "10",
         },
     )
@@ -2618,12 +2619,142 @@ async def test_list_providers_by_procedure_infers_ptg_code_system(monkeypatch):
     assert observed_search_args_by_name["code_system"] == "CPT"
 
 
+def _build_allowed_amount_fallback_response() -> dict:
+    return {
+        "result_state": "allowed_amounts_found",
+        "pricing_scope": "plan_scoped_allowed_amounts",
+        "resolved": True,
+        "items": [
+            {
+                "npi": 1427166008,
+                "network_status": (
+                    "out_of_network_or_not_confirmed_in_network"
+                ),
+                "prices": [
+                    {
+                        "source": "allowed_amounts",
+                        "allowed_amount": 133.0,
+                    }
+                ],
+            }
+        ],
+        "pagination": {
+            "total": 1,
+            "limit": 25,
+            "offset": 0,
+            "page": 1,
+        },
+        "query": {
+            "source": "ptg2_allowed_amounts",
+            "plan_id": "TESTPLAN001",
+        },
+    }
+
+
+def _build_current_allowed_snapshots() -> list[dict]:
+    return [
+        {
+            "snapshot_id": "ptg2:202607:allowed-a",
+            "source_key": "allowed_source_a",
+        },
+        {
+            "snapshot_id": "ptg2:202607:allowed-b",
+            "source_key": "allowed_source_b",
+        },
+    ]
+
+
+def _build_allowed_amount_page_row(*, total: int = 12501) -> dict:
+    return {
+        "total": total,
+        "result_network_statuses": ["in_network"],
+        "result_network_semantics_values": [
+            "in_network_historical_allowed_amounts"
+        ],
+        "source_rows_json": json.dumps(
+            [
+                {
+                    "source_key": "allowed_source_a",
+                    "snapshot_id": "ptg2:202607:allowed-a",
+                    "source_file_import_id": "allowed-import-a",
+                },
+                {
+                    "source_key": "allowed_source_b",
+                    "snapshot_id": "ptg2:202607:allowed-b",
+                    "source_file_import_id": "allowed-import-b",
+                },
+            ]
+        ),
+        "npi": 1427166008,
+        "provider_name": "Example Medical Group",
+        "state": "IL",
+        "city": "Chicago",
+        "zip5": "60601",
+        "distance_miles": 2.5,
+        "address_payload": json.dumps({"city": "Chicago", "state": "IL"}),
+        "taxonomy_codes": ["207Q00000X"],
+        "specialties": ["Family Medicine"],
+        "classifications": ["Family Medicine"],
+        "specializations": [],
+        "primary_specialty": "Family Medicine",
+        "primary_specialization": None,
+        "allowed_amount_min": 133.0,
+        "allowed_amount_max": 175.0,
+        "allowed_amount_avg": 151.25,
+        "billed_charge_min": 155.0,
+        "billed_charge_max": 210.0,
+        "evidence_count": 15000,
+        "network_statuses": ["in_network"],
+        "network_semantics_values": [
+            "in_network_historical_allowed_amounts"
+        ],
+        "source_keys": ["allowed_source_a", "allowed_source_b"],
+        "snapshot_ids": [
+            "ptg2:202607:allowed-a",
+            "ptg2:202607:allowed-b",
+        ],
+        "import_run_ids": [
+            "ptg2:allowed-import-a",
+            "ptg2:allowed-import-b",
+        ],
+    }
+
+
+def _build_in_network_allowed_evidence(
+    *,
+    source_key: str = "allowed_source_a",
+) -> dict:
+    return {
+        "npi": 1427166008,
+        "source_key": source_key,
+        "snapshot_id": f"ptg2:202607:{source_key}",
+        "import_run_id": f"ptg2:{source_key}",
+        "plan_id": "TESTPLAN001",
+        "billing_code_type": "CPT",
+        "billing_code": "99214",
+        "allowed_amount": 133.0,
+        "billed_charge": 155.0,
+        "tin_type": "ein",
+        "tin_value": "123456789",
+        "network_status": "in_network",
+        "network_semantics": "in_network_historical_allowed_amounts",
+    }
+
+
 @pytest.mark.asyncio
-async def test_list_providers_by_procedure_rejects_allowed_amounts_before_ptg_search(
+async def test_list_providers_by_procedure_falls_back_to_allowed_amounts(
     monkeypatch,
 ):
-    strict_search = AsyncMock()
+    strict_search = AsyncMock(return_value=None)
+    allowed_search = AsyncMock(
+        return_value=_build_allowed_amount_fallback_response()
+    )
     monkeypatch.setattr(pricing_module, "search_current_ptg2_index", strict_search)
+    monkeypatch.setattr(
+        pricing_module,
+        "_search_ptg_allowed_amount_evidence",
+        allowed_search,
+    )
     request = make_request(
         [],
         args={
@@ -2636,24 +2767,34 @@ async def test_list_providers_by_procedure_rejects_allowed_amounts_before_ptg_se
         },
     )
 
-    with pytest.raises(
-        pricing_module.InvalidUsage,
-        match="include_allowed_amounts.*not supported",
-    ):
-        await list_providers_by_procedure(request)
+    response = await list_providers_by_procedure(request)
+    response_by_field = json.loads(response.body)
 
-    strict_search.assert_not_awaited()
+    assert response_by_field["result_state"] == "allowed_amounts_found"
+    assert response_by_field["pricing_scope"] == "plan_scoped_allowed_amounts"
+    assert response_by_field["items"][0]["prices"][0]["allowed_amount"] == 133.0
+    assert response_by_field["query"]["year_semantics"] == (
+        "ignored_for_plan_scoped_ptg_rates"
+    )
+    strict_search.assert_awaited_once()
+    allowed_search.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_plan_scoped_ptg_miss_does_not_query_allowed_amounts_by_default(
+async def test_plan_scoped_ptg_miss_queries_allowed_amounts_by_default(
     monkeypatch,
 ):
     strict_search = AsyncMock(return_value=None)
+    allowed_search = AsyncMock(return_value=None)
     monkeypatch.setattr(
         pricing_module,
         "search_current_ptg2_index",
         strict_search,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_search_ptg_allowed_amount_evidence",
+        allowed_search,
     )
 
     request = make_request(
@@ -2666,11 +2807,12 @@ async def test_plan_scoped_ptg_miss_does_not_query_allowed_amounts_by_default(
         },
     )
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
+    response_by_field = json.loads(response.body)
 
-    assert payload["pricing_scope"] == "plan_scoped_ptg"
-    assert payload["items"] == []
+    assert response_by_field["pricing_scope"] == "plan_scoped_ptg"
+    assert response_by_field["items"] == []
     strict_search.assert_awaited_once()
+    allowed_search.assert_awaited_once()
     assert request.ctx.sa_session.executions == []
 
 
@@ -2698,6 +2840,471 @@ async def test_plan_scoped_ptg_miss_does_not_query_allowed_amounts_when_false(
     assert pricing_response["query"]["source"] == "ptg2"
     strict_search.assert_awaited_once()
     assert request.ctx.sa_session.executions == []
+
+
+@pytest.mark.asyncio
+async def test_negotiated_ptg_result_does_not_query_allowed_amounts(monkeypatch):
+    strict_response_by_field = {
+        "items": [{"npi": 1427166008, "prices": [{"negotiated_rate": 98.0}]}],
+        "pagination": {"total": 1, "limit": 25, "offset": 0, "page": 1},
+        "query": {"source": "ptg2"},
+    }
+    strict_search = AsyncMock(return_value=strict_response_by_field)
+    allowed_search = AsyncMock()
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", strict_search)
+    monkeypatch.setattr(
+        pricing_module,
+        "_search_ptg_allowed_amount_evidence",
+        allowed_search,
+    )
+    request = make_request(
+        [],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "99203",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+    response_by_field = json.loads(response.body)
+
+    assert response_by_field["items"] == strict_response_by_field["items"]
+    strict_search.assert_awaited_once()
+    allowed_search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_snapshot_lookup_uses_allowed_only_current_pointers(
+):
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "source_key": "allowed_source_a",
+                        "snapshot_id": "ptg2:202607:allowed-a",
+                    },
+                    {
+                        "source_key": "allowed_source_b",
+                        "snapshot_id": "ptg2:202607:allowed-b",
+                    },
+                ]
+            )
+        ]
+    )
+
+    current_snapshots = (
+        await pricing_module._current_allowed_amount_snapshots_for_plan(
+            session,
+            {"market_type": "group"},
+            plan_id="TESTPLAN001",
+        )
+    )
+
+    assert current_snapshots == _build_current_allowed_snapshots()
+    lookup_sql = str(session.executions[0][0][0])
+    lookup_parameters = session.executions[0][0][1]
+    assert "ptg2_current_source_snapshot allowed_pointer" in lookup_sql
+    assert "ptg2_allowed_amount_plan plan_coverage" in lookup_sql
+    assert "ptg2_current_plan_source" not in lookup_sql
+    assert "serving_index" not in lookup_sql
+    assert "allowed_index->>'current_source_key'" in lookup_sql
+    assert "allowed_index->>'arch_version' = 'postgres_binary_v3'" in lookup_sql
+    assert "allowed_index->>'storage' = 'postgresql'" in lookup_sql
+    assert "allowed_index->>'snapshot_scoped' = 'true'" in lookup_sql
+    assert lookup_parameters["allowed_contract"] == (
+        pricing_module.PTG2_ALLOWED_AMOUNT_CONTRACT
+    )
+    assert lookup_parameters["market_type"] == "group"
+    assert lookup_parameters["plan_ids"] == ["TESTPLAN001"]
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_snapshot_lookup_uses_isolated_divergent_pointer(
+):
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "source_key": "allowed_source_a",
+                        "snapshot_id": "ptg2:202607:allowed-current",
+                    }
+                ]
+            )
+        ]
+    )
+
+    current_snapshots = (
+        await pricing_module._current_allowed_amount_snapshots_for_plan(
+            session,
+            {
+                "market_type": "group",
+                "snapshot_id": "ptg2:202607:negotiated-current",
+            },
+            plan_id="TESTPLAN001",
+        )
+    )
+
+    assert current_snapshots == [
+        {
+            "source_key": "allowed_source_a",
+            "snapshot_id": "ptg2:202607:allowed-current",
+        }
+    ]
+    lookup_parameters = session.executions[0][0][1]
+    assert "snapshot_id" not in lookup_parameters
+
+
+def _allowed_amount_sql_test_context():
+    request_args_by_name = {
+        "plan_id": "TESTPLAN001",
+        "plan_market_type": "group",
+        "code": "99214",
+        "code_system": "CPT",
+        "pos": "11",
+        "modifier": "25,59",
+        "taxonomy_codes": "207Q00000X",
+        "primary_only": "true",
+        "state": "IL",
+        "city": "Chicago",
+        "zip5": "60601",
+        "lat": 41.88,
+        "long": -87.63,
+        "radius_miles": 10,
+    }
+    pagination = types.SimpleNamespace(limit=25, offset=50, page=3)
+    parameter_map = pricing_module._allowed_amount_query_params(
+        request_args_by_name,
+        pagination,
+        plan_id="TESTPLAN001",
+        code="99214",
+        code_system="CPT",
+        npi=None,
+        current_snapshots=_build_current_allowed_snapshots(),
+    )
+
+    sql_text = str(
+        pricing_module._allowed_amount_page_sql(
+            request_args_by_name,
+            address_table="mrf.entity_address_unified",
+            parameter_map=parameter_map,
+        )
+    )
+    return sql_text, parameter_map
+
+
+def test_allowed_amount_sql_filters_before_exact_count_and_pagination():
+    sql_text, _parameter_map = _allowed_amount_sql_test_context()
+
+    assert "ptg2_current_plan_source" not in sql_text
+    assert "mrf.ptg2_current_source_snapshot allowed_pointer" in sql_text
+    assert (
+        "allowed_pointer.snapshot_id = snapshot.snapshot_id"
+        in sql_text
+    )
+    assert (
+        "allowed_pointer.source_key"
+        in sql_text
+    )
+    assert (
+        "->'allowed_amount_index'->>'current_source_key'"
+        in sql_text
+    )
+    assert "unnest(" in sql_text
+    assert "mrf.ptg2_allowed_amount_plan" in sql_text
+    assert "mrf.ptg2_allowed_amount_item" in sql_text
+    assert "mrf.ptg2_allowed_amount_payment" in sql_text
+    assert "mrf.ptg2_allowed_amount_provider_payment" in sql_text
+    assert "provider_payment.npi" in sql_text
+    assert "@> ARRAY[CAST(:npi AS bigint)]" in sql_text
+    assert "COUNT(DISTINCT filtered_provider.npi)" in sql_text
+    assert "LIMIT :limit" in sql_text
+    assert "OFFSET :offset" in sql_text
+    assert "LIMIT 10000" not in sql_text
+    assert "allowed_payment.service_code" in sql_text
+    assert "allowed_payment.billing_code_modifier" in sql_text
+    assert "allowed_amount_specialty_nt" in sql_text
+    assert "healthcare_provider_primary_taxonomy_switch" in sql_text
+    assert "mrf.entity_address_unified" in sql_text
+    assert "provider_page.npi ASC" in sql_text
+    assert "__LOCATION_" not in sql_text
+    assert "__TAXONOMY_" not in sql_text
+
+
+def test_allowed_amount_sql_uses_stable_current_source_parameters():
+    _sql_text, parameter_map = _allowed_amount_sql_test_context()
+
+    assert parameter_map["snapshot_ids"] == [
+        "ptg2:202607:allowed-a",
+        "ptg2:202607:allowed-b",
+    ]
+    assert parameter_map["service_codes"] == ["11"]
+    assert parameter_map["modifier_codes"] == ["25", "59"]
+    assert parameter_map["limit"] == 25
+    assert parameter_map["offset"] == 50
+
+
+def test_allowed_amount_data_queries_rebind_snapshots_to_live_pointer():
+    page_sql, _parameter_map = _allowed_amount_sql_test_context()
+    detail_sql = str(pricing_module._allowed_amount_detail_sql())
+
+    for query_sql in (page_sql, detail_sql):
+        assert "ptg2_current_source_snapshot allowed_pointer" in query_sql
+        assert (
+            "allowed_pointer.snapshot_id = snapshot.snapshot_id"
+            in query_sql
+        )
+        assert (
+            "snapshot.manifest"
+            in query_sql
+        )
+        assert (
+            "->'allowed_amount_index'->>'current_source_key'"
+            in query_sql
+        )
+        assert (
+            "= LOWER(current_snapshot.source_key)"
+            in query_sql
+        )
+
+
+def test_allowed_amount_sql_uses_shared_file_plan_coverage_for_each_plan():
+    request_args_by_name = {
+        "plan_market_type": "group",
+        "code": "99214",
+        "code_system": "CPT",
+    }
+    pagination = types.SimpleNamespace(limit=25, offset=0, page=1)
+    sql_texts = []
+    plan_parameter_sets = []
+
+    for plan_id in ("PLAN-A", "PLAN-B"):
+        parameter_map = pricing_module._allowed_amount_query_params(
+            request_args_by_name,
+            pagination,
+            plan_id=plan_id,
+            code="99214",
+            code_system="CPT",
+            npi=None,
+            current_snapshots=_build_current_allowed_snapshots(),
+        )
+        sql_texts.append(
+            str(
+                pricing_module._allowed_amount_page_sql(
+                    request_args_by_name,
+                    address_table=None,
+                    parameter_map=parameter_map,
+                )
+            )
+        )
+        plan_parameter_sets.append(parameter_map["plan_ids"])
+
+    assert sql_texts[0] == sql_texts[1]
+    assert plan_parameter_sets == [["PLAN-A"], ["PLAN-B"]]
+    assert "allowed_item.file_id = plan_coverage.file_id" in sql_texts[0]
+    assert "plan_coverage.plan_id" in sql_texts[0]
+    assert "allowed_item.plan_id" not in sql_texts[0]
+    assert "allowed_item.plan_market_type" not in sql_texts[0]
+
+
+def _assert_allowed_amount_multi_source_response(response_by_field):
+    assert response_by_field is not None
+    assert response_by_field["result_state"] == "allowed_amounts_found"
+    assert response_by_field["pricing_scope"] == "plan_scoped_allowed_amounts"
+    assert response_by_field["query"]["source"] == "ptg2_allowed_amounts"
+    assert response_by_field["query"]["snapshot_id"] is None
+    assert response_by_field["query"]["snapshot_ids"] == [
+        "ptg2:202607:allowed-a",
+        "ptg2:202607:allowed-b",
+    ]
+    assert response_by_field["pagination"] == {
+        "total": 12501,
+        "limit": 25,
+        "offset": 10000,
+        "page": 401,
+        "has_more": True,
+        "total_is_exact": True,
+    }
+    assert {
+        source_by_field["source_key"]
+        for source_by_field in response_by_field["sources"]
+    } == {"allowed_source_a", "allowed_source_b"}
+    assert all(
+        source_by_field["network_status"] == "in_network"
+        for source_by_field in response_by_field["sources"]
+    )
+    assert response_by_field["warnings"][0]["code"] == (
+        "allowed_amounts_not_negotiated_rates"
+    )
+    provider_by_field = response_by_field["items"][0]
+    assert provider_by_field["network_status"] == "in_network"
+    assert provider_by_field["prices"][0]["allowed_amount"] == 133.0
+    assert provider_by_field["evidence_count"] == 15000
+    assert provider_by_field["source_keys"] == [
+        "allowed_source_a",
+        "allowed_source_b",
+    ]
+
+
+def _assert_allowed_amount_sql_executions(session):
+    page_sql = str(session.executions[0][0][0])
+    detail_sql = str(session.executions[1][0][0])
+    assert "LIMIT 10000" not in page_sql
+    assert "ROW_NUMBER() OVER" in detail_sql
+    assert session.executions[0][0][1]["snapshot_ids"] == [
+        "ptg2:202607:allowed-a",
+        "ptg2:202607:allowed-b",
+    ]
+
+
+def _assert_allowed_amount_location_payload_suppressed(provider_by_field):
+    """Assert inferred location data and metadata are absent at every depth."""
+
+    suppressed_field_names = {
+        "address",
+        "address_network_binding",
+        "city",
+        "distance_bucket",
+        "distance_miles",
+        "network_bound_address",
+        "requires_location_confirmation",
+        "state",
+        "zip5",
+    }
+    pending_payloads = [provider_by_field]
+    while pending_payloads:
+        nested_payload = pending_payloads.pop()
+        if isinstance(nested_payload, dict):
+            assert suppressed_field_names.isdisjoint(nested_payload)
+            confidence_payload = nested_payload.get("confidence")
+            if isinstance(confidence_payload, dict):
+                assert "location" not in confidence_payload
+            pending_payloads.extend(nested_payload.values())
+        elif isinstance(nested_payload, list):
+            pending_payloads.extend(nested_payload)
+    assert provider_by_field["confidence"] == {
+        "network": "allowed_amounts_in_network"
+    }
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_search_combines_sources_and_keeps_exact_large_total(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        pricing_module,
+        "_current_allowed_amount_snapshots_for_plan",
+        AsyncMock(return_value=_build_current_allowed_snapshots()),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_allowed_amount_address_table",
+        AsyncMock(return_value="mrf.npi_address"),
+    )
+    session = FakeSession(
+        [
+            FakeResult([_build_allowed_amount_page_row()]),
+            FakeResult(
+                [
+                    _build_in_network_allowed_evidence(
+                        source_key="allowed_source_a"
+                    ),
+                    _build_in_network_allowed_evidence(
+                        source_key="allowed_source_b"
+                    ),
+                ]
+            ),
+        ]
+    )
+    response_by_field = await pricing_module._search_ptg_allowed_amount_evidence(
+        session,
+        {
+            "plan_id": "TESTPLAN001",
+            "plan_market_type": "group",
+            "code": "99214",
+            "code_system": "CPT",
+            "pos": "11",
+            "modifier": "25",
+            "taxonomy_codes": "207Q00000X",
+            "primary_only": "true",
+        },
+        types.SimpleNamespace(limit=25, offset=10000, page=401),
+    )
+
+    _assert_allowed_amount_multi_source_response(response_by_field)
+    _assert_allowed_amount_sql_executions(session)
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_search_filters_with_location_but_omits_unverified_address(
+    monkeypatch,
+):
+    """Location filters remain active while inferred location output is omitted."""
+
+    monkeypatch.setattr(
+        pricing_module,
+        "_current_allowed_amount_snapshots_for_plan",
+        AsyncMock(return_value=_build_current_allowed_snapshots()),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_allowed_amount_address_table",
+        AsyncMock(return_value="mrf.npi_address"),
+    )
+    session = FakeSession(
+        [
+            FakeResult([_build_allowed_amount_page_row(total=1)]),
+            FakeResult([_build_in_network_allowed_evidence()]),
+        ]
+    )
+
+    response_by_field = await pricing_module._search_ptg_allowed_amount_evidence(
+        session,
+        {
+            "plan_id": "TESTPLAN001",
+            "plan_market_type": "group",
+            "code": "99214",
+            "code_system": "CPT",
+            "city": "Chicago",
+            "state": "IL",
+            "include_unverified_addresses": "false",
+        },
+        types.SimpleNamespace(limit=25, offset=0, page=1),
+    )
+
+    page_sql = str(session.executions[0][0][0])
+    assert "allowed_location.npi IS NOT NULL" in page_sql
+    assert "UPPER(COALESCE(addr.city_name, '')) = :allowed_city" in page_sql
+    provider_by_field = response_by_field["items"][0]
+    _assert_allowed_amount_location_payload_suppressed(provider_by_field)
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_search_preserves_no_match_for_negotiated_rate_filter(
+    monkeypatch,
+):
+    snapshot_lookup = AsyncMock(return_value=_build_current_allowed_snapshots())
+    monkeypatch.setattr(
+        pricing_module,
+        "_current_allowed_amount_snapshots_for_plan",
+        snapshot_lookup,
+    )
+
+    response_by_field = await pricing_module._search_ptg_allowed_amount_evidence(
+        FakeSession(),
+        {
+            "plan_id": "TESTPLAN001",
+            "code": "99214",
+            "negotiated_rate": "133.00",
+            "negotiated_rate_tolerance": "0.01",
+        },
+        types.SimpleNamespace(limit=10, offset=0, page=1),
+    )
+
+    assert response_by_field is None
+    snapshot_lookup.assert_not_awaited()
 
 
 @pytest.mark.asyncio
