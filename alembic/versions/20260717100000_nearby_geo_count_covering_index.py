@@ -62,9 +62,52 @@ def _create_replacement_sql(schema: str, include_columns: tuple[str, ...]) -> st
     )
 
 
+def _index_matches(
+    index_name: str,
+    include_columns: tuple[str, ...],
+) -> bool:
+    """Return whether an index matches, allowing only the known replaceable shapes."""
+
+    schema = _schema()
+    try:
+        return has_matching_index(
+            op,
+            index_name,
+            TABLE_NAME,
+            INDEX_COLUMNS,
+            schema=schema,
+            postgresql_include=include_columns,
+            postgresql_where=text(INDEX_PREDICATE),
+        )
+    except RuntimeError as exc:
+        mismatch = f"existing_schema_index_mismatch:{schema}.{index_name}"
+        invalid = f"existing_schema_index_invalid:{schema}.{index_name}"
+        if str(exc) not in {mismatch, invalid}:
+            raise
+        if index_name == REPLACEMENT_INDEX_NAME:
+            # This name is private to this migration. A stale or interrupted
+            # replacement is safe to drop and rebuild concurrently.
+            return False
+        if str(exc) == invalid:
+            raise
+
+        alternate_include = () if include_columns else INCLUDE_COLUMNS
+        if has_matching_index(
+            op,
+            index_name,
+            TABLE_NAME,
+            INDEX_COLUMNS,
+            schema=schema,
+            postgresql_include=alternate_include,
+            postgresql_where=text(INDEX_PREDICATE),
+        ):
+            # Upgrade and downgrade each replace exactly the other known shape.
+            return False
+        raise
+
+
 def _replace_index(include_columns: tuple[str, ...]) -> None:
     schema = _schema()
-    predicate = text(INDEX_PREDICATE)
     offline_context = _offline_context()
     if offline_context is not None:
         with offline_context.autocommit_block():
@@ -94,26 +137,10 @@ def _replace_index(include_columns: tuple[str, ...]) -> None:
         {"table_name": f"{schema}.{TABLE_NAME}"},
     ).scalar():
         return
-    if has_matching_index(
-        op,
-        INDEX_NAME,
-        TABLE_NAME,
-        INDEX_COLUMNS,
-        schema=schema,
-        postgresql_include=include_columns,
-        postgresql_where=predicate,
-    ):
+    if _index_matches(INDEX_NAME, include_columns):
         return
 
-    replacement_matches = has_matching_index(
-        op,
-        REPLACEMENT_INDEX_NAME,
-        TABLE_NAME,
-        INDEX_COLUMNS,
-        schema=schema,
-        postgresql_include=include_columns,
-        postgresql_where=predicate,
-    )
+    replacement_matches = _index_matches(REPLACEMENT_INDEX_NAME, include_columns)
     with op.get_context().autocommit_block():
         if not replacement_matches:
             bind.exec_driver_sql(
@@ -122,15 +149,7 @@ def _replace_index(include_columns: tuple[str, ...]) -> None:
             )
             bind.exec_driver_sql(_create_replacement_sql(schema, include_columns))
 
-    if not has_matching_index(
-        op,
-        REPLACEMENT_INDEX_NAME,
-        TABLE_NAME,
-        INDEX_COLUMNS,
-        schema=schema,
-        postgresql_include=include_columns,
-        postgresql_where=predicate,
-    ):
+    if not _index_matches(REPLACEMENT_INDEX_NAME, include_columns):
         raise RuntimeError(
             f"required_replacement_index_missing:{schema}.{REPLACEMENT_INDEX_NAME}"
         )
@@ -143,15 +162,7 @@ def _replace_index(include_columns: tuple[str, ...]) -> None:
         f"ALTER INDEX {_qt(schema, REPLACEMENT_INDEX_NAME)} "
         f"RENAME TO {_q(INDEX_NAME)};"
     )
-    if not has_matching_index(
-        op,
-        INDEX_NAME,
-        TABLE_NAME,
-        INDEX_COLUMNS,
-        schema=schema,
-        postgresql_include=include_columns,
-        postgresql_where=predicate,
-    ):
+    if not _index_matches(INDEX_NAME, include_columns):
         raise RuntimeError(f"required_index_missing:{schema}.{INDEX_NAME}")
 
 
