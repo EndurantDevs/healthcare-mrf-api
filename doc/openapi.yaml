@@ -2749,6 +2749,14 @@ paths:
           schema:
             type: boolean
           description: Include total distinct provider count.
+        - name: provider_sex_code
+          in: query
+          schema:
+            type: string
+            enum: [M, F, U, X]
+          description: |
+            Exact NPPES provider sex code applied before keyset pagination.
+            Input is case-insensitive and normalized to uppercase.
         - name: city
           in: query
           schema:
@@ -4040,6 +4048,14 @@ paths:
         - name: taxonomy_codes
           in: query
           schema: { type: string }
+        - name: provider_sex_code
+          in: query
+          schema:
+            type: string
+            enum: [M, F, U, X]
+          description: |
+            Exact NPPES provider sex code. For PTG/TiC pricing this implicitly
+            enables provider expansion and filters before pagination.
         - name: primary_only
           in: query
           schema: { type: boolean }
@@ -4265,6 +4281,14 @@ paths:
           schema:
             type: string
           description: Comma-separated NUCC taxonomy codes resolved through terminology synonyms for claims results.
+        - name: provider_sex_code
+          in: query
+          schema:
+            type: string
+            enum: [M, F, U, X]
+          description: |
+            Exact NPPES provider sex code. For PTG/TiC pricing this implicitly
+            enables provider expansion and filters before pagination.
         - name: primary_only
           in: query
           schema:

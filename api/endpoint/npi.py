@@ -18,7 +18,7 @@ from collections import OrderedDict, defaultdict
 from datetime import UTC, datetime
 from textwrap import dedent
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional, Sequence
 
 import sanic.exceptions
 from sanic import Blueprint, response
@@ -31,6 +31,7 @@ from api.code_systems import (EXTERNAL_PROCEDURE_CODE_SYSTEMS,
                               INTERNAL_PROCEDURE_CODE_SYSTEM,
                               INTERNAL_RX_CODE_SYSTEM)
 from api.endpoint.pagination import parse_pagination
+from api.provider_demographic_filters import normalize_provider_sex_code
 from api.provider_specialty_filters import (
     ensure_specialty_resolution_cache,
     resolve_provider_specialty_filter,
@@ -78,7 +79,6 @@ MEDICATION_ALLOWED_CODE_SYSTEMS = {
     "NDC",
     "RXNORM",
 }
-PROVIDER_SEX_CODES = {"M", "F", "U", "X"}
 CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
 INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
@@ -397,6 +397,59 @@ def _taxonomy_codes_subquery(conditions: str) -> str:
         )
         .strip()
         .format(conditions=conditions)
+    )
+
+
+def _provider_taxonomy_lateral_join(
+    address_alias: str = "c",
+    taxonomy_alias: str = "q",
+    code_placeholders: Sequence[str] = (),
+) -> str:
+    """Return an NPI-first taxonomy probe for selective provider searches."""
+
+    taxonomy_code_predicate = (
+        "provider_taxonomy.healthcare_provider_taxonomy_code "
+        f"IN ({', '.join(code_placeholders)})"
+        if code_placeholders
+        else "provider_taxonomy.healthcare_provider_taxonomy_code "
+        f"= ANY({taxonomy_alias}.codes)"
+    )
+    return f"""
+    JOIN LATERAL (
+        SELECT 1
+          FROM mrf.npi_taxonomy AS provider_taxonomy
+         WHERE provider_taxonomy.npi = {address_alias}.npi
+           AND {taxonomy_code_predicate}
+         LIMIT 1
+    ) AS provider_taxonomy_match ON TRUE
+    """
+
+
+def _provider_taxonomy_code_parameters(
+    taxonomy_codes: Sequence[str],
+    parameter_prefix: str,
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Return scalar taxonomy parameters that keep composite indexes usable."""
+
+    parameters_by_name = {
+        f"{parameter_prefix}_{index}": str(taxonomy_code).upper()
+        for index, taxonomy_code in enumerate(taxonomy_codes)
+    }
+    placeholders = tuple(
+        f":{parameter_name}" for parameter_name in parameters_by_name
+    )
+    return parameters_by_name, placeholders
+
+
+def _is_location_first_taxonomy_filter(
+    use_taxonomy_filter: bool,
+    candidate_filters: Iterable[Any],
+) -> bool:
+    """Return whether selective candidates should drive taxonomy probes."""
+
+    return use_taxonomy_filter and any(
+        value not in (None, "", (), [], {})
+        for value in candidate_filters
     )
 
 
@@ -4545,19 +4598,6 @@ def _normalize_exact_npi(raw: Optional[str]) -> Optional[int]:
     return int(digits)
 
 
-def _normalize_provider_sex_code(raw: Optional[str]) -> Optional[str]:
-    if raw is None:
-        return None
-    value = str(raw).strip().upper()
-    if not value:
-        return None
-    if value not in PROVIDER_SEX_CODES:
-        raise sanic.exceptions.InvalidUsage(
-            "provider_sex_code must be one of: F, M, U, X"
-        )
-    return value
-
-
 def _normalize_code_system(raw: Optional[str], param_name: str, allowed: set[str]) -> str:
     value = str(raw or "").strip().upper()
     if not value:
@@ -7620,7 +7660,7 @@ async def get_all(request):
             raise sanic.exceptions.InvalidUsage(
                 "entity_type_code must be either 1 (individual) or 2 (organization)"
             )
-    provider_sex_code = _normalize_provider_sex_code(provider_sex_code_raw)
+    provider_sex_code = normalize_provider_sex_code(provider_sex_code_raw)
     if entity_type_code == 2 and provider_sex_code is not None:
         raise sanic.exceptions.InvalidUsage(
             "provider_sex_code cannot be combined with entity_type_code=2"
@@ -7824,6 +7864,19 @@ async def get_all(request):
         )
 
         use_taxonomy_filter = bool(taxonomy_filters)
+        use_location_first_taxonomy = _is_location_first_taxonomy_filter(
+            use_taxonomy_filter,
+            (
+                npi_where,
+                city,
+                state,
+                zip_code,
+                phone_digits,
+                address_key,
+                address_site_key,
+                exact_npi,
+            ),
+        )
         include_service_locations = bool(address_key or address_site_key or phone_digits or exact_npi)
         address_where = [
             _provider_list_address_type_clause(
@@ -7834,7 +7887,7 @@ async def get_all(request):
         ]
         phone_candidates_cte = None
         phone_candidates_join = ""
-        if use_taxonomy_filter:
+        if use_taxonomy_filter and not use_location_first_taxonomy:
             address_where.insert(0, "c.taxonomy_array && q.int_codes")
         if plan_network:
             address_where.append("plans_network_array && :plan_network_array")
@@ -7870,6 +7923,21 @@ async def get_all(request):
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
         taxonomy_subquery = _taxonomy_codes_subquery(taxonomy_conditions)
+        taxonomy_join = f"CROSS JOIN {taxonomy_subquery}"
+        taxonomy_parameters_by_name: dict[str, str] = {}
+        if use_location_first_taxonomy:
+            if codes and len(taxonomy_filters) == 1:
+                taxonomy_parameters_by_name, taxonomy_code_placeholders = (
+                    _provider_taxonomy_code_parameters(
+                        codes,
+                        "count_provider_taxonomy_code",
+                    )
+                )
+                taxonomy_join = _provider_taxonomy_lateral_join(
+                    code_placeholders=taxonomy_code_placeholders,
+                )
+            else:
+                taxonomy_join += _provider_taxonomy_lateral_join()
 
         if npi_where and use_taxonomy_filter:
             query = text(
@@ -7883,7 +7951,7 @@ async def get_all(request):
                   FROM filtered_npi AS fn
                   JOIN {address_table_sql} AS c ON c.npi = fn.npi
                   {phone_candidates_join}
-                  CROSS JOIN {taxonomy_subquery}
+                  {taxonomy_join}
                  WHERE {' AND '.join(address_where)}
                 """
             )
@@ -7909,7 +7977,7 @@ async def get_all(request):
                 SELECT COUNT(DISTINCT c.npi)
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
-                  CROSS JOIN {taxonomy_subquery}
+                  {taxonomy_join}
                  WHERE {' AND '.join(address_where)}
                 """
             )
@@ -7954,26 +8022,29 @@ async def get_all(request):
             )
 
         async with db.acquire() as conn:
-            rows = await conn.all(query, **query_params)
-        return rows[0][0] if rows else 0
+            count_records = await conn.all(query, **query_params)
+        return count_records[0][0] if count_records else 0
 
     async def get_formatted_count(response_format: str) -> dict:
         """
         Return mapping for special count formats (full_taxonomy/classification).
         """
         if response_format == "full_taxonomy":
-            q = text(
+            formatted_count_query = text(
                 "SELECT ARRAY[int_code] AS key, COUNT(*) AS value "
                 "FROM mrf.nucc_taxonomy GROUP BY ARRAY[int_code]"
             )
         else:
-            q = text(
+            formatted_count_query = text(
                 "SELECT classification AS key, COUNT(*) AS value "
                 "FROM mrf.nucc_taxonomy GROUP BY classification"
             )
         async with db.acquire() as conn:
-            rows = await conn.all(q)
-        return {row[0]: row[1] for row in rows}
+            formatted_count_records = await conn.all(formatted_count_query)
+        return {
+            count_record[0]: count_record[1]
+            for count_record in formatted_count_records
+        }
 
     async def get_classification_count_map(filters) -> dict:
         """Return provider counts grouped by NUCC classification."""
@@ -8113,8 +8184,12 @@ async def get_all(request):
                 count_query=True,
             )
         async with db.acquire() as conn:
-            rows = await conn.all(query, **query_params)
-        return {row[0]: row[1] for row in rows if row and row[0]}
+            classification_count_records = await conn.all(query, **query_params)
+        return {
+            count_record[0]: count_record[1]
+            for count_record in classification_count_records
+            if count_record and count_record[0]
+        }
 
     procedure_filter_unresolved = bool(requested_procedure_codes) and not bool(procedure_internal_codes)
     medication_filter_unresolved = bool(requested_medication_codes) and not bool(medication_internal_codes)
@@ -8138,8 +8213,8 @@ async def get_all(request):
         return response.json({"rows": await _fast_primary_npi_count()}, default=str)
 
     if count_only and has_insurance and not simple_filter_present:
-        rows = await _fast_has_insurance_count(city, state)
-        return response.json({"rows": rows}, default=str)
+        insurance_provider_count = await _fast_has_insurance_count(city, state)
+        return response.json({"rows": insurance_provider_count}, default=str)
 
     if count_only and response_format == "all":
         mapping = await get_classification_count_map(filters)
@@ -8181,12 +8256,12 @@ async def get_all(request):
                 query,
                 page_npis=page_npis,
             )
-        rows: list[dict[str, Any]] = []
-        for row in rows_iter:
-            mapping = getattr(row, "_mapping", None)
+        sitemap_results: list[dict[str, Any]] = []
+        for sitemap_record in rows_iter:
+            mapping = getattr(sitemap_record, "_mapping", None)
             if mapping is None:
                 continue
-            rows.append(
+            sitemap_results.append(
                 {
                     "npi": mapping.get("npi"),
                     "provider_organization_name": mapping.get("provider_organization_name"),
@@ -8200,17 +8275,22 @@ async def get_all(request):
                     "medications_array": [],
                 }
             )
-        return rows
+        return sitemap_results
 
     async def get_formatted_count(response_format: str) -> dict:
         """
         Return mapping for special count formats (full_taxonomy/classification).
         """
         # The actual SQL is less important for tests; return pairs from DB.
-        q = text("SELECT key, value FROM (VALUES (1, 1)) AS t(key, value)")
+        formatted_count_query = text(
+            "SELECT key, value FROM (VALUES (1, 1)) AS t(key, value)"
+        )
         async with db.acquire() as conn:
-            rows = await conn.all(q)
-        return {row[0]: row[1] for row in rows}
+            formatted_count_records = await conn.all(formatted_count_query)
+        return {
+            count_record[0]: count_record[1]
+            for count_record in formatted_count_records
+        }
 
     async def get_results(start, limit, filters):
         """Return one provider result page for normalized search filters."""
@@ -8228,6 +8308,7 @@ async def get_all(request):
         city = filters.get("city")
         state = filters.get("state")
         has_insurance = filters.get("has_insurance")
+        codes = filters.get("codes")
         zip_code = filters.get("zip_code")
         phone_digits = filters.get("phone_digits")
         address_key = filters.get("address_key")
@@ -8252,8 +8333,22 @@ async def get_all(request):
             where.append("section = :section")
         if display_name:
             where.append("display_name = :display_name")
+        if codes:
+            where.append("code = ANY(:codes)")
         use_taxonomy_filter = bool(where)
-        if use_taxonomy_filter:
+        use_location_first_taxonomy = _is_location_first_taxonomy_filter(
+            use_taxonomy_filter,
+            (
+                city,
+                state,
+                zip_code,
+                phone_digits,
+                address_key,
+                address_site_key,
+                exact_npi,
+            ),
+        )
+        if use_taxonomy_filter and not use_location_first_taxonomy:
             address_where.insert(0, "c.taxonomy_array && q.int_codes")
         if plan_network:
             address_where.append("plans_network_array && :plan_network_array")
@@ -8306,12 +8401,34 @@ async def get_all(request):
         )
 """
 
+        taxonomy_source = (
+            "CROSS JOIN ("
+            "SELECT ARRAY_AGG(code) AS codes, "
+            "ARRAY_AGG(int_code) AS int_codes "
+            f"FROM mrf.nucc_taxonomy WHERE {taxonomy_filter}"
+            ") AS q"
+        )
+        taxonomy_parameters_by_name: dict[str, str] = {}
+        if use_location_first_taxonomy:
+            if codes and len(where) == 1:
+                taxonomy_parameters_by_name, taxonomy_code_placeholders = (
+                    _provider_taxonomy_code_parameters(
+                        codes,
+                        "page_provider_taxonomy_code",
+                    )
+                )
+                taxonomy_source = _provider_taxonomy_lateral_join(
+                    code_placeholders=taxonomy_code_placeholders,
+                )
+            else:
+                taxonomy_source += _provider_taxonomy_lateral_join()
+
         if npi_where and use_taxonomy_filter:
             address_source = (
                 "filtered_npi as fn\n"
                 f"    JOIN {address_table_sql} as c ON c.npi = fn.npi\n"
                 f"    {phone_candidates_join}\n"
-                f"    CROSS JOIN (select ARRAY_AGG(int_code) as int_codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q"
+                f"    {taxonomy_source}"
             )
         elif npi_where:
             address_source = (
@@ -8323,12 +8440,12 @@ async def get_all(request):
             address_source = (
                 f"{address_table_sql} as c\n"
                 f"    {phone_candidates_join}\n"
-                f"    CROSS JOIN (select ARRAY_AGG(int_code) as int_codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q"
+                f"    {taxonomy_source}"
             )
         else:
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}"
         address_order = _primary_address_order_clause("c", address_table_sql)
-        q = text(
+        provider_page_query = text(
             f"""
         {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte)}page_npis AS (
             SELECT DISTINCT c.npi
@@ -8356,7 +8473,7 @@ async def get_all(request):
     """
         )
 
-        res = {}
+        providers_by_npi = {}
         async with db.acquire() as conn:
             query_params = {
                 "start": start,
@@ -8364,6 +8481,7 @@ async def get_all(request):
                 "classification": classification,
                 "section": section,
                 "display_name": display_name,
+                "codes": codes,
                 "plan_network_array": plan_network,
                 "specialization": specialization,
                 "city": city,
@@ -8376,6 +8494,7 @@ async def get_all(request):
                 "provider_sex_code": provider_sex_code,
                 **npi_params,
                 **dynamic_code_params,
+                **taxonomy_parameters_by_name,
             }
             if phone_candidates_cte:
                 query_params["candidate_limit"] = _provider_list_phone_candidate_limit(
@@ -8383,14 +8502,14 @@ async def get_all(request):
                     start,
                 )
             rows_iter = await conn.all(
-                q,
+                provider_page_query,
                 **query_params,
             )
-            for r in rows_iter:
+            for provider_record in rows_iter:
                 # Prefer key-based extraction so schema drift in upstream tables
                 # (for example missing optional array columns) does not break
                 # positional offsets and crash /npi/all.
-                row_mapping = getattr(r, "_mapping", None)
+                row_mapping = getattr(provider_record, "_mapping", None)
                 if row_mapping is not None:
                     npi_value = (
                         row_mapping.get("npi_code")
@@ -8401,90 +8520,90 @@ async def get_all(request):
                     if npi_value is None:
                         continue
 
-                    obj = res.get(npi_value)
-                    if obj is None:
-                        obj = {"taxonomy_list": []}
-                        for c in NPIData.__table__.columns:
-                            if c.key in row_mapping:
-                                obj[c.key] = row_mapping.get(c.key)
-                        for c in NPIAddress.__table__.columns:
-                            if c.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                    provider_by_field = providers_by_npi.get(npi_value)
+                    if provider_by_field is None:
+                        provider_by_field = {"taxonomy_list": []}
+                        for column in NPIData.__table__.columns:
+                            if column.key in row_mapping:
+                                provider_by_field[column.key] = row_mapping.get(column.key)
+                        for column in NPIAddress.__table__.columns:
+                            if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                                 continue
-                            if c.key in row_mapping:
-                                obj[c.key] = row_mapping.get(c.key)
-                        _attach_public_address_site_key(obj, row_mapping)
+                            if column.key in row_mapping:
+                                provider_by_field[column.key] = row_mapping.get(column.key)
+                        _attach_public_address_site_key(provider_by_field, row_mapping)
                         # Unified serving: include per-address source/plan attribution
                         # (not declared on the legacy NPIAddress model) so list results
                         # match the detail + geo endpoints.
                         if address_table_sql.endswith(".entity_address_unified"):
                             for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
                                 if key in row_mapping and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                                    obj[key] = row_mapping.get(key)
+                                    provider_by_field[key] = row_mapping.get(key)
                             if "source_record_ids" in row_mapping:
-                                obj["source_record_ids"] = row_mapping.get("source_record_ids")
-                        obj["do_business_as"] = obj.get("do_business_as") or []
-                        obj.setdefault("procedures_array", [])
-                        obj.setdefault("medications_array", [])
+                                provider_by_field["source_record_ids"] = row_mapping.get("source_record_ids")
+                        provider_by_field["do_business_as"] = provider_by_field.get("do_business_as") or []
+                        provider_by_field.setdefault("procedures_array", [])
+                        provider_by_field.setdefault("medications_array", [])
 
                     taxonomy = {}
-                    for c in NPIDataTaxonomy.__table__.columns:
-                        if c.key in ("npi", "checksum"):
+                    for column in NPIDataTaxonomy.__table__.columns:
+                        if column.key in ("npi", "checksum"):
                             continue
-                        if c.key in row_mapping:
-                            taxonomy[c.key] = row_mapping.get(c.key)
+                        if column.key in row_mapping:
+                            taxonomy[column.key] = row_mapping.get(column.key)
                     if taxonomy:
-                        obj["taxonomy_list"].append(taxonomy)
+                        provider_by_field["taxonomy_list"].append(taxonomy)
 
-                    res[npi_value] = obj
+                    providers_by_npi[npi_value] = provider_by_field
                     continue
 
                 # Fallback for positional row types.
-                row_len = len(r)
+                row_len = len(provider_record)
                 if row_len <= 1:
                     continue
 
-                obj = {"taxonomy_list": []}
+                provider_by_field = {"taxonomy_list": []}
                 count = 0
-                for c in NPIData.__table__.columns:
+                for column in NPIData.__table__.columns:
                     count += 1
                     if count >= row_len:
                         break
-                    obj[c.key] = r[count]
-                for c in NPIAddress.__table__.columns:
+                    provider_by_field[column.key] = provider_record[count]
+                for column in NPIAddress.__table__.columns:
                     count += 1
                     if count >= row_len:
                         break
-                    if c.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                    if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                         continue
-                    obj[c.key] = r[count]
+                    provider_by_field[column.key] = provider_record[count]
 
-                npi_value = obj.get("npi")
+                npi_value = provider_by_field.get("npi")
                 if npi_value is None:
                     continue
 
-                if npi_value in res:
-                    obj = res[npi_value]
+                if npi_value in providers_by_npi:
+                    provider_by_field = providers_by_npi[npi_value]
                 else:
-                    obj["do_business_as"] = obj.get("do_business_as") or []
-                    obj.setdefault("procedures_array", [])
-                    obj.setdefault("medications_array", [])
+                    provider_by_field["do_business_as"] = provider_by_field.get("do_business_as") or []
+                    provider_by_field.setdefault("procedures_array", [])
+                    provider_by_field.setdefault("medications_array", [])
 
                 taxonomy = {}
-                for c in NPIDataTaxonomy.__table__.columns:
+                for column in NPIDataTaxonomy.__table__.columns:
                     count += 1
                     if count >= row_len:
                         break
-                    if c.key in ("npi", "checksum"):
+                    if column.key in ("npi", "checksum"):
                         continue
-                    taxonomy[c.key] = r[count]
+                    taxonomy[column.key] = provider_record[count]
                 if taxonomy:
-                    obj["taxonomy_list"].append(taxonomy)
-                res[npi_value] = obj
+                    provider_by_field["taxonomy_list"].append(taxonomy)
+                providers_by_npi[npi_value] = provider_by_field
 
             if (
                 _address_table_is_unified(address_table_sql)
                 and (address_key or address_site_key or phone_digits or exact_npi is not None)
-                and len(res) < limit
+                and len(providers_by_npi) < limit
                 and not npi_where
                 and not use_taxonomy_filter
                 and provider_sex_code is None
@@ -8520,14 +8639,14 @@ async def get_all(request):
                     fallback_limit=limit,
                     **fallback_params,
                 )
-                for row in fallback_rows:
-                    mapping = getattr(row, "_mapping", row)
+                for fallback_record in fallback_rows:
+                    mapping = getattr(fallback_record, "_mapping", fallback_record)
                     if not isinstance(mapping, Mapping):
                         continue
                     npi_value = mapping.get("npi") or mapping.get("inferred_npi")
-                    if npi_value is None or npi_value in res:
+                    if npi_value is None or npi_value in providers_by_npi:
                         continue
-                    obj = {
+                    provider_by_field = {
                         "npi": npi_value,
                         "entity_type_code": 1
                         if any(
@@ -8545,21 +8664,21 @@ async def get_all(request):
                         if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                             continue
                         if column.key in mapping:
-                            obj[column.key] = mapping.get(column.key)
-                    _attach_public_address_site_key(obj, mapping)
+                            provider_by_field[column.key] = mapping.get(column.key)
+                    _attach_public_address_site_key(provider_by_field, mapping)
                     for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
                         if key in mapping and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                            obj[key] = mapping.get(key)
+                            provider_by_field[key] = mapping.get(key)
                     if "source_record_ids" in mapping:
-                        obj["source_record_ids"] = mapping.get("source_record_ids")
-                    res[npi_value] = obj
+                        provider_by_field["source_record_ids"] = mapping.get("source_record_ids")
+                    providers_by_npi[npi_value] = provider_by_field
 
-        res = list(res.values())
-        for row in res:
-            row["do_business_as"] = row.get("do_business_as") or []
-            _add_canonical_contact_fields_to_address(row)
-            _redact_internal_address_fields(row)
-        return res
+        provider_results = list(providers_by_npi.values())
+        for provider_result in provider_results:
+            provider_result["do_business_as"] = provider_result.get("do_business_as") or []
+            _add_canonical_contact_fields_to_address(provider_result)
+            _redact_internal_address_fields(provider_result)
+        return provider_results
 
     if count_only:
         rows = await get_count(filters)
@@ -9060,7 +9179,7 @@ async def get_near_npi(request):
     medication_codes_raw = request.args.get("medication_codes")
     medication_code_system_raw = request.args.get("medication_code_system")
     year_raw = request.args.get("year")
-    provider_sex_code = _normalize_provider_sex_code(
+    provider_sex_code = normalize_provider_sex_code(
         request.args.get("provider_sex_code")
     )
     request.args.get("q")

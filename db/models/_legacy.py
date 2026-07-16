@@ -1038,6 +1038,11 @@ class NPIData(Base, JSONOutputMixin):
             'index_elements': ('entity_type_code',),
             'name': 'entity_type_code',
         },
+        {
+            'index_elements': ('npi', 'provider_sex_code'),
+            'where': 'provider_sex_code IS NOT NULL',
+            'name': 'npi_idx_npi_provider_sex_code',
+        },
     ]
     npi = Column(BigInteger, primary_key=True)
     employer_identification_number = Column(String)

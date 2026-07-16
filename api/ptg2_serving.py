@@ -11,7 +11,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any, Awaitable, Callable, Iterable, Mapping
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 from sqlalchemy import text
 
@@ -111,6 +111,7 @@ from api.provider_specialty_filters import (
     provider_specialty_taxonomy_semijoin_sql,
     resolve_provider_specialty_filter,
 )
+from api.provider_demographic_filters import provider_sex_exists_sql
 
 PTG2_MODE_EXACT_SOURCE = "exact_source"
 PTG2_MODE_PRODUCT_SEARCH = "product_search"
@@ -238,7 +239,7 @@ def _add_location_phone_fields(
     location_data_by_field: dict[str, Any],
     address_payload: dict[str, Any],
 ) -> None:
-    """Copy canonical and display contact fields into one provider item."""
+    """Merge display and canonical contact fields into a provider result."""
 
     display_phone = _first_payload_value(
         location_data_by_field.get("telephone_number"),
@@ -4184,6 +4185,7 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                 COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations,
                 tax.primary_specialty,
                 tax.primary_specialization,
+                n.provider_sex_code,
                 {_ptg2_provider_name_sql("n")} AS provider_name
             FROM source_npis
             LEFT JOIN {npi_data_table} n ON n.npi = source_npis.npi
@@ -4214,7 +4216,9 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
     )
 
 
-def _ptg2_provider_taxonomy_filter_requested(args: dict[str, Any]) -> bool:
+def _is_ptg2_provider_filter_requested(args: dict[str, Any]) -> bool:
+    if args.get("provider_sex_code") not in (None, "", "null"):
+        return True
     if resolve_provider_specialty_filter(args).active:
         return True
     return _inferred_provider_taxonomy_rule(args) is not None
@@ -4270,7 +4274,7 @@ def _ptg2_manifest_rate_candidate_limit(
             requested_offset + requested_limit + 1,
             candidate_floor,
         )
-    if expand_providers and not location_filter_requested and _ptg2_provider_taxonomy_filter_requested(args):
+    if expand_providers and not location_filter_requested and _is_ptg2_provider_filter_requested(args):
         return min(
             _PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT,
             max(requested_limit, requested_offset + requested_limit, requested_limit * 5, 5),
@@ -4714,6 +4718,22 @@ def _merge_ptg2_provider_rate_items(
     return merged_provider_rates
 
 
+def _manifest_base_provider_predicates(
+    args: Mapping[str, Any],
+    query_parameters_by_name: dict[str, Any],
+) -> list[str]:
+    """Return strict-V3 non-taxonomy provider predicates."""
+
+    provider_sex_predicate = provider_sex_exists_sql(
+        "source_npis.npi",
+        query_parameters_by_name,
+        "manifest_provider_sex",
+        args.get("provider_sex_code"),
+        schema=PTG2_SCHEMA,
+    )
+    return [provider_sex_predicate] if provider_sex_predicate else []
+
+
 async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
     session,
     args: dict[str, Any],
@@ -4721,17 +4741,15 @@ async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
     *,
     limit: int,
 ) -> tuple[int, ...]:
-    """Return requested NPIs that satisfy the resolved taxonomy filter."""
-
+    """Filter candidate NPIs by canonical demographic and taxonomy predicates."""
     candidate_npis = tuple(sorted({int(npi) for npi in npis if int(npi) > 0}))
     if not candidate_npis:
         return ()
     specialty_filter = resolve_provider_specialty_filter(args)
     query_parameters_by_name: dict[str, Any] = {
-        "npis": list(candidate_npis),
-        "limit": max(int(limit), 1),
+        "npis": list(candidate_npis), "limit": max(int(limit), 1)
     }
-    predicates: list[str] = []
+    predicates = _manifest_base_provider_predicates(args, query_parameters_by_name)
     if specialty_filter.active:
         predicates.append(
             provider_specialty_taxonomy_exists_sql(
@@ -5018,8 +5036,17 @@ def _membership_taxonomy_filters(
     args: dict[str, Any],
     parameter_map: dict[str, Any],
 ) -> list[str]:
-    """Build taxonomy predicates that must run before location limits."""
+    """Build provider predicates that must run before location limits."""
     filter_clauses: list[str] = []
+    provider_sex_predicate = provider_sex_exists_sql(
+        "addr.npi",
+        parameter_map,
+        "membership_provider_sex",
+        args.get("provider_sex_code"),
+        schema=PTG2_SCHEMA,
+    )
+    if provider_sex_predicate:
+        filter_clauses.append(provider_sex_predicate)
     specialty_filter = resolve_provider_specialty_filter(args)
     if specialty_filter.active:
         filter_clauses.append(
@@ -5445,6 +5472,16 @@ def _next_graph_location_probe_limit(
     return min(max(minimum_growth, proposed_limit), current_limit * 8, max_candidates)
 
 
+def _is_graph_location_source_exhausted(
+    candidate_location_rows: Sequence[dict[str, Any]],
+    probe_limit: int,
+) -> bool:
+    """Return whether a location probe consumed the full available source."""
+    if "_ptg_source_exhausted" in candidate_location_rows[0]:
+        return bool(candidate_location_rows[0].get("_ptg_source_exhausted"))
+    return len(candidate_location_rows) < probe_limit
+
+
 async def _paged_graph_candidates(
     session,
     serving_tables: PTG2ServingTables,
@@ -5453,8 +5490,10 @@ async def _paged_graph_candidates(
     candidate_limit: int,
 ) -> _GraphLocationCandidates | None:
     """Scan indexed addresses in bounded pages and reverse-check graph membership."""
-    taxonomy_filter_requested = _ptg2_provider_taxonomy_filter_requested(args)
-    batch_size = _graph_location_probe_batch_size(candidate_limit, taxonomy_filter_requested=taxonomy_filter_requested)
+    is_provider_filter_requested = _is_ptg2_provider_filter_requested(args)
+    batch_size = _graph_location_probe_batch_size(
+        candidate_limit, taxonomy_filter_requested=is_provider_filter_requested
+    )
     max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
     probe_limit = batch_size
     probe_state = _GraphLocationProbeState()
@@ -5477,18 +5516,16 @@ async def _paged_graph_candidates(
             args,
             rate_scope,
             candidate_location_rows,
-            taxonomy_filter_requested=taxonomy_filter_requested,
+            taxonomy_filter_requested=is_provider_filter_requested,
             candidate_limit=candidate_limit,
         )
         if has_enough_matches:
-            return probe_state.result(taxonomy_filter_requested=taxonomy_filter_requested)
-        source_exhausted = (
-            bool(candidate_location_rows[0].get("_ptg_source_exhausted"))
-            if candidate_location_rows
-            and "_ptg_source_exhausted" in candidate_location_rows[0]
-            else len(candidate_location_rows) < probe_limit
+            return probe_state.result(taxonomy_filter_requested=is_provider_filter_requested)
+        is_source_exhausted = _is_graph_location_source_exhausted(
+            candidate_location_rows,
+            probe_limit,
         )
-        if source_exhausted:
+        if is_source_exhausted:
             break
         if probe_limit >= max_candidates:
             raise PTG2ManifestArtifactError(
@@ -5499,11 +5536,11 @@ async def _paged_graph_candidates(
             batch_size=batch_size,
             max_candidates=max_candidates,
             observed_matches=probe_state.observed_match_count(
-                taxonomy_filter_requested=taxonomy_filter_requested
+                taxonomy_filter_requested=is_provider_filter_requested
             ),
             required_matches=candidate_limit,
         )
-    return probe_state.result(taxonomy_filter_requested=taxonomy_filter_requested)
+    return probe_state.result(taxonomy_filter_requested=is_provider_filter_requested)
 
 
 async def _graph_location_candidates(
@@ -5529,7 +5566,7 @@ async def _graph_location_candidates(
     return _GraphLocationCandidates(
         location_rows,
         direct_groups_by_npi,
-        taxonomy_filtered=_ptg2_provider_taxonomy_filter_requested(args),
+        taxonomy_filtered=_is_ptg2_provider_filter_requested(args),
     )
 
 
@@ -5950,11 +5987,11 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
     if not provider_set_ids:
         return {}
     args = args or {}
-    provider_taxonomy_filter_requested = _ptg2_provider_taxonomy_filter_requested(args)
+    is_provider_filter_requested = _is_ptg2_provider_filter_requested(args)
     candidate_limit_per_set = (
         max(int(limit_per_set), 1) if limit_per_set is not None else None
     )
-    if provider_taxonomy_filter_requested:
+    if is_provider_filter_requested:
         candidate_limit_per_set = (
             max(candidate_limit_per_set * 200, 1000)
             if candidate_limit_per_set is not None
@@ -5967,7 +6004,7 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
         provider_set_ids,
         limit_per_set=candidate_limit_per_set,
     )
-    if provider_taxonomy_filter_requested:
+    if is_provider_filter_requested:
         filtered_npis_by_set: dict[str, tuple[int, ...]] = {}
         for provider_set_id in provider_set_ids:
             provider_npis = npis_by_set.get(provider_set_id, ())
@@ -6524,7 +6561,10 @@ async def _search_ptg2_manifest_db_serving_table(
     if args.get("q") or not requested_code or (not requested_plan and not explicit_source_scope):
         return None
 
-    expand_providers = _request_bool(args.get("include_providers"))
+    expand_providers = (
+        _request_bool(args.get("include_providers"))
+        or _is_ptg2_provider_filter_requested(args)
+    )
     candidate_audit_npi = (
         _normalize_npi(args.get("npi"))
         if candidate_audit_access_from_args(args) is not None
@@ -6610,6 +6650,7 @@ async def _search_ptg2_manifest_db_serving_table(
                     "long": args.get("long") or None,
                     "radius_miles": args.get("radius_miles") or None,
                     "npi": args.get("npi") or None,
+                    "provider_sex_code": args.get("provider_sex_code") or None,
                     "source": "ptg2_db",
                     "serving_table": None,
                     "include_providers": expand_providers,
@@ -6745,7 +6786,7 @@ async def _search_ptg2_manifest_db_serving_table(
     strict_cost_provider_expansion = (
         expand_providers
         and not location_filter_requested
-        and not _ptg2_provider_taxonomy_filter_requested(args)
+        and not _is_ptg2_provider_filter_requested(args)
         and not price_filter_requested
         and str(args.get("order_by") or "total_allowed_amount").strip().lower()
         in _PTG2_COST_ORDER_FIELDS
@@ -6982,7 +7023,7 @@ async def _search_ptg2_manifest_db_serving_table(
             _ptg2_manifest_id(data.get("provider_set_global_id_128")),
             [],
         )
-        if not provider_rows and not location_filter_requested and not _ptg2_provider_taxonomy_filter_requested(args):
+        if not provider_rows and not location_filter_requested and not _is_ptg2_provider_filter_requested(args):
             item = dict(base_item)
             item["npi"] = None
             item["provider_expansion_status"] = "no_npi_members"
@@ -6996,6 +7037,7 @@ async def _search_ptg2_manifest_db_serving_table(
                     "provider_ordinal": provider.get("npi") or provider_set_hash,
                     "npi": provider.get("npi"),
                     "provider_name": provider.get("provider_name") or base_item["provider_name"],
+                    "provider_sex_code": provider.get("provider_sex_code"),
                     "state": provider.get("state"),
                     "city": provider.get("city"),
                     "zip5": provider.get("zip5"),
@@ -7137,6 +7179,7 @@ async def _search_ptg2_manifest_db_serving_table(
                 "long": args.get("long") or None,
                 "radius_miles": args.get("radius_miles") or None,
                 "npi": args.get("npi") or None,
+                "provider_sex_code": args.get("provider_sex_code") or None,
                 "source": "ptg2_db",
                 "serving_table": None,
                 "include_providers": expand_providers,

@@ -178,7 +178,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260717100000_nearby_geo_count_covering_index"
+        "20260716150000_npi_provider_sex_lookup_index"
     ]
 
 

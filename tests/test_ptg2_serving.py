@@ -806,6 +806,26 @@ async def test_taxonomy_filter_uses_primary_specialty_codes():
 
 
 @pytest.mark.asyncio
+async def test_provider_filter_applies_provider_sex_before_limit():
+    session = FakeSession([FakeResult(result_rows=[{"npi": 1234567890}])])
+
+    filtered = await ptg2_serving._ptg2_manifest_filter_npis_by_provider_taxonomy(
+        session,
+        {"provider_sex_code": "F"},
+        [1234567890, 1234567891],
+        limit=10,
+    )
+
+    assert filtered == (1234567890,)
+    sql = str(session.calls[0][0][0])
+    params_by_name = session.calls[0][0][1]
+    assert "mrf.npi manifest_provider_sex_npi" in sql
+    assert "manifest_provider_sex_npi.npi = source_npis.npi" in sql
+    assert params_by_name["manifest_provider_sex_provider_sex_code"] == "F"
+    assert "LIMIT :limit" in sql
+
+
+@pytest.mark.asyncio
 async def test_inferred_taxonomy_filter_requires_individual_npi():
     session = FakeSession([FakeResult(result_rows=[{"npi": 1234567890}])])
 
