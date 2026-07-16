@@ -407,9 +407,9 @@ async def test_register_mrf_work_counts_unique_work_ids_once():
 
     redis = FakeRedis()
 
-    assert await process_initial._register_mrf_work(redis, "run_test", "work-1") is True
-    assert await process_initial._register_mrf_work(redis, "run_test", "work-1") is False
-    assert await process_initial._register_mrf_work(redis, "run_test", "work-2") is True
+    assert await process_initial._has_registered_mrf_work(redis, "run_test", "work-1") is True
+    assert await process_initial._has_registered_mrf_work(redis, "run_test", "work-1") is False
+    assert await process_initial._has_registered_mrf_work(redis, "run_test", "work-2") is True
 
     assert redis.values[process_initial._mrf_state_key("run_test", "total_work")] == 2
     assert redis.sets[process_initial._mrf_state_key("run_test", "expected_work")] == {"work-1", "work-2"}

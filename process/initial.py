@@ -113,7 +113,7 @@ def is_test_mode(ctx: dict) -> bool:
     return bool(ctx.get("context", {}).get("test_mode"))
 
 
-def _truthy(value, truthy=("yes", "y", "true")) -> bool:
+def _is_truthy(value, truthy=("yes", "y", "true")) -> bool:
     if value is None:
         return False
     if isinstance(value, str):
@@ -257,7 +257,7 @@ async def _increment_mrf_total_work(redis, run_id: str, delta: int) -> None:
     await redis.expire(total_key, _mrf_run_state_ttl_seconds())
 
 
-async def _register_mrf_work(
+async def _has_registered_mrf_work(
     redis,
     run_id: str,
     work_id: str,
@@ -392,7 +392,7 @@ async def mrf_worker_shutdown(ctx: dict) -> None:
     )
 
 
-async def _claim_mrf_finalize_lock(redis, run_id: str) -> bool:
+async def _has_claimed_mrf_finalize_lock(redis, run_id: str) -> bool:
     lock_key = _mrf_state_key(run_id, "finalize_lock")
     lock_set = await redis.set(lock_key, "1", ex=_mrf_run_state_ttl_seconds(), nx=True)
     return bool(lock_set)
@@ -424,7 +424,7 @@ def _mrf_size_bytes(name: str, default_bytes: int) -> int:
     return number * multiplier
 
 
-def _mrf_file_chunking_enabled(kind: str, ctx: dict | None = None) -> bool:
+def _is_mrf_file_chunking_enabled(kind: str, ctx: dict | None = None) -> bool:
     context_value = None
     if ctx:
         context_value = ctx.get("context", {}).get("mrf_file_chunking")
@@ -481,12 +481,12 @@ def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: st
     buffered_records: list[bytes] = []
     chunk_bytes = 2
     record_buffer = bytearray()
-    in_array = False
-    record_started = False
-    in_string = False
-    escaped = False
+    is_in_array = False
+    has_record_started = False
+    is_in_string = False
+    is_escaped = False
     depth = 0
-    array_done = False
+    is_array_done = False
 
     def flush_record(current_chunk_bytes: int) -> int:
         """Flush the buffered record into the active output chunk."""
@@ -509,50 +509,50 @@ def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: st
     with open(source_path, "rb") as handle:
         while True:
             block = handle.read(1024 * 1024)
-            if not block or array_done:
+            if not block or is_array_done:
                 break
             for byte in block:
-                if not in_array:
+                if not is_in_array:
                     if byte in b" \t\r\n":
                         continue
                     if byte != ord("["):
                         return []
-                    in_array = True
+                    is_in_array = True
                     continue
 
-                if not record_started:
+                if not has_record_started:
                     if byte in b" \t\r\n,":
                         continue
                     if byte == ord("]"):
-                        array_done = True
+                        is_array_done = True
                         break
-                    record_started = True
+                    has_record_started = True
                     depth = 0
-                    in_string = False
-                    escaped = False
+                    is_in_string = False
+                    is_escaped = False
 
                 record_buffer.append(byte)
 
-                if in_string:
-                    if escaped:
-                        escaped = False
+                if is_in_string:
+                    if is_escaped:
+                        is_escaped = False
                     elif byte == ord("\\"):
-                        escaped = True
+                        is_escaped = True
                     elif byte == ord('"'):
-                        in_string = False
+                        is_in_string = False
                     continue
 
                 if byte == ord('"'):
-                    in_string = True
+                    is_in_string = True
                 elif byte in (ord("{"), ord("[")):
                     depth += 1
                 elif byte in (ord("}"), ord("]")):
                     depth -= 1
                     if depth == 0:
-                        record_started = False
+                        has_record_started = False
                         chunk_bytes = flush_record(chunk_bytes)
 
-    if record_started:
+    if has_record_started:
         raise ValueError(f"Unable to split {source_path}; unterminated top-level JSON record")
     if buffered_records:
         _write_mrf_chunk(chunks, chunk_dir / f"{kind}_{len(chunks):05d}.json", buffered_records)
@@ -562,8 +562,8 @@ def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: st
     return chunks
 
 
-async def _maybe_enqueue_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: str, kind: str, function_name: str) -> bool:
-    if task.get("input_url") or not _mrf_file_chunking_enabled(kind, ctx):
+async def _has_enqueued_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: str, kind: str, function_name: str) -> bool:
+    if task.get("input_url") or not _is_mrf_file_chunking_enabled(kind, ctx):
         return False
     file_size = os.path.getsize(tmp_filename)
     min_bytes = _mrf_size_bytes("HLTHPRT_MRF_CHUNK_MIN_BYTES", 512 * 1024 * 1024)
@@ -589,7 +589,7 @@ async def _maybe_enqueue_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: st
             "chunk_index": idx,
             "chunk_count": len(chunks),
         }
-        if not await _register_mrf_work(
+        if not await _has_registered_mrf_work(
             redis,
             run_scope,
             work_id,
@@ -612,7 +612,7 @@ async def _maybe_enqueue_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: st
 
 def _cleanup_mrf_chunk_file(task: dict) -> None:
     input_url = str(task.get("input_url") or "")
-    if not input_url.startswith("file://") or _truthy(os.environ.get("HLTHPRT_MRF_KEEP_CHUNKS"), ("1", "true", "yes", "on")):
+    if not input_url.startswith("file://") or _is_truthy(os.environ.get("HLTHPRT_MRF_KEEP_CHUNKS"), ("1", "true", "yes", "on")):
         return
     parsed = urlparse(input_url)
     try:
@@ -628,7 +628,7 @@ async def _mark_mrf_task_terminal(ctx: dict, task: dict, kind: str, *, cleanup_c
 
 
 def _cleanup_mrf_run_chunks(ctx: dict) -> None:
-    if _truthy(os.environ.get("HLTHPRT_MRF_KEEP_CHUNKS"), ("1", "true", "yes", "on")):
+    if _is_truthy(os.environ.get("HLTHPRT_MRF_KEEP_CHUNKS"), ("1", "true", "yes", "on")):
         return
     base_dir = Path(
         os.environ.get("HLTHPRT_MRF_CHUNK_WORKDIR")
@@ -662,6 +662,28 @@ def _clean_name_part(value):
     return str(value).strip()
 
 
+def _coerce_plan_year(candidate) -> int | None:
+    if candidate is None:
+        return None
+    try:
+        if isinstance(candidate, int):
+            year_value = candidate
+        elif isinstance(candidate, float):
+            if not candidate.is_integer():
+                return None
+            year_value = int(candidate)
+        else:
+            year_text = str(candidate).strip()
+            if not year_text:
+                return None
+            if year_text.endswith(".0"):
+                year_text = year_text[:-2]
+            year_value = int(year_text)
+    except (TypeError, ValueError):
+        return None
+    return year_value if 1900 <= year_value <= 2200 else None
+
+
 def _extract_plan_years(plan_obj: dict) -> list[int]:
     raw_years = plan_obj.get("years")
     if raw_years is None:
@@ -676,26 +698,9 @@ def _extract_plan_years(plan_obj: dict) -> list[int]:
 
     years: list[int] = []
     for candidate in candidates:
-        if candidate is None:
-            continue
-        try:
-            if isinstance(candidate, int):
-                year_val = candidate
-            elif isinstance(candidate, float):
-                if not candidate.is_integer():
-                    continue
-                year_val = int(candidate)
-            else:
-                text = str(candidate).strip()
-                if not text:
-                    continue
-                if text.endswith(".0"):
-                    text = text[:-2]
-                year_val = int(text)
-        except (TypeError, ValueError):
-            continue
-        if 1900 <= year_val <= 2200 and year_val not in years:
-            years.append(year_val)
+        year_value = _coerce_plan_year(candidate)
+        if year_value is not None and year_value not in years:
+            years.append(year_value)
 
     return years
 
@@ -740,7 +745,7 @@ def _mrf_address_summary_deferred_indexes(address_cls) -> list[dict]:
     raw = os.getenv("HLTHPRT_MRF_ADDRESS_SUMMARY_DEFER_SOURCE_INDEXES", "true").strip().lower()
     if raw in disabled_values:
         return []
-    if not _truthy(os.getenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST"), ("yes", "y", "true", "1")):
+    if not _is_truthy(os.getenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST"), ("yes", "y", "true", "1")):
         return list(getattr(address_cls, "__my_initial_indexes__", []) or []) + list(
             getattr(address_cls, "__my_additional_indexes__", []) or []
         )
@@ -1088,7 +1093,7 @@ _MRF_ADDRESS_INSERT_COLUMNS = (
 
 
 async def _push_mrf_address_rows(rows, cls) -> None:
-    if not _truthy(os.getenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST"), ("yes", "y", "true", "1")):
+    if not _is_truthy(os.getenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST"), ("yes", "y", "true", "1")):
         return
     # Address provenance arrays are rebuilt from mrf_address_evidence during
     # finalization, so duplicate aggregate address rows and early provenance
@@ -1103,7 +1108,7 @@ async def _push_mrf_address_rows(rows, cls) -> None:
 async def _push_mrf_duplicate_tolerant_rows(rows, cls) -> None:
     if not rows:
         return
-    if _truthy(os.getenv("HLTHPRT_MRF_COPY_FIRST_DUPLICATE_TOLERANT_INSERTS"), ("yes", "y", "true", "1")):
+    if _is_truthy(os.getenv("HLTHPRT_MRF_COPY_FIRST_DUPLICATE_TOLERANT_INSERTS"), ("yes", "y", "true", "1")):
         await push_objects(rows, cls)
         return
     await push_objects(rows, cls, rewrite=False, use_copy=False)
@@ -1332,14 +1337,14 @@ async def process_plan(ctx, task):
     if "context" in task:
         ctx["context"] = task["context"]
     import_date = ctx["context"]["import_date"]
-    test_mode = is_test_mode(ctx)
-    plan_limit = TEST_PLAN_RECORDS if test_mode else None
-    plan_flush_rows = _mrf_plan_flush_rows(test_mode)
+    is_test_mode_enabled = is_test_mode(ctx)
+    plan_limit = TEST_PLAN_RECORDS if is_test_mode_enabled else None
+    plan_flush_rows = _mrf_plan_flush_rows(is_test_mode_enabled)
     source_url = str(task.get("source_url") or task.get("url") or "")
     download_url = str(task.get("input_url") or source_url)
-    await ensure_database(test_mode)
+    await ensure_database(is_test_mode_enabled)
 
-    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", is_test_mode_enabled)
     myplan = make_class(Plan, import_date, schema_override=db_schema)
     myplanformulary = make_class(PlanFormulary, import_date, schema_override=db_schema)
     myplanbenefitsmarketplace = make_class(PlanBenefitsMarketplace, import_date, schema_override=db_schema)
@@ -1347,8 +1352,8 @@ async def process_plan(ctx, task):
 
     print("Starting Plan data download: ", source_url)
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = Path(urlparse(download_url).path if download_url.startswith("file://") else source_url)
-        tmp_filename = str(PurePath(str(tmpdirname), p.name))
+        source_path = Path(urlparse(download_url).path if download_url.startswith("file://") else source_url)
+        tmp_filename = str(PurePath(str(tmpdirname), source_path.name))
         try:
             await download_it_and_save(
                 download_url,
@@ -1361,7 +1366,7 @@ async def process_plan(ctx, task):
             await _mark_mrf_task_terminal(ctx, task, "plan", cleanup_chunk=True)
             return
 
-        if await _maybe_enqueue_mrf_file_chunks(ctx, task, tmp_filename, "plan", "process_plan"):
+        if await _has_enqueued_mrf_file_chunks(ctx, task, tmp_filename, "plan", "process_plan"):
             await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "plan"))
             return 1
 
@@ -1371,10 +1376,10 @@ async def process_plan(ctx, task):
             marketplace_benefit_rows = []
             count = 0
             processed_plans = 0
-            stop_processing = False
+            should_stop_processing = False
             try:
                 async for plan_entry in ijson.items(afp, "item", use_float=True):
-                    if stop_processing:
+                    if should_stop_processing:
                         break
                     if not isinstance(plan_entry, dict):
                         await log_error(
@@ -1416,7 +1421,7 @@ async def process_plan(ctx, task):
                             )
                         continue
                     for year in years:
-                        if stop_processing:
+                        if should_stop_processing:
                             break
                         try:
                             for k in (
@@ -1499,7 +1504,7 @@ async def process_plan(ctx, task):
                             )
                             processed_plans += 1
                             if plan_limit and processed_plans >= plan_limit:
-                                stop_processing = True
+                                should_stop_processing = True
                                 break
                             if count > plan_flush_rows:
                                 await asyncio.gather(
@@ -1521,7 +1526,7 @@ async def process_plan(ctx, task):
 
                     count = 0
                     for year in years:
-                        if stop_processing:
+                        if should_stop_processing:
                             break
                         if formulary_entries:
                             for formulary in formulary_entries:
@@ -1628,7 +1633,7 @@ async def process_plan(ctx, task):
                                 "json",
                                 myimportlog,
                             )
-                    if stop_processing:
+                    if should_stop_processing:
                         break
 
                 await asyncio.gather(
@@ -1682,15 +1687,15 @@ async def process_provider(ctx, task):
     if "context" in task:
         ctx["context"] = task["context"]
     import_date = ctx["context"]["import_date"]
-    test_mode = is_test_mode(ctx)
-    provider_limit = TEST_PROVIDER_RECORDS if test_mode else None
-    provider_flush_rows = _mrf_provider_flush_rows(test_mode)
+    is_test_mode_enabled = is_test_mode(ctx)
+    provider_limit = TEST_PROVIDER_RECORDS if is_test_mode_enabled else None
+    provider_flush_rows = _mrf_provider_flush_rows(is_test_mode_enabled)
     source_url = str(task.get("source_url") or task.get("url") or "")
     download_url = str(task.get("input_url") or source_url)
-    await ensure_database(test_mode)
+    await ensure_database(is_test_mode_enabled)
 
     current_year = datetime.datetime.now().year
-    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", is_test_mode_enabled)
     myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
     myissuer = make_class(Issuer, import_date, schema_override=db_schema)
     myplan_npi = make_class(PlanNPIRaw, import_date, schema_override=db_schema)
@@ -1716,8 +1721,8 @@ async def process_provider(ctx, task):
 
     print("Starting Provider file data download: ", source_url)
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = Path(urlparse(download_url).path if download_url.startswith("file://") else source_url)
-        tmp_filename = str(PurePath(str(tmpdirname), p.name))
+        source_path = Path(urlparse(download_url).path if download_url.startswith("file://") else source_url)
+        tmp_filename = str(PurePath(str(tmpdirname), source_path.name))
         try:
             await download_it_and_save(
                 download_url,
@@ -1729,7 +1734,7 @@ async def process_provider(ctx, task):
             logger.warning("Failed to download provider data from %s: %s", source_url, exc)
             await _mark_mrf_task_terminal(ctx, task, "provider", cleanup_chunk=True)
             return
-        if await _maybe_enqueue_mrf_file_chunks(ctx, task, tmp_filename, "provider", "process_provider"):
+        if await _has_enqueued_mrf_file_chunks(ctx, task, tmp_filename, "provider", "process_provider"):
             await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "provider"))
             return 1
 
@@ -1745,7 +1750,7 @@ async def process_provider(ctx, task):
                     if provider_limit and processed_providers >= provider_limit:
                         break
                     network_tiers_by_checksum = {}
-                    not_good = False
+                    has_invalid_plan = False
                     my_years = set()
                     if not provider_record or not provider_record.get("plans"):
                         continue
@@ -1775,7 +1780,7 @@ async def process_provider(ctx, task):
                         has_plan_id = bool(plan.get("plan_id"))
                         has_years = bool(plan.get("years"))
                         if not has_valid_npi or not has_plan_id or not has_years:
-                            not_good = True
+                            has_invalid_plan = True
                             break
                         if len(plan["plan_id"]) <= 12 or len(plan["plan_id"]) > 14:
                             continue
@@ -1801,7 +1806,7 @@ async def process_provider(ctx, task):
                                 "year": year,
                                 "checksum_network": checksum_network,
                             }
-                    if not_good:
+                    if has_invalid_plan:
                         continue
 
                     provider_name_dict = provider_record.get("name", {})
@@ -2014,121 +2019,105 @@ def _chunked(values, chunk_size=500):
         yield items[idx: idx + chunk_size]
 
 
+_PLAN_DRUG_STATS_COLUMNS = (
+    "total_drugs",
+    "auth_required",
+    "auth_not_required",
+    "step_required",
+    "step_not_required",
+    "quantity_limit",
+    "quantity_no_limit",
+    "last_updated_on",
+)
+
+
+def _plan_drug_stats_select(plan_drug_table, plan_ids):
+    return (
+        select(
+            plan_drug_table.c.plan_id.label("plan_id"),
+            func.count().label("total_drugs"),
+            func.count().filter(plan_drug_table.c.prior_authorization.is_(True)).label("auth_required"),
+            func.count()
+            .filter(
+                or_(
+                    plan_drug_table.c.prior_authorization.is_(False),
+                    plan_drug_table.c.prior_authorization.is_(None),
+                )
+            )
+            .label("auth_not_required"),
+            func.count().filter(plan_drug_table.c.step_therapy.is_(True)).label("step_required"),
+            func.count()
+            .filter(
+                or_(
+                    plan_drug_table.c.step_therapy.is_(False),
+                    plan_drug_table.c.step_therapy.is_(None),
+                )
+            )
+            .label("step_not_required"),
+            func.count().filter(plan_drug_table.c.quantity_limit.is_(True)).label("quantity_limit"),
+            func.count()
+            .filter(
+                or_(
+                    plan_drug_table.c.quantity_limit.is_(False),
+                    plan_drug_table.c.quantity_limit.is_(None),
+                )
+            )
+            .label("quantity_no_limit"),
+            func.max(plan_drug_table.c.last_updated_on).label("last_updated_on"),
+        )
+        .where(plan_drug_table.c.plan_id.in_(plan_ids))
+        .group_by(plan_drug_table.c.plan_id)
+    )
+
+
+def _plan_drug_stats_upsert(stats_table, stats_select):
+    stats_insert = db.insert(stats_table).from_select(
+        ("plan_id", *_PLAN_DRUG_STATS_COLUMNS),
+        stats_select,
+    )
+    return stats_insert.on_conflict_do_update(
+        index_elements=[stats_table.c.plan_id],
+        set_={
+            column_name: getattr(stats_insert.excluded, column_name)
+            for column_name in _PLAN_DRUG_STATS_COLUMNS
+        },
+    )
+
+
+def _plan_drug_tier_upsert(plan_drug_table, tier_table, plan_ids):
+    tier_label = func.coalesce(plan_drug_table.c.drug_tier, literal("UNKNOWN"))
+    tier_select = (
+        select(
+            plan_drug_table.c.plan_id.label("plan_id"),
+            tier_label.label("drug_tier"),
+            func.count().label("drug_count"),
+        )
+        .where(plan_drug_table.c.plan_id.in_(plan_ids))
+        .group_by(plan_drug_table.c.plan_id, tier_label)
+    )
+    tier_insert = db.insert(tier_table).from_select(
+        ("plan_id", "drug_tier", "drug_count"),
+        tier_select,
+    )
+    return tier_insert.on_conflict_do_update(
+        index_elements=[tier_table.c.plan_id, tier_table.c.drug_tier],
+        set_={"drug_count": tier_insert.excluded.drug_count},
+    )
+
+
 async def _refresh_plan_drug_statistics(plan_ids, import_date, db_schema):
     """Refresh aggregate drug statistics for the selected plans."""
     plan_ids = [plan_id for plan_id in set(plan_ids) if plan_id]
     if not plan_ids:
         return
 
-    plan_drug_cls = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
-    stats_cls = make_class(PlanDrugStats, import_date, schema_override=db_schema)
-    tier_stats_cls = make_class(PlanDrugTierStats, import_date, schema_override=db_schema)
-
-    plan_drug_table = plan_drug_cls.__table__
-    stats_table = stats_cls.__table__
-    tier_table = tier_stats_cls.__table__
-    tier_label = func.coalesce(plan_drug_table.c.drug_tier, literal("UNKNOWN"))
-
-    stats_columns = [
-        "total_drugs",
-        "auth_required",
-        "auth_not_required",
-        "step_required",
-        "step_not_required",
-        "quantity_limit",
-        "quantity_no_limit",
-        "last_updated_on",
-    ]
-
-    for chunk in _chunked(plan_ids):
-        stats_select = (
-            select(
-                plan_drug_table.c.plan_id.label("plan_id"),
-                func.count().label("total_drugs"),
-                func.count().filter(plan_drug_table.c.prior_authorization.is_(True)).label("auth_required"),
-                func.count()
-                .filter(
-                    or_(
-                        plan_drug_table.c.prior_authorization.is_(False),
-                        plan_drug_table.c.prior_authorization.is_(None),
-                    )
-                )
-                .label("auth_not_required"),
-                func.count().filter(plan_drug_table.c.step_therapy.is_(True)).label("step_required"),
-                func.count()
-                .filter(
-                    or_(
-                        plan_drug_table.c.step_therapy.is_(False),
-                        plan_drug_table.c.step_therapy.is_(None),
-                    )
-                )
-                .label("step_not_required"),
-                func.count().filter(plan_drug_table.c.quantity_limit.is_(True)).label("quantity_limit"),
-                func.count()
-                .filter(
-                    or_(
-                        plan_drug_table.c.quantity_limit.is_(False),
-                        plan_drug_table.c.quantity_limit.is_(None),
-                    )
-                )
-                .label("quantity_no_limit"),
-                func.max(plan_drug_table.c.last_updated_on).label("last_updated_on"),
-            )
-            .where(plan_drug_table.c.plan_id.in_(chunk))
-            .group_by(plan_drug_table.c.plan_id)
-        )
-
-        stats_insert = (
-            db.insert(stats_table)
-            .from_select(
-                [
-                    "plan_id",
-                    "total_drugs",
-                    "auth_required",
-                    "auth_not_required",
-                    "step_required",
-                    "step_not_required",
-                    "quantity_limit",
-                    "quantity_no_limit",
-                    "last_updated_on",
-                ],
-                stats_select,
-            )
-        )
-        stats_insert = stats_insert.on_conflict_do_update(
-            index_elements=[stats_table.c.plan_id],
-            set_={
-                column_name: getattr(stats_insert.excluded, column_name)
-                for column_name in stats_columns
-            },
-        )
-        await stats_insert.status()
-
-        tier_select = (
-            select(
-                plan_drug_table.c.plan_id.label("plan_id"),
-                tier_label.label("drug_tier"),
-                func.count().label("drug_count"),
-            )
-            .where(plan_drug_table.c.plan_id.in_(chunk))
-            .group_by(plan_drug_table.c.plan_id, tier_label)
-        )
-        tier_insert = (
-            db.insert(tier_table)
-            .from_select(
-                [
-                    "plan_id",
-                    "drug_tier",
-                    "drug_count",
-                ],
-                tier_select,
-            )
-        )
-        tier_insert = tier_insert.on_conflict_do_update(
-            index_elements=[tier_table.c.plan_id, tier_table.c.drug_tier],
-            set_={"drug_count": tier_insert.excluded.drug_count},
-        )
-        await tier_insert.status()
+    plan_drug_table = make_class(PlanDrugRaw, import_date, schema_override=db_schema).__table__
+    stats_table = make_class(PlanDrugStats, import_date, schema_override=db_schema).__table__
+    tier_table = make_class(PlanDrugTierStats, import_date, schema_override=db_schema).__table__
+    for plan_id_chunk in _chunked(plan_ids):
+        stats_select = _plan_drug_stats_select(plan_drug_table, plan_id_chunk)
+        await _plan_drug_stats_upsert(stats_table, stats_select).status()
+        await _plan_drug_tier_upsert(plan_drug_table, tier_table, plan_id_chunk).status()
 
 
 async def _refresh_all_plan_drug_statistics(import_date, db_schema):
@@ -2174,21 +2163,21 @@ async def process_formulary(ctx, task):
     if "context" in task:
         ctx["context"] = task["context"]
     import_date = ctx["context"]["import_date"]
-    test_mode = is_test_mode(ctx)
-    drug_limit = TEST_DRUG_RECORDS if test_mode else None
-    formulary_flush_rows = _mrf_formulary_flush_rows(test_mode)
+    is_test_mode_enabled = is_test_mode(ctx)
+    drug_limit = TEST_DRUG_RECORDS if is_test_mode_enabled else None
+    formulary_flush_rows = _mrf_formulary_flush_rows(is_test_mode_enabled)
     source_url = str(task.get("source_url") or task.get("url") or "")
     download_url = str(task.get("input_url") or source_url)
-    await ensure_database(test_mode)
+    await ensure_database(is_test_mode_enabled)
 
-    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", is_test_mode_enabled)
     myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
     myplan_drug = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
 
     print("Starting Formulary file data download: ", source_url)
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = Path(urlparse(download_url).path if download_url.startswith("file://") else source_url)
-        tmp_filename = str(PurePath(str(tmpdirname), p.name))
+        source_path = Path(urlparse(download_url).path if download_url.startswith("file://") else source_url)
+        tmp_filename = str(PurePath(str(tmpdirname), source_path.name))
         try:
             await download_it_and_save(
                 download_url,
@@ -2201,7 +2190,7 @@ async def process_formulary(ctx, task):
             await _mark_mrf_task_terminal(ctx, task, "formulary", cleanup_chunk=True)
             return
 
-        if await _maybe_enqueue_mrf_file_chunks(ctx, task, tmp_filename, "formulary", "process_formulary"):
+        if await _has_enqueued_mrf_file_chunks(ctx, task, tmp_filename, "formulary", "process_formulary"):
             await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "formulary"))
             return 1
 
@@ -2380,14 +2369,14 @@ async def process_json_index(ctx, task):
         ctx["context"] = task["context"]
     import_date = ctx["context"]["import_date"]
     job_scope = str(ctx["context"].get("control_run_id") or import_date)
-    test_mode = is_test_mode(ctx)
-    await ensure_database(test_mode)
-    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    is_test_mode_enabled = is_test_mode(ctx)
+    await ensure_database(is_test_mode_enabled)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", is_test_mode_enabled)
 
     myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = Path(task.get("url"))
-        tmp_filename = str(PurePath(str(tmpdirname), p.name))
+        source_path = Path(task.get("url"))
+        tmp_filename = str(PurePath(str(tmpdirname), source_path.name))
         try:
             await download_it_and_save(
                 task.get("url"),
@@ -2399,9 +2388,9 @@ async def process_json_index(ctx, task):
             logger.warning("Failed to download MRF index data from %s: %s", task.get("url"), exc)
             await _mark_mrf_task_terminal(ctx, task, "index")
             return
-        plan_limit = TEST_PLAN_URLS if test_mode else None
-        provider_limit = TEST_PROVIDER_URLS if test_mode else None
-        formulary_limit = TEST_FORMULARY_URLS if test_mode else None
+        plan_limit = TEST_PLAN_URLS if is_test_mode_enabled else None
+        provider_limit = TEST_PROVIDER_URLS if is_test_mode_enabled else None
+        formulary_limit = TEST_FORMULARY_URLS if is_test_mode_enabled else None
         enqueued_plans = 0
         enqueued_providers = 0
         enqueued_formularies = 0
@@ -2419,7 +2408,7 @@ async def process_json_index(ctx, task):
                         "context": ctx["context"],
                         "work_id": work_id,
                     }
-                    if not await _register_mrf_work(
+                    if not await _has_registered_mrf_work(
                         redis,
                         job_scope,
                         work_id,
@@ -2462,7 +2451,7 @@ async def process_json_index(ctx, task):
                         "context": ctx["context"],
                         "work_id": work_id,
                     }
-                    if not await _register_mrf_work(
+                    if not await _has_registered_mrf_work(
                         redis,
                         job_scope,
                         work_id,
@@ -2522,7 +2511,7 @@ async def process_json_index(ctx, task):
                         "context": ctx["context"],
                         "work_id": work_id,
                     }
-                    if not await _register_mrf_work(
+                    if not await _has_registered_mrf_work(
                         redis,
                         job_scope,
                         work_id,
@@ -2580,8 +2569,8 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
     row_limit = TEST_UNKNOWN_STATE_ROWS if test_mode else None
     for file in attribute_files:
         with tempfile.TemporaryDirectory() as tmpdirname:
-            p = "attr.csv"
-            tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
+            archive_name = "attr.csv"
+            tmp_filename = str(PurePath(str(tmpdirname), archive_name + ".zip"))
             await download_it_and_save(file["url"], tmp_filename)
             try:
                 await unzip(tmp_filename, tmpdirname)
@@ -2643,8 +2632,8 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
     state_attribute_files = json.loads(os.environ["HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF"])
     for file in state_attribute_files:
         with tempfile.TemporaryDirectory() as tmpdirname:
-            p = "attr.csv"
-            tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
+            archive_name = "attr.csv"
+            tmp_filename = str(PurePath(str(tmpdirname), archive_name + ".zip"))
             await download_it_and_save(file["url"], tmp_filename)
             try:
                 await unzip(tmp_filename, tmpdirname)
@@ -2749,17 +2738,41 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
     return (issuers_by_id, plans_by_key)
 
 
+async def _read_rate_review_issuer_names(csv_files: list[str], row_limit: int | None) -> tuple[dict, int]:
+    issuers_by_id = {}
+    processed_rows = 0
+    for csv_path in csv_files:
+        async with async_open(csv_path, "r", encoding="utf-8-sig") as afp:
+            async for rate_row in AsyncDictReader(afp, delimiter=","):
+                issuers_by_id[int(rate_row["ISSUER_ID"])] = {
+                    "state": str(rate_row["STATE"]).upper(),
+                    "issuer_id": int(rate_row["ISSUER_ID"]),
+                    "mrf_url": "",
+                    "data_contact_email": "",
+                    "issuer_marketing_name": "",
+                    "issuer_name": (
+                        rate_row["COMPANY"].strip()
+                        if rate_row["COMPANY"].strip()
+                        else rate_row["ISSUER_ID"]
+                    ),
+                }
+                processed_rows += 1
+                if row_limit and processed_rows >= row_limit:
+                    return issuers_by_id, processed_rows
+    return issuers_by_id, processed_rows
+
+
 async def update_issuer_names_data(test_mode: bool = False):
     """Refresh issuer names from bounded federal rate-review sources."""
 
     issuers_by_id = {}
-    my_files = json.loads(os.environ["HLTHPRT_CMSGOV_RATE_REVIEW_URL_PUF"])
+    rate_review_files = json.loads(os.environ["HLTHPRT_CMSGOV_RATE_REVIEW_URL_PUF"])
     processed_rows = 0
     row_limit = TEST_UNKNOWN_STATE_ROWS if test_mode else None
-    for file in my_files:
+    for file in rate_review_files:
         with tempfile.TemporaryDirectory() as tmpdirname:
-            p = "some_file"
-            tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
+            archive_name = "some_file"
+            tmp_filename = str(PurePath(str(tmpdirname), archive_name + ".zip"))
             await download_it_and_save(file["url"], tmp_filename)
             print(f"Trying to unpack1: {tmp_filename}")
 
@@ -2770,26 +2783,13 @@ async def update_issuer_names_data(test_mode: bool = False):
             print(glob.glob(f"{tmpdirname}/*PUF*.csv"))
 
             csv_files = glob.glob(f"{tmpdirname}/*PUF*.csv")
-            for tmp_filename in csv_files:
-                async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
-                    async for rate_row in AsyncDictReader(afp, delimiter=","):
-                        issuers_by_id[int(rate_row["ISSUER_ID"])] = {
-                            "state": str(rate_row["STATE"]).upper(),
-                            "issuer_id": int(rate_row["ISSUER_ID"]),
-                            "mrf_url": "",
-                            "data_contact_email": "",
-                            "issuer_marketing_name": "",
-                            "issuer_name": (
-                                rate_row["COMPANY"].strip()
-                                if rate_row["COMPANY"].strip()
-                                else rate_row["ISSUER_ID"]
-                            ),
-                        }
-                        processed_rows += 1
-                        if row_limit and processed_rows >= row_limit:
-                            break
-                if row_limit and processed_rows >= row_limit:
-                    break
+            remaining_rows = row_limit - processed_rows if row_limit else None
+            file_issuers, file_row_count = await _read_rate_review_issuer_names(
+                csv_files,
+                remaining_rows,
+            )
+            issuers_by_id.update(file_issuers)
+            processed_rows += file_row_count
         if row_limit and processed_rows >= row_limit:
             break
 
@@ -2808,16 +2808,16 @@ async def init_file(ctx, task=None):
 
     """
     task = task or {}
-    test_mode = bool(task.get("test_mode"))
+    is_test_mode_enabled = bool(task.get("test_mode"))
     run_id = str(task.get("run_id") or "").strip() or None
     redis = ctx["redis"]
     ctx.setdefault("context", {})
-    ctx["context"]["test_mode"] = test_mode
+    ctx["context"]["test_mode"] = is_test_mode_enabled
     if run_id:
         ctx["context"]["control_run_id"] = run_id
     if "mrf_file_chunking" in task:
         ctx["context"]["mrf_file_chunking"] = task["mrf_file_chunking"]
-    await ensure_database(test_mode)
+    await ensure_database(is_test_mode_enabled)
 
     mrf_source = os.environ["HLTHPRT_CMSGOV_MRF_URL_PUF"]
     try:
@@ -2840,9 +2840,9 @@ async def init_file(ctx, task=None):
     )
 
     import_date = ctx["context"]["import_date"]
-    await _prepare_import_tables(import_date, test_mode)
+    await _prepare_import_tables(import_date, is_test_mode_enabled)
     ctx["context"]["run"] += 1
-    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", is_test_mode_enabled)
     myissuer = make_class(Issuer, import_date, schema_override=db_schema)
     myplan = make_class(Plan, import_date, schema_override=db_schema)
     myplantransparency = make_class(PlanTransparency, import_date, schema_override=db_schema)
@@ -2850,7 +2850,7 @@ async def init_file(ctx, task=None):
     with tempfile.TemporaryDirectory() as tmpdirname:
         transparent_files = json.loads(os.environ["HLTHPRT_CMSGOV_PLAN_TRANSPARENCY_URL_PUF"])
         for file_idx, file in enumerate(transparent_files):
-            if test_mode and file_idx >= 1:
+            if is_test_mode_enabled and file_idx >= 1:
                 break
             tmp_filename = _transparency_zip_path(tmpdirname, file_idx, file)
             await download_it_and_save(file["url"], tmp_filename)
@@ -2884,8 +2884,8 @@ async def init_file(ctx, task=None):
                     "Metal_Level": "metal",
                     "URL_Claims_Payment_Policies": "claims_payment_policies_url",
                 }
-                for _, v in column_name_by_heading.items():
-                    column_index_by_name[v] = -1
+                for _, column_name in column_name_by_heading.items():
+                    column_index_by_name[column_name] = -1
 
                 for worksheet_row in xls_file.ws(ws=ws_name).rows:
                     if count > 2:
@@ -2899,10 +2899,10 @@ async def init_file(ctx, task=None):
                         transparency_row_dict["issuer_id"] = int(
                             worksheet_row[column_index_by_name["issuer_id"]]
                         )
-                        transparency_row_dict["new_issuer_to_exchange"] = _truthy(
+                        transparency_row_dict["new_issuer_to_exchange"] = _is_truthy(
                             worksheet_row[column_index_by_name["new_issuer_to_exchange"]], ("yes", "y")
                         )
-                        transparency_row_dict["sadp_only"] = _truthy(
+                        transparency_row_dict["sadp_only"] = _is_truthy(
                             worksheet_row[column_index_by_name["sadp_only"]], ("yes", "y")
                         )
                         transparency_row_dict["plan_id"] = str(
@@ -2927,7 +2927,7 @@ async def init_file(ctx, task=None):
                             count = 3
                             await push_objects(obj_list, myplantransparency)
                             obj_list = []
-                        if test_mode and len(obj_list) >= TEST_PLAN_TRANSPARENCY_ROWS:
+                        if is_test_mode_enabled and len(obj_list) >= TEST_PLAN_TRANSPARENCY_ROWS:
                             break
                     elif count == 2:
                         i = 0
@@ -2938,12 +2938,14 @@ async def init_file(ctx, task=None):
                     count += 1
 
                 await push_objects(obj_list, myplantransparency)
-                if test_mode and len(obj_list) >= TEST_PLAN_TRANSPARENCY_ROWS:
+                if is_test_mode_enabled and len(obj_list) >= TEST_PLAN_TRANSPARENCY_ROWS:
                     break
 
-        (issuers_by_id, plans_by_key) = await import_unknown_state_issuers_data(test_mode=test_mode)
-        issuers_by_id.update(await update_issuer_names_data(test_mode=test_mode))
-        if test_mode:
+        (issuers_by_id, plans_by_key) = await import_unknown_state_issuers_data(
+            test_mode=is_test_mode_enabled
+        )
+        issuers_by_id.update(await update_issuer_names_data(test_mode=is_test_mode_enabled))
+        if is_test_mode_enabled:
             issuers_by_id = dict(list(issuers_by_id.items())[:TEST_UNKNOWN_STATE_ROWS])
             plans_by_key = dict(list(plans_by_key.items())[:TEST_UNKNOWN_STATE_ROWS])
 
@@ -3054,7 +3056,7 @@ async def init_file(ctx, task=None):
             message=f"staged {len(issuers_by_id)} issuers and {len(plans_by_key)} plans",
         )
 
-        max_urls = TEST_PLAN_URLS if test_mode else None
+        max_urls = TEST_PLAN_URLS if is_test_mode_enabled else None
         selected_urls = sorted(url_list)[:max_urls] if max_urls else sorted(url_list)
         state_run_id = _mrf_run_state_id(ctx)
         await _init_mrf_run_state(redis, state_run_id)
@@ -3085,7 +3087,7 @@ async def init_file(ctx, task=None):
                 "context": ctx["context"],
                 "work_id": work_id,
             }
-            if not await _register_mrf_work(
+            if not await _has_registered_mrf_work(
                 redis,
                 state_run_id,
                 work_id,
@@ -3113,7 +3115,7 @@ async def init_file(ctx, task=None):
         shutdown_job_id = f"shutdown_mrf_{ctx['context']['import_date']}"
         await redis.enqueue_job(
             "shutdown",
-            {"context": ctx["context"], "test_mode": test_mode},
+            {"context": ctx["context"], "test_mode": is_test_mode_enabled},
             _job_id=shutdown_job_id,
             _queue_name=MRF_FINISH_QUEUE_NAME,
         )
@@ -3150,7 +3152,7 @@ async def shutdown(ctx, task):
         ctx["context"] = task["context"]
     run_id = str(ctx.get("context", {}).get("control_run_id") or "").strip() or None
     import_date = ctx["context"]["import_date"]
-    test_mode = is_test_mode(ctx)
+    is_test_mode_enabled = is_test_mode(ctx)
     redis = ctx.get("redis")
     state_run_id = _mrf_run_state_id(ctx)
     if redis and state_run_id:
@@ -3248,7 +3250,7 @@ async def shutdown(ctx, task):
                 "shutdown",
                 {
                     "context": ctx["context"],
-                    "test_mode": test_mode,
+                    "test_mode": is_test_mode_enabled,
                     "mrf_finalize_waits": wait_count + 1,
                 },
                 _job_id=f"shutdown_mrf_{import_date}_wait_{wait_count + 1}",
@@ -3257,14 +3259,14 @@ async def shutdown(ctx, task):
             )
             return 1
 
-        if total_work and not await _claim_mrf_finalize_lock(redis, state_run_id):
+        if total_work and not await _has_claimed_mrf_finalize_lock(redis, state_run_id):
             wait_count = _safe_int(task.get("mrf_finalize_waits"), 0)
             delay_seconds = _env_int("HLTHPRT_MRF_FINISH_REQUEUE_SECONDS", 60)
             await redis.enqueue_job(
                 "shutdown",
                 {
                     "context": ctx["context"],
-                    "test_mode": test_mode,
+                    "test_mode": is_test_mode_enabled,
                     "mrf_finalize_waits": wait_count + 1,
                 },
                 _job_id=f"shutdown_mrf_{import_date}_lock_wait_{wait_count + 1}",
@@ -3280,8 +3282,8 @@ async def shutdown(ctx, task):
         progress_message="finalizing",
         progress={"unit": "phase", "total": 4, "done": 3, "pct": 90, "message": "finalizing"},
     )
-    await ensure_database(test_mode)
-    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    await ensure_database(is_test_mode_enabled)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", is_test_mode_enabled)
     myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
     await flush_error_log(myimportlog)
     await db.status("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
@@ -3289,7 +3291,7 @@ async def shutdown(ctx, task):
 
     test = make_class(Plan, import_date, schema_override=db_schema)
     plans_count = await db.scalar(select(func.count(test.plan_id)))
-    if test_mode:
+    if is_test_mode_enabled:
         print(f"Test mode: imported {plans_count} plan rows (no minimum enforced).")
     else:
         if not plans_count or plans_count < 500:
@@ -3299,7 +3301,7 @@ async def shutdown(ctx, task):
     await _refresh_all_plan_drug_statistics(import_date, db_schema)
     await _refresh_mrf_address_summary(import_date, db_schema)
     address_stats = None
-    if source_enabled("mrf") and not test_mode:
+    if source_enabled("mrf") and not is_test_mode_enabled:
         mrf_address_stage = make_class(MRFAddress, import_date, schema_override=db_schema)
         mrf_evidence_stage = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
         address_field_map = {
@@ -3310,7 +3312,7 @@ async def shutdown(ctx, task):
             "zip": "postal_code",
             "country": "COALESCE(NULLIF(country_code, ''), 'US')",
         }
-        repair_existing_address_keys = _truthy(
+        should_repair_existing_address_keys = _is_truthy(
             os.environ.get("HLTHPRT_ADDRESS_CANON_REPAIR_EXISTING"),
             ("yes", "y", "true", "1"),
         )
@@ -3318,13 +3320,13 @@ async def shutdown(ctx, task):
             mrf_address_stage.__tablename__,
             address_field_map,
             schema=db_schema,
-            update_existing=repair_existing_address_keys,
+            update_existing=should_repair_existing_address_keys,
         )
         await propagate_child_address_keys(
             mrf_evidence_stage.__tablename__,
             mrf_address_stage.__tablename__,
             schema=db_schema,
-            skip_when_child_fully_keyed=not repair_existing_address_keys,
+            skip_when_child_fully_keyed=not should_repair_existing_address_keys,
         )
         await stamp_address_keys(
             mrf_evidence_stage.__tablename__,
@@ -3340,7 +3342,7 @@ async def shutdown(ctx, task):
             schema=db_schema,
         )
         logger.info("MRF canonical address resolve complete: %s", address_stats)
-        if _truthy(os.environ.get("HLTHPRT_MRF_OPENADDRESSES_BACKFILL"), ("yes", "y", "true", "1")):
+        if _is_truthy(os.environ.get("HLTHPRT_MRF_OPENADDRESSES_BACKFILL"), ("yes", "y", "true", "1")):
             oa_stats = await refresh_archive_geocodes_from_openaddresses(schema=db_schema)
             logger.info(
                 "OpenAddresses archive backfill after MRF canonical resolve: exact=%s fuzzy=%s relaxed=%s",
@@ -3350,7 +3352,7 @@ async def shutdown(ctx, task):
             )
         else:
             logger.info("Skipping OpenAddresses archive backfill during MRF publish")
-    elif test_mode:
+    elif is_test_mode_enabled:
         logger.info("Skipping MRF archive address resolve in test mode")
 
     staging_tables_by_main_name = {}
@@ -3421,7 +3423,7 @@ async def shutdown(ctx, task):
     )
     await upsert_history.status()
     print("Plans in DB: ", await db.scalar(select(func.count(Plan.plan_id))))
-    if test_mode:
+    if is_test_mode_enabled:
         summary_ready, missing_summary_tables = await _plan_summary_dependencies_ready(db_schema)
         if not summary_ready:
             print(
@@ -3430,9 +3432,9 @@ async def shutdown(ctx, task):
             )
             summary_rows = 0
         else:
-            summary_rows = await rebuild_plan_search_summary(test_mode=test_mode)
+            summary_rows = await rebuild_plan_search_summary(test_mode=is_test_mode_enabled)
     else:
-        summary_rows = await rebuild_plan_search_summary(test_mode=test_mode)
+        summary_rows = await rebuild_plan_search_summary(test_mode=is_test_mode_enabled)
     print("Plan search summary rows: ", summary_rows)
     start_time = ctx.get("context", {}).get("start")
     if start_time:

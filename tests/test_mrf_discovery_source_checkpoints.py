@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections import Counter
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -14,6 +15,7 @@ from process.mrf_discovery_checkpoints import (
     DiscoverySourceBatchMismatch,
     SourceBatchSummary,
     SourceProcessResult,
+    _is_retry_descendant,
     execute_checkpointed_source_batch,
     source_set_sha256,
 )
@@ -202,6 +204,31 @@ def test_source_set_digest_matches_catalog_sync_contract():
     assert source_set_sha256(
         [" source_beta ", "source_alpha", "source_alpha"]
     ) == hashlib.sha256(canonical_payload).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_retry_lineage_accepts_an_intermediate_attempt_without_ownership():
+    session = AsyncMock()
+    session.scalar.side_effect = ["run_retry_1", "run_root"]
+
+    assert await _is_retry_descendant(
+        session,
+        candidate_run_id="run_retry_2",
+        ancestor_run_id="run_root",
+    )
+    assert session.scalar.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_lineage_rejects_an_unrelated_attempt():
+    session = AsyncMock()
+    session.scalar.return_value = None
+
+    assert not await _is_retry_descendant(
+        session,
+        candidate_run_id="run_unrelated",
+        ancestor_run_id="run_root",
+    )
 
 
 @pytest.mark.asyncio
