@@ -688,6 +688,7 @@ def test_v3_all_scanner_paths_emit_identical_fixed_width_records(tmp_path):
         assert Path(partition_frame["path"]).name.endswith(".ready")
         summary = _single_frame(run["frames"], "scanner_summary")
         config = _single_frame(run["frames"], "scanner_config")
+        dedupe_summary = _single_frame(run["frames"], "dedupe_summary")
         assert config["snapshot_arch"] == "postgres_binary_v3"
         assert config["storage_generation"] == "shared_blocks_v3"
         assert config["serving_row_semantics"] == "source_multiset_v1"
@@ -695,6 +696,11 @@ def test_v3_all_scanner_paths_emit_identical_fixed_width_records(tmp_path):
         assert summary["serving_run_files"] == 1
         assert summary["serving_run_rows"] == 1
         assert summary["serving_run_bytes"] == _SERVING_RECORD.size
+        assert dedupe_summary["serving_rate_attempted"] == 1
+        assert dedupe_summary["serving_rate_dedupe_enabled"] is False
+        assert dedupe_summary["serving_rate_unique"] is None
+        assert dedupe_summary["serving_rate_duplicate"] is None
+        assert dedupe_summary["serving_rate_reduction_pct"] is None
         assert len(run["code_dictionary_frames"]) == 1
         assert run["code_dictionary_frames"][0]["format"] == (
             "ptg2_v3_serving_code_dictionary"

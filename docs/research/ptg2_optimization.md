@@ -82,6 +82,12 @@ population. Dense assigned rows feed the block encoder in their native
 fixed-width representation, removing a synthetic PostgreSQL-COPY encode/decode
 loop while retaining byte-identical committed block output.
 
+Strict V3 also avoids constructing legacy serving-row hashes and the associated
+process-wide uniqueness set. Those values are not part of V3 publication.
+Completed worker-run counts provide the exact attempted-row metric; the
+scanner marks legacy uniqueness metrics as unmeasured instead of paying their
+per-row CPU and memory cost.
+
 The authoritative by-code writer emits only `by_code_provider_shard_v1`.
 Provider-set keys are partitioned into 1,024-key shards, where
 `shard_id = provider_set_key // 1024` and
