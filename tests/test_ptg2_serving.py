@@ -8,7 +8,10 @@ from types import SimpleNamespace
 import pytest
 
 from api import ptg2_serving
-from api.code_systems import catalog_code_lookup_values
+from api.code_systems import (
+    catalog_code_lookup_values,
+    catalog_code_system_lookup_values,
+)
 from process.ptg_parts.address_assurance import summarize_ptg_price_address_payload
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
@@ -545,6 +548,34 @@ async def test_strict_shared_v3_search_scopes_code_lookup_to_shared_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_strict_shared_v3_search_matches_persisted_code_system_aliases():
+    session = FakeSession([FakeResult(result_rows=[])])
+
+    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "ptg2:209901:synthetic",
+        {
+            "plan_id": "SYNTHETIC-PLAN",
+            "code": "0297",
+            "code_system": "MS_DRG",
+        },
+        FakePagination(),
+        _strict_v3_tables(),
+        ptg2_serving.PTG2_MODE_EXACT_SOURCE,
+    )
+
+    assert response is None
+    sql = str(session.calls[0][0][0])
+    params_by_name = session.calls[0][0][1]
+    assert "code_metadata.reported_code_system IN" in sql
+    assert {
+        value
+        for key, value in params_by_name.items()
+        if key.startswith("reported_code_system")
+    } == {"MS_DRG", "MS-DRG", "MSDRG", "DRG"}
+
+
+@pytest.mark.asyncio
 async def test_strict_shared_v3_reverse_lookup_matches_revenue_code_forms():
     session = FakeSession(
         [
@@ -595,6 +626,28 @@ def test_revenue_code_lookup_values_include_raw_and_canonical_forms():
     assert catalog_code_lookup_values("revenue_code", "0450") == ("0450", "450")
     assert catalog_code_lookup_values("RC", "020") == ("0020", "020", "20")
     assert catalog_code_lookup_values("CPT", "99213") == ("99213",)
+
+
+def test_code_system_lookup_values_include_legacy_persisted_aliases():
+    assert catalog_code_system_lookup_values("MS-DRG") == (
+        "MS_DRG",
+        "MS-DRG",
+        "MSDRG",
+        "DRG",
+    )
+    assert catalog_code_system_lookup_values("CPT") == ("CPT",)
+
+
+def test_code_metadata_rows_expose_canonical_code_systems():
+    assert ptg2_serving._canonical_code_metadata_row(
+        {
+            "reported_code_system": "MS-DRG",
+            "reported_code": "0297",
+        }
+    ) == {
+        "reported_code_system": "MS_DRG",
+        "reported_code": "0297",
+    }
 
 
 @pytest.mark.asyncio

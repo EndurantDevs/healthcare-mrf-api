@@ -49,6 +49,20 @@ def normalize_code(raw_code: Any) -> str:
     return str(raw_code or "").strip().upper()
 
 
+def catalog_code_system_lookup_values(raw_system: Any) -> tuple[str, ...]:
+    """Return canonical and legacy persisted names for one code system."""
+
+    canonical = normalize_code_system(raw_system)
+    if not canonical:
+        return ()
+    aliases = tuple(
+        alias
+        for alias, alias_canonical in CODE_SYSTEM_ALIASES.items()
+        if alias_canonical == canonical and alias != canonical
+    )
+    return (canonical, *aliases)
+
+
 def canonical_catalog_code(code_system: str, raw_code: Any) -> str:
     """Normalize one code according to its catalog system's width rules."""
 
