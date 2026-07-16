@@ -5031,12 +5031,13 @@ fn process_provider_ref_raw_batch_with_metrics(
             .saturating_add(transform_started_at.elapsed().as_micros());
 
         let (key, mut entry) = provider_entry;
-        entry.source_locator =
-            Some(source_witness.store_provider_source(metrics.worker_id, raw_ref)?);
+        let source_locator = source_witness.store_provider_source(metrics.worker_id, raw_ref)?;
+        entry.source_locator = Some(source_locator);
         if let Some(priority) = witness_priority {
             source_witness.commit_provider_reference(
                 priority,
                 coordinate,
+                source_locator,
                 raw_ref,
                 &source_provider_witness_expected(&key, &entry),
             )?;

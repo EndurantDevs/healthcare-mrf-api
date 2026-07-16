@@ -256,15 +256,15 @@ def _mark_released_paths_unleased_locked(
     active_prefixes: set[str],
     now: datetime.datetime,
 ) -> set[str]:
-    newly_unleased: set[str] = set()
+    newly_unleased_paths: set[str] = set()
     for relative_path in sorted(_lease_referenced_paths_locked(store, payload)):
         if _is_protected(relative_path, active_exact_paths, active_prefixes):
             continue
         path = store.root / relative_path
         if path.is_file() and not path.is_symlink():
             if _mark_unleased_locked(store, relative_path, now=now):
-                newly_unleased.add(relative_path)
-    return newly_unleased
+                newly_unleased_paths.add(relative_path)
+    return newly_unleased_paths
 
 
 class PTG2ArtifactLease:
@@ -390,9 +390,12 @@ class PTG2ArtifactLease:
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=5)
         with self.store.retention_lock():
-            payload = _read_json(self.marker_path)
+            lease_payload = _read_json(self.marker_path)
             self.marker_path.unlink(missing_ok=True)
-            if payload is not None and payload.get("lease_id") == self.lease_id:
+            if (
+                lease_payload is not None
+                and lease_payload.get("lease_id") == self.lease_id
+            ):
                 now = _utcnow()
                 try:
                     exact_paths, prefixes, _active_ids, _stale = _active_lease_references_locked(
@@ -406,7 +409,7 @@ class PTG2ArtifactLease:
                 else:
                     _mark_released_paths_unleased_locked(
                         self.store,
-                        payload,
+                        lease_payload,
                         active_exact_paths=exact_paths,
                         active_prefixes=prefixes,
                         now=now,
@@ -732,29 +735,31 @@ def _active_lease_references_locked(
     if not store.leases_dir.exists():
         return exact_paths, prefixes, (), ()
     for marker_path in sorted(store.leases_dir.glob("*.json")):
-        payload = _read_json(marker_path)
+        lease_payload = _read_json(marker_path)
         expected_id = marker_path.stem
         if (
-            payload is None
-            or payload.get("schema_version") != LEASE_SCHEMA_VERSION
-            or payload.get("lease_id") != expected_id
+            lease_payload is None
+            or lease_payload.get("schema_version") != LEASE_SCHEMA_VERSION
+            or lease_payload.get("lease_id") != expected_id
         ):
             raise RuntimeError(
                 f"Invalid PTG artifact lease marker; cleanup fails closed: {marker_path}"
             )
-        expires_at = _parse_timestamp(payload.get("expires_at"))
+        expires_at = _parse_timestamp(lease_payload.get("expires_at"))
         if expires_at is None:
             raise RuntimeError(
                 f"Invalid PTG artifact lease expiration; cleanup fails closed: {marker_path}"
             )
         try:
-            referenced_paths, referenced_prefixes = _payload_reference_sets(payload)
+            referenced_paths, referenced_prefixes = _payload_reference_sets(lease_payload)
         except ValueError as exc:
             raise RuntimeError(
                 f"Invalid PTG artifact lease references; cleanup fails closed: {marker_path}"
             ) from exc
         if expires_at <= now:
-            stale_leases.append(_StaleLease(path=marker_path, payload=payload))
+            stale_leases.append(
+                _StaleLease(path=marker_path, payload=lease_payload)
+            )
             continue
         active_ids.append(expected_id)
         exact_paths.update(referenced_paths)
@@ -778,7 +783,7 @@ def _stale_unleased_candidates_locked(
     active_exact_paths: set[str],
     active_prefixes: set[str],
 ) -> dict[str, datetime.datetime]:
-    candidates: dict[str, datetime.datetime] = {}
+    candidates_by_path: dict[str, datetime.datetime] = {}
     for stale_lease in stale_leases:
         expires_at = _parse_timestamp(stale_lease.payload.get("expires_at"))
         if expires_at is None:
@@ -789,10 +794,10 @@ def _stale_unleased_candidates_locked(
             artifact_path = store.root / relative_path
             if not artifact_path.is_file() or artifact_path.is_symlink():
                 continue
-            previous = candidates.get(relative_path)
+            previous = candidates_by_path.get(relative_path)
             if previous is None or expires_at > previous:
-                candidates[relative_path] = expires_at
-    return candidates
+                candidates_by_path[relative_path] = expires_at
+    return candidates_by_path
 
 
 def _stored_artifacts_locked(
@@ -804,8 +809,8 @@ def _stored_artifacts_locked(
     observation_time: datetime.datetime,
     unleased_since_overrides: dict[str, datetime.datetime] | None = None,
 ) -> tuple[list[_StoredArtifact], list[Path]]:
-    stored: list[_StoredArtifact] = []
-    newly_unleased: list[Path] = []
+    stored_artifacts: list[_StoredArtifact] = []
+    newly_unleased_paths: list[Path] = []
     for kind in sorted(MANAGED_ARTIFACT_KINDS):
         kind_root = store.root / kind
         if not kind_root.exists():
@@ -818,28 +823,28 @@ def _stored_artifacts_locked(
             except OSError:
                 continue
             relative_path = path.relative_to(store.root).as_posix()
-            protected = _is_protected(relative_path, exact_paths, prefixes)
+            is_protected = _is_protected(relative_path, exact_paths, prefixes)
             unleased_since = _read_unleased_since_locked(store, relative_path)
-            if not protected and unleased_since is None:
+            if not is_protected and unleased_since is None:
                 unleased_since = (unleased_since_overrides or {}).get(relative_path)
                 if unleased_since is None:
                     # Unknown/legacy files get a durable first-observed time.
                     # Their old mtime never short-circuits the grace period.
                     unleased_since = observation_time
-                newly_unleased.append(path)
+                newly_unleased_paths.append(path)
                 if persist_unleased:
                     _mark_unleased_locked(store, relative_path, now=unleased_since)
-            stored.append(
+            stored_artifacts.append(
                 _StoredArtifact(
                     path=path,
                     relative_path=relative_path,
                     size=stat.st_size,
                     modified_at=stat.st_mtime,
-                    protected=protected,
+                    protected=is_protected,
                     unleased_since=unleased_since,
                 )
             )
-    return stored, newly_unleased
+    return stored_artifacts, newly_unleased_paths
 
 
 def _select_artifacts(
@@ -854,61 +859,69 @@ def _select_artifacts(
 ) -> tuple[list[_StoredArtifact], list[_StoredArtifact]]:
     """Return age-eligible artifacts and a bounded, retention-first selection."""
 
-    eligible: list[_StoredArtifact] = []
-    retention_due: set[str] = set()
-    for item in stored:
-        if item.protected or item.unleased_since is None:
+    eligible_artifacts: list[_StoredArtifact] = []
+    retention_due_paths: set[str] = set()
+    for artifact in stored:
+        if artifact.protected or artifact.unleased_since is None:
             continue
-        unleased_age = now_timestamp - item.unleased_since.timestamp()
-        file_age = now_timestamp - item.modified_at
+        unleased_age = now_timestamp - artifact.unleased_since.timestamp()
+        file_age = now_timestamp - artifact.modified_at
         if unleased_age >= min_age_seconds and file_age >= min_age_seconds:
-            eligible.append(item)
+            eligible_artifacts.append(artifact)
             if unleased_age >= retention_seconds:
-                retention_due.add(item.relative_path)
-    eligible.sort(
-        key=lambda item: (
-            item.unleased_since.timestamp() if item.unleased_since else now_timestamp,
-            item.modified_at,
-            item.relative_path,
+                retention_due_paths.add(artifact.relative_path)
+    eligible_artifacts.sort(
+        key=lambda artifact: (
+            artifact.unleased_since.timestamp()
+            if artifact.unleased_since
+            else now_timestamp,
+            artifact.modified_at,
+            artifact.relative_path,
         )
     )
-    selected: list[_StoredArtifact] = []
+    selected_artifacts: list[_StoredArtifact] = []
     selected_paths: set[str] = set()
     selected_bytes = 0
 
-    def can_select(item: _StoredArtifact) -> bool:
+    def can_select(artifact: _StoredArtifact) -> bool:
         """Return whether an item fits deletion caps, allowing one oversized first item."""
 
-        if max_delete_files is not None and len(selected) >= max_delete_files:
+        if (
+            max_delete_files is not None
+            and len(selected_artifacts) >= max_delete_files
+        ):
             return False
-        if max_delete_bytes is None or selected_bytes + item.size <= max_delete_bytes:
+        if (
+            max_delete_bytes is None
+            or selected_bytes + artifact.size <= max_delete_bytes
+        ):
             return True
-        return not selected
+        return not selected_artifacts
 
-    def add(item: _StoredArtifact, current_bytes: int) -> int:
+    def add(artifact: _StoredArtifact, current_bytes: int) -> int:
         """Record an item for deletion and return the updated selected byte count."""
 
-        selected.append(item)
-        selected_paths.add(item.relative_path)
-        return current_bytes + item.size
+        selected_artifacts.append(artifact)
+        selected_paths.add(artifact.relative_path)
+        return current_bytes + artifact.size
 
-    for item in eligible:
-        if item.relative_path in retention_due and can_select(item):
-            selected_bytes = add(item, selected_bytes)
+    for artifact in eligible_artifacts:
+        if artifact.relative_path in retention_due_paths and can_select(artifact):
+            selected_bytes = add(artifact, selected_bytes)
 
-    total_bytes = sum(item.size for item in stored)
+    total_bytes = sum(artifact.size for artifact in stored)
     projected_bytes = total_bytes - selected_bytes
     if target_bytes is not None and projected_bytes > target_bytes:
-        for item in eligible:
-            if item.relative_path in selected_paths:
+        for artifact in eligible_artifacts:
+            if artifact.relative_path in selected_paths:
                 continue
-            if not can_select(item):
+            if not can_select(artifact):
                 continue
-            selected_bytes = add(item, selected_bytes)
-            projected_bytes -= item.size
+            selected_bytes = add(artifact, selected_bytes)
+            projected_bytes -= artifact.size
             if projected_bytes <= target_bytes:
                 break
-    return eligible, selected
+    return eligible_artifacts, selected_artifacts
 
 
 def _manifest_record_key(payload: dict[str, Any]) -> tuple[str, ...]:
@@ -991,19 +1004,25 @@ def _compact_manifest_locked(store: PTG2ArtifactStore) -> tuple[int, int, int]:
     with manifest:
         for index, line in enumerate(manifest):
             try:
-                payload = json.loads(line)
+                manifest_record = json.loads(line)
             except (ValueError, TypeError):
                 invalid_lines += 1
                 continue
-            if not isinstance(payload, dict):
+            if not isinstance(manifest_record, dict):
                 invalid_lines += 1
                 continue
             valid_entries += 1
-            latest_by_key[_manifest_record_key(payload)] = (index, payload)
-    compacted = [
-        payload
-        for _index, payload in sorted(latest_by_key.values(), key=lambda item: item[0])
-        if not _record_points_to_missing_managed_file(store, payload)
+            latest_by_key[_manifest_record_key(manifest_record)] = (
+                index,
+                manifest_record,
+            )
+    compacted_records = [
+        manifest_record
+        for _index, manifest_record in sorted(
+            latest_by_key.values(),
+            key=lambda record: record[0],
+        )
+        if not _record_points_to_missing_managed_file(store, manifest_record)
     ]
     if invalid_lines:
         raise RuntimeError(
@@ -1018,8 +1037,10 @@ def _compact_manifest_locked(store: PTG2ArtifactStore) -> tuple[int, int, int]:
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fp:
-            for payload in compacted:
-                fp.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+            for manifest_record in compacted_records:
+                fp.write(
+                    json.dumps(manifest_record, sort_keys=True, default=str) + "\n"
+                )
             fp.flush()
             os.fsync(fp.fileno())
         with suppress(OSError):
@@ -1027,7 +1048,7 @@ def _compact_manifest_locked(store: PTG2ArtifactStore) -> tuple[int, int, int]:
         os.replace(temporary_path, store.manifest_path)
     finally:
         temporary_path.unlink(missing_ok=True)
-    return valid_entries, len(compacted), invalid_lines
+    return valid_entries, len(compacted_records), invalid_lines
 
 
 def _prune_empty_artifact_directories(store: PTG2ArtifactStore) -> None:
@@ -1127,12 +1148,12 @@ def collect_ptg2_input_artifacts(
         )
     retention_seconds = max(float(retention_value), 0.0) * 3600
     min_age_seconds = max(float(min_age_value), 0.0) * 3600
-    deleted: list[Path] = []
+    deleted_files: list[Path] = []
     deleted_bytes = 0
     manifest_before = 0
     manifest_after = 0
     manifest_invalid = 0
-    newly_unleased: set[Path] = set()
+    newly_unleased_paths: set[Path] = set()
 
     with store.retention_lock():
         manifest_before = _validate_manifest_locked(store)
@@ -1153,8 +1174,8 @@ def collect_ptg2_input_artifacts(
                 stale_lease.path.unlink(missing_ok=True)
             for relative_path, unleased_since in sorted(stale_unleased.items()):
                 if _mark_unleased_locked(store, relative_path, now=unleased_since):
-                    newly_unleased.add(store.root / relative_path)
-        stored, discovered_unleased = _stored_artifacts_locked(
+                    newly_unleased_paths.add(store.root / relative_path)
+        stored_artifacts, discovered_unleased = _stored_artifacts_locked(
             store,
             exact_paths=exact_paths,
             prefixes=prefixes,
@@ -1162,9 +1183,9 @@ def collect_ptg2_input_artifacts(
             observation_time=current_time,
             unleased_since_overrides=stale_unleased,
         )
-        newly_unleased.update(discovered_unleased)
-        eligible, selected = _select_artifacts(
-            stored,
+        newly_unleased_paths.update(discovered_unleased)
+        eligible_artifacts, selected_artifacts = _select_artifacts(
+            stored_artifacts,
             now_timestamp=current_time.timestamp(),
             retention_seconds=retention_seconds,
             min_age_seconds=min_age_seconds,
@@ -1177,40 +1198,48 @@ def collect_ptg2_input_artifacts(
         # is already a durable, heartbeat-backed unleased boundary.
         stale_paths = {store.root / relative_path for relative_path in stale_unleased}
         unknown_discovered_paths = set(discovered_unleased) - stale_paths
-        selected = [
-            item for item in selected if item.path not in unknown_discovered_paths
+        selected_artifacts = [
+            artifact
+            for artifact in selected_artifacts
+            if artifact.path not in unknown_discovered_paths
         ]
         if execute:
-            for item in stored:
-                if item.protected:
-                    _clear_unleased_locked(store, item.relative_path)
-            for item in selected:
+            for artifact in stored_artifacts:
+                if artifact.protected:
+                    _clear_unleased_locked(store, artifact.relative_path)
+            for artifact in selected_artifacts:
                 try:
-                    item.path.unlink()
+                    artifact.path.unlink()
                 except FileNotFoundError:
                     continue
-                _clear_unleased_locked(store, item.relative_path)
-                deleted.append(item.path)
-                deleted_bytes += item.size
+                _clear_unleased_locked(store, artifact.relative_path)
+                deleted_files.append(artifact.path)
+                deleted_bytes += artifact.size
             _prune_empty_artifact_directories(store)
             _prune_unleased_metadata_locked(store)
             manifest_before, manifest_after, manifest_invalid = _compact_manifest_locked(store)
 
-    total_before = sum(item.size for item in stored)
+    total_before = sum(artifact.size for artifact in stored_artifacts)
     total_after = total_before - deleted_bytes
     return PTG2InputArtifactGCResult(
         executed=execute,
         root=store.root,
         active_lease_ids=active_ids,
-        stale_lease_files=tuple(item.path for item in stale_leases),
-        protected_files=tuple(item.path for item in stored if item.protected),
-        newly_unleased_files=tuple(sorted(newly_unleased)),
-        eligible_files=tuple(item.path for item in eligible),
-        selected_files=tuple(item.path for item in selected),
-        deleted_files=tuple(deleted),
+        stale_lease_files=tuple(stale_lease.path for stale_lease in stale_leases),
+        protected_files=tuple(
+            artifact.path for artifact in stored_artifacts if artifact.protected
+        ),
+        newly_unleased_files=tuple(sorted(newly_unleased_paths)),
+        eligible_files=tuple(
+            artifact.path for artifact in eligible_artifacts
+        ),
+        selected_files=tuple(
+            artifact.path for artifact in selected_artifacts
+        ),
+        deleted_files=tuple(deleted_files),
         total_bytes_before=total_before,
         total_bytes_after=total_after,
-        selected_bytes=sum(item.size for item in selected),
+        selected_bytes=sum(artifact.size for artifact in selected_artifacts),
         deleted_bytes=deleted_bytes,
         target_bytes=target_bytes,
         manifest_entries_before=manifest_before,

@@ -472,6 +472,10 @@ sources. Up to 48 records are reserved for provider references; queryable
 occurrences fill the remainder, and either cohort deterministically backfills
 unused capacity. Both local and global population-derived counts are checked,
 so an omitted queryable occurrence or provider candidate fails publication.
+Per-source scanner candidates use a separate bounded intermediate bundle
+(currently 512 MiB maximum) because a local bottom-k set can be larger than the
+final cross-source selection. The immutable PostgreSQL witness remains capped
+at 128 MiB; exceeding that final bound still fails publication.
 
 The exact raw JSON token is preserved, individually zlib-compressed, and
 protected by its own SHA-256. Publication merges all per-source bottom-k sets
