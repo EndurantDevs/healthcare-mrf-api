@@ -6409,27 +6409,6 @@ def test_scanner_error_labels_sigterm():
     assert "PTG2_DEDUPE_SUMMARY" in message
 
 
-def test_scanner_error_prioritizes_primary_validation_failure():
-    message = ptg_rust_scanner._scanner_error_message(
-        "PTG2 Rust compact scanner",
-        1,
-        [
-            "PTG2_SCANNER_WORKER_FAILED\tworker_id=2\ttype=error\t"
-            "error=No such file or directory (os error 2)",
-            "PTG2_SCANNER_WORKER_FAILED\tworker_id=0\ttype=error\t"
-            "error=No such file or directory (os error 2)",
-            'Error: Custom { kind: InvalidData, error: "required field is empty" }',
-            "PTG2_SCANNER_WORKER_FAILED\tworker_id=0\ttype=error\t"
-            "error=No such file or directory (os error 2)",
-        ],
-    )
-
-    validation_position = message.index("required field is empty")
-    worker_position = message.index("PTG2_SCANNER_WORKER_FAILED")
-    assert validation_position < worker_position
-    assert message.count("worker_id=0") == 1
-
-
 def test_scanner_allows_sigterm_after_dedupe():
     assert ptg_rust_scanner._is_scanner_sigterm_after_dedupe(
         -15,

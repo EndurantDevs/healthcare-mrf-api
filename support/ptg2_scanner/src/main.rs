@@ -155,6 +155,18 @@ fn compact_pipeline_error(
     }
 }
 
+fn primary_producer_failure_diagnostic(error: &io::Error) -> Option<String> {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::BrokenPipe
+    ) {
+        return None;
+    }
+    Some(format!(
+        "PTG2_SCANNER_PRIMARY_FAILED\ttype=producer_error\terror={error}"
+    ))
+}
+
 fn scan(path: &Path, requested: &[String]) -> io::Result<()> {
     let mut targets: HashMap<Vec<u8>, String> = HashMap::new();
     for name in requested {
@@ -8156,13 +8168,11 @@ fn scan_compact_byte_top_level_parallel(
                                     Ok(Ok(events)) => Ok(events),
                                     Ok(Err(err)) => {
                                         worker_cancelled.store(true, Ordering::Release);
-                                        log_worker_failure(worker_id, "error", &err.to_string());
                                         Err(err)
                                     }
                                     Err(payload) => {
                                         worker_cancelled.store(true, Ordering::Release);
                                         let message = panic_payload_message(payload.as_ref());
-                                        log_worker_failure(worker_id, "panic", &message);
                                         Err(io::Error::other(format!(
                                             "compact worker {worker_id} panicked: {message}"
                                         )))
@@ -8525,6 +8535,12 @@ fn scan_compact_byte_top_level_parallel(
                             .saturating_sub(in_network_compressed_started_at)
                     };
 
+                    if let Some(diagnostic) = producer_error
+                        .as_ref()
+                        .and_then(primary_producer_failure_diagnostic)
+                    {
+                        eprintln!("{diagnostic}");
+                    }
                     drop(tx);
                     drop(event_tx);
                     let worker_join_started_at = Instant::now();
@@ -19531,6 +19547,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(error.to_string(), "primary rapidgzip producer failure");
+    }
+
+    #[test]
+    fn primary_producer_diagnostic_excludes_peer_cancellation() {
+        let source_error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "billing_code must be a non-empty JSON string",
+        );
+        let diagnostic = primary_producer_failure_diagnostic(&source_error).unwrap();
+        assert!(diagnostic.starts_with("PTG2_SCANNER_PRIMARY_FAILED\t"));
+        assert!(diagnostic.contains("billing_code must be a non-empty JSON string"));
+
+        for peer_kind in [io::ErrorKind::Interrupted, io::ErrorKind::BrokenPipe] {
+            let peer_error = io::Error::new(peer_kind, "peer worker stopped");
+            assert!(primary_producer_failure_diagnostic(&peer_error).is_none());
+        }
     }
 
     struct LateErrorReader {

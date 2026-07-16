@@ -1121,36 +1121,7 @@ async def convert_v3_provider_membership_shards_to_shared_graph_rust(
 
 
 def _scanner_error_message(prefix: str, return_code: int, stderr_tail: list[str]) -> str:
-    detail_lines = _prioritized_scanner_error_lines(stderr_tail)
-    details = "\n".join(detail_lines)
-    return (
-        f"{prefix} failed with {_scanner_return_code_label(return_code)}: "
-        f"{details[:1000]}"
-    )
-
-
-def _prioritized_scanner_error_lines(stderr_tail: list[str]) -> list[str]:
-    lines = [
-        line.strip()
-        for stderr_entry in stderr_tail
-        for line in stderr_entry.splitlines()
-        if line.strip()
-    ]
-    unique_lines = list(dict.fromkeys(lines))
-    primary_errors = [line for line in unique_lines if line.startswith("Error:")]
-    if not primary_errors:
-        return unique_lines
-    worker_failures = [
-        line
-        for line in unique_lines
-        if line.startswith("PTG2_SCANNER_WORKER_FAILED\t")
-    ]
-    other_lines = [
-        line
-        for line in unique_lines
-        if line not in primary_errors and line not in worker_failures
-    ]
-    return [*primary_errors, *other_lines, *worker_failures]
+    return f"{prefix} failed with {_scanner_return_code_label(return_code)}: {chr(10).join(stderr_tail)[-1000:]}"
 
 
 def _scanner_progress_fields(line: str) -> dict[str, str] | None:
