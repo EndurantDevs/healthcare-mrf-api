@@ -1,7 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import base64
+import binascii
 import contextlib
+import hashlib
 import json
 import logging
 import math
@@ -4120,6 +4123,17 @@ async def _fast_primary_npi_count() -> int:
     return _primary_total_cache_set(int(value or 0))
 
 
+def _nearby_geo_type_clause(address_table_sql: str) -> str:
+    """Return the partial geo-index address-type predicate."""
+
+    if address_table_sql.endswith(".entity_address_unified") and _geo_includes_service_locations():
+        type_list = ", ".join(
+            f"'{address_type}'" for address_type in GEO_SERVICE_LOCATION_TYPES
+        )
+        return f"AND a.type IN ({type_list})"
+    return "AND (a.type = 'primary' OR a.type = 'secondary')"
+
+
 def _build_nearby_sql(
     taxonomy_conditions: str,
     extra_clause: str,
@@ -4128,8 +4142,15 @@ def _build_nearby_sql(
     use_taxonomy_filter: bool,
     address_table_sql: str = "mrf.npi_address",
     geo_precision_clause: str = "",
+    cursor_clause: str = "",
 ) -> str:
-    """Build the indexed nearby-provider query for the selected address model."""
+    """Build the GiST KNN nearby-provider query for the selected address model.
+
+    Do not add a separate latitude/longitude bounding box here. It makes PostgreSQL
+    prefer the B-tree geo_bbox index, which must scan and sort the entire box before
+    applying LIMIT. The geography KNN order lets geo_idx stop after the first page.
+    Exact total counts use a different access pattern and should remain separate.
+    """
     taxonomy_from = ""
     taxonomy_where = ""
     if use_taxonomy_filter:
@@ -4142,54 +4163,114 @@ def _build_nearby_sql(
             "                              ) AS g"
         )
         taxonomy_where = "\n                          AND a.taxonomy_array && g.codes"
-    # Match the geo_idx partial predicate so the GiST index is used. Only widen to
-    # practice/site when serving the unified table AND the rebuilt index covers them
-    # (flag-gated); otherwise keep the NPPES primary/secondary filter the live index
-    # supports, so geo search never seq-scans.
-    if address_table_sql.endswith(".entity_address_unified") and _geo_includes_service_locations():
-        type_list = ", ".join(f"'{t}'" for t in GEO_SERVICE_LOCATION_TYPES)
-        geo_type_clause = f"AND a.type IN ({type_list})"
-    else:
-        geo_type_clause = "AND (a.type = 'primary' OR a.type = 'secondary')"
+    geo_type_clause = _nearby_geo_type_clause(address_table_sql)
+    row_tiebreaker = (
+        "a.location_key ASC"
+        if address_table_sql.endswith(".entity_address_unified")
+        else "a.type ASC"
+    )
+    outer_row_tiebreaker = (
+        "sub_s.location_key ASC"
+        if address_table_sql.endswith(".entity_address_unified")
+        else "sub_s.type ASC"
+    )
     return dedent(
         """
         WITH sub_s AS (
             SELECT d.npi AS npi_code,
-                   q.*,
-                   d.*
-              FROM mrf.npi AS d,
-                   (
-                       SELECT
-                           ROUND(
-                               CAST(
-                                   ST_Distance(
-                                       Geography(ST_MakePoint(a.long, a.lat)),
-                                       Geography(ST_MakePoint(:in_long, :in_lat))
-                                   ) / 1609.34 AS NUMERIC
+                   ROUND(
+                       CAST(
+                           ST_Distance(
+                               Geography(
+                                   ST_MakePoint(
+                                       (a.long)::double precision,
+                                       (a.lat)::double precision
+                                   )
                                ),
-                               2
-                           ) AS distance,
-                           a.*
-                        FROM {address_table_sql} AS a{taxonomy_from}
-                        WHERE ST_DWithin(
-                                Geography(ST_MakePoint(long, lat)),
-                                Geography(ST_MakePoint(:in_long, :in_lat)),
-                                :radius * 1609.34
-                             )
-                          AND a.lat IS NOT NULL
-                          AND a.long IS NOT NULL
-                          {taxonomy_where}
-                          {geo_precision_clause}
-                          {geo_type_clause}
-                          {extra_clause}
-                     ORDER BY distance ASC
-                     LIMIT :limit
-                   ) AS q
-             WHERE q.npi = d.npi{ilike_clause}
+                               Geography(
+                                   ST_MakePoint(
+                                       CAST(:in_long AS double precision),
+                                       CAST(:in_lat AS double precision)
+                                   )
+                               )
+                           ) / 1609.34 AS NUMERIC
+                       ),
+                       2
+                   ) AS distance,
+                   Geography(
+                       ST_MakePoint(
+                           (a.long)::double precision,
+                           (a.lat)::double precision
+                       )
+                   ) <-> Geography(
+                       ST_MakePoint(
+                           CAST(:in_long AS double precision),
+                           CAST(:in_lat AS double precision)
+                       )
+                   ) AS cursor_distance_meters,
+                   a.*,
+                   d.*
+              FROM {address_table_sql} AS a
+              JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
+             WHERE ST_DWithin(
+                       Geography(
+                           ST_MakePoint(
+                               (a.long)::double precision,
+                               (a.lat)::double precision
+                           )
+                       ),
+                       Geography(
+                           ST_MakePoint(
+                               CAST(:in_long AS double precision),
+                               CAST(:in_lat AS double precision)
+                           )
+                       ),
+                       :radius * 1609.34
+                   )
+               AND a.lat IS NOT NULL
+               AND a.long IS NOT NULL
+               AND a.address_key IS NOT NULL
+               {taxonomy_where}
+               {geo_precision_clause}
+               {geo_type_clause}
+               {extra_clause}{ilike_clause}{cursor_clause}
+          ORDER BY Geography(
+                       ST_MakePoint(
+                           (a.long)::double precision,
+                           (a.lat)::double precision
+                       )
+                   ) <-> Geography(
+                       ST_MakePoint(
+                           CAST(:in_long AS double precision),
+                           CAST(:in_lat AS double precision)
+                       )
+                   ) ASC,
+                   a.npi ASC,
+                   a.address_key ASC,
+                   CASE a.type
+                       WHEN 'primary' THEN 0
+                       WHEN 'practice' THEN 1
+                       WHEN 'site' THEN 2
+                       WHEN 'secondary' THEN 3
+                       ELSE 9
+                   END ASC,
+                   {row_tiebreaker}
+             LIMIT :limit
         )
         SELECT sub_s.*, t.*
           FROM sub_s
-          JOIN mrf.npi_taxonomy AS t ON sub_s.npi_code = t.npi;
+          LEFT JOIN mrf.npi_taxonomy AS t ON sub_s.npi_code = t.npi
+      ORDER BY sub_s.cursor_distance_meters ASC,
+               sub_s.npi_code ASC,
+               sub_s.address_key ASC,
+               CASE sub_s.type
+                   WHEN 'primary' THEN 0
+                   WHEN 'practice' THEN 1
+                   WHEN 'site' THEN 2
+                   WHEN 'secondary' THEN 3
+                   ELSE 9
+               END ASC,
+               {outer_row_tiebreaker};
         """
     ).format(
         taxonomy_from=taxonomy_from,
@@ -4198,8 +4279,175 @@ def _build_nearby_sql(
         geo_type_clause=geo_type_clause,
         extra_clause=extra_clause,
         ilike_clause=ilike_clause,
+        cursor_clause=cursor_clause,
+        row_tiebreaker=row_tiebreaker,
+        outer_row_tiebreaker=outer_row_tiebreaker,
         address_table_sql=address_table_sql,
     )
+
+
+_NEARBY_COUNT_SQL_TEMPLATE = dedent(
+    """
+    SELECT COUNT(DISTINCT (a.npi, a.address_key)) AS total_count
+      FROM {address_table_sql} AS a
+      JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
+     WHERE ST_DWithin(
+               Geography(
+                   ST_MakePoint(
+                       (a.long)::double precision,
+                       (a.lat)::double precision
+                   )
+               ),
+               Geography(
+                   ST_MakePoint(
+                       CAST(:in_long AS double precision),
+                       CAST(:in_lat AS double precision)
+                   )
+               ),
+               :radius * 1609.34
+           )
+       AND a.lat IS NOT NULL
+       AND a.long IS NOT NULL
+       AND a.address_key IS NOT NULL
+       {taxonomy_where}
+       {geo_precision_clause}
+       {geo_type_clause}
+       {bbox_clause}
+       {extra_clause}{ilike_clause};
+    """
+)
+
+
+def _build_nearby_count_sql(
+    taxonomy_conditions: str,
+    extra_clause: str,
+    ilike_clause: str,
+    *,
+    use_taxonomy_filter: bool,
+    address_table_sql: str = "mrf.npi_address",
+    geo_precision_clause: str = "",
+    bbox_clause: str = "",
+) -> str:
+    """Build the exact provider-address count query for nearby search."""
+
+    taxonomy_from = ""
+    taxonomy_where = ""
+    if use_taxonomy_filter:
+        taxonomy_from = (
+            ",\n"
+            "       (\n"
+            "           SELECT ARRAY_AGG(int_code) AS codes\n"
+            "             FROM mrf.nucc_taxonomy\n"
+            f"            WHERE {taxonomy_conditions}\n"
+            "       ) AS g"
+        )
+        taxonomy_where = "\n   AND a.taxonomy_array && g.codes"
+    geo_type_clause = _nearby_geo_type_clause(address_table_sql)
+    return _NEARBY_COUNT_SQL_TEMPLATE.format(
+        taxonomy_from=taxonomy_from,
+        taxonomy_where=taxonomy_where,
+        geo_precision_clause=geo_precision_clause,
+        geo_type_clause=geo_type_clause,
+        bbox_clause=bbox_clause,
+        extra_clause=extra_clause,
+        ilike_clause=ilike_clause,
+        address_table_sql=address_table_sql,
+    )
+
+
+_NEARBY_CURSOR_VERSION = 1
+_NEARBY_CURSOR_IGNORED_PARAMS = frozenset({"cursor", "include_total", "limit"})
+
+
+def _nearby_cursor_scope(args: Mapping[str, Any]) -> str:
+    values = []
+    for key in sorted(str(value) for value in args.keys()):
+        if key in _NEARBY_CURSOR_IGNORED_PARAMS:
+            continue
+        values.append((key, str(args.get(key) or "")))
+    serialized = json.dumps(values, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _encode_nearby_cursor(
+    scope: str,
+    distance_meters: float,
+    npi: int,
+    address_key: str,
+) -> str:
+    payload = {
+        "v": _NEARBY_CURSOR_VERSION,
+        "s": scope,
+        "d": float(distance_meters),
+        "n": int(npi),
+        "a": str(address_key).lower(),
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    )
+    return encoded.rstrip(b"=").decode("ascii")
+
+
+def _decode_nearby_cursor(raw: str, scope: str) -> tuple[float, int, str]:
+    try:
+        value = str(raw or "").strip()
+        if not value or len(value) > 2048:
+            raise ValueError("invalid cursor length")
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(value + padding))
+        distance = float(payload["d"])
+        npi = int(payload["n"])
+        address_key = str(uuid.UUID(str(payload["a"])))
+        if payload.get("v") != _NEARBY_CURSOR_VERSION:
+            raise ValueError("unsupported cursor version")
+        if payload.get("s") != scope:
+            raise ValueError("cursor filters do not match this request")
+        if not math.isfinite(distance) or distance < 0 or npi <= 0:
+            raise ValueError("invalid cursor values")
+        return distance, npi, address_key
+    except (binascii.Error, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise sanic.exceptions.InvalidUsage(
+            "cursor is invalid or does not match the current geo filters"
+        ) from exc
+
+
+def _nearby_cursor_filter(
+    cursor: tuple[float, int, str] | None,
+) -> tuple[str, dict[str, Any]]:
+    """Return the KNN keyset predicate and parameters for one geo batch."""
+
+    if cursor is None:
+        return "", {}
+    cursor_clause = dedent(
+        """
+
+           AND (
+               Geography(
+                   ST_MakePoint(
+                       (a.long)::double precision,
+                       (a.lat)::double precision
+                   )
+               ) <-> Geography(
+                   ST_MakePoint(
+                       CAST(:in_long AS double precision),
+                       CAST(:in_lat AS double precision)
+                   )
+               ),
+               a.npi,
+               a.address_key
+           ) > (
+               CAST(:cursor_distance_meters AS double precision),
+               CAST(:cursor_npi AS bigint),
+               CAST(:cursor_address_key AS uuid)
+           )
+        """
+    ).rstrip()
+    parameters_by_name = {
+        "cursor_distance_meters": cursor[0],
+        "cursor_npi": cursor[1],
+        "cursor_address_key": cursor[2],
+    }
+    return cursor_clause, parameters_by_name
 
 
 def _exact_geo_precision_clause(address_table_sql: str) -> str:
@@ -4796,12 +5044,14 @@ def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str) -
 
 def _sql_with_prefix_ctes(*ctes: str | None) -> str:
     available_ctes = [cte.strip() for cte in ctes if cte and cte.strip()]
-    return f"WITH {',\n'.join(available_ctes)},\n" if available_ctes else "WITH "
+    joined_ctes = ",\n".join(available_ctes)
+    return f"WITH {joined_ctes},\n" if available_ctes else "WITH "
 
 
 def _sql_with_ctes(*ctes: str | None) -> str:
     available_ctes = [cte.strip() for cte in ctes if cte and cte.strip()]
-    return f"WITH {',\n'.join(available_ctes)}\n" if available_ctes else ""
+    joined_ctes = ",\n".join(available_ctes)
+    return f"WITH {joined_ctes}\n" if available_ctes else ""
 
 
 def _address_npi_filter(alias: str, address_table_sql: str) -> str:
@@ -8821,6 +9071,15 @@ async def get_near_npi(request):
     name_query = str(request.args.get("q") or "").strip()
     exclude_npi = int(request.args.get("exclude_npi", 0))
     limit = int(request.args.get("limit", 5))
+    if limit < 1:
+        raise sanic.exceptions.InvalidUsage("limit must be at least 1")
+    include_total = _parse_bool_arg(request.args.get("include_total"), default=False)
+    cursor_raw = str(request.args.get("cursor") or "").strip()
+    pagination_requested = include_total or bool(cursor_raw)
+    cursor_scope = _nearby_cursor_scope(request.args)
+    initial_cursor = (
+        _decode_nearby_cursor(cursor_raw, cursor_scope) if cursor_raw else None
+    )
     zip_codes = []
     for zip_c in request.args.get("zip_codes", "").split(","):
         if not zip_c:
@@ -8914,6 +9173,17 @@ async def get_near_npi(request):
     if (requested_procedure_codes and not procedure_internal_codes) or (
         requested_medication_codes and not medication_internal_codes
     ):
+        if pagination_requested:
+            return response.json(
+                {
+                    "items": [],
+                    "total_count": 0,
+                    "next_cursor": None,
+                    "has_more": False,
+                    "result_identity": ["npi", "address_key"],
+                },
+                default=str,
+            )
         return response.json([], default=str)
 
     filter_capabilities = {
@@ -8933,20 +9203,20 @@ async def get_near_npi(request):
     if (not (in_long and in_lat)) and zip_codes and zip_codes[0]:
         zip_sql = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
         async with db.acquire() as conn_zip:
-            for r in await conn_zip.all(text(zip_sql), zip_code=zip_codes[0]):
+            for coordinate_record in await conn_zip.all(text(zip_sql), zip_code=zip_codes[0]):
                 try:
-                    in_long = float(r["intptlon"])
-                    in_lat = float(r["intptlat"])
+                    in_long = float(coordinate_record["intptlon"])
+                    in_lat = float(coordinate_record["intptlat"])
                 except Exception:
-                    in_lat = float(r[0])
-                    in_long = float(r[1])
+                    in_lat = float(coordinate_record[0])
+                    in_long = float(coordinate_record[1])
 
     address_table_sql = await _address_serving_table_sql(
         _public_address_serving_column_keys(),
         session=request_session,
     )
 
-    res = {}
+    providers_by_identity: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
     extra_filters: list[str] = []
     if exclude_npi:
         extra_filters.append("a.npi <> :exclude_npi")
@@ -9017,19 +9287,6 @@ async def get_near_npi(request):
         radius = 25
         extra_filters.append(_address_zip5_filter("a", address_table_sql, any_array=True))
 
-    bbox_params: dict[str, float] = {}
-    if in_long is not None and in_lat is not None:
-        delta_lat = radius / 69.0  # approx miles per degree latitude
-        cos_lat = math.cos(math.radians(in_lat)) or 1e-6
-        delta_long = radius / (69.0 * cos_lat)
-        bbox_params = {
-            "min_lat": in_lat - delta_lat,
-            "max_lat": in_lat + delta_lat,
-            "min_long": in_long - delta_long,
-            "max_long": in_long + delta_long,
-        }
-        extra_filters.append("a.lat BETWEEN :min_lat AND :max_lat")
-        extra_filters.append("a.long BETWEEN :min_long AND :max_long")
     if classification:
         where.append("classification = :classification")
     if section:
@@ -9049,37 +9306,137 @@ async def get_near_npi(request):
     if extra_filters:
         extra_clause = "\n          AND " + "\n          AND ".join(extra_filters)
 
-    nearby_sql = _build_nearby_sql(
-        taxonomy_conditions,
-        extra_clause,
-        ilike_clause,
-        use_taxonomy_filter=bool(where),
-        address_table_sql=address_table_sql,
-        geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
-    )
+    query_parameters_by_name: dict[str, Any] = {
+        "in_long": in_long,
+        "in_lat": in_lat,
+        "classification": classification,
+        "radius": radius,
+        "exclude_npi": exclude_npi,
+        "section": section,
+        "display_name": display_name,
+        "q": q_like,
+        "codes": codes,
+        "zip_codes": zip_codes,
+        "plan_network_array": plan_network,
+        "provider_sex_code": provider_sex_code,
+        **dynamic_code_params,
+    }
 
-    async with db.acquire() as conn:
-        res_q = await conn.all(
-            text(nearby_sql),
-            in_long=in_long,
-            in_lat=in_lat,
-            classification=classification,
-            limit=limit,
-            radius=radius,
-            exclude_npi=exclude_npi,
-            section=section,
-            display_name=display_name,
-            q=q_like,
-            codes=codes,
-            zip_codes=zip_codes,
-            plan_network_array=plan_network,
-            provider_sex_code=provider_sex_code,
-            **dynamic_code_params,
-            **bbox_params,
+    async def fetch_nearby_rows() -> list[Any]:
+        """Fetch enough KNN rows to page unique provider-address identities."""
+        target_identities = limit + 1 if pagination_requested else limit
+        candidate_limit = max((target_identities + 1) * 4, 16)
+        batch_cursor = initial_cursor
+        collected_rows: list[Any] = []
+        collected_identities: set[tuple[int, str]] = set()
+        async with db.acquire() as conn:
+            for _batch_number in range(100):
+                cursor_clause, cursor_parameters_by_name = _nearby_cursor_filter(
+                    batch_cursor
+                )
+                batch_parameters_by_name = {
+                    **query_parameters_by_name,
+                    **cursor_parameters_by_name,
+                }
+                nearby_sql = _build_nearby_sql(
+                    taxonomy_conditions,
+                    extra_clause,
+                    ilike_clause,
+                    use_taxonomy_filter=bool(where),
+                    address_table_sql=address_table_sql,
+                    geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
+                    cursor_clause=cursor_clause,
+                )
+                batch_rows = await conn.all(
+                    text(nearby_sql),
+                    limit=candidate_limit,
+                    **batch_parameters_by_name,
+                )
+                if not batch_rows:
+                    break
+                collected_rows.extend(batch_rows)
+                last_cursor = None
+                for batch_row in batch_rows:
+                    mapping = getattr(batch_row, "_mapping", None)
+                    if mapping is None:
+                        continue
+                    npi_value = mapping.get("npi_code") or mapping.get("npi")
+                    address_key_value = mapping.get("address_key")
+                    distance_value = mapping.get("cursor_distance_meters")
+                    if npi_value is None or address_key_value is None:
+                        continue
+                    identity = (int(npi_value), str(address_key_value).lower())
+                    collected_identities.add(identity)
+                    if distance_value is not None:
+                        last_cursor = (
+                            float(distance_value),
+                            int(npi_value),
+                            str(address_key_value),
+                        )
+
+                if len(collected_identities) >= target_identities:
+                    break
+                if last_cursor is None or last_cursor == batch_cursor:
+                    break
+                batch_cursor = last_cursor
+
+        return collected_rows
+
+    bbox_params: dict[str, float] = {}
+    bbox_clause = ""
+    if in_long is not None and in_lat is not None:
+        delta_lat = radius / 69.0
+        cos_lat = math.cos(math.radians(in_lat)) or 1e-6
+        delta_long = radius / (69.0 * cos_lat)
+        bbox_params = {
+            "min_lat": in_lat - delta_lat,
+            "max_lat": in_lat + delta_lat,
+            "min_long": in_long - delta_long,
+            "max_long": in_long + delta_long,
+        }
+        bbox_clause = dedent(
+            """
+
+               AND a.lat BETWEEN :min_lat AND :max_lat
+               AND a.long BETWEEN :min_long AND :max_long
+            """
+        ).rstrip()
+
+    async def fetch_exact_total() -> int:
+        """Count exact provider-address matches without the page limit."""
+
+        count_sql = _build_nearby_count_sql(
+            taxonomy_conditions,
+            extra_clause,
+            ilike_clause,
+            use_taxonomy_filter=bool(where),
+            address_table_sql=address_table_sql,
+            geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
+            bbox_clause=bbox_clause,
         )
+        async with db.acquire() as conn:
+            rows = await conn.all(
+                text(count_sql),
+                **query_parameters_by_name,
+                **bbox_params,
+            )
+        if not rows:
+            return 0
+        mapping = getattr(rows[0], "_mapping", None)
+        value = mapping.get("total_count") if mapping is not None else rows[0][0]
+        return int(value or 0)
 
-    for r in res_q:
-        row_mapping = getattr(r, "_mapping", None)
+    if pagination_requested:
+        res_q, total_count = await asyncio.gather(
+            fetch_nearby_rows(),
+            fetch_exact_total(),
+        )
+    else:
+        res_q = await fetch_nearby_rows()
+        total_count = None
+
+    for provider_record in res_q:
+        row_mapping = getattr(provider_record, "_mapping", None)
         if row_mapping is not None:
             row_dict = dict(row_mapping)
             npi_value = (
@@ -9092,91 +9449,133 @@ async def get_near_npi(request):
                 continue
 
             npi_value = int(npi_value)
-            obj = res.get(npi_value, {"taxonomy_list": []})
-            if "distance" in row_dict and row_dict.get("distance") is not None:
-                obj["distance"] = row_dict.get("distance")
+            address_key_value = row_dict.get("address_key")
+            if address_key_value is None:
+                continue
+            identity = (npi_value, str(address_key_value).lower())
+            is_new_identity = identity not in providers_by_identity
+            provider_by_field = providers_by_identity.get(identity, {"taxonomy_list": []})
+            if is_new_identity:
+                if "distance" in row_dict and row_dict.get("distance") is not None:
+                    provider_by_field["distance"] = row_dict.get("distance")
+                provider_by_field["_cursor_distance_meters"] = row_dict.get(
+                    "cursor_distance_meters"
+                )
+                provider_by_field["_cursor_npi"] = npi_value
+                provider_by_field["_cursor_address_key"] = str(address_key_value)
 
-            for c in NPIAddress.__table__.columns:
-                if c.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                    continue
-                if c.key in row_dict:
-                    obj[c.key] = row_dict[c.key]
-            _attach_public_address_site_key(obj, row_dict)
-            # Unified serving carries per-address source/plan attribution that the
-            # legacy NPIAddress model doesn't declare, so the loop above skips it.
-            # Surface it here so geo results show WHERE each address came from and
-            # which plans/networks confirm it (parity with the detail endpoint).
-            if address_table_sql.endswith(".entity_address_unified"):
-                for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
-                    if key in row_dict and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                        obj[key] = row_dict[key]
-            for c in NPIData.__table__.columns:
-                if c.key in ("npi", "checksum", "do_business_as_text"):
-                    continue
-                if c.key in row_dict:
-                    obj[c.key] = row_dict[c.key]
+                for column in NPIAddress.__table__.columns:
+                    if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                        continue
+                    if column.key in row_dict:
+                        provider_by_field[column.key] = row_dict[column.key]
+                _attach_public_address_site_key(provider_by_field, row_dict)
+                # Unified serving carries per-address source/plan attribution that the
+                # legacy NPIAddress model doesn't declare, so the loop above skips it.
+                # Surface it here so geo results show WHERE each address came from and
+                # which plans/networks confirm it (parity with the detail endpoint).
+                if address_table_sql.endswith(".entity_address_unified"):
+                    for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
+                        if key in row_dict and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                            provider_by_field[key] = row_dict[key]
+                for column in NPIData.__table__.columns:
+                    if column.key in ("npi", "checksum", "do_business_as_text"):
+                        continue
+                    if column.key in row_dict:
+                        provider_by_field[column.key] = row_dict[column.key]
 
             taxonomy = {}
-            for c in NPIDataTaxonomy.__table__.columns:
-                if c.key in ("npi", "checksum"):
+            for column in NPIDataTaxonomy.__table__.columns:
+                if column.key in ("npi", "checksum"):
                     continue
-                if c.key in row_dict:
-                    taxonomy[c.key] = row_dict[c.key]
-            if taxonomy:
-                obj["taxonomy_list"].append(taxonomy)
+                if column.key in row_dict:
+                    taxonomy[column.key] = row_dict[column.key]
+            if taxonomy and taxonomy not in provider_by_field["taxonomy_list"]:
+                provider_by_field["taxonomy_list"].append(taxonomy)
 
-            res[npi_value] = obj
+            providers_by_identity[identity] = provider_by_field
             continue
 
         # Fallback for positional row types. Keep this defensive to avoid crashes
         # when result shape differs from model column expectations.
-        row_len = len(r)
+        row_len = len(provider_record)
         if row_len <= 1:
             continue
 
-        obj = {"taxonomy_list": []}
+        provider_by_field = {"taxonomy_list": []}
         count = 1
-        obj["distance"] = r[count]
+        provider_by_field["distance"] = provider_record[count]
 
-        for c in NPIAddress.__table__.columns:
+        for column in NPIAddress.__table__.columns:
             count += 1
             if count >= row_len:
                 break
-            if c.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+            if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                 continue
-            obj[c.key] = r[count]
-        for c in NPIData.__table__.columns:
+            provider_by_field[column.key] = provider_record[count]
+        for column in NPIData.__table__.columns:
             count += 1
             if count >= row_len:
                 break
-            if c.key in ("npi", "checksum", "do_business_as_text"):
+            if column.key in ("npi", "checksum", "do_business_as_text"):
                 continue
-            obj[c.key] = r[count]
+            provider_by_field[column.key] = provider_record[count]
 
-        npi_value = obj.get("npi")
+        npi_value = provider_by_field.get("npi")
         if npi_value is None:
             continue
-        if npi_value in res:
-            obj = res[npi_value]
+        address_key_value = provider_by_field.get("address_key")
+        identity = (int(npi_value), str(address_key_value or "").lower())
+        if identity in providers_by_identity:
+            provider_by_field = providers_by_identity[identity]
         taxonomy = {}
-        for c in NPIDataTaxonomy.__table__.columns:
+        for column in NPIDataTaxonomy.__table__.columns:
             count += 1
             if count >= row_len:
                 break
-            if c.key in ("npi", "checksum"):
+            if column.key in ("npi", "checksum"):
                 continue
-            taxonomy[c.key] = r[count]
-        if taxonomy:
-            obj["taxonomy_list"].append(taxonomy)
+            taxonomy[column.key] = provider_record[count]
+        if taxonomy and taxonomy not in provider_by_field["taxonomy_list"]:
+            provider_by_field["taxonomy_list"].append(taxonomy)
 
-        res[npi_value] = obj
+        providers_by_identity[identity] = provider_by_field
 
-    res = list(res.values())
-    for row in res:
-        if isinstance(row, dict):
-            _add_canonical_contact_fields_to_address(row)
-    _redact_internal_address_fields(res)
-    return response.json(res, default=str)
+    all_provider_results = list(providers_by_identity.values())
+    has_more = pagination_requested and len(all_provider_results) > limit
+    provider_results = all_provider_results[:limit]
+    next_cursor = None
+    if has_more and provider_results:
+        final_result = provider_results[-1]
+        distance_value = final_result.get("_cursor_distance_meters")
+        npi_value = final_result.get("_cursor_npi")
+        address_key_value = final_result.get("_cursor_address_key")
+        if distance_value is not None and npi_value is not None and address_key_value:
+            next_cursor = _encode_nearby_cursor(
+                cursor_scope,
+                float(distance_value),
+                int(npi_value),
+                str(address_key_value),
+            )
+    for provider_result in provider_results:
+        if isinstance(provider_result, dict):
+            provider_result.pop("_cursor_distance_meters", None)
+            provider_result.pop("_cursor_npi", None)
+            provider_result.pop("_cursor_address_key", None)
+            _add_canonical_contact_fields_to_address(provider_result)
+    _redact_internal_address_fields(provider_results)
+    if pagination_requested:
+        return response.json(
+            {
+                "items": provider_results,
+                "total_count": int(total_count or 0),
+                "next_cursor": next_cursor,
+                "has_more": bool(has_more),
+                "result_identity": ["npi", "address_key"],
+            },
+            default=str,
+        )
+    return response.json(provider_results, default=str)
 
 
 @blueprint.get("/id/<npi>/full_taxonomy")
