@@ -165,6 +165,53 @@ def test_one_snapshot_cannot_mix_logical_plan_scopes():
         _identity([_downloaded(plan_id="plan-1"), _downloaded(plan_id="plan-2")])
 
 
+def test_multiple_plan_records_can_share_one_logical_scope():
+    downloaded = _downloaded()
+    downloaded.job["plan_info"] = [
+        {
+            "plan_name": "first benefit design",
+            "plan_id": "plan-1",
+            "plan_id_type": "EIN",
+            "plan_market_type": "Group",
+            "plan_sponsor_name": "logical owner one",
+        },
+        {
+            "plan_name": "second benefit design",
+            "plan_id": "plan-1",
+            "plan_id_type": "ein",
+            "plan_market_type": "group",
+            "plan_sponsor_name": "logical owner one",
+        },
+    ]
+
+    identity = _identity([downloaded])
+
+    assert identity.logical_plan.plan_id == "plan-1"
+    assert identity.logical_plan.plan_id_type == "ein"
+    assert identity.logical_plan.plan_market_type == "group"
+    assert identity.logical_plan_fields["plan_name"] is None
+    assert identity.logical_plan_fields["plan_sponsor_name"] == "logical owner one"
+
+
+def test_multiple_plan_records_with_different_scopes_fail_closed():
+    downloaded = _downloaded()
+    downloaded.job["plan_info"] = [
+        {
+            "plan_id": "plan-1",
+            "plan_id_type": "ein",
+            "plan_market_type": "group",
+        },
+        {
+            "plan_id": "plan-2",
+            "plan_id_type": "ein",
+            "plan_market_type": "group",
+        },
+    ]
+
+    with pytest.raises(ValueError, match="unambiguous logical plan id"):
+        _identity([downloaded])
+
+
 def test_plan_descriptive_metadata_is_merged_deterministically():
     missing = _downloaded(sponsor="")
     populated = _downloaded(

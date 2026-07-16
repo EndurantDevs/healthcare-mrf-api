@@ -46,28 +46,57 @@ async def _extract_metadata_fields(file_path: str) -> dict[str, Any]:
     return meta
 
 
-def _derive_plan_fields(meta: dict[str, Any], plan_info: list[dict[str, Any]] | None) -> dict[str, Any]:
-    if any(meta.get(k) for k in ("plan_name", "plan_id", "plan_market_type", "plan_sponsor_name", "issuer_name")):
-        return {
-            "plan_name": meta.get("plan_name"),
-            "plan_id_type": meta.get("plan_id_type"),
-            "plan_id": meta.get("plan_id"),
-            "plan_market_type": meta.get("plan_market_type"),
-            "issuer_name": meta.get("issuer_name"),
-            "plan_sponsor_name": meta.get("plan_sponsor_name"),
-        }
-    if plan_info:
-        if len(plan_info) == 1:
-            single = _normalize_plan_payload(plan_info[0])
-            return {
-                "plan_name": single.get("plan_name"),
-                "plan_id_type": single.get("plan_id_type"),
-                "plan_id": single.get("plan_id"),
-                "plan_market_type": single.get("plan_market_type"),
-                "issuer_name": single.get("issuer_name"),
-                "plan_sponsor_name": single.get("plan_sponsor_name"),
-            }
-    return {}
+_PLAN_FIELD_NAMES = (
+    "plan_name",
+    "plan_id_type",
+    "plan_id",
+    "plan_market_type",
+    "issuer_name",
+    "plan_sponsor_name",
+)
+
+
+def _plan_field_consensus(
+    plans: list[dict[str, Any]],
+    field_name: str,
+) -> str | None:
+    """Return one shared value, allowing duplicate plan records to disagree elsewhere."""
+
+    values_by_identity: dict[str, str] = {}
+    for plan in plans:
+        value = str(plan.get(field_name) or "").strip()
+        if not value:
+            continue
+        values_by_identity.setdefault(value.casefold(), value)
+    if len(values_by_identity) != 1:
+        return None
+    return next(iter(values_by_identity.values()))
+
+
+def _derive_plan_fields(
+    meta: dict[str, Any],
+    plan_info: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Derive one logical plan scope from top-level or repeated plan metadata."""
+
+    normalized_plans = [
+        _normalize_plan_payload(plan)
+        for plan in (plan_info or [])
+        if isinstance(plan, dict)
+    ]
+    plan_fields_by_name = {
+        field_name: _plan_field_consensus(normalized_plans, field_name)
+        for field_name in _PLAN_FIELD_NAMES
+    }
+    for field_name in _PLAN_FIELD_NAMES:
+        metadata_value = str(meta.get(field_name) or "").strip()
+        if metadata_value:
+            plan_fields_by_name[field_name] = metadata_value
+    return (
+        plan_fields_by_name
+        if any(plan_fields_by_name.values())
+        else {}
+    )
 
 
 def _build_file_row(

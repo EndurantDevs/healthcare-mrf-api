@@ -60,7 +60,8 @@ python main.py start ptg
 ```
 
 A release import normally supplies a table-of-contents URL and one unambiguous
-plan scope:
+plan scope. Several plan records may reference the same physical files when
+their plan ID, ID type, and market resolve to that same logical scope:
 
 ```bash
 HLTHPRT_PTG2_SNAPSHOT_ARCH=postgres_binary_v3 \
