@@ -399,6 +399,21 @@ pub fn strict_money_number_from_reader<R: Read>(
     }
 }
 
+pub fn strict_money_number(value: &Value) -> io::Result<String> {
+    let Value::Number(number) = value else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiated_rate must be a JSON number",
+        ));
+    };
+    canonical_decimal_text(&number.to_string()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiated_rate cannot be represented by the canonical decimal contract",
+        )
+    })
+}
+
 pub fn strict_string_array_from_reader<R: Read>(
     json_reader: &mut JsonStreamReader<R>,
     field_name: &str,

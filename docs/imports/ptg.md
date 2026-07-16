@@ -317,6 +317,17 @@ duplicate, and reduction fields null rather than presenting unmeasured values
 as zero. Any diagnostic path that emits a serving row retains its dedupe
 invariant.
 
+Negotiated-rate parsing remains bounded and streamed. The gzip reader and
+top-level scanner frame rate objects into the existing bounded raw-chunk
+queue; they never materialize the full file or `in_network` array. Workers use
+a typed parser for the supported rate shape and preserve the same canonical
+money, provider-reference, NPI, modifier, service-code, and optional-text
+contracts as the strict streaming parser. A shape the typed parser cannot
+represent is retried through that strict parser rather than accepted with
+weaker validation. `typed_rate_parses` and
+`streaming_rate_parse_fallbacks` in the scanner summary expose which path
+handled every successfully parsed rate.
+
 Gzip scanning uses `rapidgzip` by default. When `provider_references` appears
 after `in_network`, the scanner builds a temporary seek index, reads the
 provider range first, and then processes indexed in-network ranges in parallel.
