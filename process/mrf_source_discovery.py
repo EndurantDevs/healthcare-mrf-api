@@ -89,6 +89,15 @@ DEFAULT_CONCURRENCY = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_CONCURRENCY", "10
 WRITE_BATCH_SIZE = max(
     int(os.getenv("HLTHPRT_MRF_DISCOVERY_WRITE_BATCH_SIZE", "2000")), 1
 )
+WRITE_BATCH_BYTES = max(
+    int(
+        os.getenv(
+            "HLTHPRT_MRF_DISCOVERY_WRITE_BATCH_BYTES",
+            str(16 * 1024 * 1024),
+        )
+    ),
+    1,
+)
 HTTP_TOTAL_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_HTTP_TIMEOUT", "300")), 1)
 HTTP_READ_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_READ_TIMEOUT", "120")), 1)
 DEFAULT_FILE_PROBE_TYPES = ("in-network", "allowed-amounts")
@@ -3330,7 +3339,7 @@ def _toc_rows_from_content(
     """Convert TOC content into plan and file rows."""
     if isinstance(toc.get("files"), list):
         return _healthsparq_rows_from_metadata(source, url, toc)
-    plan_rows: list[dict[str, Any]] = []
+    plan_rows_by_id: dict[str, dict[str, Any]] = {}
     file_rows: list[dict[str, Any]] = []
     target_query = _source_target_payer_query(source)
     target_queries = _source_target_payer_queries(source)
@@ -3370,22 +3379,20 @@ def _toc_rows_from_content(
                     "market_type": market_type,
                 },
             )
-            plan_rows.append(
-                {
-                    "mrf_plan_id": plan_row_id,
-                    "payer_id": source.get("payer_id"),
-                    "source_id": source["source_id"],
-                    "plan_id": plan_id or None,
-                    "plan_id_type": plan.get("plan_id_type"),
-                    "plan_name": plan_name,
-                    "market_type": market_type,
-                    "reporting_entity_name": entry.reporting_entity_name,
-                    "reporting_entity_type": entry.reporting_entity_type,
-                    "metadata_json": {"raw_plan": plan},
-                    "first_seen_at": _utc_now(),
-                    "last_seen_at": _utc_now(),
-                }
-            )
+            plan_rows_by_id[plan_row_id] = {
+                "mrf_plan_id": plan_row_id,
+                "payer_id": source.get("payer_id"),
+                "source_id": source["source_id"],
+                "plan_id": plan_id or None,
+                "plan_id_type": plan.get("plan_id_type"),
+                "plan_name": plan_name,
+                "market_type": market_type,
+                "reporting_entity_name": entry.reporting_entity_name,
+                "reporting_entity_type": entry.reporting_entity_type,
+                "metadata_json": {"raw_plan": plan},
+                "first_seen_at": _utc_now(),
+                "last_seen_at": _utc_now(),
+            }
         if entry.source_type == "table-of-contents":
             continue
         if not str(entry.original_url or "").startswith(("http://", "https://")):
@@ -3443,7 +3450,7 @@ def _toc_rows_from_content(
                 "last_seen_at": _utc_now(),
             }
         )
-    return plan_rows, file_rows
+    return list(plan_rows_by_id.values()), file_rows
 
 
 def _metadata_text_file_type(value: Any) -> str:
@@ -13898,6 +13905,44 @@ def _dedupe_source_rows_for_crawl(
     return list(by_url.values()) + no_url
 
 
+def _estimate_crawl_row_write_bytes(row_dict: dict[str, Any]) -> int:
+    """Estimate encoded bind bytes without retaining another row payload."""
+    estimated_bytes = 0
+    for field_value in row_dict.values():
+        if field_value is None:
+            continue
+        if isinstance(field_value, bytes):
+            estimated_bytes += len(field_value)
+        elif isinstance(field_value, str):
+            estimated_bytes += len(field_value.encode("utf-8"))
+        elif isinstance(field_value, (dict, list, tuple)):
+            encoded_value = json.dumps(
+                field_value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+            estimated_bytes += len(encoded_value)
+        else:
+            estimated_bytes += len(str(field_value).encode("utf-8"))
+    return max(estimated_bytes, 1)
+
+
+def _next_crawl_write_chunk(
+    row_dict_list: list[dict[str, Any]], row_limit: int, byte_limit: int
+) -> list[dict[str, Any]]:
+    """Select a non-empty chunk bounded by row count and encoded bytes."""
+    selected_row_dict_list: list[dict[str, Any]] = []
+    selected_bytes = 0
+    for row_dict in row_dict_list[:row_limit]:
+        row_bytes = _estimate_crawl_row_write_bytes(row_dict)
+        if selected_row_dict_list and selected_bytes + row_bytes > byte_limit:
+            break
+        selected_row_dict_list.append(row_dict)
+        selected_bytes += row_bytes
+    return selected_row_dict_list
+
+
 async def _push_crawl_row_batches(
     plan_rows: list[dict[str, Any]],
     file_rows: list[dict[str, Any]],
@@ -13922,7 +13967,7 @@ async def _push_crawl_row_batches(
         """Write pending crawl rows in bounded chunks."""
         size = max(1, int(batch_size or len(rows) or 1))
         while rows:
-            chunk = rows[:size]
+            chunk = _next_crawl_write_chunk(rows, size, WRITE_BATCH_BYTES)
             write_coro = push_objects(chunk, model, rewrite=True, use_copy=False)
             try:
                 if row_write_timeout and row_write_timeout > 0:
