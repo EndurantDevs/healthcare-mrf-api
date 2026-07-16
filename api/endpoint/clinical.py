@@ -168,7 +168,7 @@ async def _list_codes(request, code_type: str):
     where_clause = and_(*filters)
     count_result = await session.execute(select(func.count()).select_from(code_table).where(where_clause))
     total = int(count_result.scalar() or 0)
-    rows = await session.execute(
+    code_rows = await session.execute(
         select(code_table)
         .where(where_clause)
         .order_by(code_table.c.code_system, code_table.c.code)
@@ -177,7 +177,10 @@ async def _list_codes(request, code_type: str):
     )
     return response.json(
         {
-            "items": [_json_safe_row(_row_to_dict(row)) for row in rows],
+            "items": [
+                _json_safe_row(_row_to_dict(code_row))
+                for code_row in code_rows
+            ],
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,
@@ -271,7 +274,7 @@ async def _list_area_concepts_response(
         ),
     )
     count_result = await session.execute(select(func.count()).select_from(joined).where(where_clause))
-    rows = await session.execute(
+    concept_rows = await session.execute(
         select(code_table, mapping_table.c.source.label("area_mapping_source"))
         .select_from(joined)
         .where(where_clause)
@@ -281,7 +284,10 @@ async def _list_area_concepts_response(
     )
     return response.json(
         {
-            "items": [_json_safe_row(_row_to_dict(row)) for row in rows],
+            "items": [
+                _json_safe_row(_row_to_dict(concept_row))
+                for concept_row in concept_rows
+            ],
             "pagination": {
                 "total": int(count_result.scalar() or 0),
                 "limit": pagination.limit,
@@ -332,10 +338,13 @@ async def list_concepts(request):
         count_query = count_query.where(where_clause)
         query = query.where(where_clause)
     count_result = await session.execute(count_query)
-    rows = await session.execute(query)
+    concept_rows = await session.execute(query)
     return response.json(
         {
-            "items": [_json_safe_row(_row_to_dict(row)) for row in rows],
+            "items": [
+                _json_safe_row(_row_to_dict(concept_row))
+                for concept_row in concept_rows
+            ],
             "pagination": {
                 "total": int(count_result.scalar() or 0),
                 "limit": pagination.limit,
@@ -397,11 +406,17 @@ async def _get_code(request, code_type: str, system: str, code: str):
         filters.append(or_(code_table.c.code_type == code_type, code_table.c.code_type.is_(None)))
     else:
         filters.append(code_table.c.code_type == code_type)
-    result = await session.execute(select(code_table).where(and_(*filters)).limit(1))
-    row = result.first()
+    code_query_result = await session.execute(
+        select(code_table).where(and_(*filters)).limit(1)
+    )
+    code_row = code_query_result.first()
 
-    if not row and code_type == "treatment" and requested_system in PROCEDURE_CODE_SYSTEMS:
-        result = await session.execute(
+    if (
+        not code_row
+        and code_type == "treatment"
+        and requested_system in PROCEDURE_CODE_SYSTEMS
+    ):
+        code_query_result = await session.execute(
             select(code_table)
             .where(
                 and_(
@@ -412,11 +427,11 @@ async def _get_code(request, code_type: str, system: str, code: str):
             )
             .limit(1)
         )
-        row = result.first()
+        code_row = code_query_result.first()
 
-    if not row:
+    if not code_row:
         raise sanic.exceptions.NotFound
-    return response.json(_json_safe_row(_row_to_dict(row)))
+    return response.json(_json_safe_row(_row_to_dict(code_row)))
 
 
 @blueprint.get("/relationships")
@@ -450,10 +465,13 @@ async def list_relationships(request):
         count_query = count_query.where(where_clause)
         query = query.where(where_clause)
     count_result = await session.execute(count_query)
-    rows = await session.execute(query)
+    relationship_rows = await session.execute(query)
     return response.json(
         {
-            "items": [_json_safe_row(_row_to_dict(row)) for row in rows],
+            "items": [
+                _json_safe_row(_row_to_dict(relationship_row))
+                for relationship_row in relationship_rows
+            ],
             "pagination": {
                 "total": int(count_result.scalar() or 0),
                 "limit": pagination.limit,
@@ -525,11 +543,14 @@ async def list_clinical_areas(request):
         count_query = count_query.where(where_clause)
         query = query.where(where_clause)
     count_result = await session.execute(count_query)
-    rows = await session.execute(query)
-    items = [await _area_payload(session, row) for row in rows]
+    clinical_area_rows = await session.execute(query)
+    clinical_area_items = [
+        await _area_payload(session, clinical_area_row)
+        for clinical_area_row in clinical_area_rows
+    ]
     return response.json(
         {
-            "items": items,
+            "items": clinical_area_items,
             "pagination": {
                 "total": int(count_result.scalar() or 0),
                 "limit": pagination.limit,
@@ -617,10 +638,13 @@ async def list_crosswalk(request):
         count_query = count_query.where(where_clause)
         query = query.where(where_clause)
     count_result = await session.execute(count_query)
-    rows = await session.execute(query)
+    crosswalk_rows = await session.execute(query)
     return response.json(
         {
-            "items": [_json_safe_row(_row_to_dict(row)) for row in rows],
+            "items": [
+                _json_safe_row(_row_to_dict(crosswalk_row))
+                for crosswalk_row in crosswalk_rows
+            ],
             "pagination": {
                 "total": int(count_result.scalar() or 0),
                 "limit": pagination.limit,
