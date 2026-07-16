@@ -32,6 +32,7 @@ from process.ptg_parts.row_helpers import (
     _normalize_code_component,
     _normalize_tin_type,
     _normalize_tin_value,
+    _normalized_modifier_list,
     _normalized_npi_list,
     _provider_group_hash_prefix,
     _provider_group_identity_hash,
@@ -392,17 +393,19 @@ def _ptg2_procedure_row(in_item: dict[str, Any]) -> dict[str, Any]:
 def _ptg2_price_atom_row(negotiated_price: dict[str, Any]) -> dict[str, Any]:
     raw_rate = negotiated_price.get("negotiated_rate")
     rate_value = str(raw_rate) if isinstance(raw_rate, float) else raw_rate
-    payload = PTG2PriceAtomEvent(
+    price_event = PTG2PriceAtomEvent(
         negotiated_type=negotiated_price.get("negotiated_type"),
         negotiated_rate=rate_value,
         expiration_date=_coerce_date(negotiated_price.get("expiration_date")),
         service_code=tuple(_as_list(negotiated_price.get("service_code"))),
         billing_class=negotiated_price.get("billing_class"),
         setting=negotiated_price.get("setting"),
-        billing_code_modifier=tuple(_as_list(negotiated_price.get("billing_code_modifier"))),
+        billing_code_modifier=tuple(
+            _normalized_modifier_list(negotiated_price.get("billing_code_modifier"))
+        ),
         additional_information=negotiated_price.get("additional_information"),
     )
-    built = build_price_atom(payload)
+    built = build_price_atom(price_event)
     return {
         "price_atom_hash": built["price_atom_hash"],
         "negotiated_type": negotiated_price.get("negotiated_type"),
@@ -411,7 +414,9 @@ def _ptg2_price_atom_row(negotiated_price: dict[str, Any]) -> dict[str, Any]:
         "service_code": _as_list(negotiated_price.get("service_code")),
         "billing_class": negotiated_price.get("billing_class"),
         "setting": negotiated_price.get("setting"),
-        "billing_code_modifier": _as_list(negotiated_price.get("billing_code_modifier")),
+        "billing_code_modifier": _normalized_modifier_list(
+            negotiated_price.get("billing_code_modifier")
+        ),
         "additional_information": negotiated_price.get("additional_information"),
         "created_at": _utcnow(),
     }

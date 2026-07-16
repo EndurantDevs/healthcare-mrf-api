@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime
 import logging
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +30,8 @@ def _artifact_progress_position(stream: Any) -> int | None:
     if raw_stream is None:
         raw_stream = getattr(stream, "fileobj", None)
     if raw_stream is not None and hasattr(raw_stream, "tell"):
-        try:
+        with suppress(OSError, TypeError, ValueError):
             return int(raw_stream.tell())
-        except (OSError, TypeError, ValueError):
-            pass
     if hasattr(stream, "tell"):
         try:
             return int(stream.tell())

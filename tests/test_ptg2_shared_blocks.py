@@ -281,11 +281,26 @@ def test_decode_shared_block_payload_is_strict():
     raw = b"payload" * 100
     compressed = zlib.compress(raw, 1)
 
-    assert decode_shared_block_payload(codec="zlib", payload=compressed, raw_byte_count=len(raw)) == raw
+    assert (
+        decode_shared_block_payload(
+            codec="zlib",
+            payload=compressed,
+            raw_byte_count=len(raw),
+        )
+        == raw
+    )
     with pytest.raises(PTG2SharedBlockError, match="length mismatch"):
-        decode_shared_block_payload(codec="none", payload=b"x", raw_byte_count=2)
+        decode_shared_block_payload(
+            codec="none",
+            payload=b"x",
+            raw_byte_count=2,
+        )
     with pytest.raises(PTG2SharedBlockError, match="unsupported"):
-        decode_shared_block_payload(codec="gzip", payload=b"x", raw_byte_count=1)
+        decode_shared_block_payload(
+            codec="gzip",
+            payload=b"x",
+            raw_byte_count=1,
+        )
 
 
 @pytest.mark.asyncio

@@ -49,7 +49,7 @@ async def _query_ptg2_code_crosswalk_edges(session, pairs: set[tuple[str, str]])
             """
         )
     try:
-        result = await session.execute(
+        query_result = await session.execute(
             text(
                 f"""
                 SELECT from_system, from_code, to_system, to_code, match_type, confidence, source
@@ -61,7 +61,7 @@ async def _query_ptg2_code_crosswalk_edges(session, pairs: set[tuple[str, str]])
         )
     except Exception:
         return []
-    return [_row_mapping(row) for row in result]
+    return [_row_mapping(edge_row) for edge_row in query_result]
 
 
 async def _resolve_ptg2_code_search_context(

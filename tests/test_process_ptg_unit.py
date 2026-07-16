@@ -1379,6 +1379,24 @@ def test_normalized_npi_list_keeps_only_ten_digit_npis():
     ]
 
 
+def test_price_atom_normalizes_payer_joined_billing_modifiers():
+    packed = process_ptg._ptg2_price_atom_row(
+        {
+            "negotiated_rate": "12.34",
+            "billing_code_modifier": ["tc, 26", "26"],
+        }
+    )
+    split = process_ptg._ptg2_price_atom_row(
+        {
+            "negotiated_rate": "12.34",
+            "billing_code_modifier": ["26", "TC"],
+        }
+    )
+
+    assert packed["billing_code_modifier"] == ["26", "TC"]
+    assert packed["price_atom_hash"] == split["price_atom_hash"]
+
+
 
 def test_ptg2_semantic_hash_ignores_set_like_array_order():
     first_map = {
@@ -3806,7 +3824,7 @@ def _assert_allowed_amount_parser_rows(metrics, pushed_rows_by_class):
     assert item_row["snapshot_id"] == "ptg2:202607:allowed-test"
     assert item_row["source_file_version_id"] == "source-version-1"
     assert payment_row["service_code"] == ["11"]
-    assert payment_row["billing_code_modifier"] == ["AA"]
+    assert payment_row["billing_code_modifier"] == ["AA", "BB"]
     assert provider_payment_row["npi"] == [1427166008]
 
 
@@ -3827,7 +3845,7 @@ def test_parse_allowed_amounts_filters_null_service_codes(monkeypatch, tmp_path)
                         "payments": [
                             {
                                 "allowed_amount": 133.0,
-                                "billing_code_modifier": [None, "AA"],
+                                "billing_code_modifier": [None, "AA, bb"],
                                 "providers": [{"billed_charge": 200.0, "npi": [1427166008]}],
                             }
                         ],

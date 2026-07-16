@@ -168,11 +168,13 @@ counter; exceeding it is a coverage failure rather than an unbounded read.
 
 ## Exact canonical comparison
 
-The report embeds the canonicalization version and rules. Version 2 applies:
+The report embeds the canonicalization version and rules. Version 5 applies:
 
 * Null and stripped empty scalar strings become null.
 * General scalar strings are stripped and otherwise remain case-sensitive.
 * Code systems, billing codes, arrangements, and modifiers are upper-cased.
+  Modifier array entries containing payer-packed comma-separated codes are split
+  into individual modifiers before sorting and deduplication.
   Public API aliases and catalog widths are applied to code fields.
 * NPIs must be integral decimals from `1000000000` through `9999999999`.
   Out-of-range nonzero integral values are excluded from NPI membership and reported

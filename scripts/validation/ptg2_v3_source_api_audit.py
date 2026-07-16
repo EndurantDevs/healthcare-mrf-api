@@ -19,6 +19,7 @@ Canonical comparison rules (also embedded in every report):
 * expiration dates must be ISO ``YYYY-MM-DD`` and compare by ISO value;
 * service-code and modifier lists are stripped, canonicalized, sorted, and
   de-duplicated because the strict serving contract exposes canonical sets;
+  payer-packed comma-separated modifier entries are split into individual codes;
 * all other strings (type, class, setting, and additional information) preserve
   case after trimming; and
 * tuple multiplicity is retained.  A count mismatch is a duplicate-count
@@ -69,7 +70,7 @@ if str(_REPOSITORY_ROOT) not in sys.path:
 from api import ptg2_capacity_evidence as capacity_evidence
 
 
-SCRIPT_VERSION = "2.11.0"
+SCRIPT_VERSION = "2.12.0"
 EXPECTED_ARCHITECTURE = "postgres_binary_v3"
 EXPECTED_STORAGE_GENERATION = "shared_blocks_v3"
 EXPECTED_DATABASE_BACKEND = "postgresql"
@@ -200,7 +201,7 @@ CODE_SYSTEM_ALIASES = {
     "SNOMEDCT": "SNOMEDCT_US",
 }
 CANONICALIZATION = {
-    "version": 4,
+    "version": 5,
     "nulls": "price-field JSON null and stripped empty scalar strings canonicalize to null",
     "strings": "trim Unicode surrounding whitespace; otherwise preserve case and content",
     "source_metadata": (
@@ -217,7 +218,9 @@ CANONICALIZATION = {
     "decimal": "finite base-10 value; expand exponent; remove leading/trailing insignificant zeroes; -0 becomes 0",
     "date": "strict ISO calendar date YYYY-MM-DD, emitted with date.isoformat()",
     "service_code": "scalar-or-list; POS canonicalization; sorted unique list",
-    "billing_code_modifier": "scalar-or-list; uppercase; sorted unique list",
+    "billing_code_modifier": (
+        "scalar-or-list; split payer-packed comma values; uppercase; sorted unique list"
+    ),
     "arrangement": "trim and uppercase; null remains null",
     "setting": "trim only; null remains null; exact case-sensitive comparison",
     "multiplicity": "count every source negotiated-price occurrence after provider membership union",
@@ -2128,6 +2131,24 @@ def canonical_list(
     return sorted(canonical_values)
 
 
+def canonical_modifier_list(values: Any) -> list[str]:
+    """Normalize modifier arrays, including payer-packed comma-separated entries."""
+
+    if values is None:
+        raw_values: list[Any] = []
+    elif isinstance(values, (list, tuple, set)):
+        raw_values = list(values)
+    else:
+        raw_values = [values]
+    split_values: list[Any] = []
+    for raw_value in raw_values:
+        if isinstance(raw_value, str):
+            split_values.extend(raw_value.split(","))
+        else:
+            split_values.append(raw_value)
+    return canonical_list(split_values, uppercase=True)
+
+
 def canonical_price_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
     """Return the canonical serving comparison fields for one source price."""
 
@@ -2138,7 +2159,7 @@ def canonical_price_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
         "service_code": canonical_list(raw.get("service_code"), code_system="POS"),
         "billing_class": canonical_scalar(raw.get("billing_class")),
         "setting": canonical_scalar(raw.get("setting")),
-        "billing_code_modifier": canonical_list(raw.get("billing_code_modifier"), uppercase=True),
+        "billing_code_modifier": canonical_modifier_list(raw.get("billing_code_modifier")),
         "additional_information": canonical_scalar(raw.get("additional_information")),
     }
 

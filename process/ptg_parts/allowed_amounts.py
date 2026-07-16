@@ -22,7 +22,12 @@ from process.ptg_parts.domain import (
     PTG2RawArtifact,
     PTG2SourceVersion,
 )
-from process.ptg_parts.row_helpers import _as_int_list, _as_list, _make_checksum
+from process.ptg_parts.row_helpers import (
+    _as_int_list,
+    _as_list,
+    _make_checksum,
+    _normalized_modifier_list,
+)
 from process.ptg_parts.source_files import _build_file_row, _derive_plan_fields
 from process.ptg_parts.source_jobs import (
     _dedupe_rows_by,
@@ -335,7 +340,9 @@ async def _append_allowed_payment(
 ) -> None:
     parse_state.metrics_by_name["allowed_amount_payments"] += 1
     service_codes = _as_text_list(allowed_amount.get("service_code"))
-    billing_code_modifiers = _as_text_list(payment.get("billing_code_modifier"))
+    billing_code_modifiers = _normalized_modifier_list(
+        payment.get("billing_code_modifier")
+    )
     payment_hash = _make_checksum(
         item_hash,
         tin_info.get("value") or "",

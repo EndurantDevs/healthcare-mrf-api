@@ -692,6 +692,9 @@ def test_canonicalization_is_exact_and_rejects_invalid_dates():
     assert audit.canonical_price_payload(_negotiated_price())["service_code"] == [
         "01"
     ]
+    assert audit.canonical_price_payload(
+        _negotiated_price(billing_code_modifier=["tc, 26", "26"])
+    )["billing_code_modifier"] == ["26", "TC"]
     with pytest.raises(ValueError, match="invalid_iso_date"):
         audit.canonical_date("2027-02-30")
     with pytest.raises(ValueError, match="non_finite_decimal"):

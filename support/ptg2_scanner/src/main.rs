@@ -39,9 +39,9 @@ use ptg2_scanner::manifest::{
     write_global_sidecar, GlobalId128, SidecarEntry, GLOBAL_ID_BYTES,
 };
 use ptg2_scanner::normalize::{
-    canonical_text_list, normalize_catalog_code, normalize_code, normalize_code_system,
-    normalize_string, normalize_tin_type, normalize_tin_value, strict_integer_text,
-    strict_money_number_from_reader, strict_npi_list, strict_npi_partition,
+    canonical_modifier_list, canonical_text_list, normalize_catalog_code, normalize_code,
+    normalize_code_system, normalize_string, normalize_tin_type, normalize_tin_value,
+    strict_integer_text, strict_money_number_from_reader, strict_npi_list, strict_npi_partition,
     strict_string_array_from_reader, StrictNpiList,
 };
 use ptg2_scanner::output::{emit_json_record, emit_object};
@@ -6521,10 +6521,10 @@ fn read_price_lite_struson<R: Read>(
                 setting = strict_nullable_string_from_reader(json_reader, "setting")?;
             }
             7 => {
-                billing_code_modifier = canonical_text_list(
-                    strict_string_array_from_reader(json_reader, "billing_code_modifier")?,
-                    true,
-                );
+                billing_code_modifier = canonical_modifier_list(strict_string_array_from_reader(
+                    json_reader,
+                    "billing_code_modifier",
+                )?);
             }
             8 => {
                 additional_information =
@@ -20651,7 +20651,7 @@ mod tests {
             }
         }
 
-        let raw = r#"{"negotiated_rate":12.5,"service_code":[" 22 ","11"],"billing_code_modifier":["tc","26"]}"#;
+        let raw = r#"{"negotiated_rate":12.5,"service_code":[" 22 ","11"],"billing_code_modifier":["tc, 26","26"]}"#;
         let mut reader = JsonStreamReader::new(raw.as_bytes());
         let price = read_price_lite_struson(&mut reader).unwrap().unwrap();
         assert_eq!(price.service_code, vec!["11", "22"]);
