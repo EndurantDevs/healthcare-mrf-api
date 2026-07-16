@@ -155,6 +155,16 @@ fn compact_pipeline_error(
     }
 }
 
+fn capture_producer_error(cancelled: &AtomicBool, result: io::Result<()>) -> Option<io::Error> {
+    match result {
+        Ok(()) => None,
+        Err(error) => {
+            cancelled.store(true, Ordering::Release);
+            Some(error)
+        }
+    }
+}
+
 fn primary_producer_failure_diagnostic(error: &io::Error) -> Option<String> {
     if matches!(
         error.kind(),
@@ -8189,7 +8199,7 @@ fn scan_compact_byte_top_level_parallel(
                     let in_network_started_at = Instant::now();
                     let in_network_compressed_started_at =
                         compressed_bytes_read.load(Ordering::Relaxed);
-                    let mut producer_error: Option<io::Error> = None;
+                    let producer_error: Option<io::Error>;
                     if let Some(reorder) = indexed_reorder.as_ref() {
                         let mut prefixed_reader = PrefixReader::new(prefix, reader);
                         drain_reader_to_eof(&mut prefixed_reader)?;
@@ -8346,8 +8356,10 @@ fn scan_compact_byte_top_level_parallel(
                                 .or_insert(0) += metrics.rate_count;
                         }
                     } else {
-                        let rate_reader: Box<dyn Read> =
-                            if let Some(reorder) = plain_reorder.as_ref() {
+                        let producer_result = (|| -> io::Result<()> {
+                            let rate_reader: Box<dyn Read> = if let Some(reorder) =
+                                plain_reorder.as_ref()
+                            {
                                 let mut provider_range_reader = PrefixReader::new(prefix, reader);
                                 drain_reader_to_eof(&mut provider_range_reader)?;
                                 let range_reader = open_plain_range_json_reader(
@@ -8369,158 +8381,157 @@ fn scan_compact_byte_top_level_parallel(
                                     array_and_suffix,
                                 ))
                             };
-                        if parse_in_workers {
-                            let mut byte_reader = BufferedJsonByteReader::new(rate_reader);
-                            byte_reader.expect_byte(b'{')?;
-                            let mut name_bytes = Vec::with_capacity(16);
-                            let mut decoded_name = String::new();
-                            let name =
-                                byte_reader.read_string_name(&mut name_bytes, &mut decoded_name)?;
-                            if name != "in_network" {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "synthetic rate object must start with in_network",
-                                ));
-                            }
-                            byte_reader.expect_byte(b':')?;
-                            byte_reader.expect_byte(b'[')?;
-                            let mut first_item = true;
-                            while next_array_value(&mut byte_reader, &mut first_item)? {
-                                let mut enqueue_io = InNetworkEnqueueIo {
-                                    tx: &tx,
-                                    event_rx: &event_rx,
-                                    writer: &mut writer,
-                                    cancelled: Some(&indexed_cancelled),
-                                    producer_blocked_micros: &mut producer_blocked_micros,
-                                    raw_chunk_stats: &mut raw_chunk_stats,
-                                };
-                                let rate_count = enqueue_in_network_raw_byte_scan(
-                                    &mut byte_reader,
-                                    &mut enqueue_io,
-                                    InNetworkEnqueueOptions {
-                                        chunk_size: negotiated_rate_chunk_size,
-                                        raw_chunk_byte_limit,
-                                        parse_in_workers,
-                                        object_ordinal: *object_counts
-                                            .get("in_network")
-                                            .unwrap_or(&0),
-                                    },
-                                )?;
-                                drain_copy_file_events(&event_rx, &mut writer)?;
-                                *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
-                                *object_counts
-                                    .entry("negotiated_rates".to_string())
-                                    .or_insert(0) += rate_count;
-                                let bytes = compressed_bytes_read.load(Ordering::Relaxed);
-                                let objects: u64 = object_counts.values().sum();
-                                if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
-                                    emit_progress(
-                                        path,
-                                        total_bytes,
-                                        &compressed_bytes_read,
-                                        &object_counts,
-                                        started_at,
-                                        false,
-                                    );
-                                    while bytes >= next_progress_bytes {
-                                        next_progress_bytes += progress_bytes_interval;
-                                    }
-                                } else if progress_objects_interval > 0
-                                    && objects >= next_progress_objects
-                                {
-                                    emit_progress(
-                                        path,
-                                        total_bytes,
-                                        &compressed_bytes_read,
-                                        &object_counts,
-                                        started_at,
-                                        false,
-                                    );
-                                    while objects >= next_progress_objects {
-                                        next_progress_objects += progress_objects_interval;
+                            if parse_in_workers {
+                                let mut byte_reader = BufferedJsonByteReader::new(rate_reader);
+                                byte_reader.expect_byte(b'{')?;
+                                let mut name_bytes = Vec::with_capacity(16);
+                                let mut decoded_name = String::new();
+                                let name = byte_reader
+                                    .read_string_name(&mut name_bytes, &mut decoded_name)?;
+                                if name != "in_network" {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "synthetic rate object must start with in_network",
+                                    ));
+                                }
+                                byte_reader.expect_byte(b':')?;
+                                byte_reader.expect_byte(b'[')?;
+                                let mut first_item = true;
+                                while next_array_value(&mut byte_reader, &mut first_item)? {
+                                    let mut enqueue_io = InNetworkEnqueueIo {
+                                        tx: &tx,
+                                        event_rx: &event_rx,
+                                        writer: &mut writer,
+                                        cancelled: Some(&indexed_cancelled),
+                                        producer_blocked_micros: &mut producer_blocked_micros,
+                                        raw_chunk_stats: &mut raw_chunk_stats,
+                                    };
+                                    let rate_count = enqueue_in_network_raw_byte_scan(
+                                        &mut byte_reader,
+                                        &mut enqueue_io,
+                                        InNetworkEnqueueOptions {
+                                            chunk_size: negotiated_rate_chunk_size,
+                                            raw_chunk_byte_limit,
+                                            parse_in_workers,
+                                            object_ordinal: *object_counts
+                                                .get("in_network")
+                                                .unwrap_or(&0),
+                                        },
+                                    )?;
+                                    drain_copy_file_events(&event_rx, &mut writer)?;
+                                    *object_counts.entry("in_network".to_string()).or_insert(0) +=
+                                        1;
+                                    *object_counts
+                                        .entry("negotiated_rates".to_string())
+                                        .or_insert(0) += rate_count;
+                                    let bytes = compressed_bytes_read.load(Ordering::Relaxed);
+                                    let objects: u64 = object_counts.values().sum();
+                                    if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
+                                        emit_progress(
+                                            path,
+                                            total_bytes,
+                                            &compressed_bytes_read,
+                                            &object_counts,
+                                            started_at,
+                                            false,
+                                        );
+                                        while bytes >= next_progress_bytes {
+                                            next_progress_bytes += progress_bytes_interval;
+                                        }
+                                    } else if progress_objects_interval > 0
+                                        && objects >= next_progress_objects
+                                    {
+                                        emit_progress(
+                                            path,
+                                            total_bytes,
+                                            &compressed_bytes_read,
+                                            &object_counts,
+                                            started_at,
+                                            false,
+                                        );
+                                        while objects >= next_progress_objects {
+                                            next_progress_objects += progress_objects_interval;
+                                        }
                                     }
                                 }
-                            }
-                            if let Err(error) = validate_compact_rate_object_suffix(
-                                byte_reader.into_unread_reader(),
-                            ) {
-                                indexed_cancelled.store(true, Ordering::Release);
-                                producer_error = Some(error);
-                            }
-                        } else {
-                            let mut json_reader = JsonStreamReader::new(rate_reader);
-                            json_reader.begin_object().map_err(to_io_error)?;
-                            let name = json_reader.next_name_owned().map_err(to_io_error)?;
-                            if name != "in_network" {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "synthetic rate object must start with in_network",
-                                ));
-                            }
-                            json_reader.begin_array().map_err(to_io_error)?;
-                            while json_reader.has_next().map_err(to_io_error)? {
-                                let mut enqueue_io = InNetworkEnqueueIo {
-                                    tx: &tx,
-                                    event_rx: &event_rx,
-                                    writer: &mut writer,
-                                    cancelled: Some(&indexed_cancelled),
-                                    producer_blocked_micros: &mut producer_blocked_micros,
-                                    raw_chunk_stats: &mut raw_chunk_stats,
-                                };
-                                let rate_count = enqueue_in_network_struson(
-                                    &mut json_reader,
-                                    &mut enqueue_io,
-                                    InNetworkEnqueueOptions {
-                                        chunk_size: negotiated_rate_chunk_size,
-                                        raw_chunk_byte_limit,
-                                        parse_in_workers,
-                                        object_ordinal: *object_counts
-                                            .get("in_network")
-                                            .unwrap_or(&0),
-                                    },
+                                validate_compact_rate_object_suffix(
+                                    byte_reader.into_unread_reader(),
                                 )?;
-                                drain_copy_file_events(&event_rx, &mut writer)?;
-                                *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
-                                *object_counts
-                                    .entry("negotiated_rates".to_string())
-                                    .or_insert(0) += rate_count;
-                                let bytes = compressed_bytes_read.load(Ordering::Relaxed);
-                                let objects: u64 = object_counts.values().sum();
-                                if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
-                                    emit_progress(
-                                        path,
-                                        total_bytes,
-                                        &compressed_bytes_read,
-                                        &object_counts,
-                                        started_at,
-                                        false,
-                                    );
-                                    while bytes >= next_progress_bytes {
-                                        next_progress_bytes += progress_bytes_interval;
-                                    }
-                                } else if progress_objects_interval > 0
-                                    && objects >= next_progress_objects
-                                {
-                                    emit_progress(
-                                        path,
-                                        total_bytes,
-                                        &compressed_bytes_read,
-                                        &object_counts,
-                                        started_at,
-                                        false,
-                                    );
-                                    while objects >= next_progress_objects {
-                                        next_progress_objects += progress_objects_interval;
+                            } else {
+                                let mut json_reader = JsonStreamReader::new(rate_reader);
+                                json_reader.begin_object().map_err(to_io_error)?;
+                                let name = json_reader.next_name_owned().map_err(to_io_error)?;
+                                if name != "in_network" {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "synthetic rate object must start with in_network",
+                                    ));
+                                }
+                                json_reader.begin_array().map_err(to_io_error)?;
+                                while json_reader.has_next().map_err(to_io_error)? {
+                                    let mut enqueue_io = InNetworkEnqueueIo {
+                                        tx: &tx,
+                                        event_rx: &event_rx,
+                                        writer: &mut writer,
+                                        cancelled: Some(&indexed_cancelled),
+                                        producer_blocked_micros: &mut producer_blocked_micros,
+                                        raw_chunk_stats: &mut raw_chunk_stats,
+                                    };
+                                    let rate_count = enqueue_in_network_struson(
+                                        &mut json_reader,
+                                        &mut enqueue_io,
+                                        InNetworkEnqueueOptions {
+                                            chunk_size: negotiated_rate_chunk_size,
+                                            raw_chunk_byte_limit,
+                                            parse_in_workers,
+                                            object_ordinal: *object_counts
+                                                .get("in_network")
+                                                .unwrap_or(&0),
+                                        },
+                                    )?;
+                                    drain_copy_file_events(&event_rx, &mut writer)?;
+                                    *object_counts.entry("in_network".to_string()).or_insert(0) +=
+                                        1;
+                                    *object_counts
+                                        .entry("negotiated_rates".to_string())
+                                        .or_insert(0) += rate_count;
+                                    let bytes = compressed_bytes_read.load(Ordering::Relaxed);
+                                    let objects: u64 = object_counts.values().sum();
+                                    if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
+                                        emit_progress(
+                                            path,
+                                            total_bytes,
+                                            &compressed_bytes_read,
+                                            &object_counts,
+                                            started_at,
+                                            false,
+                                        );
+                                        while bytes >= next_progress_bytes {
+                                            next_progress_bytes += progress_bytes_interval;
+                                        }
+                                    } else if progress_objects_interval > 0
+                                        && objects >= next_progress_objects
+                                    {
+                                        emit_progress(
+                                            path,
+                                            total_bytes,
+                                            &compressed_bytes_read,
+                                            &object_counts,
+                                            started_at,
+                                            false,
+                                        );
+                                        while objects >= next_progress_objects {
+                                            next_progress_objects += progress_objects_interval;
+                                        }
                                     }
                                 }
+                                json_reader.end_array().map_err(to_io_error)?;
+                                finish_compact_rate_object(json_reader, true, true)?;
                             }
-                            json_reader.end_array().map_err(to_io_error)?;
-                            if let Err(error) = finish_compact_rate_object(json_reader, true, true)
-                            {
-                                indexed_cancelled.store(true, Ordering::Release);
-                                producer_error = Some(error);
-                            }
-                        }
+                            Ok(())
+                        })();
+                        producer_error =
+                            capture_producer_error(&indexed_cancelled, producer_result);
                     }
                     in_network_enqueue_seconds += in_network_started_at.elapsed().as_secs_f64();
                     in_network_compressed_bytes = if indexed_reorder_used {
@@ -19549,22 +19560,6 @@ mod tests {
         assert_eq!(error.to_string(), "primary rapidgzip producer failure");
     }
 
-    #[test]
-    fn primary_producer_diagnostic_excludes_peer_cancellation() {
-        let source_error = io::Error::new(
-            io::ErrorKind::InvalidData,
-            "billing_code must be a non-empty JSON string",
-        );
-        let diagnostic = primary_producer_failure_diagnostic(&source_error).unwrap();
-        assert!(diagnostic.starts_with("PTG2_SCANNER_PRIMARY_FAILED\t"));
-        assert!(diagnostic.contains("billing_code must be a non-empty JSON string"));
-
-        for peer_kind in [io::ErrorKind::Interrupted, io::ErrorKind::BrokenPipe] {
-            let peer_error = io::Error::new(peer_kind, "peer worker stopped");
-            assert!(primary_producer_failure_diagnostic(&peer_error).is_none());
-        }
-    }
-
     struct LateErrorReader {
         bytes: Cursor<Vec<u8>>,
         emitted_error: bool,
@@ -20460,6 +20455,44 @@ mod tests {
                 procedure.insert(field_name.to_owned(), valid_value);
                 validate_procedure_for_rate_dispatch(&procedure).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn producer_failure_capture_cancels_workers_and_preserves_source_error() {
+        let cancelled = AtomicBool::new(false);
+        let source_error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "billing_code must be a non-empty JSON string",
+        );
+
+        let captured = capture_producer_error(&cancelled, Err(source_error)).unwrap();
+
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(captured.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            captured.to_string(),
+            "billing_code must be a non-empty JSON string"
+        );
+
+        let not_cancelled = AtomicBool::new(false);
+        assert!(capture_producer_error(&not_cancelled, Ok(())).is_none());
+        assert!(!not_cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn primary_producer_diagnostic_excludes_peer_cancellation() {
+        let source_error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "billing_code must be a non-empty JSON string",
+        );
+        let diagnostic = primary_producer_failure_diagnostic(&source_error).unwrap();
+        assert!(diagnostic.starts_with("PTG2_SCANNER_PRIMARY_FAILED\t"));
+        assert!(diagnostic.contains("billing_code must be a non-empty JSON string"));
+
+        for peer_kind in [io::ErrorKind::Interrupted, io::ErrorKind::BrokenPipe] {
+            let peer_error = io::Error::new(peer_kind, "peer worker stopped");
+            assert!(primary_producer_failure_diagnostic(&peer_error).is_none());
         }
     }
 
@@ -21545,6 +21578,74 @@ mod tests {
             true,
             "JSON",
         );
+    }
+
+    #[test]
+    fn normal_order_parallel_byte_scan_preserves_producer_source_error() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        let base =
+            std::env::temp_dir().join(format!("ptg2-normal-producer-error-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let input_path = base.join("input.json");
+        let serving_path = base.join("serving.copy");
+        let serving_run_directory = base.join("serving-runs");
+        let provider_reference = valid_provider_reference();
+        std::fs::write(
+            &input_path,
+            format!(
+                r#"{{
+                    "provider_references":[{provider_reference}],
+                    "in_network":[
+                        {{
+                            "billing_code_type":"CPT",
+                            "billing_code":"99213",
+                            "negotiation_arrangement":"ffs",
+                            "negotiated_rates":[{{
+                                "provider_references":[7],
+                                "negotiated_prices":[{{
+                                    "negotiated_type":"negotiated",
+                                    "negotiated_rate":123.45
+                                }}]
+                            }}]
+                        }},
+                        {{
+                            "billing_code_type":"CPT",
+                            "billing_code":"",
+                            "negotiation_arrangement":"ffs",
+                            "negotiated_rates":[]
+                        }}
+                    ]
+                }}"#
+            ),
+        )
+        .unwrap();
+        let _strict_env = strict_scan_env(&serving_run_directory);
+        let _env = [
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_WORKERS", "2"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_WORK_QUEUE", "8"),
+            TestEnvVar::set("HLTHPRT_PTG2_V3_SERVING_RUN_PARTITIONS", "2"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN", "true"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS", "true"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED", "false"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", "true"),
+            TestEnvVar::set(
+                "HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH",
+                serving_path.to_str().unwrap(),
+            ),
+            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES", "0"),
+            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS", "0"),
+        ];
+
+        let error = scan_compact_struson(&input_path).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "billing_code must be a non-empty JSON string"
+        );
+        assert!(!serving_path.exists());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
