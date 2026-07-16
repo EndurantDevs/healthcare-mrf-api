@@ -46,6 +46,7 @@ jobs:
           github.event.workflow_run.head_repository.full_name == github.repository
         )
       }}
+    environment: dev-deploy
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -151,7 +152,12 @@ jobs:
         env:
           DEV_DEPLOY_SSH_KEY: ${{ secrets.DEV_DEPLOY_SSH_KEY }}
           DEV_DEPLOY_KNOWN_HOSTS: ${{ secrets.DEV_DEPLOY_KNOWN_HOSTS }}
+          DEV_DEPLOY_SCOPE: ${{ secrets.DEV_DEPLOY_SCOPE }}
         run: |
+          if [ "${DEV_DEPLOY_SCOPE}" != "main-only-v1" ]; then
+            echo "::error::DEV_DEPLOY_SCOPE is invalid"
+            exit 1
+          fi
           for name in DEV_DEPLOY_SSH_KEY DEV_DEPLOY_KNOWN_HOSTS; do
             if [ -z "${!name}" ]; then
               echo "::error::${name} is not configured"
