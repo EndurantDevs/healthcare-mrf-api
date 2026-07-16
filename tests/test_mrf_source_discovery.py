@@ -1776,7 +1776,7 @@ def _static_lookup_scoped_zip_target(query_source_dict):
             ]
         },
         lookup_url=query_source_dict["index_url"],
-        source=query_source_dict,
+        source_row_dict=query_source_dict,
         resolver={},
     )
     return discovery._toc_level_query_expansion_target(target, "Sample Employer")
@@ -5479,7 +5479,7 @@ def test_meritain_mrf_search_parser_extracts_group_healthsparq_links():
     [crawl_target] = discovery._parse_meritain_mrf_search_targets(
         html,
         base_url="https://mrfsearch.meritain.com/",
-        source=source_dict,
+        source_row_dict=source_dict,
         resolver_type="meritain_mrf_search",
     )
 
@@ -11788,7 +11788,7 @@ def test_parse_bcbs_asomrf_filelist_targets_expands_index_urls():
     [toc_target] = discovery._parse_bcbs_asomrf_filelist_targets(
         filelist_entries,
         filelist_url="https://www.bcbsil.com/content/dam/bcbs/mrf/si-filelist.json",
-        source=source_dict,
+        source_row_dict=source_dict,
         resolver={"toc_max_bytes": 12345},
     )
 
@@ -11826,7 +11826,7 @@ def test_parse_bcbs_asomrf_filelist_targets_applies_state_balanced_limit():
     toc_targets = discovery._parse_bcbs_asomrf_filelist_targets(
         filelist_entries,
         filelist_url="https://www.bcbsil.com/content/dam/bcbs/mrf/si-filelist.json",
-        source=source_dict,
+        source_row_dict=source_dict,
         resolver={"max_targets": 5},
     )
 
@@ -11866,7 +11866,7 @@ def test_cigna_lookup_targets_preserve_file_metadata_and_large_toc_limit():
     crawl_targets = discovery._parse_cigna_lookup_targets(
         lookup_by_key,
         lookup_url="https://www.cigna.com/static/mrf/latest.json",
-        source=source_dict,
+        source_row_dict=source_dict,
         resolver={"toc_max_bytes": 104857600},
     )
 

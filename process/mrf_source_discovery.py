@@ -2546,7 +2546,7 @@ def _json_values_from_zip_bytes(
     *,
     max_bytes: int = MAX_TOC_BYTES_DEFAULT,
 ) -> list[tuple[str, Any]]:
-    values: list[tuple[str, Any]] = []
+    json_members: list[tuple[str, Any]] = []
     try:
         with zipfile.ZipFile(io.BytesIO(body)) as archive:
             infos = sorted(
@@ -2568,14 +2568,14 @@ def _json_values_from_zip_bytes(
                     raise ValueError(
                         f"zip member {name} exceeds {max_bytes} byte discovery limit"
                     )
-                payload = archive.read(info)
-                text = _decode_response_body(payload)
-                values.append((name, _loads_mrf_json_value(text)))
+                member_bytes = archive.read(info)
+                text = _decode_response_body(member_bytes)
+                json_members.append((name, _loads_mrf_json_value(text)))
     except zipfile.BadZipFile as exc:
         raise ValueError("response body is not a readable ZIP archive") from exc
-    if not values:
+    if not json_members:
         raise ValueError("ZIP archive does not contain JSON TOC members")
-    return values
+    return json_members
 
 
 async def _fetch_zip_json_values(
@@ -2805,26 +2805,26 @@ def _candidate_to_rows(
     source_url = candidate.index_url or candidate.human_url
     aliases = sorted(
         {
-            _clean_text(value)
-            for value in (candidate.payer_name, *candidate.aliases)
-            if _clean_text(value)
+            _clean_text(alias_text)
+            for alias_text in (candidate.payer_name, *candidate.aliases)
+            if _clean_text(alias_text)
         },
         key=str.lower,
     )
     candidate_metadata = _candidate_metadata(candidate, aliases)
     target_payer_query = _candidate_target_payer_query(candidate)
-    source_identity: dict[str, Any] = {
+    source_identity_dict: dict[str, Any] = {
         "payer": payer_id,
         "url": _canonical_or_none(source_url),
         "provider": candidate.provider,
     }
     if target_payer_query:
-        source_identity["target_payer_query"] = target_payer_query
+        source_identity_dict["target_payer_query"] = target_payer_query
     source_id = _id(
         "mrfsource",
-        source_identity,
+        source_identity_dict,
     )
-    payer_row = {
+    payer_row_dict = {
         "payer_id": payer_id,
         "canonical_name": _clean_text(candidate.payer_name),
         "aliases": aliases,
@@ -2842,17 +2842,17 @@ def _candidate_to_rows(
         "updated_at": now,
     }
     if not source_url:
-        return payer_row, None
+        return payer_row_dict, None
     source_key_base = _slug(
         "-".join(
-            value
-            for value in (
+            identity_part
+            for identity_part in (
                 candidate.provider,
                 candidate.payer_name,
                 target_payer_query,
                 _domain(source_url) or "",
             )
-            if value
+            if identity_part
         )
     )
     source_key = f"{source_key_base[:80]}-{source_id[-8:]}"
@@ -2860,7 +2860,7 @@ def _candidate_to_rows(
     normalized_discovery_run_id = _clean_text(discovery_run_id)
     if normalized_discovery_run_id:
         source_metadata_dict["discovery_run_id"] = normalized_discovery_run_id
-    source_row = {
+    source_row_dict = {
         "source_id": source_id,
         "payer_id": payer_id,
         "source_key": source_key,
@@ -2889,7 +2889,7 @@ def _candidate_to_rows(
         "created_at": now,
         "updated_at": now,
     }
-    return payer_row, source_row
+    return payer_row_dict, source_row_dict
 
 
 def _candidate_metadata(
@@ -3215,12 +3215,16 @@ def _healthsparq_last_updated_on(file_item: dict[str, Any]) -> Any:
 
 
 def _healthsparq_rows_from_metadata(
-    source: dict[str, Any], metadata_url: str, payload: dict[str, Any]
+    source_row_dict: dict[str, Any],
+    metadata_url: str,
+    metadata_payload: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Convert HealthSparq metadata into normalized plan and file rows."""
-    files = _healthsparq_metadata_files(payload if isinstance(payload, dict) else {})
+    files = _healthsparq_metadata_files(
+        metadata_payload if isinstance(metadata_payload, dict) else {}
+    )
     now = _utc_now()
-    target_query = _source_target_payer_query(source)
+    target_query = _source_target_payer_query(source_row_dict)
     plan_rows_by_id: dict[str, dict[str, Any]] = {}
     file_rows_by_id: dict[str, dict[str, Any]] = {}
     for file_item in files:
@@ -3244,7 +3248,7 @@ def _healthsparq_rows_from_metadata(
             plan_row_id = _id(
                 "mrfplan",
                 {
-                    "source": source["source_id"],
+                    "source": source_row_dict["source_id"],
                     "plan_id": plan_id,
                     "plan_name": plan_name,
                     "market_type": market_type,
@@ -3252,8 +3256,8 @@ def _healthsparq_rows_from_metadata(
             )
             plan_rows_by_id[plan_row_id] = {
                 "mrf_plan_id": plan_row_id,
-                "payer_id": source.get("payer_id"),
-                "source_id": source["source_id"],
+                "payer_id": source_row_dict.get("payer_id"),
+                "source_id": source_row_dict["source_id"],
                 "plan_id": plan_id or None,
                 "plan_id_type": _healthsparq_plan_value(
                     plan, "planIdType", "plan_id_type"
@@ -3275,12 +3279,16 @@ def _healthsparq_rows_from_metadata(
         canonical_url = _canonical_or_none(file_url) or file_url
         file_row_id = _id(
             "mrffile",
-            {"source": source["source_id"], "type": file_type, "url": canonical_url},
+            {
+                "source": source_row_dict["source_id"],
+                "type": file_type,
+                "url": canonical_url,
+            },
         )
         file_rows_by_id[file_row_id] = {
             "mrf_file_id": file_row_id,
-            "payer_id": source.get("payer_id"),
-            "source_id": source["source_id"],
+            "payer_id": source_row_dict.get("payer_id"),
+            "source_id": source_row_dict["source_id"],
             "file_type": file_type,
             "url": file_url,
             "canonical_url": canonical_url,
@@ -3311,7 +3319,7 @@ def _healthsparq_rows_from_metadata(
                 "resolver": "healthsparq_public_mrf",
                 "container_format": _container_format(file_url),
                 **_file_benefit_metadata(
-                    source,
+                    source_row_dict,
                     file_url,
                     _healthsparq_file_name(file_item),
                     _healthsparq_reporting_entity_name(file_item),
@@ -3486,7 +3494,7 @@ def _metadata_text_fields(line: str) -> dict[str, str]:
 
 
 def _metadata_text_rows_from_content(
-    source: dict[str, Any], url: str, text: str
+    source_row_dict: dict[str, Any], url: str, text: str
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Parse text metadata into normalized plan and file rows."""
     now = _utc_now()
@@ -3505,7 +3513,7 @@ def _metadata_text_rows_from_content(
         plan_row_id = _id(
             "mrfplan",
             {
-                "source": source["source_id"],
+                "source": source_row_dict["source_id"],
                 "plan_id": sponsor_ein,
                 "plan_name": plan_name,
                 "metadata_url": url,
@@ -3514,13 +3522,13 @@ def _metadata_text_rows_from_content(
         if sponsor_ein or plan_name:
             plan_rows_by_id[plan_row_id] = {
                 "mrf_plan_id": plan_row_id,
-                "payer_id": source.get("payer_id"),
-                "source_id": source["source_id"],
+                "payer_id": source_row_dict.get("payer_id"),
+                "source_id": source_row_dict["source_id"],
                 "plan_id": sponsor_ein or None,
                 "plan_id_type": "ein" if sponsor_ein else None,
                 "plan_name": plan_name,
                 "market_type": None,
-                "reporting_entity_name": source.get("display_name"),
+                "reporting_entity_name": source_row_dict.get("display_name"),
                 "reporting_entity_type": "third_party_administrator",
                 "metadata_json": {"raw_line": line, "metadata_url": url},
                 "first_seen_at": now,
@@ -3529,12 +3537,16 @@ def _metadata_text_rows_from_content(
         canonical_url = _canonical_or_none(file_url) or file_url
         file_row_id = _id(
             "mrffile",
-            {"source": source["source_id"], "type": file_type, "url": canonical_url},
+            {
+                "source": source_row_dict["source_id"],
+                "type": file_type,
+                "url": canonical_url,
+            },
         )
         file_rows_by_id[file_row_id] = {
             "mrf_file_id": file_row_id,
-            "payer_id": source.get("payer_id"),
-            "source_id": source["source_id"],
+            "payer_id": source_row_dict.get("payer_id"),
+            "source_id": source_row_dict["source_id"],
             "file_type": file_type,
             "url": file_url,
             "canonical_url": canonical_url,
@@ -3547,10 +3559,15 @@ def _metadata_text_rows_from_content(
             "is_signed_url": _looks_signed(file_url),
             "size_bytes": None,
             "schema_version": None,
-            "metadata_json": {
-                "resolver": "html_metadata_text",
-                "container_format": _container_format(file_url),
-                **_file_benefit_metadata(source, file_url, plan_name, line),
+                "metadata_json": {
+                    "resolver": "html_metadata_text",
+                    "container_format": _container_format(file_url),
+                    **_file_benefit_metadata(
+                        source_row_dict,
+                        file_url,
+                        plan_name,
+                        line,
+                    ),
                 "metadata_fields": fields,
                 "metadata_url": url,
             },
@@ -3603,11 +3620,17 @@ def _label_from_index_name(name: str) -> str:
     return _clean_text(label).title()
 
 
-def _parse_uhc_blob_listing(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    blobs = payload.get("blobs") if isinstance(payload, dict) else None
+def _parse_uhc_blob_listing(
+    listing_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    blobs = (
+        listing_payload.get("blobs")
+        if isinstance(listing_payload, dict)
+        else None
+    )
     if not isinstance(blobs, list):
         return []
-    targets: list[dict[str, Any]] = []
+    blob_targets: list[dict[str, Any]] = []
     for blob in blobs:
         if not isinstance(blob, dict):
             continue
@@ -3629,7 +3652,7 @@ def _parse_uhc_blob_listing(payload: dict[str, Any]) -> list[dict[str, Any]]:
             if direct_embedded_vision
             else "table-of-contents"
         )
-        targets.append(
+        blob_targets.append(
             {
                 "url": url,
                 "label": (
@@ -3644,7 +3667,7 @@ def _parse_uhc_blob_listing(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "container_format": _container_format(url),
             }
         )
-    return targets
+    return blob_targets
 
 
 def _uhc_blob_targets_matching_query(
@@ -4436,7 +4459,7 @@ def _mymedicalshopper_entry_history(entry: dict[str, Any]) -> list[dict[str, Any
 
 
 def _mymedicalshopper_targets_from_generated(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     *,
     entity_slug: str | None,
     employer: dict[str, Any],
@@ -4472,25 +4495,25 @@ def _mymedicalshopper_targets_from_generated(
         history = _mymedicalshopper_entry_history(entry)
         latest = sorted(
             (
-                item
-                for item in history
-                if item.get("mrfGenerated") is True
-                and str(item.get("link") or "")
+                generation_record
+                for generation_record in history
+                if generation_record.get("mrfGenerated") is True
+                and str(generation_record.get("link") or "")
                 .strip()
                 .startswith(("http://", "https://"))
             ),
-            key=lambda item: str(item.get("month") or ""),
+            key=lambda generation_record: str(generation_record.get("month") or ""),
             reverse=True,
         )
         if not latest:
             continue
-        item = latest[0]
-        url = str(item.get("link") or "").strip()
+        generation_record = latest[0]
+        url = str(generation_record.get("link") or "").strip()
         canonical = _canonical_or_none(url) or url
-        month = str(item.get("month") or "").strip() or None
+        month = str(generation_record.get("month") or "").strip() or None
         label_parts = [part for part in (employer_name, plan_name, month) if part]
         targets_by_url[canonical] = CrawlTarget(
-            source=source,
+            source=source_row_dict,
             url=url,
             label=" - ".join(label_parts),
             resolved_from_url=resolved_from_url,
@@ -4826,7 +4849,7 @@ def _magnacare_row_plan_info(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _magnacare_result_rows(html_text: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+    result_rows: list[dict[str, Any]] = []
     for row_match in re.finditer(
         r"<tr\b(?P<attrs>[^>]*)>(?P<body>.*?)</tr>",
         html_text or "",
@@ -4847,7 +4870,7 @@ def _magnacare_result_rows(html_text: str) -> list[dict[str, Any]]:
             continue
         link_attrs = _magnacare_html_attrs(link_match.group("attrs") or "")
         run_history_id = _clean_text(link_attrs.get("data-rhid"))
-        rows.append(
+        result_rows.append(
             {
                 "plan_id_type": columns[0],
                 "plan_market_type": columns[1],
@@ -4863,7 +4886,7 @@ def _magnacare_result_rows(html_text: str) -> list[dict[str, Any]]:
                 "raw_ere": _clean_text(link_attrs.get("data-ere")),
             }
         )
-    return rows
+    return result_rows
 
 
 def _magnacare_target_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -5044,30 +5067,32 @@ def _asr_group_number_from_url(url: str | None) -> str | None:
     return group_number or None
 
 
-def _crawl_target_context_metadata(target: CrawlTarget) -> dict[str, Any]:
-    metadata = dict(target.metadata or {})
-    source_metadata = dict((target.source or {}).get("metadata_json") or {})
+def _crawl_target_context_metadata(crawl_target: CrawlTarget) -> dict[str, Any]:
+    metadata = dict(crawl_target.metadata or {})
+    source_metadata_dict = dict(
+        (crawl_target.source or {}).get("metadata_json") or {}
+    )
     group_number = (
         str(metadata.get("group_number") or metadata.get("group_id") or "").strip()
-        or _asr_group_number_from_url(target.url)
-        or _asr_group_number_from_url(target.resolved_from_url)
+        or _asr_group_number_from_url(crawl_target.url)
+        or _asr_group_number_from_url(crawl_target.resolved_from_url)
     )
-    context: dict[str, Any] = {}
+    context_metadata_dict: dict[str, Any] = {}
     benefit_lines = _normalize_benefit_lines(
         _benefit_line_values(metadata.get("benefit_lines"))
         + _benefit_line_values(metadata.get("benefit_line"))
-        + _benefit_line_values(source_metadata.get("benefit_lines"))
-        + _benefit_line_values(source_metadata.get("benefit_line"))
+        + _benefit_line_values(source_metadata_dict.get("benefit_lines"))
+        + _benefit_line_values(source_metadata_dict.get("benefit_line"))
     )
     if benefit_lines:
-        context["benefit_lines"] = list(benefit_lines)
+        context_metadata_dict["benefit_lines"] = list(benefit_lines)
         if len(benefit_lines) in {1}:
-            context["benefit_line"] = benefit_lines[0]
+            context_metadata_dict["benefit_line"] = benefit_lines[0]
     if group_number:
-        context["group_id"] = group_number
-        context["group_number"] = group_number
-    if target.label:
-        context["target_label"] = str(target.label)
+        context_metadata_dict["group_id"] = group_number
+        context_metadata_dict["group_number"] = group_number
+    if crawl_target.label:
+        context_metadata_dict["target_label"] = str(crawl_target.label)
     for key in (
         "client_id",
         "client_name",
@@ -5085,14 +5110,16 @@ def _crawl_target_context_metadata(target: CrawlTarget) -> dict[str, Any]:
         "plan_id",
         "plan_name",
     ):
-        value = str(metadata.get(key) or "").strip()
-        if value:
-            context[key] = value
-    if not context.get("company_name"):
-        source_display_name = str((target.source or {}).get("display_name") or "").strip()
+        metadata_text = str(metadata.get(key) or "").strip()
+        if metadata_text:
+            context_metadata_dict[key] = metadata_text
+    if not context_metadata_dict.get("company_name"):
+        source_display_name = str(
+            (crawl_target.source or {}).get("display_name") or ""
+        ).strip()
         if source_display_name:
-            context["company_name"] = source_display_name
-    return context
+            context_metadata_dict["company_name"] = source_display_name
+    return context_metadata_dict
 
 
 def _apply_crawl_target_context_to_file_rows(
@@ -7071,10 +7098,10 @@ def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
 
 def _json_mrf_directory_links_from_html(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
-    seen: set[str] = set()
+    seen_url_keys: set[str] = set()
     candidates = [
-        str(item.get("url") or "")
-        for item in _html_link_candidates(html_text, base_url=base_url)
+        str(link_candidate.get("url") or "")
+        for link_candidate in _html_link_candidates(html_text, base_url=base_url)
     ]
     candidates.extend(_embedded_http_urls(html_text))
     for url in candidates:
@@ -7097,9 +7124,9 @@ def _json_mrf_directory_links_from_html(html_text: str, *, base_url: str) -> lis
         ):
             continue
         key = _canonical_or_none(url) or url
-        if key in seen:
+        if key in seen_url_keys:
             continue
-        seen.add(key)
+        seen_url_keys.add(key)
         urls.append(url)
     return urls
 
@@ -7126,29 +7153,32 @@ def _embedded_mrf_urls(value: str, *, base_url: str | None = None) -> list[str]:
 
 
 def _json_mrf_directory_targets_from_payload(
-    source: dict[str, Any],
-    payload: Any,
+    source_row_dict: dict[str, Any],
+    directory_payload: Any,
     *,
     directory_url: str,
     resolver_type: str,
 ) -> list[CrawlTarget]:
     """Walk a JSON directory payload and build unique crawl targets."""
     crawl_targets: list[CrawlTarget] = []
-    seen: set[str] = set()
+    seen_url_keys: set[str] = set()
 
-    def visit(value: Any) -> None:
+    def visit(directory_value: Any) -> None:
         """Visit nested JSON values and collect directory MRF references."""
-        if isinstance(value, dict):
-            for nested in value.values():
+        if isinstance(directory_value, dict):
+            for nested in directory_value.values():
                 visit(nested)
             return
-        if isinstance(value, list):
-            for nested in value:
+        if isinstance(directory_value, list):
+            for nested in directory_value:
                 visit(nested)
             return
-        if not isinstance(value, str):
+        if not isinstance(directory_value, str):
             return
-        for file_url in _embedded_mrf_urls(value, base_url=directory_url):
+        for file_url in _embedded_mrf_urls(
+            directory_value,
+            base_url=directory_url,
+        ):
             label = Path(urlsplit(file_url).path).name
             target_kind: str | None = None
             target_file_type: str | None = None
@@ -7161,9 +7191,9 @@ def _json_mrf_directory_targets_from_payload(
             if not target_kind or not target_file_type:
                 continue
             key = _canonical_or_none(file_url) or file_url
-            if key in seen:
+            if key in seen_url_keys:
                 continue
-            seen.add(key)
+            seen_url_keys.add(key)
             plan_info = (
                 _plan_info_from_label(label) if target_kind == "file_reference" else []
             )
@@ -7177,19 +7207,19 @@ def _json_mrf_directory_targets_from_payload(
             }
             crawl_targets.append(
                 CrawlTarget(
-                    source=source,
+                    source=source_row_dict,
                     url=file_url,
                     label=_mrf_file_plan_label(label) or label,
                     resolved_from_url=directory_url,
                     metadata={
-                        key: value
-                        for key, value in metadata.items()
-                        if value not in (None, "", [])
+                        key: metadata_value
+                        for key, metadata_value in metadata.items()
+                        if metadata_value not in (None, "", [])
                     },
                 )
             )
 
-    visit(payload)
+    visit(directory_payload)
     return crawl_targets
 
 
@@ -7288,8 +7318,8 @@ def _humana_pct_download_url(base_url: str, resolver: dict[str, Any], file_name:
 
 
 def _humana_pct_targets_from_payload(
-    source: dict[str, Any],
-    payload: dict[str, Any],
+    source_row_dict: dict[str, Any],
+    file_list_payload: dict[str, Any],
     *,
     api_url: str,
     resolver: dict[str, Any],
@@ -7299,8 +7329,8 @@ def _humana_pct_targets_from_payload(
 ) -> list[CrawlTarget]:
     base_url = f"{urlsplit(api_url).scheme}://{urlsplit(api_url).netloc}/"
     crawl_targets: list[CrawlTarget] = []
-    seen: set[str] = set()
-    for file_row in _humana_pct_payload_rows(payload):
+    seen_url_keys: set[str] = set()
+    for file_row in _humana_pct_payload_rows(file_list_payload):
         file_name = _humana_pct_file_name_from_row(file_row)
         if not file_name:
             continue
@@ -7315,9 +7345,9 @@ def _humana_pct_targets_from_payload(
             continue
         url = _humana_pct_download_url(base_url, resolver, file_name)
         key = _canonical_or_none(url) or url
-        if key in seen:
+        if key in seen_url_keys:
             continue
-        seen.add(key)
+        seen_url_keys.add(key)
         metadata = {
             "resolver": resolver_type,
             "target_kind": target_kind,
@@ -7331,7 +7361,7 @@ def _humana_pct_targets_from_payload(
         }
         crawl_targets.append(
             CrawlTarget(
-                source=source,
+                source=source_row_dict,
                 url=url,
                 label=_mrf_file_plan_label(file_name) or file_name,
                 resolved_from_url=api_url,
@@ -7827,8 +7857,8 @@ def _payercompass_target_match_keys(target: CrawlTarget) -> set[str]:
     )
 
 
-async def _enrich_payercompass_targets_with_index_plan_info(
-    targets: list[CrawlTarget],
+async def _enrich_payercompass_target_plan_info(
+    crawl_targets: list[CrawlTarget],
     *,
     resolver: dict[str, Any],
     max_bytes: int,
@@ -7842,7 +7872,7 @@ async def _enrich_payercompass_targets_with_index_plan_info(
     )
     plan_info_by_key: dict[str, list[dict[str, Any]]] = {}
     toc_metadata_by_field: dict[str, str | None] = {}
-    for crawl_target in targets:
+    for crawl_target in crawl_targets:
         if not _payercompass_is_index_target(crawl_target):
             continue
         size_bytes = _parse_size_bytes((crawl_target.metadata or {}).get("size_bytes"))
@@ -7869,8 +7899,8 @@ async def _enrich_payercompass_targets_with_index_plan_info(
                 if metadata_value and not toc_metadata_by_field.get(metadata_key):
                     toc_metadata_by_field[metadata_key] = metadata_value
     if not plan_info_by_key:
-        return targets
-    for crawl_target in targets:
+        return crawl_targets
+    for crawl_target in crawl_targets:
         metadata = crawl_target.metadata or {}
         if metadata.get("target_file_type") != "in-network":
             continue
@@ -7892,7 +7922,7 @@ async def _enrich_payercompass_targets_with_index_plan_info(
         for metadata_key, metadata_value in toc_metadata_by_field.items():
             if metadata_value and not metadata.get(metadata_key):
                 metadata[metadata_key] = metadata_value
-    return targets
+    return crawl_targets
 
 
 def _payercompass_targets_from_structure(
@@ -7983,7 +8013,7 @@ async def _resolve_payercompass_mrf(
         structure=structure,
         file_lists=files_by_timeframe,
     )
-    crawl_targets = await _enrich_payercompass_targets_with_index_plan_info(
+    crawl_targets = await _enrich_payercompass_target_plan_info(
         crawl_targets,
         resolver=resolver,
         max_bytes=max_bytes,
@@ -9145,7 +9175,7 @@ def _mrf_file_type_from_html_link_context(
 
 def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     """Extract normalized MRF links and file types from HTML."""
-    urls: dict[tuple[str, str], dict[str, Any]] = {}
+    links_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     section_file_type: str | None = None
     last_html_position = 0
     for candidate in _html_link_candidates(html_text, base_url=base_url):
@@ -9211,14 +9241,14 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
                 label = inferred_label
         if not target_kind or not target_file_type:
             continue
-        plan_info = []
+        plan_info_rows = []
         if target_kind == "file_reference":
             if _html_label_looks_fileish(candidate.get("label"), path) or (
                 target_file_type == "in-network" and _html_label_looks_planish(label)
             ):
-                plan_info = _plan_info_from_label(label)
+                plan_info_rows = _plan_info_from_label(label)
         key = (target_kind, _canonical_or_none(url) or url)
-        row = {
+        parsed_link_dict = {
             "url": url,
             "label": label,
             "resolver": resolver,
@@ -9227,14 +9257,15 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
             "container_format": _container_format(url),
             "html_attr": attr,
         }
-        if plan_info:
-            row["plan_info"] = plan_info
-        existing = urls.get(key)
+        if plan_info_rows:
+            parsed_link_dict["plan_info"] = plan_info_rows
+        existing = links_by_key.get(key)
         if existing is None or (
-            existing.get("html_attr") == "text" and row.get("html_attr") != "text"
+            existing.get("html_attr") == "text"
+            and parsed_link_dict.get("html_attr") != "text"
         ):
-            urls[key] = row
-    return list(urls.values())
+            links_by_key[key] = parsed_link_dict
+    return list(links_by_key.values())
 
 
 def _dedupe_crawl_targets_by_url(targets: list[CrawlTarget]) -> list[CrawlTarget]:
@@ -10255,7 +10286,7 @@ def _parse_meritain_mrf_search_targets(
     html_text: str,
     *,
     base_url: str,
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     resolver_type: str,
 ) -> list[CrawlTarget]:
     targets_by_url: dict[str, CrawlTarget] = {}
@@ -10281,7 +10312,7 @@ def _parse_meritain_mrf_search_targets(
         )
         key = _canonical_or_none(url) or url
         targets_by_url[key] = CrawlTarget(
-            source=source,
+            source=source_row_dict,
             url=url,
             label=label,
             resolved_from_url=base_url,
@@ -10313,7 +10344,10 @@ async def _resolve_meritain_mrf_search(
         session=session,
     )
     targets = _parse_meritain_mrf_search_targets(
-        html_text, base_url=url, source=source, resolver_type=resolver_type
+        html_text,
+        base_url=url,
+        source_row_dict=source,
+        resolver_type=resolver_type,
     )
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets:
@@ -11019,21 +11053,29 @@ def _cigna_file_url(item: dict[str, Any]) -> str | None:
 
 
 def _parse_cigna_lookup_targets(
-    payload: dict[str, Any],
+    lookup_payload: dict[str, Any],
     *,
     lookup_url: str,
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     resolver: dict[str, Any],
 ) -> list[CrawlTarget]:
     """Convert a Cigna lookup payload into crawl targets."""
     toc_max_bytes = (
         _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
     )
-    groups = payload.get("mrfs") if isinstance(payload.get("mrfs"), list) else None
+    groups = (
+        lookup_payload.get("mrfs")
+        if isinstance(lookup_payload.get("mrfs"), list)
+        else None
+    )
     if groups is None:
-        groups = payload.get("mrf") if isinstance(payload.get("mrf"), list) else None
+        groups = (
+            lookup_payload.get("mrf")
+            if isinstance(lookup_payload.get("mrf"), list)
+            else None
+        )
     if groups is None:
-        groups = [payload]
+        groups = [lookup_payload]
     targets_by_url: dict[str, CrawlTarget] = {}
     for group in groups:
         if not isinstance(group, dict):
@@ -11144,9 +11186,10 @@ def _parse_cigna_lookup_targets(
             }
             key = _canonical_or_none(file_url) or file_url
             targets_by_url[key] = CrawlTarget(
-                source=source,
+                source=source_row_dict,
                 url=file_url,
-                label=file_name or str(source.get("display_name") or "Cigna MRF index"),
+                label=file_name
+                or str(source_row_dict.get("display_name") or "Cigna MRF index"),
                 resolved_from_url=lookup_url,
                 metadata={
                     key: metadata_value
@@ -11158,19 +11201,19 @@ def _parse_cigna_lookup_targets(
 
 
 def _parse_bcbs_asomrf_filelist_targets(
-    payload: Any,
+    filelist_payload: Any,
     *,
     filelist_url: str,
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     resolver: dict[str, Any],
 ) -> list[CrawlTarget]:
-    if not isinstance(payload, list):
+    if not isinstance(filelist_payload, list):
         raise ValueError("expected BCBS ASO filelist JSON array")
     toc_max_bytes = (
         _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
     )
     targets_by_url: dict[str, CrawlTarget] = {}
-    for file_entry in payload:
+    for file_entry in filelist_payload:
         if not isinstance(file_entry, dict):
             continue
         file_url = str(file_entry.get("url") or "").strip()
@@ -11193,9 +11236,10 @@ def _parse_bcbs_asomrf_filelist_targets(
         }
         key = _canonical_or_none(file_url) or file_url
         targets_by_url[key] = CrawlTarget(
-            source=source,
+            source=source_row_dict,
             url=file_url,
-            label=file_name or str(source.get("display_name") or "BCBS ASO MRF index"),
+            label=file_name
+            or str(source_row_dict.get("display_name") or "BCBS ASO MRF index"),
             resolved_from_url=filelist_url,
             metadata={
                 key: metadata_value for key, metadata_value in metadata.items() if metadata_value not in (None, "")
@@ -11423,7 +11467,10 @@ async def _resolve_bcbs_asomrf_filelist(
         )
         targets.extend(
             _parse_bcbs_asomrf_filelist_targets(
-                payload, filelist_url=filelist_url, source=source, resolver=resolver
+                payload,
+                filelist_url=filelist_url,
+                source_row_dict=source,
+                resolver=resolver,
             )
         )
     if not targets:
@@ -11497,7 +11544,7 @@ def _bcbsma_monthly_toc_targets(
 
 
 def _monthly_toc_targets(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     *,
@@ -11548,7 +11595,7 @@ def _monthly_toc_targets(
             seen_urls.add(key)
             crawl_targets.append(
                 CrawlTarget(
-                    source=source,
+                    source=source_row_dict,
                     url=target_url,
                     label=file_name,
                     resolved_from_url=url,
@@ -11882,7 +11929,7 @@ def _healthspace_execute_soap_envelope(
 
 
 def _healthspace_mrf_targets_from_soap(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     soap_text: str,
     *,
     resolved_from_url: str,
@@ -11931,7 +11978,7 @@ def _healthspace_mrf_targets_from_soap(
         seen_urls.add(key)
         crawl_targets.append(
             CrawlTarget(
-                source=source,
+                source=source_row_dict,
                 url=url,
                 label=company_name or _mrf_file_plan_label(file_name) or file_name,
                 resolved_from_url=resolved_from_url,
@@ -12228,7 +12275,10 @@ async def _resolve_cigna_static_mrf_lookup(
         )
         crawl_targets.extend(
             _parse_cigna_lookup_targets(
-                lookup_payload, lookup_url=lookup_url, source=source, resolver=resolver
+                lookup_payload,
+                lookup_url=lookup_url,
+                source_row_dict=source,
+                resolver=resolver,
             )
         )
     if not crawl_targets:
@@ -12578,15 +12628,17 @@ def _healthsparq_file_matches_query(
 
 
 def _healthsparq_targets_from_metadata(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     metadata_url: str,
-    payload: dict[str, Any],
+    metadata_payload: dict[str, Any],
     *,
     resolved_from_url: str,
     params: dict[str, str],
 ) -> list[CrawlTarget]:
-    files = _healthsparq_metadata_files(payload if isinstance(payload, dict) else {})
-    target_query = _source_target_payer_query(source)
+    files = _healthsparq_metadata_files(
+        metadata_payload if isinstance(metadata_payload, dict) else {}
+    )
+    target_query = _source_target_payer_query(source_row_dict)
     targets_by_key: dict[tuple[str, str], CrawlTarget] = {}
     for file_item in files:
         if not _healthsparq_file_matches_query(file_item, target_query):
@@ -12602,7 +12654,7 @@ def _healthsparq_targets_from_metadata(
         label = (
             file_name
             or _clean_text(_healthsparq_reporting_entity_name(file_item))
-            or str(source.get("display_name") or params["brandCode"])
+            or str(source_row_dict.get("display_name") or params["brandCode"])
         )
         metadata = {
             "resolver": "healthsparq_public_mrf",
@@ -12627,7 +12679,7 @@ def _healthsparq_targets_from_metadata(
         }
         key = (target_kind, _canonical_or_none(file_url) or file_url)
         targets_by_key[key] = CrawlTarget(
-            source=source,
+            source=source_row_dict,
             url=file_url,
             label=label,
             resolved_from_url=metadata_url,

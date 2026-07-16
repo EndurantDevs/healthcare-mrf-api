@@ -156,6 +156,30 @@ Both responses return `items` and `next_cursor`. Consumers should continue
 until `next_cursor` is null, checkpoint only after a page is durably ingested,
 and treat replayed pages as idempotent.
 
+### Reader performance notes
+
+File pages are bounded by both file count and 10,000 expanded plan references.
+The database reader must apply both budgets while rows are streamed; fetching
+the requested 500 rows before applying the plan budget can materialize far more
+JSON than the response needs.
+
+A July 2026 dense-source measurement found 619 remaining rows carrying about
+128 MB of metadata JSON and 36 MB of plan arrays. The old 501-row query loaded
+most of that data even though the plan budget needed about two rows. Streaming
+in 16-row database batches reduced the first materialization batch to roughly
+5 MB. A server-side serialization check on the same cursor fell from 0.70
+seconds for 501 rows to 0.05 seconds for 16 rows; application-side savings are
+larger because unused JSON no longer needs async driver decoding or Python
+object construction.
+
+When investigating a slow catalog refresh, record these separately:
+
+- database row materialization and JSON decoding;
+- API response construction and transfer;
+- catalog write time;
+- derived catalog refresh time;
+- idle worker time caused by source-page barriers.
+
 ## Safety Rules
 
 - Discovery never downloads full rate bodies.
