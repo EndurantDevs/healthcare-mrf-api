@@ -219,6 +219,42 @@ async def test_group_plan_providers_pages_strict_v3_npi_scope(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_group_plan_providers_filters_by_canonical_provider_sex(monkeypatch):
+    async def fake_snapshot_serving_tables(_session, _snapshot_id):
+        return strict_snapshot_tables(_snapshot_id)
+
+    monkeypatch.setattr(
+        pricing_module,
+        "current_source_snapshot_ids_for_plan",
+        fake_plan_snapshot_pairs,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "snapshot_serving_tables",
+        fake_snapshot_serving_tables,
+    )
+    request = make_request(
+        [FakeResult(rows=[types.SimpleNamespace(npi=1234567890)])],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "provider_sex_code": "f",
+            "limit": "10",
+        },
+    )
+
+    response = await group_plan_providers(request)
+    pricing_response = json.loads(response.body)
+
+    sql = str(request.ctx.sa_session.executions[0][0][0])
+    params = request.ctx.sa_session.executions[0][0][1]
+    assert pricing_response["provider_sex_code"] == "F"
+    assert "mrf.npi group_provider_sex_npi" in sql
+    assert "group_provider_sex_npi.npi = gm.npi" in sql
+    assert params["group_provider_sex_provider_sex_code"] == "F"
+
+
+@pytest.mark.asyncio
 async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
     async def fake_snapshot_id(_session, _plan_fields):
         return "ptg2:test"
@@ -2021,6 +2057,7 @@ async def test_list_providers_by_procedure_with_q():
             "q": "mri",
             "year": "2023",
             "state": "MD",
+            "provider_sex_code": "f",
             "include_sources": "true",
             "include_evidence": "true",
         },
@@ -2032,12 +2069,17 @@ async def test_list_providers_by_procedure_with_q():
     assert pricing_response["items"][0]["npi"] == 1003000126
     assert pricing_response["query"]["q"] == "mri"
     assert pricing_response["query"]["state"] == "MD"
+    assert pricing_response["query"]["provider_sex_code"] == "F"
     assert pricing_response["query"]["include_sources"] is True
     assert pricing_response["query"]["include_evidence"] is True
     assert pricing_response["sources"][0]["source_importer"] == "claims-pricing"
     assert pricing_response["sources"][0]["serving_tables"] == ["pricing_provider", "pricing_provider_procedure"]
     assert pricing_response["evidence"]["matched_provider_location_count"] == 1
     assert pricing_response["evidence"]["filters"]["state"] == "MD"
+    assert "mrf.npi" in str(request.ctx.sa_session.executions[1][0][0])
+    assert "provider_sex_code" in str(
+        request.ctx.sa_session.executions[1][0][0]
+    )
 
 
 @pytest.mark.asyncio
@@ -2297,6 +2339,7 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
             "include_unverified_addresses": "true",
             "classification": "Internal Medicine",
             "taxonomy_codes": "207R00000X",
+            "provider_sex_code": "x",
             "include_subspecialties": "false",
             "primary_only": "false",
             "lat": "29.7604",
@@ -2318,6 +2361,7 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     assert seen_argument_map["include_details"] is None
     assert seen_argument_map["classification"] == "Internal Medicine"
     assert seen_argument_map["taxonomy_codes"] == "207R00000X"
+    assert seen_argument_map["provider_sex_code"] == "X"
     assert seen_argument_map["include_subspecialties"] == "false"
     assert seen_argument_map["primary_only"] == "false"
     assert seen_argument_map["order_by"] == "total_allowed_amount"
@@ -2760,8 +2804,9 @@ async def test_list_providers_by_procedure_falls_back_to_allowed_amounts(
         args={
             "plan_id": "TESTPLAN001",
             "market_type": "group",
-            "code": "99203",
+            "code": "70551",
             "zip5": "60601",
+            "provider_sex_code": "u",
             "year": "2023",
             "include_allowed_amounts": "true",
         },
@@ -2778,6 +2823,23 @@ async def test_list_providers_by_procedure_falls_back_to_allowed_amounts(
     )
     strict_search.assert_awaited_once()
     allowed_search.assert_awaited_once()
+    assert strict_search.await_args.args[1]["provider_sex_code"] == "U"
+    assert allowed_search.await_args.args[1]["provider_sex_code"] == "U"
+
+
+def test_allowed_amount_provider_predicate_preserves_provider_sex():
+    query_parameter_map = {}
+
+    provider_predicate_sql = pricing_module._allowed_amount_provider_filter_sql(
+        {"provider_sex_code": "x"},
+        query_parameter_map,
+    )
+
+    assert (
+        "npi_data.provider_sex_code = :allowed_provider_sex_code"
+        in provider_predicate_sql
+    )
+    assert query_parameter_map["allowed_provider_sex_code"] == "X"
 
 
 @pytest.mark.asyncio

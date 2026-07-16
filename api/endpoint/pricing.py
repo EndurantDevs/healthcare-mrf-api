@@ -52,6 +52,10 @@ from api.ptg2_address_policy import (
 from api.ptg2_serving_utils import ein_plan_id_variants
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
+from api.provider_demographic_filters import (
+    normalize_provider_sex_code,
+    provider_sex_exists_sql,
+)
 from api.provider_specialty_filters import (
     DynamicSpecialtyResolutionError,
     ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
@@ -1015,11 +1019,19 @@ def _reject_broad_group_plan_provider_expansion(
     latitude = context.get("latitude")
     longitude = context.get("longitude")
     npi = context.get("npi")
+    provider_sex_code = context.get("provider_sex_code")
     if plan_market_type != "group":
         return
     if not (plan_id or plan_external_id):
         return
-    if not _parse_bool(args.get("include_providers"), "include_providers", default=False):
+    if not (
+        _parse_bool(
+            args.get("include_providers"),
+            "include_providers",
+            default=False,
+        )
+        or provider_sex_code
+    ):
         return
     if not _is_broad_office_visit_cpt(code_system, code):
         return
@@ -5262,11 +5274,41 @@ def _append_allowed_amount_text_location_filters(
         )
 
 
-def _allowed_amount_taxonomy_filter_sql(
+def _allowed_amount_provider_sex_filter_sql(
     args: Mapping[str, Any],
     parameter_map: dict[str, Any],
 ) -> str:
-    predicates: list[str] = []
+    """Build the canonical provider-sex predicate for allowed evidence."""
+
+    provider_sex_code = normalize_provider_sex_code(
+        args.get("provider_sex_code")
+    )
+    if provider_sex_code is None:
+        return ""
+    parameter_map["allowed_provider_sex_code"] = provider_sex_code
+    return "npi_data.provider_sex_code = :allowed_provider_sex_code"
+
+
+def _allowed_amount_base_provider_predicates(
+    args: Mapping[str, Any],
+    parameter_map: dict[str, Any],
+) -> list[str]:
+    """Return the shared non-taxonomy provider predicates."""
+
+    provider_sex_predicate = _allowed_amount_provider_sex_filter_sql(
+        args,
+        parameter_map,
+    )
+    return [provider_sex_predicate] if provider_sex_predicate else []
+
+
+def _allowed_amount_provider_filter_sql(
+    args: Mapping[str, Any],
+    parameter_map: dict[str, Any],
+) -> str:
+    """Build demographic and taxonomy predicates for allowed evidence."""
+
+    predicates = _allowed_amount_base_provider_predicates(args, parameter_map)
     specialty_filter = resolve_provider_specialty_filter(args)
     if specialty_filter.active:
         predicates.append(
@@ -5498,6 +5540,7 @@ _ALLOWED_AMOUNT_PAGE_SQL_TEMPLATE = f"""
         SELECT
             provider_rollup.*,
             __PROVIDER_NAME_SQL__ AS provider_name,
+            npi_data.provider_sex_code,
             __LOCATION_SELECT_SQL__
           FROM provider_rollup
           LEFT JOIN {PTG2_SCHEMA}.npi npi_data
@@ -5505,7 +5548,7 @@ _ALLOWED_AMOUNT_PAGE_SQL_TEMPLATE = f"""
           __LOCATION_JOIN_SQL__
          WHERE TRUE
                __LOCATION_REQUIRED_SQL__
-               __TAXONOMY_FILTER_SQL__
+               __PROVIDER_FILTER_SQL__
     ),
     provider_page AS MATERIALIZED (
         SELECT *
@@ -5602,7 +5645,7 @@ def _allowed_amount_page_sql(
         "__LOCATION_SELECT_SQL__": location_select_sql,
         "__LOCATION_JOIN_SQL__": location_join_sql,
         "__LOCATION_REQUIRED_SQL__": location_required_sql,
-        "__TAXONOMY_FILTER_SQL__": _allowed_amount_taxonomy_filter_sql(
+        "__PROVIDER_FILTER_SQL__": _allowed_amount_provider_filter_sql(
             args,
             parameter_map,
         ),
@@ -5978,6 +6021,7 @@ def _allowed_amount_response_filters(
 ) -> dict[str, Any]:
     return {
         "specialty": args.get("specialty") or None,
+        "provider_sex_code": args.get("provider_sex_code") or None,
         "taxonomy_codes": (
             args.get("taxonomy_codes") or args.get("taxonomy_code") or None
         ),
@@ -6309,6 +6353,7 @@ def _allowed_amount_provider_identity(
         "provider_name": (
             provider_by_field.get("provider_name") or "TiC provider"
         ),
+        "provider_sex_code": provider_by_field.get("provider_sex_code"),
         "state": provider_by_field.get("state"),
         "city": provider_by_field.get("city"),
         "zip5": provider_by_field.get("zip5"),
@@ -6519,7 +6564,11 @@ async def group_plan_providers(request):
         cursor_npi = int(cursor_raw) if cursor_raw else 0
     except (TypeError, ValueError):
         cursor_npi = 0
-    enrich = (request.args.get("enrich") or "").strip().lower() in ("1", "true", "yes")
+    include_enrichment = (request.args.get("enrich") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     city = (request.args.get("city") or "").strip().lower()
     state = (request.args.get("state") or "").strip().upper()
     zip5 = _normalize_zip5(request.args.get("zip5"))
@@ -6537,6 +6586,9 @@ async def group_plan_providers(request):
         "include_mail_addresses",
         default=False,
     )
+    provider_sex_code = normalize_provider_sex_code(
+        request.args.get("provider_sex_code")
+    )
     specialty_filter = await _resolve_ptg_specialty_or_raise(session, request.args)
     specialty_warning = None
 
@@ -6550,6 +6602,7 @@ async def group_plan_providers(request):
             "snapshot_id": None, "resolved": False,
             "reason": "no published serving snapshot for this plan_id + market_type",
             "providers": {"count": 0, "items": [], "next_cursor": None},
+            "provider_sex_code": provider_sex_code,
             "taxonomy_filter": specialty_filter.response_payload(),
             "specialty_warning": specialty_warning,
             "exhausted": True,
@@ -6609,6 +6662,18 @@ async def group_plan_providers(request):
         specialty_filter,
     ) if specialty_filter.active else ""
     taxonomy_where = f"\n               AND {taxonomy_predicate}" if taxonomy_predicate else ""
+    provider_sex_predicate = provider_sex_exists_sql(
+        "gm.npi",
+        params,
+        "group_provider_sex",
+        provider_sex_code,
+        schema=PRICING_SCHEMA,
+    )
+    provider_sex_where = (
+        f"\n               AND {provider_sex_predicate}"
+        if provider_sex_predicate
+        else ""
+    )
     has_location_filter = bool(city or state or zip5)
     address_table = f"{PRICING_SCHEMA}.npi_address"
     uses_unified_addresses = False
@@ -6642,7 +6707,12 @@ async def group_plan_providers(request):
                 state_hint=state or None,
             )
             location_zips = sorted(
-                {str(row.get("zip5")) for row in radius_rows if row.get("zip5")} | {zip5}
+                {
+                    str(radius_record.get("zip5"))
+                    for radius_record in radius_rows
+                    if radius_record.get("zip5")
+                }
+                | {zip5}
             )
         else:
             location_zips = [zip5]
@@ -6702,6 +6772,15 @@ async def group_plan_providers(request):
             )
         if candidate_taxonomy_predicate:
             candidate_clauses.append(candidate_taxonomy_predicate)
+        candidate_provider_sex_predicate = provider_sex_exists_sql(
+            "addr.npi",
+            params,
+            "group_candidate_sex",
+            provider_sex_code,
+            schema=PRICING_SCHEMA,
+        )
+        if candidate_provider_sex_predicate:
+            candidate_clauses.append(candidate_provider_sex_predicate)
         candidate_where = "\n                      AND ".join(candidate_clauses)
         candidate_cte = f"""WITH local_specialty_npis AS MATERIALIZED (
                 SELECT DISTINCT addr.npi
@@ -6736,29 +6815,39 @@ async def group_plan_providers(request):
                   FROM {PRICING_SCHEMA}.ptg2_v3_npi_scope gm
                  WHERE gm.npi BETWEEN :npi_min AND :npi_max
                    AND gm.snapshot_key = :split_snapshot_key
-                   AND gm.npi > :cursor_npi{taxonomy_where}{location_where}
+                   AND gm.npi > :cursor_npi{taxonomy_where}{provider_sex_where}{location_where}
                  ORDER BY gm.npi
                  LIMIT :limit
                 """
-            split_query_params = {
+            split_parameters_by_name = {
                 **split_query_params_by_name,
                 "split_snapshot_key": split_snapshot_key,
             }
-            split_rows = (await session.execute(text(provider_sql), split_query_params)).fetchall()
-            provider_npi_set.update(int(row.npi) for row in split_rows if row.npi is not None)
+            split_rows = (
+                await session.execute(text(provider_sql), split_parameters_by_name)
+            ).fetchall()
+            provider_npi_set.update(
+                int(split_record.npi)
+                for split_record in split_rows
+                if split_record.npi is not None
+            )
         provider_npis = sorted(provider_npi_set)[:limit]
     else:
         provider_sql = f"""
             SELECT DISTINCT gm.npi
               FROM {group_member_table} gm
              WHERE gm.npi BETWEEN :npi_min AND :npi_max
-               AND gm.npi > :cursor_npi{taxonomy_where}{location_where}
+               AND gm.npi > :cursor_npi{taxonomy_where}{provider_sex_where}{location_where}
              ORDER BY gm.npi
              LIMIT :limit
             """
     if provider_npis is None:
         provider_rows = (await session.execute(text(provider_sql), params)).fetchall()
-        provider_npis = [int(row.npi) for row in provider_rows if row.npi is not None]
+        provider_npis = [
+            int(provider_record.npi)
+            for provider_record in provider_rows
+            if provider_record.npi is not None
+        ]
 
     total_distinct = None
     is_count_requested = (request.args.get("count") or "").strip().lower() in ("1", "true", "yes")
@@ -6776,26 +6865,29 @@ async def group_plan_providers(request):
         else:
             count_sql = f"""
                 SELECT COUNT(DISTINCT gm.npi)
-                  FROM {group_member_table} gm
-                 WHERE gm.npi BETWEEN :npi_min AND :npi_max{taxonomy_where}{location_where}
+                 FROM {group_member_table} gm
+                 WHERE gm.npi BETWEEN :npi_min AND :npi_max{taxonomy_where}{provider_sex_where}{location_where}
                 """
         total_distinct = int((await session.execute(text(count_sql), params)).scalar() or 0)
 
     provider_items: list[dict[str, Any]] = [{"npi": npi} for npi in provider_npis]
     addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
     if has_location_filter and provider_npis:
-        address_params: dict[str, Any] = {"npis": provider_npis, "plan_id": plan_id}
+        address_parameters_by_name: dict[str, Any] = {
+            "npis": provider_npis,
+            "plan_id": plan_id,
+        }
         address_clauses = ["addr.npi = ANY(:npis)"]
         if not include_mail_addresses:
             address_clauses.append(f"addr.type IN ({_group_plan_provider_address_type_sql(address_types)})")
         if city:
-            address_params["location_city"] = city
+            address_parameters_by_name["location_city"] = city
             address_clauses.append("LOWER(COALESCE(addr.city_name, '')) = :location_city")
         if state:
-            address_params["location_state"] = state
+            address_parameters_by_name["location_state"] = state
             address_clauses.append(f"{state_expr} = :location_state")
         if location_zips:
-            address_params["location_zips"] = location_zips
+            address_parameters_by_name["location_zips"] = location_zips
             address_clauses.append(f"{zip5_expr} = ANY(:location_zips)")
         address_where = "\n                   AND ".join(address_clauses)
         coverage_match_sql = _group_plan_provider_coverage_match_sql(
@@ -6851,10 +6943,10 @@ async def group_plan_providers(request):
                           addr.first_line
                 """
             ),
-            address_params,
+            address_parameters_by_name,
         )).mappings().all()
         for address_row in address_rows:
-            provider_address = {
+            provider_address_by_field = {
                 "type": address_row.get("type"),
                 "first_line": address_row.get("first_line"),
                 "second_line": address_row.get("second_line"),
@@ -6865,10 +6957,12 @@ async def group_plan_providers(request):
                 "phone_number": address_row.get("phone_number"),
             }
             if uses_unified_addresses:
-                provider_address["address_precision"] = address_row.get("address_precision")
-                provider_address["plan_coverage_match"] = bool(address_row.get("plan_coverage_match"))
-            addresses_by_npi.setdefault(int(address_row["npi"]), []).append(provider_address)
-    if enrich and provider_npis:
+                provider_address_by_field["address_precision"] = address_row.get("address_precision")
+                provider_address_by_field["plan_coverage_match"] = bool(address_row.get("plan_coverage_match"))
+            addresses_by_npi.setdefault(int(address_row["npi"]), []).append(
+                provider_address_by_field
+            )
+    if include_enrichment and provider_npis:
         enrich_rows = (await session.execute(
             select(
                 npi_data_table.c.npi,
@@ -6877,19 +6971,29 @@ async def group_plan_providers(request):
                 npi_data_table.c.provider_organization_name,
                 npi_data_table.c.provider_credential_text,
                 npi_data_table.c.entity_type_code,
+                npi_data_table.c.provider_sex_code,
             ).where(npi_data_table.c.npi.in_(provider_npis))
         )).fetchall()
-        by_npi = {int(r.npi): r for r in enrich_rows}
+        by_npi = {
+            int(enrichment_record.npi): enrichment_record
+            for enrichment_record in enrich_rows
+        }
         for provider_item in provider_items:
             npi_row = by_npi.get(provider_item["npi"])
             if npi_row is None:
                 continue
             person = " ".join(
-                p for p in [npi_row.provider_first_name, npi_row.provider_last_name] if p
+                name_part
+                for name_part in [
+                    npi_row.provider_first_name,
+                    npi_row.provider_last_name,
+                ]
+                if name_part
             )
             provider_item["name"] = person or (npi_row.provider_organization_name or None)
             provider_item["credential"] = npi_row.provider_credential_text
             provider_item["entity_type_code"] = npi_row.entity_type_code
+            provider_item["provider_sex_code"] = npi_row.provider_sex_code
     for provider_item in provider_items:
         item_addresses = addresses_by_npi.get(provider_item["npi"])
         if item_addresses:
@@ -6905,6 +7009,7 @@ async def group_plan_providers(request):
         "source_key": selected_source_key,
         "snapshots": snapshots,
         "resolved": True,
+        "provider_sex_code": provider_sex_code,
         "taxonomy_filter": specialty_filter.response_payload(),
         "specialty_warning": specialty_warning,
         "location_filter": {
@@ -8849,13 +8954,13 @@ async def resolve_procedure_term(request):
     """Resolve a procedure or service term to catalog and internal codes."""
     session = _get_session(request)
     args = request.args
-    q = _normalize_query_text(args.get("q"), "q", min_len=2)
+    search_term = _normalize_query_text(args.get("q"), "q", min_len=2)
     exact = _parse_bool(args.get("exact"), "exact", default=True)
     include_broad = _parse_bool(args.get("include_broad"), "include_broad", default=True)
     procedure_rows = await _query_terminology(
         session,
         domain="procedure",
-        term=q,
+        term=search_term,
         exact=exact,
         include_broad=include_broad,
         limit=100,
@@ -8870,7 +8975,7 @@ async def resolve_procedure_term(request):
                 for row in procedure_rows
             ],
             "query": {
-                "q": q,
+                "q": search_term,
                 "exact": exact,
                 "include_broad": include_broad,
                 "matched": bool(procedure_rows),
@@ -8886,12 +8991,12 @@ async def resolve_medication_term(request):
     """Resolve a medication term to terminology matches and internal codes."""
     session = _get_session(request)
     args = request.args
-    q = _normalize_query_text(args.get("q"), "q", min_len=2)
+    search_term = _normalize_query_text(args.get("q"), "q", min_len=2)
     exact = _parse_bool(args.get("exact"), "exact", default=True)
     medication_rows = await _query_terminology(
         session,
         domain="medication",
-        term=q,
+        term=search_term,
         exact=exact,
         include_broad=True,
         limit=100,
@@ -8909,7 +9014,7 @@ async def resolve_medication_term(request):
                 for medication_row in medication_rows
             ],
             "query": {
-                "q": q,
+                "q": search_term,
                 "exact": exact,
                 "matched": bool(medication_rows),
             },
@@ -9698,6 +9803,9 @@ async def list_providers_by_procedure(request):
     snapshot_id = str(args.get("snapshot_id", "")).strip()
     mode = str(args.get("mode", "")).strip()
     npi = _parse_int(args.get("npi") or None, "npi", minimum=1)
+    provider_sex_code = normalize_provider_sex_code(
+        args.get("provider_sex_code")
+    )
     args.get("provider_type")
     args.get("classification")
     args.get("taxonomy_codes")
@@ -9729,6 +9837,7 @@ async def list_providers_by_procedure(request):
             "latitude": latitude,
             "longitude": longitude,
             "npi": npi,
+            "provider_sex_code": provider_sex_code,
         },
         specialty_filter=ptg_specialty_filter,
     )
@@ -9772,6 +9881,7 @@ async def list_providers_by_procedure(request):
                     or specialty_probe.taxonomy_codes
                     or None
                 ),
+                "provider_sex_code": provider_sex_code,
                 "include_subspecialties": args.get("include_subspecialties") or None,
                 "primary_only": args.get("primary_only") or None,
                 "taxonomy_code": args.get("taxonomy_code") or None,
@@ -9850,6 +9960,7 @@ async def list_providers_by_procedure(request):
                 "taxonomy_classification": args.get("taxonomy_classification") or None,
                 "taxonomy_specialization": args.get("taxonomy_specialization") or None,
                 "taxonomy_section": args.get("taxonomy_section") or None,
+                "provider_sex_code": provider_sex_code,
                 "state": state or None,
                 "city": city or None,
                 "zip5": zip5 or None,
@@ -10016,6 +10127,18 @@ async def list_providers_by_procedure(request):
         filters.append(provider_procedure_table.c.total_services >= min_claims)
     if min_total_cost is not None:
         filters.append(provider_procedure_table.c.total_allowed_amount >= min_total_cost)
+    provider_procedure_from = provider_procedure_table.join(
+        provider_table,
+        provider_table.c.npi == provider_procedure_table.c.npi,
+    )
+    if provider_sex_code is not None:
+        provider_procedure_from = provider_procedure_from.join(
+            npi_data_table,
+            npi_data_table.c.npi == provider_procedure_table.c.npi,
+        )
+        filters.append(
+            npi_data_table.c.provider_sex_code == provider_sex_code
+        )
     where_clause = and_(*filters)
 
     grouped = (
@@ -10032,7 +10155,7 @@ async def list_providers_by_procedure(request):
             func.sum(provider_procedure_table.c.total_beneficiaries).label("total_beneficiaries"),
             func.count(func.distinct(provider_procedure_table.c.procedure_code)).label("matched_service_codes"),
         )
-        .select_from(provider_procedure_table.join(provider_table, provider_table.c.npi == provider_procedure_table.c.npi))
+        .select_from(provider_procedure_from)
         .where(where_clause)
         .group_by(
             provider_procedure_table.c.npi,
@@ -10113,6 +10236,7 @@ async def list_providers_by_procedure(request):
         "zip_radius_miles": zip_radius_miles if zip5 else None,
         "zip_candidate_count": len(zip_filter_values) if zip_filter_values else (1 if zip5 else None),
         "specialty": specialty or None,
+        "provider_sex_code": provider_sex_code,
         "provider_type_resolution": provider_type_resolution,
         "procedure_term_resolution": procedure_term_resolution,
         "min_claims": min_claims,
@@ -10166,6 +10290,7 @@ async def list_providers_by_procedure(request):
                 "city": city or None,
                 "zip5": zip5 or None,
                 "specialty": specialty or None,
+                "provider_sex_code": provider_sex_code,
                 "q": q or None,
                 "min_claims": min_claims,
                 "min_total_cost": min_total_cost,

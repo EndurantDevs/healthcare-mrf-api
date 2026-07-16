@@ -365,6 +365,28 @@ def test_openapi_exposes_strict_v3_allowed_amount_fallback():
     }
 
 
+def test_provider_routes_share_canonical_provider_sex_parameter():
+    """Keep one provider-sex parameter name and value contract across APIs."""
+
+    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    for path in (
+        "/npi/all",
+        "/npi/near/",
+        "/pricing/group-plan-providers",
+        "/pricing/providers/search-by-procedure",
+        "/pricing/providers/by-procedure",
+    ):
+        parameters = spec["paths"][path]["get"]["parameters"]
+        provider_sex_parameter = next(
+            parameter_by_field
+            for parameter_by_field in parameters
+            if parameter_by_field["name"] == "provider_sex_code"
+        )
+        assert provider_sex_parameter["in"] == "query"
+        assert provider_sex_parameter["schema"]["enum"] == ["M", "F", "U", "X"]
+        assert provider_sex_parameter["schema"]["type"] == "string"
+
+
 def test_openapi_documents_allowed_unverified_location_suppression():
     """Document allowed fallback output suppression without changing filtering."""
 

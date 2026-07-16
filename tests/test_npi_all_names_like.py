@@ -356,6 +356,35 @@ async def test_get_all_without_taxonomy_filters_skips_expensive_overlap(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_get_all_zip_taxonomy_uses_location_first_probe(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    request = types.SimpleNamespace(
+        args={
+            "zip_code": "60601",
+            "codes": "207Q00000X",
+            "provider_sex_code": "f",
+            "include_total": "false",
+            "limit": "10",
+            "start": "0",
+        }
+    )
+    await get_all(request)
+
+    page_sql = conn.sql_calls[-1][0]
+    assert "JOIN LATERAL" in page_sql
+    assert "FROM mrf.npi_taxonomy AS provider_taxonomy" in page_sql
+    assert (
+        "provider_taxonomy.healthcare_provider_taxonomy_code "
+        "IN (:page_provider_taxonomy_code_0)"
+    ) in page_sql
+    assert "c.taxonomy_array && q.int_codes" not in page_sql
+    assert "sex_provider.provider_sex_code = :provider_sex_code" in page_sql
+    assert conn.sql_calls[-1][1]["page_provider_taxonomy_code_0"] == "207Q00000X"
+
+
+@pytest.mark.asyncio
 async def test_get_all_zip_phone_and_name_filters_are_applied(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
