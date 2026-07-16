@@ -5757,7 +5757,7 @@ def test_ptg2_source_plan_rows_uses_strict_plan_month_rows(monkeypatch):
 
     async def fake_all(statement, **_params):
         calls.append(statement)
-        assert "ptg2_v3_snapshot_scope" in statement
+        assert "ptg2_v3_snapshot_plan_scope" in statement
         assert "ptg2_plan_month AS plan_month" in statement
         return [{"plan_id": "TESTPLAN001", "plan_market_type": "group"}]
 
@@ -5832,7 +5832,20 @@ def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkey
 
     class FakeSession:
         async def execute(self, statement, params=None):
-            executed_list.append((str(statement), params or {}))
+            sql = str(statement)
+            executed_list.append((sql, params or {}))
+            if "RETURNING coverage_scope_id" in sql:
+                return SimpleNamespace(first=lambda: (b"s" * 32,))
+            if "SELECT plan_id, plan_market_type" in sql:
+                return [
+                    {
+                        "plan_id": "TESTPLAN001",
+                        "plan_market_type": "group",
+                    }
+                ]
+            if "SELECT status FROM staged" in sql:
+                return SimpleNamespace(first=lambda: ("validated",))
+            return SimpleNamespace(first=lambda: None)
 
         async def scalar(self, statement, params=None):
             executed_list.append((str(statement), params or {}))
@@ -5859,8 +5872,12 @@ def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkey
             snapshot_attributes=base_snapshot,
             shared_snapshot_key=7,
             coverage_scope_id=b"s" * 32,
-            coverage_plan_id="TESTPLAN001",
-            coverage_plan_market_type="group",
+            coverage_plan_scopes=[
+                {
+                    "plan_id": "TESTPLAN001",
+                    "plan_market_type": "group",
+                }
+            ],
         )
     )
 
@@ -5877,6 +5894,7 @@ def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkey
     bind_layout.assert_awaited_once()
     joined = "\n".join(statement for statement, _params in executed_list)
     assert "ptg2_v3_snapshot_scope" in joined
+    assert "ptg2_v3_snapshot_plan_scope" in joined
     assert "UPDATE \"mrf\".ptg2_snapshot" in joined
     assert "ptg2_current_source_snapshot" not in joined
     assert "ptg2_current_plan_source" not in joined
@@ -6515,8 +6533,12 @@ def _run_reused_mixed_publish(
             shared_snapshot_key=7,
             semantic_fingerprint=b"\x11" * 32,
             coverage_scope_id=b"\x22" * 32,
-            coverage_plan_id="TEST-PLAN-001",
-            coverage_plan_market_type="group",
+            coverage_plan_scopes=[
+                SimpleNamespace(
+                    plan_id="TEST-PLAN-001",
+                    plan_market_type="group",
+                )
+            ],
             snapshot_id="ptg2:202607:reused-mixed",
             import_run_id="reused-mixed",
             source_key="example_dental",

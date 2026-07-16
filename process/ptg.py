@@ -181,6 +181,7 @@ from process.ptg_parts.ptg2_shared_finalize import (
 )
 from process.ptg_parts.ptg2_shared_reuse import (
     SharedPhysicalArtifactIdentity,
+    logical_plan_fields_for_job,
     normalized_physical_artifact_identity,
     same_downloaded_physical_input,
     shared_logical_artifact_metadata,
@@ -3116,12 +3117,31 @@ async def _publish_shared_v3_source_dictionary(
     await publish_shared_v3_snapshot_sources(
         schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
         snapshot_id=snapshot_id,
-        plan_id=shared_input_identity.logical_plan.plan_id,
-        plan_market_type=shared_input_identity.logical_plan.plan_market_type,
+        plan_scopes=shared_input_identity.logical_plans,
         coverage_scope_id=shared_input_identity.coverage_scope_id,
         assignments=assignments,
     )
     return assignments
+
+
+async def _publish_shared_v3_plan_rows(
+    *,
+    shared_input_identity: Any,
+    snapshot_id: str,
+    import_month: datetime.date,
+) -> None:
+    """Persist every logical plan that will bind to one physical V3 layout."""
+
+    for plan_fields in shared_input_identity.logical_plan_fields_by_scope:
+        plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(
+            dict(plan_fields),
+            snapshot_id,
+            import_month,
+        )
+        await _push_ptg2_objects([plan_row], PTG2Plan, rewrite=True)
+        if alias_rows:
+            await _push_ptg2_objects(alias_rows, PTG2PlanAlias, rewrite=True)
+        await _push_ptg2_objects([plan_month_row], PTG2PlanMonth, rewrite=True)
 
 
 def _is_shared_v3_preflight_eligible(
@@ -3140,9 +3160,7 @@ def _is_shared_v3_preflight_eligible(
         ):
             return False
         job = downloaded.job
-        meta = job.get("meta") if isinstance(job.get("meta"), dict) else {}
-        plan_info = job.get("plan_info") if isinstance(job.get("plan_info"), list) else None
-        if not str(_derive_plan_fields(meta, plan_info).get("plan_id") or "").strip():
+        if not logical_plan_fields_for_job(job):
             return False
     return True
 
@@ -3214,8 +3232,7 @@ async def _publish_reused_shared_v3_snapshot(
     shared_snapshot_key: int,
     semantic_fingerprint: bytes,
     coverage_scope_id: bytes,
-    coverage_plan_id: str,
-    coverage_plan_market_type: str,
+    coverage_plan_scopes: Sequence[Any],
     snapshot_id: str,
     import_run_id: str,
     source_key: str,
@@ -3256,7 +3273,6 @@ async def _publish_reused_shared_v3_snapshot(
             )
         )
     source_file_versions: list[dict[str, Any]] = []
-    observed_plans: set[tuple[str, str]] = set()
     source_trace_hashes: set[str] = set()
     network_names: set[str] = set()
     source_provenance_entries: list[dict[str, Any]] = []
@@ -3274,30 +3290,6 @@ async def _publish_reused_shared_v3_snapshot(
             import_run_id=import_run_id,
         )
         source_metadata_map = dict(provenance["meta"])
-        plan_info = job.get("plan_info") if isinstance(job.get("plan_info"), list) else None
-        plan_fields = _derive_plan_fields(source_metadata_map, plan_info)
-        plan_id = str(plan_fields.get("plan_id") or "").strip()
-        if not plan_id:
-            raise RuntimeError("strict V3 fast reuse requires source plan identity metadata")
-        plan_market_type = str(plan_fields.get("plan_market_type") or "").strip().lower()
-        if (plan_id, plan_market_type) != (
-            str(coverage_plan_id).strip(),
-            str(coverage_plan_market_type).strip().lower(),
-        ):
-            raise RuntimeError(
-                "strict V3 reusable input plan metadata changed after physical identity planning"
-            )
-        if (plan_id, plan_market_type) not in observed_plans:
-            plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(
-                plan_fields,
-                snapshot_id,
-                import_month,
-            )
-            await _push_ptg2_objects([plan_row], PTG2Plan, rewrite=True)
-            if alias_rows:
-                await _push_ptg2_objects(alias_rows, PTG2PlanAlias, rewrite=True)
-            await _push_ptg2_objects([plan_month_row], PTG2PlanMonth, rewrite=True)
-            observed_plans.add((plan_id, plan_market_type))
         file_row = provenance["file_row"]
         source_version = provenance["source_version"]
         source_trace_hashes.add(str(provenance["source_trace_hash"]))
@@ -3426,8 +3418,7 @@ async def _publish_reused_shared_v3_snapshot(
         snapshot_attributes=snapshot_values_by_field,
         shared_snapshot_key=int(shared_snapshot_key),
         coverage_scope_id=bytes(coverage_scope_id),
-        coverage_plan_id=coverage_plan_id,
-        coverage_plan_market_type=coverage_plan_market_type,
+        coverage_plan_scopes=coverage_plan_scopes,
     )
     if candidate_stage_flags_by_name is not None:
         candidate_stage_flags_by_name["staged"] = True
@@ -4743,7 +4734,7 @@ async def _main_with_artifact_lease(
                 )
             if not _shared_v3_preflight_eligible(buffered_downloads):
                 raise RuntimeError(
-                    "strict V3 requires successful in-network downloads with one logical plan scope"
+                    "strict V3 requires successful in-network downloads with logical plan scope metadata"
                 )
             write_live_progress(
                 phase="planning",
@@ -4757,6 +4748,11 @@ async def _main_with_artifact_lease(
                 buffered_downloads,
                 options=options_by_name,
                 scanner_canon_version=_shared_v3_scanner_identity(),
+            )
+            await _publish_shared_v3_plan_rows(
+                shared_input_identity=shared_input_identity,
+                snapshot_id=snapshot_id,
+                import_month=import_month_value,
             )
             canonical_plan_values_by_field = {
                 key: plan_field_value
@@ -4788,6 +4784,7 @@ async def _main_with_artifact_lease(
                     ),
                     "coverage_scope_id": shared_input_identity.coverage_scope_hex,
                     "shared_layout_reused": shared_layout_reservation.reused,
+                    "logical_plan_count": shared_input_identity.logical_plan_count,
                 }
             )
             if shared_layout_reservation.reused:
@@ -4799,10 +4796,7 @@ async def _main_with_artifact_lease(
                     shared_snapshot_key=shared_layout_reservation.snapshot_key,
                     semantic_fingerprint=shared_input_identity.semantic_fingerprint,
                     coverage_scope_id=shared_input_identity.coverage_scope_id,
-                    coverage_plan_id=shared_input_identity.logical_plan.plan_id,
-                    coverage_plan_market_type=(
-                        shared_input_identity.logical_plan.plan_market_type
-                    ),
+                    coverage_plan_scopes=shared_input_identity.logical_plans,
                     snapshot_id=snapshot_id,
                     import_run_id=import_run_id,
                     source_key=source_key_val,
@@ -5229,10 +5223,7 @@ async def _main_with_artifact_lease(
             snapshot_attributes=snapshot_publish_by_field,
             shared_snapshot_key=published_shared_snapshot_key,
             coverage_scope_id=shared_input_identity.coverage_scope_id,
-            coverage_plan_id=shared_input_identity.logical_plan.plan_id,
-            coverage_plan_market_type=(
-                shared_input_identity.logical_plan.plan_market_type
-            ),
+            coverage_plan_scopes=shared_input_identity.logical_plans,
         )
         candidate_stage_flags_by_name["staged"] = True
         candidate_attributes_by_field = dict(candidate_result["candidate_attributes"])

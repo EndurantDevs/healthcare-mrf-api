@@ -500,10 +500,13 @@ async def test_shared_code_and_provider_support_queries_are_snapshot_scoped():
     assert code_rows[0]["code_key"] == 7
     assert code_rows[0]["negotiation_arrangement"] == "FFS"
     assert "ptg2_v3_code" in code_sql
-    assert "JOIN mrf.ptg2_v3_snapshot_scope logical_scope" in code_sql
-    assert "logical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+    assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in code_sql
+    assert "JOIN LATERAL (" in code_sql
+    assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in code_sql
+    assert "physical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+    assert "plan_scope.snapshot_id = :logical_snapshot_id" in code_sql
     assert (
-        "logical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in code_sql
+        "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in code_sql
     )
     assert "logical_scope.plan_id" in code_sql
     assert "code_metadata.negotiation_arrangement" in code_sql
@@ -562,10 +565,13 @@ async def test_forward_search_scopes_shared_layout_rows_to_each_logical_plan(
         assert response is None
         code_sql, code_params = session.calls[0]
         assert "FROM mrf.ptg2_v3_code code_metadata" in code_sql
-        assert "JOIN mrf.ptg2_v3_snapshot_scope logical_scope" in code_sql
-        assert "logical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+        assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in code_sql
+        assert "JOIN LATERAL (" in code_sql
+        assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in code_sql
+        assert "physical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+        assert "plan_scope.snapshot_id = :logical_snapshot_id" in code_sql
         assert (
-            "logical_scope.coverage_scope_id = code_metadata.coverage_scope_id"
+            "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id"
             in code_sql
         )
         assert "logical_scope.plan_id" in code_sql
@@ -1270,10 +1276,13 @@ async def test_location_rate_provider_lookup_uses_logical_plan_scope(monkeypatch
     assert candidates is expected_candidates
     code_sql, code_params = session.calls[0]
     assert "FROM mrf.ptg2_v3_code code_metadata" in code_sql
-    assert "JOIN mrf.ptg2_v3_snapshot_scope logical_scope" in code_sql
-    assert "logical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+    assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in code_sql
+    assert "JOIN LATERAL (" in code_sql
+    assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in code_sql
+    assert "physical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+    assert "plan_scope.snapshot_id = :logical_snapshot_id" in code_sql
     assert (
-        "logical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in code_sql
+        "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in code_sql
     )
     assert "logical_scope.plan_id" in code_sql
     assert "logical_scope.plan_market_type" in code_sql
@@ -1336,13 +1345,16 @@ async def test_route_proof_joins_logical_scope_and_fails_closed_on_no_row():
     assert has_route is False
     proof_sql, proof_params = session.calls[0]
     assert "FROM mrf.ptg2_v3_code code_metadata" in proof_sql
-    assert "JOIN mrf.ptg2_v3_snapshot_scope logical_scope" in proof_sql
-    assert "logical_scope.snapshot_id = :logical_snapshot_id" in proof_sql
+    assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in proof_sql
+    assert "JOIN LATERAL (" in proof_sql
+    assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in proof_sql
+    assert "physical_scope.snapshot_id = :logical_snapshot_id" in proof_sql
+    assert "plan_scope.snapshot_id = :logical_snapshot_id" in proof_sql
     assert (
-        "logical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in proof_sql
+        "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in proof_sql
     )
-    assert "logical_scope.plan_id = :plan_id" in proof_sql
-    assert "logical_scope.plan_market_type = :plan_market_type" in proof_sql
+    assert "plan_scope.plan_id = :plan_id" in proof_sql
+    assert "plan_scope.plan_market_type = :plan_market_type" in proof_sql
     assert "code_metadata.plan_id" not in proof_sql
     assert "COALESCE(plan_id" not in proof_sql
     assert proof_params == {

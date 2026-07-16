@@ -7,6 +7,7 @@ import pytest
 
 from process.ptg_parts import ptg2_shared_snapshot_publish as publication
 from process.ptg_parts.ptg2_shared_reuse import (
+    SharedLogicalPlanScope,
     SharedPhysicalArtifactIdentity,
     SharedSnapshotSourceAssignment,
     shared_source_set_metadata,
@@ -112,8 +113,7 @@ async def test_fresh_snapshot_source_publication_is_insert_only(monkeypatch):
     rows = await publication.publish_shared_v3_snapshot_sources(
         schema_name="mrf",
         snapshot_id="snapshot-fresh",
-        plan_id="plan-1",
-        plan_market_type="group",
+        plan_scopes=[SharedLogicalPlanScope("plan-1", "ein", "group")],
         coverage_scope_id=b"s" * 32,
         assignments=[assignment],
     )
@@ -147,16 +147,14 @@ async def test_reused_layout_snapshots_keep_independent_trace_and_wrapper_rows(m
     first_rows = await publication.publish_shared_v3_snapshot_sources(
         schema_name="mrf",
         snapshot_id="snapshot-one",
-        plan_id="plan-1",
-        plan_market_type="group",
+        plan_scopes=[SharedLogicalPlanScope("plan-1", "ein", "group")],
         coverage_scope_id=b"s" * 32,
         assignments=[first],
     )
     second_rows = await publication.publish_shared_v3_snapshot_sources(
         schema_name="mrf",
         snapshot_id="snapshot-two",
-        plan_id="plan-2",
-        plan_market_type="group",
+        plan_scopes=[SharedLogicalPlanScope("plan-2", "ein", "group")],
         coverage_scope_id=b"s" * 32,
         assignments=[second],
     )
@@ -185,8 +183,7 @@ async def test_snapshot_source_conflict_fails_without_overwrite(monkeypatch):
         await publication.publish_shared_v3_snapshot_sources(
             schema_name="mrf",
             snapshot_id="snapshot-conflict",
-            plan_id="plan-1",
-            plan_market_type="group",
+            plan_scopes=[SharedLogicalPlanScope("plan-1", "ein", "group")],
             coverage_scope_id=b"s" * 32,
             assignments=[assignment],
         )

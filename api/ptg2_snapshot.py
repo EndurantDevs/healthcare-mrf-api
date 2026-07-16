@@ -141,7 +141,7 @@ async def current_snapshot_id(
             plan_sql = f"""
                    AND EXISTS (
                        SELECT 1
-                         FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_scope snapshot_scope
+                         FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope snapshot_scope
                         WHERE snapshot_scope.snapshot_id = ptg2_snapshot.snapshot_id
                           AND snapshot_scope.plan_id = ANY(CAST(:plan_ids AS text[]))
                           {market_sql}

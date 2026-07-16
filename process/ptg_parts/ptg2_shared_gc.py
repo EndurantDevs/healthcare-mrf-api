@@ -35,6 +35,7 @@ PTG2_V3_MIGRATION_OWNED_TABLE_NAMES = (
     "ptg2_v3_layout_fingerprint",
     "ptg2_v3_snapshot_binding",
     "ptg2_v3_snapshot_scope",
+    "ptg2_v3_snapshot_plan_scope",
     "ptg2_v3_snapshot_source",
     "ptg2_v3_block",
     "ptg2_v3_snapshot_block",

@@ -46,6 +46,7 @@ from process.ptg_parts.ptg2_shared_graph import (
     PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
 )
 from process.ptg_parts.ptg2_shared_reuse import (
+    SharedLogicalPlanScope,
     SharedPhysicalArtifactIdentity,
     SharedSnapshotSourceAssignment,
 )
@@ -62,6 +63,10 @@ MIGRATION_PATHS = (
     / "alembic"
     / "versions"
     / "20260715120000_ptg2_v3_source_audit_witness.py",
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260716130000_ptg2_v3_multi_plan_scope.py",
 )
 SCANNER_TEST_PATH = Path(__file__).with_name("test_ptg2_scanner_v3_runs.py")
 SERVING_RECORD = struct.Struct(">16s16s16sI")
@@ -285,8 +290,9 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         await publish_shared_v3_snapshot_sources(
             schema_name=schema_name,
             snapshot_id=snapshot_id,
-            plan_id="plan-v3-runs",
-            plan_market_type="group",
+            plan_scopes=[
+                SharedLogicalPlanScope("plan-v3-runs", "ein", "group")
+            ],
             coverage_scope_id=coverage_scope_id,
             assignments=[source_assignment],
         )
@@ -771,8 +777,13 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         await publish_shared_v3_snapshot_sources(
             schema_name=schema_name,
             snapshot_id=reused_snapshot_id,
-            plan_id="plan-v3-runs-reused",
-            plan_market_type="group",
+            plan_scopes=[
+                SharedLogicalPlanScope(
+                    "plan-v3-runs-reused",
+                    "ein",
+                    "group",
+                )
+            ],
             coverage_scope_id=coverage_scope_id,
             assignments=[reused_assignment],
         )

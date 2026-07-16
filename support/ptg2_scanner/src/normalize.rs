@@ -30,6 +30,46 @@ pub fn normalize_code(value: Option<&Value>) -> Option<String> {
     normalize_string(value).map(|value| value.to_uppercase())
 }
 
+pub fn normalize_code_system(value: Option<&Value>) -> Option<String> {
+    normalize_code(value).map(|value| {
+        match value.as_str() {
+            "CLM_REV_CNTR_CD" | "REVENUE_CENTER" | "REVENUE_CODE" | "REV_CNTR" => "RC",
+            "PLACE_OF_SERVICE" | "SERVICE_CODE" => "POS",
+            "BILLING_CODE_MODIFIER" | "CPT_MODIFIER" | "HCPCS_MODIFIER" | "MOD" => "MODIFIER",
+            "ICD-10-CM" | "ICD10" => "ICD10CM",
+            "ICD-10-PCS" => "ICD10PCS",
+            "MS-DRG" | "MSDRG" | "DRG" => "MS_DRG",
+            "RXCUI" => "RXNORM",
+            "SNOMED" | "SNOMEDCT" => "SNOMEDCT_US",
+            _ => value.as_str(),
+        }
+        .to_string()
+    })
+}
+
+pub fn normalize_catalog_code(value: Option<&Value>, code_system: Option<&str>) -> Option<String> {
+    let code = normalize_code(value)?;
+    match code_system {
+        Some("RC") => Some(zero_pad_numeric_code(code, 4)),
+        Some("POS") => Some(zero_pad_numeric_code(code, 2)),
+        Some("MS_DRG") => Some(zero_pad_numeric_code(code, 3)),
+        Some("ICD10CM" | "ICD10PCS") => Some(code.replace('.', "")),
+        _ => Some(code),
+    }
+}
+
+fn zero_pad_numeric_code(code: String, width: usize) -> String {
+    let digits = code
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    if digits.is_empty() {
+        code
+    } else {
+        format!("{digits:0>width$}")
+    }
+}
+
 pub fn normalize_tin_type(value: Option<&Value>) -> String {
     normalize_string(value)
         .unwrap_or_default()
@@ -170,18 +210,14 @@ pub fn strict_npi_partition(value: Option<&Value>) -> io::Result<StrictNpiList> 
             "provider group npi must contain at least one JSON integer",
         ));
     }
-    if items.len() == 1 && strict_integer(&items[0], "provider group npi element")? == 0 {
-        return Ok(StrictNpiList::default());
-    }
     let mut valid = Vec::with_capacity(items.len());
     let mut quarantined = Vec::new();
     for item in items {
         let npi = strict_integer(item, "provider group npi element")?;
         if npi == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "provider group zero NPI marker must be the sole array element",
-            ));
+            // Zero is the TiC TIN-only marker, not an NPI. Some publishers
+            // repeat it beside real NPIs; it must not create membership.
+            continue;
         } else if is_valid_npi(npi) {
             valid.push(npi);
         } else {
@@ -436,11 +472,12 @@ pub fn canonical_text_list(values: Vec<String>, uppercase: bool) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_text_list, int_list, normalize_code, normalize_money_text, normalize_string,
-        normalize_tin_type, normalize_tin_value, normalized_money_from_reader,
-        normalized_scalar_from_reader, normalized_string_list_from_reader, npi_list,
-        strict_integer, strict_integer_text, strict_money_number_from_reader, strict_npi_list,
-        strict_npi_partition, strict_string_array_from_reader, StrictNpiList,
+        canonical_text_list, int_list, normalize_catalog_code, normalize_code,
+        normalize_code_system, normalize_money_text, normalize_string, normalize_tin_type,
+        normalize_tin_value, normalized_money_from_reader, normalized_scalar_from_reader,
+        normalized_string_list_from_reader, npi_list, strict_integer, strict_integer_text,
+        strict_money_number_from_reader, strict_npi_list, strict_npi_partition,
+        strict_string_array_from_reader, StrictNpiList,
     };
     use serde_json::json;
     use struson::reader::JsonStreamReader;
@@ -458,6 +495,34 @@ mod tests {
             Some("true".to_string())
         );
         assert_eq!(normalize_code(Some(&json!(" rc "))), Some("RC".to_string()));
+    }
+
+    #[test]
+    fn canonicalizes_external_code_systems_and_catalog_codes() {
+        assert_eq!(
+            normalize_code_system(Some(&json!(" ms-drg "))),
+            Some("MS_DRG".to_string())
+        );
+        assert_eq!(
+            normalize_code_system(Some(&json!("revenue_code"))),
+            Some("RC".to_string())
+        );
+        assert_eq!(
+            normalize_catalog_code(Some(&json!("7")), Some("MS_DRG")),
+            Some("007".to_string())
+        );
+        assert_eq!(
+            normalize_catalog_code(Some(&json!("450")), Some("RC")),
+            Some("0450".to_string())
+        );
+        assert_eq!(
+            normalize_catalog_code(Some(&json!("A12.34")), Some("ICD10CM")),
+            Some("A1234".to_string())
+        );
+        assert_eq!(
+            normalize_catalog_code(Some(&json!("custom")), Some("CPT")),
+            Some("CUSTOM".to_string())
+        );
     }
 
     #[test]
@@ -515,6 +580,17 @@ mod tests {
                 quarantined: vec![123456789, 123456789],
             }
         );
+        assert_eq!(
+            strict_npi_partition(Some(&json!([0, 1234567890, 0]))).unwrap(),
+            StrictNpiList {
+                valid: vec![1234567890],
+                quarantined: Vec::new(),
+            }
+        );
+        assert_eq!(
+            strict_npi_partition(Some(&json!([0, 0]))).unwrap(),
+            StrictNpiList::default(),
+        );
         for invalid in [
             json!(1234567890_i64),
             json!([]),
@@ -522,9 +598,6 @@ mod tests {
             json!([true]),
             json!([{}]),
             json!([[]]),
-            json!([0, 1234567890]),
-            json!([1234567890, 0]),
-            json!([0, 0]),
         ] {
             assert!(strict_npi_list(Some(&invalid)).is_err());
         }

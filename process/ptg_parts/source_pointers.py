@@ -7,7 +7,7 @@ import datetime
 import json
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from db.connection import db
 from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
@@ -253,7 +253,7 @@ async def _source_plan_rows(
           FROM (
                 SELECT scope.plan_id,
                        COALESCE(scope.plan_market_type, '') AS plan_market_type
-                  FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope AS scope
+                  FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_plan_scope AS scope
                  WHERE scope.snapshot_id = :snapshot_id
                 UNION ALL
                 SELECT plan.plan_id,
@@ -589,11 +589,10 @@ async def _bind_snapshot_coverage_scope(
     schema_name: str,
     snapshot_id: str,
     coverage_scope_id: bytes,
-    coverage_plan_id: str,
-    coverage_plan_market_type: str,
     plan_pointer_entries: list[dict[str, Any]],
+    coverage_plan_scopes: Sequence[Any] | None = None,
 ) -> None:
-    """Bind logical plan ownership to one immutable physical coverage scope."""
+    """Bind all logical plans to one immutable physical coverage scope."""
 
     scope_id = bytes(coverage_scope_id)
     if len(scope_id) != 32:
@@ -608,57 +607,101 @@ async def _bind_snapshot_coverage_scope(
     }
     if not distinct_plans:
         raise RuntimeError("strict V3 snapshot has no logical plan for its coverage scope")
-    expected_plan = (
-        str(coverage_plan_id or "").strip(),
-        str(coverage_plan_market_type or "").strip().lower(),
+    expected_plans = (
+        {
+            (
+                str(
+                    scope.get("plan_id")
+                    if isinstance(scope, Mapping)
+                    else getattr(scope, "plan_id", "")
+                ).strip(),
+                str(
+                    scope.get("plan_market_type")
+                    if isinstance(scope, Mapping)
+                    else getattr(scope, "plan_market_type", "")
+                )
+                .strip()
+                .lower(),
+            )
+            for scope in coverage_plan_scopes
+        }
+        if coverage_plan_scopes is not None
+        else set(distinct_plans)
     )
-    if not expected_plan[0]:
-        raise ValueError("strict V3 publication requires its logical coverage plan id")
-    if distinct_plans != {expected_plan}:
+    expected_plans = {plan for plan in expected_plans if plan[0]}
+    if not expected_plans:
+        raise ValueError("strict V3 publication requires logical coverage plans")
+    if distinct_plans != expected_plans:
         raise RuntimeError(
             f"PTG snapshot {snapshot_id} plan pointers do not match its immutable coverage scope"
         )
-    for plan_id, plan_market_type in sorted(distinct_plans):
-        result = await session.execute(
-            db.text(
-                f"""
-                INSERT INTO {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope
-                    (snapshot_id, plan_id, plan_market_type, coverage_scope_id)
-                VALUES
-                    (:snapshot_id, :plan_id, :plan_market_type, :coverage_scope_id)
-                ON CONFLICT (snapshot_id) DO UPDATE SET
-                    coverage_scope_id = EXCLUDED.coverage_scope_id
-                WHERE {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope.plan_id
-                      = EXCLUDED.plan_id
-                  AND {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope.plan_market_type
-                      = EXCLUDED.plan_market_type
-                  AND {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope.coverage_scope_id
-                      = EXCLUDED.coverage_scope_id
-                RETURNING coverage_scope_id
-                """
-            ),
+    primary_plan_id, primary_plan_market_type = min(expected_plans)
+    result = await session.execute(
+        db.text(
+            f"""
+            INSERT INTO {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope
+                (snapshot_id, plan_id, plan_market_type, coverage_scope_id)
+            VALUES
+                (:snapshot_id, :plan_id, :plan_market_type, :coverage_scope_id)
+            ON CONFLICT (snapshot_id) DO UPDATE SET
+                coverage_scope_id = EXCLUDED.coverage_scope_id
+            WHERE {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope.plan_id
+                  = EXCLUDED.plan_id
+              AND {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope.plan_market_type
+                  = EXCLUDED.plan_market_type
+              AND {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope.coverage_scope_id
+                  = EXCLUDED.coverage_scope_id
+            RETURNING coverage_scope_id
+            """
+        ),
+        {
+            "snapshot_id": snapshot_id,
+            "plan_id": primary_plan_id,
+            "plan_market_type": primary_plan_market_type,
+            "coverage_scope_id": scope_id,
+        },
+    )
+    if not _has_result_row(result):
+        raise RuntimeError(
+            f"PTG snapshot {snapshot_id} is already bound to another physical coverage scope"
+        )
+    await session.execute(
+        db.text(
+            f"""
+            INSERT INTO {_quote_ident(schema_name)}.ptg2_v3_snapshot_plan_scope
+                (snapshot_id, plan_id, plan_market_type)
+            VALUES
+                (:snapshot_id, :plan_id, :plan_market_type)
+            ON CONFLICT (snapshot_id, plan_id, plan_market_type) DO NOTHING
+            """
+        ),
+        [
             {
                 "snapshot_id": snapshot_id,
                 "plan_id": plan_id,
                 "plan_market_type": plan_market_type,
-                "coverage_scope_id": scope_id,
-            },
-        )
-        if not _has_result_row(result):
-            raise RuntimeError(
-                f"PTG snapshot {snapshot_id} is already bound to a different logical plan or coverage scope"
-            )
-    observed = await session.scalar(
+            }
+            for plan_id, plan_market_type in sorted(expected_plans)
+        ],
+    )
+    observed_rows = await session.execute(
         db.text(
             f"""
-            SELECT COUNT(*)
-              FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope
+            SELECT plan_id, plan_market_type
+              FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_plan_scope
              WHERE snapshot_id = :snapshot_id
             """
         ),
         {"snapshot_id": snapshot_id},
     )
-    if int(observed or 0) != len(distinct_plans):
+    observed_plans = {
+        (
+            str(_row_mapping(row).get("plan_id") or ""),
+            str(_row_mapping(row).get("plan_market_type") or ""),
+        )
+        for row in observed_rows
+    }
+    if observed_plans != expected_plans:
         raise RuntimeError(
             f"PTG snapshot {snapshot_id} has stale logical coverage-scope mappings"
         )
@@ -674,8 +717,7 @@ async def _stage_ptg2_source_candidate(
     snapshot_attributes: dict[str, Any],
     shared_snapshot_key: int,
     coverage_scope_id: bytes,
-    coverage_plan_id: str,
-    coverage_plan_market_type: str,
+    coverage_plan_scopes: Sequence[Any],
 ) -> dict[str, Any]:
     """Bind a sealed V3 layout without changing any live serving pointer."""
 
@@ -695,23 +737,31 @@ async def _stage_ptg2_source_candidate(
         )
         plan_pointer_entries = [
             _plan_pointer_entry(
-                plan_id=coverage_plan_id,
-                plan_market_type=coverage_plan_market_type,
+                plan_id=str(
+                    scope.get("plan_id")
+                    if isinstance(scope, Mapping)
+                    else getattr(scope, "plan_id", "")
+                ),
+                plan_market_type=str(
+                    scope.get("plan_market_type")
+                    if isinstance(scope, Mapping)
+                    else getattr(scope, "plan_market_type", "")
+                ),
                 import_month=import_month,
                 source_key=source_key,
                 snapshot_id=snapshot_id,
                 previous_snapshot_id=previous_snapshot_id,
                 updated_at=updated_at,
             )
+            for scope in coverage_plan_scopes
         ]
         await _bind_snapshot_coverage_scope(
             session,
             schema_name=schema_name,
             snapshot_id=snapshot_id,
             coverage_scope_id=coverage_scope_id,
-            coverage_plan_id=coverage_plan_id,
-            coverage_plan_market_type=coverage_plan_market_type,
             plan_pointer_entries=plan_pointer_entries,
+            coverage_plan_scopes=coverage_plan_scopes,
         )
         await _stage_snapshot_in_pointer_transaction(
             session,
@@ -959,6 +1009,46 @@ class _CandidateActivationContext:
     plan_pointer_entries: list[dict[str, Any]]
 
 
+async def _candidate_plan_pointer_entries(
+    session: Any,
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+    previous_snapshot_id: str | None,
+    import_month: datetime.date,
+    activated_at: datetime.datetime,
+) -> list[dict[str, Any]]:
+    plan_scope_result = await session.execute(
+        db.text(
+            f"""
+            SELECT plan_id, plan_market_type
+              FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_plan_scope
+             WHERE snapshot_id = :snapshot_id
+             ORDER BY plan_id, plan_market_type
+            """
+        ),
+        {"snapshot_id": snapshot_id},
+    )
+    plan_pointer_entries = [
+        _plan_pointer_entry(
+            plan_id=str(_row_mapping(row).get("plan_id") or ""),
+            plan_market_type=str(
+                _row_mapping(row).get("plan_market_type") or ""
+            ),
+            import_month=import_month,
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=previous_snapshot_id,
+            updated_at=activated_at,
+        )
+        for row in plan_scope_result
+    ]
+    if not plan_pointer_entries:
+        raise ValueError("validated candidate has no logical plan mappings")
+    return plan_pointer_entries
+
+
 async def _candidate_activation_context(
     session: Any,
     *,
@@ -985,17 +1075,15 @@ async def _candidate_activation_context(
     import_month = candidate.get("import_month")
     if not isinstance(import_month, datetime.date):
         raise ValueError("validated candidate has no import month")
-    plan_pointer_entries = [
-        _plan_pointer_entry(
-            plan_id=activation_by_field["plan_id"],
-            plan_market_type=activation_by_field["plan_market_type"],
-            import_month=import_month,
-            source_key=source_key,
-            snapshot_id=snapshot_id,
-            previous_snapshot_id=activation_by_field["previous_snapshot_id"],
-            updated_at=activated_at,
-        )
-    ]
+    plan_pointer_entries = await _candidate_plan_pointer_entries(
+        session,
+        schema_name=schema_name,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        previous_snapshot_id=activation_by_field["previous_snapshot_id"],
+        import_month=import_month,
+        activated_at=activated_at,
+    )
     return _CandidateActivationContext(
         candidate=candidate,
         activation_by_field=activation_by_field,
@@ -1137,7 +1225,7 @@ def _candidate_activation_result(
         "previous_snapshot_id": activation_context.activation_by_field[
             "previous_snapshot_id"
         ],
-        "plan_source_count": 1,
+        "plan_source_count": len(activation_context.plan_pointer_entries),
         "global_pointer": "reconciled",
     }
     if allowed_pointer_by_field is not None:
@@ -1200,8 +1288,7 @@ async def _publish_ptg2_source_pointers(
     snapshot_attributes: dict[str, Any] | None = None,
     shared_snapshot_key: int | None = None,
     coverage_scope_id: bytes | None = None,
-    coverage_plan_id: str | None = None,
-    coverage_plan_market_type: str | None = None,
+    coverage_plan_scopes: Sequence[Any] | None = None,
     require_audit_attestation: bool = False,
 ) -> dict[str, Any]:
     """Publish or activate source pointers under the strict audit contract."""
@@ -1255,9 +1342,8 @@ async def _publish_ptg2_source_pointers(
                 schema_name=schema_name,
                 snapshot_id=normalized_snapshot_id,
                 coverage_scope_id=coverage_scope_id,
-                coverage_plan_id=str(coverage_plan_id or ""),
-                coverage_plan_market_type=str(coverage_plan_market_type or ""),
                 plan_pointer_entries=plan_pointer_entries,
+                coverage_plan_scopes=coverage_plan_scopes,
             )
         if snapshot_attributes is None and (
             str(authoritative_snapshot.get("status") or "").strip().lower()

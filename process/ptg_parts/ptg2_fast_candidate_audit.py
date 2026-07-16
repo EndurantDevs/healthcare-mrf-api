@@ -222,6 +222,11 @@ def _validated_candidate_page(
     requested_offset: int,
     declared_total: int | None,
 ) -> _CandidatePage:
+    if response_fields.get("result_state") in {
+        "no_matching_rates",
+        "no_match_in_radius",
+    }:
+        raise FastCandidateAuditError("source_witness_missing_from_api")
     if _contract_errors(response_fields, audit_target, positive=True):
         raise FastCandidateAuditError("api_contract_mismatch")
     raw_response_items = response_fields.get("items")

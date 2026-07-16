@@ -1353,6 +1353,10 @@ def _shared_v3_snapshot_scope_table() -> str:
     return f"{PTG2_SCHEMA}.ptg2_v3_snapshot_scope"
 
 
+def _shared_v3_snapshot_plan_scope_table() -> str:
+    return f"{PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope"
+
+
 def _normalized_plan_market_type(value: Any) -> str:
     return str(value or "").strip().lower()
 
@@ -1370,20 +1374,36 @@ def _shared_v3_code_scope_sql(
     params: dict[str, Any] = {
         "logical_snapshot_id": _required_logical_snapshot_id(serving_tables),
     }
-    join_sql = f"""
-        JOIN {_shared_v3_snapshot_scope_table()} {scope_alias}
-          ON {scope_alias}.snapshot_id = :logical_snapshot_id
-         AND {scope_alias}.coverage_scope_id = {code_alias}.coverage_scope_id
-    """
-    filters: list[str] = []
+    plan_filters: list[str] = []
     normalized_plan = str(requested_plan or "").strip()
     normalized_market_type = _normalized_plan_market_type(plan_market_type)
     if normalized_plan:
-        filters.append(f"{scope_alias}.plan_id = :plan_id")
+        plan_filters.append("plan_scope.plan_id = :plan_id")
         params["plan_id"] = normalized_plan
     if normalized_market_type:
-        filters.append(f"{scope_alias}.plan_market_type = :plan_market_type")
+        plan_filters.append(
+            "plan_scope.plan_market_type = :plan_market_type"
+        )
         params["plan_market_type"] = normalized_market_type
+    plan_filter_sql = (
+        " AND " + " AND ".join(plan_filters)
+        if plan_filters
+        else ""
+    )
+    join_sql = f"""
+        JOIN {_shared_v3_snapshot_scope_table()} physical_scope
+          ON physical_scope.snapshot_id = :logical_snapshot_id
+         AND physical_scope.coverage_scope_id = {code_alias}.coverage_scope_id
+        JOIN LATERAL (
+            SELECT plan_scope.plan_id, plan_scope.plan_market_type
+              FROM {_shared_v3_snapshot_plan_scope_table()} plan_scope
+             WHERE plan_scope.snapshot_id = :logical_snapshot_id
+               {plan_filter_sql}
+             ORDER BY plan_scope.plan_id, plan_scope.plan_market_type
+             LIMIT 1
+        ) {scope_alias} ON TRUE
+    """
+    filters: list[str] = []
     order_sql = f"{scope_alias}.plan_id, {scope_alias}.plan_market_type"
     return join_sql, filters, params, order_sql
 

@@ -178,7 +178,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260716120000_ptg2_allowed_amounts_v3"
+        "20260716140000_ptg2_v3_code_identity_index"
     ]
 
 
@@ -748,18 +748,7 @@ def test_v3_shared_models_define_keys_foreign_keys_and_uniqueness():
         PTG2V3Code.__table__,
         sa.UniqueConstraint,
     )
-    code_unique = code_uniques["ptg2_v3_code_identity_key"]
-    assert tuple(column.name for column in code_unique.columns) == (
-        "snapshot_key",
-        "coverage_scope_id",
-        "reported_code_system",
-        "reported_code",
-        "negotiation_arrangement",
-        "billing_code_type_version",
-        "source_name",
-        "source_description",
-    )
-    assert code_unique.dialect_options["postgresql"]["nulls_not_distinct"] is True
+    assert "ptg2_v3_code_identity_key" not in code_uniques
     assert tuple(
         column.name
         for column in code_uniques["ptg2_v3_code_global_id_key"].columns

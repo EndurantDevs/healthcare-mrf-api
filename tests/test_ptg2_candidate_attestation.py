@@ -488,6 +488,14 @@ class _Result:
         return self._row
 
 
+class _RowsResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
 class _Session:
     def __init__(self, result=None):
         self.calls = []
@@ -507,6 +515,21 @@ class _Transaction:
 
     async def __aexit__(self, exc_type, exc, tb):
         return False
+
+
+def _candidate_plan_pointer_entries():
+    return [
+        {
+            "plan_source_key": "plan_source_a",
+            "plan_id": "12-3456789",
+            "plan_market_type": "group",
+            "import_month": datetime.date(2026, 7, 1),
+            "source_key": "source_a",
+            "snapshot_id": "snap_new",
+            "previous_snapshot_id": "snap_old",
+            "updated_at": datetime.datetime(2026, 7, 13, 9, 0, 0),
+        }
+    ]
 
 
 def test_record_candidate_attestation_binds_database_identity(monkeypatch):
@@ -1008,6 +1031,42 @@ def test_candidate_metadata_is_reread_from_postgres_under_row_lock():
     assert params == {"snapshot_id": "snap_new"}
 
 
+def test_candidate_plan_pointer_entries_load_all_logical_plan_mappings():
+    session = _Session(
+        _RowsResult(
+            [
+                {"plan_id": "12-3456789", "plan_market_type": "group"},
+                {"plan_id": "98-7654321", "plan_market_type": "group"},
+            ]
+        )
+    )
+    activated_at = datetime.datetime(2026, 7, 13, 9, 0, 0)
+
+    entries = asyncio.run(
+        source_pointers._candidate_plan_pointer_entries(
+            session,
+            schema_name="mrf",
+            source_key="source_a",
+            snapshot_id="snap_new",
+            previous_snapshot_id="snap_old",
+            import_month=datetime.date(2026, 7, 1),
+            activated_at=activated_at,
+        )
+    )
+
+    assert [entry["plan_id"] for entry in entries] == [
+        "12-3456789",
+        "98-7654321",
+    ]
+    assert {entry["snapshot_id"] for entry in entries} == {"snap_new"}
+    assert {entry["previous_snapshot_id"] for entry in entries} == {"snap_old"}
+    assert {entry["updated_at"] for entry in entries} == {activated_at}
+    sql, params = session.calls[0]
+    assert '"mrf".ptg2_v3_snapshot_plan_scope' in sql
+    assert "ORDER BY plan_id, plan_market_type" in sql
+    assert params == {"snapshot_id": "snap_new"}
+
+
 def test_activation_cas_does_not_accept_candidate_already_current():
     session = _Session(_Result(None))
 
@@ -1088,6 +1147,11 @@ def test_strict_candidate_activation_verifies_and_consumes_attestation_atomicall
     )
     monkeypatch.setattr(
         source_pointers,
+        "_candidate_plan_pointer_entries",
+        AsyncMock(return_value=_candidate_plan_pointer_entries()),
+    )
+    monkeypatch.setattr(
+        source_pointers,
         "verify_candidate_audit_attestation_in_transaction",
         lambda _session, **_kwargs: record("verify", b"r" * 32),
     )
@@ -1130,6 +1194,7 @@ def test_strict_candidate_activation_verifies_and_consumes_attestation_atomicall
     )
 
     assert activation_result["status"] == "promoted"
+    assert activation_result["plan_source_count"] == 1
     assert events == [
         "lock",
         "candidate",
@@ -1225,6 +1290,11 @@ def _install_mixed_candidate_activation_readers(
         source_pointers,
         "_database_utc_timestamp",
         lambda _session: record_event("clock", activation_time),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_candidate_plan_pointer_entries",
+        AsyncMock(return_value=_candidate_plan_pointer_entries()),
     )
     monkeypatch.setattr(
         source_pointers,
@@ -1330,6 +1400,7 @@ def test_audited_mixed_candidate_activates_allowed_pointer_in_same_transaction(
         "allowed_old",
     ]
     assert all(call["allow_already_current"] is False for call in cas_calls)
+    assert activation_result["plan_source_count"] == 1
     assert activation_result["allowed_amount_pointer"] == {
         "status": "promoted",
         "source_key": "source_a_allowed_amounts",
@@ -1402,6 +1473,11 @@ def test_attestation_consumption_failure_rolls_back_all_activation_state(monkeyp
         source_pointers,
         "_database_utc_timestamp",
         AsyncMock(return_value=datetime.datetime(2026, 7, 13, 9, 0, 0)),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_candidate_plan_pointer_entries",
+        AsyncMock(return_value=_candidate_plan_pointer_entries()),
     )
     monkeypatch.setattr(
         source_pointers,

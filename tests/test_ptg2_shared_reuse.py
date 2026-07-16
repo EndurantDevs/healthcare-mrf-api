@@ -160,9 +160,17 @@ def test_deferred_logical_hash_reuses_only_byte_identical_containers():
     assert _identity([first]).payload["artifacts"][0]["identity_kind"] == "raw_container_sha256_v1"
 
 
-def test_one_snapshot_cannot_mix_logical_plan_scopes():
-    with pytest.raises(ValueError, match="exactly one logical plan scope"):
-        _identity([_downloaded(plan_id="plan-1"), _downloaded(plan_id="plan-2")])
+def test_one_physical_snapshot_can_bind_multiple_logical_plan_scopes():
+    identity = _identity(
+        [_downloaded(plan_id="plan-1"), _downloaded(plan_id="plan-2")]
+    )
+
+    assert [plan.plan_id for plan in identity.logical_plans] == [
+        "plan-1",
+        "plan-2",
+    ]
+    assert identity.logical_plan_count == 2
+    assert identity.artifact_count == 1
 
 
 def test_multiple_plan_records_can_share_one_logical_scope():
@@ -193,7 +201,7 @@ def test_multiple_plan_records_can_share_one_logical_scope():
     assert identity.logical_plan_fields["plan_sponsor_name"] == "logical owner one"
 
 
-def test_multiple_plan_records_with_different_scopes_fail_closed():
+def test_multiple_plan_records_with_different_scopes_share_physical_input():
     downloaded = _downloaded()
     downloaded.job["plan_info"] = [
         {
@@ -208,8 +216,15 @@ def test_multiple_plan_records_with_different_scopes_fail_closed():
         },
     ]
 
-    with pytest.raises(ValueError, match="unambiguous logical plan id"):
-        _identity([downloaded])
+    identity = _identity([downloaded])
+
+    assert [plan.plan_id for plan in identity.logical_plans] == [
+        "plan-1",
+        "plan-2",
+    ]
+    assert identity.semantic_fingerprint == _identity(
+        [_downloaded(plan_id="plan-1")]
+    ).semantic_fingerprint
 
 
 def test_plan_descriptive_metadata_is_merged_deterministically():
@@ -225,7 +240,7 @@ def test_plan_descriptive_metadata_is_merged_deterministically():
     assert identity.logical_plan_fields["plan_sponsor_name"] == "canonical owner"
 
 
-def test_conflicting_plan_descriptive_metadata_fails_closed():
+def test_conflicting_plan_descriptive_metadata_is_not_physical_identity():
     first = _downloaded(sponsor="owner one")
     second = _downloaded(
         raw_sha="c" * 64,
@@ -233,8 +248,9 @@ def test_conflicting_plan_descriptive_metadata_fails_closed():
         sponsor="owner two",
     )
 
-    with pytest.raises(ValueError, match="conflicting plan_sponsor_name"):
-        _identity([first, second])
+    identity = _identity([first, second])
+
+    assert identity.logical_plan_fields["plan_sponsor_name"] is None
 
 
 def test_missing_or_failed_artifact_fails_closed():

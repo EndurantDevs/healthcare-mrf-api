@@ -136,6 +136,18 @@ async def _create_test_schema(connection, schema_name: str) -> None:
         )
         """,
         f"""
+        CREATE TABLE {schema}.ptg2_v3_snapshot_plan_scope (
+            snapshot_id varchar(96) NOT NULL,
+            plan_id varchar(64) NOT NULL,
+            plan_market_type varchar(32) NOT NULL DEFAULT '',
+            created_at timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (snapshot_id, plan_id, plan_market_type),
+            FOREIGN KEY (snapshot_id)
+                REFERENCES {schema}.ptg2_v3_snapshot_scope(snapshot_id)
+                ON DELETE CASCADE
+        )
+        """,
+        f"""
         CREATE TABLE {schema}.ptg2_v3_code (
             snapshot_key bigint NOT NULL,
             code_key integer NOT NULL,
@@ -176,6 +188,7 @@ async def _create_test_schema(connection, schema_name: str) -> None:
         "ptg2_v3_layout_fingerprint",
         "ptg2_v3_snapshot_binding",
         "ptg2_v3_snapshot_scope",
+        "ptg2_v3_snapshot_plan_scope",
         "ptg2_v3_code",
         "ptg2_v3_block",
         "ptg2_v3_snapshot_block",
@@ -207,8 +220,6 @@ async def _bind_logical_snapshot(
         schema_name=schema_name,
         snapshot_id=snapshot_id,
         coverage_scope_id=coverage_scope_id,
-        coverage_plan_id=plan_id,
-        coverage_plan_market_type="group",
         plan_pointer_entries=[
             {"plan_id": plan_id, "plan_market_type": "group"}
         ],
@@ -406,12 +417,12 @@ async def test_postgres_cross_plan_scope_isolation_and_bound_layout_retention(mo
             assert own_rows == [PLAN_A]
             assert cross_plan_rows == []
             assert other_rows == [PLAN_B]
-            assert "logical_scope.snapshot_id = :logical_snapshot_id" in own_sql
+            assert "physical_scope.snapshot_id = :logical_snapshot_id" in own_sql
             assert (
-                "logical_scope.coverage_scope_id = code_metadata.coverage_scope_id"
+                "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id"
                 in own_sql
             )
-            assert "logical_scope.plan_id = :plan_id" in cross_plan_sql
+            assert "plan_scope.plan_id = :plan_id" in cross_plan_sql
             assert own_params["logical_snapshot_id"] == SNAPSHOT_A
             assert own_params["plan_id"] == PLAN_A
             assert cross_plan_params["logical_snapshot_id"] == SNAPSHOT_A

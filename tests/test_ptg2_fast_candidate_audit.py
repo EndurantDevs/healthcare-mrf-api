@@ -343,6 +343,27 @@ def test_provider_witness_validates_only_independently_derivable_claims():
         )
 
 
+def test_candidate_no_match_is_reported_as_missing_source_witness():
+    with pytest.raises(
+        audit.FastCandidateAuditError,
+        match="source_witness_missing_from_api",
+    ):
+        audit._validated_candidate_page(
+            {
+                "result_state": "no_match_in_radius",
+                "items": [],
+                "pagination": {
+                    "offset": 0,
+                    "limit": audit.FAST_AUDIT_PAGE_SIZE,
+                    "total": 0,
+                },
+            },
+            _target(),
+            requested_offset=0,
+            declared_total=None,
+        )
+
+
 @pytest.mark.asyncio
 async def test_source_challenge_uses_candidate_api_with_exact_filters(
     unused_tcp_port,
