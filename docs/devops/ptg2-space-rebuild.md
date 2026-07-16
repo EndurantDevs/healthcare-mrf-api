@@ -93,6 +93,10 @@ Dry-run `scripts/devops/ptg2_remove_source_snapshot.py`, review pointer and
 shared-layout reference checks, then execute one snapshot at a time. Cleanup may
 recognize old generation metadata solely to delete it safely.
 
+An unreferenced `validated` candidate may be removed only through this explicit
+authenticated path. Generic age-based GC continues to exclude validated
+candidates, and pending, running, or building snapshots remain non-removable.
+
 The bulk legacy cleanup command fails closed while any current pointer still
 references an old snapshot. It must never delete current pointer rows to make a
 cleanup plan executable.
