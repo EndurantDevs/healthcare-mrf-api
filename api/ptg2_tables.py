@@ -515,28 +515,32 @@ async def snapshot_serving_tables(
                    = snapshot_scope.plan_market_type
              LIMIT 1
         """
-    result = await session.execute(
+    snapshot_query = await session.execute(
         text(query_sql),
         query_params_by_name,
     )
-    row = result.one_or_none()
-    if row is None:
+    snapshot_record = snapshot_query.one_or_none()
+    if snapshot_record is None:
         raise PTG2ManifestArtifactError(
             "PTG2 snapshot is not published and bound to a sealed shared V3 layout"
         )
-    row_fields = row if isinstance(row, dict) else row._mapping
+    row_fields = (
+        snapshot_record
+        if isinstance(snapshot_record, dict)
+        else snapshot_record._mapping
+    )
     if candidate_audit_access is not None:
-        value = row_fields.get("manifest")
-        if isinstance(value, str):
+        snapshot_manifest = row_fields.get("manifest")
+        if isinstance(snapshot_manifest, str):
             try:
-                value = json.loads(value)
+                snapshot_manifest = json.loads(snapshot_manifest)
             except json.JSONDecodeError as exc:
                 raise PTG2ManifestArtifactError(
                     "PTG2 snapshot manifest is malformed"
                 ) from exc
-        if not isinstance(value, dict):
+        if not isinstance(snapshot_manifest, dict):
             raise PTG2ManifestArtifactError("PTG2 snapshot manifest is malformed")
-        serving_index = value.get("serving_index")
+        serving_index = snapshot_manifest.get("serving_index")
     else:
         serving_index = row_fields.get("layout_serving_index")
     if isinstance(serving_index, str):
@@ -589,7 +593,7 @@ async def snapshot_serving_tables(
             raise PTG2ManifestArtifactError(
                 "PTG2 sealed layout code count does not match its snapshot manifest"
             )
-        source_set = _strict_v3_source_set(
+        source_set_by_field = _strict_v3_source_set(
             serving_index,
             source_count=int(source_count or 0),
         )
@@ -643,7 +647,7 @@ async def snapshot_serving_tables(
             raise PTG2ManifestArtifactError(
                 "PTG2 published source-set attestation is invalid"
             )
-        source_set = {
+        source_set_by_field = {
             "contract": PTG2_V3_SOURCE_SET_CONTRACT,
             "source_count": source_count,
             "raw_container_sha256_digest": source_set_digest,
@@ -683,14 +687,14 @@ async def snapshot_serving_tables(
         ),
         source_key=source_key,
         audit_sample=audit_sample,
-        source_set=source_set,
+        source_set=source_set_by_field,
         database_evidence=_database_execution_evidence(row_fields),
         source_trace_set_hash=str(
             serving_index.get("source_trace_set_hash") or ""
         ).strip()
         or None,
         network_names=(
-            [str(item) for item in network_names]
+            [str(network_name) for network_name in network_names]
             if isinstance(network_names, list)
             else None
         ),

@@ -1458,7 +1458,7 @@ def test_manifest_response_keeps_address_verification_in_public_shape():
 def test_manifest_provider_procedure_item_shapes_address_and_prices():
     provider_by_field = ptg2_serving._ptg2_manifest_provider_procedure_item(
         npi=1234567890,
-        data={
+        serving_data={
             "serving_content_hash_128": "rate-pack",
             "provider_set_global_id_128": "provider-set",
             "provider_count": 3,
@@ -2172,7 +2172,7 @@ async def test_provider_reverse_response_uses_page_sentinel_and_honest_total(mon
         ptg2_serving,
         "_ptg2_manifest_provider_procedure_item",
         lambda **kwargs: {
-            "reported_code": kwargs["data"]["reported_code"],
+            "reported_code": kwargs["serving_data"]["reported_code"],
             "prices": kwargs["prices"],
         },
     )

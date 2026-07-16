@@ -238,6 +238,8 @@ def _add_location_phone_fields(
     location_data_by_field: dict[str, Any],
     address_payload: dict[str, Any],
 ) -> None:
+    """Copy canonical and display contact fields into one provider item."""
+
     display_phone = _first_payload_value(
         location_data_by_field.get("telephone_number"),
         address_payload.get("telephone_number"),
@@ -1796,21 +1798,23 @@ def _shared_forward_row_window(
 ) -> list[Any]:
     """Return the requested ordered serving-row window before response materialization."""
     eligible_rows = [
-        row
-        for row in forward_rows
-        if provider_set_ids_by_key.get(row.provider_set_key)
+        forward_row
+        for forward_row in forward_rows
+        if provider_set_ids_by_key.get(forward_row.provider_set_key)
     ]
-    if any(row.price_key is None for row in eligible_rows):
+    if any(forward_row.price_key is None for forward_row in eligible_rows):
         raise PTG2ManifestArtifactError(
             "PTG2 strict V3 forward row is missing its dense price key"
         )
     ordered_rows = sorted(
         eligible_rows,
-        key=lambda row: (
-            -int(row.price_key) if descending else int(row.price_key),
-            int(row.provider_set_key),
-            int(row.source_key),
-            int(row.provider_count or 0),
+        key=lambda forward_row: (
+            -int(forward_row.price_key)
+            if descending
+            else int(forward_row.price_key),
+            int(forward_row.provider_set_key),
+            int(forward_row.source_key),
+            int(forward_row.provider_count or 0),
         ),
     )
     if limit is None:
@@ -1991,23 +1995,26 @@ async def _shared_rows_for_code(
             provider_set_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
                 session,
                 serving_tables,
-                [row.provider_set_key for row in selected_rows],
+                [
+                    selected_row.provider_set_key
+                    for selected_row in selected_rows
+                ],
             )
             if set(provider_set_ids_by_key) != {
-                row.provider_set_key for row in selected_rows
+                selected_row.provider_set_key for selected_row in selected_rows
             }:
                 raise PTG2ManifestArtifactError(
                     "PTG2 v3 provider-set dictionary is missing a prefix-referenced key"
                 )
             return [
                 _shared_forward_response_row(
-                    row,
-                    provider_set_ids_by_key[row.provider_set_key],
+                    selected_row,
+                    provider_set_ids_by_key[selected_row.provider_set_key],
                     code_data,
                     source_trace_set_hash,
                     network_names,
                 )
-                for row in selected_rows
+                for selected_row in selected_rows
             ]
     return await _full_shared_code_rows(
         session,
@@ -2932,7 +2939,7 @@ async def _version_three_reverse_page_selection(
     )
     if set(price_ids_by_key) != {page_entry.price_key for page_entry in selected_entries}:
         raise PTG2ManifestArtifactError("PTG2 v3 reverse page references an unknown price set")
-    rows = tuple(
+    candidate_rows = tuple(
         _version_three_reverse_page_candidates(
             code_metadata_by_key,
             selected_entries,
@@ -2946,8 +2953,11 @@ async def _version_three_reverse_page_selection(
         for provider_page in page_scope.provider_pages_by_key.values()
     )
     return _VersionThreeReverseSelection(
-        rows=rows,
-        exhausted=max(int(reverse_query.offset or 0), 0) + len(rows) >= total_row_count,
+        rows=candidate_rows,
+        exhausted=(
+            max(int(reverse_query.offset or 0), 0) + len(candidate_rows)
+            >= total_row_count
+        ),
         total_row_count=total_row_count,
     )
 
@@ -3073,9 +3083,9 @@ async def _version_three_filtered_reverse_selection(
         )
     requested_offset = max(int(offset), 0)
     requested_limit = max(int(limit), 0)
-    filter_args = dict(args)
+    filter_args_by_name = dict(args)
     selected_rows: list[dict[str, Any]] = []
-    selected_prices: dict[str, list[dict[str, Any]]] = {}
+    selected_prices_by_set: dict[str, list[dict[str, Any]]] = {}
     matched_rows_seen = 0
     metadata_offset = 0
     metadata_batch_size = (
@@ -3098,17 +3108,25 @@ async def _version_three_filtered_reverse_selection(
         if code_metadata_count == 0:
             return _VersionThreeFilteredReverseSelection(
                 rows=tuple(selected_rows),
-                prices_by_price_set=selected_prices,
+                prices_by_price_set=selected_prices_by_set,
                 exhausted=True,
                 matched_rows_seen=matched_rows_seen,
                 total_row_count=matched_rows_seen,
             )
-        candidate_rows = [row for row_group in candidate_row_groups for row in row_group]
+        candidate_rows = [
+            candidate_row
+            for row_group in candidate_row_groups
+            for candidate_row in row_group
+        ]
         price_key_by_set_id = {
-            _ptg2_manifest_id(row.get("price_set_global_id_128")): int(row["price_key"])
-            for row in candidate_rows
-            if row.get("price_key") is not None
-            and _ptg2_manifest_id(row.get("price_set_global_id_128"))
+            _ptg2_manifest_id(
+                candidate_row.get("price_set_global_id_128")
+            ): int(candidate_row["price_key"])
+            for candidate_row in candidate_rows
+            if candidate_row.get("price_key") is not None
+            and _ptg2_manifest_id(
+                candidate_row.get("price_set_global_id_128")
+            )
         }
         prices_by_price_set = await _ptg2_manifest_prices_for_price_sets(
             session,
@@ -3116,11 +3134,13 @@ async def _version_three_filtered_reverse_selection(
             tuple(price_key_by_set_id),
             price_key_by_set_id=price_key_by_set_id,
         )
-        for row in candidate_rows:
-            price_set_id = _ptg2_manifest_id(row.get("price_set_global_id_128"))
+        for candidate_row in candidate_rows:
+            price_set_id = _ptg2_manifest_id(
+                candidate_row.get("price_set_global_id_128")
+            )
             prices = _ptg2_manifest_filter_prices(
                 prices_by_price_set.get(price_set_id, []),
-                filter_args,
+                filter_args_by_name,
             )
             if not prices:
                 continue
@@ -3128,19 +3148,19 @@ async def _version_three_filtered_reverse_selection(
             if matched_rows_seen <= requested_offset:
                 continue
             if len(selected_rows) < requested_limit:
-                selected_rows.append(row)
-                selected_prices[price_set_id] = prices
+                selected_rows.append(candidate_row)
+                selected_prices_by_set[price_set_id] = prices
             if len(selected_rows) >= requested_limit:
                 return _VersionThreeFilteredReverseSelection(
                     rows=tuple(selected_rows),
-                    prices_by_price_set=selected_prices,
+                    prices_by_price_set=selected_prices_by_set,
                     exhausted=False,
                     matched_rows_seen=matched_rows_seen,
                 )
         if metadata_batch_size is None or code_metadata_count < metadata_batch_size:
             return _VersionThreeFilteredReverseSelection(
                 rows=tuple(selected_rows),
-                prices_by_price_set=selected_prices,
+                prices_by_price_set=selected_prices_by_set,
                 exhausted=True,
                 matched_rows_seen=matched_rows_seen,
                 total_row_count=matched_rows_seen,
@@ -3415,7 +3435,7 @@ async def _shared_forward_entries_for_code_rows(
     return forward_entries
 
 
-async def _shared_group_ids_for_provider_set_keys(
+async def _shared_group_ids_for_set_keys(
     session,
     serving_tables: PTG2ServingTables,
     provider_set_keys: Iterable[int],
@@ -3490,7 +3510,7 @@ async def _shared_rate_provider_groups(
         column="code_metadata.reported_code_system",
         code_system=code_system,
     )
-    result = await session.execute(
+    code_query_result = await session.execute(
         text(
             f"""
             SELECT code_metadata.code_key,
@@ -3506,7 +3526,10 @@ async def _shared_rate_provider_groups(
         ),
         params,
     )
-    code_rows = [_canonical_code_metadata_row(row) for row in result]
+    code_rows = [
+        _canonical_code_metadata_row(code_record)
+        for code_record in code_query_result
+    ]
     if not code_rows:
         return ()
     forward_rows = await _shared_forward_entries_for_code_rows(
@@ -3515,10 +3538,10 @@ async def _shared_rate_provider_groups(
         code_rows,
         provider_set_keys=provider_set_keys,
     )
-    return await _shared_group_ids_for_provider_set_keys(
+    return await _shared_group_ids_for_set_keys(
         session,
         serving_tables,
-        [row.provider_set_key for row in forward_rows],
+        [forward_entry.provider_set_key for forward_entry in forward_rows],
     )
 
 
@@ -3805,20 +3828,23 @@ async def _version_three_dictionary_values(
         },
     )
     values_by_key: dict[tuple[str, int], Any] = {}
-    for dictionary_entry in (_row_mapping(dictionary_record) for dictionary_record in dictionary_result):
+    for dictionary_entry in (
+        _row_mapping(dictionary_record)
+        for dictionary_record in dictionary_result
+    ):
         attr_kind = dictionary_entry.get("attribute_kind")
         attr_key = dictionary_entry.get("attribute_key")
         if attr_kind is None or attr_key is None:
             continue
-        value = dictionary_entry.get("value")
+        dictionary_value = dictionary_entry.get("value")
         if str(attr_kind) in {"service_code", "billing_code_modifier"}:
             try:
-                value = json.loads(str(value or "[]"))
+                dictionary_value = json.loads(str(dictionary_value or "[]"))
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise PTG2ManifestArtifactError("PTG2 v3 price atom array dictionary value is malformed") from exc
-            if not isinstance(value, list):
+            if not isinstance(dictionary_value, list):
                 raise PTG2ManifestArtifactError("PTG2 v3 price atom array dictionary value is malformed")
-        values_by_key[(str(attr_kind), int(attr_key))] = value
+        values_by_key[(str(attr_kind), int(attr_key))] = dictionary_value
     missing_keys = required_keys.difference(values_by_key)
     if missing_keys:
         raise PTG2ManifestArtifactError("PTG2 v3 price atom dictionary key is missing")
@@ -4060,10 +4086,10 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
         ]
     address_location_source = _ptg2_address_location_source(npi_address_table)
     address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
-    using_unified_enrich = _is_unified_address_table(npi_address_table)
+    is_using_unified_enrichment = _is_unified_address_table(npi_address_table)
     # Same street-fill as the location search: when the unified row has no
     # first_line (or no row at all), fall back to the NPPES npi_address row.
-    if using_unified_enrich:
+    if is_using_unified_enrichment:
         fallback_columns = set(
             await _ptg2_table_columns(session, f"{PTG2_SCHEMA}.npi_address")
         )
@@ -4174,11 +4200,14 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
             """
         )
     )
-    result = await session.execute(enrich_stmt, {"npis": npis})
-    rows = [_row_mapping(row) for row in result]
+    enrichment_query = await session.execute(enrich_stmt, {"npis": npis})
+    enriched_provider_rows = [
+        _row_mapping(provider_record)
+        for provider_record in enrichment_query
+    ]
     return await _overlay_provider_directory_corroboration(
         session,
-        rows,
+        enriched_provider_rows,
         plan_id=plan_id,
         snapshot_id=snapshot_id,
         source_key=source_key,
@@ -4313,67 +4342,77 @@ def _ptg2_address_verification_sort_value(item: dict[str, Any]) -> int:
 
 
 def _sort_ptg2_manifest_provider_items(
-    items: list[dict[str, Any]],
+    provider_items: list[dict[str, Any]],
     args: dict[str, Any],
     *,
     location_filter_requested: bool,
 ) -> list[dict[str, Any]]:
     """Sort provider items by rank or the query's deterministic order."""
-    if items and all(item.get("_ptg_provider_rank") is not None for item in items):
-        return sorted(items, key=lambda item: int(item["_ptg_provider_rank"]))
+    if provider_items and all(
+        provider_item.get("_ptg_provider_rank") is not None
+        for provider_item in provider_items
+    ):
+        return sorted(
+            provider_items,
+            key=lambda provider_item: int(provider_item["_ptg_provider_rank"]),
+        )
     requested_order = str(args.get("order_by") or "").strip().lower()
     order_by = requested_order or ("distance" if location_filter_requested else "")
     order = str(args.get("order") or "").strip().lower()
-    descending = order == "desc"
+    is_descending = order == "desc"
     distance_order_fields = {"distance", "distance_miles"}
     if order_by in _PTG2_COST_ORDER_FIELDS:
         return sorted(
-            items,
-            key=lambda item: (
+            provider_items,
+            key=lambda provider_item: (
                 (
-                    -_ptg2_provider_price_sort_value(item)
-                    if descending
-                    and _ptg2_provider_price_sort_value(item).is_finite()
-                    else _ptg2_provider_price_sort_value(item)
+                    -_ptg2_provider_price_sort_value(provider_item)
+                    if is_descending
+                    and _ptg2_provider_price_sort_value(
+                        provider_item
+                    ).is_finite()
+                    else _ptg2_provider_price_sort_value(provider_item)
                 ),
                 int(
-                    item["_ptg_price_key"]
-                    if item.get("_ptg_price_key") is not None
+                    provider_item["_ptg_price_key"]
+                    if provider_item.get("_ptg_price_key") is not None
                     else 2**32
                 ),
-                _ptg2_provider_distance_sort_value(item),
-                str(item.get("provider_name") or ""),
-                int(item.get("npi") or 2**63 - 1),
+                _ptg2_provider_distance_sort_value(provider_item),
+                str(provider_item.get("provider_name") or ""),
+                int(provider_item.get("npi") or 2**63 - 1),
             ),
         )
     if order_by in distance_order_fields:
         return sorted(
-            items,
-            key=lambda item: (
+            provider_items,
+            key=lambda provider_item: (
                 (
-                    -_ptg2_provider_distance_sort_value(item)
-                    if descending
-                    and math.isfinite(_ptg2_provider_distance_sort_value(item))
-                    else _ptg2_provider_distance_sort_value(item)
+                    -_ptg2_provider_distance_sort_value(provider_item)
+                    if is_descending
+                    and math.isfinite(
+                        _ptg2_provider_distance_sort_value(provider_item)
+                    )
+                    else _ptg2_provider_distance_sort_value(provider_item)
                 ),
-                int(item.get("npi") or 2**63 - 1),
-                _ptg2_provider_price_sort_value(item),
-                str(item.get("provider_name") or ""),
+                int(provider_item.get("npi") or 2**63 - 1),
+                _ptg2_provider_price_sort_value(provider_item),
+                str(provider_item.get("provider_name") or ""),
                 int(
-                    item["_ptg_price_key"]
-                    if item.get("_ptg_price_key") is not None
+                    provider_item["_ptg_price_key"]
+                    if provider_item.get("_ptg_price_key") is not None
                     else 2**32
                 ),
             ),
         )
     return sorted(
-        items,
-        key=lambda item: (
-            _ptg2_address_verification_sort_value(item),
-            _ptg2_provider_price_sort_value(item),
-            _ptg2_provider_distance_sort_value(item),
-            str(item.get("provider_name") or ""),
-            str(item.get("npi") or ""),
+        provider_items,
+        key=lambda provider_item: (
+            _ptg2_address_verification_sort_value(provider_item),
+            _ptg2_provider_price_sort_value(provider_item),
+            _ptg2_provider_distance_sort_value(provider_item),
+            str(provider_item.get("provider_name") or ""),
+            str(provider_item.get("npi") or ""),
         ),
     )
 
@@ -4381,44 +4420,58 @@ def _sort_ptg2_manifest_provider_items(
 def _ptg2_manifest_provider_procedure_item(
     *,
     npi: int,
-    data: dict[str, Any],
+    serving_data: dict[str, Any],
     prices: list[dict[str, Any]],
     procedure_detail: dict[str, Any],
     provider_context: dict[str, Any] | None,
     args: dict[str, Any],
 ) -> dict[str, Any]:
     """Shape one provider and negotiated-price match into an API result item."""
-    reported_code = data.get("reported_code")
-    reported_system = data.get("reported_code_system")
-    provider_set_hash = _ptg2_manifest_id(data.get("provider_set_global_id_128"))
-    price_set_hash = _ptg2_manifest_id(data.get("price_set_global_id_128"))
-    rate_pack_hash = _ptg2_manifest_id(data.get("serving_content_hash_128"))
-    source_artifact_key = data.get("source_artifact_key")
+    reported_code = serving_data.get("reported_code")
+    reported_system = serving_data.get("reported_code_system")
+    provider_set_hash = _ptg2_manifest_id(
+        serving_data.get("provider_set_global_id_128")
+    )
+    price_set_hash = _ptg2_manifest_id(
+        serving_data.get("price_set_global_id_128")
+    )
+    rate_pack_hash = _ptg2_manifest_id(
+        serving_data.get("serving_content_hash_128")
+    )
+    source_artifact_key = serving_data.get("source_artifact_key")
     if source_artifact_key is None:
-        source_artifact_key = data.get("source_key")
-    exact_source_mode = normalize_ptg2_mode(args.get("mode")) == PTG2_MODE_EXACT_SOURCE
-    source_procedure_name = data.get("source_procedure_name")
-    source_procedure_description = data.get("source_procedure_description")
-    item_data = dict(provider_context or {})
-    item_data.update(
+        source_artifact_key = serving_data.get("source_key")
+    is_exact_source_mode = (
+        normalize_ptg2_mode(args.get("mode")) == PTG2_MODE_EXACT_SOURCE
+    )
+    source_procedure_name = serving_data.get("source_procedure_name")
+    source_procedure_description = serving_data.get(
+        "source_procedure_description"
+    )
+    provider_item_fields = dict(provider_context or {})
+    provider_item_fields.update(
         {
             "npi": npi,
-            "plan_id": data.get("plan_id"),
-            "plan_market_type": data.get("plan_market_type"),
+            "plan_id": serving_data.get("plan_id"),
+            "plan_market_type": serving_data.get("plan_market_type"),
             "provider_set_hash": provider_set_hash,
-            "provider_count": data.get("provider_count") or 0,
+            "provider_count": serving_data.get("provider_count") or 0,
             "provider_set_count": 1 if provider_set_hash else 0,
-            "network_names": _coerce_str_list_payload(data.get("network_names")),
+            "network_names": _coerce_str_list_payload(
+                serving_data.get("network_names")
+            ),
             "procedure_code": reported_code,
-            "billing_code_type_version": data.get("billing_code_type_version"),
+            "billing_code_type_version": serving_data.get(
+                "billing_code_type_version"
+            ),
             "procedure_name": (
                 source_procedure_name
-                if exact_source_mode
+                if is_exact_source_mode
                 else source_procedure_name or procedure_detail.get("procedure_name")
             ),
             "procedure_description": (
                 source_procedure_description
-                if exact_source_mode
+                if is_exact_source_mode
                 else source_procedure_description
                 or procedure_detail.get("procedure_description")
             ),
@@ -4428,25 +4481,28 @@ def _ptg2_manifest_provider_procedure_item(
             "catalog_procedure_description": procedure_detail.get("procedure_description"),
             "reported_code": reported_code,
             "reported_code_system": reported_system,
-            "negotiation_arrangement": data.get("negotiation_arrangement"),
+            "negotiation_arrangement": serving_data.get(
+                "negotiation_arrangement"
+            ),
             "billing_code": reported_code,
             "billing_code_type": reported_system,
             "prices": prices,
             "price_set_hash": price_set_hash,
             "rate_pack_hash": rate_pack_hash,
-            "source_key": data.get("logical_source_key") or args.get("source_key"),
+            "source_key": serving_data.get("logical_source_key")
+            or args.get("source_key"),
             "source_artifact_key": source_artifact_key,
-            "source_type": data.get("source_type"),
-            "identity_kind": data.get("identity_kind"),
-            "identity_sha256": data.get("identity_sha256"),
-            "raw_container_sha256": data.get("raw_container_sha256"),
-            "logical_json_sha256": data.get("logical_json_sha256"),
-            "logical_hash_deferred": data.get("logical_hash_deferred"),
-            "source_trace_set_hash": data.get("source_trace_set_hash"),
-            "source_trace": data.get("source_trace"),
+            "source_type": serving_data.get("source_type"),
+            "identity_kind": serving_data.get("identity_kind"),
+            "identity_sha256": serving_data.get("identity_sha256"),
+            "raw_container_sha256": serving_data.get("raw_container_sha256"),
+            "logical_json_sha256": serving_data.get("logical_json_sha256"),
+            "logical_hash_deferred": serving_data.get("logical_hash_deferred"),
+            "source_trace_set_hash": serving_data.get("source_trace_set_hash"),
+            "source_trace": serving_data.get("source_trace"),
         }
     )
-    return _compact_item_from_row(item_data, args)
+    return _compact_item_from_row(provider_item_fields, args)
 
 
 def _source_code_variant_group_key(
@@ -4665,6 +4721,8 @@ async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
     *,
     limit: int,
 ) -> tuple[int, ...]:
+    """Return requested NPIs that satisfy the resolved taxonomy filter."""
+
     candidate_npis = tuple(sorted({int(npi) for npi in npis if int(npi) > 0}))
     if not candidate_npis:
         return ()
@@ -5951,7 +6009,11 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
     )
     if provider_rows is None:
         return None
-    providers_by_npi = {int(row.get("npi")): row for row in provider_rows if row.get("npi") is not None}
+    providers_by_npi = {
+        int(provider_row.get("npi")): provider_row
+        for provider_row in provider_rows
+        if provider_row.get("npi") is not None
+    }
     return {
         provider_set_id: [
             providers_by_npi.get(npi) or {"npi": npi, "provider_name": "TiC provider"}
@@ -6071,10 +6133,12 @@ def _rank_provider_expansion_prefix(
     tuple[str, ...],
 ]:
     rank_by_key: dict[_ProviderExpansionKey, int] = {}
-    selected_npis: dict[int, None] = {}
-    selected_provider_set_ids: dict[str, None] = {}
-    for data in row_data:
-        provider_set_id = _ptg2_manifest_id(data.get("provider_set_global_id_128"))
+    selected_npi_order_by_value: dict[int, None] = {}
+    selected_provider_set_order_by_id: dict[str, None] = {}
+    for serving_row in row_data:
+        provider_set_id = _ptg2_manifest_id(
+            serving_row.get("provider_set_global_id_128")
+        )
         if not provider_set_id:
             raise PTG2ManifestArtifactError(
                 "PTG2 strict V3 rate is missing its provider-set identity"
@@ -6082,20 +6146,24 @@ def _rank_provider_expansion_prefix(
         provider_npis = npis_by_set.get(provider_set_id, ())
         candidates: tuple[int | None, ...] = provider_npis or (None,)
         for npi in candidates:
-            key = _provider_expansion_key(data, npi=npi)
+            key = _provider_expansion_key(serving_row, npi=npi)
             if key in rank_by_key:
                 continue
             rank_by_key[key] = len(rank_by_key)
-            selected_provider_set_ids[provider_set_id] = None
+            selected_provider_set_order_by_id[provider_set_id] = None
             if npi is not None:
-                selected_npis[int(npi)] = None
+                selected_npi_order_by_value[int(npi)] = None
             if len(rank_by_key) >= target_count:
                 return (
                     rank_by_key,
-                    tuple(selected_npis),
-                    tuple(selected_provider_set_ids),
+                    tuple(selected_npi_order_by_value),
+                    tuple(selected_provider_set_order_by_id),
                 )
-    return rank_by_key, tuple(selected_npis), tuple(selected_provider_set_ids)
+    return (
+        rank_by_key,
+        tuple(selected_npi_order_by_value),
+        tuple(selected_provider_set_order_by_id),
+    )
 
 
 async def _provider_set_ids_for_selected_npis(
@@ -6159,9 +6227,9 @@ async def _selected_provider_rows_by_set(
     if provider_rows is None:
         return None
     provider_by_npi = {
-        int(row["npi"]): row
-        for row in provider_rows
-        if row.get("npi") is not None
+        int(provider_row["npi"]): provider_row
+        for provider_row in provider_rows
+        if provider_row.get("npi") is not None
     }
     provider_set_ids = tuple(
         dict.fromkeys(
@@ -6239,7 +6307,10 @@ async def _strict_cost_provider_expansion_selection(
     descending: bool,
 ) -> _ProviderExpansionSelection | None:
     """Expand cost-ordered rates until the requested provider prefix is complete."""
-    declared_rate_count = sum(max(int(row.get("rate_count") or 0), 0) for row in code_rows)
+    declared_rate_count = sum(
+        max(int(code_row.get("rate_count") or 0), 0)
+        for code_row in code_rows
+    )
     if declared_rate_count <= 0:
         return _ProviderExpansionSelection([], {}, {}, True)
     rate_window = min(
@@ -6249,10 +6320,10 @@ async def _strict_cost_provider_expansion_selection(
     rank_by_key: dict[_ProviderExpansionKey, int] = {}
     selected_npis: tuple[int, ...] = ()
     selected_provider_set_ids: tuple[str, ...] = ()
-    exhausted = False
-    row_prefix: list[dict[str, Any]] = []
+    is_exhausted = False
+    serving_rows_prefix: list[dict[str, Any]] = []
     while True:
-        row_prefix = await _merge_manifest_code_variant_rows(
+        serving_rows_prefix = await _merge_manifest_code_variant_rows(
             session,
             serving_tables,
             code_rows=code_rows,
@@ -6263,15 +6334,15 @@ async def _strict_cost_provider_expansion_selection(
             offset=0,
             descending=descending,
         )
-        if row_prefix is None:
+        if serving_rows_prefix is None:
             return None
         provider_set_ids = tuple(
             dict.fromkeys(
                 provider_set_id
-                for row in row_prefix
+                for serving_row in serving_rows_prefix
                 if (
                     provider_set_id := _ptg2_manifest_id(
-                        row.get("provider_set_global_id_128")
+                        serving_row.get("provider_set_global_id_128")
                     )
                 )
             )
@@ -6284,13 +6355,16 @@ async def _strict_cost_provider_expansion_selection(
         )
         rank_by_key, selected_npis, selected_provider_set_ids = (
             _rank_provider_expansion_prefix(
-                row_prefix,
+                serving_rows_prefix,
                 npis_by_set,
                 target_count=max(int(target_count), 1),
             )
         )
-        exhausted = rate_window >= declared_rate_count or len(row_prefix) < rate_window
-        if len(rank_by_key) >= target_count or exhausted:
+        is_exhausted = (
+            rate_window >= declared_rate_count
+            or len(serving_rows_prefix) < rate_window
+        )
+        if len(rank_by_key) >= target_count or is_exhausted:
             break
         next_window = _next_provider_expansion_rate_window(
             rate_window,
@@ -6359,7 +6433,7 @@ async def _strict_cost_provider_expansion_selection(
         row_data=completion_rows,
         providers_by_set=providers_by_set,
         rank_by_key=rank_by_key,
-        exhausted=exhausted and len(rank_by_key) < target_count,
+        exhausted=is_exhausted and len(rank_by_key) < target_count,
     )
 
 
@@ -6848,7 +6922,7 @@ async def _search_ptg2_manifest_db_serving_table(
         procedure_detail = procedure_details.get(_catalog_key(reported_system, reported_code) or ("", ""), {})
         source_procedure_name = data.get("source_procedure_name")
         source_procedure_description = data.get("source_procedure_description")
-        exact_source_mode = mode_value == PTG2_MODE_EXACT_SOURCE
+        is_exact_source_mode = mode_value == PTG2_MODE_EXACT_SOURCE
         base_item = {
             "plan_id": data.get("plan_id"),
             "plan_market_type": data.get("plan_market_type"),
@@ -6867,12 +6941,12 @@ async def _search_ptg2_manifest_db_serving_table(
             "billing_code_type_version": data.get("billing_code_type_version"),
             "procedure_name": (
                 source_procedure_name
-                if exact_source_mode
+                if is_exact_source_mode
                 else source_procedure_name or procedure_detail.get("procedure_name")
             ),
             "procedure_description": (
                 source_procedure_description
-                if exact_source_mode
+                if is_exact_source_mode
                 else source_procedure_description
                 or procedure_detail.get("procedure_description")
             ),
@@ -7077,13 +7151,13 @@ async def _search_ptg2_manifest_db_serving_table(
 async def _ptg2_source_provenance_for_rows(
     session: Any,
     serving_tables: PTG2ServingTables,
-    rows: Iterable[Mapping[str, Any]],
+    serving_rows: Iterable[Mapping[str, Any]],
 ) -> dict[int, dict[str, Any]]:
     source_keys: set[int] = set()
-    for row in rows:
-        source_key = row.get("source_artifact_key")
+    for serving_row in serving_rows:
+        source_key = serving_row.get("source_artifact_key")
         if source_key is None:
-            source_key = row.get("source_key")
+            source_key = serving_row.get("source_key")
         if isinstance(source_key, bool) or source_key is None:
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 serving row is missing exact source provenance"
@@ -7549,7 +7623,7 @@ async def _search_ptg2_manifest_provider_procedures(
         items.append(
             _ptg2_manifest_provider_procedure_item(
                 npi=npi,
-                data=data_with_trace,
+                serving_data=data_with_trace,
                 prices=prices,
                 procedure_detail=procedure_detail,
                 provider_context=provider_context,
@@ -8014,9 +8088,9 @@ async def _search_multi_ptg2_snapshots(
         source=getattr(pagination, "source", "page"),
     )
 
-    combined: list[dict[str, Any]] = []
+    combined_provider_items: list[dict[str, Any]] = []
     total = 0
-    base_query: dict[str, Any] | None = None
+    base_query_by_field: dict[str, Any] | None = None
     matched_networks: list[dict[str, str]] = []
 
     async def read_network(source_key: str, snapshot_id: str):
@@ -8032,46 +8106,48 @@ async def _search_multi_ptg2_snapshots(
         network_snapshots,
         read_network,
     )
-    for source_key, snapshot_id, payload in network_responses:
-        if not payload:
+    for source_key, snapshot_id, network_response in network_responses:
+        if not network_response:
             continue
-        if base_query is None:
-            base_query = dict(payload.get("query") or {})
-        page_info = payload.get("pagination") or {}
+        if base_query_by_field is None:
+            base_query_by_field = dict(network_response.get("query") or {})
+        page_info = network_response.get("pagination") or {}
         try:
             page_total = int(page_info.get("total") or 0)
         except (TypeError, ValueError):
             page_total = 0
         total += page_total
-        items = payload.get("items") or []
-        if items:
+        network_items = network_response.get("items") or []
+        if network_items:
             matched_networks.append({"source_key": source_key, "snapshot_id": snapshot_id})
-        for item in items:
-            tagged = dict(item)
+        for network_item in network_items:
+            tagged_provider_item_by_field = dict(network_item)
             if source_key:
-                tagged.setdefault("network", source_key)
-            combined.append(tagged)
+                tagged_provider_item_by_field.setdefault("network", source_key)
+            combined_provider_items.append(tagged_provider_item_by_field)
 
-    if base_query is None:
+    if base_query_by_field is None:
         # No network produced a payload, so behave like
         # the single-snapshot path returning no match.
         return None
 
-    combined = _sort_ptg2_manifest_provider_items(
-        combined,
+    combined_provider_items = _sort_ptg2_manifest_provider_items(
+        combined_provider_items,
         args,
         location_filter_requested=_ptg2_location_filter_requested(args),
     )
     start = max(int(pagination.offset), 0)
     end = start + max(int(pagination.limit), 0)
-    page_items = combined[start:end]
+    page_items = combined_provider_items[start:end]
 
-    query = dict(base_query)
-    query["source_key"] = None
-    query["snapshot_id"] = None
-    query["snapshots"] = [snapshot_id for _, snapshot_id in network_snapshots]
-    query["networks"] = matched_networks
-    query["combined"] = True
+    query_by_field = dict(base_query_by_field)
+    query_by_field["source_key"] = None
+    query_by_field["snapshot_id"] = None
+    query_by_field["snapshots"] = [
+        snapshot_id for _, snapshot_id in network_snapshots
+    ]
+    query_by_field["networks"] = matched_networks
+    query_by_field["combined"] = True
 
     return {
         "items": page_items,
@@ -8082,7 +8158,7 @@ async def _search_multi_ptg2_snapshots(
             "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
             "has_more": (int(pagination.offset) + len(page_items)) < total,
         },
-        "query": query,
+        "query": query_by_field,
     }
 
 

@@ -1229,7 +1229,7 @@ def test_shared_v3_response_rows_preserve_negotiation_arrangement():
 
     provider_item = ptg2_serving._ptg2_manifest_provider_procedure_item(
         npi=1234567890,
-        data=response_row,
+        serving_data=response_row,
         prices=[],
         procedure_detail={},
         provider_context={},
@@ -1259,7 +1259,7 @@ def test_reverse_provider_items_keep_exact_source_identity_and_do_not_premerge()
     provider_items = [
         ptg2_serving._ptg2_manifest_provider_procedure_item(
             npi=1234567890,
-            data={**base_by_field, "source_key": source_key},
+            serving_data={**base_by_field, "source_key": source_key},
             prices=[],
             procedure_detail={},
             provider_context={},
@@ -1363,7 +1363,7 @@ async def test_location_rate_provider_lookup_uses_logical_plan_scope(monkeypatch
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_shared_group_ids_for_provider_set_keys",
+        "_shared_group_ids_for_set_keys",
         AsyncMock(return_value=(provider_group_id,)),
     )
     expected_candidates = object()

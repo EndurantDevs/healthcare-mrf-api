@@ -133,7 +133,7 @@ async def test_v3_provider_set_scope_uses_dense_graph_keys(monkeypatch):
         AsyncMock(return_value={2: group_id}),
     )
 
-    group_ids = await ptg2_serving._shared_group_ids_for_provider_set_keys(
+    group_ids = await ptg2_serving._shared_group_ids_for_set_keys(
         object(),
         serving_tables,
         (3,),
