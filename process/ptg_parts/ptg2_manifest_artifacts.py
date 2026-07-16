@@ -136,20 +136,25 @@ def _cached_sidecar_mmap(path: Path, *, metadata: Mapping[str, Any] | None = Non
     with _SIDE_CAR_MMAP_LOCK:
         cached = _SIDE_CAR_MMAP_CACHE.get(cache_key)
         if cached is not None:
-            _fp, payload, cached_size, cached_mtime_ns = cached
+            _fp, mapped_bytes, cached_size, cached_mtime_ns = cached
             if cached_size == stat_result.st_size and cached_mtime_ns == stat_result.st_mtime_ns:
-                return payload
-            payload.close()
+                return mapped_bytes
+            mapped_bytes.close()
             _fp.close()
             _SIDE_CAR_MMAP_CACHE.pop(cache_key, None)
         fp = open(sidecar_path, "rb")
         try:
-            payload = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
+            mapped_bytes = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
         except Exception:
             fp.close()
             raise
-        _SIDE_CAR_MMAP_CACHE[cache_key] = (fp, payload, stat_result.st_size, stat_result.st_mtime_ns)
-        return payload
+        _SIDE_CAR_MMAP_CACHE[cache_key] = (
+            fp,
+            mapped_bytes,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+        )
+        return mapped_bytes
 
 
 def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> tuple[str, int]:
@@ -177,24 +182,29 @@ def _normalize_global_id(value: bytes | bytearray | memoryview | str) -> bytes:
     return raw
 
 
-def _normalize_local_ids(values: Iterable[int]) -> tuple[int, ...]:
-    normalized: set[int] = set()
-    for value in values:
+def _normalize_local_ids(local_ids: Iterable[int]) -> tuple[int, ...]:
+    normalized_ids: set[int] = set()
+    for value in local_ids:
         local_id = int(value)
         if local_id < 0 or local_id > _UINT32_MAX:
             raise PTG2ManifestArtifactError(f"local ids must fit uint32; got {value!r}")
-        normalized.add(local_id)
-    return tuple(sorted(normalized))
+        normalized_ids.add(local_id)
+    return tuple(sorted(normalized_ids))
 
 
 def _canonical_mapping(
     mapping: Mapping[bytes | bytearray | memoryview | str, Iterable[int]],
 ) -> list[tuple[bytes, tuple[int, ...]]]:
-    merged: dict[bytes, set[int]] = {}
+    local_ids_by_global_id: dict[bytes, set[int]] = {}
     for global_id, local_ids in mapping.items():
         normalized_global_id = _normalize_global_id(global_id)
-        merged.setdefault(normalized_global_id, set()).update(_normalize_local_ids(local_ids))
-    return sorted((global_id, tuple(sorted(local_ids))) for global_id, local_ids in merged.items())
+        local_ids_by_global_id.setdefault(normalized_global_id, set()).update(
+            _normalize_local_ids(local_ids)
+        )
+    return sorted(
+        (global_id, tuple(sorted(local_ids)))
+        for global_id, local_ids in local_ids_by_global_id.items()
+    )
 
 
 def build_dense_id_mapping(
@@ -211,12 +221,15 @@ def build_dense_id_mapping(
 def _canonical_membership(
     mapping: Mapping[bytes | bytearray | memoryview | str, Iterable[bytes | bytearray | memoryview | str]],
 ) -> list[tuple[bytes, tuple[bytes, ...]]]:
-    merged: dict[bytes, set[bytes]] = {}
+    member_ids_by_owner: dict[bytes, set[bytes]] = {}
     for owner_id, member_ids in mapping.items():
         normalized_owner_id = _normalize_global_id(owner_id)
         members = {_normalize_global_id(member_id) for member_id in member_ids}
-        merged.setdefault(normalized_owner_id, set()).update(members)
-    return sorted((owner_id, tuple(sorted(member_ids))) for owner_id, member_ids in merged.items())
+        member_ids_by_owner.setdefault(normalized_owner_id, set()).update(members)
+    return sorted(
+        (owner_id, tuple(sorted(member_ids)))
+        for owner_id, member_ids in member_ids_by_owner.items()
+    )
 
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
@@ -319,8 +332,13 @@ def _existing_serving_sidecar_path_entry(
         return None
     try:
         with path.open("rb") as fp:
-            with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as payload:
-                header, _header_end = _serving_sidecar_header(payload, magic, expected_format, None)
+            with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as mapped_bytes:
+                header, _header_end = _serving_sidecar_header(
+                    mapped_bytes,
+                    magic,
+                    expected_format,
+                    None,
+                )
     except (OSError, PTG2ManifestArtifactError, json.JSONDecodeError, struct.error, ValueError):
         return None
     try:
@@ -371,7 +389,7 @@ def _serving_sidecar_header(
 
 def write_serving_by_code_sidecar(
     path: str | Path,
-    rows: Iterable[Iterable[Any]],
+    serving_rows: Iterable[Iterable[Any]],
     *,
     name: str = "serving_by_code",
     expected_row_count: int | None = None,
@@ -396,7 +414,7 @@ def write_serving_by_code_sidecar(
         return existing
     body_path = sidecar_path.with_name(f"{sidecar_path.name}.body.tmp")
     tmp_path = sidecar_path.with_name(f"{sidecar_path.name}.tmp")
-    price_set_to_key: dict[bytes, int] = {}
+    price_set_key_by_id: dict[bytes, int] = {}
     price_set_values: list[bytes] = []
     blocks: list[dict[str, int]] = []
     row_count = 0
@@ -406,14 +424,14 @@ def write_serving_by_code_sidecar(
     previous_provider_set_key = 0
 
     with body_path.open("wb") as body:
-        for raw_row in rows:
-            values = list(raw_row)
-            if len(values) < 4:
+        for raw_row in serving_rows:
+            row_values = list(raw_row)
+            if len(row_values) < 4:
                 raise PTG2ManifestArtifactError("serving-by-code rows must have at least four columns")
-            code_key = int(values[0])
-            provider_set_key = int(values[1])
-            provider_count = int(values[2])
-            price_set_id = _normalize_128_id(values[3])
+            code_key = int(row_values[0])
+            provider_set_key = int(row_values[1])
+            provider_count = int(row_values[2])
+            price_set_id = _normalize_128_id(row_values[3])
             if current_code != code_key:
                 if current_code is not None:
                     blocks[-1]["count"] = current_block_count
@@ -421,10 +439,10 @@ def write_serving_by_code_sidecar(
                 current_code = code_key
                 current_block_count = 0
                 previous_provider_set_key = 0
-            price_set_key = price_set_to_key.get(price_set_id)
+            price_set_key = price_set_key_by_id.get(price_set_id)
             if price_set_key is None:
                 price_set_key = len(price_set_values)
-                price_set_to_key[price_set_id] = price_set_key
+                price_set_key_by_id[price_set_id] = price_set_key
                 price_set_values.append(price_set_id)
             if provider_set_key < previous_provider_set_key:
                 raise PTG2ManifestArtifactError("serving-by-code rows must be ordered by provider_set_key within code_key")
@@ -473,7 +491,7 @@ def write_serving_by_code_sidecar(
 
 def write_serving_by_provider_set_sidecar(
     path: str | Path,
-    rows: Iterable[Iterable[Any]],
+    serving_rows: Iterable[Iterable[Any]],
     *,
     name: str = "serving_by_provider_set",
     expected_row_count: int | None = None,
@@ -498,24 +516,24 @@ def write_serving_by_provider_set_sidecar(
         return existing
     body_path = sidecar_path.with_name(f"{sidecar_path.name}.body.tmp")
     tmp_path = sidecar_path.with_name(f"{sidecar_path.name}.tmp")
-    price_set_to_key: dict[bytes, int] = {}
+    price_set_key_by_id: dict[bytes, int] = {}
     price_set_values: list[bytes] = []
-    code_keys_seen: set[int] = set()
+    seen_code_keys: set[int] = set()
     blocks: list[dict[str, int]] = []
     row_count = 0
     write_state = _ProviderSetBlockWriteState()
     current_provider_set: int | None = None
     current_code: int | None = None
     current_code_entries: list[tuple[int, int]] = []
-    current_patterns: dict[tuple[tuple[int, int], ...], list[int]] = {}
+    code_keys_by_pattern: dict[tuple[tuple[int, int], ...], list[int]] = {}
 
     def price_key_for(value: Any) -> int:
         """Intern a normalized price-set ID and return its dense integer key."""
         price_set_id = _normalize_128_id(value)
-        price_set_key = price_set_to_key.get(price_set_id)
+        price_set_key = price_set_key_by_id.get(price_set_id)
         if price_set_key is None:
             price_set_key = len(price_set_values)
-            price_set_to_key[price_set_id] = price_set_key
+            price_set_key_by_id[price_set_id] = price_set_key
             price_set_values.append(price_set_id)
         return price_set_key
 
@@ -524,8 +542,8 @@ def write_serving_by_provider_set_sidecar(
 
         if current_code is None:
             return
-        vector = tuple(current_code_entries)
-        current_patterns.setdefault(vector, []).append(current_code)
+        price_entries = tuple(current_code_entries)
+        code_keys_by_pattern.setdefault(price_entries, []).append(current_code)
         current_code_entries.clear()
 
     def write_provider_block(body: Any, provider_set_key: int) -> None:
@@ -533,7 +551,7 @@ def write_serving_by_provider_set_sidecar(
 
         flush_code()
         ordered_patterns = sorted(
-            current_patterns.items(),
+            code_keys_by_pattern.items(),
             key=lambda item: (item[1][0] if item[1] else -1, item[0]),
         )
         block_count = 0
@@ -560,17 +578,17 @@ def write_serving_by_provider_set_sidecar(
             block_count += 1
             write_state.pattern_count += 1
         blocks[-1]["count"] = block_count
-        current_patterns.clear()
+        code_keys_by_pattern.clear()
 
     with body_path.open("wb") as body:
-        for raw_row in rows:
-            values = list(raw_row)
-            if len(values) < 4:
+        for raw_row in serving_rows:
+            row_values = list(raw_row)
+            if len(row_values) < 4:
                 raise PTG2ManifestArtifactError("serving-by-provider-set rows must have at least four columns")
-            provider_set_key = int(values[0])
-            code_key = int(values[1])
-            provider_count = int(values[2])
-            price_set_key = price_key_for(values[3])
+            provider_set_key = int(row_values[0])
+            code_key = int(row_values[1])
+            provider_count = int(row_values[2])
+            price_set_key = price_key_for(row_values[3])
             if current_provider_set != provider_set_key:
                 if current_provider_set is not None:
                     write_provider_block(body, current_provider_set)
@@ -580,7 +598,7 @@ def write_serving_by_provider_set_sidecar(
                 flush_code()
                 current_code = code_key
             current_code_entries.append((provider_count, price_set_key))
-            code_keys_seen.add(code_key)
+            seen_code_keys.add(code_key)
             row_count += 1
         if current_provider_set is not None:
             write_provider_block(body, current_provider_set)
@@ -589,7 +607,7 @@ def write_serving_by_provider_set_sidecar(
         "format": PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
         "row_count": row_count,
         "provider_set_count": len(blocks),
-        "code_count": len(code_keys_seen),
+        "code_count": len(seen_code_keys),
         "price_set_count": len(price_set_values),
         "pattern_count": write_state.pattern_count,
         "body_bytes": write_state.body_offset,
@@ -621,7 +639,7 @@ def write_serving_by_provider_set_sidecar(
 
 async def write_serving_by_code_sidecar_async(
     path: str | Path,
-    rows: AsyncIterable[Iterable[Any]],
+    serving_rows: AsyncIterable[Iterable[Any]],
     *,
     name: str = "serving_by_code",
     expected_row_count: int | None = None,
@@ -641,7 +659,7 @@ async def write_serving_by_code_sidecar_async(
         return existing
     body_path = sidecar_path.with_name(f"{sidecar_path.name}.body.tmp")
     tmp_path = sidecar_path.with_name(f"{sidecar_path.name}.tmp")
-    price_set_to_key: dict[bytes, int] = {}
+    price_set_key_by_id: dict[bytes, int] = {}
     price_set_values: list[bytes] = []
     blocks: list[dict[str, int]] = []
     row_count = 0
@@ -651,14 +669,14 @@ async def write_serving_by_code_sidecar_async(
     previous_provider_set_key = 0
 
     with body_path.open("wb") as body:
-        async for raw_row in rows:
-            values = list(raw_row)
-            if len(values) < 4:
+        async for raw_row in serving_rows:
+            row_values = list(raw_row)
+            if len(row_values) < 4:
                 raise PTG2ManifestArtifactError("serving-by-code rows must have at least four columns")
-            code_key = int(values[0])
-            provider_set_key = int(values[1])
-            provider_count = int(values[2])
-            price_set_id = _normalize_128_id(values[3])
+            code_key = int(row_values[0])
+            provider_set_key = int(row_values[1])
+            provider_count = int(row_values[2])
+            price_set_id = _normalize_128_id(row_values[3])
             if current_code != code_key:
                 if current_code is not None:
                     blocks[-1]["count"] = current_block_count
@@ -666,10 +684,10 @@ async def write_serving_by_code_sidecar_async(
                 current_code = code_key
                 current_block_count = 0
                 previous_provider_set_key = 0
-            price_set_key = price_set_to_key.get(price_set_id)
+            price_set_key = price_set_key_by_id.get(price_set_id)
             if price_set_key is None:
                 price_set_key = len(price_set_values)
-                price_set_to_key[price_set_id] = price_set_key
+                price_set_key_by_id[price_set_id] = price_set_key
                 price_set_values.append(price_set_id)
             if provider_set_key < previous_provider_set_key:
                 raise PTG2ManifestArtifactError("serving-by-code rows must be ordered by provider_set_key within code_key")
@@ -718,7 +736,7 @@ async def write_serving_by_code_sidecar_async(
 
 async def write_serving_by_provider_set_sidecar_async(
     path: str | Path,
-    rows: AsyncIterable[Iterable[Any]],
+    serving_rows: AsyncIterable[Iterable[Any]],
     *,
     name: str = "serving_by_provider_set",
     expected_row_count: int | None = None,
@@ -738,24 +756,24 @@ async def write_serving_by_provider_set_sidecar_async(
         return existing
     body_path = sidecar_path.with_name(f"{sidecar_path.name}.body.tmp")
     tmp_path = sidecar_path.with_name(f"{sidecar_path.name}.tmp")
-    price_set_to_key: dict[bytes, int] = {}
+    price_set_key_by_id: dict[bytes, int] = {}
     price_set_values: list[bytes] = []
-    code_keys_seen: set[int] = set()
+    seen_code_keys: set[int] = set()
     blocks: list[dict[str, int]] = []
     row_count = 0
     write_state = _ProviderSetBlockWriteState()
     current_provider_set: int | None = None
     current_code: int | None = None
     current_code_entries: list[tuple[int, int]] = []
-    current_patterns: dict[tuple[tuple[int, int], ...], list[int]] = {}
+    code_keys_by_pattern: dict[tuple[tuple[int, int], ...], list[int]] = {}
 
     def price_key_for(value: Any) -> int:
         """Intern a normalized price-set ID and return its dense integer key."""
         price_set_id = _normalize_128_id(value)
-        price_set_key = price_set_to_key.get(price_set_id)
+        price_set_key = price_set_key_by_id.get(price_set_id)
         if price_set_key is None:
             price_set_key = len(price_set_values)
-            price_set_to_key[price_set_id] = price_set_key
+            price_set_key_by_id[price_set_id] = price_set_key
             price_set_values.append(price_set_id)
         return price_set_key
 
@@ -764,7 +782,9 @@ async def write_serving_by_provider_set_sidecar_async(
 
         if current_code is None:
             return
-        current_patterns.setdefault(tuple(current_code_entries), []).append(current_code)
+        code_keys_by_pattern.setdefault(tuple(current_code_entries), []).append(
+            current_code
+        )
         current_code_entries.clear()
 
     def write_provider_block(body: Any, provider_set_key: int) -> None:
@@ -780,7 +800,7 @@ async def write_serving_by_provider_set_sidecar_async(
         )
         block_count = 0
         for entries, code_key_list in sorted(
-            current_patterns.items(),
+            code_keys_by_pattern.items(),
             key=lambda item: (item[1][0] if item[1] else -1, item[0]),
         ):
             code_keys = tuple(sorted(code_key_list))
@@ -798,17 +818,17 @@ async def write_serving_by_provider_set_sidecar_async(
             block_count += 1
             write_state.pattern_count += 1
         blocks[-1]["count"] = block_count
-        current_patterns.clear()
+        code_keys_by_pattern.clear()
 
     with body_path.open("wb") as body:
-        async for raw_row in rows:
-            values = list(raw_row)
-            if len(values) < 4:
+        async for raw_row in serving_rows:
+            row_values = list(raw_row)
+            if len(row_values) < 4:
                 raise PTG2ManifestArtifactError("serving-by-provider-set rows must have at least four columns")
-            provider_set_key = int(values[0])
-            code_key = int(values[1])
-            provider_count = int(values[2])
-            price_set_key = price_key_for(values[3])
+            provider_set_key = int(row_values[0])
+            code_key = int(row_values[1])
+            provider_count = int(row_values[2])
+            price_set_key = price_key_for(row_values[3])
             if current_provider_set != provider_set_key:
                 if current_provider_set is not None:
                     write_provider_block(body, current_provider_set)
@@ -818,7 +838,7 @@ async def write_serving_by_provider_set_sidecar_async(
                 flush_code()
                 current_code = code_key
             current_code_entries.append((provider_count, price_set_key))
-            code_keys_seen.add(code_key)
+            seen_code_keys.add(code_key)
             row_count += 1
         if current_provider_set is not None:
             write_provider_block(body, current_provider_set)
@@ -827,7 +847,7 @@ async def write_serving_by_provider_set_sidecar_async(
         "format": PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
         "row_count": row_count,
         "provider_set_count": len(blocks),
-        "code_count": len(code_keys_seen),
+        "code_count": len(seen_code_keys),
         "price_set_count": len(price_set_values),
         "pattern_count": write_state.pattern_count,
         "body_bytes": write_state.body_offset,
@@ -904,7 +924,7 @@ def write_global_local_id_mapping(
     manifest_path = artifact_dir / manifest_name
     canonical = _canonical_mapping(mapping)
 
-    payload = bytearray()
+    sidecar_bytes = bytearray()
     record_count = 0
     global_id_count = 0
     for global_id, local_ids in canonical:
@@ -912,12 +932,12 @@ def write_global_local_id_mapping(
             continue
         global_id_count += 1
         for local_id in local_ids:
-            payload.extend(_MAPPING_RECORD.pack(global_id, local_id))
+            sidecar_bytes.extend(_MAPPING_RECORD.pack(global_id, local_id))
             record_count += 1
-    _atomic_write_bytes(sidecar_path, bytes(payload))
+    _atomic_write_bytes(sidecar_path, bytes(sidecar_bytes))
     sidecar_sha, sidecar_byte_count = _sha256_file(sidecar_path)
 
-    manifest = {
+    artifact_manifest_dict = {
         "version": PTG2_MANIFEST_VERSION,
         "artifact_type": PTG2_MANIFEST_MAPPING_ARTIFACT_TYPE,
         "name": name,
@@ -935,8 +955,8 @@ def write_global_local_id_mapping(
             }
         ],
     }
-    write_manifest(manifest_path, manifest)
-    return manifest
+    write_manifest(manifest_path, artifact_manifest_dict)
+    return artifact_manifest_dict
 
 
 def read_global_local_id_mapping(manifest_path: str | Path) -> dict[bytes, tuple[int, ...]]:
@@ -965,15 +985,18 @@ def read_global_local_id_mapping(manifest_path: str | Path) -> dict[bytes, tuple
             f"global/local id sidecar record count mismatch: expected {expected_records}, got {actual_records}"
         )
 
-    result: dict[bytes, list[int]] = {}
+    local_ids_by_global_id: dict[bytes, list[int]] = {}
     with open(sidecar_path, "rb") as fp:
         while chunk := fp.read(PTG2_MANIFEST_MAPPING_RECORD_SIZE):
             if len(chunk) != PTG2_MANIFEST_MAPPING_RECORD_SIZE:
                 raise PTG2ManifestArtifactError("global/local id sidecar ended mid-record")
             global_id, local_id = _MAPPING_RECORD.unpack(chunk)
-            result.setdefault(global_id, []).append(local_id)
+            local_ids_by_global_id.setdefault(global_id, []).append(local_id)
 
-    return {global_id: tuple(local_ids) for global_id, local_ids in sorted(result.items())}
+    return {
+        global_id: tuple(local_ids)
+        for global_id, local_ids in sorted(local_ids_by_global_id.items())
+    }
 
 
 def write_global_membership_sidecar(
@@ -996,21 +1019,23 @@ def write_global_membership_sidecar(
     manifest_path = artifact_dir / manifest_name
     canonical = _canonical_membership(mapping)
 
-    payload = bytearray()
-    payload.extend(_MEMBERSHIP_HEADER.pack(PTG2_MANIFEST_MEMBERSHIP_MAGIC, PTG2_MANIFEST_VERSION, len(canonical)))
+    sidecar_bytes = bytearray()
+    sidecar_bytes.extend(
+        _MEMBERSHIP_HEADER.pack(PTG2_MANIFEST_MEMBERSHIP_MAGIC, PTG2_MANIFEST_VERSION, len(canonical))
+    )
     member_offset = 0
     member_count = 0
     for owner_id, member_ids in canonical:
-        payload.extend(_MEMBERSHIP_INDEX_RECORD.pack(owner_id, member_offset, len(member_ids)))
+        sidecar_bytes.extend(_MEMBERSHIP_INDEX_RECORD.pack(owner_id, member_offset, len(member_ids)))
         member_offset += len(member_ids)
         member_count += len(member_ids)
     for _owner_id, member_ids in canonical:
         for member_id in member_ids:
-            payload.extend(member_id)
-    _atomic_write_bytes(sidecar_path, bytes(payload))
+            sidecar_bytes.extend(member_id)
+    _atomic_write_bytes(sidecar_path, bytes(sidecar_bytes))
     sidecar_sha, sidecar_byte_count = _sha256_file(sidecar_path)
 
-    manifest = {
+    artifact_manifest_dict = {
         "version": PTG2_MANIFEST_VERSION,
         "artifact_type": PTG2_MANIFEST_MEMBERSHIP_ARTIFACT_TYPE,
         "name": name,
@@ -1029,8 +1054,8 @@ def write_global_membership_sidecar(
             }
         ],
     }
-    write_manifest(manifest_path, manifest)
-    return manifest
+    write_manifest(manifest_path, artifact_manifest_dict)
+    return artifact_manifest_dict
 
 
 def read_global_membership_sidecar(manifest_path: str | Path) -> dict[bytes, tuple[bytes, ...]]:
@@ -1065,16 +1090,16 @@ def read_global_sidecar_entries(
     if metadata is not None:
         _validate_sidecar_metadata(sidecar_path, metadata)
         _validate_membership_record_format(metadata)
-    payload = sidecar_path.read_bytes()
-    if len(payload) < 8:
+    sidecar_bytes = sidecar_path.read_bytes()
+    if len(sidecar_bytes) < 8:
         raise PTG2ManifestArtifactError("global membership sidecar is missing its header")
-    magic = bytes(payload[:8])
+    magic = bytes(sidecar_bytes[:8])
     if _is_dense_membership_magic(magic):
-        return _read_dense_sidecar_entries(payload, metadata=metadata)
+        return _read_dense_sidecar_entries(sidecar_bytes, metadata=metadata)
     if not _is_standard_membership_magic(magic):
         raise PTG2ManifestArtifactError("global membership sidecar has an invalid magic header")
     header_size = _MEMBERSHIP_HEADER.size
-    magic, version, entry_count = _MEMBERSHIP_HEADER.unpack_from(payload, 0)
+    magic, version, entry_count = _MEMBERSHIP_HEADER.unpack_from(sidecar_bytes, 0)
     if version != PTG2_MANIFEST_VERSION:
         raise PTG2ManifestArtifactError(f"unsupported global membership sidecar version: {version!r}")
     if metadata is not None:
@@ -1084,15 +1109,18 @@ def read_global_sidecar_entries(
 
     index_start = header_size
     index_end = index_start + entry_count * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
-    if len(payload) < index_end:
+    if len(sidecar_bytes) < index_end:
         raise PTG2ManifestArtifactError("global membership sidecar ended inside the owner index")
     member_start = index_end
-    result: list[PTG2ManifestSidecarEntry] = []
+    sidecar_entries: list[PTG2ManifestSidecarEntry] = []
     total_members = 0
     previous_owner: bytes | None = None
     for index in range(entry_count):
         record_offset = index_start + index * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
-        owner_id, member_offset, member_count = _MEMBERSHIP_INDEX_RECORD.unpack_from(payload, record_offset)
+        owner_id, member_offset, member_count = _MEMBERSHIP_INDEX_RECORD.unpack_from(
+            sidecar_bytes,
+            record_offset,
+        )
         if previous_owner is not None and owner_id <= previous_owner:
             raise PTG2ManifestArtifactError("global membership sidecar owners must be sorted and unique")
         previous_owner = owner_id
@@ -1100,21 +1128,23 @@ def read_global_sidecar_entries(
         members: list[bytes] = []
         start = member_start + member_offset * 16
         end = start + member_count * 16
-        if end > len(payload):
+        if end > len(sidecar_bytes):
             raise PTG2ManifestArtifactError("global membership sidecar member block is truncated")
         for member_pos in range(start, end, 16):
-            members.append(payload[member_pos : member_pos + 16])
+            members.append(sidecar_bytes[member_pos : member_pos + 16])
         if tuple(members) != tuple(sorted(set(members))):
             raise PTG2ManifestArtifactError("global membership sidecar members must be sorted and unique")
-        result.append(PTG2ManifestSidecarEntry(owner=owner_id, members=tuple(members)))
+        sidecar_entries.append(
+            PTG2ManifestSidecarEntry(owner=owner_id, members=tuple(members))
+        )
     if metadata is not None:
         expected_members = metadata.get("member_count")
         if expected_members is not None and total_members != int(expected_members):
             raise PTG2ManifestArtifactError("global membership sidecar member count mismatch")
     expected_size = member_start + total_members * 16
-    if len(payload) != expected_size:
+    if len(sidecar_bytes) != expected_size:
         raise PTG2ManifestArtifactError("global membership sidecar has trailing bytes")
-    return tuple(result)
+    return tuple(sidecar_entries)
 
 
 def lookup_global_sidecar_members(
@@ -1145,16 +1175,24 @@ def lookup_global_sidecar_members(
                 f"expected {expected_byte_count}, got {actual_byte_count}"
             )
     with open(sidecar_path, "rb") as fp:
-        with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as payload:
+        with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as mapped_bytes:
             header_size = _MEMBERSHIP_HEADER.size
-            if len(payload) < header_size:
+            if len(mapped_bytes) < header_size:
                 raise PTG2ManifestArtifactError("global membership sidecar is missing its header")
-            magic = bytes(payload[:8])
+            magic = bytes(mapped_bytes[:8])
             if _is_dense_membership_magic(magic):
-                return _lookup_dense_sidecar_members(payload, owner_id, metadata=metadata, max_members=max_members)
+                return _lookup_dense_sidecar_members(
+                    mapped_bytes,
+                    owner_id,
+                    metadata=metadata,
+                    max_members=max_members,
+                )
             if not _is_standard_membership_magic(magic):
                 raise PTG2ManifestArtifactError("global membership sidecar has an invalid magic header")
-            magic, version, entry_count = _MEMBERSHIP_HEADER.unpack_from(payload, 0)
+            magic, version, entry_count = _MEMBERSHIP_HEADER.unpack_from(
+                mapped_bytes,
+                0,
+            )
             if version != PTG2_MANIFEST_VERSION:
                 raise PTG2ManifestArtifactError(f"unsupported global membership sidecar version: {version!r}")
             expected_entries = metadata.get("entry_count", metadata.get("owner_count")) if metadata is not None else None
@@ -1162,7 +1200,7 @@ def lookup_global_sidecar_members(
                 raise PTG2ManifestArtifactError("global membership sidecar entry count mismatch")
             index_start = header_size
             index_end = index_start + entry_count * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
-            if len(payload) < index_end:
+            if len(mapped_bytes) < index_end:
                 raise PTG2ManifestArtifactError("global membership sidecar ended inside the owner index")
             member_start = index_end
             low = 0
@@ -1171,7 +1209,7 @@ def lookup_global_sidecar_members(
                 mid = (low + high) // 2
                 record_offset = index_start + mid * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
                 candidate_owner, member_offset, member_count = _MEMBERSHIP_INDEX_RECORD.unpack_from(
-                    payload,
+                    mapped_bytes,
                     record_offset,
                 )
                 if candidate_owner < owner_id:
@@ -1182,23 +1220,26 @@ def lookup_global_sidecar_members(
                     continue
                 start = member_start + member_offset * 16
                 end = start + member_count * 16
-                if end > len(payload):
+                if end > len(mapped_bytes):
                     raise PTG2ManifestArtifactError("global membership sidecar member block is truncated")
                 if max_members is not None:
                     end = min(end, start + max(max_members, 0) * 16)
-                return tuple(bytes(payload[pos : pos + 16]) for pos in range(start, end, 16))
+                return tuple(
+                    bytes(mapped_bytes[pos : pos + 16])
+                    for pos in range(start, end, 16)
+                )
             return ()
 
 
 def _lookup_standard_sidecar_members(
-    payload: mmap.mmap,
+    mapped_bytes: mmap.mmap,
     owner_id: bytes,
     *,
     metadata: Mapping[str, Any] | None = None,
     max_members: int | None = None,
 ) -> tuple[bytes, ...]:
     header_size = _MEMBERSHIP_HEADER.size
-    magic, version, entry_count = _MEMBERSHIP_HEADER.unpack_from(payload, 0)
+    magic, version, entry_count = _MEMBERSHIP_HEADER.unpack_from(mapped_bytes, 0)
     if not _is_standard_membership_magic(magic):
         raise PTG2ManifestArtifactError("global membership sidecar has an invalid magic header")
     if version != PTG2_MANIFEST_VERSION:
@@ -1208,7 +1249,7 @@ def _lookup_standard_sidecar_members(
         raise PTG2ManifestArtifactError("global membership sidecar entry count mismatch")
     index_start = header_size
     index_end = index_start + entry_count * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
-    if len(payload) < index_end:
+    if len(mapped_bytes) < index_end:
         raise PTG2ManifestArtifactError("global membership sidecar ended inside the owner index")
     member_start = index_end
     low = 0
@@ -1217,7 +1258,7 @@ def _lookup_standard_sidecar_members(
         mid = (low + high) // 2
         record_offset = index_start + mid * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
         candidate_owner, member_offset, member_count = _MEMBERSHIP_INDEX_RECORD.unpack_from(
-            payload,
+            mapped_bytes,
             record_offset,
         )
         if candidate_owner < owner_id:
@@ -1228,11 +1269,14 @@ def _lookup_standard_sidecar_members(
             continue
         start = member_start + member_offset * 16
         end = start + member_count * 16
-        if end > len(payload):
+        if end > len(mapped_bytes):
             raise PTG2ManifestArtifactError("global membership sidecar member block is truncated")
         if max_members is not None:
             end = min(end, start + max(max_members, 0) * 16)
-        return tuple(bytes(payload[pos : pos + 16]) for pos in range(start, end, 16))
+        return tuple(
+            bytes(mapped_bytes[pos : pos + 16])
+            for pos in range(start, end, 16)
+        )
     return ()
 
 
@@ -1252,41 +1296,49 @@ def lookup_global_sidecar_members_many(
     if metadata is not None:
         _validate_membership_record_format(metadata)
     if _sidecar_mmap_cache_enabled():
-        payload = _cached_sidecar_mmap(sidecar_path, metadata=metadata)
-        if len(payload) < _MEMBERSHIP_HEADER.size:
+        mapped_bytes = _cached_sidecar_mmap(sidecar_path, metadata=metadata)
+        if len(mapped_bytes) < _MEMBERSHIP_HEADER.size:
             raise PTG2ManifestArtifactError("global membership sidecar is missing its header")
-        magic = bytes(payload[:8])
+        magic = bytes(mapped_bytes[:8])
         if _is_dense_membership_magic(magic):
             return {
-                owner_id: _lookup_dense_sidecar_members(payload, owner_id, metadata=metadata, max_members=max_members)
+                owner_id: _lookup_dense_sidecar_members(
+                    mapped_bytes, owner_id, metadata=metadata, max_members=max_members
+                )
                 for owner_id in owner_ids
             }
         if not _is_standard_membership_magic(magic):
             raise PTG2ManifestArtifactError("global membership sidecar has an invalid magic header")
         return {
-            owner_id: _lookup_standard_sidecar_members(payload, owner_id, metadata=metadata, max_members=max_members)
+            owner_id: _lookup_standard_sidecar_members(
+                mapped_bytes, owner_id, metadata=metadata, max_members=max_members
+            )
             for owner_id in owner_ids
         }
     with open(sidecar_path, "rb") as fp:
-        with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as payload:
-            if len(payload) < _MEMBERSHIP_HEADER.size:
+        with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as mapped_bytes:
+            if len(mapped_bytes) < _MEMBERSHIP_HEADER.size:
                 raise PTG2ManifestArtifactError("global membership sidecar is missing its header")
-            magic = bytes(payload[:8])
+            magic = bytes(mapped_bytes[:8])
             if _is_dense_membership_magic(magic):
                 return {
-                    owner_id: _lookup_dense_sidecar_members(payload, owner_id, metadata=metadata, max_members=max_members)
+                    owner_id: _lookup_dense_sidecar_members(
+                        mapped_bytes, owner_id, metadata=metadata, max_members=max_members
+                    )
                     for owner_id in owner_ids
                 }
             if not _is_standard_membership_magic(magic):
                 raise PTG2ManifestArtifactError("global membership sidecar has an invalid magic header")
             return {
-                owner_id: _lookup_standard_sidecar_members(payload, owner_id, metadata=metadata, max_members=max_members)
+                owner_id: _lookup_standard_sidecar_members(
+                    mapped_bytes, owner_id, metadata=metadata, max_members=max_members
+                )
                 for owner_id in owner_ids
             }
 
 
 def _lookup_serving_block(
-    payload: bytes | bytearray | memoryview | mmap.mmap,
+    sidecar_bytes: bytes | bytearray | memoryview | mmap.mmap,
     *,
     key: int,
     magic: bytes,
@@ -1294,20 +1346,28 @@ def _lookup_serving_block(
     block_count_field: str,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], int, int, int, int, int]:
-    header, header_end = _serving_sidecar_header(payload, magic, expected_format, metadata)
+    header, header_end = _serving_sidecar_header(
+        sidecar_bytes,
+        magic,
+        expected_format,
+        metadata,
+    )
     price_count = int(header.get("price_set_count") or 0)
     block_count = int(header.get(block_count_field) or 0)
     price_start = header_end
     index_start = price_start + price_count * 16
     body_start = index_start + block_count * PTG2_SERVING_BLOCK_INDEX_RECORD_SIZE
-    if body_start > len(payload):
+    if body_start > len(sidecar_bytes):
         raise PTG2ManifestArtifactError("serving sidecar index is truncated")
     low = 0
     high = block_count - 1
     while low <= high:
         mid = (low + high) // 2
         record_offset = index_start + mid * PTG2_SERVING_BLOCK_INDEX_RECORD_SIZE
-        candidate_key, body_offset, row_count = _SERVING_BLOCK_INDEX_RECORD.unpack_from(payload, record_offset)
+        candidate_key, body_offset, row_count = _SERVING_BLOCK_INDEX_RECORD.unpack_from(
+            sidecar_bytes,
+            record_offset,
+        )
         if candidate_key < key:
             low = mid + 1
             continue
@@ -1336,9 +1396,9 @@ def lookup_serving_by_code_sidecar(
 ) -> tuple[PTG2ServingSidecarRow, ...]:
     """Return compact serving rows for one code key from a serving-by-code sidecar."""
 
-    payload = _serving_sidecar_payload(path, metadata)
+    sidecar_bytes = _serving_sidecar_payload(path, metadata)
     _header, price_start, body_start, body_offset, row_count, price_count = _lookup_serving_block(
-        payload,
+        sidecar_bytes,
         key=int(code_key),
         magic=PTG2_SERVING_BY_CODE_MAGIC,
         expected_format=PTG2_SERVING_BY_CODE_FORMAT,
@@ -1347,15 +1407,19 @@ def lookup_serving_by_code_sidecar(
     )
     if row_count <= 0:
         return ()
-    provider_filter = {int(value) for value in provider_set_keys} if provider_set_keys is not None else None
+    provider_filter = (
+        {int(provider_set_key) for provider_set_key in provider_set_keys}
+        if provider_set_keys is not None
+        else None
+    )
     provider_filter_max = max(provider_filter) if provider_filter else None
     cursor = body_start + body_offset
     provider_set_key = 0
-    rows: list[PTG2ServingSidecarRow] = []
+    serving_rows: list[PTG2ServingSidecarRow] = []
     for _ in range(row_count):
-        provider_delta, cursor = _read_uvarint(payload, cursor)
-        provider_count, cursor = _read_uvarint(payload, cursor)
-        price_key, cursor = _read_uvarint(payload, cursor)
+        provider_delta, cursor = _read_uvarint(sidecar_bytes, cursor)
+        provider_count, cursor = _read_uvarint(sidecar_bytes, cursor)
+        price_key, cursor = _read_uvarint(sidecar_bytes, cursor)
         if price_key >= price_count:
             raise PTG2ManifestArtifactError("serving-by-code sidecar price key is out of range")
         provider_set_key += provider_delta
@@ -1364,15 +1428,17 @@ def lookup_serving_by_code_sidecar(
                 break
             continue
         price_offset = price_start + price_key * 16
-        rows.append(
+        serving_rows.append(
             PTG2ServingSidecarRow(
                 code_key=int(code_key),
                 provider_set_key=provider_set_key,
                 provider_count=provider_count,
-                price_set_global_id_128=_id_text(payload[price_offset : price_offset + 16]),
+                price_set_global_id_128=_id_text(
+                    sidecar_bytes[price_offset : price_offset + 16]
+                ),
             )
         )
-    return tuple(rows)
+    return tuple(serving_rows)
 
 
 def lookup_serving_by_provider_set_sidecar(
@@ -1384,9 +1450,9 @@ def lookup_serving_by_provider_set_sidecar(
 ) -> tuple[PTG2ServingSidecarRow, ...]:
     """Return compact serving rows for one provider-set key from a reverse sidecar."""
 
-    payload = _serving_sidecar_payload(path, metadata)
+    sidecar_bytes = _serving_sidecar_payload(path, metadata)
     _header, price_start, body_start, body_offset, pattern_count, price_count = _lookup_serving_block(
-        payload,
+        sidecar_bytes,
         key=int(provider_set_key),
         magic=PTG2_SERVING_BY_PROVIDER_SET_MAGIC,
         expected_format=PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
@@ -1395,23 +1461,27 @@ def lookup_serving_by_provider_set_sidecar(
     )
     if pattern_count <= 0:
         return ()
-    code_filter = {int(value) for value in code_keys} if code_keys is not None else None
+    code_filter = (
+        {int(code_key) for code_key in code_keys}
+        if code_keys is not None
+        else None
+    )
     cursor = body_start + body_offset
-    rows: list[PTG2ServingSidecarRow] = []
+    serving_rows: list[PTG2ServingSidecarRow] = []
     for _ in range(pattern_count):
-        code_count, cursor = _read_uvarint(payload, cursor)
+        code_count, cursor = _read_uvarint(sidecar_bytes, cursor)
         decoded_code_keys: list[int] = []
         previous_code_key = 0
         for index in range(code_count):
-            encoded_code_key, cursor = _read_uvarint(payload, cursor)
+            encoded_code_key, cursor = _read_uvarint(sidecar_bytes, cursor)
             code_key = encoded_code_key if index == 0 else previous_code_key + encoded_code_key
             decoded_code_keys.append(code_key)
             previous_code_key = code_key
-        entry_count, cursor = _read_uvarint(payload, cursor)
+        entry_count, cursor = _read_uvarint(sidecar_bytes, cursor)
         entries: list[tuple[int, int]] = []
         for _entry_index in range(entry_count):
-            provider_count, cursor = _read_uvarint(payload, cursor)
-            price_key, cursor = _read_uvarint(payload, cursor)
+            provider_count, cursor = _read_uvarint(sidecar_bytes, cursor)
+            price_key, cursor = _read_uvarint(sidecar_bytes, cursor)
             if price_key >= price_count:
                 raise PTG2ManifestArtifactError("serving-by-provider-set sidecar price key is out of range")
             entries.append((provider_count, price_key))
@@ -1420,15 +1490,17 @@ def lookup_serving_by_provider_set_sidecar(
                 continue
             for provider_count, price_key in entries:
                 price_offset = price_start + price_key * 16
-                rows.append(
+                serving_rows.append(
                     PTG2ServingSidecarRow(
                         code_key=code_key,
                         provider_set_key=int(provider_set_key),
                         provider_count=provider_count,
-                        price_set_global_id_128=_id_text(payload[price_offset : price_offset + 16]),
+                        price_set_global_id_128=_id_text(
+                            sidecar_bytes[price_offset : price_offset + 16]
+                        ),
                     )
                 )
-    return tuple(rows)
+    return tuple(serving_rows)
 
 
 def lookup_serving_by_provider_set_patterns(
@@ -1440,9 +1512,9 @@ def lookup_serving_by_provider_set_patterns(
 ) -> tuple[PTG2ServingProviderSetPattern, ...]:
     """Return compact code-vector patterns for one provider-set key."""
 
-    payload = _serving_sidecar_payload(path, metadata)
+    sidecar_bytes = _serving_sidecar_payload(path, metadata)
     _header, price_start, body_start, body_offset, pattern_count, price_count = _lookup_serving_block(
-        payload,
+        sidecar_bytes,
         key=int(provider_set_key),
         magic=PTG2_SERVING_BY_PROVIDER_SET_MAGIC,
         expected_format=PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
@@ -1451,29 +1523,38 @@ def lookup_serving_by_provider_set_patterns(
     )
     if pattern_count <= 0:
         return ()
-    code_filter = {int(value) for value in code_keys} if code_keys is not None else None
+    code_filter = (
+        {int(code_key) for code_key in code_keys}
+        if code_keys is not None
+        else None
+    )
     cursor = body_start + body_offset
     patterns: list[PTG2ServingProviderSetPattern] = []
     for _ in range(pattern_count):
-        code_count, cursor = _read_uvarint(payload, cursor)
+        code_count, cursor = _read_uvarint(sidecar_bytes, cursor)
         decoded_code_keys: list[int] = []
         previous_code_key = 0
         for index in range(code_count):
-            encoded_code_key, cursor = _read_uvarint(payload, cursor)
+            encoded_code_key, cursor = _read_uvarint(sidecar_bytes, cursor)
             code_key = encoded_code_key if index == 0 else previous_code_key + encoded_code_key
             if code_filter is None or code_key in code_filter:
                 decoded_code_keys.append(code_key)
             previous_code_key = code_key
-        entry_count, cursor = _read_uvarint(payload, cursor)
+        entry_count, cursor = _read_uvarint(sidecar_bytes, cursor)
         entries: list[tuple[int, str]] = []
         for _entry_index in range(entry_count):
-            provider_count, cursor = _read_uvarint(payload, cursor)
-            price_key, cursor = _read_uvarint(payload, cursor)
+            provider_count, cursor = _read_uvarint(sidecar_bytes, cursor)
+            price_key, cursor = _read_uvarint(sidecar_bytes, cursor)
             if price_key >= price_count:
                 raise PTG2ManifestArtifactError("serving-by-provider-set sidecar price key is out of range")
             if decoded_code_keys:
                 price_offset = price_start + price_key * 16
-                entries.append((provider_count, _id_text(payload[price_offset : price_offset + 16])))
+                entries.append(
+                    (
+                        provider_count,
+                        _id_text(sidecar_bytes[price_offset : price_offset + 16]),
+                    )
+                )
         if decoded_code_keys and entries:
             patterns.append(
                 PTG2ServingProviderSetPattern(
