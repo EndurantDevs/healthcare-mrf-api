@@ -192,11 +192,11 @@ async def _cleanup_mrf_finalize_jobs(redis, import_date: str) -> int:
     base_job_id = f"shutdown_mrf_{import_date}"
     job_ids = {base_job_id}
     try:
-        queued = await redis.zrange(MRF_FINISH_QUEUE_NAME, 0, -1)
+        queued_job_ids = await redis.zrange(MRF_FINISH_QUEUE_NAME, 0, -1)
     except Exception:  # pragma: no cover - cleanup must not fail publish
         logger.debug("Unable to inspect MRF finish queue for cleanup", exc_info=True)
-        queued = []
-    for raw_job_id in queued or []:
+        queued_job_ids = []
+    for raw_job_id in queued_job_ids or []:
         job_id = _decode_redis_text(raw_job_id)
         if _is_mrf_finalize_job_id(job_id, import_date):
             job_ids.add(job_id)
@@ -436,13 +436,13 @@ def _mrf_file_chunking_enabled(kind: str, ctx: dict | None = None) -> bool:
         return False
     if lowered in {"1", "true", "yes", "on", "all"}:
         return True
-    aliases = {
+    aliases_by_kind = {
         "plan": {"plan", "plans"},
         "provider": {"provider", "providers"},
         "formulary": {"formulary", "formularies", "drug", "drugs"},
     }
-    enabled = {item.strip().lower() for item in re.split(r"[,;\s]+", lowered) if item.strip()}
-    return bool(enabled & aliases.get(kind, {kind}))
+    enabled_aliases = {item.strip().lower() for item in re.split(r"[,;\s]+", lowered) if item.strip()}
+    return bool(enabled_aliases & aliases_by_kind.get(kind, {kind}))
 
 
 def _mrf_chunk_dir(ctx: dict, kind: str, source_url: str) -> Path:
@@ -478,9 +478,9 @@ def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: st
 
     chunk_dir.mkdir(parents=True, exist_ok=True)
     chunks: list[dict] = []
-    records: list[bytes] = []
+    buffered_records: list[bytes] = []
     chunk_bytes = 2
-    record = bytearray()
+    record_buffer = bytearray()
     in_array = False
     record_started = False
     in_string = False
@@ -488,23 +488,23 @@ def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: st
     depth = 0
     array_done = False
 
-    def flush_record() -> None:
+    def flush_record(current_chunk_bytes: int) -> int:
         """Flush the buffered record into the active output chunk."""
 
-        nonlocal chunk_bytes, record
-        if not record:
-            return
-        payload = bytes(record).strip()
-        record.clear()
+        if not record_buffer:
+            return current_chunk_bytes
+        payload = bytes(record_buffer).strip()
+        record_buffer.clear()
         if not payload:
-            return
-        projected = chunk_bytes + len(payload) + (1 if records else 0)
-        if records and projected > target_bytes:
-            _write_mrf_chunk(chunks, chunk_dir / f"{kind}_{len(chunks):05d}.json", records)
-            records.clear()
-            chunk_bytes = 2
-        records.append(payload)
-        chunk_bytes += len(payload) + (1 if len(records) > 1 else 0)
+            return current_chunk_bytes
+        projected = current_chunk_bytes + len(payload) + (1 if buffered_records else 0)
+        if buffered_records and projected > target_bytes:
+            _write_mrf_chunk(chunks, chunk_dir / f"{kind}_{len(chunks):05d}.json", buffered_records)
+            buffered_records.clear()
+            current_chunk_bytes = 2
+        buffered_records.append(payload)
+        current_chunk_bytes += len(payload) + (1 if len(buffered_records) > 1 else 0)
+        return current_chunk_bytes
 
     with open(source_path, "rb") as handle:
         while True:
@@ -531,7 +531,7 @@ def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: st
                     in_string = False
                     escaped = False
 
-                record.append(byte)
+                record_buffer.append(byte)
 
                 if in_string:
                     if escaped:
@@ -550,12 +550,12 @@ def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: st
                     depth -= 1
                     if depth == 0:
                         record_started = False
-                        flush_record()
+                        chunk_bytes = flush_record(chunk_bytes)
 
     if record_started:
         raise ValueError(f"Unable to split {source_path}; unterminated top-level JSON record")
-    if records:
-        _write_mrf_chunk(chunks, chunk_dir / f"{kind}_{len(chunks):05d}.json", records)
+    if buffered_records:
+        _write_mrf_chunk(chunks, chunk_dir / f"{kind}_{len(chunks):05d}.json", buffered_records)
     if len(chunks) <= 1:
         shutil.rmtree(chunk_dir, ignore_errors=True)
         return []
@@ -580,7 +580,7 @@ async def _maybe_enqueue_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: st
     run_scope = _mrf_job_scope(ctx)
     for idx, chunk in enumerate(chunks):
         work_id = _mrf_url_job_id(f"{kind}-chunk", run_scope, f"{source_url}:{idx}")
-        chunk_task = {
+        chunk_task_dict = {
             **task,
             "url": source_url,
             "source_url": source_url,
@@ -594,11 +594,11 @@ async def _maybe_enqueue_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: st
             run_scope,
             work_id,
             function_name=function_name,
-            task=chunk_task,
+            task=chunk_task_dict,
         ):
             continue
         await redis.enqueue_job(
-            function_name, chunk_task, _queue_name=MRF_QUEUE_NAME, _job_id=work_id
+            function_name, chunk_task_dict, _queue_name=MRF_QUEUE_NAME, _job_id=work_id
         )
     logger.info(
         "Enqueued %s %s chunk job(s) for %s (%s bytes)",
@@ -795,39 +795,42 @@ def _normalize_benefit_value(value):
     return (json.dumps(value, sort_keys=True), None, None, _serialize_jsonable(value))
 
 
-def _iter_marketplace_benefit_entries(item, position):
-    if isinstance(item, dict):
-        named_key = _coerce_text(item.get("benefit_name") or item.get("name") or item.get("key"))
-        has_value_field = "value" in item
+def _iter_marketplace_benefit_entries(benefit_item, position):
+    if isinstance(benefit_item, dict):
+        named_key = _coerce_text(
+            benefit_item.get("benefit_name") or benefit_item.get("name") or benefit_item.get("key")
+        )
+        has_value_field = "value" in benefit_item
         extra_keys = {
-            key for key in item.keys()
+            key for key in benefit_item.keys()
             if key not in {"benefit_name", "name", "key", "label", "display_name", "value"}
         }
         if named_key and has_value_field and not extra_keys:
             yield {
                 "benefit_name": named_key,
-                "benefit_label": _coerce_text(item.get("label") or item.get("display_name")) or _benefit_label_from_key(named_key),
-                "benefit_value": item.get("value"),
+                "benefit_label": _coerce_text(benefit_item.get("label") or benefit_item.get("display_name"))
+                or _benefit_label_from_key(named_key),
+                "benefit_value": benefit_item.get("value"),
                 "benefit_position": position,
-                "benefit_item_json": _serialize_jsonable(item),
+                "benefit_item_json": _serialize_jsonable(benefit_item),
             }
             return
-        for key, value in item.items():
+        for key, benefit_value in benefit_item.items():
             yield {
                 "benefit_name": str(key).strip(),
                 "benefit_label": _benefit_label_from_key(key),
-                "benefit_value": value,
+                "benefit_value": benefit_value,
                 "benefit_position": position,
-                "benefit_item_json": _serialize_jsonable(item),
+                "benefit_item_json": _serialize_jsonable(benefit_item),
             }
         return
 
     yield {
         "benefit_name": f"benefit_{position}",
         "benefit_label": f"Benefit {position + 1}",
-        "benefit_value": item,
+        "benefit_value": benefit_item,
         "benefit_position": position,
-        "benefit_item_json": _serialize_jsonable(item),
+        "benefit_item_json": _serialize_jsonable(benefit_item),
     }
 
 
@@ -837,9 +840,9 @@ def _normalize_marketplace_benefits(plan_id, year, issuer_id, benefits, last_upd
     if not isinstance(benefits, list):
         return []
 
-    rows = []
-    for position, item in enumerate(benefits):
-        for entry in _iter_marketplace_benefit_entries(item, position):
+    benefit_rows = []
+    for position, benefit_item in enumerate(benefits):
+        for entry in _iter_marketplace_benefit_entries(benefit_item, position):
             benefit_value_text, benefit_value_bool, benefit_value_number, benefit_value_json = _normalize_benefit_value(
                 entry["benefit_value"]
             )
@@ -852,7 +855,7 @@ def _normalize_marketplace_benefits(plan_id, year, issuer_id, benefits, last_upd
                     json.dumps(entry["benefit_item_json"], sort_keys=True),
                 ]
             )
-            rows.append(
+            benefit_rows.append(
                 {
                     "plan_id": plan_id,
                     "year": int(year),
@@ -869,7 +872,7 @@ def _normalize_marketplace_benefits(plan_id, year, issuer_id, benefits, last_upd
                     "checksum": checksum,
                 }
             )
-    return rows
+    return benefit_rows
 
 
 def _marketplace_contact_row(address):
@@ -946,17 +949,17 @@ def _normalize_marketplace_address_entry(address):
     return _apply_marketplace_contact_fields(normalized, canonical_contact)
 
 
-def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_updated_on, issuer_lookup=None):
+def _build_mrf_address_rows(provider_record, network_tiers, import_id, source_url, last_updated_on, issuer_lookup=None):
     """Build canonical address and evidence rows from one MRF provider record."""
-    addresses = res.get("addresses", []) or []
+    addresses = provider_record.get("addresses", []) or []
     if not isinstance(addresses, list):
         return [], []
 
     issuer_lookup = issuer_lookup or {}
-    npi = int(res["npi"])
+    npi = int(provider_record["npi"])
     address_type = "practice"
-    address_rows = {}
-    evidence_rows = {}
+    addresses_by_key = {}
+    evidence_by_checksum = {}
     try:
         import_date_value = datetime.datetime.strptime(str(import_id)[:8], "%Y%m%d").date()
     except (TypeError, ValueError):
@@ -1007,7 +1010,7 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
                     source_record_id,
                 ]
             )
-            evidence_rows[evidence_checksum] = {
+            evidence_by_checksum[evidence_checksum] = {
                 "evidence_checksum": evidence_checksum,
                 "npi": npi,
                 "type": address_type,
@@ -1038,7 +1041,7 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
                 "address_key": computed_address_key,
             }
 
-        address_rows[address_key] = {
+        addresses_by_key[address_key] = {
             "npi": npi,
             "type": address_type,
             "checksum": normalized["checksum"],
@@ -1059,7 +1062,7 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
             "address_key": computed_address_key,
         }
 
-    return list(address_rows.values()), list(evidence_rows.values())
+    return list(addresses_by_key.values()), list(evidence_by_checksum.values())
 
 
 _MRF_ADDRESS_INSERT_COLUMNS = (
@@ -1292,27 +1295,27 @@ async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
         MRFAddress,
         MRFAddressEvidence,
     ):
-        obj = make_class(cls, import_date, schema_override=db_schema)
+        staging_cls = make_class(cls, import_date, schema_override=db_schema)
         try:
-            await db.status("DROP TABLE IF EXISTS " + f"{db_schema}.{obj.__tablename__};")
+            await db.status("DROP TABLE IF EXISTS " + f"{db_schema}.{staging_cls.__tablename__};")
         except ProgrammingError:
-            logger.debug("Import staging table could not be dropped: %s", obj.__tablename__)
+            logger.debug("Import staging table could not be dropped: %s", staging_cls.__tablename__)
         try:
-            await db.create_table(obj.__table__, checkfirst=True)
+            await db.create_table(staging_cls.__table__, checkfirst=True)
         except (ProgrammingError, DuplicateTableError, IntegrityError):
-            logger.debug("Import staging table already exists: %s", obj.__tablename__)
-        if hasattr(obj, "__my_index_elements__") and obj.__my_index_elements__:
-            cols = ", ".join(obj.__my_index_elements__)
+            logger.debug("Import staging table already exists: %s", staging_cls.__tablename__)
+        if hasattr(staging_cls, "__my_index_elements__") and staging_cls.__my_index_elements__:
+            cols = ", ".join(staging_cls.__my_index_elements__)
             try:
                 await db.status(
                     "CREATE UNIQUE INDEX IF NOT EXISTS "
-                    + f"{obj.__tablename__}_idx_primary ON "
-                    + f"{db_schema}.{obj.__tablename__} ({cols});"
+                    + f"{staging_cls.__tablename__}_idx_primary ON "
+                    + f"{db_schema}.{staging_cls.__tablename__} ({cols});"
                 )
             except IntegrityError:
-                logger.debug("Import staging primary index has conflicting rows: %s", obj.__tablename__)
+                logger.debug("Import staging primary index has conflicting rows: %s", staging_cls.__tablename__)
         if cls in {PlanBenefitsMarketplace, MRFAddress, MRFAddressEvidence}:
-            await _create_named_indexes(obj, db_schema)
+            await _create_named_indexes(staging_cls, db_schema)
 
     print("Preparing done")
 
@@ -1363,20 +1366,20 @@ async def process_plan(ctx, task):
             return 1
 
         async with async_open(tmp_filename, "rb") as afp:
-            plan_obj = []
-            planformulary_obj = []
-            planbenefitsmarketplace_obj = []
+            plan_rows = []
+            plan_formulary_rows = []
+            marketplace_benefit_rows = []
             count = 0
             processed_plans = 0
             stop_processing = False
             try:
-                async for res in ijson.items(afp, "item", use_float=True):
+                async for plan_entry in ijson.items(afp, "item", use_float=True):
                     if stop_processing:
                         break
-                    if not isinstance(res, dict):
+                    if not isinstance(plan_entry, dict):
                         await log_error(
                             "err",
-                            f"Malformed plan entry type: {type(res).__name__}. Expected object.",
+                            f"Malformed plan entry type: {type(plan_entry).__name__}. Expected object.",
                             task.get("issuer_array"),
                             task.get("url"),
                             "plans",
@@ -1384,9 +1387,9 @@ async def process_plan(ctx, task):
                             myimportlog,
                         )
                         continue
-                    plan_id_raw = res.get("plan_id")
+                    plan_id_raw = plan_entry.get("plan_id")
                     plan_id_value = str(plan_id_raw).strip() if plan_id_raw is not None else ""
-                    years = _extract_plan_years(res)
+                    years = _extract_plan_years(plan_entry)
                     if not years:
                         await log_error(
                             "err",
@@ -1426,7 +1429,7 @@ async def process_plan(ctx, task):
                                 "formulary",
                                 "last_updated_on",
                             ):
-                                if k not in res or res[k] is None:
+                                if k not in plan_entry or plan_entry[k] is None:
                                     await log_error(
                                         "err",
                                         f"Mandatory field `{k}` is not present or incorrect. Plan ID: "
@@ -1453,39 +1456,39 @@ async def process_plan(ctx, task):
                                     myimportlog,
                                 )
 
-                            network_entries = res.get("network", [])
+                            network_entries = plan_entry.get("network", [])
                             if isinstance(network_entries, dict):
                                 network_entries = [network_entries]
-                            formulary_entries = res.get("formulary", [])
+                            formulary_entries = plan_entry.get("formulary", [])
                             if isinstance(formulary_entries, dict):
                                 formulary_entries = [formulary_entries]
                             if not isinstance(formulary_entries, list):
                                 formulary_entries = []
-                            benefits_entries = res.get("benefits", [])
+                            benefits_entries = plan_entry.get("benefits", [])
                             if isinstance(benefits_entries, dict):
                                 benefits_entries = [benefits_entries]
                             if not isinstance(benefits_entries, list):
                                 benefits_entries = []
-                            last_updated_on = _parse_timestamp(res["last_updated_on"])
+                            last_updated_on = _parse_timestamp(plan_entry["last_updated_on"])
 
-                            obj = {
+                            plan_row_dict = {
                                 "plan_id": plan_id_value,
-                                "plan_id_type": res["plan_id_type"],
+                                "plan_id_type": plan_entry["plan_id_type"],
                                 "year": int(year),
                                 "issuer_id": int(plan_id_value[:5]),
                                 "state": str(plan_id_value[5:7]).upper(),
-                                "marketing_name": res["marketing_name"],
-                                "summary_url": res["summary_url"],
-                                "marketing_url": res.get("marketing_url", ""),
-                                "formulary_url": res.get("formulary_url", ""),
-                                "plan_contact": res["plan_contact"],
+                                "marketing_name": plan_entry["marketing_name"],
+                                "summary_url": plan_entry["summary_url"],
+                                "marketing_url": plan_entry.get("marketing_url", ""),
+                                "formulary_url": plan_entry.get("formulary_url", ""),
+                                "plan_contact": plan_entry["plan_contact"],
                                 "network": [(k["network_tier"]) for k in network_entries if isinstance(k, dict)],
                                 "benefits": [json.dumps(x) for x in benefits_entries],
                                 "last_updated_on": last_updated_on,
                                 "checksum": return_checksum([plan_id_value.lower(), year], crc=32),
                             }
-                            plan_obj.append(obj)
-                            planbenefitsmarketplace_obj.extend(
+                            plan_rows.append(plan_row_dict)
+                            marketplace_benefit_rows.extend(
                                 _normalize_marketplace_benefits(
                                     plan_id_value,
                                     year,
@@ -1500,18 +1503,18 @@ async def process_plan(ctx, task):
                                 break
                             if count > plan_flush_rows:
                                 await asyncio.gather(
-                                    push_objects(plan_obj, myplan),
-                                    push_objects(planbenefitsmarketplace_obj, myplanbenefitsmarketplace),
+                                    push_objects(plan_rows, myplan),
+                                    push_objects(marketplace_benefit_rows, myplanbenefitsmarketplace),
                                 )
-                                plan_obj.clear()
-                                planbenefitsmarketplace_obj.clear()
+                                plan_rows.clear()
+                                marketplace_benefit_rows.clear()
                                 count = 0
                             else:
                                 count += 1
                         except Exception as exc:
                             logger.debug(
                                 "Skipping malformed plan entry plan_id=%s year=%s: %s",
-                                res.get("plan_id"),
+                                plan_entry.get("plan_id"),
                                 year,
                                 exc,
                             )
@@ -1565,7 +1568,7 @@ async def process_plan(ctx, task):
                                                         "json",
                                                         myimportlog,
                                                     )
-                                            obj = {
+                                            formulary_row_dict = {
                                                 "plan_id": plan_id_value,
                                                 "year": int(year),
                                                 "drug_tier": formulary.get("drug_tier", ""),
@@ -1584,22 +1587,24 @@ async def process_plan(ctx, task):
                                                 ),
                                                 "coinsurance_opt": cost_sharing.get("coinsurance_opt", ""),
                                             }
-                                            planformulary_obj.append(obj)
+                                            plan_formulary_rows.append(formulary_row_dict)
                                             if count > plan_flush_rows:
-                                                await _push_mrf_duplicate_tolerant_rows(planformulary_obj, myplanformulary)
-                                                planformulary_obj.clear()
+                                                await _push_mrf_duplicate_tolerant_rows(
+                                                    plan_formulary_rows, myplanformulary
+                                                )
+                                                plan_formulary_rows.clear()
                                                 count = 0
                                             else:
                                                 count += 1
                                     except Exception as exc:
                                         logger.debug(
                                             "Skipping cost sharing entry for plan %s year=%s: %s",
-                                            res.get("plan_id"),
+                                            plan_entry.get("plan_id"),
                                             year,
                                             exc,
                                         )
 
-                                    planformulary_obj.clear()
+                                    plan_formulary_rows.clear()
                                     count = 0
                                 else:
                                     await log_error(
@@ -1627,9 +1632,9 @@ async def process_plan(ctx, task):
                         break
 
                 await asyncio.gather(
-                    _push_mrf_duplicate_tolerant_rows(plan_obj, myplan),
-                    _push_mrf_duplicate_tolerant_rows(planformulary_obj, myplanformulary),
-                    _push_mrf_duplicate_tolerant_rows(planbenefitsmarketplace_obj, myplanbenefitsmarketplace),
+                    _push_mrf_duplicate_tolerant_rows(plan_rows, myplan),
+                    _push_mrf_duplicate_tolerant_rows(plan_formulary_rows, myplanformulary),
+                    _push_mrf_duplicate_tolerant_rows(marketplace_benefit_rows, myplanbenefitsmarketplace),
                 )
             except ijson.IncompleteJSONError as exc:
                 await log_error(
@@ -1699,14 +1704,14 @@ async def process_provider(ctx, task):
         myissuer.mrf_url,
     ).all()
     issuer_lookup = {
-        int(row.issuer_id): _issuer_display_name(
-            row.issuer_id,
-            issuer_name=row.issuer_name,
-            issuer_marketing_name=row.issuer_marketing_name,
-            issuer_url=row.mrf_url,
+        int(issuer_row.issuer_id): _issuer_display_name(
+            issuer_row.issuer_id,
+            issuer_name=issuer_row.issuer_name,
+            issuer_marketing_name=issuer_row.issuer_marketing_name,
+            issuer_url=issuer_row.mrf_url,
         )
-        for row in issuer_rows
-        if row.issuer_id is not None
+        for issuer_row in issuer_rows
+        if issuer_row.issuer_id is not None
     }
 
     print("Starting Provider file data download: ", source_url)
@@ -1730,21 +1735,21 @@ async def process_provider(ctx, task):
 
         async with async_open(tmp_filename, "rb") as afp:
             plan_npi_obj_dict = {}
-            plan_network_year = {}
+            plan_networks_by_checksum = {}
             mrf_address_obj_dict = {}
             mrf_address_evidence_dict = {}
             count = 0
             processed_providers = 0
             try:
-                async for res in ijson.items(afp, "item", use_float=True):
+                async for provider_record in ijson.items(afp, "item", use_float=True):
                     if provider_limit and processed_providers >= provider_limit:
                         break
-                    my_network_tiers = {}
+                    network_tiers_by_checksum = {}
                     not_good = False
                     my_years = set()
-                    if not res or not res.get("plans"):
+                    if not provider_record or not provider_record.get("plans"):
                         continue
-                    for plan in res["plans"]:
+                    for plan in provider_record["plans"]:
                         # try:
                         #     for k in (
                         #             'npi', 'type', 'plans', 'addresses', 'last_updated_on'):
@@ -1765,7 +1770,7 @@ async def process_provider(ctx, task):
                         #                     f"Plan ID: {plan['plan_id']}, NPI: {res.get('npi', None)}",
                         #                     task.get('issuer_array'), task.get('url'), 'providers', 'json',
                         #                     myimportlog)
-                        npi_raw = res.get("npi", "")
+                        npi_raw = provider_record.get("npi", "")
                         has_valid_npi = npi_raw and npi_raw.isdigit() and 0 < int(npi_raw) < 4294967295
                         has_plan_id = bool(plan.get("plan_id"))
                         has_years = bool(plan.get("years"))
@@ -1783,14 +1788,14 @@ async def process_provider(ctx, task):
                         for year in my_years:
                             checksum_plan = return_checksum([plan["plan_id"], plan["network_tier"], issuer_id, year])
                             checksum_network = return_checksum([plan["network_tier"], issuer_id, year])
-                            plan_network_year[checksum_plan] = {
+                            plan_networks_by_checksum[checksum_plan] = {
                                 "plan_id": plan["plan_id"],
                                 "network_tier": plan["network_tier"],
                                 "issuer_id": issuer_id,
                                 "year": year,
                                 "checksum_network": checksum_network,
                             }
-                            my_network_tiers[checksum_network] = {
+                            network_tiers_by_checksum[checksum_network] = {
                                 "network_tier": plan["network_tier"],
                                 "issuer_id": issuer_id,
                                 "year": year,
@@ -1799,42 +1804,42 @@ async def process_provider(ctx, task):
                     if not_good:
                         continue
 
-                    name = res.get("name", {})
-                    if not name:
-                        name = {}
-                    languages = res.get("languages", [])
+                    provider_name_dict = provider_record.get("name", {})
+                    if not provider_name_dict:
+                        provider_name_dict = {}
+                    languages = provider_record.get("languages", [])
                     if not languages:
                         languages = []
-                    addresses = res.get("addresses", [])
+                    addresses = provider_record.get("addresses", [])
                     if not addresses:
                         addresses = []
-                    last_updated_on = _parse_timestamp(res["last_updated_on"])
+                    last_updated_on = _parse_timestamp(provider_record["last_updated_on"])
 
-                    obj = {
-                        "npi": int(res["npi"]),
+                    provider_row_dict = {
+                        "npi": int(provider_record["npi"]),
                         "network_tier": "",
                         "checksum_network": "",
                         "year": 0,
                         "issuer_id": 0,
                         "name_or_facility_name": "",
                         "specialty_or_facility_type": [],
-                        "type": str(res.get("type", "")),
-                        "prefix": name.get("prefix", None),
-                        "first_name": name.get("first", None),
-                        "middle_name": name.get("middle", None),
-                        "last_name": name.get("last", None),
-                        "suffix": name.get("suffix", None),
+                        "type": str(provider_record.get("type", "")),
+                        "prefix": provider_name_dict.get("prefix", None),
+                        "first_name": provider_name_dict.get("first", None),
+                        "middle_name": provider_name_dict.get("middle", None),
+                        "last_name": provider_name_dict.get("last", None),
+                        "suffix": provider_name_dict.get("suffix", None),
                         "addresses": [json.dumps(x) for x in addresses],
-                        "accepting": res.get("accepting", None),
-                        "gender": res.get("gender", None),
+                        "accepting": provider_record.get("accepting", None),
+                        "gender": provider_record.get("gender", None),
                         "languages": [str(x) for x in languages],
                         "last_updated_on": last_updated_on,
                     }
 
                     if (
-                        ("facility_name" in res)
-                        and res.get("facility_name", None)
-                        and str(res.get("facility_name", "")).strip()
+                        ("facility_name" in provider_record)
+                        and provider_record.get("facility_name", None)
+                        and str(provider_record.get("facility_name", "")).strip()
                     ):
                         # for k in (
                         #         'facility_name', 'facility_type'):
@@ -1846,8 +1851,12 @@ async def process_provider(ctx, task):
                         #                         task.get('issuer_array'), task.get('url'), 'providers', 'json',
                         #                         myimportlog)
 
-                        obj["name_or_facility_name"] = str(res.get("facility_name", "").strip())
-                        obj["specialty_or_facility_type"] = [str(x) for x in res.get("facility_type", [])]
+                        provider_row_dict["name_or_facility_name"] = str(
+                            provider_record.get("facility_name", "").strip()
+                        )
+                        provider_row_dict["specialty_or_facility_type"] = [
+                            str(x) for x in provider_record.get("facility_type", [])
+                        ]
                     else:
                         # for k in (
                         #         'name', 'first', 'last', 'speciality', 'accepting'):
@@ -1859,21 +1868,27 @@ async def process_provider(ctx, task):
                         #                         task.get('issuer_array'), task.get('url'), 'providers', 'json',
                         #                         myimportlog)
 
-                        obj["name_or_facility_name"] = ""
+                        provider_row_dict["name_or_facility_name"] = ""
                         for k in ("prefix", "first", "middle", "last", "suffix"):
-                            if (k in name) and (name.get(k, None)):
-                                cleaned = _clean_name_part(name.get(k))
+                            if (k in provider_name_dict) and (provider_name_dict.get(k, None)):
+                                cleaned = _clean_name_part(provider_name_dict.get(k))
                                 if cleaned:
-                                    obj["name_or_facility_name"] += f"{cleaned} "
-                        obj["name_or_facility_name"] = obj["name_or_facility_name"].strip()
-                        obj["specialty_or_facility_type"] = [str(x) for x in res.get("specialty", [])]
+                                    provider_row_dict["name_or_facility_name"] += f"{cleaned} "
+                        provider_row_dict["name_or_facility_name"] = provider_row_dict[
+                            "name_or_facility_name"
+                        ].strip()
+                        provider_row_dict["specialty_or_facility_type"] = [
+                            str(x) for x in provider_record.get("specialty", [])
+                        ]
 
-                    for x in my_network_tiers.values():
-                        obj["network_tier"] = x["network_tier"]
-                        obj["checksum_network"] = x["checksum_network"]
-                        obj["issuer_id"] = x["issuer_id"]
-                        obj["year"] = x["year"]
-                        plan_npi_obj_dict["_".join([str(obj["npi"]), str(x["checksum_network"])])] = obj.copy()
+                    for x in network_tiers_by_checksum.values():
+                        provider_row_dict["network_tier"] = x["network_tier"]
+                        provider_row_dict["checksum_network"] = x["checksum_network"]
+                        provider_row_dict["issuer_id"] = x["issuer_id"]
+                        provider_row_dict["year"] = x["year"]
+                        plan_npi_obj_dict[
+                            "_".join([str(provider_row_dict["npi"]), str(x["checksum_network"])])
+                        ] = provider_row_dict.copy()
 
                         # if count > 10 * int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 50)):
                         #     await push_objects(list(plan_npi_obj_dict.values()), myplan_npi)
@@ -1888,8 +1903,8 @@ async def process_provider(ctx, task):
                         #     #     print('WTF>', obj)
                         #     #     pass
                     address_rows, evidence_rows = _build_mrf_address_rows(
-                        res,
-                        my_network_tiers,
+                        provider_record,
+                        network_tiers_by_checksum,
                         import_date,
                         source_url,
                         last_updated_on,
@@ -1913,7 +1928,9 @@ async def process_provider(ctx, task):
                     if count > provider_flush_rows:
                         await asyncio.gather(
                             _push_mrf_duplicate_tolerant_rows(list(plan_npi_obj_dict.values()), myplan_npi),
-                            _push_mrf_duplicate_tolerant_rows(list(plan_network_year.values()), myplan_networktier),
+                            _push_mrf_duplicate_tolerant_rows(
+                                list(plan_networks_by_checksum.values()), myplan_networktier
+                            ),
                             _push_mrf_address_rows(list(mrf_address_obj_dict.values()), mymrfaddress),
                             _push_mrf_duplicate_tolerant_rows(
                                 list(mrf_address_evidence_dict.values()),
@@ -1922,13 +1939,15 @@ async def process_provider(ctx, task):
                         )
                         count = 0
                         plan_npi_obj_dict.clear()
-                        plan_network_year.clear()
+                        plan_networks_by_checksum.clear()
                         mrf_address_obj_dict.clear()
                         mrf_address_evidence_dict.clear()
 
                 await asyncio.gather(
                     _push_mrf_duplicate_tolerant_rows(list(plan_npi_obj_dict.values()), myplan_npi),
-                    _push_mrf_duplicate_tolerant_rows(list(plan_network_year.values()), myplan_networktier),
+                    _push_mrf_duplicate_tolerant_rows(
+                        list(plan_networks_by_checksum.values()), myplan_networktier
+                    ),
                     _push_mrf_address_rows(list(mrf_address_obj_dict.values()), mymrfaddress),
                     _push_mrf_duplicate_tolerant_rows(
                         list(mrf_address_evidence_dict.values()),
@@ -1936,7 +1955,7 @@ async def process_provider(ctx, task):
                     ),
                 )
                 plan_npi_obj_dict.clear()
-                plan_network_year.clear()
+                plan_networks_by_checksum.clear()
                 mrf_address_obj_dict.clear()
                 mrf_address_evidence_dict.clear()
 
@@ -1997,7 +2016,7 @@ def _chunked(values, chunk_size=500):
 
 async def _refresh_plan_drug_statistics(plan_ids, import_date, db_schema):
     """Refresh aggregate drug statistics for the selected plans."""
-    plan_ids = [value for value in set(plan_ids) if value]
+    plan_ids = [plan_id for plan_id in set(plan_ids) if plan_id]
     if not plan_ids:
         return
 
@@ -2139,13 +2158,13 @@ async def _refresh_all_plan_drug_statistics(import_date, db_schema):
 
 
 async def _plan_summary_dependencies_ready(db_schema: str) -> tuple[bool, list[str]]:
-    missing = []
+    missing_tables = []
     for table_name in ("plan_attributes", "plan_benefits", "plan_prices"):
         qualified_name = f"{db_schema}.{table_name}"
         exists = await db.scalar("SELECT to_regclass(:qualified_name)", qualified_name=qualified_name)
         if not exists:
-            missing.append(table_name)
-    return (len(missing) == 0, missing)
+            missing_tables.append(table_name)
+    return (len(missing_tables) == 0, missing_tables)
 
 
 async def process_formulary(ctx, task):
@@ -2186,14 +2205,14 @@ async def process_formulary(ctx, task):
             await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "formulary"))
             return 1
 
-        batch = []
+        drug_rows = []
         processed = 0
         try:
             async with async_open(tmp_filename, "rb") as afp:
-                async for res in ijson.items(afp, "item", use_float=True):
-                    rxnorm_id = str(res.get("rxnorm_id", "")).strip()
-                    drug_name = str(res.get("drug_name", "")).strip()
-                    plans = res.get("plans") or []
+                async for formulary_record in ijson.items(afp, "item", use_float=True):
+                    rxnorm_id = str(formulary_record.get("rxnorm_id", "")).strip()
+                    drug_name = str(formulary_record.get("drug_name", "")).strip()
+                    plans = formulary_record.get("plans") or []
                     if not rxnorm_id or not drug_name or not isinstance(plans, list) or not plans:
                         await log_error(
                             "err",
@@ -2223,7 +2242,7 @@ async def process_formulary(ctx, task):
                         drug_tier = plan_entry.get("drug_tier")
                         if isinstance(drug_tier, str):
                             drug_tier = drug_tier.strip().upper()
-                        record = {
+                        drug_row_dict = {
                             "plan_id": plan_id,
                             "plan_id_type": plan_id_type,
                             "rxnorm_id": rxnorm_id,
@@ -2234,22 +2253,22 @@ async def process_formulary(ctx, task):
                             "quantity_limit": _parse_optional_bool(plan_entry.get("quantity_limit")),
                             "last_updated_on": None,
                         }
-                        if res.get("last_updated_on"):
+                        if formulary_record.get("last_updated_on"):
                             try:
-                                record["last_updated_on"] = datetime.datetime.combine(
-                                    parse_date(res["last_updated_on"], fuzzy=True),
+                                drug_row_dict["last_updated_on"] = datetime.datetime.combine(
+                                    parse_date(formulary_record["last_updated_on"], fuzzy=True),
                                     datetime.datetime.min.time(),
                                 )
                             except (ValueError, TypeError):
-                                record["last_updated_on"] = None
-                        batch.append(record)
+                                drug_row_dict["last_updated_on"] = None
+                        drug_rows.append(drug_row_dict)
 
                     processed += 1
                     if drug_limit and processed >= drug_limit:
                         break
-                    if len(batch) > formulary_flush_rows:
-                        await _push_mrf_duplicate_tolerant_rows(batch, myplan_drug)
-                        batch.clear()
+                    if len(drug_rows) > formulary_flush_rows:
+                        await _push_mrf_duplicate_tolerant_rows(drug_rows, myplan_drug)
+                        drug_rows.clear()
 
         except ijson.IncompleteJSONError as exc:
             await log_error(
@@ -2276,8 +2295,8 @@ async def process_formulary(ctx, task):
             await _mark_mrf_task_terminal(ctx, task, "formulary", cleanup_chunk=True)
             return
 
-        if batch:
-            await _push_mrf_duplicate_tolerant_rows(batch, myplan_drug)
+        if drug_rows:
+            await _push_mrf_duplicate_tolerant_rows(drug_rows, myplan_drug)
 
     await flush_error_log(myimportlog)
     await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "formulary"))
@@ -2293,16 +2312,16 @@ async def save_mrf_data(ctx, task):
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     await ensure_database(test_mode)
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
-    x = []
+    pending_writes = []
     print("Got task for saving MRF data")
     for key in task:
         match key:
             case "plan_npi":
                 myplan_npi = make_class(PlanNPIRaw, import_date, schema_override=db_schema)
-                x.append(push_objects(task["plan_npi"], myplan_npi, rewrite=True))
+                pending_writes.append(push_objects(task["plan_npi"], myplan_npi, rewrite=True))
             case "plan_networktier":
                 myplan_networktier = make_class(PlanNetworkTierRaw, import_date, schema_override=db_schema)
-                x.append(push_objects(task["plan_networktier"], myplan_networktier, rewrite=True))
+                pending_writes.append(push_objects(task["plan_networktier"], myplan_networktier, rewrite=True))
             case "plan_drugs":
                 myplan_drugs = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
                 await push_objects(task["plan_drugs"], myplan_drugs, rewrite=True)
@@ -2310,31 +2329,37 @@ async def save_mrf_data(ctx, task):
                 myplanbenefitsmarketplace = make_class(
                     PlanBenefitsMarketplace, import_date, schema_override=db_schema
                 )
-                x.append(push_objects(task["plan_benefits_marketplace"], myplanbenefitsmarketplace))
+                pending_writes.append(
+                    push_objects(task["plan_benefits_marketplace"], myplanbenefitsmarketplace)
+                )
             case "mrf_address":
                 mymrfaddress = make_class(MRFAddress, import_date, schema_override=db_schema)
-                x.append(_push_mrf_address_rows(task["mrf_address"], mymrfaddress))
+                pending_writes.append(_push_mrf_address_rows(task["mrf_address"], mymrfaddress))
             case "mrf_address_evidence":
                 mymrfaddressevidence = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
-                x.append(push_objects(task["mrf_address_evidence"], mymrfaddressevidence))
+                pending_writes.append(push_objects(task["mrf_address_evidence"], mymrfaddressevidence))
             case "npi_other_id_list":
                 mynpidataotheridentifier = make_class(
                     NPIDataOtherIdentifier, import_date, schema_override=db_schema
                 )
-                x.append(push_objects(task["npi_other_id_list"], mynpidataotheridentifier, rewrite=True))
+                pending_writes.append(
+                    push_objects(task["npi_other_id_list"], mynpidataotheridentifier, rewrite=True)
+                )
             case "npi_taxonomy_group_list":
                 mynpidatataxonomygroup = make_class(
                     NPIDataTaxonomyGroup, import_date, schema_override=db_schema
                 )
-                x.append(push_objects(task["npi_taxonomy_group_list"], mynpidatataxonomygroup, rewrite=True))
+                pending_writes.append(
+                    push_objects(task["npi_taxonomy_group_list"], mynpidatataxonomygroup, rewrite=True)
+                )
             case "npi_address_list":
                 mynpiaddress = make_class(NPIAddress, import_date, schema_override=db_schema)
-                x.append(push_objects(task["npi_address_list"], mynpiaddress, rewrite=True))
+                pending_writes.append(push_objects(task["npi_address_list"], mynpiaddress, rewrite=True))
             case "context":
                 continue
             case _:
                 print("Some wrong key passed")
-    await asyncio.gather(*x)
+    await asyncio.gather(*pending_writes)
 
 
 async def process_json_index(ctx, task):
@@ -2547,8 +2572,8 @@ async def process_json_index(ctx, task):
 async def import_unknown_state_issuers_data(test_mode: bool = False):
     """Import issuer and plan identities missing explicit state attribution."""
 
-    plan_list = {}
-    issuer_list = {}
+    plans_by_key = {}
+    issuers_by_id = {}
 
     attribute_files = json.loads(os.environ["HLTHPRT_CMSGOV_PLAN_ATTRIBUTES_URL_PUF"])
     processed_rows = 0
@@ -2568,43 +2593,47 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
             tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
 
             async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
-                async for row in AsyncDictReader(afp, delimiter=","):
-                    if not row["StandardComponentId"] or not row["PlanId"]:
+                async for attribute_row in AsyncDictReader(afp, delimiter=","):
+                    if not attribute_row["StandardComponentId"] or not attribute_row["PlanId"]:
                         continue
-                    plan_key = f"{row['StandardComponentId']}_{row['BusinessYear']}"
-                    if plan_key in plan_list:
+                    plan_key = f"{attribute_row['StandardComponentId']}_{attribute_row['BusinessYear']}"
+                    if plan_key in plans_by_key:
                         continue
-                    plan_list[plan_key] = {
-                        "plan_id": row["StandardComponentId"],
+                    plans_by_key[plan_key] = {
+                        "plan_id": attribute_row["StandardComponentId"],
                         "plan_id_type": "CMS-HIOS-PLAN-ID",
-                        "year": int(row["BusinessYear"]),
-                        "issuer_id": int(row["IssuerId"]),
-                        "state": str(row["StateCode"]).upper(),
-                        "marketing_name": row["PlanMarketingName"],
-                        "summary_url": row["URLForSummaryofBenefitsCoverage"],
-                        "marketing_url": row["PlanBrochure"],
-                        "formulary_url": row["FormularyURL"],
+                        "year": int(attribute_row["BusinessYear"]),
+                        "issuer_id": int(attribute_row["IssuerId"]),
+                        "state": str(attribute_row["StateCode"]).upper(),
+                        "marketing_name": attribute_row["PlanMarketingName"],
+                        "summary_url": attribute_row["URLForSummaryofBenefitsCoverage"],
+                        "marketing_url": attribute_row["PlanBrochure"],
+                        "formulary_url": attribute_row["FormularyURL"],
                         "plan_contact": "",
-                        "network": [row["NetworkId"]],
+                        "network": [attribute_row["NetworkId"]],
                         "benefits": [],
                         "last_updated_on": datetime.datetime.combine(
-                            parse_date(row["ImportDate"], fuzzy=True), datetime.datetime.min.time()
+                            parse_date(attribute_row["ImportDate"], fuzzy=True), datetime.datetime.min.time()
                         ),
                         "checksum": return_checksum(
-                            [row["StandardComponentId"].lower(), int(row["BusinessYear"])], crc=32
+                            [
+                                attribute_row["StandardComponentId"].lower(),
+                                int(attribute_row["BusinessYear"]),
+                            ],
+                            crc=32,
                         ),
                     }
 
-                    issuer_list[int(row["IssuerId"])] = {
-                        "state": str(row["StateCode"]).upper(),
-                        "issuer_id": int(row["IssuerId"]),
+                    issuers_by_id[int(attribute_row["IssuerId"])] = {
+                        "state": str(attribute_row["StateCode"]).upper(),
+                        "issuer_id": int(attribute_row["IssuerId"]),
                         "mrf_url": "",
                         "data_contact_email": "",
                         "issuer_marketing_name": "",
                         "issuer_name": (
-                            row["IssuerMarketPlaceMarketingName"].strip()
-                            if row["IssuerMarketPlaceMarketingName"].strip()
-                            else row["IssuerId"]
+                            attribute_row["IssuerMarketPlaceMarketingName"].strip()
+                            if attribute_row["IssuerMarketPlaceMarketingName"].strip()
+                            else attribute_row["IssuerId"]
                         ),
                     }
                     # except:
@@ -2633,7 +2662,7 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
                 parts = s.split()
                 return "".join(word.capitalize() for word in parts)
 
-            unique_keys = {
+            field_name_by_label = {
                 "STANDARD COMPONENT ID": "STANDARD COMPONENT ID",
                 "PLAN ID": "PLAN ID",
                 "BUSINESS YEAR": "BUSINESS YEAR",
@@ -2649,43 +2678,45 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
             }
 
             async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
-                async for row in AsyncDictReader(afp, delimiter=","):
-                    if row.get("STANDARD COMPONENT ID") and row.get("PLAN ID"):
+                async for attribute_row in AsyncDictReader(afp, delimiter=","):
+                    if attribute_row.get("STANDARD COMPONENT ID") and attribute_row.get("PLAN ID"):
                         continue
-                    for key in unique_keys:
-                        unique_keys[key] = to_camel_case(unique_keys[key])
+                    for key in field_name_by_label:
+                        field_name_by_label[key] = to_camel_case(field_name_by_label[key])
                     break
 
             async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
-                async for row in AsyncDictReader(afp, delimiter=","):
-                    standard_component_id = row.get(unique_keys["STANDARD COMPONENT ID"])
-                    plan_identifier = row.get(unique_keys["PLAN ID"])
-                    business_year = row.get(unique_keys["BUSINESS YEAR"])
+                async for attribute_row in AsyncDictReader(afp, delimiter=","):
+                    standard_component_id = attribute_row.get(field_name_by_label["STANDARD COMPONENT ID"])
+                    plan_identifier = attribute_row.get(field_name_by_label["PLAN ID"])
+                    business_year = attribute_row.get(field_name_by_label["BUSINESS YEAR"])
                     if standard_component_id and plan_identifier:
                         continue
                     if not standard_component_id or business_year is None:
                         continue
 
                     plan_key = f"{standard_component_id.upper()}_{business_year}"
-                    if plan_key in plan_list:
+                    if plan_key in plans_by_key:
                         continue
 
-                    issuer_id_value = row.get(unique_keys["ISSUER ID"])
-                    plan_list[plan_key] = {
+                    issuer_id_value = attribute_row.get(field_name_by_label["ISSUER ID"])
+                    plans_by_key[plan_key] = {
                         "plan_id": standard_component_id,
                         "plan_id_type": "STATE-HIOS-PLAN-ID",
                         "year": int(business_year),
                         "issuer_id": int(issuer_id_value),
-                        "state": str(row.get(unique_keys["STATE CODE"])).upper(),
-                        "marketing_name": row.get(unique_keys["PLAN MARKETING NAME"]),
-                        "summary_url": row.get(unique_keys["URL FOR SUMMARY OF BENEFITS COVERAGE"]),
-                        "marketing_url": row.get(unique_keys["PLAN BROCHURE"]),
-                        "formulary_url": row.get(unique_keys["FORMULARY URL"]),
+                        "state": str(attribute_row.get(field_name_by_label["STATE CODE"])).upper(),
+                        "marketing_name": attribute_row.get(field_name_by_label["PLAN MARKETING NAME"]),
+                        "summary_url": attribute_row.get(
+                            field_name_by_label["URL FOR SUMMARY OF BENEFITS COVERAGE"]
+                        ),
+                        "marketing_url": attribute_row.get(field_name_by_label["PLAN BROCHURE"]),
+                        "formulary_url": attribute_row.get(field_name_by_label["FORMULARY URL"]),
                         "plan_contact": "",
-                        "network": [row.get(unique_keys["NETWORK ID"])],
+                        "network": [attribute_row.get(field_name_by_label["NETWORK ID"])],
                         "benefits": [],
                         "last_updated_on": datetime.datetime.combine(
-                            parse_date(row.get(unique_keys["IMPORT DATE"]), fuzzy=True),
+                            parse_date(attribute_row.get(field_name_by_label["IMPORT DATE"]), fuzzy=True),
                             datetime.datetime.min.time(),
                         ),
                         "checksum": return_checksum(
@@ -2697,9 +2728,9 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
                         ),
                     }
 
-                    issuer_name_value = (row.get(unique_keys["ISSUER NAME"]) or "").strip()
-                    issuer_list[int(issuer_id_value)] = {
-                        "state": str(row.get(unique_keys["STATE CODE"])).upper(),
+                    issuer_name_value = (attribute_row.get(field_name_by_label["ISSUER NAME"]) or "").strip()
+                    issuers_by_id[int(issuer_id_value)] = {
+                        "state": str(attribute_row.get(field_name_by_label["STATE CODE"])).upper(),
                         "issuer_id": int(issuer_id_value),
                         "mrf_url": "",
                         "data_contact_email": "",
@@ -2715,13 +2746,13 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
         if row_limit and processed_rows >= row_limit:
             break
 
-    return (issuer_list, plan_list)
+    return (issuers_by_id, plans_by_key)
 
 
 async def update_issuer_names_data(test_mode: bool = False):
     """Refresh issuer names from bounded federal rate-review sources."""
 
-    issuer_list = {}
+    issuers_by_id = {}
     my_files = json.loads(os.environ["HLTHPRT_CMSGOV_RATE_REVIEW_URL_PUF"])
     processed_rows = 0
     row_limit = TEST_UNKNOWN_STATE_ROWS if test_mode else None
@@ -2741,14 +2772,18 @@ async def update_issuer_names_data(test_mode: bool = False):
             csv_files = glob.glob(f"{tmpdirname}/*PUF*.csv")
             for tmp_filename in csv_files:
                 async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
-                    async for row in AsyncDictReader(afp, delimiter=","):
-                        issuer_list[int(row["ISSUER_ID"])] = {
-                            "state": str(row["STATE"]).upper(),
-                            "issuer_id": int(row["ISSUER_ID"]),
+                    async for rate_row in AsyncDictReader(afp, delimiter=","):
+                        issuers_by_id[int(rate_row["ISSUER_ID"])] = {
+                            "state": str(rate_row["STATE"]).upper(),
+                            "issuer_id": int(rate_row["ISSUER_ID"]),
                             "mrf_url": "",
                             "data_contact_email": "",
                             "issuer_marketing_name": "",
-                            "issuer_name": row["COMPANY"].strip() if row["COMPANY"].strip() else row["ISSUER_ID"],
+                            "issuer_name": (
+                                rate_row["COMPANY"].strip()
+                                if rate_row["COMPANY"].strip()
+                                else rate_row["ISSUER_ID"]
+                            ),
                         }
                         processed_rows += 1
                         if row_limit and processed_rows >= row_limit:
@@ -2758,7 +2793,7 @@ async def update_issuer_names_data(test_mode: bool = False):
         if row_limit and processed_rows >= row_limit:
             break
 
-    return issuer_list
+    return issuers_by_id
 
 
 async def init_file(ctx, task=None):
@@ -2836,8 +2871,8 @@ async def init_file(ctx, task=None):
                 if not ws_name.startswith("Transparency"):
                     continue
                 count = 0
-                template = {}
-                convert = {
+                column_index_by_name = {}
+                column_name_by_heading = {
                     "State": "state",
                     "Issuer_Name": "issuer_name",
                     "Issuer_ID": "issuer_id",
@@ -2849,25 +2884,45 @@ async def init_file(ctx, task=None):
                     "Metal_Level": "metal",
                     "URL_Claims_Payment_Policies": "claims_payment_policies_url",
                 }
-                for _, v in convert.items():
-                    template[v] = -1
+                for _, v in column_name_by_heading.items():
+                    column_index_by_name[v] = -1
 
-                for row in xls_file.ws(ws=ws_name).rows:
+                for worksheet_row in xls_file.ws(ws=ws_name).rows:
                     if count > 2:
-                        obj = {}
-                        obj["state"] = str(row[template["state"]].upper())
-                        obj["issuer_name"] = str(row[template["issuer_name"]])
-                        obj["issuer_id"] = int(row[template["issuer_id"]])
-                        obj["new_issuer_to_exchange"] = _truthy(row[template["new_issuer_to_exchange"]], ("yes", "y"))
-                        obj["sadp_only"] = _truthy(row[template["sadp_only"]], ("yes", "y"))
-                        obj["plan_id"] = str(row[template["plan_id"]])
-                        obj["year"] = int(file["year"])
-                        obj["qhp_sadp"] = str(row[template["qhp_sadp"]])
-                        obj["plan_type"] = str(row[template["plan_type"]])
-                        obj["metal"] = str(row[template["metal"]])
-                        obj["claims_payment_policies_url"] = str(row[template["claims_payment_policies_url"]])
+                        transparency_row_dict = {}
+                        transparency_row_dict["state"] = str(
+                            worksheet_row[column_index_by_name["state"]].upper()
+                        )
+                        transparency_row_dict["issuer_name"] = str(
+                            worksheet_row[column_index_by_name["issuer_name"]]
+                        )
+                        transparency_row_dict["issuer_id"] = int(
+                            worksheet_row[column_index_by_name["issuer_id"]]
+                        )
+                        transparency_row_dict["new_issuer_to_exchange"] = _truthy(
+                            worksheet_row[column_index_by_name["new_issuer_to_exchange"]], ("yes", "y")
+                        )
+                        transparency_row_dict["sadp_only"] = _truthy(
+                            worksheet_row[column_index_by_name["sadp_only"]], ("yes", "y")
+                        )
+                        transparency_row_dict["plan_id"] = str(
+                            worksheet_row[column_index_by_name["plan_id"]]
+                        )
+                        transparency_row_dict["year"] = int(file["year"])
+                        transparency_row_dict["qhp_sadp"] = str(
+                            worksheet_row[column_index_by_name["qhp_sadp"]]
+                        )
+                        transparency_row_dict["plan_type"] = str(
+                            worksheet_row[column_index_by_name["plan_type"]]
+                        )
+                        transparency_row_dict["metal"] = str(
+                            worksheet_row[column_index_by_name["metal"]]
+                        )
+                        transparency_row_dict["claims_payment_policies_url"] = str(
+                            worksheet_row[column_index_by_name["claims_payment_policies_url"]]
+                        )
 
-                        obj_list.append(obj)
+                        obj_list.append(transparency_row_dict)
                         if count > int(os.environ.get("HLTHPRT_SAVE_PER_PACK", 50)):
                             count = 3
                             await push_objects(obj_list, myplantransparency)
@@ -2876,9 +2931,9 @@ async def init_file(ctx, task=None):
                             break
                     elif count == 2:
                         i = 0
-                        for name in row:
-                            if name in convert:
-                                template[convert[name]] = i
+                        for name in worksheet_row:
+                            if name in column_name_by_heading:
+                                column_index_by_name[column_name_by_heading[name]] = i
                             i += 1
                     count += 1
 
@@ -2886,14 +2941,14 @@ async def init_file(ctx, task=None):
                 if test_mode and len(obj_list) >= TEST_PLAN_TRANSPARENCY_ROWS:
                     break
 
-        (issuer_list, plan_list) = await import_unknown_state_issuers_data(test_mode=test_mode)
-        issuer_list.update(await update_issuer_names_data(test_mode=test_mode))
+        (issuers_by_id, plans_by_key) = await import_unknown_state_issuers_data(test_mode=test_mode)
+        issuers_by_id.update(await update_issuer_names_data(test_mode=test_mode))
         if test_mode:
-            issuer_list = dict(list(issuer_list.items())[:TEST_UNKNOWN_STATE_ROWS])
-            plan_list = dict(list(plan_list.items())[:TEST_UNKNOWN_STATE_ROWS])
+            issuers_by_id = dict(list(issuers_by_id.items())[:TEST_UNKNOWN_STATE_ROWS])
+            plans_by_key = dict(list(plans_by_key.items())[:TEST_UNKNOWN_STATE_ROWS])
 
         url_list: set[str] = set()
-        url2issuer = {}
+        issuer_ids_by_url = {}
 
         for url_idx, source_url in enumerate(mrf_urls):
             zip_name = f"mrf_puf_{url_idx}.zip"
@@ -2918,10 +2973,10 @@ async def init_file(ctx, task=None):
                 count = 0
                 obj_list = []
 
-                for row in xls_file.ws(ws=ws_name).rows:
+                for worksheet_row in xls_file.ws(ws=ws_name).rows:
                     if count != 0:
                         row_urls = []
-                        raw_url = row[2]
+                        raw_url = worksheet_row[2]
                         if raw_url:
                             raw_url = str(raw_url).strip()
                             if raw_url.startswith("["):
@@ -2931,39 +2986,49 @@ async def init_file(ctx, task=None):
                                     row_urls = [raw_url]
                             else:
                                 row_urls = [raw_url]
-                        row_urls = [str(item).strip() for item in row_urls if str(item).strip()]
+                        row_urls = [str(row_url).strip() for row_url in row_urls if str(row_url).strip()]
                         if not row_urls:
                             count += 1
                             continue
 
-                        obj = {
-                            "state": row[0].upper(),
-                            "issuer_id": int(row[1]),
+                        issuer_row_dict = {
+                            "state": worksheet_row[0].upper(),
+                            "issuer_id": int(worksheet_row[1]),
                             "issuer_marketing_name": "",
-                            "data_contact_email": (row[3] or "").strip() if row[3] else "",
+                            "data_contact_email": (
+                                (worksheet_row[3] or "").strip() if worksheet_row[3] else ""
+                            ),
                         }
                         issuer_stmt = select(myplantransparency.issuer_name).where(
-                            myplantransparency.issuer_id == obj["issuer_id"]
+                            myplantransparency.issuer_id == issuer_row_dict["issuer_id"]
                         )
                         issuer_name = await db.scalar(issuer_stmt)
-                        obj["issuer_name"] = issuer_name if issuer_name else "N/A"
+                        issuer_row_dict["issuer_name"] = issuer_name if issuer_name else "N/A"
                         for single_url in row_urls:
-                            obj["mrf_url"] = single_url
-                            obj_list.append(obj.copy())
-                            url2issuer.setdefault(single_url, []).append(obj["issuer_id"])
+                            issuer_row_dict["mrf_url"] = single_url
+                            obj_list.append(issuer_row_dict.copy())
+                            issuer_ids_by_url.setdefault(single_url, []).append(issuer_row_dict["issuer_id"])
                             url_list.add(single_url)
-                            existing_issuer = issuer_list.get(obj["issuer_id"])
+                            existing_issuer = issuers_by_id.get(issuer_row_dict["issuer_id"])
                             if existing_issuer:
                                 if not existing_issuer.get("mrf_url"):
                                     existing_issuer["mrf_url"] = single_url
-                                if obj["data_contact_email"] and not existing_issuer.get("data_contact_email"):
-                                    existing_issuer["data_contact_email"] = obj["data_contact_email"]
-                                if obj["issuer_name"] and not existing_issuer.get("issuer_name"):
-                                    existing_issuer["issuer_name"] = obj["issuer_name"]
-                                if obj["issuer_marketing_name"] and not existing_issuer.get("issuer_marketing_name"):
-                                    existing_issuer["issuer_marketing_name"] = obj["issuer_marketing_name"]
+                                if issuer_row_dict["data_contact_email"] and not existing_issuer.get(
+                                    "data_contact_email"
+                                ):
+                                    existing_issuer["data_contact_email"] = issuer_row_dict[
+                                        "data_contact_email"
+                                    ]
+                                if issuer_row_dict["issuer_name"] and not existing_issuer.get("issuer_name"):
+                                    existing_issuer["issuer_name"] = issuer_row_dict["issuer_name"]
+                                if issuer_row_dict["issuer_marketing_name"] and not existing_issuer.get(
+                                    "issuer_marketing_name"
+                                ):
+                                    existing_issuer["issuer_marketing_name"] = issuer_row_dict[
+                                        "issuer_marketing_name"
+                                    ]
                             else:
-                                issuer_list[obj["issuer_id"]] = obj.copy()
+                                issuers_by_id[issuer_row_dict["issuer_id"]] = issuer_row_dict.copy()
                     count += 1
 
                 # obj_list mirrors legacy behaviour (kept for potential reuse), but inserts are handled via issuer_list.
@@ -2974,7 +3039,8 @@ async def init_file(ctx, task=None):
                 logger.debug("Issuer archive was already removed: %s", zip_path)
 
         await asyncio.gather(
-            push_objects(list(issuer_list.values()), myissuer), push_objects(list(plan_list.values()), myplan)
+            push_objects(list(issuers_by_id.values()), myissuer),
+            push_objects(list(plans_by_key.values()), myplan),
         )
         enqueue_live_progress(
             run_id=run_id,
@@ -2985,7 +3051,7 @@ async def init_file(ctx, task=None):
             total=4,
             done=2,
             pct=50,
-            message=f"staged {len(issuer_list)} issuers and {len(plan_list)} plans",
+            message=f"staged {len(issuers_by_id)} issuers and {len(plans_by_key)} plans",
         )
 
         max_urls = TEST_PLAN_URLS if test_mode else None
@@ -2997,7 +3063,11 @@ async def init_file(ctx, task=None):
             status="running",
             phase_detail="mrf index jobs enqueuing",
             progress_message=f"enqueuing {len(selected_urls)} index job(s)",
-            metrics={"index_url_count": len(selected_urls), "issuer_count": len(issuer_list), "plan_count": len(plan_list)},
+            metrics={
+                "index_url_count": len(selected_urls),
+                "issuer_count": len(issuers_by_id),
+                "plan_count": len(plans_by_key),
+            },
             progress={
                 "unit": "index_jobs",
                 "total": len(selected_urls),
@@ -3011,7 +3081,7 @@ async def init_file(ctx, task=None):
             work_id = _mrf_url_job_id("index", _mrf_job_scope(ctx), url)
             index_task_dict = {
                 "url": url,
-                "issuer_array": url2issuer[url],
+                "issuer_array": issuer_ids_by_url[url],
                 "context": ctx["context"],
                 "work_id": work_id,
             }
@@ -3232,7 +3302,7 @@ async def shutdown(ctx, task):
     if source_enabled("mrf") and not test_mode:
         mrf_address_stage = make_class(MRFAddress, import_date, schema_override=db_schema)
         mrf_evidence_stage = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
-        address_fields = {
+        address_field_map = {
             "first_line": "first_line",
             "second_line": "second_line",
             "city": "city_name",
@@ -3246,7 +3316,7 @@ async def shutdown(ctx, task):
         )
         await stamp_address_keys(
             mrf_address_stage.__tablename__,
-            address_fields,
+            address_field_map,
             schema=db_schema,
             update_existing=repair_existing_address_keys,
         )
@@ -3258,13 +3328,13 @@ async def shutdown(ctx, task):
         )
         await stamp_address_keys(
             mrf_evidence_stage.__tablename__,
-            address_fields,
+            address_field_map,
             schema=db_schema,
             update_existing=False,
         )
         address_stats = await resolve_into_archive(
             mrf_address_stage.__tablename__,
-            address_fields,
+            address_field_map,
             source_bit=16,
             priority=5,
             schema=db_schema,
@@ -3283,7 +3353,7 @@ async def shutdown(ctx, task):
     elif test_mode:
         logger.info("Skipping MRF archive address resolve in test mode")
 
-    tables = {}
+    staging_tables_by_main_name = {}
     async with db.transaction():
         for cls in (
             Issuer,
@@ -3300,12 +3370,16 @@ async def shutdown(ctx, task):
             MRFAddress,
             MRFAddressEvidence,
         ):
-            tables[cls.__main_table__] = make_class(cls, import_date, schema_override=db_schema)
-            obj = tables[cls.__main_table__]
-            table = obj.__main_table__
+            staging_tables_by_main_name[cls.__main_table__] = make_class(
+                cls, import_date, schema_override=db_schema
+            )
+            staging_cls = staging_tables_by_main_name[cls.__main_table__]
+            table = staging_cls.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{obj.__tablename__} RENAME TO {table};")
+            await db.status(
+                f"ALTER TABLE IF EXISTS {db_schema}.{staging_cls.__tablename__} RENAME TO {table};"
+            )
 
             await db.status(
                 f"ALTER INDEX IF EXISTS " f"{db_schema}.{table}_idx_primary RENAME TO " f"{table}_idx_primary_old;"
@@ -3313,7 +3387,7 @@ async def shutdown(ctx, task):
 
             await db.status(
                 f"ALTER INDEX IF EXISTS "
-                f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
+                f"{db_schema}.{staging_cls.__tablename__}_idx_primary RENAME TO "
                 f"{table}_idx_primary;"
             )
 
@@ -3332,7 +3406,7 @@ async def shutdown(ctx, task):
                     )
                     await db.status(
                         f"ALTER INDEX IF EXISTS "
-                        f"{db_schema}.{obj.__tablename__}_idx_{index_name} RENAME TO "
+                        f"{db_schema}.{staging_cls.__tablename__}_idx_{index_name} RENAME TO "
                         f"{table}_idx_{index_name};"
                     )
 
@@ -3400,13 +3474,13 @@ async def finish_main(test_mode: bool = False, import_id: str | None = None):
     resolved_import_id = import_id or os.environ.get("HLTHPRT_IMPORT_ID_OVERRIDE") or datetime.datetime.utcnow().strftime(
         "%Y%m%d"
     )
-    context = {
+    finish_context_dict = {
         "import_date": resolved_import_id,
         "test_mode": bool(test_mode),
     }
     await redis.enqueue_job(
         "shutdown",
-        {"context": context, "test_mode": bool(test_mode)},
+        {"context": finish_context_dict, "test_mode": bool(test_mode)},
         _queue_name=MRF_FINISH_QUEUE_NAME,
         _job_id=f"shutdown_mrf_{resolved_import_id}",
     )

@@ -38,6 +38,7 @@ from xml.etree import ElementTree
 
 import aiohttp
 from sqlalchemy import bindparam, func, or_, select, update
+from sqlalchemy.exc import SQLAlchemyError
 
 from db.connection import init_db
 from db.models import (
@@ -13905,16 +13906,39 @@ async def _push_crawl_row_batches(
     batch_size: int | None = None,
     row_write_timeout: float | None = None,
 ) -> None:
+    def should_split_failed_batch(error: BaseException) -> bool:
+        """Return whether a smaller idempotent batch can avoid the write failure."""
+        error_text = str(getattr(error, "orig", error)).lower()
+        return isinstance(error, BufferError) or any(
+            marker in error_text
+            for marker in (
+                "message is too large",
+                "connection was closed in the middle of operation",
+                "connectiondoesnotexisterror",
+            )
+        )
+
     async def push_chunked(rows: list[dict[str, Any]], model: type[Any]) -> None:
         """Write pending crawl rows in bounded chunks."""
         size = max(1, int(batch_size or len(rows) or 1))
         while rows:
             chunk = rows[:size]
             write_coro = push_objects(chunk, model, rewrite=True, use_copy=False)
-            if row_write_timeout and row_write_timeout > 0:
-                await asyncio.wait_for(write_coro, timeout=row_write_timeout)
-            else:
-                await write_coro
+            try:
+                if row_write_timeout and row_write_timeout > 0:
+                    await asyncio.wait_for(write_coro, timeout=row_write_timeout)
+                else:
+                    await write_coro
+            except (BufferError, SQLAlchemyError) as error:
+                if len(chunk) <= 1 or not should_split_failed_batch(error):
+                    raise
+                size = max(1, len(chunk) // 2)
+                logging.getLogger(__name__).warning(
+                    "retrying oversized %s crawl write with %d-row batches",
+                    model.__tablename__,
+                    size,
+                )
+                continue
             del rows[: len(chunk)]
 
     if plan_rows:

@@ -13661,6 +13661,61 @@ async def test_push_crawl_row_batches_applies_timeout_per_chunk(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "write_error",
+    [
+        BufferError("end_message: message is too large"),
+        discovery.SQLAlchemyError("connection was closed in the middle of operation"),
+    ],
+)
+async def test_push_crawl_row_batches_splits_retryable_write_failures(
+    monkeypatch,
+    write_error,
+):
+    batch_sizes = []
+
+    async def fake_push_objects(rows, _model, *, rewrite, use_copy):
+        assert rewrite is True
+        assert use_copy is False
+        batch_sizes.append(len(rows))
+        if len(rows) > 2:
+            raise write_error
+
+    monkeypatch.setattr(discovery, "push_objects", fake_push_objects)
+    plan_rows = [{"mrf_plan_id": str(index)} for index in range(5)]
+
+    await discovery._push_crawl_row_batches(
+        plan_rows,
+        [],
+        [],
+        batch_size=5,
+    )
+
+    assert plan_rows == []
+    assert batch_sizes == [5, 2, 2, 1]
+
+
+@pytest.mark.asyncio
+async def test_push_crawl_row_batches_preserves_unrelated_write_errors(monkeypatch):
+    write_error = discovery.SQLAlchemyError("constraint violation")
+
+    async def fake_push_objects(_rows, _model, *, rewrite, use_copy):
+        assert rewrite is True
+        assert use_copy is False
+        raise write_error
+
+    monkeypatch.setattr(discovery, "push_objects", fake_push_objects)
+
+    with pytest.raises(discovery.SQLAlchemyError, match="constraint violation"):
+        await discovery._push_crawl_row_batches(
+            [{"mrf_plan_id": "plan_1"}, {"mrf_plan_id": "plan_2"}],
+            [],
+            [],
+            batch_size=2,
+        )
+
+
+@pytest.mark.asyncio
 async def test_store_observations_does_not_emit_live_progress_without_control_run(
     monkeypatch,
 ):
