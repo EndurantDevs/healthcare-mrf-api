@@ -7,6 +7,12 @@ from typing import Any
 
 import ijson
 
+from db.models import (
+    PTG2AllowedAmountItem,
+    PTG2AllowedAmountPayment,
+    PTG2AllowedAmountPlan,
+    PTG2AllowedAmountProviderPayment,
+)
 from process.ptg_parts.artifact_streams import open_json_artifact_stream
 from process.ptg_parts.domain import (
     PTG2_DOMAIN_ALLOWED_AMOUNT,
@@ -16,7 +22,10 @@ from process.ptg_parts.domain import (
 )
 from process.ptg_parts.row_helpers import _as_int_list, _as_list, _make_checksum
 from process.ptg_parts.source_files import _build_file_row, _derive_plan_fields
-from process.ptg_parts.source_jobs import _dedupe_rows_by
+from process.ptg_parts.source_jobs import (
+    _dedupe_rows_by,
+    _normalize_plan_payload,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -26,6 +35,16 @@ ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK = "in_network"
 ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED = "out_of_network_or_not_confirmed_in_network"
 ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK = "in_network_historical_allowed_amounts"
 ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK = "out_of_network_historical_allowed_amounts"
+PTG2_ALLOWED_AMOUNT_CONTRACT = "ptg2_allowed_amounts_v1"
+PTG2_ALLOWED_AMOUNT_TABLE_NAMES = (
+    "ptg2_allowed_amount_provider_payment",
+    "ptg2_allowed_amount_payment",
+    "ptg2_allowed_amount_item",
+    "ptg2_allowed_amount_plan",
+)
+ALLOWED_AMOUNT_ITEM_BATCH_SIZE = 100
+ALLOWED_AMOUNT_PAYMENT_BATCH_SIZE = 200
+ALLOWED_AMOUNT_PROVIDER_PAYMENT_BATCH_SIZE = 200
 
 
 def _as_text_list(value: Any) -> list[str]:
@@ -75,38 +94,150 @@ def _allowed_amount_network_semantics(network_status: str) -> str:
     return ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK
 
 
-async def _push_objects_from_facade(rows: list[dict[str, Any]], cls) -> None:
-    await _ptg_facade().push_objects(rows, cls)
-
-
 async def _push_ptg2_objects_from_facade(rows: list[dict[str, Any]], cls, *, rewrite: bool = True) -> None:
     await _ptg_facade()._push_ptg2_objects(rows, cls, rewrite=rewrite)
+
+
+def _allowed_amount_plan_rows(
+    *,
+    snapshot_id: str,
+    source_file_version_id: str | None,
+    file_id: int,
+    meta: dict[str, Any],
+    plan_info: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    plan_candidates = [
+        _normalize_plan_payload(plan)
+        for plan in (plan_info or [])
+        if isinstance(plan, dict)
+    ]
+    metadata_plan = _derive_plan_fields(meta, None)
+    if metadata_plan.get("plan_id"):
+        plan_candidates.append(metadata_plan)
+    plan_rows: list[dict[str, Any]] = []
+    seen_plan_keys: set[tuple[str, str, str]] = set()
+    for plan_by_field in plan_candidates:
+        plan_id = str(
+            plan_by_field.get("plan_id") or ""
+        ).strip().upper()
+        if not plan_id:
+            continue
+        plan_id_type = str(
+            plan_by_field.get("plan_id_type") or ""
+        ).strip().lower()
+        plan_market_type = str(
+            plan_by_field.get("plan_market_type") or ""
+        ).strip().lower()
+        plan_key = (
+            plan_id_type,
+            plan_id,
+            plan_market_type,
+        )
+        if plan_key in seen_plan_keys:
+            continue
+        seen_plan_keys.add(plan_key)
+        plan_rows.append(
+            {
+                "snapshot_id": snapshot_id,
+                "plan_hash": _make_checksum(file_id, *plan_key),
+                "source_file_version_id": source_file_version_id,
+                "file_id": file_id,
+                "plan_name": plan_by_field.get("plan_name"),
+                "plan_id_type": plan_id_type or None,
+                "plan_id": plan_id,
+                "plan_market_type": plan_market_type or None,
+                "issuer_name": plan_by_field.get("issuer_name"),
+                "plan_sponsor_name": plan_by_field.get(
+                    "plan_sponsor_name"
+                ),
+            }
+        )
+    return plan_rows
+
+
+async def _persist_ready_allowed_amount_batches(
+    item_rows: list[dict[str, Any]],
+    payment_rows: list[dict[str, Any]],
+    provider_payment_rows: list[dict[str, Any]],
+    *,
+    force: bool = False,
+) -> None:
+    """Persist parent-first batches once any allowed-amount limit is reached."""
+    if not force and (
+        len(item_rows) < ALLOWED_AMOUNT_ITEM_BATCH_SIZE
+        and len(payment_rows) < ALLOWED_AMOUNT_PAYMENT_BATCH_SIZE
+        and len(provider_payment_rows)
+        < ALLOWED_AMOUNT_PROVIDER_PAYMENT_BATCH_SIZE
+    ):
+        return
+
+    if item_rows:
+        item_batch_rows = list(
+            _dedupe_rows_by(item_rows, "allowed_item_hash")
+        )
+        item_rows.clear()
+        await _push_ptg2_objects_from_facade(
+            item_batch_rows,
+            PTG2AllowedAmountItem,
+        )
+    if payment_rows:
+        payment_batch_rows = list(
+            _dedupe_rows_by(payment_rows, "payment_hash")
+        )
+        payment_rows.clear()
+        await _push_ptg2_objects_from_facade(
+            payment_batch_rows,
+            PTG2AllowedAmountPayment,
+        )
+    if provider_payment_rows:
+        provider_payment_batch_rows = list(
+            _dedupe_rows_by(
+                provider_payment_rows,
+                "provider_payment_hash",
+            )
+        )
+        provider_payment_rows.clear()
+        await _push_ptg2_objects_from_facade(
+            provider_payment_batch_rows,
+            PTG2AllowedAmountProviderPayment,
+        )
 
 
 async def _parse_allowed_amounts(
     file_path: str,
     file_id: int,
+    snapshot_id: str,
+    source_file_version_id: str | None,
     meta: dict[str, Any],
     plan_info: list[dict[str, Any]] | None,
-    classes: dict[str, type],
     test_mode: bool,
     import_log_cls,
     source_url: str,
     max_items: int | None = None,
 ) -> dict[str, Any]:
     """Parse one allowed-amounts artifact into import rows."""
-    item_cls = classes["PTGAllowedItem"]
-    payment_cls = classes["PTGAllowedPayment"]
-    provider_payment_cls = classes["PTGAllowedProviderPayment"]
-
     plan_fields = _derive_plan_fields(meta, plan_info)
+    plan_rows = _allowed_amount_plan_rows(
+        snapshot_id=snapshot_id,
+        source_file_version_id=source_file_version_id,
+        file_id=file_id,
+        meta=meta,
+        plan_info=plan_info,
+    )
+    if plan_rows:
+        await _push_ptg2_objects_from_facade(
+            plan_rows,
+            PTG2AllowedAmountPlan,
+        )
     network_status = _allowed_amount_network_status_from_meta(meta)
     network_semantics = _allowed_amount_network_semantics(network_status)
 
     item_rows: list[dict[str, Any]] = []
     payment_rows: list[dict[str, Any]] = []
     provider_payment_rows: list[dict[str, Any]] = []
+
     metrics_by_name: dict[str, Any] = {
+        "allowed_amount_plans": len(plan_rows),
         "allowed_amount_items": 0,
         "allowed_amount_blocks": 0,
         "allowed_amount_payments": 0,
@@ -129,7 +260,9 @@ async def _parse_allowed_amounts(
             )
             item_rows.append(
                 {
+                    "snapshot_id": snapshot_id,
                     "allowed_item_hash": item_hash,
+                    "source_file_version_id": source_file_version_id,
                     "file_id": file_id,
                     "name": out_item.get("name"),
                     "billing_code_type": out_item.get("billing_code_type"),
@@ -166,6 +299,7 @@ async def _parse_allowed_amounts(
                     )
                     payment_rows.append(
                         {
+                            "snapshot_id": snapshot_id,
                             "payment_hash": payment_hash,
                             "allowed_item_hash": item_hash,
                             "tin_type": tin_info.get("type"),
@@ -179,12 +313,18 @@ async def _parse_allowed_amounts(
                             "network_semantics": network_semantics,
                         }
                     )
+                    await _persist_ready_allowed_amount_batches(
+                        item_rows,
+                        payment_rows,
+                        provider_payment_rows,
+                    )
                     for provider in payment.get("providers", []):
                         provider_npis = _as_int_list(provider.get("npi"))
                         metrics_by_name["allowed_amount_provider_payments"] += 1
                         metrics_by_name["allowed_amount_npi_references"] += len(provider_npis)
                         provider_payment_rows.append(
                             {
+                                "snapshot_id": snapshot_id,
                                 "provider_payment_hash": _make_checksum(
                                     payment_hash,
                                     provider.get("billed_charge"),
@@ -195,26 +335,27 @@ async def _parse_allowed_amounts(
                                 "npi": provider_npis,
                             }
                         )
-            if len(item_rows) >= 100:
-                await _push_objects_from_facade(_dedupe_rows_by(item_rows, "allowed_item_hash"), item_cls)
-                item_rows = []
-            if len(payment_rows) >= 200:
-                await _push_objects_from_facade(payment_rows, payment_cls)
-                payment_rows = []
-            if len(provider_payment_rows) >= 200:
-                await _push_objects_from_facade(provider_payment_rows, provider_payment_cls)
-                provider_payment_rows = []
+                        await _persist_ready_allowed_amount_batches(
+                            item_rows,
+                            payment_rows,
+                            provider_payment_rows,
+                        )
+            await _persist_ready_allowed_amount_batches(
+                item_rows,
+                payment_rows,
+                provider_payment_rows,
+            )
             if max_items is not None and count >= max_items:
                 break
             if test_mode and count >= _ptg_facade().TEST_ALLOWED_ITEMS:
                 break
 
-    if item_rows:
-        await _push_objects_from_facade(_dedupe_rows_by(item_rows, "allowed_item_hash"), item_cls)
-    if payment_rows:
-        await _push_objects_from_facade(payment_rows, payment_cls)
-    if provider_payment_rows:
-        await _push_objects_from_facade(provider_payment_rows, provider_payment_cls)
+    await _persist_ready_allowed_amount_batches(
+        item_rows,
+        payment_rows,
+        provider_payment_rows,
+        force=True,
+    )
     await _ptg_facade().flush_error_log(import_log_cls)
     metrics_by_name["allowed_amount_unique_tins"] = len(unique_tins)
     return metrics_by_name
@@ -228,11 +369,14 @@ async def _process_allowed_amounts_file(
     max_bytes: int | None = None,
     max_items: int | None = None,
     import_run_id: str | None = None,
+    snapshot_id: str | None = None,
     keep_partial_artifacts: bool | None = None,
     raw_artifact: PTG2RawArtifact | None = None,
     logical_artifact: PTG2LogicalArtifact | None = None,
 ) -> PTG2FileProcessResult:
     """Download and process one allowed-amounts work item."""
+    if not snapshot_id:
+        raise ValueError("snapshot_id is required for strict V3 allowed-amount imports")
     url = job["url"]
     description = job.get("description")
     plan_info = job.get("plan_info")
@@ -268,7 +412,15 @@ async def _process_allowed_amounts_file(
             import_run_id=import_run_id,
         )
         allowed_metrics = await _parse_allowed_amounts(
-            extracted, file_row["file_id"], meta, plan_info, classes, test_mode, import_log_cls, url,
+            extracted,
+            file_row["file_id"],
+            snapshot_id,
+            source_version.source_file_version_id if source_version is not None else None,
+            meta,
+            plan_info,
+            test_mode,
+            import_log_cls,
+            url,
             max_items=max_items,
         )
     summary = {}

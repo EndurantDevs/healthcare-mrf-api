@@ -3,6 +3,7 @@
 import asyncio
 import binascii
 import copy
+import datetime
 import gzip
 import hashlib
 import importlib
@@ -20,7 +21,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 from aiohttp import web
@@ -2120,12 +2121,104 @@ def test_ptg2_toc_repairs_missing_array_commas_and_ignores_unsupported_files(
         )
     )
 
-    assert [job["type"] for job in jobs] == ["in_network", "in_network"]
+    assert [job["type"] for job in jobs] == [
+        "in_network",
+        "in_network",
+        "allowed_amounts",
+        "allowed_amounts",
+    ]
     assert jobs[1]["url"].endswith("/Dental_InNetwork.json?download=true")
+    assert jobs[3]["url"].endswith(
+        "/Secondary_AllowedAmount.json?download=true"
+    )
     assert [repaired_row["file_type"] for repaired_row in pushed_file_rows] == [
         "table-of-contents",
         "in-network",
         "in-network",
+        "allowed-amounts",
+        "allowed-amounts",
+    ]
+
+
+def _write_targeted_allowed_amount_toc_fixture(
+    tmp_path,
+    allowed_url: str,
+) -> Path:
+    toc_path = tmp_path / "toc.json"
+    toc_path.write_text(
+        json.dumps(
+            {
+                "reporting_entity_name": "Example Payer",
+                "reporting_entity_type": "payer",
+                "reporting_structure": [
+                    {
+                        "reporting_plans": [
+                            {
+                                "plan_name": "Example Group Plan",
+                                "plan_id": "TESTPLAN001",
+                                "plan_id_type": "ein",
+                                "plan_market_type": "group",
+                            }
+                        ],
+                        "in_network_files": [
+                            {
+                                "location": (
+                                    "https://files.example.test/"
+                                    "2026-07_in-network-rates.json.gz"
+                                )
+                            }
+                        ],
+                        "allowed_amount_file": {
+                            "description": "historical payment evidence",
+                            "location": allowed_url,
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return toc_path
+
+
+def test_ptg2_toc_jobs_emit_targeted_allowed_amount_file(monkeypatch, tmp_path):
+    allowed_url = (
+        "https://files.example.test/2026-07_target-allowed-amounts.json.gz"
+    )
+    toc_path = _write_targeted_allowed_amount_toc_fixture(
+        tmp_path,
+        allowed_url,
+    )
+    pushed_file_rows = []
+
+    async def fake_materialize(*_args, **_kwargs):
+        artifact = SimpleNamespace(logical_path=toc_path)
+        return artifact, artifact
+
+    async def fake_push_objects(rows, _cls, **_kwargs):
+        pushed_file_rows.extend(rows)
+
+    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    jobs = asyncio.run(
+        process_ptg._process_table_of_contents(
+            "https://files.example.test/toc.json",
+            {"PTGFile": object, "ImportLog": object},
+            test_mode=False,
+            file_url_contains=["target-allowed-amounts"],
+            max_files=1,
+        )
+    )
+
+    assert [(job["type"], job["url"]) for job in jobs] == [
+        ("allowed_amounts", allowed_url)
+    ]
+    assert jobs[0]["plan_info"][0]["plan_id"] == "TESTPLAN001"
+    assert [file_row["file_type"] for file_row in pushed_file_rows] == [
+        "table-of-contents",
+        "allowed-amounts",
     ]
 
 
@@ -2345,10 +2438,15 @@ def test_ptg2_toc_jobs_skip_non_mrf_body_locations(monkeypatch, tmp_path):
             "in_network",
             "https://cdn.example.test/2026-06_in-network-rates.json.gz",
         ),
+        (
+            "allowed_amounts",
+            "https://cdn.example.test/2026-06_allowed-amounts.json.gz",
+        ),
     ]
     assert [job_row["file_type"] for job_row in pushed_file_rows] == [
         "table-of-contents",
         "in-network",
+        "allowed-amounts",
     ]
 
 
@@ -3129,6 +3227,35 @@ def test_ptg2_ensure_tables_requires_v3_migration_before_runtime_ddl(monkeypatch
     assert created_list == []
 
 
+def test_ptg2_ensure_tables_requires_allowed_amount_migration(monkeypatch):
+    created_list = []
+
+    async def fake_status(_statement):
+        return None
+
+    async def fake_all(_statement, **params):
+        return [
+            {"table_name": table_name}
+            for table_name in params["table_names"]
+            if table_name != "ptg2_allowed_amount_plan"
+        ]
+
+    async def fake_create_table(table, **_kwargs):
+        created_list.append(table.name)
+
+    monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "all", fake_all)
+    monkeypatch.setattr(process_ptg.db, "create_table", fake_create_table)
+
+    with pytest.raises(
+        RuntimeError,
+        match="ptg2_allowed_amount_plan.*alembic upgrade head",
+    ):
+        asyncio.run(process_ptg.ensure_ptg2_tables())
+
+    assert created_list == []
+
+
 def test_ptg2_ensure_tables_fails_fast_on_create_error(monkeypatch):
     async def fake_status(_statement):
         return None
@@ -3558,6 +3685,7 @@ def test_failed_snapshot_upsert_merges_existing_strict_v3_manifest():
 def test_ptg2_main_cleans_complete_stage_family_when_stage_creation_fails(monkeypatch):
     pushed_entries = []
     stage_cleanup = AsyncMock()
+    partially_created_tables = []
 
     async def push(object_entries, cls, **_kwargs):
         pushed_entries.extend((cls, entry) for entry in object_entries)
@@ -3570,12 +3698,24 @@ def test_ptg2_main_cleans_complete_stage_family_when_stage_creation_fails(monkey
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", push)
+    monkeypatch.setattr(
+        process_ptg,
+        "_prepare_ptg_tables",
+        AsyncMock(return_value={"ImportLog": object}),
+    )
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_tables_for_manifest", AsyncMock())
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", stage_cleanup)
+
+    async def create_partial_stage(stage_token):
+        partially_created_tables.append(
+            process_ptg._ptg2_manifest_stage_table_name(stage_token)
+        )
+        raise RuntimeError("stage creation failed")
+
     monkeypatch.setattr(
         process_ptg,
         "_create_ptg2_manifest_serving_stage_table",
-        AsyncMock(side_effect=RuntimeError("stage creation failed")),
+        AsyncMock(side_effect=create_partial_stage),
     )
 
     with pytest.raises(RuntimeError, match="stage creation failed"):
@@ -3589,6 +3729,7 @@ def test_ptg2_main_cleans_complete_stage_family_when_stage_creation_fails(monkey
         )
 
     stage_table_names = stage_cleanup.await_args.args[0]
+    assert partially_created_tables == [stage_table_names[0]]
     assert len(stage_table_names) == 3
     assert stage_table_names[1:] == process_ptg._ptg2_manifest_stage_table_names(
         stage_table_names[0]
@@ -3649,6 +3790,26 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
     assert current_rows == []
 
 
+def _assert_allowed_amount_parser_rows(metrics, pushed_rows_by_class):
+    assert metrics["allowed_amount_provider_payments"] == 1
+    assert metrics["allowed_amount_plans"] == 1
+    plan_row = pushed_rows_by_class["PTG2AllowedAmountPlan"][0]
+    payment_row = pushed_rows_by_class["PTG2AllowedAmountPayment"][0]
+    provider_payment_row = pushed_rows_by_class[
+        "PTG2AllowedAmountProviderPayment"
+    ][0]
+    item_row = pushed_rows_by_class["PTG2AllowedAmountItem"][0]
+    assert plan_row["snapshot_id"] == "ptg2:202607:allowed-test"
+    assert plan_row["source_file_version_id"] == "source-version-1"
+    assert plan_row["file_id"] == 123
+    assert plan_row["plan_id"] == "7862274FDC01BCC0"
+    assert item_row["snapshot_id"] == "ptg2:202607:allowed-test"
+    assert item_row["source_file_version_id"] == "source-version-1"
+    assert payment_row["service_code"] == ["11"]
+    assert payment_row["billing_code_modifier"] == ["AA"]
+    assert provider_payment_row["npi"] == [1427166008]
+
+
 def test_parse_allowed_amounts_filters_null_service_codes(monkeypatch, tmp_path):
     allowed_amount_payload_dict = {
         "out_of_network": [
@@ -3678,34 +3839,69 @@ def test_parse_allowed_amounts_filters_null_service_codes(monkeypatch, tmp_path)
     allowed_path = tmp_path / "allowed.json"
     allowed_path.write_text(json.dumps(allowed_amount_payload_dict), encoding="utf-8")
     pushed_rows_by_class = {}
-
-    async def fake_push(rows, cls):
-        pushed_rows_by_class.setdefault(cls, []).extend(rows)
-
-    monkeypatch.setattr(process_ptg, "push_objects", fake_push)
+    async def fake_push(rows, cls, **_kwargs):
+        pushed_rows_by_class.setdefault(cls.__name__, []).extend(rows)
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
-
     metrics = asyncio.run(
         ptg_allowed_amounts._parse_allowed_amounts(
             str(allowed_path),
             123,
+            "ptg2:202607:allowed-test",
+            "source-version-1",
             {},
             [{"plan_id": "7862274fdc01bcc0", "plan_market_type": "group"}],
-            {
-                "PTGAllowedItem": "item",
-                "PTGAllowedPayment": "payment",
-                "PTGAllowedProviderPayment": "provider_payment",
-            },
             False,
             "import_log",
             "https://example.test/allowed.json",
         )
     )
+    _assert_allowed_amount_parser_rows(metrics, pushed_rows_by_class)
 
-    assert metrics["allowed_amount_provider_payments"] == 1
-    assert pushed_rows_by_class["payment"][0]["service_code"] == ["11"]
-    assert pushed_rows_by_class["payment"][0]["billing_code_modifier"] == ["AA"]
-    assert pushed_rows_by_class["provider_payment"][0]["npi"] == [1427166008]
+
+def test_allowed_amount_plan_rows_preserve_shared_file_plan_coverage():
+    plan_rows = ptg_allowed_amounts._allowed_amount_plan_rows(
+        snapshot_id="ptg2:202607:allowed-plans",
+        source_file_version_id="source-version-plans",
+        file_id=123,
+        meta={},
+        plan_info=[
+            {
+                "plan_name": "Example Plan Alpha",
+                "plan_id": "plan-alpha",
+                "plan_id_type": "hios",
+                "plan_market_type": "Individual",
+            },
+            {
+                "plan_name": "Example Plan Beta",
+                "plan_id": "PLAN-BETA",
+                "plan_id_type": "hios",
+                "plan_market_type": "individual",
+            },
+        ],
+    )
+
+    assert {plan_row["plan_id"] for plan_row in plan_rows} == {
+        "PLAN-ALPHA",
+        "PLAN-BETA",
+    }
+    assert {plan_row["file_id"] for plan_row in plan_rows} == {123}
+    assert {
+        plan_row["plan_market_type"] for plan_row in plan_rows
+    } == {"individual"}
+    assert len({plan_row["plan_hash"] for plan_row in plan_rows}) == 2
+
+
+def test_direct_allowed_amount_job_preserves_dispatch_plan_filters():
+    plan_info = process_ptg._direct_allowed_plan_info(
+        ["plan-alpha", "plan-beta"],
+        ["Group"],
+    )
+
+    assert plan_info == [
+        {"plan_id": "plan-alpha", "plan_market_type": "group"},
+        {"plan_id": "plan-beta", "plan_market_type": "group"},
+    ]
 
 
 def test_parse_allowed_amounts_persists_in_network_metadata(monkeypatch, tmp_path):
@@ -3737,36 +3933,559 @@ def test_parse_allowed_amounts_persists_in_network_metadata(monkeypatch, tmp_pat
     allowed_path.write_text(json.dumps(allowed_amount_payload_dict), encoding="utf-8")
     pushed_rows_by_class = {}
 
-    async def fake_push(rows, cls):
-        pushed_rows_by_class.setdefault(cls, []).extend(rows)
+    async def fake_push(rows, cls, **_kwargs):
+        pushed_rows_by_class.setdefault(cls.__name__, []).extend(rows)
 
-    monkeypatch.setattr(process_ptg, "push_objects", fake_push)
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
 
     asyncio.run(
         ptg_allowed_amounts._parse_allowed_amounts(
             str(allowed_path),
             123,
+            "ptg2:202607:allowed-network-test",
+            "source-version-2",
             {"network_status": "in_network"},
             [{"plan_id": "7862274fdc01bcc0", "plan_market_type": "group"}],
-            {
-                "PTGAllowedItem": "item",
-                "PTGAllowedPayment": "payment",
-                "PTGAllowedProviderPayment": "provider_payment",
-            },
             False,
             "import_log",
             "https://example.test/allowed.json",
         )
     )
 
-    assert pushed_rows_by_class["payment"][0]["network_status"] == "in_network"
-    assert pushed_rows_by_class["payment"][0]["network_semantics"] == "in_network_historical_allowed_amounts"
+    payment_row = pushed_rows_by_class["PTG2AllowedAmountPayment"][0]
+    assert payment_row["network_status"] == "in_network"
+    assert payment_row["network_semantics"] == (
+        "in_network_historical_allowed_amounts"
+    )
+
+
+def _write_allowed_amount_batch_fixture(
+    tmp_path: Path,
+    filename: str,
+    payment_rows: list[dict],
+) -> Path:
+    allowed_path = tmp_path / filename
+    allowed_path.write_text(
+        json.dumps(
+            {
+                "out_of_network": [
+                    {
+                        "name": "Office visit",
+                        "billing_code_type": "CPT",
+                        "billing_code": "99214",
+                        "allowed_amounts": [
+                            {
+                                "tin": {
+                                    "type": "ein",
+                                    "value": "371382997",
+                                },
+                                "payments": payment_rows,
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return allowed_path
+
+
+class _AllowedAmountBatchOrderRecorder:
+    def __init__(self) -> None:
+        self.persisted_item_hashes: set[str] = set()
+        self.persisted_payment_hashes: set[str] = set()
+        self.payment_batch_sizes: list[int] = []
+        self.provider_batch_sizes: list[int] = []
+
+    async def push(self, object_rows, model_class, **_kwargs):
+        if model_class is ptg_allowed_amounts.PTG2AllowedAmountItem:
+            self.persisted_item_hashes.update(
+                row_by_field["allowed_item_hash"]
+                for row_by_field in object_rows
+            )
+        if model_class is ptg_allowed_amounts.PTG2AllowedAmountPayment:
+            assert all(
+                row_by_field["allowed_item_hash"]
+                in self.persisted_item_hashes
+                for row_by_field in object_rows
+            )
+            self.persisted_payment_hashes.update(
+                row_by_field["payment_hash"]
+                for row_by_field in object_rows
+            )
+            self.payment_batch_sizes.append(len(object_rows))
+        if (
+            model_class
+            is ptg_allowed_amounts.PTG2AllowedAmountProviderPayment
+        ):
+            assert all(
+                row_by_field["payment_hash"]
+                in self.persisted_payment_hashes
+                for row_by_field in object_rows
+            )
+            self.provider_batch_sizes.append(len(object_rows))
+
+
+def test_parse_allowed_amounts_flushes_item_before_large_payment_batch(
+    monkeypatch,
+    tmp_path,
+):
+    """Persist each item before writing its bounded payment batches."""
+    payment_count = 201
+    payment_rows = [
+        {
+            "allowed_amount": payment_number,
+            "providers": [],
+        }
+        for payment_number in range(payment_count)
+    ]
+    allowed_path = _write_allowed_amount_batch_fixture(
+        tmp_path,
+        "allowed-many-payments.json",
+        payment_rows,
+    )
+
+    batch_recorder = _AllowedAmountBatchOrderRecorder()
+    monkeypatch.setattr(
+        process_ptg,
+        "_push_ptg2_objects",
+        batch_recorder.push,
+    )
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    metrics = asyncio.run(
+        ptg_allowed_amounts._parse_allowed_amounts(
+            str(allowed_path),
+            123,
+            "ptg2:202607:allowed-many-payments",
+            "source-version-many-payments",
+            {},
+            None,
+            False,
+            "import_log",
+            "https://example.test/allowed-many-payments.json",
+        )
+    )
+
+    assert metrics["allowed_amount_payments"] == payment_count
+    assert sum(batch_recorder.payment_batch_sizes) == payment_count
+    assert max(batch_recorder.payment_batch_sizes) <= (
+        ptg_allowed_amounts.ALLOWED_AMOUNT_PAYMENT_BATCH_SIZE
+    )
+
+
+def test_parse_allowed_amounts_flushes_payment_before_large_provider_batch(
+    monkeypatch,
+    tmp_path,
+):
+    """Persist each payment before writing bounded provider batches."""
+    provider_count = 201
+    provider_rows = [
+        {
+            "billed_charge": provider_number,
+            "npi": [1000000000 + provider_number],
+        }
+        for provider_number in range(provider_count)
+    ]
+    allowed_path = _write_allowed_amount_batch_fixture(
+        tmp_path,
+        "allowed-many-provider-groups.json",
+        [
+            {
+                "allowed_amount": 133,
+                "providers": provider_rows,
+            }
+        ],
+    )
+
+    batch_recorder = _AllowedAmountBatchOrderRecorder()
+    monkeypatch.setattr(
+        process_ptg,
+        "_push_ptg2_objects",
+        batch_recorder.push,
+    )
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    metrics = asyncio.run(
+        ptg_allowed_amounts._parse_allowed_amounts(
+            str(allowed_path),
+            123,
+            "ptg2:202607:allowed-many-providers",
+            "source-version-many-providers",
+            {},
+            None,
+            False,
+            "import_log",
+            "https://example.test/allowed-many-providers.json",
+        )
+    )
+
+    assert metrics["allowed_amount_provider_payments"] == provider_count
+    assert sum(batch_recorder.provider_batch_sizes) == provider_count
+    assert max(batch_recorder.provider_batch_sizes) <= (
+        ptg_allowed_amounts.ALLOWED_AMOUNT_PROVIDER_PAYMENT_BATCH_SIZE
+    )
+
+
+def _build_allowed_only_toc_jobs() -> list[dict]:
+    return [
+        {
+            "type": "allowed_amounts",
+            "url": "https://example.test/allowed-amounts.json.gz",
+            "plan_info": [
+                {
+                    "plan_id": "TESTPLAN001",
+                    "plan_id_type": "ein",
+                    "plan_market_type": "group",
+                }
+            ],
+        }
+    ]
+
+
+def _build_allowed_amount_file_result(
+    job_by_field: dict,
+    *_args,
+    **_kwargs,
+) -> process_ptg.PTG2FileProcessResult:
+    return process_ptg.PTG2FileProcessResult(
+        "allowed_amounts",
+        job_by_field["url"],
+        True,
+        file_id=123,
+        summary={
+            "engine_source_identity_hash": "a" * 64,
+            "engine_source_file_version_id": "source-version-allowed",
+            "allowed_amount_plans": 1,
+            "allowed_amount_items": 1,
+            "allowed_amount_blocks": 1,
+            "allowed_amount_payments": 1,
+            "allowed_amount_provider_payments": 1,
+            "allowed_amount_npi_references": 1,
+            "allowed_amount_unique_tins": 1,
+            "allowed_amount_evidence": True,
+        },
+    )
+
+
+def _build_allowed_only_push_recorder(
+    pushed_rows: list[tuple[str, dict]],
+):
+    async def fake_push(object_rows, model_class, **_kwargs):
+        class_name = getattr(model_class, "__name__", str(model_class))
+        pushed_rows.extend(
+            (class_name, copy.deepcopy(row_by_field))
+            for row_by_field in object_rows
+        )
+        first_row_by_field = object_rows[0]
+        if model_class is process_ptg.PTG2Snapshot:
+            if first_row_by_field["status"] == process_ptg.PTG2_STATUS_BUILDING:
+                return {
+                    **first_row_by_field,
+                    "snapshot_claim_status": "acquired",
+                }
+            return dict(first_row_by_field)
+        return None
+
+    return fake_push
+
+
+async def _iter_allowed_only_downloaded_jobs(selected_jobs, **_kwargs):
+    for job_by_field in selected_jobs:
+        yield _strict_v3_downloaded_job(job_by_field)
+
+
+def _install_allowed_only_import_mocks(monkeypatch, pushed_rows) -> None:
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(
+        process_ptg,
+        "_current_source_snapshot_id",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_push_ptg2_objects",
+        _build_allowed_only_push_recorder(pushed_rows),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_prepare_ptg_tables",
+        AsyncMock(return_value={"ImportLog": object, "PTGFile": object}),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_process_table_of_contents",
+        AsyncMock(return_value=_build_allowed_only_toc_jobs()),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_iter_downloaded_ptg_jobs",
+        _iter_allowed_only_downloaded_jobs,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_process_allowed_amounts_file",
+        AsyncMock(side_effect=_build_allowed_amount_file_result),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_delete_allowed_snapshot_rows",
+        AsyncMock(),
+    )
+
+
+def _install_allowed_only_publish_mocks(
+    monkeypatch,
+    manifest_stage,
+    publish_source_pointers,
+    publish_allowed_pointer,
+) -> None:
+    monkeypatch.setattr(
+        process_ptg,
+        "_create_ptg2_manifest_serving_stage_table",
+        manifest_stage,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_publish_ptg2_source_pointers",
+        publish_source_pointers,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_publish_allowed_current_pointer",
+        publish_allowed_pointer,
+    )
+
+
+def _install_allowed_only_main_mocks(monkeypatch):
+    """Install the common allowed-only lifecycle collaborators."""
+    pushed_rows: list[tuple[str, dict]] = []
+    manifest_stage = AsyncMock(return_value="unexpected-stage")
+    publish_source_pointers = AsyncMock()
+    publish_allowed_pointer = AsyncMock(
+        return_value={
+            "status": "promoted",
+            "source_key": "example_allowed_source_allowed_amounts",
+        }
+    )
+    _install_allowed_only_import_mocks(monkeypatch, pushed_rows)
+    _install_allowed_only_publish_mocks(
+        monkeypatch,
+        manifest_stage,
+        publish_source_pointers,
+        publish_allowed_pointer,
+    )
+    return (
+        pushed_rows,
+        manifest_stage,
+        publish_source_pointers,
+        publish_allowed_pointer,
+    )
+
+
+def test_ptg2_main_publishes_allowed_amount_only_snapshot(monkeypatch):
+    (
+        pushed_rows,
+        manifest_stage,
+        publish_source_pointers,
+        publish_allowed_pointer,
+    ) = (
+        _install_allowed_only_main_mocks(monkeypatch)
+    )
+    import_result_by_field = asyncio.run(
+        process_ptg.main(
+            toc_urls=["https://example.test/index.json"],
+            import_month="2026-07",
+            import_id="allowed_amount_only",
+            source_key="example_allowed_source",
+        )
+    )
+
+    snapshot_rows = [
+        row_by_field for class_name, row_by_field in pushed_rows
+        if class_name == "PTG2Snapshot"
+    ]
+    final_snapshot = snapshot_rows[-1]
+    import_run_rows = [
+        row_by_field for class_name, row_by_field in pushed_rows
+        if class_name == "PTG2ImportRun"
+    ]
+    final_report = import_run_rows[-1]["report"]
+
+    assert import_result_by_field["status"] == "succeeded"
+    assert import_result_by_field["publish_status"] == "published_allowed_amounts"
+    assert import_result_by_field["snapshot_status"] == process_ptg.PTG2_STATUS_PUBLISHED
+    assert import_result_by_field["activation_status"] == "not_applicable"
+    assert import_result_by_field["serving_rates"] == 0
+    assert import_result_by_field["allowed_amount_evidence"] is True
+    assert [row_by_field["status"] for row_by_field in snapshot_rows] == [
+        process_ptg.PTG2_STATUS_BUILDING,
+        process_ptg.PTG2_STATUS_PUBLISHED,
+    ]
+    assert final_snapshot["manifest"]["source_key"] == "example_allowed_source"
+    assert final_snapshot["manifest"]["allowed_amount_index"]["contract"] == (
+        ptg_allowed_amounts.PTG2_ALLOWED_AMOUNT_CONTRACT
+    )
+    assert final_snapshot["manifest"]["allowed_amount_index"]["tables"] == {
+        "plans": "mrf.ptg2_allowed_amount_plan",
+        "items": "mrf.ptg2_allowed_amount_item",
+        "payments": "mrf.ptg2_allowed_amount_payment",
+        "provider_payments": "mrf.ptg2_allowed_amount_provider_payment",
+    }
+    assert final_snapshot["manifest"]["allowed_amount_index"][
+        "current_source_key"
+    ] == "example_allowed_source_allowed_amounts"
+    assert final_report["allowed_amount_plans"] == 1
+    assert final_report["allowed_amount_provider_payments"] == 1
+    assert final_report["serving_rates"] == 0
+    manifest_stage.assert_not_awaited()
+    publish_source_pointers.assert_not_awaited()
+    publish_allowed_pointer.assert_awaited_once()
+
+
+def test_ptg2_allowed_current_pointer_replaces_previous_snapshot(monkeypatch):
+    (
+        pushed_rows,
+        _manifest_stage,
+        _publish_source_pointers,
+        publish_allowed_pointer,
+    ) = _install_allowed_only_main_mocks(monkeypatch)
+    monkeypatch.setattr(
+        process_ptg,
+        "_current_allowed_snapshot_id",
+        AsyncMock(return_value="ptg2:202606:old-allowed"),
+    )
+
+    import_result_by_field = asyncio.run(
+        process_ptg.main(
+            toc_urls=["https://example.test/index.json"],
+            import_month="2026-07",
+            import_id="allowed_amount_replacement",
+            source_key="example_allowed_source",
+        )
+    )
+
+    final_snapshot = [
+        row_by_field
+        for class_name, row_by_field in pushed_rows
+        if class_name == "PTG2Snapshot"
+    ][-1]
+    allowed_index = final_snapshot["manifest"]["allowed_amount_index"]
+    assert final_snapshot["previous_snapshot_id"] == "ptg2:202606:old-allowed"
+    assert allowed_index["previous_snapshot_id"] == "ptg2:202606:old-allowed"
+    publish_allowed_pointer.assert_awaited_once_with(
+        source_key="example_allowed_source",
+        snapshot_id=import_result_by_field["snapshot_id"],
+        previous_snapshot_id="ptg2:202606:old-allowed",
+        import_month=datetime.date(2026, 7, 1),
+        updated_at=final_snapshot["published_at"],
+    )
+
+
+def _mixed_partial_allowed_jobs() -> list[dict]:
+    return [
+        {
+            "type": "in_network",
+            "url": "https://example.test/in-network.json.gz",
+        },
+        {
+            "type": "allowed_amounts",
+            "url": "https://example.test/allowed-ok.json.gz",
+        },
+        {
+            "type": "allowed_amounts",
+            "url": "https://example.test/allowed-failed.json.gz",
+        },
+    ]
+
+
+def _partial_allowed_file_result(
+    job_by_field: dict,
+    *_args,
+    **_kwargs,
+):
+    if "failed" in job_by_field["url"]:
+        return process_ptg.PTG2FileProcessResult(
+            "allowed_amounts",
+            job_by_field["url"],
+            False,
+            error="invalid allowed evidence",
+        )
+    return _build_allowed_amount_file_result(job_by_field)
+
+
+def _install_failed_import_cleanup_mocks(monkeypatch) -> None:
+    for helper_name in (
+        "_drop_ptg2_snapshot_tables_for_manifest",
+        "_drop_ptg2_snapshot_table_names",
+        "delete_ptg2_artifacts_for_snapshot",
+        "delete_unpublished_shared_v3_snapshot_sources",
+    ):
+        monkeypatch.setattr(process_ptg, helper_name, AsyncMock())
+
+
+def test_ptg2_mixed_import_fails_before_negotiated_stage_on_partial_evidence(
+    monkeypatch,
+):
+    """Reject partial allowed evidence before negotiated staging begins."""
+
+    (
+        pushed_rows,
+        manifest_stage,
+        _publish_source_pointers,
+        publish_allowed_pointer,
+    ) = _install_allowed_only_main_mocks(monkeypatch)
+    monkeypatch.setattr(
+        process_ptg,
+        "_process_table_of_contents",
+        AsyncMock(return_value=_mixed_partial_allowed_jobs()),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_process_allowed_amounts_file",
+        AsyncMock(side_effect=_partial_allowed_file_result),
+    )
+    _install_failed_import_cleanup_mocks(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="failed 1 of 2 attempted"):
+        asyncio.run(
+            process_ptg.main(
+                toc_urls=["https://example.test/index.json"],
+                import_month="2026-07",
+                import_id="mixed_partial_allowed",
+                source_key="example_allowed_source",
+            )
+        )
+
+    snapshot_rows = [
+        row_by_field
+        for class_name, row_by_field in pushed_rows
+        if class_name == "PTG2Snapshot"
+    ]
+    assert snapshot_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
+    manifest_stage.assert_not_awaited()
+    publish_allowed_pointer.assert_not_awaited()
 
 
 def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
-    """One failed in-network file prevents strict V3 publication."""
+    """Mixed evidence succeeds, then one failed negotiated file blocks publish."""
     pushed_list = []
+    process_allowed_lane = AsyncMock(
+        return_value=[
+            {
+                "source_type": "allowed_amounts",
+                "source_url": "https://example.test/allowed.json.gz",
+                "success": True,
+                "summary": {
+                    "allowed_amount_payments": 1,
+                    "allowed_amount_provider_payments": 1,
+                },
+            }
+        ]
+    )
 
     async def fake_push(rows, cls, **_kwargs):
         pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
@@ -3777,6 +4496,10 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
 
     async def fake_toc(*_args, **_kwargs):
         return [
+            {
+                "type": "allowed_amounts",
+                "url": "https://example.test/allowed.json.gz",
+            },
             {"type": "in_network", "url": "https://example.test/rates-ok.json.gz"},
             {"type": "in_network", "url": "https://example.test/rates-failed.json.gz"},
         ]
@@ -3804,6 +4527,11 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
     monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
     monkeypatch.setattr(process_ptg, "_process_table_of_contents", fake_toc)
+    monkeypatch.setattr(
+        process_ptg,
+        "_process_allowed_snapshot_files",
+        process_allowed_lane,
+    )
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_in_network)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
@@ -3830,6 +4558,7 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
     assert import_run_rows[-1]["report"]["files_processed"] in {1}
     assert import_run_rows[-1]["report"]["files_failed"] in {1}
     assert current_rows == []
+    process_allowed_lane.assert_awaited_once()
 
 
 def test_ptg2_main_marks_failed_when_toc_download_fails(monkeypatch):
@@ -5611,6 +6340,389 @@ def _strict_v3_downloaded_job(job):
     )
 
 
+def _reused_mixed_allowed_context():
+    allowed_result = vars(
+        _build_allowed_amount_file_result(
+            {"url": "https://example.test/allowed-amounts.json.gz"}
+        )
+    )
+    lane_report_by_field = {
+        "files_attempted": 1,
+        "files_processed": 1,
+        "files_failed": 0,
+        "files_skipped": 0,
+        "successful_files": [allowed_result],
+        "failed_files": [],
+    }
+    state_by_name = {"published": False}
+    return (
+        process_ptg._ReusedSharedV3AllowedContext(
+            successful_files=[allowed_result],
+            lane_report_by_field=lane_report_by_field,
+            previous_snapshot_id="ptg2:202606:previous-allowed",
+            snapshot_state_by_name=state_by_name,
+        ),
+        state_by_name,
+    )
+
+
+def _reused_mixed_negotiated_provenance():
+    source_version = ptg_domain.PTG2SourceVersion(
+        source_identity_hash="b" * 64,
+        source_file_version_id="source-version-negotiated",
+        original_url="https://example.test/rates.json.gz",
+        canonical_url="https://example.test/rates.json.gz",
+        raw_sha256="c" * 64,
+        logical_sha256="d" * 64,
+    )
+    return {
+        "meta": {
+            "plan_id": "TEST-PLAN-001",
+            "plan_id_type": "ein",
+            "plan_market_type": "group",
+        },
+        "file_row": {"file_id": 456},
+        "source_version": source_version,
+        "source_trace_hash": "e" * 64,
+        "network_names": ["Example PPO"],
+    }
+
+
+def _install_reused_mixed_support_mocks(monkeypatch):
+    transaction_session = object()
+
+    @asynccontextmanager
+    async def fake_transaction():
+        yield transaction_session
+
+    monkeypatch.setattr(
+        process_ptg,
+        "_record_in_network_file_provenance",
+        AsyncMock(return_value=_reused_mixed_negotiated_provenance()),
+    )
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", AsyncMock())
+    monkeypatch.setattr(
+        process_ptg,
+        "_publish_shared_v3_source_dictionary",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "validate_reused_shared_v3_snapshot_sources",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_cleanup_old_ptg2_source_tables",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_enqueue_ptg2_auto_address_refresh_after_import",
+        AsyncMock(return_value={"status": "disabled"}),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_drop_ptg2_snapshot_table_names",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "release_current_artifact_lease",
+        Mock(),
+    )
+    monkeypatch.setattr(process_ptg.db, "transaction", fake_transaction)
+    return transaction_session
+
+
+def _install_reused_mixed_publish_mocks(monkeypatch):
+    """Install the isolated lifecycle collaborators for reused mixed imports."""
+
+    transaction_session = _install_reused_mixed_support_mocks(monkeypatch)
+    candidate_stage = _install_candidate_stage_mock(monkeypatch)
+    fallback_publish_source_pointers = AsyncMock(
+        return_value={"status": "promoted"}
+    )
+    activate_candidate = AsyncMock(
+        return_value={
+            "status": "promoted",
+            "source_key": "example_dental",
+            "allowed_amount_pointer": {
+                "status": "promoted",
+                "source_key": "example_dental_allowed_amounts",
+                "snapshot_id": "ptg2:202607:reused-mixed",
+                "previous_snapshot_id": (
+                    "ptg2:202606:previous-allowed"
+                ),
+            },
+        }
+    )
+    persist_completion = AsyncMock()
+    monkeypatch.setattr(
+        process_ptg,
+        "_publish_ptg2_source_pointers",
+        fallback_publish_source_pointers,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_activate_ptg2_source_candidate_in_transaction",
+        activate_candidate,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_acquire_source_pointer_gc_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_persist_completed_ptg2_import_run",
+        persist_completion,
+    )
+    return SimpleNamespace(
+        transaction_session=transaction_session,
+        candidate_stage=candidate_stage,
+        fallback_publish_source_pointers=fallback_publish_source_pointers,
+        activate_candidate=activate_candidate,
+        persist_completion=persist_completion,
+    )
+
+
+def _run_reused_mixed_publish(
+    monkeypatch,
+    *,
+    auto_activate: bool,
+):
+    lifecycle = _install_reused_mixed_publish_mocks(monkeypatch)
+    allowed_context, allowed_state_by_name = (
+        _reused_mixed_allowed_context()
+    )
+    downloaded = _strict_v3_downloaded_job(
+        {
+            "type": "in_network",
+            "url": "https://example.test/rates.json.gz",
+        }
+    )
+    publication_by_field = asyncio.run(
+        process_ptg._publish_reused_shared_v3_snapshot(
+            downloaded_jobs=[downloaded],
+            shared_input_identity=SimpleNamespace(source_count=1),
+            classes={"ImportLog": object},
+            layout_manifest=_reusable_v3_layout_manifest(
+                ptg_provider_quarantine.provider_identifier_quarantine_payload(
+                    {}
+                )
+            ),
+            shared_snapshot_key=7,
+            semantic_fingerprint=b"\x11" * 32,
+            coverage_scope_id=b"\x22" * 32,
+            coverage_plan_id="TEST-PLAN-001",
+            coverage_plan_market_type="group",
+            snapshot_id="ptg2:202607:reused-mixed",
+            import_run_id="reused-mixed",
+            source_key="example_dental",
+            import_month=datetime.date(2026, 7, 1),
+            previous_snapshot_id="ptg2:202606:previous-negotiated",
+            started_at=process_ptg._utcnow(),
+            options={"auto_activate_candidates": auto_activate},
+            allowed_context=allowed_context,
+            manifest_stage_table="mrf.ptg2_stage_reused",
+            test_mode=True,
+            import_started_monotonic=process_ptg._ptg2_monotonic(),
+        )
+    )
+    return SimpleNamespace(
+        publication_by_field=publication_by_field,
+        allowed_state_by_name=allowed_state_by_name,
+        **vars(lifecycle),
+    )
+
+
+def _assert_reused_mixed_pointer_cutover(lifecycle):
+    lifecycle.activate_candidate.assert_awaited_once_with(
+        lifecycle.transaction_session,
+        schema_name="mrf",
+        source_key="example_dental",
+        snapshot_id="ptg2:202607:reused-mixed",
+        expected_current_snapshot_id=(
+            "ptg2:202606:previous-negotiated"
+        ),
+    )
+    lifecycle.fallback_publish_source_pointers.assert_not_awaited()
+
+
+def test_reused_v3_mixed_pointer_cutover_fails_closed_on_allowed_cas(
+    monkeypatch,
+):
+    """Rollback negotiated activation when the allowed pointer CAS fails."""
+
+    transaction_session = object()
+    rollback_events = []
+
+    @asynccontextmanager
+    async def failing_transaction():
+        try:
+            yield transaction_session
+        except RuntimeError:
+            rollback_events.append(True)
+            raise
+
+    activate_candidate = AsyncMock(
+        side_effect=RuntimeError("allowed pointer conflict")
+    )
+    monkeypatch.setattr(process_ptg.db, "transaction", failing_transaction)
+    monkeypatch.setattr(
+        process_ptg,
+        "_acquire_source_pointer_gc_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_activate_ptg2_source_candidate_in_transaction",
+        activate_candidate,
+    )
+
+    with pytest.raises(RuntimeError, match="allowed pointer conflict"):
+        asyncio.run(
+            process_ptg._publish_mixed_candidate_current_pointers(
+                source_key="example_dental",
+                snapshot_id="ptg2:202607:reused-mixed",
+                previous_snapshot_id=(
+                    "ptg2:202606:previous-negotiated"
+                ),
+                previous_allowed_snapshot_id=(
+                    "ptg2:202606:previous-allowed"
+                ),
+                import_month=datetime.date(2026, 7, 1),
+                updated_at=process_ptg._utcnow(),
+            )
+        )
+
+    activate_candidate.assert_awaited_once()
+    assert rollback_events == [True]
+
+
+def test_reused_v3_mixed_auto_activation_publishes_allowed_evidence(
+    monkeypatch,
+):
+    """Publish both mixed-evidence pointer families from a reused layout."""
+
+    lifecycle = _run_reused_mixed_publish(
+        monkeypatch,
+        auto_activate=True,
+    )
+
+    candidate_manifest = lifecycle.candidate_stage.await_args.kwargs[
+        "snapshot_attributes"
+    ]["manifest"]
+    allowed_index = candidate_manifest["allowed_amount_index"]
+    source_types = {
+        version["source_type"]
+        for version in candidate_manifest["source_file_versions"]
+    }
+
+    assert candidate_manifest["data_domains"] == [
+        process_ptg.PTG2_DOMAIN_IN_NETWORK,
+        process_ptg.PTG2_DOMAIN_ALLOWED_AMOUNT,
+    ]
+    assert candidate_manifest["allowed_amount_lane"]["files_processed"] == 1
+    assert candidate_manifest["allowed_amount_provider_payments"] == 1
+    assert candidate_manifest["allowed_amount_evidence"] is True
+    assert allowed_index["previous_snapshot_id"] == (
+        "ptg2:202606:previous-allowed"
+    )
+    assert allowed_index["current_source_key"] == (
+        "example_dental_allowed_amounts"
+    )
+    assert source_types == {"in_network", "allowed_amounts"}
+
+    _assert_reused_mixed_pointer_cutover(lifecycle)
+    assert lifecycle.allowed_state_by_name["published"] is True
+    assert lifecycle.publication_by_field["activation_status"] == "activated"
+    assert lifecycle.publication_by_field["allowed_amount_evidence"] is True
+    assert {
+        version["source_type"]
+        for version in lifecycle.publication_by_field[
+            "source_file_versions"
+        ]
+    } == {"in_network", "allowed_amounts"}
+    completion_report = lifecycle.persist_completion.await_args.kwargs[
+        "report_payload"
+    ]
+    assert completion_report["allowed_amount_pointer"]["status"] == (
+        "promoted"
+    )
+
+
+def _reused_mixed_candidate_attributes(lifecycle):
+    stage_call_by_field = lifecycle.candidate_stage.await_args.kwargs
+    return ptg_source_pointers.candidate_snapshot_attributes(
+        stage_call_by_field["snapshot_attributes"],
+        source_key=stage_call_by_field["source_key"],
+        previous_snapshot_id=stage_call_by_field["previous_snapshot_id"],
+    )
+
+
+def _activate_reused_mixed_candidate(monkeypatch, candidate_attributes):
+    """Activate the candidate staged by the deferred reused-layout fixture."""
+
+    monkeypatch.setattr(
+        process_ptg,
+        "_missing_snapshot_serving_resources",
+        AsyncMock(return_value=([], [])),
+    )
+    activation_by_field = asyncio.run(
+        process_ptg._resume_validated_candidate(
+            snapshot_attributes=candidate_attributes,
+            snapshot_id="ptg2:202607:reused-mixed",
+            source_key="example_dental",
+            import_month=datetime.date(2026, 7, 1),
+            auto_activate=True,
+        )
+    )
+    return activation_by_field
+
+
+def test_reused_v3_mixed_deferred_activation_preserves_and_promotes_allowed(
+    monkeypatch,
+):
+    """Keep mixed evidence dormant, then promote both pointer families."""
+
+    lifecycle = _run_reused_mixed_publish(
+        monkeypatch,
+        auto_activate=False,
+    )
+    candidate_attributes = _reused_mixed_candidate_attributes(
+        lifecycle
+    )
+    candidate_manifest = candidate_attributes["manifest"]
+
+    assert lifecycle.publication_by_field["activation_status"] == "deferred"
+    assert lifecycle.publication_by_field["allowed_amount_evidence"] is True
+    assert candidate_manifest["allowed_amount_index"][
+        "previous_snapshot_id"
+    ] == "ptg2:202606:previous-allowed"
+    assert candidate_manifest["allowed_amount_lane"]["successful_files"]
+    assert {
+        version["source_type"]
+        for version in candidate_manifest["source_file_versions"]
+    } == {"in_network", "allowed_amounts"}
+    assert lifecycle.allowed_state_by_name["published"] is False
+    lifecycle.activate_candidate.assert_not_awaited()
+
+    activation_by_field = _activate_reused_mixed_candidate(
+        monkeypatch,
+        candidate_attributes,
+    )
+    _assert_reused_mixed_pointer_cutover(lifecycle)
+    assert activation_by_field["activation_status"] == "activated"
+    assert activation_by_field["allowed_amount_pointer"]["status"] == "promoted"
+    assert activation_by_field["allowed_amount_provider_payments"] == 1
+    assert {
+        version["source_type"]
+        for version in activation_by_field["source_file_versions"]
+    } == {"in_network", "allowed_amounts"}
+
+
 def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch):
     """Verify this PTG import regression contract."""
     pushed_list = []
@@ -6090,7 +7202,10 @@ def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
             yield _strict_v3_downloaded_job(job)
 
     async def fake_process(*_args, **kwargs):
-        assert kwargs.get("ptg2_manifest_stage_table") == "manifest_stage"
+        stage_token = create_stage_mock.await_args.args[0]
+        assert kwargs.get("ptg2_manifest_stage_table") == (
+            process_ptg._ptg2_manifest_stage_table_name(stage_token)
+        )
         return process_ptg.PTG2FileProcessResult(
             "in_network",
             "https://example.test/rates.json.gz",

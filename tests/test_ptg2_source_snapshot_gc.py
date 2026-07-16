@@ -20,6 +20,20 @@ def _strict_index(**values):
     }
 
 
+def _allowed_manifest(source_key, previous_snapshot_id=None):
+    return {
+        "source_key": source_key,
+        "allowed_amount_index": {
+            "contract": snapshot_gc.PTG2_ALLOWED_AMOUNT_CONTRACT,
+            "arch_version": "postgres_binary_v3",
+            "storage": "postgresql",
+            "snapshot_scoped": True,
+            "current_source_key": f"{source_key}_allowed_amounts",
+            "previous_snapshot_id": previous_snapshot_id,
+        },
+    }
+
+
 class _Executor:
     def __init__(self, snapshot_rows, current_snapshot_ids=()):
         self.snapshot_rows = snapshot_rows
@@ -123,6 +137,54 @@ def test_gc_plan_selects_only_unreferenced_strict_v3_snapshots():
 
     assert plan.candidate_snapshot_ids == ("failed", "stale")
     assert plan.shared_snapshot_ids == ("failed", "stale")
+    assert plan.tables == ()
+
+
+def test_gc_plan_tracks_allowed_current_replacement_and_collects_older_snapshot():
+    executor = _Executor(
+        [
+            {
+                "snapshot_id": "allowed-current",
+                "status": "published",
+                "previous_snapshot_id": "allowed-previous",
+                "manifest": _allowed_manifest(
+                    "source_a",
+                    "allowed-previous",
+                ),
+            },
+            {
+                "snapshot_id": "allowed-previous",
+                "status": "published",
+                "previous_snapshot_id": "allowed-old",
+                "manifest": _allowed_manifest(
+                    "source_a",
+                    "allowed-old",
+                ),
+            },
+            {
+                "snapshot_id": "allowed-old",
+                "status": "published",
+                "previous_snapshot_id": None,
+                "manifest": _allowed_manifest("source_a"),
+            },
+        ],
+        current_snapshot_ids=("allowed-current", "allowed-previous"),
+    )
+
+    plan = asyncio.run(
+        snapshot_gc.build_ptg2_source_snapshot_gc_plan(
+            executor=executor,
+            retain_current_lineage=1,
+        )
+    )
+
+    assert plan.current_snapshot_ids == (
+        "allowed-current",
+        "allowed-previous",
+    )
+    assert plan.candidate_snapshot_ids == ("allowed-old",)
+    assert plan.candidate_reasons == (("allowed-old", "terminal"),)
+    assert plan.shared_snapshot_ids == ()
     assert plan.tables == ()
 
 

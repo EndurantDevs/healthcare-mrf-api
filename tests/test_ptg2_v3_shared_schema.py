@@ -178,7 +178,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260715160000_mrf_discovery_source_checkpoints"
+        "20260716120000_ptg2_allowed_amounts_v3"
     ]
 
 

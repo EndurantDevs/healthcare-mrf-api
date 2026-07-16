@@ -9,10 +9,12 @@ import os
 from typing import Any
 
 from db.connection import db
+from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
 from process.ptg_parts.canonical import semantic_hash
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.domain import (
     PTG2_CANDIDATE_ACTIVATION_CONTRACT,
+    PTG2_DOMAIN_ALLOWED_AMOUNT,
     PTG2_STATUS_PUBLISHED,
     PTG2_STATUS_VALIDATED,
 )
@@ -25,6 +27,7 @@ from process.ptg_parts.ptg2_lifecycle_lock import (
     PTG2_SOURCE_POINTER_GC_LOCK_KEY,
     acquire_ptg2_lifecycle_lock,
 )
+from process.ptg_parts.snapshot_tables import _normalize_source_key
 
 
 _GLOBAL_SNAPSHOT_POINTER_RECONCILIATION_SQL = """
@@ -74,6 +77,15 @@ LIMIT 1
 
 class PTG2SourcePointerConflict(RuntimeError):
     """Raised when a source pointer changed after an import observed it."""
+
+
+def _allowed_source_pointer_key(source_key: str) -> str:
+    """Return the current-source key reserved for allowed evidence."""
+
+    pointer_key = _normalize_source_key(f"{source_key}_allowed_amounts")
+    if not pointer_key:
+        raise ValueError("allowed-amount source pointer requires a source key")
+    return pointer_key
 
 
 def _manifest_mapping(value: Any) -> dict[str, Any]:
@@ -859,6 +871,59 @@ def _validated_activation_identity(
     }
 
 
+def _validated_allowed_activation_identity(
+    candidate: dict[str, Any],
+    *,
+    source_key: str,
+) -> dict[str, Any] | None:
+    """Validate an optional allowed-evidence pointer bound to a candidate."""
+
+    manifest = _manifest_mapping(candidate.get("manifest"))
+    raw_allowed_index = manifest.get("allowed_amount_index")
+    if raw_allowed_index is None:
+        return None
+    if not isinstance(raw_allowed_index, dict):
+        raise ValueError("candidate allowed-amount index must be an object")
+    allowed_index = dict(raw_allowed_index)
+    normalized_source_key = str(source_key or "").strip().lower()
+    current_source_key = _allowed_source_pointer_key(normalized_source_key)
+    required_contract_by_field = {
+        "contract": PTG2_ALLOWED_AMOUNT_CONTRACT,
+        "arch_version": "postgres_binary_v3",
+        "storage": "postgresql",
+        "data_domain": PTG2_DOMAIN_ALLOWED_AMOUNT,
+        "source_key": normalized_source_key,
+        "current_source_key": current_source_key,
+    }
+    for field_name, required_value in required_contract_by_field.items():
+        if allowed_index.get(field_name) != required_value:
+            raise ValueError(
+                "candidate allowed-amount index has an invalid "
+                f"{field_name} binding"
+            )
+    if allowed_index.get("snapshot_scoped") is not True:
+        raise ValueError(
+            "candidate allowed-amount index is not snapshot scoped"
+        )
+    try:
+        payment_count = int(allowed_index.get("allowed_amount_payments") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "candidate allowed-amount payment count is invalid"
+        ) from exc
+    if not allowed_index.get("allowed_amount_evidence") or payment_count <= 0:
+        raise ValueError(
+            "candidate allowed-amount index has no payment evidence"
+        )
+    previous_snapshot_id = (
+        str(allowed_index.get("previous_snapshot_id") or "").strip() or None
+    )
+    return {
+        "source_key": current_source_key,
+        "previous_snapshot_id": previous_snapshot_id,
+    }
+
+
 async def activate_ptg2_source_candidate(
     *,
     source_key: str,
@@ -897,10 +962,14 @@ async def _activate_ptg2_source_candidate_in_transaction(
         schema_name=schema_name,
         snapshot_id=snapshot_id,
     )
-    identity = _validated_activation_identity(
+    activation_by_field = _validated_activation_identity(
         candidate,
         source_key=source_key,
         expected_current_snapshot_id=expected_current_snapshot_id,
+    )
+    allowed_activation_by_field = _validated_allowed_activation_identity(
+        candidate,
+        source_key=source_key,
     )
     activated_at = await _database_utc_timestamp(session)
     import_month = candidate.get("import_month")
@@ -908,12 +977,14 @@ async def _activate_ptg2_source_candidate_in_transaction(
         raise ValueError("validated candidate has no import month")
     plan_pointer_entries = [
         _plan_pointer_entry(
-            plan_id=identity["plan_id"],
-            plan_market_type=identity["plan_market_type"],
+            plan_id=activation_by_field["plan_id"],
+            plan_market_type=activation_by_field["plan_market_type"],
             import_month=import_month,
             source_key=source_key,
             snapshot_id=snapshot_id,
-            previous_snapshot_id=identity["previous_snapshot_id"],
+            previous_snapshot_id=activation_by_field[
+                "previous_snapshot_id"
+            ],
             updated_at=activated_at,
         )
     ]
@@ -921,22 +992,46 @@ async def _activate_ptg2_source_candidate_in_transaction(
         session,
         schema_name=schema_name,
         snapshot_id=snapshot_id,
-        snapshot_key=identity["snapshot_key"],
+        snapshot_key=activation_by_field["snapshot_key"],
         source_key=source_key,
-        plan_id=identity["plan_id"],
-        plan_market_type=identity["plan_market_type"],
-        coverage_scope_id=identity["coverage_scope_id"],
+        plan_id=activation_by_field["plan_id"],
+        plan_market_type=activation_by_field["plan_market_type"],
+        coverage_scope_id=activation_by_field["coverage_scope_id"],
     )
     await _compare_and_swap_source_pointer(
         session,
         schema_name=schema_name,
         source_key=source_key,
         snapshot_id=snapshot_id,
-        previous_snapshot_id=identity["previous_snapshot_id"],
+        previous_snapshot_id=activation_by_field[
+            "previous_snapshot_id"
+        ],
         import_month=import_month,
         updated_at=activated_at,
         allow_already_current=False,
     )
+    allowed_pointer_by_field = None
+    if allowed_activation_by_field is not None:
+        await _compare_and_swap_source_pointer(
+            session,
+            schema_name=schema_name,
+            source_key=allowed_activation_by_field["source_key"],
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=allowed_activation_by_field[
+                "previous_snapshot_id"
+            ],
+            import_month=import_month,
+            updated_at=activated_at,
+            allow_already_current=False,
+        )
+        allowed_pointer_by_field = {
+            "status": "promoted",
+            "source_key": allowed_activation_by_field["source_key"],
+            "snapshot_id": snapshot_id,
+            "previous_snapshot_id": allowed_activation_by_field[
+                "previous_snapshot_id"
+            ],
+        }
     candidate_attributes = {
         key: candidate.get(key)
         for key in (
@@ -979,14 +1074,21 @@ async def _activate_ptg2_source_candidate_in_transaction(
         report_digest=audit_report_digest,
         activated_at=activated_at,
     )
-    return {
+    result_by_field = {
         "status": "promoted",
         "source_key": source_key,
         "snapshot_id": snapshot_id,
-        "previous_snapshot_id": identity["previous_snapshot_id"],
+        "previous_snapshot_id": activation_by_field[
+            "previous_snapshot_id"
+        ],
         "plan_source_count": 1,
         "global_pointer": "reconciled",
     }
+    if allowed_pointer_by_field is not None:
+        result_by_field["allowed_amount_pointer"] = (
+            allowed_pointer_by_field
+        )
+    return result_by_field
 
 
 async def _publish_ptg2_source_pointers(

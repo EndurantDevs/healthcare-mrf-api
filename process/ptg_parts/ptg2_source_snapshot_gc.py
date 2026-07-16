@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from db.connection import db
+from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
 from process.ptg_parts.ptg2_lifecycle_lock import PTG2_SOURCE_POINTER_GC_LOCK_KEY
@@ -126,6 +127,20 @@ def _serving_index(row: dict[str, Any]) -> dict[str, Any]:
     return serving_index if isinstance(serving_index, dict) else {}
 
 
+def _is_allowed_amount_snapshot(row: dict[str, Any]) -> bool:
+    manifest = _manifest_dict(row.get("manifest"))
+    allowed_amount_index = manifest.get("allowed_amount_index")
+    return bool(
+        isinstance(allowed_amount_index, dict)
+        and allowed_amount_index.get("contract")
+        == PTG2_ALLOWED_AMOUNT_CONTRACT
+        and allowed_amount_index.get("arch_version")
+        == "postgres_binary_v3"
+        and allowed_amount_index.get("storage") == "postgresql"
+        and allowed_amount_index.get("snapshot_scoped") is True
+    )
+
+
 def _protected_snapshot_lineage_ids(
     snapshot_rows: Iterable[Any],
     current_snapshot_ids: tuple[str, ...],
@@ -192,7 +207,10 @@ async def build_ptg2_source_snapshot_gc_plan(
                snapshot.previous_snapshot_id,
                snapshot.manifest,
                snapshot.manifest->'serving_index' AS serving_index,
-               snapshot.manifest->'serving_index'->>'source_key' AS source_key,
+               COALESCE(
+                   snapshot.manifest->'serving_index'->>'source_key',
+                   snapshot.manifest->>'source_key'
+               ) AS source_key,
                (
                    snapshot.status = 'building'
                    AND snapshot.created_at
@@ -228,7 +246,11 @@ async def build_ptg2_source_snapshot_gc_plan(
         snapshot_id = str(row.get("snapshot_id") or "")
         snapshot_status = str(row.get("status") or "")
         serving_index = _serving_index(row)
-        is_strict_v3 = is_strict_ptg2_v3_shared_blocks_manifest(serving_index)
+        is_shared_strict_v3 = is_strict_ptg2_v3_shared_blocks_manifest(
+            serving_index
+        )
+        is_allowed_strict_v3 = _is_allowed_amount_snapshot(row)
+        is_strict_v3 = is_shared_strict_v3 or is_allowed_strict_v3
         # Strict V3 snapshot state is owned by shared-block tables; no manifest
         # may authorize per-snapshot table cleanup.
         table_names: tuple[str, ...] = ()
@@ -259,7 +281,7 @@ async def build_ptg2_source_snapshot_gc_plan(
                 snapshot_id=snapshot_id,
                 source_key=source_key,
                 table_names=table_names,
-                is_shared=True,
+                is_shared=is_shared_strict_v3,
                 reason="stale_building" if stale_building_candidate else "terminal",
             )
         )
@@ -461,7 +483,7 @@ async def execute_ptg2_source_snapshot_gc_plan(
         for table_name in sorted({table.table_name for table in plan.tables}):
             await connection.status(
                 f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)}"
-        )
+            )
         if plan.candidate_snapshot_ids:
             layout_rows = await connection.all(
                 f"""
@@ -514,12 +536,33 @@ async def execute_ptg2_source_snapshot_gc_plan(
                 DELETE FROM {_quote_ident(schema_name)}.ptg2_snapshot
                  WHERE snapshot_id = ANY(:snapshot_ids)
                    AND status IN ('published', 'failed', 'building')
-                   AND lower(COALESCE(manifest->'serving_index'->>'arch_version', ''))
-                       = 'postgres_binary_v3'
-                   AND lower(COALESCE(manifest->'serving_index'->>'storage_generation', ''))
-                       = 'shared_blocks_v3'
+                   AND (
+                        (
+                            lower(COALESCE(manifest->'serving_index'->>'arch_version', ''))
+                                = 'postgres_binary_v3'
+                            AND lower(COALESCE(manifest->'serving_index'->>'storage_generation', ''))
+                                = 'shared_blocks_v3'
+                        )
+                        OR (
+                            manifest->'allowed_amount_index'->>'contract'
+                                = :allowed_amount_contract
+                            AND lower(COALESCE(
+                                manifest->'allowed_amount_index'->>'arch_version',
+                                ''
+                            )) = 'postgres_binary_v3'
+                            AND lower(COALESCE(
+                                manifest->'allowed_amount_index'->>'storage',
+                                ''
+                            )) = 'postgresql'
+                            AND lower(COALESCE(
+                                manifest->'allowed_amount_index'->>'snapshot_scoped',
+                                ''
+                            )) = 'true'
+                        )
+                   )
                 """,
                 snapshot_ids=list(plan.candidate_snapshot_ids),
+                allowed_amount_contract=PTG2_ALLOWED_AMOUNT_CONTRACT,
             )
             if int(deleted_binding_count or 0) > 0:
                 await release_unbound_ptg2_shared_layouts(

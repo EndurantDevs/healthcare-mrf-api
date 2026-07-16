@@ -77,13 +77,7 @@ def test_retired_importer_modules_and_entry_points_are_absent():
 
 
 @pytest.mark.asyncio
-async def test_strict_v3_import_rejects_retired_input_lanes_before_database_work():
-    with pytest.raises(ValueError, match="allowed_url is not supported"):
-        await process_ptg.main(
-            source_key="source-a",
-            allowed_url="https://example.invalid/allowed.json.gz",
-        )
-
+async def test_strict_v3_import_rejects_retired_provider_lane_before_database_work():
     with pytest.raises(ValueError, match="provider_ref_url is not supported"):
         await process_ptg.main(
             source_key="source-a",
