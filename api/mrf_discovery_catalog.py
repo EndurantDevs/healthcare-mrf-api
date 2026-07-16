@@ -11,9 +11,11 @@ from typing import Any
 from sqlalchemy import String, cast, func, or_, select
 
 from api.mrf_discovery_catalog_paging import (
+    FILE_QUERY_STREAM_BATCH_SIZE,
     MAX_FILE_PAGE_PLAN_REFERENCES,
     ambiguous_plan_identity_keys as _ambiguous_plan_identity_keys,
     bounded_file_windows,
+    collect_bounded_file_query_rows as _bounded_stream_file_query_rows,
     parse_file_cursor as _parse_file_cursor,
     plan_identity_key as _plan_identity_key,
     plan_reference_count as _plan_reference_count,
@@ -196,7 +198,7 @@ async def list_discovery_source_files_page(
         )
     )
     statement = (
-        select(*selected_columns)
+        db.select(*selected_columns)
         .select_from(
             file_table.join(
                 source_table,
@@ -213,8 +215,11 @@ async def list_discovery_source_files_page(
             else file_table.c.mrf_file_id > cursor_file_id
         )
         statement = statement.where(cursor_comparison)
-    file_query_rows = await db.all(
-        statement.order_by(file_table.c.mrf_file_id).limit(limit + 1)
+    file_query_rows = await _bounded_stream_file_query_rows(
+        statement.order_by(file_table.c.mrf_file_id).limit(limit + 1),
+        limit=limit,
+        cursor_plan_offset=cursor_plan_offset,
+        plan_reference_limit=MAX_FILE_PAGE_PLAN_REFERENCES,
     )
     page_items, next_cursor = _bounded_file_items(
         file_query_rows,

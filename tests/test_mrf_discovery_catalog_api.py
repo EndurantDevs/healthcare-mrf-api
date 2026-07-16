@@ -44,6 +44,80 @@ def _dense_file_row(file_id: str, plan_count: int) -> dict[str, object]:
     }
 
 
+class _FileRowStreamStatement:
+    """Expose deterministic rows through the production streaming contract."""
+
+    def __init__(self, file_rows):
+        self.file_rows = file_rows
+        self.emitted_count = 0
+        self.execution_options_dict = {}
+
+    def execution_options(self, **execution_options):
+        self.execution_options_dict = execution_options
+        return self
+
+    async def iterate(self):
+        for file_row in self.file_rows:
+            self.emitted_count += 1
+            yield file_row
+
+
+@pytest.mark.asyncio
+async def test_file_row_stream_stops_after_dense_plan_budget():
+    """Do not materialize the unused tail of a plan-dense source."""
+
+    stream_statement = _FileRowStreamStatement(
+        [_dense_file_row(f"file_{index:03d}", 100) for index in range(500)]
+    )
+
+    file_rows = await catalog._bounded_stream_file_query_rows(
+        stream_statement,
+        limit=500,
+        cursor_plan_offset=0,
+        plan_reference_limit=10,
+    )
+
+    assert len(file_rows) == 1
+    assert stream_statement.emitted_count == 1
+    assert stream_statement.execution_options_dict == {
+        "yield_per": catalog.FILE_QUERY_STREAM_BATCH_SIZE
+    }
+
+
+@pytest.mark.asyncio
+async def test_file_row_stream_reads_one_cursor_lookahead():
+    """Read one extra row when a page ends exactly on a plan boundary."""
+
+    stream_statement = _FileRowStreamStatement(
+        [
+            _dense_file_row("file_a", 5),
+            _dense_file_row("file_b", 5),
+            _dense_file_row("file_c", 5),
+            _dense_file_row("file_d", 5),
+        ]
+    )
+
+    file_rows = await catalog._bounded_stream_file_query_rows(
+        stream_statement,
+        limit=10,
+        cursor_plan_offset=0,
+        plan_reference_limit=10,
+    )
+    page_items, next_cursor = catalog._bounded_file_items(
+        file_rows,
+        limit=10,
+        cursor_plan_offset=0,
+        plan_reference_limit=10,
+    )
+
+    assert [file_item["mrf_file_id"] for file_item in page_items] == [
+        "file_a",
+        "file_b",
+    ]
+    assert next_cursor == "file_b"
+    assert stream_statement.emitted_count == 3
+
+
 def test_file_page_splits_one_plan_dense_file_with_composite_cursor():
     """Split one file's plan identities without skipping or duplicating them."""
 
@@ -157,10 +231,14 @@ async def test_file_page_resumes_composite_plan_cursor(monkeypatch):
 
     dense_row = _dense_file_row("file_dense", 5)
 
-    async def fake_all(_statement):
+    async def fake_file_rows(_statement, **_paging_options):
         return [dense_row]
 
-    monkeypatch.setattr(catalog.db, "all", fake_all)
+    monkeypatch.setattr(
+        catalog,
+        "_bounded_stream_file_query_rows",
+        fake_file_rows,
+    )
     monkeypatch.setattr(catalog, "MAX_FILE_PAGE_PLAN_REFERENCES", 3)
 
     first_page = await catalog.list_discovery_source_files_page(
@@ -268,7 +346,7 @@ async def test_source_page_filters_exact_discovery_run(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_file_page_normalizes_label_only_plan_identity(monkeypatch):
-    async def fake_all(_statement):
+    async def fake_file_rows(_statement, **_paging_options):
         return [
             {
                 "mrf_file_id": "file_001",
@@ -289,7 +367,11 @@ async def test_file_page_normalizes_label_only_plan_identity(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(catalog.db, "all", fake_all)
+    monkeypatch.setattr(
+        catalog,
+        "_bounded_stream_file_query_rows",
+        fake_file_rows,
+    )
 
     first_page = await catalog.list_discovery_source_files_page(
         "source_001", limit=10
@@ -312,7 +394,7 @@ async def test_file_page_normalizes_label_only_plan_identity(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_file_page_prefers_stored_plan_metadata(monkeypatch):
-    async def fake_all(_statement):
+    async def fake_file_rows(_statement, **_paging_options):
         return [
             {
                 "mrf_file_id": "file_001",
@@ -336,7 +418,11 @@ async def test_file_page_prefers_stored_plan_metadata(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(catalog.db, "all", fake_all)
+    monkeypatch.setattr(
+        catalog,
+        "_bounded_stream_file_query_rows",
+        fake_file_rows,
+    )
 
     page = await catalog.list_discovery_source_files_page("source_001", limit=10)
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
+FILE_QUERY_STREAM_BATCH_SIZE = 16
 MAX_FILE_PAGE_PLAN_REFERENCES = 10_000
 
 _FILE_PLAN_CURSOR_SEPARATOR = "~plan~"
@@ -20,6 +21,44 @@ class FilePlanWindow:
     plan_offset: int
     plan_limit: int
     plan_total: int
+
+
+async def collect_bounded_file_query_rows(
+    file_statement: Any,
+    *,
+    limit: int,
+    cursor_plan_offset: int,
+    plan_reference_limit: int,
+) -> list[Any]:
+    """Stream only the rows needed to establish one bounded file page."""
+
+    collected_file_rows: list[Any] = []
+    plan_reference_count_so_far = 0
+    needs_lookahead = False
+    file_row_stream = file_statement.execution_options(
+        yield_per=FILE_QUERY_STREAM_BATCH_SIZE
+    ).iterate()
+    try:
+        async for file_query_row in file_row_stream:
+            collected_file_rows.append(file_query_row)
+            if needs_lookahead:
+                break
+            file_data = row_mapping(file_query_row)
+            plan_offset = cursor_plan_offset if len(collected_file_rows) == 1 else 0
+            remaining_plan_reference_count = max(
+                plan_reference_count(file_data) - plan_offset,
+                0,
+            )
+            plan_reference_count_so_far += remaining_plan_reference_count
+            if plan_reference_count_so_far > plan_reference_limit:
+                break
+            needs_lookahead = (
+                plan_reference_count_so_far == plan_reference_limit
+                or len(collected_file_rows) >= limit
+            )
+    finally:
+        await file_row_stream.aclose()
+    return collected_file_rows
 
 
 def bounded_file_windows(
@@ -107,6 +146,14 @@ def value_count(candidate_value: Any) -> int:
     if isinstance(candidate_value, (list, tuple, set)):
         return len(candidate_value)
     return 0
+
+
+def row_mapping(file_query_row: Any) -> Mapping[str, Any]:
+    """Return one SQLAlchemy row through its stable mapping interface."""
+
+    if isinstance(file_query_row, Mapping):
+        return file_query_row
+    return file_query_row._mapping
 
 
 def slice_values(

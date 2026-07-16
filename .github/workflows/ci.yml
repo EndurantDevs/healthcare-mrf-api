@@ -85,6 +85,7 @@ jobs:
           tests/test_control_failure_metrics.py
           tests/test_control_imports_api.py
           tests/test_control_workers.py
+          tests/test_mrf_discovery_catalog_api.py
           tests/test_mrf_discovery_checkpoint_integration.py
           tests/test_mrf_discovery_process_pool.py
           tests/test_mrf_discovery_source_checkpoint_schema.py
