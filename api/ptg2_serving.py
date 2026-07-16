@@ -24,7 +24,12 @@ from api.ptg2_address_policy import (
     PTG_NO_DISPLAY_ADDRESS_FIELDS,
     PTG_NO_DISPLAY_VERIFICATION_FIELDS,
 )
-from api.code_systems import EQUIVALENT_PROCEDURE_CODE_SYSTEMS, canonical_catalog_code, catalog_code_lookup_values
+from api.code_systems import (
+    EQUIVALENT_PROCEDURE_CODE_SYSTEMS,
+    canonical_catalog_code,
+    catalog_code_lookup_values,
+    catalog_code_system_lookup_values,
+)
 from api.endpoint.pagination import PaginationParams
 from api.ptg2_code_filters import (
     INFERRED_PROVIDER_TAXONOMY_RULES,
@@ -403,35 +408,46 @@ def _pre_shaped_provider_directory_network_match_payload(
 def _provider_directory_network_match_context_payload(
     address_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    evidence = _coerce_json_payload(address_payload.get("address_verification_evidence"), {})
-    if not isinstance(evidence, dict):
-        evidence = {}
+    evidence_by_field = _coerce_json_payload(
+        address_payload.get("address_verification_evidence"),
+        {},
+    )
+    if not isinstance(evidence_by_field, dict):
+        evidence_by_field = {}
     address_sources = {
-        str(value or "").strip().lower().replace("-", "_")
-        for value in _coerce_str_list_payload(address_payload.get("address_sources"))
+        str(address_source or "").strip().lower().replace("-", "_")
+        for address_source in _coerce_str_list_payload(
+            address_payload.get("address_sources")
+        )
     }
-    source = evidence.get("source") or address_payload.get("provider_directory_source")
-    if not source and "provider_directory_fhir" in address_sources:
-        source = "provider_directory_fhir"
-    context = {
-        "provider_directory_source": source,
+    directory_source = evidence_by_field.get("source") or address_payload.get(
+        "provider_directory_source"
+    )
+    if not directory_source and "provider_directory_fhir" in address_sources:
+        directory_source = "provider_directory_fhir"
+    context_by_field = {
+        "provider_directory_source": directory_source,
         "provider_directory_source_id": (
             address_payload.get("provider_directory_source_id")
-            or evidence.get("source_id")
-            or evidence.get("provider_directory_source_id")
+            or evidence_by_field.get("source_id")
+            or evidence_by_field.get("provider_directory_source_id")
         ),
         "provider_directory_org_name": (
             address_payload.get("provider_directory_org_name")
-            or evidence.get("org_name")
-            or evidence.get("provider_directory_org_name")
+            or evidence_by_field.get("org_name")
+            or evidence_by_field.get("provider_directory_org_name")
         ),
         "provider_directory_plan_name": (
             address_payload.get("provider_directory_plan_name")
-            or evidence.get("plan_name")
-            or evidence.get("provider_directory_plan_name")
+            or evidence_by_field.get("plan_name")
+            or evidence_by_field.get("provider_directory_plan_name")
         ),
     }
-    return {key: value for key, value in context.items() if value not in (None, "", [])}
+    return {
+        field_name: field_value
+        for field_name, field_value in context_by_field.items()
+        if field_value not in (None, "", [])
+    }
 
 
 def _provider_directory_issuer_network_key_fields_payload(
@@ -486,16 +502,21 @@ def _candidate_provider_directory_network_name_match_payload(
 
 
 def _provider_directory_network_name_matches(
-    item: dict[str, Any],
+    provider_item_by_field: dict[str, Any],
     address_payload: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    """Return directory network names that corroborate one provider row."""
+
     ptg_names = _coerce_str_list_payload(
-        _first_payload_value(item.get("network_names"), address_payload.get("network_names"))
+        _first_payload_value(
+            provider_item_by_field.get("network_names"),
+            address_payload.get("network_names"),
+        )
     )
     ptg_by_key = {
-        _canonical_network_name_payload(value): value
-        for value in ptg_names
-        if _canonical_network_name_payload(value)
+        _canonical_network_name_payload(network_name): network_name
+        for network_name in ptg_names
+        if _canonical_network_name_payload(network_name)
     }
     if not ptg_by_key:
         return []
@@ -505,8 +526,8 @@ def _provider_directory_network_name_matches(
     for name in _coerce_str_list_payload(address_payload.get("provider_directory_network_names")):
         directory_networks.append({"name": name})
 
-    matches: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str | None]] = set()
+    network_match_rows: list[dict[str, Any]] = []
+    seen_match_keys: set[tuple[str, str, str | None]] = set()
     seen_candidate_keys: set[str] = set()
     context = _provider_directory_network_match_context_payload(address_payload)
     for network in directory_networks:
@@ -517,7 +538,7 @@ def _provider_directory_network_name_matches(
             candidate_key = _canonical_network_name_payload(pre_shaped_match.get("ptg_network_name"))
             if candidate_key and candidate_key not in seen_candidate_keys:
                 seen_candidate_keys.add(candidate_key)
-                matches.append(pre_shaped_match)
+                network_match_rows.append(pre_shaped_match)
             continue
         candidate_values = [network.get("name"), network.get("provider_directory_network_name")]
         aliases = _coerce_json_payload(network.get("aliases"), [])
@@ -530,11 +551,11 @@ def _provider_directory_network_name_matches(
             if candidate_key in seen_candidate_keys:
                 continue
             match_key = (candidate_key, str(network.get("resource_id") or ""), str(network.get("ref") or ""))
-            if match_key in seen:
+            if match_key in seen_match_keys:
                 continue
-            seen.add(match_key)
+            seen_match_keys.add(match_key)
             seen_candidate_keys.add(candidate_key)
-            matches.append(
+            network_match_rows.append(
                 _candidate_provider_directory_network_name_match_payload(
                     ptg_network_name=ptg_by_key[candidate_key],
                     provider_directory_network_name=str(candidate or ""),
@@ -543,7 +564,7 @@ def _provider_directory_network_name_matches(
                     context=context,
                 )
             )
-    return matches
+    return network_match_rows
 
 
 def _provider_directory_network_context_matched(
@@ -617,14 +638,17 @@ def _promote_address_provenance_fields(item: dict[str, Any], address_payload: di
 
 
 def _address_verification_payload(
-    item: dict[str, Any],
-    data: dict[str, Any],
+    provider_item_by_field: dict[str, Any],
+    location_data_by_field: dict[str, Any],
     address_payload: dict[str, Any],
 ) -> dict[str, Any]:
     """Describe the network and address evidence behind one provider row."""
 
-    displayed_address_present = _has_displayed_address_payload(item, address_payload)
-    if displayed_address_present is False:
+    has_displayed_address = _has_displayed_address_payload(
+        provider_item_by_field,
+        address_payload,
+    )
+    if has_displayed_address is False:
         return {
             "rate_network_binding": "tic_provider_group_npi_tin",
             "address_network_binding": "inferred_from_provider_identity",
@@ -635,42 +659,63 @@ def _address_verification_payload(
             "network_bound_address": False,
         }
 
-    location_source = item.get("location_source") or data.get("location_source")
-    location_confidence_code = item.get("location_confidence_code") or data.get("location_confidence_code")
+    location_source = provider_item_by_field.get(
+        "location_source"
+    ) or location_data_by_field.get("location_source")
+    location_confidence_code = provider_item_by_field.get(
+        "location_confidence_code"
+    ) or location_data_by_field.get("location_confidence_code")
     address_sources = _coerce_str_list_payload(
-        _first_payload_value(item.get("address_sources"), address_payload.get("address_sources"))
+        _first_payload_value(
+            provider_item_by_field.get("address_sources"),
+            address_payload.get("address_sources"),
+        )
     )
     address_precision = (
-        item.get("address_precision")
+        provider_item_by_field.get("address_precision")
         or address_payload.get("address_precision")
         or ("street" if address_payload.get("first_line") else None)
     )
     source_count = _coerce_int_payload(
-        _first_payload_value(item.get("source_count"), address_payload.get("source_count"))
+        _first_payload_value(
+            provider_item_by_field.get("source_count"),
+            address_payload.get("source_count"),
+        )
     )
     source_mask = (
-        _coerce_int_payload(_first_payload_value(item.get("source_mask"), address_payload.get("source_mask")))
+        _coerce_int_payload(
+            _first_payload_value(
+                provider_item_by_field.get("source_mask"),
+                address_payload.get("source_mask"),
+            )
+        )
         or 0
     )
     address_source_mask = (
         _coerce_int_payload(
-            _first_payload_value(item.get("address_source_mask"), address_payload.get("address_source_mask"))
+            _first_payload_value(
+                provider_item_by_field.get("address_source_mask"),
+                address_payload.get("address_source_mask"),
+            )
         )
         or 0
     )
-    multi_source_confirmed = _coerce_bool_payload(
-        _first_payload_value(item.get("multi_source_confirmed"), address_payload.get("multi_source_confirmed"))
+    is_multi_source_confirmed = _coerce_bool_payload(
+        _first_payload_value(
+            provider_item_by_field.get("multi_source_confirmed"),
+            address_payload.get("multi_source_confirmed"),
+        )
     )
-    if not multi_source_confirmed and source_count is not None:
-        multi_source_confirmed = source_count > 1
+    if not is_multi_source_confirmed and source_count is not None:
+        is_multi_source_confirmed = source_count > 1
 
     source_markers = {
-        str(value or "").strip().lower()
-        for value in (
+        str(source_marker or "").strip().lower()
+        for source_marker in (
             location_source,
             location_confidence_code,
-            item.get("address_network_binding"),
-            data.get("address_network_binding"),
+            provider_item_by_field.get("address_network_binding"),
+            location_data_by_field.get("address_network_binding"),
             address_payload.get("address_network_binding"),
             address_payload.get("location_source"),
             address_payload.get("location_confidence_code"),
@@ -684,8 +729,13 @@ def _address_verification_payload(
             "ptg_provider_group_location",
             "tic_provider_group_location",
         }
-    ) and _has_direct_payer_location_record_evidence(address_payload) and _has_source_file_version_trace(item)
-    normalized_sources = {value.lower().replace("-", "_") for value in address_sources}
+    ) and _has_direct_payer_location_record_evidence(
+        address_payload
+    ) and _has_source_file_version_trace(provider_item_by_field)
+    normalized_sources = {
+        address_source.lower().replace("-", "_")
+        for address_source in address_sources
+    }
     provider_directory_address = bool(
         source_markers
         & {
@@ -695,7 +745,12 @@ def _address_verification_payload(
             "payer_directory_corroborated_location",
         }
     ) or bool(normalized_sources & {"provider_directory", "provider_directory_fhir", "payer_provider_directory"})
-    provider_directory_network_name_matches = _provider_directory_network_name_matches(item, address_payload)
+    provider_directory_network_name_matches = (
+        _provider_directory_network_name_matches(
+            provider_item_by_field,
+            address_payload,
+        )
+    )
     provider_directory_evidence = _provider_directory_address_verification_evidence(
         address_payload,
         provider_directory_network_name_matches,
@@ -708,66 +763,70 @@ def _address_verification_payload(
             "provider_directory_network_location",
             "provider_directory_plan_network_location",
         }
-    ) and _provider_directory_network_context_matched(item, address_payload)
+    ) and _provider_directory_network_context_matched(
+        provider_item_by_field,
+        address_payload,
+    )
     direct_mrf_address = bool(address_source_mask & 2) or "mrf" in normalized_sources
     nppes_address = bool(address_source_mask & 1) or "nppes" in normalized_sources
     if direct_ptg_location:
         address_evidence_level = "payer_confirmed_location"
         address_network_binding = "payer_confirmed_location"
-        requires_location_confirmation = False
+        is_location_confirmation_required = False
         reason = "The payer/PTG source supplied the provider location used for this result."
     elif provider_directory_network_location:
         address_evidence_level = "payer_directory_network_location"
         address_network_binding = "payer_directory_corroborated_location"
-        requires_location_confirmation = False
+        is_location_confirmation_required = False
         reason = "A payer Provider Directory record links this provider, network or plan context, and displayed address."
     elif provider_directory_address:
         address_evidence_level = "provider_directory_address"
         address_network_binding = "inferred_from_provider_identity"
-        requires_location_confirmation = True
+        is_location_confirmation_required = True
         reason = "A payer Provider Directory record corroborates the displayed provider address, but the PTG rate file did not supply it."
     elif address_precision == "city_zip":
         address_evidence_level = "city_zip_fallback"
         address_network_binding = "inferred_from_provider_identity"
-        requires_location_confirmation = True
+        is_location_confirmation_required = True
         reason = "PTG proves the provider identity is in network, but only city/ZIP address evidence is available."
-    elif direct_mrf_address and multi_source_confirmed:
+    elif direct_mrf_address and is_multi_source_confirmed:
         address_evidence_level = "multi_source_direct_mrf_address"
         address_network_binding = "inferred_from_provider_identity"
-        requires_location_confirmation = True
+        is_location_confirmation_required = True
         reason = "The street address is corroborated by MRF and another source, but not by this PTG rate file."
     elif direct_mrf_address:
         address_evidence_level = "direct_mrf_address"
         address_network_binding = "inferred_from_provider_identity"
-        requires_location_confirmation = True
+        is_location_confirmation_required = True
         reason = "The street address came from MRF provider-address evidence, but not from this PTG rate file."
-    elif multi_source_confirmed:
+    elif is_multi_source_confirmed:
         address_evidence_level = "multi_source_provider_address"
         address_network_binding = "inferred_from_provider_identity"
-        requires_location_confirmation = True
+        is_location_confirmation_required = True
         reason = "The street address is corroborated by multiple provider-address sources, but not by this PTG rate file."
     elif nppes_address or str(location_source or "").strip().lower() == "npi_address":
         address_evidence_level = "nppes_provider_address"
         address_network_binding = "inferred_from_provider_identity"
-        requires_location_confirmation = True
+        is_location_confirmation_required = True
         reason = "PTG proves the NPI/TIN is in network; the displayed address comes from NPPES/provider enrichment."
     elif str(location_source or "").strip().lower() == "entity_address_unified":
         address_evidence_level = "unified_provider_address"
         address_network_binding = "inferred_from_provider_identity"
-        requires_location_confirmation = True
+        is_location_confirmation_required = True
         reason = "PTG proves the provider identity is in network; the displayed address comes from unified address evidence."
     else:
         address_evidence_level = "unknown"
         address_network_binding = "inferred_from_provider_identity"
-        requires_location_confirmation = True
+        is_location_confirmation_required = True
         reason = "PTG proves the provider identity is in network, but address provenance is weak or unavailable."
 
     response_address_sources = list(address_sources)
     if address_network_binding != "payer_confirmed_location":
         response_address_sources = [
-            value
-            for value in response_address_sources
-            if value.lower().replace("-", "_") not in {"ptg", "tic", "tic_provider_group"}
+            address_source
+            for address_source in response_address_sources
+            if address_source.lower().replace("-", "_")
+            not in {"ptg", "tic", "tic_provider_group"}
         ]
     provider_directory_plan_context = (
         True
@@ -778,25 +837,25 @@ def _address_verification_payload(
         address_payload.get("provider_directory_network_context_present")
     )
 
-    payload = {
+    verification_by_field = {
         "rate_network_binding": "tic_provider_group_npi_tin",
         "address_network_binding": address_network_binding,
         "address_evidence_level": address_evidence_level,
-        "requires_location_confirmation": requires_location_confirmation,
+        "requires_location_confirmation": is_location_confirmation_required,
         "reason": reason,
         "network_bound_address": address_network_binding in {
             "payer_confirmed_location",
             "payer_directory_corroborated_location",
         },
     }
-    optional_fields = {
-        "displayed_address_present": displayed_address_present,
+    optional_values_by_field = {
+        "displayed_address_present": has_displayed_address,
         "location_source": location_source,
         "location_confidence_code": location_confidence_code,
         "address_precision": address_precision,
         "address_sources": response_address_sources,
         "source_count": source_count,
-        "multi_source_confirmed": multi_source_confirmed,
+        "multi_source_confirmed": is_multi_source_confirmed,
         "source_mask": source_mask or None,
         "address_source_mask": address_source_mask or None,
         "provider_directory_source_id": address_payload.get("provider_directory_source_id"),
@@ -819,10 +878,10 @@ def _address_verification_payload(
         "provider_directory_match_type": address_payload.get("provider_directory_match_type"),
         "address_verification_evidence": provider_directory_evidence,
     }
-    for key, value in optional_fields.items():
-        if value not in (None, "", []):
-            payload[key] = value
-    return payload
+    for field_name, field_value in optional_values_by_field.items():
+        if field_value not in (None, "", []):
+            verification_by_field[field_name] = field_value
+    return verification_by_field
 
 
 def _strip_no_display_address_fields(item: dict[str, Any]) -> None:
@@ -951,7 +1010,7 @@ async def _ptg2_provider_directory_corroboration_table(session) -> str | None:
 
 async def _overlay_provider_directory_corroboration(
     session,
-    rows: list[dict[str, Any]],
+    provider_rows: list[dict[str, Any]],
     *,
     plan_id: str | None = None,
     snapshot_id: str | None = None,
@@ -959,12 +1018,12 @@ async def _overlay_provider_directory_corroboration(
 ) -> list[dict[str, Any]]:
     """Overlay plan-scoped directory corroboration onto provider rows."""
 
-    if not rows or not (plan_id or snapshot_id or source_key):
-        return rows
+    if not provider_rows or not (plan_id or snapshot_id or source_key):
+        return provider_rows
     lookup_pairs: list[tuple[int, str]] = []
-    for row in rows:
-        npi = row.get("npi")
-        address_key = _ptg2_row_address_key(row)
+    for provider_row in provider_rows:
+        npi = provider_row.get("npi")
+        address_key = _ptg2_row_address_key(provider_row)
         if npi in (None, "") or not address_key:
             continue
         try:
@@ -972,14 +1031,14 @@ async def _overlay_provider_directory_corroboration(
         except (TypeError, ValueError):
             continue
     if not lookup_pairs:
-        return rows
+        return provider_rows
     corroboration_table = await _ptg2_provider_directory_corroboration_table(session)
     if not corroboration_table:
-        return rows
+        return provider_rows
     npis = sorted({npi for npi, _address_key in lookup_pairs})
     address_keys = sorted({address_key for _npi, address_key in lookup_pairs})
     try:
-        result = await session.execute(
+        corroboration_query = await session.execute(
             text(
                 f"""
                 SELECT DISTINCT ON (npi, address_key::text)
@@ -1042,24 +1101,34 @@ async def _overlay_provider_directory_corroboration(
         )
     except Exception:
         await _rollback_optional_ptg2_query(session)
-        return rows
-    matches = {
-        (int(data.get("npi")), str(data.get("address_key"))): data
-        for data in (_row_mapping(row) for row in result)
-        if data.get("npi") is not None and data.get("address_key")
+        return provider_rows
+    corroboration_by_key = {
+        (
+            int(corroboration_by_field.get("npi")),
+            str(corroboration_by_field.get("address_key")),
+        ): corroboration_by_field
+        for corroboration_by_field in (
+            _row_mapping(corroboration_record)
+            for corroboration_record in corroboration_query
+        )
+        if corroboration_by_field.get("npi") is not None
+        and corroboration_by_field.get("address_key")
     }
-    if not matches:
-        return rows
-    overlaid: list[dict[str, Any]] = []
-    for row in rows:
+    if not corroboration_by_key:
+        return provider_rows
+    overlaid_provider_rows: list[dict[str, Any]] = []
+    for provider_row in provider_rows:
         try:
-            match_key = (int(row.get("npi")), str(_ptg2_row_address_key(row)))
+            match_key = (
+                int(provider_row.get("npi")),
+                str(_ptg2_row_address_key(provider_row)),
+            )
         except (TypeError, ValueError):
-            overlaid.append(row)
+            overlaid_provider_rows.append(provider_row)
             continue
-        corroboration = matches.get(match_key)
+        corroboration = corroboration_by_key.get(match_key)
         if not corroboration:
-            overlaid.append(row)
+            overlaid_provider_rows.append(provider_row)
             continue
         address_network_binding = (
             str(corroboration.get("address_network_binding") or "payer_directory_corroborated_location").strip()
@@ -1069,28 +1138,46 @@ async def _overlay_provider_directory_corroboration(
             and not _coerce_bool_payload(corroboration.get("provider_directory_plan_context_matched"))
         ):
             address_network_binding = "provider_directory_address"
-        updated = dict(row)
-        updated["location_source"] = "provider_directory_fhir"
-        updated["location_confidence_code"] = address_network_binding
+        updated_provider_by_field = dict(provider_row)
+        updated_provider_by_field["location_source"] = "provider_directory_fhir"
+        updated_provider_by_field["location_confidence_code"] = address_network_binding
         if corroboration.get("provider_directory_telephone_number"):
-            updated["telephone_number"] = corroboration.get("provider_directory_telephone_number")
+            updated_provider_by_field["telephone_number"] = corroboration.get(
+                "provider_directory_telephone_number"
+            )
         if corroboration.get("provider_directory_phone_number"):
-            updated["phone_number"] = corroboration.get("provider_directory_phone_number")
+            updated_provider_by_field["phone_number"] = corroboration.get(
+                "provider_directory_phone_number"
+            )
         if corroboration.get("provider_directory_phone_extension"):
-            updated["phone_extension"] = corroboration.get("provider_directory_phone_extension")
+            updated_provider_by_field["phone_extension"] = corroboration.get(
+                "provider_directory_phone_extension"
+            )
         if corroboration.get("provider_directory_fax_number"):
-            updated["fax_number"] = corroboration.get("provider_directory_fax_number")
+            updated_provider_by_field["fax_number"] = corroboration.get(
+                "provider_directory_fax_number"
+            )
         if corroboration.get("provider_directory_fax_number_digits"):
-            updated["fax_number_digits"] = corroboration.get("provider_directory_fax_number_digits")
+            updated_provider_by_field["fax_number_digits"] = corroboration.get(
+                "provider_directory_fax_number_digits"
+            )
         if corroboration.get("provider_directory_fax_extension"):
-            updated["fax_extension"] = corroboration.get("provider_directory_fax_extension")
-        address_payload = _coerce_json_payload(updated.get("address_payload") or updated.get("address"), {})
-        if not isinstance(address_payload, dict):
-            address_payload = {}
-        address_sources = _coerce_str_list_payload(address_payload.get("address_sources"))
+            updated_provider_by_field["fax_extension"] = corroboration.get(
+                "provider_directory_fax_extension"
+            )
+        address_by_field = _coerce_json_payload(
+            updated_provider_by_field.get("address_payload")
+            or updated_provider_by_field.get("address"),
+            {},
+        )
+        if not isinstance(address_by_field, dict):
+            address_by_field = {}
+        address_sources = _coerce_str_list_payload(
+            address_by_field.get("address_sources")
+        )
         if "provider_directory_fhir" not in address_sources:
             address_sources.append("provider_directory_fhir")
-        address_payload.update(
+        address_by_field.update(
             {
                 "address_sources": address_sources,
                 "address_network_binding": address_network_binding,
@@ -1113,21 +1200,33 @@ async def _overlay_provider_directory_corroboration(
                 "address_verification_evidence": corroboration.get("address_verification_evidence"),
             }
         )
-        if updated.get("telephone_number"):
-            address_payload["telephone_number"] = updated.get("telephone_number")
-        if updated.get("phone_number"):
-            address_payload["phone_number"] = updated.get("phone_number")
-        if updated.get("phone_extension"):
-            address_payload["phone_extension"] = updated.get("phone_extension")
-        if updated.get("fax_number"):
-            address_payload["fax_number"] = updated.get("fax_number")
-        if updated.get("fax_number_digits"):
-            address_payload["fax_number_digits"] = updated.get("fax_number_digits")
-        if updated.get("fax_extension"):
-            address_payload["fax_extension"] = updated.get("fax_extension")
-        updated["address_payload"] = address_payload
-        overlaid.append(updated)
-    return overlaid
+        if updated_provider_by_field.get("telephone_number"):
+            address_by_field["telephone_number"] = updated_provider_by_field.get(
+                "telephone_number"
+            )
+        if updated_provider_by_field.get("phone_number"):
+            address_by_field["phone_number"] = updated_provider_by_field.get(
+                "phone_number"
+            )
+        if updated_provider_by_field.get("phone_extension"):
+            address_by_field["phone_extension"] = updated_provider_by_field.get(
+                "phone_extension"
+            )
+        if updated_provider_by_field.get("fax_number"):
+            address_by_field["fax_number"] = updated_provider_by_field.get(
+                "fax_number"
+            )
+        if updated_provider_by_field.get("fax_number_digits"):
+            address_by_field["fax_number_digits"] = updated_provider_by_field.get(
+                "fax_number_digits"
+            )
+        if updated_provider_by_field.get("fax_extension"):
+            address_by_field["fax_extension"] = updated_provider_by_field.get(
+                "fax_extension"
+            )
+        updated_provider_by_field["address_payload"] = address_by_field
+        overlaid_provider_rows.append(updated_provider_by_field)
+    return overlaid_provider_rows
 
 
 async def _ptg2_address_serving_table(
@@ -1286,6 +1385,35 @@ def _append_reported_code_value_filter(
     filters.append(f"{column} IN ({', '.join(placeholders)})")
 
 
+def _append_reported_code_system_filter(
+    filters: list[str],
+    params: dict[str, Any],
+    *,
+    column: str,
+    code_system: Any,
+) -> None:
+    if not code_system:
+        filters.append(f"{column} IS NULL")
+        return
+    _append_reported_code_value_filter(
+        filters,
+        params,
+        column=column,
+        param_name="reported_code_system",
+        values=catalog_code_system_lookup_values(code_system),
+    )
+
+
+def _canonical_code_metadata_row(row: Any) -> dict[str, Any]:
+    """Normalize persisted code-system aliases before response shaping."""
+
+    code_metadata = _row_mapping(row)
+    code_metadata["reported_code_system"] = _normalize_code_system(
+        code_metadata.get("reported_code_system")
+    )
+    return code_metadata
+
+
 def _external_catalog_lookup_pairs(code_context: Mapping[str, Any] | None) -> set[tuple[str, str]]:
     """Expand resolved external codes into compatible persisted lookup pairs."""
 
@@ -1294,8 +1422,14 @@ def _external_catalog_lookup_pairs(code_context: Mapping[str, Any] | None) -> se
         resolved_system = _normalize_code_system(resolved_code.get("code_system"))
         if not resolved_system or resolved_system == INTERNAL_PROCEDURE_CODE_SYSTEM:
             continue
+        lookup_systems = catalog_code_system_lookup_values(resolved_system)
         lookup_values = catalog_code_lookup_values(resolved_system, resolved_code.get("code"))
-        external_pairs.update((resolved_system, lookup_value) for lookup_value in lookup_values if lookup_value)
+        external_pairs.update(
+            (lookup_system, lookup_value)
+            for lookup_system in lookup_systems
+            for lookup_value in lookup_values
+            if lookup_value
+        )
     return external_pairs
 
 
@@ -1313,8 +1447,11 @@ def _append_manifest_reported_code_filter(
         return
     external_pairs = _external_catalog_lookup_pairs(code_context)
     if not external_pairs and requested_system and requested_system != INTERNAL_PROCEDURE_CODE_SYSTEM:
-        for reported_value in catalog_code_lookup_values(requested_system, code):
-            external_pairs.add((requested_system, reported_value))
+        external_pairs.update(
+            (reported_system, reported_value)
+            for reported_system in catalog_code_system_lookup_values(requested_system)
+            for reported_value in catalog_code_lookup_values(requested_system, code)
+        )
     if not external_pairs and not requested_system:
         params["reported_code"] = requested_code
         filters.append("reported_code = :reported_code")
@@ -1323,7 +1460,14 @@ def _append_manifest_reported_code_filter(
         filters.append("FALSE")
         return
     clauses: list[str] = []
-    for idx, (reported_system, reported_value) in enumerate(sorted(external_pairs)):
+    ordered_pairs = sorted(
+        external_pairs,
+        key=lambda pair: (
+            _normalize_code_system(pair[0]) != pair[0],
+            pair,
+        ),
+    )
+    for idx, (reported_system, reported_value) in enumerate(ordered_pairs):
         system_key = f"reported_code_system_{idx}"
         code_key = f"reported_code_{idx}"
         params[system_key] = reported_system
@@ -2194,7 +2338,7 @@ async def _ptg2_manifest_code_rows_for_provider_reverse(
         ),
         params,
     )
-    return [_row_mapping(code_row) for code_row in code_row_result]
+    return [_canonical_code_metadata_row(code_row) for code_row in code_row_result]
 
 
 def _version_three_candidate_rows(
@@ -3300,9 +3444,12 @@ async def _shared_rate_provider_groups(
         param_name="reported_code",
         values=_ptg2_reported_code_lookup_values(code_system, reported_code),
     )
-    if code_system:
-        filters.append("code_metadata.reported_code_system = :reported_code_system")
-        params["reported_code_system"] = code_system
+    _append_reported_code_system_filter(
+        filters,
+        params,
+        column="code_metadata.reported_code_system",
+        code_system=code_system,
+    )
     result = await session.execute(
         text(
             f"""
@@ -3319,7 +3466,7 @@ async def _shared_rate_provider_groups(
         ),
         params,
     )
-    code_rows = [_row_mapping(row) for row in result]
+    code_rows = [_canonical_code_metadata_row(row) for row in result]
     if not code_rows:
         return ()
     forward_rows = await _shared_forward_entries_for_code_rows(
@@ -6441,17 +6588,17 @@ async def _search_ptg2_manifest_db_serving_table(
         requested_plan=requested_plan,
         plan_market_type=args.get("plan_market_type") or args.get("market_type") or "",
     )
-    code_filters.extend(
-        [
-            "code_metadata.reported_code_system IS NOT DISTINCT FROM :reported_code_system",
-            "code_metadata.snapshot_key = :shared_snapshot_key",
-        ]
-    )
+    code_filters.append("code_metadata.snapshot_key = :shared_snapshot_key")
     code_params.update(
         {
-            "reported_code_system": requested_system or None,
             "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
         }
+    )
+    _append_reported_code_system_filter(
+        code_filters,
+        code_params,
+        column="code_metadata.reported_code_system",
+        code_system=requested_system,
     )
     _append_reported_code_value_filter(
         code_filters,
@@ -6483,7 +6630,7 @@ async def _search_ptg2_manifest_db_serving_table(
         ),
         code_params,
     )
-    code_rows = [_row_mapping(row) for row in code_result]
+    code_rows = [_canonical_code_metadata_row(row) for row in code_result]
     if not code_rows:
         return None
     if not all(code_row.get("code_key") is not None for code_row in code_rows):
@@ -7000,32 +7147,63 @@ def _provider_taxonomy_summary_lateral_sql(npi_sql: str, alias: str = "tax") -> 
     """
 
 
-def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+def _compact_item_from_row(
+    serving_row_by_field: dict[str, Any],
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Shape one compact database row into the public provider payload."""
 
-    prices = _normalize_price_payload(data.get("prices") or [])
-    provider_set_hashes = _coerce_json_payload(data.get("provider_set_hashes"), [])
-    provider_set_hash = data.get("provider_set_hash") or (provider_set_hashes[0] if provider_set_hashes else None)
-    specialties = _coerce_json_payload(data.get("specialties"), [])
-    specializations = _coerce_json_payload(data.get("specializations"), [])
-    classifications = _coerce_json_payload(data.get("classifications"), [])
-    primary_specialty = data.get("primary_specialty") or (specialties[0] if specialties else None)
-    primary_specialization = data.get("primary_specialization") or (specializations[0] if specializations else None)
-    address_payload = _coerce_json_payload(data.get("address_payload"), {})
-    item = {
-        "npi": data.get("npi") or args.get("npi"),
-        "provider_ordinal": data.get("provider_ordinal") or data.get("npi") or provider_set_hash,
-        "provider_name": data.get("provider_name"),
-        "plan_id": data.get("plan_id"),
-        "plan_market_type": data.get("plan_market_type"),
-        "state": data.get("state"),
-        "city": data.get("city"),
-        "zip5": data.get("zip5"),
-        "location_hash": data.get("location_hash"),
-        "location_source": data.get("location_source"),
-        "location_confidence_code": data.get("location_confidence_code"),
+    prices = _normalize_price_payload(serving_row_by_field.get("prices") or [])
+    provider_set_hashes = _coerce_json_payload(
+        serving_row_by_field.get("provider_set_hashes"),
+        [],
+    )
+    provider_set_hash = serving_row_by_field.get("provider_set_hash") or (
+        provider_set_hashes[0] if provider_set_hashes else None
+    )
+    specialties = _coerce_json_payload(
+        serving_row_by_field.get("specialties"),
+        [],
+    )
+    specializations = _coerce_json_payload(
+        serving_row_by_field.get("specializations"),
+        [],
+    )
+    classifications = _coerce_json_payload(
+        serving_row_by_field.get("classifications"),
+        [],
+    )
+    primary_specialty = serving_row_by_field.get("primary_specialty") or (
+        specialties[0] if specialties else None
+    )
+    primary_specialization = serving_row_by_field.get(
+        "primary_specialization"
+    ) or (specializations[0] if specializations else None)
+    address_payload = _coerce_json_payload(
+        serving_row_by_field.get("address_payload"),
+        {},
+    )
+    provider_item_by_field = {
+        "npi": serving_row_by_field.get("npi") or args.get("npi"),
+        "provider_ordinal": serving_row_by_field.get("provider_ordinal")
+        or serving_row_by_field.get("npi")
+        or provider_set_hash,
+        "provider_name": serving_row_by_field.get("provider_name"),
+        "plan_id": serving_row_by_field.get("plan_id"),
+        "plan_market_type": serving_row_by_field.get("plan_market_type"),
+        "state": serving_row_by_field.get("state"),
+        "city": serving_row_by_field.get("city"),
+        "zip5": serving_row_by_field.get("zip5"),
+        "location_hash": serving_row_by_field.get("location_hash"),
+        "location_source": serving_row_by_field.get("location_source"),
+        "location_confidence_code": serving_row_by_field.get(
+            "location_confidence_code"
+        ),
         "address": address_payload,
-        "taxonomy_codes": _coerce_json_payload(data.get("taxonomy_codes"), []),
+        "taxonomy_codes": _coerce_json_payload(
+            serving_row_by_field.get("taxonomy_codes"),
+            [],
+        ),
         "specialties": specialties,
         "primary_specialty": primary_specialty,
         "classification": classifications[0] if classifications else None,
@@ -7033,71 +7211,131 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
         "specialization": primary_specialization,
         "primary_specialization": primary_specialization,
         "specializations": specializations,
-        "procedure_code": data.get("procedure_code"),
-        "hp_procedure_code": data.get("procedure_code"),
+        "procedure_code": serving_row_by_field.get("procedure_code"),
+        "hp_procedure_code": serving_row_by_field.get("procedure_code"),
         "procedure_name": (
-            data.get("procedure_name")
-            if "procedure_name" in data
-            else data.get("procedure_display_name")
+            serving_row_by_field.get("procedure_name")
+            if "procedure_name" in serving_row_by_field
+            else serving_row_by_field.get("procedure_display_name")
         ),
-        "procedure_description": data.get("procedure_description"),
-        "billing_code_type_version": data.get("billing_code_type_version"),
-        "source_procedure_name": data.get("source_procedure_name"),
-        "source_procedure_description": data.get("source_procedure_description"),
-        "catalog_procedure_name": data.get("catalog_procedure_name"),
-        "catalog_procedure_description": data.get("catalog_procedure_description"),
-        "service_code": data.get("billing_code") or data.get("reported_code"),
-        "service_code_system": data.get("billing_code_type") or data.get("reported_code_system"),
-        "reported_code": data.get("reported_code"),
-        "reported_code_system": data.get("reported_code_system"),
-        "negotiation_arrangement": data.get("negotiation_arrangement"),
-        "billing_code": data.get("billing_code") or data.get("reported_code"),
-        "billing_code_type": data.get("billing_code_type") or data.get("reported_code_system"),
+        "procedure_description": serving_row_by_field.get(
+            "procedure_description"
+        ),
+        "billing_code_type_version": serving_row_by_field.get(
+            "billing_code_type_version"
+        ),
+        "source_procedure_name": serving_row_by_field.get(
+            "source_procedure_name"
+        ),
+        "source_procedure_description": serving_row_by_field.get(
+            "source_procedure_description"
+        ),
+        "catalog_procedure_name": serving_row_by_field.get(
+            "catalog_procedure_name"
+        ),
+        "catalog_procedure_description": serving_row_by_field.get(
+            "catalog_procedure_description"
+        ),
+        "service_code": serving_row_by_field.get("billing_code")
+        or serving_row_by_field.get("reported_code"),
+        "service_code_system": serving_row_by_field.get("billing_code_type")
+        or serving_row_by_field.get("reported_code_system"),
+        "reported_code": serving_row_by_field.get("reported_code"),
+        "reported_code_system": serving_row_by_field.get(
+            "reported_code_system"
+        ),
+        "negotiation_arrangement": serving_row_by_field.get(
+            "negotiation_arrangement"
+        ),
+        "billing_code": serving_row_by_field.get("billing_code")
+        or serving_row_by_field.get("reported_code"),
+        "billing_code_type": serving_row_by_field.get("billing_code_type")
+        or serving_row_by_field.get("reported_code_system"),
         "provider_set_hash": provider_set_hash,
-        "provider_set_hashes": provider_set_hashes or ([provider_set_hash] if provider_set_hash else []),
-        "provider_count": data.get("provider_count"),
-        "provider_set_count": data.get("provider_set_count"),
-        "price_set_hash": data.get("price_set_hash"),
-        "rate_pack_hash": data.get("rate_pack_hash") or data.get("serving_rate_id"),
-        "source_key": data.get("source_key") or args.get("source_key"),
-        "source_artifact_key": data.get("source_artifact_key"),
-        "source_type": data.get("source_type"),
-        "identity_kind": data.get("identity_kind"),
-        "identity_sha256": data.get("identity_sha256"),
-        "raw_container_sha256": data.get("raw_container_sha256"),
-        "logical_json_sha256": data.get("logical_json_sha256"),
-        "logical_hash_deferred": data.get("logical_hash_deferred"),
-        "source_trace_set_hash": data.get("source_trace_set_hash"),
-        "snapshot_id": data.get("snapshot_id") or args.get("snapshot_id"),
-        "network_names": _coerce_str_list_payload(data.get("network_names")),
+        "provider_set_hashes": provider_set_hashes
+        or ([provider_set_hash] if provider_set_hash else []),
+        "provider_count": serving_row_by_field.get("provider_count"),
+        "provider_set_count": serving_row_by_field.get("provider_set_count"),
+        "price_set_hash": serving_row_by_field.get("price_set_hash"),
+        "rate_pack_hash": serving_row_by_field.get("rate_pack_hash")
+        or serving_row_by_field.get("serving_rate_id"),
+        "source_key": serving_row_by_field.get("source_key")
+        or args.get("source_key"),
+        "source_artifact_key": serving_row_by_field.get("source_artifact_key"),
+        "source_type": serving_row_by_field.get("source_type"),
+        "identity_kind": serving_row_by_field.get("identity_kind"),
+        "identity_sha256": serving_row_by_field.get("identity_sha256"),
+        "raw_container_sha256": serving_row_by_field.get(
+            "raw_container_sha256"
+        ),
+        "logical_json_sha256": serving_row_by_field.get(
+            "logical_json_sha256"
+        ),
+        "logical_hash_deferred": serving_row_by_field.get(
+            "logical_hash_deferred"
+        ),
+        "source_trace_set_hash": serving_row_by_field.get(
+            "source_trace_set_hash"
+        ),
+        "snapshot_id": serving_row_by_field.get("snapshot_id")
+        or args.get("snapshot_id"),
+        "network_names": _coerce_str_list_payload(
+            serving_row_by_field.get("network_names")
+        ),
         **_price_response_fields(prices),
         "source_trace": _coerce_json_payload(
-            _first_payload_value(data.get("hydrated_source_trace"), data.get("source_trace")),
+            _first_payload_value(
+                serving_row_by_field.get("hydrated_source_trace"),
+                serving_row_by_field.get("source_trace"),
+            ),
             [],
         ),
-        "confidence": data.get("confidence") or {"network": "tic_rate_npi_tin"},
+        "confidence": serving_row_by_field.get("confidence")
+        or {"network": "tic_rate_npi_tin"},
     }
-    if data.get("distance_miles") is not None:
-        item["distance_miles"] = data.get("distance_miles")
-    if data.get("zip_match_type") is not None:
-        item["zip_match_type"] = data.get("zip_match_type")
-    if data.get("anchor_zip5") is not None:
-        item["anchor_zip5"] = data.get("anchor_zip5")
-    if data.get("zip_radius_miles") is not None:
-        item["zip_radius_miles"] = data.get("zip_radius_miles")
-    _add_location_phone_fields(item, data, address_payload)
-    _promote_address_provenance_fields(item, address_payload)
-    item["address_verification"] = _address_verification_payload(item, data, address_payload)
-    _apply_address_display_policy(item, args)
-    compact_item = {key: value for key, value in item.items() if value is not None}
+    if serving_row_by_field.get("distance_miles") is not None:
+        provider_item_by_field["distance_miles"] = serving_row_by_field.get(
+            "distance_miles"
+        )
+    if serving_row_by_field.get("zip_match_type") is not None:
+        provider_item_by_field["zip_match_type"] = serving_row_by_field.get(
+            "zip_match_type"
+        )
+    if serving_row_by_field.get("anchor_zip5") is not None:
+        provider_item_by_field["anchor_zip5"] = serving_row_by_field.get(
+            "anchor_zip5"
+        )
+    if serving_row_by_field.get("zip_radius_miles") is not None:
+        provider_item_by_field["zip_radius_miles"] = serving_row_by_field.get(
+            "zip_radius_miles"
+        )
+    _add_location_phone_fields(
+        provider_item_by_field,
+        serving_row_by_field,
+        address_payload,
+    )
+    _promote_address_provenance_fields(provider_item_by_field, address_payload)
+    provider_item_by_field["address_verification"] = (
+        _address_verification_payload(
+            provider_item_by_field,
+            serving_row_by_field,
+            address_payload,
+        )
+    )
+    _apply_address_display_policy(provider_item_by_field, args)
+    compact_item_by_field = {
+        field_name: field_value
+        for field_name, field_value in provider_item_by_field.items()
+        if field_value is not None
+    }
     if normalize_ptg2_mode(args.get("mode")) == "exact_source":
         for field_name in (
             "billing_code_type_version",
             "procedure_name",
             "procedure_description",
         ):
-            compact_item[field_name] = item[field_name]
-    return compact_item
+            compact_item_by_field[field_name] = provider_item_by_field[field_name]
+    return compact_item_by_field
 
 
 async def search_ptg2_serving_table(
@@ -7629,9 +7867,12 @@ async def _has_ptg2_table_plan_code(
         param_name="reported_code",
         values=_ptg2_reported_code_lookup_values(requested_system, requested_code),
     )
-    if requested_system:
-        query_params_by_name["reported_code_system"] = requested_system
-        code_filters.append("code_metadata.reported_code_system = :reported_code_system")
+    _append_reported_code_system_filter(
+        code_filters,
+        query_params_by_name,
+        column="code_metadata.reported_code_system",
+        code_system=requested_system,
+    )
     exists_result = await session.execute(
         text(
             f"""
