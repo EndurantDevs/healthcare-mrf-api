@@ -31,7 +31,7 @@ def test_live_index_without_include_is_a_known_upgrade_shape(monkeypatch):
     migration = _load_migration()
     calls = []
 
-    def fake_has_matching_index(*_args, **options):
+    def is_index_shape_matching(*_args, **options):
         include_columns = tuple(options.get("postgresql_include", ()))
         calls.append(include_columns)
         if include_columns == migration.INCLUDE_COLUMNS:
@@ -41,7 +41,7 @@ def test_live_index_without_include_is_a_known_upgrade_shape(monkeypatch):
         return True
 
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "fixture")
-    monkeypatch.setattr(migration, "has_matching_index", fake_has_matching_index)
+    monkeypatch.setattr(migration, "has_matching_index", is_index_shape_matching)
 
     assert (
         migration._index_matches(migration.INDEX_NAME, migration.INCLUDE_COLUMNS)
@@ -53,13 +53,13 @@ def test_live_index_without_include_is_a_known_upgrade_shape(monkeypatch):
 def test_unknown_live_index_shape_is_rejected(monkeypatch):
     migration = _load_migration()
 
-    def fake_has_matching_index(*_args, **_options):
+    def is_index_shape_matching(*_args, **_options):
         raise RuntimeError(
             "existing_schema_index_mismatch:fixture.entity_address_unified_idx_geo_bbox"
         )
 
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "fixture")
-    monkeypatch.setattr(migration, "has_matching_index", fake_has_matching_index)
+    monkeypatch.setattr(migration, "has_matching_index", is_index_shape_matching)
 
     with pytest.raises(
         RuntimeError,
@@ -71,7 +71,7 @@ def test_unknown_live_index_shape_is_rejected(monkeypatch):
 def test_interrupted_private_replacement_is_rebuilt(monkeypatch):
     migration = _load_migration()
 
-    def fake_has_matching_index(*_args, **_options):
+    def is_index_shape_matching(*_args, **_options):
         raise RuntimeError(
             "existing_schema_index_invalid:fixture."
             "entity_address_unified_idx_geo_bbox_hjhp3"
@@ -81,7 +81,7 @@ def test_interrupted_private_replacement_is_rebuilt(monkeypatch):
     monkeypatch.setattr(
         migration,
         "has_matching_index",
-        fake_has_matching_index,
+        is_index_shape_matching,
     )
 
     assert (
