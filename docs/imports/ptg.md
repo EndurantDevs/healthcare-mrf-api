@@ -556,6 +556,21 @@ from fresh API processes with distinct keys under representative concurrent
 import and API load; it does not imply database or operating-system cache
 eviction.
 
+Published strict-V3 requests do not inflate the full snapshot manifest on the
+hot path. Snapshot resolution and serving-table discovery validate the sealed
+layout, logical scope, dense source dictionary, and consumed release
+attestation through compact relational rows. The full snapshot manifest remains
+authoritative for pre-activation candidate validation, but it is not a
+per-request serving dependency after activation. Exact-NPI traversal also stays
+in dense graph keys until stable provider-group IDs are needed; the internal
+candidate-audit route materializes only the challenged NPI and does not require
+provider-directory or address enrichment.
+
+Per-request audit latency starts after the request obtains its bounded
+concurrency slot, so p50/p95 describe HTTP and API execution rather than local
+semaphore wait. Complete audit wall time still includes queueing and is enforced
+by the fail-closed deadline.
+
 An out-of-range nonzero integral value in an NPI array is never padded, coerced, or
 published as an NPI. The scanner excludes it from NPI membership, includes it
 in provider-group identity so anomalous and clean groups cannot collapse, and

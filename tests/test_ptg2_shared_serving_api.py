@@ -199,14 +199,21 @@ async def test_shared_snapshot_metadata_is_never_process_cached():
             self.value = value
 
         def one_or_none(self):
+            serving_index = self.value["serving_index"]
             return {
-                "manifest": self.value,
-                "layout_audit_sample": self.value["serving_index"]["audit_sample"],
-                "layout_coverage_scope_id": "c" * 64,
-                "layout_code_count": 1,
+                "layout_serving_index": serving_index,
+                "bound_snapshot_key": serving_index["shared_snapshot_key"],
                 "snapshot_plan_id": "TEST-PLAN-001",
                 "snapshot_plan_market_type": "group",
                 "snapshot_coverage_scope_id": "c" * 64,
+                "attested_source_key": "source-a",
+                "attested_coverage_scope_id": "c" * 64,
+                "attested_source_set_digest": "b" * 64,
+                "attested_audit_sample_digest": "a" * 64,
+                "source_row_count": 1,
+                "distinct_source_key_count": 1,
+                "minimum_source_key": 0,
+                "maximum_source_key": 0,
                 "postgres_server_version_num": 160004,
                 "database_selected": True,
                 "backend_session_active": True,
@@ -241,9 +248,9 @@ def test_snapshot_availability_branches_v3_to_binding_and_layout():
     assert "ptg2_v3_snapshot_layout" in sql
     assert "shared_layout.state = 'sealed'" in sql
     assert "shared_layout.generation = 'shared_blocks_v3'" in sql
-    assert "ptg2_shared_blocks_v3" in sql
-    assert "postgres_shared_graph" in sql
-    assert "dense_shared_blocks_v3" in sql
+    assert "ptg2_v3_candidate_audit_attestation" in sql
+    assert "shared_attestation.activated_at IS NOT NULL" in sql
+    assert "manifest" not in sql
     assert "<> 'postgres_binary_v3'" not in sql
     assert "to_regclass" not in sql
 
@@ -814,10 +821,15 @@ def _stub_candidate_audit_npi_without_address(
         "_ptg2_manifest_provider_rows_for_provider_sets",
         broad_rows,
     )
+    enrichment = AsyncMock(
+        side_effect=AssertionError(
+            "candidate audit must not query provider-directory enrichment"
+        )
+    )
     monkeypatch.setattr(
         ptg2_serving,
         "_ptg2_manifest_enriched_provider_rows_for_npis",
-        AsyncMock(return_value=[]),
+        enrichment,
     )
     monkeypatch.setattr(
         ptg2_serving,
@@ -838,7 +850,7 @@ def _stub_candidate_audit_npi_without_address(
             }
         ),
     )
-    return location_matches, broad_rows
+    return location_matches, broad_rows, enrichment
 
 
 def _candidate_audit_query_args():
@@ -870,7 +882,7 @@ async def test_candidate_audit_exact_npi_does_not_require_an_address(
 
     provider_set_id = "03" * 16
     price_set_id = "05" * 16
-    location_matches, broad_rows = _stub_candidate_audit_npi_without_address(
+    location_matches, broad_rows, enrichment = _stub_candidate_audit_npi_without_address(
         monkeypatch,
         provider_set_id,
         price_set_id,
@@ -893,6 +905,7 @@ async def test_candidate_audit_exact_npi_does_not_require_an_address(
     ] is False
     location_matches.assert_not_awaited()
     broad_rows.assert_not_awaited()
+    enrichment.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1216,7 +1229,7 @@ def test_shared_v3_response_rows_preserve_negotiation_arrangement():
 
     provider_item = ptg2_serving._ptg2_manifest_provider_procedure_item(
         npi=1234567890,
-        data=response_row,
+        serving_data=response_row,
         prices=[],
         procedure_detail={},
         provider_context={},
@@ -1246,7 +1259,7 @@ def test_reverse_provider_items_keep_exact_source_identity_and_do_not_premerge()
     provider_items = [
         ptg2_serving._ptg2_manifest_provider_procedure_item(
             npi=1234567890,
-            data={**base_by_field, "source_key": source_key},
+            serving_data={**base_by_field, "source_key": source_key},
             prices=[],
             procedure_detail={},
             provider_context={},
@@ -1337,7 +1350,6 @@ async def test_shaped_row_provenance_lookup_uses_source_artifact_key(monkeypatch
 async def test_location_rate_provider_lookup_uses_logical_plan_scope(monkeypatch):
     """Ensure location-rate candidates use the logical snapshot's plan scope."""
 
-    provider_set_id = "00000000000000000000000000000003"
     provider_group_id = "00000000000000000000000000000009"
     monkeypatch.setattr(
         ptg2_serving,
@@ -1351,13 +1363,8 @@ async def test_location_rate_provider_lookup_uses_logical_plan_scope(monkeypatch
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_set_ids_for_keys",
-        AsyncMock(return_value={3: provider_set_id}),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_shared_graph_members_by_id",
-        AsyncMock(return_value={provider_set_id: (provider_group_id,)}),
+        "_shared_group_ids_for_set_keys",
+        AsyncMock(return_value=(provider_group_id,)),
     )
     expected_candidates = object()
     graph_candidates = AsyncMock(return_value=expected_candidates)

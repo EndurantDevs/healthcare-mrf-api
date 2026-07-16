@@ -75,8 +75,10 @@ async def test_explicit_snapshot_source_and_plan_are_resolved_together():
 
     assert resolved == "strict-v3"
     sql, params = session.calls[0]
-    assert "ptg2_snapshot.manifest->'serving_index'->>'source_key'" in sql
-    assert "= :source_key" in sql
+    assert "ptg2_v3_candidate_audit_attestation source_attestation" in sql
+    assert "source_attestation.source_key = :source_key" in sql
+    assert "source_attestation.activated_at IS NOT NULL" in sql
+    assert "ptg2_snapshot.manifest->'serving_index'->>'source_key'" not in sql
     assert "mrf.ptg2_v3_snapshot_plan_scope snapshot_scope" in sql
     assert "snapshot_scope.snapshot_id = ptg2_snapshot.snapshot_id" in sql
     assert "snapshot_scope.plan_id" in sql

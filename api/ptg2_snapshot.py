@@ -13,46 +13,50 @@ from api.ptg2_candidate_audit import (
 )
 from api.ptg2_serving_utils import ein_plan_id_variants
 from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
+from process.ptg_parts.ptg2_candidate_attestation import (
+    PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+)
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
 
 
-def _serving_relation_available_sql(snapshot_alias: str) -> str:
-    """Return SQL for the only supported sealed shared V3 layout."""
-    serving_index = f"{snapshot_alias}.manifest->'serving_index'"
-    arch_version = f"lower(COALESCE({serving_index}->>'arch_version', ''))"
-    shared_snapshot_key = f"{serving_index}->>'shared_snapshot_key'"
+def _serving_relation_available_sql(
+    snapshot_alias: str,
+    *,
+    require_activated_attestation: bool = True,
+) -> str:
+    """Return relational availability SQL without inflating snapshot JSON."""
+
+    attestation_join = ""
+    attestation_checks = ""
+    if require_activated_attestation:
+        attestation_join = f"""
+              JOIN {PTG2_SCHEMA}.ptg2_v3_candidate_audit_attestation shared_attestation
+                ON shared_attestation.snapshot_id = shared_binding.snapshot_id
+               AND shared_attestation.snapshot_key = shared_binding.snapshot_key
+               AND shared_attestation.coverage_scope_id = shared_scope.coverage_scope_id
+               AND shared_attestation.plan_id = shared_scope.plan_id
+               AND shared_attestation.plan_market_type
+                   = shared_scope.plan_market_type
+        """
+        attestation_checks = f"""
+               AND shared_attestation.contract
+                   = '{PTG2_CANDIDATE_ATTESTATION_CONTRACT}'
+               AND shared_attestation.activated_at IS NOT NULL
+        """
     return f"""
-        {arch_version} = 'postgres_binary_v3'
-        AND lower(COALESCE({serving_index}->>'storage', '')) = 'manifest_snapshot'
-        AND lower(COALESCE({serving_index}->>'type', '')) = 'ptg2_shared_blocks_v3'
-        AND lower(COALESCE({serving_index}->>'snapshot_scoped', '')) = 'true'
-        AND lower(COALESCE({serving_index}->>'storage_generation', '')) = 'shared_blocks_v3'
-        AND lower(COALESCE({serving_index}->>'cold_lookup_contract', '')) = 'ptg_v3_cold_v2'
-        AND lower(COALESCE({serving_index}->>'price_membership_semantics', '')) = 'multiset_v1'
-        AND lower(COALESCE({serving_index}->>'serving_multiplicity_semantics', '')) = 'source_multiset_v1'
-        AND lower(COALESCE({serving_index}->>'provider_scope_strategy', '')) = 'postgres_shared_graph'
-        AND lower(COALESCE({serving_index}->>'id_storage', '')) = 'binary128'
-        AND lower(COALESCE({serving_index}->>'serving_table_layout', '')) = 'lean_provider_key_v1'
-        AND lower(COALESCE({serving_index}->>'shared_block_layout', '')) = 'dense_shared_blocks_v3'
-        AND COALESCE({serving_index}->>'source_count', '') ~ '^[1-9][0-9]*$'
-        AND COALESCE({serving_index}->>'serving_binary_table', '') = ''
-        AND COALESCE({serving_index}->'materialized_tables'->>'serving_binary', '') = ''
-        AND COALESCE({serving_index}->>'artifact_uri', '') = ''
-        AND COALESCE({serving_index}->>'storage_uri', '') = ''
-        AND EXISTS (
+        EXISTS (
             SELECT 1
               FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_binding shared_binding
               JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_layout shared_layout
                 ON shared_layout.snapshot_key = shared_binding.snapshot_key
+              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_scope shared_scope
+                ON shared_scope.snapshot_id = shared_binding.snapshot_id
+              {attestation_join}
              WHERE shared_binding.snapshot_id = {snapshot_alias}.snapshot_id
-               AND shared_binding.snapshot_key = CASE
-                   WHEN {shared_snapshot_key} ~ '^[1-9][0-9]*$'
-                   THEN ({shared_snapshot_key})::bigint
-                   ELSE NULL
-               END
                AND shared_layout.state = 'sealed'
                AND shared_layout.generation = 'shared_blocks_v3'
+               {attestation_checks}
         )
     """
 
@@ -108,6 +112,14 @@ async def current_snapshot_id(
                     manifest->'activation'->>'source_key', ''
                 ))) = :candidate_source_key
             """
+            relation_available_sql = _serving_relation_available_sql(
+                "ptg2_snapshot",
+                require_activated_attestation=False,
+            )
+        else:
+            relation_available_sql = _serving_relation_available_sql(
+                "ptg2_snapshot"
+            )
         source_sql = ""
         normalized_source_key: str | None = None
         if requested_source_key is not None:
@@ -115,12 +127,25 @@ async def current_snapshot_id(
             if not normalized_source_key:
                 return None
             query_params_by_name["source_key"] = normalized_source_key
-            source_sql = """
-                   AND lower(btrim(COALESCE(
-                       ptg2_snapshot.manifest->'serving_index'->>'source_key',
-                       ''
-                   ))) = :source_key
-            """
+            if candidate_audit_access is not None:
+                source_sql = """
+                       AND lower(btrim(COALESCE(
+                           ptg2_snapshot.manifest->'serving_index'->>'source_key',
+                           ''
+                       ))) = :source_key
+                """
+            else:
+                source_sql = f"""
+                       AND EXISTS (
+                           SELECT 1
+                             FROM {PTG2_SCHEMA}.ptg2_v3_candidate_audit_attestation source_attestation
+                            WHERE source_attestation.snapshot_id = ptg2_snapshot.snapshot_id
+                              AND source_attestation.source_key = :source_key
+                              AND source_attestation.contract
+                                  = '{PTG2_CANDIDATE_ATTESTATION_CONTRACT}'
+                              AND source_attestation.activated_at IS NOT NULL
+                       )
+                """
         plan_sql = ""
         if requested_plan_id is not None:
             normalized_plan_id = str(requested_plan_id).strip()
@@ -154,7 +179,7 @@ async def current_snapshot_id(
                  FROM {PTG2_SCHEMA}.ptg2_snapshot
                  WHERE snapshot_id = :snapshot_id
                    AND {status_sql}
-                   AND {_serving_relation_available_sql('ptg2_snapshot')}
+                   AND {relation_available_sql}
                    {source_sql}
                    {plan_sql}
                  LIMIT 1

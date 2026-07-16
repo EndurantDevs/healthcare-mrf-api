@@ -30,6 +30,9 @@ from process.ptg_parts.ptg2_manifest_publish import (
     _create_ptg2_manifest_serving_stage_table,
     _ptg2_manifest_support_stage_table,
 )
+from process.ptg_parts.ptg2_candidate_attestation import (
+    PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+)
 from process.ptg_parts.ptg2_shared_blocks import (
     bind_snapshot_to_shared_layout,
     reserve_shared_layout,
@@ -49,6 +52,7 @@ from process.ptg_parts.ptg2_shared_reuse import (
     SharedLogicalPlanScope,
     SharedPhysicalArtifactIdentity,
     SharedSnapshotSourceAssignment,
+    shared_source_set_metadata,
 )
 from process.ptg_parts.ptg2_shared_snapshot_publish import (
     publish_shared_v3_snapshot_sources,
@@ -457,6 +461,40 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
                 snapshot_id=snapshot_id,
                 snapshot_key=publication.snapshot_key,
             )
+        source_set_by_field = shared_source_set_metadata(
+            [source_assignment.raw_container_sha256]
+        )
+        await db.status(
+            f"""
+            INSERT INTO {quoted_schema}.ptg2_v3_candidate_audit_attestation
+                (snapshot_id, snapshot_key, source_key, plan_id,
+                 plan_market_type, coverage_scope_id, source_set_digest,
+                 audit_sample_digest, contract, tool_name, tool_version,
+                 report_digest, report, attested_at, expires_at, activated_at)
+            VALUES
+                (:snapshot_id, :snapshot_key, 'synthetic-source',
+                 'plan-v3-runs', 'group', :coverage_scope_id,
+                 :source_set_digest, :audit_sample_digest,
+                 :contract, 'integration-test', '1',
+                 :report_digest, '{{}}'::jsonb,
+                 transaction_timestamp(),
+                 transaction_timestamp() + interval '1 hour',
+                 transaction_timestamp())
+            """,
+            snapshot_id=snapshot_id,
+            snapshot_key=publication.snapshot_key,
+            coverage_scope_id=coverage_scope_id,
+            source_set_digest=bytes.fromhex(
+                source_set_by_field[
+                    "raw_container_sha256_digest"
+                ]
+            ),
+            audit_sample_digest=bytes.fromhex(
+                publication.serving_index["audit_sample"]["sample_digest"]
+            ),
+            contract=PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+            report_digest=b"\x11" * 32,
+        )
 
         row_counts = await db.first(
             f"""
