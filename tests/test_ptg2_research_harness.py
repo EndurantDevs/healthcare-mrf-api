@@ -140,22 +140,25 @@ def test_default_suite_never_overrides_the_strict_snapshot_architecture():
 
 
 def test_copy_output_gate_detects_digest_mismatch():
-    baseline = {
+    baseline_output_by_kind = {
         "serving": {"rows": 1, "sha256": "a"},
         "price_atom": {"rows": 1, "sha256": "b"},
     }
-    candidate = {
+    candidate_output_by_kind = {
         "serving": {"rows": 1, "sha256": "z"},
         "price_atom": {"rows": 1, "sha256": "b"},
     }
 
-    result = harness.compare_copy_outputs(baseline, candidate)
+    result = harness.compare_copy_outputs(
+        baseline_output_by_kind,
+        candidate_output_by_kind,
+    )
 
     assert result == {"status": "failed", "mismatches": ["serving"]}
 
 
 def test_gate_evaluation_accepts_matching_correctness_and_fast_candidate():
-    report = {
+    benchmark_report_dict = {
         "results": [
             {
                 "case_id": "case-a",
@@ -195,7 +198,7 @@ def test_gate_evaluation_accepts_matching_correctness_and_fast_candidate():
     }
 
     gate_result = harness.evaluate_gates(
-        report,
+        benchmark_report_dict,
         {"min_improvement_pct": 15.0, "max_memory_growth_pct": 20.0},
     )
 
@@ -206,7 +209,7 @@ def test_gate_evaluation_accepts_matching_correctness_and_fast_candidate():
 
 
 def test_gate_evaluation_can_skip_case_performance_gate():
-    report = {
+    benchmark_report_dict = {
         "results": [
             {
                 "case_id": "case-a",
@@ -246,7 +249,7 @@ def test_gate_evaluation_can_skip_case_performance_gate():
     }
 
     gate_result = harness.evaluate_gates(
-        report,
+        benchmark_report_dict,
         {"min_improvement_pct": 15.0, "max_memory_growth_pct": 20.0},
         case_gates={"case-a": {"performance": False}},
     )
@@ -344,7 +347,7 @@ def test_gate_evaluation_fails_when_import_total_regresses():
 
 
 def test_gate_evaluation_accepts_case_baseline_variant():
-    report = {
+    benchmark_report_dict = {
         "results": [
             {
                 "case_id": "case-a",
@@ -368,7 +371,7 @@ def test_gate_evaluation_accepts_case_baseline_variant():
     }
 
     gate_result = harness.evaluate_gates(
-        report,
+        benchmark_report_dict,
         {"min_improvement_pct": 15.0},
         case_gates={"case-a": {"baseline_variant": "current", "performance": False}},
     )
@@ -378,7 +381,7 @@ def test_gate_evaluation_accepts_case_baseline_variant():
 
 
 def test_gate_evaluation_accepts_storage_only_case():
-    report = {
+    benchmark_report_dict = {
         "results": [
             {
                 "case_id": "storage-case",
@@ -397,10 +400,13 @@ def test_gate_evaluation_accepts_storage_only_case():
         ]
     }
 
-    result = harness.evaluate_gates(report, {"min_storage_ratio": 15.0})
+    gate_result = harness.evaluate_gates(
+        benchmark_report_dict,
+        {"min_storage_ratio": 15.0},
+    )
 
-    assert result["overall"] == "passed"
-    candidate = result["cases"]["storage-case"][0]
+    assert gate_result["overall"] == "passed"
+    candidate = gate_result["cases"]["storage-case"][0]
     assert candidate["overall"] == "passed"
     assert candidate["checks"]["storage"]["ratio"] == 19.96
     assert candidate["checks"]["storage"]["required_ratio"] == 15.0
@@ -677,7 +683,7 @@ def test_storage_report_renders_postgres_binary_details():
 
 
 def test_gate_evaluation_fails_storage_ratio_below_threshold():
-    report = {
+    benchmark_report_dict = {
         "results": [
             {
                 "case_id": "storage-case",
@@ -695,10 +701,13 @@ def test_gate_evaluation_fails_storage_ratio_below_threshold():
         ]
     }
 
-    result = harness.evaluate_gates(report, {"min_storage_ratio": 15.0})
+    gate_result = harness.evaluate_gates(
+        benchmark_report_dict,
+        {"min_storage_ratio": 15.0},
+    )
 
-    assert result["overall"] == "failed"
-    assert result["cases"]["storage-case"][0]["checks"]["storage"]["status"] == "failed"
+    assert gate_result["overall"] == "failed"
+    assert gate_result["cases"]["storage-case"][0]["checks"]["storage"]["status"] == "failed"
 
 
 def test_api_latency_probe_failure_classification():
@@ -740,12 +749,16 @@ def test_api_latency_probe_config_preserves_zero_warmup():
 
 
 def test_dry_run_writes_report(tmp_path):
-    suite = {
+    benchmark_suite_dict = {
         "variants": [{"id": "baseline"}],
         "cases": [{"id": "case-a", "kind": "scanner_fixture", "fixture": "duplicate_serving", "variants": ["baseline"]}],
     }
 
-    report = harness.run_suite(suite, report_dir=tmp_path, dry_run=True)
+    report = harness.run_suite(
+        benchmark_suite_dict,
+        report_dir=tmp_path,
+        dry_run=True,
+    )
 
     report_paths = list(Path(tmp_path).glob("run-*/report.json"))
     assert report["results"][0]["status"] == "dry_run"
@@ -755,7 +768,7 @@ def test_dry_run_writes_report(tmp_path):
 def test_local_ptg_cli_dry_run_writes_fixture_and_command(tmp_path, monkeypatch):
     monkeypatch.setenv("HLTHPRT_DB_USER", "tester")
     monkeypatch.setenv("HLTHPRT_DB_PORT", "5440")
-    suite = {
+    benchmark_suite_dict = {
         "variants": [{"id": "baseline", "env": {"HLTHPRT_PTG2_RUST_WORKERS": "2"}}],
         "cases": [
             {
@@ -767,27 +780,35 @@ def test_local_ptg_cli_dry_run_writes_fixture_and_command(tmp_path, monkeypatch)
         ],
     }
 
-    report = harness.run_suite(suite, report_dir=tmp_path, dry_run=True)
-    result = report["results"][0]
-    fixture_dir = Path(result["import_run"]["fixture_dir"])
+    report = harness.run_suite(
+        benchmark_suite_dict,
+        report_dir=tmp_path,
+        dry_run=True,
+    )
+    dry_run_result = report["results"][0]
+    fixture_dir = Path(dry_run_result["import_run"]["fixture_dir"])
 
-    assert result["status"] == "dry_run"
-    assert result["kind"] == "local_ptg_cli"
-    assert result["env_overrides"]["HLTHPRT_DB_PORT"] == "5440"
-    assert result["env_overrides"]["HLTHPRT_DB_USER"] == "tester"
-    assert "main.py" in result["command"]
+    assert dry_run_result["status"] == "dry_run"
+    assert dry_run_result["kind"] == "local_ptg_cli"
+    assert dry_run_result["env_overrides"]["HLTHPRT_DB_PORT"] == "5440"
+    assert dry_run_result["env_overrides"]["HLTHPRT_DB_USER"] == "tester"
+    assert "main.py" in dry_run_result["command"]
     assert (fixture_dir / "index.json").exists()
     assert (fixture_dir / "rates.json.gz").exists()
 
 
 def test_original_file_summary_counts_unique_prices(tmp_path):
-    case = {
+    fixture_case_dict = {
         "id": "full-file",
         "fixture": "large_in_network",
         "negotiated_rates": 3,
     }
     fixture_dir = tmp_path / "fixture"
-    harness.write_ptg_toc_fixture(case, fixture_dir, base_url="http://127.0.0.1:1")
+    harness.write_ptg_toc_fixture(
+        fixture_case_dict,
+        fixture_dir,
+        base_url="http://127.0.0.1:1",
+    )
 
     summary = harness.expected_original_file_summary(fixture_dir / "rates.json.gz")
 
@@ -1073,7 +1094,7 @@ def test_serving_by_provider_set_candidate_roundtrips_and_groups_patterns(tmp_pa
 
 def test_local_ptg_cli_full_file_dry_run_omits_max_items(tmp_path, monkeypatch):
     monkeypatch.setenv("HLTHPRT_DB_USER", "tester")
-    suite = {
+    benchmark_suite_dict = {
         "variants": [{"id": "parse_in_workers"}],
         "cases": [
             {
@@ -1087,7 +1108,11 @@ def test_local_ptg_cli_full_file_dry_run_omits_max_items(tmp_path, monkeypatch):
         ],
     }
 
-    report = harness.run_suite(suite, report_dir=tmp_path, dry_run=True)
+    report = harness.run_suite(
+        benchmark_suite_dict,
+        report_dir=tmp_path,
+        dry_run=True,
+    )
     result = report["results"][0]
     fixture_dir = Path(result["import_run"]["fixture_dir"])
 
@@ -1099,7 +1124,7 @@ def test_local_ptg_cli_full_file_dry_run_omits_max_items(tmp_path, monkeypatch):
 
 
 def test_markdown_report_includes_scanner_and_import_summary():
-    report = {
+    benchmark_report_dict = {
         "generated_at": "20260620T000000Z",
         "gates": {"overall": "passed"},
         "results": [
@@ -1142,7 +1167,7 @@ def test_markdown_report_includes_scanner_and_import_summary():
         ],
     }
 
-    markdown = harness.render_markdown_report(report)
+    markdown = harness.render_markdown_report(benchmark_report_dict)
 
     assert "parse_workers=true<br>workers=2<br>producer_blocked_us=12" in markdown
     assert "raw_chunks=3<br>max_raw_chunk_bytes=1024<br>max_raw_chunk_rates=8" in markdown
