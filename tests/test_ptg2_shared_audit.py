@@ -96,7 +96,7 @@ def test_candidate_file_rejects_key_outside_dense_dictionary(tmp_path):
 
 def test_occurrence_identity_includes_candidate_and_atom_ordinals():
     core_layout_id = b"\x9a" * 32
-    base = dict(
+    base_coordinates_dict = dict(
         code_key=1,
         provider_set_key=2,
         price_key=3,
@@ -107,25 +107,25 @@ def test_occurrence_identity_includes_candidate_and_atom_ordinals():
 
     first = audit.occurrence_id(
         core_layout_id,
-        **base,
+        **base_coordinates_dict,
         atom_ordinal=0,
         candidate_ordinal=0,
     )
     duplicate_source_occurrence = audit.occurrence_id(
         core_layout_id,
-        **base,
+        **base_coordinates_dict,
         atom_ordinal=0,
         candidate_ordinal=1,
     )
     duplicate_atom_occurrence = audit.occurrence_id(
         core_layout_id,
-        **base,
+        **base_coordinates_dict,
         atom_ordinal=1,
         candidate_ordinal=0,
     )
     other_artifact_occurrence = audit.occurrence_id(
         core_layout_id,
-        **{**base, "source_key": 1},
+        **{**base_coordinates_dict, "source_key": 1},
         atom_ordinal=0,
         candidate_ordinal=0,
     )
@@ -286,7 +286,7 @@ async def test_audit_source_keys_require_complete_snapshot_dictionary():
 
 
 def test_hash_member_selection_is_repeatable_and_not_prefix_based():
-    kwargs = {
+    selection_options_dict = {
         "candidate_ordinal": 17,
         "selection_kind": b"group-npi",
         "owner_key": 91,
@@ -294,12 +294,12 @@ def test_hash_member_selection_is_repeatable_and_not_prefix_based():
         "member_count": 10_000,
     }
 
-    first = audit._deterministic_member_ordinal(b"\x44" * 32, **kwargs)
-    second = audit._deterministic_member_ordinal(b"\x44" * 32, **kwargs)
+    first = audit._deterministic_member_ordinal(b"\x44" * 32, **selection_options_dict)
+    second = audit._deterministic_member_ordinal(b"\x44" * 32, **selection_options_dict)
 
     assert first == second
     assert first > 0
-    assert first < kwargs["member_count"]
+    assert first < selection_options_dict["member_count"]
 
 
 @pytest.mark.asyncio
@@ -313,20 +313,20 @@ async def test_targeted_graph_reads_only_chunks_containing_selected_ordinals():
             self.calls = []
 
         async def logical_blocks(self, object_kind, block_keys):
-            requested = tuple(sorted(block_keys))
-            self.calls.append((object_kind, requested))
-            payloads = {}
-            for block_key in requested:
+            requested_block_keys = tuple(sorted(block_keys))
+            self.calls.append((object_kind, requested_block_keys))
+            payload_by_block_key = {}
+            for block_key in requested_block_keys:
                 payload = bytearray(audit.PTG2_V3_GRAPH_CHUNK_BYTES)
                 if block_key == 100:
                     payload[24:32] = (1_000_000_003).to_bytes(8, "little")
                 if block_key == 102:
                     payload[4928:4936] = (1_000_017_000).to_bytes(8, "little")
-                payloads[block_key] = (bytes(payload), 0)
-            return payloads
+                payload_by_block_key[block_key] = (bytes(payload), 0)
+            return payload_by_block_key
 
     reader = Reader()
-    values = await audit._graph_targeted_members(
+    members_by_owner = await audit._graph_targeted_members(
         reader,
         direction=audit.PTG2_V3_GRAPH_GROUP_TO_NPI,
         member_ordinals_by_owner={7: (3, 17_000)},
@@ -339,7 +339,7 @@ async def test_targeted_graph_reads_only_chunks_containing_selected_ordinals():
         },
     )
 
-    assert values == {7: {3: 1_000_000_003, 17_000: 1_000_017_000}}
+    assert members_by_owner == {7: {3: 1_000_000_003, 17_000: 1_000_017_000}}
     assert reader.calls == [("graph_group_npis_v1", (100, 102))]
     assert reader.budget.member_attempts == 2
 
@@ -402,11 +402,11 @@ async def test_candidate_npis_dedupe_overlap_across_targeted_groups(monkeypatch)
     monkeypatch.setattr(audit, "PTG2_V3_AUDIT_MAX_SAMPLE_ROWS", 4)
 
     async def locators(_reader, *, direction, owner_keys):
-        requested = set(owner_keys)
+        requested_owner_keys = set(owner_keys)
         if direction == audit.PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP:
-            assert requested == {5}
+            assert requested_owner_keys == {5}
             return {5: audit._GraphOwnerLocator(1, 0, 2)}
-        assert requested == {10, 11}
+        assert requested_owner_keys == {10, 11}
         return {
             10: audit._GraphOwnerLocator(2, 0, 2),
             11: audit._GraphOwnerLocator(3, 0, 2),
@@ -445,14 +445,14 @@ async def test_candidate_npis_dedupe_overlap_across_targeted_groups(monkeypatch)
     monkeypatch.setattr(audit, "_graph_targeted_members", members)
     monkeypatch.setattr(audit, "_deterministic_member_ordinal", ordinal)
 
-    result = await audit._candidate_npis_by_ordinal(
+    candidate_npis_by_ordinal = await audit._candidate_npis_by_ordinal(
         object(),
         candidates=(audit.AuditCandidate(1, 5, 7, 0, 1, candidate_ordinal=0),),
         price_memberships={7: (9,)},
         core_layout_id=b"\x55" * 32,
     )
 
-    assert result == {0: (1_234_567_890,)}
+    assert candidate_npis_by_ordinal == {0: (1_234_567_890,)}
 
 
 @pytest.mark.asyncio
@@ -462,9 +462,12 @@ async def test_price_membership_uses_published_block_span(monkeypatch):
             self.calls = []
 
         async def logical_blocks(self, object_kind, block_keys):
-            requested = tuple(sorted(block_keys))
-            self.calls.append((object_kind, requested))
-            return {block_key: (b"payload", 1) for block_key in requested}
+            requested_block_keys = tuple(sorted(block_keys))
+            self.calls.append((object_kind, requested_block_keys))
+            return {
+                block_key: (b"payload", 1)
+                for block_key in requested_block_keys
+            }
 
     def decode(
         _payload,

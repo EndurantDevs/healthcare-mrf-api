@@ -42,7 +42,7 @@ def _make_file(path: Path, payload: bytes, *, age_hours: float = 48) -> Path:
 
 
 def _collect(root: Path, **overrides):
-    options = {
+    collection_options_dict = {
         "root": root,
         "execute": True,
         "now": NOW,
@@ -52,8 +52,8 @@ def _collect(root: Path, **overrides):
         "max_delete_bytes": None,
         "max_delete_files": None,
     }
-    options.update(overrides)
-    return collect_ptg2_input_artifacts(**options)
+    collection_options_dict.update(overrides)
+    return collect_ptg2_input_artifacts(**collection_options_dict)
 
 
 def test_concurrent_identical_artifact_has_one_logical_file_and_two_safe_leases(
@@ -229,8 +229,12 @@ def test_heartbeats_keep_a_72_hour_import_active(tmp_path, monkeypatch):
     root = tmp_path / "artifacts"
     store = PTG2ArtifactStore(root)
     raw_path = _make_file(store.artifact_path("0" * 64), b"long-running")
-    clock = {"now": NOW}
-    monkeypatch.setattr(retention, "_utcnow", lambda: clock["now"])
+    mutable_clock_dict = {"now": NOW}
+    monkeypatch.setattr(
+        retention,
+        "_utcnow",
+        lambda: mutable_clock_dict["now"],
+    )
     lease = PTG2ArtifactLease(
         store=store,
         owner="72-hour-import",
@@ -241,15 +245,15 @@ def test_heartbeats_keep_a_72_hour_import_active(tmp_path, monkeypatch):
         with bind_artifact_lease(lease.lease_id):
             assert protect_existing_artifact(store, raw_path)
         for elapsed_hours in range(5, 71, 5):
-            clock["now"] = NOW + datetime.timedelta(hours=elapsed_hours)
+            mutable_clock_dict["now"] = NOW + datetime.timedelta(hours=elapsed_hours)
             lease.heartbeat()
-        clock["now"] = NOW + datetime.timedelta(hours=72)
+        mutable_clock_dict["now"] = NOW + datetime.timedelta(hours=72)
 
-        result = _collect(root, now=clock["now"])
+        retention_result = _collect(root, now=mutable_clock_dict["now"])
 
-        assert result.active_lease_ids == (lease.lease_id,)
-        assert result.protected_files == (raw_path,)
-        assert result.deleted_files == ()
+        assert retention_result.active_lease_ids == (lease.lease_id,)
+        assert retention_result.protected_files == (raw_path,)
+        assert retention_result.deleted_files == ()
         assert raw_path.exists()
     finally:
         lease.release()
@@ -552,15 +556,15 @@ def test_gc_compacts_manifest_and_drops_missing_artifact_records(tmp_path):
         b"keep",
         age_hours=0,
     )
-    base_record = {
+    base_record_dict = {
         "artifact_kind": "raw",
         "canonical_url": "https://example.test/file.json",
         "raw_storage_uri": store.storage_uri(raw_path),
         "raw_sha256": "f" * 64,
         "status": "available",
     }
-    store.record_manifest({**base_record, "etag": '"old"'})
-    store.record_manifest({**base_record, "etag": '"new"'})
+    store.record_manifest({**base_record_dict, "etag": '"old"'})
+    store.record_manifest({**base_record_dict, "etag": '"new"'})
     missing_path = store.artifact_path("1" * 64, suffix=".json")
     store.record_manifest(
         {
@@ -573,14 +577,14 @@ def test_gc_compacts_manifest_and_drops_missing_artifact_records(tmp_path):
     )
     partial_path = store.partial_path("https://example.test/partial.json")
     partial_path.write_bytes(b"partial")
-    partial_record = {
+    partial_record_dict = {
         "artifact_kind": "partial_raw",
         "canonical_url": "https://example.test/partial.json",
         "raw_storage_uri": store.storage_uri(partial_path),
         "status": "partial",
     }
-    store.record_manifest({**partial_record, "partial_sha256": "2" * 64})
-    store.record_manifest({**partial_record, "partial_sha256": "3" * 64})
+    store.record_manifest({**partial_record_dict, "partial_sha256": "2" * 64})
+    store.record_manifest({**partial_record_dict, "partial_sha256": "3" * 64})
     orphan_temps = [
         root / ".manifest.jsonl.crashed.tmp",
         store.leases_dir / ".lease.json.crashed.tmp",
@@ -596,7 +600,7 @@ def test_gc_compacts_manifest_and_drops_missing_artifact_records(tmp_path):
         min_age_hours=1,
         target_bytes=1024,
     )
-    compacted = [
+    compacted_records = [
         json.loads(line)
         for line in store.manifest_path.read_text(encoding="utf-8").splitlines()
     ]
@@ -604,15 +608,15 @@ def test_gc_compacts_manifest_and_drops_missing_artifact_records(tmp_path):
     assert retention_result.manifest_entries_before == 5
     assert retention_result.manifest_entries_after == 2
     assert retention_result.manifest_invalid_lines == 0
-    assert compacted[0] == {
-        **base_record,
+    assert compacted_records[0] == {
+        **base_record_dict,
         "etag": '"new"',
-        "recorded_at": compacted[0]["recorded_at"],
+        "recorded_at": compacted_records[0]["recorded_at"],
     }
-    assert compacted[1] == {
-        **partial_record,
+    assert compacted_records[1] == {
+        **partial_record_dict,
         "partial_sha256": "3" * 64,
-        "recorded_at": compacted[1]["recorded_at"],
+        "recorded_at": compacted_records[1]["recorded_at"],
     }
     assert raw_path.exists()
     assert not any(path.exists() for path in orphan_temps)
@@ -623,7 +627,7 @@ def test_torn_manifest_tail_is_isolated_and_gc_fails_closed(tmp_path):
     store = PTG2ArtifactStore(root)
     raw_path = _make_file(store.artifact_path("7" * 64), b"retained")
     store.manifest_path.write_text('{"artifact_kind":"raw"', encoding="utf-8")
-    valid_record = {
+    valid_record_dict = {
         "artifact_kind": "raw",
         "canonical_url": "https://example.test/retained.json",
         "raw_storage_uri": store.storage_uri(raw_path),
@@ -631,15 +635,15 @@ def test_torn_manifest_tail_is_isolated_and_gc_fails_closed(tmp_path):
         "status": "available",
     }
 
-    store.record_manifest(valid_record)
+    store.record_manifest(valid_record_dict)
 
     lines = store.manifest_path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2
     assert json.loads(lines[1]) == {
-        **valid_record,
+        **valid_record_dict,
         "recorded_at": json.loads(lines[1])["recorded_at"],
     }
-    assert store.find_candidates(valid_record["canonical_url"])
+    assert store.find_candidates(valid_record_dict["canonical_url"])
     manifest_before = store.manifest_path.read_bytes()
 
     with pytest.raises(RuntimeError, match="manifest; cleanup fails closed"):
@@ -862,8 +866,8 @@ def test_heartbeat_keeps_a_72_hour_import_live(tmp_path, monkeypatch):
     root = tmp_path / "artifacts"
     store = PTG2ArtifactStore(root)
     raw_path = _make_file(store.artifact_path("b1" * 32), b"long-running")
-    clock = [NOW]
-    monkeypatch.setattr(retention, "_utcnow", lambda: clock[0])
+    clock_values = [NOW]
+    monkeypatch.setattr(retention, "_utcnow", lambda: clock_values[0])
     lease = PTG2ArtifactLease(
         store=store,
         owner="long-import",
@@ -874,7 +878,7 @@ def test_heartbeat_keeps_a_72_hour_import_live(tmp_path, monkeypatch):
         with bind_artifact_lease(lease.lease_id):
             assert protect_existing_artifact(store, raw_path)
         for elapsed_hours in (24, 48, 71):
-            clock[0] = NOW + datetime.timedelta(hours=elapsed_hours)
+            clock_values[0] = NOW + datetime.timedelta(hours=elapsed_hours)
             lease.heartbeat()
 
         result = _collect(root, now=NOW + datetime.timedelta(hours=72))
@@ -883,7 +887,7 @@ def test_heartbeat_keeps_a_72_hour_import_live(tmp_path, monkeypatch):
         assert result.deleted_files == ()
         assert raw_path.exists()
     finally:
-        clock[0] = NOW + datetime.timedelta(hours=72)
+        clock_values[0] = NOW + datetime.timedelta(hours=72)
         lease.release()
 
 

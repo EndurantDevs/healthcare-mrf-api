@@ -1126,6 +1126,13 @@ async def _ptg2_address_serving_table(
 
 
 def _inferred_provider_taxonomy_rule(args: dict[str, Any]) -> InferredProviderTaxonomyRule | None:
+    # A source-scoped occurrence or explicit NPI is already an exact provider
+    # selection. Do not replace that source evidence with a code-family guess.
+    if (
+        str(args.get("mode") or "").strip().lower() == "exact_source"
+        or _normalize_npi(args.get("npi")) is not None
+    ):
+        return None
     requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
     requested_code = _normalize_code(args.get("code") or args.get("reported_code"))
     # OpenAPI compatibility paths can arrive with only a 5-digit CPT code.

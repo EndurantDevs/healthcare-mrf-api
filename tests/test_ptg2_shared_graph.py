@@ -55,7 +55,7 @@ def _npi(value: int) -> bytes:
 
 def _metadata(path: Path, *, dense: bool, owner_count: int, member_count: int, dictionary_count: int = 0):
     payload = path.read_bytes()
-    result = {
+    metadata_dict = {
         "record_format": (
             PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT if dense else PTG2_MANIFEST_MEMBERSHIP_FORMAT
         ),
@@ -65,8 +65,8 @@ def _metadata(path: Path, *, dense: bool, owner_count: int, member_count: int, d
         "member_count": member_count,
     }
     if dense:
-        result["member_global_count"] = dictionary_count
-    return result
+        metadata_dict["member_global_count"] = dictionary_count
+    return metadata_dict
 
 
 def _write_artifact(path: Path, mapping: dict[bytes, list[bytes]], *, dense: bool) -> MembershipArtifact:
@@ -96,10 +96,13 @@ def _write_artifact(path: Path, mapping: dict[bytes, list[bytes]], *, dense: boo
     if dense:
         for member in member_dictionary:
             encoded_artifact.extend(member)
-        local_ids = {member: key for key, member in enumerate(member_dictionary)}
+        local_id_by_member = {
+            member: key
+            for key, member in enumerate(member_dictionary)
+        }
         for _owner, members in entries:
             for member in members:
-                encoded_artifact.extend(_U32.pack(local_ids[member]))
+                encoded_artifact.extend(_U32.pack(local_id_by_member[member]))
     else:
         for _owner, members in entries:
             for member in members:
@@ -129,7 +132,7 @@ def _fixtures(tmp_path: Path, *, dense_directions=frozenset(), boundary=False):
         if boundary
         else {group_a: npis, group_b: [npis[0]], group_empty: []}
     )
-    npi_group = {
+    groups_by_npi = {
         npi: (
             [group_a, group_b]
             if index == 0
@@ -137,9 +140,21 @@ def _fixtures(tmp_path: Path, *, dense_directions=frozenset(), boundary=False):
         )
         for index, npi in enumerate(npis)
     }
-    group_provider = {group_a: [provider_a, provider_b], group_b: [provider_b], group_empty: []}
-    provider_group = {provider_a: [group_a], provider_b: [group_a, group_b]}
-    mappings = (group_npi, npi_group, group_provider, provider_group)
+    provider_sets_by_group = {
+        group_a: [provider_a, provider_b],
+        group_b: [provider_b],
+        group_empty: [],
+    }
+    groups_by_provider_set = {
+        provider_a: [group_a],
+        provider_b: [group_a, group_b],
+    }
+    mappings = (
+        group_npi,
+        groups_by_npi,
+        provider_sets_by_group,
+        groups_by_provider_set,
+    )
     names = ("group-npi", "npi-group", "group-provider", "provider-group")
     artifacts = tuple(
         _write_artifact(tmp_path / f"{name}.bin", mapping, dense=index in dense_directions)
@@ -220,18 +235,22 @@ def _overlapping_bundles(tmp_path: Path):
     group_empty = _global(0xC0)
     provider_a = _global(0x1000)
     provider_b = _global(0x2000)
-    npi_a, npi_b, npi_c, npi_d = (_npi(1_000_000_000 + index) for index in range(4))
+    npi_values = [_npi(1_000_000_000 + index) for index in range(4)]
+    first_npi = npi_values[0]
+    second_npi = npi_values[1]
+    third_npi = npi_values[2]
+    fourth_npi = npi_values[3]
     first = _write_bundle(
         tmp_path / "first",
         "source-a",
-        group_npi={group_a: [npi_a, npi_b], group_empty: []},
+        group_npi={group_a: [first_npi, second_npi], group_empty: []},
         group_provider_set={group_a: [provider_a], group_empty: []},
         dense_directions=frozenset({0, 2}),
     )
     second = _write_bundle(
         tmp_path / "second",
         "source-b",
-        group_npi={group_a: [npi_b, npi_c], group_b: [npi_d]},
+        group_npi={group_a: [second_npi, third_npi], group_b: [fourth_npi]},
         group_provider_set={group_a: [provider_a, provider_b], group_b: [provider_b]},
         dense_directions=frozenset({1, 3}),
     )
@@ -618,7 +637,7 @@ def test_multi_shard_external_runs_respect_spill_bound(monkeypatch, tmp_path):
     )
     spill_dir = tmp_path / "spill"
     observed_run_bytes = []
-    observed_merge_fan_in = []
+    observed_merge_fan_in_counts = []
     original_write = shared_graph_module._write_sorted_run
     original_merge = shared_graph_module._merge_runs
 
@@ -627,7 +646,7 @@ def test_multi_shard_external_runs_respect_spill_bound(monkeypatch, tmp_path):
         return original_write(path, records)
 
     def tracking_merge(paths, destination, record_size):
-        observed_merge_fan_in.append(len(paths))
+        observed_merge_fan_in_counts.append(len(paths))
         return original_merge(paths, destination, record_size)
 
     monkeypatch.setattr(shared_graph_module, "_write_sorted_run", tracking_write)
@@ -645,7 +664,7 @@ def test_multi_shard_external_runs_respect_spill_bound(monkeypatch, tmp_path):
     assert graph_result.integrity.duplicate_edge_count == 68
     assert len(observed_run_bytes) > 100
     assert max(observed_run_bytes) <= 32
-    assert max(observed_merge_fan_in) <= 32
+    assert max(observed_merge_fan_in_counts) <= 32
     graph_result.cleanup()
     assert list(spill_dir.iterdir()) == []
 

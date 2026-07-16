@@ -813,6 +813,50 @@ def test_inferred_taxonomy_sql_ignores_mixed_use_cpt_families(code):
     assert sql == ""
 
 
+@pytest.mark.parametrize(
+    "request_scope",
+    [
+        {"mode": "exact_source"},
+        {"npi": 1053910794},
+    ],
+)
+def test_inferred_taxonomy_sql_does_not_override_exact_provider_evidence(
+    request_scope,
+):
+    sql = ptg2_serving._inferred_provider_taxonomy_code_sql(
+        {
+            "code": "23670",
+            "code_system": "CPT",
+            **request_scope,
+        },
+        nt_alias="nt",
+        schema="mrf",
+        params={},
+        param_prefix="inferred",
+    )
+
+    assert sql == ""
+
+
+def test_exact_source_taxonomy_filters_preserve_explicit_specialty():
+    params_by_name = {}
+
+    filters = ptg2_serving._membership_taxonomy_filters(
+        {
+            "mode": "exact_source",
+            "specialty": "Family Medicine",
+            "code": "23670",
+            "code_system": "CPT",
+            "npi": 1053910794,
+        },
+        params_by_name,
+    )
+
+    assert len(filters) == 1
+    assert "207Q00000X" in params_by_name.values()
+    assert "207X00000X" not in params_by_name.values()
+
+
 def test_membership_taxonomy_filters_use_uncorrelated_semijoins():
     params_by_name = {}
 
