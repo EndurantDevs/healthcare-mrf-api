@@ -42,6 +42,9 @@ class _PromotionTransaction:
             await self.state.cleanup_waiting.wait()
             self.state.current_snapshot_id = params["snapshot_id"]
             self.state.events.append("promotion_repointed")
+        elif "ptg2_v3_snapshot_plan_scope" in sql:
+            assert params == {"snapshot_id": "snap_new"}
+            return [{"plan_id": "P1", "plan_market_type": "group"}]
 
 
 class _CleanupConnection:

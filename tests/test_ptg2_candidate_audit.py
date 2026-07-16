@@ -153,7 +153,9 @@ async def test_candidate_serving_metadata_query_is_validated_and_scope_bound():
     sql, params = session.calls[0]
     assert "snapshot.status = 'validated'" in sql
     assert "snapshot.status = 'published'" not in sql
-    assert "snapshot_scope.plan_id = ANY" in sql
-    assert "snapshot_scope.plan_market_type = :candidate_plan_market_type" in sql
+    assert "candidate_plan_scope.plan_id" in sql
+    assert "= ANY(CAST(:candidate_plan_ids AS text[]))" in sql
+    assert "candidate_plan_scope.plan_market_type" in sql
+    assert "= :candidate_plan_market_type" in sql
     assert params["candidate_plan_ids"] == ["12-3456789", "123456789"]
     assert params["candidate_plan_market_type"] == "group"

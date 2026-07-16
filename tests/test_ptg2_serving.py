@@ -1520,6 +1520,51 @@ def test_provider_rate_items_do_not_merge_different_arrangements():
     } == {("FFS", 100), ("BUNDLE", 200)}
 
 
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    (
+        ("billing_code_type_version", "2026"),
+        ("source_procedure_name", "Updated source label"),
+        ("source_procedure_description", "Updated source description"),
+        ("network_names", ["Second Network"]),
+    ),
+)
+def test_provider_rate_items_do_not_merge_distinct_source_code_variants(
+    changed_field,
+    changed_value,
+):
+    base_by_field = {
+        "npi": 1234567890,
+        "provider_name": "Example Clinician",
+        "location_hash": "synthetic-location",
+        "reported_code": "38222",
+        "reported_code_system": "CPT",
+        "negotiation_arrangement": "FFS",
+        "billing_code_type_version": "2025",
+        "source_procedure_name": "Source label",
+        "source_procedure_description": "Source description",
+        "network_names": ["First Network"],
+        "source_artifact_key": 0,
+        "address": {"first_line": "100 Example Street"},
+        "provider_set_hash": "provider-set-1",
+        "price_set_hash": "price-set-1",
+        "rate_pack_hash": "rate-pack-1",
+        "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
+    }
+    changed_variant_by_field = {
+        **base_by_field,
+        changed_field: changed_value,
+        "price_set_hash": "price-set-2",
+        "rate_pack_hash": "rate-pack-2",
+    }
+
+    merged = ptg2_serving._merge_ptg2_provider_rate_items(
+        [base_by_field, changed_variant_by_field]
+    )
+
+    assert len(merged) == 2
+
+
 def test_provider_search_never_caps_rate_rows_before_merge():
     assert (
         ptg2_serving._ptg2_manifest_serving_row_limit(

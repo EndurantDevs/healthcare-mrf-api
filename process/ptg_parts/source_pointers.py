@@ -117,8 +117,10 @@ def candidate_snapshot_attributes(
 ) -> dict[str, Any]:
     """Return immutable-layout metadata that is validated but not live."""
 
-    candidate = dict(snapshot_attributes)
-    manifest = _manifest_mapping(candidate.get("manifest"))
+    candidate_attributes_by_name = dict(snapshot_attributes)
+    manifest = _manifest_mapping(
+        candidate_attributes_by_name.get("manifest")
+    )
     manifest["activation"] = {
         "contract": PTG2_CANDIDATE_ACTIVATION_CONTRACT,
         "state": "validated",
@@ -127,7 +129,7 @@ def candidate_snapshot_attributes(
             str(previous_snapshot_id) if previous_snapshot_id else None
         ),
     }
-    candidate.update(
+    candidate_attributes_by_name.update(
         {
             "status": PTG2_STATUS_VALIDATED,
             "published_at": None,
@@ -135,7 +137,7 @@ def candidate_snapshot_attributes(
             "manifest": manifest,
         }
     )
-    return candidate
+    return candidate_attributes_by_name
 
 
 def activated_snapshot_attributes(
@@ -146,8 +148,10 @@ def activated_snapshot_attributes(
 ) -> dict[str, Any]:
     """Return the published state written atomically with live pointers."""
 
-    activated = dict(candidate_attributes)
-    manifest = _manifest_mapping(activated.get("manifest"))
+    activated_attributes_by_name = dict(candidate_attributes)
+    manifest = _manifest_mapping(
+        activated_attributes_by_name.get("manifest")
+    )
     activation = _manifest_mapping(manifest.get("activation"))
     if activation.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT:
         raise ValueError("strict V3 snapshot is missing its candidate activation contract")
@@ -159,14 +163,14 @@ def activated_snapshot_attributes(
         }
     )
     manifest["activation"] = activation
-    activated.update(
+    activated_attributes_by_name.update(
         {
             "status": PTG2_STATUS_PUBLISHED,
             "published_at": activated_at,
             "manifest": manifest,
         }
     )
-    return activated
+    return activated_attributes_by_name
 
 
 def _ptg2_plan_source_key(
@@ -247,7 +251,7 @@ async def _source_plan_rows(
 ) -> list[dict[str, Any]]:
     """Build pointer rows from public snapshot scope and retained plan metadata."""
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    rows = await db.all(
+    plan_scope_records = await db.all(
         f"""
         SELECT DISTINCT plans.plan_id, plans.plan_market_type
           FROM (
@@ -268,14 +272,20 @@ async def _source_plan_rows(
         """,
         snapshot_id=snapshot_id,
     )
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        data = row if isinstance(row, dict) else row._mapping
-        plan_id = str(data.get("plan_id") or "").strip()
+    plan_pointer_entries: list[dict[str, Any]] = []
+    for plan_scope_record in plan_scope_records:
+        plan_scope_by_field = (
+            plan_scope_record
+            if isinstance(plan_scope_record, dict)
+            else plan_scope_record._mapping
+        )
+        plan_id = str(plan_scope_by_field.get("plan_id") or "").strip()
         if not plan_id:
             continue
-        plan_market_type = str(data.get("plan_market_type") or "").strip().lower()
-        result.append(
+        plan_market_type = str(
+            plan_scope_by_field.get("plan_market_type") or ""
+        ).strip().lower()
+        plan_pointer_entries.append(
             _plan_pointer_entry(
                 plan_id=plan_id,
                 plan_market_type=plan_market_type,
@@ -286,7 +296,7 @@ async def _source_plan_rows(
                 updated_at=updated_at,
             )
         )
-    return result
+    return plan_pointer_entries
 
 
 def _has_result_row(query_result: Any) -> bool:
@@ -636,7 +646,7 @@ async def _bind_snapshot_coverage_scope(
             f"PTG snapshot {snapshot_id} plan pointers do not match its immutable coverage scope"
         )
     primary_plan_id, primary_plan_market_type = min(expected_plans)
-    result = await session.execute(
+    scope_upsert_query = await session.execute(
         db.text(
             f"""
             INSERT INTO {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope
@@ -661,7 +671,7 @@ async def _bind_snapshot_coverage_scope(
             "coverage_scope_id": scope_id,
         },
     )
-    if not _has_result_row(result):
+    if not _has_result_row(scope_upsert_query):
         raise RuntimeError(
             f"PTG snapshot {snapshot_id} is already bound to another physical coverage scope"
         )
@@ -684,7 +694,7 @@ async def _bind_snapshot_coverage_scope(
             for plan_id, plan_market_type in sorted(expected_plans)
         ],
     )
-    observed_rows = await session.execute(
+    observed_scope_records = await session.execute(
         db.text(
             f"""
             SELECT plan_id, plan_market_type
@@ -696,10 +706,10 @@ async def _bind_snapshot_coverage_scope(
     )
     observed_plans = {
         (
-            str(_row_mapping(row).get("plan_id") or ""),
-            str(_row_mapping(row).get("plan_market_type") or ""),
+            str(_row_mapping(scope_record).get("plan_id") or ""),
+            str(_row_mapping(scope_record).get("plan_market_type") or ""),
         )
-        for row in observed_rows
+        for scope_record in observed_scope_records
     }
     if observed_plans != expected_plans:
         raise RuntimeError(
@@ -826,7 +836,7 @@ async def _locked_candidate_activation_row(
     schema_name: str,
     snapshot_id: str,
 ) -> dict[str, Any]:
-    result = await session.execute(
+    activation_query = await session.execute(
         db.text(
             f"""
             SELECT snapshot.snapshot_id,
@@ -857,10 +867,10 @@ async def _locked_candidate_activation_row(
         ),
         {"snapshot_id": snapshot_id},
     )
-    row = result.one_or_none()
-    if row is None:
+    activation_record = activation_query.one_or_none()
+    if activation_record is None:
         raise ValueError("validated candidate is unavailable")
-    return _row_mapping(row)
+    return _row_mapping(activation_record)
 
 
 async def _database_utc_timestamp(session: Any) -> datetime.datetime:
@@ -1032,9 +1042,11 @@ async def _candidate_plan_pointer_entries(
     )
     plan_pointer_entries = [
         _plan_pointer_entry(
-            plan_id=str(_row_mapping(row).get("plan_id") or ""),
+            plan_id=str(
+                _row_mapping(plan_scope_record).get("plan_id") or ""
+            ),
             plan_market_type=str(
-                _row_mapping(row).get("plan_market_type") or ""
+                _row_mapping(plan_scope_record).get("plan_market_type") or ""
             ),
             import_month=import_month,
             source_key=source_key,
@@ -1042,7 +1054,7 @@ async def _candidate_plan_pointer_entries(
             previous_snapshot_id=previous_snapshot_id,
             updated_at=activated_at,
         )
-        for row in plan_scope_result
+        for plan_scope_record in plan_scope_result
     ]
     if not plan_pointer_entries:
         raise ValueError("validated candidate has no logical plan mappings")

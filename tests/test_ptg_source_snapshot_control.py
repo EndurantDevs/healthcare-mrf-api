@@ -121,7 +121,7 @@ def test_source_plan_rows_use_only_public_snapshot_scope(monkeypatch):
     assert all(plan_source_row["source_key"] == "ptg_source" for plan_source_row in plan_source_rows)
     assert len(captured_sql_calls) == 1
     scope_sql = captured_sql_calls[0][0]
-    assert "ptg2_v3_snapshot_scope" in scope_sql
+    assert "ptg2_v3_snapshot_plan_scope" in scope_sql
 
 
 def test_promote_ptg2_source_snapshot_refuses_stale_expected_pointer(monkeypatch):
