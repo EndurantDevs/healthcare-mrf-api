@@ -151,14 +151,14 @@ jobs:
       - name: Install SSH key
         env:
           DEV_DEPLOY_SSH_KEY_B64: ${{ secrets.DEV_DEPLOY_SSH_KEY_B64 }}
-          DEV_DEPLOY_KNOWN_HOSTS: ${{ secrets.DEV_DEPLOY_KNOWN_HOSTS }}
+          DEV_DEPLOY_KNOWN_HOSTS_B64: ${{ secrets.DEV_DEPLOY_KNOWN_HOSTS_B64 }}
           DEV_DEPLOY_SCOPE: ${{ secrets.DEV_DEPLOY_SCOPE }}
         run: |
           if [ "${DEV_DEPLOY_SCOPE}" != "main-only-v1" ]; then
             echo "::error::DEV_DEPLOY_SCOPE is invalid"
             exit 1
           fi
-          for name in DEV_DEPLOY_SSH_KEY_B64 DEV_DEPLOY_KNOWN_HOSTS; do
+          for name in DEV_DEPLOY_SSH_KEY_B64 DEV_DEPLOY_KNOWN_HOSTS_B64; do
             if [ -z "${!name}" ]; then
               echo "::error::${name} is not configured"
               exit 1
@@ -167,7 +167,7 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s' "${DEV_DEPLOY_SSH_KEY_B64}" | base64 --decode > ~/.ssh/dev-deploy
           chmod 600 ~/.ssh/dev-deploy
-          printf '%s\n' "${DEV_DEPLOY_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          printf '%s' "${DEV_DEPLOY_KNOWN_HOSTS_B64}" | base64 --decode > ~/.ssh/known_hosts
 
       - name: Queue build on dev node
         env:
