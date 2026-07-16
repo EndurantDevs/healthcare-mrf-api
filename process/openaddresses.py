@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -93,6 +93,51 @@ class _RecordBatch:
     zip_recovery_rows: list[dict[str, Any]]
     rejection_counts: dict[str, int]
 
+
+@dataclass
+class _LoadProgress:
+    processed_files: int = 0
+    processed_rows: int = 0
+    accepted_rows: int = 0
+    zip_recovery_rows: int = 0
+    rejection_counts_by_reason: dict[str, int] = field(default_factory=dict)
+
+    def add_file(
+        self,
+        *,
+        processed: int,
+        accepted: int,
+        zip_recovery: int,
+        rejection_counts_by_reason: dict[str, int],
+    ) -> None:
+        """Add one completed source file to the aggregate load progress."""
+        self.processed_files += 1
+        self.processed_rows += processed
+        self.accepted_rows += accepted
+        self.zip_recovery_rows += zip_recovery
+        for reason, count in rejection_counts_by_reason.items():
+            self.rejection_counts_by_reason[reason] = (
+                self.rejection_counts_by_reason.get(reason, 0) + count
+            )
+
+    def audit(self, *, restore_shards: int, restore_concurrency: int) -> dict[str, Any]:
+        """Return the stable audit payload for a completed load."""
+        rejected_rows = max(
+            self.processed_rows - self.accepted_rows - self.zip_recovery_rows,
+            0,
+        )
+        return {
+            "processed_files": self.processed_files,
+            "processed_rows": self.processed_rows,
+            "accepted_rows": self.accepted_rows,
+            "zip_recovery_rows": self.zip_recovery_rows,
+            "rejected_rows": rejected_rows,
+            "rejection_counts": self.rejection_counts_by_reason,
+            "zip_restore_shards": restore_shards,
+            "zip_restore_concurrency": restore_concurrency,
+        }
+
+
 def _env_positive_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     return _positive_int_value(raw, default)
@@ -116,7 +161,7 @@ def _env_float(name: str, default: float) -> float:
         return default
     return value if value > 0 else default
 
-def _env_bool(name: str, default: bool = False) -> bool:
+def _is_env_flag_enabled(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -352,7 +397,7 @@ def _zip_restore_bucket(raw_hash: str, shard_count: int) -> int:
 def _feature_parts(
     feature: dict[str, Any],
     *,
-    source: str | None,
+    source_name: str | None,
     updated: Any,
 ) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(feature, dict):
@@ -373,7 +418,7 @@ def _feature_parts(
     state = (
         address_canon.state_code(properties.get("region"))
         or address_canon.state_code(properties.get("state"))
-        or _source_state(source)
+        or _source_state(source_name)
     )
     zip5 = address_canon.zip5_norm(properties.get("postcode") or properties.get("zip"))
     if not house_number:
@@ -388,7 +433,7 @@ def _feature_parts(
     unit = _safe_text(properties.get("unit") or properties.get("addr:unit"))
     city = _safe_text(properties.get("city"))
     feature_id = _safe_text(properties.get("id") or properties.get("hash"))
-    parts = {
+    feature_parts_by_name = {
         "house_number": house_number,
         "street_name": street_name,
         "street_match": street_match,
@@ -403,8 +448,8 @@ def _feature_parts(
         "source_updated": _source_updated(updated),
     }
     if not zip5:
-        return parts, "missing_zip5"
-    return parts, None
+        return feature_parts_by_name, "missing_zip5"
+    return feature_parts_by_name, None
 
 
 def lookup_params_from_address(address: dict[str, Any]) -> dict[str, Any] | None:
@@ -594,31 +639,35 @@ def relaxed_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> st
 def _record_from_feature(
     feature: dict[str, Any],
     *,
-    source: str | None,
+    source_name: str | None,
     data_id: int | None,
     job_id: int | None,
     updated: Any,
 ) -> dict[str, Any] | None:
     """Convert one GeoJSON feature into an import record."""
-    parts, reason = _feature_parts(feature, source=source, updated=updated)
-    if reason or not parts:
+    feature_parts_by_name, reason = _feature_parts(
+        feature,
+        source_name=source_name,
+        updated=updated,
+    )
+    if reason or not feature_parts_by_name:
         return None
-    house_number = parts["house_number"]
-    street_name = parts["street_name"]
-    street_match = parts["street_match"]
-    state = parts["state"]
-    zip5 = parts["zip5"]
-    unit = parts["unit"]
-    city = parts["city"]
-    lat = parts["lat"]
-    lon = parts["lon"]
+    house_number = feature_parts_by_name["house_number"]
+    street_name = feature_parts_by_name["street_name"]
+    street_match = feature_parts_by_name["street_match"]
+    state = feature_parts_by_name["state"]
+    zip5 = feature_parts_by_name["zip5"]
+    unit = feature_parts_by_name["unit"]
+    city = feature_parts_by_name["city"]
+    lat = feature_parts_by_name["lat"]
+    lon = feature_parts_by_name["lon"]
     first_line = f"{house_number} {street_name}"
     identity_key = address_canon.identity_key_v1(first_line, unit, city, state, zip5, "US")
     address_key = address_canon.address_key_v1(first_line, unit, city, state, zip5, "US")
     formatted_address = _format_address(first_line=first_line, unit=unit, city=city, state=state, zip5=zip5)
-    feature_id = parts["feature_id"]
+    feature_id = feature_parts_by_name["feature_id"]
     row_hash = _openaddresses_row_hash(
-        source=source,
+        source=source_name,
         feature_id=feature_id,
         house_number=house_number,
         street_match=street_match,
@@ -644,12 +693,12 @@ def _record_from_feature(
         "formatted_address": formatted_address,
         "lat": lat,
         "long": lon,
-        "source": source,
+        "source": source_name,
         "data_id": data_id,
         "job_id": job_id,
         "feature_id": feature_id,
-        "accuracy": parts["accuracy"],
-        "source_updated": parts["source_updated"],
+        "accuracy": feature_parts_by_name["accuracy"],
+        "source_updated": feature_parts_by_name["source_updated"],
         "imported_at": datetime.datetime.now(datetime.timezone.utc),
     }
 
@@ -657,42 +706,46 @@ def _record_from_feature(
 def _zip_recovery_record_from_feature(
     feature: dict[str, Any],
     *,
-    source: str | None,
+    source_name: str | None,
     data_id: int | None,
     job_id: int | None,
     updated: Any,
     restore_shards: int,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    parts, reason = _feature_parts(feature, source=source, updated=updated)
-    if reason != "missing_zip5" or not parts:
+    feature_parts_by_name, reason = _feature_parts(
+        feature,
+        source_name=source_name,
+        updated=updated,
+    )
+    if reason != "missing_zip5" or not feature_parts_by_name:
         return None, reason
     raw_hash = _openaddresses_recovery_hash(
-        source=source,
-        feature_id=parts["feature_id"],
-        house_number=parts["house_number"],
-        street_match=parts["street_match"],
-        city=parts["city"],
-        state=parts["state"],
-        lat=parts["lat"],
-        lon=parts["lon"],
+        source=source_name,
+        feature_id=feature_parts_by_name["feature_id"],
+        house_number=feature_parts_by_name["house_number"],
+        street_match=feature_parts_by_name["street_match"],
+        city=feature_parts_by_name["city"],
+        state=feature_parts_by_name["state"],
+        lat=feature_parts_by_name["lat"],
+        lon=feature_parts_by_name["lon"],
     )
     return {
         "raw_hash": raw_hash,
         "restore_bucket": _zip_restore_bucket(raw_hash, restore_shards),
-        "house_number": parts["house_number"],
-        "street_match_key": parts["street_match"],
-        "street_name": parts["street_name"],
-        "unit": parts["unit"],
-        "city_name": parts["city"],
-        "state_code": parts["state"],
-        "lat": parts["lat"],
-        "long": parts["lon"],
-        "source": source,
+        "house_number": feature_parts_by_name["house_number"],
+        "street_match_key": feature_parts_by_name["street_match"],
+        "street_name": feature_parts_by_name["street_name"],
+        "unit": feature_parts_by_name["unit"],
+        "city_name": feature_parts_by_name["city"],
+        "state_code": feature_parts_by_name["state"],
+        "lat": feature_parts_by_name["lat"],
+        "long": feature_parts_by_name["lon"],
+        "source": source_name,
         "data_id": data_id,
         "job_id": job_id,
-        "feature_id": parts["feature_id"],
-        "accuracy": parts["accuracy"],
-        "source_updated": parts["source_updated"],
+        "feature_id": feature_parts_by_name["feature_id"],
+        "accuracy": feature_parts_by_name["accuracy"],
+        "source_updated": feature_parts_by_name["source_updated"],
         "imported_at": datetime.datetime.now(datetime.timezone.utc),
     }, reason
 
@@ -733,17 +786,17 @@ def _iter_geojson_features(path: Path) -> Iterable[dict[str, Any]]:
                 yield from _iter_geojson_lines(handle)
                 return
 
-    yielded = False
+    has_yielded_feature = False
     try:
         with _open_geojson(path) as handle:
             for feature in ijson.items(handle, "features.item"):
-                yielded = True
+                has_yielded_feature = True
                 yield feature
     except ijson.JSONError:
         with _open_geojson(path) as handle:
             yield from _iter_geojson_lines(handle)
         return
-    if yielded:
+    if has_yielded_feature:
         return
     with _open_geojson(path) as handle:
         for feature in ijson.items(handle, "item"):
@@ -782,62 +835,89 @@ async def _maybe_raise_if_cancelled(ctx: dict[str, Any] | None, task: dict[str, 
         await raise_if_cancelled(ctx, task)
 
 
+def _feature_import_records(
+    feature: dict[str, Any],
+    *,
+    source_name: str | None,
+    data_id: int | None,
+    job_id: int | None,
+    updated: Any,
+    restore_shards: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    """Return the accepted row or ZIP recovery row for one feature."""
+    address_record = _record_from_feature(
+        feature,
+        source_name=source_name,
+        data_id=data_id,
+        job_id=job_id,
+        updated=updated,
+    )
+    if address_record:
+        return address_record, None, None
+    recovery_record, rejection_reason = _zip_recovery_record_from_feature(
+        feature,
+        source_name=source_name,
+        data_id=data_id,
+        job_id=job_id,
+        updated=updated,
+        restore_shards=restore_shards,
+    )
+    return None, recovery_record, rejection_reason
+
+
 def _iter_record_batches(
     path: Path,
     *,
     batch_size: int,
-    source: str | None = None,
+    source_name: str | None = None,
     data_id: int | None = None,
     job_id: int | None = None,
     updated: Any = None,
     row_limit: int | None = None,
     restore_shards: int = 1,
 ) -> Iterable[_RecordBatch]:
+    """Convert source features into bounded address and ZIP recovery batches."""
     processed = 0
-    rows: list[dict[str, Any]] = []
+    address_rows: list[dict[str, Any]] = []
     zip_recovery_rows: list[dict[str, Any]] = []
-    rejection_counts: dict[str, int] = {}
+    rejection_counts_by_reason: dict[str, int] = {}
     for feature in _iter_geojson_features(path):
         processed += 1
-        record = _record_from_feature(
+        address_record, recovery_record, rejection_reason = _feature_import_records(
             feature,
-            source=source,
+            source_name=source_name,
             data_id=data_id,
             job_id=job_id,
             updated=updated,
+            restore_shards=restore_shards,
         )
-        if record:
-            rows.append(record)
-        else:
-            recovery_record, reason = _zip_recovery_record_from_feature(
-                feature,
-                source=source,
-                data_id=data_id,
-                job_id=job_id,
-                updated=updated,
-                restore_shards=restore_shards,
+        if address_record:
+            address_rows.append(address_record)
+        elif recovery_record:
+            zip_recovery_rows.append(recovery_record)
+        if not address_record:
+            rejection_key = rejection_reason or "rejected"
+            rejection_counts_by_reason[rejection_key] = (
+                rejection_counts_by_reason.get(rejection_key, 0) + 1
             )
-            if recovery_record:
-                zip_recovery_rows.append(recovery_record)
-            rejection_counts[reason or "rejected"] = rejection_counts.get(reason or "rejected", 0) + 1
-        if len(rows) >= batch_size or len(zip_recovery_rows) >= batch_size:
+        if len(address_rows) >= batch_size or len(zip_recovery_rows) >= batch_size:
             yield _RecordBatch(
                 processed=processed,
-                rows=rows,
+                rows=address_rows,
                 zip_recovery_rows=zip_recovery_rows,
-                rejection_counts=rejection_counts,
+                rejection_counts=rejection_counts_by_reason,
             )
-            rows = []
+            address_rows = []
             zip_recovery_rows = []
-            rejection_counts = {}
+            rejection_counts_by_reason = {}
         if row_limit and processed >= row_limit:
             break
-    if rows or zip_recovery_rows or processed:
+    if address_rows or zip_recovery_rows or processed:
         yield _RecordBatch(
             processed=processed,
-            rows=rows,
+            rows=address_rows,
             zip_recovery_rows=zip_recovery_rows,
-            rejection_counts=rejection_counts,
+            rejection_counts=rejection_counts_by_reason,
         )
 
 
@@ -859,7 +939,7 @@ async def _download_file(
 ) -> None:
     """Download one OpenAddresses artifact with bounded retries."""
     await _maybe_raise_if_cancelled(ctx, task)
-    headers = {"Authorization": f"Bearer {token}"}
+    request_headers_by_name = {"Authorization": f"Bearer {token}"}
     retry_task = task or {}
     retries = _task_or_env_positive_int(
         retry_task,
@@ -872,20 +952,17 @@ async def _download_file(
         try:
             async with client.get(
                 url,
-                headers=headers,
+                headers=request_headers_by_name,
                 timeout=aiohttp.ClientTimeout(total=None, connect=60, sock_read=600),
             ) as response:
-                if response.status != 200:
-                    body = await response.text()
-                    message = f"OpenAddresses download failed HTTP {response.status}: {body[:200]}"
-                    if response.status not in RETRYABLE_DOWNLOAD_STATUSES or attempt >= max_attempts:
-                        raise RuntimeError(message)
-                    raise _RetryableOpenAddressesDownload(message)
-                with path.open("wb") as handle:
-                    async for chunk_index, chunk in _aiter_enumerate(response.content.iter_chunked(1024 * 1024), start=1):
-                        handle.write(chunk)
-                        if chunk_index % 16 == 0:
-                            await _maybe_raise_if_cancelled(ctx, task)
+                await _write_download_response(
+                    response,
+                    path,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    ctx=ctx,
+                    task=task,
+                )
             await _maybe_raise_if_cancelled(ctx, task)
             return
         except _RetryableOpenAddressesDownload as exc:
@@ -912,15 +989,36 @@ async def _download_file(
             await _sleep_before_download_retry(attempt, ctx=ctx, task=task)
 
 
+async def _write_download_response(
+    response: aiohttp.ClientResponse,
+    path: Path,
+    *,
+    attempt: int,
+    max_attempts: int,
+    ctx: dict[str, Any] | None,
+    task: dict[str, Any] | None,
+) -> None:
+    """Validate and stream one OpenAddresses download response."""
+    if response.status != 200:
+        body = await response.text()
+        message = f"OpenAddresses download failed HTTP {response.status}: {body[:200]}"
+        if response.status not in RETRYABLE_DOWNLOAD_STATUSES or attempt >= max_attempts:
+            raise RuntimeError(message)
+        raise _RetryableOpenAddressesDownload(message)
+    with path.open("wb") as handle:
+        chunks = response.content.iter_chunked(1024 * 1024)
+        async for chunk_index, chunk in _aiter_enumerate(chunks, start=1):
+            handle.write(chunk)
+            if chunk_index % 16 == 0:
+                await _maybe_raise_if_cancelled(ctx, task)
+
+
 class _RetryableOpenAddressesDownload(RuntimeError):
     pass
 
 
 def _remove_partial_download(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
+    path.unlink(missing_ok=True)
 
 
 async def _sleep_before_download_retry(
@@ -942,20 +1040,22 @@ async def _aiter_enumerate(iterable, *, start: int = 0):
         index += 1
 
 
-def _us_data_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    selected = []
-    for item in items:
-        source = str(item.get("source") or "")
-        output = item.get("output") or {}
-        if not source.startswith("us/"):
+def _us_data_items(source_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected_source_items = []
+    for source_item in source_items:
+        source_name = str(source_item.get("source") or "")
+        output = source_item.get("output") or {}
+        if not source_name.startswith("us/"):
             continue
-        if item.get("layer") != "addresses":
+        if source_item.get("layer") != "addresses":
             continue
         if output and not output.get("output"):
             continue
-        selected.append(item)
-    selected.sort(key=lambda item: str(item.get("source") or ""))
-    return selected
+        selected_source_items.append(source_item)
+    selected_source_items.sort(
+        key=lambda source_item: str(source_item.get("source") or "")
+    )
+    return selected_source_items
 
 
 def _local_files_from_env() -> list[Path]:
@@ -997,24 +1097,29 @@ def _task_or_env_int_range(
     return min(max(value, minimum), maximum)
 
 
-def _task_or_env_bool(task: dict[str, Any], key: str, env_name: str, default: bool = False) -> bool:
+def _is_task_or_env_flag_enabled(
+    task: dict[str, Any],
+    key: str,
+    env_name: str,
+    default: bool = False,
+) -> bool:
     if key in task and task.get(key) is not None:
         value = task.get(key)
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
-    return _env_bool(env_name, default)
+    return _is_env_flag_enabled(env_name, default)
 
 
 def _progress_run_id(ctx: dict[str, Any], task: dict[str, Any]) -> str | None:
-    context = ctx.get("context") if isinstance(ctx, dict) else {}
-    if not isinstance(context, dict):
-        context = {}
+    nested_context_by_name = ctx.get("context") if isinstance(ctx, dict) else {}
+    if not isinstance(nested_context_by_name, dict):
+        nested_context_by_name = {}
     run_id = (
         task.get("run_id")
         or task.get("control_run_id")
         or ctx.get("control_run_id")
-        or context.get("control_run_id")
+        or nested_context_by_name.get("control_run_id")
     )
     value = str(run_id or "").strip()
     return value or None
@@ -1037,7 +1142,7 @@ def _emit_load_progress(
         f"{done:,}/{total_files:,} sources; "
         f"{processed_rows:,} rows processed; {accepted_rows:,} rows accepted"
     )
-    payload = dict(
+    progress_event_by_name = dict(
         importer="openaddresses",
         status="running",
         unit="sources",
@@ -1052,8 +1157,8 @@ def _emit_load_progress(
         confidence="live",
     )
     if run_id:
-        payload["run_id"] = run_id
-    enqueue_live_progress(**payload)
+        progress_event_by_name["run_id"] = run_id
+    enqueue_live_progress(**progress_event_by_name)
 
 
 def _emit_backfill_progress(
@@ -1075,7 +1180,7 @@ def _emit_backfill_progress(
         f"(exact={stats.exact_updates:,}, fuzzy={stats.fuzzy_updates:,}, "
         f"relaxed={stats.relaxed_updates:,}){candidate_text}"
     )
-    payload = dict(
+    progress_event_by_name = dict(
         importer="openaddresses",
         status="running",
         unit="shards",
@@ -1090,8 +1195,8 @@ def _emit_backfill_progress(
         confidence="live",
     )
     if run_id:
-        payload["run_id"] = run_id
-    enqueue_live_progress(**payload)
+        progress_event_by_name["run_id"] = run_id
+    enqueue_live_progress(**progress_event_by_name)
 
 
 async def _load_file(
@@ -1100,7 +1205,7 @@ async def _load_file(
     stage_cls,
     recovery_cls=None,
     batch_size: int,
-    source: str | None = None,
+    source_name: str | None = None,
     data_id: int | None = None,
     job_id: int | None = None,
     updated: Any = None,
@@ -1113,12 +1218,12 @@ async def _load_file(
     accepted = 0
     zip_recovery = 0
     processed = 0
-    rejection_counts: dict[str, int] = {}
+    rejection_counts_by_reason: dict[str, int] = {}
     batch_iter = iter(
         _iter_record_batches(
             path,
             batch_size=batch_size,
-            source=source,
+            source_name=source_name,
             data_id=data_id,
             job_id=job_id,
             updated=updated,
@@ -1135,9 +1240,11 @@ async def _load_file(
         if recovery_cls is not None:
             zip_recovery += await _flush_zip_recovery_rows(batch.zip_recovery_rows, recovery_cls)
         for reason, count in batch.rejection_counts.items():
-            rejection_counts[reason] = rejection_counts.get(reason, 0) + count
+            rejection_counts_by_reason[reason] = (
+                rejection_counts_by_reason.get(reason, 0) + count
+            )
         await _maybe_raise_if_cancelled(ctx, task)
-    return processed, accepted, zip_recovery, rejection_counts
+    return processed, accepted, zip_recovery, rejection_counts_by_reason
 
 
 async def _load_source_item(
@@ -1145,7 +1252,7 @@ async def _load_source_item(
     ctx: dict[str, Any],
     task: dict[str, Any],
     client: aiohttp.ClientSession,
-    item: dict[str, Any],
+    source_item: dict[str, Any],
     tmpdir_path: Path,
     token: str,
     stage_cls,
@@ -1155,32 +1262,35 @@ async def _load_source_item(
     test_row_limit: int,
     restore_shards: int,
 ) -> tuple[str, int, int, int, dict[str, int]]:
-    job_id = int(item["job"])
-    data_id = int(item["id"])
-    source = str(item.get("source") or "")
+    job_id = int(source_item["job"])
+    data_id = int(source_item["id"])
+    source_name = str(source_item.get("source") or "")
     url = f"{OPENADDRESSES_API_BASE}/job/{job_id}/output/source.geojson.gz"
     path = tmpdir_path / f"openaddresses-{data_id}-{job_id}.geojson.gz"
-    logger.info("Downloading OpenAddresses source=%s job=%s", source, job_id)
+    logger.info("Downloading OpenAddresses source=%s job=%s", source_name, job_id)
     await _download_file(client, url, path, token, ctx=ctx, task=task)
     file_processed, file_accepted, file_zip_recovery, rejection_counts = await _load_file(
         path,
         stage_cls=stage_cls,
         recovery_cls=recovery_cls,
         batch_size=batch_size,
-        source=source,
+        source_name=source_name,
         data_id=data_id,
         job_id=job_id,
-        updated=item.get("updated"),
+        updated=source_item.get("updated"),
         row_limit=test_row_limit if test_mode else None,
         restore_shards=restore_shards,
         ctx=ctx,
         task=task,
     )
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-    return source, file_processed, file_accepted, file_zip_recovery, rejection_counts
+    path.unlink(missing_ok=True)
+    return (
+        source_name,
+        file_processed,
+        file_accepted,
+        file_zip_recovery,
+        rejection_counts,
+    )
 
 async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], stage_cls, recovery_cls) -> dict[str, int]:
     """Load configured OpenAddresses sources into staging tables."""
@@ -1222,11 +1332,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
     ctx["context"]["zip_restore_concurrency"] = zip_restore_concurrency
     ctx["context"]["zip_restore_shards"] = restore_shards
 
-    processed_files = 0
-    processed_rows = 0
-    accepted_rows = 0
-    zip_recovery_rows = 0
-    rejection_counts: dict[str, int] = {}
+    load_progress = _LoadProgress()
     progress_run_id = _progress_run_id(ctx, task)
     timeout = aiohttp.ClientTimeout(total=120, connect=30, sock_read=120)
 
@@ -1248,7 +1354,6 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
             queue.put_nowait((source_index, path))
         async def local_worker(worker_id: int) -> None:
             """Consume local source files until the queue is empty."""
-            nonlocal processed_files, processed_rows, accepted_rows, zip_recovery_rows, rejection_counts
             while True:
                 await _maybe_raise_if_cancelled(ctx, task)
                 try:
@@ -1263,7 +1368,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                         stage_cls=stage_cls,
                         recovery_cls=recovery_cls,
                         batch_size=batch_size,
-                        source="local/openaddresses",
+                        source_name="local/openaddresses",
                         row_limit=test_row_limit if test_mode else None,
                         restore_shards=restore_shards,
                         ctx=ctx,
@@ -1271,26 +1376,26 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                     )
                     async with progress_lock:
                         await _maybe_raise_if_cancelled(ctx, task)
-                        processed_files += 1
-                        processed_rows += file_processed
-                        accepted_rows += file_accepted
-                        zip_recovery_rows += file_zip_recovery
-                        for reason, count in file_rejection_counts.items():
-                            rejection_counts[reason] = rejection_counts.get(reason, 0) + count
+                        load_progress.add_file(
+                            processed=file_processed,
+                            accepted=file_accepted,
+                            zip_recovery=file_zip_recovery,
+                            rejection_counts_by_reason=file_rejection_counts,
+                        )
                         print(
                             "OpenAddresses local source "
-                            f"{processed_files:,}/{total_files:,} "
+                            f"{load_progress.processed_files:,}/{total_files:,} "
                             f"index={source_index:,} worker={worker_id} {path}: "
                             f"processed={file_processed:,} accepted={file_accepted:,} "
                             f"zip_recovery={file_zip_recovery:,} "
-                            f"accepted_total={accepted_rows:,}",
+                            f"accepted_total={load_progress.accepted_rows:,}",
                             flush=True,
                         )
                         _emit_load_progress(
-                            processed_files=processed_files,
+                            processed_files=load_progress.processed_files,
                             total_files=total_files,
-                            processed_rows=processed_rows,
-                            accepted_rows=accepted_rows,
+                            processed_rows=load_progress.processed_rows,
+                            accepted_rows=load_progress.accepted_rows,
                             label=str(path),
                             phase="loading local OpenAddresses files",
                             run_id=progress_run_id,
@@ -1301,16 +1406,10 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
         async with asyncio.TaskGroup() as task_group:
             for worker_id in range(1, local_concurrency + 1):
                 task_group.create_task(local_worker(worker_id))
-        return {
-            "processed_files": processed_files,
-            "processed_rows": processed_rows,
-            "accepted_rows": accepted_rows,
-            "zip_recovery_rows": zip_recovery_rows,
-            "rejected_rows": max(processed_rows - accepted_rows - zip_recovery_rows, 0),
-            "rejection_counts": rejection_counts,
-            "zip_restore_shards": restore_shards,
-            "zip_restore_concurrency": zip_restore_concurrency,
-        }
+        return load_progress.audit(
+            restore_shards=restore_shards,
+            restore_concurrency=zip_restore_concurrency,
+        )
 
     token = os.getenv("HLTHPRT_OPENADDRESSES_API_TOKEN", "").strip()
     if not token:
@@ -1318,11 +1417,11 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
 
     data_url = f"{OPENADDRESSES_API_BASE}/data?layer=addresses"
     async with aiohttp.ClientSession(timeout=timeout) as client:
-        items = _us_data_items(await _fetch_json(client, data_url, token))
+        source_items = _us_data_items(await _fetch_json(client, data_url, token))
         if test_mode:
-            items = items[:test_file_limit]
+            source_items = source_items[:test_file_limit]
         elif max_files:
-            items = items[:max_files]
+            source_items = source_items[:max_files]
         first_source_index = 1
         start_index_raw = task.get("start_index") or os.getenv("HLTHPRT_OPENADDRESSES_START_INDEX")
         if start_index_raw:
@@ -1330,13 +1429,16 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                 start_index = max(int(start_index_raw), 1)
             except (TypeError, ValueError) as exc:
                 raise RuntimeError(f"Invalid OpenAddresses start index: {start_index_raw!r}") from exc
-            if start_index > len(items):
-                raise RuntimeError(f"OpenAddresses start index {start_index:,} exceeds source count {len(items):,}")
+            if start_index > len(source_items):
+                raise RuntimeError(
+                    f"OpenAddresses start index {start_index:,} exceeds "
+                    f"source count {len(source_items):,}"
+                )
             first_source_index = start_index
-            items = items[start_index - 1:]
+            source_items = source_items[start_index - 1:]
             print(
                 f"OpenAddresses resume: starting at source index {start_index:,} "
-                f"of {start_index + len(items) - 1:,}",
+                f"of {start_index + len(source_items) - 1:,}",
                 flush=True,
             )
         end_index_raw = task.get("end_index") or os.getenv("HLTHPRT_OPENADDRESSES_END_INDEX")
@@ -1350,27 +1452,28 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                     f"OpenAddresses end index {end_index:,} is before start index {first_source_index:,}"
                 )
             item_count = end_index - first_source_index + 1
-            items = items[:item_count]
+            source_items = source_items[:item_count]
             print(
                 f"OpenAddresses shard: ending at source index {end_index:,} "
-                f"({len(items):,} sources in shard)",
+                f"({len(source_items):,} sources in shard)",
                 flush=True,
             )
         start_source = str(task.get("start_source") or os.getenv("HLTHPRT_OPENADDRESSES_START_SOURCE") or "").strip()
         if start_source:
-            for start_index, item in enumerate(items):
-                if str(item.get("source") or "") == start_source:
-                    items = items[start_index:]
+            for start_index, source_item in enumerate(source_items):
+                if str(source_item.get("source") or "") == start_source:
+                    source_items = source_items[start_index:]
                     first_source_index += start_index
                     print(
                         f"OpenAddresses resume: starting at source {start_source} "
-                        f"({first_source_index:,}/{first_source_index + len(items) - 1:,})",
+                        f"({first_source_index:,}/"
+                        f"{first_source_index + len(source_items) - 1:,})",
                         flush=True,
                     )
                     break
             else:
                 raise RuntimeError(f"OpenAddresses start source not found: {start_source}")
-        total_files = len(items)
+        total_files = len(source_items)
         source_concurrency = min(max(source_concurrency, 1), max(total_files, 1))
         print(f"OpenAddresses source concurrency={source_concurrency}", flush=True)
         _emit_load_progress(
@@ -1385,20 +1488,22 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
             tmpdir_path = Path(tmpdir)
             progress_lock = asyncio.Lock()
             queue: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue()
-            for source_index, item in enumerate(items, start=first_source_index):
-                queue.put_nowait((source_index, item))
+            for source_index, source_item in enumerate(
+                source_items,
+                start=first_source_index,
+            ):
+                queue.put_nowait((source_index, source_item))
             async def worker(worker_id: int) -> None:
                 """Consume remote source items until the queue is empty."""
-                nonlocal processed_files, processed_rows, accepted_rows, zip_recovery_rows, rejection_counts
                 while True:
                     await _maybe_raise_if_cancelled(ctx, task)
                     try:
-                        source_index, item = queue.get_nowait()
+                        source_index, source_item = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         return
                     try:
                         (
-                            source,
+                            source_name,
                             file_processed,
                             file_accepted,
                             file_zip_recovery,
@@ -1407,7 +1512,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                             ctx=ctx,
                             task=task,
                             client=client,
-                            item=item,
+                            source_item=source_item,
                             tmpdir_path=tmpdir_path,
                             token=token,
                             stage_cls=stage_cls,
@@ -1419,27 +1524,27 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                         )
                         async with progress_lock:
                             await _maybe_raise_if_cancelled(ctx, task)
-                            processed_files += 1
-                            processed_rows += file_processed
-                            accepted_rows += file_accepted
-                            zip_recovery_rows += file_zip_recovery
-                            for reason, count in file_rejection_counts.items():
-                                rejection_counts[reason] = rejection_counts.get(reason, 0) + count
+                            load_progress.add_file(
+                                processed=file_processed,
+                                accepted=file_accepted,
+                                zip_recovery=file_zip_recovery,
+                                rejection_counts_by_reason=file_rejection_counts,
+                            )
                             print(
                                 "OpenAddresses source "
-                                f"{processed_files:,}/{total_files:,} "
-                                f"index={source_index:,} worker={worker_id} {source}: "
+                                f"{load_progress.processed_files:,}/{total_files:,} "
+                                f"index={source_index:,} worker={worker_id} {source_name}: "
                                 f"processed={file_processed:,} accepted={file_accepted:,} "
                                 f"zip_recovery={file_zip_recovery:,} "
-                                f"accepted_total={accepted_rows:,}",
+                                f"accepted_total={load_progress.accepted_rows:,}",
                                 flush=True,
                             )
                             _emit_load_progress(
-                                processed_files=processed_files,
+                                processed_files=load_progress.processed_files,
                                 total_files=total_files,
-                                processed_rows=processed_rows,
-                                accepted_rows=accepted_rows,
-                                label=source,
+                                processed_rows=load_progress.processed_rows,
+                                accepted_rows=load_progress.accepted_rows,
+                                label=source_name,
                                 run_id=progress_run_id,
                             )
                     finally:
@@ -1449,16 +1554,10 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                 for worker_id in range(1, source_concurrency + 1):
                     task_group.create_task(worker(worker_id))
 
-    return {
-        "processed_files": processed_files,
-        "processed_rows": processed_rows,
-        "accepted_rows": accepted_rows,
-        "zip_recovery_rows": zip_recovery_rows,
-        "rejected_rows": max(processed_rows - accepted_rows - zip_recovery_rows, 0),
-        "rejection_counts": rejection_counts,
-        "zip_restore_shards": restore_shards,
-        "zip_restore_concurrency": zip_restore_concurrency,
-    }
+    return load_progress.audit(
+        restore_shards=restore_shards,
+        restore_concurrency=zip_restore_concurrency,
+    )
 
 
 async def _create_indexes(table_name: str, schema: str) -> None:
@@ -1519,7 +1618,7 @@ async def _ensure_openaddresses_stage_schema(table_name: str, schema: str) -> No
 
 async def _prepare_zip_recovery_table(recovery_cls, schema: str, *, reset: bool) -> None:
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(schema)};")
-    exists = await _table_exists(schema, recovery_cls.__tablename__)
+    exists = await _is_table_present(schema, recovery_cls.__tablename__)
     if reset:
         await db.status(f"DROP TABLE IF EXISTS {_qtable(schema, recovery_cls.__tablename__)};")
         await db.create_table(recovery_cls.__table__, checkfirst=True)
@@ -1545,7 +1644,7 @@ def _emit_zip_restore_progress(
         f"{done:,}/{total_shards:,} ZIP restore shards; "
         f"{restored:,}/{candidates:,} candidates restored"
     )
-    payload = dict(
+    progress_event_by_name = dict(
         importer="openaddresses",
         status="running",
         unit="shards",
@@ -1560,8 +1659,8 @@ def _emit_zip_restore_progress(
         confidence="live",
     )
     if run_id:
-        payload["run_id"] = run_id
-    enqueue_live_progress(**payload)
+        progress_event_by_name["run_id"] = run_id
+    enqueue_live_progress(**progress_event_by_name)
 
 
 def _openaddresses_zip_restore_insert_sql(schema: str, stage_table: str, recovery_table: str) -> str:
@@ -1677,30 +1776,29 @@ def _openaddresses_zip_restore_insert_sql(schema: str, stage_table: str, recover
     """
 
 
-async def restore_openaddresses_zip5_from_tiger_zcta(
-    *,
-    schema: str,
-    stage_table: str,
-    recovery_table: str,
-    concurrency: int,
-    run_id: str | None = None,
-) -> OpenAddressesZipRestoreStats:
-    """Restore missing ZIP codes from TIGER ZCTA polygons."""
-    if not await _table_exists(schema, recovery_table):
-        return OpenAddressesZipRestoreStats()
-    if not await _table_exists("tiger", "zcta5"):
-        if _env_bool("HLTHPRT_OPENADDRESSES_ZIP_RESTORE_REQUIRED"):
+async def _is_zip_restore_ready(schema: str, recovery_table: str) -> bool:
+    """Validate that the recovery table and spatial references are available."""
+    if not await _is_table_present(schema, recovery_table):
+        return False
+    if not await _is_table_present("tiger", "zcta5"):
+        if _is_env_flag_enabled("HLTHPRT_OPENADDRESSES_ZIP_RESTORE_REQUIRED"):
             raise RuntimeError("OpenAddresses ZIP restore requires tiger.zcta5, but it is missing.")
         logger.warning("Skipping OpenAddresses ZIP restore: tiger.zcta5 is missing")
-        return OpenAddressesZipRestoreStats()
-    if not await _table_exists(schema, "geo_zip_lookup"):
-        if _env_bool("HLTHPRT_OPENADDRESSES_ZIP_RESTORE_REQUIRED"):
+        return False
+    if not await _is_table_present(schema, "geo_zip_lookup"):
+        if _is_env_flag_enabled("HLTHPRT_OPENADDRESSES_ZIP_RESTORE_REQUIRED"):
             raise RuntimeError("OpenAddresses ZIP restore requires geo_zip_lookup, but it is missing.")
         logger.warning("Skipping OpenAddresses ZIP restore: %s.geo_zip_lookup is missing", schema)
-        return OpenAddressesZipRestoreStats()
+        return False
+    return True
 
-    await _create_zip_recovery_indexes(recovery_table, schema)
-    rows = await db.all(
+
+async def _zip_restore_candidate_counts(
+    schema: str,
+    recovery_table: str,
+) -> dict[int, int]:
+    """Count staged ZIP recovery candidates by deterministic bucket."""
+    bucket_count_rows = await db.all(
         f"""
         SELECT restore_bucket, count(*)::bigint AS candidates
           FROM {_qtable(schema, recovery_table)}
@@ -1708,16 +1806,28 @@ async def restore_openaddresses_zip5_from_tiger_zcta(
          ORDER BY restore_bucket;
         """
     )
-    shard_counts = {
-        int(_row_mapping(row)["restore_bucket"]): int(_row_mapping(row)["candidates"] or 0)
-        for row in rows or []
+    candidate_counts_by_bucket = {
+        int(_row_mapping(bucket_count_row)["restore_bucket"]): int(
+            _row_mapping(bucket_count_row)["candidates"] or 0
+        )
+        for bucket_count_row in bucket_count_rows or []
     }
-    total_candidates = sum(shard_counts.values())
-    if not total_candidates:
-        return OpenAddressesZipRestoreStats()
+    return candidate_counts_by_bucket
 
-    buckets = sorted(shard_counts)
+
+async def _run_zip_restore_buckets(
+    *,
+    schema: str,
+    stage_table: str,
+    recovery_table: str,
+    candidate_counts_by_bucket: dict[int, int],
+    concurrency: int,
+    run_id: str | None,
+) -> int:
+    """Restore planned candidate buckets and report live progress."""
+    buckets = sorted(candidate_counts_by_bucket)
     total_shards = len(buckets)
+    total_candidates = sum(candidate_counts_by_bucket.values())
     restored = 0
     completed = 0
     concurrency = max(1, min(int(concurrency or 1), total_shards))
@@ -1760,28 +1870,62 @@ async def restore_openaddresses_zip5_from_tiger_zcta(
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
+    return restored
+
+
+async def restore_openaddresses_zips(
+    *,
+    schema: str,
+    stage_table: str,
+    recovery_table: str,
+    concurrency: int,
+    run_id: str | None = None,
+) -> OpenAddressesZipRestoreStats:
+    """Restore missing ZIP codes from TIGER ZCTA polygons."""
+    if not await _is_zip_restore_ready(schema, recovery_table):
+        return OpenAddressesZipRestoreStats()
+    await _create_zip_recovery_indexes(recovery_table, schema)
+    candidate_counts_by_bucket = await _zip_restore_candidate_counts(
+        schema,
+        recovery_table,
+    )
+    total_candidates = sum(candidate_counts_by_bucket.values())
+    if not total_candidates:
+        return OpenAddressesZipRestoreStats()
+    bounded_concurrency = max(
+        1,
+        min(int(concurrency or 1), len(candidate_counts_by_bucket)),
+    )
+    restored = await _run_zip_restore_buckets(
+        schema=schema,
+        stage_table=stage_table,
+        recovery_table=recovery_table,
+        candidate_counts_by_bucket=candidate_counts_by_bucket,
+        concurrency=bounded_concurrency,
+        run_id=run_id,
+    )
 
     discarded = max(total_candidates - restored, 0)
     print(
         "OpenAddresses ZIP restore complete: "
         f"candidates={total_candidates:,} restored={restored:,} discarded={discarded:,} "
-        f"shards={total_shards:,} concurrency={concurrency:,}",
+        f"shards={len(candidate_counts_by_bucket):,} concurrency={bounded_concurrency:,}",
         flush=True,
     )
     return OpenAddressesZipRestoreStats(
         candidates=total_candidates,
         restored=restored,
         discarded=discarded,
-        shards=total_shards,
+        shards=len(candidate_counts_by_bucket),
     )
 
 
-async def _table_exists(schema: str, table_name: str) -> bool:
+async def _is_table_present(schema: str, table_name: str) -> bool:
     schema = _validate_schema_name(schema)
     return bool(await db.scalar("SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=f"{schema}.{table_name}"))
 
 
-async def _table_has_column(schema: str, table_name: str, column_name: str) -> bool:
+async def _has_table_column(schema: str, table_name: str, column_name: str) -> bool:
     return bool(
         await db.scalar(
             """
@@ -1802,7 +1946,7 @@ async def _table_has_column(schema: str, table_name: str, column_name: str) -> b
 
 async def _prepare_stage_table(stage_cls, schema: str, *, reset: bool) -> None:
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(schema)};")
-    exists = await _table_exists(schema, stage_cls.__tablename__)
+    exists = await _is_table_present(schema, stage_cls.__tablename__)
     if reset:
         await db.status(f"DROP TABLE IF EXISTS {_qtable(schema, stage_cls.__tablename__)};")
         await db.create_table(stage_cls.__table__, checkfirst=True)
@@ -1998,7 +2142,7 @@ async def _plan_openaddresses_backfill_shards(
 
     archive = _qtable(schema, archive_table)
     shard_filter = _backfill_shard_filter(state_code=state_code, zip_prefix=None)
-    rows = await db.all(
+    shard_candidate_rows = await db.all(
         f"""
         SELECT
             state_code,
@@ -2022,8 +2166,8 @@ async def _plan_openaddresses_backfill_shards(
     )
     shards: list[OpenAddressesBackfillShard] = []
     skipped_candidates = 0
-    for row in rows or []:
-        mapping = _row_mapping(row)
+    for candidate_row in shard_candidate_rows or []:
+        mapping = _row_mapping(candidate_row)
         candidate_count = int(mapping["candidate_count"] or 0)
         try:
             shard_state = _normalize_backfill_state_code(mapping["state_code"])
@@ -2127,7 +2271,7 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
         )
         return stats
 
-    if not await _table_exists(schema, source_table):
+    if not await _is_table_present(schema, source_table):
         return await refresh_archive_geocodes_from_openaddresses(
             schema=schema,
             archive_table=archive_table,
@@ -2137,8 +2281,8 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
             match_modes=match_modes,
         )
     if not (
-        await _table_has_column(schema, archive_table, "address_key")
-        and await _table_has_column(schema, archive_table, "geo_source")
+        await _has_table_column(schema, archive_table, "address_key")
+        and await _has_table_column(schema, archive_table, "geo_source")
     ):
         return await refresh_archive_geocodes_from_openaddresses(
             schema=schema,
@@ -2266,12 +2410,12 @@ async def refresh_archive_geocodes_from_openaddresses(
         zip_prefix if zip_prefix is not None else os.getenv("HLTHPRT_OPENADDRESSES_BACKFILL_ZIP_PREFIX")
     )
     match_modes = _normalize_backfill_match_modes(match_modes)
-    if not await _table_exists(schema, source_table):
+    if not await _is_table_present(schema, source_table):
         logger.warning("Skipping OpenAddresses backfill: %s.%s is missing", schema, source_table)
         return OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
     if not (
-        await _table_has_column(schema, archive_table, "address_key")
-        and await _table_has_column(schema, archive_table, "geo_source")
+        await _has_table_column(schema, archive_table, "address_key")
+        and await _has_table_column(schema, archive_table, "geo_source")
     ):
         logger.warning("Skipping OpenAddresses backfill: canonical archive table is unavailable.")
         return OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
@@ -2285,9 +2429,9 @@ async def refresh_archive_geocodes_from_openaddresses(
         state_code=state_code,
         zip_prefix=zip_prefix,
     )
-    source = _qtable(schema, source_table)
+    source_table_ref = _qtable(schema, source_table)
     qschema = _quote_ident(schema)
-    params = {
+    query_params_by_name = {
         "coord_tolerance": _env_float(
             "HLTHPRT_OPENADDRESSES_DUPLICATE_COORD_TOLERANCE",
             DEFAULT_DUPLICATE_COORD_TOLERANCE,
@@ -2301,12 +2445,14 @@ async def refresh_archive_geocodes_from_openaddresses(
         "relaxed_margin": _env_float("HLTHPRT_OPENADDRESSES_RELAXED_MARGIN", DEFAULT_RELAXED_MARGIN),
     }
     if state_code:
-        params["backfill_state_code"] = state_code
+        query_params_by_name["backfill_state_code"] = state_code
     if zip_prefix:
-        params["backfill_zip_lower"] = _zip_prefix_lower_bound(zip_prefix)
+        query_params_by_name["backfill_zip_lower"] = _zip_prefix_lower_bound(
+            zip_prefix
+        )
         zip_upper = _zip_prefix_upper_bound(zip_prefix)
         if zip_upper:
-            params["backfill_zip_upper"] = zip_upper
+            query_params_by_name["backfill_zip_upper"] = zip_upper
 
     city_exact_updates = 0
     broad_exact_updates = 0
@@ -2324,7 +2470,7 @@ async def refresh_archive_geocodes_from_openaddresses(
                     min(oa.feature_id) AS place_id,
                     NULLIF(max(NULLIF(oa.accuracy, '')), '') AS accuracy
                   FROM missing
-                  JOIN {source} AS oa
+                  JOIN {source_table_ref} AS oa
                     ON oa.state_code = missing.state_code
                    AND oa.zip5 = missing.zip5
                    AND oa.house_number = missing.house_number
@@ -2360,7 +2506,7 @@ async def refresh_archive_geocodes_from_openaddresses(
                AND archive.lat IS NULL
                AND archive.long IS NULL;
             """,
-                **params,
+                **query_params_by_name,
             )
         )
 
@@ -2377,7 +2523,7 @@ async def refresh_archive_geocodes_from_openaddresses(
                     min(oa.feature_id) AS place_id,
                     NULLIF(max(NULLIF(oa.accuracy, '')), '') AS accuracy
                   FROM missing
-                  JOIN {source} AS oa
+                  JOIN {source_table_ref} AS oa
                     ON oa.state_code = missing.state_code
                    AND oa.zip5 = missing.zip5
                    AND oa.house_number = missing.house_number
@@ -2411,7 +2557,7 @@ async def refresh_archive_geocodes_from_openaddresses(
                AND archive.lat IS NULL
                AND archive.long IS NULL;
             """,
-                **params,
+                **query_params_by_name,
             )
         )
     exact_updates = city_exact_updates + broad_exact_updates
@@ -2433,7 +2579,7 @@ async def refresh_archive_geocodes_from_openaddresses(
                     count(*) AS row_count,
                     similarity(oa.street_match_key, missing.street_match_key) AS score
                   FROM missing
-                  JOIN {source} AS oa
+                  JOIN {source_table_ref} AS oa
                     ON oa.state_code = missing.state_code
                    AND oa.zip5 = missing.zip5
                    AND oa.house_number = missing.house_number
@@ -2487,7 +2633,7 @@ async def refresh_archive_geocodes_from_openaddresses(
                AND archive.lat IS NULL
                AND archive.long IS NULL;
             """,
-                **params,
+                **query_params_by_name,
             )
         )
 
@@ -2508,7 +2654,7 @@ async def refresh_archive_geocodes_from_openaddresses(
                     count(*) AS row_count,
                     similarity(oa.street_match_key, missing.street_match_key) AS score
                   FROM missing
-                  JOIN {source} AS oa
+                  JOIN {source_table_ref} AS oa
                     ON oa.state_code = missing.state_code
                    AND oa.zip5 = missing.zip5
                    AND oa.house_number = missing.house_number
@@ -2564,7 +2710,7 @@ async def refresh_archive_geocodes_from_openaddresses(
                AND archive.lat IS NULL
                AND archive.long IS NULL;
             """,
-                **params,
+                **query_params_by_name,
             )
         )
     return OpenAddressesBackfillStats(
@@ -2585,7 +2731,11 @@ async def process_data(ctx, task=None):  # pragma: no cover
     if task_import_id:
         ctx["import_date"] = _normalize_import_id(task_import_id)
     ctx["context"]["import_date"] = ctx["import_date"]
-    if _task_or_env_bool(task, "publish_only", "HLTHPRT_OPENADDRESSES_PUBLISH_ONLY"):
+    if _is_task_or_env_flag_enabled(
+        task,
+        "publish_only",
+        "HLTHPRT_OPENADDRESSES_PUBLISH_ONLY",
+    ):
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         ctx["context"]["publish_only"] = True
         print("OpenAddresses publish-only mode: using existing stage table", flush=True)
@@ -2616,7 +2766,12 @@ async def process_data(ctx, task=None):  # pragma: no cover
             zip_prefix_length=backfill_zip_prefix_length,
             match_modes=backfill_match_modes,
             run_id=_progress_run_id(ctx, task),
-            sharded=_task_or_env_bool(task, "sharded_backfill", "HLTHPRT_OPENADDRESSES_SHARDED_BACKFILL", True),
+            sharded=_is_task_or_env_flag_enabled(
+                task,
+                "sharded_backfill",
+                "HLTHPRT_OPENADDRESSES_SHARDED_BACKFILL",
+                True,
+            ),
         )
         normalized_match_modes = _normalize_backfill_match_modes(backfill_match_modes)
         ctx["context"]["backfill"] = {
@@ -2631,21 +2786,29 @@ async def process_data(ctx, task=None):  # pragma: no cover
         }
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         ctx["context"]["backfill_only"] = True
-        shard = []
+        shard_labels = []
         if ctx["context"]["backfill"]["state_code"]:
-            shard.append(f"state={ctx['context']['backfill']['state_code']}")
+            shard_labels.append(
+                f"state={ctx['context']['backfill']['state_code']}"
+            )
         if ctx["context"]["backfill"]["zip_prefix"]:
-            shard.append(f"zip_prefix={ctx['context']['backfill']['zip_prefix']}")
+            shard_labels.append(
+                f"zip_prefix={ctx['context']['backfill']['zip_prefix']}"
+            )
         print(
             "OpenAddresses backfill complete: "
             f"exact={stats.exact_updates:,} fuzzy={stats.fuzzy_updates:,} "
             f"relaxed={stats.relaxed_updates:,}"
-            f"{' ' + ' '.join(shard) if shard else ''}"
+            f"{' ' + ' '.join(shard_labels) if shard_labels else ''}"
         )
         return
 
     await ensure_database(bool(ctx["context"].get("test_mode", False)))
-    if _task_or_env_bool(task, "load_only", "HLTHPRT_OPENADDRESSES_LOAD_ONLY"):
+    if _is_task_or_env_flag_enabled(
+        task,
+        "load_only",
+        "HLTHPRT_OPENADDRESSES_LOAD_ONLY",
+    ):
         ctx["context"]["load_only"] = True
     if "min_rows" in task:
         ctx["context"]["min_rows"] = _positive_int_value(task.get("min_rows"), DEFAULT_MIN_ROWS)
@@ -2656,12 +2819,20 @@ async def process_data(ctx, task=None):  # pragma: no cover
     await _prepare_stage_table(
         stage_cls,
         schema,
-        reset=not _task_or_env_bool(task, "resume_stage", "HLTHPRT_OPENADDRESSES_RESUME_STAGE"),
+        reset=not _is_task_or_env_flag_enabled(
+            task,
+            "resume_stage",
+            "HLTHPRT_OPENADDRESSES_RESUME_STAGE",
+        ),
     )
     await _prepare_zip_recovery_table(
         recovery_cls,
         schema,
-        reset=not _task_or_env_bool(task, "resume_stage", "HLTHPRT_OPENADDRESSES_RESUME_STAGE"),
+        reset=not _is_task_or_env_flag_enabled(
+            task,
+            "resume_stage",
+            "HLTHPRT_OPENADDRESSES_RESUME_STAGE",
+        ),
     )
     stats = await _load_openaddresses_data(ctx, task, stage_cls, recovery_cls)
     ctx["context"]["audit"] = stats
@@ -2707,8 +2878,11 @@ async def shutdown(ctx):  # pragma: no cover
     recovery_cls = make_class(OpenAddressesZipRecovery, import_date)
     stage_table = stage_cls.__tablename__
     recovery_table = recovery_cls.__tablename__
-    if not await _table_exists(schema, stage_table):
-        if context.get("openaddresses_stage_published") and await _table_exists(schema, OpenAddressesGeocode.__main_table__):
+    if not await _is_table_present(schema, stage_table):
+        if context.get("openaddresses_stage_published") and await _is_table_present(
+            schema,
+            OpenAddressesGeocode.__main_table__,
+        ):
             logger.warning(
                 "Skipping repeated OpenAddresses shutdown: staging table %s.%s was already published.",
                 schema,
@@ -2717,7 +2891,7 @@ async def shutdown(ctx):  # pragma: no cover
             return
         raise RuntimeError(f"OpenAddresses staging table {schema}.{stage_table} is missing.")
 
-    zip_restore_stats = await restore_openaddresses_zip5_from_tiger_zcta(
+    zip_restore_stats = await restore_openaddresses_zips(
         schema=schema,
         stage_table=stage_table,
         recovery_table=recovery_table,

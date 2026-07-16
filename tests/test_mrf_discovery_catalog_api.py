@@ -27,6 +27,161 @@ def test_page_limit_validates_and_clamps_values():
         catalog.page_limit("many", default=100, maximum=250)
 
 
+def _dense_file_row(file_id: str, plan_count: int) -> dict[str, object]:
+    """Build one stored file row with a controllable plan-reference count."""
+
+    return {
+        "mrf_file_id": file_id,
+        "source_id": "source_example",
+        "file_type": "in-network",
+        "url": f"https://example.test/{file_id}.json.gz",
+        "plan_ids": [f"plan-{index}" for index in range(plan_count)],
+        "plan_names": [f"Example Plan {index}" for index in range(plan_count)],
+        "market_types": ["group"] * plan_count,
+        "metadata_json": {},
+        "source_display_name": "Example Payer",
+        "source_metadata_json": {},
+    }
+
+
+def test_file_page_splits_one_plan_dense_file_with_composite_cursor():
+    """Split one file's plan identities without skipping or duplicating them."""
+
+    dense_file_rows = [_dense_file_row("file_dense", 5)]
+
+    first_items, first_cursor = catalog._bounded_file_items(
+        dense_file_rows,
+        limit=10,
+        cursor_plan_offset=0,
+        plan_reference_limit=3,
+    )
+    second_items, second_cursor = catalog._bounded_file_items(
+        dense_file_rows,
+        limit=10,
+        cursor_plan_offset=3,
+        plan_reference_limit=3,
+    )
+
+    assert [plan["plan_id"] for plan in first_items[0]["plan_info"]] == [
+        "plan-0",
+        "plan-1",
+        "plan-2",
+    ]
+    assert first_items[0]["plan_chunk_offset"] == 0
+    assert first_items[0]["plan_chunk_total"] == 5
+    assert "plan_ids" not in first_items[0]
+    assert "plan_names" not in first_items[0]
+    assert "market_types" not in first_items[0]
+    assert first_cursor == "file_dense~plan~3"
+    assert [plan["plan_id"] for plan in second_items[0]["plan_info"]] == [
+        "plan-3",
+        "plan-4",
+    ]
+    assert second_items[0]["plan_chunk_offset"] == 3
+    assert second_cursor is None
+
+
+def test_file_page_plan_budget_continues_inside_next_file():
+    """Use the remaining budget before continuing within the next file."""
+
+    rows = [
+        _dense_file_row("file_a", 2),
+        _dense_file_row("file_b", 3),
+    ]
+
+    page_items, next_cursor = catalog._bounded_file_items(
+        rows,
+        limit=10,
+        cursor_plan_offset=0,
+        plan_reference_limit=3,
+    )
+
+    assert [len(item["plan_info"]) for item in page_items] == [2, 1]
+    assert next_cursor == "file_b~plan~1"
+
+
+def test_file_page_preserves_ambiguous_plan_identity_hints_across_chunks():
+    """Annotate split plans using ambiguity from the complete stored file."""
+
+    dense_row = _dense_file_row("file_dense", 4)
+    dense_row["metadata_json"] = {
+        "plan_info": [
+            {
+                "plan_id": "123456789",
+                "plan_id_type": "ein",
+                "plan_market_type": "group",
+                "plan_name": f"Example Plan {index}",
+            }
+            for index in range(4)
+        ]
+    }
+    first_items, first_cursor = catalog._bounded_file_items(
+        [dense_row],
+        limit=10,
+        cursor_plan_offset=0,
+        plan_reference_limit=2,
+    )
+    second_items, second_cursor = catalog._bounded_file_items(
+        [dense_row],
+        limit=10,
+        cursor_plan_offset=2,
+        plan_reference_limit=2,
+    )
+
+    first_hints = [
+        plan["plan_identity_hint"] for plan in first_items[0]["plan_info"]
+    ]
+    second_hints = [
+        plan["plan_identity_hint"] for plan in second_items[0]["plan_info"]
+    ]
+    assert first_hints == ["plan_name:Example Plan 0", "plan_name:Example Plan 1"]
+    assert second_hints == ["plan_name:Example Plan 2", "plan_name:Example Plan 3"]
+    assert first_cursor == "file_dense~plan~2"
+    assert second_cursor is None
+
+
+def test_file_plan_cursor_accepts_legacy_and_rejects_invalid_offsets():
+    """Keep legacy cursors valid while rejecting malformed plan offsets."""
+
+    assert catalog._parse_file_cursor("file_001") == ("file_001", 0)
+    assert catalog._parse_file_cursor("file_001~plan~4") == ("file_001", 4)
+    with pytest.raises(ValueError, match="integer"):
+        catalog._parse_file_cursor("file_001~plan~many")
+    with pytest.raises(ValueError, match="greater than zero"):
+        catalog._parse_file_cursor("file_001~plan~0")
+
+
+@pytest.mark.asyncio
+async def test_file_page_resumes_composite_plan_cursor(monkeypatch):
+    """Resume the same file at the next plan slice through the public reader."""
+
+    dense_row = _dense_file_row("file_dense", 5)
+
+    async def fake_all(_statement):
+        return [dense_row]
+
+    monkeypatch.setattr(catalog.db, "all", fake_all)
+    monkeypatch.setattr(catalog, "MAX_FILE_PAGE_PLAN_REFERENCES", 3)
+
+    first_page = await catalog.list_discovery_source_files_page(
+        "source_example",
+        limit=10,
+    )
+    second_page = await catalog.list_discovery_source_files_page(
+        "source_example",
+        cursor=first_page["next_cursor"],
+        limit=10,
+    )
+
+    assert [
+        plan["plan_id"] for plan in first_page["items"][0]["plan_info"]
+    ] == ["plan-0", "plan-1", "plan-2"]
+    assert [
+        plan["plan_id"] for plan in second_page["items"][0]["plan_info"]
+    ] == ["plan-3", "plan-4"]
+    assert second_page["next_cursor"] is None
+
+
 @pytest.mark.asyncio
 async def test_source_page_is_cursor_bounded_and_merges_payer_identity(monkeypatch):
     query_calls = []
@@ -195,6 +350,7 @@ async def test_file_page_prefers_stored_plan_metadata(monkeypatch):
             "plan_name": "Example PPO",
         }
     ]
+    assert "plan_info" not in file_item["metadata"]
 
 
 @pytest.mark.asyncio

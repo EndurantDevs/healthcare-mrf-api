@@ -10,13 +10,21 @@ from typing import Any
 
 from sqlalchemy import String, cast, func, or_, select
 
+from api.mrf_discovery_catalog_paging import (
+    MAX_FILE_PAGE_PLAN_REFERENCES,
+    ambiguous_plan_identity_keys as _ambiguous_plan_identity_keys,
+    bounded_file_windows,
+    parse_file_cursor as _parse_file_cursor,
+    plan_identity_key as _plan_identity_key,
+    plan_reference_count as _plan_reference_count,
+    slice_values as _slice_values,
+)
 from db.models import MRFFile, MRFPayer, MRFSource, db
 
 DEFAULT_SOURCE_PAGE_SIZE = 100
 MAX_SOURCE_PAGE_SIZE = 250
 DEFAULT_FILE_PAGE_SIZE = 250
 MAX_FILE_PAGE_SIZE = 500
-
 _SOURCE_FIELDS = (
     "source_id",
     "source_key",
@@ -197,16 +205,25 @@ async def list_discovery_source_files_page(
         )
         .where(file_table.c.source_id == normalized_source_id)
     )
-    if cursor:
-        statement = statement.where(file_table.c.mrf_file_id > cursor)
+    cursor_file_id, cursor_plan_offset = _parse_file_cursor(cursor)
+    if cursor_file_id:
+        cursor_comparison = (
+            file_table.c.mrf_file_id >= cursor_file_id
+            if cursor_plan_offset
+            else file_table.c.mrf_file_id > cursor_file_id
+        )
+        statement = statement.where(cursor_comparison)
     file_query_rows = await db.all(
         statement.order_by(file_table.c.mrf_file_id).limit(limit + 1)
     )
-    page_rows, next_cursor = _bounded_rows(
-        file_query_rows, limit=limit, cursor_key="mrf_file_id"
+    page_items, next_cursor = _bounded_file_items(
+        file_query_rows,
+        limit=limit,
+        cursor_plan_offset=cursor_plan_offset,
+        plan_reference_limit=MAX_FILE_PAGE_PLAN_REFERENCES,
     )
     return {
-        "items": [_file_item(file_row) for file_row in page_rows],
+        "items": page_items,
         "next_cursor": next_cursor,
     }
 
@@ -220,6 +237,32 @@ def _bounded_rows(
         return page_rows, None
     final_mapping = _row_mapping(page_rows[-1])
     return page_rows, str(final_mapping.get(cursor_key) or "") or None
+
+
+def _bounded_file_items(
+    file_query_rows: list[Any],
+    *,
+    limit: int,
+    cursor_plan_offset: int,
+    plan_reference_limit: int,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Build a file page bounded by both rows and expanded plan references."""
+
+    plan_windows, next_cursor = bounded_file_windows(
+        [_row_mapping(file_row) for file_row in file_query_rows],
+        limit=limit,
+        cursor_plan_offset=cursor_plan_offset,
+        plan_reference_limit=plan_reference_limit,
+    )
+    return [
+        _file_item(
+            plan_window.file_data,
+            plan_offset=plan_window.plan_offset,
+            plan_limit=plan_window.plan_limit,
+            plan_total=plan_window.plan_total,
+        )
+        for plan_window in plan_windows
+    ], next_cursor
 
 
 def _source_item(source_row: Any) -> dict[str, Any]:
@@ -246,7 +289,15 @@ def _source_item(source_row: Any) -> dict[str, Any]:
     return source_item_dict
 
 
-def _file_item(file_row: Any) -> dict[str, Any]:
+def _file_item(
+    file_row: Any,
+    *,
+    plan_offset: int = 0,
+    plan_limit: int | None = None,
+    plan_total: int | None = None,
+) -> dict[str, Any]:
+    """Normalize one stored file row and its selected plan slice."""
+
     file_data = _row_mapping(file_row)
     file_metadata = _metadata_dict(file_data.get("metadata_json"))
     source_metadata = _metadata_dict(file_data.get("source_metadata_json"))
@@ -264,7 +315,13 @@ def _file_item(file_row: Any) -> dict[str, Any]:
         or ""
     ).strip()
     file_item_dict = {field: file_data.get(field) for field in _FILE_FIELDS}
-    file_item_dict.pop("metadata_json", None)
+    for raw_plan_field in (
+        "metadata_json",
+        "plan_ids",
+        "plan_names",
+        "market_types",
+    ):
+        file_item_dict.pop(raw_plan_field, None)
     file_item_dict.update(
         {
             "canonical_url": canonical_url,
@@ -276,20 +333,52 @@ def _file_item(file_row: Any) -> dict[str, Any]:
             "content_length": file_data.get("size_bytes"),
             "company_name": file_metadata.get("company_name")
             or source_metadata.get("target_payer_query"),
-            "plan_info": _normalized_plan_info(file_data, file_metadata),
-            "metadata": file_metadata,
+            "plan_info": _normalized_plan_info(
+                file_data,
+                file_metadata,
+                offset=plan_offset,
+                limit=plan_limit,
+            ),
+            "plan_chunk_offset": plan_offset,
+            "plan_chunk_total": (
+                _plan_reference_count(file_data)
+                if plan_total is None
+                else plan_total
+            ),
+            "metadata": _file_response_metadata(file_metadata),
         }
     )
     return file_item_dict
 
 
+def _file_response_metadata(
+    file_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Remove raw plan rows already represented by the bounded plan slice."""
+
+    return {
+        metadata_key: metadata_value
+        for metadata_key, metadata_value in file_metadata.items()
+        if metadata_key != "plan_info"
+    }
+
+
 def _normalized_plan_info(
-    file_data: Mapping[str, Any], file_metadata: Mapping[str, Any]
+    file_data: Mapping[str, Any],
+    file_metadata: Mapping[str, Any],
+    *,
+    offset: int = 0,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
     metadata_plans = file_metadata.get("plan_info")
-    plan_rows = [dict(plan) for plan in metadata_plans or () if isinstance(plan, Mapping)]
+    ambiguous_plan_keys = _ambiguous_plan_identity_keys(metadata_plans)
+    plan_rows = [
+        dict(plan)
+        for plan in _slice_values(metadata_plans, offset=offset, limit=limit)
+        if isinstance(plan, Mapping)
+    ]
     if not plan_rows:
-        plan_rows = _column_plan_info(file_data)
+        plan_rows = _column_plan_info(file_data, offset=offset, limit=limit)
     normalized_rows: list[dict[str, Any]] = []
     for plan_row in plan_rows:
         plan_name = str(plan_row.get("plan_name") or "").strip() or None
@@ -300,6 +389,22 @@ def _normalized_plan_info(
             plan_row["plan_id_type"] = "source_file_context_hash"
         if not plan_id or not market_type:
             continue
+        plan_row["plan_id"] = plan_id
+        plan_row["plan_market_type"] = market_type
+        if (
+            plan_name
+            and not any(
+                str(plan_row.get(hash_field) or "").strip()
+                for hash_field in (
+                    "engine_plan_hash",
+                    "plan_hash",
+                    "ptg2_plan_hash",
+                )
+            )
+            and not str(plan_row.get("plan_identity_hint") or "").strip()
+            and _plan_identity_key(plan_row) in ambiguous_plan_keys
+        ):
+            plan_row["plan_identity_hint"] = f"plan_name:{plan_name}"
         normalized_rows.append(
             {
                 **plan_row,
@@ -311,13 +416,19 @@ def _normalized_plan_info(
     return normalized_rows
 
 
-def _column_plan_info(file_data: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _column_plan_info(
+    file_data: Mapping[str, Any],
+    *,
+    offset: int = 0,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
     plan_ids = _text_list(file_data.get("plan_ids"))
     plan_names = _text_list(file_data.get("plan_names"))
     market_types = _text_list(file_data.get("market_types"))
     row_count = max(len(plan_ids), len(plan_names), len(market_types), 0)
     rows: list[dict[str, Any]] = []
-    for index in range(row_count):
+    stop_index = row_count if limit is None else min(row_count, offset + limit)
+    for index in range(offset, stop_index):
         rows.append(
             {
                 "plan_id": _value_at(plan_ids, index),

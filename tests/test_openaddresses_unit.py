@@ -28,7 +28,7 @@ def test_openaddresses_record_uses_us_source_state_and_canonical_keys():
 
     address_record = openaddresses._record_from_feature(
         feature,
-        source="us/tx/austin",
+        source_name="us/tx/austin",
         data_id=10,
         job_id=20,
         updated=1781288662893,
@@ -61,7 +61,7 @@ def test_openaddresses_missing_zip_point_is_staged_for_zip_recovery():
 
     recovery_record, reason = openaddresses._zip_recovery_record_from_feature(
         feature,
-        source="us/tx/austin",
+        source_name="us/tx/austin",
         data_id=10,
         job_id=20,
         updated=1781288662893,
@@ -93,7 +93,7 @@ def test_openaddresses_record_rejects_non_us_coordinates():
     assert (
         openaddresses._record_from_feature(
             feature,
-            source="us/tx/austin",
+            source_name="us/tx/austin",
             data_id=10,
             job_id=20,
             updated=None,
@@ -400,8 +400,8 @@ async def test_openaddresses_sharded_backfill_uses_bounded_concurrency_and_aggre
             relaxed_updates=2,
         )
 
-    monkeypatch.setattr(openaddresses, "_table_exists", fake_table_exists)
-    monkeypatch.setattr(openaddresses, "_table_has_column", fake_table_has_column)
+    monkeypatch.setattr(openaddresses, "_is_table_present", fake_table_exists)
+    monkeypatch.setattr(openaddresses, "_has_table_column", fake_table_has_column)
     monkeypatch.setattr(openaddresses, "_plan_openaddresses_backfill_shards", fake_plan)
     monkeypatch.setattr(openaddresses, "refresh_archive_geocodes_from_openaddresses", fake_refresh)
     monkeypatch.setattr(openaddresses, "enqueue_live_progress", lambda **payload: progress.append(payload))
@@ -437,8 +437,8 @@ async def test_openaddresses_backfill_exact_match_mode_skips_fuzzy_relaxed(monke
             statements.append(stmt)
             return "UPDATE 1" if "UPDATE" in stmt else "CREATE EXTENSION"
 
-    monkeypatch.setattr(openaddresses, "_table_exists", fake_table_exists)
-    monkeypatch.setattr(openaddresses, "_table_has_column", fake_table_has_column)
+    monkeypatch.setattr(openaddresses, "_is_table_present", fake_table_exists)
+    monkeypatch.setattr(openaddresses, "_has_table_column", fake_table_has_column)
     monkeypatch.setattr(openaddresses, "db", FakeDb())
 
     stats = await openaddresses.refresh_archive_geocodes_from_openaddresses(
@@ -665,7 +665,10 @@ async def test_openaddresses_remote_sources_load_in_parallel(monkeypatch):
         max_active = max(max_active, active)
         await asyncio.sleep(0.01)
         active -= 1
-        return kwargs["item"]["source"], 10, 5, 1, {"missing_zip5": 1, "not_point": 4}
+        return kwargs["source_item"]["source"], 10, 5, 1, {
+            "missing_zip5": 1,
+            "not_point": 4,
+        }
 
     monkeypatch.setenv("HLTHPRT_OPENADDRESSES_API_TOKEN", "test-token")
     monkeypatch.setattr(openaddresses, "_fetch_json", fake_fetch_json)
@@ -719,7 +722,10 @@ async def test_openaddresses_remote_tempdir_ignores_cleanup_errors(monkeypatch, 
         return source_entries
 
     async def fake_load_source_item(**kwargs):
-        return kwargs["item"]["source"], 10, 5, 1, {"missing_zip5": 1, "not_point": 4}
+        return kwargs["source_item"]["source"], 10, 5, 1, {
+            "missing_zip5": 1,
+            "not_point": 4,
+        }
 
     monkeypatch.setenv("HLTHPRT_OPENADDRESSES_API_TOKEN", "test-token")
     monkeypatch.setattr(openaddresses.tempfile, "TemporaryDirectory", FakeTemporaryDirectory)
@@ -767,7 +773,10 @@ async def test_openaddresses_remote_test_mode_honors_source_concurrency(monkeypa
         max_active = max(max_active, active)
         await asyncio.sleep(0.01)
         active -= 1
-        return kwargs["item"]["source"], 10, 5, 1, {"missing_zip5": 1, "not_point": 4}
+        return kwargs["source_item"]["source"], 10, 5, 1, {
+            "missing_zip5": 1,
+            "not_point": 4,
+        }
 
     monkeypatch.setenv("HLTHPRT_OPENADDRESSES_API_TOKEN", "test-token")
     monkeypatch.setattr(openaddresses, "_fetch_json", fake_fetch_json)
@@ -852,7 +861,7 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
             return FakeTransaction()
 
     monkeypatch.setattr(openaddresses, "ensure_database", fake_ensure_database)
-    monkeypatch.setattr(openaddresses, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(openaddresses, "_is_table_present", fake_table_exists)
     monkeypatch.setattr(openaddresses, "_create_indexes", fake_create_indexes)
     monkeypatch.setattr(
         openaddresses,
@@ -861,7 +870,7 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
     )
     monkeypatch.setattr(
         openaddresses,
-        "restore_openaddresses_zip5_from_tiger_zcta",
+        "restore_openaddresses_zips",
         fake_restore_zip5_from_tiger,
     )
     monkeypatch.setattr(openaddresses, "db", FakeDb())
@@ -893,7 +902,7 @@ async def test_openaddresses_shutdown_is_idempotent_after_stage_publish(monkeypa
         return table_name == openaddresses.OpenAddressesGeocode.__main_table__
 
     monkeypatch.setattr(openaddresses, "ensure_database", fake_ensure_database)
-    monkeypatch.setattr(openaddresses, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(openaddresses, "_is_table_present", fake_table_exists)
 
     await openaddresses.shutdown(
         {
