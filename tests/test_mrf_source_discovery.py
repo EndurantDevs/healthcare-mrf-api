@@ -167,10 +167,12 @@ def test_source_urls_are_loaded_from_registry_file():
     assert config["platform_resolvers"]["sapphire"]["type"] == "sapphire_html_tocs"
     assert config["platform_resolvers"]["sapphire"]["max_static_queries"] == 8
     assert config["platform_resolvers"]["anthem_s3_mrf"]["type"] == "anthem_s3_mrf"
-    assert (
-        config["platform_resolvers"]["kaiser_hawaii_monthly_toc"]["type"]
-        == "monthly_toc_templates"
+    assert config["platform_resolvers"]["kaiser_mrf_inventory"]["type"] == (
+        "kaiser_monthly_inventory"
     )
+    assert config["platform_resolvers"]["kaiser_hawaii_mrf_inventory"][
+        "region_codes"
+    ] == ["hi"]
     assert (
         config["platform_resolvers"]["hcsc_asomrf_landing"]["type"]
         == "hcsc_asomrf_landing"
@@ -431,7 +433,14 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
         discovery.classify_hosting_platform(
             "https://healthy.kaiserpermanente.org/hawaii/front-door/machine-readable"
         )
-        == "kaiser_hawaii_monthly_toc"
+        == "kaiser_hawaii_mrf_inventory"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://healthy.kaiserpermanente.org/"
+            "northern-california/front-door/machine-readable"
+        )
+        == "kaiser_mrf_inventory"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -7431,7 +7440,7 @@ async def test_mymedicalshopper_entity_employers_searches_target_query(monkeypat
 
     employers = await discovery._mymedicalshopper_entity_employers(
         object(),
-        source=source_dict,
+        source_record=source_dict,
         entity_slug="example-tpa",
         resolver={"page_size": 20},
         timeout_seconds=5,
@@ -7491,7 +7500,7 @@ async def test_mms_primary_search_query_passes_local_filter(monkeypatch):
 
     employers = await discovery._mymedicalshopper_entity_employers(
         object(),
-        source={
+        source_record={
             "metadata_json": {
                 "raw": {
                     "target_payer_query": "Example Packaging",
@@ -7612,7 +7621,7 @@ async def test_mms_query_fallback_filters_employers(monkeypatch):
 
     employers = await discovery._mymedicalshopper_entity_employers(
         object(),
-        source=source_payload_dict,
+        source_record=source_payload_dict,
         entity_slug="example-tpa",
         resolver={
             "page_size": 2,
@@ -7673,9 +7682,9 @@ async def test_mymedicalshopper_resolver_honors_max_targets(monkeypatch):
         return FakeWS()
 
     async def fake_entity_employers(
-        _ws, *, source, entity_slug, resolver, timeout_seconds
+        _ws, *, source_record, entity_slug, resolver, timeout_seconds
     ):
-        assert source["source_id"] == "source_bywater"
+        assert source_record["source_id"] == "source_bywater"
         assert entity_slug == "bywater"
         assert timeout_seconds == 30
         assert resolver["max_targets"] == 2
@@ -10988,7 +10997,7 @@ def test_webtpa_record_target_preserves_plan_metadata():
     crawl_target = discovery._webtpa_record_target(
         source_dict,
         plan={"mrfBenefitplanId": 239, "benefitplanNm": "Example Plan"},
-        record={
+        file_record={
             "mrfInNetworkRatesId": 32120,
             "fileName": "Preferred PPO",
             "type": "link",
@@ -11984,33 +11993,104 @@ def test_monthly_toc_templates_generate_current_and_previous_month_targets():
     assert targets[0].metadata["month_start"] == "2026-06-01"
 
 
-def test_kaiser_hawaii_monthly_toc_uses_official_regional_indexes():
+def test_kaiser_inventory_parses_tocs_rate_files_and_allowed_amounts():
     source_by_field = {
         "source_id": "source_1",
         "payer_id": "payer_1",
-        "display_name": "Kaiser Foundation Health Plan of Hawaii",
+        "display_name": "Kaiser Permanente",
     }
-    resolver = discovery._source_config()["platform_resolvers"][
-        "kaiser_hawaii_monthly_toc"
-    ]
-
-    targets = discovery._monthly_toc_targets(
+    resolver = discovery._source_config()["platform_resolvers"]["kaiser_mrf_inventory"]
+    in_network_targets = discovery._kaiser_inventory_targets_from_text(
         source_by_field,
-        "https://healthy.kaiserpermanente.org/hawaii/front-door/machine-readable",
-        resolver,
-        now=discovery.dt.datetime(2026, 7, 13, 12, 0, 0),
+        "\n".join(
+            [
+                "/hi/2026-07-01_KFHP-HI_index.json 26574",
+                "/hi/2026-07-01_NEW_HI-COMMERCIAL-01_in-network-rates.zip 650894695",
+                "/externaldata/ash/2026-07-01_ASH_KFHP-HI_in-network-rates.json 433813",
+            ]
+        ),
+        inventory_url=(
+            "https://healthy.kaiserpermanente.org/pricing/"
+            "innetwork/2026-07_List.txt"
+        ),
+        inventory_month="2026-07",
+        category="innetwork",
+        resolver=resolver,
+    )
+    allowed_targets = discovery._kaiser_inventory_targets_from_text(
+        source_by_field,
+        "/hi/2026-07-01_KFHP_HI-40513_allowed-amounts.zip 6131",
+        inventory_url=(
+            "https://healthy.kaiserpermanente.org/pricing/"
+            "outofnetwork/2026-07_List.txt"
+        ),
+        inventory_month="2026-07",
+        category="outofnetwork",
+        resolver=resolver,
     )
 
-    assert [target.url for target in targets] == [
-        "https://healthy.kaiserpermanente.org/pricing/innetwork/hi/"
-        "2026-07-01_KFHP-HI_index.json",
-        "https://healthy.kaiserpermanente.org/pricing/innetwork/hi/"
-        "2026-06-01_KFHP-HI_index.json",
+    assert [target.metadata["target_file_type"] for target in in_network_targets] == [
+        "table-of-contents",
+        "in-network",
     ]
+    assert in_network_targets[0].metadata["target_kind"] == "toc_json"
+    assert in_network_targets[0].metadata["size_bytes"] == 26574
+    assert in_network_targets[1].metadata["container_format"] == "zip"
     assert all(
-        target.metadata["target_file_type"] == "table-of-contents"
-        for target in targets
+        target.metadata["kaiser_region_code"] == "hi"
+        for target in in_network_targets + allowed_targets
     )
+    assert allowed_targets[0].metadata["target_file_type"] == "allowed-amounts"
+    assert allowed_targets[0].url.endswith("KFHP_HI-40513_allowed-amounts.zip")
+
+
+@pytest.mark.asyncio
+async def test_kaiser_inventory_uses_previous_month_per_missing_category(monkeypatch):
+    source_by_field = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Kaiser Permanente",
+    }
+    resolver = {
+        **discovery._source_config()["platform_resolvers"]["kaiser_mrf_inventory"],
+        "month_offsets": [0, -1],
+    }
+    response_by_url = {
+        (
+            "https://healthy.kaiserpermanente.org/pricing/"
+            "innetwork/2026-07_List.txt"
+        ): "/hi/2026-07-01_KFHP-HI_index.json 26574",
+        (
+            "https://healthy.kaiserpermanente.org/pricing/"
+            "outofnetwork/2026-07_List.txt"
+        ): "<html>not found</html>",
+        (
+            "https://healthy.kaiserpermanente.org/pricing/"
+            "outofnetwork/2026-06_List.txt"
+        ): "/hi/2026-06-01_KFHP_HI-40513_allowed-amounts.zip 6131",
+    }
+
+    async def fake_fetch_text(url, **_kwargs):
+        return response_by_url.get(url, "")
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(
+        discovery,
+        "_utc_now",
+        lambda: discovery.dt.datetime(2026, 7, 16, 12, 0, 0),
+    )
+
+    targets = await discovery._resolve_kaiser_monthly_inventory(
+        source_by_field,
+        "https://healthy.kaiserpermanente.org/front-door/machine-readable",
+        resolver,
+        None,
+    )
+
+    assert [target.metadata["inventory_month"] for target in targets] == [
+        "2026-07",
+        "2026-06",
+    ]
 
 
 def test_bcbsmn_monthly_toc_template_generates_public_index_targets():
