@@ -56,7 +56,7 @@ def test_manual_promotion_rejects_published_snapshot_rollback(monkeypatch):
     publish.assert_awaited_once()
 
 
-@pytest.mark.parametrize("snapshot_status", ["pending", "running", "building", "validated"])
+@pytest.mark.parametrize("snapshot_status", ["pending", "running", "building"])
 def test_manual_removal_rejects_in_flight_snapshot(monkeypatch, snapshot_status):
     monkeypatch.setattr(
         source_snapshot_control,
@@ -93,6 +93,51 @@ def test_manual_removal_rejects_in_flight_snapshot(monkeypatch, snapshot_status)
 
     assert removal_plan["removable"] is False
     assert removal_plan["reason"] == f"snapshot is in-flight (status: {snapshot_status})"
+
+
+def test_manual_removal_allows_unreferenced_validated_candidate(monkeypatch):
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_snapshot_row",
+        AsyncMock(
+            return_value={
+                "snapshot_id": "snap_validated",
+                "status": "validated",
+                "manifest": {"serving_index": {
+                    "source_key": "source_a",
+                    "arch_version": "postgres_binary_v3",
+                    "storage_generation": "shared_blocks_v3",
+                }},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_current_references",
+        AsyncMock(return_value={
+            "global_slots": [],
+            "source_keys": [],
+            "plan_source_keys": [],
+            "previous_global_slots": [],
+            "previous_source_keys": [],
+            "previous_plan_source_keys": [],
+        }),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_artifact_manifest_ids",
+        AsyncMock(return_value=[]),
+    )
+
+    removal_plan = asyncio.run(
+        source_snapshot_control.build_ptg2_source_snapshot_remove_plan(
+            snapshot_id="snap_validated",
+            source_key="source_a",
+        )
+    )
+
+    assert removal_plan["removable"] is True
+    assert removal_plan["reason"] is None
 
 
 def test_manual_removal_rejects_previous_pointer_reference(monkeypatch):

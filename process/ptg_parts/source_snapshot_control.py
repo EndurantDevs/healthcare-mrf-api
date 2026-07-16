@@ -27,6 +27,16 @@ class SourceSnapshotConflict(ValueError):
     """Raised when a source snapshot pointer changed between plan and execute."""
 
 
+def _is_remove_blocked(snapshot_status: Any) -> bool:
+    """Allow explicit cleanup of validated candidates while builds stay protected."""
+
+    normalized_status = str(snapshot_status or "").strip().lower()
+    return (
+        _is_ptg2_snapshot_in_flight(normalized_status)
+        and normalized_status != "validated"
+    )
+
+
 class _TransactionExecutor:
     """Expose the current SQLAlchemy transaction through the shared-GC interface."""
 
@@ -86,7 +96,7 @@ def _snapshot_remove_reasons(
     reasons: list[str] = []
     if source_key and manifest_source_key and source_key != manifest_source_key:
         reasons.append("snapshot source_key does not match requested source_key")
-    if _is_ptg2_snapshot_in_flight(snapshot_status):
+    if _is_remove_blocked(snapshot_status):
         reasons.append(f"snapshot is in-flight (status: {snapshot_status})")
     label_by_reference_name = {
         "global_slots": "current global",
