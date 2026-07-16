@@ -34,31 +34,31 @@ def _normalize_filter_values(values: list[str] | None) -> list[str]:
 
 
 def _dedupe_preserve(seq: list[str]) -> list[str]:
-    seen = set()
-    out = []
+    seen_values_set = set()
+    deduped_values = []
     for item in seq:
-        if item in seen:
+        if item in seen_values_set:
             continue
-        seen.add(item)
-        out.append(item)
-    return out
+        seen_values_set.add(item)
+        deduped_values.append(item)
+    return deduped_values
 
 
 def _dedupe_rows_by(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
     if len(rows) < 2:
         return rows
-    seen: dict[Any, dict[str, Any]] = {}
-    missing: list[dict[str, Any]] = []
+    rows_by_value: dict[Any, dict[str, Any]] = {}
+    rows_without_keys: list[dict[str, Any]] = []
     for row in rows:
         value = row.get(key)
         if value is None:
-            missing.append(row)
+            rows_without_keys.append(row)
         else:
-            seen[value] = row
-    return list(seen.values()) + missing
+            rows_by_value[value] = row
+    return list(rows_by_value.values()) + rows_without_keys
 
 
-def _plan_matches_filters(
+def _is_plan_matching_filters(
     plan: dict[str, Any],
     plan_ids: list[str] | None = None,
     plan_name_contains: list[str] | None = None,
@@ -96,6 +96,9 @@ def _plan_matches_filters(
     return True
 
 
+_plan_matches_filters = _is_plan_matching_filters
+
+
 def _filter_reporting_plans(
     plans: list[dict[str, Any]],
     plan_ids: list[str] | None = None,
@@ -108,16 +111,26 @@ def _filter_reporting_plans(
     return [
         plan
         for plan in plans
-        if _plan_matches_filters(plan, plan_ids, plan_name_contains, plan_market_types)
+        if _is_plan_matching_filters(
+            plan,
+            plan_ids,
+            plan_name_contains,
+            plan_market_types,
+        )
         and (plan_predicate is None or plan_predicate(plan))
     ]
 
 
 def _normalize_plan_payload(plan: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(plan or {})
-    if "plan_sponsor_name" not in normalized and normalized.get("plan_sponser_name"):
-        normalized["plan_sponsor_name"] = normalized.get("plan_sponser_name")
-    return normalized
+    normalized_plan_by_field = dict(plan or {})
+    if (
+        "plan_sponsor_name" not in normalized_plan_by_field
+        and normalized_plan_by_field.get("plan_sponser_name")
+    ):
+        normalized_plan_by_field["plan_sponsor_name"] = normalized_plan_by_field.get(
+            "plan_sponser_name"
+        )
+    return normalized_plan_by_field
 
 
 def _is_provider_directory_index_payload(payload: dict[str, Any]) -> bool:
@@ -156,7 +169,7 @@ def parse_toc_catalog_entries(
     """Return filtered PTG source catalog entries parsed from a TOC payload."""
     if _is_provider_directory_index_payload(toc_content):
         return []
-    toc_meta = {
+    toc_metadata_by_field = {
         "reporting_entity_name": toc_content.get("reporting_entity_name"),
         "reporting_entity_type": toc_content.get("reporting_entity_type"),
         "last_updated_on": toc_content.get("last_updated_on"),
@@ -169,8 +182,8 @@ def parse_toc_catalog_entries(
             original_url=toc_url,
             canonical_url=canonicalize_url(toc_url),
             description=toc_content.get("description"),
-            reporting_entity_name=toc_meta["reporting_entity_name"],
-            reporting_entity_type=toc_meta["reporting_entity_type"],
+            reporting_entity_name=toc_metadata_by_field["reporting_entity_name"],
+            reporting_entity_type=toc_metadata_by_field["reporting_entity_type"],
             plan_info=(),
         )
     ]
@@ -178,13 +191,19 @@ def parse_toc_catalog_entries(
         healthsparq_catalog_entries(
             toc_content,
             toc_url,
-            toc_meta,
+            toc_metadata_by_field,
             plan_ids=plan_ids,
             plan_name_contains=plan_name_contains,
             plan_market_types=plan_market_types,
         )
     )
-    entries.extend(flat_toc_catalog_entries(toc_content, toc_url, toc_meta))
+    entries.extend(
+        flat_toc_catalog_entries(
+            toc_content,
+            toc_url,
+            toc_metadata_by_field,
+        )
+    )
     for structure in toc_content.get("reporting_structure", []) or []:
         plans = [
             _normalize_plan_payload(plan)
@@ -199,7 +218,7 @@ def parse_toc_catalog_entries(
         )
         if not plans:
             continue
-        plan_tuple = tuple(plans)
+        reporting_plans = tuple(plans)
         for file_entry in _as_list(structure.get("in_network_files")):
             if not isinstance(file_entry, dict):
                 continue
@@ -217,9 +236,13 @@ def parse_toc_catalog_entries(
                         canonical_url=canonicalize_url(location),
                         from_index_url=toc_url,
                         description=file_entry.get("description"),
-                        reporting_entity_name=toc_meta["reporting_entity_name"],
-                        reporting_entity_type=toc_meta["reporting_entity_type"],
-                        plan_info=plan_tuple,
+                        reporting_entity_name=toc_metadata_by_field[
+                            "reporting_entity_name"
+                        ],
+                        reporting_entity_type=toc_metadata_by_field[
+                            "reporting_entity_type"
+                        ],
+                        plan_info=reporting_plans,
                     )
                 )
         allowed_amount_files = _as_list(structure.get("allowed_amount_file")) + _as_list(
@@ -246,9 +269,13 @@ def parse_toc_catalog_entries(
                     canonical_url=canonicalize_url(location),
                     from_index_url=toc_url,
                     description=allowed_amount_file.get("description"),
-                    reporting_entity_name=toc_meta["reporting_entity_name"],
-                    reporting_entity_type=toc_meta["reporting_entity_type"],
-                    plan_info=plan_tuple,
+                    reporting_entity_name=toc_metadata_by_field[
+                        "reporting_entity_name"
+                    ],
+                    reporting_entity_type=toc_metadata_by_field[
+                        "reporting_entity_type"
+                    ],
+                    plan_info=reporting_plans,
                 )
             )
         for drug_key in (
@@ -278,9 +305,13 @@ def parse_toc_catalog_entries(
                             canonical_url=canonicalize_url(location),
                             from_index_url=toc_url,
                             description=drug_entry.get("description"),
-                            reporting_entity_name=toc_meta["reporting_entity_name"],
-                            reporting_entity_type=toc_meta["reporting_entity_type"],
-                            plan_info=plan_tuple,
+                            reporting_entity_name=toc_metadata_by_field[
+                                "reporting_entity_name"
+                            ],
+                            reporting_entity_type=toc_metadata_by_field[
+                                "reporting_entity_type"
+                            ],
+                            plan_info=reporting_plans,
                         )
                     )
     return _merge_duplicate_catalog_entries(entries)
@@ -297,17 +328,23 @@ def _load_toc_urls_from_file(path: str) -> list[str]:
         return urls
     if text_strip.startswith("["):
         try:
-            data = json.loads(text_strip)
-            if isinstance(data, list):
-                for entry in data:
+            parsed_content = json.loads(text_strip)
+            if isinstance(parsed_content, list):
+                for entry in parsed_content:
                     if isinstance(entry, str) and entry.strip():
                         urls.append(entry.strip())
-            elif isinstance(data, dict):
-                for entry in data.values():
+            elif isinstance(parsed_content, dict):
+                for entry in parsed_content.values():
                     if isinstance(entry, str) and entry.strip():
                         urls.append(entry.strip())
                     elif isinstance(entry, list):
-                        urls.extend([str(v).strip() for v in entry if str(v).strip()])
+                        urls.extend(
+                            [
+                                str(toc_url_value).strip()
+                                for toc_url_value in entry
+                                if str(toc_url_value).strip()
+                            ]
+                        )
         except json.JSONDecodeError:
             return urls
     else:
@@ -326,7 +363,7 @@ def _filter_jobs_by_url_contains(
     ]
     if not needles:
         return jobs
-    filtered: list[dict[str, Any]] = []
+    filtered_jobs: list[dict[str, Any]] = []
     for job in jobs:
         haystack = " ".join(
             str(value or "")
@@ -336,8 +373,8 @@ def _filter_jobs_by_url_contains(
             )
         ).lower()
         if any(needle in haystack for needle in needles):
-            filtered.append(job)
-    return filtered
+            filtered_jobs.append(job)
+    return filtered_jobs
 
 
 def _ptg_job_identity(job: dict[str, Any]) -> tuple[str, str]:
@@ -374,15 +411,20 @@ def _merge_ptg_job(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
 
 
 def _dedupe_ptg_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    deduped: dict[tuple[str, str], dict[str, Any]] = {}
+    jobs_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
     duplicate_count = 0
     for job in jobs:
         identity = _ptg_job_identity(job)
-        normalized_job = dict(job)
-        normalized_job["url"] = normalize_tic_source_url(str(job.get("url") or ""))
-        if identity in deduped:
+        normalized_job_by_field = dict(job)
+        normalized_job_by_field["url"] = normalize_tic_source_url(
+            str(job.get("url") or "")
+        )
+        if identity in jobs_by_identity:
             duplicate_count += 1
-            _merge_ptg_job(deduped[identity], normalized_job)
+            _merge_ptg_job(
+                jobs_by_identity[identity],
+                normalized_job_by_field,
+            )
             continue
-        deduped[identity] = normalized_job
-    return list(deduped.values()), duplicate_count
+        jobs_by_identity[identity] = normalized_job_by_field
+    return list(jobs_by_identity.values()), duplicate_count

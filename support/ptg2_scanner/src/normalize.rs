@@ -469,15 +469,30 @@ pub fn canonical_text_list(values: Vec<String>, uppercase: bool) -> Vec<String> 
     out
 }
 
+pub fn canonical_modifier_list(values: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        for modifier in value.split(',') {
+            let trimmed = modifier.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_uppercase());
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_text_list, int_list, normalize_catalog_code, normalize_code,
-        normalize_code_system, normalize_money_text, normalize_string, normalize_tin_type,
-        normalize_tin_value, normalized_money_from_reader, normalized_scalar_from_reader,
-        normalized_string_list_from_reader, npi_list, strict_integer, strict_integer_text,
-        strict_money_number_from_reader, strict_npi_list, strict_npi_partition,
-        strict_string_array_from_reader, StrictNpiList,
+        canonical_modifier_list, canonical_text_list, int_list, normalize_catalog_code,
+        normalize_code, normalize_code_system, normalize_money_text, normalize_string,
+        normalize_tin_type, normalize_tin_value, normalized_money_from_reader,
+        normalized_scalar_from_reader, normalized_string_list_from_reader, npi_list,
+        strict_integer, strict_integer_text, strict_money_number_from_reader, strict_npi_list,
+        strict_npi_partition, strict_string_array_from_reader, StrictNpiList,
     };
     use serde_json::json;
     use struson::reader::JsonStreamReader;
@@ -714,6 +729,18 @@ mod tests {
                 false
             ),
             vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn canonical_modifier_lists_split_payer_joined_values() {
+        assert_eq!(
+            canonical_modifier_list(vec![
+                " tc, 26 ".to_string(),
+                "26".to_string(),
+                ",,".to_string(),
+            ]),
+            vec!["26".to_string(), "TC".to_string()]
         );
     }
 }

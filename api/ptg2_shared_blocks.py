@@ -202,11 +202,15 @@ class SharedBlockPayload:
     payload: bytes
 
 
-def _validated_payload(row: Mapping[str, Any], *, expected_kind: str) -> SharedBlockPayload:
-    object_kind = str(row.get("object_kind") or "")
-    codec = str(row.get("codec") or "")
-    format_version = int(row.get("format_version") or 0)
-    stored_payload = bytes(row.get("payload") or b"")
+def _validated_payload(
+    block_row: Mapping[str, Any],
+    *,
+    expected_kind: str,
+) -> SharedBlockPayload:
+    object_kind = str(block_row.get("object_kind") or "")
+    codec = str(block_row.get("codec") or "")
+    format_version = int(block_row.get("format_version") or 0)
+    stored_payload = bytes(block_row.get("payload") or b"")
     if format_version != PTG2_V3_SHARED_FORMAT_VERSION:
         raise PTG2SharedBlockError(
             "shared PTG block has an unsupported format version"
@@ -220,10 +224,13 @@ def _validated_payload(row: Mapping[str, Any], *, expected_kind: str) -> SharedB
         )
     except ValueError as exc:
         raise PTG2SharedBlockError(str(exc)) from exc
-    if object_kind != expected_kind or bytes(row.get("block_hash") or b"") != expected_hash:
+    if (
+        object_kind != expected_kind
+        or bytes(block_row.get("block_hash") or b"") != expected_hash
+    ):
         raise PTG2SharedBlockError("shared PTG block identity validation failed")
-    mapping_entry_count = int(row.get("mapping_entry_count") or 0)
-    block_entry_value = row.get("block_entry_count")
+    mapping_entry_count = int(block_row.get("mapping_entry_count") or 0)
+    block_entry_value = block_row.get("block_entry_count")
     if (
         mapping_entry_count < 0
         or (
@@ -235,11 +242,11 @@ def _validated_payload(row: Mapping[str, Any], *, expected_kind: str) -> SharedB
     raw_payload = decode_shared_block_payload(
         codec=codec,
         payload=stored_payload,
-        raw_byte_count=int(row.get("raw_byte_count") or 0),
+        raw_byte_count=int(block_row.get("raw_byte_count") or 0),
     )
     return SharedBlockPayload(
-        block_key=int(row.get("block_key") or 0),
-        fragment_no=int(row.get("fragment_no") or 0),
+        block_key=int(block_row.get("block_key") or 0),
+        fragment_no=int(block_row.get("fragment_no") or 0),
         entry_count=mapping_entry_count,
         payload=raw_payload,
     )
@@ -323,7 +330,7 @@ async def stream_shared_blocks(
              ORDER BY mapping.block_key, mapping.fragment_no
             """
     )
-    params = {
+    query_params_by_name = {
         "snapshot_key": int(snapshot_key),
         "generation": PTG2_V3_SHARED_GENERATION,
         "object_kind": str(object_kind),
@@ -331,32 +338,35 @@ async def stream_shared_blocks(
         "fragment_nos": requested_fragments,
     }
     stream = getattr(session, "stream", None)
-    result = (
-        await stream(statement, params)
+    query_result = (
+        await stream(statement, query_params_by_name)
         if callable(stream)
-        else await session.execute(statement, params)
+        else await session.execute(statement, query_params_by_name)
     )
     observed_keys: set[int] = set()
     observed_fragments_by_key: dict[int, set[int]] = {}
     previous_mapping_key: tuple[int, int] | None = None
 
     async def _validated_rows():
-        if hasattr(result, "__aiter__"):
-            async for raw_row in result:
+        if hasattr(query_result, "__aiter__"):
+            async for raw_row in query_result:
                 yield raw_row
             return
-        for raw_row in result:
+        for raw_row in query_result:
             yield raw_row
 
     async for raw_row in _validated_rows():
-        payload = _validated_payload(_row_mapping(raw_row), expected_kind=str(object_kind))
-        mapping_key = (payload.block_key, payload.fragment_no)
+        block_payload = _validated_payload(
+            _row_mapping(raw_row),
+            expected_kind=str(object_kind),
+        )
+        mapping_key = (block_payload.block_key, block_payload.fragment_no)
         if (
-            payload.block_key not in requested_keys
-            or payload.fragment_no < 0
+            block_payload.block_key not in requested_keys
+            or block_payload.fragment_no < 0
             or (
                 fragment_nos is not None
-                and payload.fragment_no not in requested_fragments
+                and block_payload.fragment_no not in requested_fragments
             )
             or (
                 previous_mapping_key is not None
@@ -367,11 +377,11 @@ async def stream_shared_blocks(
                 "shared PTG query returned an unexpected or unordered fragment"
             )
         previous_mapping_key = mapping_key
-        observed_keys.add(payload.block_key)
-        observed_fragments_by_key.setdefault(payload.block_key, set()).add(
-            payload.fragment_no
+        observed_keys.add(block_payload.block_key)
+        observed_fragments_by_key.setdefault(block_payload.block_key, set()).add(
+            block_payload.fragment_no
         )
-        yield payload
+        yield block_payload
 
     if require_all:
         missing_keys = sorted(set(requested_keys) - observed_keys)
@@ -409,7 +419,7 @@ async def fetch_snapshot_source_set_metadata(
     if not snapshot_id:
         raise PTG2SharedBlockError("shared PTG logical snapshot id is missing")
     schema = _quote_ident(schema_name)
-    result = await session.execute(
+    query_result = await session.execute(
         text(
             f"""
             SELECT source_key, raw_container_sha256
@@ -424,17 +434,21 @@ async def fetch_snapshot_source_set_metadata(
             "row_limit": source_count + 1,
         },
     )
-    rows = [_row_mapping(row) for row in result]
+    metadata_rows = [
+        _row_mapping(metadata_row) for metadata_row in query_result
+    ]
     if (
-        len(rows) != source_count
-        or [row.get("source_key") for row in rows] != list(range(source_count))
+        len(metadata_rows) != source_count
+        or [metadata_row.get("source_key") for metadata_row in metadata_rows]
+        != list(range(source_count))
     ):
         raise PTG2SharedBlockError(
             "shared PTG source metadata is not complete and dense"
         )
     try:
         return shared_source_set_metadata(
-            row.get("raw_container_sha256") for row in rows
+            metadata_row.get("raw_container_sha256")
+            for metadata_row in metadata_rows
         )
     except ValueError as exc:
         raise PTG2SharedBlockError(
@@ -465,7 +479,7 @@ async def fetch_snapshot_source_provenance(
     if not snapshot_id:
         raise PTG2SharedBlockError("shared PTG logical snapshot id is missing")
     schema = _quote_ident(schema_name)
-    result = await session.execute(
+    query_result = await session.execute(
         text(
             f"""
             WITH source_summary AS MATERIALIZED (
@@ -530,13 +544,13 @@ async def fetch_snapshot_source_provenance(
         },
     )
     provenance_by_key: dict[int, dict[str, Any]] = {}
-    for raw_row in result:
-        row = _row_mapping(raw_row)
-        minimum_source_key = row.get("minimum_source_key")
-        maximum_source_key = row.get("maximum_source_key")
+    for raw_row in query_result:
+        provenance_row = _row_mapping(raw_row)
+        minimum_source_key = provenance_row.get("minimum_source_key")
+        maximum_source_key = provenance_row.get("maximum_source_key")
         if (
-            int(row.get("source_count") or 0) != source_count
-            or int(row.get("distinct_source_count") or 0) != source_count
+            int(provenance_row.get("source_count") or 0) != source_count
+            or int(provenance_row.get("distinct_source_count") or 0) != source_count
             or minimum_source_key is None
             or int(minimum_source_key) != 0
             or maximum_source_key is None
@@ -545,28 +559,28 @@ async def fetch_snapshot_source_provenance(
             raise PTG2SharedBlockError(
                 "shared PTG source metadata is not complete and dense"
             )
-        source_key = int(row.get("source_key"))
-        identity_sha256 = str(row.get("identity_sha256") or "")
-        raw_sha256 = str(row.get("raw_container_sha256") or "")
-        logical_sha256 = row.get("logical_json_sha256")
+        source_key = int(provenance_row.get("source_key"))
+        identity_sha256 = str(provenance_row.get("identity_sha256") or "")
+        raw_sha256 = str(provenance_row.get("raw_container_sha256") or "")
+        logical_sha256 = provenance_row.get("logical_json_sha256")
         logical_sha256 = str(logical_sha256) if logical_sha256 is not None else None
-        trace_set_hash = str(row.get("source_trace_set_hash") or "")
-        deferred = bool(row.get("logical_hash_deferred"))
+        trace_set_hash = str(provenance_row.get("source_trace_set_hash") or "")
+        deferred = bool(provenance_row.get("logical_hash_deferred"))
         if (
-            not str(row.get("source_type") or "").strip()
-            or not str(row.get("identity_kind") or "").strip()
+            not str(provenance_row.get("source_type") or "").strip()
+            or not str(provenance_row.get("identity_kind") or "").strip()
             or not _SHA256_RE.fullmatch(identity_sha256)
             or not _SHA256_RE.fullmatch(raw_sha256)
             or not _SHA256_RE.fullmatch(trace_set_hash)
             or (deferred and logical_sha256 is not None)
             or (not deferred and not _SHA256_RE.fullmatch(logical_sha256 or ""))
-            or int(row.get("resolved_trace_count") or 0)
-            != int(row.get("trace_hash_count") or 0)
+            or int(provenance_row.get("resolved_trace_count") or 0)
+            != int(provenance_row.get("trace_hash_count") or 0)
         ):
             raise PTG2SharedBlockError(
                 "shared PTG source identity or trace mapping is invalid"
             )
-        source_trace = row.get("source_trace")
+        source_trace = provenance_row.get("source_trace")
         if isinstance(source_trace, str):
             try:
                 source_trace = json.loads(source_trace)
@@ -586,8 +600,8 @@ async def fetch_snapshot_source_provenance(
             )
         provenance_by_key[source_key] = {
             "source_key": source_key,
-            "source_type": str(row["source_type"]),
-            "identity_kind": str(row["identity_kind"]),
+            "source_type": str(provenance_row["source_type"]),
+            "identity_kind": str(provenance_row["identity_kind"]),
             "identity_sha256": identity_sha256,
             "raw_container_sha256": raw_sha256,
             "logical_json_sha256": logical_sha256,
@@ -631,7 +645,7 @@ async def fetch_shared_graph_members(
             raise ValueError("shared PTG graph max_members must be non-negative")
         member_count_sql = "LEAST(owner.member_count, :max_members)"
     schema = _quote_ident(schema_name)
-    query_params = {
+    graph_params_by_name = {
         "snapshot_key": int(snapshot_key),
         "generation": PTG2_V3_SHARED_GENERATION,
         "direction": int(direction),
@@ -641,8 +655,8 @@ async def fetch_shared_graph_members(
         "chunk_bytes": PTG2_V3_GRAPH_CHUNK_BYTES,
     }
     if normalized_max_members is not None:
-        query_params["max_members"] = normalized_max_members
-    result = await session.execute(
+        graph_params_by_name["max_members"] = normalized_max_members
+    query_result = await session.execute(
         text(
             f"""
             SELECT owner.owner_key, owner.first_chunk, owner.member_offset,
@@ -677,17 +691,22 @@ async def fetch_shared_graph_members(
              ORDER BY owner.owner_key, mapping.block_key, mapping.fragment_no
             """
         ),
-        query_params,
+        graph_params_by_name,
     )
     locator_by_owner: dict[int, tuple[int, int, int]] = {}
     chunks_by_owner: dict[int, list[SharedBlockPayload]] = {}
-    for raw_row in result:
-        row = _row_mapping(raw_row)
-        owner_key = int(row["owner_key"])
+    for raw_row in query_result:
+        graph_row = _row_mapping(raw_row)
+        owner_key = int(graph_row["owner_key"])
         locator = (
-            int(row["member_offset"]),
-            int(row["member_count"]),
-            int(row.get("selected_member_count", row["member_count"])),
+            int(graph_row["member_offset"]),
+            int(graph_row["member_count"]),
+            int(
+                graph_row.get(
+                    "selected_member_count",
+                    graph_row["member_count"],
+                )
+            ),
         )
         if locator[1] < 0 or locator[2] < 0 or locator[2] > locator[1]:
             raise PTG2SharedBlockError(
@@ -697,7 +716,7 @@ async def fetch_shared_graph_members(
         if previous_locator != locator:
             raise PTG2SharedBlockError("shared PTG graph owner locator changed within one query")
         chunks_by_owner.setdefault(owner_key, []).append(
-            _validated_payload(row, expected_kind=object_kind)
+            _validated_payload(graph_row, expected_kind=object_kind)
         )
 
     members_by_owner: dict[int, tuple[int, ...]] = {}

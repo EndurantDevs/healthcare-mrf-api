@@ -382,7 +382,9 @@ def _append_resolved_code_filter(
             )
             """
         )
-    internal_codes = [int(value) for value in code_context.get("internal_codes") or []]
+    internal_codes = [
+        int(code_value) for code_value in code_context.get("internal_codes") or []
+    ]
     if internal_codes:
         internal_placeholders = []
         for idx, internal_code in enumerate(internal_codes):

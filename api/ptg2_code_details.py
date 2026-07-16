@@ -20,22 +20,32 @@ from api.ptg2_serving_utils import _row_mapping
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
 
 
-async def _enrich_ptg2_code_details(session, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+async def _enrich_ptg2_code_details(
+    session,
+    response_payload: dict[str, Any],
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Attach requested code-catalog details to a PTG pricing response."""
 
     if not _request_bool(args.get("include_code_details")):
-        return payload
+        return response_payload
 
     lookup_keys: set[tuple[str, str]] = set()
-    items = [dict(item) for item in payload.get("items", [])]
-    for item in items:
+    response_items = [
+        dict(response_item) for response_item in response_payload.get("items", [])
+    ]
+    for response_item in response_items:
         billing_key = _catalog_key(
-            item.get("reported_code_system") or item.get("billing_code_type") or item.get("service_code_system"),
-            item.get("reported_code") or item.get("billing_code") or item.get("service_code"),
+            response_item.get("reported_code_system")
+            or response_item.get("billing_code_type")
+            or response_item.get("service_code_system"),
+            response_item.get("reported_code")
+            or response_item.get("billing_code")
+            or response_item.get("service_code"),
         )
         if billing_key:
             lookup_keys.add(billing_key)
-        for price in item.get("prices") or []:
+        for price in response_item.get("prices") or []:
             for service_code in price.get("service_code") or []:
                 service_key = _catalog_key("POS", service_code)
                 if service_key:
@@ -46,7 +56,7 @@ async def _enrich_ptg2_code_details(session, payload: dict[str, Any], args: dict
                     lookup_keys.add(modifier_key)
 
     if not lookup_keys:
-        return payload
+        return response_payload
 
     clauses: list[str] = []
     params: dict[str, Any] = {}
@@ -54,7 +64,7 @@ async def _enrich_ptg2_code_details(session, payload: dict[str, Any], args: dict
         clauses.append(f"(code_system = :code_system_{idx} AND code = :code_{idx})")
         params[f"code_system_{idx}"] = code_system
         params[f"code_{idx}"] = code
-    result = await session.execute(
+    query_result = await session.execute(
         text(
             f"""
             SELECT code_system, code, display_name, short_description
@@ -65,19 +75,28 @@ async def _enrich_ptg2_code_details(session, payload: dict[str, Any], args: dict
         params,
     )
     detail_map = {
-        (str(row_data.get("code_system") or ""), str(row_data.get("code") or "")): _catalog_detail(row_data)
-        for row_data in (_row_mapping(row) for row in result)
+        (
+            str(catalog_row.get("code_system") or ""),
+            str(catalog_row.get("code") or ""),
+        ): _catalog_detail(catalog_row)
+        for catalog_row in (
+            _row_mapping(query_row) for query_row in query_result
+        )
     }
 
-    for item in items:
+    for response_item in response_items:
         billing_key = _catalog_key(
-            item.get("reported_code_system") or item.get("billing_code_type") or item.get("service_code_system"),
-            item.get("reported_code") or item.get("billing_code") or item.get("service_code"),
+            response_item.get("reported_code_system")
+            or response_item.get("billing_code_type")
+            or response_item.get("service_code_system"),
+            response_item.get("reported_code")
+            or response_item.get("billing_code")
+            or response_item.get("service_code"),
         )
         if billing_key and billing_key in detail_map:
-            item["billing_code_detail"] = detail_map[billing_key]
+            response_item["billing_code_detail"] = detail_map[billing_key]
         enriched_prices = []
-        for price in item.get("prices") or []:
+        for price in response_item.get("prices") or []:
             price_payload = dict(price)
             service_details = []
             for service_code in price_payload.get("service_code") or []:
@@ -96,10 +115,10 @@ async def _enrich_ptg2_code_details(session, payload: dict[str, Any], args: dict
             if modifier_details:
                 price_payload["billing_code_modifier_details"] = modifier_details
             enriched_prices.append(price_payload)
-        item["prices"] = enriched_prices
-        item["tic_prices"] = enriched_prices
-        item["price_summary"] = _summarize_price_payload(enriched_prices)
+        response_item["prices"] = enriched_prices
+        response_item["tic_prices"] = enriched_prices
+        response_item["price_summary"] = _summarize_price_payload(enriched_prices)
 
-    enriched = dict(payload)
-    enriched["items"] = items
+    enriched = dict(response_payload)
+    enriched["items"] = response_items
     return enriched

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+from contextlib import suppress
 from typing import Any
 
 from dateutil.parser import parse as parse_date
@@ -29,10 +30,8 @@ def _coerce_date(value: Any) -> datetime.date | None:
     if not text:
         return None
     if len(text) >= 10 and text[4] == "-" and text[7] == "-":
-        try:
+        with suppress(ValueError):
             return datetime.date.fromisoformat(text[:10])
-        except ValueError:
-            pass
     try:
         parsed = parse_date(text)
     except (ValueError, TypeError):
@@ -50,14 +49,26 @@ def _as_list(value: Any) -> list:
     return [value]
 
 
+def _normalized_modifier_list(value: Any) -> list[str]:
+    modifiers: set[str] = set()
+    for item in _as_list(value):
+        if item is None:
+            continue
+        for part in str(item).split(","):
+            modifier = part.strip().upper()
+            if modifier:
+                modifiers.add(modifier)
+    return sorted(modifiers)
+
+
 def _as_int_list(value: Any) -> list[int]:
-    result: list[int] = []
+    integer_values: list[int] = []
     for item in _as_list(value):
         try:
-            result.append(int(str(item).strip()))
+            integer_values.append(int(str(item).strip()))
         except (TypeError, ValueError):
             continue
-    return result
+    return integer_values
 
 
 def _is_valid_npi(value: int) -> bool:
