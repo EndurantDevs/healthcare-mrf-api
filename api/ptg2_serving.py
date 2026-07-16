@@ -228,47 +228,68 @@ def _ptg2_provider_name_sql(alias: str = "n") -> str:
     )
 
 
-def _add_location_phone_fields(item: dict[str, Any], data: dict[str, Any], address_payload: dict[str, Any]) -> None:
+def _add_location_phone_fields(
+    provider_item_by_field: dict[str, Any],
+    location_data_by_field: dict[str, Any],
+    address_payload: dict[str, Any],
+) -> None:
     display_phone = _first_payload_value(
-        data.get("telephone_number"),
+        location_data_by_field.get("telephone_number"),
         address_payload.get("telephone_number"),
         address_payload.get("telephone"),
         address_payload.get("phone"),
-        data.get("phone"),
-        data.get("phone_number"),
+        location_data_by_field.get("phone"),
+        location_data_by_field.get("phone_number"),
         address_payload.get("phone_number"),
     )
-    canonical_phone = _first_payload_value(data.get("phone_number"), address_payload.get("phone_number"))
+    canonical_phone = _first_payload_value(
+        location_data_by_field.get("phone_number"),
+        address_payload.get("phone_number"),
+    )
     display_fax = _first_payload_value(
-        data.get("fax_number"),
+        location_data_by_field.get("fax_number"),
         address_payload.get("fax_number"),
         address_payload.get("fax"),
     )
-    canonical_fax = _first_payload_value(data.get("fax_number_digits"), address_payload.get("fax_number_digits"))
-    fallback_contact: dict[str, str | bool | None] = {}
+    canonical_fax = _first_payload_value(
+        location_data_by_field.get("fax_number_digits"),
+        address_payload.get("fax_number_digits"),
+    )
+    fallback_contact_by_field: dict[str, str | bool | None] = {}
     if (canonical_phone in (None, "", "null") and display_phone not in (None, "", "null")) or (
         canonical_fax in (None, "", "null") and display_fax not in (None, "", "null")
     ):
-        fallback_contact = canonicalize_one(
+        fallback_contact_by_field = canonicalize_one(
             (
                 display_phone,
                 display_fax,
-                _first_payload_value(data.get("country_code"), address_payload.get("country_code"), "US"),
+                _first_payload_value(
+                    location_data_by_field.get("country_code"),
+                    address_payload.get("country_code"),
+                    "US",
+                ),
             )
         )
 
     if display_phone not in (None, "", "null"):
-        item["telephone_number"] = display_phone
-        item["phone"] = display_phone
-    canonical_phone = _first_payload_value(canonical_phone, fallback_contact.get("phone_number"))
+        provider_item_by_field["telephone_number"] = display_phone
+        provider_item_by_field["phone"] = display_phone
+    canonical_phone = _first_payload_value(
+        canonical_phone,
+        fallback_contact_by_field.get("phone_number"),
+    )
     if canonical_phone not in (None, "", "null"):
-        item["phone_number"] = canonical_phone
+        provider_item_by_field["phone_number"] = canonical_phone
     if display_fax not in (None, "", "null"):
-        item["fax_number"] = display_fax
+        provider_item_by_field["fax_number"] = display_fax
     for field in PTG_CONTACT_DETAIL_FIELDS:
-        value = _first_payload_value(data.get(field), address_payload.get(field), fallback_contact.get(field))
-        if value not in (None, "", "null"):
-            item[field] = value
+        contact_value = _first_payload_value(
+            location_data_by_field.get(field),
+            address_payload.get(field),
+            fallback_contact_by_field.get(field),
+        )
+        if contact_value not in (None, "", "null"):
+            provider_item_by_field[field] = contact_value
 
 
 def _coerce_bool_payload(value: Any) -> bool:
@@ -1292,8 +1313,8 @@ def _append_manifest_reported_code_filter(
         return
     external_pairs = _external_catalog_lookup_pairs(code_context)
     if not external_pairs and requested_system and requested_system != INTERNAL_PROCEDURE_CODE_SYSTEM:
-        for value in catalog_code_lookup_values(requested_system, code):
-            external_pairs.add((requested_system, value))
+        for reported_value in catalog_code_lookup_values(requested_system, code):
+            external_pairs.add((requested_system, reported_value))
     if not external_pairs and not requested_system:
         params["reported_code"] = requested_code
         filters.append("reported_code = :reported_code")
@@ -1302,11 +1323,11 @@ def _append_manifest_reported_code_filter(
         filters.append("FALSE")
         return
     clauses: list[str] = []
-    for idx, (system, value) in enumerate(sorted(external_pairs)):
+    for idx, (reported_system, reported_value) in enumerate(sorted(external_pairs)):
         system_key = f"reported_code_system_{idx}"
         code_key = f"reported_code_{idx}"
-        params[system_key] = system
-        params[code_key] = value
+        params[system_key] = reported_system
+        params[code_key] = reported_value
         clauses.append(f"(reported_code_system = :{system_key} AND reported_code = :{code_key})")
     filters.append("(" + " OR ".join(clauses) + ")")
 
@@ -1353,6 +1374,10 @@ def _shared_v3_snapshot_scope_table() -> str:
     return f"{PTG2_SCHEMA}.ptg2_v3_snapshot_scope"
 
 
+def _shared_v3_snapshot_plan_scope_table() -> str:
+    return f"{PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope"
+
+
 def _normalized_plan_market_type(value: Any) -> str:
     return str(value or "").strip().lower()
 
@@ -1370,20 +1395,36 @@ def _shared_v3_code_scope_sql(
     params: dict[str, Any] = {
         "logical_snapshot_id": _required_logical_snapshot_id(serving_tables),
     }
-    join_sql = f"""
-        JOIN {_shared_v3_snapshot_scope_table()} {scope_alias}
-          ON {scope_alias}.snapshot_id = :logical_snapshot_id
-         AND {scope_alias}.coverage_scope_id = {code_alias}.coverage_scope_id
-    """
-    filters: list[str] = []
+    plan_filters: list[str] = []
     normalized_plan = str(requested_plan or "").strip()
     normalized_market_type = _normalized_plan_market_type(plan_market_type)
     if normalized_plan:
-        filters.append(f"{scope_alias}.plan_id = :plan_id")
+        plan_filters.append("plan_scope.plan_id = :plan_id")
         params["plan_id"] = normalized_plan
     if normalized_market_type:
-        filters.append(f"{scope_alias}.plan_market_type = :plan_market_type")
+        plan_filters.append(
+            "plan_scope.plan_market_type = :plan_market_type"
+        )
         params["plan_market_type"] = normalized_market_type
+    plan_filter_sql = (
+        " AND " + " AND ".join(plan_filters)
+        if plan_filters
+        else ""
+    )
+    join_sql = f"""
+        JOIN {_shared_v3_snapshot_scope_table()} physical_scope
+          ON physical_scope.snapshot_id = :logical_snapshot_id
+         AND physical_scope.coverage_scope_id = {code_alias}.coverage_scope_id
+        JOIN LATERAL (
+            SELECT plan_scope.plan_id, plan_scope.plan_market_type
+              FROM {_shared_v3_snapshot_plan_scope_table()} plan_scope
+             WHERE plan_scope.snapshot_id = :logical_snapshot_id
+               {plan_filter_sql}
+             ORDER BY plan_scope.plan_id, plan_scope.plan_market_type
+             LIMIT 1
+        ) {scope_alias} ON TRUE
+    """
+    filters: list[str] = []
     order_sql = f"{scope_alias}.plan_id, {scope_alias}.plan_market_type"
     return join_sql, filters, params, order_sql
 
@@ -1429,7 +1470,7 @@ async def _ptg2_manifest_provider_set_ids_for_keys(
     if not keys:
         return {}
     _require_strict_shared_v3(serving_tables)
-    params = {
+    query_parameters_by_name = {
         "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
         "provider_set_keys": keys,
     }
@@ -1442,7 +1483,7 @@ async def _ptg2_manifest_provider_set_ids_for_keys(
               AND provider_set_key = ANY(CAST(:provider_set_keys AS integer[]))
             """
         ),
-        params,
+        query_parameters_by_name,
     )
     return {
         int(data.get("provider_set_key")): _ptg2_manifest_id(data.get("provider_set_global_id_128"))
@@ -1454,23 +1495,23 @@ async def _ptg2_manifest_provider_set_ids_for_keys(
 async def _hydrate_provider_set_network_names(
     session,
     serving_tables: PTG2ServingTables,
-    rows: Iterable[dict[str, Any]],
+    provider_rows: Iterable[dict[str, Any]],
 ) -> None:
-    row_list = list(rows)
+    provider_entries = list(provider_rows)
     provider_set_ids = sorted(
         {
             provider_set_id
-            for row in row_list
+            for provider_entry in provider_entries
             if (
                 provider_set_id := _ptg2_manifest_id(
-                    row.get("provider_set_global_id_128")
+                    provider_entry.get("provider_set_global_id_128")
                 )
             )
         }
     )
     if not provider_set_ids:
         return
-    result = await session.execute(
+    network_metadata_query = await session.execute(
         text(
             f"""
             SELECT encode(provider_set_global_id_128, 'hex') AS provider_set_id,
@@ -1482,25 +1523,31 @@ async def _hydrate_provider_set_network_names(
         ),
         {
             "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
-            "provider_set_ids": [bytes.fromhex(value) for value in provider_set_ids],
+            "provider_set_ids": [
+                bytes.fromhex(provider_set_id)
+                for provider_set_id in provider_set_ids
+            ],
         },
     )
     network_names_by_id = {
-        str(data.get("provider_set_id") or ""): _coerce_str_list_payload(
-            data.get("network_names")
+        str(network_metadata.get("provider_set_id") or ""): _coerce_str_list_payload(
+            network_metadata.get("network_names")
         )
-        for data in (_row_mapping(row) for row in result)
+        for network_metadata in (
+            _row_mapping(network_metadata_record)
+            for network_metadata_record in network_metadata_query
+        )
     }
     if set(network_names_by_id) != set(provider_set_ids):
         raise PTG2ManifestArtifactError(
             "PTG2 v3 provider-set network metadata is incomplete"
         )
-    for row in row_list:
+    for provider_entry in provider_entries:
         provider_set_id = _ptg2_manifest_id(
-            row.get("provider_set_global_id_128")
+            provider_entry.get("provider_set_global_id_128")
         )
         if provider_set_id:
-            row["network_names"] = network_names_by_id[provider_set_id]
+            provider_entry["network_names"] = network_names_by_id[provider_set_id]
 
 
 async def _ptg2_manifest_provider_set_keys_for_ids(
@@ -1512,7 +1559,7 @@ async def _ptg2_manifest_provider_set_keys_for_ids(
     if not normalized_ids:
         return {}
     _require_strict_shared_v3(serving_tables)
-    params = {
+    query_parameters_by_name = {
         "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
         "provider_set_ids": [bytes.fromhex(provider_set_id) for provider_set_id in normalized_ids],
     }
@@ -1525,7 +1572,7 @@ async def _ptg2_manifest_provider_set_keys_for_ids(
               AND provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS bytea[]))
             """
         ),
-        params,
+        query_parameters_by_name,
     )
     return {
         _ptg2_manifest_id(data.get("provider_set_global_id_128")): int(data.get("provider_set_key"))
@@ -3767,7 +3814,7 @@ async def _ptg2_manifest_taxonomy_rows_for_npis(
         taxonomy_table,
     ) or not await _relation_available(session, vocabulary_table):
         return {}
-    result = await session.execute(
+    taxonomy_query = await session.execute(
         text(
             f"""
             SELECT
@@ -3785,18 +3832,20 @@ async def _ptg2_manifest_taxonomy_rows_for_npis(
         {"npis": list(npis)},
     )
     taxonomy_by_npi: dict[int, dict[str, Any]] = {}
-    for row in result:
-        data = _row_mapping(row)
-        npi = data.get("npi")
+    for taxonomy_record in taxonomy_query:
+        taxonomy_by_field = _row_mapping(taxonomy_record)
+        npi = taxonomy_by_field.get("npi")
         if npi is None:
             continue
         taxonomy_by_npi[int(npi)] = {
-            "taxonomy_codes": data.get("taxonomy_codes") or [],
-            "specialties": data.get("specialties") or [],
-            "classifications": data.get("classifications") or [],
-            "specializations": data.get("specializations") or [],
-            "primary_specialty": data.get("primary_specialty"),
-            "primary_specialization": data.get("primary_specialization"),
+            "taxonomy_codes": taxonomy_by_field.get("taxonomy_codes") or [],
+            "specialties": taxonomy_by_field.get("specialties") or [],
+            "classifications": taxonomy_by_field.get("classifications") or [],
+            "specializations": taxonomy_by_field.get("specializations") or [],
+            "primary_specialty": taxonomy_by_field.get("primary_specialty"),
+            "primary_specialization": taxonomy_by_field.get(
+                "primary_specialization"
+            ),
         }
     return taxonomy_by_npi
 
@@ -4227,52 +4276,77 @@ def _ptg2_manifest_provider_procedure_item(
     return _compact_item_from_row(item_data, args)
 
 
+def _source_code_variant_group_key(
+    provider_rate: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    return (
+        (
+            provider_rate.get("billing_code_type_version") is not None,
+            str(provider_rate.get("billing_code_type_version") or ""),
+        ),
+        (
+            provider_rate.get("source_procedure_name") is not None,
+            str(provider_rate.get("source_procedure_name") or ""),
+        ),
+        (
+            provider_rate.get("source_procedure_description") is not None,
+            str(provider_rate.get("source_procedure_description") or ""),
+        ),
+        tuple(
+            sorted(_coerce_str_list_payload(provider_rate.get("network_names")))
+        ),
+    )
+
+
 def _ptg2_provider_rate_group_key(
-    item: dict[str, Any],
-) -> tuple[str, str, str, str, str, str] | None:
-    npi = item.get("npi")
+    provider_rate: dict[str, Any],
+) -> tuple[Any, ...] | None:
+    """Return the identity used to merge equivalent provider rate rows."""
+
+    npi = provider_rate.get("npi")
     if npi in (None, ""):
         return None
-    address_payload = _coerce_json_payload(item.get("address"), {})
-    if not isinstance(address_payload, dict):
-        address_payload = {}
+    address_by_field = _coerce_json_payload(provider_rate.get("address"), {})
+    if not isinstance(address_by_field, dict):
+        address_by_field = {}
     location_key = (
-        item.get("location_hash")
-        or address_payload.get("address_key")
-        or address_payload.get("address_site_key")
-        or address_payload.get("premise_key")
+        provider_rate.get("location_hash")
+        or address_by_field.get("address_key")
+        or address_by_field.get("address_site_key")
+        or address_by_field.get("premise_key")
     )
     if not location_key:
         location_key = "|".join(
             str(
-                address_payload.get(key)
-                or item.get(key)
+                address_by_field.get(key)
+                or provider_rate.get(key)
                 or ""
             ).strip().upper()
             for key in ("first_line", "second_line", "city", "state", "zip5")
         )
     reported_system = (
-        item.get("reported_code_system")
-        or item.get("service_code_system")
-        or item.get("billing_code_type")
+        provider_rate.get("reported_code_system")
+        or provider_rate.get("service_code_system")
+        or provider_rate.get("billing_code_type")
         or ""
     )
     reported_code = (
-        item.get("reported_code")
-        or item.get("service_code")
-        or item.get("billing_code")
+        provider_rate.get("reported_code")
+        or provider_rate.get("service_code")
+        or provider_rate.get("billing_code")
         or ""
     )
-    negotiation_arrangement = item.get("negotiation_arrangement") or ""
+    negotiation_arrangement = provider_rate.get("negotiation_arrangement") or ""
     return (
         str(npi),
         str(location_key),
         str(reported_system),
         str(reported_code),
         str(negotiation_arrangement),
+        *_source_code_variant_group_key(provider_rate),
         str(
-            item.get("source_artifact_key")
-            if item.get("source_artifact_key") is not None
+            provider_rate.get("source_artifact_key")
+            if provider_rate.get("source_artifact_key") is not None
             else ""
         ),
     )
@@ -4314,58 +4388,101 @@ def _ensure_provider_rate_price_fields(item: dict[str, Any]) -> None:
     item.update(_price_response_fields(prices))
 
 
-def _merge_ptg2_provider_rate_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _merge_ptg2_provider_rate_items(
+    provider_rate_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Collapse duplicate provider/location rows while preserving every rate option."""
-    merged: list[dict[str, Any]] = []
-    grouped: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
-    price_dirty: set[tuple[str, str, str, str, str, str]] = set()
-    for item in items:
-        group_key = _ptg2_provider_rate_group_key(item)
+    merged_provider_rates: list[dict[str, Any]] = []
+    provider_rate_by_group_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    price_dirty_group_keys: set[tuple[Any, ...]] = set()
+    for provider_rate in provider_rate_items:
+        group_key = _ptg2_provider_rate_group_key(provider_rate)
         if group_key is None:
-            merged.append(item)
+            merged_provider_rates.append(provider_rate)
             continue
-        existing = grouped.get(group_key)
-        if existing is None:
-            existing = dict(item)
-            _ensure_provider_rate_price_fields(existing)
-            existing.setdefault("price_set_hashes", [])
-            existing.setdefault("rate_pack_hashes", [])
-            existing.setdefault("provider_set_hashes", [])
-            _append_unique_value(existing["price_set_hashes"], item.get("price_set_hash"))
-            _append_unique_value(existing["rate_pack_hashes"], item.get("rate_pack_hash"))
-            _append_unique_value(existing["provider_set_hashes"], item.get("provider_set_hash"))
-            _merge_unique_payload_list(existing, "price_set_hashes", item.get("price_set_hashes"))
-            _merge_unique_payload_list(existing, "rate_pack_hashes", item.get("rate_pack_hashes"))
-            _merge_unique_payload_list(existing, "provider_set_hashes", item.get("provider_set_hashes"))
-            grouped[group_key] = existing
-            merged.append(existing)
+        merged_provider_rate = provider_rate_by_group_key.get(group_key)
+        if merged_provider_rate is None:
+            merged_provider_rate = dict(provider_rate)
+            _ensure_provider_rate_price_fields(merged_provider_rate)
+            merged_provider_rate.setdefault("price_set_hashes", [])
+            merged_provider_rate.setdefault("rate_pack_hashes", [])
+            merged_provider_rate.setdefault("provider_set_hashes", [])
+            _append_unique_value(
+                merged_provider_rate["price_set_hashes"],
+                provider_rate.get("price_set_hash"),
+            )
+            _append_unique_value(
+                merged_provider_rate["rate_pack_hashes"],
+                provider_rate.get("rate_pack_hash"),
+            )
+            _append_unique_value(
+                merged_provider_rate["provider_set_hashes"],
+                provider_rate.get("provider_set_hash"),
+            )
+            _merge_unique_payload_list(
+                merged_provider_rate,
+                "price_set_hashes",
+                provider_rate.get("price_set_hashes"),
+            )
+            _merge_unique_payload_list(
+                merged_provider_rate,
+                "rate_pack_hashes",
+                provider_rate.get("rate_pack_hashes"),
+            )
+            _merge_unique_payload_list(
+                merged_provider_rate,
+                "provider_set_hashes",
+                provider_rate.get("provider_set_hashes"),
+            )
+            provider_rate_by_group_key[group_key] = merged_provider_rate
+            merged_provider_rates.append(merged_provider_rate)
             continue
 
         combined_prices = (
-            _normalize_price_payload(existing.get("prices"))
-            + _normalize_price_payload(item.get("prices"))
+            _normalize_price_payload(merged_provider_rate.get("prices"))
+            + _normalize_price_payload(provider_rate.get("prices"))
         )
-        existing["prices"] = combined_prices
-        existing["tic_prices"] = combined_prices
-        price_dirty.add(group_key)
-        existing_price_key = existing.get("_ptg_price_key")
-        item_price_key = item.get("_ptg_price_key")
+        merged_provider_rate["prices"] = combined_prices
+        merged_provider_rate["tic_prices"] = combined_prices
+        price_dirty_group_keys.add(group_key)
+        existing_price_key = merged_provider_rate.get("_ptg_price_key")
+        item_price_key = provider_rate.get("_ptg_price_key")
         if item_price_key is not None and (
             existing_price_key is None or int(item_price_key) < int(existing_price_key)
         ):
-            existing["_ptg_price_key"] = int(item_price_key)
-        _append_unique_value(existing.setdefault("price_set_hashes", []), item.get("price_set_hash"))
-        _append_unique_value(existing.setdefault("rate_pack_hashes", []), item.get("rate_pack_hash"))
-        _append_unique_value(existing.setdefault("provider_set_hashes", []), item.get("provider_set_hash"))
-        _merge_unique_payload_list(existing, "price_set_hashes", item.get("price_set_hashes"))
-        _merge_unique_payload_list(existing, "rate_pack_hashes", item.get("rate_pack_hashes"))
-        _merge_unique_payload_list(existing, "provider_set_hashes", item.get("provider_set_hashes"))
-        _merge_unique_payload_list(existing, "source_trace", item.get("source_trace"))
-        existing["price_set_count"] = len(existing.get("price_set_hashes") or [])
-        existing["rate_pack_count"] = len(existing.get("rate_pack_hashes") or [])
-    for group_key in price_dirty:
-        grouped[group_key].update(_price_response_fields(grouped[group_key].get("prices")))
-    return merged
+            merged_provider_rate["_ptg_price_key"] = int(item_price_key)
+        for hash_field in (
+            "price_set_hash",
+            "rate_pack_hash",
+            "provider_set_hash",
+        ):
+            _append_unique_value(
+                merged_provider_rate.setdefault(f"{hash_field}es", []),
+                provider_rate.get(hash_field),
+            )
+        for hash_list_field in (
+            "price_set_hashes",
+            "rate_pack_hashes",
+            "provider_set_hashes",
+            "source_trace",
+        ):
+            _merge_unique_payload_list(
+                merged_provider_rate,
+                hash_list_field,
+                provider_rate.get(hash_list_field),
+            )
+        merged_provider_rate["price_set_count"] = len(
+            merged_provider_rate.get("price_set_hashes") or []
+        )
+        merged_provider_rate["rate_pack_count"] = len(
+            merged_provider_rate.get("rate_pack_hashes") or []
+        )
+    for group_key in price_dirty_group_keys:
+        grouped_provider_rate = provider_rate_by_group_key[group_key]
+        grouped_provider_rate.update(
+            _price_response_fields(grouped_provider_rate.get("prices"))
+        )
+    return merged_provider_rates
 
 
 async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
@@ -4379,13 +4496,16 @@ async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
     if not candidate_npis:
         return ()
     specialty_filter = resolve_provider_specialty_filter(args)
-    params: dict[str, Any] = {"npis": list(candidate_npis), "limit": max(int(limit), 1)}
+    query_parameters_by_name: dict[str, Any] = {
+        "npis": list(candidate_npis),
+        "limit": max(int(limit), 1),
+    }
     predicates: list[str] = []
     if specialty_filter.active:
         predicates.append(
             provider_specialty_taxonomy_exists_sql(
                 "source_npis.npi",
-                params,
+                query_parameters_by_name,
                 "manifest_provider_specialty",
                 specialty_filter,
                 schema=PTG2_SCHEMA,
@@ -4395,7 +4515,7 @@ async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
         args,
         nt_alias="nt",
         schema=PTG2_SCHEMA,
-        params=params,
+        params=query_parameters_by_name,
         param_prefix="manifest_provider_inferred_taxonomy",
     )
     if inferred_sql:
@@ -4405,7 +4525,7 @@ async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
         predicates.append(_ptg2_individual_npi_exists_sql("source_npis.npi"))
     if not predicates:
         return candidate_npis[: max(int(limit), 1)]
-    result = await session.execute(
+    filtered_npi_query = await session.execute(
         text(
             f"""
             SELECT source_npis.npi
@@ -4415,9 +4535,16 @@ async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
             LIMIT :limit
             """
         ),
-        params,
+        query_parameters_by_name,
     )
-    return tuple(int(_row_mapping(row).get("npi")) for row in result if _row_mapping(row).get("npi") is not None)
+    return tuple(
+        int(npi_by_field["npi"])
+        for npi_by_field in (
+            _row_mapping(npi_record)
+            for npi_record in filtered_npi_query
+        )
+        if npi_by_field.get("npi") is not None
+    )
 
 
 def _ptg2_manifest_location_match_limit() -> int:
@@ -5710,26 +5837,26 @@ class _ProviderExpansionSelection:
 
 
 def _provider_expansion_key(
-    data: Mapping[str, Any],
+    serving_row: Mapping[str, Any],
     *,
     npi: int | None,
 ) -> _ProviderExpansionKey:
-    source_key = data.get("source_artifact_key")
+    source_key = serving_row.get("source_artifact_key")
     if source_key is None:
-        source_key = data.get("source_key")
+        source_key = serving_row.get("source_key")
     reported_system = str(
-        data.get("reported_code_system")
-        or data.get("service_code_system")
-        or data.get("billing_code_type")
+        serving_row.get("reported_code_system")
+        or serving_row.get("service_code_system")
+        or serving_row.get("billing_code_type")
         or ""
     )
     reported_code = str(
-        data.get("reported_code")
-        or data.get("service_code")
-        or data.get("billing_code")
+        serving_row.get("reported_code")
+        or serving_row.get("service_code")
+        or serving_row.get("billing_code")
         or ""
     )
-    arrangement = str(data.get("negotiation_arrangement") or "")
+    arrangement = str(serving_row.get("negotiation_arrangement") or "")
     if npi is not None:
         return (
             "npi",
@@ -5740,7 +5867,8 @@ def _provider_expansion_key(
             str(source_key if source_key is not None else ""),
         )
     occurrence_id = _ptg2_manifest_id(
-        data.get("serving_content_hash_128") or data.get("rate_pack_hash")
+        serving_row.get("serving_content_hash_128")
+        or serving_row.get("rate_pack_hash")
     )
     if not occurrence_id:
         raise PTG2ManifestArtifactError(
@@ -5875,6 +6003,40 @@ async def _selected_provider_rows_by_set(
         ]
         for provider_set_id in provider_set_ids
     }
+
+
+async def _candidate_audit_provider_rows_by_set(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    candidate_npi: int,
+    serving_rows: Iterable[Mapping[str, Any]],
+    args: Mapping[str, Any],
+    snapshot_id: str,
+) -> dict[str, list[dict[str, Any]]] | None:
+    """Resolve only the audited NPI, without requiring address enrichment."""
+
+    candidate_provider_set_ids = tuple(
+        dict.fromkeys(
+            provider_set_id
+            for serving_row in serving_rows
+            if (
+                provider_set_id := _ptg2_manifest_id(
+                    serving_row.get("provider_set_global_id_128")
+                )
+            )
+        )
+    )
+    return await _selected_provider_rows_by_set(
+        session,
+        serving_tables,
+        npis=(candidate_npi,),
+        provider_set_ids_by_npi={
+            candidate_npi: candidate_provider_set_ids
+        },
+        args=args,
+        snapshot_id=snapshot_id,
+    )
 
 
 def _next_provider_expansion_rate_window(
@@ -6032,27 +6194,31 @@ async def _strict_cost_provider_expansion_selection(
 
 async def _ptg2_manifest_procedure_details_for_rows(
     session,
-    rows: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    serving_rows: list[dict[str, Any]] | tuple[dict[str, Any], ...],
 ) -> dict[tuple[str, str], dict[str, Any]]:
     lookup_keys = sorted(
         key
         for key in {
-            _catalog_key(row.get("reported_code_system"), row.get("reported_code"))
-            for row in rows
-            if row.get("reported_code_system") and row.get("reported_code")
+            _catalog_key(
+                serving_row.get("reported_code_system"),
+                serving_row.get("reported_code"),
+            )
+            for serving_row in serving_rows
+            if serving_row.get("reported_code_system")
+            and serving_row.get("reported_code")
         }
         if key is not None
     )
     if not lookup_keys:
         return {}
     clauses: list[str] = []
-    params: dict[str, Any] = {}
+    query_parameters_by_name: dict[str, Any] = {}
     for idx, (code_system, code) in enumerate(lookup_keys):
         clauses.append(f"(code_system = :code_system_{idx} AND code = :code_{idx})")
-        params[f"code_system_{idx}"] = code_system
-        params[f"code_{idx}"] = code
+        query_parameters_by_name[f"code_system_{idx}"] = code_system
+        query_parameters_by_name[f"code_{idx}"] = code
     try:
-        result = await session.execute(
+        procedure_catalog_query = await session.execute(
             text(
                 f"""
                 SELECT code_system, code, display_name, short_description
@@ -6060,17 +6226,26 @@ async def _ptg2_manifest_procedure_details_for_rows(
                 WHERE {" OR ".join(clauses)}
                 """
             ),
-            params,
+            query_parameters_by_name,
         )
     except Exception:
         await _rollback_optional_ptg2_query(session)
         return {}
     return {
-        (str(data.get("code_system") or ""), str(data.get("code") or "")): {
-            "procedure_name": data.get("display_name"),
-            "procedure_description": data.get("short_description") or data.get("display_name"),
+        (
+            str(procedure_metadata.get("code_system") or ""),
+            str(procedure_metadata.get("code") or ""),
+        ): {
+            "procedure_name": procedure_metadata.get("display_name"),
+            "procedure_description": procedure_metadata.get(
+                "short_description"
+            )
+            or procedure_metadata.get("display_name"),
         }
-        for data in (_row_mapping(row) for row in result)
+        for procedure_metadata in (
+            _row_mapping(procedure_record)
+            for procedure_record in procedure_catalog_query
+        )
     }
 
 
@@ -6105,7 +6280,15 @@ async def _search_ptg2_manifest_db_serving_table(
         return None
 
     expand_providers = _request_bool(args.get("include_providers"))
-    location_filter_requested = _ptg2_location_filter_requested(args)
+    candidate_audit_npi = (
+        _normalize_npi(args.get("npi"))
+        if candidate_audit_access_from_args(args) is not None
+        else None
+    )
+    location_filter_requested = _ptg2_location_filter_requested(
+        args,
+        include_npi=candidate_audit_npi is None,
+    )
     price_filter_requested = any(
         args.get(field)
         for field in (
@@ -6459,6 +6642,17 @@ async def _search_ptg2_manifest_db_serving_table(
             providers_by_set = exact_provider_selection.providers_by_set
         elif location_filter_requested:
             providers_by_set = location_providers_by_set
+        elif candidate_audit_npi is not None:
+            providers_by_set = await _candidate_audit_provider_rows_by_set(
+                session,
+                serving_tables,
+                candidate_npi=candidate_audit_npi,
+                serving_rows=row_data,
+                args=args,
+                snapshot_id=snapshot_id,
+            )
+            if providers_by_set is None:
+                return None
         else:
             provider_set_ids = [_ptg2_manifest_id(data.get("provider_set_global_id_128")) for data in row_data]
             provider_rows_by_set = await _ptg2_manifest_provider_rows_for_provider_sets(
@@ -7381,13 +7575,17 @@ async def search_ptg2_provider_procedures(
     )
 
 
-def _ptg2_location_filter_requested(args: dict[str, Any]) -> bool:
+def _ptg2_location_filter_requested(
+    args: dict[str, Any],
+    *,
+    include_npi: bool = True,
+) -> bool:
     return bool(
         args.get("state")
         or args.get("city")
         or args.get("zip5")
         or args.get("zip")
-        or args.get("npi")
+        or (include_npi and args.get("npi"))
         or args.get("lat") is not None
         or args.get("long") is not None
         or args.get("radius_miles") is not None

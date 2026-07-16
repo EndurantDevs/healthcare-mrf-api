@@ -55,6 +55,7 @@ from process.ptg_parts.ptg2_shared_publish import (
     shared_graph_bundles_from_artifacts,
 )
 from process.ptg_parts.ptg2_shared_reuse import (
+    SharedLogicalPlanScope,
     SharedPhysicalArtifactIdentity,
     SharedSnapshotSourceAssignment,
     deterministic_source_key_assignments,
@@ -149,22 +150,35 @@ async def publish_shared_v3_snapshot_sources(
     *,
     schema_name: str,
     snapshot_id: str,
-    plan_id: str,
-    plan_market_type: str,
+    plan_scopes: Iterable[SharedLogicalPlanScope],
     coverage_scope_id: bytes,
     assignments: Iterable[SharedSnapshotSourceAssignment],
 ) -> tuple[dict[str, Any], ...]:
-    """Publish one immutable logical source dictionary without overwrite semantics."""
+    """Publish immutable source and logical-plan mappings for one snapshot."""
 
     source_records = _snapshot_source_rows(
         snapshot_id=snapshot_id,
         assignments=assignments,
     )
     scope_id = _validated_coverage_scope_id(coverage_scope_id)
-    normalized_plan_id = str(plan_id or "").strip()
-    normalized_market = str(plan_market_type or "").strip().lower()
-    if not normalized_plan_id:
-        raise ValueError("strict V3 source publication requires a logical plan id")
+    normalized_plan_scopes = tuple(
+        sorted(
+            {
+                SharedLogicalPlanScope(
+                    plan_id=str(scope.plan_id or "").strip(),
+                    plan_id_type=str(scope.plan_id_type or "").strip().lower(),
+                    plan_market_type=str(
+                        scope.plan_market_type or ""
+                    ).strip().lower(),
+                )
+                for scope in plan_scopes
+                if str(scope.plan_id or "").strip()
+            }
+        )
+    )
+    if not normalized_plan_scopes:
+        raise ValueError("strict V3 source publication requires logical plans")
+    primary_plan = normalized_plan_scopes[0]
     schema = _quote_ident(schema_name)
     async with db.transaction() as session:
         await session.execute(
@@ -179,8 +193,8 @@ async def publish_shared_v3_snapshot_sources(
             ),
             {
                 "snapshot_id": str(snapshot_id),
-                "plan_id": normalized_plan_id,
-                "plan_market_type": normalized_market,
+                "plan_id": primary_plan.plan_id,
+                "plan_market_type": primary_plan.plan_market_type,
                 "coverage_scope_id": scope_id,
             },
         )
@@ -197,12 +211,59 @@ async def publish_shared_v3_snapshot_sources(
         scope_row = scope_result.first()
         scope = _row_mapping(scope_row)
         if (
-            str(scope.get("plan_id") or "") != normalized_plan_id
-            or str(scope.get("plan_market_type") or "") != normalized_market
+            str(scope.get("plan_id") or "") != primary_plan.plan_id
+            or str(scope.get("plan_market_type") or "")
+            != primary_plan.plan_market_type
             or bytes(scope.get("coverage_scope_id") or b"") != scope_id
         ):
             raise RuntimeError(
                 f"PTG snapshot {snapshot_id} already has another immutable source scope"
+            )
+        plan_scope_records = [
+            {
+                "snapshot_id": str(snapshot_id),
+                "plan_id": logical_plan.plan_id,
+                "plan_market_type": logical_plan.plan_market_type,
+            }
+            for logical_plan in normalized_plan_scopes
+        ]
+        await session.execute(
+            db.text(
+                f"""
+                INSERT INTO {schema}.ptg2_v3_snapshot_plan_scope
+                    (snapshot_id, plan_id, plan_market_type)
+                VALUES
+                    (:snapshot_id, :plan_id, :plan_market_type)
+                ON CONFLICT (snapshot_id, plan_id, plan_market_type) DO NOTHING
+                """
+            ),
+            plan_scope_records,
+        )
+        observed_plan_result = await session.execute(
+            db.text(
+                f"""
+                SELECT plan_id, plan_market_type
+                  FROM {schema}.ptg2_v3_snapshot_plan_scope
+                 WHERE snapshot_id = :snapshot_id
+                 ORDER BY plan_id, plan_market_type
+                """
+            ),
+            {"snapshot_id": str(snapshot_id)},
+        )
+        observed_plans = {
+            (
+                str(_row_mapping(row).get("plan_id") or ""),
+                str(_row_mapping(row).get("plan_market_type") or ""),
+            )
+            for row in observed_plan_result
+        }
+        expected_plans = {
+            (logical_plan.plan_id, logical_plan.plan_market_type)
+            for logical_plan in normalized_plan_scopes
+        }
+        if observed_plans != expected_plans:
+            raise RuntimeError(
+                f"PTG snapshot {snapshot_id} has stale logical plan mappings"
             )
         await session.execute(
             db.text(

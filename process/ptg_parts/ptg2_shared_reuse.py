@@ -22,6 +22,7 @@ from process.ptg_parts.ptg2_shared_source_set import (
     shared_source_set_metadata,
 )
 from process.ptg_parts.source_files import _derive_plan_fields
+from process.ptg_parts.source_jobs import _normalize_plan_payload
 from process.ptg_parts.values import build_source_trace_set
 
 
@@ -48,7 +49,7 @@ def _normalized_physical_source_type(value: Any) -> str:
     return normalized
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class SharedLogicalPlanScope:
     plan_id: str
     plan_id_type: str
@@ -99,12 +100,30 @@ class SharedSnapshotSourceAssignment:
 class SharedInputIdentity:
     semantic_fingerprint: bytes
     coverage_scope_id: bytes
-    logical_plan: SharedLogicalPlanScope
-    logical_plan_fields: Mapping[str, Any]
+    logical_plans: tuple[SharedLogicalPlanScope, ...]
+    logical_plan_fields_by_scope: tuple[Mapping[str, Any], ...]
     payload: Mapping[str, Any]
     source_identities: tuple[SharedPhysicalArtifactIdentity, ...]
     artifact_count: int
     identity_byte_count: int
+
+    @property
+    def logical_plan(self) -> SharedLogicalPlanScope:
+        """Return the deterministic primary plan used for attestation metadata."""
+
+        return self.logical_plans[0]
+
+    @property
+    def logical_plan_fields(self) -> Mapping[str, Any]:
+        """Return fields for the deterministic primary logical plan."""
+
+        return self.logical_plan_fields_by_scope[0]
+
+    @property
+    def logical_plan_count(self) -> int:
+        """Return the number of logical plans bound to this physical input."""
+
+        return len(self.logical_plans)
 
     @property
     def coverage_scope_hex(self) -> str:
@@ -119,24 +138,91 @@ class SharedInputIdentity:
         return len(self.source_identities)
 
 
-def _normalized_logical_plan(job: Mapping[str, Any]) -> SharedLogicalPlanScope:
-    meta = job.get("meta") if isinstance(job.get("meta"), dict) else {}
-    plan_info = job.get("plan_info") if isinstance(job.get("plan_info"), list) else None
-    plan_fields = _derive_plan_fields(meta, plan_info)
+def _logical_plan_scope(plan_fields: Mapping[str, Any]) -> SharedLogicalPlanScope:
+    """Return one normalized logical plan scope from canonical plan fields."""
+
     plan_id = str(plan_fields.get("plan_id") or "").strip()
     if not plan_id:
-        raise ValueError("strict shared V3 input is missing one unambiguous logical plan id")
+        raise ValueError("strict shared V3 input is missing a logical plan id")
     return SharedLogicalPlanScope(
         plan_id=plan_id,
         plan_id_type=str(plan_fields.get("plan_id_type") or "").strip().lower(),
-        plan_market_type=str(plan_fields.get("plan_market_type") or "").strip().lower(),
+        plan_market_type=str(
+            plan_fields.get("plan_market_type") or ""
+        ).strip().lower(),
     )
 
 
-def _logical_plan_fields(job: Mapping[str, Any]) -> dict[str, Any]:
+def logical_plan_fields_for_job(
+    job: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Return every distinct logical plan represented by one physical-file job."""
+
     meta = job.get("meta") if isinstance(job.get("meta"), dict) else {}
-    plan_info = job.get("plan_info") if isinstance(job.get("plan_info"), list) else None
-    return dict(_derive_plan_fields(meta, plan_info))
+    plan_info = (
+        job.get("plan_info")
+        if isinstance(job.get("plan_info"), list)
+        else []
+    )
+    normalized_plans = [
+        _normalize_plan_payload(plan)
+        for plan in plan_info
+        if isinstance(plan, dict)
+    ]
+    metadata_plan = _derive_plan_fields(meta, None)
+    metadata_plan_id = str(metadata_plan.get("plan_id") or "").strip()
+    if metadata_plan_id:
+        matching_plans = [
+            plan
+            for plan in normalized_plans
+            if str(plan.get("plan_id") or "").strip().casefold()
+            == metadata_plan_id.casefold()
+        ]
+        return (
+            dict(_derive_plan_fields(meta, matching_plans or None)),
+        )
+
+    plans_by_scope: dict[
+        tuple[str, str, str],
+        list[dict[str, Any]],
+    ] = {}
+    canonical_id_by_scope: dict[tuple[str, str, str], str] = {}
+    for plan in normalized_plans:
+        plan_id = str(plan.get("plan_id") or "").strip()
+        if not plan_id:
+            continue
+        scope_key = (
+            plan_id.casefold(),
+            str(plan.get("plan_id_type") or "").strip().lower(),
+            str(plan.get("plan_market_type") or "").strip().lower(),
+        )
+        canonical_id_by_scope.setdefault(scope_key, plan_id)
+        plans_by_scope.setdefault(scope_key, []).append(plan)
+
+    logical_plan_fields: list[dict[str, Any]] = []
+    for scope_key in sorted(plans_by_scope):
+        plan_fields = dict(_derive_plan_fields({}, plans_by_scope[scope_key]))
+        plan_fields["plan_id"] = canonical_id_by_scope[scope_key]
+        logical_plan_fields.append(plan_fields)
+    return tuple(logical_plan_fields)
+
+
+def _merged_plan_fields(
+    plan_fields_values: Iterable[Mapping[str, Any]],
+    scope: SharedLogicalPlanScope,
+) -> dict[str, Any]:
+    """Merge repeated metadata for one plan without conflating other plans."""
+
+    values = [dict(plan_fields) for plan_fields in plan_fields_values]
+    merged = dict(_derive_plan_fields({}, values))
+    merged.update(
+        {
+            "plan_id": scope.plan_id,
+            "plan_id_type": scope.plan_id_type or None,
+            "plan_market_type": scope.plan_market_type or None,
+        }
+    )
+    return merged
 
 
 def _downloaded_artifact_payload(downloaded: PTG2DownloadedJob) -> dict[str, Any]:
@@ -351,14 +437,15 @@ def shared_snapshot_source_assignments(
 
 def _distinct_artifact_payloads(
     downloaded_jobs: Iterable[PTG2DownloadedJob],
-) -> tuple[list[dict[str, Any]], SharedLogicalPlanScope, dict[str, Any]]:
+) -> tuple[
+    list[dict[str, Any]],
+    tuple[SharedLogicalPlanScope, ...],
+    tuple[dict[str, Any], ...],
+]:
     artifact_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
-    logical_plans: set[SharedLogicalPlanScope] = set()
-    descriptive_values: dict[str, set[str]] = {
-        "plan_name": set(),
-        "issuer_name": set(),
-        "plan_sponsor_name": set(),
-    }
+    plan_fields_by_scope: dict[
+        SharedLogicalPlanScope, list[Mapping[str, Any]]
+    ] = {}
     for downloaded in downloaded_jobs:
         artifact = _downloaded_artifact_payload(downloaded)
         identity = (
@@ -369,32 +456,18 @@ def _distinct_artifact_payloads(
         previous = artifact_by_identity.setdefault(identity, artifact)
         if previous != artifact:
             raise ValueError("strict shared V3 logical artifact metadata is inconsistent")
-        logical_plans.add(_normalized_logical_plan(downloaded.job))
-        plan_fields = _logical_plan_fields(downloaded.job)
-        for field_name, observed_values in descriptive_values.items():
-            normalized = str(plan_fields.get(field_name) or "").strip()
-            if normalized:
-                observed_values.add(normalized)
+        for plan_fields in logical_plan_fields_for_job(downloaded.job):
+            scope = _logical_plan_scope(plan_fields)
+            plan_fields_by_scope.setdefault(scope, []).append(plan_fields)
     if not artifact_by_identity:
         raise ValueError("strict shared V3 layout requires at least one downloaded artifact")
-    if len(logical_plans) != 1:
-        raise ValueError(
-            "strict shared V3 currently requires exactly one logical plan scope per snapshot"
-        )
-    logical_plan = next(iter(logical_plans))
-    logical_plan_fields: dict[str, Any] = {
-        "plan_id": logical_plan.plan_id,
-        "plan_id_type": logical_plan.plan_id_type or None,
-        "plan_market_type": logical_plan.plan_market_type or None,
-    }
-    for field_name, observed_values in descriptive_values.items():
-        if len(observed_values) > 1:
-            raise ValueError(
-                f"strict shared V3 input has conflicting {field_name} metadata"
-            )
-        logical_plan_fields[field_name] = (
-            next(iter(observed_values)) if observed_values else None
-        )
+    if not plan_fields_by_scope:
+        raise ValueError("strict shared V3 input is missing logical plan metadata")
+    logical_plans = tuple(sorted(plan_fields_by_scope))
+    logical_plan_fields = tuple(
+        _merged_plan_fields(plan_fields_by_scope[scope], scope)
+        for scope in logical_plans
+    )
     artifacts = sorted(
         artifact_by_identity.values(),
         key=lambda item: (
@@ -403,7 +476,7 @@ def _distinct_artifact_payloads(
             str(item["identity_sha256"]),
         ),
     )
-    return artifacts, logical_plan, logical_plan_fields
+    return artifacts, logical_plans, logical_plan_fields
 
 
 def shared_physical_input_identity(
@@ -414,7 +487,7 @@ def shared_physical_input_identity(
 ) -> SharedInputIdentity:
     """Fingerprint physical content while retaining logical ownership separately."""
 
-    artifacts, logical_plan, logical_plan_fields = _distinct_artifact_payloads(
+    artifacts, logical_plans, logical_plan_fields = _distinct_artifact_payloads(
         downloaded_jobs
     )
     source_identities = tuple(
@@ -443,8 +516,8 @@ def shared_physical_input_identity(
     return SharedInputIdentity(
         semantic_fingerprint=shared_semantic_fingerprint(payload),
         coverage_scope_id=coverage_scope_id,
-        logical_plan=logical_plan,
-        logical_plan_fields=logical_plan_fields,
+        logical_plans=logical_plans,
+        logical_plan_fields_by_scope=logical_plan_fields,
         payload=payload,
         source_identities=source_identities,
         artifact_count=len(artifacts),
@@ -469,6 +542,7 @@ __all__ = [
     "SharedSnapshotSourceAssignment",
     "deterministic_source_key_assignments",
     "normalized_physical_artifact_identity",
+    "logical_plan_fields_for_job",
     "same_downloaded_physical_input",
     "shared_physical_artifact_identity",
     "shared_logical_artifact_metadata",

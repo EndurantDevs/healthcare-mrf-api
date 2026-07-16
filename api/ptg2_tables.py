@@ -407,9 +407,16 @@ async def snapshot_serving_tables(
                 snapshot.manifest->'activation'->>'source_key', ''
             ))) = :candidate_source_key
         """
-        candidate_scope_sql = """
-            AND snapshot_scope.plan_id = ANY(CAST(:candidate_plan_ids AS text[]))
-            AND snapshot_scope.plan_market_type = :candidate_plan_market_type
+        candidate_scope_sql = f"""
+            AND EXISTS (
+                SELECT 1
+                  FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope AS candidate_plan_scope
+                 WHERE candidate_plan_scope.snapshot_id = snapshot.snapshot_id
+                   AND candidate_plan_scope.plan_id
+                       = ANY(CAST(:candidate_plan_ids AS text[]))
+                   AND candidate_plan_scope.plan_market_type
+                       = :candidate_plan_market_type
+            )
         """
     result = await session.execute(
         text(

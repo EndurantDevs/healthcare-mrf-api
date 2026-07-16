@@ -280,8 +280,10 @@ def _audit_page_sql(*, filter_market_type: bool) -> str:
     )
     return f"""
         WITH matching_scope AS MATERIALIZED (
-            SELECT logical_scope.coverage_scope_id
-              FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_scope logical_scope
+            SELECT physical_scope.coverage_scope_id
+              FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope logical_scope
+              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_scope physical_scope
+                ON physical_scope.snapshot_id = logical_scope.snapshot_id
              WHERE logical_scope.snapshot_id = :snapshot_id
                AND logical_scope.plan_id = ANY(CAST(:plan_ids AS text[]))
                {market_filter}

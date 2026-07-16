@@ -39,8 +39,9 @@ use ptg2_scanner::manifest::{
     write_global_sidecar, GlobalId128, SidecarEntry, GLOBAL_ID_BYTES,
 };
 use ptg2_scanner::normalize::{
-    canonical_text_list, normalize_code, normalize_string, normalize_tin_type, normalize_tin_value,
-    strict_integer_text, strict_money_number_from_reader, strict_npi_list, strict_npi_partition,
+    canonical_text_list, normalize_catalog_code, normalize_code, normalize_code_system,
+    normalize_string, normalize_tin_type, normalize_tin_value, strict_integer_text,
+    strict_money_number_from_reader, strict_npi_list, strict_npi_partition,
     strict_string_array_from_reader, StrictNpiList,
 };
 use ptg2_scanner::output::{emit_json_record, emit_object};
@@ -4052,10 +4053,15 @@ struct CompactRateBatch<'a> {
 }
 
 fn procedure_identity_payload(procedure_value: &Value) -> Value {
+    let billing_code_type = normalize_code_system(procedure_value.get("billing_code_type"));
+    let billing_code = normalize_catalog_code(
+        procedure_value.get("billing_code"),
+        billing_code_type.as_deref(),
+    );
     json!({
-        "billing_code_type": normalize_code(procedure_value.get("billing_code_type")),
+        "billing_code_type": billing_code_type,
         "billing_code_type_version": normalize_code(procedure_value.get("billing_code_type_version")),
-        "billing_code": normalize_code(procedure_value.get("billing_code")),
+        "billing_code": billing_code,
         "negotiation_arrangement": normalize_code(procedure_value.get("negotiation_arrangement")),
     })
 }
@@ -4092,11 +4098,22 @@ fn process_compact_rate_lites<W: Write>(
     if rates.is_empty() {
         return Ok(());
     }
-    let billing_code = normalize_string(procedure_value.get("billing_code")).unwrap_or_default();
-    let billing_code_type =
-        normalize_string(procedure_value.get("billing_code_type")).unwrap_or_default();
-    let reported_code = normalize_code(procedure_value.get("billing_code"));
-    let reported_code_system = normalize_code(procedure_value.get("billing_code_type"));
+    let procedure = procedure_value.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "procedure must be a JSON object",
+        )
+    })?;
+    if !procedure_has_queryable_code(procedure) {
+        return Ok(());
+    }
+    let reported_code_system = normalize_code_system(procedure_value.get("billing_code_type"));
+    let reported_code = normalize_catalog_code(
+        procedure_value.get("billing_code"),
+        reported_code_system.as_deref(),
+    );
+    let billing_code = reported_code.clone().unwrap_or_default();
+    let billing_code_type = reported_code_system.clone().unwrap_or_default();
     let negotiation_arrangement = normalize_code(procedure_value.get("negotiation_arrangement"));
     let billing_code_type_version =
         strict_optional_source_metadata_text(procedure_value, "billing_code_type_version")?;
@@ -4445,6 +4462,22 @@ fn source_rate_witness_expected() -> Value {
     json!({
         "contract": "ptg2_v3_source_rate_occurrence_expected_v2",
     })
+}
+
+fn mark_source_rate_unqueryable(
+    context: &CompactContext,
+    procedure_json: &[u8],
+    source_input: SourceRateWitnessInput<'_>,
+) -> io::Result<()> {
+    context
+        .source_witness
+        .rate_occurrence_candidates(
+            source_input.coordinate,
+            procedure_json,
+            source_input.raw_rate,
+            0,
+        )
+        .map(|_| ())
 }
 
 fn npi_source_coordinate(groups: &[Value], selected_npi: i64) -> Option<(usize, usize)> {
@@ -5768,11 +5801,29 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
     if rates.is_empty() {
         return Ok(());
     }
-    let billing_code = normalize_string(procedure_value.get("billing_code")).unwrap_or_default();
-    let billing_code_type =
-        normalize_string(procedure_value.get("billing_code_type")).unwrap_or_default();
-    let reported_code = normalize_code(procedure_value.get("billing_code"));
-    let reported_code_system = normalize_code(procedure_value.get("billing_code_type"));
+    let procedure = procedure_value.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "procedure must be a JSON object",
+        )
+    })?;
+    if !procedure_has_queryable_code(procedure) {
+        if let (Some(source_inputs), Some(source_procedure_json)) =
+            (source_inputs, source_procedure_json.as_deref())
+        {
+            for source_input in source_inputs {
+                mark_source_rate_unqueryable(context, source_procedure_json, *source_input)?;
+            }
+        }
+        return Ok(());
+    }
+    let reported_code_system = normalize_code_system(procedure_value.get("billing_code_type"));
+    let reported_code = normalize_catalog_code(
+        procedure_value.get("billing_code"),
+        reported_code_system.as_deref(),
+    );
+    let billing_code = reported_code.clone().unwrap_or_default();
+    let billing_code_type = reported_code_system.clone().unwrap_or_default();
     let negotiation_arrangement = normalize_code(procedure_value.get("negotiation_arrangement"));
     let billing_code_type_version =
         strict_optional_source_metadata_text(procedure_value, "billing_code_type_version")?;
@@ -5808,6 +5859,27 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
     if !group_negotiated_rate_chunks {
         let mut code_count_rows = 0usize;
         for (rate_index, rate) in rates.iter().enumerate() {
+            let source_input = source_inputs.map(|inputs| inputs[rate_index]);
+            if let Some(unresolved_reference) = rate
+                .provider_refs
+                .iter()
+                .find(|provider_reference| !provider_map.contains_key(*provider_reference))
+            {
+                if let Some(source_input) = source_input {
+                    mark_source_rate_unqueryable(
+                        context,
+                        source_procedure_json
+                            .as_deref()
+                            .expect("source procedure JSON created above"),
+                        source_input,
+                    )?;
+                    continue;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unresolved provider reference: {unresolved_reference}"),
+                ));
+            }
             let Some(provider_entry) = provider_entry_view_for_worker_rate(
                 provider_map,
                 rate,
@@ -5815,9 +5887,27 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                 dedupe,
             )?
             else {
+                if let Some(source_input) = source_input {
+                    mark_source_rate_unqueryable(
+                        context,
+                        source_procedure_json
+                            .as_deref()
+                            .expect("source procedure JSON created above"),
+                        source_input,
+                    )?;
+                }
                 continue;
             };
             let Some(price_set) = price_lite_set(&rate.prices, price_code_set_hash_cache) else {
+                if let Some(source_input) = source_input {
+                    mark_source_rate_unqueryable(
+                        context,
+                        source_procedure_json
+                            .as_deref()
+                            .expect("source procedure JSON created above"),
+                        source_input,
+                    )?;
+                }
                 continue;
             };
             let network_names = rate_network_names(rate, provider_entry.network_names(), context);
@@ -5997,7 +6087,7 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                     },
                     manifest_global_id_cache,
                 )?;
-                if let Some(source_input) = source_inputs.map(|inputs| inputs[rate_index]) {
+                if let Some(source_input) = source_input {
                     capture_emitted_source_rate_occurrences(EmittedSourceRateWitnessInput {
                         procedure: source_procedure.expect("source procedure validated above"),
                         rate,
@@ -6518,6 +6608,17 @@ struct InNetworkStreamState<'a, W: Write> {
     chunk_size: usize,
 }
 
+fn procedure_has_queryable_code(procedure: &Map<String, Value>) -> bool {
+    ["billing_code_type", "billing_code"]
+        .iter()
+        .all(|field_name| {
+            matches!(
+                procedure.get(*field_name),
+                Some(Value::String(value)) if !value.trim().is_empty()
+            )
+        })
+}
+
 fn validate_procedure_for_rate_dispatch(procedure: &Map<String, Value>) -> io::Result<()> {
     if !procedure.contains_key("billing_code_type") || !procedure.contains_key("billing_code") {
         return Err(io::Error::new(
@@ -6527,11 +6628,11 @@ fn validate_procedure_for_rate_dispatch(procedure: &Map<String, Value>) -> io::R
     }
     for field_name in ["billing_code_type", "billing_code"] {
         match procedure.get(field_name) {
-            Some(Value::String(value)) if !value.trim().is_empty() => {}
+            Some(Value::String(_)) => {}
             Some(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("{field_name} must be a non-empty JSON string"),
+                    format!("{field_name} must be a JSON string"),
                 ));
             }
             None => unreachable!("required procedure fields were checked above"),
@@ -19707,22 +19808,28 @@ mod tests {
         assert!(serving_binary_compression_is_worthwhile(1_000_000, 970_000));
     }
 
-    fn write_reversed_provider_reference_fixture(path: &Path, referenced_id: i64) {
+    fn write_reversed_provider_reference_fixture(path: &Path, referenced_ids: &[i64]) {
+        let negotiated_rates = referenced_ids
+            .iter()
+            .map(|referenced_id| {
+                json!({
+                    "provider_references": [referenced_id],
+                    "negotiated_prices": [{
+                        "negotiated_type": "negotiated",
+                        "negotiated_rate": 123.45,
+                        "expiration_date": "2026-12-31",
+                        "service_code": ["11"],
+                        "billing_class": "professional"
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
         let in_network = json!([{
             "billing_code_type": "CPT",
             "billing_code": "99213",
             "negotiation_arrangement": " fFs ",
             "name": "Office visit",
-            "negotiated_rates": [{
-                "provider_references": [referenced_id],
-                "negotiated_prices": [{
-                    "negotiated_type": "negotiated",
-                    "negotiated_rate": 123.45,
-                    "expiration_date": "2026-12-31",
-                    "service_code": ["11"],
-                    "billing_class": "professional"
-                }]
-            }]
+            "negotiated_rates": negotiated_rates
         }]);
         let provider_references = json!([{
             "provider_group_id": 7,
@@ -19818,6 +19925,12 @@ mod tests {
         }
         assert_eq!(offset, bundle.len());
         metadata
+    }
+
+    fn source_witness_header(bundle: &[u8]) -> Value {
+        assert_eq!(&bundle[..8], b"PTG2SW02");
+        let header_length = u32::from_be_bytes(bundle[8..12].try_into().unwrap()) as usize;
+        serde_json::from_slice(&bundle[12..12 + header_length]).unwrap()
     }
 
     #[test]
@@ -20428,13 +20541,18 @@ mod tests {
             ("negotiation_arrangement".to_owned(), Value::Null),
         ]);
         validate_procedure_for_rate_dispatch(&valid).unwrap();
+        assert!(procedure_has_queryable_code(&valid));
 
         for field_name in ["billing_code_type", "billing_code"] {
-            for invalid in [Value::Null, json!(12), json!(true), json!(" ")] {
+            for invalid in [Value::Null, json!(12), json!(true)] {
                 let mut procedure = valid.clone();
                 procedure.insert(field_name.to_owned(), invalid);
                 assert!(validate_procedure_for_rate_dispatch(&procedure).is_err());
             }
+            let mut unqueryable = valid.clone();
+            unqueryable.insert(field_name.to_owned(), json!(" "));
+            validate_procedure_for_rate_dispatch(&unqueryable).unwrap();
+            assert!(!procedure_has_queryable_code(&unqueryable));
             let mut missing = valid.clone();
             missing.remove(field_name);
             assert!(validate_procedure_for_rate_dispatch(&missing).is_err());
@@ -20819,6 +20937,25 @@ mod tests {
         assert_ne!(
             procedure_global_id(&first_payload),
             procedure_global_id(&bundled_payload)
+        );
+
+        let drg_alias = json!({
+            "billing_code_type": "MS-DRG",
+            "billing_code": "7",
+            "negotiation_arrangement": "ffs"
+        });
+        let drg_canonical = json!({
+            "billing_code_type": "MS_DRG",
+            "billing_code": "007",
+            "negotiation_arrangement": "FFS"
+        });
+        assert_eq!(
+            procedure_identity_payload(&drg_alias),
+            procedure_identity_payload(&drg_canonical)
+        );
+        assert_eq!(
+            procedure_global_id(&procedure_identity_payload(&drg_alias)),
+            procedure_global_id(&procedure_identity_payload(&drg_canonical))
         );
 
         let scope = [0x44; COVERAGE_SCOPE_ID_BYTES];
@@ -21249,7 +21386,7 @@ mod tests {
         let serving_run_directory = base.join("serving-runs");
         let price_atom_path = base.join("price-atom.copy");
         let provider_member_path = base.join("provider-group-member.copy");
-        write_reversed_provider_reference_fixture(&input_path, 7);
+        write_reversed_provider_reference_fixture(&input_path, &[7]);
         let _strict_env = strict_scan_env(&serving_run_directory);
         let _env = [
             TestEnvVar::set("HLTHPRT_PTG2_RUST_WORKERS", "2"),
@@ -21308,7 +21445,7 @@ mod tests {
     }
 
     #[test]
-    fn reversed_top_level_order_dangling_reference_fails_end_to_end() {
+    fn reversed_top_level_order_quarantines_dangling_rate_end_to_end() {
         let _env_lock = scanner_env_lock().lock().unwrap();
         let base = std::env::temp_dir().join(format!(
             "ptg2-reversed-top-level-order-dangling-{}",
@@ -21318,7 +21455,7 @@ mod tests {
         let input_path = base.join("input.json");
         let serving_path = base.join("serving.copy");
         let serving_run_directory = base.join("serving-runs");
-        write_reversed_provider_reference_fixture(&input_path, 999);
+        write_reversed_provider_reference_fixture(&input_path, &[7, 999]);
         let _strict_env = strict_scan_env(&serving_run_directory);
         let _env = [
             TestEnvVar::set("HLTHPRT_PTG2_RUST_WORKERS", "2"),
@@ -21330,12 +21467,35 @@ mod tests {
             TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS", "0"),
         ];
 
-        let error = scan_compact_struson(&input_path).unwrap_err();
+        scan_compact_struson(&input_path).unwrap();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error
-            .to_string()
-            .contains("unresolved provider reference: 999"));
+        let serving_run_bytes = std::fs::read_dir(&serving_run_directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("-partition-"))
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum::<u64>();
+        let witness_path = std::fs::read_dir(&serving_run_directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("ptg2-v3-source-witness-"))
+            })
+            .unwrap();
+        let witness_header = source_witness_header(&std::fs::read(witness_path).unwrap());
+
+        assert_eq!(serving_run_bytes, SERVING_RUN_RECORD_BYTES as u64);
+        assert_eq!(
+            witness_header["rate_occurrence"]["emitted_rate_row_count"],
+            2
+        );
+        assert_eq!(
+            witness_header["rate_occurrence"]["unqueryable_rate_row_count"],
+            1,
+        );
         assert!(!serving_path.exists());
         let _ = std::fs::remove_dir_all(base);
     }
@@ -21581,7 +21741,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_order_parallel_byte_scan_preserves_producer_source_error() {
+    fn normal_order_parallel_byte_scan_quarantines_empty_code_rows() {
         let _env_lock = scanner_env_lock().lock().unwrap();
         let base =
             std::env::temp_dir().join(format!("ptg2-normal-producer-error-{}", std::process::id()));
@@ -21613,7 +21773,13 @@ mod tests {
                             "billing_code_type":"CPT",
                             "billing_code":"",
                             "negotiation_arrangement":"ffs",
-                            "negotiated_rates":[]
+                            "negotiated_rates":[{{
+                                "provider_references":[7],
+                                "negotiated_prices":[{{
+                                    "negotiated_type":"negotiated",
+                                    "negotiated_rate":999.99
+                                }}]
+                            }}]
                         }}
                     ]
                 }}"#
@@ -21637,12 +21803,34 @@ mod tests {
             TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS", "0"),
         ];
 
-        let error = scan_compact_struson(&input_path).unwrap_err();
+        scan_compact_struson(&input_path).unwrap();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let serving_run_bytes = std::fs::read_dir(&serving_run_directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("-partition-"))
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum::<u64>();
+        let witness_path = std::fs::read_dir(&serving_run_directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("ptg2-v3-source-witness-"))
+            })
+            .unwrap();
+        let witness_header = source_witness_header(&std::fs::read(witness_path).unwrap());
+
+        assert_eq!(serving_run_bytes, SERVING_RUN_RECORD_BYTES as u64);
         assert_eq!(
-            error.to_string(),
-            "billing_code must be a non-empty JSON string"
+            witness_header["rate_occurrence"]["emitted_rate_row_count"],
+            2
+        );
+        assert_eq!(
+            witness_header["rate_occurrence"]["unqueryable_rate_row_count"],
+            1,
         );
         assert!(!serving_path.exists());
         std::fs::remove_dir_all(base).unwrap();

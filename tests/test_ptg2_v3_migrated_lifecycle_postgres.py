@@ -48,6 +48,7 @@ from process.ptg_parts.ptg2_shared_finalize import (
 )
 from process.ptg_parts.ptg2_shared_gc import sweep_ptg2_shared_blocks
 from process.ptg_parts.ptg2_shared_reuse import (
+    SharedLogicalPlanScope,
     SharedPhysicalArtifactIdentity,
     SharedSnapshotSourceAssignment,
     shared_source_set_metadata,
@@ -328,8 +329,7 @@ async def _insert_logical_snapshot_prerequisites(
     await publish_shared_v3_snapshot_sources(
         schema_name=SCHEMA_NAME,
         snapshot_id=snapshot_id,
-        plan_id=plan_id,
-        plan_market_type="group",
+        plan_scopes=[SharedLogicalPlanScope(plan_id, "ein", "group")],
         coverage_scope_id=COVERAGE_SCOPE_ID,
         assignments=[assignment],
     )
@@ -368,8 +368,9 @@ async def _stage_candidate(
         },
         shared_snapshot_key=snapshot_key,
         coverage_scope_id=COVERAGE_SCOPE_ID,
-        coverage_plan_id=plan_id,
-        coverage_plan_market_type="group",
+        coverage_plan_scopes=[
+            SharedLogicalPlanScope(plan_id, "ein", "group")
+        ],
     )
     assert staged["status"] == "validated"
     assert staged["candidate_attributes"]["manifest"]["activation"] == {

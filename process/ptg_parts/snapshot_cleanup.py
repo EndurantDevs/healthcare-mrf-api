@@ -44,6 +44,7 @@ _STRICT_V3_SHARED_TABLE_NAMES = (
     "ptg2_v3_snapshot_layout",
     "ptg2_v3_snapshot_binding",
     "ptg2_v3_snapshot_scope",
+    "ptg2_v3_snapshot_plan_scope",
     "ptg2_v3_block",
     "ptg2_v3_snapshot_block",
     "ptg2_v3_graph_owner",
@@ -468,9 +469,13 @@ async def _missing_snapshot_serving_resources(
                   FROM {schema}.ptg2_v3_snapshot_scope AS scope
                  WHERE scope.snapshot_id = binding.snapshot_id) AS scope_count,
                (SELECT COUNT(*)
-                  FROM {schema}.ptg2_v3_snapshot_scope AS scope
+                 FROM {schema}.ptg2_v3_snapshot_scope AS scope
                  WHERE scope.snapshot_id = binding.snapshot_id
-                   AND scope.coverage_scope_id = :coverage_scope_id) AS matching_scope_count
+                   AND scope.coverage_scope_id = :coverage_scope_id) AS matching_scope_count,
+               (SELECT COUNT(*)
+                  FROM {schema}.ptg2_v3_snapshot_plan_scope AS plan_scope
+                 WHERE plan_scope.snapshot_id = binding.snapshot_id)
+                   AS logical_plan_scope_count
           FROM {schema}.ptg2_v3_snapshot_binding AS binding
           JOIN {schema}.ptg2_v3_snapshot_layout AS layout
             ON layout.snapshot_key = binding.snapshot_key
@@ -508,6 +513,8 @@ async def _missing_snapshot_serving_resources(
         contract_errors.append("snapshot_scope")
     if int(resource_record.get("matching_scope_count") or 0) != 1:
         contract_errors.append("coverage_scope_binding")
+    if int(resource_record.get("logical_plan_scope_count") or 0) <= 0:
+        contract_errors.append("logical_plan_scope")
     code_count = int(resource_record.get("code_count") or 0)
     code_scope_count = int(resource_record.get("code_scope_count") or 0)
     matching_code_scope_count = int(

@@ -23,7 +23,8 @@ const SOURCE_WITNESS_LOCAL_CANDIDATE_TARGET: usize = SOURCE_WITNESS_TOTAL_TARGET
 const SOURCE_WITNESS_MAGIC: &[u8; 8] = b"PTG2SW02";
 const SOURCE_WITNESS_RECORD_MAGIC: &[u8; 8] = b"PTG2SWR2";
 const SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES: usize = 8 * 1024 * 1024;
-const SOURCE_WITNESS_MAX_COMPRESSED_COHORT_BYTES: u64 = 64 * 1024 * 1024;
+const SOURCE_WITNESS_MAX_COMPRESSED_RATE_COHORT_BYTES: u64 = 112 * 1024 * 1024;
+const SOURCE_WITNESS_MAX_COMPRESSED_PROVIDER_COHORT_BYTES: u64 = 12 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SourceWitnessCoordinate {
@@ -134,6 +135,7 @@ struct SourceWitnessSamplerState {
 
 struct SourceWitnessSampler {
     target: usize,
+    compressed_byte_limit: u64,
     population: AtomicU64,
     evaluated: AtomicU64,
     oversized: AtomicU64,
@@ -142,9 +144,10 @@ struct SourceWitnessSampler {
 }
 
 impl SourceWitnessSampler {
-    fn new(target: usize) -> Self {
+    fn new(target: usize, compressed_byte_limit: u64) -> Self {
         Self {
             target,
+            compressed_byte_limit,
             population: AtomicU64::new(0),
             evaluated: AtomicU64::new(0),
             oversized: AtomicU64::new(0),
@@ -217,10 +220,13 @@ impl SourceWitnessSampler {
             .compressed_bytes
             .saturating_sub(evicted_bytes)
             .saturating_add(compressed_record.len() as u64);
-        if projected_bytes > SOURCE_WITNESS_MAX_COMPRESSED_COHORT_BYTES {
+        if projected_bytes > self.compressed_byte_limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "selected source witness cohort exceeds the fail-closed payload budget",
+                format!(
+                    "selected source witness cohort would use {projected_bytes} bytes, exceeding the fail-closed {}-byte payload budget",
+                    self.compressed_byte_limit,
+                ),
             ));
         }
         state.compressed_bytes = state
@@ -270,7 +276,7 @@ impl SourceWitnessSampler {
             "selected_count": selected_count,
             "compressed_bytes": compressed_bytes,
             "compressed_record_byte_limit": SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES,
-            "compressed_byte_limit": SOURCE_WITNESS_MAX_COMPRESSED_COHORT_BYTES,
+            "compressed_byte_limit": self.compressed_byte_limit,
         })
     }
 }
@@ -342,8 +348,14 @@ impl SourceWitnessCollector {
         Ok(Self {
             raw_source_sha256: digest,
             raw_source_sha256_hex: normalized,
-            rate_occurrences: SourceWitnessSampler::new(SOURCE_WITNESS_LOCAL_CANDIDATE_TARGET),
-            provider_references: SourceWitnessSampler::new(SOURCE_WITNESS_LOCAL_CANDIDATE_TARGET),
+            rate_occurrences: SourceWitnessSampler::new(
+                SOURCE_WITNESS_LOCAL_CANDIDATE_TARGET,
+                SOURCE_WITNESS_MAX_COMPRESSED_RATE_COHORT_BYTES,
+            ),
+            provider_references: SourceWitnessSampler::new(
+                SOURCE_WITNESS_PROVIDER_QUOTA,
+                SOURCE_WITNESS_MAX_COMPRESSED_PROVIDER_COHORT_BYTES,
+            ),
             rate_rows: AtomicU64::new(0),
             unqueryable_rate_rows: AtomicU64::new(0),
             provider_spools: OnceLock::new(),
@@ -702,10 +714,29 @@ impl SourceWitnessCollector {
         record.extend_from_slice(raw);
         record.extend_from_slice(&linked_provider_length.to_be_bytes());
         record.extend_from_slice(linked_provider_raw);
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&record)?;
-        encoder.finish()
+        compress_source_witness_record(&record)
     }
+}
+
+fn zlib_compress_record(record: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), compression);
+    encoder.write_all(record)?;
+    encoder.finish()
+}
+
+fn compress_source_witness_record_with_limit(
+    record: &[u8],
+    fast_limit: usize,
+) -> io::Result<Vec<u8>> {
+    let fast_record = zlib_compress_record(record, Compression::fast())?;
+    if fast_record.len() <= fast_limit {
+        return Ok(fast_record);
+    }
+    zlib_compress_record(record, Compression::best())
+}
+
+fn compress_source_witness_record(record: &[u8]) -> io::Result<Vec<u8>> {
+    compress_source_witness_record_with_limit(record, SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES)
 }
 
 fn deterministic_u64(seed: &[u8; 32], domain: &[u8], counter: u64, attempt: u64) -> u64 {
@@ -835,7 +866,7 @@ mod tests {
 
     #[test]
     fn sampler_is_order_independent_and_bounded() {
-        let sampler = SourceWitnessSampler::new(3);
+        let sampler = SourceWitnessSampler::new(3, 1_024);
         for priority in [9, 2, 7, 1, 3, 8] {
             sampler.add_population(1).unwrap();
             sampler
@@ -981,7 +1012,7 @@ mod tests {
 
     #[test]
     fn selected_oversized_record_fails_closed() {
-        let sampler = SourceWitnessSampler::new(1);
+        let sampler = SourceWitnessSampler::new(1, u64::MAX);
         let error = sampler
             .insert(
                 1,
@@ -995,7 +1026,7 @@ mod tests {
 
     #[test]
     fn selected_record_above_the_old_limit_remains_bounded_and_is_accepted() {
-        let sampler = SourceWitnessSampler::new(1);
+        let sampler = SourceWitnessSampler::new(1, u64::MAX);
         let compressed_record = vec![0; 512 * 1024 + 1];
 
         sampler
@@ -1005,5 +1036,40 @@ mod tests {
         let selected = sampler.take_sorted().unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].compressed_record, compressed_record);
+    }
+
+    #[test]
+    fn provider_sampler_keeps_only_the_global_provider_quota() {
+        let collector = SourceWitnessCollector::new(&"ab".repeat(32)).unwrap();
+
+        assert_eq!(
+            collector.provider_references.target,
+            SOURCE_WITNESS_PROVIDER_QUOTA
+        );
+        assert_eq!(
+            collector.provider_references.compressed_byte_limit,
+            SOURCE_WITNESS_MAX_COMPRESSED_PROVIDER_COHORT_BYTES,
+        );
+    }
+
+    #[test]
+    fn large_witness_records_retry_with_best_compression() {
+        let mut record = br#"{"provider_groups":[{"npi":["#.to_vec();
+        for index in 0..225_000 {
+            if index > 0 {
+                record.push(b',');
+            }
+            write!(&mut record, "{}", 1_234_567_890 + index % 10_000).unwrap();
+        }
+        record.extend_from_slice(br#"]}]}"#);
+        let fast_record = zlib_compress_record(&record, Compression::fast()).unwrap();
+        let best_record = zlib_compress_record(&record, Compression::best()).unwrap();
+        let retry_limit = fast_record.len().saturating_sub(1);
+
+        assert!(best_record.len() < fast_record.len());
+        assert_eq!(
+            compress_source_witness_record_with_limit(&record, retry_limit).unwrap(),
+            best_record,
+        );
     }
 }

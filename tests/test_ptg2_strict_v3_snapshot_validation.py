@@ -135,6 +135,7 @@ def _layout_row(serving_index: dict[str, object]) -> dict[str, object]:
         "has_npi_scope": True,
         "scope_count": 1,
         "matching_scope_count": 1,
+        "logical_plan_scope_count": 1,
     }
 
 

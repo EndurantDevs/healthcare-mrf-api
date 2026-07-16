@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import (
+    ptg2_candidate_audit,
     ptg2_db_sidecars,
     ptg2_db_serving_v3_pages,
     ptg2_serving,
@@ -500,10 +501,13 @@ async def test_shared_code_and_provider_support_queries_are_snapshot_scoped():
     assert code_rows[0]["code_key"] == 7
     assert code_rows[0]["negotiation_arrangement"] == "FFS"
     assert "ptg2_v3_code" in code_sql
-    assert "JOIN mrf.ptg2_v3_snapshot_scope logical_scope" in code_sql
-    assert "logical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+    assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in code_sql
+    assert "JOIN LATERAL (" in code_sql
+    assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in code_sql
+    assert "physical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+    assert "plan_scope.snapshot_id = :logical_snapshot_id" in code_sql
     assert (
-        "logical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in code_sql
+        "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in code_sql
     )
     assert "logical_scope.plan_id" in code_sql
     assert "code_metadata.negotiation_arrangement" in code_sql
@@ -562,10 +566,13 @@ async def test_forward_search_scopes_shared_layout_rows_to_each_logical_plan(
         assert response is None
         code_sql, code_params = session.calls[0]
         assert "FROM mrf.ptg2_v3_code code_metadata" in code_sql
-        assert "JOIN mrf.ptg2_v3_snapshot_scope logical_scope" in code_sql
-        assert "logical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+        assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in code_sql
+        assert "JOIN LATERAL (" in code_sql
+        assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in code_sql
+        assert "physical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+        assert "plan_scope.snapshot_id = :logical_snapshot_id" in code_sql
         assert (
-            "logical_scope.coverage_scope_id = code_metadata.coverage_scope_id"
+            "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id"
             in code_sql
         )
         assert "logical_scope.plan_id" in code_sql
@@ -773,6 +780,118 @@ async def test_explicit_npi_search_does_not_expand_other_provider_set_members(
     ]
     assert merge_rows.await_args.kwargs["provider_set_keys"] == [3]
     assert location_matches.await_args.kwargs["provider_set_keys"] == {3}
+    broad_rows.assert_not_awaited()
+
+
+def _stub_candidate_audit_npi_without_address(
+    monkeypatch,
+    provider_set_id,
+    price_set_id,
+):
+    _stub_exact_npi_price_rows(monkeypatch, provider_set_id, price_set_id)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_version_three_explicit_npi_graph_scope",
+        AsyncMock(return_value=_exact_npi_graph_scope()),
+    )
+    location_matches = AsyncMock(
+        side_effect=AssertionError(
+            "candidate audit must not require address-backed location matching"
+        )
+    )
+    broad_rows = AsyncMock(
+        side_effect=AssertionError(
+            "candidate audit must not expand unrelated provider-set members"
+        )
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_location_provider_matches",
+        location_matches,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_provider_rows_for_provider_sets",
+        broad_rows,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_enriched_provider_rows_for_npis",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_source_provenance_for_rows",
+        AsyncMock(
+            return_value={
+                0: {
+                    "source_key": 0,
+                    "source_type": "in_network",
+                    "identity_kind": "raw_container_sha256_v1",
+                    "identity_sha256": "1" * 64,
+                    "raw_container_sha256": "1" * 64,
+                    "logical_json_sha256": None,
+                    "logical_hash_deferred": True,
+                    "source_trace_set_hash": "2" * 64,
+                    "source_trace": [],
+                }
+            }
+        ),
+    )
+    return location_matches, broad_rows
+
+
+def _candidate_audit_query_args():
+    candidate_access = ptg2_candidate_audit.PTG2CandidateAuditAccess(
+        snapshot_id="logical-plan-a",
+        source_key="logical-source",
+        plan_id="plan-a",
+        plan_market_type="group",
+    )
+    return {
+        "plan_id": "plan-a",
+        "plan_market_type": "group",
+        "source_key": "logical-source",
+        "code_system": "CPT",
+        "code": "99213",
+        "npi": "1234567890",
+        "negotiated_rate": "125.00",
+        "include_providers": True,
+        "include_sources": True,
+        ptg2_candidate_audit.PTG2_CANDIDATE_AUDIT_ACCESS_ARG: candidate_access,
+    }
+
+
+@pytest.mark.asyncio
+async def test_candidate_audit_exact_npi_does_not_require_an_address(
+    monkeypatch,
+):
+    """Return exact graph evidence even when provider enrichment has no address."""
+
+    provider_set_id = "03" * 16
+    price_set_id = "05" * 16
+    location_matches, broad_rows = _stub_candidate_audit_npi_without_address(
+        monkeypatch,
+        provider_set_id,
+        price_set_id,
+    )
+    session = _single_code_metadata_session()
+
+    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "logical-plan-a",
+        _candidate_audit_query_args(),
+        SimpleNamespace(limit=100, offset=0),
+        _strict_tables(snapshot_id="logical-plan-a", snapshot_key=41),
+        "exact_source",
+    )
+
+    assert response is not None
+    assert response["items"][0]["npi"] == 1234567890
+    assert response["items"][0]["address_verification"][
+        "displayed_address_present"
+    ] is False
+    location_matches.assert_not_awaited()
     broad_rows.assert_not_awaited()
 
 
@@ -1270,10 +1389,13 @@ async def test_location_rate_provider_lookup_uses_logical_plan_scope(monkeypatch
     assert candidates is expected_candidates
     code_sql, code_params = session.calls[0]
     assert "FROM mrf.ptg2_v3_code code_metadata" in code_sql
-    assert "JOIN mrf.ptg2_v3_snapshot_scope logical_scope" in code_sql
-    assert "logical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+    assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in code_sql
+    assert "JOIN LATERAL (" in code_sql
+    assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in code_sql
+    assert "physical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+    assert "plan_scope.snapshot_id = :logical_snapshot_id" in code_sql
     assert (
-        "logical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in code_sql
+        "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in code_sql
     )
     assert "logical_scope.plan_id" in code_sql
     assert "logical_scope.plan_market_type" in code_sql
@@ -1336,13 +1458,16 @@ async def test_route_proof_joins_logical_scope_and_fails_closed_on_no_row():
     assert has_route is False
     proof_sql, proof_params = session.calls[0]
     assert "FROM mrf.ptg2_v3_code code_metadata" in proof_sql
-    assert "JOIN mrf.ptg2_v3_snapshot_scope logical_scope" in proof_sql
-    assert "logical_scope.snapshot_id = :logical_snapshot_id" in proof_sql
+    assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in proof_sql
+    assert "JOIN LATERAL (" in proof_sql
+    assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in proof_sql
+    assert "physical_scope.snapshot_id = :logical_snapshot_id" in proof_sql
+    assert "plan_scope.snapshot_id = :logical_snapshot_id" in proof_sql
     assert (
-        "logical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in proof_sql
+        "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in proof_sql
     )
-    assert "logical_scope.plan_id = :plan_id" in proof_sql
-    assert "logical_scope.plan_market_type = :plan_market_type" in proof_sql
+    assert "plan_scope.plan_id = :plan_id" in proof_sql
+    assert "plan_scope.plan_market_type = :plan_market_type" in proof_sql
     assert "code_metadata.plan_id" not in proof_sql
     assert "COALESCE(plan_id" not in proof_sql
     assert proof_params == {

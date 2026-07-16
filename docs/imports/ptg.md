@@ -146,13 +146,19 @@ ownership:
 - Fixed PostgreSQL support tables store dense code, provider, price, graph,
   NPI-scope, and audit metadata for the physical layout.
 - `ptg2_v3_snapshot_binding` binds each logical snapshot id to a sealed layout.
-- `ptg2_v3_snapshot_scope` stores the logical plan and coverage scope used to
-  filter that snapshot.
+- `ptg2_v3_snapshot_scope` stores one immutable physical coverage scope for
+  the logical snapshot.
+- `ptg2_v3_snapshot_plan_scope` binds every logical plan record represented by
+  that file set to the snapshot. Several employers or groups may legitimately
+  reference the same complete physical file set.
 
-A reused layout does not merge plans or snapshots. Each API request resolves
-the requested logical snapshot, follows its binding, and joins physical code
-metadata to that snapshot's logical scope. Source-current and plan-current
-pointers also remain logical and can move independently.
+A reused layout does not merge plan ownership. The importer stores and scans
+one physical layout for an identical complete file set, then creates one
+logical binding per plan record without copying rates. Each API request
+resolves the requested logical snapshot and plan binding, follows the shared
+layout binding, and joins physical code metadata to the snapshot's coverage
+scope. Source-current and plan-current pointers remain logical and can move
+independently.
 
 Allowed evidence uses four fixed PostgreSQL relations for plan coverage,
 billable items, payments, and provider payments. Each row carries its logical

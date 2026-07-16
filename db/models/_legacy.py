@@ -2422,6 +2422,51 @@ class PTG2V3SnapshotScope(Base, JSONOutputMixin):
     )
 
 
+class PTG2V3SnapshotPlanScope(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_snapshot_plan_scope"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_id",
+            "plan_id",
+            "plan_market_type",
+            name="ptg2_v3_snapshot_plan_scope_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_id"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v3_snapshot_scope.snapshot_id"
+            ],
+            name="ptg2_v3_snapshot_plan_scope_snapshot_id_fkey",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "ptg2_v3_snapshot_plan_scope_lookup_idx",
+            "plan_id",
+            "plan_market_type",
+            "snapshot_id",
+        ),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_id = Column(String(96), nullable=False)
+    plan_id = Column(String(64), nullable=False)
+    plan_market_type = Column(
+        String(32),
+        nullable=False,
+        server_default=text("''"),
+    )
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+
 class PTG2V3CandidateAuditAttestation(Base, JSONOutputMixin):
     __tablename__ = "ptg2_v3_candidate_audit_attestation"
     __main_table__ = __tablename__
@@ -2772,18 +2817,6 @@ class PTG2V3Code(Base, JSONOutputMixin):
             "snapshot_key",
             "code_key",
             name="ptg2_v3_code_pkey",
-        ),
-        UniqueConstraint(
-            "snapshot_key",
-            "coverage_scope_id",
-            "reported_code_system",
-            "reported_code",
-            "negotiation_arrangement",
-            "billing_code_type_version",
-            "source_name",
-            "source_description",
-            name="ptg2_v3_code_identity_key",
-            postgresql_nulls_not_distinct=True,
         ),
         UniqueConstraint(
             "snapshot_key",

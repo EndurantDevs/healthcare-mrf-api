@@ -141,7 +141,7 @@ async def current_snapshot_id(
             plan_sql = f"""
                    AND EXISTS (
                        SELECT 1
-                         FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_scope snapshot_scope
+                         FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope snapshot_scope
                         WHERE snapshot_scope.snapshot_id = ptg2_snapshot.snapshot_id
                           AND snapshot_scope.plan_id = ANY(CAST(:plan_ids AS text[]))
                           {market_sql}
@@ -217,17 +217,17 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
     # Plan-source pointers are updated by importer worker processes while API
     # servers keep their own memory. Do not cache this lookup in-process, or a
     # just-published network can stay invisible until the API pod's TTL expires.
-    params: dict[str, object] = {"plan_ids": plan_variants}
+    query_parameters_by_name: dict[str, object] = {"plan_ids": plan_variants}
     market_sql = ""
     if market_type:
-        params["plan_market_type"] = market_type
+        query_parameters_by_name["plan_market_type"] = market_type
         market_sql = "AND cps.plan_market_type = :plan_market_type"
     source_sql = ""
     if source_key:
-        params["source_key"] = source_key
+        query_parameters_by_name["source_key"] = source_key
         source_sql = "AND cps.source_key = :source_key"
     effective_month_sql = _source_effective_month_sql("cps", "s")
-    result = await session.execute(
+    snapshot_query = await session.execute(
         text(
             f"""
              SELECT cps.snapshot_id
@@ -244,11 +244,10 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
              LIMIT 1
             """
         ),
-        params,
+        query_parameters_by_name,
     )
-    value = result.scalar()
-    value = str(value) if value else None
-    return value
+    snapshot_id_value = snapshot_query.scalar()
+    return str(snapshot_id_value) if snapshot_id_value else None
 
 
 async def current_source_snapshot_ids_for_plan(
@@ -269,18 +268,18 @@ async def current_source_snapshot_ids_for_plan(
     source_key = str(args.get("source_key") or "").strip().lower()
     # This list changes whenever a source/network publish completes. API pods
     # cannot see cache invalidation from importer workers, so resolve it live.
-    params: dict[str, object] = {"plan_ids": plan_variants}
+    query_parameters_by_name: dict[str, object] = {"plan_ids": plan_variants}
     market_sql = ""
     if market_type:
-        params["plan_market_type"] = market_type
+        query_parameters_by_name["plan_market_type"] = market_type
         market_sql = "AND cps.plan_market_type = :plan_market_type"
     source_sql = ""
     if source_key:
-        params["source_key"] = source_key
+        query_parameters_by_name["source_key"] = source_key
         source_sql = "AND cps.source_key = :source_key"
     logical_network_sql = _logical_network_key_sql("cps", "s")
     effective_month_sql = _source_effective_month_sql("cps", "s")
-    result = await session.execute(
+    source_snapshot_query = await session.execute(
         text(
             f"""
              WITH candidate_snapshots AS (
@@ -306,14 +305,14 @@ async def current_source_snapshot_ids_for_plan(
                        updated_at DESC NULLS LAST
             """
         ),
-        params,
+        query_parameters_by_name,
     )
-    pairs = [
-        (str(row[0] or ""), str(row[1]))
-        for row in result
-        if row[1]
+    source_snapshot_pairs = [
+        (str(snapshot_record[0] or ""), str(snapshot_record[1]))
+        for snapshot_record in source_snapshot_query
+        if snapshot_record[1]
     ]
-    return pairs
+    return source_snapshot_pairs
 
 
 async def resolve_current_ptg2_snapshot_id(session, args: dict[str, object]) -> str | None:
