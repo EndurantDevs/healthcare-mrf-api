@@ -703,6 +703,7 @@ pub struct PartitionFile {
     pub path: PathBuf,
     pub record_count: u64,
     pub bytes: u64,
+    pub sha256: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -781,6 +782,7 @@ pub struct CodeDictionaryFile {
     pub path: PathBuf,
     pub record_count: u64,
     pub bytes: u64,
+    pub sha256: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -793,6 +795,7 @@ struct PartitionSink {
     staged_path: PathBuf,
     ready_path: PathBuf,
     writer: BufWriter<File>,
+    sha256: Sha256,
 }
 
 /// Buffered, lazily opened staged files for code-ID partitions.
@@ -876,9 +879,12 @@ impl ServingRunPartitionWriter {
                 "partition record count overflow",
             )
         })?;
-        let write_result = self
-            .writer_for_partition(partition_index)
-            .and_then(|writer| record.write_to(writer));
+        let encoded = record.encode();
+        let write_result = self.sink_for_partition(partition_index).and_then(|sink| {
+            sink.writer.write_all(&encoded)?;
+            sink.sha256.update(encoded);
+            Ok(())
+        });
         if let Err(error) = write_result {
             self.poisoned = true;
             return Err(error);
@@ -974,6 +980,7 @@ impl ServingRunPartitionWriter {
                 path: sink.ready_path,
                 record_count: self.counts[partition_index],
                 bytes,
+                sha256: sink.sha256.finalize().into(),
             });
         }
         let code_dictionary_file = if let Some(sink) = code_dictionary_sink {
@@ -985,6 +992,7 @@ impl ServingRunPartitionWriter {
                 path: sink.ready_path,
                 record_count: self.code_dictionary.len() as u64,
                 bytes,
+                sha256: sink.sha256.finalize().into(),
             })
         } else {
             None
@@ -1038,23 +1046,30 @@ impl ServingRunPartitionWriter {
             .create_new(true)
             .open(&staged_path)?;
         self.staged_cleanup_paths.push(staged_path.clone());
-        let mut writer = BufWriter::with_capacity(self.buffer_capacity, file);
-        writer.write_all(CODE_DICTIONARY_MAGIC)?;
-        writer.write_all(&CODE_DICTIONARY_FORMAT_VERSION.to_be_bytes())?;
-        writer.write_all(&(self.code_dictionary.len() as u64).to_be_bytes())?;
-        for code in self.code_dictionary.values() {
-            write_code_dictionary_record(&mut writer, code)?;
-        }
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        Ok(Some(PartitionSink {
+        let mut sink = PartitionSink {
             staged_path,
             ready_path,
-            writer,
-        }))
+            writer: BufWriter::with_capacity(self.buffer_capacity, file),
+            sha256: Sha256::new(),
+        };
+        {
+            let mut writer = Sha256Writer {
+                writer: &mut sink.writer,
+                sha256: &mut sink.sha256,
+            };
+            writer.write_all(CODE_DICTIONARY_MAGIC)?;
+            writer.write_all(&CODE_DICTIONARY_FORMAT_VERSION.to_be_bytes())?;
+            writer.write_all(&(self.code_dictionary.len() as u64).to_be_bytes())?;
+            for code in self.code_dictionary.values() {
+                write_code_dictionary_record(&mut writer, code)?;
+            }
+            writer.flush()?;
+        }
+        sink.writer.get_ref().sync_all()?;
+        Ok(Some(sink))
     }
 
-    fn writer_for_partition(&mut self, partition_index: usize) -> io::Result<&mut BufWriter<File>> {
+    fn sink_for_partition(&mut self, partition_index: usize) -> io::Result<&mut PartitionSink> {
         if self.writers[partition_index].is_none() {
             let staged_path = self.staged_path(partition_index);
             let ready_path = self.ready_path(partition_index);
@@ -1067,12 +1082,29 @@ impl ServingRunPartitionWriter {
                 staged_path,
                 ready_path,
                 writer: BufWriter::with_capacity(self.buffer_capacity, file),
+                sha256: Sha256::new(),
             });
         }
         self.writers[partition_index]
             .as_mut()
-            .map(|sink| &mut sink.writer)
             .ok_or_else(|| io::Error::other("partition writer was not initialized"))
+    }
+}
+
+struct Sha256Writer<'a, W> {
+    writer: &'a mut W,
+    sha256: &'a mut Sha256,
+}
+
+impl<W: Write> Write for Sha256Writer<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.writer.write(bytes)?;
+        self.sha256.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
 }
 

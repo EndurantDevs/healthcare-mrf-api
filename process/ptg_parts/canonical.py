@@ -106,39 +106,44 @@ def _canonical_sort_key(value: Any) -> str:
     return json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def _canonicalize_for_json(value: Any, key: str | None = None) -> Any:
+def _canonicalize_for_json(input_value: Any, key: str | None = None) -> Any:
     key_name = _canonical_key(key)
-    if is_dataclass(value):
-        value = asdict(value)
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, Decimal):
-        return normalize_money(value)
-    if isinstance(value, float) and key_name in PTG2_MONEY_KEYS:
-        return normalize_money(value)
-    if isinstance(value, (datetime.date, datetime.datetime)):
-        return normalize_date(value)
-    if isinstance(value, tuple):
-        value = list(value)
-    if isinstance(value, list):
-        normalized_list = [_canonicalize_for_json(item, key=key) for item in value]
+    if is_dataclass(input_value):
+        input_value = asdict(input_value)
+    if isinstance(input_value, Enum):
+        return input_value.value
+    if isinstance(input_value, Decimal):
+        return normalize_money(input_value)
+    if isinstance(input_value, float) and key_name in PTG2_MONEY_KEYS:
+        return normalize_money(input_value)
+    if isinstance(input_value, (datetime.date, datetime.datetime)):
+        return normalize_date(input_value)
+    if isinstance(input_value, tuple):
+        return _canonicalize_for_json(list(input_value), key=key)
+    if isinstance(input_value, list):
+        normalized_list = [
+            _canonicalize_for_json(list_entry, key=key)
+            for list_entry in input_value
+        ]
         if key_name in PTG2_SET_LIKE_KEYS:
             return sorted(normalized_list, key=_canonical_sort_key)
         return normalized_list
-    if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for child_key in sorted(value.keys(), key=lambda item: str(item)):
-            child_value = value[child_key]
+    if isinstance(input_value, dict):
+        normalized_mapping: dict[str, Any] = {}
+        for child_key in sorted(input_value.keys(), key=str):
+            child_value = input_value[child_key]
             child_key_text = str(child_key)
             child_key_name = _canonical_key(child_key_text)
             if child_key_name in PTG2_MONEY_KEYS:
-                out[child_key_text] = normalize_money(child_value)
+                normalized_mapping[child_key_text] = normalize_money(child_value)
             elif child_key_name.endswith("_date") or child_key_name in {"expiration_date", "last_updated_on"}:
-                out[child_key_text] = normalize_date(child_value)
+                normalized_mapping[child_key_text] = normalize_date(child_value)
             else:
-                out[child_key_text] = _canonicalize_for_json(child_value, key=child_key_text)
-        return out
-    return value
+                normalized_mapping[child_key_text] = _canonicalize_for_json(
+                    child_value, key=child_key_text
+                )
+        return normalized_mapping
+    return input_value
 
 
 def canonical_json_dumps(value: Any) -> str:
@@ -202,10 +207,21 @@ def normalize_tic_source_url(url: str) -> str:
     if parsed.netloc.lower() == "www.asrhealthbenefits.com":
         path = parsed.path.rstrip("/")
         if path.lower() == "/home/umbraco/surface/mrfdownload/index":
-            query = {key.lower(): value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
-            group_number = query.get("g") or query.get("groupnumber")
-            file_id = query.get("i") or query.get("fileid")
-            file_type = query.get("t") or query.get("filetype")
+            query_parameter_map = {
+                key.lower(): query_value
+                for key, query_value in parse_qsl(
+                    parsed.query, keep_blank_values=True
+                )
+            }
+            group_number = query_parameter_map.get("g") or query_parameter_map.get(
+                "groupnumber"
+            )
+            file_id = query_parameter_map.get("i") or query_parameter_map.get(
+                "fileid"
+            )
+            file_type = query_parameter_map.get("t") or query_parameter_map.get(
+                "filetype"
+            )
             if group_number and file_id and file_type:
                 return urlunsplit(
                     (

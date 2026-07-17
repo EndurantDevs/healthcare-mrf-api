@@ -10,8 +10,13 @@ from process.ptg_parts.ptg2_shared_finalize import (
 
 
 def _entry(path, **values):
-    path.write_bytes(b"x" * int(values.get("bytes") or 1))
-    return {"path": str(path), **values}
+    payload = b"x" * int(values.get("bytes") or 1)
+    path.write_bytes(payload)
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        **values,
+    }
 
 
 def _canonical_sha256(payload):
@@ -124,6 +129,8 @@ def _summary_payload():
         },
         "blocks": {
             "serving": {
+                "copy_bytes": 1,
+                "copy_sha256": "a" * 64,
                 "artifact_record_counts": {
                     "by_code_provider_shard_v1": 1,
                     "by_code_price_page_v4": 1,
@@ -133,6 +140,8 @@ def _summary_payload():
                 }
             },
             "price_dictionary": {
+                "copy_bytes": 1,
+                "copy_sha256": "b" * 64,
                 "artifact_record_counts": {"by_code_price_dictionary": 1}
             },
         },

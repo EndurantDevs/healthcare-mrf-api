@@ -287,20 +287,25 @@ def test_finalizer_rejects_dictionary_shard_omitted_after_attachment(tmp_path):
         )
 
 
-def test_finalizer_rejects_dictionary_shard_mutated_after_attachment(tmp_path):
+def test_manifest_uses_scanner_dictionary_digest_without_rereading(tmp_path):
     identity, serving_entries, dictionary_entries = _one_source_contracted_inputs(
         tmp_path,
         dictionary_file_count=1,
     )
+    scanner_digest = dictionary_entries[0]["sha256"]
     Path(dictionary_entries[0]["path"]).write_bytes(b"m" * 64)
 
-    with pytest.raises(RuntimeError, match="file digests"):
-        write_v3_finalizer_input_manifest(
-            tmp_path / "mutated-dictionary.json",
-            serving_run_entries=serving_entries,
-            code_dictionary_entries=dictionary_entries,
-            expected_source_identities=[identity],
-        )
+    manifest_path = write_v3_finalizer_input_manifest(
+        tmp_path / "mutated-dictionary.json",
+        serving_run_entries=serving_entries,
+        code_dictionary_entries=dictionary_entries,
+        expected_source_identities=[identity],
+    )
+    payload = json.loads(manifest_path.read_text(encoding="ascii"))
+    assert payload["serving_run_code_dictionary_files"][0]["sha256"] == (
+        scanner_digest
+    )
+    assert scanner_digest != hashlib.sha256(b"m" * 64).hexdigest()
 
 
 def test_finalizer_rejects_duplicate_dictionary_contract_identity(tmp_path):
@@ -426,6 +431,7 @@ def test_finalizer_rejects_unsorted_dictionary_contract_descriptors(tmp_path):
     )
     second_path = Path(dictionary_entries[1]["path"])
     second_path.write_bytes(b"z" * 64)
+    dictionary_entries[1]["sha256"] = hashlib.sha256(b"z" * 64).hexdigest()
     dictionary_entries = _contracted_dictionary_entries(
         [
             {

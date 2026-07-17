@@ -908,6 +908,16 @@ def _strict_non_negative_int(value: Any, field_name: str) -> int:
     return normalized
 
 
+def _strict_sha256(value: Any, field_name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeError(f"strict V3 scanner emitted invalid {field_name}")
+    return value
+
+
 def _validated_v3_file_frame(
     frame_fields: Any,
     *,
@@ -938,6 +948,9 @@ def _validated_v3_file_frame(
     )
     if row_count <= 0 or byte_count <= 0:
         raise RuntimeError(f"strict V3 scanner emitted empty {label} metadata")
+    field_by_name["sha256"] = _strict_sha256(
+        field_by_name.get("sha256"), f"{label} sha256"
+    )
     if "partition" in field_by_name:
         partition = _strict_non_negative_int(
             field_by_name.get("partition"), f"{label} partition"
@@ -1748,6 +1761,7 @@ def _iter_compact_serving_records_rust(
                             "bytes",
                             "format",
                             "version",
+                            "sha256",
                         ),
                         expected_format=_V3_SERVING_RUN_FORMAT,
                         expected_version=_V3_SERVING_RUN_VERSION,
@@ -1758,7 +1772,14 @@ def _iter_compact_serving_records_rust(
                     _validated_v3_file_frame(
                         frame_field_map,
                         label="code-dictionary",
-                        fields=("path", "row_count", "bytes", "format", "version"),
+                        fields=(
+                            "path",
+                            "row_count",
+                            "bytes",
+                            "format",
+                            "version",
+                            "sha256",
+                        ),
                         expected_format=_V3_CODE_DICTIONARY_FORMAT,
                         expected_version=_V3_CODE_DICTIONARY_VERSION,
                     )

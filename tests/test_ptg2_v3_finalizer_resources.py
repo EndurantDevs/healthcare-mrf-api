@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -92,6 +93,8 @@ def _summary_metadata(output_directory):
         },
         "blocks": {
             "serving": {
+                "copy_bytes": 1,
+                "copy_sha256": "a" * 64,
                 "artifact_record_counts": {
                     "by_code_provider_shard_v1": 1,
                     "by_code_price_page_v4": 1,
@@ -101,6 +104,8 @@ def _summary_metadata(output_directory):
                 }
             },
             "price_dictionary": {
+                "copy_bytes": 1,
+                "copy_sha256": "b" * 64,
                 "artifact_record_counts": {"by_code_price_dictionary": 1}
             },
         },
@@ -146,6 +151,7 @@ def _finalizer_inputs(tmp_path):
                 "partition_count": 1,
                 "format": "ptg2_v3_serving_run",
                 "version": 1,
+                "sha256": hashlib.sha256(serving_path.read_bytes()).hexdigest(),
             }
         ],
         source_identity=_physical_identity(),
@@ -166,6 +172,7 @@ def _finalizer_inputs(tmp_path):
                 "bytes": 64,
                 "format": "ptg2_v3_serving_code_dictionary",
                 "version": 4,
+                "sha256": hashlib.sha256(code_path.read_bytes()).hexdigest(),
             }
         ],
         source_identity=_physical_identity(),

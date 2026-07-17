@@ -4,6 +4,7 @@ mod source_witness;
 mod source_witness_spool;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
+#[cfg(test)]
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -386,6 +387,54 @@ impl PartialEq for ProviderEntry {
 
 impl Eq for ProviderEntry {}
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ProviderRefKey {
+    Signed(i64),
+    Unsigned(u64),
+    Text(Box<str>),
+}
+
+impl ProviderRefKey {
+    fn from_number(number: serde_json::Number, field_name: &str) -> io::Result<Self> {
+        if let Some(value) = number.as_i64() {
+            return Ok(Self::Signed(value));
+        }
+        if let Some(value) = number.as_u64() {
+            return Ok(Self::Unsigned(value));
+        }
+        let canonical = strict_integer_text(&Value::Number(number), field_name)?;
+        Ok(Self::from(canonical))
+    }
+}
+
+impl From<String> for ProviderRefKey {
+    fn from(value: String) -> Self {
+        if let Ok(integer) = value.parse::<i64>() {
+            Self::Signed(integer)
+        } else if let Ok(integer) = value.parse::<u64>() {
+            Self::Unsigned(integer)
+        } else {
+            Self::Text(value.into_boxed_str())
+        }
+    }
+}
+
+impl From<&str> for ProviderRefKey {
+    fn from(value: &str) -> Self {
+        Self::from(value.to_owned())
+    }
+}
+
+impl std::fmt::Display for ProviderRefKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Signed(value) => value.fmt(formatter),
+            Self::Unsigned(value) => value.fmt(formatter),
+            Self::Text(value) => value.fmt(formatter),
+        }
+    }
+}
+
 enum ProviderEntryView<'a> {
     Borrowed(&'a ProviderEntry),
     Owned(ProviderEntry),
@@ -430,10 +479,19 @@ impl<'a> ProviderEntryView<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RateLite {
-    provider_refs: Vec<String>,
+    provider_refs: Vec<ProviderRefKey>,
     provider_groups: Vec<Value>,
     network_names: Vec<String>,
     prices: Vec<PriceLite>,
+    prepared_price_set: Option<PriceSetLite>,
+}
+
+impl RateLite {
+    fn price_count(&self) -> usize {
+        self.prepared_price_set
+            .as_ref()
+            .map_or(self.prices.len(), |price_set| price_set.atoms.len())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -500,7 +558,7 @@ impl StringOrStrings {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PriceAtomLite {
     global_id: GlobalId128,
     negotiated_type: Option<String>,
@@ -513,7 +571,7 @@ struct PriceAtomLite {
     additional_information: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PriceSetLite {
     global_id: GlobalId128,
     atoms: Vec<PriceAtomLite>,
@@ -819,6 +877,7 @@ struct CopyFileEvent {
     partition_count: Option<usize>,
     format: Option<String>,
     version: Option<u32>,
+    sha256: Option<String>,
 }
 
 fn emit_copy_file_event<W: Write>(writer: &mut W, event: &CopyFileEvent) -> io::Result<()> {
@@ -838,6 +897,9 @@ fn emit_copy_file_event<W: Write>(writer: &mut W, event: &CopyFileEvent) -> io::
     }
     if let Some(version) = event.version {
         payload.insert("version".to_string(), json!(version));
+    }
+    if let Some(sha256) = event.sha256.as_ref() {
+        payload.insert("sha256".to_string(), json!(sha256));
     }
     emit_json_record(writer, &event.record_kind, &Value::Object(payload))
 }
@@ -1227,11 +1289,17 @@ fn build_provider_entry(provider_ref: &Value) -> io::Result<ProviderEntry> {
     })
 }
 
-fn provider_ref_key(value: &Value) -> io::Result<String> {
-    strict_integer_text(value, "provider_group_id")
+fn provider_ref_key(value: &Value) -> io::Result<ProviderRefKey> {
+    let Value::Number(number) = value else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider_group_id must be a JSON integer",
+        ));
+    };
+    ProviderRefKey::from_number(number.clone(), "provider_group_id")
 }
 
-fn provider_ref_definition(value: &Value) -> io::Result<(String, ProviderEntry)> {
+fn provider_ref_definition(value: &Value) -> io::Result<(ProviderRefKey, ProviderEntry)> {
     let key_value = value.get("provider_group_id").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1242,7 +1310,7 @@ fn provider_ref_definition(value: &Value) -> io::Result<(String, ProviderEntry)>
 }
 
 fn provider_identifier_quarantine_payload(
-    provider_map: &HashMap<String, ProviderEntry>,
+    provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
     inline_quarantine: ProviderIdentifierQuarantine,
 ) -> io::Result<Value> {
     let mut quarantine = inline_quarantine;
@@ -1253,8 +1321,8 @@ fn provider_identifier_quarantine_payload(
 }
 
 fn insert_provider_definition(
-    provider_map: &mut HashMap<String, ProviderEntry>,
-    key: String,
+    provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
+    key: ProviderRefKey,
     entry: ProviderEntry,
 ) -> io::Result<()> {
     // TiC provider_group_id definitions are unique; merging duplicates would invent membership.
@@ -1269,12 +1337,12 @@ fn insert_provider_definition(
 }
 
 fn validate_preloaded_provider_definition(
-    provider_map: &HashMap<String, ProviderEntry>,
-    seen_keys: &mut HashSet<String>,
-    key: &str,
+    provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
+    seen_keys: &mut HashSet<ProviderRefKey>,
+    key: &ProviderRefKey,
     entry: &ProviderEntry,
 ) -> io::Result<()> {
-    if !seen_keys.insert(key.to_owned()) {
+    if !seen_keys.insert(key.clone()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("duplicate provider_group_id definition: {key}"),
@@ -1294,8 +1362,8 @@ fn validate_preloaded_provider_definition(
 }
 
 fn provider_set_from_ref_keys(
-    provider_map: &HashMap<String, ProviderEntry>,
-    refs: &[String],
+    provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
+    refs: &[ProviderRefKey],
 ) -> io::Result<Option<ProviderEntry>> {
     let mut entry_hashes: HashSet<i64> = HashSet::new();
     let mut group_hashes: HashSet<i64> = HashSet::new();
@@ -1390,8 +1458,8 @@ fn combine_provider_entries(first: ProviderEntry, second: ProviderEntry) -> Prov
 }
 
 fn provider_entry_view_from_ref_keys<'a>(
-    provider_map: &'a HashMap<String, ProviderEntry>,
-    refs: &[String],
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
+    refs: &[ProviderRefKey],
 ) -> io::Result<Option<ProviderEntryView<'a>>> {
     if refs.is_empty() {
         return Ok(None);
@@ -1433,12 +1501,35 @@ fn price_atom_from_lite(price: &PriceLite) -> PriceAtomLite {
     }
 }
 
+fn price_atom_from_owned_lite(price: PriceLite) -> PriceAtomLite {
+    let global_id = GlobalId128::from_price_atom_parts(
+        price.negotiated_type.as_deref(),
+        Some(&price.negotiated_rate),
+        price.expiration_date.as_deref(),
+        &price.service_code,
+        price.billing_class.as_deref(),
+        price.setting.as_deref(),
+        &price.billing_code_modifier,
+        price.additional_information.as_deref(),
+    );
+    PriceAtomLite {
+        global_id,
+        negotiated_type: price.negotiated_type,
+        negotiated_rate: price.negotiated_rate,
+        expiration_date: price.expiration_date,
+        service_code: price.service_code,
+        billing_class: price.billing_class,
+        setting: price.setting,
+        billing_code_modifier: price.billing_code_modifier,
+        additional_information: price.additional_information,
+    }
+}
+
 fn price_code_set_hash(codes: &[String]) -> String {
     hash_string_list("price_code_set", codes)
 }
 
-fn price_lite_set(prices: &[PriceLite]) -> Option<PriceSetLite> {
-    let atoms = prices.iter().map(price_atom_from_lite).collect::<Vec<_>>();
+fn price_set_from_atoms(atoms: Vec<PriceAtomLite>) -> Option<PriceSetLite> {
     if atoms.is_empty() {
         return None;
     }
@@ -1450,6 +1541,50 @@ fn price_lite_set(prices: &[PriceLite]) -> Option<PriceSetLite> {
         atoms,
         atom_ids,
     })
+}
+
+fn price_lite_set(prices: &[PriceLite]) -> Option<PriceSetLite> {
+    price_set_from_atoms(prices.iter().map(price_atom_from_lite).collect())
+}
+
+fn price_lite_set_owned(prices: Vec<PriceLite>) -> Option<PriceSetLite> {
+    price_set_from_atoms(prices.into_iter().map(price_atom_from_owned_lite).collect())
+}
+
+enum RatePriceSet<'a> {
+    Borrowed(&'a PriceSetLite),
+    Owned(PriceSetLite),
+}
+
+impl std::ops::Deref for RatePriceSet<'_> {
+    type Target = PriceSetLite;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl RatePriceSet<'_> {
+    fn as_ref(&self) -> &PriceSetLite {
+        match self {
+            Self::Borrowed(price_set) => price_set,
+            Self::Owned(price_set) => price_set,
+        }
+    }
+
+    fn into_owned(self) -> PriceSetLite {
+        match self {
+            Self::Borrowed(price_set) => price_set.clone(),
+            Self::Owned(price_set) => price_set,
+        }
+    }
+}
+
+fn rate_price_set(rate: &RateLite) -> Option<RatePriceSet<'_>> {
+    match rate.prepared_price_set.as_ref() {
+        Some(price_set) => Some(RatePriceSet::Borrowed(price_set)),
+        None => price_lite_set(&rate.prices).map(RatePriceSet::Owned),
+    }
 }
 
 fn price_atom_global_id(atom: &PriceAtomLite) -> GlobalId128 {
@@ -2450,6 +2585,7 @@ fn emit_manifest_sidecar_file<W: Write>(
             partition_count: None,
             format: None,
             version: None,
+            sha256: None,
         },
     )
 }
@@ -2480,6 +2616,7 @@ fn emit_manifest_sidecar_path<W: Write>(
             partition_count: None,
             format: None,
             version: None,
+            sha256: None,
         },
     )
 }
@@ -2719,6 +2856,7 @@ impl CompactCopySink {
             partition_count: None,
             format: None,
             version: None,
+            sha256: None,
         };
         self.row_count = 0;
         Ok(Some(event))
@@ -2767,6 +2905,7 @@ impl CompactCopySink {
             partition_count: None,
             format: None,
             version: None,
+            sha256: None,
         }))
     }
 }
@@ -2925,6 +3064,7 @@ fn serving_run_partition_events(
                 partition_count: Some(file.partition_count),
                 format: Some(SERVING_RUN_FORMAT.to_string()),
                 version: Some(SERVING_RUN_FORMAT_VERSION),
+                sha256: Some(sha256_hex(&file.sha256)),
             };
             metrics.record(&event);
             event
@@ -2941,6 +3081,7 @@ fn serving_run_partition_events(
             partition_count: None,
             format: Some(ptg2_scanner::v3_runs::CODE_DICTIONARY_FORMAT.to_string()),
             version: Some(ptg2_scanner::v3_runs::CODE_DICTIONARY_FORMAT_VERSION),
+            sha256: Some(sha256_hex(&file.sha256)),
         };
         metrics.record_code_dictionary(&event);
         events.push(event);
@@ -4054,7 +4195,7 @@ struct LocalCompactDedupe<'a> {
 }
 
 struct CompactRateBatch<'a> {
-    provider_map: &'a HashMap<String, ProviderEntry>,
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
     manifest_global_id_cache: &'a mut ManifestGlobalIdCache,
     rates: &'a [RateLite],
     procedure_value: &'a Value,
@@ -4229,12 +4370,12 @@ fn process_compact_rate_lites<W: Write>(
                 None => continue,
             }
         };
-        let Some(price_set) = price_lite_set(&rate.prices) else {
+        let Some(price_set) = rate_price_set(rate) else {
             continue;
         };
         let network_names = rate_network_names(rate, &provider_entry.network_names, context);
         parsed_rates.push((
-            price_set,
+            price_set.into_owned(),
             provider_entry.entry_hash,
             provider_entry.provider_group_hashes,
             provider_entry.npi,
@@ -4583,7 +4724,7 @@ fn npi_source_coordinate(groups: &[Value], selected_npi: i64) -> Option<(usize, 
 
 fn linked_provider_source_evidence(
     rate: &RateLite,
-    provider_map: &HashMap<String, ProviderEntry>,
+    provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
     context: &CompactContext,
     selected_npi: i64,
 ) -> io::Result<(Value, Option<Vec<u8>>)> {
@@ -4648,7 +4789,7 @@ fn linked_provider_source_evidence(
         return Ok((
             json!({
                 "source_kind": "provider_reference",
-                "provider_reference_id": provider_reference,
+                "provider_reference_id": provider_reference.to_string(),
                 "provider_group_ordinal": group_ordinal,
                 "npi_ordinal": npi_ordinal,
             }),
@@ -4666,7 +4807,7 @@ struct EmittedSourceRateWitnessInput<'a> {
     rate: &'a RateLite,
     emitted_provider_npis: &'a [i64],
     emitted_price_count: usize,
-    provider_map: &'a HashMap<String, ProviderEntry>,
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
     context: &'a CompactContext,
     coordinate: SourceWitnessCoordinate,
     procedure_json: &'a [u8],
@@ -4689,7 +4830,7 @@ fn capture_emitted_source_rate_occurrences(
         raw_rate,
         population_delta,
     } = input;
-    if emitted_price_count != rate.prices.len() {
+    if emitted_price_count != rate.price_count() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "source witness price population differs from emitted V3 prices",
@@ -4738,10 +4879,10 @@ fn capture_emitted_source_rate_occurrences(
     Ok(())
 }
 
-fn source_provider_witness_expected(key: &str, _entry: &ProviderEntry) -> Value {
+fn source_provider_witness_expected(key: &ProviderRefKey, _entry: &ProviderEntry) -> Value {
     json!({
         "contract": "ptg2_v3_source_provider_expected_v2",
-        "provider_group_id": key,
+        "provider_group_id": key.to_string(),
     })
 }
 
@@ -4946,7 +5087,6 @@ struct RawChunkStats {
     max_rates: usize,
     queue_high_water: usize,
     queue_blocked_sends: u64,
-    capture_bytes: u64,
     capture_micros: u128,
     framing_micros: u128,
     buffer_allocations: u64,
@@ -4965,7 +5105,6 @@ impl RawChunkStats {
         self.queue_blocked_sends = self
             .queue_blocked_sends
             .saturating_add(other.queue_blocked_sends);
-        self.capture_bytes = self.capture_bytes.saturating_add(other.capture_bytes);
         self.capture_micros = self.capture_micros.saturating_add(other.capture_micros);
         self.framing_micros = self.framing_micros.saturating_add(other.framing_micros);
         self.buffer_allocations = self
@@ -5030,9 +5169,12 @@ impl RawChunkStats {
         self.queue_blocked_sends = self.queue_blocked_sends.saturating_add(1);
     }
 
-    fn record_capture(&mut self, byte_count: usize, elapsed_micros: u128) {
-        self.capture_bytes = self.capture_bytes.saturating_add(byte_count as u64);
-        self.capture_micros = self.capture_micros.saturating_add(elapsed_micros);
+    fn record_capture_batch(&mut self, started_at: Option<Instant>) {
+        if let Some(started_at) = started_at {
+            self.capture_micros = self
+                .capture_micros
+                .saturating_add(started_at.elapsed().as_micros());
+        }
     }
 }
 
@@ -5133,7 +5275,7 @@ impl CompactWorkerMetrics {
 }
 
 struct ProviderRefWorkerOutput {
-    provider_map: HashMap<String, ProviderEntry>,
+    provider_map: HashMap<ProviderRefKey, ProviderEntry>,
     events: Vec<CopyFileEvent>,
     metrics: ProviderRefWorkerMetrics,
 }
@@ -5165,7 +5307,7 @@ impl WorkerJob {
 
 fn process_provider_ref_raw_batch_with_metrics(
     raw_refs: &RawRateChunk,
-    provider_map: &mut HashMap<String, ProviderEntry>,
+    provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
     dictionary_copy_sinks: &mut DictionaryCopySinks,
     dedupe: &SharedDedupe,
     source_witness: &SourceWitnessCollector,
@@ -5212,7 +5354,7 @@ fn process_provider_ref_raw_batch_with_metrics(
 #[cfg(test)]
 fn process_provider_ref_raw_batch(
     raw_refs: &RawRateChunk,
-    provider_map: &mut HashMap<String, ProviderEntry>,
+    provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
     dictionary_copy_sinks: &mut DictionaryCopySinks,
     dedupe: &SharedDedupe,
 ) -> io::Result<u64> {
@@ -5689,7 +5831,7 @@ fn validate_compact_rate_object_suffix<R: Read>(reader: R) -> io::Result<()> {
 }
 
 struct JoinedProviderRefs {
-    provider_map: HashMap<String, ProviderEntry>,
+    provider_map: HashMap<ProviderRefKey, ProviderEntry>,
     events: Vec<CopyFileEvent>,
     worker_metrics: Vec<ProviderRefWorkerMetrics>,
     worker_join_seconds: f64,
@@ -5697,9 +5839,9 @@ struct JoinedProviderRefs {
 }
 
 fn merge_ordered_provider_map_pair(
-    mut left: HashMap<String, ProviderEntry>,
-    right: HashMap<String, ProviderEntry>,
-) -> io::Result<HashMap<String, ProviderEntry>> {
+    mut left: HashMap<ProviderRefKey, ProviderEntry>,
+    right: HashMap<ProviderRefKey, ProviderEntry>,
+) -> io::Result<HashMap<ProviderRefKey, ProviderEntry>> {
     if left.len() >= right.len() {
         for (key, entry) in right {
             insert_provider_definition(&mut left, key, entry)?;
@@ -5715,8 +5857,8 @@ fn merge_ordered_provider_map_pair(
 }
 
 fn merge_provider_maps_pairwise(
-    mut provider_maps: Vec<(usize, HashMap<String, ProviderEntry>)>,
-) -> io::Result<HashMap<String, ProviderEntry>> {
+    mut provider_maps: Vec<(usize, HashMap<ProviderRefKey, ProviderEntry>)>,
+) -> io::Result<HashMap<ProviderRefKey, ProviderEntry>> {
     provider_maps.sort_unstable_by_key(|(worker_id, _provider_map)| *worker_id);
     while provider_maps.len() > 1 {
         provider_maps = provider_maps
@@ -5834,7 +5976,7 @@ struct SharedCompactState<'a, W: Write> {
     manifest_sidecars: Option<Arc<Mutex<ManifestSidecarCollector>>>,
     record_price_forward_sidecar: bool,
     suppress_legacy_row_output: bool,
-    provider_map: &'a HashMap<String, ProviderEntry>,
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
     dedupe: &'a SharedDedupe,
     provider_set_scope_cache: &'a mut ProviderSetScopeCache,
     manifest_global_id_cache: &'a mut ManifestGlobalIdCache,
@@ -5842,7 +5984,7 @@ struct SharedCompactState<'a, W: Write> {
 }
 
 fn provider_entry_view_for_worker_rate<'a>(
-    provider_map: &'a HashMap<String, ProviderEntry>,
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
     rate: &RateLite,
     dictionary_copy_sinks: &mut DictionaryCopySinks,
     dedupe: &SharedDedupe,
@@ -6026,33 +6168,52 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
         let mut code_count_rows = 0usize;
         for (rate_index, rate) in rates.iter().enumerate() {
             let source_input = source_inputs.map(|inputs| inputs[rate_index]);
-            if let Some(unresolved_reference) = rate
-                .provider_refs
-                .iter()
-                .find(|provider_reference| !provider_map.contains_key(*provider_reference))
+            let provider_entry = if rate.provider_groups.is_empty() && rate.provider_refs.len() == 1
             {
-                if source_input.is_some() {
-                    mark_source_rate_unqueryable(&mut source_witness_population)?;
+                let provider_reference = &rate.provider_refs[0];
+                match provider_map.get(provider_reference) {
+                    Some(provider_entry) => ProviderEntryView::Borrowed(provider_entry),
+                    None if source_input.is_some() => {
+                        mark_source_rate_unqueryable(&mut source_witness_population)?;
+                        continue;
+                    }
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unresolved provider reference: {provider_reference}"),
+                        ));
+                    }
+                }
+            } else {
+                if let Some(unresolved_reference) = rate
+                    .provider_refs
+                    .iter()
+                    .find(|provider_reference| !provider_map.contains_key(*provider_reference))
+                {
+                    if source_input.is_some() {
+                        mark_source_rate_unqueryable(&mut source_witness_population)?;
+                        continue;
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unresolved provider reference: {unresolved_reference}"),
+                    ));
+                }
+                let Some(provider_entry) = provider_entry_view_for_worker_rate(
+                    provider_map,
+                    rate,
+                    dictionary_copy_sinks,
+                    dedupe,
+                )?
+                else {
+                    if source_input.is_some() {
+                        mark_source_rate_unqueryable(&mut source_witness_population)?;
+                    }
                     continue;
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unresolved provider reference: {unresolved_reference}"),
-                ));
-            }
-            let Some(provider_entry) = provider_entry_view_for_worker_rate(
-                provider_map,
-                rate,
-                dictionary_copy_sinks,
-                dedupe,
-            )?
-            else {
-                if source_input.is_some() {
-                    mark_source_rate_unqueryable(&mut source_witness_population)?;
-                }
-                continue;
+                };
+                provider_entry
             };
-            let Some(price_set) = price_lite_set(&rate.prices) else {
+            let Some(price_set) = rate_price_set(rate) else {
                 if source_input.is_some() {
                     mark_source_rate_unqueryable(&mut source_witness_population)?;
                 }
@@ -6088,10 +6249,10 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                             "price-forward sidecar output requires a manifest sidecar collector",
                         )
                     })?;
-                    lock_manifest_sidecars(sidecars).record_price_set(&price_set)?;
+                    lock_manifest_sidecars(sidecars).record_price_set(price_set.as_ref())?;
                 }
                 dictionary_copy_sinks.write_price_atoms_shared(&price_set.atoms, dedupe)?;
-                dictionary_copy_sinks.write_manifest_price_set_atoms(&price_set)?;
+                dictionary_copy_sinks.write_manifest_price_set_atoms(price_set.as_ref())?;
                 dictionary_copy_sinks.write_price_set_entries_shared(
                     price_set.global_id,
                     &price_set.atom_ids,
@@ -6240,7 +6401,7 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                         sorted_provider_group_hashes: sorted_provider_hashes,
                         network_names,
                         provider_count,
-                        price_set: &price_set,
+                        price_set: price_set.as_ref(),
                     },
                     manifest_global_id_cache,
                 )?;
@@ -6281,14 +6442,14 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
         else {
             continue;
         };
-        let Some(price_set) = price_lite_set(&rate.prices) else {
+        let Some(price_set) = rate_price_set(rate) else {
             continue;
         };
         let provider_entry_hash = provider_entry.entry_hash();
         let group = by_price_set
             .entry(price_set.global_id)
             .or_insert_with(|| GroupedPriceSet {
-                price_set,
+                price_set: price_set.into_owned(),
                 provider_entry_hashes: HashSet::new(),
                 provider_group_hashes: HashSet::new(),
                 provider_npis: HashSet::new(),
@@ -6530,7 +6691,7 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
 fn read_rate_lite_struson<R: Read>(
     json_reader: &mut JsonStreamReader<R>,
 ) -> io::Result<Option<RateLite>> {
-    let mut provider_refs: Vec<String> = Vec::new();
+    let mut provider_refs: Vec<ProviderRefKey> = Vec::new();
     let mut provider_groups: Vec<Value> = Vec::new();
     let mut network_names: Vec<String> = Vec::new();
     let mut prices: Vec<PriceLite> = Vec::new();
@@ -6557,7 +6718,16 @@ fn read_rate_lite_struson<R: Read>(
                 json_reader.begin_array().map_err(to_io_error)?;
                 while json_reader.has_next().map_err(to_io_error)? {
                     let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
-                    provider_refs.push(strict_integer_text(&value, "provider_references element")?);
+                    let Value::Number(number) = value else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "provider_references element must be a JSON integer",
+                        ));
+                    };
+                    provider_refs.push(ProviderRefKey::from_number(
+                        number,
+                        "provider_references element",
+                    )?);
                 }
                 json_reader.end_array().map_err(to_io_error)?;
             }
@@ -6594,11 +6764,18 @@ fn read_rate_lite_struson<R: Read>(
             "negotiated rate must contain at least one negotiated price",
         ));
     }
+    let prepared_price_set = price_lite_set_owned(prices).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiated rate must contain at least one negotiated price",
+        )
+    })?;
     Ok(Some(RateLite {
         provider_refs,
         provider_groups,
         network_names: canonical_text_list(network_names, false),
-        prices,
+        prices: Vec::new(),
+        prepared_price_set: Some(prepared_price_set),
     }))
 }
 
@@ -6636,8 +6813,8 @@ fn read_rate_lite_bytes_typed(raw: &[u8]) -> io::Result<Option<RateLite>> {
     let wire: RateLiteWire = serde_json::from_slice(raw).map_err(to_io_error)?;
     let mut provider_refs = Vec::with_capacity(wire.provider_references.len());
     for provider_reference in wire.provider_references {
-        provider_refs.push(strict_integer_text(
-            &Value::Number(provider_reference),
+        provider_refs.push(ProviderRefKey::from_number(
+            provider_reference,
             "provider_references element",
         )?);
     }
@@ -6673,11 +6850,18 @@ fn read_rate_lite_bytes_typed(raw: &[u8]) -> io::Result<Option<RateLite>> {
             additional_information: trim_optional_wire_text(price.additional_information),
         });
     }
+    let prepared_price_set = price_lite_set_owned(prices).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiated rate must contain at least one negotiated price",
+        )
+    })?;
     Ok(Some(RateLite {
         provider_refs,
         provider_groups: wire.provider_groups,
         network_names: canonical_text_list(network_names, false),
-        prices,
+        prices: Vec::new(),
+        prepared_price_set: Some(prepared_price_set),
     }))
 }
 
@@ -6837,7 +7021,7 @@ struct InNetworkStreamState<'a, W: Write> {
     manifest_sidecars: Option<&'a mut ManifestSidecarCollector>,
     record_price_forward_sidecar: bool,
     suppress_legacy_row_output: bool,
-    provider_map: &'a HashMap<String, ProviderEntry>,
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
     dedupe: LocalCompactDedupe<'a>,
     manifest_global_id_cache: &'a mut ManifestGlobalIdCache,
     context: CompactContext,
@@ -7022,6 +7206,7 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
     let mut decoded_name = String::new();
     let mut rate_count = 0u64;
     let mut rates_dispatched = false;
+    let mut capture_batch_started_at = None;
     reader.expect_byte(b'{')?;
     let mut first_field = true;
     loop {
@@ -7052,15 +7237,11 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
             "negotiated_rates" => {
                 reader.expect_byte(b'[')?;
                 let mut first_rate = true;
+                capture_batch_started_at = Some(Instant::now());
                 while next_array_value(reader, &mut first_rate)? {
                     rate_count += 1;
                     let raw_start = raw_rate_chunk.byte_len();
-                    let capture_started_at = Instant::now();
                     reader.capture_value_bytes_append(&mut raw_rate_chunk.bytes)?;
-                    io_state.raw_chunk_stats.record_capture(
-                        raw_rate_chunk.byte_len().saturating_sub(raw_start),
-                        capture_started_at.elapsed().as_micros(),
-                    );
                     raw_rate_chunk.push_current_value_span_at(
                         raw_start,
                         SourceWitnessCoordinate::new(
@@ -7071,6 +7252,9 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
                     if raw_rate_chunk.len() >= chunk_size
                         || raw_rate_chunk.byte_len() >= raw_chunk_byte_limit
                     {
+                        io_state
+                            .raw_chunk_stats
+                            .record_capture_batch(capture_batch_started_at.take());
                         validate_procedure_for_rate_dispatch(&procedure)?;
                         let raw_rates = io_state.raw_chunk_stats.take_filled_chunk(
                             &mut raw_rate_chunk,
@@ -7093,6 +7277,7 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
                         )?;
                         rates_dispatched = true;
                         drain_copy_file_events(io_state.event_rx, io_state.writer)?;
+                        capture_batch_started_at = Some(Instant::now());
                     }
                 }
             }
@@ -7104,6 +7289,9 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
     }
     validate_procedure_for_rate_dispatch(&procedure)?;
     if !raw_rate_chunk.is_empty() {
+        io_state
+            .raw_chunk_stats
+            .record_capture_batch(capture_batch_started_at.take());
         validate_procedure_for_rate_dispatch(&procedure)?;
         io_state
             .raw_chunk_stats
@@ -7145,6 +7333,7 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
         .allocate_chunk(chunk_size, raw_chunk_byte_limit.min(READ_BUF_SIZE));
     let mut rate_count = 0u64;
     let mut rates_dispatched = false;
+    let mut capture_batch_started_at = None;
     json_reader.begin_object().map_err(to_io_error)?;
     while json_reader.has_next().map_err(to_io_error)? {
         let name = json_reader.next_name_owned().map_err(to_io_error)?;
@@ -7161,19 +7350,17 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
             }
             "negotiated_rates" => {
                 json_reader.begin_array().map_err(to_io_error)?;
+                if parse_in_workers {
+                    capture_batch_started_at = Some(Instant::now());
+                }
                 while json_reader.has_next().map_err(to_io_error)? {
                     rate_count += 1;
                     if parse_in_workers {
                         let raw_start = raw_rate_chunk.byte_len();
-                        let capture_started_at = Instant::now();
                         transfer_next_value_to_bytes_append(
                             json_reader,
                             &mut raw_rate_chunk.bytes,
                         )?;
-                        io_state.raw_chunk_stats.record_capture(
-                            raw_rate_chunk.byte_len().saturating_sub(raw_start),
-                            capture_started_at.elapsed().as_micros(),
-                        );
                         raw_rate_chunk.push_current_value_span_at(
                             raw_start,
                             SourceWitnessCoordinate::new(
@@ -7184,6 +7371,9 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
                         if raw_rate_chunk.len() >= chunk_size
                             || raw_rate_chunk.byte_len() >= raw_chunk_byte_limit
                         {
+                            io_state
+                                .raw_chunk_stats
+                                .record_capture_batch(capture_batch_started_at.take());
                             validate_procedure_for_rate_dispatch(&procedure)?;
                             let raw_rates = io_state.raw_chunk_stats.take_filled_chunk(
                                 &mut raw_rate_chunk,
@@ -7206,6 +7396,7 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
                             )?;
                             rates_dispatched = true;
                             drain_copy_file_events(io_state.event_rx, io_state.writer)?;
+                            capture_batch_started_at = Some(Instant::now());
                         }
                     } else if let Some(rate) = read_rate_lite_struson(json_reader)? {
                         rate_chunk.push(rate);
@@ -7240,6 +7431,9 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
     json_reader.end_object().map_err(to_io_error)?;
     validate_procedure_for_rate_dispatch(&procedure)?;
     if !raw_rate_chunk.is_empty() {
+        io_state
+            .raw_chunk_stats
+            .record_capture_batch(capture_batch_started_at.take());
         validate_procedure_for_rate_dispatch(&procedure)?;
         io_state
             .raw_chunk_stats
@@ -7303,7 +7497,7 @@ fn finish_worker_outputs(
 
 struct CompactWorkerConfig {
     event_tx: Sender<CopyFileEvent>,
-    provider_map: Arc<HashMap<String, ProviderEntry>>,
+    provider_map: Arc<HashMap<ProviderRefKey, ProviderEntry>>,
     dedupe: Arc<SharedDedupe>,
     manifest_sidecars: Option<Arc<Mutex<ManifestSidecarCollector>>>,
     queue_bytes: Arc<QueueByteMetrics>,
@@ -8442,6 +8636,7 @@ fn scan_compact_byte_top_level_parallel(
                     depth += 1;
                     in_provider_refs = true;
                     active_array_depth = depth;
+                    provider_capture_started_at = Some(Instant::now());
                     continue;
                 }
                 if byte == b'['
@@ -8449,6 +8644,8 @@ fn scan_compact_byte_top_level_parallel(
                     && matches!(pending, CompactTopLevelArrayKey::InNetwork)
                 {
                     if !raw_refs.is_empty() {
+                        provider_ref_raw_chunk_stats
+                            .record_capture_batch(provider_capture_started_at.take());
                         provider_ref_raw_chunk_stats.record(raw_refs.len(), raw_refs.byte_len());
                         let batch = provider_ref_raw_chunk_stats.take_filled_chunk(
                             &mut raw_refs,
@@ -9029,7 +9226,8 @@ fn scan_compact_byte_top_level_parallel(
                             "queued_bytes_at_finish": raw_chunk_stats.queue_bytes.current_bytes(),
                             "producer_byte_framing_seconds": seconds_from_micros(raw_chunk_stats.framing_micros),
                             "producer_byte_capture_seconds": seconds_from_micros(raw_chunk_stats.capture_micros),
-                            "producer_byte_capture_bytes": raw_chunk_stats.capture_bytes,
+                            "producer_byte_capture_bytes": raw_chunk_stats.total_bytes,
+                            "producer_byte_capture_timing_granularity": "raw_chunk",
                             "provider_ref_raw_chunk_count": provider_ref_raw_chunk_stats.chunk_count,
                             "provider_ref_raw_chunk_total_bytes": provider_ref_raw_chunk_stats.total_bytes,
                             "provider_ref_raw_chunk_max_bytes": provider_ref_raw_chunk_stats.max_bytes,
@@ -9040,7 +9238,7 @@ fn scan_compact_byte_top_level_parallel(
                             "provider_ref_queue_blocked_sends": provider_ref_raw_chunk_stats.queue_blocked_sends,
                             "provider_ref_peak_queued_bytes": provider_ref_raw_chunk_stats.queue_bytes.peak_bytes(),
                             "provider_ref_queued_bytes_at_finish": provider_ref_raw_chunk_stats.queue_bytes.current_bytes(),
-                            "provider_capture_bytes": provider_ref_raw_chunk_stats.capture_bytes,
+                            "provider_capture_bytes": provider_ref_raw_chunk_stats.total_bytes,
                             "provider_capture_seconds": provider_capture_seconds,
                             "provider_capture_compressed_bytes": provider_capture_compressed_bytes,
                             "provider_capture_compressed_mib_s": compressed_mib_per_second(provider_capture_compressed_bytes, provider_capture_seconds),
@@ -9159,7 +9357,6 @@ fn scan_compact_byte_top_level_parallel(
             if in_provider_refs && capture_depth == 0 && byte == b'{' && depth == active_array_depth
             {
                 capture_start = raw_refs.byte_len();
-                provider_capture_started_at = Some(Instant::now());
                 raw_refs.bytes.push(b'{');
                 capture_depth = 1;
                 depth += 1;
@@ -9184,18 +9381,14 @@ fn scan_compact_byte_top_level_parallel(
                                     0,
                                 ),
                             );
-                            provider_ref_raw_chunk_stats.record_capture(
-                                raw_refs.byte_len().saturating_sub(capture_start),
-                                provider_capture_started_at
-                                    .take()
-                                    .map_or(0, |started_at| started_at.elapsed().as_micros()),
-                            );
                             *object_counts
                                 .entry("provider_references".to_string())
                                 .or_insert(0) += 1;
                             if raw_refs.len() >= provider_ref_chunk_items
                                 || raw_refs.byte_len() >= provider_ref_raw_chunk_byte_limit
                             {
+                                provider_ref_raw_chunk_stats
+                                    .record_capture_batch(provider_capture_started_at.take());
                                 let batch = provider_ref_raw_chunk_stats.take_filled_chunk(
                                     &mut raw_refs,
                                     provider_ref_chunk_items,
@@ -9211,6 +9404,7 @@ fn scan_compact_byte_top_level_parallel(
                                     batch,
                                 )?;
                                 drain_copy_file_events(&event_rx, &mut writer)?;
+                                provider_capture_started_at = Some(Instant::now());
                             }
                             if !indexed_reorder_used {
                                 let bytes = compressed_bytes_read.load(Ordering::Relaxed);
@@ -9302,7 +9496,7 @@ fn scan_compact_struson_parallel(
     let mut next_progress_objects = progress_objects_interval;
     let mut object_counts: HashMap<String, u64> = HashMap::new();
     let started_at = Instant::now();
-    let mut provider_map: HashMap<String, ProviderEntry> = HashMap::new();
+    let mut provider_map: HashMap<ProviderRefKey, ProviderEntry> = HashMap::new();
     let negotiated_rate_chunk_size = split_interval(
         "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
         DEFAULT_SPLIT_NEGOTIATED_RATES,
@@ -9449,14 +9643,10 @@ fn scan_compact_struson_parallel(
                         provider_ref_raw_chunk_byte_limit.min(READ_BUF_SIZE),
                     );
                     json_reader.begin_array().map_err(to_io_error)?;
+                    let mut capture_batch_started_at = Some(Instant::now());
                     while json_reader.has_next().map_err(to_io_error)? {
                         let raw_start = raw_refs.byte_len();
-                        let capture_started_at = Instant::now();
                         transfer_next_value_to_bytes_append(&mut json_reader, &mut raw_refs.bytes)?;
-                        provider_ref_raw_chunk_stats.record_capture(
-                            raw_refs.byte_len().saturating_sub(raw_start),
-                            capture_started_at.elapsed().as_micros(),
-                        );
                         raw_refs.push_current_value_span_at(
                             raw_start,
                             SourceWitnessCoordinate::new(
@@ -9470,6 +9660,8 @@ fn scan_compact_struson_parallel(
                         if raw_refs.len() >= provider_ref_chunk_items
                             || raw_refs.byte_len() >= provider_ref_raw_chunk_byte_limit
                         {
+                            provider_ref_raw_chunk_stats
+                                .record_capture_batch(capture_batch_started_at.take());
                             let batch = provider_ref_raw_chunk_stats.take_filled_chunk(
                                 &mut raw_refs,
                                 provider_ref_chunk_items,
@@ -9485,10 +9677,13 @@ fn scan_compact_struson_parallel(
                                 batch,
                             )?;
                             drain_copy_file_events(&event_rx, &mut writer)?;
+                            capture_batch_started_at = Some(Instant::now());
                         }
                     }
                     json_reader.end_array().map_err(to_io_error)?;
                     if !raw_refs.is_empty() {
+                        provider_ref_raw_chunk_stats
+                            .record_capture_batch(capture_batch_started_at.take());
                         provider_ref_raw_chunk_stats.record(raw_refs.len(), raw_refs.byte_len());
                         send_provider_ref_batch(
                             &provider_tx,
@@ -9820,7 +10015,8 @@ fn scan_compact_struson_parallel(
                         "queued_bytes_at_finish": raw_chunk_stats.queue_bytes.current_bytes(),
                         "producer_byte_framing_seconds": seconds_from_micros(raw_chunk_stats.framing_micros),
                         "producer_byte_capture_seconds": seconds_from_micros(raw_chunk_stats.capture_micros),
-                        "producer_byte_capture_bytes": raw_chunk_stats.capture_bytes,
+                        "producer_byte_capture_bytes": raw_chunk_stats.total_bytes,
+                        "producer_byte_capture_timing_granularity": "raw_chunk",
                         "provider_ref_raw_chunk_count": provider_ref_raw_chunk_stats.chunk_count,
                         "provider_ref_raw_chunk_total_bytes": provider_ref_raw_chunk_stats.total_bytes,
                         "provider_ref_raw_chunk_max_bytes": provider_ref_raw_chunk_stats.max_bytes,
@@ -9831,7 +10027,7 @@ fn scan_compact_struson_parallel(
                         "provider_ref_queue_blocked_sends": provider_ref_raw_chunk_stats.queue_blocked_sends,
                         "provider_ref_peak_queued_bytes": provider_ref_raw_chunk_stats.queue_bytes.peak_bytes(),
                         "provider_ref_queued_bytes_at_finish": provider_ref_raw_chunk_stats.queue_bytes.current_bytes(),
-                        "provider_capture_bytes": provider_ref_raw_chunk_stats.capture_bytes,
+                        "provider_capture_bytes": provider_ref_raw_chunk_stats.total_bytes,
                         "provider_capture_seconds": provider_capture_seconds,
                         "provider_capture_compressed_bytes": provider_capture_compressed_bytes,
                         "provider_capture_compressed_mib_s": compressed_mib_per_second(provider_capture_compressed_bytes, provider_capture_seconds),
@@ -9918,7 +10114,7 @@ fn scan_compact_struson_parallel(
 enum CompactProviderReferenceOrder {
     None,
     BeforeInNetwork,
-    AfterInNetwork(HashMap<String, ProviderEntry>),
+    AfterInNetwork(HashMap<ProviderRefKey, ProviderEntry>),
     AfterInNetworkIndexed(CompactIndexedReorder),
     AfterInNetworkPlain(CompactPlainReorder),
 }
@@ -11586,6 +11782,7 @@ fn pg_binary_nonnegative_int8(field: &[u8], name: &str) -> io::Result<u64> {
     Ok(value as u64)
 }
 
+#[cfg(test)]
 fn pg_binary_nonnegative_i32(field: &[u8], name: &str) -> io::Result<i32> {
     let value = pg_binary_nonnegative_i64(field, name)?;
     i32::try_from(value).map_err(|_| {
@@ -13030,6 +13227,8 @@ fn write_serving_binary_copy_trailer<W: Write>(
 struct CountingWriter<W: Write> {
     inner: W,
     byte_count: u64,
+    sha256: Sha256,
+    shared_blocks: SharedBlockCopySummary,
 }
 
 impl<W: Write> CountingWriter<W> {
@@ -13037,11 +13236,21 @@ impl<W: Write> CountingWriter<W> {
         Self {
             inner,
             byte_count: 0,
+            sha256: Sha256::new(),
+            shared_blocks: SharedBlockCopySummary::default(),
         }
     }
 
     fn byte_count(&self) -> u64 {
         self.byte_count
+    }
+
+    fn shared_block_summary(&self, path: &Path) -> Value {
+        self.shared_blocks.to_json(
+            path,
+            self.byte_count,
+            sha256_hex(&self.sha256.clone().finalize()),
+        )
     }
 }
 
@@ -13049,6 +13258,7 @@ impl<W: Write> Write for CountingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.inner.write(buf)?;
         self.byte_count = self.byte_count.saturating_add(written as u64);
+        self.sha256.update(&buf[..written]);
         Ok(written)
     }
 
@@ -13062,6 +13272,95 @@ struct ServingBinaryCopyRecordStats {
     stored_payload_bytes: u64,
     raw_payload_bytes: u64,
     compressed: bool,
+}
+
+struct SharedBlockCopyRecord<'a> {
+    block_hash: &'a [u8; 32],
+    object_kind: &'a str,
+    block_key: i64,
+    fragment_no: i32,
+    entry_count: u64,
+    raw_payload_bytes: u64,
+    stored_payload_bytes: u64,
+}
+
+struct SharedBlockCopySummary {
+    row_count: u64,
+    entry_count: u64,
+    raw_payload_bytes: u64,
+    stored_payload_bytes: u64,
+    artifact_record_counts: BTreeMap<String, u64>,
+    block_hash_digest: Sha256,
+}
+
+impl Default for SharedBlockCopySummary {
+    fn default() -> Self {
+        let mut block_hash_digest = Sha256::new();
+        block_hash_digest.update(b"PTG2V3FINALBLOCKS\x01");
+        Self {
+            row_count: 0,
+            entry_count: 0,
+            raw_payload_bytes: 0,
+            stored_payload_bytes: 0,
+            artifact_record_counts: BTreeMap::new(),
+            block_hash_digest,
+        }
+    }
+}
+
+impl SharedBlockCopySummary {
+    fn record(&mut self, record: SharedBlockCopyRecord<'_>) -> io::Result<()> {
+        self.block_hash_digest.update(record.block_hash);
+        update_sha256_length_prefixed(&mut self.block_hash_digest, record.object_kind.as_bytes())?;
+        self.block_hash_digest
+            .update(record.block_key.to_be_bytes());
+        self.block_hash_digest
+            .update(record.fragment_no.to_be_bytes());
+        self.block_hash_digest
+            .update(record.entry_count.to_be_bytes());
+        *self
+            .artifact_record_counts
+            .entry(record.object_kind.to_owned())
+            .or_insert(0) += 1;
+        self.row_count = self.row_count.saturating_add(1);
+        self.entry_count = self.entry_count.saturating_add(record.entry_count);
+        self.raw_payload_bytes = self
+            .raw_payload_bytes
+            .saturating_add(record.raw_payload_bytes);
+        self.stored_payload_bytes = self
+            .stored_payload_bytes
+            .saturating_add(record.stored_payload_bytes);
+        Ok(())
+    }
+
+    fn to_json(&self, path: &Path, copy_bytes: u64, copy_sha256: String) -> Value {
+        json!({
+            "path": path.file_name().and_then(|value| value.to_str()).unwrap_or_default(),
+            "copy_format": "postgresql_binary_copy",
+            "field_count": 10,
+            "fields": ["block_hash", "format_version", "object_kind", "block_key", "fragment_no", "entry_count", "codec", "raw_byte_count", "stored_byte_count", "payload"],
+            "mapping_identity_fields": ["object_kind", "block_key", "fragment_no", "entry_count", "block_hash"],
+            "snapshot_key_included": false,
+            "copy_bytes": copy_bytes,
+            "copy_sha256": copy_sha256,
+            "row_count": self.row_count,
+            "entry_count": self.entry_count,
+            "raw_payload_bytes": self.raw_payload_bytes,
+            "stored_payload_bytes": self.stored_payload_bytes,
+            "block_hash_digest": sha256_hex(&self.block_hash_digest.clone().finalize()),
+            "artifact_record_counts": self.artifact_record_counts,
+        })
+    }
+}
+
+trait SharedBlockCopyWriter: Write {
+    fn record_shared_block(&mut self, record: SharedBlockCopyRecord<'_>) -> io::Result<()>;
+}
+
+impl<W: Write> SharedBlockCopyWriter for CountingWriter<W> {
+    fn record_shared_block(&mut self, record: SharedBlockCopyRecord<'_>) -> io::Result<()> {
+        self.shared_blocks.record(record)
+    }
 }
 
 const PTG2_V3_SHARED_BLOCK_FORMAT_VERSION: i16 = 2;
@@ -13108,7 +13407,7 @@ fn shared_v3_block_hash(
     Ok(hasher.finalize().into())
 }
 
-fn write_serving_binary_copy_record_with_stats<W: Write>(
+fn write_serving_binary_copy_record_with_stats<W: SharedBlockCopyWriter>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     kind: &str,
@@ -13128,7 +13427,7 @@ fn write_serving_binary_copy_record_with_stats<W: Write>(
     )
 }
 
-fn write_serving_binary_copy_record_with_i64_key_and_stats<W: Write>(
+fn write_serving_binary_copy_record_with_i64_key_and_stats<W: SharedBlockCopyWriter>(
     writer: &mut W,
     _target_format: ServingBinaryTargetCopyFormat,
     kind: &str,
@@ -13181,6 +13480,20 @@ fn write_serving_binary_copy_record_with_i64_key_and_stats<W: Write>(
     write_pg_binary_copy_i64_field(writer, shared_raw_payload_bytes)?;
     write_pg_binary_copy_i64_field(writer, stored_payload_bytes)?;
     write_pg_binary_copy_field(writer, &stored_payload)?;
+    writer.record_shared_block(SharedBlockCopyRecord {
+        block_hash: &block_hash,
+        object_kind: kind,
+        block_key,
+        fragment_no: block_no,
+        entry_count: u64::try_from(entry_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "shared block entry count cannot be negative",
+            )
+        })?,
+        raw_payload_bytes: record_stats.raw_payload_bytes,
+        stored_payload_bytes: record_stats.stored_payload_bytes,
+    })?;
     Ok(record_stats)
 }
 
@@ -13214,7 +13527,7 @@ struct ServingBinaryV3LogicalBlock<'a> {
     payload: &'a [u8],
 }
 
-fn write_serving_binary_v3_logical_block<W: Write>(
+fn write_serving_binary_v3_logical_block<W: SharedBlockCopyWriter>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     max_payload_bytes: usize,
@@ -13277,7 +13590,7 @@ struct ServingBinaryV3SpoolBlock<'a> {
     spool_bytes: u64,
 }
 
-fn write_serving_binary_v3_spooled_logical_block<W: Write, R: Read + Seek>(
+fn write_serving_binary_v3_spooled_logical_block<W: SharedBlockCopyWriter, R: Read + Seek>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     max_payload_bytes: usize,
@@ -13519,7 +13832,7 @@ impl ServingBinaryV3ProviderCodeState {
         })
     }
 
-    fn push<W: Write>(
+    fn push<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13575,7 +13888,7 @@ impl ServingBinaryV3ProviderCodeState {
         Ok(())
     }
 
-    fn finish_provider<W: Write>(
+    fn finish_provider<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13664,7 +13977,7 @@ impl ServingBinaryV3ProviderCodeState {
         Ok(())
     }
 
-    fn flush_block<W: Write>(
+    fn flush_block<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13703,7 +14016,7 @@ impl ServingBinaryV3ProviderCodeState {
         Ok(())
     }
 
-    fn finish<W: Write>(
+    fn finish<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13744,7 +14057,7 @@ impl ServingBinaryV3PriceMembershipState {
         }
     }
 
-    fn push<W: Write>(
+    fn push<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13776,7 +14089,7 @@ impl ServingBinaryV3PriceMembershipState {
         Ok(())
     }
 
-    fn finish_membership<W: Write>(
+    fn finish_membership<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13802,7 +14115,7 @@ impl ServingBinaryV3PriceMembershipState {
         Ok(())
     }
 
-    fn flush_block<W: Write>(
+    fn flush_block<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13833,7 +14146,7 @@ impl ServingBinaryV3PriceMembershipState {
         )
     }
 
-    fn finish<W: Write>(
+    fn finish<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13864,7 +14177,7 @@ impl ServingBinaryV3PriceAtomState {
         }
     }
 
-    fn push<W: Write>(
+    fn push<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13916,7 +14229,7 @@ impl ServingBinaryV3PriceAtomState {
         Ok(())
     }
 
-    fn flush_block<W: Write>(
+    fn flush_block<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13946,7 +14259,7 @@ impl ServingBinaryV3PriceAtomState {
         )
     }
 
-    fn finish<W: Write>(
+    fn finish<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -14406,7 +14719,7 @@ impl ServingBinaryByCodeProviderShardState {
     }
 }
 
-fn flush_serving_binary_by_code_provider_shard_fragment<W: Write>(
+fn flush_serving_binary_by_code_provider_shard_fragment<W: SharedBlockCopyWriter>(
     writer: &mut W,
     state: &mut ServingBinaryByCodeProviderShardState,
     target_format: ServingBinaryTargetCopyFormat,
@@ -14435,7 +14748,7 @@ fn flush_serving_binary_by_code_provider_shard_fragment<W: Write>(
     Ok(())
 }
 
-fn append_serving_binary_by_code_provider_group<W: Write>(
+fn append_serving_binary_by_code_provider_group<W: SharedBlockCopyWriter>(
     writer: &mut W,
     state: &mut ServingBinaryByCodeProviderShardState,
     target_format: ServingBinaryTargetCopyFormat,
@@ -14514,7 +14827,7 @@ fn append_serving_binary_by_code_provider_group<W: Write>(
     Ok(())
 }
 
-fn push_serving_binary_by_code_occurrence<W: Write>(
+fn push_serving_binary_by_code_occurrence<W: SharedBlockCopyWriter>(
     writer: &mut W,
     state: &mut ServingBinaryByCodeProviderShardState,
     target_format: ServingBinaryTargetCopyFormat,
@@ -14640,7 +14953,7 @@ fn push_serving_binary_v3_forward_page_candidate(
     }
 }
 
-fn write_serving_binary_v3_forward_page<W: Write>(
+fn write_serving_binary_v3_forward_page<W: SharedBlockCopyWriter>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     max_payload_bytes: usize,
@@ -14802,7 +15115,7 @@ fn serving_binary_v3_provider_page_block_payload(
     Ok(payload)
 }
 
-fn write_serving_binary_v3_provider_pages<W: Write>(
+fn write_serving_binary_v3_provider_pages<W: SharedBlockCopyWriter>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     max_payload_bytes: usize,
@@ -14921,7 +15234,7 @@ impl ServingBinaryV3ProviderCodeSpool {
         Ok(())
     }
 
-    fn emit_sorted_unique<W: Write>(
+    fn emit_sorted_unique<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -14997,7 +15310,7 @@ impl ServingBinaryV3ProviderCodeSpool {
         })
     }
 
-    fn emit_in_memory<W: Write>(
+    fn emit_in_memory<W: SharedBlockCopyWriter>(
         &self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -15059,7 +15372,7 @@ fn read_provider_code_pair<R: Read>(
     Ok(Some(pair))
 }
 
-fn emit_provider_code_pair<W: Write>(
+fn emit_provider_code_pair<W: SharedBlockCopyWriter>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     state: &mut ServingBinaryV3ProviderCodeState,
@@ -15622,7 +15935,7 @@ impl ServingBinaryV3PriceDictionaryState {
         })
     }
 
-    fn push<W: Write>(
+    fn push<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -15660,7 +15973,7 @@ impl ServingBinaryV3PriceDictionaryState {
         Ok(())
     }
 
-    fn flush_block<W: Write>(
+    fn flush_block<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -15702,7 +16015,7 @@ impl ServingBinaryV3PriceDictionaryState {
         Ok(())
     }
 
-    fn finish<W: Write>(
+    fn finish<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -15728,6 +16041,33 @@ impl ServingBinaryV3PriceDictionaryState {
     }
 }
 
+fn serving_binary_v3_price_dictionary_summary<W: Write>(
+    state: &ServingBinaryV3PriceDictionaryState,
+    writer: &CountingWriter<W>,
+    target_format: ServingBinaryTargetCopyFormat,
+    max_payload_bytes: usize,
+    source_copy_format: &str,
+) -> Value {
+    json!({
+        "name": "serving_binary_v3_price_dictionary",
+        "format": PTG2_SERVING_BINARY_V3_FORMAT,
+        "encoder_kind": PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND,
+        "artifact_kind": PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
+        "dense_price_ordering": "minimum_negotiated_rate_then_global_id_128_v1",
+        "price_set_count": state.expected_price_key,
+        "row_count": state.expected_price_key,
+        "id_bytes": GLOBAL_ID_BYTES,
+        "block_count": state.block_stats.logical_block_count,
+        "copy_record_count": state.block_stats.copy_record_count,
+        "byte_count": writer.byte_count(),
+        "block_bytes": max_payload_bytes,
+        "source_copy_format": source_copy_format,
+        "target_copy_format": target_format.label(),
+        "storage": state.block_stats.storage_summary(),
+    })
+}
+
+#[cfg(test)]
 fn write_serving_binary_v3_price_dictionary_copy_from_pg_binary_reader<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut CountingWriter<W>,
@@ -15755,23 +16095,36 @@ fn write_serving_binary_v3_price_dictionary_copy_from_pg_binary_reader<R: Read, 
     state.finish(writer, target_format)?;
     write_serving_binary_copy_trailer(writer, target_format)?;
     writer.flush()?;
-    Ok(json!({
-        "name": "serving_binary_v3_price_dictionary",
-        "format": PTG2_SERVING_BINARY_V3_FORMAT,
-        "encoder_kind": PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND,
-        "artifact_kind": PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
-        "dense_price_ordering": "minimum_negotiated_rate_then_global_id_128_v1",
-        "price_set_count": state.expected_price_key,
-        "row_count": state.expected_price_key,
-        "id_bytes": GLOBAL_ID_BYTES,
-        "block_count": state.block_stats.logical_block_count,
-        "copy_record_count": state.block_stats.copy_record_count,
-        "byte_count": writer.byte_count(),
-        "block_bytes": max_payload_bytes,
-        "source_copy_format": "postgres_binary",
-        "target_copy_format": target_format.label(),
-        "storage": state.block_stats.storage_summary(),
-    }))
+    Ok(serving_binary_v3_price_dictionary_summary(
+        &state,
+        writer,
+        target_format,
+        max_payload_bytes,
+        "postgres_binary",
+    ))
+}
+
+fn write_serving_binary_v3_price_dictionary_copy_from_fixed_reader<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut CountingWriter<W>,
+    target_format: ServingBinaryTargetCopyFormat,
+    max_payload_bytes: usize,
+) -> io::Result<Value> {
+    write_serving_binary_copy_header(writer, target_format)?;
+    let mut state = ServingBinaryV3PriceDictionaryState::new(max_payload_bytes)?;
+    while let Some((price_key, price_set_id)) = read_v3_price_key_map_by_key_record(reader)? {
+        state.push(writer, target_format, u64::from(price_key), price_set_id)?;
+    }
+    state.finish(writer, target_format)?;
+    write_serving_binary_copy_trailer(writer, target_format)?;
+    writer.flush()?;
+    Ok(serving_binary_v3_price_dictionary_summary(
+        &state,
+        writer,
+        target_format,
+        max_payload_bytes,
+        "price_key_map_by_key_fixed_v1",
+    ))
 }
 
 #[cfg(test)]
@@ -17857,69 +18210,6 @@ impl AssignedV3RowSource for AssignedFixedRecordStream {
     }
 }
 
-struct PriceDictionaryPgBinaryStream {
-    reader: BufReader<File>,
-    pending: Vec<u8>,
-    pending_offset: usize,
-    phase: u8,
-}
-
-impl PriceDictionaryPgBinaryStream {
-    fn new(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            reader: BufReader::new(File::open(path)?),
-            pending: Vec::new(),
-            pending_offset: 0,
-            phase: 0,
-        })
-    }
-
-    fn fill_pending(&mut self) -> io::Result<bool> {
-        self.pending.clear();
-        self.pending_offset = 0;
-        match self.phase {
-            0 => {
-                write_pg_binary_copy_header(&mut self.pending)?;
-                self.phase = 1;
-            }
-            1 => {
-                if let Some((price_key, price_id)) =
-                    read_v3_price_key_map_by_key_record(&mut self.reader)?
-                {
-                    self.pending.write_all(&2i16.to_be_bytes())?;
-                    write_pg_binary_copy_i64_field(&mut self.pending, i64::from(price_key))?;
-                    write_pg_binary_copy_field(&mut self.pending, &price_id)?;
-                } else {
-                    self.phase = 2;
-                    return self.fill_pending();
-                }
-            }
-            2 => {
-                write_pg_binary_copy_trailer(&mut self.pending)?;
-                self.phase = 3;
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
-}
-
-impl Read for PriceDictionaryPgBinaryStream {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-        if self.pending_offset >= self.pending.len() && !self.fill_pending()? {
-            return Ok(0);
-        }
-        let available = &self.pending[self.pending_offset..];
-        let copied = available.len().min(output.len());
-        output[..copied].copy_from_slice(&available[..copied]);
-        self.pending_offset += copied;
-        Ok(copied)
-    }
-}
-
 struct V3StageWriteSummary {
     row_count: u64,
     code_count: u64,
@@ -18615,6 +18905,7 @@ fn assign_v3_partition(
     })
 }
 
+#[cfg(test)]
 fn pg_binary_i16(field: &[u8], name: &str) -> io::Result<i16> {
     if field.len() != 2 {
         return Err(io::Error::new(
@@ -18625,6 +18916,7 @@ fn pg_binary_i16(field: &[u8], name: &str) -> io::Result<i16> {
     Ok(i16::from_be_bytes(field.try_into().map_err(to_io_error)?))
 }
 
+#[cfg(test)]
 fn summarize_shared_block_copy(path: &Path) -> io::Result<Value> {
     let mut reader = BufReader::new(File::open(path)?);
     read_pg_binary_copy_header(&mut reader)?;
@@ -18743,6 +19035,7 @@ fn summarize_shared_block_copy(path: &Path) -> io::Result<Value> {
         "mapping_identity_fields": ["object_kind", "block_key", "fragment_no", "entry_count", "block_hash"],
         "snapshot_key_included": false,
         "copy_bytes": path.metadata()?.len(),
+        "copy_sha256": sha256_hex(&sha256_file(path)?),
         "row_count": row_count,
         "entry_count": entry_count,
         "raw_payload_bytes": raw_bytes,
@@ -19241,6 +19534,7 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
     let assignment_seconds = assignment_started_at.elapsed().as_secs_f64();
 
     let encode_started_at = Instant::now();
+    let serving_encode_started_at = Instant::now();
     let serving_blocks_path = output.path("shared_serving_blocks.copy");
     let serving_blocks_file = OpenOptions::new()
         .write(true)
@@ -19266,6 +19560,8 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         },
     )?;
     sync_counting_writer(&mut serving_blocks_writer)?;
+    let serving_block_summary = serving_blocks_writer.shared_block_summary(&serving_blocks_path);
+    let serving_encode_seconds = serving_encode_started_at.elapsed().as_secs_f64();
 
     let audit_candidate_path = output.path("audit_candidates.bin");
     let distinct_serving_records = assigned_stream.distinct_record_count();
@@ -19285,22 +19581,23 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
     )?;
 
     let price_blocks_path = output.path("shared_price_dictionary_blocks.copy");
+    let price_dictionary_encode_started_at = Instant::now();
     let price_blocks_file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&price_blocks_path)?;
     let mut price_blocks_writer = CountingWriter::new(BufWriter::new(price_blocks_file));
-    let mut price_stream = PriceDictionaryPgBinaryStream::new(&price_key_map_by_key_path)?;
-    let price_dictionary_summary =
-        write_serving_binary_v3_price_dictionary_copy_from_pg_binary_reader(
-            &mut price_stream,
-            &mut price_blocks_writer,
-            ServingBinaryTargetCopyFormat::SharedBinary,
-            V3_FINALIZER_HOT_BLOCK_BYTES,
-        )?;
+    let mut price_stream = BufReader::new(File::open(&price_key_map_by_key_path)?);
+    let price_dictionary_summary = write_serving_binary_v3_price_dictionary_copy_from_fixed_reader(
+        &mut price_stream,
+        &mut price_blocks_writer,
+        ServingBinaryTargetCopyFormat::SharedBinary,
+        V3_FINALIZER_HOT_BLOCK_BYTES,
+    )?;
     sync_counting_writer(&mut price_blocks_writer)?;
-    let serving_block_summary = summarize_shared_block_copy(&serving_blocks_path)?;
-    let price_block_summary = summarize_shared_block_copy(&price_blocks_path)?;
+    let price_block_summary = price_blocks_writer.shared_block_summary(&price_blocks_path);
+    let price_dictionary_encode_seconds =
+        price_dictionary_encode_started_at.elapsed().as_secs_f64();
     let encode_seconds = encode_started_at.elapsed().as_secs_f64();
 
     let support_digest = v3_support_digest(
@@ -19609,6 +19906,8 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "stage_seconds": stage_seconds,
             "identity_sort_seconds": identity_sort_seconds,
             "assignment_seconds": assignment_seconds,
+            "serving_encode_seconds": serving_encode_seconds,
+            "price_dictionary_encode_seconds": price_dictionary_encode_seconds,
             "encode_seconds": encode_seconds,
             "elapsed_seconds": started_at.elapsed().as_secs_f64(),
         },
@@ -20226,10 +20525,11 @@ mod tests {
     fn provider_set_scope_cache_preserves_canonical_identity_and_checks_collisions() {
         let context = test_compact_context();
         let rate = RateLite {
-            provider_refs: vec!["7".to_string()],
+            provider_refs: vec!["7".into()],
             provider_groups: Vec::new(),
             network_names: vec!["A network".to_string(), "Shared".to_string()],
             prices: vec![test_price_lite("100.00")],
+            prepared_price_set: None,
         };
         let provider_entry = ProviderEntryView::Owned(ProviderEntry {
             entry_hash: 17,
@@ -20316,7 +20616,7 @@ mod tests {
         let provider_value: Value = serde_json::from_slice(raw_provider).unwrap();
         let mut provider_entry = build_provider_entry(&provider_value).unwrap();
         provider_entry.source_locator = Some(source_locator);
-        let provider_map = HashMap::from([("7".to_string(), provider_entry)]);
+        let provider_map = HashMap::from([(ProviderRefKey::from("7"), provider_entry)]);
         let rate = read_rate_lite_bytes(raw_rate).unwrap().unwrap();
         let procedure = json!({
             "billing_code_type": "CPT",
@@ -20453,6 +20753,7 @@ mod tests {
             provider_groups: Vec::new(),
             network_names: vec![" Rate Network ".to_string(), "Shared".to_string()],
             prices: Vec::new(),
+            prepared_price_set: None,
         };
         assert_eq!(
             rate_network_names(
@@ -20472,6 +20773,7 @@ mod tests {
                 provider_groups: Vec::new(),
                 network_names: Vec::new(),
                 prices: Vec::new(),
+                prepared_price_set: None,
             },
             &[],
             &context,
@@ -20776,7 +21078,7 @@ mod tests {
     fn provider_set_count_deduplicates_overlapping_npis_across_references() {
         let mut provider_map = HashMap::new();
         provider_map.insert(
-            "first".to_owned(),
+            ProviderRefKey::from("first"),
             build_provider_entry(&json!({
                 "provider_groups": [{
                     "tin": {"type": "ein", "value": "123456789"},
@@ -20786,7 +21088,7 @@ mod tests {
             .unwrap(),
         );
         provider_map.insert(
-            "second".to_owned(),
+            ProviderRefKey::from("second"),
             build_provider_entry(&json!({
                 "provider_groups": [{
                     "tin": {"type": "ein", "value": "987654321"},
@@ -20796,10 +21098,15 @@ mod tests {
             .unwrap(),
         );
 
-        let entry =
-            provider_set_from_ref_keys(&provider_map, &["first".to_owned(), "second".to_owned()])
-                .unwrap()
-                .unwrap();
+        let entry = provider_set_from_ref_keys(
+            &provider_map,
+            &[
+                ProviderRefKey::from("first"),
+                ProviderRefKey::from("second"),
+            ],
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(entry.provider_count, 3);
         assert_eq!(entry.npi, vec![1234567890, 1234567891, 1234567892]);
@@ -20809,7 +21116,7 @@ mod tests {
     fn provider_set_count_unions_npis_even_when_entry_hashes_match() {
         let mut provider_map = HashMap::new();
         provider_map.insert(
-            "first".to_owned(),
+            ProviderRefKey::from("first"),
             ProviderEntry {
                 entry_hash: 42,
                 provider_count: 2,
@@ -20821,7 +21128,7 @@ mod tests {
             },
         );
         provider_map.insert(
-            "second".to_owned(),
+            ProviderRefKey::from("second"),
             ProviderEntry {
                 entry_hash: 42,
                 provider_count: 2,
@@ -20833,10 +21140,15 @@ mod tests {
             },
         );
 
-        let entry =
-            provider_set_from_ref_keys(&provider_map, &["first".to_owned(), "second".to_owned()])
-                .unwrap()
-                .unwrap();
+        let entry = provider_set_from_ref_keys(
+            &provider_map,
+            &[
+                ProviderRefKey::from("first"),
+                ProviderRefKey::from("second"),
+            ],
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(entry.provider_count, 3);
         assert_eq!(entry.npi, vec![1234567890, 1234567891, 1234567892]);
@@ -21163,7 +21475,7 @@ mod tests {
         let valid_entry = build_provider_entry(&valid_provider_reference()).unwrap();
         assert_ne!(mixed_entry.entry_hash, valid_entry.entry_hash);
 
-        let provider_map = HashMap::from([("7".to_string(), mixed_entry)]);
+        let provider_map = HashMap::from([(ProviderRefKey::from("7"), mixed_entry)]);
         let payload = provider_identifier_quarantine_payload(
             &provider_map,
             ProviderIdentifierQuarantine::default(),
@@ -21280,12 +21592,12 @@ mod tests {
 
         let mut left = HashMap::new();
         left.insert(
-            "7".to_string(),
+            ProviderRefKey::from("7"),
             build_provider_entry(&provider_ref).unwrap(),
         );
         let mut right = HashMap::new();
         right.insert(
-            "7".to_string(),
+            ProviderRefKey::from("7"),
             build_provider_entry(&provider_ref).unwrap(),
         );
         let error = merge_provider_maps_pairwise(vec![(0, left), (1, right)]).unwrap_err();
@@ -21463,12 +21775,14 @@ mod tests {
         let combined =
             build_provider_entry(&json!({"provider_groups": [group_a, group_b]})).unwrap();
         let mut provider_map = HashMap::new();
-        provider_map.insert("a".to_string(), entry_a);
-        provider_map.insert("b".to_string(), entry_b);
-        let separate =
-            provider_set_from_ref_keys(&provider_map, &["a".to_string(), "b".to_string()])
-                .unwrap()
-                .unwrap();
+        provider_map.insert(ProviderRefKey::from("a"), entry_a);
+        provider_map.insert(ProviderRefKey::from("b"), entry_b);
+        let separate = provider_set_from_ref_keys(
+            &provider_map,
+            &[ProviderRefKey::from("a"), ProviderRefKey::from("b")],
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(
             separate.provider_group_hashes,
@@ -21539,17 +21853,17 @@ mod tests {
 
         assert_eq!(processed, 3);
         assert_eq!(provider_map.len(), 3);
-        assert!(provider_map.contains_key("7"));
-        assert!(provider_map.contains_key("8"));
-        assert!(provider_map.contains_key("121591448686103182592848195376305442061"));
-        assert_eq!(provider_map["7"].provider_count, 2);
-        assert_eq!(provider_map["8"].provider_count, 1);
-        assert_eq!(
-            provider_map["121591448686103182592848195376305442061"].provider_count,
-            1
-        );
-        assert_eq!(provider_map["7"].npi, vec![1234567890, 1234567891]);
-        assert!(!provider_map["7"].provider_group_hashes.is_empty());
+        let key_7 = ProviderRefKey::from("7");
+        let key_8 = ProviderRefKey::from("8");
+        let wide_key = ProviderRefKey::from("121591448686103182592848195376305442061");
+        assert!(provider_map.contains_key(&key_7));
+        assert!(provider_map.contains_key(&key_8));
+        assert!(provider_map.contains_key(&wide_key));
+        assert_eq!(provider_map[&key_7].provider_count, 2);
+        assert_eq!(provider_map[&key_8].provider_count, 1);
+        assert_eq!(provider_map[&wide_key].provider_count, 1);
+        assert_eq!(provider_map[&key_7].npi, vec![1234567890, 1234567891]);
+        assert!(!provider_map[&key_7].provider_group_hashes.is_empty());
     }
 
     fn assert_worker_handles_mixed_referenced_and_inline_rates(group_rates: bool) {
@@ -21579,33 +21893,37 @@ mod tests {
         });
         let mut provider_map = HashMap::new();
         provider_map.insert(
-            "top-level-ref".to_string(),
+            ProviderRefKey::from("top-level-ref"),
             build_provider_entry(&referenced_provider).unwrap(),
         );
         let rates = vec![
             RateLite {
-                provider_refs: vec!["top-level-ref".to_string()],
+                provider_refs: vec![ProviderRefKey::from("top-level-ref")],
                 provider_groups: Vec::new(),
                 network_names: Vec::new(),
                 prices: vec![test_price_lite("100.00")],
+                prepared_price_set: None,
             },
             RateLite {
                 provider_refs: Vec::new(),
                 provider_groups: vec![inline_group.clone()],
                 network_names: Vec::new(),
                 prices: vec![test_price_lite("101.00")],
+                prepared_price_set: None,
             },
             RateLite {
-                provider_refs: vec!["top-level-ref".to_string()],
+                provider_refs: vec![ProviderRefKey::from("top-level-ref")],
                 provider_groups: vec![inline_group.clone()],
                 network_names: Vec::new(),
                 prices: vec![test_price_lite("102.00")],
+                prepared_price_set: None,
             },
             RateLite {
                 provider_refs: Vec::new(),
                 provider_groups: vec![inline_group.clone()],
                 network_names: Vec::new(),
                 prices: vec![test_price_lite("101.00")],
+                prepared_price_set: None,
             },
         ];
         let procedure = json!({
@@ -21719,14 +22037,18 @@ mod tests {
         });
         let mut provider_map = HashMap::new();
         provider_map.insert(
-            "valid-ref".to_string(),
+            ProviderRefKey::from("valid-ref"),
             build_provider_entry(&provider_ref).unwrap(),
         );
         let rates = vec![RateLite {
-            provider_refs: vec!["valid-ref".to_string(), "dangling-ref".to_string()],
+            provider_refs: vec![
+                ProviderRefKey::from("valid-ref"),
+                ProviderRefKey::from("dangling-ref"),
+            ],
             provider_groups: Vec::new(),
             network_names: Vec::new(),
             prices: vec![test_price_lite("100.00")],
+            prepared_price_set: None,
         }];
         let procedure = json!({"billing_code_type": "CPT", "billing_code": "99213"});
         let paths = CopyPathConfig::default();
@@ -22405,23 +22727,25 @@ mod tests {
         });
         let mut provider_map = HashMap::new();
         provider_map.insert(
-            "1".to_string(),
+            ProviderRefKey::from("1"),
             build_provider_entry(&provider_ref_a).unwrap(),
         );
         provider_map.insert(
-            "2".to_string(),
+            ProviderRefKey::from("2"),
             build_provider_entry(&provider_ref_b).unwrap(),
         );
 
-        let single = provider_entry_view_from_ref_keys(&provider_map, &["1".to_string()])
+        let single = provider_entry_view_from_ref_keys(&provider_map, &[ProviderRefKey::from("1")])
             .unwrap()
             .expect("single ref should resolve");
         assert!(matches!(single, ProviderEntryView::Borrowed(_)));
 
-        let combined =
-            provider_entry_view_from_ref_keys(&provider_map, &["1".to_string(), "2".to_string()])
-                .unwrap()
-                .expect("combined refs should resolve");
+        let combined = provider_entry_view_from_ref_keys(
+            &provider_map,
+            &[ProviderRefKey::from("1"), ProviderRefKey::from("2")],
+        )
+        .unwrap()
+        .expect("combined refs should resolve");
         assert!(matches!(combined, ProviderEntryView::Owned(_)));
         assert_eq!(combined.provider_count(), 2);
     }
@@ -23345,6 +23669,56 @@ mod tests {
         assert_eq!(
             sha256_hex(&hash),
             "4ce3f60a45772e30f3055b5f385024010c45863a0e9091c9c55aabc9482f603e"
+        );
+    }
+
+    #[test]
+    fn shared_block_writer_summary_matches_reread_oracle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared-blocks.copy");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let mut writer = CountingWriter::new(BufWriter::new(file));
+        write_serving_binary_copy_header(&mut writer, ServingBinaryTargetCopyFormat::SharedBinary)
+            .unwrap();
+        let mut stats = ServingBinaryV3BlockStats::default();
+        write_serving_binary_v3_logical_block(
+            &mut writer,
+            ServingBinaryTargetCopyFormat::SharedBinary,
+            32,
+            ServingBinaryV3LogicalBlock {
+                artifact_kind: PTG2_SERVING_BINARY_BY_CODE_PRICE_PAGE_V4_KIND,
+                block_key: 7,
+                entry_count: 3,
+                payload: &[42; 96],
+            },
+            &mut stats,
+        )
+        .unwrap();
+        let compressible_payload = vec![7u8; 8192];
+        write_serving_binary_v3_logical_block(
+            &mut writer,
+            ServingBinaryTargetCopyFormat::SharedBinary,
+            64 * 1024,
+            ServingBinaryV3LogicalBlock {
+                artifact_kind: PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND,
+                block_key: 8,
+                entry_count: 1,
+                payload: &compressible_payload,
+            },
+            &mut stats,
+        )
+        .unwrap();
+        write_serving_binary_copy_trailer(&mut writer, ServingBinaryTargetCopyFormat::SharedBinary)
+            .unwrap();
+        sync_counting_writer(&mut writer).unwrap();
+
+        assert_eq!(
+            writer.shared_block_summary(&path),
+            summarize_shared_block_copy(&path).unwrap(),
         );
     }
 
@@ -26016,10 +26390,29 @@ mod tests {
             32,
         )
         .unwrap();
-        let records = read_test_shared_binary_records(writer.inner);
+        let pg_binary_output = writer.inner;
+        let records = read_test_shared_binary_records(pg_binary_output.clone());
         let expected_payload = price_ids.into_iter().flatten().collect::<Vec<_>>();
 
+        let mut fixed_input = Vec::new();
+        for (price_key, price_id) in price_ids.iter().enumerate() {
+            fixed_input.extend_from_slice(&(price_key as u32).to_be_bytes());
+            fixed_input.extend_from_slice(price_id);
+        }
+        let mut fixed_reader = Cursor::new(fixed_input);
+        let mut fixed_writer = CountingWriter::new(Vec::new());
+        let fixed_summary = write_serving_binary_v3_price_dictionary_copy_from_fixed_reader(
+            &mut fixed_reader,
+            &mut fixed_writer,
+            ServingBinaryTargetCopyFormat::SharedBinary,
+            32,
+        )
+        .unwrap();
+
         assert_eq!(records.len(), 2);
+        assert_eq!(fixed_writer.inner, pg_binary_output);
+        assert_eq!(fixed_summary["price_set_count"], summary["price_set_count"]);
+        assert_eq!(fixed_summary["storage"], summary["storage"]);
         assert!(records
             .iter()
             .all(|record| record.kind == PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND));

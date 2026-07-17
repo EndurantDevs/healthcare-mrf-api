@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -31,9 +32,7 @@ def _finalizer_contract():
         "price_key_map": {
             "copy_format": "postgresql_binary_copy",
             "row_count": 1,
-            "dense_price_ordering": (
-                "minimum_negotiated_rate_then_global_id_128_v1"
-            ),
+            "dense_price_ordering": "minimum_negotiated_rate_then_global_id_128_v1",
             "keys_unique_dense_contiguous": True,
             "source_ids_exact_match": True,
         },
@@ -45,6 +44,8 @@ def _finalizer_contract():
         },
         "blocks": {
             "serving": {
+                "copy_bytes": 1,
+                "copy_sha256": "a" * 64,
                 "artifact_record_counts": {
                     "by_code_provider_shard_v1": 1,
                     "by_code_price_page_v4": 1,
@@ -54,6 +55,8 @@ def _finalizer_contract():
                 }
             },
             "price_dictionary": {
+                "copy_bytes": 1,
+                "copy_sha256": "b" * 64,
                 "artifact_record_counts": {"by_code_price_dictionary": 1}
             },
         },
@@ -167,6 +170,7 @@ def _serving_run_entries(tmp_path):
                 "partition_count": 2,
                 "row_count": 1,
                 "bytes": PTG2_V3_SERVING_RUN_RECORD_BYTES,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
         )
     return entries
@@ -182,6 +186,7 @@ def _unannotated_file_result(tmp_path):
             "version": 4,
             "row_count": 1,
             "bytes": 64,
+            "sha256": hashlib.sha256(dictionary_path.read_bytes()).hexdigest(),
         }
     ]
     return PTG2FileProcessResult(

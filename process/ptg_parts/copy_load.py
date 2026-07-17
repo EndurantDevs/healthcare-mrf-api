@@ -62,12 +62,12 @@ def _primary_key_column_names(obj) -> list[str]:
 
 
 def _ptg2_json_columns(cls) -> set[str]:
-    result = set()
+    json_columns: set[str] = set()
     for column in cls.__table__.c:
         type_name = column.type.__class__.__name__.upper()
         if "JSON" in type_name:
-            result.add(column.name)
-    return result
+            json_columns.add(column.name)
+    return json_columns
 
 
 def _ptg2_copy_record(row: dict[str, Any], columns: list[str], json_columns: set[str]) -> tuple[Any, ...]:
@@ -80,20 +80,24 @@ def _ptg2_copy_record(row: dict[str, Any], columns: list[str], json_columns: set
     return tuple(values)
 
 
-async def _copy_upsert_ptg2_objects(rows: list[dict[str, Any]], cls) -> None:
-    if not rows:
+async def _copy_upsert_ptg2_objects(object_rows: list[dict[str, Any]], cls) -> None:
+    if not object_rows:
         return
-    columns = [column.name for column in cls.__table__.c if column.name in rows[0]]
+    columns = [
+        column.name for column in cls.__table__.c if column.name in object_rows[0]
+    ]
     if not columns:
         return
     conflict_targets = _ptg2_conflict_targets(cls)
     if not conflict_targets:
-        await push_objects(rows, cls, rewrite=True, use_copy=False)
+        await push_objects(object_rows, cls, rewrite=True, use_copy=False)
         return
-    deduped_rows: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for row in rows:
-        deduped_rows[tuple(row.get(target) for target in conflict_targets)] = row
-    rows = list(deduped_rows.values())
+    deduped_row_by_conflict: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for object_row in object_rows:
+        deduped_row_by_conflict[
+            tuple(object_row.get(conflict_column) for conflict_column in conflict_targets)
+        ] = object_row
+    object_rows = list(deduped_row_by_conflict.values())
     json_columns = _ptg2_json_columns(cls)
     schema_name = cls.__table__.schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     table_name = cls.__tablename__
@@ -110,7 +114,10 @@ async def _copy_upsert_ptg2_objects(rows: list[dict[str, Any]], cls) -> None:
         )
     else:
         conflict_sql = "DO NOTHING"
-    records = [_ptg2_copy_record(row, columns, json_columns) for row in rows]
+    copy_records = [
+        _ptg2_copy_record(object_row, columns, json_columns)
+        for object_row in object_rows
+    ]
     async with db.acquire() as conn:
         await conn.status(
             f"CREATE TEMP TABLE {quoted_temp} (LIKE {quoted_target} INCLUDING DEFAULTS) ON COMMIT DROP;"
@@ -120,7 +127,7 @@ async def _copy_upsert_ptg2_objects(rows: list[dict[str, Any]], cls) -> None:
         await driver_conn.copy_records_to_table(
             temp_table,
             columns=columns,
-            records=records,
+            records=copy_records,
         )
         await conn.status(
             f"""
@@ -150,14 +157,14 @@ async def _copy_insert_ptg2_objects(rows: list[dict[str, Any]], cls) -> None:
         )
 
 
-async def _copy_ignore_ptg2_objects(rows: list[dict[str, Any]], cls) -> None:
-    if not rows:
+async def _copy_ignore_ptg2_objects(object_rows: list[dict[str, Any]], cls) -> None:
+    if not object_rows:
         return
     conflict_targets = list(getattr(cls, "__my_index_elements__", []) or [])
     if not conflict_targets:
-        await _copy_insert_ptg2_objects(rows, cls)
+        await _copy_insert_ptg2_objects(object_rows, cls)
         return
-    columns = list(rows[0].keys())
+    columns = list(object_rows[0].keys())
     json_columns = _ptg2_json_columns(cls)
     schema_name = cls.__table__.schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     table_name = cls.__tablename__
@@ -166,7 +173,10 @@ async def _copy_ignore_ptg2_objects(rows: list[dict[str, Any]], cls) -> None:
     quoted_target = f"{_quote_ident(schema_name)}.{_quote_ident(table_name)}"
     quoted_columns = ", ".join(_quote_ident(column) for column in columns)
     quoted_conflict = ", ".join(_quote_ident(column) for column in conflict_targets)
-    records = [_ptg2_copy_record(row, columns, json_columns) for row in rows]
+    copy_records = [
+        _ptg2_copy_record(object_row, columns, json_columns)
+        for object_row in object_rows
+    ]
     async with db.acquire() as conn:
         await conn.status(
             f"CREATE TEMP TABLE {quoted_temp} (LIKE {quoted_target} INCLUDING DEFAULTS) ON COMMIT DROP;"
@@ -176,7 +186,7 @@ async def _copy_ignore_ptg2_objects(rows: list[dict[str, Any]], cls) -> None:
         await driver_conn.copy_records_to_table(
             temp_table,
             columns=columns,
-            records=records,
+            records=copy_records,
         )
         await conn.status(
             f"""
@@ -217,9 +227,11 @@ async def _copy_stage_price_set_rows(rows: list[dict[str, Any]], snapshot_id: st
         )
 
 
-async def _copy_stage_serving_rate_rows(rows: list[dict[str, Any]], snapshot_id: str) -> None:
+async def _copy_stage_serving_rate_rows(
+    serving_rate_rows: list[dict[str, Any]], snapshot_id: str
+) -> None:
     """Bulk-copy serving-rate rows into the snapshot staging table."""
-    if not rows:
+    if not serving_rate_rows:
         return
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     columns = [
@@ -253,41 +265,50 @@ async def _copy_stage_serving_rate_rows(rows: list[dict[str, Any]], snapshot_id:
         "confidence",
         "created_at",
     ]
-    records = [
+    serving_rate_records = [
         (
-            row.get("serving_rate_id"),
+            serving_rate_row.get("serving_rate_id"),
             snapshot_id,
-            row.get("plan_id"),
-            row.get("plan_name"),
-            row.get("plan_id_type"),
-            row.get("plan_market_type"),
-            row.get("issuer_name"),
-            row.get("plan_sponsor_name"),
-            row.get("procedure_code"),
-            row.get("reported_code_system"),
-            row.get("reported_code"),
-            row.get("billing_code"),
-            row.get("billing_code_type"),
-            row.get("procedure_name"),
-            row.get("procedure_description"),
-            row.get("procedure_display_name"),
-            row.get("rate_pack_hash"),
-            row.get("provider_set_hash"),
-            row.get("provider_set_hashes") or [],
-            row.get("provider_count"),
-            row.get("provider_set_count"),
-            row.get("price_set_hash"),
-            row.get("source_trace_set_hash"),
-            row.get("network_names") or [],
-            row.get("confidence_code"),
-            json.dumps(row.get("prices"), default=_json_default) if row.get("prices") is not None else None,
-            json.dumps(row.get("source_trace"), default=_json_default) if row.get("source_trace") is not None else None,
-            json.dumps(row.get("confidence"), default=_json_default) if row.get("confidence") is not None else None,
-            row.get("created_at"),
+            serving_rate_row.get("plan_id"),
+            serving_rate_row.get("plan_name"),
+            serving_rate_row.get("plan_id_type"),
+            serving_rate_row.get("plan_market_type"),
+            serving_rate_row.get("issuer_name"),
+            serving_rate_row.get("plan_sponsor_name"),
+            serving_rate_row.get("procedure_code"),
+            serving_rate_row.get("reported_code_system"),
+            serving_rate_row.get("reported_code"),
+            serving_rate_row.get("billing_code"),
+            serving_rate_row.get("billing_code_type"),
+            serving_rate_row.get("procedure_name"),
+            serving_rate_row.get("procedure_description"),
+            serving_rate_row.get("procedure_display_name"),
+            serving_rate_row.get("rate_pack_hash"),
+            serving_rate_row.get("provider_set_hash"),
+            serving_rate_row.get("provider_set_hashes") or [],
+            serving_rate_row.get("provider_count"),
+            serving_rate_row.get("provider_set_count"),
+            serving_rate_row.get("price_set_hash"),
+            serving_rate_row.get("source_trace_set_hash"),
+            serving_rate_row.get("network_names") or [],
+            serving_rate_row.get("confidence_code"),
+            json.dumps(serving_rate_row.get("prices"), default=_json_default)
+            if serving_rate_row.get("prices") is not None
+            else None,
+            json.dumps(serving_rate_row.get("source_trace"), default=_json_default)
+            if serving_rate_row.get("source_trace") is not None
+            else None,
+            json.dumps(serving_rate_row.get("confidence"), default=_json_default)
+            if serving_rate_row.get("confidence") is not None
+            else None,
+            serving_rate_row.get("created_at"),
         )
-        for row in rows
+        for serving_rate_row in serving_rate_rows
     ]
-    records = [_copy_record_values(record) for record in records]
+    serving_rate_records = [
+        _copy_record_values(serving_rate_record)
+        for serving_rate_record in serving_rate_records
+    ]
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection
         driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
@@ -295,12 +316,14 @@ async def _copy_stage_serving_rate_rows(rows: list[dict[str, Any]], snapshot_id:
             "ptg2_serving_rate_stage",
             schema_name=schema_name,
             columns=columns,
-            records=records,
+            records=serving_rate_records,
         )
 
 
-async def _copy_compact_serving_rate_rows(rows: list[dict[str, Any]], snapshot_id: str) -> None:
-    if not rows:
+async def _copy_compact_serving_rate_rows(
+    serving_rate_rows: list[dict[str, Any]], snapshot_id: str
+) -> None:
+    if not serving_rate_rows:
         return
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     columns = [
@@ -318,25 +341,28 @@ async def _copy_compact_serving_rate_rows(rows: list[dict[str, Any]], snapshot_i
         "network_names",
         "created_at",
     ]
-    records = [
+    serving_rate_records = [
         (
-            row.get("serving_rate_id"),
+            serving_rate_row.get("serving_rate_id"),
             snapshot_id,
-            row.get("plan_id"),
-            row.get("procedure_hash"),
-            row.get("procedure_code"),
-            row.get("reported_code_system"),
-            row.get("reported_code"),
-            row.get("provider_set_hash"),
-            row.get("provider_count"),
-            row.get("price_set_hash"),
-            row.get("source_trace_set_hash"),
-            row.get("network_names") or [],
-            row.get("created_at"),
+            serving_rate_row.get("plan_id"),
+            serving_rate_row.get("procedure_hash"),
+            serving_rate_row.get("procedure_code"),
+            serving_rate_row.get("reported_code_system"),
+            serving_rate_row.get("reported_code"),
+            serving_rate_row.get("provider_set_hash"),
+            serving_rate_row.get("provider_count"),
+            serving_rate_row.get("price_set_hash"),
+            serving_rate_row.get("source_trace_set_hash"),
+            serving_rate_row.get("network_names") or [],
+            serving_rate_row.get("created_at"),
         )
-        for row in rows
+        for serving_rate_row in serving_rate_rows
     ]
-    records = [_copy_record_values(record) for record in records]
+    serving_rate_records = [
+        _copy_record_values(serving_rate_record)
+        for serving_rate_record in serving_rate_records
+    ]
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection
         driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
@@ -344,7 +370,7 @@ async def _copy_compact_serving_rate_rows(rows: list[dict[str, Any]], snapshot_i
             "ptg2_serving_rate_compact",
             schema_name=schema_name,
             columns=columns,
-            records=records,
+            records=serving_rate_records,
         )
 
 
@@ -354,7 +380,9 @@ async def _copy_compact_serving_rate_file(copy_path: Path, *, target_table: str 
     await _copy_compact_serving_rate_source(copy_path.open("rb"), target_table=target_table)
 
 
-async def _copy_compact_serving_rate_source(source, *, target_table: str = "ptg2_serving_rate_compact") -> None:
+async def _copy_compact_serving_rate_source(
+    copy_source, *, target_table: str = "ptg2_serving_rate_compact"
+) -> None:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     columns = [
         "serving_rate_id",
@@ -379,7 +407,7 @@ async def _copy_compact_serving_rate_source(source, *, target_table: str = "ptg2
         try:
             await copy_to_table(
                 target_table,
-                source=source,
+                source=copy_source,
                 schema_name=schema_name,
                 columns=columns,
                 format="text",
@@ -387,7 +415,7 @@ async def _copy_compact_serving_rate_source(source, *, target_table: str = "ptg2
                 null="\\N",
             )
         finally:
-            close = getattr(source, "close", None)
+            close = getattr(copy_source, "close", None)
             if close is not None:
                 close()
 
@@ -397,7 +425,7 @@ async def _copy_ptg2_dictionary_file(copy_path: Path, kind: str, *, target_table
 
     if not copy_path.exists() or copy_path.stat().st_size <= 0:
         return
-    specs = {
+    copy_spec_by_kind = {
         "procedure": (
             "ptg2_procedure",
             ["procedure_hash", "billing_code_type", "billing_code_type_version", "billing_code", "name", "description"],
@@ -454,9 +482,9 @@ async def _copy_ptg2_dictionary_file(copy_path: Path, kind: str, *, target_table
             ["provider_entry_hash", "provider_group_hash"],
         ),
     }
-    if kind not in specs:
+    if kind not in copy_spec_by_kind:
         raise ValueError(f"Unsupported PTG2 dictionary copy kind: {kind}")
-    table_name, columns, conflict_targets = specs[kind]
+    table_name, columns, conflict_targets = copy_spec_by_kind[kind]
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     if target_table is not None:
         dedupe_stage_copy = _ptg2_stage_copy_dedupe_enabled(kind)
@@ -467,10 +495,10 @@ async def _copy_ptg2_dictionary_file(copy_path: Path, kind: str, *, target_table
             if copy_to_table is None:
                 raise NotImplementedError("Active database driver does not expose copy_to_table")
             if not dedupe_stage_copy:
-                with copy_path.open("rb") as source:
+                with copy_path.open("rb") as copy_source:
                     await copy_to_table(
                         target_table,
-                        source=source,
+                        source=copy_source,
                         columns=columns,
                         format="text",
                         delimiter="\t",
@@ -490,10 +518,10 @@ async def _copy_ptg2_dictionary_file(copy_path: Path, kind: str, *, target_table
                 ON COMMIT DROP;
                 """
             )
-            with copy_path.open("rb") as source:
+            with copy_path.open("rb") as copy_source:
                 await copy_to_table(
                     temp_table,
-                    source=source,
+                    source=copy_source,
                     columns=columns,
                     format="text",
                     delimiter="\t",
@@ -522,10 +550,10 @@ async def _copy_ptg2_dictionary_file(copy_path: Path, kind: str, *, target_table
         copy_to_table = getattr(driver_conn, "copy_to_table", None)
         if copy_to_table is None:
             raise NotImplementedError("Active database driver does not expose copy_to_table")
-        with copy_path.open("rb") as source:
+        with copy_path.open("rb") as copy_source:
             await copy_to_table(
                 temp_table,
-                source=source,
+                source=copy_source,
                 columns=columns,
                 format="text",
                 delimiter="\t",

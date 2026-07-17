@@ -181,6 +181,8 @@ summary = {{
     }},
     "blocks": {{
         "serving": {{
+            "copy_bytes": 1,
+            "copy_sha256": "a" * 64,
             "artifact_record_counts": {{
                 "by_code_provider_shard_v1": 1,
                 "by_code_price_page_v4": 1,
@@ -190,6 +192,8 @@ summary = {{
             }}
         }},
         "price_dictionary": {{
+            "copy_bytes": 1,
+            "copy_sha256": "b" * 64,
             "artifact_record_counts": {{"by_code_price_dictionary": 1}}
         }},
     }},

@@ -343,6 +343,23 @@ digest. Rust verifies these before allocating or decoding variable-length
 fields and charges the conservative dictionary resident estimate to the
 process identity-map limit.
 
+Serving-run and code-dictionary SHA-256 digests are accumulated by the scanner
+while it writes their canonical bytes. Python binds those declared digests into
+the source contracts without rereading the files. The Rust finalizer still
+recomputes and compares each digest during its required record scan, so removing
+the two Python passes does not weaken content or path-substitution detection.
+
+Finalizer block counts, mapping commitments, and artifact-kind totals are also
+accumulated while Rust writes each PostgreSQL binary COPY record. The finalizer
+records a SHA-256 digest over the complete COPY byte stream, including its
+header and trailer. Publication recomputes that digest while PostgreSQL consumes
+the same stream and rejects byte-count or digest drift before promotion. This
+replaces a standalone pass that reopened every block, parsed every COPY field,
+inflated every zlib payload, and recomputed every block hash.
+The price dictionary encoder also consumes the finalizer's native fixed-width
+key records directly instead of wrapping them as an in-memory PostgreSQL COPY
+stream and immediately parsing that stream back into the same two fields.
+
 Physical-source keys are not caller-selected identifiers. Python normalizes
 each source identity as a lowercase ASCII token, one supported digest kind,
 and a 32-byte digest; sorting that tuple assigns the contiguous keys. Rust
