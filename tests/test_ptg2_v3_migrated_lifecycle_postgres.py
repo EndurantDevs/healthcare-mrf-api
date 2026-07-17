@@ -30,6 +30,10 @@ from process.ptg import (
     _reused_shared_v3_serving_index,
 )
 from process.ptg_parts.import_rows import _ptg2_source_trace_rows
+from process.ptg_parts.ptg2_candidate_audit_contract import (
+    PTG2_FAST_AUDIT_CONTRACT,
+    PTG2_FAST_AUDIT_TOOL_VERSION,
+)
 from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 from process.ptg_parts.ptg2_manifest_artifacts import write_global_membership_sidecar
 from process.ptg_parts.ptg2_manifest_publish import (
@@ -440,8 +444,8 @@ def _release_report(
         "schema_version": 3,
         "harness": {
             "name": "ptg2_v3_fast_source_witness_audit",
-            "version": "2.1.0",
-            "contract": "ptg2_v3_fast_source_witness_audit_v2",
+            "version": PTG2_FAST_AUDIT_TOOL_VERSION,
+            "contract": PTG2_FAST_AUDIT_CONTRACT,
         },
         "runtime": {"http_client": "aiohttp", "event_loop": "uvloop"},
         "status": "pass",

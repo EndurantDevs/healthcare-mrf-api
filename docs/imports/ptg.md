@@ -496,7 +496,7 @@ build. Selection happens only after the strict V3 writer accepts a rate, so the
 authoritative population is the emitted, API-queryable price/provider
 occurrence population rather than raw JSON row count. Each source contributes
 deterministic local bottom-k candidates with contract
-`bottom_k_atomic_occurrence_exponential_priority_v2`:
+`bottom_k_independent_occurrence_provider_cohorts_v3`:
 
 - negotiated-rate JSON plus its procedure fields, exact emitted price ordinal,
   exact provider-set NPI ordinal, and linked raw provider evidence;
@@ -506,11 +506,12 @@ deterministic local bottom-k candidates with contract
   for every token. Worker identity and partition layout are not part of the
   selection key.
 
-Publication selects exactly `min(total_population, 2,048)` records across all
-sources. Up to 48 records are reserved for provider references; queryable
-occurrences fill the remainder, and either cohort deterministically backfills
-unused capacity. Both local and global population-derived counts are checked,
-so an omitted queryable occurrence or provider candidate fails publication.
+Publication independently selects `min(queryable_occurrence_population,
+10,000)` exact pricing occurrences and `min(provider_population, 1,000)`
+provider records across all sources, for at most 11,000 records. Neither cohort
+borrows unused capacity from the other. Both local and global
+population-derived counts are checked, so an omitted queryable occurrence or
+provider candidate fails publication.
 Per-source scanner candidates use a separate bounded intermediate bundle
 (currently 512 MiB maximum) because a local bottom-k set can be larger than the
 final cross-source selection. The immutable PostgreSQL witness remains capped
@@ -554,11 +555,10 @@ snapshot, source, plan, and market selectors all match.
 
 The activation audit loads the sealed source-witness payload from PostgreSQL,
 checks all framing and manifest digests, reparses every selected raw token,
-validates provider evidence, and then runs one exact standard pricing challenge
-for every selected occurrence witness. With the normal 48-record provider
-quota, a dense import runs 2,000 pricing challenges plus one served-sample
-preflight: 2,001 no-retry HTTP requests. The absolute maximum is 2,049 when no
-provider-reference records exist. Exact filters normally resolve in one page;
+validates up to 1,000 independently selected provider records, and then runs
+one exact standard pricing challenge for every selected occurrence witness. A
+dense import runs 10,000 pricing challenges plus one served-sample preflight:
+10,001 no-retry HTTP requests. Exact filters normally resolve in one page;
 pagination is bounded to eight pages and all retries and extra requests are
 counted rather than hidden.
 
@@ -712,11 +712,11 @@ For 2,000 logical imports per 30-day month:
 - One build lane therefore has little burst, retry, and maintenance headroom
   near that bound even though its theoretical steady-state capacity is 2,880
   builds per 30-day month. Candidate audits use separately measured lanes and
-  availability. A full 2,048-record activation normally has 2,000 occurrence
-  challenges plus one preflight, or 4,002,000 calls at the monthly objective.
-  The provider-empty maximum is 2,049 calls per activation and 4,098,000 per
-  month; measured retries and bounded pagination must be added rather than
-  projected away.
+  availability. A full activation has 10,000 occurrence challenges plus one
+  preflight, or 20,002,000 calls at the monthly objective. That averages about
+  7.7 requests per second over a 30-day month, but the capacity gate must prove
+  burst concurrency rather than relying on the average. Measured retries and
+  bounded pagination must be added rather than projected away.
 - Physical reuse reduces build work only when the complete-set fingerprint
   matches. Capacity models must measure the reuse hit rate and keep an
   unreused scenario.
@@ -793,9 +793,9 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
 - No release import used truncation or partial-source options.
 - Temporary scanner/finalizer files and disposable stages are gone.
 - The PostgreSQL source-witness payload exists, validates against the sealed
-  manifests and complete source set, contains exactly 2,048 combined witnesses
-  for a large population (normally 2,000 queryable rate occurrences and 48
-  provider references), and has no API-pod filesystem copy. Repeated linked
+  manifests and complete source set, contains exactly 10,000 queryable rate
+  occurrences plus 1,000 provider records for a large population, and has no
+  API-pod filesystem copy. Repeated linked
   provider JSON is stored once in the payload's SHA-256-keyed compressed
   dictionary; every occurrence reference, dictionary digest, byte count, and
   dictionary coverage set must validate before the audit can run.

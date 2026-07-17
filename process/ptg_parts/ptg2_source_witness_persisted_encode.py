@@ -17,6 +17,7 @@ from process.ptg_parts.ptg2_source_witness_contract import (
     PERSISTED_PAYLOAD_MAGIC,
     PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES,
     PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES,
+    PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
     PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION,
     PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
     PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
@@ -126,12 +127,13 @@ def _payload_header(
         sample_hasher.update(witness_record.compressed)
     return {
         "contract": PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
-        "format_version": 3,
+        "format_version": 4,
         "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
         "unqueryable_rate_policy": PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
         "source_count": counts.source_count,
         "source_set_digest": counts.source_digest,
+        "occurrence_target": PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
         "total_target": PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
         "provider_quota": PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
         "queryable_occurrence_population_count": counts.occurrence_population,

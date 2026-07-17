@@ -7,17 +7,21 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-PTG2_V3_SOURCE_WITNESS_CONTRACT = "ptg2_v3_source_witness_v2"
+PTG2_V3_SOURCE_WITNESS_CONTRACT = "ptg2_v3_source_witness_v3"
 PTG2_V3_SOURCE_WITNESS_RECORD_CONTRACT = "ptg2_v3_source_witness_record_v2"
 PTG2_V3_SOURCE_WITNESS_SELECTION = (
-    "bottom_k_atomic_occurrence_exponential_priority_v2"
+    "bottom_k_independent_occurrence_provider_cohorts_v3"
 )
-PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT = "ptg2_v3_source_witness_payload_v3"
+PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT = "ptg2_v3_source_witness_payload_v4"
 PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION = (
     "per_record_zlib_linked_provider_dictionary_v1"
 )
-PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET = 2_048
-PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA = 48
+PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET = 10_000
+PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA = 1_000
+PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET = (
+    PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET
+    + PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA
+)
 PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY = (
     "count_but_exclude_from_npi_api_challenges_v1"
 )
@@ -27,7 +31,7 @@ PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES = 8 * 1024 * 1024
 PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES = 64 * 1024 * 1024
 SOURCE_BUNDLE_MAGIC = b"PTG2SW02"
 SOURCE_RECORD_MAGIC = b"PTG2SWR2"
-PERSISTED_PAYLOAD_MAGIC = b"PTG2SWP3"
+PERSISTED_PAYLOAD_MAGIC = b"PTG2SWP4"
 
 
 @dataclass(frozen=True)
@@ -108,29 +112,19 @@ def source_witness_targets(
     occurrence_population: int,
     provider_population: int,
 ) -> tuple[int, int, int]:
-    """Return exact occurrence/provider counts under the 2,048-total policy."""
+    """Return independent exact occurrence and provider witness counts."""
 
     if occurrence_population < 0 or provider_population < 0:
         raise RuntimeError("strict V3 source witness population is invalid")
-    total_target = min(
-        PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
-        occurrence_population + provider_population,
+    occurrence_target = min(
+        occurrence_population,
+        PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
     )
     provider_target = min(
         provider_population,
         PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
-        total_target,
     )
-    occurrence_target = min(
-        occurrence_population,
-        total_target - provider_target,
-    )
-    provider_target += min(
-        provider_population - provider_target,
-        total_target - provider_target - occurrence_target,
-    )
-    if occurrence_target + provider_target != total_target:
-        raise RuntimeError("strict V3 source witness quota cannot be satisfied")
+    total_target = occurrence_target + provider_target
     return occurrence_target, provider_target, total_target
 
 
@@ -158,10 +152,11 @@ def _strict_manifest_digest(manifest: Mapping[str, Any], field_name: str) -> str
 def _validate_manifest_contract(manifest_by_field: Mapping[str, Any]) -> None:
     expected_value_by_field = {
         "contract": PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
-        "format_version": 3,
+        "format_version": 4,
         "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
         "unqueryable_rate_policy": PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
+        "occurrence_target": PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
         "total_target": PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
         "provider_quota": PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
         "compression": PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION,
@@ -289,6 +284,7 @@ __all__ = [
     "PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES",
     "PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES",
     "PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES",
+    "PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET",
     "PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION",
     "PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT",
     "PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA",

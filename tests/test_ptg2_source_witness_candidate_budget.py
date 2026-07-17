@@ -43,7 +43,7 @@ def test_scanner_bundle_has_a_separate_larger_intermediate_budget(
     )
 
 
-def test_local_targets_preserve_provider_backfill_and_global_bottom_k():
+def test_local_targets_preserve_independent_global_bottom_k_cohorts():
     source_populations = (
         (10_000, 80),
         (2_040, 8),
@@ -78,8 +78,8 @@ def test_local_targets_preserve_provider_backfill_and_global_bottom_k():
             global_provider_target,
         )
 
-    assert global_total_target == 2_048
+    assert global_total_target == 10_188
     assert source_witness_targets(
         occurrence_population=10,
         provider_population=10_000,
-    ) == (10, 2_038, 2_048)
+    ) == (10, 1_000, 1_010)

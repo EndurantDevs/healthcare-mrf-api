@@ -33,23 +33,24 @@ NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload
 
 def _source_witness_by_field() -> dict[str, object]:
     return {
-        "contract": "ptg2_v3_source_witness_payload_v3",
-        "format_version": 3,
-        "selection_method": "bottom_k_atomic_occurrence_exponential_priority_v2",
+        "contract": "ptg2_v3_source_witness_payload_v4",
+        "format_version": 4,
+        "selection_method": "bottom_k_independent_occurrence_provider_cohorts_v3",
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
         "unqueryable_rate_policy": "count_but_exclude_from_npi_api_challenges_v1",
         "source_count": 1,
         "source_set_digest": SOURCE_SET_DIGEST,
-        "total_target": 2_048,
-        "provider_quota": 48,
-        "queryable_occurrence_population_count": 5_000,
-        "provider_population_count": 100,
+        "occurrence_target": 10_000,
+        "total_target": 11_000,
+        "provider_quota": 1_000,
+        "queryable_occurrence_population_count": 50_000,
+        "provider_population_count": 5_000,
         "emitted_rate_row_count": 1_000,
         "unqueryable_rate_row_count": 0,
-        "occurrence_witness_count": 2_000,
-        "provider_witness_count": 48,
-        "record_count": 2_048,
-        "linked_provider_dictionary_count": 100,
+        "occurrence_witness_count": 10_000,
+        "provider_witness_count": 1_000,
+        "record_count": 11_000,
+        "linked_provider_dictionary_count": 1_000,
         "linked_provider_dictionary_raw_bytes": 10_000,
         "linked_provider_dictionary_stored_bytes": 5_000,
         "sample_digest": SOURCE_WITNESS_SAMPLE_DIGEST,
@@ -131,13 +132,13 @@ def _passing_report(
         "release_gate_eligible": True,
         "duration_seconds": 12.5,
         "checks": {
-            "source_witnesses": 2_048,
-            "api_witnesses_matched": 2_000,
-            "api_challenges_executed": 2_000,
-            "provider_witnesses_validated": 48,
+            "source_witnesses": 11_000,
+            "api_witnesses_matched": 10_000,
+            "api_challenges_executed": 10_000,
+            "provider_witnesses_validated": 1_000,
             "api_audit_occurrences_validated": 1,
         },
-        "http": {"standard_api_actual_http_requests": 2_001},
+        "http": {"standard_api_actual_http_requests": 10_001},
         "latency": {
             "request_p50_ms": 18.2,
             "request_p95_ms": 31.2,
@@ -464,7 +465,7 @@ async def test_passing_audit_loads_postgres_witness_attests_then_activates(monke
     assert activation_response["snapshot_status"] == "published"
     assert activation_response["activation_status"] == "activated"
     assert activation_response["audit_report_digest"] == "ef" * 32
-    assert activation_response["audit_counts"]["standard_api_actual_http_requests"] == 2_001
+    assert activation_response["audit_counts"]["standard_api_actual_http_requests"] == 10_001
     assert activation_response["metrics"]["candidate_run_id"] == "ptg2:derived-import"
 
 

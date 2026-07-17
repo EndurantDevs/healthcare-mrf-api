@@ -4,9 +4,9 @@
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-PTG2_FAST_AUDIT_CONTRACT = "ptg2_v3_fast_source_witness_audit_v2"
+PTG2_FAST_AUDIT_CONTRACT = "ptg2_v3_fast_source_witness_audit_v3"
 PTG2_FAST_AUDIT_TOOL = "ptg2_v3_fast_source_witness_audit"
-PTG2_FAST_AUDIT_TOOL_VERSION = "2.1.0"
+PTG2_FAST_AUDIT_TOOL_VERSION = "3.0.0"
 PTG2_FAST_AUDIT_DEADLINE_SECONDS = 55.0
 PTG2_FAST_AUDIT_REQUEST_P95_CEILING_MS = 250.0
 PTG2_PUBLIC_AUDIT_SAMPLE_FIELDS = (

@@ -34,7 +34,7 @@ from process.ptg_parts.ptg2_source_witness_contract import (
 )
 
 
-PTG2_CANDIDATE_ATTESTATION_CONTRACT = "ptg2_v3_release_audit_attestation_v2"
+PTG2_CANDIDATE_ATTESTATION_CONTRACT = "ptg2_v3_release_audit_attestation_v3"
 PTG2_CANDIDATE_AUDIT_TOOL = PTG2_FAST_AUDIT_TOOL
 PTG2_CANDIDATE_AUDIT_TOOL_VERSION = PTG2_FAST_AUDIT_TOOL_VERSION
 PTG2_VERIFIED_HTTPS_TRANSPORT = "verified_https_v1"

@@ -10,8 +10,19 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process.ptg_parts import ptg2_candidate_attestation, source_pointers
+from process.ptg_parts.ptg2_candidate_audit_contract import (
+    PTG2_FAST_AUDIT_CONTRACT,
+    PTG2_FAST_AUDIT_TOOL_VERSION,
+)
 from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_payload,
+)
+from process.ptg_parts.ptg2_source_witness_contract import (
+    PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
+    PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
+    PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
+    PTG2_V3_SOURCE_WITNESS_SELECTION,
+    PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
 )
 
 
@@ -27,23 +38,24 @@ def _sha256(value: str) -> str:
 
 def _source_witness(source_set):
     return {
-        "contract": "ptg2_v3_source_witness_payload_v3",
-        "format_version": 3,
-        "selection_method": "bottom_k_atomic_occurrence_exponential_priority_v2",
+        "contract": PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
+        "format_version": 4,
+        "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
         "unqueryable_rate_policy": "count_but_exclude_from_npi_api_challenges_v1",
         "source_count": source_set["source_count"],
         "source_set_digest": source_set["raw_container_sha256_digest"],
-        "total_target": 2_048,
-        "provider_quota": 48,
-        "queryable_occurrence_population_count": 5_000,
-        "provider_population_count": 100,
+        "occurrence_target": PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
+        "total_target": PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
+        "provider_quota": PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
+        "queryable_occurrence_population_count": 50_000,
+        "provider_population_count": 5_000,
         "emitted_rate_row_count": 1_000,
         "unqueryable_rate_row_count": 0,
-        "occurrence_witness_count": 2_000,
-        "provider_witness_count": 48,
-        "record_count": 2_048,
-        "linked_provider_dictionary_count": 100,
+        "occurrence_witness_count": 10_000,
+        "provider_witness_count": 1_000,
+        "record_count": 11_000,
+        "linked_provider_dictionary_count": 1_000,
         "linked_provider_dictionary_raw_bytes": 10_000,
         "linked_provider_dictionary_stored_bytes": 5_000,
         "sample_digest": "cd" * 32,
@@ -85,8 +97,8 @@ def _release_report(**target_overrides):
         "schema_version": 3,
         "harness": {
             "name": "ptg2_v3_fast_source_witness_audit",
-            "version": "2.1.0",
-            "contract": "ptg2_v3_fast_source_witness_audit_v2",
+            "version": PTG2_FAST_AUDIT_TOOL_VERSION,
+            "contract": PTG2_FAST_AUDIT_CONTRACT,
         },
         "runtime": {"http_client": "aiohttp", "event_loop": "uvloop"},
         "status": "pass",
@@ -111,27 +123,27 @@ def _release_report(**target_overrides):
         },
         "coverage": {
             "failures": [],
-            "selection_method": "bottom_k_atomic_occurrence_exponential_priority_v2",
-            "queryable_occurrence_population_count": 5_000,
+            "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
+            "queryable_occurrence_population_count": 50_000,
             "emitted_rate_row_count": 1_000,
             "unqueryable_rate_row_count": 0,
             "unqueryable_rate_policy": "count_but_exclude_from_npi_api_challenges_v1",
-            "occurrence_sample_count": 2_000,
-            "provider_sample_count": 48,
+            "occurrence_sample_count": 10_000,
+            "provider_sample_count": 1_000,
         },
         "checks": {
-            "source_witnesses": 2_048,
-            "api_witnesses_matched": 2_000,
-            "api_challenges_executed": 2_000,
-            "provider_witnesses_validated": 48,
+            "source_witnesses": 11_000,
+            "api_witnesses_matched": 10_000,
+            "api_challenges_executed": 10_000,
+            "provider_witnesses_validated": 1_000,
             "api_audit_occurrences_validated": 1,
         },
         "http": {
-            "standard_api_actual_http_requests": 2_001,
+            "standard_api_actual_http_requests": 10_001,
             "retry_count": 0,
             "max_concurrency": 32,
         },
-        "random_api_requests": {"requested": 2_000, "executed": 2_000},
+        "random_api_requests": {"requested": 10_000, "executed": 10_000},
         "latency": {
             "request_p50_ms": 100.0,
             "request_p95_ms": 250.0,
@@ -182,8 +194,8 @@ def test_release_report_validation_is_exact_and_deterministic():
 
     assert len(first["report_digest"]) == 32
     assert first["report_digest"] == second["report_digest"]
-    assert first["checks"]["source_witnesses"] == 2_048
-    assert first["standard_api_actual_http_requests"] == 2_001
+    assert first["checks"]["source_witnesses"] == 11_000
+    assert first["standard_api_actual_http_requests"] == 10_001
 
 
 def test_release_report_rejects_non_uvloop_or_non_aiohttp_runtime():
@@ -221,11 +233,11 @@ def test_release_report_accepts_explicit_authenticated_cluster_transport():
     ("mutation", "message"),
     [
         (lambda report: report["target"].update(expected_snapshot_lifecycle="published"), "target"),
-        (lambda report: report["checks"].update(source_witnesses=2_047), "below"),
+        (lambda report: report["checks"].update(source_witnesses=10_999), "below"),
         (lambda report: report["failures"]["counts"].update(altered=1), "release gate"),
         (lambda report: report["api_audit_sample"].update(source_set_validated=False), "coverage"),
-        (lambda report: report["random_api_requests"].update(executed=2_047), "coverage"),
-        (lambda report: report["checks"].update(source_witnesses="2048"), "invalid"),
+        (lambda report: report["random_api_requests"].update(executed=9_999), "coverage"),
+        (lambda report: report["checks"].update(source_witnesses="11000"), "invalid"),
         (lambda report: report["api_audit_sample"].update(sample_digest="bad"), "sample_digest"),
         (lambda report: report["redaction"]["excluded"].pop(), "redaction"),
         (lambda report: report["target"].update(transport_contract=None), "transport"),

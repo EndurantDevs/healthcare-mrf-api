@@ -40,10 +40,10 @@ def test_strict_ptg_docs_define_sharded_writer_and_bounded_cost_pages():
 def test_strict_ptg_docs_define_bounded_candidate_audit_contract():
     for path in PTG_DOCS:
         text = _normalized_text(path)
-        assert "2,048" in text
-        assert "2,049" in text
-        assert "2,000" in text
-        assert "48" in text
+        assert "10,000" in text
+        assert "1,000" in text
+        assert "10,001" in text
+        assert "independent" in text.lower()
         assert re.search(r"55[- ]second", text, re.IGNORECASE)
         assert "`aiohttp`" in text
         assert "`uvloop`" in text

@@ -56,8 +56,8 @@ A representative dev import is required before broad deployment. Record:
 - exact source/API audit results from the original JSON or gzip inputs.
 
 Automatic activation uses the bounded PostgreSQL source-witness audit. It
-reparses exactly 2,048 combined witnesses for a large population (normally
-2,000 emitted price/provider occurrences and 48 provider references), runs one
+reparses independently selected cohorts of 10,000 emitted price/provider
+occurrences and 1,000 provider records for a large population, runs one
 served-sample preflight plus one standard API challenge per occurrence,
 requires `aiohttp` on `uvloop`, and fails closed at 55 seconds. The report must
 be freshly attested against the sealed witness,

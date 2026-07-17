@@ -136,7 +136,7 @@ total is not yet known; a false `total_is_exact` marks `total` and
 | Source and dictionary completeness | Implemented in repository | Per-source run and dictionary contracts bind exact file descriptors to canonical physical identities; Python/Rust parity and coherent-omission tests fail closed. |
 | Exact multiplicity | Implemented in repository | Duplicate source candidates and duplicate atom ordinals survive publication and audit. |
 | Persisted audit sample | Implemented in repository | Publish-time sample metadata, digest, row bound, and API readback tests. |
-| Bounded candidate release audit | Implemented in repository | Import-time exact source witnesses are sealed in PostgreSQL; activation reparses them and runs up to 2,048 concurrent source-to-API challenges plus one served-sample preflight within a 55-second deadline. |
+| Bounded candidate release audit | Implemented in repository | Import-time exact source witnesses are sealed in PostgreSQL; activation reparses independent cohorts of up to 10,000 pricing occurrences and 1,000 provider records, then runs 10,001 normal no-retry HTTP requests including one served-sample preflight within a 55-second deadline. |
 | Candidate attestation and atomic activation | Implemented in repository | Fresh report and sealed-sample binding, immutable validated row, exact predecessor CAS, wall-clock expiry, single-use receipt, and transaction rollback tests. |
 | Automatic candidate audit orchestration | Implemented in repository | The generic `ptg-candidate-audit` job resolves one validated candidate, loads and verifies its sealed PostgreSQL witness, runs the bounded `aiohttp`/`uvloop` audit, records the attestation, and atomically promotes the exact predecessor. |
 | Class-specific cold first-page p95 <= 40 ms | Pending release measurement | Fresh API processes, distinct keys, and complete first-page observations measured separately for matched-positive, negative, and deterministic-random requests. |
@@ -188,9 +188,9 @@ The bounded activation gate requires all of these floors:
 
 | Check | Floor or ceiling |
 | --- | ---: |
-| Deterministic source witnesses | exactly 2,048 total for a large combined population |
-| Queryable occurrence witnesses | normally 2,000 after the provider reserve |
-| Provider-reference witnesses | all sealed witnesses; at most 48 |
+| Deterministic source witnesses | 10,000 occurrences plus 1,000 providers for a large combined population |
+| Queryable occurrence witnesses | independently selected; at most 10,000 |
+| Provider-reference witnesses | independently selected; at most 1,000 |
 | Persisted served-sample preflight | exactly 1 |
 | Standard-API challenges | one per selected rate witness |
 | No-retry HTTP baseline | selected rate witnesses plus 1 preflight |
@@ -311,11 +311,10 @@ A qualifying dev measurement must:
    path.
 5. Exercise bounded temporary scratch and prove cleanup after completion.
 6. Persist and validate the publish-time audit sample.
-7. Run the bounded candidate audit over the exact 2,048-record combined source
-   sample (normally 2,000 occurrence and 48 provider witnesses) and
-   one served-sample preflight. Require `aiohttp` on `uvloop`, a 55-second hard
-   deadline, and a reconciled 2,001-request normal no-retry baseline (2,049
-   absolute maximum when the provider cohort is empty).
+7. Run the bounded candidate audit over independently selected source cohorts
+   of 10,000 occurrences and 1,000 provider witnesses for a large population,
+   plus one served-sample preflight. Require `aiohttp` on `uvloop`, a 55-second
+   hard deadline, and a reconciled 10,001-request normal no-retry baseline.
 8. Collect at least 30 successful candidate audits with zero errors. Record
    audit lane count and availability, duration, queue age, actual HTTP and retry
    counts per activation, attestation, and exact-predecessor activation.
@@ -437,9 +436,8 @@ Schema-v7 release evidence uses these fixed representativeness policies:
   Candidate-audit request totals, duration, and derived rate reconcile both in
   the sample population and contention interval, covering the observed
   occurrence-witness count plus one preflight per audit. The normal dense
-  baseline is 2,001 calls per audit and 4,002,000 per 2,000 activations; the
-  provider-empty maximum is 2,049 and 4,098,000. Add measured retries and
-  bounded pagination.
+  baseline is 10,001 calls per audit and 20,002,000 per 2,000 activations. Add
+  measured retries and bounded pagination.
   The signed raw timestamps cover at least 99 percent of the contention interval
   with no import, audit, or HTTP observation gap above five seconds.
 - Fresh-process cold first-page p95 is at most 40 ms independently for at
