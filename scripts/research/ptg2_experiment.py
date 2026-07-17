@@ -2021,111 +2021,82 @@ def digest_serving_by_code_db_records(records: list[tuple[str, int, int, int, by
     return digest.hexdigest()
 
 
-def build_serving_by_provider_set_db_records(serving_rows: Any) -> dict[str, Any]:
-    """Build database records for the provider-set serving candidate."""
-    price_key_by_set_id: dict[str, int] = {}
-    price_set_values: list[str] = []
-    seen_code_keys: set[int] = set()
-    row_count = 0
-    current_provider_set: int | None = None
-    current_code: int | None = None
-    current_code_entries: list[tuple[int, int]] = []
-    code_keys_by_pattern: dict[tuple[tuple[int, int], ...], list[int]] = {}
-    binary_records: list[tuple[str, int, int, int, bytes]] = []
-    source_digest = hashlib.sha256()
+def _provider_price_key(
+    value: str,
+    price_key_by_set_id: dict[str, int],
+    price_set_values: list[str],
+) -> int:
+    """Intern a normalized price-set ID and return its dense integer key."""
+    price_set_id = str(value).strip().lower()
+    price_set_key = price_key_by_set_id.get(price_set_id)
+    if price_set_key is None:
+        price_set_key = len(price_set_values)
+        price_key_by_set_id[price_set_id] = price_set_key
+        price_set_values.append(price_set_id)
+    return price_set_key
 
-    def price_key_for(value: str) -> int:
-        """Intern a normalized price-set ID and return its dense integer key."""
-        price_set_id = str(value).strip().lower()
-        price_set_key = price_key_by_set_id.get(price_set_id)
-        if price_set_key is None:
-            price_set_key = len(price_set_values)
-            price_key_by_set_id[price_set_id] = price_set_key
-            price_set_values.append(price_set_id)
-        return price_set_key
 
-    def flush_code(
-        code_key: int | None,
-        code_entries: list[tuple[int, int]],
-        pattern_map: dict[tuple[tuple[int, int], ...], list[int]],
-    ) -> list[tuple[int, int]]:
-        """Group one code key under its serving-entry pattern and reset the buffer."""
-        if code_key is not None:
-            pattern_map.setdefault(tuple(code_entries), []).append(code_key)
-        return []
+def _group_provider_code(
+    code_key: int | None,
+    code_entries: list[tuple[int, int]],
+    pattern_map: dict[tuple[tuple[int, int], ...], list[int]],
+) -> list[tuple[int, int]]:
+    """Group one code key under its serving-entry pattern and reset the buffer."""
+    if code_key is not None:
+        pattern_map.setdefault(tuple(code_entries), []).append(code_key)
+    return []
 
-    def append_provider_binary_block(
-        provider_set_key: int | None,
-        code_key: int | None,
-        code_entries: list[tuple[int, int]],
-        pattern_map: dict[tuple[tuple[int, int], ...], list[int]],
-    ) -> tuple[list[tuple[int, int]], dict[tuple[tuple[int, int], ...], list[int]]]:
-        """Append one reverse binary record and reset the current provider state."""
-        if provider_set_key is None:
-            return code_entries, pattern_map
-        remaining_code_entries = flush_code(code_key, code_entries, pattern_map)
-        binary_payload = bytearray()
-        provider_row_count = 0
-        pattern_items = sorted(
-            pattern_map.items(),
-            key=lambda item: (item[0], item[1]),
-        )
-        _append_uvarint(binary_payload, len(pattern_items))
-        for entries, code_keys in pattern_items:
-            sorted_code_keys = sorted(code_keys)
-            _append_uvarint(binary_payload, len(sorted_code_keys))
-            previous_code_key = 0
-            for index, code_key in enumerate(sorted_code_keys):
-                _append_uvarint(binary_payload, code_key if index == 0 else code_key - previous_code_key)
-                previous_code_key = code_key
-            _append_uvarint(binary_payload, len(entries))
-            for provider_count, price_key in entries:
-                _append_uvarint(binary_payload, provider_count)
-                _append_uvarint(binary_payload, price_key)
-            provider_row_count += len(sorted_code_keys) * len(entries)
-        binary_records.append(
-            (
-                "by_provider_set",
-                provider_set_key,
-                0,
-                provider_row_count,
-                bytes(binary_payload),
-            )
-        )
-        return remaining_code_entries, {}
 
-    for raw_row in serving_rows:
-        provider_set_key = int(raw_row[0])
-        code_key = int(raw_row[1])
-        provider_count = int(raw_row[2])
-        price_set_id = str(raw_row[3]).strip().lower()
-        price_set_key = price_key_for(price_set_id)
-        if current_provider_set != provider_set_key:
-            current_code_entries, code_keys_by_pattern = append_provider_binary_block(
-                current_provider_set,
-                current_code,
-                current_code_entries,
-                code_keys_by_pattern,
-            )
-            current_provider_set = provider_set_key
-            current_code = None
-        if current_code != code_key:
-            current_code_entries = flush_code(
-                current_code,
-                current_code_entries,
-                code_keys_by_pattern,
-            )
-            current_code = code_key
-        current_code_entries.append((provider_count, price_set_key))
-        seen_code_keys.add(code_key)
-        row_count += 1
-        _serving_row_digest_update(source_digest, code_key, provider_set_key, provider_count, price_set_id)
-    current_code_entries, code_keys_by_pattern = append_provider_binary_block(
-        current_provider_set,
-        current_code,
-        current_code_entries,
-        code_keys_by_pattern,
+def _append_provider_binary_block(
+    provider_set_key: int | None,
+    code_key: int | None,
+    code_entries: list[tuple[int, int]],
+    pattern_map: dict[tuple[tuple[int, int], ...], list[int]],
+    binary_records: list[tuple[str, int, int, int, bytes]],
+) -> tuple[list[tuple[int, int]], dict[tuple[tuple[int, int], ...], list[int]]]:
+    """Append one reverse binary record and reset the current provider state."""
+    if provider_set_key is None:
+        return code_entries, pattern_map
+    remaining_code_entries = _group_provider_code(code_key, code_entries, pattern_map)
+    binary_payload = bytearray()
+    provider_row_count = 0
+    pattern_items = sorted(
+        pattern_map.items(),
+        key=lambda item: (item[0], item[1]),
     )
+    _append_uvarint(binary_payload, len(pattern_items))
+    for entries, code_keys in pattern_items:
+        sorted_code_keys = sorted(code_keys)
+        _append_uvarint(binary_payload, len(sorted_code_keys))
+        previous_code_key = 0
+        for index, code_key in enumerate(sorted_code_keys):
+            _append_uvarint(binary_payload, code_key if index == 0 else code_key - previous_code_key)
+            previous_code_key = code_key
+        _append_uvarint(binary_payload, len(entries))
+        for provider_count, price_key in entries:
+            _append_uvarint(binary_payload, provider_count)
+            _append_uvarint(binary_payload, price_key)
+        provider_row_count += len(sorted_code_keys) * len(entries)
+    binary_records.append(
+        (
+            "by_provider_set",
+            provider_set_key,
+            0,
+            provider_row_count,
+            bytes(binary_payload),
+        )
+    )
+    return remaining_code_entries, {}
+
+
+def _provider_set_record_summary(
+    binary_records: list[tuple[str, int, int, int, bytes]],
+    row_count: int,
+    seen_code_keys: set[int],
+    price_set_values: list[str],
+    source_digest: Any,
+) -> dict[str, Any]:
+    """Return the completed provider-set record summary."""
     binary_records.insert(
         0,
         (
@@ -2136,7 +2107,7 @@ def build_serving_by_provider_set_db_records(serving_rows: Any) -> dict[str, Any
             _price_dictionary_payload(price_set_values),
         ),
     )
-    decoded_digest = digest_serving_by_provider_set_db_records(binary_records)
+    decoded_digest = digest_provider_set_records(binary_records)
     source_sha256 = source_digest.hexdigest()
     return {
         "format": "research_postgres_serving_by_provider_set_binary_v1",
@@ -2154,7 +2125,70 @@ def build_serving_by_provider_set_db_records(serving_rows: Any) -> dict[str, Any
     }
 
 
-def digest_serving_by_provider_set_db_records(
+def build_provider_set_records(serving_rows: Any) -> dict[str, Any]:
+    """Build database records for the provider-set serving candidate."""
+    price_key_by_set_id: dict[str, int] = {}
+    price_set_values: list[str] = []
+    seen_code_keys: set[int] = set()
+    row_count = 0
+    current_provider_set: int | None = None
+    current_code: int | None = None
+    current_code_entries: list[tuple[int, int]] = []
+    code_keys_by_pattern: dict[tuple[tuple[int, int], ...], list[int]] = {}
+    binary_records: list[tuple[str, int, int, int, bytes]] = []
+    source_digest = hashlib.sha256()
+
+    for raw_row in serving_rows:
+        provider_set_key = int(raw_row[0])
+        code_key = int(raw_row[1])
+        provider_count = int(raw_row[2])
+        price_set_id = str(raw_row[3]).strip().lower()
+        price_set_key = _provider_price_key(
+            price_set_id,
+            price_key_by_set_id,
+            price_set_values,
+        )
+        if current_provider_set != provider_set_key:
+            current_code_entries, code_keys_by_pattern = _append_provider_binary_block(
+                current_provider_set,
+                current_code,
+                current_code_entries,
+                code_keys_by_pattern,
+                binary_records,
+            )
+            current_provider_set = provider_set_key
+            current_code = None
+        if current_code != code_key:
+            current_code_entries = _group_provider_code(
+                current_code,
+                current_code_entries,
+                code_keys_by_pattern,
+            )
+            current_code = code_key
+        current_code_entries.append((provider_count, price_set_key))
+        seen_code_keys.add(code_key)
+        row_count += 1
+        _serving_row_digest_update(source_digest, code_key, provider_set_key, provider_count, price_set_id)
+    current_code_entries, code_keys_by_pattern = _append_provider_binary_block(
+        current_provider_set,
+        current_code,
+        current_code_entries,
+        code_keys_by_pattern,
+        binary_records,
+    )
+    return _provider_set_record_summary(
+        binary_records,
+        row_count,
+        seen_code_keys,
+        price_set_values,
+        source_digest,
+    )
+
+
+build_serving_by_provider_set_db_records = build_provider_set_records
+
+
+def digest_provider_set_records(
     binary_records: list[tuple[str, int, int, int, bytes]],
 ) -> str:
     """Compute a stable digest of serving by provider set db records."""
@@ -2206,6 +2240,9 @@ def digest_serving_by_provider_set_db_records(
                 price_sets,
             )
     return digest.hexdigest()
+
+
+digest_serving_by_provider_set_db_records = digest_provider_set_records
 
 
 def postgres_binary_candidate_table_names(
@@ -2332,7 +2369,7 @@ async def _write_postgres_binary_records_async(
     *,
     env_overrides: dict[str, str],
     table_name: str,
-    records: list[tuple[str, int, int, int, bytes]],
+    binary_records: list[tuple[str, int, int, int, bytes]],
 ) -> None:
     import asyncpg
 
@@ -2363,7 +2400,7 @@ async def _write_postgres_binary_records_async(
         )
         await conn.copy_records_to_table(
             relation_name,
-            records=records,
+            records=binary_records,
             columns=["artifact_kind", "block_key", "block_no", "row_count", "payload"],
             schema_name=schema_name,
         )
@@ -2391,7 +2428,7 @@ async def _read_postgres_binary_records_async(
         database=db_name,
     )
     try:
-        rows = await conn.fetch(
+        binary_rows = await conn.fetch(
             f"""
             SELECT artifact_kind, block_key, block_no, row_count, payload
             FROM {table_name}
@@ -2402,13 +2439,13 @@ async def _read_postgres_binary_records_async(
         await conn.close()
     return [
         (
-            str(row["artifact_kind"]),
-            int(row["block_key"]),
-            int(row["block_no"]),
-            int(row["row_count"]),
-            bytes(row["payload"]),
+            str(binary_row["artifact_kind"]),
+            int(binary_row["block_key"]),
+            int(binary_row["block_no"]),
+            int(binary_row["row_count"]),
+            bytes(binary_row["payload"]),
         )
-        for row in rows
+        for binary_row in binary_rows
     ]
 
 
@@ -2435,7 +2472,7 @@ def analyze_postgres_binary_candidate(
         "ORDER BY code_key, provider_set_key, price_set_global_id_128"
     )
     forward = build_serving_by_code_db_records(psql_copy_lines(env_overrides, sql_by_code))
-    records = list(forward["records"])
+    binary_records = list(forward["records"])
     reverse = None
     if include_reverse:
         sql_by_provider_set = (
@@ -2443,13 +2480,13 @@ def analyze_postgres_binary_candidate(
             f"FROM {serving_table} "
             "ORDER BY provider_set_key, code_key, price_set_global_id_128"
         )
-        reverse = build_serving_by_provider_set_db_records(psql_copy_lines(env_overrides, sql_by_provider_set))
-        records.extend(reverse["records"])
+        reverse = build_provider_set_records(psql_copy_lines(env_overrides, sql_by_provider_set))
+        binary_records.extend(reverse["records"])
     asyncio.run(
         _write_postgres_binary_records_async(
             env_overrides=env_overrides,
             table_name=table_name,
-            records=records,
+            binary_records=binary_records,
         )
     )
     readback_records = asyncio.run(
@@ -2462,7 +2499,7 @@ def analyze_postgres_binary_candidate(
     readback_forward_digest = digest_serving_by_code_db_records(readback_records)
     readback_reverse_digest = None
     if include_reverse:
-        readback_reverse_digest = digest_serving_by_provider_set_db_records(readback_records)
+        readback_reverse_digest = digest_provider_set_records(readback_records)
     has_forward_roundtrip = forward.get("source_sha256") == readback_forward_digest
     has_reverse_roundtrip = (
         True
@@ -2502,14 +2539,14 @@ def analyze_postgres_binary_candidate(
         "AS provider_set_key"
         ") AS t;".format(table=table_name),
     )
-    benchmarks: dict[str, Any] = {}
+    benchmark_results_by_name: dict[str, Any] = {}
     if sample.get("code_key") is not None:
         code_key = int(sample["code_key"])
         plan = explain_json(
             env_overrides,
             f"SELECT payload FROM {table_name} WHERE artifact_kind = 'by_code' AND block_key = {code_key}",
         )
-        benchmarks["by_code_fetch"] = {
+        benchmark_results_by_name["by_code_fetch"] = {
             "execution_ms": _explain_execution_ms(plan),
             "plan": plan[0].get("Plan", {}) if isinstance(plan, list) and plan and isinstance(plan[0], dict) else {},
         }
@@ -2520,7 +2557,7 @@ def analyze_postgres_binary_candidate(
             f"SELECT payload FROM {table_name} "
             f"WHERE artifact_kind = 'by_provider_set' AND block_key = {provider_set_key}",
         )
-        benchmarks["by_provider_set_fetch"] = {
+        benchmark_results_by_name["by_provider_set_fetch"] = {
             "execution_ms": _explain_execution_ms(plan),
             "plan": plan[0].get("Plan", {}) if isinstance(plan, list) and plan and isinstance(plan[0], dict) else {},
         }
@@ -2536,16 +2573,16 @@ def analyze_postgres_binary_candidate(
         "tables": table_names,
         "storage": storage,
         "forward": {
-            key: value for key, value in forward.items() if key != "records"
+            key: forward_value for key, forward_value in forward.items() if key != "records"
         },
         "reverse": (
-            {key: value for key, value in reverse.items() if key != "records"}
+            {key: reverse_value for key, reverse_value in reverse.items() if key != "records"}
             if isinstance(reverse, dict)
             else None
         ),
         "combined_row_count": combined_rows,
         "build_elapsed_seconds": round(build_elapsed_seconds, 3),
-        "benchmarks": benchmarks,
+        "benchmarks": benchmark_results_by_name,
         "candidate": {
             "roundtrip": "passed" if has_complete_roundtrip else "failed",
             "candidate_total_bytes": artifact_total_bytes,
@@ -2616,12 +2653,12 @@ def analyze_postgres_posting_candidate(
         "LIMIT 1"
         ") AS t;",
     )
-    benchmarks: dict[str, Any] = {}
+    benchmark_results_by_name: dict[str, Any] = {}
     if sample.get("code_key") is not None and sample.get("provider_set_key") is not None:
         code_key = int(sample["code_key"])
         provider_set_key = int(sample["provider_set_key"])
         price_set_key = int(sample.get("price_set_key") or 0)
-        benchmark_sql = {
+        benchmark_queries_by_name = {
             "code_lookup": f"SELECT COALESCE(SUM(row_count), 0) FROM {posting_table} WHERE code_key = {code_key}",
             "provider_overlap": (
                 f"SELECT COALESCE(SUM(row_count), 0) FROM {posting_table} "
@@ -2637,9 +2674,9 @@ def analyze_postgres_posting_candidate(
                 f"WHERE price_set_keys && ARRAY[{price_set_key}]::integer[]"
             ),
         }
-        for name, sql in benchmark_sql.items():
+        for name, sql in benchmark_queries_by_name.items():
             plan = explain_json(env_overrides, sql)
-            benchmarks[name] = {
+            benchmark_results_by_name[name] = {
                 "execution_ms": _explain_execution_ms(plan),
                 "plan": plan[0].get("Plan", {}) if isinstance(plan, list) and plan and isinstance(plan[0], dict) else {},
             }
@@ -2651,7 +2688,7 @@ def analyze_postgres_posting_candidate(
         "tables": table_names,
         "storage": storage,
         "build_elapsed_seconds": round(build_elapsed_seconds, 3),
-        "benchmarks": benchmarks,
+        "benchmarks": benchmark_results_by_name,
         "candidate": {
             "roundtrip": "passed" if is_roundtrip_valid else "failed",
             "candidate_total_bytes": candidate_total_bytes,
@@ -2931,7 +2968,7 @@ def run_scanner_fixture(
     serving_copy = run_dir / "manifest_serving.copy"
     price_atom_copy = run_dir / "price_atom.copy"
     member_copy = run_dir / "provider_group_member.copy"
-    scanner_env = {
+    scanner_environment_by_name = {
         "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "research-snapshot",
         "HLTHPRT_PTG2_COMPACT_PLAN_ID": "research-plan",
         "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "research-plan-month",
@@ -2942,15 +2979,15 @@ def run_scanner_fixture(
         "HLTHPRT_PTG2_MANIFEST_ONLY": "true",
         **env_overrides,
     }
-    command = [str(scanner), "--compact-serving", str(artifact)]
+    command_args = [str(scanner), "--compact-serving", str(artifact)]
     if dry_run:
         return RunResult(
             case_id=case_id,
             variant_id=variant_id,
             kind="scanner_fixture",
             status="dry_run",
-            command=command,
-            env_overrides=scanner_env,
+            command=command_args,
+            env_overrides=scanner_environment_by_name,
         )
     if not scanner.exists():
         return RunResult(
@@ -2958,11 +2995,11 @@ def run_scanner_fixture(
             variant_id=variant_id,
             kind="scanner_fixture",
             status="skipped",
-            command=command,
-            env_overrides=scanner_env,
+            command=command_args,
+            env_overrides=scanner_environment_by_name,
             error=f"scanner binary not found: {scanner}",
         )
-    completed, elapsed, memory = run_with_sampling(command, scanner_env, cwd=ROOT)
+    completed, elapsed, memory = run_with_sampling(command_args, scanner_environment_by_name, cwd=ROOT)
     frames = parse_sized_frames(completed.stdout)
     progress = parse_scanner_progress(completed.stderr)
     copy_outputs = collect_copy_outputs(run_dir)
@@ -2972,8 +3009,8 @@ def run_scanner_fixture(
         variant_id=variant_id,
         kind="scanner_fixture",
         status=status,
-        command=command,
-        env_overrides=scanner_env,
+        command=command_args,
+        env_overrides=scanner_environment_by_name,
         elapsed_seconds=elapsed,
         returncode=completed.returncode,
         frames=frames,
@@ -3063,7 +3100,7 @@ def run_local_ptg_cli(
     fixture_dir = run_dir / "http_fixture"
     artifact_dir = run_dir / "artifacts"
     run_dir.mkdir(parents=True, exist_ok=True)
-    env_overrides = {
+    environment_by_name = {
         "PYTHONPATH": ".",
         "HLTHPRT_LOG_CFG": "logging.yaml",
         "HLTHPRT_DB_HOST": str(case.get("db_host") or os.getenv("HLTHPRT_DB_HOST") or "127.0.0.1"),
@@ -3087,15 +3124,15 @@ def run_local_ptg_cli(
         "HLTHPRT_PTG2_RANGE_DOWNLOADS": "false",
     }
     if "HLTHPRT_DB_PASSWORD" in os.environ or case.get("db_password") is not None:
-        env_overrides["HLTHPRT_DB_PASSWORD"] = str(case.get("db_password") or os.getenv("HLTHPRT_DB_PASSWORD") or "")
-    env_overrides.update(env_for_variant(case, variant))
+        environment_by_name["HLTHPRT_DB_PASSWORD"] = str(case.get("db_password") or os.getenv("HLTHPRT_DB_PASSWORD") or "")
+    environment_by_name.update(env_for_variant(case, variant))
 
     plan_id = str(case.get("plan_id") or "LOCAL-PTG2-SMOKE")
     plan_market_type = str(case.get("plan_market_type") or "group")
     import_id = str(case.get("import_id") or f"{case_id}-{variant_id}-{dt.datetime.now(dt.UTC).strftime('%Y%m%d%H%M%S')}")
     source_key = str(case.get("source_key") or f"{case_id}-{variant_id}")
     import_month = str(case.get("import_month") or "2026-06")
-    command = [
+    command_args = [
         sys.executable,
         "main.py",
         "start",
@@ -3117,7 +3154,7 @@ def run_local_ptg_cli(
         plan_market_type,
     ]
     if case.get("full_file") is not True:
-        command.extend(["--max-items", str(case.get("max_items") or 5)])
+        command_args.extend(["--max-items", str(case.get("max_items") or 5)])
     elif case.get("max_items") is not None:
         raise ValueError("local_ptg_cli full_file=true cannot be combined with max_items")
     if dry_run:
@@ -3127,25 +3164,25 @@ def run_local_ptg_cli(
             variant_id=variant_id,
             kind="local_ptg_cli",
             status="dry_run",
-            command=command,
-            env_overrides=env_overrides,
+            command=command_args,
+            env_overrides=environment_by_name,
             import_run={"fixture_dir": str(fixture_dir), "artifact_dir": str(artifact_dir)},
         )
-    scanner = Path(env_overrides["HLTHPRT_PTG2_RUST_SCANNER_BIN"])
+    scanner = Path(environment_by_name["HLTHPRT_PTG2_RUST_SCANNER_BIN"])
     if not scanner.exists():
         return RunResult(
             case_id=case_id,
             variant_id=variant_id,
             kind="local_ptg_cli",
             status="skipped",
-            command=command,
-            env_overrides=env_overrides,
+            command=command_args,
+            env_overrides=environment_by_name,
             error=f"scanner binary not found: {scanner}",
         )
     with LocalFixtureServer(fixture_dir) as server:
         write_ptg_toc_fixture(case, fixture_dir, base_url=server.base_url)
-        command = [part if part != "http://127.0.0.1:<auto>/index.json" else f"{server.base_url}/index.json" for part in command]
-        completed, elapsed, memory = run_with_sampling(command, env_overrides, cwd=ROOT)
+        command_args = [part if part != "http://127.0.0.1:<auto>/index.json" else f"{server.base_url}/index.json" for part in command_args]
+        completed, elapsed, memory = run_with_sampling(command_args, environment_by_name, cwd=ROOT)
     combined = completed.stdout + b"\n" + completed.stderr
     import_done = parse_import_done(combined)
     serving_summary = parse_serving_only_summary(combined) or {}
@@ -3159,7 +3196,7 @@ def run_local_ptg_cli(
     serving_index_payload: dict[str, Any] | None = None
     if status == "succeeded" and case.get("verify_original"):
         verification = verify_local_import_against_original(
-            env_overrides=env_overrides,
+            env_overrides=environment_by_name,
             original_path=fixture_dir / "rates.json.gz",
             import_run_id=import_run_id,
         )
@@ -3167,7 +3204,7 @@ def run_local_ptg_cli(
             status = "failed"
     if status == "succeeded" and _is_serving_storage_probe_enabled(case, variant):
         storage_summary_dict = analyze_local_serving_sidecar_candidate(
-            env_overrides=env_overrides,
+            env_overrides=environment_by_name,
             import_run_id=import_run_id,
             variant_id=variant_id,
             output_dir=run_dir / "serving_sidecar_candidate",
@@ -3177,9 +3214,9 @@ def run_local_ptg_cli(
             status = "failed"
     expectations = serving_index_expectations_for(case, variant)
     if status == "succeeded" and expectations:
-        serving_index_payload = import_run_serving_index(env_overrides=env_overrides, import_run_id=import_run_id)
+        serving_index_payload = import_run_serving_index(env_overrides=environment_by_name, import_run_id=import_run_id)
         serving_index_checks = check_serving_index_expectations(
-            env_overrides,
+            environment_by_name,
             serving_index_payload,
             expectations,
         )
@@ -3187,19 +3224,19 @@ def run_local_ptg_cli(
             status = "failed"
     if status == "succeeded" and storage_summary_dict is None:
         if serving_index_payload is None:
-            serving_index_payload = import_run_serving_index(env_overrides=env_overrides, import_run_id=import_run_id)
+            serving_index_payload = import_run_serving_index(env_overrides=environment_by_name, import_run_id=import_run_id)
         published_storage = analyze_published_serving_binary_storage(
-            env_overrides=env_overrides,
+            env_overrides=environment_by_name,
             serving_index=serving_index_payload,
         )
         if published_storage.get("status") == "passed":
             storage_summary_dict = published_storage
     if status == "succeeded":
         if serving_index_payload is None:
-            serving_index_payload = import_run_serving_index(env_overrides=env_overrides, import_run_id=import_run_id)
+            serving_index_payload = import_run_serving_index(env_overrides=environment_by_name, import_run_id=import_run_id)
         if serving_index_payload:
             snapshot_footprint = analyze_snapshot_postgres_footprint(
-                env_overrides=env_overrides,
+                env_overrides=environment_by_name,
                 serving_index=serving_index_payload,
                 snapshot_id=str((import_done or {}).get("snapshot_id") or ""),
             )
@@ -3208,7 +3245,7 @@ def run_local_ptg_cli(
             storage_summary_dict["snapshot_footprint"] = snapshot_footprint
     if status == "succeeded" and _is_api_latency_probe_enabled(case, variant):
         api_latency = run_api_latency_probe(
-            env_overrides=env_overrides,
+            env_overrides=environment_by_name,
             snapshot_id=str((import_done or {}).get("snapshot_id") or ""),
             case=case,
             variant=variant,
@@ -3220,8 +3257,8 @@ def run_local_ptg_cli(
         variant_id=variant_id,
         kind="local_ptg_cli",
         status=status,
-        command=command,
-        env_overrides=env_overrides,
+        command=command_args,
+        env_overrides=environment_by_name,
         elapsed_seconds=elapsed,
         returncode=completed.returncode,
         progress=parse_scanner_progress(combined),
@@ -3267,7 +3304,7 @@ def run_suite(
     timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     output_root = report_dir / f"run-{timestamp}"
     output_root.mkdir(parents=True, exist_ok=True)
-    results: list[RunResult] = []
+    experiment_results: list[RunResult] = []
     for case in cases:
         selected_variant_ids = list(case.get("variants") or variants.keys())
         if variant_ids:
@@ -3276,7 +3313,7 @@ def run_suite(
             variant = variants[variant_id]
             kind = str(case.get("kind") or "scanner_fixture")
             if kind == "scanner_fixture":
-                results.append(
+                experiment_results.append(
                     run_scanner_fixture(
                         case=case,
                         variant=variant,
@@ -3286,7 +3323,7 @@ def run_suite(
                     )
                 )
             else:
-                results.append(
+                experiment_results.append(
                     run_local_ptg_cli(
                         case=case,
                         variant=variant,
@@ -3295,7 +3332,7 @@ def run_suite(
                         dry_run=dry_run,
                     )
                 )
-    report = {
+    experiment_report_map = {
         "schema_version": 1,
         "generated_at": timestamp,
         "suite": {
@@ -3303,15 +3340,15 @@ def run_suite(
             "description": suite.get("description"),
             "gates": suite.get("gates") or {},
         },
-        "results": [result.to_json() for result in results],
+        "results": [experiment_result.to_json() for experiment_result in experiment_results],
     }
-    report["gates"] = evaluate_gates(
-        report,
+    experiment_report_map["gates"] = evaluate_gates(
+        experiment_report_map,
         suite.get("gates") or {},
         case_gates={str(case.get("id")): case.get("gates") or {} for case in suite.get("cases") or []},
     )
-    write_report(output_root, report)
-    return report
+    write_report(output_root, experiment_report_map)
+    return experiment_report_map
 
 
 def evaluate_gates(
@@ -3325,7 +3362,7 @@ def evaluate_gates(
     by_case: dict[str, list[dict[str, Any]]] = {}
     for result in report.get("results") or []:
         by_case.setdefault(str(result.get("case_id")), []).append(result)
-    case_results = {
+    results_by_case = {
         case_id: evaluate_case_gate_results(
             case_id=case_id,
             variant_result_dicts=results,
@@ -3334,7 +3371,7 @@ def evaluate_gates(
         )
         for case_id, results in by_case.items()
     }
-    return {"overall": gate_results_overall(case_results), "cases": case_results}
+    return {"overall": gate_results_overall(results_by_case), "cases": results_by_case}
 
 
 def gate_default_options(gates: dict[str, Any]) -> dict[str, Any]:
@@ -3466,7 +3503,7 @@ def evaluate_candidate(
     gate_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate a candidate against required correctness and resource gates."""
-    checks: dict[str, Any] = {}
+    gate_checks_by_name: dict[str, Any] = {}
     if not baseline:
         return {"variant_id": candidate.get("variant_id"), "overall": "unknown", "checks": {"baseline": "missing"}}
     if candidate.get("status") in {"dry_run", "skipped"} or baseline.get("status") in {"dry_run", "skipped"}:
@@ -3480,40 +3517,40 @@ def evaluate_candidate(
                 }
             },
         }
-    checks["status"] = "passed" if candidate.get("status") == baseline.get("status") == "succeeded" else "failed"
-    checks["copy_outputs"] = compare_copy_outputs(baseline.get("copy_outputs") or {}, candidate.get("copy_outputs") or {})
-    checks["dedupe"] = compare_dedupe(baseline.get("dedupe_summary") or {}, candidate.get("dedupe_summary") or {})
+    gate_checks_by_name["status"] = "passed" if candidate.get("status") == baseline.get("status") == "succeeded" else "failed"
+    gate_checks_by_name["copy_outputs"] = compare_copy_outputs(baseline.get("copy_outputs") or {}, candidate.get("copy_outputs") or {})
+    gate_checks_by_name["dedupe"] = compare_dedupe(baseline.get("dedupe_summary") or {}, candidate.get("dedupe_summary") or {})
     gate_options = gate_options or {}
-    checks["performance"] = candidate_performance_check(
+    gate_checks_by_name["performance"] = candidate_performance_check(
         baseline,
         candidate,
         gate_options=gate_options,
         min_improvement_pct=min_improvement_pct,
     )
-    checks["memory"] = candidate_memory_check(
+    gate_checks_by_name["memory"] = candidate_memory_check(
         baseline,
         candidate,
         gate_options=gate_options,
         max_memory_growth_pct=max_memory_growth_pct,
     )
-    checks["import_total"] = candidate_import_total_check(
+    gate_checks_by_name["import_total"] = candidate_import_total_check(
         baseline,
         candidate,
         gate_options=gate_options,
         min_import_total_improvement_pct=min_import_total_improvement_pct,
     )
-    checks["storage"] = candidate_storage_check(
+    gate_checks_by_name["storage"] = candidate_storage_check(
         baseline,
         candidate,
         gate_options=gate_options,
         min_storage_ratio=min_storage_ratio,
         min_snapshot_total_ratio=min_snapshot_total_ratio,
     )
-    required = required_candidate_gate_statuses(checks)
+    required = required_candidate_gate_statuses(gate_checks_by_name)
     return {
         "variant_id": candidate.get("variant_id"),
         "overall": "failed" if "failed" in required else "passed",
-        "checks": checks,
+        "checks": gate_checks_by_name,
     }
 
 
@@ -3607,20 +3644,20 @@ def evaluate_storage_result(result: dict[str, Any], *, min_storage_ratio: float)
     """Evaluate a candidate's storage evidence against its required ratio."""
     verification = (result.get("import_run") or {}).get("verification") if isinstance(result.get("import_run"), dict) else {}
     verification_status = str((verification or {}).get("status") or "")
-    checks = {
+    storage_checks_by_name = {
         "status": "passed" if result.get("status") == "succeeded" else "failed",
         "verification": "passed" if not verification_status or verification_status == "passed" else "failed",
         "storage": compare_storage(result_storage(result), min_storage_ratio=min_storage_ratio),
     }
-    if checks["status"] == "failed" or checks["verification"] == "failed" or checks["storage"]["status"] == "failed":
+    if storage_checks_by_name["status"] == "failed" or storage_checks_by_name["verification"] == "failed" or storage_checks_by_name["storage"]["status"] == "failed":
         overall = "failed"
-    elif checks["storage"]["status"] == "not_evaluated":
+    elif storage_checks_by_name["storage"]["status"] == "not_evaluated":
         overall = "not_evaluated"
-    elif checks["storage"]["status"] == "unknown":
+    elif storage_checks_by_name["storage"]["status"] == "unknown":
         overall = "unknown"
     else:
         overall = "passed"
-    return {"variant_id": result.get("variant_id"), "overall": overall, "checks": checks}
+    return {"variant_id": result.get("variant_id"), "overall": overall, "checks": storage_checks_by_name}
 
 
 def compare_storage(storage: dict[str, Any], *, min_storage_ratio: float) -> dict[str, Any]:
@@ -3873,20 +3910,20 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "| Case | Variant | Kind | Status | Scanner | Import | Verification | Storage | Serving Arch | Elapsed | Peak RSS |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: |",
     ]
-    for result in report.get("results") or []:
-        memory = result.get("memory") or {}
+    for case_result in report.get("results") or []:
+        memory = case_result.get("memory") or {}
         lines.append(
             "| {case} | {variant} | {kind} | {status} | {scanner} | {import_done} | {verification} | {storage} | {serving_arch} | {elapsed} | {rss} |".format(
-                case=result.get("case_id"),
-                variant=result.get("variant_id"),
-                kind=result.get("kind"),
-                status=result.get("status"),
-                scanner=format_scanner_summary(result),
-                import_done=format_import_done(result),
-                verification=format_verification(result),
-                storage=format_storage_analysis(result),
-                serving_arch=format_serving_arch_checks(result),
-                elapsed=format_optional_float(result.get("elapsed_seconds")),
+                case=case_result.get("case_id"),
+                variant=case_result.get("variant_id"),
+                kind=case_result.get("kind"),
+                status=case_result.get("status"),
+                scanner=format_scanner_summary(case_result),
+                import_done=format_import_done(case_result),
+                verification=format_verification(case_result),
+                storage=format_storage_analysis(case_result),
+                serving_arch=format_serving_arch_checks(case_result),
+                elapsed=format_optional_float(case_result.get("elapsed_seconds")),
                 rss=memory.get("peak_rss_kb") or "",
             )
         )
@@ -4058,9 +4095,9 @@ def format_bytes(value: Any) -> str:
     return str(value)
 
 
-def format_storage_analysis(result: dict[str, Any]) -> str:
+def format_storage_analysis(storage_result: dict[str, Any]) -> str:
     """Format candidate storage measurements for the experiment report."""
-    import_run = result.get("import_run") or {}
+    import_run = storage_result.get("import_run") or {}
     storage = import_run.get("storage") if isinstance(import_run, dict) else None
     if not isinstance(storage, dict) or not storage:
         return ""
@@ -4138,9 +4175,9 @@ def format_storage_analysis(result: dict[str, Any]) -> str:
     if benchmarks:
         timing_parts = []
         for name in ("code_lookup", "provider_overlap", "code_provider_overlap", "price_overlap"):
-            item = benchmarks.get(name) if isinstance(benchmarks.get(name), dict) else {}
-            if item.get("execution_ms") is not None:
-                timing_parts.append(f"{name}={item.get('execution_ms')}ms")
+            benchmark_result = benchmarks.get(name) if isinstance(benchmarks.get(name), dict) else {}
+            if benchmark_result.get("execution_ms") is not None:
+                timing_parts.append(f"{name}={benchmark_result.get('execution_ms')}ms")
         if timing_parts:
             parts.append("pg_posting_timings=" + ",".join(timing_parts))
     if postgres_binary_storage.get("artifact_total_bytes") is not None:
@@ -4171,9 +4208,9 @@ def format_storage_analysis(result: dict[str, Any]) -> str:
     if binary_benchmarks:
         timing_parts = []
         for name in ("by_code_fetch", "by_provider_set_fetch"):
-            item = binary_benchmarks.get(name) if isinstance(binary_benchmarks.get(name), dict) else {}
-            if item.get("execution_ms") is not None:
-                timing_parts.append(f"{name}={item.get('execution_ms')}ms")
+            benchmark_result = binary_benchmarks.get(name) if isinstance(binary_benchmarks.get(name), dict) else {}
+            if benchmark_result.get("execution_ms") is not None:
+                timing_parts.append(f"{name}={benchmark_result.get('execution_ms')}ms")
         if timing_parts:
             parts.append("pg_binary_timings=" + ",".join(timing_parts))
     if snapshot_footprint.get("total_logical_bytes") is not None:
