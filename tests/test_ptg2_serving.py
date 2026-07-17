@@ -1847,6 +1847,54 @@ def test_provider_rate_items_merge_duplicate_location_and_code_prices():
     assert merged[0]["rate_pack_count"] == 2
 
 
+def test_price_merge_preserves_occurrences():
+    base_by_field = {
+        "npi": 1234567890,
+        "location_hash": "synthetic-location",
+        "reported_code": "70551",
+        "reported_code_system": "CPT",
+        "address": {"first_line": "100 Example Street"},
+    }
+    first_prices = [
+        {"negotiated_type": "negotiated", "negotiated_rate": 100},
+        {"negotiated_type": "negotiated", "negotiated_rate": 100},
+    ]
+    second_prices = [
+        {"negotiated_type": "negotiated", "negotiated_rate": 200},
+    ]
+    rate_items = [
+        {
+            **base_by_field,
+            "price_set_hash": "price-set-1",
+            "price_set_hashes": ["price-set-1"],
+            "source_trace": [{"source_key": 0}],
+            **ptg2_serving._price_response_fields(first_prices),
+        },
+        {
+            **base_by_field,
+            "price_set_hash": "price-set-2",
+            **ptg2_serving._price_response_fields(second_prices),
+        },
+    ]
+    original_price_lists = [list(rate_item["prices"]) for rate_item in rate_items]
+    original_hashes = list(rate_items[0]["price_set_hashes"])
+    original_source_traces = list(rate_items[0]["source_trace"])
+
+    merged = ptg2_serving._merge_ptg2_provider_rate_items(rate_items)
+
+    assert [price["negotiated_rate"] for price in merged[0]["prices"]] == [
+        100,
+        100,
+        200,
+    ]
+    assert [rate_item["prices"] for rate_item in rate_items] == original_price_lists
+    assert rate_items[0]["price_set_hashes"] == original_hashes
+    assert rate_items[0]["source_trace"] == original_source_traces
+    assert merged[0]["price_set_hashes"] is not rate_items[0]["price_set_hashes"]
+    assert merged[0]["source_trace"] is not rate_items[0]["source_trace"]
+    assert merged[0]["prices"] is not rate_items[0]["prices"]
+
+
 def test_provider_rate_items_do_not_merge_different_arrangements():
     base_by_field = {
         "npi": 1234567890,

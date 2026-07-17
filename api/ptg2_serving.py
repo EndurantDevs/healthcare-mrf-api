@@ -1853,18 +1853,32 @@ async def _version_three_provider_counts_for_keys(
 ) -> dict[int, int] | None:
     """Read sparse provider counts from existing v3 provider-page blocks."""
 
+    provider_pages = await _version_three_provider_pages_for_keys(
+        session,
+        serving_tables,
+        provider_set_keys,
+    )
+    if provider_pages is None:
+        return None
+    return {
+        provider_set_key: provider_page.provider_count
+        for provider_set_key, provider_page in provider_pages.items()
+    }
+
+
+async def _version_three_provider_pages_for_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_keys: Iterable[int] | None,
+) -> Mapping[int, PTG2V3ProviderPage] | None:
+    """Read and validate requested provider-page projections once per query."""
+
     _require_strict_shared_v3(serving_tables)
     if provider_set_keys is None:
         return None
     normalized_keys = tuple(sorted({int(provider_set_key) for provider_set_key in provider_set_keys}))
     if not normalized_keys:
         return {}
-    if not await has_shared_provider_pages_in_db(
-        session,
-        _required_shared_snapshot_key(serving_tables),
-        schema_name=PTG2_SCHEMA,
-    ):
-        return None
     provider_pages = await lookup_shared_provider_pages_from_db(
         session,
         _required_shared_snapshot_key(serving_tables),
@@ -1874,10 +1888,11 @@ async def _version_three_provider_counts_for_keys(
     )
     if provider_pages is None:
         return None
-    return {
-        provider_set_key: provider_page.provider_count
-        for provider_set_key, provider_page in provider_pages.items()
-    }
+    if set(provider_pages) != set(normalized_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider-page projection is missing a referenced provider set"
+        )
+    return provider_pages
 
 
 async def _lookup_shared_forward_rows(
@@ -1960,7 +1975,6 @@ def _version_three_forward_page_payloads(
     code_metadata: Mapping[str, Any],
     provider_ids_by_key: Mapping[int, str],
     price_ids_by_key: Mapping[int, str],
-    source_trace_set_hash: str | None,
     network_names: list[str],
     limit: int,
     offset: int,
@@ -2031,6 +2045,86 @@ async def _version_three_forward_page_ids(
     return provider_ids_by_key, price_ids_by_key
 
 
+def _version_three_provider_code_entries(
+    provider_pages_by_key: Mapping[int, PTG2V3ProviderPage],
+    code_key: int,
+) -> tuple[PTG2V3PageRecord, ...] | None:
+    """Return complete projected rows for a code, or None at a truncated boundary."""
+
+    selected_entries: list[PTG2V3PageRecord] = []
+    for provider_set_key in sorted(provider_pages_by_key):
+        provider_page = provider_pages_by_key[provider_set_key]
+        page_entries = provider_page.entries
+        if not page_entries:
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 provider-page projection has no rows"
+            )
+        selected_entries.extend(
+            page_entry
+            for page_entry in page_entries
+            if page_entry.code_key == code_key
+        )
+        if (
+            provider_page.total_row_count > len(page_entries)
+            and page_entries[-1].code_key <= code_key
+        ):
+            return None
+    selected_entries.sort(
+        key=lambda page_entry: (
+            page_entry.price_key,
+            page_entry.provider_set_key,
+            page_entry.source_key,
+            page_entry.provider_count,
+        )
+    )
+    return tuple(selected_entries)
+
+
+async def _version_three_provider_filtered_page_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    code_metadata: Mapping[str, Any],
+    provider_pages_by_key: Mapping[int, PTG2V3ProviderPage],
+    network_names: list[str],
+    limit: int | None,
+    offset: int,
+    descending: bool,
+) -> list[dict[str, Any]] | None:
+    """Materialize an exact provider-filtered code window from provider pages."""
+
+    if descending or code_metadata.get("code_key") is None:
+        return None
+    page_entries = _version_three_provider_code_entries(
+        provider_pages_by_key,
+        int(code_metadata["code_key"]),
+    )
+    if page_entries is None:
+        return None
+    start = max(int(offset), 0)
+    selected_entries = (
+        page_entries[start:]
+        if limit is None
+        else page_entries[start : start + max(int(limit), 0)]
+    )
+    if not selected_entries:
+        return []
+    provider_ids_by_key, price_ids_by_key = await _version_three_forward_page_ids(
+        session,
+        serving_tables,
+        selected_entries,
+    )
+    return _version_three_forward_page_payloads(
+        selected_entries,
+        code_metadata,
+        provider_ids_by_key,
+        price_ids_by_key,
+        network_names,
+        len(selected_entries),
+        0,
+    )
+
+
 async def _version_three_forward_page_rows(
     session,
     serving_tables: PTG2ServingTables,
@@ -2077,7 +2171,6 @@ async def _version_three_forward_page_rows(
         code_metadata,
         provider_ids_by_key,
         price_ids_by_key,
-        source_trace_set_hash,
         network_names,
         len(selected_entries),
         0,
@@ -2090,6 +2183,7 @@ async def _shared_rows_for_code(
     *,
     code_data: Mapping[str, Any],
     provider_set_keys: Iterable[int] | None,
+    provider_pages_by_key: Mapping[int, PTG2V3ProviderPage] | None = None,
     source_trace_set_hash: str | None,
     network_names: list[str],
     limit: int | None = None,
@@ -2159,6 +2253,7 @@ async def _shared_rows_for_code(
         serving_tables,
         code_data=code_data,
         provider_set_keys=provider_set_keys,
+        provider_pages_by_key=provider_pages_by_key,
         source_trace_set_hash=source_trace_set_hash,
         network_names=network_names,
         limit=limit,
@@ -2196,6 +2291,72 @@ def _manifest_response_row_order_for_direction(
     return (-int(order[0]), *order[1:])
 
 
+@dataclass(frozen=True)
+class _ManifestCodeReadScope:
+    provider_set_keys: tuple[int, ...] | None
+    provider_pages_by_key: Mapping[int, PTG2V3ProviderPage] | None
+    source_trace_set_hash: str | None
+    network_names: list[str]
+    descending: bool
+
+
+async def _version_three_provider_filter_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_keys: Iterable[int] | None,
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+    *,
+    descending: bool,
+) -> _ManifestCodeReadScope:
+    """Normalize one provider filter and read its bounded page projection."""
+
+    normalized_keys = (
+        tuple(sorted({int(provider_set_key) for provider_set_key in provider_set_keys}))
+        if provider_set_keys is not None
+        else None
+    )
+    provider_pages_by_key = (
+        await _version_three_provider_pages_for_keys(
+            session,
+            serving_tables,
+            normalized_keys,
+        )
+        if normalized_keys
+        and len(normalized_keys) <= _PTG2_VERSION_THREE_PAGE_PROVIDER_SET_LIMIT
+        and not descending
+        else None
+    )
+    return _ManifestCodeReadScope(
+        provider_set_keys=normalized_keys,
+        provider_pages_by_key=provider_pages_by_key,
+        source_trace_set_hash=source_trace_set_hash,
+        network_names=network_names,
+        descending=descending,
+    )
+
+
+async def _shared_rows_for_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    code_data: Mapping[str, Any],
+    read_scope: _ManifestCodeReadScope,
+    *,
+    limit: int | None,
+    offset: int,
+) -> list[dict[str, Any]] | None:
+    """Read one code with a provider projection shared across variants."""
+
+    return await _shared_rows_for_code(
+        session, serving_tables, code_data=code_data,
+        provider_set_keys=read_scope.provider_set_keys,
+        provider_pages_by_key=read_scope.provider_pages_by_key,
+        source_trace_set_hash=read_scope.source_trace_set_hash,
+        network_names=read_scope.network_names, limit=limit, offset=offset,
+        descending=read_scope.descending,
+    )
+
+
 async def _merge_manifest_code_variant_rows(
     session,
     serving_tables: PTG2ServingTables,
@@ -2210,13 +2371,14 @@ async def _merge_manifest_code_variant_rows(
 ) -> list[dict[str, Any]] | None:
     """Merge one ordered serving window across compatible persisted code forms."""
 
+    read_scope = await _version_three_provider_filter_scope(
+        session, serving_tables, provider_set_keys,
+        source_trace_set_hash, network_names, descending=descending,
+    )
     if len(code_rows) == 1:
-        return await _shared_rows_for_code(
-            session, serving_tables, code_data=code_rows[0],
-            provider_set_keys=provider_set_keys,
-            source_trace_set_hash=source_trace_set_hash,
-            network_names=network_names, limit=limit,
-            offset=offset, descending=descending,
+        return await _shared_rows_for_scope(
+            session, serving_tables, code_rows[0], read_scope,
+            limit=limit, offset=offset,
         )
     start = max(int(offset), 0)
     per_code_limit = None if limit is None else start + max(int(limit), 0)
@@ -2228,12 +2390,9 @@ async def _merge_manifest_code_variant_rows(
     combined_rows: list[dict[str, Any]] = []
     for logical_code_rows in logical_rows_by_code_key.values():
         physical_code_row = logical_code_rows[0]
-        variant_rows = await _shared_rows_for_code(
-            session, serving_tables, code_data=physical_code_row,
-            provider_set_keys=provider_set_keys,
-            source_trace_set_hash=source_trace_set_hash,
-            network_names=network_names, limit=per_code_limit,
-            offset=0, descending=descending,
+        variant_rows = await _shared_rows_for_scope(
+            session, serving_tables, physical_code_row, read_scope,
+            limit=per_code_limit, offset=0,
         )
         if variant_rows is None:
             return None
@@ -2257,12 +2416,45 @@ async def _merge_manifest_code_variant_rows(
     return combined_rows[start : start + max(int(limit), 0)]
 
 
+async def _version_three_projected_code_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    code_data: Mapping[str, Any],
+    provider_pages_by_key: Mapping[int, PTG2V3ProviderPage] | None,
+    network_names: list[str],
+    limit: int | None,
+    offset: int,
+    descending: bool,
+) -> tuple[list[dict[str, Any]] | None, Mapping[int, int] | None]:
+    """Use complete provider pages or return counts for the full-block fallback."""
+
+    if provider_pages_by_key is None:
+        return None, None
+    projected_rows = await _version_three_provider_filtered_page_rows(
+        session,
+        serving_tables,
+        code_metadata=code_data,
+        provider_pages_by_key=provider_pages_by_key,
+        network_names=network_names,
+        limit=limit,
+        offset=offset,
+        descending=descending,
+    )
+    if projected_rows is not None:
+        return projected_rows, None
+    return None, {
+        provider_set_key: provider_page.provider_count
+        for provider_set_key, provider_page in provider_pages_by_key.items()
+    }
+
+
 async def _full_shared_code_rows(
     session,
     serving_tables: PTG2ServingTables,
     *,
     code_data: Mapping[str, Any],
     provider_set_keys: Iterable[int] | None,
+    provider_pages_by_key: Mapping[int, PTG2V3ProviderPage] | None,
     source_trace_set_hash: str | None,
     network_names: list[str],
     limit: int | None,
@@ -2272,11 +2464,18 @@ async def _full_shared_code_rows(
     """Read and materialize an authoritative complete by-code block."""
 
     code_key = int(code_data["code_key"])
+    projected_rows, provider_counts_by_key = await _version_three_projected_code_rows(
+        session, serving_tables, code_data, provider_pages_by_key,
+        network_names, limit, offset, descending,
+    )
+    if projected_rows is not None:
+        return projected_rows
     forward_rows = await _lookup_shared_forward_rows(
         session,
         serving_tables,
         code_key,
         provider_set_keys=provider_set_keys,
+        provider_counts_by_key=provider_counts_by_key,
     )
     if not forward_rows:
         await _raise_missing_v3_block(session, serving_tables, code_key)
@@ -2293,6 +2492,24 @@ async def _full_shared_code_rows(
         raise PTG2ManifestArtifactError(
             "PTG2 v3 provider-set dictionary is missing a referenced key"
         )
+    return _materialize_full_shared_rows(
+        forward_rows, provider_set_ids_by_key, code_data,
+        source_trace_set_hash, network_names, limit, offset, descending,
+    )
+
+
+def _materialize_full_shared_rows(
+    forward_rows: Iterable[Any],
+    provider_set_ids_by_key: Mapping[int, str],
+    code_data: Mapping[str, Any],
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+    limit: int | None,
+    offset: int,
+    descending: bool,
+) -> list[dict[str, Any]]:
+    """Order complete forward rows and shape their response payloads."""
+
     ordered_rows = _shared_forward_row_window(
         forward_rows,
         provider_set_ids_by_key,
@@ -4863,9 +5080,18 @@ def _merge_ptg2_provider_rate_items(
         if merged_provider_rate_by_field is None:
             merged_provider_rate_by_field = dict(provider_rate)
             _ensure_provider_rate_price_fields(merged_provider_rate_by_field)
-            merged_provider_rate_by_field.setdefault("price_set_hashes", [])
-            merged_provider_rate_by_field.setdefault("rate_pack_hashes", [])
-            merged_provider_rate_by_field.setdefault("provider_set_hashes", [])
+            owned_prices = list(merged_provider_rate_by_field.get("prices") or [])
+            merged_provider_rate_by_field["prices"] = owned_prices
+            merged_provider_rate_by_field["tic_prices"] = owned_prices
+            for list_field in (
+                "price_set_hashes",
+                "rate_pack_hashes",
+                "provider_set_hashes",
+                "source_trace",
+            ):
+                merged_provider_rate_by_field[list_field] = list(
+                    merged_provider_rate_by_field.get(list_field) or []
+                )
             _append_unique_value(
                 merged_provider_rate_by_field["price_set_hashes"],
                 provider_rate.get("price_set_hash"),
@@ -4897,11 +5123,14 @@ def _merge_ptg2_provider_rate_items(
             merged_provider_rates.append(merged_provider_rate_by_field)
             continue
 
-        combined_prices = (
-            _normalize_price_payload(merged_provider_rate_by_field.get("prices"))
-            + _normalize_price_payload(provider_rate.get("prices"))
+        incoming_prices = provider_rate.get("prices")
+        normalized_incoming_prices = (
+            list(incoming_prices)
+            if isinstance(incoming_prices, list) and "price_summary" in provider_rate
+            else _normalize_price_payload(incoming_prices)
         )
-        merged_provider_rate_by_field["prices"] = combined_prices
+        combined_prices = merged_provider_rate_by_field["prices"]
+        combined_prices.extend(normalized_incoming_prices)
         merged_provider_rate_by_field["tic_prices"] = combined_prices
         price_dirty_group_keys.add(group_key)
         existing_price_key = merged_provider_rate_by_field.get("_ptg_price_key")
@@ -7487,6 +7716,14 @@ async def _search_manifest_serving_table(
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 location projection did not retain a matching serving row"
             )
+    retained_price_set_ids = {
+        _ptg2_manifest_id(serving_row.get("price_set_global_id_128"))
+        for serving_row in serving_rows
+    }
+    price_fields_by_price_set = {
+        price_set_id: _price_response_fields(prices_by_price_set.get(price_set_id, []))
+        for price_set_id in retained_price_set_ids
+    }
     providers_by_set: dict[str, list[dict[str, Any]]] = {}
     if expand_providers:
         if exact_provider_selection is not None:
@@ -7551,7 +7788,10 @@ async def _search_manifest_serving_table(
         rate_pack_hash = _ptg2_manifest_id(
             serving_row.get("serving_content_hash_128")
         )
-        prices = prices_by_price_set.get(price_set_hash, [])
+        price_response_by_field = price_fields_by_price_set.get(
+            price_set_hash,
+            {"prices": [], "tic_prices": [], "price_summary": []},
+        )
         procedure_detail = procedure_details.get(_catalog_key(reported_system, reported_code) or ("", ""), {})
         source_procedure_name = serving_row.get("source_procedure_name")
         source_procedure_description = serving_row.get(
@@ -7602,7 +7842,7 @@ async def _search_manifest_serving_table(
             ),
             "billing_code": reported_code,
             "billing_code_type": reported_system,
-            **_price_response_fields(prices),
+            **price_response_by_field,
             "price_set_hash": price_set_hash,
             "rate_pack_hash": rate_pack_hash,
             "_ptg_price_key": (

@@ -604,13 +604,16 @@ layout, logical scope, dense source dictionary, and consumed release
 attestation through compact relational rows. The full snapshot manifest remains
 authoritative for pre-activation candidate validation, but it is not a
 per-request serving dependency after activation. A standard exact-NPI request
-without geographic or taxonomy filters stays in dense graph keys, intersects
-provider-set keys directly with the requested code shards, and never scans the
-generic provider-page projection. Provider expansion enriches only the requested
-NPI. Exact-NPI requests that also carry geographic or taxonomy filters retain
-the full address or taxonomy validation path. The internal candidate-audit route
-materializes only the challenged NPI and does not require provider-directory or
-address enrichment.
+without geographic or taxonomy filters stays in dense graph keys and intersects
+provider-set keys directly with the requested code. For at most 64 provider sets,
+the reader may use their bounded provider-page projection when the page boundary
+proves that every row for the requested code is present. A truncated page ending
+at or before that code falls back to the complete filtered code shard; larger
+provider scopes and descending requests also use that fallback. Provider
+expansion enriches only the requested NPI. Exact-NPI requests that also carry
+geographic or taxonomy filters retain the full address or taxonomy validation
+path. The internal candidate-audit route materializes only the challenged NPI
+and does not require provider-directory or address enrichment.
 
 Per-request audit latency starts after the request obtains its bounded
 concurrency slot, so p50/p95 describe HTTP and API execution rather than local
