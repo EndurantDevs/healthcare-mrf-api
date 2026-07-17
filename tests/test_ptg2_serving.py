@@ -58,6 +58,65 @@ class FakePagination:
     offset = 0
 
 
+class FilteredProviderExpansionHarness:
+    """Provide bounded provider-membership fakes for expansion tests."""
+
+    def __init__(self, provider_set_id, rate_rows, member_npis, matching_npis):
+        self.provider_set_id = provider_set_id
+        self.rate_rows = rate_rows
+        self.member_npis = member_npis
+        self.matching_npis = matching_npis
+        self.membership_limits = []
+
+    async def merge_rates(self, *_args, provider_set_keys, **_kwargs):
+        assert provider_set_keys is None or tuple(provider_set_keys) == (1,)
+        return self.rate_rows
+
+    async def provider_npis(
+        self,
+        _session,
+        _tables,
+        provider_set_global_ids,
+        *,
+        limit_per_set,
+    ):
+        self.membership_limits.append(limit_per_set)
+        return {
+            provider_set_id: self.member_npis[:limit_per_set]
+            for provider_set_id in provider_set_global_ids
+        }
+
+    async def filter_npis(self, _session, args, npis, *, limit):
+        assert args["provider_sex_code"] == "F"
+        return tuple(npi for npi in npis if npi in self.matching_npis)[:limit]
+
+    async def reverse_sets(self, _session, _tables, npis):
+        return {npi: (self.provider_set_id,) for npi in npis}
+
+    async def provider_set_keys(self, _session, _tables, provider_set_ids):
+        return {provider_set_id: 1 for provider_set_id in provider_set_ids}
+
+    async def provider_rows(self, *_args, npis, **_kwargs):
+        return {
+            self.provider_set_id: [
+                {"npi": npi, "provider_name": f"Provider {npi}"}
+                for npi in npis
+            ]
+        }
+
+    def install(self, monkeypatch):
+        patch_values_by_name = {
+            "_merge_manifest_code_variant_rows": self.merge_rates,
+            "_ptg2_manifest_provider_npis_for_provider_sets": self.provider_npis,
+            "_ptg2_manifest_filter_npis_by_provider_taxonomy": self.filter_npis,
+            "_provider_set_ids_for_selected_npis": self.reverse_sets,
+            "_ptg2_manifest_provider_set_keys_for_ids": self.provider_set_keys,
+            "_selected_provider_rows_by_set": self.provider_rows,
+        }
+        for function_name, replacement in patch_values_by_name.items():
+            monkeypatch.setattr(ptg2_serving, function_name, replacement)
+
+
 class ConcurrentSessionFactory:
     def __init__(self):
         self.active = 0
@@ -485,6 +544,57 @@ async def test_strict_cost_provider_selection_grows_until_page_is_contained(
     assert completion_filters == [(1, 2)]
     assert selection.total_lower_bound == 5
     assert selection.exhausted is False
+
+
+@pytest.mark.asyncio
+async def test_strict_cost_provider_selection_bounds_demographic_filter_expansion(
+    monkeypatch,
+):
+    """Verify demographic filtering grows membership without full expansion."""
+
+    provider_set_id = "01" * 16
+    rate_rows = [
+        {
+            "provider_set_global_id_128": provider_set_id,
+            "serving_content_hash_128": "11" * 16,
+            "reported_code_system": "CPT",
+            "reported_code": "99213",
+            "negotiation_arrangement": "FFS",
+            "source_key": 0,
+        }
+    ]
+    member_npis = tuple(range(1000000001, 1000000051))
+    female_npis = member_npis[-2:]
+    harness = FilteredProviderExpansionHarness(
+        provider_set_id,
+        rate_rows,
+        member_npis,
+        female_npis,
+    )
+    harness.install(monkeypatch)
+
+    selection = await ptg2_serving._strict_cost_provider_expansion_selection(
+        object(),
+        SimpleNamespace(source_key="synthetic-source"),
+        code_rows=[{"code_key": 7, "rate_count": 1}],
+        args={"plan_id": "synthetic-plan", "provider_sex_code": "F"},
+        snapshot_id="synthetic-snapshot",
+        source_trace_set_hash=None,
+        network_names=[],
+        target_count=2,
+        descending=False,
+    )
+
+    assert selection is not None
+    assert harness.membership_limits == [32, 64]
+    assert list(selection.rank_by_key) == [
+        ("npi", str(npi), "CPT", "99213", "FFS", "0")
+        for npi in female_npis
+    ]
+    assert [
+        provider["npi"]
+        for provider in selection.providers_by_set[provider_set_id]
+    ] == list(female_npis)
 
 
 # Strict shared V3 serving contract

@@ -447,43 +447,68 @@ def _coalesce_value(*values: Any) -> Any:
     return None
 
 
-def _normalize_service_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _normalize_service_payload(service_payload_by_field: dict[str, Any]) -> dict[str, Any]:
     """
     Keep legacy fields for compatibility, but expose physician-service-native aliases.
     """
-    if "procedure_code" not in payload:
-        return payload
-    include_legacy = bool(payload.pop("__include_legacy_fields__", False))
-    procedure_code = payload.get("procedure_code")
+    if "procedure_code" not in service_payload_by_field:
+        return service_payload_by_field
+    include_legacy = bool(service_payload_by_field.pop("__include_legacy_fields__", False))
+    procedure_code = service_payload_by_field.get("procedure_code")
     service_name = _coalesce_value(
-        payload.get("service_description"),
-        payload.get("generic_name"),
-        payload.get("reported_code"),
-        payload.get("brand_name"),
+        service_payload_by_field.get("service_description"),
+        service_payload_by_field.get("generic_name"),
+        service_payload_by_field.get("reported_code"),
+        service_payload_by_field.get("brand_name"),
     )
-    reported_code = _coalesce_value(payload.get("reported_code"), payload.get("brand_name"))
+    reported_code = _coalesce_value(
+        service_payload_by_field.get("reported_code"),
+        service_payload_by_field.get("brand_name"),
+    )
     reported_code_system = _reported_procedure_code_system(reported_code)
-    payload["service_code_system"] = INTERNAL_CODE_SYSTEM
-    payload["service_code"] = str(procedure_code) if procedure_code is not None else None
-    payload["service_name"] = service_name
-    payload["service_description"] = service_name
-    payload["reported_code"] = str(reported_code).strip().upper() if reported_code else None
-    payload["reported_code_system"] = reported_code_system
-    payload["total_services"] = _coalesce_value(payload.get("total_services"), payload.get("total_claims"))
-    payload["total_beneficiary_day_services"] = _coalesce_value(
-        payload.get("total_beneficiary_day_services"),
-        payload.get("total_30day_fills"),
+    service_payload_by_field["service_code_system"] = INTERNAL_CODE_SYSTEM
+    service_payload_by_field["service_code"] = (
+        str(procedure_code) if procedure_code is not None else None
     )
-    payload["total_beneficiaries"] = _coalesce_value(payload.get("total_beneficiaries"), payload.get("total_benes"))
-    payload["total_submitted_charges"] = _coalesce_value(payload.get("total_submitted_charges"), payload.get("total_day_supply"))
-    payload["total_allowed_amount"] = _coalesce_value(payload.get("total_allowed_amount"), payload.get("total_drug_cost"))
-    payload["ge65_total_services"] = _coalesce_value(payload.get("ge65_total_services"), payload.get("ge65_total_claims"))
-    payload["ge65_total_beneficiaries"] = _coalesce_value(payload.get("ge65_total_beneficiaries"), payload.get("ge65_total_benes"))
-    payload["ge65_total_allowed_amount"] = _coalesce_value(
-        payload.get("ge65_total_allowed_amount"),
-        payload.get("ge65_total_drug_cost"),
+    service_payload_by_field["service_name"] = service_name
+    service_payload_by_field["service_description"] = service_name
+    service_payload_by_field["reported_code"] = (
+        str(reported_code).strip().upper() if reported_code else None
     )
-    payload["legacy_field_aliases"] = {
+    service_payload_by_field["reported_code_system"] = reported_code_system
+    service_payload_by_field["total_services"] = _coalesce_value(
+        service_payload_by_field.get("total_services"),
+        service_payload_by_field.get("total_claims"),
+    )
+    service_payload_by_field["total_beneficiary_day_services"] = _coalesce_value(
+        service_payload_by_field.get("total_beneficiary_day_services"),
+        service_payload_by_field.get("total_30day_fills"),
+    )
+    service_payload_by_field["total_beneficiaries"] = _coalesce_value(
+        service_payload_by_field.get("total_beneficiaries"),
+        service_payload_by_field.get("total_benes"),
+    )
+    service_payload_by_field["total_submitted_charges"] = _coalesce_value(
+        service_payload_by_field.get("total_submitted_charges"),
+        service_payload_by_field.get("total_day_supply"),
+    )
+    service_payload_by_field["total_allowed_amount"] = _coalesce_value(
+        service_payload_by_field.get("total_allowed_amount"),
+        service_payload_by_field.get("total_drug_cost"),
+    )
+    service_payload_by_field["ge65_total_services"] = _coalesce_value(
+        service_payload_by_field.get("ge65_total_services"),
+        service_payload_by_field.get("ge65_total_claims"),
+    )
+    service_payload_by_field["ge65_total_beneficiaries"] = _coalesce_value(
+        service_payload_by_field.get("ge65_total_beneficiaries"),
+        service_payload_by_field.get("ge65_total_benes"),
+    )
+    service_payload_by_field["ge65_total_allowed_amount"] = _coalesce_value(
+        service_payload_by_field.get("ge65_total_allowed_amount"),
+        service_payload_by_field.get("ge65_total_drug_cost"),
+    )
+    service_payload_by_field["legacy_field_aliases"] = {
         "procedure_code": "service_code",
         "service_description": "service_name",
         "reported_code": "reported_code",
@@ -494,16 +519,32 @@ def _normalize_service_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "total_drug_cost": "total_allowed_amount",
     }
     if include_legacy:
-        payload["generic_name"] = payload.get("service_description")
-        payload["brand_name"] = payload.get("reported_code")
-        payload["total_claims"] = payload.get("total_services")
-        payload["total_30day_fills"] = payload.get("total_beneficiary_day_services")
-        payload["total_day_supply"] = payload.get("total_submitted_charges")
-        payload["total_benes"] = payload.get("total_beneficiaries")
-        payload["total_drug_cost"] = payload.get("total_allowed_amount")
-        payload["ge65_total_claims"] = payload.get("ge65_total_services")
-        payload["ge65_total_benes"] = payload.get("ge65_total_beneficiaries")
-        payload["ge65_total_drug_cost"] = payload.get("ge65_total_allowed_amount")
+        service_payload_by_field["generic_name"] = service_payload_by_field.get(
+            "service_description"
+        )
+        service_payload_by_field["brand_name"] = service_payload_by_field.get("reported_code")
+        service_payload_by_field["total_claims"] = service_payload_by_field.get("total_services")
+        service_payload_by_field["total_30day_fills"] = service_payload_by_field.get(
+            "total_beneficiary_day_services"
+        )
+        service_payload_by_field["total_day_supply"] = service_payload_by_field.get(
+            "total_submitted_charges"
+        )
+        service_payload_by_field["total_benes"] = service_payload_by_field.get(
+            "total_beneficiaries"
+        )
+        service_payload_by_field["total_drug_cost"] = service_payload_by_field.get(
+            "total_allowed_amount"
+        )
+        service_payload_by_field["ge65_total_claims"] = service_payload_by_field.get(
+            "ge65_total_services"
+        )
+        service_payload_by_field["ge65_total_benes"] = service_payload_by_field.get(
+            "ge65_total_beneficiaries"
+        )
+        service_payload_by_field["ge65_total_drug_cost"] = service_payload_by_field.get(
+            "ge65_total_allowed_amount"
+        )
     if not include_legacy:
         for key in (
             "generic_name",
@@ -518,21 +559,38 @@ def _normalize_service_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "ge65_total_drug_cost",
             "legacy_field_aliases",
         ):
-            payload.pop(key, None)
-    return payload
+            service_payload_by_field.pop(key, None)
+    return service_payload_by_field
 
 
-def _normalize_provider_payload(payload: dict[str, Any], include_legacy: bool) -> dict[str, Any]:
-    payload["total_services"] = _coalesce_value(payload.get("total_services"), payload.get("total_claims"))
-    payload["total_reported_service_codes"] = _coalesce_value(
-        payload.get("total_reported_service_codes"),
-        payload.get("total_distinct_hcpcs_codes"),
-        payload.get("total_30day_fills"),
+def _normalize_provider_payload(
+    provider_payload_by_field: dict[str, Any],
+    include_legacy: bool,
+) -> dict[str, Any]:
+    """Normalize provider totals while retaining optional legacy field aliases."""
+
+    provider_payload_by_field["total_services"] = _coalesce_value(
+        provider_payload_by_field.get("total_services"),
+        provider_payload_by_field.get("total_claims"),
     )
-    payload["total_submitted_charges"] = _coalesce_value(payload.get("total_submitted_charges"), payload.get("total_day_supply"))
-    payload["total_beneficiaries"] = _coalesce_value(payload.get("total_beneficiaries"), payload.get("total_benes"))
-    payload["total_allowed_amount"] = _coalesce_value(payload.get("total_allowed_amount"), payload.get("total_drug_cost"))
-    payload["legacy_field_aliases"] = {
+    provider_payload_by_field["total_reported_service_codes"] = _coalesce_value(
+        provider_payload_by_field.get("total_reported_service_codes"),
+        provider_payload_by_field.get("total_distinct_hcpcs_codes"),
+        provider_payload_by_field.get("total_30day_fills"),
+    )
+    provider_payload_by_field["total_submitted_charges"] = _coalesce_value(
+        provider_payload_by_field.get("total_submitted_charges"),
+        provider_payload_by_field.get("total_day_supply"),
+    )
+    provider_payload_by_field["total_beneficiaries"] = _coalesce_value(
+        provider_payload_by_field.get("total_beneficiaries"),
+        provider_payload_by_field.get("total_benes"),
+    )
+    provider_payload_by_field["total_allowed_amount"] = _coalesce_value(
+        provider_payload_by_field.get("total_allowed_amount"),
+        provider_payload_by_field.get("total_drug_cost"),
+    )
+    provider_payload_by_field["legacy_field_aliases"] = {
         "total_claims": "total_services",
         "total_30day_fills": "total_reported_service_codes",
         "total_day_supply": "total_submitted_charges",
@@ -540,11 +598,21 @@ def _normalize_provider_payload(payload: dict[str, Any], include_legacy: bool) -
         "total_drug_cost": "total_allowed_amount",
     }
     if include_legacy:
-        payload["total_claims"] = payload.get("total_services")
-        payload["total_30day_fills"] = payload.get("total_reported_service_codes")
-        payload["total_day_supply"] = payload.get("total_submitted_charges")
-        payload["total_benes"] = payload.get("total_beneficiaries")
-        payload["total_drug_cost"] = payload.get("total_allowed_amount")
+        provider_payload_by_field["total_claims"] = provider_payload_by_field.get(
+            "total_services"
+        )
+        provider_payload_by_field["total_30day_fills"] = provider_payload_by_field.get(
+            "total_reported_service_codes"
+        )
+        provider_payload_by_field["total_day_supply"] = provider_payload_by_field.get(
+            "total_submitted_charges"
+        )
+        provider_payload_by_field["total_benes"] = provider_payload_by_field.get(
+            "total_beneficiaries"
+        )
+        provider_payload_by_field["total_drug_cost"] = provider_payload_by_field.get(
+            "total_allowed_amount"
+        )
     if not include_legacy:
         for key in (
             "total_distinct_hcpcs_codes",
@@ -555,8 +623,8 @@ def _normalize_provider_payload(payload: dict[str, Any], include_legacy: bool) -
             "total_drug_cost",
             "legacy_field_aliases",
         ):
-            payload.pop(key, None)
-    return payload
+            provider_payload_by_field.pop(key, None)
+    return provider_payload_by_field
 
 
 def _normalize_provider_service_aggregate(payload: dict[str, Any], include_legacy: bool) -> dict[str, Any]:
@@ -1229,7 +1297,10 @@ async def _build_dynamic_zip_peer_stats(
                 provider_procedure_cost_profile_table.c.geography_value,
             ).where(and_(*filters))
         )
-        candidate_rows = [_row_to_dict(row) for row in candidate_result]
+        candidate_rows = [
+            _row_to_dict(cost_profile_row)
+            for cost_profile_row in candidate_result
+        ]
         if len(candidate_rows) < min_providers:
             continue
 
@@ -1397,7 +1468,7 @@ def _geography_candidates(
 
 async def _enrich_provider_service_cost_indices(
     session,
-    items: list[dict[str, Any]],
+    provider_service_rows: list[dict[str, Any]],
     *,
     year: int,
     internal_codes: list[int],
@@ -1406,17 +1477,17 @@ async def _enrich_provider_service_cost_indices(
     fallback_zip5: str | None = None,
 ) -> None:
     """Populate provider service rows with peer-derived cost indices when profile tables exist."""
-    if not items or not internal_codes:
+    if not provider_service_rows or not internal_codes:
         return
     if not await _table_exists(session, provider_procedure_cost_profile_table.name):
         return
     if not await _table_exists(session, procedure_peer_stats_table.name):
         return
 
-    npi_candidates: dict[int, list[tuple[str, str]]] = {}
+    geography_candidates_by_npi: dict[int, list[tuple[str, str]]] = {}
     geography_values_by_scope: dict[str, set[str]] = {"national": {"US"}}
-    for item in items:
-        npi_raw = item.get("npi")
+    for provider_service_row in provider_service_rows:
+        npi_raw = provider_service_row.get("npi")
         if npi_raw is None:
             continue
         try:
@@ -1426,28 +1497,34 @@ async def _enrich_provider_service_cost_indices(
         if npi <= 0:
             continue
 
-        state = str(item.get("state") or fallback_state or "").strip().upper()
-        city = str(item.get("city") or fallback_city or "").strip().lower()
-        zip5 = str(item.get("zip5") or fallback_zip5 or "").strip()
+        state = str(provider_service_row.get("state") or fallback_state or "").strip().upper()
+        city = str(provider_service_row.get("city") or fallback_city or "").strip().lower()
+        zip5 = str(provider_service_row.get("zip5") or fallback_zip5 or "").strip()
         geography_candidates = _geography_candidates(state_raw=state, city_raw=city, zip5_raw=zip5)
         if not geography_candidates:
             continue
 
-        npi_candidates[npi] = geography_candidates
-        for scope, value in geography_candidates:
-            geography_values_by_scope.setdefault(scope, set()).add(value)
+        geography_candidates_by_npi[npi] = geography_candidates
+        for geography_scope, geography_value in geography_candidates:
+            geography_values_by_scope.setdefault(geography_scope, set()).add(geography_value)
 
-    if not npi_candidates:
+    if not geography_candidates_by_npi:
         return
 
     geography_clauses = []
-    for scope, values in geography_values_by_scope.items():
-        sanitized_values = sorted({str(value).strip() for value in values if str(value).strip()})
+    for geography_scope, geography_values in geography_values_by_scope.items():
+        sanitized_values = sorted(
+            {
+                str(geography_value).strip()
+                for geography_value in geography_values
+                if str(geography_value).strip()
+            }
+        )
         if not sanitized_values:
             continue
         geography_clauses.append(
             and_(
-                provider_procedure_cost_profile_table.c.geography_scope == scope,
+                provider_procedure_cost_profile_table.c.geography_scope == geography_scope,
                 provider_procedure_cost_profile_table.c.geography_value.in_(sanitized_values),
             )
         )
@@ -1458,36 +1535,43 @@ async def _enrich_provider_service_cost_indices(
         select(provider_procedure_cost_profile_table).where(
             and_(
                 provider_procedure_cost_profile_table.c.year == year,
-                provider_procedure_cost_profile_table.c.npi.in_(sorted(npi_candidates.keys())),
+                provider_procedure_cost_profile_table.c.npi.in_(
+                    sorted(geography_candidates_by_npi.keys())
+                ),
                 provider_procedure_cost_profile_table.c.procedure_code.in_(internal_codes),
                 provider_procedure_cost_profile_table.c.setting_key == "all",
                 or_(*geography_clauses),
             )
         )
     )
-    profile_rows = [_row_to_dict(row) for row in profile_result]
+    profile_rows = [
+        _row_to_dict(profile_row)
+        for profile_row in profile_result
+    ]
     if not profile_rows:
         return
 
     profiles_by_npi_and_geo: dict[tuple[int, str, str], list[dict[str, Any]]] = {}
-    for row in profile_rows:
-        npi_raw = row.get("npi")
+    for profile_row in profile_rows:
+        npi_raw = profile_row.get("npi")
         if npi_raw is None:
             continue
         try:
             npi = int(npi_raw)
         except (TypeError, ValueError):
             continue
-        geography_scope = str(row.get("geography_scope") or "").strip()
-        geography_value = str(row.get("geography_value") or "").strip()
+        geography_scope = str(profile_row.get("geography_scope") or "").strip()
+        geography_value = str(profile_row.get("geography_value") or "").strip()
         if not geography_scope or not geography_value:
             continue
-        profiles_by_npi_and_geo.setdefault((npi, geography_scope, geography_value), []).append(row)
+        profiles_by_npi_and_geo.setdefault((npi, geography_scope, geography_value), []).append(
+            profile_row
+        )
 
-    selected_profiles: dict[int, dict[str, Any]] = {}
-    for npi, candidates in npi_candidates.items():
+    selected_profile_by_npi: dict[int, dict[str, Any]] = {}
+    for npi, geography_candidates in geography_candidates_by_npi.items():
         selected: dict[str, Any] | None = None
-        for geography_scope, geography_value in candidates:
+        for geography_scope, geography_value in geography_candidates:
             candidates_for_geo = profiles_by_npi_and_geo.get((npi, geography_scope, geography_value), [])
             if not candidates_for_geo:
                 continue
@@ -1500,13 +1584,13 @@ async def _enrich_provider_service_cost_indices(
             )
             break
         if selected is not None:
-            selected_profiles[npi] = selected
+            selected_profile_by_npi[npi] = selected
 
-    if not selected_profiles:
+    if not selected_profile_by_npi:
         return
 
     peer_key_candidates: set[tuple[int, int, str, str, str, str]] = set()
-    for profile in selected_profiles.values():
+    for profile in selected_profile_by_npi.values():
         procedure_code_raw = profile.get("procedure_code")
         year_raw = profile.get("year")
         geography_scope = str(profile.get("geography_scope") or "").strip()
@@ -1556,27 +1640,30 @@ async def _enrich_provider_service_cost_indices(
         ) in peer_key_candidates
     ]
     peer_result = await session.execute(select(procedure_peer_stats_table).where(or_(*peer_clauses)))
-    peer_rows = [_row_to_dict(row) for row in peer_result]
+    peer_rows = [
+        _row_to_dict(peer_stats_row)
+        for peer_stats_row in peer_result
+    ]
     if not peer_rows:
         return
 
     peers_by_key: dict[tuple[int, int, str, str, str, str], dict[str, Any]] = {}
-    for row in peer_rows:
+    for peer_stats_row in peer_rows:
         try:
             key = (
-                int(row.get("procedure_code")),
-                int(row.get("year")),
-                str(row.get("geography_scope") or "").strip(),
-                str(row.get("geography_value") or "").strip(),
-                str(row.get("specialty_key") or "").strip().lower(),
-                str(row.get("setting_key") or "").strip().lower(),
+                int(peer_stats_row.get("procedure_code")),
+                int(peer_stats_row.get("year")),
+                str(peer_stats_row.get("geography_scope") or "").strip(),
+                str(peer_stats_row.get("geography_value") or "").strip(),
+                str(peer_stats_row.get("specialty_key") or "").strip().lower(),
+                str(peer_stats_row.get("setting_key") or "").strip().lower(),
             )
         except (TypeError, ValueError):
             continue
-        peers_by_key[key] = row
+        peers_by_key[key] = peer_stats_row
 
-    for item in items:
-        npi_raw = item.get("npi")
+    for provider_service_row in provider_service_rows:
+        npi_raw = provider_service_row.get("npi")
         if npi_raw is None:
             continue
         try:
@@ -1584,7 +1671,7 @@ async def _enrich_provider_service_cost_indices(
         except (TypeError, ValueError):
             continue
 
-        profile = selected_profiles.get(npi)
+        profile = selected_profile_by_npi.get(npi)
         if profile is None:
             continue
 
@@ -1632,8 +1719,8 @@ async def _enrich_provider_service_cost_indices(
         )
         if estimated_cost_level is None:
             continue
-        item["cost_index"] = estimated_cost_level
-        item["estimated_cost_level"] = estimated_cost_level
+        provider_service_row["cost_index"] = estimated_cost_level
+        provider_service_row["estimated_cost_level"] = estimated_cost_level
 
 
 async def _default_year(session, table) -> int:
@@ -4052,17 +4139,17 @@ async def _resolve_code_context(
             "expanded": False,
         }
 
-    visited: set[tuple[str, str]] = {(code_system, code)}
-    frontier: set[tuple[str, str]] = {(code_system, code)}
-    matched_via: list[dict[str, Any]] = []
+    visited_code_pairs: set[tuple[str, str]] = {(code_system, code)}
+    frontier_code_pairs: set[tuple[str, str]] = {(code_system, code)}
+    crosswalk_matches: list[dict[str, Any]] = []
     seen_edges: set[tuple[str, str, str, str]] = set()
 
     hops = MAX_CODE_EXPANSION_HOPS if expand_codes else 1
     for _ in range(hops):
-        edges = await _query_crosswalk_edges(session, frontier)
+        edges = await _query_crosswalk_edges(session, frontier_code_pairs)
         if not edges:
             break
-        next_frontier: set[tuple[str, str]] = set()
+        next_frontier_code_pairs: set[tuple[str, str]] = set()
         for edge in edges:
             from_pair = (
                 str(edge.get("from_system", "")).upper(),
@@ -4075,7 +4162,7 @@ async def _resolve_code_context(
             edge_key = (*from_pair, *to_pair)
             if edge_key not in seen_edges:
                 seen_edges.add(edge_key)
-                matched_via.append(
+                crosswalk_matches.append(
                     {
                         "from_system": from_pair[0],
                         "from_code": from_pair[1],
@@ -4087,36 +4174,36 @@ async def _resolve_code_context(
                     }
                 )
             for pair in (from_pair, to_pair):
-                if pair not in visited:
-                    visited.add(pair)
-                    next_frontier.add(pair)
-        frontier = next_frontier
-        if not frontier:
+                if pair not in visited_code_pairs:
+                    visited_code_pairs.add(pair)
+                    next_frontier_code_pairs.add(pair)
+        frontier_code_pairs = next_frontier_code_pairs
+        if not frontier_code_pairs:
             break
 
     # Optional expansion by display_name peers from code catalog.
     if expand_codes:
-        named_pairs = await _query_catalog_neighbors(session, visited)
-        visited.update(named_pairs)
+        named_pairs = await _query_catalog_neighbors(session, visited_code_pairs)
+        visited_code_pairs.update(named_pairs)
 
     internal_codes = sorted(
         {
             int(pair[1])
-            for pair in visited
+            for pair in visited_code_pairs
             if pair[0] == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(pair[1])
         }
     )
 
     resolved_codes = [
         {"code_system": pair[0], "code": pair[1]}
-        for pair in sorted(visited, key=lambda item: (item[0], item[1]))
+        for pair in sorted(visited_code_pairs, key=lambda item: (item[0], item[1]))
     ]
 
     return {
         "input_code": {"code_system": code_system, "code": code},
         "resolved_codes": resolved_codes,
         "internal_codes": internal_codes,
-        "matched_via": matched_via,
+        "matched_via": crosswalk_matches,
         "expanded": bool(expand_codes),
     }
 
@@ -4278,22 +4365,38 @@ def _classify_procedure_taxonomy_resolution(
     is_em_ambiguous = normalized_code in PROCEDURE_TAXONOMY_OFFICE_EM_CODES and not intent_source
     is_known_young_skew = normalized_code in PROCEDURE_TAXONOMY_KNOWN_YOUNG_SKEW_CODES
 
-    evidence_totals = {
-        "distinct_npis": sum(item.get("distinct_npis") or 0 for item in evidence_items),
-        "total_services": sum(_as_float(item.get("total_services")) or 0.0 for item in evidence_items),
-        "total_beneficiaries": sum(_as_float(item.get("total_beneficiaries")) or 0.0 for item in evidence_items),
+    evidence_totals_by_metric = {
+        "distinct_npis": sum(
+            evidence_item.get("distinct_npis") or 0
+            for evidence_item in evidence_items
+        ),
+        "total_services": sum(
+            _as_float(evidence_item.get("total_services")) or 0.0
+            for evidence_item in evidence_items
+        ),
+        "total_beneficiaries": sum(
+            _as_float(evidence_item.get("total_beneficiaries")) or 0.0
+            for evidence_item in evidence_items
+        ),
     }
-    for item in evidence_items:
-        total_npis = max(float(evidence_totals["distinct_npis"]), 1.0)
-        total_services = max(float(evidence_totals["total_services"]), 1.0)
-        item["distinct_npi_share"] = round(float(item.get("distinct_npis") or 0) / total_npis, 6)
-        item["service_share"] = round(float(item.get("total_services") or 0.0) / total_services, 6)
+    for evidence_item in evidence_items:
+        total_npis = max(float(evidence_totals_by_metric["distinct_npis"]), 1.0)
+        total_services = max(float(evidence_totals_by_metric["total_services"]), 1.0)
+        evidence_item["distinct_npi_share"] = round(
+            float(evidence_item.get("distinct_npis") or 0) / total_npis,
+            6,
+        )
+        evidence_item["service_share"] = round(
+            float(evidence_item.get("total_services") or 0.0) / total_services,
+            6,
+        )
 
     top_item = evidence_items[0] if evidence_items else None
     top_npi_share = _as_float(top_item.get("distinct_npi_share")) if top_item else 0.0
     representative = (
-        evidence_totals["distinct_npis"] >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_NPIS
-        and evidence_totals["total_beneficiaries"] >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_BENEFICIARIES
+        evidence_totals_by_metric["distinct_npis"] >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_NPIS
+        and evidence_totals_by_metric["total_beneficiaries"]
+        >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_BENEFICIARIES
         and not is_known_young_skew
     )
     if top_npi_share is not None and top_npi_share >= PROCEDURE_TAXONOMY_HIGH_NPI_SHARE and representative:
@@ -4306,10 +4409,10 @@ def _classify_procedure_taxonomy_resolution(
         confidence = "none"
 
     recommended_codes = _dedupe_taxonomy_codes(intent_codes, curated_codes)
-    source = intent_source or (curated_rule or {}).get("source")
+    taxonomy_source = intent_source or (curated_rule or {}).get("source")
     if not recommended_codes and top_item and top_item.get("taxonomy_code"):
         recommended_codes = [str(top_item["taxonomy_code"])]
-        source = "medicare_provider_taxonomy_evidence"
+        taxonomy_source = "medicare_provider_taxonomy_evidence"
 
     needs_intent = bool(is_em_ambiguous)
     needs_review = False
@@ -4356,15 +4459,15 @@ def _classify_procedure_taxonomy_resolution(
     filter_payload = None
     boost_payload = None
     if recommended_codes:
-        payload = {
+        taxonomy_filter_parameters = {
             "taxonomy_codes": recommended_codes,
             "include_subspecialties": False,
             "primary_only": False,
         }
         if recommended_mode == "hard_filter":
-            filter_payload = payload
+            filter_payload = taxonomy_filter_parameters
         else:
-            boost_payload = payload
+            boost_payload = taxonomy_filter_parameters
 
     return {
         "status": status,
@@ -4374,15 +4477,15 @@ def _classify_procedure_taxonomy_resolution(
         "needs_review": needs_review,
         "safe_for_hard_filter": safe_for_hard_filter,
         "taxonomy_codes": recommended_codes,
-        "taxonomy_source": source,
+        "taxonomy_source": taxonomy_source,
         "provider_filter": filter_payload,
         "provider_boost": boost_payload,
         "conflict_reasons": conflict_reasons,
         "representativeness": {
             "passed": representative,
-            "distinct_npis": evidence_totals["distinct_npis"],
-            "total_services": evidence_totals["total_services"],
-            "total_beneficiaries": evidence_totals["total_beneficiaries"],
+            "distinct_npis": evidence_totals_by_metric["distinct_npis"],
+            "total_services": evidence_totals_by_metric["total_services"],
+            "total_beneficiaries": evidence_totals_by_metric["total_beneficiaries"],
             "min_distinct_npis": PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_NPIS,
             "min_total_beneficiaries": PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_BENEFICIARIES,
             "known_young_skew": is_known_young_skew,
@@ -8878,39 +8981,59 @@ async def autocomplete_provider_types(request):
         include_broad=True,
         limit=max((pagination.offset + pagination.limit) * 5, 100),
     )
-    grouped: dict[tuple[str, str], dict[str, Any]] = {}
-    for row in provider_type_rows:
-        target_system = str(row.get("target_system") or "").upper()
-        target_code = str(row.get("target_code") or "")
+    provider_type_items_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for provider_type_row in provider_type_rows:
+        target_system = str(provider_type_row.get("target_system") or "").upper()
+        target_code = str(provider_type_row.get("target_code") or "")
         key = (target_system, target_code)
-        current = grouped.get(key)
-        if current is None:
-            current = {
-                "term": row.get("target_display") or row.get("canonical_term") or row.get("term"),
+        current_provider_type_item_by_field = provider_type_items_by_key.get(key)
+        if current_provider_type_item_by_field is None:
+            current_provider_type_item_by_field = {
+                "term": (
+                    provider_type_row.get("target_display")
+                    or provider_type_row.get("canonical_term")
+                    or provider_type_row.get("term")
+                ),
                 "provider_type": target_code if target_system == "PROVIDER_TYPE" else None,
                 "target_system": target_system,
                 "target_code": target_code,
-                "canonical_term": row.get("canonical_term"),
+                "canonical_term": provider_type_row.get("canonical_term"),
                 "aliases": set(),
                 "sources": set(),
                 "matches": [],
             }
-            grouped[key] = current
-        if row.get("term"):
-            current["aliases"].add(str(row["term"]))
-        if row.get("source"):
-            current["sources"].add(str(row["source"]))
-        if len(current["matches"]) < 5:
-            current["matches"].append(row)
+            provider_type_items_by_key[key] = current_provider_type_item_by_field
+        if provider_type_row.get("term"):
+            current_provider_type_item_by_field["aliases"].add(
+                str(provider_type_row["term"])
+            )
+        if provider_type_row.get("source"):
+            current_provider_type_item_by_field["sources"].add(
+                str(provider_type_row["source"])
+            )
+        if len(current_provider_type_item_by_field["matches"]) < 5:
+            current_provider_type_item_by_field["matches"].append(provider_type_row)
 
-    ordered = []
-    for item in grouped.values():
-        item["aliases"] = sorted(item["aliases"], key=lambda value: value.lower())
-        item["sources"] = sorted(item["sources"])
-        ordered.append(item)
-    ordered.sort(key=lambda item: (0 if item.get("provider_type") else 1, str(item.get("term") or "").lower()))
-    total = len(ordered)
-    page_items = ordered[pagination.offset: pagination.offset + pagination.limit]
+    ordered_provider_type_items = []
+    for provider_type_item_by_field in provider_type_items_by_key.values():
+        provider_type_item_by_field["aliases"] = sorted(
+            provider_type_item_by_field["aliases"],
+            key=lambda value: value.lower(),
+        )
+        provider_type_item_by_field["sources"] = sorted(
+            provider_type_item_by_field["sources"]
+        )
+        ordered_provider_type_items.append(provider_type_item_by_field)
+    ordered_provider_type_items.sort(
+        key=lambda provider_type_item_by_field: (
+            0 if provider_type_item_by_field.get("provider_type") else 1,
+            str(provider_type_item_by_field.get("term") or "").lower(),
+        )
+    )
+    total = len(ordered_provider_type_items)
+    page_items = ordered_provider_type_items[
+        pagination.offset: pagination.offset + pagination.limit
+    ]
 
     return response.json(
         {
@@ -9110,8 +9233,11 @@ async def autocomplete_procedures(request):
         )
         .limit(fetch_limit)
     )
-    result = await session.execute(query)
-    rows = [_row_to_dict(row) for row in result]
+    code_catalog_result_cursor = await session.execute(query)
+    code_catalog_rows = [
+        _row_to_dict(code_catalog_row)
+        for code_catalog_row in code_catalog_result_cursor
+    ]
     terminology_rows = await _query_terminology(
         session,
         domain="procedure",
@@ -9123,14 +9249,14 @@ async def autocomplete_procedures(request):
     )
 
     if not dedupe_terms:
-        items = []
+        procedure_items = []
         for term_row in terminology_rows:
             code_system = str(term_row.get("target_system") or "").upper()
             code_value = str(term_row.get("target_code") or "").upper()
             term = str(term_row.get("canonical_term") or term_row.get("term") or code_value).strip()
             if not term:
                 continue
-            items.append(
+            procedure_items.append(
                 {
                     "term": term,
                     "matched_term": term_row.get("term"),
@@ -9141,24 +9267,29 @@ async def autocomplete_procedures(request):
                     "terminology_match": term_row,
                 }
             )
-        for row in rows:
-            display_name = str(row.get("display_name") or row.get("short_description") or row.get("code") or "").strip()
+        for code_catalog_row in code_catalog_rows:
+            display_name = str(
+                code_catalog_row.get("display_name")
+                or code_catalog_row.get("short_description")
+                or code_catalog_row.get("code")
+                or ""
+            ).strip()
             if not display_name:
                 continue
-            code_system = str(row.get("code_system") or "").upper()
-            code_value = str(row.get("code") or "").upper()
-            item = {
+            code_system = str(code_catalog_row.get("code_system") or "").upper()
+            code_value = str(code_catalog_row.get("code") or "").upper()
+            procedure_item_by_field = {
                 "term": display_name,
                 "code_systems": [code_system] if code_system else [],
                 "codes": [{"code_system": code_system, "code": code_value}] if code_system and code_value else [],
                 "internal_codes": [code_value] if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code_value) else [],
-                "sources": [row.get("source")] if row.get("source") else [],
+                "sources": [code_catalog_row.get("source")] if code_catalog_row.get("source") else [],
             }
-            items.append(item)
-        total = len(items)
-        page_items = items[pagination.offset: pagination.offset + pagination.limit]
+            procedure_items.append(procedure_item_by_field)
+        total = len(procedure_items)
+        page_items = procedure_items[pagination.offset: pagination.offset + pagination.limit]
     else:
-        grouped: dict[str, dict[str, Any]] = {}
+        procedure_items_by_term: dict[str, dict[str, Any]] = {}
         for term_row in terminology_rows:
             term = str(term_row.get("canonical_term") or term_row.get("target_display") or term_row.get("term") or "").strip()
             if not term:
@@ -9166,9 +9297,9 @@ async def autocomplete_procedures(request):
             term_key = term.lower()
             code_system = str(term_row.get("target_system") or "").upper()
             code_value = str(term_row.get("target_code") or "").upper()
-            current = grouped.get(term_key)
-            if current is None:
-                current = {
+            current_procedure_item_by_field = procedure_items_by_term.get(term_key)
+            if current_procedure_item_by_field is None:
+                current_procedure_item_by_field = {
                     "term": term,
                     "code_systems": set(),
                     "codes": [],
@@ -9178,39 +9309,49 @@ async def autocomplete_procedures(request):
                     "_rank": 0,
                     "matches": [],
                 }
-                grouped[term_key] = current
-            current["_rank"] = min(current["_rank"], 0)
+                procedure_items_by_term[term_key] = current_procedure_item_by_field
+            current_procedure_item_by_field["_rank"] = min(current_procedure_item_by_field["_rank"], 0)
             if term_row.get("source"):
-                current["sources"].add(str(term_row["source"]))
-            if len(current.setdefault("matches", [])) < 5:
-                current["matches"].append(term_row)
+                current_procedure_item_by_field["sources"].add(str(term_row["source"]))
+            if len(current_procedure_item_by_field.setdefault("matches", [])) < 5:
+                current_procedure_item_by_field["matches"].append(term_row)
             if code_system:
-                current["code_systems"].add(code_system)
+                current_procedure_item_by_field["code_systems"].add(code_system)
             if code_system and code_value:
                 pair = (code_system, code_value)
-                if pair not in current["_seen_codes"] and len(current["codes"]) < max_codes_per_term:
-                    current["_seen_codes"].add(pair)
-                    current["codes"].append({"code_system": code_system, "code": code_value})
+                if (
+                    pair not in current_procedure_item_by_field["_seen_codes"]
+                    and len(current_procedure_item_by_field["codes"]) < max_codes_per_term
+                ):
+                    current_procedure_item_by_field["_seen_codes"].add(pair)
+                    current_procedure_item_by_field["codes"].append(
+                        {"code_system": code_system, "code": code_value}
+                    )
                 if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code_value):
-                    current["internal_codes"].add(code_value)
-        for row in rows:
-            term = str(row.get("display_name") or row.get("short_description") or row.get("code") or "").strip()
+                    current_procedure_item_by_field["internal_codes"].add(code_value)
+        for code_catalog_row in code_catalog_rows:
+            term = str(
+                code_catalog_row.get("display_name")
+                or code_catalog_row.get("short_description")
+                or code_catalog_row.get("code")
+                or ""
+            ).strip()
             if not term:
                 continue
             term_key = term.lower()
-            code_system = str(row.get("code_system") or "").upper()
-            code_value = str(row.get("code") or "").upper()
+            code_system = str(code_catalog_row.get("code_system") or "").upper()
+            code_value = str(code_catalog_row.get("code") or "").upper()
             row_rank = 3
             if term_key.startswith(q):
                 row_rank = 0
-            elif str(row.get("short_description") or "").strip().lower().startswith(q):
+            elif str(code_catalog_row.get("short_description") or "").strip().lower().startswith(q):
                 row_rank = 1
             elif code_value.lower().startswith(q):
                 row_rank = 2
 
-            current = grouped.get(term_key)
-            if current is None:
-                current = {
+            current_procedure_item_by_field = procedure_items_by_term.get(term_key)
+            if current_procedure_item_by_field is None:
+                current_procedure_item_by_field = {
                     "term": term,
                     "code_systems": set(),
                     "codes": [],
@@ -9220,49 +9361,63 @@ async def autocomplete_procedures(request):
                     "_rank": row_rank,
                     "matches": [],
                 }
-                grouped[term_key] = current
+                procedure_items_by_term[term_key] = current_procedure_item_by_field
 
-            current["_rank"] = min(current["_rank"], row_rank)
-            if row.get("source"):
-                current["sources"].add(str(row["source"]))
+            current_procedure_item_by_field["_rank"] = min(
+                current_procedure_item_by_field["_rank"],
+                row_rank,
+            )
+            if code_catalog_row.get("source"):
+                current_procedure_item_by_field["sources"].add(str(code_catalog_row["source"]))
             if code_system:
-                current["code_systems"].add(code_system)
+                current_procedure_item_by_field["code_systems"].add(code_system)
             if code_system and code_value:
                 pair = (code_system, code_value)
-                if pair not in current["_seen_codes"] and len(current["codes"]) < max_codes_per_term:
-                    current["_seen_codes"].add(pair)
-                    current["codes"].append({"code_system": code_system, "code": code_value})
+                if (
+                    pair not in current_procedure_item_by_field["_seen_codes"]
+                    and len(current_procedure_item_by_field["codes"]) < max_codes_per_term
+                ):
+                    current_procedure_item_by_field["_seen_codes"].add(pair)
+                    current_procedure_item_by_field["codes"].append(
+                        {"code_system": code_system, "code": code_value}
+                    )
                 if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code_value):
-                    current["internal_codes"].add(code_value)
+                    current_procedure_item_by_field["internal_codes"].add(code_value)
 
         ordered_items = []
-        for item in grouped.values():
-            code_systems = sorted(item["code_systems"])
-            codes = sorted(item["codes"], key=lambda code_item: (code_item["code_system"], code_item["code"]))
-            internal_codes = sorted(item["internal_codes"], key=lambda value: int(value))
-            sources = sorted(item["sources"])
+        for procedure_item_by_field in procedure_items_by_term.values():
+            code_systems = sorted(procedure_item_by_field["code_systems"])
+            codes = sorted(
+                procedure_item_by_field["codes"],
+                key=lambda code_item: (code_item["code_system"], code_item["code"]),
+            )
+            internal_codes = sorted(
+                procedure_item_by_field["internal_codes"],
+                key=lambda internal_code: int(internal_code),
+            )
+            source_names = sorted(procedure_item_by_field["sources"])
             ordered_items.append(
                 {
-                    "term": item["term"],
+                    "term": procedure_item_by_field["term"],
                     "code_systems": code_systems,
                     "codes": codes,
                     "internal_codes": internal_codes,
-                    "sources": sources,
-                    "matches": item.get("matches") or [],
-                    "_rank": item["_rank"],
+                    "sources": source_names,
+                    "matches": procedure_item_by_field.get("matches") or [],
+                    "_rank": procedure_item_by_field["_rank"],
                 }
             )
 
         ordered_items.sort(
-            key=lambda item: (
-                item["_rank"],
-                item["term"].lower(),
+            key=lambda procedure_item_by_field: (
+                procedure_item_by_field["_rank"],
+                procedure_item_by_field["term"].lower(),
             )
         )
         total = len(ordered_items)
         page_items = ordered_items[pagination.offset: pagination.offset + pagination.limit]
-        for item in page_items:
-            item.pop("_rank", None)
+        for procedure_item_by_field in page_items:
+            procedure_item_by_field.pop("_rank", None)
 
     return response.json(
         {
@@ -9646,37 +9801,69 @@ async def autocomplete_prescriptions(request):
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
 
-    result = await session.execute(query)
-    items = []
-    for row in result:
-        item = _row_to_dict(row)
-        generic_name = str(item.get("generic_name") or item.get("rx_name") or item.get("brand_name") or "").strip()
-        brand_name = str(item.get("brand_name") or item.get("rx_name") or item.get("generic_name") or "").strip()
-        item["generic_name"] = generic_name or None
-        item["brand_name"] = brand_name or None
-        item["prescription_name"] = str(item.get("rx_name") or generic_name or brand_name or "").strip() or None
-        item["display_label"] = (
+    prescription_result_cursor = await session.execute(query)
+    prescription_items = []
+    for prescription_row in prescription_result_cursor:
+        prescription_item_by_field = _row_to_dict(prescription_row)
+        generic_name = str(
+            prescription_item_by_field.get("generic_name")
+            or prescription_item_by_field.get("rx_name")
+            or prescription_item_by_field.get("brand_name")
+            or ""
+        ).strip()
+        brand_name = str(
+            prescription_item_by_field.get("brand_name")
+            or prescription_item_by_field.get("rx_name")
+            or prescription_item_by_field.get("generic_name")
+            or ""
+        ).strip()
+        prescription_item_by_field["generic_name"] = generic_name or None
+        prescription_item_by_field["brand_name"] = brand_name or None
+        prescription_item_by_field["prescription_name"] = (
+            str(
+                prescription_item_by_field.get("rx_name")
+                or generic_name
+                or brand_name
+                or ""
+            ).strip()
+            or None
+        )
+        prescription_item_by_field["display_label"] = (
             f"{generic_name} / {brand_name}" if generic_name and brand_name and generic_name != brand_name else (generic_name or brand_name or None)
         )
-        item["prescription_code_system"] = item.get("rx_code_system")
-        item["prescription_code"] = item.get("rx_code")
-        item["total_prescriptions"] = item.get("total_claims")
-        item["total_allowed_amount"] = item.get("total_drug_cost")
-        items.append(item)
+        prescription_item_by_field["prescription_code_system"] = (
+            prescription_item_by_field.get("rx_code_system")
+        )
+        prescription_item_by_field["prescription_code"] = prescription_item_by_field.get(
+            "rx_code"
+        )
+        prescription_item_by_field["total_prescriptions"] = (
+            prescription_item_by_field.get("total_claims")
+        )
+        prescription_item_by_field["total_allowed_amount"] = (
+            prescription_item_by_field.get("total_drug_cost")
+        )
+        prescription_items.append(prescription_item_by_field)
 
-    if items:
+    if prescription_items:
         try:
             external_codes_by_internal = await _resolve_external_rx_codes_for_internal(
                 session,
-                [str(item.get("rx_code") or "") for item in items],
+                [
+                    str(prescription_item_by_field.get("rx_code") or "")
+                    for prescription_item_by_field in prescription_items
+                ],
             )
         except Exception:  # pragma: no cover - defensive fallback for missing/migrating crosswalk table
             external_codes_by_internal = {}
-        _apply_prescription_code_preferences(items, external_codes_by_internal)
+        _apply_prescription_code_preferences(
+            prescription_items,
+            external_codes_by_internal,
+        )
 
     return response.json(
         {
-            "items": items,
+            "items": prescription_items,
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,
