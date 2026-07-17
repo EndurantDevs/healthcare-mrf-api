@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -84,6 +85,7 @@ def _finalizer_inputs(tmp_path: Path):
                 "partition_count": 1,
                 "format": "ptg2_v3_serving_run",
                 "version": 1,
+                "sha256": hashlib.sha256(serving_path.read_bytes()).hexdigest(),
             }
         ],
         source_identity=source_identity_map,
@@ -104,6 +106,7 @@ def _finalizer_inputs(tmp_path: Path):
                 "bytes": 64,
                 "format": "ptg2_v3_serving_code_dictionary",
                 "version": 4,
+                "sha256": hashlib.sha256(code_path.read_bytes()).hexdigest(),
             }
         ],
         source_identity=source_identity_map,
