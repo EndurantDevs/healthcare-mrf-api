@@ -6223,6 +6223,92 @@ def _rank_provider_expansion_prefix(
     )
 
 
+async def _filtered_provider_npis_for_expansion_set(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_id: str,
+    args: Mapping[str, Any],
+    *,
+    target_count: int,
+) -> tuple[int, ...]:
+    """Read enough ordered set members to prove a filtered provider prefix."""
+
+    raw_limit = max(max(int(target_count), 1) * 4, 32)
+    while True:
+        npis_by_set = await _ptg2_manifest_provider_npis_for_provider_sets(
+            session,
+            serving_tables,
+            [provider_set_id],
+            limit_per_set=raw_limit,
+        )
+        provider_npis = npis_by_set.get(provider_set_id, ())
+        filtered_npis = await _ptg2_manifest_filter_npis_by_provider_taxonomy(
+            session,
+            dict(args),
+            provider_npis,
+            limit=max(int(target_count), 1),
+        )
+        if len(filtered_npis) >= target_count or len(provider_npis) < raw_limit:
+            return filtered_npis
+        raw_limit *= 2
+
+
+async def _rank_filtered_provider_expansion_prefix(
+    session,
+    serving_tables: PTG2ServingTables,
+    row_data: list[dict[str, Any]],
+    args: Mapping[str, Any],
+    *,
+    target_count: int,
+    npis_by_set: dict[str, tuple[int, ...]],
+) -> tuple[
+    dict[_ProviderExpansionKey, int],
+    tuple[int, ...],
+    tuple[str, ...],
+]:
+    """Rank a provider-filtered prefix without expanding every rate member."""
+
+    rank_by_key: dict[_ProviderExpansionKey, int] = {}
+    selected_npi_order_by_value: dict[int, None] = {}
+    selected_provider_set_order_by_id: dict[str, None] = {}
+    for serving_row in row_data:
+        provider_set_id = _ptg2_manifest_id(
+            serving_row.get("provider_set_global_id_128")
+        )
+        if not provider_set_id:
+            raise PTG2ManifestArtifactError(
+                "PTG2 strict V3 rate is missing its provider-set identity"
+            )
+        if provider_set_id not in npis_by_set:
+            npis_by_set[provider_set_id] = (
+                await _filtered_provider_npis_for_expansion_set(
+                    session,
+                    serving_tables,
+                    provider_set_id,
+                    args,
+                    target_count=target_count,
+                )
+            )
+        for npi in npis_by_set[provider_set_id]:
+            key = _provider_expansion_key(serving_row, npi=npi)
+            if key in rank_by_key:
+                continue
+            rank_by_key[key] = len(rank_by_key)
+            selected_provider_set_order_by_id[provider_set_id] = None
+            selected_npi_order_by_value[int(npi)] = None
+            if len(rank_by_key) >= target_count:
+                return (
+                    rank_by_key,
+                    tuple(selected_npi_order_by_value),
+                    tuple(selected_provider_set_order_by_id),
+                )
+    return (
+        rank_by_key,
+        tuple(selected_npi_order_by_value),
+        tuple(selected_provider_set_order_by_id),
+    )
+
+
 async def _provider_set_ids_for_selected_npis(
     session,
     serving_tables: PTG2ServingTables,
@@ -6411,6 +6497,8 @@ async def _strict_cost_provider_expansion_selection(
     selected_provider_set_ids: tuple[str, ...] = ()
     is_exhausted = False
     serving_rows: list[dict[str, Any]] = []
+    filtered_npis_by_set: dict[str, tuple[int, ...]] = {}
+    is_provider_filter_requested = _is_ptg2_provider_filter_requested(dict(args))
     while True:
         serving_rows = await _merge_manifest_code_variant_rows(
             session,
@@ -6436,19 +6524,31 @@ async def _strict_cost_provider_expansion_selection(
                 )
             )
         )
-        npis_by_set = await _ptg2_manifest_provider_npis_for_provider_sets(
-            session,
-            serving_tables,
-            provider_set_ids,
-            limit_per_set=max(int(target_count), 1),
-        )
-        rank_by_key, selected_npis, selected_provider_set_ids = (
-            _rank_provider_expansion_prefix(
-                serving_rows,
-                npis_by_set,
-                target_count=max(int(target_count), 1),
+        if is_provider_filter_requested:
+            rank_by_key, selected_npis, selected_provider_set_ids = (
+                await _rank_filtered_provider_expansion_prefix(
+                    session,
+                    serving_tables,
+                    serving_rows,
+                    args,
+                    target_count=max(int(target_count), 1),
+                    npis_by_set=filtered_npis_by_set,
+                )
             )
-        )
+        else:
+            npis_by_set = await _ptg2_manifest_provider_npis_for_provider_sets(
+                session,
+                serving_tables,
+                provider_set_ids,
+                limit_per_set=max(int(target_count), 1),
+            )
+            rank_by_key, selected_npis, selected_provider_set_ids = (
+                _rank_provider_expansion_prefix(
+                    serving_rows,
+                    npis_by_set,
+                    target_count=max(int(target_count), 1),
+                )
+            )
         is_exhausted = (
             rate_window >= declared_rate_count
             or len(serving_rows) < rate_window
@@ -6859,7 +6959,6 @@ async def _search_ptg2_manifest_db_serving_table(
         expand_providers
         and not location_filter_requested
         and not direct_npi_filter_requested
-        and not _is_ptg2_provider_filter_requested(args)
         and not price_filter_requested
         and str(args.get("order_by") or "total_allowed_amount").strip().lower()
         in _PTG2_COST_ORDER_FIELDS
