@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 
-from process.ptg_parts import ptg2_source_witness_codec as witness_codec
+from process.ptg_parts import ptg2_source_witness_bundle as witness_bundle
 from process.ptg_parts.ptg2_source_witness_contract import (
     PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES,
     PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES,
@@ -29,7 +29,7 @@ def test_scanner_bundle_has_a_separate_larger_intermediate_budget(
         "byte_count": len(payload),
     }
     monkeypatch.setattr(
-        witness_codec,
+        witness_bundle,
         "PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES",
         len(payload),
     )
@@ -38,7 +38,7 @@ def test_scanner_bundle_has_a_separate_larger_intermediate_budget(
         PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES
     )
     assert (
-        witness_codec._authenticated_bundle_payload(bundle_entry_by_field)
+        witness_bundle._authenticated_bundle_payload(bundle_entry_by_field)
         == payload
     )
 

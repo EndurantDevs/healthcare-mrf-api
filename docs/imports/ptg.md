@@ -776,7 +776,10 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
 - The PostgreSQL source-witness payload exists, validates against the sealed
   manifests and complete source set, contains exactly 2,048 combined witnesses
   for a large population (normally 2,000 queryable rate occurrences and 48
-  provider references), and has no API-pod filesystem copy.
+  provider references), and has no API-pod filesystem copy. Repeated linked
+  provider JSON is stored once in the payload's SHA-256-keyed compressed
+  dictionary; every occurrence reference, dictionary digest, byte count, and
+  dictionary coverage set must validate before the audit can run.
 - The persisted audit sample exists, validates, and contains no more than 2,560
   rows.
 - The bounded candidate audit reparsed every sealed source witness, passed all
@@ -785,6 +788,9 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
   and retry counts.
 - Cold first-page p95 is at or below 40 ms separately for matched-positive,
   negative, and deterministic-random requests.
+- Audit-only source-witness endpoints may use the separate 250 ms p95 ceiling.
+  That allowance does not relax the 40 ms cold ceiling for standard pricing
+  endpoints.
 - The authenticated schema-v7 monthly capacity report passes with at least 30
   qualifying large builds, 30 reuse-only samples, committed end-to-end timing
   for every logical sample, reconciled candidate-audit traffic, signed raw

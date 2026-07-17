@@ -7,21 +7,11 @@ import hashlib
 import json
 import zlib
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Mapping
 
 from process.ptg_parts.ptg2_source_witness_contract import (
-    CompressedSourceWitnessRecord,
-    PTG2_V3_SOURCE_WITNESS_CONTRACT,
-    PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES,
     PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES,
-    PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES,
-    PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
     PTG2_V3_SOURCE_WITNESS_RECORD_CONTRACT,
-    PTG2_V3_SOURCE_WITNESS_SELECTION,
-    PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
-    PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
-    SOURCE_BUNDLE_MAGIC,
     SOURCE_RECORD_MAGIC,
     SourceWitnessRecord,
 )
@@ -31,7 +21,7 @@ from process.ptg_parts.ptg2_source_witness_primitives import (
     read_u32,
     sha256_hex,
 )
-from process.ptg_parts.ptg2_source_witness_selection import local_source_witness_targets
+
 
 @dataclass(frozen=True)
 class _RecordFields:
@@ -172,6 +162,8 @@ def _verified_raw_evidence(
     decoded_record: bytes,
     metadata_end: int,
     record_metadata: Mapping[str, Any],
+    *,
+    linked_provider_by_sha256: Mapping[str, bytes] | None = None,
 ) -> tuple[bytes, bytes | None, str, str | None]:
     raw_json, linked_provider_json = _framed_raw_tokens(
         decoded_record,
@@ -188,6 +180,14 @@ def _verified_raw_evidence(
         linked_provider_sha256 = sha256_hex(
             linked_provider_sha256,
             field_name="linked provider digest",
+        )
+    if (
+        linked_provider_json is None
+        and linked_provider_sha256 is not None
+        and linked_provider_by_sha256 is not None
+    ):
+        linked_provider_json = linked_provider_by_sha256.get(
+            linked_provider_sha256
         )
     if (linked_provider_json is None) != (linked_provider_sha256 is None):
         raise RuntimeError("strict V3 linked provider evidence is incomplete")
@@ -234,12 +234,12 @@ def _record_fields(record_metadata: Mapping[str, Any]) -> _RecordFields:
     )
 
 
-def decode_record(
+def _decode_record(
     compressed_record: bytes,
     raw_source_sha256: str,
+    *,
+    linked_provider_by_sha256: Mapping[str, bytes] | None,
 ) -> SourceWitnessRecord:
-    """Decode and authenticate one compressed scanner witness record."""
-
     decoded_record, record_metadata, metadata_end = _decoded_record_metadata(
         compressed_record
     )
@@ -253,6 +253,7 @@ def decode_record(
         decoded_record,
         metadata_end,
         record_metadata,
+        linked_provider_by_sha256=linked_provider_by_sha256,
     )
     _validate_record_shape(
         witness_kind=record_fields.witness_kind,
@@ -273,6 +274,67 @@ def decode_record(
         expected=record_fields.expected_evidence,
         raw_json=raw_json,
         linked_provider_json=linked_provider_json,
+    )
+
+
+def decode_record(
+    compressed_record: bytes,
+    raw_source_sha256: str,
+) -> SourceWitnessRecord:
+    """Decode and authenticate one compressed scanner witness record."""
+
+    return _decode_record(
+        compressed_record,
+        raw_source_sha256,
+        linked_provider_by_sha256=None,
+    )
+
+
+def decode_persisted_record(
+    compressed_record: bytes,
+    raw_source_sha256: str,
+    *,
+    linked_provider_by_sha256: Mapping[str, bytes],
+) -> SourceWitnessRecord:
+    """Decode one persisted record backed by the authenticated provider dictionary."""
+
+    return _decode_record(
+        compressed_record,
+        raw_source_sha256,
+        linked_provider_by_sha256=linked_provider_by_sha256,
+    )
+
+
+def externalize_linked_provider_record(
+    compressed_record: bytes,
+    raw_source_sha256: str,
+) -> tuple[bytes, str | None, bytes | None]:
+    """Remove repeated linked-provider JSON from one authenticated scanner record."""
+
+    decoded = decode_record(compressed_record, raw_source_sha256)
+    if decoded.linked_provider_json is None:
+        return compressed_record, None, None
+    decoded_record, _record_metadata, metadata_end = _decoded_record_metadata(
+        compressed_record
+    )
+    raw_length, raw_offset = read_u32(
+        decoded_record,
+        metadata_end,
+        field_name="raw JSON token",
+    )
+    raw_end = raw_offset + raw_length
+    if raw_length <= 0 or raw_end > len(decoded_record):
+        raise RuntimeError("strict V3 source witness raw JSON token is invalid")
+    externalized_record = b"".join(
+        (
+            decoded_record[:raw_end],
+            U32.pack(0),
+        )
+    )
+    return (
+        zlib.compress(externalized_record, level=1),
+        decoded.linked_provider_sha256,
+        decoded.linked_provider_json,
     )
 
 
@@ -298,202 +360,12 @@ def _validate_record_shape(
         raise RuntimeError("strict V3 occurrence provider source is invalid")
 
 
-def _compressed_record(
-    compressed_bytes: bytes,
-    raw_source_sha256: str,
-) -> CompressedSourceWitnessRecord:
-    decoded_record = decode_record(compressed_bytes, raw_source_sha256)
-    return CompressedSourceWitnessRecord(
-        kind=decoded_record.kind,
-        priority=decoded_record.priority,
-        tie_breaker=decoded_record.tie_breaker,
-        raw_source_sha256=raw_source_sha256,
-        compressed=compressed_bytes,
-    )
-
-
-def _authenticated_bundle_payload(bundle_entry: Mapping[str, Any]) -> bytes:
-    bundle_path = Path(str(bundle_entry.get("path") or ""))
-    if not bundle_path.is_file() or bundle_path.is_symlink():
-        raise RuntimeError("strict V3 source witness bundle is missing")
-    bundle_size = bundle_path.stat().st_size
-    if bundle_size <= 0 or bundle_size > PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES:
-        raise RuntimeError("strict V3 source witness bundle size is invalid")
-    bundle_payload = bundle_path.read_bytes()
-    if len(bundle_payload) != bundle_size:
-        raise RuntimeError("strict V3 source witness bundle changed while reading")
-    if hashlib.sha256(bundle_payload).hexdigest() != sha256_hex(
-        bundle_entry.get("sha256"),
-        field_name="bundle digest",
-    ):
-        raise RuntimeError("strict V3 source witness bundle digest does not match")
-    if bundle_entry.get("byte_count") != bundle_size:
-        raise RuntimeError("strict V3 source witness bundle byte count does not match")
-    if not bundle_payload.startswith(SOURCE_BUNDLE_MAGIC):
-        raise RuntimeError("strict V3 source witness bundle magic is invalid")
-    return bundle_payload
-
-
-def _bundle_records(
-    bundle_payload: bytes,
-    *,
-    record_count: int,
-    record_offset: int,
-    raw_source_sha256: str,
-) -> tuple[list[CompressedSourceWitnessRecord], int]:
-    compressed_records: list[CompressedSourceWitnessRecord] = []
-    for _record_index in range(record_count):
-        record_length, record_offset = read_u32(
-            bundle_payload,
-            record_offset,
-            field_name="record length",
-        )
-        record_end = record_offset + record_length
-        if (
-            record_length <= 0
-            or record_length > PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES
-            or record_end > len(bundle_payload)
-        ):
-            raise RuntimeError("strict V3 source witness record framing is invalid")
-        compressed_records.append(
-            _compressed_record(
-                bundle_payload[record_offset:record_end],
-                raw_source_sha256,
-            )
-        )
-        record_offset = record_end
-    return compressed_records, record_offset
-
-
-def read_scanner_bundle(
-    bundle_entry: Mapping[str, Any],
-) -> tuple[dict[str, Any], list[CompressedSourceWitnessRecord]]:
-    """Read one authenticated scanner bundle and validate local completeness."""
-
-    bundle_payload = _authenticated_bundle_payload(bundle_entry)
-    header_length, header_offset = read_u32(
-        bundle_payload,
-        len(SOURCE_BUNDLE_MAGIC),
-        field_name="header",
-    )
-    header_end = header_offset + header_length
-    if header_end > len(bundle_payload):
-        raise RuntimeError("strict V3 source witness bundle header is truncated")
-    bundle_header = _json_object(
-        bundle_payload[header_offset:header_end],
-        field_name="bundle header",
-    )
-    _validate_bundle_header(bundle_header, bundle_entry)
-    raw_source_sha256 = sha256_hex(
-        bundle_header.get("raw_source_sha256"),
-        field_name="raw source digest",
-    )
-    record_count, record_offset = read_u32(
-        bundle_payload,
-        header_end,
-        field_name="record count",
-    )
-    compressed_records, record_offset = _bundle_records(
-        bundle_payload,
-        record_count=record_count,
-        record_offset=record_offset,
-        raw_source_sha256=raw_source_sha256,
-    )
-    if record_offset != len(bundle_payload) or bundle_entry.get("row_count") != len(
-        compressed_records
-    ):
-        raise RuntimeError("strict V3 source witness bundle record count does not match")
-    _validate_local_coverage(bundle_header, compressed_records)
-    return bundle_header, compressed_records
-
-
-def _validate_bundle_header(
-    bundle_header: Mapping[str, Any],
-    bundle_entry: Mapping[str, Any],
-) -> None:
-    if (
-        bundle_header.get("contract") != PTG2_V3_SOURCE_WITNESS_CONTRACT
-        or bundle_header.get("selection_method")
-        != PTG2_V3_SOURCE_WITNESS_SELECTION
-        or bundle_header.get("format_version") != 2
-        or bundle_header.get("total_target")
-        != PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET
-        or bundle_header.get("provider_quota")
-        != PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA
-        or bundle_header.get("unqueryable_rate_policy")
-        != PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY
-    ):
-        raise RuntimeError("strict V3 source witness bundle contract is invalid")
-    if sha256_hex(
-        bundle_header.get("raw_source_sha256"),
-        field_name="raw source digest",
-    ) != sha256_hex(
-        bundle_entry.get("raw_source_sha256"),
-        field_name="entry raw source digest",
-    ):
-        raise RuntimeError("strict V3 source witness source digest changed")
-
-
-def _validate_local_coverage(
-    bundle_header: Mapping[str, Any],
-    compressed_records: list[CompressedSourceWitnessRecord],
-) -> None:
-    """Require each scanner bundle to carry its exact local bottom-k cohorts."""
-    occurrence_metrics = bundle_header.get("rate_occurrence")
-    provider_metrics = bundle_header.get("provider_reference")
-    if not isinstance(occurrence_metrics, Mapping) or not isinstance(
-        provider_metrics, Mapping
-    ):
-        raise RuntimeError("strict V3 source witness cohort metrics are invalid")
-    emitted_rate_rows = nonnegative_int(
-        occurrence_metrics,
-        "emitted_rate_row_count",
-        error_field_name="emitted rate row count",
-    )
-    unqueryable_rate_rows = nonnegative_int(
-        occurrence_metrics,
-        "unqueryable_rate_row_count",
-        error_field_name="unqueryable rate row count",
-    )
-    if unqueryable_rate_rows > emitted_rate_rows:
-        raise RuntimeError("strict V3 source witness unqueryable rate count is invalid")
-    occurrence_target, provider_target, _total_target = local_source_witness_targets(
-        occurrence_metrics,
-        provider_metrics,
-    )
-    observed_count_by_cohort = {
-        "rate_occurrence": sum(
-            witness_record.kind == "rate_occurrence"
-            for witness_record in compressed_records
-        ),
-        "provider_reference": sum(
-            witness_record.kind == "provider_reference"
-            for witness_record in compressed_records
-        ),
-    }
-    for cohort_name, cohort_metrics, expected_count in (
-        ("rate_occurrence", occurrence_metrics, occurrence_target),
-        ("provider_reference", provider_metrics, provider_target),
-    ):
-        selected_count = nonnegative_int(
-            cohort_metrics,
-            "selected_count",
-            error_field_name=f"{cohort_name} selected count",
-        )
-        if (
-            selected_count != expected_count
-            or observed_count_by_cohort[cohort_name] != expected_count
-        ):
-            raise RuntimeError(
-                f"strict V3 source witness {cohort_name} coverage is incomplete"
-            )
-
-
 __all__ = [
     "U32",
     "decode_record",
+    "decode_persisted_record",
+    "externalize_linked_provider_record",
     "nonnegative_int",
-    "read_scanner_bundle",
     "read_u32",
     "sha256_hex",
 ]

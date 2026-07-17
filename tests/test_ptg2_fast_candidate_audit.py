@@ -140,8 +140,8 @@ def _witness(
     witness_records = (*occurrences, *providers)
     return LoadedSourceWitness(
         metadata={
-            "contract": "ptg2_v3_source_witness_payload_v2",
-            "format_version": 2,
+            "contract": "ptg2_v3_source_witness_payload_v3",
+            "format_version": 3,
             "selection_method": "bottom_k_atomic_occurrence_exponential_priority_v2",
             "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
             "unqueryable_rate_policy": "count_but_exclude_from_npi_api_challenges_v1",
@@ -152,7 +152,7 @@ def _witness(
             "sample_digest": SAMPLE_DIGEST,
             "payload_sha256": PAYLOAD_DIGEST,
             "payload_bytes": 1024,
-            "compression": "per_record_zlib",
+            "compression": "per_record_zlib_linked_provider_dictionary_v1",
             "queryable_occurrence_population_count": occurrence_count,
             "provider_population_count": provider_count,
             "emitted_rate_row_count": max(1, occurrence_count),
@@ -160,6 +160,9 @@ def _witness(
             "occurrence_witness_count": occurrence_count,
             "provider_witness_count": provider_count,
             "record_count": len(witness_records),
+            "linked_provider_dictionary_count": occurrence_count,
+            "linked_provider_dictionary_raw_bytes": occurrence_count * 100,
+            "linked_provider_dictionary_stored_bytes": occurrence_count * 50,
         },
         records=witness_records,
     )

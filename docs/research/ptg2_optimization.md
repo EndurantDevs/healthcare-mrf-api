@@ -195,10 +195,18 @@ and provider ordinals, linked provider token, and raw-container SHA in
 occurrence identity. Emitted rows without a queryable NPI are counted under the
 sealed `count_but_exclude_from_npi_api_challenges_v1` policy.
 Publication merges deterministic per-source bottom-k sets and stores the
-bounded payload only in PostgreSQL. Activation never rereads or decompresses a
-source file. It verifies one persisted served occurrence as a source-set and
-sample-digest preflight, then challenges the standard pricing API with each
-source witness.
+bounded payload only in PostgreSQL. The persisted envelope externalizes
+repeated linked-provider JSON into one compressed, SHA-256-keyed dictionary.
+Records retain the linked digest, and decoding rejects missing, corrupt,
+duplicate, out-of-order, or unused dictionary entries. This removes repeated
+audit evidence without weakening exact source-token verification. Activation
+never rereads or decompresses a source file. It verifies one persisted served
+occurrence as a source-set and sample-digest preflight, then challenges the
+standard pricing API with each source witness.
+
+Audit-only endpoints have a 250 ms p95 ceiling because they perform bounded
+evidence decoding and integrity checks. Standard cold pricing endpoints retain
+their independent 40 ms p95 ceiling.
 
 TIN-only provider groups use only the schema-defined singleton `[0]` marker and
 never create a fake NPI. Zero mixed with another value or repeated zero values

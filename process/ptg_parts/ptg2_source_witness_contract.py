@@ -12,7 +12,10 @@ PTG2_V3_SOURCE_WITNESS_RECORD_CONTRACT = "ptg2_v3_source_witness_record_v2"
 PTG2_V3_SOURCE_WITNESS_SELECTION = (
     "bottom_k_atomic_occurrence_exponential_priority_v2"
 )
-PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT = "ptg2_v3_source_witness_payload_v2"
+PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT = "ptg2_v3_source_witness_payload_v3"
+PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION = (
+    "per_record_zlib_linked_provider_dictionary_v1"
+)
 PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET = 2_048
 PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA = 48
 PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY = (
@@ -24,7 +27,7 @@ PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES = 8 * 1024 * 1024
 PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES = 64 * 1024 * 1024
 SOURCE_BUNDLE_MAGIC = b"PTG2SW02"
 SOURCE_RECORD_MAGIC = b"PTG2SWR2"
-PERSISTED_PAYLOAD_MAGIC = b"PTG2SWP2"
+PERSISTED_PAYLOAD_MAGIC = b"PTG2SWP3"
 
 
 @dataclass(frozen=True)
@@ -155,13 +158,13 @@ def _strict_manifest_digest(manifest: Mapping[str, Any], field_name: str) -> str
 def _validate_manifest_contract(manifest_by_field: Mapping[str, Any]) -> None:
     expected_value_by_field = {
         "contract": PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
-        "format_version": 2,
+        "format_version": 3,
         "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
         "unqueryable_rate_policy": PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
         "total_target": PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
         "provider_quota": PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
-        "compression": "per_record_zlib",
+        "compression": PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION,
     }
     if any(
         manifest_by_field.get(field_name) != expected_value
@@ -221,7 +224,7 @@ def validate_source_witness_manifest(
     *,
     expected_source_count: int | None = None,
 ) -> dict[str, Any]:
-    """Validate a reusable layout's complete V2 source-witness contract."""
+    """Validate a reusable layout's complete source-witness contract."""
 
     if not isinstance(raw_manifest, Mapping):
         raise ValueError("missing source witness manifest")
@@ -249,6 +252,25 @@ def validate_source_witness_manifest(
     )
     if payload_bytes > PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES:
         raise ValueError("source witness payload exceeds its bound")
+    dictionary_count = _strict_manifest_int(
+        manifest_by_field,
+        "linked_provider_dictionary_count",
+    )
+    record_count = _strict_manifest_int(
+        manifest_by_field,
+        "record_count",
+        positive=True,
+    )
+    if dictionary_count > record_count:
+        raise ValueError("source witness provider dictionary count is invalid")
+    _strict_manifest_int(
+        manifest_by_field,
+        "linked_provider_dictionary_raw_bytes",
+    )
+    _strict_manifest_int(
+        manifest_by_field,
+        "linked_provider_dictionary_stored_bytes",
+    )
     for digest_field in (
         "source_set_digest",
         "sample_digest",
@@ -267,6 +289,7 @@ __all__ = [
     "PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES",
     "PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES",
     "PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES",
+    "PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION",
     "PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT",
     "PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA",
     "PTG2_V3_SOURCE_WITNESS_RECORD_CONTRACT",
