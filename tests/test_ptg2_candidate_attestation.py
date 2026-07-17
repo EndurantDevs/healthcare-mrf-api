@@ -39,7 +39,7 @@ def _sha256(value: str) -> str:
 def _source_witness(source_set):
     return {
         "contract": PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
-        "format_version": 4,
+        "format_version": 5,
         "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
         "unqueryable_rate_policy": "count_but_exclude_from_npi_api_challenges_v1",
@@ -55,13 +55,13 @@ def _source_witness(source_set):
         "occurrence_witness_count": 10_000,
         "provider_witness_count": 1_000,
         "record_count": 11_000,
-        "linked_provider_dictionary_count": 1_000,
-        "linked_provider_dictionary_raw_bytes": 10_000,
-        "linked_provider_dictionary_stored_bytes": 5_000,
+        "evidence_dictionary_count": 1_000,
+        "evidence_dictionary_raw_bytes": 10_000,
+        "evidence_dictionary_stored_bytes": 5_000,
         "sample_digest": "cd" * 32,
         "payload_sha256": (b"w" * 32).hex(),
         "payload_bytes": 1024,
-        "compression": "per_record_zlib_linked_provider_dictionary_v1",
+        "compression": "per_record_zlib_shared_evidence_dictionary_v1",
     }
 
 

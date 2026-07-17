@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import struct
 import zlib
 
+from process.ptg_parts import ptg2_source_witness_persisted_encode as witness_encoder
 from process.ptg_parts.ptg2_source_witness import (
     decode_persisted_source_witness,
 )
@@ -24,11 +26,27 @@ SOURCE_DIGEST = "11" * 32
 U32 = struct.Struct(">I")
 
 
+def _payload_counts(occurrence_count: int) -> SourceWitnessPayloadCounts:
+    return SourceWitnessPayloadCounts(
+        source_count=1,
+        source_digest=hashlib.sha256(bytes.fromhex(SOURCE_DIGEST)).hexdigest(),
+        occurrence_population=occurrence_count,
+        provider_population=0,
+        emitted_rate_rows=occurrence_count,
+        unqueryable_rate_rows=0,
+        occurrence_count=occurrence_count,
+        provider_count=0,
+        record_count=occurrence_count,
+    )
+
+
 def _compressed_occurrence(
     index: int,
     linked_provider_json: bytes,
+    *,
+    raw_json: bytes | None = None,
 ) -> CompressedSourceWitnessRecord:
-    raw_json = f'{{"rate":{index}}}'.encode()
+    raw_json = raw_json or f'{{"rate":{index}}}'.encode()
     linked_sha256 = hashlib.sha256(linked_provider_json).hexdigest()
     metadata = {
         "contract": PTG2_V3_SOURCE_WITNESS_RECORD_CONTRACT,
@@ -83,7 +101,7 @@ def _compressed_occurrence(
     )
 
 
-def test_persisted_witness_deduplicates_linked_provider_json():
+def test_persisted_witness_deduplicates_exact_source_evidence():
     linked_provider_json = json.dumps(
         {
             "provider_group_id": 7,
@@ -96,25 +114,25 @@ def test_persisted_witness_deduplicates_linked_provider_json():
         },
         separators=(",", ":"),
     ).encode()
+    shared_raw_json = json.dumps(
+        {
+            "negotiated_prices": [
+                {"negotiated_rate": 100 + index} for index in range(1_000)
+            ]
+        },
+        separators=(",", ":"),
+    ).encode()
     compressed_records = [
-        _compressed_occurrence(index, linked_provider_json)
+        _compressed_occurrence(
+            index,
+            linked_provider_json,
+            raw_json=shared_raw_json,
+        )
         for index in range(100)
     ]
-    counts = SourceWitnessPayloadCounts(
-        source_count=1,
-        source_digest=hashlib.sha256(bytes.fromhex(SOURCE_DIGEST)).hexdigest(),
-        occurrence_population=100,
-        provider_population=0,
-        emitted_rate_rows=100,
-        unqueryable_rate_rows=0,
-        occurrence_count=100,
-        provider_count=0,
-        record_count=100,
-    )
-
     witness_payload, witness_metadata = encode_persisted_source_witness(
         compressed_records,
-        counts,
+        _payload_counts(100),
     )
     loaded_witness = decode_persisted_source_witness(
         witness_payload,
@@ -122,12 +140,12 @@ def test_persisted_witness_deduplicates_linked_provider_json():
         expected_metadata=witness_metadata,
     )
 
-    assert witness_metadata["linked_provider_dictionary_count"] == 1
+    assert witness_metadata["evidence_dictionary_count"] == 2
     assert (
-        witness_metadata["linked_provider_dictionary_raw_bytes"]
-        == len(linked_provider_json)
+        witness_metadata["evidence_dictionary_raw_bytes"]
+        == len(linked_provider_json) + len(shared_raw_json)
     )
-    assert witness_metadata["linked_provider_dictionary_stored_bytes"] > 0
+    assert witness_metadata["evidence_dictionary_stored_bytes"] > 0
     assert len(witness_payload) < sum(
         len(witness_record.compressed)
         for witness_record in compressed_records
@@ -136,3 +154,75 @@ def test_persisted_witness_deduplicates_linked_provider_json():
         witness_record.linked_provider_json
         for witness_record in loaded_witness.occurrence_records
     } == {linked_provider_json}
+    assert {
+        witness_record.raw_json
+        for witness_record in loaded_witness.occurrence_records
+    } == {shared_raw_json}
+
+
+def test_persisted_witness_shares_evidence_across_raw_and_linked_roles():
+    shared_evidence = b'{"provider_group_id":7,"provider_groups":[]}'
+    compressed_record = _compressed_occurrence(
+        0,
+        shared_evidence,
+        raw_json=shared_evidence,
+    )
+    witness_payload, witness_metadata = encode_persisted_source_witness(
+        [compressed_record],
+        _payload_counts(1),
+    )
+    loaded_witness = decode_persisted_source_witness(
+        witness_payload,
+        expected_raw_source_sha256=[SOURCE_DIGEST],
+        expected_metadata=witness_metadata,
+    )
+
+    assert witness_metadata["evidence_dictionary_count"] == 1
+    assert loaded_witness.records[0].raw_json == shared_evidence
+    assert loaded_witness.records[0].linked_provider_json == shared_evidence
+
+
+def test_persisted_witness_fits_repeated_large_source_evidence_within_budget(
+    monkeypatch,
+):
+    shared_raw_json = json.dumps(
+        {"source_noise": random.Random(7).randbytes(64 * 1024).hex()},
+        separators=(",", ":"),
+    ).encode()
+    linked_provider_json = b'{"provider_group_id":7,"provider_groups":[]}'
+    compressed_records = [
+        _compressed_occurrence(
+            index,
+            linked_provider_json,
+            raw_json=shared_raw_json,
+        )
+        for index in range(50)
+    ]
+    payload_budget = 1024 * 1024
+    assert (
+        sum(
+            len(compressed_record.compressed)
+            for compressed_record in compressed_records
+        )
+        > payload_budget
+    )
+    monkeypatch.setattr(
+        witness_encoder,
+        "PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES",
+        payload_budget,
+    )
+    witness_payload, witness_metadata = encode_persisted_source_witness(
+        compressed_records,
+        _payload_counts(50),
+    )
+    loaded_witness = decode_persisted_source_witness(
+        witness_payload,
+        expected_raw_source_sha256=[SOURCE_DIGEST],
+        expected_metadata=witness_metadata,
+    )
+
+    assert len(witness_payload) < payload_budget
+    assert len(loaded_witness.records) == 50
+    assert {
+        witness_record.raw_json for witness_record in loaded_witness.records
+    } == {shared_raw_json}

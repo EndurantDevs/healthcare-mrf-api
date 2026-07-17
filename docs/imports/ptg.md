@@ -528,14 +528,17 @@ Per-source scanner candidates use a separate bounded intermediate bundle
 final cross-source selection. The immutable PostgreSQL witness remains capped
 at 128 MiB; exceeding that final bound still fails publication.
 
-The exact raw JSON token is preserved, individually zlib-compressed, and
-protected by its own SHA-256. Publication merges all per-source bottom-k sets
-deterministically, verifies complete source coverage and framing, then stores
-one bounded payload in `ptg2_v3_source_audit_witness`. The layout and logical
-snapshot manifests bind the payload digest, source-set digest, sample digest,
-counts, and selection contract before sealing. Scanner bundle files are
-temporary publication scratch and are deleted; PostgreSQL is the only durable
-copy and API pods do not materialize a filesystem cache.
+Every exact raw JSON token is preserved and protected by its own SHA-256.
+Publication merges all per-source bottom-k sets deterministically, then stores
+the unique source tokens in one sorted content-addressed dictionary using zlib
+level 6. Witness records reference those authenticated dictionary entries, so
+multiple sampled occurrences from one negotiated-rate object do not duplicate
+the full source object. The bounded payload lives in
+`ptg2_v3_source_audit_witness`; the layout and logical snapshot manifests bind
+its payload digest, source-set digest, sample digest, counts, and selection
+contract before sealing. Scanner bundle files are temporary publication
+scratch and are deleted; PostgreSQL is the only durable copy and API pods do
+not materialize a filesystem cache.
 
 This witness is intentionally independent of the compact serving encoding.
 The source half contains the exact original rate token and, for referenced

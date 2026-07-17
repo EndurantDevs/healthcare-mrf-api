@@ -121,7 +121,7 @@ def _framed_raw_tokens(
         field_name="raw JSON token",
     )
     raw_end = raw_offset + raw_length
-    if raw_length <= 0 or raw_end > len(decoded_record):
+    if raw_end > len(decoded_record):
         raise RuntimeError("strict V3 source witness raw JSON token is invalid")
     linked_length, linked_offset = read_u32(
         decoded_record,
@@ -163,7 +163,7 @@ def _verified_raw_evidence(
     metadata_end: int,
     record_metadata: Mapping[str, Any],
     *,
-    linked_provider_by_sha256: Mapping[str, bytes] | None = None,
+    evidence_by_sha256: Mapping[str, bytes] | None = None,
 ) -> tuple[bytes, bytes | None, str, str | None]:
     raw_json, linked_provider_json = _framed_raw_tokens(
         decoded_record,
@@ -173,6 +173,8 @@ def _verified_raw_evidence(
         record_metadata.get("raw_sha256"),
         field_name="raw record digest",
     )
+    if not raw_json and evidence_by_sha256 is not None:
+        raw_json = evidence_by_sha256.get(raw_sha256, b"")
     if hashlib.sha256(raw_json).hexdigest() != raw_sha256:
         raise RuntimeError("strict V3 source witness raw token digest is invalid")
     linked_provider_sha256 = record_metadata.get("linked_provider_sha256")
@@ -184,9 +186,9 @@ def _verified_raw_evidence(
     if (
         linked_provider_json is None
         and linked_provider_sha256 is not None
-        and linked_provider_by_sha256 is not None
+        and evidence_by_sha256 is not None
     ):
-        linked_provider_json = linked_provider_by_sha256.get(
+        linked_provider_json = evidence_by_sha256.get(
             linked_provider_sha256
         )
     if (linked_provider_json is None) != (linked_provider_sha256 is None):
@@ -238,7 +240,7 @@ def _decode_record(
     compressed_record: bytes,
     raw_source_sha256: str,
     *,
-    linked_provider_by_sha256: Mapping[str, bytes] | None,
+    evidence_by_sha256: Mapping[str, bytes] | None,
 ) -> SourceWitnessRecord:
     decoded_record, record_metadata, metadata_end = _decoded_record_metadata(
         compressed_record
@@ -253,7 +255,7 @@ def _decode_record(
         decoded_record,
         metadata_end,
         record_metadata,
-        linked_provider_by_sha256=linked_provider_by_sha256,
+        evidence_by_sha256=evidence_by_sha256,
     )
     _validate_record_shape(
         witness_kind=record_fields.witness_kind,
@@ -286,7 +288,7 @@ def decode_record(
     return _decode_record(
         compressed_record,
         raw_source_sha256,
-        linked_provider_by_sha256=None,
+        evidence_by_sha256=None,
     )
 
 
@@ -294,48 +296,46 @@ def decode_persisted_record(
     compressed_record: bytes,
     raw_source_sha256: str,
     *,
-    linked_provider_by_sha256: Mapping[str, bytes],
+    evidence_by_sha256: Mapping[str, bytes],
 ) -> SourceWitnessRecord:
-    """Decode one persisted record backed by the authenticated provider dictionary."""
+    """Decode one persisted record backed by the authenticated evidence dictionary."""
 
     return _decode_record(
         compressed_record,
         raw_source_sha256,
-        linked_provider_by_sha256=linked_provider_by_sha256,
+        evidence_by_sha256=evidence_by_sha256,
     )
 
 
-def externalize_linked_provider_record(
+def externalize_source_evidence_record(
     compressed_record: bytes,
     raw_source_sha256: str,
-) -> tuple[bytes, str | None, bytes | None]:
-    """Remove repeated linked-provider JSON from one authenticated scanner record."""
+) -> tuple[bytes, dict[str, bytes]]:
+    """Move exact source tokens into a shared authenticated evidence dictionary."""
 
     decoded = decode_record(compressed_record, raw_source_sha256)
-    if decoded.linked_provider_json is None:
-        return compressed_record, None, None
     decoded_record, _record_metadata, metadata_end = _decoded_record_metadata(
         compressed_record
     )
-    raw_length, raw_offset = read_u32(
-        decoded_record,
-        metadata_end,
-        field_name="raw JSON token",
-    )
-    raw_end = raw_offset + raw_length
-    if raw_length <= 0 or raw_end > len(decoded_record):
-        raise RuntimeError("strict V3 source witness raw JSON token is invalid")
     externalized_record = b"".join(
         (
-            decoded_record[:raw_end],
+            decoded_record[:metadata_end],
+            U32.pack(0),
             U32.pack(0),
         )
     )
-    return (
-        zlib.compress(externalized_record, level=1),
-        decoded.linked_provider_sha256,
-        decoded.linked_provider_json,
-    )
+    evidence_by_sha256 = {decoded.raw_sha256: decoded.raw_json}
+    if decoded.linked_provider_sha256 is not None:
+        linked_provider_json = decoded.linked_provider_json
+        if linked_provider_json is None:
+            raise RuntimeError("strict V3 linked provider evidence is incomplete")
+        existing_evidence = evidence_by_sha256.setdefault(
+            decoded.linked_provider_sha256,
+            linked_provider_json,
+        )
+        if existing_evidence != linked_provider_json:
+            raise RuntimeError("strict V3 source evidence digest is inconsistent")
+    return zlib.compress(externalized_record, level=1), evidence_by_sha256
 
 
 def _validate_record_shape(
@@ -364,7 +364,7 @@ __all__ = [
     "U32",
     "decode_record",
     "decode_persisted_record",
-    "externalize_linked_provider_record",
+    "externalize_source_evidence_record",
     "nonnegative_int",
     "read_u32",
     "sha256_hex",

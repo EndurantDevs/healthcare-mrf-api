@@ -140,13 +140,13 @@ async def test_start_marks_run_failed_on_canonical_address_failure(monkeypatch):
 
 def test_normalize_stage_row_drops_missing_npi():
     source = pharmacy_license.StateSource(state_code="TX", state_name="Texas", board_url="https://example.com/tx")
-    row = {
+    row_map = {
         "License Number": "TX-1234",
         "License Status": "Active",
     }
 
     payload, reason = pharmacy_license._normalize_stage_row(
-        row,
+        row_map,
         run_id="run_1",
         snapshot_id="snap_1",
         state_source=source,
@@ -164,7 +164,7 @@ def test_normalize_stage_row_maps_interesting_fields():
         state_name="Texas",
         board_url="https://example.com/tx",
     )
-    license_fields = {
+    license_field_map = {
         "NPI": "1518379601",
         "License Number": "TX-PH-00001",
         "License Type": "Pharmacy",
@@ -183,7 +183,7 @@ def test_normalize_stage_row_maps_interesting_fields():
     }
 
     stage_payload, reason = pharmacy_license._normalize_stage_row(
-        license_fields,
+        license_field_map,
         run_id="run_1",
         snapshot_id="snap_1",
         state_source=state_source,
@@ -267,7 +267,7 @@ def test_normalize_stage_row_uses_npi_resolver_when_npi_missing():
     resolver = pharmacy_license.StateNpiResolver(state_code="IN")
     resolver.by_license = {"60002818A": 1518379601}
     source = pharmacy_license.StateSource(state_code="IN", state_name="Indiana", board_url="https://example.com")
-    row = {
+    row_map = {
         "Name": "2200 PHARMACY INC",
         "License #": "60002818A",
         "License Type": "Pharmacy",
@@ -279,7 +279,7 @@ def test_normalize_stage_row_uses_npi_resolver_when_npi_missing():
     }
 
     payload, reason = pharmacy_license._normalize_stage_row(
-        row,
+        row_map,
         run_id="run_1",
         snapshot_id="snap_1",
         state_source=source,
@@ -297,7 +297,7 @@ def test_normalize_stage_row_uses_other_identifier_resolver_when_npi_missing():
     resolver = pharmacy_license.StateNpiResolver(state_code="MA")
     resolver.by_other_identifier = {"MAPH00123": 1518379602}
     source = pharmacy_license.StateSource(state_code="MA", state_name="Massachusetts", board_url="https://example.com")
-    row = {
+    row_map = {
         "License Number": "MA-PH-00123",
         "License Type": "Pharmacy",
         "License Status": "Active",
@@ -308,7 +308,7 @@ def test_normalize_stage_row_uses_other_identifier_resolver_when_npi_missing():
     }
 
     payload, reason = pharmacy_license._normalize_stage_row(
-        row,
+        row_map,
         run_id="run_1",
         snapshot_id="snap_1",
         state_source=source,
@@ -327,7 +327,7 @@ def test_normalize_stage_row_uses_other_identifier_digits_resolver_when_needed()
     resolver = pharmacy_license.StateNpiResolver(state_code="MA")
     resolver.by_other_identifier_digits = {"1200345": 1518379603}
     source = pharmacy_license.StateSource(state_code="MA", state_name="Massachusetts", board_url="https://example.com")
-    row = {
+    row_map = {
         "License Number": "12-00345",
         "License Type": "Pharmacy",
         "License Status": "Active",
@@ -338,7 +338,7 @@ def test_normalize_stage_row_uses_other_identifier_digits_resolver_when_needed()
     }
 
     payload, reason = pharmacy_license._normalize_stage_row(
-        row,
+        row_map,
         run_id="run_1",
         snapshot_id="snap_1",
         state_source=source,
@@ -451,7 +451,7 @@ def test_to_date_supports_us_date_formats():
 
 
 def test_map_tx_csv_row_maps_key_fields():
-    row = {
+    row_map = {
         "LIC_NBR": "33377",
         "ENTITY_NBR": "1102384",
         "PHARMACY_NAME": "AVITA PHARMACY 1034",
@@ -469,7 +469,7 @@ def test_map_tx_csv_row_maps_key_fields():
         "CLASS": "Community Pharmacy",
     }
 
-    mapped = pharmacy_license._map_tx_csv_row(row)
+    mapped = pharmacy_license._map_tx_csv_row(row_map)
 
     assert mapped["License Number"] == "33377"
     assert mapped["Entity Name"] == "AVITA PHARMACY 1034"
@@ -479,7 +479,7 @@ def test_map_tx_csv_row_maps_key_fields():
 
 
 def test_map_fl_csv_row_maps_key_fields():
-    row = {
+    row_map = {
         "License Number": "PH4",
         " Profession ": "Pharmacy",
         " Org Name": "LANIER PHARMACY, INC",
@@ -489,7 +489,7 @@ def test_map_fl_csv_row_maps_key_fields():
         " License Status": "Closed",
     }
 
-    mapped = pharmacy_license._map_fl_csv_row(row)
+    mapped = pharmacy_license._map_fl_csv_row(row_map)
 
     assert mapped["License Number"] == "PH4"
     assert mapped["Entity Name"] == "LANIER PHARMACY, INC"
@@ -500,7 +500,7 @@ def test_map_fl_csv_row_maps_key_fields():
 
 
 def test_map_co_socrata_row_maps_license_fields():
-    row = {
+    row_map = {
         "licensetype": "PDO",
         "lastname": "",
         "firstname": "",
@@ -515,7 +515,7 @@ def test_map_co_socrata_row_maps_license_fields():
         "licenselastreneweddate": "2024-10-31T00:00:00.000",
     }
 
-    mapped = pharmacy_license._map_co_socrata_row(row)
+    mapped = pharmacy_license._map_co_socrata_row(row_map)
 
     assert mapped["License Number"] == "1680000102"
     assert mapped["License Type"] == "PDO"
@@ -524,7 +524,7 @@ def test_map_co_socrata_row_maps_license_fields():
 
 
 def test_map_wa_socrata_row_maps_license_fields():
-    row = {
+    row_map = {
         "credentialnumber": "VA1234567",
         "lastname": "Pharmacy",
         "firstname": "Sample",
@@ -537,7 +537,7 @@ def test_map_wa_socrata_row_maps_license_fields():
         "actiontaken": "No",
     }
 
-    mapped = pharmacy_license._map_wa_socrata_row(row)
+    mapped = pharmacy_license._map_wa_socrata_row(row_map)
 
     assert mapped["License Number"] == "VA1234567"
     assert mapped["Entity Name"] == "Sample WA Pharmacy"
@@ -546,7 +546,7 @@ def test_map_wa_socrata_row_maps_license_fields():
 
 
 def test_map_ny_rosa_row_maps_address_and_discipline():
-    row = {
+    row_map = {
         "registrationNumber": "000001",
         "type": {"value": "Pharmacy", "label": "Type"},
         "legalName": {"value": "J. LEON LASCOFF & SON INC.", "label": "Legal Name"},
@@ -559,7 +559,7 @@ def test_map_ny_rosa_row_maps_address_and_discipline():
         "enforcementActions": [{"action": {"value": "Consent order"}}],
     }
 
-    mapped = pharmacy_license._map_ny_rosa_row(row)
+    mapped = pharmacy_license._map_ny_rosa_row(row_map)
 
     assert mapped["License Number"] == "000001"
     assert mapped["Entity Name"] == "J. LEON LASCOFF & SON INC."

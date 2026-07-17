@@ -56,7 +56,7 @@ def _read_header(witness_payload: bytes) -> tuple[dict[str, Any], int]:
 def _validate_header_contract(header: Mapping[str, Any]) -> None:
     required_value_by_field = {
         "contract": PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
-        "format_version": 4,
+        "format_version": 5,
         "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
         "unqueryable_rate_policy": PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
@@ -93,20 +93,18 @@ def _validate_header_scope(
     )
     if emitted_rate_rows <= 0 or unqueryable_rate_rows > emitted_rate_rows:
         raise RuntimeError("strict V3 persisted source witness rate policy is invalid")
-    dictionary_count = nonnegative_int(
+    evidence_count = nonnegative_int(
         header,
-        "linked_provider_dictionary_count",
-        error_field_name="linked provider dictionary count",
+        "evidence_dictionary_count",
+        error_field_name="evidence dictionary count",
     )
     record_count = nonnegative_int(
         header,
         "record_count",
         error_field_name="record count",
     )
-    if dictionary_count > record_count:
-        raise RuntimeError(
-            "strict V3 persisted source witness dictionary count is invalid"
-        )
+    if evidence_count > record_count * 2:
+        raise RuntimeError("strict V3 persisted source witness dictionary count is invalid")
 
 
 def _persisted_header(
@@ -120,49 +118,49 @@ def _persisted_header(
     _validate_header_contract(header)
     _validate_header_scope(header, expected_sources)
     for field_name in (
-        "linked_provider_dictionary_raw_bytes",
-        "linked_provider_dictionary_stored_bytes",
+        "evidence_dictionary_raw_bytes",
+        "evidence_dictionary_stored_bytes",
     ):
         nonnegative_int(header, field_name, error_field_name=field_name.replace("_", " "))
     return header, header_end
 
 
-def _decompress_linked_provider(compressed_provider: bytes) -> bytes:
+def _decompress_evidence(compressed_evidence: bytes) -> bytes:
     decompressor = zlib.decompressobj()
     try:
-        raw_provider = decompressor.decompress(
-            compressed_provider,
+        raw_json = decompressor.decompress(
+            compressed_evidence,
             PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES + 1,
         )
         if (
-            len(raw_provider) > PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES
+            len(raw_json) > PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES
             or decompressor.unconsumed_tail
         ):
             raise RuntimeError(
-                "strict V3 linked provider dictionary entry exceeds its decode budget"
+                "strict V3 evidence dictionary entry exceeds its decode budget"
             )
-        raw_provider += decompressor.flush(
+        raw_json += decompressor.flush(
             PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES
-            - len(raw_provider)
+            - len(raw_json)
             + 1
         )
     except zlib.error as exc:
         raise RuntimeError(
-            "strict V3 linked provider dictionary entry has invalid zlib framing"
+            "strict V3 evidence dictionary entry has invalid zlib framing"
         ) from exc
     if (
-        len(raw_provider) > PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES
+        len(raw_json) > PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES
         or decompressor.unconsumed_tail
         or not decompressor.eof
         or decompressor.unused_data
     ):
         raise RuntimeError(
-            "strict V3 linked provider dictionary entry violates its zlib framing"
+            "strict V3 evidence dictionary entry violates its zlib framing"
         )
-    return raw_provider
+    return raw_json
 
 
-def _read_dictionary_entry(
+def _read_evidence_entry(
     witness_payload: bytes,
     dictionary_offset: int,
     previous_sha256: str,
@@ -170,42 +168,40 @@ def _read_dictionary_entry(
     digest_end = dictionary_offset + 32
     if digest_end > len(witness_payload):
         raise RuntimeError(
-            "strict V3 linked provider dictionary digest is truncated"
+            "strict V3 evidence dictionary digest is truncated"
         )
-    linked_provider_sha256 = witness_payload[dictionary_offset:digest_end].hex()
-    if linked_provider_sha256 <= previous_sha256:
-        raise RuntimeError("strict V3 linked provider dictionary order is invalid")
-    provider_length, compressed_offset = read_u32(
+    evidence_sha256 = witness_payload[dictionary_offset:digest_end].hex()
+    if evidence_sha256 <= previous_sha256:
+        raise RuntimeError("strict V3 evidence dictionary order is invalid")
+    evidence_length, compressed_offset = read_u32(
         witness_payload,
         digest_end,
-        field_name="linked provider dictionary record",
+        field_name="evidence dictionary record",
     )
-    compressed_end = compressed_offset + provider_length
+    compressed_end = compressed_offset + evidence_length
     if (
-        provider_length <= 0
-        or provider_length > PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES
+        evidence_length <= 0
+        or evidence_length > PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES
         or compressed_end > len(witness_payload)
     ):
-        raise RuntimeError("strict V3 linked provider dictionary record is invalid")
-    raw_provider_json = _decompress_linked_provider(
+        raise RuntimeError("strict V3 evidence dictionary record is invalid")
+    raw_json = _decompress_evidence(
         witness_payload[compressed_offset:compressed_end]
     )
-    if hashlib.sha256(raw_provider_json).hexdigest() != linked_provider_sha256:
-        raise RuntimeError("strict V3 linked provider dictionary digest is invalid")
+    if hashlib.sha256(raw_json).hexdigest() != evidence_sha256:
+        raise RuntimeError("strict V3 evidence dictionary digest is invalid")
     try:
-        provider_object = json.loads(raw_provider_json)
+        evidence_object = json.loads(raw_json)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(
-            "strict V3 linked provider dictionary JSON is invalid"
+            "strict V3 evidence dictionary JSON is invalid"
         ) from exc
-    if not isinstance(provider_object, dict):
-        raise RuntimeError(
-            "strict V3 linked provider dictionary JSON must be an object"
-        )
-    return linked_provider_sha256, raw_provider_json, compressed_end, provider_length
+    if not isinstance(evidence_object, dict):
+        raise RuntimeError("strict V3 evidence dictionary JSON must be an object")
+    return evidence_sha256, raw_json, compressed_end, evidence_length
 
 
-def _validate_dictionary_metrics(
+def _validate_evidence_dictionary_metrics(
     header: Mapping[str, Any],
     *,
     raw_byte_count: int,
@@ -213,63 +209,64 @@ def _validate_dictionary_metrics(
 ) -> None:
     expected_raw_bytes = nonnegative_int(
         header,
-        "linked_provider_dictionary_raw_bytes",
-        error_field_name="linked provider dictionary raw bytes",
+        "evidence_dictionary_raw_bytes",
+        error_field_name="evidence dictionary raw bytes",
     )
     expected_stored_bytes = nonnegative_int(
         header,
-        "linked_provider_dictionary_stored_bytes",
-        error_field_name="linked provider dictionary stored bytes",
+        "evidence_dictionary_stored_bytes",
+        error_field_name="evidence dictionary stored bytes",
     )
     if raw_byte_count != expected_raw_bytes or stored_byte_count != expected_stored_bytes:
         raise RuntimeError(
-            "strict V3 linked provider dictionary byte counts do not match"
+            "strict V3 evidence dictionary byte counts do not match"
         )
 
 
-def _decode_linked_provider_dictionary(
+def _decode_evidence_dictionary(
     witness_payload: bytes,
     *,
     dictionary_offset: int,
     header: Mapping[str, Any],
 ) -> tuple[dict[str, bytes], int]:
-    """Decode and authenticate the shared linked-provider dictionary."""
+    """Decode and authenticate the shared exact source-evidence dictionary."""
 
     dictionary_count, dictionary_offset = read_u32(
         witness_payload,
         dictionary_offset,
-        field_name="linked provider dictionary count",
+        field_name="evidence dictionary count",
     )
     expected_count = nonnegative_int(
         header,
-        "linked_provider_dictionary_count",
-        error_field_name="linked provider dictionary count",
+        "evidence_dictionary_count",
+        error_field_name="evidence dictionary count",
     )
-    if dictionary_count != expected_count or dictionary_count > PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET:
-        raise RuntimeError(
-            "strict V3 linked provider dictionary count does not match"
-        )
-    linked_provider_by_sha256: dict[str, bytes] = {}
+    if (
+        dictionary_count != expected_count
+        or dictionary_count > PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET * 2
+    ):
+        raise RuntimeError("strict V3 evidence dictionary count does not match")
+    evidence_by_sha256: dict[str, bytes] = {}
     raw_byte_count = stored_byte_count = 0
     previous_sha256 = ""
     for _dictionary_index in range(dictionary_count):
-        linked_sha256, raw_json, dictionary_offset, stored_bytes = (
-            _read_dictionary_entry(
+        evidence_sha256, raw_json, dictionary_offset, stored_bytes = (
+            _read_evidence_entry(
                 witness_payload,
                 dictionary_offset,
                 previous_sha256,
             )
         )
-        linked_provider_by_sha256[linked_sha256] = raw_json
+        evidence_by_sha256[evidence_sha256] = raw_json
         raw_byte_count += len(raw_json)
         stored_byte_count += stored_bytes
-        previous_sha256 = linked_sha256
-    _validate_dictionary_metrics(
+        previous_sha256 = evidence_sha256
+    _validate_evidence_dictionary_metrics(
         header,
         raw_byte_count=raw_byte_count,
         stored_byte_count=stored_byte_count,
     )
-    return linked_provider_by_sha256, dictionary_offset
+    return evidence_by_sha256, dictionary_offset
 
 
 def _read_persisted_record(
@@ -277,7 +274,7 @@ def _read_persisted_record(
     *,
     record_offset: int,
     expected_sources: set[str],
-    linked_provider_by_sha256: Mapping[str, bytes],
+    evidence_by_sha256: Mapping[str, bytes],
 ) -> tuple[SourceWitnessRecord, bytes, str, int]:
     source_end = record_offset + 32
     if source_end > len(witness_payload):
@@ -301,7 +298,7 @@ def _read_persisted_record(
     witness_record = decode_persisted_record(
         compressed_record,
         raw_source_sha256,
-        linked_provider_by_sha256=linked_provider_by_sha256,
+        evidence_by_sha256=evidence_by_sha256,
     )
     return witness_record, compressed_record, raw_source_sha256, compressed_end
 
@@ -311,7 +308,7 @@ def _decode_persisted_records(
     *,
     record_offset: int,
     expected_sources: set[str],
-    linked_provider_by_sha256: Mapping[str, bytes],
+    evidence_by_sha256: Mapping[str, bytes],
 ) -> tuple[list[SourceWitnessRecord], str]:
     record_count, record_offset = read_u32(
         witness_payload,
@@ -328,7 +325,7 @@ def _decode_persisted_records(
                 witness_payload,
                 record_offset=record_offset,
                 expected_sources=expected_sources,
-                linked_provider_by_sha256=linked_provider_by_sha256,
+                evidence_by_sha256=evidence_by_sha256,
             )
         )
         witness_records.append(witness_record)
@@ -336,15 +333,17 @@ def _decode_persisted_records(
         sample_hasher.update(compressed_record)
     if record_offset != len(witness_payload):
         raise RuntimeError("strict V3 persisted source witness has trailing bytes")
-    used_linked_provider_digests = {
-        witness_record.linked_provider_sha256
+    used_evidence_digests = {
+        evidence_sha256
         for witness_record in witness_records
-        if witness_record.linked_provider_sha256 is not None
-    }
-    if used_linked_provider_digests != set(linked_provider_by_sha256):
-        raise RuntimeError(
-            "strict V3 linked provider dictionary coverage is inconsistent"
+        for evidence_sha256 in (
+            witness_record.raw_sha256,
+            witness_record.linked_provider_sha256,
         )
+        if evidence_sha256 is not None
+    }
+    if used_evidence_digests != set(evidence_by_sha256):
+        raise RuntimeError("strict V3 evidence dictionary coverage is inconsistent")
     return witness_records, sample_hasher.hexdigest()
 
 
@@ -419,7 +418,7 @@ def decode_persisted_source_witness(
         payload_bytes,
         expected_sources=expected_sources,
     )
-    linked_provider_map, record_offset = _decode_linked_provider_dictionary(
+    evidence_map, record_offset = _decode_evidence_dictionary(
         payload_bytes,
         dictionary_offset=dictionary_offset,
         header=header,
@@ -428,7 +427,7 @@ def decode_persisted_source_witness(
         payload_bytes,
         record_offset=record_offset,
         expected_sources=set(expected_sources),
-        linked_provider_by_sha256=linked_provider_map,
+        evidence_by_sha256=evidence_map,
     )
     _validate_persisted_counts(header, witness_records)
     if header.get("sample_digest") != sample_digest:

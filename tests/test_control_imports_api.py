@@ -558,9 +558,9 @@ Hugetlb:         92274688 kB
 
 
 def test_normalize_run_accepts_plain_dict():
-    row = {"run_id": "run_1", "status": "queued"}
+    run_row_map = {"run_id": "run_1", "status": "queued"}
 
-    assert normalize_run(row) == row
+    assert normalize_run(run_row_map) == run_row_map
 
 
 @pytest.mark.asyncio
@@ -1478,16 +1478,16 @@ async def test_create_import_run_persists_enqueued_state(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_create_import_run_returns_active_run_after_integrity_race(monkeypatch):
-    calls = {"find": 0}
-    active = {"run_id": "run_existing", "status": "queued"}
+    lookup_count_by_kind = {"find": 0}
+    active_run_map = {"run_id": "run_existing", "status": "queued"}
 
     class FakeDb:
         async def execute(self, _statement):
             raise IntegrityError("insert", {}, Exception("duplicate"))
 
     async def fake_find(_idempotency_key):
-        calls["find"] += 1
-        return None if calls["find"] == 1 else active
+        lookup_count_by_kind["find"] += 1
+        return None if lookup_count_by_kind["find"] == 1 else active_run_map
 
     async def fake_find_importer(_importer):
         return None
@@ -1496,7 +1496,7 @@ async def test_create_import_run_returns_active_run_after_integrity_race(monkeyp
     monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find)
     monkeypatch.setattr(control_imports, "find_active_run_by_importer", fake_find_importer)
 
-    row, created = await create_import_run(
+    created_run_map, created = await create_import_run(
         {
             "run_id": "run_duplicate",
             "importer": "npi",
@@ -1505,18 +1505,22 @@ async def test_create_import_run_returns_active_run_after_integrity_race(monkeyp
     )
 
     assert created is False
-    assert row == active
+    assert created_run_map == active_run_map
 
 
 @pytest.mark.asyncio
 async def test_create_import_run_returns_active_same_importer_run(monkeypatch):
-    active = {"run_id": "run_active_npi", "status": "running", "importer": "npi"}
+    active_run_map = {
+        "run_id": "run_active_npi",
+        "status": "running",
+        "importer": "npi",
+    }
 
     async def fake_find_idem(_idempotency_key):
         return None
 
     async def fake_find_importer(_importer):
-        return active
+        return active_run_map
 
     async def fail_enqueue(_row):
         raise AssertionError("enqueue should not run when importer already has an active run")
@@ -1525,10 +1529,12 @@ async def test_create_import_run_returns_active_same_importer_run(monkeypatch):
     monkeypatch.setattr(control_imports, "find_active_run_by_importer", fake_find_importer)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
 
-    row, created = await create_import_run({"run_id": "run_duplicate_npi", "importer": "npi"})
+    created_run_map, created = await create_import_run(
+        {"run_id": "run_duplicate_npi", "importer": "npi"}
+    )
 
     assert created is False
-    assert row == active
+    assert created_run_map == active_run_map
 
 
 @pytest.mark.asyncio
@@ -1581,13 +1587,17 @@ async def test_create_import_run_allows_parallel_source_file_ptg(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_create_import_run_serializes_unsourced_ptg(monkeypatch):
-    active = {"run_id": "run_active_ptg", "status": "running", "importer": "ptg"}
+    active_run_map = {
+        "run_id": "run_active_ptg",
+        "status": "running",
+        "importer": "ptg",
+    }
 
     async def fake_find_idem(_idempotency_key):
         return None
 
     async def fake_find_importer(_importer):
-        return active
+        return active_run_map
 
     async def fail_enqueue(_row):
         raise AssertionError("enqueue should not run for unsourced PTG while PTG is active")
@@ -1596,7 +1606,7 @@ async def test_create_import_run_serializes_unsourced_ptg(monkeypatch):
     monkeypatch.setattr(control_imports, "find_active_run_by_importer", fake_find_importer)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
 
-    row, created = await create_import_run(
+    created_run_map, created = await create_import_run(
         {
             "run_id": "run_duplicate_ptg",
             "importer": "ptg",
@@ -1605,7 +1615,7 @@ async def test_create_import_run_serializes_unsourced_ptg(monkeypatch):
     )
 
     assert created is False
-    assert row == active
+    assert created_run_map == active_run_map
 
 
 def _provider_directory_acquisition_params(source_id, endpoint_scope, **overrides):
@@ -2260,7 +2270,7 @@ async def test_sync_terminal_worker_failure_persists_oom_evidence(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_request_cancel_finishes_pending_adapter_run(monkeypatch):
-    request_counts = {"get": 0}
+    request_count_by_kind = {"get": 0}
     current_run_map = {
         "run_id": "run_pending",
         "status": "queued",
@@ -2278,8 +2288,8 @@ async def test_request_cancel_finishes_pending_adapter_run(monkeypatch):
             return FakeResult()
 
     async def fake_get(_run_id):
-        request_counts["get"] += 1
-        if request_counts["get"] == 1:
+        request_count_by_kind["get"] += 1
+        if request_count_by_kind["get"] == 1:
             return current_run_map
         return {
             **current_run_map,
@@ -2304,7 +2314,7 @@ async def test_request_cancel_finishes_pending_adapter_run(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_request_cancel_finishes_queued_arq_run(monkeypatch):
-    request_counts = {"get": 0}
+    request_count_by_kind = {"get": 0}
     current_run_map = {
         "run_id": "run_queued",
         "status": "queued",
@@ -2322,8 +2332,8 @@ async def test_request_cancel_finishes_queued_arq_run(monkeypatch):
             return FakeResult()
 
     async def fake_get(_run_id):
-        request_counts["get"] += 1
-        if request_counts["get"] == 1:
+        request_count_by_kind["get"] += 1
+        if request_count_by_kind["get"] == 1:
             return current_run_map
         return {
             **current_run_map,
@@ -2356,7 +2366,7 @@ async def test_request_cancel_finishes_queued_arq_run(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_request_cancel_marks_running_run_canceling(monkeypatch):
-    request_counts = {"get": 0}
+    request_count_by_kind = {"get": 0}
     current_run_map = {
         "run_id": "run_running",
         "importer": "npi",
@@ -2375,8 +2385,8 @@ async def test_request_cancel_marks_running_run_canceling(monkeypatch):
             return FakeResult()
 
     async def fake_get(_run_id):
-        request_counts["get"] += 1
-        if request_counts["get"] == 1:
+        request_count_by_kind["get"] += 1
+        if request_count_by_kind["get"] == 1:
             return current_run_map
         return {
             **current_run_map,
@@ -2575,7 +2585,7 @@ async def test_control_ptg_source_snapshot_attest_endpoint(monkeypatch):
         }
 
     monkeypatch.setattr(control, "record_candidate_audit_attestation", fake_attest)
-    report = {"schema_version": 2, "status": "pass"}
+    audit_report_map = {"schema_version": 2, "status": "pass"}
     response = await control.control_ptg_source_snapshot_attest(
         authed_request(
             json={
@@ -2583,7 +2593,7 @@ async def test_control_ptg_source_snapshot_attest_endpoint(monkeypatch):
                 "source_key": "source_a",
                 "plan_id": "12-3456789",
                 "plan_market_type": "group",
-                "report": report,
+                "report": audit_report_map,
             }
         )
     )
@@ -2597,7 +2607,7 @@ async def test_control_ptg_source_snapshot_attest_endpoint(monkeypatch):
             "source_key": "source_a",
             "plan_id": "12-3456789",
             "plan_market_type": "group",
-            "report": report,
+            "report": audit_report_map,
         }
     ]
 
