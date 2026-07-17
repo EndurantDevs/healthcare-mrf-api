@@ -254,7 +254,7 @@ async def _discover_forward_shard_keys(
     if not normalized_code_keys:
         return {}
     schema = _quote_ident(schema_name)
-    result = await session.execute(
+    shard_query_result = await session.execute(
         text(
             f"""
             WITH requested_code(code_key) AS (
@@ -291,10 +291,10 @@ async def _discover_forward_shard_keys(
         code_key: [] for code_key in normalized_code_keys
     }
     observed_pairs: set[tuple[int, int]] = set()
-    for raw_row in result:
-        row = _row_mapping(raw_row)
-        code_key = int(row.get("code_key"))
-        block_key = int(row.get("block_key"))
+    for raw_row in shard_query_result:
+        shard_row = _row_mapping(raw_row)
+        code_key = int(shard_row.get("code_key"))
+        block_key = int(shard_row.get("block_key"))
         if code_key not in requested_code_set:
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 shard discovery returned an unexpected code key"
@@ -1434,7 +1434,7 @@ async def lookup_serving_binary_by_code_prefix_from_db(
         options,
         decoded_keys,
     )
-    rows = _materialize_forward_rows(
+    response_rows = _materialize_forward_rows(
         normalized_code_key,
         decoded_keys,
         provider_counts_by_key,
@@ -1455,7 +1455,7 @@ async def lookup_serving_binary_by_code_prefix_from_db(
 
     # provider_count is functionally dependent on provider_set_key, so adding it
     # here cannot change which occurrences crossed the bounded heap boundary.
-    return tuple(sorted(rows, key=_row_rank))
+    return tuple(sorted(response_rows, key=_row_rank))
 
 
 async def lookup_price_ids_from_db(
@@ -1498,7 +1498,7 @@ async def has_serving_binary_code_block(
         normalized_code_key
     )
     schema = _quote_ident(schema_name)
-    result = await session.execute(
+    block_exists_result = await session.execute(
         text(
             f"""
             SELECT EXISTS (
@@ -1526,7 +1526,7 @@ async def has_serving_binary_code_block(
             "upper_bound": upper_bound,
         },
     )
-    return bool(result.scalar())
+    return bool(block_exists_result.scalar())
 
 
 serving_binary_code_block_exists = has_serving_binary_code_block

@@ -3084,15 +3084,15 @@ class PTG2V3SourceAuditWitness(Base, JSONOutputMixin):
             name="ptg2_v3_source_audit_witness_provider_population_check",
         ),
         CheckConstraint(
-            "occurrence_witness_count BETWEEN 1 AND 2048",
+            "occurrence_witness_count BETWEEN 1 AND 10000",
             name="ptg2_v3_source_audit_witness_occurrence_count_check",
         ),
         CheckConstraint(
-            "provider_witness_count BETWEEN 0 AND 2048",
+            "provider_witness_count BETWEEN 0 AND 1000",
             name="ptg2_v3_source_audit_witness_provider_count_check",
         ),
         CheckConstraint(
-            "occurrence_witness_count + provider_witness_count <= 2048",
+            "occurrence_witness_count + provider_witness_count <= 11000",
             name="ptg2_v3_source_audit_witness_total_count_check",
         ),
         CheckConstraint(

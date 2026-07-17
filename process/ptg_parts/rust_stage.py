@@ -188,8 +188,8 @@ async def _create_one_rust_copy_stage_table(
     )
     serving_stage = kind == "serving_rate_compact" or kind.startswith(PTG2_SERVING_STAGE_LANE_PREFIX)
     keep_columns = None if serving_stage else set(columns) | {"created_at"}
-    for row in existing_columns:
-        column_name = row.get("column_name") if isinstance(row, dict) else getattr(row, "column_name", None)
+    for column_row in existing_columns:
+        column_name = column_row.get("column_name") if isinstance(column_row, dict) else getattr(column_row, "column_name", None)
         if keep_columns is not None and column_name and column_name not in keep_columns:
             await db.status(
                 f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} "

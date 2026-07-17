@@ -259,8 +259,8 @@ async def _scoped_plan_rows(
          WHERE {where_sql}
          ORDER BY logical_scope.plan_id
     """
-    result = await session.execute(text(sql), params)
-    return list(result.scalars().all()), sql, params
+    query_result = await session.execute(text(sql), params)
+    return list(query_result.scalars().all()), sql, params
 
 
 def test_identical_full_input_reuses_physical_identity_across_logical_plans():
@@ -383,11 +383,11 @@ async def test_postgres_cross_plan_scope_isolation_and_bound_layout_retention(mo
                     )
                 )
             ).all()
-            assert [tuple(row) for row in bindings] == [
+            assert [tuple(binding_row) for binding_row in bindings] == [
                 (SNAPSHOT_A, first.snapshot_key),
                 (SNAPSHOT_B, first.snapshot_key),
             ]
-            assert [tuple(row) for row in scopes] == [
+            assert [tuple(scope_row) for scope_row in scopes] == [
                 (SNAPSHOT_A, PLAN_A, "group", identity_a.coverage_scope_id),
                 (SNAPSHOT_B, PLAN_B, "group", identity_a.coverage_scope_id),
             ]

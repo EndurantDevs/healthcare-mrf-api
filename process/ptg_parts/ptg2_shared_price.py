@@ -301,11 +301,7 @@ async def _copy_through_price_encoder(
     metrics: dict[str, Any],
     started_at: float,
 ) -> None:
-    async with db.acquire() as source_conn, db.acquire() as target_conn:
-        source_raw = source_conn.raw_connection
-        target_raw = target_conn.raw_connection
-        source_driver = getattr(source_raw, "driver_connection", source_raw)
-        target_driver = getattr(target_raw, "driver_connection", target_raw)
+    async with db.acquire_driver() as source_driver, db.acquire_driver() as target_driver:
         copy_tasks = [
             asyncio.create_task(
                 _copy_price_query_to_encoder(
@@ -1067,9 +1063,7 @@ async def export_shared_price_key_map(
           FROM {_qualified(prepared.schema_name, prepared.price_key_map)}
          ORDER BY price_set_global_id_128
     """
-    async with db.acquire() as conn:
-        raw_conn = conn.raw_connection
-        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+    async with db.acquire_driver() as driver_conn:
         copy_from_query = getattr(driver_conn, "copy_from_query", None)
         if copy_from_query is None:
             raise NotImplementedError("active database driver does not expose COPY TO")

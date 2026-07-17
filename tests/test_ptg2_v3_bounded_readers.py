@@ -605,7 +605,7 @@ async def test_bounded_code_prefix_matches_eager_rank_and_reads_selected_refs(
             item[0] * 10,
         ),
     )[:3]
-    actual = [
+    actual_prefix_rows = [
         (
             bounded_row.provider_set_key,
             bounded_row.price_key,
@@ -614,7 +614,7 @@ async def test_bounded_code_prefix_matches_eager_rank_and_reads_selected_refs(
         for bounded_row in bounded_rows
     ]
 
-    assert actual == expected == eager_prefix
+    assert actual_prefix_rows == expected == eager_prefix
     assert {
         (provider_set_key, price_key, source_key)
         for provider_set_key, price_key, source_key in provider_counts.await_args.kwargs[
@@ -871,7 +871,7 @@ def _stored_row(
     payload: bytes,
     extra: dict | None = None,
 ):
-    row = {
+    stored_row_map = {
         "object_kind": object_kind,
         "block_key": block_key,
         "fragment_no": fragment_no,
@@ -887,8 +887,8 @@ def _stored_row(
             payload=payload,
         ),
     }
-    row.update(extra or {})
-    return row
+    stored_row_map.update(extra or {})
+    return stored_row_map
 
 
 @pytest.mark.asyncio
@@ -919,14 +919,14 @@ async def test_shared_block_stream_uses_server_side_iteration():
 @pytest.mark.asyncio
 async def test_graph_member_limit_bounds_generate_series_and_decoded_bytes():
     all_members = (3, 9, 17, 25)
-    payload = b"".join(
+    member_payload = b"".join(
         member.to_bytes(4, "little", signed=False) for member in all_members
     )
     graph_row = _stored_row(
         object_kind="graph_npi_groups_v1",
         block_key=4,
         fragment_no=0,
-        payload=payload,
+        payload=member_payload,
         extra={
             "owner_key": 1234567890,
             "first_chunk": 4,

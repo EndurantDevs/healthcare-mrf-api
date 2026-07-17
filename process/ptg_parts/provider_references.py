@@ -47,7 +47,7 @@ async def _load_provider_references_from_file(
     log_cls,
     source_url: str,
 ) -> None:
-    rows: list[dict[str, Any]] = []
+    provider_rows: list[dict[str, Any]] = []
     seen_hashes: set[int] = set()
     provider_ref_batch_rows = max(_env_int(PTG2_PROVIDER_REF_BATCH_ROWS_ENV, 5000), 1)
     with open_json_artifact_stream(file_path) as afp:
@@ -67,17 +67,22 @@ async def _load_provider_references_from_file(
             provider_hash = provider_entry["__hash__"]
             if provider_hash not in seen_hashes:
                 seen_hashes.add(provider_hash)
-                rows.append(provider_row)
-            if len(rows) >= provider_ref_batch_rows:
-                await _push_objects_from_facade(_dedupe_rows_by(rows, "provider_group_hash"), provider_cls)
-                rows = []
+                provider_rows.append(provider_row)
+            if len(provider_rows) >= provider_ref_batch_rows:
+                await _push_objects_from_facade(
+                    _dedupe_rows_by(provider_rows, "provider_group_hash"),
+                    provider_cls,
+                )
+                provider_rows = []
             _provider_cache_put(provider_map, provider_group_id, [provider_entry])
             if test_mode and ref_count >= _ptg_facade().TEST_PROVIDER_GROUPS:
                 break
     if isinstance(provider_map, PTG2ProviderReferenceCache):
         provider_map.commit()
-    if rows:
-        await _push_objects_from_facade(_dedupe_rows_by(rows, "provider_group_hash"), provider_cls)
+    if provider_rows:
+        await _push_objects_from_facade(
+            _dedupe_rows_by(provider_rows, "provider_group_hash"), provider_cls
+        )
     await _ptg_facade().flush_error_log(log_cls)
     return None
 
@@ -125,7 +130,7 @@ async def _process_provider_reference_file(
     await _push_ptg2_objects_from_facade([file_row], file_cls, rewrite=True)
 
     provider_groups = provider_content.get("provider_groups") or []
-    rows: list[dict[str, Any]] = []
+    provider_rows: list[dict[str, Any]] = []
     for idx, group in enumerate(provider_groups):
         tin_info = group.get("tin") or {}
         npi_list = group.get("npi") or []
@@ -134,7 +139,7 @@ async def _process_provider_reference_file(
             group.get("provider_group_id") or group.get("provider_group_ref") or (idx + 1)
         )
         provider_hash = _provider_group_identity_hash(tin_info, normalized_npi)
-        rows.append(
+        provider_rows.append(
             {
                 "provider_group_hash": provider_hash,
                 "provider_group_ref": provider_group_ref,
@@ -154,10 +159,12 @@ async def _process_provider_reference_file(
                 "provider_group_id": provider_group_ref,
             }
         )
-        if test_mode and len(rows) >= _ptg_facade().TEST_PROVIDER_GROUPS:
+        if test_mode and len(provider_rows) >= _ptg_facade().TEST_PROVIDER_GROUPS:
             break
 
-    if rows:
-        await _push_objects_from_facade(_dedupe_rows_by(rows, "provider_group_hash"), provider_cls)
+    if provider_rows:
+        await _push_objects_from_facade(
+            _dedupe_rows_by(provider_rows, "provider_group_hash"), provider_cls
+        )
     await _ptg_facade().flush_error_log(import_log_cls)
     return provider_map

@@ -343,14 +343,14 @@ def test_only_atomic_parse_and_derive_is_public_and_direct_construction_fails():
     telemetry, summaries = derived_resources
     assert telemetry is derived_resources.telemetry
     assert summaries is derived_resources.summaries
-    constructor_field_values = {
+    constructor_field_value_map = {
         resource_field.name: getattr(telemetry, resource_field.name)
         for resource_field in fields(resources.ResourceTelemetry)
         if resource_field.name != "_validation_token"
     }
     with pytest.raises(resources.ResourceTelemetryError) as caught:
         resources.ResourceTelemetry(
-            _validation_token=object(), **constructor_field_values
+            _validation_token=object(), **constructor_field_value_map
         )
     assert (caught.value.code, caught.value.field) == (
         "unvalidated_telemetry",

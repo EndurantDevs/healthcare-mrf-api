@@ -351,6 +351,40 @@ async def test_connection_proxy_helpers(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_acquire_driver_avoids_managed_transaction_and_invalidates_on_error():
+    driver_connection = SimpleNamespace()
+
+    class FakeConnection:
+        def __init__(self):
+            self.invalidated = False
+
+        async def get_raw_connection(self):
+            return SimpleNamespace(driver_connection=driver_connection)
+
+        async def invalidate(self):
+            self.invalidated = True
+
+    connection = FakeConnection()
+
+    class ConnectContext:
+        async def __aenter__(self):
+            return connection
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    engine = SimpleNamespace(connect=lambda: ConnectContext())
+    database = Database(engine=engine)
+
+    with pytest.raises(RuntimeError, match="copy failed"):
+        async with database.acquire_driver() as acquired:
+            assert acquired is driver_connection
+            raise RuntimeError("copy failed")
+
+    assert connection.invalidated
+
+
+@pytest.mark.asyncio
 async def test_create_table_and_execute_ddl(monkeypatch):
     table = Table("things", MetaData(), Column("id", Integer))
 
