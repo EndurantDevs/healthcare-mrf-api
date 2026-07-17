@@ -614,9 +614,9 @@ async def _release_layouts_ready(
         layout_keys=list(layout_keys or ()),
     )
     layout_keys = [
-        int(_row_mapping(row).get("snapshot_key"))
-        for row in locked_rows
-        if _row_mapping(row).get("snapshot_key") is not None
+        int(_row_mapping(locked_layout_row).get("snapshot_key"))
+        for locked_layout_row in locked_rows
+        if _row_mapping(locked_layout_row).get("snapshot_key") is not None
     ]
     if not layout_keys:
         return PTG2SharedLayoutGCStats()
@@ -822,11 +822,11 @@ async def _sweep_ready(
         max_rows=max_rows,
     )
     deleted_bytes_by_hash = {
-        bytes(_row_mapping(row).get("block_hash") or b""): int(
-            _row_mapping(row).get("stored_byte_count") or 0
+        bytes(_row_mapping(deleted_block_row).get("block_hash") or b""): int(
+            _row_mapping(deleted_block_row).get("stored_byte_count") or 0
         )
-        for row in deleted_rows
-        if _row_mapping(row).get("block_hash")
+        for deleted_block_row in deleted_rows
+        if _row_mapping(deleted_block_row).get("block_hash")
     }
     deleted_hashes = tuple(
         block_hash

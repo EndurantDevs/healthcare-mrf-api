@@ -189,15 +189,15 @@ async def store_ptg2_artifact_file_in_db(
     """Store an artifact file in PostgreSQL chunks and return manifest metadata."""
 
     artifact_path = Path(path)
-    entry = dict(metadata or {})
-    entry.setdefault("name", name or artifact_kind)
-    entry.setdefault("path", str(artifact_path))
+    artifact_entry_map = dict(metadata or {})
+    artifact_entry_map.setdefault("name", name or artifact_kind)
+    artifact_entry_map.setdefault("path", str(artifact_path))
     if not artifact_path.exists() or artifact_path.stat().st_size <= 0:
-        return entry
+        return artifact_entry_map
 
     artifact_sha, byte_count = sha256_file(artifact_path)
-    expected_sha = str(entry.get("sha256") or artifact_sha)
-    expected_byte_count = int(entry.get("byte_count") or byte_count)
+    expected_sha = str(artifact_entry_map.get("sha256") or artifact_sha)
+    expected_byte_count = int(artifact_entry_map.get("byte_count") or byte_count)
     if expected_sha != artifact_sha:
         raise ValueError(f"artifact checksum changed before PostgreSQL upload: {artifact_path}")
     if expected_byte_count != byte_count:
@@ -206,11 +206,11 @@ async def store_ptg2_artifact_file_in_db(
     if retain_local_cache is None:
         retain_local_cache = ptg2_artifact_db_retain_local_cache()
     if not retain_local_cache:
-        entry.pop("path", None)
-        entry.pop("cache_path", None)
+        artifact_entry_map.pop("path", None)
+        artifact_entry_map.pop("cache_path", None)
 
     schema = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    artifact_name = str(entry.get("name") or name or artifact_kind)
+    artifact_name = str(artifact_entry_map.get("name") or name or artifact_kind)
     artifact_id = _artifact_id_for(
         snapshot_id=snapshot_id,
         artifact_kind=artifact_kind,
@@ -218,7 +218,7 @@ async def store_ptg2_artifact_file_in_db(
         sha256=artifact_sha,
         byte_count=byte_count,
     )
-    requested_chunk_bytes = entry.get("chunk_bytes")
+    requested_chunk_bytes = artifact_entry_map.get("chunk_bytes")
     chunk_size = (
         _artifact_db_chunk_bytes()
         if requested_chunk_bytes is None
@@ -229,8 +229,8 @@ async def store_ptg2_artifact_file_in_db(
     storage_uri = ptg2_db_artifact_uri(artifact_id)
     qualified_chunks = f"{_quote_ident(schema)}.ptg2_artifact_blob_chunk"
     qualified_manifest = f"{_quote_ident(schema)}.ptg2_artifact_manifest"
-    payload_metadata = {
-        **entry,
+    artifact_blob_metadata_map = {
+        **artifact_entry_map,
         "storage": "postgresql_chunks_v1",
         "storage_uri": storage_uri,
         "chunk_bytes": chunk_size,
@@ -247,7 +247,11 @@ async def store_ptg2_artifact_file_in_db(
         chunk_no = 0
         with artifact_path.open("rb") as fp:
             for raw_chunk in iter(lambda: fp.read(chunk_size), b""):
-                payload = zlib.compress(raw_chunk, compression_level) if compression == "zlib" else raw_chunk
+                stored_chunk_bytes = (
+                    zlib.compress(raw_chunk, compression_level)
+                    if compression == "zlib"
+                    else raw_chunk
+                )
                 await session.execute(
                     text(
                         f"""
@@ -261,9 +265,9 @@ async def store_ptg2_artifact_file_in_db(
                         "artifact_id": artifact_id,
                         "chunk_no": chunk_no,
                         "compression": compression,
-                        "payload": payload,
+                        "payload": stored_chunk_bytes,
                         "raw_byte_count": len(raw_chunk),
-                        "byte_count": len(payload),
+                        "byte_count": len(stored_chunk_bytes),
                         "created_at": _utcnow(),
                     },
                 )
@@ -295,12 +299,12 @@ async def store_ptg2_artifact_file_in_db(
                 "storage_uri": storage_uri,
                 "sha256": artifact_sha,
                 "byte_count": byte_count,
-                "payload": _json_param(payload_metadata),
+                "payload": _json_param(artifact_blob_metadata_map),
                 "created_at": _utcnow(),
             },
         )
 
-    entry.update(
+    artifact_entry_map.update(
         {
             "artifact_id": artifact_id,
             "storage": "postgresql_chunks_v1",
@@ -313,7 +317,7 @@ async def store_ptg2_artifact_file_in_db(
     )
     if not retain_local_cache:
         artifact_path.unlink(missing_ok=True)
-    return entry
+    return artifact_entry_map
 
 
 def _artifact_cache_root() -> Path:
@@ -377,7 +381,7 @@ async def materialize_ptg2_artifact_from_db(
     chunk_count = 0
     try:
         with tmp_path.open("wb") as out:
-            result = await session.stream(
+            chunk_stream = await session.stream(
                 text(
                     f"""
                     SELECT chunk_no, compression, payload, raw_byte_count
@@ -388,12 +392,16 @@ async def materialize_ptg2_artifact_from_db(
                 ),
                 {"artifact_id": artifact_id},
             )
-            async for row in result:
-                data = _row_mapping(row)
-                compression = str(data.get("compression") or "none")
-                payload = bytes(data.get("payload") or b"")
-                raw_chunk = zlib.decompress(payload) if compression == "zlib" else payload
-                expected_raw = data.get("raw_byte_count")
+            async for chunk_row in chunk_stream:
+                chunk_record_map = _row_mapping(chunk_row)
+                compression = str(chunk_record_map.get("compression") or "none")
+                stored_chunk_bytes = bytes(chunk_record_map.get("payload") or b"")
+                raw_chunk = (
+                    zlib.decompress(stored_chunk_bytes)
+                    if compression == "zlib"
+                    else stored_chunk_bytes
+                )
+                expected_raw = chunk_record_map.get("raw_byte_count")
                 if expected_raw is not None and len(raw_chunk) != int(expected_raw):
                     raise ValueError(f"artifact chunk raw byte_count mismatch for {artifact_id}:{chunk_count}")
                 out.write(raw_chunk)
@@ -425,16 +433,16 @@ async def hydrate_ptg2_artifact_entry_from_db(
     schema_name: str | None = None,
 ) -> dict[str, Any]:
     """Materialize a database-backed artifact entry into a local cache file."""
-    hydrated = dict(entry)
-    storage_uri = str(hydrated.get("storage_uri") or "").strip()
+    hydrated_entry_map = dict(entry)
+    storage_uri = str(hydrated_entry_map.get("storage_uri") or "").strip()
     if not ptg2_artifact_id_from_db_uri(storage_uri):
-        return hydrated
+        return hydrated_entry_map
     cache_path = await materialize_ptg2_artifact_from_db(
         session,
         storage_uri,
         schema_name=schema_name,
-        metadata=hydrated,
+        metadata=hydrated_entry_map,
     )
-    hydrated["path"] = str(cache_path)
-    hydrated["cache_path"] = str(cache_path)
-    return hydrated
+    hydrated_entry_map["path"] = str(cache_path)
+    hydrated_entry_map["cache_path"] = str(cache_path)
+    return hydrated_entry_map

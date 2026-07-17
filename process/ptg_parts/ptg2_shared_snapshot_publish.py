@@ -275,10 +275,10 @@ async def publish_shared_v3_snapshot_sources(
         )
         observed_plans = {
             (
-                str(_row_mapping(row).get("plan_id") or ""),
-                str(_row_mapping(row).get("plan_market_type") or ""),
+                str(_row_mapping(plan_scope_row).get("plan_id") or ""),
+                str(_row_mapping(plan_scope_row).get("plan_market_type") or ""),
             )
-            for row in observed_plan_result
+            for plan_scope_row in observed_plan_result
         }
         expected_plans = {
             (logical_plan.plan_id, logical_plan.plan_market_type)

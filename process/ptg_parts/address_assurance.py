@@ -140,15 +140,15 @@ def _source_file_version_ids_from_value(value: Any, found: set[str]) -> None:
 def source_file_version_ids_from_ptg_payload(payload: Any) -> list[str]:
     """Extract retained source-file IDs from PTG API source_trace payloads."""
 
-    found: set[str] = set()
-    _source_file_version_ids_from_value(payload, found)
-    return sorted(found)
+    source_file_version_ids: set[str] = set()
+    _source_file_version_ids_from_value(payload, source_file_version_ids)
+    return sorted(source_file_version_ids)
 
 
 def _source_file_version_ids_from_item(item: dict[str, Any]) -> list[str]:
-    found: set[str] = set()
-    _source_file_version_ids_from_value(item, found)
-    return sorted(found)
+    source_file_version_ids: set[str] = set()
+    _source_file_version_ids_from_value(item, source_file_version_ids)
+    return sorted(source_file_version_ids)
 
 
 def _network_names_from_item(item: dict[str, Any]) -> list[str]:
@@ -276,12 +276,14 @@ def _network_matches_align_with_served_network_names(
     return bool(matched_keys) and matched_keys.issubset(served_network_keys)
 
 
-def _network_match_entries_issue(value: Any, *, field_name: str, index: int | None) -> dict[str, Any] | None:
-    if value is None:
+def _network_match_entries_issue(
+    network_match_entries: Any, *, field_name: str, index: int | None
+) -> dict[str, Any] | None:
+    if network_match_entries is None:
         return None
-    if not isinstance(value, list):
+    if not isinstance(network_match_entries, list):
         return _issue(f"{field_name} must be a list when present", index=index)
-    for entry in value:
+    for entry in network_match_entries:
         if not isinstance(entry, dict):
             return _issue(
                 f"{field_name} entries must include ptg_network_name and provider_directory_network_name",
@@ -379,9 +381,9 @@ def validate_ptg_price_address_item(
     evidence_payload = evidence if isinstance(evidence, dict) else {}
     evidence_network_name_matches = evidence_payload.get("network_name_matches")
     normalized_address_sources = {
-        str(value or "").strip().lower().replace("-", "_")
-        for value in address_sources
-        if str(value or "").strip()
+        str(address_source or "").strip().lower().replace("-", "_")
+        for address_source in address_sources
+        if str(address_source or "").strip()
     } if isinstance(address_sources, list) else set()
 
     if rate_binding not in ALLOWED_RATE_BINDINGS:
@@ -540,10 +542,10 @@ def summarize_ptg_price_address_payload(
     """Summarize address assurance across a pricing payload."""
     require_network_names = require_network_names or require_network_bound_address
     require_source_file_version_id = require_source_file_version_id or require_network_bound_address
-    items = _items_from_payload(payload)
+    price_items = _items_from_payload(payload)
     issues: list[dict[str, Any]] = []
-    binding_counts: dict[str, int] = {}
-    evidence_counts: dict[str, int] = {}
+    binding_count_by_name: dict[str, int] = {}
+    evidence_count_by_level: dict[str, int] = {}
     network_name_values: set[str] = set()
     displayed_address_rows = 0
     verification_rows = 0
@@ -551,43 +553,43 @@ def summarize_ptg_price_address_payload(
     source_trace_rows = 0
     source_file_version_id_rows = 0
     network_bound_address_rows = 0
-    if not items:
+    if not price_items:
         issues.append(_issue("no PTG price rows found", index=None))
-    for index, item in enumerate(items):
-        if _usable_address(item):
+    for index, price_item in enumerate(price_items):
+        if _usable_address(price_item):
             displayed_address_rows += 1
-        network_names = _network_names_from_item(item)
+        network_names = _network_names_from_item(price_item)
         if network_names:
             network_name_rows += 1
             network_name_values.update(network_names)
-        if isinstance(item.get("source_trace"), list) and item["source_trace"]:
+        if isinstance(price_item.get("source_trace"), list) and price_item["source_trace"]:
             source_trace_rows += 1
-        if _source_file_version_ids_from_item(item):
+        if _source_file_version_ids_from_item(price_item):
             source_file_version_id_rows += 1
-        verification = item.get("address_verification")
+        verification = price_item.get("address_verification")
         if isinstance(verification, dict) and verification:
             verification_rows += 1
             if verification.get("network_bound_address") is True:
                 network_bound_address_rows += 1
             binding = str(verification.get("address_network_binding") or "missing")
             evidence = str(verification.get("address_evidence_level") or "missing")
-            binding_counts[binding] = binding_counts.get(binding, 0) + 1
-            evidence_counts[evidence] = evidence_counts.get(evidence, 0) + 1
+            binding_count_by_name[binding] = binding_count_by_name.get(binding, 0) + 1
+            evidence_count_by_level[evidence] = evidence_count_by_level.get(evidence, 0) + 1
         issues.extend(
             validate_ptg_price_address_item(
-                item,
+                price_item,
                 index=index,
                 require_displayed_address=require_displayed_address,
                 require_network_bound_address=require_network_bound_address,
             )
         )
-    if require_network_names and items and network_name_rows == 0:
+    if require_network_names and price_items and network_name_rows == 0:
         issues.append(_issue("no PTG price rows include network_names", index=None))
-    elif require_network_names and items and network_name_rows < len(items):
+    elif require_network_names and price_items and network_name_rows < len(price_items):
         missing_indexes = [
             index
-            for index, item in enumerate(items)
-            if not _network_names_from_item(item)
+            for index, price_item in enumerate(price_items)
+            if not _network_names_from_item(price_item)
         ]
         issues.append(
             _issue(
@@ -596,13 +598,17 @@ def summarize_ptg_price_address_payload(
                 index=None,
             )
         )
-    if require_source_file_version_id and items and source_file_version_id_rows == 0:
+    if require_source_file_version_id and price_items and source_file_version_id_rows == 0:
         issues.append(_issue("no PTG price rows include source_trace.source_file_version_id", index=None))
-    elif require_source_file_version_id and items and source_file_version_id_rows < len(items):
+    elif (
+        require_source_file_version_id
+        and price_items
+        and source_file_version_id_rows < len(price_items)
+    ):
         missing_indexes = [
             index
-            for index, item in enumerate(items)
-            if not _source_file_version_ids_from_item(item)
+            for index, price_item in enumerate(price_items)
+            if not _source_file_version_ids_from_item(price_item)
         ]
         issues.append(
             _issue(
@@ -613,7 +619,7 @@ def summarize_ptg_price_address_payload(
         )
     return {
         "ok": not any(issue["severity"] == "error" for issue in issues),
-        "item_count": len(items),
+        "item_count": len(price_items),
         "displayed_address_rows": displayed_address_rows,
         "address_verification_rows": verification_rows,
         "network_name_rows": network_name_rows,
@@ -621,8 +627,8 @@ def summarize_ptg_price_address_payload(
         "source_file_version_id_rows": source_file_version_id_rows,
         "network_bound_address_rows": network_bound_address_rows,
         "network_name_values": sorted(network_name_values),
-        "address_network_binding_counts": dict(sorted(binding_counts.items())),
-        "address_evidence_level_counts": dict(sorted(evidence_counts.items())),
+        "address_network_binding_counts": dict(sorted(binding_count_by_name.items())),
+        "address_evidence_level_counts": dict(sorted(evidence_count_by_level.items())),
         "issues": issues,
     }
 
