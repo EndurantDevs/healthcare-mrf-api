@@ -1375,28 +1375,23 @@ def _is_requested_toc_body_file_url(location: str, file_url_match_tokens: list[s
     return any(token in normalized_location for token in file_url_match_tokens)
 
 
-def _has_reached_toc_file_limit(jobs: list[dict[str, Any]], max_files: int | None) -> bool:
-    """Return whether TOC processing has selected enough body-file jobs."""
-    return max_files is not None and len(jobs) >= max_files
-
-
 def _include_toc_job_with_limit(
     jobs: list[dict[str, Any]],
-    jobs_by_identity: dict[tuple[str, str], dict[str, Any]],
+    selected_job_identities: set[tuple[str, str]],
     job: dict[str, Any],
     max_files: int | None,
 ) -> bool:
     """Select one physical file while retaining every matching plan scope."""
 
     identity = _ptg_job_identity(job)
-    existing_job = jobs_by_identity.get(identity)
-    if existing_job is not None:
-        _merge_ptg_job(existing_job, job)
-        return True
-    if _has_reached_toc_file_limit(jobs, max_files):
+    if (
+        identity not in selected_job_identities
+        and max_files is not None
+        and len(selected_job_identities) >= max_files
+    ):
         return False
+    selected_job_identities.add(identity)
     jobs.append(job)
-    jobs_by_identity[identity] = job
     return True
 
 
@@ -1419,7 +1414,7 @@ async def _process_table_of_contents(
     file_cls = classes["PTGFile"]
     import_log_cls = classes["ImportLog"]
     jobs: list[dict[str, Any]] = []
-    jobs_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+    selected_job_identities: set[tuple[str, str]] = set()
     file_rows: list[dict[str, Any]] = []
     allowed_job_candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
     seen_files: set[int] = set()
@@ -1556,7 +1551,7 @@ async def _process_table_of_contents(
                 continue
             if not _include_toc_job_with_limit(
                 jobs,
-                jobs_by_identity,
+                selected_job_identities,
                 job_by_field,
                 body_file_limit,
             ):
@@ -1605,7 +1600,7 @@ async def _process_table_of_contents(
             }
             if not _include_toc_job_with_limit(
                 jobs,
-                jobs_by_identity,
+                selected_job_identities,
                 job_by_field,
                 body_file_limit,
             ):
@@ -1655,7 +1650,7 @@ async def _process_table_of_contents(
     for allowed_job, file_row in allowed_job_candidates:
         if not _include_toc_job_with_limit(
             jobs,
-            jobs_by_identity,
+            selected_job_identities,
             allowed_job,
             body_file_limit,
         ):

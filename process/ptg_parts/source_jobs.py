@@ -387,11 +387,19 @@ def _plan_identity(plan: dict[str, Any]) -> str:
     return canonical_json_dumps(_canonicalize_for_json(plan))
 
 
-def _merge_ptg_job(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
+def _merge_ptg_job(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+    known_plan_identities: set[str] | None = None,
+) -> None:
     existing_plans = list(existing.get("plan_info") or [])
-    seen_plans = {
-        _plan_identity(plan) for plan in existing_plans if isinstance(plan, dict)
-    }
+    seen_plans = known_plan_identities
+    if seen_plans is None:
+        seen_plans = {
+            _plan_identity(plan)
+            for plan in existing_plans
+            if isinstance(plan, dict)
+        }
     for plan in incoming.get("plan_info") or []:
         if not isinstance(plan, dict):
             continue
@@ -412,6 +420,7 @@ def _merge_ptg_job(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
 
 def _dedupe_ptg_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
     jobs_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+    plan_identities_by_job: dict[tuple[str, str], set[str]] = {}
     duplicate_count = 0
     for job in jobs:
         identity = _ptg_job_identity(job)
@@ -424,7 +433,13 @@ def _dedupe_ptg_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
             _merge_ptg_job(
                 jobs_by_identity[identity],
                 normalized_job_by_field,
+                plan_identities_by_job[identity],
             )
             continue
         jobs_by_identity[identity] = normalized_job_by_field
+        plan_identities_by_job[identity] = {
+            _plan_identity(plan)
+            for plan in normalized_job_by_field.get("plan_info") or []
+            if isinstance(plan, dict)
+        }
     return list(jobs_by_identity.values()), duplicate_count

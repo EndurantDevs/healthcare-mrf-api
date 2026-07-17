@@ -1250,6 +1250,34 @@ def test_ptg2_dedupe_jobs_uses_canonical_url_and_merges_plans():
     assert deduped[1]["type"] == "allowed_amounts"
 
 
+def test_ptg2_job_dedupe_merges_plans_in_linear_work(monkeypatch):
+    plan_count = 250
+    shared_url = "https://files.example.test/shared-rates.json.gz"
+    source_jobs = [
+        {
+            "type": "in_network",
+            "url": shared_url,
+            "plan_info": [{"plan_id": f"PLAN-{plan_index}"}],
+        }
+        for plan_index in range(plan_count)
+    ]
+    original_dumps = ptg_source_jobs.canonical_json_dumps
+    serialized_plan_payloads = []
+
+    def tracked_dumps(plan_payload):
+        serialized_plan_payloads.append(plan_payload)
+        return original_dumps(plan_payload)
+
+    monkeypatch.setattr(ptg_source_jobs, "canonical_json_dumps", tracked_dumps)
+
+    deduped_jobs, duplicate_count = process_ptg._dedupe_ptg_jobs(source_jobs)
+
+    assert duplicate_count == plan_count - 1
+    assert len(deduped_jobs) == 1
+    assert len(deduped_jobs[0]["plan_info"]) == plan_count
+    assert len(serialized_plan_payloads) == plan_count
+
+
 
 
 def test_ptg2_rust_compact_stage_preserves_serving_parent_shape_for_inheritance(monkeypatch):
@@ -2116,9 +2144,12 @@ def test_toc_limit_merges_shared_file_plan_scopes(monkeypatch):
         )
     )
 
-    assert len(selected_jobs) == 1
-    assert selected_jobs[0]["url"] == shared_url
-    assert {plan["plan_id"] for plan in selected_jobs[0]["plan_info"]} == {
+    deduped_jobs, duplicate_count = process_ptg._dedupe_ptg_jobs(selected_jobs)
+
+    assert duplicate_count == 1
+    assert len(deduped_jobs) == 1
+    assert deduped_jobs[0]["url"] == shared_url
+    assert {plan["plan_id"] for plan in deduped_jobs[0]["plan_info"]} == {
         "PLAN-A",
         "PLAN-B",
     }
