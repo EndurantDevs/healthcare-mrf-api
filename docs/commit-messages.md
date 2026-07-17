@@ -37,6 +37,9 @@ Allowed types:
 - `chore` - narrow housekeeping when no better type fits
 - `revert` - explicit rollback
 
+Do not invent adjacent types such as `quality`; use
+`refactor(readability): ...` for readability-budget reductions.
+
 Scopes are optional. When used, keep them lowercase and domain-focused, for
 example `api`, `ptg`, `routing`, `readability`, `imports`, or `postgres`.
 
