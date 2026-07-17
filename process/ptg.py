@@ -3962,7 +3962,7 @@ async def _publish_allowed_snapshot(
     )
 
 
-def _direct_allowed_plan_info(
+def _direct_dispatch_plan_info(
     plan_ids: Sequence[str] | None,
     plan_market_types: Sequence[str] | None,
 ) -> list[dict[str, Any]]:
@@ -4413,6 +4413,12 @@ async def _main_with_artifact_lease(
                 "type": "in_network",
                 "url": in_network_url,
             }
+            direct_in_network_plans = _direct_dispatch_plan_info(
+                plan_ids,
+                plan_market_types,
+            )
+            if direct_in_network_plans:
+                direct_job_by_field["plan_info"] = direct_in_network_plans
             if source_network_name_values:
                 direct_job_by_field["source_network_names"] = source_network_name_values
             jobs.append(direct_job_by_field)
@@ -4421,7 +4427,7 @@ async def _main_with_artifact_lease(
                 "type": "allowed_amounts",
                 "url": allowed_url,
             }
-            direct_allowed_plans = _direct_allowed_plan_info(
+            direct_allowed_plans = _direct_dispatch_plan_info(
                 plan_ids,
                 plan_market_types,
             )
