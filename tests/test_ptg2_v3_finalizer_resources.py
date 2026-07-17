@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -146,6 +147,7 @@ def _finalizer_inputs(tmp_path):
                 "partition_count": 1,
                 "format": "ptg2_v3_serving_run",
                 "version": 1,
+                "sha256": hashlib.sha256(serving_path.read_bytes()).hexdigest(),
             }
         ],
         source_identity=_physical_identity(),
@@ -166,6 +168,7 @@ def _finalizer_inputs(tmp_path):
                 "bytes": 64,
                 "format": "ptg2_v3_serving_code_dictionary",
                 "version": 4,
+                "sha256": hashlib.sha256(code_path.read_bytes()).hexdigest(),
             }
         ],
         source_identity=_physical_identity(),

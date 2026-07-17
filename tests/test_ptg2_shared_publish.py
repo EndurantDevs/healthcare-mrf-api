@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -167,6 +168,7 @@ def _serving_run_entries(tmp_path):
                 "partition_count": 2,
                 "row_count": 1,
                 "bytes": PTG2_V3_SERVING_RUN_RECORD_BYTES,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
         )
     return entries
@@ -182,6 +184,7 @@ def _unannotated_file_result(tmp_path):
             "version": 4,
             "row_count": 1,
             "bytes": 64,
+            "sha256": hashlib.sha256(dictionary_path.read_bytes()).hexdigest(),
         }
     ]
     return PTG2FileProcessResult(
