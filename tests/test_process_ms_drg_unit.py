@@ -133,13 +133,13 @@ async def test_catalog_only_import_replaces_only_ms_drg_sources(monkeypatch):
     monkeypatch.setattr(ms_drg, "_merge_synonym_stage", merge_synonym)
     monkeypatch.setattr(ms_drg, "_merge_relationship_stage", merge_relationship)
 
-    result = await ms_drg.import_ms_drg(
+    import_summary = await ms_drg.import_ms_drg(
         include_relationships=False,
         manual_toc_url="https://example.test/toc.html",
         import_id="unit",
     )
 
-    assert result["relationship_rows"] == 0
+    assert import_summary["relationship_rows"] == 0
     assert calls == [
         ("catalog", (ms_drg.SOURCE_MS_DRG,)),
         ("synonym", (ms_drg.SOURCE_MS_DRG,)),

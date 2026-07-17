@@ -418,12 +418,12 @@ async def test_match_candidates_route_shapes_payload(monkeypatch):
     response = await npi_module.match_candidates(
         _request({"address_key": "11111111-1111-1111-1111-111111111111", "limit": "5"})
     )
-    payload = json.loads(response.body)
+    match_candidates_payload = json.loads(response.body)
 
-    assert payload["total"] == 1
-    assert payload["candidates"][0]["npi"] == 1234567890
-    assert payload["candidates"][0]["address_key"] == "11111111-1111-1111-1111-111111111111"
-    assert payload["meta"]["timeout_ms"] == 8000
+    assert match_candidates_payload["total"] == 1
+    assert match_candidates_payload["candidates"][0]["npi"] == 1234567890
+    assert match_candidates_payload["candidates"][0]["address_key"] == "11111111-1111-1111-1111-111111111111"
+    assert match_candidates_payload["meta"]["timeout_ms"] == 8000
 
 
 @pytest.mark.asyncio

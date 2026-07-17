@@ -699,11 +699,11 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
     timings = metrics["npi_shutdown_phase_timings"]
     openaddresses_backfill.assert_not_awaited()
     assert metrics["openaddresses_backfill_enabled"] is False
-    assert any(item["phase"] == "canonical_address_resolve" for item in timings)
-    assert not any(item["phase"] == "openaddresses_archive_backfill" for item in timings)
-    assert any(str(item["phase"]).startswith("vacuum_analyze:") for item in timings)
-    assert any(str(item["phase"]).startswith("publish_swap:") for item in timings)
-    assert all("elapsed_seconds" in item for item in timings)
+    assert any(phase_timing["phase"] == "canonical_address_resolve" for phase_timing in timings)
+    assert not any(phase_timing["phase"] == "openaddresses_archive_backfill" for phase_timing in timings)
+    assert any(str(phase_timing["phase"]).startswith("vacuum_analyze:") for phase_timing in timings)
+    assert any(str(phase_timing["phase"]).startswith("publish_swap:") for phase_timing in timings)
+    assert all("elapsed_seconds" in phase_timing for phase_timing in timings)
     assert any(event.get("phase") == "npi shutdown canonical_address_resolve" for event in progress_events)
 
 

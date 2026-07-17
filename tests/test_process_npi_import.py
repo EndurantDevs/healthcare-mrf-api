@@ -16,7 +16,7 @@ def npi_module():
 
 
 def _minimal_npi_row() -> dict[str, str]:
-    row = {
+    npi_csv_row = {
         "NPI": "1215387113",
         "Entity Type Code": "2",
         "Provider Organization Name (Legal Business Name)": "Example Org",
@@ -39,27 +39,27 @@ def _minimal_npi_row() -> dict[str, str]:
         "Last Update Date": "2024-01-15",
     }
     for idx in range(1, 16):
-        row[f"Healthcare Provider Taxonomy Code_{idx}"] = ""
-        row[f"Provider License Number_{idx}"] = ""
-        row[f"Provider License Number State Code_{idx}"] = ""
-        row[f"Healthcare Provider Primary Taxonomy Switch_{idx}"] = ""
-        row[f"Healthcare Provider Taxonomy Group_{idx}"] = ""
-    row["Healthcare Provider Taxonomy Code_1"] = "207Q00000X"
-    row["Provider License Number_1"] = "TX123"
-    row["Provider License Number State Code_1"] = "TX"
-    row["Healthcare Provider Primary Taxonomy Switch_1"] = "Y"
-    row["Healthcare Provider Taxonomy Group_1"] = "Allopathic & Osteopathic Physicians"
+        npi_csv_row[f"Healthcare Provider Taxonomy Code_{idx}"] = ""
+        npi_csv_row[f"Provider License Number_{idx}"] = ""
+        npi_csv_row[f"Provider License Number State Code_{idx}"] = ""
+        npi_csv_row[f"Healthcare Provider Primary Taxonomy Switch_{idx}"] = ""
+        npi_csv_row[f"Healthcare Provider Taxonomy Group_{idx}"] = ""
+    npi_csv_row["Healthcare Provider Taxonomy Code_1"] = "207Q00000X"
+    npi_csv_row["Provider License Number_1"] = "TX123"
+    npi_csv_row["Provider License Number State Code_1"] = "TX"
+    npi_csv_row["Healthcare Provider Primary Taxonomy Switch_1"] = "Y"
+    npi_csv_row["Healthcare Provider Taxonomy Group_1"] = "Allopathic & Osteopathic Physicians"
 
     for idx in range(1, 51):
-        row[f"Other Provider Identifier_{idx}"] = ""
-        row[f"Other Provider Identifier Type Code_{idx}"] = ""
-        row[f"Other Provider Identifier State_{idx}"] = ""
-        row[f"Other Provider Identifier Issuer_{idx}"] = ""
-    row["Other Provider Identifier_1"] = "ALT123"
-    row["Other Provider Identifier Type Code_1"] = "05"
-    row["Other Provider Identifier State_1"] = "TX"
-    row["Other Provider Identifier Issuer_1"] = "Issuer"
-    return row
+        npi_csv_row[f"Other Provider Identifier_{idx}"] = ""
+        npi_csv_row[f"Other Provider Identifier Type Code_{idx}"] = ""
+        npi_csv_row[f"Other Provider Identifier State_{idx}"] = ""
+        npi_csv_row[f"Other Provider Identifier Issuer_{idx}"] = ""
+    npi_csv_row["Other Provider Identifier_1"] = "ALT123"
+    npi_csv_row["Other Provider Identifier Type Code_1"] = "05"
+    npi_csv_row["Other Provider Identifier State_1"] = "TX"
+    npi_csv_row["Other Provider Identifier Issuer_1"] = "Issuer"
+    return npi_csv_row
 
 
 def _write_csv(path, rows: list[dict[str, str]]) -> None:
@@ -149,7 +149,11 @@ async def test_process_data_test_mode_imports_nppes_zip(monkeypatch, tmp_path, n
     assert ctx["context"]["run"] == 1
     assert ctx["context"]["test_mode"] is True
 
-    npi_payload = next(payload for payload in captured_payloads if payload.get("npi_obj_list"))
+    npi_payload = next(
+        candidate_npi_payload
+        for candidate_npi_payload in captured_payloads
+        if candidate_npi_payload.get("npi_obj_list")
+    )
     assert npi_payload["npi_obj_list"][0]["npi"] == 1215387113
     assert npi_payload["npi_taxonomy_list"][0]["healthcare_provider_taxonomy_code"] == "207Q00000X"
     assert npi_payload["npi_taxonomy_group_list"][0]["healthcare_provider_taxonomy_group"]
@@ -157,14 +161,17 @@ async def test_process_data_test_mode_imports_nppes_zip(monkeypatch, tmp_path, n
     assert {address["type"] for address in npi_payload["npi_address_list"]} == {"primary", "mail"}
 
     secondary_payload = next(
-        payload for payload in captured_payloads
-        if payload.get("npi_address_list") and payload["npi_address_list"][0]["type"] == "secondary"
+        candidate_secondary_payload
+        for candidate_secondary_payload in captured_payloads
+        if candidate_secondary_payload.get("npi_address_list")
+        and candidate_secondary_payload["npi_address_list"][0]["type"] == "secondary"
     )
     assert secondary_payload["npi_address_list"][0]["city_name"] == "AUSTIN"
 
     other_name_payload = next(
-        payload for payload in captured_payloads
-        if payload.get("npi_other_id_list")
-        and payload["npi_other_id_list"][0]["other_provider_identifier"] == "Example DBA"
+        candidate_other_name_payload
+        for candidate_other_name_payload in captured_payloads
+        if candidate_other_name_payload.get("npi_other_id_list")
+        and candidate_other_name_payload["npi_other_id_list"][0]["other_provider_identifier"] == "Example DBA"
     )
     assert other_name_payload["npi_other_id_list"][0]["other_provider_identifier_type_code"] == "3"

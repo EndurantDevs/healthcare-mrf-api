@@ -86,8 +86,8 @@ async def test_process_data_keeps_multiple_addresses_per_npi(monkeypatch, cms_do
     await cms_doctors_module.process_data(ctx, {"test_mode": True})
 
     assert len(pushed_rows) == 2
-    assert len({row["address_checksum"] for row in pushed_rows}) == 2
-    assert {row["npi"] for row in pushed_rows} == {1111111111}
+    assert len({pushed_doctor_row["address_checksum"] for pushed_doctor_row in pushed_rows}) == 2
+    assert {pushed_doctor_row["npi"] for pushed_doctor_row in pushed_rows} == {1111111111}
 
 
 @pytest.mark.asyncio

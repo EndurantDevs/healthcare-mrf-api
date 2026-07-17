@@ -105,7 +105,7 @@ async def _create_fixture_tables(database: Database, schema: str, stage_table: s
 
 async def _insert_practitioner_rows(database: Database, schema: str) -> None:
     """Insert practitioner rows used by the overlay fixture."""
-    rows = [
+    practitioner_fixture_rows = [
         (
             "source-target",
             "practitioner-good",
@@ -165,7 +165,7 @@ async def _insert_practitioner_rows(database: Database, schema: str) -> None:
             [],
         ),
     ]
-    for source_id, resource_id, npi, active, run_id, addresses, telecom in rows:
+    for source_id, resource_id, npi, active, run_id, addresses, telecom in practitioner_fixture_rows:
         await database.status(
             f"""
             INSERT INTO "{schema}"."provider_directory_practitioner" (
@@ -221,7 +221,7 @@ async def test_practitioner_address_overlay_executes_scoped_sql_in_isolated_sche
         )
 
         assert inserted == 1
-        row = await database.first(
+        overlay_stage_row = await database.first(
             f"""
             SELECT source_record_id, source_id, last_seen_run_id, resource_type,
                    resource_id, npi, address_key::text, first_line, second_line,
@@ -230,8 +230,8 @@ async def test_practitioner_address_overlay_executes_scoped_sql_in_isolated_sche
               FROM "{schema}"."{stage_table}";
             """
         )
-        assert row is not None
-        values = row._mapping
+        assert overlay_stage_row is not None
+        overlay_stage_mapping = overlay_stage_row._mapping
         expected_address_key = await database.scalar(
             f"""
             SELECT "{schema}".addr_key_v1(
@@ -239,19 +239,19 @@ async def test_practitioner_address_overlay_executes_scoped_sql_in_isolated_sche
             )::text;
             """
         )
-        assert values["source_record_id"] == (
+        assert overlay_stage_mapping["source_record_id"] == (
             "provider_directory_fhir:practitioner_address:"
             "source-target:practitioner-good:1"
         )
-        assert values["source_id"] == "source-target"
-        assert values["last_seen_run_id"] == "run-current"
-        assert values["resource_type"] == "Practitioner"
-        assert values["resource_id"] == "practitioner-good"
-        assert values["npi"] == 1234567890
-        assert values["address_key"] == expected_address_key
-        assert values["state_code"] == "TX"
-        assert values["country_code"] == "US"
-        assert values["telephone_number"] == "(312) 555-1212"
-        assert values["fax_number"] == "+1 (312) 555-0199"
-        assert values["phone_number"] == "3125551212"
-        assert values["fax_number_digits"] == "3125550199"
+        assert overlay_stage_mapping["source_id"] == "source-target"
+        assert overlay_stage_mapping["last_seen_run_id"] == "run-current"
+        assert overlay_stage_mapping["resource_type"] == "Practitioner"
+        assert overlay_stage_mapping["resource_id"] == "practitioner-good"
+        assert overlay_stage_mapping["npi"] == 1234567890
+        assert overlay_stage_mapping["address_key"] == expected_address_key
+        assert overlay_stage_mapping["state_code"] == "TX"
+        assert overlay_stage_mapping["country_code"] == "US"
+        assert overlay_stage_mapping["telephone_number"] == "(312) 555-1212"
+        assert overlay_stage_mapping["fax_number"] == "+1 (312) 555-0199"
+        assert overlay_stage_mapping["phone_number"] == "3125551212"
+        assert overlay_stage_mapping["fax_number_digits"] == "3125550199"

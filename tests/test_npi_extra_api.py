@@ -219,9 +219,9 @@ async def test_pharmacists_per_pharmacy_state_and_name(monkeypatch):
 
     request = types.SimpleNamespace(args={'state': 'ny', 'name_like': 'clinic'})
     response = await pharmacists_per_pharmacy(request)
-    payload = json.loads(response.body)
+    pharmacists_per_pharmacy_payload = json.loads(response.body)
 
-    assert payload["histogram"][0]['pharmacist_group'] == '1'
+    assert pharmacists_per_pharmacy_payload["histogram"][0]['pharmacist_group'] == '1'
     # name params now use indexed placeholders
     assert captured['params']['state'] == 'NY'
     assert any(v == '%clinic%' for k, v in captured['params'].items() if k.startswith('name_like'))

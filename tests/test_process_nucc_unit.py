@@ -60,10 +60,10 @@ async def test_process_data_extracts_records(monkeypatch, nucc_module, tmp_path)
     await nucc_module.process_data(ctx)
 
     assert push_calls
-    table, rewrite, rows = push_calls[0]
+    table, rewrite, taxonomy_rows = push_calls[0]
     assert table == "nucc_taxonomy_20260101"
     assert rewrite is False
-    assert rows[0]["code"] == "1234"
+    assert taxonomy_rows[0]["code"] == "1234"
 
 
 @pytest.mark.asyncio

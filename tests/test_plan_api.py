@@ -346,11 +346,11 @@ async def test_plan_find_plan_success():
     response_payload = json.loads(response.body)
     assert response_payload["total"] == 1
     assert response_payload["facets"]["plan_types"] == []
-    result = response_payload["results"][0]
-    assert result["price_range"] == {"min": 100.0, "max": 200.0}
-    assert result["attributes"]["Coverage"]["attr_value"] == "Standard"
-    assert result["plan_benefits"]["Primary Care Visit"]["benefit_name"] == "Primary Care Visit"
-    assert result["rate_expiration_date"] == "2025-06-04 00:00:00"
+    matched_plan = response_payload["results"][0]
+    assert matched_plan["price_range"] == {"min": 100.0, "max": 200.0}
+    assert matched_plan["attributes"]["Coverage"]["attr_value"] == "Standard"
+    assert matched_plan["plan_benefits"]["Primary Care Visit"]["benefit_name"] == "Primary Care Visit"
+    assert matched_plan["rate_expiration_date"] == "2025-06-04 00:00:00"
 
 
 def test_get_session_missing():

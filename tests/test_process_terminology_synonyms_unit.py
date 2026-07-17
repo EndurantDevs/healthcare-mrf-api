@@ -54,9 +54,9 @@ async def test_main_passes_test_mode_to_database_bootstrap(monkeypatch):
     monkeypatch.setattr(terminology_synonyms, "import_terminology_synonyms", fake_import_terminology_synonyms)
     monkeypatch.setattr(terminology_synonyms.db, "disconnect", fake_disconnect)
 
-    result = await terminology_synonyms.main(test_mode=True, import_id="smoke")
+    import_summary = await terminology_synonyms.main(test_mode=True, import_id="smoke")
 
-    assert result == {"ok": True}
+    assert import_summary == {"ok": True}
     assert calls == [
         ("init_db", None),
         ("ensure_database", True),

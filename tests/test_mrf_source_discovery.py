@@ -12029,7 +12029,7 @@ def test_kaiser_inventory_parses_tocs_rate_files_and_allowed_amounts():
         resolver=resolver,
     )
 
-    assert [target.metadata["target_file_type"] for target in in_network_targets] == [
+    assert [inventory_target.metadata["target_file_type"] for inventory_target in in_network_targets] == [
         "table-of-contents",
         "in-network",
     ]
@@ -12037,8 +12037,8 @@ def test_kaiser_inventory_parses_tocs_rate_files_and_allowed_amounts():
     assert in_network_targets[0].metadata["size_bytes"] == 26574
     assert in_network_targets[1].metadata["container_format"] == "zip"
     assert all(
-        target.metadata["kaiser_region_code"] == "hi"
-        for target in in_network_targets + allowed_targets
+        inventory_target.metadata["kaiser_region_code"] == "hi"
+        for inventory_target in in_network_targets + allowed_targets
     )
     assert allowed_targets[0].metadata["target_file_type"] == "allowed-amounts"
     assert allowed_targets[0].url.endswith("KFHP_HI-40513_allowed-amounts.zip")
@@ -12080,14 +12080,14 @@ async def test_kaiser_inventory_uses_previous_month_per_missing_category(monkeyp
         lambda: discovery.dt.datetime(2026, 7, 16, 12, 0, 0),
     )
 
-    targets = await discovery._resolve_kaiser_monthly_inventory(
+    inventory_targets = await discovery._resolve_kaiser_monthly_inventory(
         source_by_field,
         "https://healthy.kaiserpermanente.org/front-door/machine-readable",
         resolver,
         None,
     )
 
-    assert [target.metadata["inventory_month"] for target in targets] == [
+    assert [inventory_target.metadata["inventory_month"] for inventory_target in inventory_targets] == [
         "2026-07",
         "2026-06",
     ]

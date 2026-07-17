@@ -189,12 +189,12 @@ async def test_geo_states_summary_success():
         ),
     )
     response = await list_geo_states(request)
-    payload = json.loads(response.body)
-    assert payload["total_states"] == 1
-    assert payload["limit"] == 50
-    assert payload["offset"] == 0
-    assert payload["states"][0]["state"] == "AK"
-    assert payload["states"][0]["top_zips"][0]["zip_code"] == "99501"
+    geo_states_summary_payload = json.loads(response.body)
+    assert geo_states_summary_payload["total_states"] == 1
+    assert geo_states_summary_payload["limit"] == 50
+    assert geo_states_summary_payload["offset"] == 0
+    assert geo_states_summary_payload["states"][0]["state"] == "AK"
+    assert geo_states_summary_payload["states"][0]["top_zips"][0]["zip_code"] == "99501"
 
 
 @pytest.mark.asyncio
