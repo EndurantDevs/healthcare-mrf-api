@@ -201,9 +201,9 @@ def logical_plan_fields_for_job(
 
     logical_plan_fields: list[dict[str, Any]] = []
     for scope_key in sorted(plans_by_scope):
-        plan_fields = dict(_derive_plan_fields({}, plans_by_scope[scope_key]))
-        plan_fields["plan_id"] = canonical_id_by_scope[scope_key]
-        logical_plan_fields.append(plan_fields)
+        plan_field_map = dict(_derive_plan_fields({}, plans_by_scope[scope_key]))
+        plan_field_map["plan_id"] = canonical_id_by_scope[scope_key]
+        logical_plan_fields.append(plan_field_map)
     return tuple(logical_plan_fields)
 
 
@@ -214,15 +214,15 @@ def _merged_plan_fields(
     """Merge repeated metadata for one plan without conflating other plans."""
 
     values = [dict(plan_fields) for plan_fields in plan_fields_values]
-    merged = dict(_derive_plan_fields({}, values))
-    merged.update(
+    merged_field_map = dict(_derive_plan_fields({}, values))
+    merged_field_map.update(
         {
             "plan_id": scope.plan_id,
             "plan_id_type": scope.plan_id_type or None,
             "plan_market_type": scope.plan_market_type or None,
         }
     )
-    return merged
+    return merged_field_map
 
 
 def _downloaded_artifact_payload(downloaded: PTG2DownloadedJob) -> dict[str, Any]:
@@ -267,11 +267,11 @@ def shared_physical_artifact_identity(
 ) -> SharedPhysicalArtifactIdentity:
     """Derive the reusable physical identity for a validated downloaded artifact."""
 
-    payload = _downloaded_artifact_payload(downloaded)
+    artifact_metadata_map = _downloaded_artifact_payload(downloaded)
     return SharedPhysicalArtifactIdentity(
-        source_type=str(payload["source_type"]),
-        identity_kind=str(payload["identity_kind"]),
-        identity_sha256=str(payload["identity_sha256"]),
+        source_type=str(artifact_metadata_map["source_type"]),
+        identity_kind=str(artifact_metadata_map["identity_kind"]),
+        identity_sha256=str(artifact_metadata_map["identity_sha256"]),
     )
 
 
@@ -325,10 +325,12 @@ def deterministic_source_key_assignments(
 ) -> tuple[tuple[int, SharedPhysicalArtifactIdentity], ...]:
     """Deduplicate, sort, and assign contiguous source keys starting at zero."""
 
-    distinct = tuple(sorted({normalized_physical_artifact_identity(value) for value in identities}))
-    if not distinct:
+    distinct_identities = tuple(
+        sorted({normalized_physical_artifact_identity(value) for value in identities})
+    )
+    if not distinct_identities:
         raise ValueError("strict shared V3 source-key assignment requires an artifact")
-    return tuple(enumerate(distinct))
+    return tuple(enumerate(distinct_identities))
 
 
 def shared_snapshot_source_assignments(
@@ -394,9 +396,9 @@ def shared_snapshot_source_assignments(
         grouped["logical_json_sha256"].add(logical_json_sha256)
         grouped["logical_hash_deferred"].add(logical_hash_deferred)
     dense = deterministic_source_key_assignments(expected_identities)
-    expected = {identity for _source_key, identity in dense}
-    unexpected = set(provenance_by_identity) - expected
-    missing = expected - set(provenance_by_identity)
+    expected_identity_set = {identity for _source_key, identity in dense}
+    unexpected = set(provenance_by_identity) - expected_identity_set
+    missing = expected_identity_set - set(provenance_by_identity)
     if unexpected or missing:
         raise ValueError(
             "strict shared V3 logical source traces do not match the complete physical input set"
@@ -493,35 +495,38 @@ def shared_physical_input_identity(
     source_identities = tuple(
         normalized_physical_artifact_identity(artifact) for artifact in artifacts
     )
-    coverage_scope_payload = {
+    coverage_scope_payload_map = {
         "coverage_scope_version": 3,
         "artifacts": artifacts,
     }
-    coverage_scope_id = shared_semantic_fingerprint(coverage_scope_payload)
-    physical_options = {
+    coverage_scope_id = shared_semantic_fingerprint(coverage_scope_payload_map)
+    physical_option_map = {
         key: _canonicalize_for_json(options.get(key))
         for key in _PHYSICAL_OPTION_KEYS
     }
-    payload = {
+    identity_payload_map = {
         "identity_version": 6,
         "storage_generation": PTG2_V3_SHARED_GENERATION,
         "cold_lookup_contract": PTG2_V3_COLD_LOOKUP_CONTRACT,
         "price_membership_semantics": PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS,
         "serving_multiplicity_semantics": PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
         "scanner_canon_version": _canonicalize_for_json(scanner_canon_version),
-        "physical_options": physical_options,
+        "physical_options": physical_option_map,
         "coverage_scope_id": coverage_scope_id.hex(),
         "artifacts": artifacts,
     }
     return SharedInputIdentity(
-        semantic_fingerprint=shared_semantic_fingerprint(payload),
+        semantic_fingerprint=shared_semantic_fingerprint(identity_payload_map),
         coverage_scope_id=coverage_scope_id,
         logical_plans=logical_plans,
         logical_plan_fields_by_scope=logical_plan_fields,
-        payload=payload,
+        payload=identity_payload_map,
         source_identities=source_identities,
         artifact_count=len(artifacts),
-        identity_byte_count=sum(int(item["identity_byte_count"]) for item in artifacts),
+        identity_byte_count=sum(
+            int(source_artifact["identity_byte_count"])
+            for source_artifact in artifacts
+        ),
     )
 
 

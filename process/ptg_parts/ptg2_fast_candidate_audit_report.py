@@ -136,7 +136,7 @@ def _source_and_coverage_sections(
 def _request_sections(
     report_input: FastAuditReportInput,
     *,
-    p95_within_ceiling: bool,
+    is_p95_within_ceiling: bool,
 ) -> dict[str, dict[str, Any]]:
     http_metrics = report_input.http_metrics
     challenge_count = report_input.challenge_count
@@ -159,7 +159,7 @@ def _request_sections(
             "request_p95_ms": _percentile(http_metrics.latencies_ms, 0.95),
             "request_max_ms": round(max(http_metrics.latencies_ms, default=0.0), 3),
             "request_p95_ceiling_ms": PTG2_FAST_AUDIT_REQUEST_P95_CEILING_MS,
-            "request_p95_within_ceiling": p95_within_ceiling,
+            "request_p95_within_ceiling": is_p95_within_ceiling,
         },
         "random_api_requests": {
             "requested": challenge_count,
@@ -168,17 +168,11 @@ def _request_sections(
     }
 
 
-def build_fast_audit_report(report_input: FastAuditReportInput) -> dict[str, Any]:
-    """Render the complete redacted report from already validated evidence."""
-
+def _audit_report_metadata(report_input: FastAuditReportInput) -> dict[str, Any]:
     duration_seconds = (
         report_input.completed_at - report_input.started_at
     ).total_seconds()
-    request_p95_ms = _raw_percentile(report_input.http_metrics.latencies_ms, 0.95)
-    p95_within_ceiling = (
-        request_p95_ms <= PTG2_FAST_AUDIT_REQUEST_P95_CEILING_MS
-    )
-    report_by_section: dict[str, Any] = {
+    return {
         "schema_version": 3,
         "harness": {
             "name": PTG2_FAST_AUDIT_TOOL,
@@ -190,9 +184,7 @@ def build_fast_audit_report(report_input: FastAuditReportInput) -> dict[str, Any
             "event_loop": report_input.event_loop_contract,
         },
         "profile": "release",
-        "status": "pass" if p95_within_ceiling else "fail",
         "release_profile_enforced": True,
-        "release_gate_eligible": p95_within_ceiling,
         "started_at": report_input.started_at.isoformat(),
         "completed_at": report_input.completed_at.isoformat(),
         "duration_seconds": round(duration_seconds, 6),
@@ -201,14 +193,6 @@ def build_fast_audit_report(report_input: FastAuditReportInput) -> dict[str, Any
             **dict(report_input.audit_sample),
             "sample_digest_validated": True,
             "source_set_validated": True,
-        },
-        "failures": {
-            "counts": (
-                {}
-                if p95_within_ceiling
-                else {"audit_request_p95_exceeded": 1}
-            ),
-            "examples": [],
         },
         "reproducibility": {
             "selection_method": report_input.witness.metadata["selection_method"],
@@ -225,11 +209,35 @@ def build_fast_audit_report(report_input: FastAuditReportInput) -> dict[str, Any
             "network_names_from_unselected_provider_references_are_subset_checked",
         ],
     }
+
+
+def build_fast_audit_report(report_input: FastAuditReportInput) -> dict[str, Any]:
+    """Render the complete redacted report from already validated evidence."""
+
+    request_p95_ms = _raw_percentile(report_input.http_metrics.latencies_ms, 0.95)
+    is_p95_within_ceiling = (
+        request_p95_ms <= PTG2_FAST_AUDIT_REQUEST_P95_CEILING_MS
+    )
+    report_by_section = _audit_report_metadata(report_input)
+    report_by_section.update(
+        {
+            "status": "pass" if is_p95_within_ceiling else "fail",
+            "release_gate_eligible": is_p95_within_ceiling,
+            "failures": {
+                "counts": (
+                    {}
+                    if is_p95_within_ceiling
+                    else {"audit_request_p95_exceeded": 1}
+                ),
+                "examples": [],
+            },
+        }
+    )
     report_by_section.update(_source_and_coverage_sections(report_input))
     report_by_section.update(
         _request_sections(
             report_input,
-            p95_within_ceiling=p95_within_ceiling,
+            is_p95_within_ceiling=is_p95_within_ceiling,
         )
     )
     return report_by_section

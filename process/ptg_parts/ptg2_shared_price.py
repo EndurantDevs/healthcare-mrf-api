@@ -917,20 +917,22 @@ async def prepare_shared_price_artifacts(
         )
     try:
         stage_started_at = time.monotonic()
-        stage_metrics = dict(
+        stage_metrics_map = dict(
             await _normalize_strict_v3_price_atom_stage(
                 schema_name=schema_name,
                 price_atom_table=price_atom_table,
             )
         )
-        stage_metrics["normalization_seconds"] = time.monotonic() - stage_started_at
+        stage_metrics_map["normalization_seconds"] = (
+            time.monotonic() - stage_started_at
+        )
         stage_started_at = time.monotonic()
         lean_manifest = await _rewrite_ptg2_manifest_price_atom_table_lean_dict(
             schema_name=schema_name,
             price_atom_table=price_atom_table,
             price_atom_dictionary_table=price_attr_dictionary_table,
         )
-        stage_metrics["dictionary_rewrite_seconds"] = (
+        stage_metrics_map["dictionary_rewrite_seconds"] = (
             time.monotonic() - stage_started_at
         )
         if not isinstance(lean_manifest, dict):
@@ -956,7 +958,9 @@ async def prepare_shared_price_artifacts(
             )
         price_map_stats = price_map_task.result()
         atom_map_stats = atom_map_task.result()
-        stage_metrics["dense_key_build_seconds"] = time.monotonic() - stage_started_at
+        stage_metrics_map["dense_key_build_seconds"] = (
+            time.monotonic() - stage_started_at
+        )
         price_set_count = int(price_map_stats.get("row_count") or 0)
         atom_count = int(atom_map_stats.get("row_count") or 0)
         if price_set_count <= 0:
@@ -972,7 +976,7 @@ async def prepare_shared_price_artifacts(
             atom_count=atom_count,
             atom_key_bits=select_atom_key_bits(atom_count),
             lean_manifest=lean_manifest,
-            stage_metrics=stage_metrics,
+            stage_metrics=stage_metrics_map,
         )
     except BaseException:
         await db.status(

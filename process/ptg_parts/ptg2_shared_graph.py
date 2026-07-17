@@ -488,7 +488,7 @@ def _merge_runs(paths: Sequence[Path], destination: Path, record_size: int) -> i
 
 
 def _external_sorted_records(
-    records: Iterable[bytes],
+    encoded_records: Iterable[bytes],
     *,
     record_size: int,
     directory: Path,
@@ -497,22 +497,22 @@ def _external_sorted_records(
     merge_fan_in: int = 32,
 ) -> tuple[Path, int, int]:
     records_per_chunk = max(1, chunk_bytes // record_size)
-    buffered: list[bytes] = []
+    buffered_records: list[bytes] = []
     runs: list[Path] = []
     input_count = 0
-    for record in records:
-        if len(record) != record_size:
+    for encoded_record in encoded_records:
+        if len(encoded_record) != record_size:
             raise RuntimeError("external graph sorter received the wrong record width")
-        buffered.append(record)
+        buffered_records.append(encoded_record)
         input_count += 1
-        if len(buffered) >= records_per_chunk:
+        if len(buffered_records) >= records_per_chunk:
             run_path = directory / f"{prefix}.{len(runs):08d}.run"
-            _write_sorted_run(run_path, buffered)
+            _write_sorted_run(run_path, buffered_records)
             runs.append(run_path)
-            buffered = []
-    if buffered or not runs:
+            buffered_records = []
+    if buffered_records or not runs:
         run_path = directory / f"{prefix}.{len(runs):08d}.run"
-        _write_sorted_run(run_path, buffered)
+        _write_sorted_run(run_path, buffered_records)
         runs.append(run_path)
 
     pass_no = 0
@@ -690,10 +690,10 @@ class _DiskDenseMap:
         self.count = size // _DENSE_MAP_RECORD.size
         previous_global: bytes | None = None
         first_key: int | None = None
-        with path.open("rb") as source:
+        with path.open("rb") as map_input:
             for index in range(self.count):
-                record = source.read(_DENSE_MAP_RECORD.size)
-                global_id, key = _DENSE_MAP_RECORD.unpack(record)
+                packed_record = map_input.read(_DENSE_MAP_RECORD.size)
+                global_id, key = _DENSE_MAP_RECORD.unpack(packed_record)
                 if previous_global is not None and global_id <= previous_global:
                     raise ValueError(f"{label} dictionary global IDs must be sorted and unique")
                 if first_key is None:
@@ -747,13 +747,13 @@ class _DiskDenseMap:
 
 
 def _write_provider_set_map(
-    source: Mapping[bytes | bytearray | memoryview | str, int] | Path,
+    provider_set_source: Mapping[bytes | bytearray | memoryview | str, int] | Path,
     destination: Path,
     *,
     chunk_bytes: int,
 ) -> _DiskDenseMap:
-    if isinstance(source, (str, Path)):
-        source_path = Path(source)
+    if isinstance(provider_set_source, (str, Path)):
+        source_path = Path(provider_set_source)
 
         def records() -> Iterator[bytes]:
             """Parse exported provider-set rows into fixed dense-map records."""
@@ -775,7 +775,7 @@ def _write_provider_set_map(
         def records() -> Iterator[bytes]:
             """Encode provider-set mapping entries as fixed dense-map records."""
 
-            for raw_global_id, raw_key in source.items():
+            for raw_global_id, raw_key in provider_set_source.items():
                 global_id = _normalize_global_id(raw_global_id)
                 if isinstance(raw_key, bool) or not isinstance(raw_key, int):
                     raise ValueError("provider-set keys must be uint32 integers")
@@ -862,15 +862,15 @@ class _BlockStream:
     def _flush(self) -> None:
         if not self.payload:
             return
-        payload = bytes(self.payload)
+        block_payload = bytes(self.payload)
         block = SharedBlock(
             object_kind=self.object_kind,
             block_key=self.block_count,
             fragment_no=0,
-            entry_count=len(payload) // self.member_struct.size,
+            entry_count=len(block_payload) // self.member_struct.size,
             codec="none",
-            raw_byte_count=len(payload),
-            payload=payload,
+            raw_byte_count=len(block_payload),
+            payload=block_payload,
         )
         self.block_copy.write_row(
             (
@@ -1016,7 +1016,7 @@ def _validate_shard_bundles(
 ) -> tuple[_ValidatedShard, ...]:
     if not bundles:
         raise PTG2ManifestArtifactError("shared graph conversion requires at least one complete shard")
-    validated: list[_ValidatedShard] = []
+    validated_shards: list[_ValidatedShard] = []
     seen_ids: set[str] = set()
     expected_names = (
         ("group_npi", "provider_group_npi"),
@@ -1054,9 +1054,11 @@ def _validate_shard_bundles(
                 raise PTG2ManifestArtifactError(
                     f"shared graph shard {shard_id} has the wrong {expected_name} artifact"
                 )
-        checked = tuple(_ValidatedArtifact(artifact) for artifact in raw_artifacts)
-        validated.append(_ValidatedShard(shard_id, *checked))
-    return tuple(validated)
+        checked_artifacts = tuple(
+            _ValidatedArtifact(artifact) for artifact in raw_artifacts
+        )
+        validated_shards.append(_ValidatedShard(shard_id, *checked_artifacts))
+    return tuple(validated_shards)
 
 
 def _npi_sort_key(global_id: bytes) -> bytes:
@@ -1314,8 +1316,11 @@ def convert_v3_provider_membership_shards_to_shared_graph(
         if group_count > _UINT32_MAX + 1:
             raise PTG2ManifestArtifactError("provider group dictionary exceeds uint32 capacity")
         group_map_path = temp_dir / "provider-group.map"
-        with group_ids_path.open("rb") as source, group_map_path.open("wb") as destination:
-            for key, global_id in enumerate(iter(lambda: source.read(16), b"")):
+        with (
+            group_ids_path.open("rb") as group_id_input,
+            group_map_path.open("wb") as destination,
+        ):
+            for key, global_id in enumerate(iter(lambda: group_id_input.read(16), b"")):
                 if len(global_id) != 16:
                     raise RuntimeError("temporary provider-group ID run is truncated")
                 destination.write(_DENSE_MAP_RECORD.pack(global_id, key))
@@ -1412,8 +1417,11 @@ def convert_v3_provider_membership_shards_to_shared_graph(
 
         with _PostgresBinaryCopyWriter(group_copy_path) as group_copy:
             for global_id, key in (
-                _DENSE_MAP_RECORD.unpack(record)
-                for record in _iter_fixed_records(group_map_path, _DENSE_MAP_RECORD.size)
+                _DENSE_MAP_RECORD.unpack(dense_map_record)
+                for dense_map_record in _iter_fixed_records(
+                    group_map_path,
+                    _DENSE_MAP_RECORD.size,
+                )
             ):
                 group_copy.write_row((struct.pack(">i", key), global_id))
                 support_hasher.update(struct.pack(">I", key))

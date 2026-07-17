@@ -110,10 +110,13 @@ def shared_graph_bundles_from_artifacts(
     )
     bundles: list[SharedGraphShardBundle] = []
     for shard_id, shard in sorted(artifact_by_shard.items()):
-        missing = [field_name for field_name in required_fields if field_name not in shard]
-        if missing:
+        missing_fields = [
+            field_name for field_name in required_fields if field_name not in shard
+        ]
+        if missing_fields:
             raise RuntimeError(
-                f"strict V3 graph shard {shard_id!r} is incomplete: missing {', '.join(missing)}"
+                "strict V3 graph shard "
+                f"{shard_id!r} is incomplete: missing {', '.join(missing_fields)}"
             )
         bundles.append(
             SharedGraphShardBundle(
@@ -222,6 +225,10 @@ def _required_summary_integer(value: Any, name: str) -> int:
     if normalized < 0:
         raise RuntimeError(f"strict V3 finalizer summary has negative {name}")
     return normalized
+
+
+def _integer_counts(query_row: Sequence[Any]) -> tuple[int, ...]:
+    return tuple(map(int, query_row))
 
 
 def _finalizer_output_file(output_directory: Path, raw_path: Any, name: str) -> Path:
@@ -496,14 +503,14 @@ async def publish_shared_finalizer_dictionaries(
                 row_count for _path, row_count in provider_metadata_files
             )
             observed_metadata_rows = 0
-            conflicting_metadata = False
+            has_conflicting_metadata = False
             if provider_count > 0:
                 observed_metadata_rows = await session.scalar(
                     db.text(
                         f"SELECT COUNT(*) FROM {schema}.{quoted_provider_metadata_stage}"
                     )
                 )
-                conflicting_metadata = await session.scalar(
+                has_conflicting_metadata = await session.scalar(
                     db.text(
                         f"""
                         SELECT EXISTS (
@@ -523,7 +530,7 @@ async def publish_shared_finalizer_dictionaries(
                 raise RuntimeError("strict V3 provider dictionary row count changed during COPY")
             if int(observed_metadata_rows or 0) != expected_metadata_rows:
                 raise RuntimeError("strict V3 provider-set metadata row count changed during COPY")
-            if bool(conflicting_metadata):
+            if bool(has_conflicting_metadata):
                 raise RuntimeError("strict V3 provider-set metadata has conflicting network names")
             if int(observed_code_count) > 0 and (
                 int(observed_scope_count) != 1
@@ -779,7 +786,7 @@ async def publish_shared_block_stage(
             )
             if mapping_mismatch:
                 raise RuntimeError("strict V3 shared layout mapping conflicts with staged output")
-            result = await session.execute(
+            query_result = await session.execute(
                 db.text(
                     f"""
                     SELECT object_kind, block_key, fragment_no, entry_count,
@@ -791,24 +798,29 @@ async def publish_shared_block_stage(
                     """
                 )
             )
-            rows = [dict(getattr(row, "_mapping", row)) for row in result]
+            block_rows = [
+                dict(getattr(query_row, "_mapping", query_row))
+                for query_row in query_result
+            ]
         references = tuple(
             SharedBlockReference(
-                object_kind=str(row["object_kind"]),
-                block_key=int(row["block_key"]),
-                fragment_no=int(row["fragment_no"]),
-                entry_count=int(row["entry_count"]),
-                block_hash=bytes(row["block_hash"]),
-                raw_byte_count=int(row["raw_byte_count"]),
+                object_kind=str(block_row["object_kind"]),
+                block_key=int(block_row["block_key"]),
+                fragment_no=int(block_row["fragment_no"]),
+                entry_count=int(block_row["entry_count"]),
+                block_hash=bytes(block_row["block_hash"]),
+                raw_byte_count=int(block_row["raw_byte_count"]),
             )
-            for row in rows
+            for block_row in block_rows
         )
         return SharedBlockStagePublication(
             references=references,
             mapping_count=len(references),
             unique_block_count=len({reference.block_hash for reference in references}),
             logical_byte_count=sum(reference.raw_byte_count for reference in references),
-            stored_byte_count=sum(int(row["stored_byte_count"]) for row in rows),
+            stored_byte_count=sum(
+                int(block_row["stored_byte_count"]) for block_row in block_rows
+            ),
         )
     finally:
         await db.status(f"DROP TABLE IF EXISTS {schema}.{stage};")
@@ -919,13 +931,14 @@ async def _publish_graph_block_stage(
                 """
             )
         )
-        block_count, raw_byte_count, stored_byte_count = (
-            int(value) for value in counts.one()
-        )
+        count_row = counts.one()
+        observed_block_count = int(count_row[0])
+        observed_raw_byte_count = int(count_row[1])
+        observed_stored_byte_count = int(count_row[2])
         if (
-            block_count != int(conversion.block_count)
-            or raw_byte_count != int(conversion.raw_block_byte_count)
-            or stored_byte_count != int(conversion.stored_block_byte_count)
+            observed_block_count != int(conversion.block_count)
+            or observed_raw_byte_count != int(conversion.raw_block_byte_count)
+            or observed_stored_byte_count != int(conversion.stored_block_byte_count)
         ):
             raise RuntimeError("strict V3 graph block counts changed during binary COPY")
 
@@ -1039,16 +1052,20 @@ async def publish_shared_graph(
                     """
                 )
             )
-            owner_count, group_count, npi_count, group_key_count, group_id_count = (
-                int(value) for value in observed.one()
-            )
+            (
+                owner_count,
+                group_count,
+                npi_count,
+                group_key_count,
+                group_id_count,
+            ) = _integer_counts(observed.one())
             if (owner_count, group_count, npi_count) != _expected_graph_row_counts(
                 conversion
             ):
                 raise RuntimeError("strict V3 graph row count changed during binary COPY")
             if group_key_count != group_count or group_id_count != group_count:
                 raise RuntimeError("strict V3 provider-group dictionary changed during binary COPY")
-            snapshot_params = {"snapshot_key": int(snapshot_key)}
+            snapshot_parameter_map = {"snapshot_key": int(snapshot_key)}
             for statement in (
                 f"""
                     INSERT INTO {schema}.ptg2_v3_graph_owner
@@ -1073,7 +1090,7 @@ async def publish_shared_graph(
                      ORDER BY npi
                 """,
             ):
-                await session.execute(db.text(statement), snapshot_params)
+                await session.execute(db.text(statement), snapshot_parameter_map)
             published = await session.execute(
                 db.text(
                     f"""
@@ -1086,11 +1103,11 @@ async def publish_shared_graph(
                           WHERE snapshot_key = :snapshot_key)
                     """
                 ),
-                snapshot_params,
+                snapshot_parameter_map,
             )
-            if tuple(
-                int(value) for value in published.one()
-            ) != _expected_graph_row_counts(conversion):
+            if _integer_counts(published.one()) != _expected_graph_row_counts(
+                conversion
+            ):
                 raise RuntimeError("strict V3 graph published row count mismatch")
     finally:
         await db.status(

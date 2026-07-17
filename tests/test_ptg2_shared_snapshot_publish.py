@@ -13,30 +13,30 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
 
 @pytest.mark.asyncio
 async def test_independent_publication_lanes_start_together():
-    started: set[str] = set()
+    started_lanes: set[str] = set()
     release = asyncio.Event()
 
     async def lane(name: str) -> str:
-        started.add(name)
-        if len(started) == 4:
+        started_lanes.add(name)
+        if len(started_lanes) == 4:
             release.set()
         await asyncio.wait_for(release.wait(), timeout=0.5)
         return name
 
-    results = await _run_independent_publication_lanes(
+    lane_outputs = await _run_independent_publication_lanes(
         finalizer_blocks=lambda: lane("finalizer_blocks"),
         provider_graph=lambda: lane("provider_graph"),
         price=lambda: lane("price"),
         source_witness=lambda: lane("source_witness"),
     )
 
-    assert started == {
+    assert started_lanes == {
         "finalizer_blocks",
         "provider_graph",
         "price",
         "source_witness",
     }
-    assert results == (
+    assert lane_outputs == (
         "finalizer_blocks",
         "provider_graph",
         "price",
