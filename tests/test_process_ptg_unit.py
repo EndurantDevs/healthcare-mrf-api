@@ -2071,6 +2071,63 @@ def test_ptg2_toc_jobs_normalize_asr_download_links(monkeypatch):
     assert any(job_row["url"] == expected_url and job_row["file_type"] == "in-network" for job_row in pushed_file_rows)
 
 
+def test_toc_limit_merges_shared_file_plan_scopes(monkeypatch):
+    """Keep every logical plan when one selected physical file is shared."""
+
+    shared_url = "https://files.example.test/selected-rates.json.gz"
+    toc_map = {
+        "reporting_entity_name": "Example Payer",
+        "reporting_entity_type": "payer",
+        "reporting_structure": [
+            {
+                "reporting_plans": [
+                    {
+                        "plan_name": f"Example Plan {suffix}",
+                        "plan_id": f"PLAN-{suffix}",
+                        "plan_market_type": "group",
+                    }
+                ],
+                "in_network_files": [{"location": shared_url}],
+            }
+            for suffix in ("A", "B")
+        ],
+    }
+    pushed_file_rows = []
+
+    async def fake_materialize(*_args, **_kwargs):
+        artifact = SimpleNamespace(logical_path="/tmp/example-toc.json")
+        return artifact, artifact
+
+    async def fake_push_objects(file_rows_to_push, _cls, **_kwargs):
+        pushed_file_rows.extend(file_rows_to_push)
+
+    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
+    monkeypatch.setattr(process_ptg, "load_json_artifact", lambda _path: toc_map)
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    selected_jobs = asyncio.run(
+        process_ptg._process_table_of_contents(
+            "https://files.example.test/toc.json",
+            {"PTGFile": object, "ImportLog": object},
+            test_mode=False,
+            file_url_contains=["selected-rates"],
+            max_files=1,
+        )
+    )
+
+    assert len(selected_jobs) == 1
+    assert selected_jobs[0]["url"] == shared_url
+    assert {plan["plan_id"] for plan in selected_jobs[0]["plan_info"]} == {
+        "PLAN-A",
+        "PLAN-B",
+    }
+    assert [file_row["plan_id"] for file_row in pushed_file_rows[1:]] == [
+        "PLAN-A",
+        "PLAN-B",
+    ]
+
+
 def test_ptg2_toc_repairs_missing_array_commas_and_ignores_unsupported_files(
     monkeypatch, tmp_path
 ):

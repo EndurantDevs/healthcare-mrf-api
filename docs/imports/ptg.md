@@ -124,10 +124,13 @@ changing any member of the complete physical input set changes the semantic
 fingerprint.
 
 URLs, source keys, plan identifiers, and descriptive ownership fields do not
-define physical equality. They remain logical metadata. One negotiated import
-can contain only one unambiguous logical plan scope, but two logical plans may
-bind to the same sealed physical layout when their complete physical input sets
-and scanner semantics are identical.
+define physical equality. They remain logical metadata. A negotiated import
+must carry at least one explicit logical plan scope and may carry several when
+multiple plan records reference the same selected physical files. File limits
+apply to distinct physical file identities; they never truncate additional
+logical plan scopes found for an already-selected file. Those plans may bind to
+the same sealed physical layout when their complete physical input sets and
+scanner semantics are identical.
 
 Allowed-amount rows are snapshot-scoped logical evidence and do not contribute
 to negotiated shared-layout equality. An allowed file may cover multiple plans;
