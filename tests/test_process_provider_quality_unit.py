@@ -317,11 +317,11 @@ def test_benchmark_modes_for_materialization():
 
 def test_npi_shard_mapping_is_deterministic():
     shard_count = 8
-    assignments = {npi: (npi % shard_count) for npi in range(1000000000, 1000000100)}
-    assert all(0 <= shard < shard_count for shard in assignments.values())
+    shard_by_npi = {npi: (npi % shard_count) for npi in range(1000000000, 1000000100)}
+    assert all(0 <= shard < shard_count for shard in shard_by_npi.values())
     # Deterministic repeat.
-    assert assignments[1000000007] == (1000000007 % shard_count)
-    assert assignments[1000000099] == (1000000099 % shard_count)
+    assert shard_by_npi[1000000007] == (1000000007 % shard_count)
+    assert shard_by_npi[1000000099] == (1000000099 % shard_count)
 
 
 def test_normalize_zcta_handles_cdc_shapes():
@@ -343,9 +343,9 @@ def test_numeric_and_npi_normalizers_handle_csv_shapes():
 
 
 def test_pick_first_helpers_preserve_case_sensitive_and_ci_semantics():
-    row = {"NPI": "", " npi ": "123", "score": 0}
-    assert provider_quality._pick_first(row, "npi", "score") == 0
-    assert provider_quality._pick_first_ci(row, "npi") == "123"
+    input_row_map = {"NPI": "", " npi ": "123", "score": 0}
+    assert provider_quality._pick_first(input_row_map, "npi", "score") == 0
+    assert provider_quality._pick_first_ci(input_row_map, "npi") == "123"
 
 
 @pytest.mark.asyncio
@@ -392,13 +392,13 @@ async def test_process_chunk_passes_test_mode_to_loader(monkeypatch, tmp_path):
     chunk = tmp_path / "qpp_chunk.csv"
     chunk.write_text("npi,year,quality_score,cost_score,final_score\n1234567890,2024,90,85,88\n", encoding="utf-8")
 
-    observed = {"test_mode": None}
+    observed_options_map = {"test_mode": None}
 
     async def _noop_database(_test_mode: bool):
         return None
 
     async def _capture_loader(_path: str, _cls: type, _year: int, test_mode: bool):
-        observed["test_mode"] = test_mode
+        observed_options_map["test_mode"] = test_mode
 
     monkeypatch.setattr(provider_quality, "ensure_database", _noop_database)
     monkeypatch.setattr(
@@ -411,7 +411,7 @@ async def test_process_chunk_passes_test_mode_to_loader(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(provider_quality, "_load_qpp_rows", _capture_loader)
 
-    result = await provider_quality.provider_quality_process_chunk(
+    chunk_result_map = await provider_quality.provider_quality_process_chunk(
         {},
         {
             "dataset_key": "qpp_provider",
@@ -425,8 +425,8 @@ async def test_process_chunk_passes_test_mode_to_loader(monkeypatch, tmp_path):
         },
     )
 
-    assert result["ok"] is True
-    assert observed["test_mode"] is True
+    assert chunk_result_map["ok"] is True
+    assert observed_options_map["test_mode"] is True
 
 
 @pytest.mark.asyncio
@@ -441,18 +441,18 @@ async def test_load_qpp_rows_parses_real_cms_field_names(monkeypatch, tmp_path):
         encoding="utf-8",
     )
 
-    captured: list[dict[str, object]] = []
+    captured_rows: list[dict[str, object]] = []
 
     async def _capture_push(rows, _cls, **_kwargs):
-        captured.extend(rows)
+        captured_rows.extend(rows)
 
     monkeypatch.setattr(provider_quality, "_push_objects_with_retry", _capture_push)
 
     fake_cls = type("QppStage", (), {"__tablename__": "pricing_qpp_provider_stage"})
     await provider_quality._load_qpp_rows(str(csv_path), fake_cls, 2024, test_mode=False)
 
-    assert len(captured) == 1
-    row = captured[0]
+    assert len(captured_rows) == 1
+    row = captured_rows[0]
     assert row["npi"] == 1234567890
     assert row["year"] == 2024
     assert row["quality_score"] == 91.5
@@ -467,13 +467,13 @@ async def test_materialize_query_contains_state_benchmark_and_extra_measures(mon
     async def _fake_status(statement: str, *args, **kwargs):
         statements.append(statement)
 
-    async def _fake_table_exists(_schema: str, _table: str) -> bool:
+    async def is_table_existing(_schema: str, _table: str) -> bool:
         return False
 
-    monkeypatch.setattr(provider_quality, "_table_exists", _fake_table_exists)
+    monkeypatch.setattr(provider_quality, "_table_exists", is_table_existing)
     monkeypatch.setattr(provider_quality.db, "status", _fake_status)
 
-    classes = {
+    staging_classes_by_name = {
         "PricingQppProvider": type("QppStage", (), {"__tablename__": "pricing_qpp_provider_stage"}),
         "PricingSviZcta": type("SviStage", (), {"__tablename__": "pricing_svi_zcta_stage"}),
         "PricingProviderQualityMeasure": type("MeasureStage", (), {"__tablename__": "pricing_provider_quality_measure_stage"}),
@@ -481,7 +481,7 @@ async def test_materialize_query_contains_state_benchmark_and_extra_measures(mon
         "PricingProviderQualityScore": type("ScoreStage", (), {"__tablename__": "pricing_provider_quality_score_stage"}),
     }
 
-    await provider_quality._materialize_quality_rows(classes, "mrf", "run_test")
+    await provider_quality._materialize_quality_rows(staging_classes_by_name, "mrf", "run_test")
 
     materialize_sql = "\n".join(statements)
     assert "peers_state AS (" in materialize_sql
@@ -507,11 +507,11 @@ async def test_materialize_cohort_query_contains_lsh_and_fallback_rules(monkeypa
     async def _fake_status(statement: str, *args, **kwargs):
         statements.append(statement)
 
-    async def _fake_table_exists(_schema: str, _table: str) -> bool:
+    async def is_table_existing(_schema: str, _table: str) -> bool:
         return False
 
     monkeypatch.setattr(provider_quality.db, "status", _fake_status)
-    monkeypatch.setattr(provider_quality, "_table_exists", _fake_table_exists)
+    monkeypatch.setattr(provider_quality, "_table_exists", is_table_existing)
 
     classes = provider_quality._staging_classes("stage_test", "mrf")
     await provider_quality._materialize_quality_rows_cohort(classes, "mrf", "run_test")
@@ -542,10 +542,10 @@ async def test_materialize_cohort_query_contains_lsh_and_fallback_rules(monkeypa
 
 @pytest.mark.asyncio
 async def test_shard_queries_delete_partition_before_insert(monkeypatch):
-    async def _fake_table_exists(_schema: str, _table: str) -> bool:
+    async def is_table_existing(_schema: str, _table: str) -> bool:
         return False
 
-    monkeypatch.setattr(provider_quality, "_table_exists", _fake_table_exists)
+    monkeypatch.setattr(provider_quality, "_table_exists", is_table_existing)
     classes = provider_quality._staging_classes("stage_test", "mrf")
     ctx = await provider_quality._build_cohort_materialization_context(classes, "mrf")
 
@@ -573,14 +573,14 @@ async def test_shard_queries_delete_partition_before_insert(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_measure_shard_limits_rx_cte_to_provider_base():
-    async def _fake_table_exists(_schema: str, table: str) -> bool:
+    async def is_table_existing(_schema: str, table: str) -> bool:
         return table == "pricing_provider_prescription"
 
     classes = provider_quality._staging_classes("stage_test", "mrf")
     ctx = await provider_quality_cohort_context._build_cohort_materialization_context(
         classes,
         "mrf",
-        table_exists=_fake_table_exists,
+        table_exists=is_table_existing,
     )
 
     measure_sql = provider_quality._cohort_sql_phase_5_build_measure_shard(ctx)
@@ -593,14 +593,14 @@ async def test_measure_shard_limits_rx_cte_to_provider_base():
 
 @pytest.mark.asyncio
 async def test_measure_shard_prefers_rx_aggregate_table():
-    async def _fake_table_exists(_schema: str, table: str) -> bool:
+    async def is_table_existing(_schema: str, table: str) -> bool:
         return table == "pricing_provider_quality_rx_agg_stage_test"
 
     classes = provider_quality._staging_classes("stage_test", "mrf")
     ctx = await provider_quality_cohort_context._build_cohort_materialization_context(
         classes,
         "mrf",
-        table_exists=_fake_table_exists,
+        table_exists=is_table_existing,
     )
 
     measure_sql = provider_quality._cohort_sql_phase_5_build_measure_shard(ctx)
@@ -686,10 +686,10 @@ async def test_wait_for_materialize_phase_completion_logs_duration_summary(monke
         "30.0",
     )
 
-    observed: list[tuple] = []
+    observed_log_entries: list[tuple] = []
 
     def _capture_info(msg, *args, **kwargs):
-        observed.append((msg, args))
+        observed_log_entries.append((msg, args))
 
     monkeypatch.setattr(provider_quality.logger, "info", _capture_info)
     await provider_quality._wait_for_materialize_phase_completion(
@@ -698,8 +698,8 @@ async def test_wait_for_materialize_phase_completion_logs_duration_summary(monke
         provider_quality.MAT_PHASE_7_BUILD_SCORE_SHARDED,
     )
 
-    assert observed
-    logged = " ".join(str(part) for part in observed[-1][1])
+    assert observed_log_entries
+    logged = " ".join(str(part) for part in observed_log_entries[-1][1])
     assert "run_done" in logged
     assert provider_quality.MAT_PHASE_7_BUILD_SCORE_SHARDED in logged
 
@@ -758,11 +758,11 @@ async def test_ensure_materialize_indexes_analyzes_available_models(monkeypatch)
     class _Model:
         __tablename__ = "stage_table"
 
-    indexed: list[tuple[type, str]] = []
+    indexed_model_schema_pairs: list[tuple[type, str]] = []
     statements: list[str] = []
 
     async def _capture_indexes(model, schema):
-        indexed.append((model, schema))
+        indexed_model_schema_pairs.append((model, schema))
 
     async def _capture_status(statement, **_kwargs):
         statements.append(statement)
@@ -777,7 +777,7 @@ async def test_ensure_materialize_indexes_analyzes_available_models(monkeypatch)
         "MissingModel",
     )
 
-    assert indexed == [(_Model, "mrf")]
+    assert indexed_model_schema_pairs == [(_Model, "mrf")]
     assert statements == ["ANALYZE mrf.stage_table;"]
 
 
@@ -789,7 +789,7 @@ async def test_ensure_provider_quality_rx_agg_table_builds_once(monkeypatch):
     statements: list[str] = []
     scalar_calls = 0
 
-    async def _fake_table_exists(_schema: str, table: str) -> bool:
+    async def is_table_existing(_schema: str, table: str) -> bool:
         return table == "pricing_provider_prescription"
 
     async def _capture_status(statement, **_kwargs):
@@ -800,7 +800,7 @@ async def test_ensure_provider_quality_rx_agg_table_builds_once(monkeypatch):
         scalar_calls += 1
         return 0
 
-    monkeypatch.setattr(provider_quality, "_table_exists", _fake_table_exists)
+    monkeypatch.setattr(provider_quality, "_table_exists", is_table_existing)
     monkeypatch.setattr(provider_quality.db, "status", _capture_status)
     monkeypatch.setattr(provider_quality.db, "scalar", _capture_scalar)
 
@@ -811,8 +811,8 @@ async def test_ensure_provider_quality_rx_agg_table_builds_once(monkeypatch):
     )
 
     assert scalar_calls == 1
-    assert any("CREATE TABLE IF NOT EXISTS mrf.pricing_provider_quality_rx_agg_stage_test" in s for s in statements)
-    assert any("FROM mrf.pricing_provider_prescription r" in s for s in statements)
-    assert any("WHERE r.year IN (2023)" in s for s in statements)
-    assert any("CREATE UNIQUE INDEX IF NOT EXISTS" in s for s in statements)
+    assert any("CREATE TABLE IF NOT EXISTS mrf.pricing_provider_quality_rx_agg_stage_test" in statement_sql for statement_sql in statements)
+    assert any("FROM mrf.pricing_provider_prescription r" in statement_sql for statement_sql in statements)
+    assert any("WHERE r.year IN (2023)" in statement_sql for statement_sql in statements)
+    assert any("CREATE UNIQUE INDEX IF NOT EXISTS" in statement_sql for statement_sql in statements)
     assert statements[-1] == "ANALYZE mrf.pricing_provider_quality_rx_agg_stage_test;"

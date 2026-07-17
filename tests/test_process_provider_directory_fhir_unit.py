@@ -2227,7 +2227,7 @@ def test_resource_import_source_selection_reports_credentialed_policy_counts():
 
 
 def test_resource_import_source_selection_allows_live_probe_success_over_open_only():
-    source = {
+    source_row = {
         "source_id": "credentialed_valid",
         "api_base": "https://auth.example/fhir",
         "auth_type": "OAuth2 Client Credentials",
@@ -2236,13 +2236,13 @@ def test_resource_import_source_selection_allows_live_probe_success_over_open_on
     }
 
     selected, metrics = importer._select_resource_import_sources(
-        [source],
+        [source_row],
         valid_source_ids={"credentialed_valid"},
         open_only=True,
         include_auth_required=False,
     )
 
-    assert selected == [source]
+    assert selected == [source_row]
     assert metrics["source_import_sources_selected"] == 1
     assert metrics["source_import_sources_selected_live_probe_valid"] == 1
     assert metrics["source_import_sources_selected_declared_credentialed"] == 1
@@ -4015,10 +4015,10 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
             None,
         )
 
-    upserts: dict[type, list[dict[str, Any]]] = {}
+    upsert_rows_by_model: dict[type, list[dict[str, Any]]] = {}
 
     async def fake_upsert(model, rows, **_kwargs):
-        upserts.setdefault(model, []).extend(rows)
+        upsert_rows_by_model.setdefault(model, []).extend(rows)
         return len(rows)
 
     monkeypatch.setattr(importer, "_fetch_alohr_graphql_page", fake_fetch_page)
@@ -4050,9 +4050,9 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
     assert counts["PractitionerRole"] == 1
     assert counts["Organization"] == 1
     assert counts["OrganizationAffiliation"] == 0
-    assert ProviderDirectoryOrganizationAffiliation not in upserts
+    assert ProviderDirectoryOrganizationAffiliation not in upsert_rows_by_model
     assert "OrganizationAffiliation" not in diagnostics
-    assert upserts[ProviderDirectoryOrganization][0]["npi"] == 1992793046
+    assert upsert_rows_by_model[ProviderDirectoryOrganization][0]["npi"] == 1992793046
     assert diagnostics["Practitioner"]["complete"] is True
     assert diagnostics["Organization"]["rows_written"] == 1
     assert stats["Location"]["sources_completed"] == 1
@@ -4542,14 +4542,14 @@ def test_oauth2_client_credentials_token_request_uses_basic_auth_and_cache(monke
     monkeypatch.setenv("PAYER_DIRECTORY_TOKEN_URL", "https://auth.example/token")
     monkeypatch.setattr(importer.urllib.request, "urlopen", fake_urlopen)
 
-    oauth2 = {
+    oauth2_config_map = {
         "token_url": "env:PAYER_DIRECTORY_TOKEN_URL",
         "client_id": "env:PAYER_DIRECTORY_CLIENT_ID",
         "client_secret": "env:PAYER_DIRECTORY_CLIENT_SECRET",
         "scope": "system/*.read",
     }
-    first = importer._fetch_oauth2_client_credentials_token_sync(oauth2)
-    second = importer._fetch_oauth2_client_credentials_token_sync(oauth2)
+    first = importer._fetch_oauth2_client_credentials_token_sync(oauth2_config_map)
+    second = importer._fetch_oauth2_client_credentials_token_sync(oauth2_config_map)
 
     assert first == "token-1"
     assert second == "token-1"
@@ -5497,7 +5497,7 @@ async def test_caresource_public_override_probes_and_selects_without_credentials
     monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
     monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
     calls: list[str] = []
-    capability_payload = {
+    capability_statement_map = {
         "resourceType": "CapabilityStatement",
         "fhirVersion": "4.0.1",
         "rest": [{"resource": [{"type": "Practitioner"}]}],
@@ -5506,7 +5506,7 @@ async def test_caresource_public_override_probes_and_selects_without_credentials
     async def fake_fetch_source_json(_source, request_url, *, timeout):
         calls.append(request_url)
         if request_url == importer.CARESOURCE_PROVIDER_DIRECTORY_METADATA_URL:
-            return 200, capability_payload, None, 4
+            return 200, capability_statement_map, None, 4
         assert request_url == (
             f"{importer.CARESOURCE_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=1"
         )
@@ -5541,7 +5541,7 @@ async def test_caresource_public_override_probes_and_selects_without_credentials
         requested_resource_types=list(importer.DEFAULT_RESOURCES),
     )
 
-    assert returned_capability == capability_payload
+    assert returned_capability == capability_statement_map
     assert probe["status"] == "valid"
     assert probe["credential"] is None
     assert selected == [tested_source_map]
@@ -10130,7 +10130,7 @@ async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
     monkeypatch.setattr(importer, "_import_linked_resource_rows", fake_import_linked)
 
-    linked_counts = {}
+    linked_counts_by_resource = {}
     counts = await importer._import_resources(
         [{"source_id": "source_a", "api_base": "https://example.test/fhir"}],
         resources=["PractitionerRole"],
@@ -10140,11 +10140,11 @@ async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
         timeout=3,
         run_id="run_1",
         linked_resource_limit=5,
-        linked_counts=linked_counts,
+        linked_counts=linked_counts_by_resource,
     )
 
     assert counts == {"PractitionerRole": 1}
-    assert linked_counts == {"Location": 2}
+    assert linked_counts_by_resource == {"Location": 2}
     assert len(linked_kwargs) == 1
     assert linked_kwargs[0]["per_source_limit"] == 5
     assert linked_kwargs[0]["concurrency"] == 5
@@ -10167,7 +10167,7 @@ async def test_import_resources_retries_suspicious_zero_practitioner_role(monkey
 
     fetch_calls: list[str] = []
 
-    async def fake_fetch_resource_rows(source, resource_type, **_kwargs):
+    async def fake_fetch_resource_rows(source_row, resource_type, **_kwargs):
         """Support the fake fetch resource rows test fixture."""
         fetch_calls.append(resource_type)
         if resource_type == "PractitionerRole" and fetch_calls.count("PractitionerRole") == 1:
@@ -10188,7 +10188,7 @@ async def test_import_resources_retries_suspicious_zero_practitioner_role(monkey
                 model=ProviderDirectoryPractitionerRole,
                 rows=[
                     {
-                        "source_id": source["source_id"],
+                        "source_id": source_row["source_id"],
                         "resource_id": "role-1",
                         "practitioner_ref": "Practitioner/prac-1",
                         "location_refs": ["Location/loc-1"],
@@ -10206,7 +10206,7 @@ async def test_import_resources_retries_suspicious_zero_practitioner_role(monkey
         if resource_type == "Practitioner":
             return importer.ResourceFetchResult(
                 model=ProviderDirectoryPractitioner,
-                rows=[{"source_id": source["source_id"], "resource_id": "prac-1"}],
+                rows=[{"source_id": source_row["source_id"], "resource_id": "prac-1"}],
                 rows_fetched=1,
                 rows_written=0,
                 pages_fetched=1,
@@ -10219,7 +10219,7 @@ async def test_import_resources_retries_suspicious_zero_practitioner_role(monkey
         if resource_type == "Location":
             return importer.ResourceFetchResult(
                 model=ProviderDirectoryLocation,
-                rows=[{"source_id": source["source_id"], "resource_id": "loc-1"}],
+                rows=[{"source_id": source_row["source_id"], "resource_id": "loc-1"}],
                 rows_fetched=1,
                 rows_written=0,
                 pages_fetched=1,
@@ -10560,10 +10560,10 @@ async def test_location_archive_holds_active_dataset_fence_through_resolve(monke
 async def test_publish_provider_directory_location_archive_skips_without_archive(monkeypatch):
     monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
 
-    async def fake_table_exists(_schema, table_name):
+    async def is_table_existing(_schema, table_name):
         return table_name != "address_archive_v2"
 
-    monkeypatch.setattr(importer, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(importer, "_table_exists", is_table_existing)
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
 
@@ -10621,11 +10621,11 @@ async def test_process_data_merges_supplemental_retest_sources(monkeypatch, tmp_
         ),
         encoding="utf-8",
     )
-    upserted: list[dict[str, Any]] = []
+    upserted_source_rows: list[dict[str, Any]] = []
 
     async def fake_upsert(model, rows, **_kwargs):
         if model is ProviderDirectorySource:
-            upserted.extend(rows)
+            upserted_source_rows.extend(rows)
         return len(rows)
 
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
@@ -10645,8 +10645,8 @@ async def test_process_data_merges_supplemental_retest_sources(monkeypatch, tmp_
 
     assert metrics["sources_seeded"] == 2
     assert metrics["supplemental_retest_sources_considered"] == 1
-    assert {observed_row_map["org_name"] for observed_row_map in upserted} == {"Cigna", "Supplemental Public Payer"}
-    supplemental = next(observed_row_map for observed_row_map in upserted if observed_row_map["org_name"] == "Supplemental Public Payer")
+    assert {observed_row_map["org_name"] for observed_row_map in upserted_source_rows} == {"Cigna", "Supplemental Public Payer"}
+    supplemental = next(observed_row_map for observed_row_map in upserted_source_rows if observed_row_map["org_name"] == "Supplemental Public Payer")
     assert supplemental["api_base"] == "https://supplemental.example/fhir"
     assert supplemental["seed_source"] == "provider-directory-db-retest"
 
@@ -10681,11 +10681,11 @@ async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp
     )
     cms_sma_catalog_path = tmp_path / "cms-sma.csv"
     cms_sma_catalog_path.write_text("State Medicaid Agency Interoperability and Patient Access Endpoint Directory\n", encoding="utf-8")
-    upserted: list[dict[str, Any]] = []
+    upserted_source_rows: list[dict[str, Any]] = []
 
     async def fake_upsert(model, rows, **_kwargs):
         if model is ProviderDirectorySource:
-            upserted.extend(rows)
+            upserted_source_rows.extend(rows)
         return len(rows)
 
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
@@ -10715,28 +10715,28 @@ async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp
     assert metrics["supplemental_catalogs"]["catalogs"]["aetna_provider_directorydata"]["rows"] == 1
     assert metrics["supplemental_catalogs"]["catalogs"]["provider_directory_blockers"]["rows"] == 3
     amerihealth = next(
-        observed_row_map for observed_row_map in upserted if observed_row_map["seed_source"] == "amerihealth-caritas-developer-portal"
+        observed_row_map for observed_row_map in upserted_source_rows if observed_row_map["seed_source"] == "amerihealth-caritas-developer-portal"
     )
     assert amerihealth["org_name"] == "AmeriHealth Caritas"
     assert amerihealth["plan_name"] == "AmeriHealth Caritas District of Columbia"
     assert amerihealth["api_base"] == "https://api-ext.amerihealthcaritas.com/5400/provider-api"
     contra_costa = next(
-        observed_row_map for observed_row_map in upserted if observed_row_map["seed_source"] == "contra-costa-health-developer-page"
+        observed_row_map for observed_row_map in upserted_source_rows if observed_row_map["seed_source"] == "contra-costa-health-developer-page"
     )
     assert contra_costa["org_name"] == "Contra Costa Health Plan"
     assert contra_costa["api_base"] == "https://ihyml0v6d9.execute-api.us-east-1.amazonaws.com/hxprod"
     health_partners_plans = next(
-        observed_row_map for observed_row_map in upserted if observed_row_map["seed_source"] == "health-partners-plans-fhir-root"
+        observed_row_map for observed_row_map in upserted_source_rows if observed_row_map["seed_source"] == "health-partners-plans-fhir-root"
     )
     assert health_partners_plans["org_name"] == "Health Partners Plans"
     assert health_partners_plans["api_base"] == importer.HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE
     aetna = next(
-        observed_row_map for observed_row_map in upserted if observed_row_map["seed_source"] == "aetna-developer-portal"
+        observed_row_map for observed_row_map in upserted_source_rows if observed_row_map["seed_source"] == "aetna-developer-portal"
     )
     assert aetna["org_name"] == "Aetna"
     assert aetna["api_base"] == importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE
     blockers = [
-        observed_row_map for observed_row_map in upserted if observed_row_map["seed_source"] == importer.PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE
+        observed_row_map for observed_row_map in upserted_source_rows if observed_row_map["seed_source"] == importer.PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE
     ]
     assert {observed_row_map["org_name"] for observed_row_map in blockers} == {
         "Chorus Community Health Plans (fka Children's Community Health Plan)",
@@ -10749,11 +10749,11 @@ async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp
 
 @pytest.mark.asyncio
 async def test_process_data_skips_full_refresh_source_catalog_stale_cleanup_without_retest(monkeypatch):
-    upserted: list[dict[str, Any]] = []
+    upserted_source_rows: list[dict[str, Any]] = []
 
     async def fake_upsert(model, rows, **_kwargs):
         if model is ProviderDirectorySource:
-            upserted.extend(rows)
+            upserted_source_rows.extend(rows)
         return len(rows)
 
     cleanup = AsyncMock(return_value={"deleted": {"provider_directory_source": 1}, "protected_source_ids_missing": []})
@@ -10802,11 +10802,11 @@ async def test_process_data_reports_full_refresh_source_catalog_stale_cleanup_wi
         ),
         encoding="utf-8",
     )
-    upserted: list[dict[str, Any]] = []
+    upserted_source_rows: list[dict[str, Any]] = []
 
     async def fake_upsert(model, rows, **_kwargs):
         if model is ProviderDirectorySource:
-            upserted.extend(rows)
+            upserted_source_rows.extend(rows)
         return len(rows)
 
     cleanup = AsyncMock(return_value={"deleted": {"provider_directory_source": 1}, "protected_source_ids_missing": []})
@@ -10830,7 +10830,7 @@ async def test_process_data_reports_full_refresh_source_catalog_stale_cleanup_wi
 
     protected_source_ids = importer._configured_catalog_protected_source_ids({})
     cleanup.assert_awaited_once_with(
-        [observed_row_map["source_id"] for observed_row_map in upserted],
+        [observed_row_map["source_id"] for observed_row_map in upserted_source_rows],
         protected_source_ids=protected_source_ids,
     )
     assert metrics["sources_seeded"] == 2
@@ -14660,7 +14660,7 @@ async def test_import_resources_fetches_scan_practitioner_roles_after_practition
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
     monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert_resource_rows)
 
-    resource_fetch_stats: dict[str, dict[str, Any]] = {}
+    resource_fetch_stats_by_type: dict[str, dict[str, Any]] = {}
     counts = await importer._import_resources(
         [
             {
@@ -14675,7 +14675,7 @@ async def test_import_resources_fetches_scan_practitioner_roles_after_practition
         page_count=25,
         timeout=3,
         run_id="run_1",
-        resource_fetch_stats=resource_fetch_stats,
+        resource_fetch_stats=resource_fetch_stats_by_type,
     )
 
     assert counts == {"PractitionerRole": 1, "Practitioner": 1}
@@ -14686,8 +14686,8 @@ async def test_import_resources_fetches_scan_practitioner_roles_after_practition
     assert role_calls == [
         "https://providerdirectory.scanhealthplan.com/PractitionerRole?practitioner=Practitioner%2Fprac-1&_count=25"
     ]
-    assert resource_fetch_stats["PractitionerRole"]["sources_attempted"] == 1
-    assert resource_fetch_stats["PractitionerRole"]["rows_fetched"] == 1
+    assert resource_fetch_stats_by_type["PractitionerRole"]["sources_attempted"] == 1
+    assert resource_fetch_stats_by_type["PractitionerRole"]["rows_fetched"] == 1
 
 
 def _uhc_reverse_lookup_source() -> dict[str, str]:
@@ -16146,9 +16146,9 @@ async def test_fetch_resource_rows_uses_bulk_export_when_available(monkeypatch):
     assert operation_result is not None
     assert operation_result.fetch_mode == "bulk_export"
     assert operation_result.rows[0]["resource_id"] == "prac-1"
-    stats: dict[str, dict[str, Any]] = {}
-    importer._record_resource_fetch_stats(stats, "Practitioner", operation_result)
-    assert stats["Practitioner"]["bulk_export_sources"] == 1
+    resource_fetch_stats_by_type: dict[str, dict[str, Any]] = {}
+    importer._record_resource_fetch_stats(resource_fetch_stats_by_type, "Practitioner", operation_result)
+    assert resource_fetch_stats_by_type["Practitioner"]["bulk_export_sources"] == 1
 
 
 @pytest.mark.asyncio
@@ -16283,10 +16283,10 @@ async def test_fetch_resource_rows_records_accepted_bulk_export_poll_failure(mon
     assert operation_result.error == "bulk_export_timeout"
     assert operation_result.complete is False
     assert operation_result.next_url_remaining is True
-    stats: dict[str, dict[str, Any]] = {}
-    importer._record_resource_fetch_stats(stats, "Practitioner", operation_result)
-    assert stats["Practitioner"]["bulk_export_sources"] == 1
-    assert stats["Practitioner"]["sources_failed"] == 1
+    resource_fetch_stats_by_type: dict[str, dict[str, Any]] = {}
+    importer._record_resource_fetch_stats(resource_fetch_stats_by_type, "Practitioner", operation_result)
+    assert resource_fetch_stats_by_type["Practitioner"]["bulk_export_sources"] == 1
+    assert resource_fetch_stats_by_type["Practitioner"]["sources_failed"] == 1
 
 
 @pytest.mark.asyncio
@@ -16726,9 +16726,9 @@ async def test_fetch_resource_rows_streams_batches_without_retaining_rows(monkey
     assert operation_result.rows_fetched == 4
     assert operation_result.rows_written == 4
     assert batches == [["prac-1-a", "prac-1-b", "prac-2-a"], ["prac-2-b"]]
-    stats: dict[str, dict[str, Any]] = {}
-    importer._record_resource_fetch_stats(stats, "Practitioner", operation_result)
-    assert stats["Practitioner"]["sources_empty"] == 0
+    resource_fetch_stats_by_type: dict[str, dict[str, Any]] = {}
+    importer._record_resource_fetch_stats(resource_fetch_stats_by_type, "Practitioner", operation_result)
+    assert resource_fetch_stats_by_type["Practitioner"]["sources_empty"] == 0
 
 
 def _cigna_checkpoint_source():
@@ -18751,8 +18751,8 @@ async def test_import_resources_deletes_stale_rows_only_after_complete_scan(monk
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
     monkeypatch.setattr(importer.db, "status", fake_status)
 
-    stats: dict[str, dict[str, Any]] = {}
-    stale_counts: dict[str, int] = {}
+    resource_fetch_stats_by_type: dict[str, dict[str, Any]] = {}
+    stale_counts_by_resource: dict[str, int] = {}
     counts = await importer._import_resources(
         [{"source_id": "source_a", "api_base": "https://example.test/fhir"}],
         resources=["Location", "Practitioner"],
@@ -18761,13 +18761,13 @@ async def test_import_resources_deletes_stale_rows_only_after_complete_scan(monk
         page_count=100,
         timeout=3,
         run_id="run_1",
-        resource_fetch_stats=stats,
-        stale_counts=stale_counts,
+        resource_fetch_stats=resource_fetch_stats_by_type,
+        stale_counts=stale_counts_by_resource,
         stale_cleanup=True,
     )
 
     assert counts == {"Location": 1, "Practitioner": 1}
-    assert stale_counts == {"Location": 4}
+    assert stale_counts_by_resource == {"Location": 4}
     assert len(deletes) == 2
     assert '"provider_directory_source_resource"' in deletes[0][0]
     assert '"provider_directory_location"' in deletes[1][0]
@@ -18775,8 +18775,8 @@ async def test_import_resources_deletes_stale_rows_only_after_complete_scan(monk
     assert "provider_directory_import_seen" in deletes[1][0]
     assert deletes[0][1] == {"source_id": "source_a", "run_id": "run_1", "resource_type": "Location"}
     assert deletes[1][1] == {"source_id": "source_a", "run_id": "run_1", "resource_type": "Location"}
-    assert stats["Location"]["sources_completed"] == 1
-    assert stats["Practitioner"]["sources_bounded"] == 1
+    assert resource_fetch_stats_by_type["Location"]["sources_completed"] == 1
+    assert resource_fetch_stats_by_type["Practitioner"]["sources_bounded"] == 1
 
 
 @pytest.mark.asyncio
@@ -19079,8 +19079,8 @@ def test_provider_directory_location_contact_backfill_sql_updates_canonical_cont
 
 @pytest.mark.asyncio
 async def test_process_data_canonical_backfill_only_skips_seed_resolution(monkeypatch):
-    expected = {"canonical_rows": 2, "source_edge_rows": 3, "resources": {"Location": {}}}
-    backfill = AsyncMock(return_value=expected)
+    expected_metrics_map = {"canonical_rows": 2, "source_edge_rows": 3, "resources": {"Location": {}}}
+    backfill = AsyncMock(return_value=expected_metrics_map)
 
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
@@ -19096,14 +19096,14 @@ async def test_process_data_canonical_backfill_only_skips_seed_resolution(monkey
         {"canonical_backfill_only": True, "resources": "Location"},
     )
 
-    assert result == expected
+    assert result == expected_metrics_map
     backfill.assert_awaited_once_with(resources="Location")
 
 
 @pytest.mark.asyncio
 async def test_process_data_contact_backfill_only_skips_seed_resolution(monkeypatch):
-    expected = {"location_contact_rows_updated": 7}
-    backfill = AsyncMock(return_value=expected)
+    expected_metrics_map = {"location_contact_rows_updated": 7}
+    backfill = AsyncMock(return_value=expected_metrics_map)
 
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
@@ -19119,7 +19119,7 @@ async def test_process_data_contact_backfill_only_skips_seed_resolution(monkeypa
         {"contact_backfill_only": True},
     )
 
-    assert result == expected
+    assert result == expected_metrics_map
     backfill.assert_awaited_once_with()
 
 
@@ -19210,7 +19210,7 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
 
 def test_harness_fixture_case_and_report_rendering(tmp_path):
     fixture_case_result = harness._run_fixture_case()
-    report = {
+    report_payload_map = {
         "generated_at": "2026-06-28T00:00:00Z",
         "overall_status": "succeeded",
         "results": [
@@ -19230,7 +19230,7 @@ def test_harness_fixture_case_and_report_rendering(tmp_path):
             ).to_json(),
         ],
     }
-    harness.write_report(report, tmp_path)
+    harness.write_report(report_payload_map, tmp_path)
 
     assert fixture_case_result.status == "succeeded"
     assert fixture_case_result.metrics["supported_resources"] == ["Endpoint", "InsurancePlan", "PractitionerRole"]
