@@ -2999,47 +2999,14 @@ def run_with_sampling(command: list[str], env_overrides: dict[str, str], *, cwd:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    output_by_stream: dict[str, bytes] = {}
-    communication_errors: list[BaseException] = []
-
-    def collect_output() -> None:
-        """Drain both child-process pipes while resource sampling continues."""
-        try:
-            stdout, stderr = proc.communicate()
-            output_by_stream["stdout"] = stdout
-            output_by_stream["stderr"] = stderr
-        except BaseException as exc:  # pragma: no cover - defensive subprocess cleanup
-            communication_errors.append(exc)
-
-    collector = Thread(target=collect_output, name="ptg2-experiment-output", daemon=True)
-    collector.start()
-    sample_seconds = max(
-        float(os.getenv("HLTHPRT_PTG2_RESEARCH_SAMPLE_SECONDS", "0.1")),
-        0.001,
-    )
-    try:
-        while collector.is_alive():
-            sampler.sample(proc.pid)
-            collector.join(timeout=sample_seconds)
-    except BaseException:
-        if proc.poll() is None:
-            proc.terminate()
-        collector.join(timeout=5)
-        if collector.is_alive() and proc.poll() is None:
-            proc.kill()
-        collector.join()
-        raise
-    if communication_errors:
-        raise communication_errors[0]
+    while proc.poll() is None:
+        sampler.sample(proc.pid)
+        time.sleep(float(os.getenv("HLTHPRT_PTG2_RESEARCH_SAMPLE_SECONDS", "0.1")))
+    stdout, stderr = proc.communicate()
     elapsed = time.monotonic() - started
     sampler.sample(proc.pid)
     return (
-        subprocess.CompletedProcess(
-            command,
-            proc.returncode,
-            stdout=output_by_stream.get("stdout", b""),
-            stderr=output_by_stream.get("stderr", b""),
-        ),
+        subprocess.CompletedProcess(command, proc.returncode, stdout=stdout, stderr=stderr),
         elapsed,
         sampler.to_json(),
     )

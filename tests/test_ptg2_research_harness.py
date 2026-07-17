@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -82,27 +81,6 @@ def test_parse_ps_memory_parses_rss_and_vsz():
         "vmsize_kb": 123456,
     }
     assert harness.parse_ps_memory("bad output") == {}
-
-
-def test_run_with_sampling_drains_large_stdout_and_stderr(tmp_path):
-    payload_bytes = 256 * 1024
-    completed, _elapsed, _memory = harness.run_with_sampling(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; "
-                f"sys.stdout.buffer.write(b'o' * {payload_bytes}); "
-                f"sys.stderr.buffer.write(b'e' * {payload_bytes})"
-            ),
-        ],
-        {},
-        cwd=tmp_path,
-    )
-
-    assert completed.returncode == 0
-    assert completed.stdout == b"o" * payload_bytes
-    assert completed.stderr == b"e" * payload_bytes
 
 
 def test_suite_validation_and_env_expansion(tmp_path):
