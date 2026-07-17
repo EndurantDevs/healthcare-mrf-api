@@ -1,11 +1,11 @@
 {
   "issue_counts": {
     "ambiguous_function_names": 43,
-    "ambiguous_variable_names": 551,
-    "boolean_name_mismatch": 317,
+    "ambiguous_variable_names": 549,
+    "boolean_name_mismatch": 310,
     "builtin_shadowing": 1,
     "class_name_shape": 2,
-    "collection_name_mismatch": 756,
+    "collection_name_mismatch": 732,
     "comment_noise": 5,
     "deep_nesting": 69,
     "function_name_shape": 98,
