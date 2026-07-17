@@ -547,6 +547,150 @@ async def test_strict_cost_provider_selection_grows_until_page_is_contained(
 
 
 @pytest.mark.asyncio
+async def test_provider_npi_prefix_cache_reuses_and_grows_sealed_membership(
+    monkeypatch,
+):
+    """Reuse bounded provider-set membership and grow only beyond cached prefixes."""
+
+    provider_set_id = "01" * 16
+    member_npis = tuple(range(1000000001, 1000000051))
+    membership_calls = []
+
+    async def load_member_ids(
+        _session,
+        _tables,
+        provider_set_ids,
+        *,
+        limit_per_set,
+    ):
+        membership_calls.append((tuple(provider_set_ids), limit_per_set))
+        return {
+            selected_provider_set_id: tuple(
+                ptg2_serving._ptg2_npi_member_id(npi)
+                for npi in member_npis[:limit_per_set]
+            )
+            for selected_provider_set_id in provider_set_ids
+        }
+
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_provider_npi_member_ids_by_set",
+        load_member_ids,
+    )
+    ptg2_serving._PTG2_PROVIDER_NPI_PREFIX_CACHE.clear()
+    serving_tables = _strict_v3_tables(shared_snapshot_key=91)
+    try:
+        first_prefix = (
+            await ptg2_serving._provider_npis_for_sets(
+                object(),
+                serving_tables,
+                (provider_set_id,),
+                limit_per_set=32,
+            )
+        )[provider_set_id]
+        cached_short_prefix = (
+            await ptg2_serving._provider_npis_for_sets(
+                object(),
+                serving_tables,
+                (provider_set_id,),
+                limit_per_set=5,
+            )
+        )[provider_set_id]
+        complete_prefix = (
+            await ptg2_serving._provider_npis_for_sets(
+                object(),
+                serving_tables,
+                (provider_set_id,),
+                limit_per_set=64,
+            )
+        )[provider_set_id]
+        cached_complete_prefix = (
+            await ptg2_serving._provider_npis_for_sets(
+                object(),
+                serving_tables,
+                (provider_set_id,),
+                limit_per_set=128,
+            )
+        )[provider_set_id]
+    finally:
+        ptg2_serving._PTG2_PROVIDER_NPI_PREFIX_CACHE.clear()
+
+    assert first_prefix == member_npis[:32]
+    assert cached_short_prefix == member_npis[:5]
+    assert complete_prefix == member_npis
+    assert cached_complete_prefix == member_npis
+    assert membership_calls == [
+        ((provider_set_id,), 32),
+        ((provider_set_id,), 64),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_filtered_provider_prefix_cache_reuses_identical_filter(
+    monkeypatch,
+):
+    """Reuse a sealed provider-set prefix for an identical provider filter."""
+
+    provider_set_id = "02" * 16
+    member_npis = tuple(range(1000000001, 1000000033))
+    membership_calls = []
+    filter_calls = []
+
+    async def provider_npis(
+        _session,
+        _tables,
+        provider_set_ids,
+        *,
+        limit_per_set,
+    ):
+        membership_calls.append((tuple(provider_set_ids), limit_per_set))
+        return {
+            selected_provider_set_id: member_npis[:limit_per_set]
+            for selected_provider_set_id in provider_set_ids
+        }
+
+    async def filter_npis(_session, args, npis, *, limit):
+        filter_calls.append((args["provider_sex_code"], tuple(npis), limit))
+        return tuple(npi for npi in npis if npi % 2 == 0)[:limit]
+
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_provider_npis_for_sets",
+        provider_npis,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_filter_npis_by_taxonomy",
+        filter_npis,
+    )
+    ptg2_serving._PTG2_FILTERED_PROVIDER_PREFIX_CACHE.clear()
+    serving_tables = _strict_v3_tables(shared_snapshot_key=92)
+    args = {"plan_id": "synthetic-plan", "provider_sex_code": "F"}
+    try:
+        first_prefix = await ptg2_serving._filtered_provider_npis_for_expansion_set(
+            object(),
+            serving_tables,
+            provider_set_id,
+            args,
+            target_count=2,
+        )
+        cached_prefix = await ptg2_serving._filtered_provider_npis_for_expansion_set(
+            object(),
+            serving_tables,
+            provider_set_id,
+            args,
+            target_count=2,
+        )
+    finally:
+        ptg2_serving._PTG2_FILTERED_PROVIDER_PREFIX_CACHE.clear()
+
+    assert first_prefix == member_npis[1:4:2]
+    assert cached_prefix == first_prefix
+    assert membership_calls == [((provider_set_id,), 32)]
+    assert len(filter_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_strict_cost_provider_selection_bounds_demographic_filter_expansion(
     monkeypatch,
 ):
@@ -572,30 +716,53 @@ async def test_strict_cost_provider_selection_bounds_demographic_filter_expansio
         female_npis,
     )
     harness.install(monkeypatch)
-
-    selection = await ptg2_serving._strict_cost_provider_expansion_selection(
-        object(),
-        SimpleNamespace(source_key="synthetic-source"),
-        code_rows=[{"code_key": 7, "rate_count": 1}],
-        args={"plan_id": "synthetic-plan", "provider_sex_code": "F"},
-        snapshot_id="synthetic-snapshot",
-        source_trace_set_hash=None,
-        network_names=[],
-        target_count=2,
-        descending=False,
+    serving_tables = _strict_v3_tables(
+        shared_snapshot_key=93,
+        source_key="synthetic-source",
     )
+    selection_args = {
+        "code_rows": [{"code_key": 7, "rate_count": 1}],
+        "args": {
+            "plan_id": "synthetic-plan",
+            "provider_sex_code": "F",
+        },
+        "snapshot_id": "synthetic-snapshot",
+        "source_trace_set_hash": None,
+        "network_names": [],
+        "target_count": 2,
+        "descending": False,
+    }
+    ptg2_serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.clear()
+    try:
+        selection = (
+            await ptg2_serving._strict_cost_provider_expansion_selection(
+                object(),
+                serving_tables,
+                **selection_args,
+            )
+        )
+        cached_selection = (
+            await ptg2_serving._strict_cost_provider_expansion_selection(
+                object(),
+                serving_tables,
+                **selection_args,
+            )
+        )
+    finally:
+        ptg2_serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.clear()
 
     assert selection is not None
+    assert cached_selection is not None
     assert harness.membership_limits == [32, 64]
     assert list(selection.rank_by_key) == [
         ("npi", str(npi), "CPT", "99213", "FFS", "0")
         for npi in female_npis
     ]
+    assert cached_selection.rank_by_key == selection.rank_by_key
     assert [
         provider["npi"]
         for provider in selection.providers_by_set[provider_set_id]
     ] == list(female_npis)
-
 
 # Strict shared V3 serving contract
 

@@ -8,7 +8,8 @@ import hashlib
 import json
 import os
 import re
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from copy import deepcopy
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -121,6 +122,19 @@ ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 _PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT = 25
 _PTG2_MULTI_NETWORK_CONCURRENCY_ENV = "HLTHPRT_PTG2_MULTI_NETWORK_CONCURRENCY"
 _PTG2_MULTI_NETWORK_CONCURRENCY_DEFAULT = 8
+_PTG2_PROVIDER_NPI_PREFIX_CACHE_MAX_ENTRIES = 4096
+_PTG2_PROVIDER_NPI_PREFIX_CACHE: OrderedDict[
+    tuple[int, str],
+    tuple[int, tuple[int, ...], bool],
+] = OrderedDict()
+_PTG2_FILTERED_PROVIDER_PREFIX_CACHE: OrderedDict[
+    tuple[int, str, int, str],
+    tuple[int, ...],
+] = OrderedDict()
+_PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE: OrderedDict[
+    tuple[int, int],
+    tuple[str, ...],
+] = OrderedDict()
 
 
 def _safe_table_name(value: Any, *, default_schema: str = PTG2_SCHEMA) -> str | None:
@@ -3634,14 +3648,41 @@ async def _provider_npis_for_sets(
     limit_per_set: int | None = None,
 ) -> dict[str, tuple[int, ...]]:
     provider_set_ids = _ptg2_manifest_ids(tuple(provider_set_global_ids))
+    if limit_per_set is None:
+        uncached_provider_set_ids = provider_set_ids
+        requested_limit = None
+    else:
+        requested_limit = max(int(limit_per_set), 1)
+        shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
+        uncached_provider_set_ids_list: list[str] = []
+        npis_by_set: dict[str, tuple[int, ...]] = {}
+        for provider_set_id in provider_set_ids:
+            cache_key = (shared_snapshot_key, provider_set_id)
+            cache_entry = _PTG2_PROVIDER_NPI_PREFIX_CACHE.get(cache_key)
+            if cache_entry is None:
+                uncached_provider_set_ids_list.append(provider_set_id)
+                continue
+            cached_limit, cached_npis, is_complete = cache_entry
+            if not is_complete and cached_limit < requested_limit:
+                uncached_provider_set_ids_list.append(provider_set_id)
+                continue
+            _PTG2_PROVIDER_NPI_PREFIX_CACHE.move_to_end(cache_key)
+            npis_by_set[provider_set_id] = cached_npis[:requested_limit]
+        uncached_provider_set_ids = tuple(uncached_provider_set_ids_list)
+        if not uncached_provider_set_ids:
+            return {
+                provider_set_id: npis_by_set.get(provider_set_id, ())
+                for provider_set_id in provider_set_ids
+            }
     member_ids_by_set = await _provider_npi_member_ids_by_set(
         session,
         serving_tables,
-        provider_set_ids,
-        limit_per_set=limit_per_set,
+        uncached_provider_set_ids,
+        limit_per_set=requested_limit,
     )
-    npis_by_set: dict[str, tuple[int, ...]] = {}
-    for provider_set_id in provider_set_ids:
+    if limit_per_set is None:
+        npis_by_set = {}
+    for provider_set_id in uncached_provider_set_ids:
         npis = tuple(
             dict.fromkeys(
                 npi
@@ -3650,9 +3691,29 @@ async def _provider_npis_for_sets(
             )
         )
         npis_by_set[provider_set_id] = (
-            npis[:limit_per_set] if limit_per_set is not None else npis
+            npis[:requested_limit] if requested_limit is not None else npis
         )
-    return npis_by_set
+        if requested_limit is not None:
+            cache_key = (
+                _required_shared_snapshot_key(serving_tables),
+                provider_set_id,
+            )
+            _PTG2_PROVIDER_NPI_PREFIX_CACHE[cache_key] = (
+                requested_limit,
+                npis_by_set[provider_set_id],
+                len(member_ids_by_set.get(provider_set_id, ()))
+                < requested_limit,
+            )
+            _PTG2_PROVIDER_NPI_PREFIX_CACHE.move_to_end(cache_key)
+            while (
+                len(_PTG2_PROVIDER_NPI_PREFIX_CACHE)
+                > _PTG2_PROVIDER_NPI_PREFIX_CACHE_MAX_ENTRIES
+            ):
+                _PTG2_PROVIDER_NPI_PREFIX_CACHE.popitem(last=False)
+    return {
+        provider_set_id: npis_by_set.get(provider_set_id, ())
+        for provider_set_id in provider_set_ids
+    }
 
 
 async def _provider_npi_member_ids_by_set(
@@ -6190,6 +6251,50 @@ class _ProviderExpansionSelection:
         return len(self.rank_by_key)
 
 
+_PTG2_PROVIDER_EXPANSION_SELECTION_CACHE_MAX_ENTRIES = 1024
+_PTG2_PROVIDER_EXPANSION_SELECTION_CACHE: OrderedDict[
+    tuple[int, str, int, bool, str],
+    _ProviderExpansionSelection,
+] = OrderedDict()
+
+
+def _provider_expansion_selection_cache_key(
+    serving_tables: PTG2ServingTables,
+    *,
+    code_rows: list[Mapping[str, Any]],
+    args: Mapping[str, Any],
+    snapshot_id: str,
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+    target_count: int,
+    descending: bool,
+) -> tuple[int, str, int, bool, str] | None:
+    """Build an immutable sealed-snapshot key for exact provider expansion."""
+
+    shared_snapshot_key = getattr(serving_tables, "shared_snapshot_key", None)
+    if shared_snapshot_key is None:
+        return None
+    selection_signature = json.dumps(
+        {
+            "args": dict(args),
+            "code_rows": code_rows,
+            "network_names": network_names,
+            "source_key": getattr(serving_tables, "source_key", None),
+            "source_trace_set_hash": source_trace_set_hash,
+        },
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return (
+        int(shared_snapshot_key),
+        snapshot_id,
+        max(int(target_count), 1),
+        bool(descending),
+        selection_signature,
+    )
+
+
 def _provider_expansion_key(
     serving_row: Mapping[str, Any],
     *,
@@ -6282,6 +6387,29 @@ def _rank_provider_expansion_prefix(
     )
 
 
+def _filtered_provider_prefix_cache_key(
+    serving_tables: PTG2ServingTables,
+    provider_set_id: str,
+    args: Mapping[str, Any],
+    target_count: int,
+) -> tuple[int, str, int, str] | None:
+    shared_snapshot_key = getattr(serving_tables, "shared_snapshot_key", None)
+    if shared_snapshot_key is None:
+        return None
+    filter_signature = json.dumps(
+        dict(args),
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return (
+        int(shared_snapshot_key),
+        provider_set_id,
+        max(int(target_count), 1),
+        filter_signature,
+    )
+
+
 async def _filtered_provider_npis_for_expansion_set(
     session,
     serving_tables: PTG2ServingTables,
@@ -6292,6 +6420,17 @@ async def _filtered_provider_npis_for_expansion_set(
 ) -> tuple[int, ...]:
     """Read enough ordered set members to prove a filtered provider prefix."""
 
+    cache_key = _filtered_provider_prefix_cache_key(
+        serving_tables,
+        provider_set_id,
+        args,
+        target_count,
+    )
+    if cache_key is not None:
+        cached_npis = _PTG2_FILTERED_PROVIDER_PREFIX_CACHE.get(cache_key)
+        if cached_npis is not None:
+            _PTG2_FILTERED_PROVIDER_PREFIX_CACHE.move_to_end(cache_key)
+            return cached_npis
     raw_limit = max(max(int(target_count), 1) * 4, 32)
     while True:
         npis_by_set = await _provider_npis_for_sets(
@@ -6308,6 +6447,14 @@ async def _filtered_provider_npis_for_expansion_set(
             limit=max(int(target_count), 1),
         )
         if len(filtered_npis) >= target_count or len(provider_npis) < raw_limit:
+            if cache_key is not None:
+                _PTG2_FILTERED_PROVIDER_PREFIX_CACHE[cache_key] = filtered_npis
+                _PTG2_FILTERED_PROVIDER_PREFIX_CACHE.move_to_end(cache_key)
+                while (
+                    len(_PTG2_FILTERED_PROVIDER_PREFIX_CACHE)
+                    > _PTG2_PROVIDER_NPI_PREFIX_CACHE_MAX_ENTRIES
+                ):
+                    _PTG2_FILTERED_PROVIDER_PREFIX_CACHE.popitem(last=False)
             return filtered_npis
         raw_limit *= 2
 
@@ -6375,7 +6522,25 @@ async def _provider_set_ids_for_selected_npis(
 ) -> dict[int, tuple[str, ...]]:
     if not npis:
         return {}
-    member_id_by_npi = {npi: _ptg2_npi_member_id(npi) for npi in npis}
+    shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
+    provider_set_ids_by_npi: dict[int, tuple[str, ...]] = {}
+    uncached_npis: list[int] = []
+    for npi in npis:
+        cache_key = (shared_snapshot_key, npi)
+        cached_provider_set_ids = _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE.get(
+            cache_key
+        )
+        if cached_provider_set_ids is None:
+            uncached_npis.append(npi)
+            continue
+        _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE.move_to_end(cache_key)
+        provider_set_ids_by_npi[npi] = cached_provider_set_ids
+    if not uncached_npis:
+        return provider_set_ids_by_npi
+    member_id_by_npi = {
+        npi: _ptg2_npi_member_id(npi)
+        for npi in uncached_npis
+    }
     groups_by_member = await _shared_graph_members_by_id(
         session,
         serving_tables,
@@ -6394,7 +6559,7 @@ async def _provider_set_ids_for_selected_npis(
         serving_tables,
         group_ids,
     )
-    return {
+    resolved_provider_set_ids_by_npi = {
         npi: tuple(
             dict.fromkeys(
                 provider_set_id
@@ -6404,6 +6569,17 @@ async def _provider_set_ids_for_selected_npis(
         )
         for npi, member_id in member_id_by_npi.items()
     }
+    provider_set_ids_by_npi.update(resolved_provider_set_ids_by_npi)
+    for npi, provider_set_ids in resolved_provider_set_ids_by_npi.items():
+        cache_key = (shared_snapshot_key, npi)
+        _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE[cache_key] = provider_set_ids
+        _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE.move_to_end(cache_key)
+        while (
+            len(_PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE)
+            > _PTG2_PROVIDER_NPI_PREFIX_CACHE_MAX_ENTRIES
+        ):
+            _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE.popitem(last=False)
+    return provider_set_ids_by_npi
 
 
 async def _selected_provider_rows_by_set(
@@ -6541,6 +6717,23 @@ async def _strict_cost_provider_expansion_selection(
     descending: bool,
 ) -> _ProviderExpansionSelection | None:
     """Expand cost-ordered rates until the requested provider prefix is complete."""
+    cache_key = _provider_expansion_selection_cache_key(
+        serving_tables,
+        code_rows=code_rows,
+        args=args,
+        snapshot_id=snapshot_id,
+        source_trace_set_hash=source_trace_set_hash,
+        network_names=network_names,
+        target_count=target_count,
+        descending=descending,
+    )
+    if cache_key is not None:
+        cached_selection = _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.get(
+            cache_key
+        )
+        if cached_selection is not None:
+            _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.move_to_end(cache_key)
+            return deepcopy(cached_selection)
     declared_rate_count = sum(
         max(int(code_row.get("rate_count") or 0), 0)
         for code_row in code_rows
@@ -6677,12 +6870,23 @@ async def _strict_cost_provider_expansion_selection(
         return None
     for provider_set_id in selected_provider_set_ids:
         providers_by_set.setdefault(provider_set_id, [])
-    return _ProviderExpansionSelection(
+    selection = _ProviderExpansionSelection(
         row_data=completion_rows,
         providers_by_set=providers_by_set,
         rank_by_key=rank_by_key,
         exhausted=is_exhausted and len(rank_by_key) < target_count,
     )
+    if cache_key is not None:
+        _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE[cache_key] = deepcopy(
+            selection
+        )
+        _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.move_to_end(cache_key)
+        while (
+            len(_PTG2_PROVIDER_EXPANSION_SELECTION_CACHE)
+            > _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE_MAX_ENTRIES
+        ):
+            _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.popitem(last=False)
+    return selection
 
 
 async def _procedure_details_for_rows(
@@ -8461,13 +8665,6 @@ async def _search_plan_network_snapshot(
 ) -> tuple[str, str, dict[str, Any] | None]:
     async with sa_db.session() as network_session:
         serving_tables = await snapshot_serving_tables(network_session, snapshot_id)
-        if not await _has_snapshot_plan_code(
-            network_session,
-            snapshot_id,
-            args,
-            serving_tables=serving_tables,
-        ):
-            return source_key, snapshot_id, None
         response = await _search_one_ptg2_snapshot(
             network_session,
             snapshot_id,
