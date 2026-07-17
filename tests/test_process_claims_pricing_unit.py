@@ -39,7 +39,7 @@ CLAIMS_YEAR_WINDOW = claims_pricing.CLAIMS_YEAR_WINDOW
 
 
 def test_find_dataset_normalizes_landing_page():
-    catalog = {
+    catalog_map = {
         "dataset": [
             {
                 "landingPage": "https://data.cms.gov/x/y/data",
@@ -49,12 +49,12 @@ def test_find_dataset_normalizes_landing_page():
         ]
     }
 
-    result = _find_dataset(catalog, "https://data.cms.gov/x/y")
+    result = _find_dataset(catalog_map, "https://data.cms.gov/x/y")
     assert result["title"] == "dataset-1"
 
 
 def test_select_csv_distribution_prefers_latest_reporting_year():
-    dataset = {
+    dataset_map = {
         "title": "demo",
         "distribution": [
             {"downloadURL": "https://example.com/file_DY21.csv", "mediaType": "text/csv", "modified": "2025-01-01"},
@@ -63,12 +63,12 @@ def test_select_csv_distribution_prefers_latest_reporting_year():
         ],
     }
 
-    selected = _select_csv_distribution(dataset)
+    selected = _select_csv_distribution(dataset_map)
     assert selected["downloadURL"].endswith("DY23.csv")
 
 
 def test_resolve_sources_extracts_urls_and_years():
-    catalog = {
+    catalog_map = {
         "dataset": [
             {
                 "landingPage": "https://data.cms.gov/provider-summary-by-type-of-service/medicare-physician-other-practitioners/medicare-physician-other-practitioners-by-provider",
@@ -100,7 +100,7 @@ def test_resolve_sources_extracts_urls_and_years():
         ]
     }
 
-    resolved = _resolve_sources(catalog)
+    resolved = _resolve_sources(catalog_map)
     assert [entry["reporting_year"] for entry in resolved["provider"]] == list(CLAIMS_YEAR_WINDOW)
     assert resolved["provider_service"][0]["url"].startswith("https://example.com/")
     assert resolved["geo_service"][-1]["dataset_title"] == "geo_service"
@@ -112,8 +112,8 @@ def test_row_allowed_for_test_is_deterministic_sparse_sample():
 
 
 def test_row_value_supports_multiple_header_variants():
-    row = {"Prscrbr_NPI": "12345"}
-    assert _row_value(row, "PRSCRBR_NPI", "Prscrbr_NPI") == "12345"
+    row_map = {"Prscrbr_NPI": "12345"}
+    assert _row_value(row_map, "PRSCRBR_NPI", "Prscrbr_NPI") == "12345"
 
 
 def test_normalize_state_and_zip5_helpers():
@@ -157,24 +157,26 @@ def test_detect_code_system_distinguishes_cpt_cdt_and_hcpcs():
 
 @pytest.mark.asyncio
 async def test_materialize_code_rows_marks_source_observed_cdt(monkeypatch):
-    calls = []
+    database_calls = []
 
     async def fake_status(sql, **params):
-        calls.append((sql, params))
+        database_calls.append((sql, params))
         return 1
 
     monkeypatch.setattr(claims_pricing.db, "status", fake_status)
 
-    classes = {"PricingProcedure": SimpleNamespace(__tablename__="pricing_procedure_stage")}
-    await claims_pricing._materialize_code_and_crosswalk_rows(classes, "mrf")
+    class_by_name = {
+        "PricingProcedure": SimpleNamespace(__tablename__="pricing_procedure_stage")
+    }
+    await claims_pricing._materialize_code_and_crosswalk_rows(class_by_name, "mrf")
 
-    sql_text = "\n".join(sql for sql, _params in calls)
+    sql_text = "\n".join(sql for sql, _params in database_calls)
     assert "THEN 'CDT'" in sql_text
     assert "source_attribution" in sql_text
     assert "WHERE src.primary_system IN ('CPT', 'CDT')" in sql_text
     assert all(
         params.get("source_attribution") == claims_pricing.SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION
-        for _sql, params in calls
+        for _sql, params in database_calls
     )
 
 
@@ -208,59 +210,59 @@ def test_env_bool_parsing(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_download_sources_uses_partial_download_in_test_mode(monkeypatch):
-    calls = {"head": 0, "full": 0}
+    call_count_by_kind = {"head": 0, "full": 0}
 
     async def fake_head(url, path, max_bytes):
-        calls["head"] += 1
+        call_count_by_kind["head"] += 1
         assert max_bytes == claims_pricing.TEST_MAX_DOWNLOAD_BYTES
         with open(path, "wb") as handle:
             handle.write(b"header1,header2\n")
 
     async def fake_full(url, path):
-        calls["full"] += 1
+        call_count_by_kind["full"] += 1
         raise AssertionError("download_it_and_save must not be called in --test mode")
 
     monkeypatch.setattr(claims_pricing, "_download_csv_head", fake_head)
     monkeypatch.setattr(claims_pricing, "download_it_and_save", fake_full)
 
-    sources = {"provider": {"url": "https://example.com/providers.csv"}}
+    source_by_kind = {"provider": {"url": "https://example.com/providers.csv"}}
     with tempfile.TemporaryDirectory() as tmpdir:
-        result = await _download_sources(sources, tmpdir, test_mode=True)
+        result = await _download_sources(source_by_kind, tmpdir, test_mode=True)
         assert os.path.exists(result["provider"])
-    assert calls["head"] == 1
-    assert calls["full"] == 0
+    assert call_count_by_kind["head"] == 1
+    assert call_count_by_kind["full"] == 0
 
 
 @pytest.mark.asyncio
 async def test_download_sources_uses_full_download_in_non_test_mode(monkeypatch):
-    calls = {"head": 0, "full": 0}
+    call_count_by_kind = {"head": 0, "full": 0}
 
     async def fake_head(url, path, max_bytes):
-        calls["head"] += 1
+        call_count_by_kind["head"] += 1
         raise AssertionError("_download_csv_head must not be called in non-test mode")
 
     async def fake_full(url, path):
-        calls["full"] += 1
+        call_count_by_kind["full"] += 1
         with open(path, "wb") as handle:
             handle.write(b"header1,header2\n")
 
     monkeypatch.setattr(claims_pricing, "_download_csv_head", fake_head)
     monkeypatch.setattr(claims_pricing, "download_it_and_save", fake_full)
 
-    sources = {"provider": {"url": "https://example.com/providers.csv"}}
+    source_by_kind = {"provider": {"url": "https://example.com/providers.csv"}}
     with tempfile.TemporaryDirectory() as tmpdir:
-        result = await _download_sources(sources, tmpdir, test_mode=False)
+        result = await _download_sources(source_by_kind, tmpdir, test_mode=False)
         assert os.path.exists(result["provider"])
-    assert calls["head"] == 0
-    assert calls["full"] == 1
+    assert call_count_by_kind["head"] == 0
+    assert call_count_by_kind["full"] == 1
 
 
 @pytest.mark.asyncio
 async def test_download_source_file_creates_missing_directory(monkeypatch):
-    calls = {"full": 0}
+    call_count_by_kind = {"full": 0}
 
     async def fake_full(url, path):
-        calls["full"] += 1
+        call_count_by_kind["full"] += 1
         with open(path, "wb") as handle:
             handle.write(b"col\n")
 
@@ -274,7 +276,7 @@ async def test_download_source_file_creates_missing_directory(monkeypatch):
             test_mode=False,
         )
         assert Path(output_path).exists()
-    assert calls["full"] == 1
+    assert call_count_by_kind["full"] == 1
 
 
 @pytest.mark.asyncio
@@ -342,21 +344,21 @@ async def test_split_provider_service_chunks_partition_by_npi(monkeypatch):
         )
         assert chunks
 
-        npi_to_chunk = {}
+        chunk_path_by_npi = {}
         for chunk in chunks:
             with open(chunk["chunk_path"], "r", encoding="utf-8-sig", newline="") as handle:
                 reader = csv.DictReader(handle)
                 for provider_service_row in reader:
                     npi = provider_service_row["Rndrng_NPI"]
-                    existing = npi_to_chunk.get(npi)
+                    existing = chunk_path_by_npi.get(npi)
                     if existing is None:
-                        npi_to_chunk[npi] = chunk["chunk_path"]
+                        chunk_path_by_npi[npi] = chunk["chunk_path"]
                     else:
                         assert existing == chunk["chunk_path"]
 
-        assert "1000000001" in npi_to_chunk
-        assert "1000000002" in npi_to_chunk
-        assert "1000000003" in npi_to_chunk
+        assert "1000000001" in chunk_path_by_npi
+        assert "1000000002" in chunk_path_by_npi
+        assert "1000000003" in chunk_path_by_npi
 
 
 @pytest.mark.asyncio
@@ -398,11 +400,11 @@ async def test_split_provider_service_chunks_ignores_overflow_fields(monkeypatch
 
 @pytest.mark.asyncio
 async def test_push_objects_with_retry_retries_deadlock(monkeypatch):
-    attempts = {"count": 0}
+    attempt_count_by_status = {"count": 0}
 
     async def fake_push(*_args, **_kwargs):
-        attempts["count"] += 1
-        if attempts["count"] < 3:
+        attempt_count_by_status["count"] += 1
+        if attempt_count_by_status["count"] < 3:
             raise RuntimeError("deadlock detected")
         return None
 
@@ -411,4 +413,4 @@ async def test_push_objects_with_retry_retries_deadlock(monkeypatch):
     monkeypatch.setattr(claims_pricing.asyncio, "sleep", AsyncMock())
 
     await _push_objects_with_retry([{"provider_key": 1}], SimpleNamespace(__tablename__="pricing_provider"))
-    assert attempts["count"] == 3
+    assert attempt_count_by_status["count"] == 3
