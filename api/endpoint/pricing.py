@@ -7199,7 +7199,7 @@ async def list_pricing_providers(request):
     min_total_cost = _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0)
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
     benchmark_mode = _parse_benchmark_mode(args.get("benchmark_mode"), "benchmark_mode")
-    q = str(args.get("q", "")).strip()
+    query_text = str(args.get("q", "")).strip()
     state = str(args.get("state", "")).strip().upper()
     city = str(args.get("city", "")).strip().lower()
     specialty = str(args.get("specialty", "")).strip().lower()
@@ -7221,13 +7221,13 @@ async def list_pricing_providers(request):
     )
     if provider_type_clause is not None:
         filters.append(provider_type_clause)
-    if q:
-        q_like = f"%{q.lower()}%"
+    if query_text:
+        q_like = f"%{query_text.lower()}%"
         filters.append(
             or_(
                 func.lower(provider_table.c.provider_name).like(q_like),
                 func.lower(provider_table.c.provider_type).like(q_like),
-                cast(provider_table.c.npi, String).like(f"%{q}%"),
+                cast(provider_table.c.npi, String).like(f"%{query_text}%"),
             )
         )
     if min_claims is not None:
@@ -7294,12 +7294,12 @@ async def list_pricing_providers(request):
         )
     query = query.limit(pagination.limit).offset(pagination.offset)
 
-    result = await session.execute(query)
-    items = [_normalize_provider_payload(_row_to_dict(row), include_legacy=include_legacy_fields) for row in result]
+    query_result = await session.execute(query)
+    provider_items = [_normalize_provider_payload(_row_to_dict(provider_record), include_legacy=include_legacy_fields) for provider_record in query_result]
 
     return response.json(
         {
-            "items": items,
+            "items": provider_items,
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,
@@ -7317,7 +7317,7 @@ async def list_pricing_providers(request):
                 "city": city or None,
                 "specialty": specialty or None,
                 "provider_type_resolution": provider_type_resolution,
-                "q": q or None,
+                "q": query_text or None,
                 "min_claims": min_claims,
                 "min_total_cost": min_total_cost,
                 "include_legacy_fields": include_legacy_fields,
@@ -7780,7 +7780,7 @@ async def list_provider_procedures(request, npi: str):
     year = _parse_int(args.get("year"), "year", minimum=2013)
     min_claims = _parse_float(args.get("min_claims"), "min_claims", minimum=0)
     min_total_cost = _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0)
-    q = str(args.get("q", "")).strip().lower()
+    query_text = str(args.get("q", "")).strip().lower()
     service_name = str(args.get("service_name", args.get("generic_name", ""))).strip().lower()
     reported_code = str(args.get("reported_code", args.get("brand_name", ""))).strip().lower()
     code = str(args.get("code", "")).strip()
@@ -7801,7 +7801,7 @@ async def list_provider_procedures(request, npi: str):
         except ValueError as exc:
             raise InvalidUsage(str(exc)) from exc
     if plan_id or plan_external_id or source_key or snapshot_id:
-        ptg_args = {
+        ptg_args_by_name = {
                 "plan_id": plan_id or None,
                 "plan_external_id": plan_external_id or None,
                 "plan_id_type": plan_id_type or None,
@@ -7811,7 +7811,7 @@ async def list_provider_procedures(request, npi: str):
                 "mode": mode or None,
                 "code": code or reported_code or None,
                 "code_system": args.get("code_system") or None,
-                "q": q or service_name or None,
+                "q": query_text or service_name or None,
                 "pos": args.get("pos") or args.get("place_of_service") or None,
                 "service_code": args.get("service_code") or None,
                 "modifier": args.get("modifier") or args.get("modifiers") or None,
@@ -7827,13 +7827,13 @@ async def list_provider_procedures(request, npi: str):
         ptg2_payload = await search_ptg2_provider_procedures(
             session,
             provider_npi,
-            ptg_args,
+            ptg_args_by_name,
             pagination,
         )
         if ptg2_payload is None:
             ptg_empty_status = "no_match" if (source_key or snapshot_id) else "no_route"
             has_location_filter = _has_ptg2_location_filter(args)
-            query_payload = {
+            query_by_field = {
                 "npi": provider_npi,
                 "plan_id": plan_id or None,
                 "plan_external_id": plan_external_id or None,
@@ -7843,13 +7843,13 @@ async def list_provider_procedures(request, npi: str):
                 "snapshot_id": snapshot_id or None,
                 "mode": mode or "product_search",
                 "code": code or reported_code or None,
-                "q": q or service_name or None,
+                "q": query_text or service_name or None,
                 "source": "ptg2",
                 "status": ptg_empty_status,
             }
             if year is not None:
-                query_payload["ignored_params"] = ["year"]
-                query_payload["year_semantics"] = "ignored_for_plan_scoped_ptg_rates"
+                query_by_field["ignored_params"] = ["year"]
+                query_by_field["year_semantics"] = "ignored_for_plan_scoped_ptg_rates"
             return response.json(
                 {
                     "result_state": _ptg2_empty_result_state(
@@ -7870,7 +7870,7 @@ async def list_provider_procedures(request, npi: str):
                         "offset": pagination.offset,
                         "page": pagination.page,
                     },
-                    "query": query_payload,
+                    "query": query_by_field,
                 }
             )
         _annotate_ptg2_query_payload(
@@ -7894,8 +7894,8 @@ async def list_provider_procedures(request, npi: str):
         filters.append(func.lower(provider_procedure_table.c.service_description).like(f"%{service_name}%"))
     if reported_code:
         filters.append(func.lower(provider_procedure_table.c.reported_code).like(f"%{reported_code}%"))
-    if q:
-        q_like = f"%{q}%"
+    if query_text:
+        q_like = f"%{query_text}%"
         filters.append(
             or_(
                 func.lower(provider_procedure_table.c.service_description).like(q_like),
@@ -7943,20 +7943,20 @@ async def list_provider_procedures(request, npi: str):
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
 
-    result = await session.execute(query)
-    items = [
-        _normalize_service_payload({**_row_to_dict(row), "__include_legacy_fields__": include_legacy_fields})
-        for row in result
+    query_result = await session.execute(query)
+    procedure_items = [
+        _normalize_service_payload({**_row_to_dict(procedure_record), "__include_legacy_fields__": include_legacy_fields})
+        for procedure_record in query_result
     ]
 
-    query_payload: dict[str, Any] = {
+    query_by_field: dict[str, Any] = {
         "npi": provider_npi,
         "year": year,
         "year_used": year,
         "year_source": year_source,
         "service_name": service_name or None,
         "reported_code": reported_code or None,
-        "q": q or None,
+        "q": query_text or None,
         "code": code or None,
         "min_claims": min_claims,
         "min_total_cost": min_total_cost,
@@ -7965,7 +7965,7 @@ async def list_provider_procedures(request, npi: str):
         "order": order,
     }
     if code_context is not None:
-        query_payload.update(
+        query_by_field.update(
             {
                 "input_code": code_context["input_code"],
                 "resolved_codes": code_context["resolved_codes"],
@@ -7975,14 +7975,14 @@ async def list_provider_procedures(request, npi: str):
 
     return response.json(
         {
-            "items": items,
+            "items": procedure_items,
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,
                 "offset": pagination.offset,
                 "page": pagination.page,
             },
-            "query": query_payload,
+            "query": query_by_field,
         }
     )
 
@@ -8610,7 +8610,7 @@ async def list_procedure_providers(request, code_system: str, code: str):
     state = str(args.get("state", "")).strip().upper()
     city = str(args.get("city", "")).strip().lower()
     specialty = str(args.get("specialty", "")).strip().lower()
-    q = str(args.get("q", "")).strip().lower()
+    query_text = str(args.get("q", "")).strip().lower()
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
     args.get("provider_type")
     args.get("classification")
@@ -8646,13 +8646,13 @@ async def list_procedure_providers(request, code_system: str, code: str):
     )
     if provider_type_clause is not None:
         filters.append(provider_type_clause)
-    if q:
-        q_like = f"%{q}%"
+    if query_text:
+        q_like = f"%{query_text}%"
         filters.append(
             or_(
                 func.lower(provider_table.c.provider_name).like(q_like),
                 func.lower(provider_table.c.provider_type).like(q_like),
-                cast(provider_table.c.npi, String).like(f"%{q}%"),
+                cast(provider_table.c.npi, String).like(f"%{query_text}%"),
             )
         )
     if min_claims is not None:
@@ -8712,12 +8712,12 @@ async def list_procedure_providers(request, code_system: str, code: str):
         },
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
-    result = await session.execute(query)
-    items = [_normalize_provider_service_aggregate(_row_to_dict(row), include_legacy=include_legacy_fields) for row in result]
+    query_result = await session.execute(query)
+    provider_items = [_normalize_provider_service_aggregate(_row_to_dict(provider_record), include_legacy=include_legacy_fields) for provider_record in query_result]
 
     return response.json(
         {
-            "items": items,
+            "items": provider_items,
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,
@@ -8732,7 +8732,7 @@ async def list_procedure_providers(request, code_system: str, code: str):
                 "city": city or None,
                 "specialty": specialty or None,
                 "provider_type_resolution": provider_type_resolution,
-                "q": q or None,
+                "q": query_text or None,
                 "min_claims": min_claims,
                 "min_total_cost": min_total_cost,
                 "include_legacy_fields": include_legacy_fields,
@@ -9963,7 +9963,7 @@ async def list_providers_by_procedure(request):
     if latitude is None and coordinate_radius_raw not in (None, "", "null"):
         raise InvalidUsage("Parameter 'radius_miles' requires 'lat' and 'long'")
     specialty = str(args.get("specialty", "")).strip().lower()
-    q = str(args.get("q", "")).strip().lower()
+    query_text = str(args.get("q", "")).strip().lower()
     code = str(args.get("code", "")).strip()
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "total_allowed_amount")
@@ -9997,7 +9997,7 @@ async def list_providers_by_procedure(request):
     args.get("classification")
     args.get("taxonomy_codes")
 
-    if not q and not code:
+    if not query_text and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
     ptg_specialty_filter = None
     if plan_id or plan_external_id or source_key or snapshot_id:
@@ -10049,7 +10049,7 @@ async def list_providers_by_procedure(request):
         ptg_order = order
         if args.get("order") in (None, "", "null"):
             ptg_order = "asc"
-        ptg_args = {
+        ptg_args_by_name = {
                 "plan_id": plan_id or None,
                 "plan_external_id": plan_external_id or None,
                 "plan_id_type": plan_id_type or None,
@@ -10059,7 +10059,7 @@ async def list_providers_by_procedure(request):
                 "mode": mode or None,
                 "code": code or None,
                 "code_system": ptg_code_system or None,
-                "q": q or None,
+                "q": query_text or None,
                 "specialty": specialty or None,
                 "classification": args.get("classification") or None,
                 "taxonomy_codes": (
@@ -10102,10 +10102,10 @@ async def list_providers_by_procedure(request):
             }
         route_name = str(getattr(getattr(request, "route", None), "name", ""))
         if route_name.endswith("pricing.providers.audit_search_by_procedure"):
-            attach_candidate_audit_access(request, ptg_args)
+            attach_candidate_audit_access(request, ptg_args_by_name)
         ptg2_payload = await search_current_ptg2_index(
             session,
-            ptg_args,
+            ptg_args_by_name,
             pagination,
         )
         if ptg2_payload is None:
@@ -10113,7 +10113,7 @@ async def list_providers_by_procedure(request):
                 allowed_amount_payload = (
                     await _search_ptg_allowed_amount_evidence(
                         session,
-                        ptg_args,
+                        ptg_args_by_name,
                         pagination,
                     )
                 )
@@ -10132,7 +10132,7 @@ async def list_providers_by_procedure(request):
                     )
             ptg_empty_status = "no_match" if (source_key or snapshot_id) else "no_route"
             has_location_filter = _has_ptg2_location_filter(args)
-            query_payload = {
+            query_by_field = {
                 "plan_id": plan_id or None,
                 "plan_external_id": plan_external_id or None,
                 "plan_id_type": plan_id_type or None,
@@ -10141,7 +10141,7 @@ async def list_providers_by_procedure(request):
                 "snapshot_id": snapshot_id or None,
                 "mode": mode or "product_search",
                 "code": code or None,
-                "q": q or None,
+                "q": query_text or None,
                 "specialty": specialty or None,
                 "taxonomy_code": args.get("taxonomy_code") or None,
                 "taxonomy_classification": args.get("taxonomy_classification") or None,
@@ -10157,8 +10157,8 @@ async def list_providers_by_procedure(request):
                 "status": ptg_empty_status,
             }
             if year is not None:
-                query_payload["ignored_params"] = ["year"]
-                query_payload["year_semantics"] = "ignored_for_plan_scoped_ptg_rates"
+                query_by_field["ignored_params"] = ["year"]
+                query_by_field["year_semantics"] = "ignored_for_plan_scoped_ptg_rates"
             return _ptg_json_response(
                 request,
                 {
@@ -10180,7 +10180,7 @@ async def list_providers_by_procedure(request):
                         "offset": pagination.offset,
                         "page": pagination.page,
                     },
-                    "query": query_payload,
+                    "query": query_by_field,
                 },
             )
         if (
@@ -10189,7 +10189,7 @@ async def list_providers_by_procedure(request):
         ):
             allowed_amount_payload = await _search_ptg_allowed_amount_evidence(
                 session,
-                ptg_args,
+                ptg_args_by_name,
                 pagination,
             )
             if allowed_amount_payload is not None:
@@ -10234,16 +10234,16 @@ async def list_providers_by_procedure(request):
             radius_miles=zip_radius_miles,
             state_hint=state or None,
         )
-        for row in sorted(
+        for provider_record in sorted(
             zip_rows,
-            key=lambda item: (_as_float(item.get("distance_miles")) or 0.0, str(item.get("zip5") or "")),
+            key=lambda provider_item_by_field: (_as_float(provider_item_by_field.get("distance_miles")) or 0.0, str(provider_item_by_field.get("zip5") or "")),
         ):
-            candidate_zip = _normalize_zip5(row.get("zip5"))
+            candidate_zip = _normalize_zip5(provider_record.get("zip5"))
             if candidate_zip is None:
                 continue
             if candidate_zip in zip_distance_map:
                 continue
-            distance_value = _as_float(row.get("distance_miles"))
+            distance_value = _as_float(provider_record.get("distance_miles"))
             zip_distance_map[candidate_zip] = {
                 "distance_miles": distance_value,
                 "distance_bucket": _distance_bucket(distance_value),
@@ -10274,9 +10274,9 @@ async def list_providers_by_procedure(request):
     )
     if provider_type_clause is not None:
         filters.append(provider_type_clause)
-    procedure_term_resolution: dict[str, Any] | None = None
-    if q:
-        q_like = f"%{q}%"
+    procedure_resolution_by_field: dict[str, Any] | None = None
+    if query_text:
+        q_like = f"%{query_text}%"
         q_clauses = [
             func.lower(provider_procedure_table.c.service_description).like(q_like),
             func.lower(provider_procedure_table.c.reported_code).like(q_like),
@@ -10284,7 +10284,7 @@ async def list_providers_by_procedure(request):
         terminology_matches = await _query_terminology(
             session,
             domain="procedure",
-            term=q,
+            term=query_text,
             exact=True,
             include_broad=True,
             limit=50,
@@ -10293,10 +10293,10 @@ async def list_providers_by_procedure(request):
         if terminology_internal_codes:
             q_clauses.append(provider_procedure_table.c.procedure_code.in_(terminology_internal_codes))
         if terminology_matches:
-            procedure_term_resolution = {
-                "input": q,
+            procedure_resolution_by_field = {
+                "input": query_text,
                 "matches": terminology_matches,
-                "internal_codes": [str(value) for value in terminology_internal_codes],
+                "internal_codes": [str(field_value) for field_value in terminology_internal_codes],
             }
         filters.append(
             or_(
@@ -10385,25 +10385,25 @@ async def list_providers_by_procedure(request):
         },
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
-    result = await session.execute(query)
-    items = [_normalize_provider_service_aggregate(_row_to_dict(row), include_legacy=include_legacy_fields) for row in result]
-    if zip5 and items:
-        for item in items:
-            item_zip = _normalize_zip5(item.get("zip5"))
+    query_result = await session.execute(query)
+    provider_items = [_normalize_provider_service_aggregate(_row_to_dict(provider_record), include_legacy=include_legacy_fields) for provider_record in query_result]
+    if zip5 and provider_items:
+        for provider_item_by_field in provider_items:
+            item_zip = _normalize_zip5(provider_item_by_field.get("zip5"))
             if item_zip is None:
                 continue
-            distance_payload = zip_distance_map.get(item_zip)
-            if distance_payload is None:
+            distance_by_field = zip_distance_map.get(item_zip)
+            if distance_by_field is None:
                 if item_zip != zip5:
                     continue
-                distance_payload = {"distance_miles": 0.0, "distance_bucket": "zip_exact"}
-            item["distance_miles"] = _as_float(distance_payload.get("distance_miles"))
-            item["distance_bucket"] = distance_payload.get("distance_bucket")
-            item["anchor_zip5"] = zip5
-    if code and internal_codes and items:
+                distance_by_field = {"distance_miles": 0.0, "distance_bucket": "zip_exact"}
+            provider_item_by_field["distance_miles"] = _as_float(distance_by_field.get("distance_miles"))
+            provider_item_by_field["distance_bucket"] = distance_by_field.get("distance_bucket")
+            provider_item_by_field["anchor_zip5"] = zip5
+    if code and internal_codes and provider_items:
         await _enrich_provider_service_cost_indices(
             session,
-            items,
+            provider_items,
             year=year,
             internal_codes=internal_codes,
             fallback_state=state or None,
@@ -10411,8 +10411,8 @@ async def list_providers_by_procedure(request):
             fallback_zip5=zip5 or None,
         )
 
-    query_payload: dict[str, Any] = {
-        "q": q or None,
+    query_by_field: dict[str, Any] = {
+        "q": query_text or None,
         "code": code or None,
         "year": year,
         "year_used": year,
@@ -10425,7 +10425,7 @@ async def list_providers_by_procedure(request):
         "specialty": specialty or None,
         "provider_sex_code": provider_sex_code,
         "provider_type_resolution": provider_type_resolution,
-        "procedure_term_resolution": procedure_term_resolution,
+        "procedure_term_resolution": procedure_resolution_by_field,
         "min_claims": min_claims,
         "min_total_cost": min_total_cost,
         "include_legacy_fields": include_legacy_fields,
@@ -10436,7 +10436,7 @@ async def list_providers_by_procedure(request):
         "order": order,
     }
     if code_context is not None:
-        query_payload.update(
+        query_by_field.update(
             {
                 "input_code": code_context["input_code"],
                 "resolved_codes": code_context["resolved_codes"],
@@ -10444,18 +10444,18 @@ async def list_providers_by_procedure(request):
             }
         )
 
-    payload: dict[str, Any] = {
-        "items": items,
+    response_by_field: dict[str, Any] = {
+        "items": provider_items,
         "pagination": {
             "total": total,
             "limit": pagination.limit,
             "offset": pagination.offset,
             "page": pagination.page,
         },
-        "query": query_payload,
+        "query": query_by_field,
     }
     if include_sources:
-        payload["sources"] = [
+        response_by_field["sources"] = [
             {
                 "source_key": "cms_medicare_provider_services_claims",
                 "source_importer": "claims-pricing",
@@ -10467,7 +10467,7 @@ async def list_providers_by_procedure(request):
             }
         ]
     if include_evidence or include_debug:
-        payload["evidence"] = {
+        response_by_field["evidence"] = {
             "matched_provider_location_count": total,
             "filters": {
                 "year": year,
@@ -10478,11 +10478,11 @@ async def list_providers_by_procedure(request):
                 "zip5": zip5 or None,
                 "specialty": specialty or None,
                 "provider_sex_code": provider_sex_code,
-                "q": q or None,
+                "q": query_text or None,
                 "min_claims": min_claims,
                 "min_total_cost": min_total_cost,
                 "provider_type_resolution": provider_type_resolution,
-                "procedure_term_resolution": procedure_term_resolution,
+                "procedure_term_resolution": procedure_resolution_by_field,
             },
             "zip_scope": {
                 "anchor_zip5": zip5,
@@ -10491,7 +10491,7 @@ async def list_providers_by_procedure(request):
             },
             "code_resolution": code_context,
         }
-    return response.json(payload)
+    return response.json(response_by_field)
 
 
 @blueprint.get("/providers/by-prescription", name="pricing.providers.by_prescription")
@@ -10511,7 +10511,7 @@ async def list_providers_by_prescription(request):
     city = str(args.get("city", "")).strip().lower()
     zip5 = str(args.get("zip5", "")).strip()
     specialty = str(args.get("specialty", "")).strip().lower()
-    q = str(args.get("q", "")).strip().lower()
+    query_text = str(args.get("q", "")).strip().lower()
     code = str(args.get("code", "")).strip()
     args.get("provider_type")
     args.get("classification")
@@ -10521,7 +10521,7 @@ async def list_providers_by_prescription(request):
     args.get("taxonomy_specialization")
     args.get("taxonomy_section")
 
-    if not q and not code:
+    if not query_text and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
 
     if not await _table_exists(session, provider_prescription_table.name):
@@ -10535,7 +10535,7 @@ async def list_providers_by_prescription(request):
                     "page": pagination.page,
                 },
                 "query": {
-                    "q": q or None,
+                    "q": query_text or None,
                     "code": code or None,
                     "year": year,
                     "year_used": year,
@@ -10566,9 +10566,9 @@ async def list_providers_by_prescription(request):
     )
     if provider_type_clause is not None:
         filters.append(provider_type_clause)
-    medication_term_resolution: dict[str, Any] | None = None
-    if q:
-        q_like = f"%{q}%"
+    medication_resolution_by_field: dict[str, Any] | None = None
+    if query_text:
+        q_like = f"%{query_text}%"
         q_clauses = [
             func.lower(provider_prescription_table.c.rx_name).like(q_like),
             func.lower(provider_prescription_table.c.generic_name).like(q_like),
@@ -10577,7 +10577,7 @@ async def list_providers_by_prescription(request):
         terminology_matches = await _query_terminology(
             session,
             domain="medication",
-            term=q,
+            term=query_text,
             exact=True,
             include_broad=True,
             limit=50,
@@ -10586,8 +10586,8 @@ async def list_providers_by_prescription(request):
         if terminology_internal_codes:
             q_clauses.append(provider_prescription_table.c.rx_code.in_(terminology_internal_codes))
         if terminology_matches:
-            medication_term_resolution = {
-                "input": q,
+            medication_resolution_by_field = {
+                "input": query_text,
                 "matches": terminology_matches,
                 "internal_codes": terminology_internal_codes,
             }
@@ -10655,11 +10655,11 @@ async def list_providers_by_prescription(request):
         },
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
-    result = await session.execute(query)
-    items = [_normalize_prescription_provider_aggregate(_row_to_dict(row)) for row in result]
+    query_result = await session.execute(query)
+    provider_items = [_normalize_prescription_provider_aggregate(_row_to_dict(provider_record)) for provider_record in query_result]
 
-    query_payload: dict[str, Any] = {
-        "q": q or None,
+    query_by_field: dict[str, Any] = {
+        "q": query_text or None,
         "code": code or None,
         "year": year,
         "year_used": year,
@@ -10669,14 +10669,14 @@ async def list_providers_by_prescription(request):
         "zip5": zip5 or None,
         "specialty": specialty or None,
         "provider_type_resolution": provider_type_resolution,
-        "medication_term_resolution": medication_term_resolution,
+        "medication_term_resolution": medication_resolution_by_field,
         "min_claims": min_claims,
         "min_total_cost": min_total_cost,
         "order_by": order_by,
         "order": order,
     }
     if code_context is not None:
-        query_payload.update(
+        query_by_field.update(
             {
                 "input_code": code_context["input_code"],
                 "resolved_codes": code_context["resolved_codes"],
@@ -10686,14 +10686,14 @@ async def list_providers_by_prescription(request):
 
     return response.json(
         {
-            "items": items,
+            "items": provider_items,
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,
                 "offset": pagination.offset,
                 "page": pagination.page,
             },
-            "query": query_payload,
+            "query": query_by_field,
         }
     )
 
@@ -10713,7 +10713,7 @@ async def list_provider_prescriptions(request, npi: str):
     year = _parse_int(args.get("year"), "year", minimum=2013)
     min_claims = _parse_float(args.get("min_claims"), "min_claims", minimum=0)
     min_total_cost = _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0)
-    q = str(args.get("q", "")).strip().lower()
+    query_text = str(args.get("q", "")).strip().lower()
     generic_name = str(args.get("generic_name", "")).strip().lower()
     brand_name = str(args.get("brand_name", "")).strip().lower()
     rx_name = str(args.get("rx_name", "")).strip().lower()
@@ -10749,14 +10749,14 @@ async def list_provider_prescriptions(request, npi: str):
         filters.append(func.lower(provider_prescription_table.c.brand_name).like(f"%{brand_name}%"))
     if rx_name:
         filters.append(func.lower(provider_prescription_table.c.rx_name).like(f"%{rx_name}%"))
-    if q:
-        q_like = f"%{q}%"
+    if query_text:
+        q_like = f"%{query_text}%"
         filters.append(
             or_(
                 func.lower(provider_prescription_table.c.rx_name).like(q_like),
                 func.lower(provider_prescription_table.c.generic_name).like(q_like),
                 func.lower(provider_prescription_table.c.brand_name).like(q_like),
-                func.upper(provider_prescription_table.c.rx_code).like(f"%{q.upper()}%"),
+                func.upper(provider_prescription_table.c.rx_code).like(f"%{query_text.upper()}%"),
             )
         )
     if code:
@@ -10796,19 +10796,19 @@ async def list_provider_prescriptions(request, npi: str):
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
 
-    result = await session.execute(query)
-    items = [_normalize_prescription_payload(_row_to_dict(row)) for row in result]
-    if items:
+    query_result = await session.execute(query)
+    prescription_items = [_normalize_prescription_payload(_row_to_dict(prescription_record)) for prescription_record in query_result]
+    if prescription_items:
         try:
             external_codes_by_internal = await _resolve_external_rx_codes_for_internal(
                 session,
-                [str(item.get("rx_code") or "") for item in items],
+                [str(prescription_item_by_field.get("rx_code") or "") for prescription_item_by_field in prescription_items],
             )
         except Exception:  # pragma: no cover - defensive fallback for missing/migrating crosswalk table
             external_codes_by_internal = {}
-        _apply_prescription_code_preferences(items, external_codes_by_internal)
+        _apply_prescription_code_preferences(prescription_items, external_codes_by_internal)
 
-    query_payload: dict[str, Any] = {
+    query_by_field: dict[str, Any] = {
         "npi": provider_npi,
         "year": year,
         "year_used": year,
@@ -10816,7 +10816,7 @@ async def list_provider_prescriptions(request, npi: str):
         "rx_name": rx_name or None,
         "generic_name": generic_name or None,
         "brand_name": brand_name or None,
-        "q": q or None,
+        "q": query_text or None,
         "code": code or None,
         "min_claims": min_claims,
         "min_total_cost": min_total_cost,
@@ -10824,7 +10824,7 @@ async def list_provider_prescriptions(request, npi: str):
         "order": order,
     }
     if code_context is not None:
-        query_payload.update(
+        query_by_field.update(
             {
                 "input_code": code_context["input_code"],
                 "resolved_codes": code_context["resolved_codes"],
@@ -10834,14 +10834,14 @@ async def list_provider_prescriptions(request, npi: str):
 
     return response.json(
         {
-            "items": items,
+            "items": prescription_items,
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,
                 "offset": pagination.offset,
                 "page": pagination.page,
             },
-            "query": query_payload,
+            "query": query_by_field,
         }
     )
 
