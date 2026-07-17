@@ -2745,11 +2745,11 @@ def _ptg2_manifest_artifacts_manifest(
         return artifact_manifest_map
     existing_sidecars = artifact_manifest_map.get("sidecars")
     sidecars: list[Any] = list(existing_sidecars) if isinstance(existing_sidecars, list) else []
-    for name, value in sidecar_artifacts.items():
-        if value is None:
+    for name, sidecar_value in sidecar_artifacts.items():
+        if sidecar_value is None:
             continue
-        if name == "sidecars" and isinstance(value, list):
-            for index, sidecar_data in enumerate(value):
+        if name == "sidecars" and isinstance(sidecar_value, list):
+            for index, sidecar_data in enumerate(sidecar_value):
                 if isinstance(sidecar_data, Mapping):
                     sidecars.append(dict(sidecar_data))
                 else:
@@ -2757,12 +2757,12 @@ def _ptg2_manifest_artifacts_manifest(
                         {"name": f"sidecar_{index}", "path": str(sidecar_data)}
                     )
             continue
-        if isinstance(value, Mapping):
-            artifact_entry_map = dict(value)
+        if isinstance(sidecar_value, Mapping):
+            artifact_entry_map = dict(sidecar_value)
             artifact_entry_map.setdefault("name", str(name))
             sidecars.append(artifact_entry_map)
         else:
-            sidecars.append({"name": str(name), "path": str(value)})
+            sidecars.append({"name": str(name), "path": str(sidecar_value)})
     artifact_manifest_map["sidecars"] = sidecars
     return artifact_manifest_map
 

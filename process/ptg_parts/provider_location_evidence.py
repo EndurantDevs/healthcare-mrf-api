@@ -123,13 +123,13 @@ def _compact_scalar(value: Any) -> Any:
 
 def _sample_value(value: Any, *, max_items: int = 6) -> Any:
     if isinstance(value, dict):
-        sampled: dict[str, Any] = {}
+        sampled_fields_map: dict[str, Any] = {}
         for index, (key, child) in enumerate(value.items()):
             if index >= max_items:
-                sampled["..."] = f"{len(value) - max_items} more field(s)"
+                sampled_fields_map["..."] = f"{len(value) - max_items} more field(s)"
                 break
-            sampled[str(key)] = _sample_value(child, max_items=max_items)
-        return sampled
+            sampled_fields_map[str(key)] = _sample_value(child, max_items=max_items)
+        return sampled_fields_map
     if isinstance(value, list):
         sampled_list = [_sample_value(item, max_items=max_items) for item in value[:max_items]]
         if len(value) > max_items:
@@ -191,7 +191,7 @@ def _has_phone_telecom_value(value: Any) -> bool:
 
 
 def _collect_matching_fields(
-    value: Any,
+    nested_value: Any,
     *,
     prefix: str = "",
     address_fields: dict[str, Any] | None = None,
@@ -201,8 +201,8 @@ def _collect_matching_fields(
     address_fields = address_fields if address_fields is not None else {}
     phone_fields = phone_fields if phone_fields is not None else {}
     network_name_fields = network_name_fields if network_name_fields is not None else {}
-    if isinstance(value, dict):
-        for key, child in value.items():
+    if isinstance(nested_value, dict):
+        for key, child in nested_value.items():
             normalized_key = _normalized_field_name(key)
             path = f"{prefix}.{key}" if prefix else str(key)
             if normalized_key in ADDRESS_FIELD_NAMES:
@@ -220,8 +220,8 @@ def _collect_matching_fields(
                 phone_fields=phone_fields,
                 network_name_fields=network_name_fields,
             )
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
+    elif isinstance(nested_value, list):
+        for index, child in enumerate(nested_value):
             _collect_matching_fields(
                 child,
                 prefix=f"{prefix}[{index}]",
@@ -295,12 +295,14 @@ def _audit_provider_reference(
     """Accumulate location evidence from one provider reference."""
     summary["provider_references"] += 1
     ref_id = ref.get("provider_group_id") or ref.get("provider_group_ref")
-    ref_fields = dict(ref)
-    ref_fields.pop("provider_groups", None)
-    ref_addresses, ref_phones, ref_network_names = _collect_matching_fields(ref_fields)
+    reference_fields_map = dict(ref)
+    reference_fields_map.pop("provider_groups", None)
+    ref_addresses, ref_phones, ref_network_names = _collect_matching_fields(
+        reference_fields_map
+    )
     if ref_addresses or ref_phones:
         summary["provider_references_with_direct_location_fields"] += 1
-        displayable_address = _has_displayable_address_value(ref_fields)
+        displayable_address = _has_displayable_address_value(reference_fields_map)
         if displayable_address:
             summary["provider_references_with_displayable_location_fields"] += 1
         _add_field_counts(address_paths, ref_addresses)
@@ -399,7 +401,7 @@ def audit_tic_provider_location_evidence(
     """
 
     artifact_path = str(Path(path))
-    summary: dict[str, Any] = {
+    evidence_summary_map: dict[str, Any] = {
         "path": artifact_path,
         "provider_references": 0,
         "provider_references_with_direct_location_fields": 0,
@@ -420,7 +422,7 @@ def audit_tic_provider_location_evidence(
     for ref in _iter_provider_references(path, max_json_fallback_bytes):
         _audit_provider_reference(
             ref,
-            summary=summary,
+            summary=evidence_summary_map,
             address_paths=address_paths,
             phone_paths=phone_paths,
             network_paths=network_paths,
@@ -432,7 +434,7 @@ def audit_tic_provider_location_evidence(
         for group in _iter_inline_provider_groups(path, max_json_fallback_bytes):
             _audit_inline_provider_group(
                 group,
-                summary=summary,
+                summary=evidence_summary_map,
                 address_paths=address_paths,
                 phone_paths=phone_paths,
                 network_paths=network_paths,
@@ -440,19 +442,19 @@ def audit_tic_provider_location_evidence(
                 max_samples=max_samples,
             )
 
-    summary["direct_location_fields_present"] = bool(
-        summary["provider_references_with_direct_location_fields"]
-        or summary["provider_groups_with_direct_location_fields"]
-        or summary["inline_provider_groups_with_direct_location_fields"]
+    evidence_summary_map["direct_location_fields_present"] = bool(
+        evidence_summary_map["provider_references_with_direct_location_fields"]
+        or evidence_summary_map["provider_groups_with_direct_location_fields"]
+        or evidence_summary_map["inline_provider_groups_with_direct_location_fields"]
     )
-    summary["direct_displayable_location_fields_present"] = bool(
-        summary["provider_references_with_displayable_location_fields"]
-        or summary["provider_groups_with_displayable_location_fields"]
-        or summary["inline_provider_groups_with_displayable_location_fields"]
+    evidence_summary_map["direct_displayable_location_fields_present"] = bool(
+        evidence_summary_map["provider_references_with_displayable_location_fields"]
+        or evidence_summary_map["provider_groups_with_displayable_location_fields"]
+        or evidence_summary_map["inline_provider_groups_with_displayable_location_fields"]
     )
-    summary["direct_phone_fields_present"] = bool(phone_paths)
-    summary["address_field_paths"] = dict(sorted(address_paths.items()))
-    summary["phone_field_paths"] = dict(sorted(phone_paths.items()))
-    summary["network_name_field_paths"] = dict(sorted(network_paths.items()))
-    summary["samples"] = samples
-    return summary
+    evidence_summary_map["direct_phone_fields_present"] = bool(phone_paths)
+    evidence_summary_map["address_field_paths"] = dict(sorted(address_paths.items()))
+    evidence_summary_map["phone_field_paths"] = dict(sorted(phone_paths.items()))
+    evidence_summary_map["network_name_field_paths"] = dict(sorted(network_paths.items()))
+    evidence_summary_map["samples"] = samples
+    return evidence_summary_map

@@ -3255,7 +3255,10 @@ class SourceIndex:
             """,
             (rate_id, rate_id),
         )
-        network_names = [str(row["network_name"]) for row in network_name_rows]
+        network_names = [
+            str(network_name_row["network_name"])
+            for network_name_row in network_name_rows
+        ]
         if len(network_names) > self.max_list_values:
             raise SourceCoverageError("rate_network_names_exceed_configured_limit")
         self.connection.execute(
@@ -4822,11 +4825,11 @@ def _strict_api_source_metadata(
         "name": name_field,
         "description": description_field,
     }
-    normalized: dict[str, Any] = {}
+    normalized_metadata_map: dict[str, Any] = {}
     for canonical_field, response_field in field_mapping.items():
         if response_field not in raw:
             raise ApiSchemaError(f"{field_prefix}_{response_field}_missing")
-        normalized[canonical_field] = _strict_string(
+        normalized_metadata_map[canonical_field] = _strict_string(
             raw[response_field],
             field=f"{field_prefix}_{response_field}",
             nullable=True,
@@ -4843,8 +4846,8 @@ def _strict_api_source_metadata(
         )
         assert network_name is not None
         network_names.append(network_name)
-    normalized["network_names"] = network_names
-    return normalized
+    normalized_metadata_map["network_names"] = network_names
+    return normalized_metadata_map
 
 
 def _canonical_api_price_tuple(
@@ -5700,13 +5703,13 @@ def _audit_digest_coordinate_bytes(
         for field_name in AUDIT_SAMPLE_DIGEST_COORDINATE_FIELDS
     )
     coordinate_bits = (32, 32, 32, 64, 64, 64, 64)
-    for field_name, value, bit_count in zip(
+    for field_name, coordinate_value, bit_count in zip(
         AUDIT_SAMPLE_DIGEST_COORDINATE_FIELDS,
         coordinate_values,
         coordinate_bits,
         strict=True,
     ):
-        if value < 0 or value >= 1 << bit_count:
+        if coordinate_value < 0 or coordinate_value >= 1 << bit_count:
             raise ApiSchemaError(f"audit_digest_{field_name}_out_of_range")
     if coordinate_values[3] != occurrence.source_identity.source_artifact_key:
         raise ApiSchemaError("audit_digest_source_artifact_key_mismatch")
@@ -5781,8 +5784,8 @@ class HttpApiOccurrenceSource:
             self.fetcher._request_page(request_params)
         )
         self._preflight_retries += retries
-        items = response_payload.get("items")
-        if not isinstance(items, list) or len(items) > 1:
+        preflight_items = response_payload.get("items")
+        if not isinstance(preflight_items, list) or len(preflight_items) > 1:
             raise ApiSchemaError("audit_source_set_preflight_items_invalid")
         pagination = _required_mapping(
             response_payload.get("pagination"),
@@ -5805,7 +5808,7 @@ class HttpApiOccurrenceSource:
             pagination.get("total"),
             field="audit_source_set_preflight_total",
         )
-        if total < len(items):
+        if total < len(preflight_items):
             raise ApiSchemaError("audit_source_set_preflight_total_out_of_range")
         metadata = self._extract_sample_metadata(response_payload)
         self._validate_sample_metadata(metadata, total)

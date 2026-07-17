@@ -3910,8 +3910,8 @@ def test_allowed_amount_plan_rows_preserve_shared_file_plan_coverage():
     assert len({plan_row["plan_hash"] for plan_row in plan_rows}) == 2
 
 
-def test_direct_allowed_amount_job_preserves_dispatch_plan_filters():
-    plan_info = process_ptg._direct_allowed_plan_info(
+def test_direct_dispatch_plan_info_preserves_multiple_logical_scopes():
+    plan_info = process_ptg._direct_dispatch_plan_info(
         ["plan-alpha", "plan-beta"],
         ["Group"],
     )
@@ -6775,7 +6775,12 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
         pushed_list.extend((getattr(cls, "__name__", str(cls)), report_row) for report_row in rows)
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
+        assert len(jobs) == 1
         for job in jobs:
+            assert job["plan_info"] == [
+                {"plan_id": "plan-alpha", "plan_market_type": "group"},
+                {"plan_id": "plan-beta", "plan_market_type": "group"},
+            ]
             yield _strict_v3_downloaded_job(job)
 
     async def fake_process(*_args, **_kwargs):
@@ -6822,6 +6827,8 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
             import_month="2026-04",
             import_id="source_report_count",
             source_key="example_dental",
+            plan_ids=["plan-alpha", "plan-beta"],
+            plan_market_types=["Group"],
         )
     )
 
