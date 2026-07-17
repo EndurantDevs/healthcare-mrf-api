@@ -2999,16 +2999,17 @@ def run_with_sampling(command: list[str], env_overrides: dict[str, str], *, cwd:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    output: dict[str, bytes] = {}
-    communication_error: list[BaseException] = []
+    output_by_stream: dict[str, bytes] = {}
+    communication_errors: list[BaseException] = []
 
     def collect_output() -> None:
+        """Drain both child-process pipes while resource sampling continues."""
         try:
             stdout, stderr = proc.communicate()
-            output["stdout"] = stdout
-            output["stderr"] = stderr
+            output_by_stream["stdout"] = stdout
+            output_by_stream["stderr"] = stderr
         except BaseException as exc:  # pragma: no cover - defensive subprocess cleanup
-            communication_error.append(exc)
+            communication_errors.append(exc)
 
     collector = Thread(target=collect_output, name="ptg2-experiment-output", daemon=True)
     collector.start()
@@ -3028,16 +3029,16 @@ def run_with_sampling(command: list[str], env_overrides: dict[str, str], *, cwd:
             proc.kill()
         collector.join()
         raise
-    if communication_error:
-        raise communication_error[0]
+    if communication_errors:
+        raise communication_errors[0]
     elapsed = time.monotonic() - started
     sampler.sample(proc.pid)
     return (
         subprocess.CompletedProcess(
             command,
             proc.returncode,
-            stdout=output.get("stdout", b""),
-            stderr=output.get("stderr", b""),
+            stdout=output_by_stream.get("stdout", b""),
+            stderr=output_by_stream.get("stderr", b""),
         ),
         elapsed,
         sampler.to_json(),
