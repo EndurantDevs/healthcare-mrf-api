@@ -471,13 +471,19 @@ async def _create_v3_price_key_stage(
     await db.status(
         f"""
         CREATE UNLOGGED TABLE {_qualified(schema_name, stage_table)} AS
-        WITH price_rank AS MATERIALIZED (
+        WITH atom_rate AS MATERIALIZED (
+            SELECT
+                price_atom_global_id_128,
+                NULLIF(BTRIM(negotiated_rate), '')::numeric AS negotiated_rate
+            FROM {_qualified(schema_name, price_atom_table)}
+        ),
+        price_rank AS MATERIALIZED (
             SELECT
                 membership.price_set_global_id_128,
-                MIN(NULLIF(BTRIM(atom.negotiated_rate), '')::numeric) AS minimum_negotiated_rate
+                MIN(atom_rate.negotiated_rate) AS minimum_negotiated_rate
             FROM {_qualified(schema_name, price_set_atom_table)} AS membership
-            JOIN {_qualified(schema_name, price_atom_table)} AS atom
-              ON atom.price_atom_global_id_128 = membership.price_atom_global_id_128
+            JOIN atom_rate
+              ON atom_rate.price_atom_global_id_128 = membership.price_atom_global_id_128
             GROUP BY membership.price_set_global_id_128
         )
         SELECT
@@ -910,19 +916,28 @@ async def prepare_shared_price_artifacts(
             f"DROP TABLE IF EXISTS {_qualified(schema_name, table_name)} CASCADE;"
         )
     try:
-        stage_metrics = await _normalize_strict_v3_price_atom_stage(
-            schema_name=schema_name,
-            price_atom_table=price_atom_table,
+        stage_started_at = time.monotonic()
+        stage_metrics = dict(
+            await _normalize_strict_v3_price_atom_stage(
+                schema_name=schema_name,
+                price_atom_table=price_atom_table,
+            )
         )
+        stage_metrics["normalization_seconds"] = time.monotonic() - stage_started_at
+        stage_started_at = time.monotonic()
         lean_manifest = await _rewrite_ptg2_manifest_price_atom_table_lean_dict(
             schema_name=schema_name,
             price_atom_table=price_atom_table,
             price_atom_dictionary_table=price_attr_dictionary_table,
         )
+        stage_metrics["dictionary_rewrite_seconds"] = (
+            time.monotonic() - stage_started_at
+        )
         if not isinstance(lean_manifest, dict):
             raise RuntimeError(
                 "strict V3 price atom rewrite did not produce a dictionary contract"
             )
+        stage_started_at = time.monotonic()
         async with asyncio.TaskGroup() as task_group:
             price_map_task = task_group.create_task(
                 _create_v3_price_key_stage(
@@ -941,6 +956,7 @@ async def prepare_shared_price_artifacts(
             )
         price_map_stats = price_map_task.result()
         atom_map_stats = atom_map_task.result()
+        stage_metrics["dense_key_build_seconds"] = time.monotonic() - stage_started_at
         price_set_count = int(price_map_stats.get("row_count") or 0)
         atom_count = int(atom_map_stats.get("row_count") or 0)
         if price_set_count <= 0:

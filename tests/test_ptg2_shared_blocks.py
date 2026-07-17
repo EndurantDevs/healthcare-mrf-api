@@ -20,6 +20,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     bind_snapshot_to_shared_layout,
     delete_shared_layout_dense_rows,
     reserve_shared_layout,
+    seal_shared_layout,
     shared_block_hash,
     shared_mapping_digest,
     shared_semantic_fingerprint,
@@ -274,6 +275,88 @@ async def test_dense_write_lock_requires_current_build_token():
             schema_name="mrf",
             snapshot_key=43,
             build_token="stale-attempt",
+        )
+
+
+@pytest.mark.asyncio
+async def test_seal_validates_mapping_without_rejoining_immutable_blocks():
+    expected = SharedBlock(
+        "page_v4",
+        7,
+        0,
+        3,
+        "none",
+        9,
+        b"123456789",
+    ).reference()
+    session = _ScriptedSession(
+        [
+            _Result(scalar_value=41),
+            _Result(
+                rows=[
+                    {
+                        "object_kind": expected.object_kind,
+                        "block_key": expected.block_key,
+                        "fragment_no": expected.fragment_no,
+                        "entry_count": expected.entry_count,
+                        "block_hash": expected.block_hash,
+                    }
+                ]
+            ),
+            _Result(),
+            _Result(scalar_value=None),
+            _Result(scalar_value=41),
+        ]
+    )
+
+    sealed = await seal_shared_layout(
+        session,
+        schema_name="mrf",
+        snapshot_key=41,
+        build_token="attempt-41",
+        expected_blocks=(expected,),
+        support_digest=b"s" * 32,
+        layout_manifest={"contract": "strict-v3"},
+    )
+
+    assert sealed.snapshot_key == 41
+    mapping_sql = session.calls[1][0]
+    assert "ptg2_v3_snapshot_block" in mapping_sql
+    assert "ptg2_v3_block block" not in mapping_sql
+    assert "JOIN" not in mapping_sql
+    update_params = session.calls[-1][1]
+    assert update_params["logical_byte_count"] == expected.raw_byte_count
+
+
+@pytest.mark.asyncio
+async def test_seal_still_rejects_mapping_hash_mismatch_without_block_join():
+    expected = SharedBlock("page_v4", 7, 0, 1, "none", 1, b"a").reference()
+    session = _ScriptedSession(
+        [
+            _Result(scalar_value=41),
+            _Result(
+                rows=[
+                    {
+                        "object_kind": expected.object_kind,
+                        "block_key": expected.block_key,
+                        "fragment_no": expected.fragment_no,
+                        "entry_count": expected.entry_count,
+                        "block_hash": b"x" * 32,
+                    }
+                ]
+            ),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="mapping mismatch"):
+        await seal_shared_layout(
+            session,
+            schema_name="mrf",
+            snapshot_key=41,
+            build_token="attempt-41",
+            expected_blocks=(expected,),
+            support_digest=b"s" * 32,
+            layout_manifest={},
         )
 
 

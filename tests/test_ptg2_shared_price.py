@@ -98,7 +98,10 @@ async def test_price_keys_use_exact_minimum_rate_order(monkeypatch):
     )
 
     sql = "\n".join(call.args[0] for call in status.await_args_list)
-    assert "MIN(NULLIF(BTRIM(atom.negotiated_rate), '')::numeric)" in sql
+    assert "atom_rate AS MATERIALIZED" in sql
+    assert sql.count("NULLIF(BTRIM(negotiated_rate), '')::numeric") == 1
+    assert "MIN(atom_rate.negotiated_rate)" in sql
+    assert "JOIN atom_rate" in sql
     assert "ORDER BY minimum_negotiated_rate ASC NULLS LAST" in sql
     assert "price_set_global_id_128" in sql
     assert "CREATE UNIQUE INDEX" in sql

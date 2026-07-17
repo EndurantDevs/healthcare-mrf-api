@@ -773,17 +773,15 @@ async def seal_shared_layout(
     )
     if owner_result.scalar() is None:
         raise RuntimeError("shared PTG seal lost ownership of its building layout")
+    # The mapping FK and block format CHECK already guarantee block existence and
+    # version; publication validated full block metadata before inserting mappings.
     mapping_result = await session.execute(
         text(
             f"""
-            SELECT mapping.object_kind, mapping.block_key, mapping.fragment_no,
-                   mapping.entry_count, mapping.block_hash,
-                   block.format_version, block.raw_byte_count
-              FROM {schema}.ptg2_v3_snapshot_block mapping
-              JOIN {schema}.ptg2_v3_block block
-                ON block.block_hash = mapping.block_hash
-             WHERE mapping.snapshot_key = :snapshot_key
-             ORDER BY mapping.object_kind, mapping.block_key, mapping.fragment_no
+            SELECT object_kind, block_key, fragment_no, entry_count, block_hash
+              FROM {schema}.ptg2_v3_snapshot_block
+             WHERE snapshot_key = :snapshot_key
+             ORDER BY object_kind, block_key, fragment_no
             """
         ),
         {"snapshot_key": int(snapshot_key)},
@@ -812,9 +810,9 @@ async def seal_shared_layout(
             observed_row["entry_count"]
         ) != int(expected.entry_count):
             raise RuntimeError(f"shared PTG mapping mismatch: {key!r}")
-        if int(observed_row["format_version"]) != PTG2_V3_SHARED_FORMAT_VERSION:
-            raise RuntimeError(f"shared PTG mapping uses an incompatible block version: {key!r}")
-        logical_byte_count += int(observed_row["raw_byte_count"])
+        if int(expected.raw_byte_count) < 0:
+            raise RuntimeError(f"shared PTG mapping has a negative logical size: {key!r}")
+        logical_byte_count += int(expected.raw_byte_count)
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:lock_key)"),
         {"lock_key": _advisory_lock_key(expected_digest)},
