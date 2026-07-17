@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from process.ptg_parts.ptg2_candidate_audit_contract import (
     PTG2_FAST_AUDIT_CONTRACT,
+    PTG2_FAST_AUDIT_REQUEST_P95_CEILING_MS,
     PTG2_FAST_AUDIT_TOOL,
     PTG2_FAST_AUDIT_TOOL_VERSION,
     FastAuditHttpConfig,
@@ -64,12 +65,16 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _percentile(metric_values: Sequence[float], percentile: float) -> float:
+def _raw_percentile(metric_values: Sequence[float], percentile: float) -> float:
     if not metric_values:
         return 0.0
     ordered_values = sorted(float(metric_value) for metric_value in metric_values)
     rank = max(math.ceil(percentile * len(ordered_values)) - 1, 0)
-    return round(ordered_values[min(rank, len(ordered_values) - 1)], 3)
+    return ordered_values[min(rank, len(ordered_values) - 1)]
+
+
+def _percentile(metric_values: Sequence[float], percentile: float) -> float:
+    return round(_raw_percentile(metric_values, percentile), 3)
 
 
 def _target_section(report_input: FastAuditReportInput) -> dict[str, Any]:
@@ -128,7 +133,11 @@ def _source_and_coverage_sections(
     }
 
 
-def _request_sections(report_input: FastAuditReportInput) -> dict[str, dict[str, Any]]:
+def _request_sections(
+    report_input: FastAuditReportInput,
+    *,
+    p95_within_ceiling: bool,
+) -> dict[str, dict[str, Any]]:
     http_metrics = report_input.http_metrics
     challenge_count = report_input.challenge_count
     provider_count = report_input.provider_count
@@ -149,6 +158,8 @@ def _request_sections(report_input: FastAuditReportInput) -> dict[str, dict[str,
             "request_p50_ms": _percentile(http_metrics.latencies_ms, 0.50),
             "request_p95_ms": _percentile(http_metrics.latencies_ms, 0.95),
             "request_max_ms": round(max(http_metrics.latencies_ms, default=0.0), 3),
+            "request_p95_ceiling_ms": PTG2_FAST_AUDIT_REQUEST_P95_CEILING_MS,
+            "request_p95_within_ceiling": p95_within_ceiling,
         },
         "random_api_requests": {
             "requested": challenge_count,
@@ -163,6 +174,10 @@ def build_fast_audit_report(report_input: FastAuditReportInput) -> dict[str, Any
     duration_seconds = (
         report_input.completed_at - report_input.started_at
     ).total_seconds()
+    request_p95_ms = _raw_percentile(report_input.http_metrics.latencies_ms, 0.95)
+    p95_within_ceiling = (
+        request_p95_ms <= PTG2_FAST_AUDIT_REQUEST_P95_CEILING_MS
+    )
     report_by_section: dict[str, Any] = {
         "schema_version": 3,
         "harness": {
@@ -175,9 +190,9 @@ def build_fast_audit_report(report_input: FastAuditReportInput) -> dict[str, Any
             "event_loop": report_input.event_loop_contract,
         },
         "profile": "release",
-        "status": "pass",
+        "status": "pass" if p95_within_ceiling else "fail",
         "release_profile_enforced": True,
-        "release_gate_eligible": True,
+        "release_gate_eligible": p95_within_ceiling,
         "started_at": report_input.started_at.isoformat(),
         "completed_at": report_input.completed_at.isoformat(),
         "duration_seconds": round(duration_seconds, 6),
@@ -187,7 +202,14 @@ def build_fast_audit_report(report_input: FastAuditReportInput) -> dict[str, Any
             "sample_digest_validated": True,
             "source_set_validated": True,
         },
-        "failures": {"counts": {}, "examples": []},
+        "failures": {
+            "counts": (
+                {}
+                if p95_within_ceiling
+                else {"audit_request_p95_exceeded": 1}
+            ),
+            "examples": [],
+        },
         "reproducibility": {
             "selection_method": report_input.witness.metadata["selection_method"],
             "source_witness_sample_digest": report_input.witness.metadata[
@@ -204,7 +226,12 @@ def build_fast_audit_report(report_input: FastAuditReportInput) -> dict[str, Any
         ],
     }
     report_by_section.update(_source_and_coverage_sections(report_input))
-    report_by_section.update(_request_sections(report_input))
+    report_by_section.update(
+        _request_sections(
+            report_input,
+            p95_within_ceiling=p95_within_ceiling,
+        )
+    )
     return report_by_section
 
 

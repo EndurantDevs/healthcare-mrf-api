@@ -114,7 +114,7 @@ def strict_candidate_row(serving_index=None, **overrides):
     serving_index["source_key"] = "source-a"
     coverage_scope_id = serving_index.get("coverage_scope_id")
     snapshot_row_map = {
-        "manifest": {"serving_index": serving_index},
+        "candidate_serving_index": serving_index,
         "layout_audit_sample": serving_index.get("audit_sample"),
         "layout_coverage_scope_id": coverage_scope_id,
         "layout_code_count": serving_index.get("code_count"),
@@ -209,7 +209,8 @@ async def test_candidate_snapshot_keeps_pre_activation_manifest_validation():
     assert tables.source_set == strict_serving_index()["source_set"]
     sql = str(session.calls[0][0][0])
     assert "snapshot.status = 'validated'" in sql
-    assert "snapshot.manifest" in sql
+    assert "snapshot.manifest->'serving_index' AS candidate_serving_index" in sql
+    assert "SELECT snapshot.manifest," not in sql
     assert "ptg2_v3_candidate_audit_attestation" not in sql
 
 

@@ -206,7 +206,10 @@ standard pricing API with each source witness.
 
 Audit-only endpoints have a 250 ms p95 ceiling because they perform bounded
 evidence decoding and integrity checks. Standard cold pricing endpoints retain
-their independent 40 ms p95 ceiling.
+their independent 40 ms p95 ceiling. Candidate requests project only the
+strict `serving_index` from the snapshot manifest; activation compares the
+unrounded nearest-rank audit p95 to the 250 ms ceiling and rejects an
+over-budget or internally inconsistent report.
 
 TIN-only provider groups use only the schema-defined singleton `[0]` marker and
 never create a fake NPI. Zero mixed with another value or repeated zero values

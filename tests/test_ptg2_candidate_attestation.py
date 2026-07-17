@@ -85,7 +85,7 @@ def _release_report(**target_overrides):
         "schema_version": 3,
         "harness": {
             "name": "ptg2_v3_fast_source_witness_audit",
-            "version": "2.0.0",
+            "version": "2.1.0",
             "contract": "ptg2_v3_fast_source_witness_audit_v2",
         },
         "runtime": {"http_client": "aiohttp", "event_loop": "uvloop"},
@@ -132,7 +132,13 @@ def _release_report(**target_overrides):
             "max_concurrency": 32,
         },
         "random_api_requests": {"requested": 2_000, "executed": 2_000},
-        "latency": {},
+        "latency": {
+            "request_p50_ms": 100.0,
+            "request_p95_ms": 250.0,
+            "request_max_ms": 300.0,
+            "request_p95_ceiling_ms": 250.0,
+            "request_p95_within_ceiling": True,
+        },
         "api_audit_sample": {
             "sample_digest": "ab" * 32,
             "sample_digest_validated": True,
@@ -224,6 +230,9 @@ def test_release_report_accepts_explicit_authenticated_cluster_transport():
         (lambda report: report["redaction"]["excluded"].pop(), "redaction"),
         (lambda report: report["target"].update(transport_contract=None), "transport"),
         (lambda report: report["target"].update(tls_verified=False), "transport"),
+        (lambda report: report["latency"].update(request_p95_ms=250.001), "latency"),
+        (lambda report: report["latency"].update(request_p95_ceiling_ms=251.0), "latency"),
+        (lambda report: report["latency"].update(request_p95_within_ceiling=False), "latency"),
         (lambda report: report.update(unexpected_sensitive_value="no"), "fields"),
     ],
 )

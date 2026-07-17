@@ -16,6 +16,7 @@ from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
 from process.ptg_parts.ptg2_candidate_audit_contract import (
     PTG2_FAST_AUDIT_CONTRACT,
     PTG2_FAST_AUDIT_DEADLINE_SECONDS,
+    PTG2_FAST_AUDIT_REQUEST_P95_CEILING_MS,
     PTG2_FAST_AUDIT_TOOL,
     PTG2_FAST_AUDIT_TOOL_VERSION,
 )
@@ -220,6 +221,7 @@ def validate_candidate_release_audit_report(
     coverage = _required_report_mapping(report_map, "coverage")
     checks = _required_report_mapping(report_map, "checks")
     http = _required_report_mapping(report_map, "http")
+    latency = _required_report_mapping(report_map, "latency")
     random_api_requests = _required_report_mapping(
         report_map,
         "random_api_requests",
@@ -282,6 +284,18 @@ def validate_candidate_release_audit_report(
         or coverage["failures"]
     ):
         raise ValueError("audit report did not pass the release gate")
+    request_p95_ms = latency.get("request_p95_ms")
+    request_p95_ceiling_ms = latency.get("request_p95_ceiling_ms")
+    if (
+        isinstance(request_p95_ms, bool)
+        or not isinstance(request_p95_ms, (int, float))
+        or not math.isfinite(float(request_p95_ms))
+        or float(request_p95_ms) < 0
+        or float(request_p95_ms) > PTG2_FAST_AUDIT_REQUEST_P95_CEILING_MS
+        or request_p95_ceiling_ms != PTG2_FAST_AUDIT_REQUEST_P95_CEILING_MS
+        or latency.get("request_p95_within_ceiling") is not True
+    ):
+        raise ValueError("audit report latency did not pass the release gate")
     expected_target_by_field = {
         "expected_architecture": "postgres_binary_v3",
         "expected_storage_generation": "shared_blocks_v3",

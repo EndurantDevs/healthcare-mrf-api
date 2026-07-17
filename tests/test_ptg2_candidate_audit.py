@@ -157,5 +157,7 @@ async def test_candidate_serving_metadata_query_is_validated_and_scope_bound():
     assert "= ANY(CAST(:candidate_plan_ids AS text[]))" in sql
     assert "candidate_plan_scope.plan_market_type" in sql
     assert "= :candidate_plan_market_type" in sql
+    assert "manifest->'serving_index' AS candidate_serving_index" in sql
+    assert "SELECT snapshot.manifest," not in sql
     assert params["candidate_plan_ids"] == ["12-3456789", "123456789"]
     assert params["candidate_plan_market_type"] == "group"
