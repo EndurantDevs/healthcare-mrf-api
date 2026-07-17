@@ -411,8 +411,8 @@ def _ptg2_code_query_fields(code_context: dict[str, Any] | None, args: dict[str,
 
 
 def _qualify_compact_filters(filters: list[str]) -> list[str]:
-    qualified = []
-    replacements = {
+    qualified_filters = []
+    column_replacement_map = {
         "reported_code_system": "r.reported_code_system",
         "procedure_code": "r.procedure_code",
         "reported_code": "r.reported_code",
@@ -421,10 +421,10 @@ def _qualify_compact_filters(filters: list[str]) -> list[str]:
     }
     for value in filters:
         text_value = value
-        for source, target in replacements.items():
+        for source, target in column_replacement_map.items():
             text_value = re.sub(rf"(?<![:.])\b{re.escape(source)}\b", target, text_value)
-        qualified.append(text_value)
-    return qualified
+        qualified_filters.append(text_value)
+    return qualified_filters
 
 
 def _normalize_taxonomy_code(value: Any) -> str | None:

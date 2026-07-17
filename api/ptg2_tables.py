@@ -109,12 +109,12 @@ def _strict_v3_audit_sample(
             "PTG2 postgres_binary_v3 snapshot is missing its persisted audit sample; "
             "reimport the snapshot"
         )
-    expected_fields = {
+    expected_values_by_field = {
         "contract": PTG2_V3_AUDIT_CONTRACT,
         "method": PTG2_V3_AUDIT_METHOD,
         "serving_multiplicity_semantics": PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
     }
-    for field_name, expected_value in expected_fields.items():
+    for field_name, expected_value in expected_values_by_field.items():
         if str(audit_sample.get(field_name) or "").strip().lower() != expected_value:
             raise PTG2ManifestArtifactError(
                 f"PTG2 postgres_binary_v3 audit sample has invalid {field_name}; "
@@ -183,7 +183,7 @@ def _database_execution_evidence(row_fields: Any) -> dict[str, Any]:
     server_version_num = _optional_integer(
         row_fields.get("postgres_server_version_num")
     )
-    evidence = {
+    database_evidence_by_field = {
         "contract": PTG2_DATABASE_EVIDENCE_CONTRACT,
         "server_version_num": server_version_num,
         "database_selected": row_fields.get("database_selected"),
@@ -195,14 +195,14 @@ def _database_execution_evidence(row_fields: Any) -> dict[str, Any]:
     if (
         server_version_num is None
         or server_version_num < 10000
-        or evidence["database_selected"] is not True
-        or evidence["backend_session_active"] is not True
-        or evidence["transaction_snapshot_observed"] is not True
+        or database_evidence_by_field["database_selected"] is not True
+        or database_evidence_by_field["backend_session_active"] is not True
+        or database_evidence_by_field["transaction_snapshot_observed"] is not True
     ):
         raise PTG2ManifestArtifactError(
             "PTG2 snapshot query did not return valid PostgreSQL execution evidence"
         )
-    return evidence
+    return database_evidence_by_field
 
 
 def _strict_v3_manifest_fields(
@@ -262,7 +262,7 @@ def _strict_v3_manifest_fields(
         )
     _strict_coverage_scope_id(serving_index)
 
-    required_markers = {
+    required_marker_values_by_field = {
         "storage": "manifest_snapshot",
         "type": PTG2_V3_STORAGE_TYPE,
         "provider_scope_strategy": "postgres_shared_graph",
@@ -270,7 +270,7 @@ def _strict_v3_manifest_fields(
         "serving_table_layout": PTG2_V3_SERVING_LAYOUT,
         "shared_block_layout": PTG2_V3_SHARED_BLOCK_LAYOUT,
     }
-    for field_name, expected_value in required_markers.items():
+    for field_name, expected_value in required_marker_values_by_field.items():
         actual_value = str(serving_index.get(field_name) or "").strip().lower()
         if actual_value != expected_value:
             raise PTG2ManifestArtifactError(

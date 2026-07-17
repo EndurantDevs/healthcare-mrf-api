@@ -226,17 +226,17 @@ def _computed_forward_shard_keys(
             }
         )
     )
-    result: dict[int, tuple[int, ...]] = {}
+    shard_keys_by_code: dict[int, tuple[int, ...]] = {}
     for code_key in code_keys:
         normalized_code_key = _normalized_code_key(code_key)
-        result[normalized_code_key] = tuple(
+        shard_keys_by_code[normalized_code_key] = tuple(
             _forward_provider_shard_block_key(
                 normalized_code_key,
                 shard_no * _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN,
             )
             for shard_no in shard_numbers
         )
-    return result
+    return shard_keys_by_code
 
 
 async def _discover_forward_shard_keys(
@@ -1309,12 +1309,12 @@ async def lookup_serving_binary_by_code_prefix_from_db(
         if normalized_provider_filter is not None
         else None
     )
-    retained: list[tuple[tuple[int, int, int, int], int, int, int, int]] = []
-    occurrence_ordinal = [0]
+    retained_occurrences: list[tuple[tuple[int, int, int, int], int, int, int, int]] = []
+    occurrence_ordinals = [0]
 
     def _retain(provider_set_key: int, price_key: int, source_key: int) -> None:
-        ordinal = occurrence_ordinal[0]
-        occurrence_ordinal[0] += 1
+        ordinal = occurrence_ordinals[0]
+        occurrence_ordinals[0] += 1
         rank = _forward_prefix_rank(
             provider_set_key,
             price_key,
@@ -1330,10 +1330,10 @@ async def lookup_serving_binary_by_code_prefix_from_db(
             int(source_key),
             ordinal,
         )
-        if len(retained) < normalized_limit:
-            heapq.heappush(retained, candidate)
-        elif candidate > retained[0]:
-            heapq.heapreplace(retained, candidate)
+        if len(retained_occurrences) < normalized_limit:
+            heapq.heappush(retained_occurrences, candidate)
+        elif candidate > retained_occurrences[0]:
+            heapq.heapreplace(retained_occurrences, candidate)
 
     current_block_key: int | None = None
     previous_provider_set_key: int | None = None
@@ -1411,12 +1411,12 @@ async def lookup_serving_binary_by_code_prefix_from_db(
     except PTG2SharedBlockError as exc:
         raise PTG2ManifestArtifactError(str(exc)) from exc
 
-    if not retained:
+    if not retained_occurrences:
         return ()
     selected = sorted(
         (
             (provider_set_key, price_key, source_key, ordinal)
-            for _heap_rank, provider_set_key, price_key, source_key, ordinal in retained
+            for _heap_rank, provider_set_key, price_key, source_key, ordinal in retained_occurrences
         ),
         key=lambda item: (
             _forward_prefix_rank(
@@ -1970,9 +1970,9 @@ async def lookup_shared_graph_members_from_db(
 ) -> dict[int, tuple[int, ...]]:
     """Read graph members directly and optionally bound each owner result."""
 
-    fetch_options: dict[str, Any] = {}
+    fetch_options_by_name: dict[str, Any] = {}
     if max_members is not None:
-        fetch_options["max_members"] = max_members
+        fetch_options_by_name["max_members"] = max_members
     try:
         return await fetch_shared_graph_members(
             session,
@@ -1980,7 +1980,7 @@ async def lookup_shared_graph_members_from_db(
             snapshot_key=_required_shared_snapshot_key(shared_snapshot_key),
             direction=int(direction),
             owner_keys=owner_keys,
-            **fetch_options,
+            **fetch_options_by_name,
         )
     except PTG2SharedBlockError as exc:
         raise PTG2ManifestArtifactError(str(exc)) from exc

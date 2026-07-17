@@ -59,11 +59,11 @@ async def _enrich_ptg2_code_details(
         return response_payload
 
     clauses: list[str] = []
-    params: dict[str, Any] = {}
+    query_params_by_name: dict[str, Any] = {}
     for idx, (code_system, code) in enumerate(sorted(lookup_keys)):
         clauses.append(f"(code_system = :code_system_{idx} AND code = :code_{idx})")
-        params[f"code_system_{idx}"] = code_system
-        params[f"code_{idx}"] = code
+        query_params_by_name[f"code_system_{idx}"] = code_system
+        query_params_by_name[f"code_{idx}"] = code
     query_result = await session.execute(
         text(
             f"""
@@ -72,7 +72,7 @@ async def _enrich_ptg2_code_details(
             WHERE {" OR ".join(clauses)}
             """
         ),
-        params,
+        query_params_by_name,
     )
     detail_map = {
         (
@@ -97,28 +97,28 @@ async def _enrich_ptg2_code_details(
             response_item["billing_code_detail"] = detail_map[billing_key]
         enriched_prices = []
         for price in response_item.get("prices") or []:
-            price_payload = dict(price)
+            price_fields_by_name = dict(price)
             service_details = []
-            for service_code in price_payload.get("service_code") or []:
+            for service_code in price_fields_by_name.get("service_code") or []:
                 detail = detail_map.get(_catalog_key("POS", service_code))
                 if detail:
                     service_details.append(detail)
             if service_details:
-                price_payload["service_code_details"] = service_details
+                price_fields_by_name["service_code_details"] = service_details
             modifier_details = []
-            for modifier_code in price_payload.get("billing_code_modifier") or []:
+            for modifier_code in price_fields_by_name.get("billing_code_modifier") or []:
                 detail = detail_map.get(_catalog_key("MODIFIER", modifier_code))
                 if not detail:
                     detail = _missing_modifier_detail(modifier_code)
                 if detail:
                     modifier_details.append(detail)
             if modifier_details:
-                price_payload["billing_code_modifier_details"] = modifier_details
-            enriched_prices.append(price_payload)
+                price_fields_by_name["billing_code_modifier_details"] = modifier_details
+            enriched_prices.append(price_fields_by_name)
         response_item["prices"] = enriched_prices
         response_item["tic_prices"] = enriched_prices
         response_item["price_summary"] = _summarize_price_payload(enriched_prices)
 
-    enriched = dict(response_payload)
-    enriched["items"] = response_items
-    return enriched
+    enriched_response_by_field = dict(response_payload)
+    enriched_response_by_field["items"] = response_items
+    return enriched_response_by_field

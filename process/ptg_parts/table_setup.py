@@ -236,7 +236,7 @@ def _is_concurrent_index_exists_race(exc: Exception, index_name: str) -> bool:
 
 
 async def _ensure_ptg2_serving_rate_columns(db_schema: str) -> None:
-    column_specs = {
+    column_types_by_name = {
         "procedure_code": "bigint",
         "reported_code_system": "varchar(64)",
         "reported_code": "varchar(64)",
@@ -245,7 +245,7 @@ async def _ensure_ptg2_serving_rate_columns(db_schema: str) -> None:
         "network_names": "varchar[]",
         "confidence_code": "varchar(64)",
     }
-    for column_name, column_type in column_specs.items():
+    for column_name, column_type in column_types_by_name.items():
         try:
             await db.status(
                 f"ALTER TABLE {db_schema}.ptg2_serving_rate "
@@ -256,10 +256,10 @@ async def _ensure_ptg2_serving_rate_columns(db_schema: str) -> None:
 
 
 async def _ensure_ptg2_serving_rate_compact_columns(db_schema: str) -> None:
-    column_specs = {
+    column_types_by_name = {
         "network_names": "varchar[]",
     }
-    for column_name, column_type in column_specs.items():
+    for column_name, column_type in column_types_by_name.items():
         try:
             await db.status(
                 f"ALTER TABLE {db_schema}.ptg2_serving_rate_compact "
@@ -298,11 +298,11 @@ async def _ensure_ptg2_price_set_columns(db_schema: str) -> None:
 
 
 async def _ensure_ptg2_price_atom_columns(db_schema: str) -> None:
-    column_specs = {
+    column_types_by_name = {
         "service_code_set_hash": "varchar(64)",
         "billing_code_modifier_set_hash": "varchar(64)",
     }
-    for column_name, column_type in column_specs.items():
+    for column_name, column_type in column_types_by_name.items():
         try:
             await db.status(
                 f"ALTER TABLE {db_schema}.ptg2_price_atom "
@@ -402,7 +402,7 @@ async def _ensure_ptg2_serving_rate_stage_table(db_schema: str) -> None:
             await db.status(f"ALTER TABLE {db_schema}.ptg2_serving_rate_stage SET UNLOGGED;")
         except Exception as exc:
             logger.debug("Skipping ptg2_serving_rate_stage unlogged ensure: %s", exc)
-    column_specs = {
+    column_types_by_name = {
         "canonical_payload": "json",
         "plan_id": "varchar(64)",
         "plan_name": "varchar",
@@ -431,7 +431,7 @@ async def _ensure_ptg2_serving_rate_stage_table(db_schema: str) -> None:
         "source_trace": "json",
         "confidence": "json",
     }
-    for column_name, column_type in column_specs.items():
+    for column_name, column_type in column_types_by_name.items():
         try:
             await db.status(
                 f"ALTER TABLE {db_schema}.ptg2_serving_rate_stage "
@@ -545,9 +545,9 @@ async def _ensure_ptg_dynamic_tables(
     except Exception as exc:
         logger.warning("Failed to ensure schema %s exists (%s); falling back to public schema", db_schema, exc)
         db_schema = "public"
-    requested = set(class_names)
+    requested_class_names = set(class_names)
     for cls in PTG_DYNAMIC_TABLE_CLASSES:
-        if cls.__name__ not in requested:
+        if cls.__name__ not in requested_class_names:
             continue
         obj = classes[cls.__name__]
         if cls.__name__ not in PTG_CONTROL_TABLE_CLASS_NAMES:
@@ -574,16 +574,20 @@ async def _prepare_ptg_tables(
     except Exception as exc:
         logger.warning("Failed to ensure schema %s exists (%s); falling back to public schema", db_schema, exc)
         db_schema = "public"
-    dynamic: dict[str, type] = {}
+    dynamic_classes_by_name: dict[str, type] = {}
     for cls in PTG_DYNAMIC_TABLE_CLASSES:
-        dynamic[cls.__name__] = (
+        dynamic_classes_by_name[cls.__name__] = (
             cls
             if cls.__name__ in PTG_CONTROL_TABLE_CLASS_NAMES
             else make_class(cls, import_id, schema_override=db_schema)
         )
-    requested = set(initial_table_class_names) if initial_table_class_names is not None else {
+    requested_class_names = set(initial_table_class_names) if initial_table_class_names is not None else {
         cls.__name__ for cls in PTG_DYNAMIC_TABLE_CLASSES
     }
-    if requested:
-        await _ensure_ptg_dynamic_tables(dynamic, requested, test_mode=test_mode)
-    return dynamic
+    if requested_class_names:
+        await _ensure_ptg_dynamic_tables(
+            dynamic_classes_by_name,
+            requested_class_names,
+            test_mode=test_mode,
+        )
+    return dynamic_classes_by_name
