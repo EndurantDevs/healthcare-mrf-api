@@ -385,6 +385,14 @@ Content-addressed source downloads may be retained by the input artifact
 policy for provenance and download reuse. They are input records, not serving
 artifacts, and the API never reads them.
 
+When a source reference identifies a ZIP or gzip container through its URL
+path or an allowlisted filename query field, the completed body must match that
+container before it can enter the retained store. The same check applies to
+range-assembled and reusable raw artifacts. A mismatched successful HTTP body
+is retried through the normal download policy and is never published as a valid
+raw artifact; an exhausted mismatch fails explicitly at the download boundary.
+References that identify plain JSON keep their streamed JSON behavior.
+
 ### Retained Input Artifact Leases
 
 Each PTG import creates an atomic marker under
