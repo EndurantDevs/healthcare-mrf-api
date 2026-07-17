@@ -331,14 +331,6 @@ def _canonical_json_sha256(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _required_sha256(value: Any, *, field_name: str) -> str:
     if type(value) is not str or len(value) != 64 or any(
         character not in "0123456789abcdef" for character in value
@@ -458,7 +450,9 @@ def attach_v3_source_run_contract(
             raise RuntimeError(
                 "strict V3 serving-run row and byte counts are inconsistent"
             )
-        file_sha256 = _sha256_file(Path(str(entry["path"])))
+        file_sha256 = _required_sha256(
+            entry.get("sha256"), field_name="serving-run sha256"
+        )
         partition_rows[partition] += row_count
         total_rows += row_count
         total_bytes += byte_count
@@ -580,7 +574,9 @@ def _attach_dictionary_entry_metadata(
     byte_count = _required_non_negative_integer(
         entry.get("bytes"), field_name="code-dictionary bytes"
     )
-    file_sha256 = _sha256_file(Path(str(entry["path"])))
+    file_sha256 = _required_sha256(
+        entry.get("sha256"), field_name="code-dictionary sha256"
+    )
     entry.update(identity.as_dict())
     entry["source_run_contract_sha256"] = source_run_digest
     return {"row_count": row_count, "bytes": byte_count, "sha256": file_sha256}
@@ -721,7 +717,12 @@ def _prepare_serving_entries(
             entry.get("source_run_file_sha256"),
             field_name="source_run_file_sha256",
         )
-        if _sha256_file(Path(str(entry["path"]))) != expected_file_sha256:
+        if (
+            _required_sha256(
+                entry.get("sha256"), field_name="serving-run sha256"
+            )
+            != expected_file_sha256
+        ):
             raise RuntimeError(
                 "strict V3 serving-run content digest does not match its source contract"
             )
@@ -1039,7 +1040,9 @@ def _bind_code_dictionary_entry(
     byte_count = _required_non_negative_integer(
         entry.get("bytes"), field_name="code-dictionary bytes"
     )
-    file_sha256 = _sha256_file(Path(str(entry["path"])))
+    file_sha256 = _required_sha256(
+        entry.get("sha256"), field_name="code-dictionary sha256"
+    )
     entries_by_source[source_key].append(
         {
             "row_count": row_count,

@@ -10,8 +10,13 @@ from process.ptg_parts.ptg2_shared_finalize import (
 
 
 def _entry(path, **values):
-    path.write_bytes(b"x" * int(values.get("bytes") or 1))
-    return {"path": str(path), **values}
+    payload = b"x" * int(values.get("bytes") or 1)
+    path.write_bytes(payload)
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        **values,
+    }
 
 
 def _canonical_sha256(payload):

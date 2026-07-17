@@ -386,6 +386,54 @@ impl PartialEq for ProviderEntry {
 
 impl Eq for ProviderEntry {}
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ProviderRefKey {
+    Signed(i64),
+    Unsigned(u64),
+    Text(Box<str>),
+}
+
+impl ProviderRefKey {
+    fn from_number(number: serde_json::Number, field_name: &str) -> io::Result<Self> {
+        if let Some(value) = number.as_i64() {
+            return Ok(Self::Signed(value));
+        }
+        if let Some(value) = number.as_u64() {
+            return Ok(Self::Unsigned(value));
+        }
+        let canonical = strict_integer_text(&Value::Number(number), field_name)?;
+        Ok(Self::from(canonical))
+    }
+}
+
+impl From<String> for ProviderRefKey {
+    fn from(value: String) -> Self {
+        if let Ok(integer) = value.parse::<i64>() {
+            Self::Signed(integer)
+        } else if let Ok(integer) = value.parse::<u64>() {
+            Self::Unsigned(integer)
+        } else {
+            Self::Text(value.into_boxed_str())
+        }
+    }
+}
+
+impl From<&str> for ProviderRefKey {
+    fn from(value: &str) -> Self {
+        Self::from(value.to_owned())
+    }
+}
+
+impl std::fmt::Display for ProviderRefKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Signed(value) => value.fmt(formatter),
+            Self::Unsigned(value) => value.fmt(formatter),
+            Self::Text(value) => value.fmt(formatter),
+        }
+    }
+}
+
 enum ProviderEntryView<'a> {
     Borrowed(&'a ProviderEntry),
     Owned(ProviderEntry),
@@ -430,10 +478,19 @@ impl<'a> ProviderEntryView<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RateLite {
-    provider_refs: Vec<String>,
+    provider_refs: Vec<ProviderRefKey>,
     provider_groups: Vec<Value>,
     network_names: Vec<String>,
     prices: Vec<PriceLite>,
+    prepared_price_set: Option<PriceSetLite>,
+}
+
+impl RateLite {
+    fn price_count(&self) -> usize {
+        self.prepared_price_set
+            .as_ref()
+            .map_or(self.prices.len(), |price_set| price_set.atoms.len())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -500,7 +557,7 @@ impl StringOrStrings {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PriceAtomLite {
     global_id: GlobalId128,
     negotiated_type: Option<String>,
@@ -513,7 +570,7 @@ struct PriceAtomLite {
     additional_information: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PriceSetLite {
     global_id: GlobalId128,
     atoms: Vec<PriceAtomLite>,
@@ -819,6 +876,7 @@ struct CopyFileEvent {
     partition_count: Option<usize>,
     format: Option<String>,
     version: Option<u32>,
+    sha256: Option<String>,
 }
 
 fn emit_copy_file_event<W: Write>(writer: &mut W, event: &CopyFileEvent) -> io::Result<()> {
@@ -838,6 +896,9 @@ fn emit_copy_file_event<W: Write>(writer: &mut W, event: &CopyFileEvent) -> io::
     }
     if let Some(version) = event.version {
         payload.insert("version".to_string(), json!(version));
+    }
+    if let Some(sha256) = event.sha256.as_ref() {
+        payload.insert("sha256".to_string(), json!(sha256));
     }
     emit_json_record(writer, &event.record_kind, &Value::Object(payload))
 }
@@ -1227,11 +1288,17 @@ fn build_provider_entry(provider_ref: &Value) -> io::Result<ProviderEntry> {
     })
 }
 
-fn provider_ref_key(value: &Value) -> io::Result<String> {
-    strict_integer_text(value, "provider_group_id")
+fn provider_ref_key(value: &Value) -> io::Result<ProviderRefKey> {
+    let Value::Number(number) = value else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider_group_id must be a JSON integer",
+        ));
+    };
+    ProviderRefKey::from_number(number.clone(), "provider_group_id")
 }
 
-fn provider_ref_definition(value: &Value) -> io::Result<(String, ProviderEntry)> {
+fn provider_ref_definition(value: &Value) -> io::Result<(ProviderRefKey, ProviderEntry)> {
     let key_value = value.get("provider_group_id").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1242,7 +1309,7 @@ fn provider_ref_definition(value: &Value) -> io::Result<(String, ProviderEntry)>
 }
 
 fn provider_identifier_quarantine_payload(
-    provider_map: &HashMap<String, ProviderEntry>,
+    provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
     inline_quarantine: ProviderIdentifierQuarantine,
 ) -> io::Result<Value> {
     let mut quarantine = inline_quarantine;
@@ -1253,8 +1320,8 @@ fn provider_identifier_quarantine_payload(
 }
 
 fn insert_provider_definition(
-    provider_map: &mut HashMap<String, ProviderEntry>,
-    key: String,
+    provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
+    key: ProviderRefKey,
     entry: ProviderEntry,
 ) -> io::Result<()> {
     // TiC provider_group_id definitions are unique; merging duplicates would invent membership.
@@ -1269,12 +1336,12 @@ fn insert_provider_definition(
 }
 
 fn validate_preloaded_provider_definition(
-    provider_map: &HashMap<String, ProviderEntry>,
-    seen_keys: &mut HashSet<String>,
-    key: &str,
+    provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
+    seen_keys: &mut HashSet<ProviderRefKey>,
+    key: &ProviderRefKey,
     entry: &ProviderEntry,
 ) -> io::Result<()> {
-    if !seen_keys.insert(key.to_owned()) {
+    if !seen_keys.insert(key.clone()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("duplicate provider_group_id definition: {key}"),
@@ -1294,8 +1361,8 @@ fn validate_preloaded_provider_definition(
 }
 
 fn provider_set_from_ref_keys(
-    provider_map: &HashMap<String, ProviderEntry>,
-    refs: &[String],
+    provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
+    refs: &[ProviderRefKey],
 ) -> io::Result<Option<ProviderEntry>> {
     let mut entry_hashes: HashSet<i64> = HashSet::new();
     let mut group_hashes: HashSet<i64> = HashSet::new();
@@ -1390,8 +1457,8 @@ fn combine_provider_entries(first: ProviderEntry, second: ProviderEntry) -> Prov
 }
 
 fn provider_entry_view_from_ref_keys<'a>(
-    provider_map: &'a HashMap<String, ProviderEntry>,
-    refs: &[String],
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
+    refs: &[ProviderRefKey],
 ) -> io::Result<Option<ProviderEntryView<'a>>> {
     if refs.is_empty() {
         return Ok(None);
@@ -1433,12 +1500,35 @@ fn price_atom_from_lite(price: &PriceLite) -> PriceAtomLite {
     }
 }
 
+fn price_atom_from_owned_lite(price: PriceLite) -> PriceAtomLite {
+    let global_id = GlobalId128::from_price_atom_parts(
+        price.negotiated_type.as_deref(),
+        Some(&price.negotiated_rate),
+        price.expiration_date.as_deref(),
+        &price.service_code,
+        price.billing_class.as_deref(),
+        price.setting.as_deref(),
+        &price.billing_code_modifier,
+        price.additional_information.as_deref(),
+    );
+    PriceAtomLite {
+        global_id,
+        negotiated_type: price.negotiated_type,
+        negotiated_rate: price.negotiated_rate,
+        expiration_date: price.expiration_date,
+        service_code: price.service_code,
+        billing_class: price.billing_class,
+        setting: price.setting,
+        billing_code_modifier: price.billing_code_modifier,
+        additional_information: price.additional_information,
+    }
+}
+
 fn price_code_set_hash(codes: &[String]) -> String {
     hash_string_list("price_code_set", codes)
 }
 
-fn price_lite_set(prices: &[PriceLite]) -> Option<PriceSetLite> {
-    let atoms = prices.iter().map(price_atom_from_lite).collect::<Vec<_>>();
+fn price_set_from_atoms(atoms: Vec<PriceAtomLite>) -> Option<PriceSetLite> {
     if atoms.is_empty() {
         return None;
     }
@@ -1450,6 +1540,50 @@ fn price_lite_set(prices: &[PriceLite]) -> Option<PriceSetLite> {
         atoms,
         atom_ids,
     })
+}
+
+fn price_lite_set(prices: &[PriceLite]) -> Option<PriceSetLite> {
+    price_set_from_atoms(prices.iter().map(price_atom_from_lite).collect())
+}
+
+fn price_lite_set_owned(prices: Vec<PriceLite>) -> Option<PriceSetLite> {
+    price_set_from_atoms(prices.into_iter().map(price_atom_from_owned_lite).collect())
+}
+
+enum RatePriceSet<'a> {
+    Borrowed(&'a PriceSetLite),
+    Owned(PriceSetLite),
+}
+
+impl std::ops::Deref for RatePriceSet<'_> {
+    type Target = PriceSetLite;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl RatePriceSet<'_> {
+    fn as_ref(&self) -> &PriceSetLite {
+        match self {
+            Self::Borrowed(price_set) => price_set,
+            Self::Owned(price_set) => price_set,
+        }
+    }
+
+    fn into_owned(self) -> PriceSetLite {
+        match self {
+            Self::Borrowed(price_set) => price_set.clone(),
+            Self::Owned(price_set) => price_set,
+        }
+    }
+}
+
+fn rate_price_set(rate: &RateLite) -> Option<RatePriceSet<'_>> {
+    match rate.prepared_price_set.as_ref() {
+        Some(price_set) => Some(RatePriceSet::Borrowed(price_set)),
+        None => price_lite_set(&rate.prices).map(RatePriceSet::Owned),
+    }
 }
 
 fn price_atom_global_id(atom: &PriceAtomLite) -> GlobalId128 {
@@ -2450,6 +2584,7 @@ fn emit_manifest_sidecar_file<W: Write>(
             partition_count: None,
             format: None,
             version: None,
+            sha256: None,
         },
     )
 }
@@ -2480,6 +2615,7 @@ fn emit_manifest_sidecar_path<W: Write>(
             partition_count: None,
             format: None,
             version: None,
+            sha256: None,
         },
     )
 }
@@ -2719,6 +2855,7 @@ impl CompactCopySink {
             partition_count: None,
             format: None,
             version: None,
+            sha256: None,
         };
         self.row_count = 0;
         Ok(Some(event))
@@ -2767,6 +2904,7 @@ impl CompactCopySink {
             partition_count: None,
             format: None,
             version: None,
+            sha256: None,
         }))
     }
 }
@@ -2925,6 +3063,7 @@ fn serving_run_partition_events(
                 partition_count: Some(file.partition_count),
                 format: Some(SERVING_RUN_FORMAT.to_string()),
                 version: Some(SERVING_RUN_FORMAT_VERSION),
+                sha256: Some(sha256_hex(&file.sha256)),
             };
             metrics.record(&event);
             event
@@ -2941,6 +3080,7 @@ fn serving_run_partition_events(
             partition_count: None,
             format: Some(ptg2_scanner::v3_runs::CODE_DICTIONARY_FORMAT.to_string()),
             version: Some(ptg2_scanner::v3_runs::CODE_DICTIONARY_FORMAT_VERSION),
+            sha256: Some(sha256_hex(&file.sha256)),
         };
         metrics.record_code_dictionary(&event);
         events.push(event);
@@ -4054,7 +4194,7 @@ struct LocalCompactDedupe<'a> {
 }
 
 struct CompactRateBatch<'a> {
-    provider_map: &'a HashMap<String, ProviderEntry>,
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
     manifest_global_id_cache: &'a mut ManifestGlobalIdCache,
     rates: &'a [RateLite],
     procedure_value: &'a Value,
@@ -4229,12 +4369,12 @@ fn process_compact_rate_lites<W: Write>(
                 None => continue,
             }
         };
-        let Some(price_set) = price_lite_set(&rate.prices) else {
+        let Some(price_set) = rate_price_set(rate) else {
             continue;
         };
         let network_names = rate_network_names(rate, &provider_entry.network_names, context);
         parsed_rates.push((
-            price_set,
+            price_set.into_owned(),
             provider_entry.entry_hash,
             provider_entry.provider_group_hashes,
             provider_entry.npi,
@@ -4583,7 +4723,7 @@ fn npi_source_coordinate(groups: &[Value], selected_npi: i64) -> Option<(usize, 
 
 fn linked_provider_source_evidence(
     rate: &RateLite,
-    provider_map: &HashMap<String, ProviderEntry>,
+    provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
     context: &CompactContext,
     selected_npi: i64,
 ) -> io::Result<(Value, Option<Vec<u8>>)> {
@@ -4648,7 +4788,7 @@ fn linked_provider_source_evidence(
         return Ok((
             json!({
                 "source_kind": "provider_reference",
-                "provider_reference_id": provider_reference,
+                "provider_reference_id": provider_reference.to_string(),
                 "provider_group_ordinal": group_ordinal,
                 "npi_ordinal": npi_ordinal,
             }),
@@ -4666,7 +4806,7 @@ struct EmittedSourceRateWitnessInput<'a> {
     rate: &'a RateLite,
     emitted_provider_npis: &'a [i64],
     emitted_price_count: usize,
-    provider_map: &'a HashMap<String, ProviderEntry>,
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
     context: &'a CompactContext,
     coordinate: SourceWitnessCoordinate,
     procedure_json: &'a [u8],
@@ -4689,7 +4829,7 @@ fn capture_emitted_source_rate_occurrences(
         raw_rate,
         population_delta,
     } = input;
-    if emitted_price_count != rate.prices.len() {
+    if emitted_price_count != rate.price_count() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "source witness price population differs from emitted V3 prices",
@@ -4738,10 +4878,10 @@ fn capture_emitted_source_rate_occurrences(
     Ok(())
 }
 
-fn source_provider_witness_expected(key: &str, _entry: &ProviderEntry) -> Value {
+fn source_provider_witness_expected(key: &ProviderRefKey, _entry: &ProviderEntry) -> Value {
     json!({
         "contract": "ptg2_v3_source_provider_expected_v2",
-        "provider_group_id": key,
+        "provider_group_id": key.to_string(),
     })
 }
 
@@ -4946,7 +5086,6 @@ struct RawChunkStats {
     max_rates: usize,
     queue_high_water: usize,
     queue_blocked_sends: u64,
-    capture_bytes: u64,
     capture_micros: u128,
     framing_micros: u128,
     buffer_allocations: u64,
@@ -4965,7 +5104,6 @@ impl RawChunkStats {
         self.queue_blocked_sends = self
             .queue_blocked_sends
             .saturating_add(other.queue_blocked_sends);
-        self.capture_bytes = self.capture_bytes.saturating_add(other.capture_bytes);
         self.capture_micros = self.capture_micros.saturating_add(other.capture_micros);
         self.framing_micros = self.framing_micros.saturating_add(other.framing_micros);
         self.buffer_allocations = self
@@ -5030,9 +5168,12 @@ impl RawChunkStats {
         self.queue_blocked_sends = self.queue_blocked_sends.saturating_add(1);
     }
 
-    fn record_capture(&mut self, byte_count: usize, elapsed_micros: u128) {
-        self.capture_bytes = self.capture_bytes.saturating_add(byte_count as u64);
-        self.capture_micros = self.capture_micros.saturating_add(elapsed_micros);
+    fn record_capture_batch(&mut self, started_at: Option<Instant>) {
+        if let Some(started_at) = started_at {
+            self.capture_micros = self
+                .capture_micros
+                .saturating_add(started_at.elapsed().as_micros());
+        }
     }
 }
 
@@ -5133,7 +5274,7 @@ impl CompactWorkerMetrics {
 }
 
 struct ProviderRefWorkerOutput {
-    provider_map: HashMap<String, ProviderEntry>,
+    provider_map: HashMap<ProviderRefKey, ProviderEntry>,
     events: Vec<CopyFileEvent>,
     metrics: ProviderRefWorkerMetrics,
 }
@@ -5165,7 +5306,7 @@ impl WorkerJob {
 
 fn process_provider_ref_raw_batch_with_metrics(
     raw_refs: &RawRateChunk,
-    provider_map: &mut HashMap<String, ProviderEntry>,
+    provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
     dictionary_copy_sinks: &mut DictionaryCopySinks,
     dedupe: &SharedDedupe,
     source_witness: &SourceWitnessCollector,
@@ -5212,7 +5353,7 @@ fn process_provider_ref_raw_batch_with_metrics(
 #[cfg(test)]
 fn process_provider_ref_raw_batch(
     raw_refs: &RawRateChunk,
-    provider_map: &mut HashMap<String, ProviderEntry>,
+    provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
     dictionary_copy_sinks: &mut DictionaryCopySinks,
     dedupe: &SharedDedupe,
 ) -> io::Result<u64> {
@@ -5689,7 +5830,7 @@ fn validate_compact_rate_object_suffix<R: Read>(reader: R) -> io::Result<()> {
 }
 
 struct JoinedProviderRefs {
-    provider_map: HashMap<String, ProviderEntry>,
+    provider_map: HashMap<ProviderRefKey, ProviderEntry>,
     events: Vec<CopyFileEvent>,
     worker_metrics: Vec<ProviderRefWorkerMetrics>,
     worker_join_seconds: f64,
@@ -5697,9 +5838,9 @@ struct JoinedProviderRefs {
 }
 
 fn merge_ordered_provider_map_pair(
-    mut left: HashMap<String, ProviderEntry>,
-    right: HashMap<String, ProviderEntry>,
-) -> io::Result<HashMap<String, ProviderEntry>> {
+    mut left: HashMap<ProviderRefKey, ProviderEntry>,
+    right: HashMap<ProviderRefKey, ProviderEntry>,
+) -> io::Result<HashMap<ProviderRefKey, ProviderEntry>> {
     if left.len() >= right.len() {
         for (key, entry) in right {
             insert_provider_definition(&mut left, key, entry)?;
@@ -5715,8 +5856,8 @@ fn merge_ordered_provider_map_pair(
 }
 
 fn merge_provider_maps_pairwise(
-    mut provider_maps: Vec<(usize, HashMap<String, ProviderEntry>)>,
-) -> io::Result<HashMap<String, ProviderEntry>> {
+    mut provider_maps: Vec<(usize, HashMap<ProviderRefKey, ProviderEntry>)>,
+) -> io::Result<HashMap<ProviderRefKey, ProviderEntry>> {
     provider_maps.sort_unstable_by_key(|(worker_id, _provider_map)| *worker_id);
     while provider_maps.len() > 1 {
         provider_maps = provider_maps
@@ -5834,7 +5975,7 @@ struct SharedCompactState<'a, W: Write> {
     manifest_sidecars: Option<Arc<Mutex<ManifestSidecarCollector>>>,
     record_price_forward_sidecar: bool,
     suppress_legacy_row_output: bool,
-    provider_map: &'a HashMap<String, ProviderEntry>,
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
     dedupe: &'a SharedDedupe,
     provider_set_scope_cache: &'a mut ProviderSetScopeCache,
     manifest_global_id_cache: &'a mut ManifestGlobalIdCache,
@@ -5842,7 +5983,7 @@ struct SharedCompactState<'a, W: Write> {
 }
 
 fn provider_entry_view_for_worker_rate<'a>(
-    provider_map: &'a HashMap<String, ProviderEntry>,
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
     rate: &RateLite,
     dictionary_copy_sinks: &mut DictionaryCopySinks,
     dedupe: &SharedDedupe,
@@ -6026,33 +6167,52 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
         let mut code_count_rows = 0usize;
         for (rate_index, rate) in rates.iter().enumerate() {
             let source_input = source_inputs.map(|inputs| inputs[rate_index]);
-            if let Some(unresolved_reference) = rate
-                .provider_refs
-                .iter()
-                .find(|provider_reference| !provider_map.contains_key(*provider_reference))
+            let provider_entry = if rate.provider_groups.is_empty() && rate.provider_refs.len() == 1
             {
-                if source_input.is_some() {
-                    mark_source_rate_unqueryable(&mut source_witness_population)?;
+                let provider_reference = &rate.provider_refs[0];
+                match provider_map.get(provider_reference) {
+                    Some(provider_entry) => ProviderEntryView::Borrowed(provider_entry),
+                    None if source_input.is_some() => {
+                        mark_source_rate_unqueryable(&mut source_witness_population)?;
+                        continue;
+                    }
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unresolved provider reference: {provider_reference}"),
+                        ));
+                    }
+                }
+            } else {
+                if let Some(unresolved_reference) = rate
+                    .provider_refs
+                    .iter()
+                    .find(|provider_reference| !provider_map.contains_key(*provider_reference))
+                {
+                    if source_input.is_some() {
+                        mark_source_rate_unqueryable(&mut source_witness_population)?;
+                        continue;
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unresolved provider reference: {unresolved_reference}"),
+                    ));
+                }
+                let Some(provider_entry) = provider_entry_view_for_worker_rate(
+                    provider_map,
+                    rate,
+                    dictionary_copy_sinks,
+                    dedupe,
+                )?
+                else {
+                    if source_input.is_some() {
+                        mark_source_rate_unqueryable(&mut source_witness_population)?;
+                    }
                     continue;
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unresolved provider reference: {unresolved_reference}"),
-                ));
-            }
-            let Some(provider_entry) = provider_entry_view_for_worker_rate(
-                provider_map,
-                rate,
-                dictionary_copy_sinks,
-                dedupe,
-            )?
-            else {
-                if source_input.is_some() {
-                    mark_source_rate_unqueryable(&mut source_witness_population)?;
-                }
-                continue;
+                };
+                provider_entry
             };
-            let Some(price_set) = price_lite_set(&rate.prices) else {
+            let Some(price_set) = rate_price_set(rate) else {
                 if source_input.is_some() {
                     mark_source_rate_unqueryable(&mut source_witness_population)?;
                 }
@@ -6088,10 +6248,10 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                             "price-forward sidecar output requires a manifest sidecar collector",
                         )
                     })?;
-                    lock_manifest_sidecars(sidecars).record_price_set(&price_set)?;
+                    lock_manifest_sidecars(sidecars).record_price_set(price_set.as_ref())?;
                 }
                 dictionary_copy_sinks.write_price_atoms_shared(&price_set.atoms, dedupe)?;
-                dictionary_copy_sinks.write_manifest_price_set_atoms(&price_set)?;
+                dictionary_copy_sinks.write_manifest_price_set_atoms(price_set.as_ref())?;
                 dictionary_copy_sinks.write_price_set_entries_shared(
                     price_set.global_id,
                     &price_set.atom_ids,
@@ -6240,7 +6400,7 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                         sorted_provider_group_hashes: sorted_provider_hashes,
                         network_names,
                         provider_count,
-                        price_set: &price_set,
+                        price_set: price_set.as_ref(),
                     },
                     manifest_global_id_cache,
                 )?;
@@ -6281,14 +6441,14 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
         else {
             continue;
         };
-        let Some(price_set) = price_lite_set(&rate.prices) else {
+        let Some(price_set) = rate_price_set(rate) else {
             continue;
         };
         let provider_entry_hash = provider_entry.entry_hash();
         let group = by_price_set
             .entry(price_set.global_id)
             .or_insert_with(|| GroupedPriceSet {
-                price_set,
+                price_set: price_set.into_owned(),
                 provider_entry_hashes: HashSet::new(),
                 provider_group_hashes: HashSet::new(),
                 provider_npis: HashSet::new(),
@@ -6530,7 +6690,7 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
 fn read_rate_lite_struson<R: Read>(
     json_reader: &mut JsonStreamReader<R>,
 ) -> io::Result<Option<RateLite>> {
-    let mut provider_refs: Vec<String> = Vec::new();
+    let mut provider_refs: Vec<ProviderRefKey> = Vec::new();
     let mut provider_groups: Vec<Value> = Vec::new();
     let mut network_names: Vec<String> = Vec::new();
     let mut prices: Vec<PriceLite> = Vec::new();
@@ -6557,7 +6717,16 @@ fn read_rate_lite_struson<R: Read>(
                 json_reader.begin_array().map_err(to_io_error)?;
                 while json_reader.has_next().map_err(to_io_error)? {
                     let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
-                    provider_refs.push(strict_integer_text(&value, "provider_references element")?);
+                    let Value::Number(number) = value else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "provider_references element must be a JSON integer",
+                        ));
+                    };
+                    provider_refs.push(ProviderRefKey::from_number(
+                        number,
+                        "provider_references element",
+                    )?);
                 }
                 json_reader.end_array().map_err(to_io_error)?;
             }
@@ -6594,11 +6763,18 @@ fn read_rate_lite_struson<R: Read>(
             "negotiated rate must contain at least one negotiated price",
         ));
     }
+    let prepared_price_set = price_lite_set_owned(prices).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiated rate must contain at least one negotiated price",
+        )
+    })?;
     Ok(Some(RateLite {
         provider_refs,
         provider_groups,
         network_names: canonical_text_list(network_names, false),
-        prices,
+        prices: Vec::new(),
+        prepared_price_set: Some(prepared_price_set),
     }))
 }
 
@@ -6636,8 +6812,8 @@ fn read_rate_lite_bytes_typed(raw: &[u8]) -> io::Result<Option<RateLite>> {
     let wire: RateLiteWire = serde_json::from_slice(raw).map_err(to_io_error)?;
     let mut provider_refs = Vec::with_capacity(wire.provider_references.len());
     for provider_reference in wire.provider_references {
-        provider_refs.push(strict_integer_text(
-            &Value::Number(provider_reference),
+        provider_refs.push(ProviderRefKey::from_number(
+            provider_reference,
             "provider_references element",
         )?);
     }
@@ -6673,11 +6849,18 @@ fn read_rate_lite_bytes_typed(raw: &[u8]) -> io::Result<Option<RateLite>> {
             additional_information: trim_optional_wire_text(price.additional_information),
         });
     }
+    let prepared_price_set = price_lite_set_owned(prices).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiated rate must contain at least one negotiated price",
+        )
+    })?;
     Ok(Some(RateLite {
         provider_refs,
         provider_groups: wire.provider_groups,
         network_names: canonical_text_list(network_names, false),
-        prices,
+        prices: Vec::new(),
+        prepared_price_set: Some(prepared_price_set),
     }))
 }
 
@@ -6837,7 +7020,7 @@ struct InNetworkStreamState<'a, W: Write> {
     manifest_sidecars: Option<&'a mut ManifestSidecarCollector>,
     record_price_forward_sidecar: bool,
     suppress_legacy_row_output: bool,
-    provider_map: &'a HashMap<String, ProviderEntry>,
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
     dedupe: LocalCompactDedupe<'a>,
     manifest_global_id_cache: &'a mut ManifestGlobalIdCache,
     context: CompactContext,
@@ -7022,6 +7205,7 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
     let mut decoded_name = String::new();
     let mut rate_count = 0u64;
     let mut rates_dispatched = false;
+    let mut capture_batch_started_at = None;
     reader.expect_byte(b'{')?;
     let mut first_field = true;
     loop {
@@ -7052,15 +7236,11 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
             "negotiated_rates" => {
                 reader.expect_byte(b'[')?;
                 let mut first_rate = true;
+                capture_batch_started_at = Some(Instant::now());
                 while next_array_value(reader, &mut first_rate)? {
                     rate_count += 1;
                     let raw_start = raw_rate_chunk.byte_len();
-                    let capture_started_at = Instant::now();
                     reader.capture_value_bytes_append(&mut raw_rate_chunk.bytes)?;
-                    io_state.raw_chunk_stats.record_capture(
-                        raw_rate_chunk.byte_len().saturating_sub(raw_start),
-                        capture_started_at.elapsed().as_micros(),
-                    );
                     raw_rate_chunk.push_current_value_span_at(
                         raw_start,
                         SourceWitnessCoordinate::new(
@@ -7071,6 +7251,9 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
                     if raw_rate_chunk.len() >= chunk_size
                         || raw_rate_chunk.byte_len() >= raw_chunk_byte_limit
                     {
+                        io_state
+                            .raw_chunk_stats
+                            .record_capture_batch(capture_batch_started_at.take());
                         validate_procedure_for_rate_dispatch(&procedure)?;
                         let raw_rates = io_state.raw_chunk_stats.take_filled_chunk(
                             &mut raw_rate_chunk,
@@ -7093,6 +7276,7 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
                         )?;
                         rates_dispatched = true;
                         drain_copy_file_events(io_state.event_rx, io_state.writer)?;
+                        capture_batch_started_at = Some(Instant::now());
                     }
                 }
             }
@@ -7104,6 +7288,9 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
     }
     validate_procedure_for_rate_dispatch(&procedure)?;
     if !raw_rate_chunk.is_empty() {
+        io_state
+            .raw_chunk_stats
+            .record_capture_batch(capture_batch_started_at.take());
         validate_procedure_for_rate_dispatch(&procedure)?;
         io_state
             .raw_chunk_stats
@@ -7145,6 +7332,7 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
         .allocate_chunk(chunk_size, raw_chunk_byte_limit.min(READ_BUF_SIZE));
     let mut rate_count = 0u64;
     let mut rates_dispatched = false;
+    let mut capture_batch_started_at = None;
     json_reader.begin_object().map_err(to_io_error)?;
     while json_reader.has_next().map_err(to_io_error)? {
         let name = json_reader.next_name_owned().map_err(to_io_error)?;
@@ -7161,19 +7349,17 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
             }
             "negotiated_rates" => {
                 json_reader.begin_array().map_err(to_io_error)?;
+                if parse_in_workers {
+                    capture_batch_started_at = Some(Instant::now());
+                }
                 while json_reader.has_next().map_err(to_io_error)? {
                     rate_count += 1;
                     if parse_in_workers {
                         let raw_start = raw_rate_chunk.byte_len();
-                        let capture_started_at = Instant::now();
                         transfer_next_value_to_bytes_append(
                             json_reader,
                             &mut raw_rate_chunk.bytes,
                         )?;
-                        io_state.raw_chunk_stats.record_capture(
-                            raw_rate_chunk.byte_len().saturating_sub(raw_start),
-                            capture_started_at.elapsed().as_micros(),
-                        );
                         raw_rate_chunk.push_current_value_span_at(
                             raw_start,
                             SourceWitnessCoordinate::new(
@@ -7184,6 +7370,9 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
                         if raw_rate_chunk.len() >= chunk_size
                             || raw_rate_chunk.byte_len() >= raw_chunk_byte_limit
                         {
+                            io_state
+                                .raw_chunk_stats
+                                .record_capture_batch(capture_batch_started_at.take());
                             validate_procedure_for_rate_dispatch(&procedure)?;
                             let raw_rates = io_state.raw_chunk_stats.take_filled_chunk(
                                 &mut raw_rate_chunk,
@@ -7206,6 +7395,7 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
                             )?;
                             rates_dispatched = true;
                             drain_copy_file_events(io_state.event_rx, io_state.writer)?;
+                            capture_batch_started_at = Some(Instant::now());
                         }
                     } else if let Some(rate) = read_rate_lite_struson(json_reader)? {
                         rate_chunk.push(rate);
@@ -7240,6 +7430,9 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
     json_reader.end_object().map_err(to_io_error)?;
     validate_procedure_for_rate_dispatch(&procedure)?;
     if !raw_rate_chunk.is_empty() {
+        io_state
+            .raw_chunk_stats
+            .record_capture_batch(capture_batch_started_at.take());
         validate_procedure_for_rate_dispatch(&procedure)?;
         io_state
             .raw_chunk_stats
@@ -7303,7 +7496,7 @@ fn finish_worker_outputs(
 
 struct CompactWorkerConfig {
     event_tx: Sender<CopyFileEvent>,
-    provider_map: Arc<HashMap<String, ProviderEntry>>,
+    provider_map: Arc<HashMap<ProviderRefKey, ProviderEntry>>,
     dedupe: Arc<SharedDedupe>,
     manifest_sidecars: Option<Arc<Mutex<ManifestSidecarCollector>>>,
     queue_bytes: Arc<QueueByteMetrics>,
@@ -8442,6 +8635,7 @@ fn scan_compact_byte_top_level_parallel(
                     depth += 1;
                     in_provider_refs = true;
                     active_array_depth = depth;
+                    provider_capture_started_at = Some(Instant::now());
                     continue;
                 }
                 if byte == b'['
@@ -8449,6 +8643,8 @@ fn scan_compact_byte_top_level_parallel(
                     && matches!(pending, CompactTopLevelArrayKey::InNetwork)
                 {
                     if !raw_refs.is_empty() {
+                        provider_ref_raw_chunk_stats
+                            .record_capture_batch(provider_capture_started_at.take());
                         provider_ref_raw_chunk_stats.record(raw_refs.len(), raw_refs.byte_len());
                         let batch = provider_ref_raw_chunk_stats.take_filled_chunk(
                             &mut raw_refs,
@@ -9029,7 +9225,8 @@ fn scan_compact_byte_top_level_parallel(
                             "queued_bytes_at_finish": raw_chunk_stats.queue_bytes.current_bytes(),
                             "producer_byte_framing_seconds": seconds_from_micros(raw_chunk_stats.framing_micros),
                             "producer_byte_capture_seconds": seconds_from_micros(raw_chunk_stats.capture_micros),
-                            "producer_byte_capture_bytes": raw_chunk_stats.capture_bytes,
+                            "producer_byte_capture_bytes": raw_chunk_stats.total_bytes,
+                            "producer_byte_capture_timing_granularity": "raw_chunk",
                             "provider_ref_raw_chunk_count": provider_ref_raw_chunk_stats.chunk_count,
                             "provider_ref_raw_chunk_total_bytes": provider_ref_raw_chunk_stats.total_bytes,
                             "provider_ref_raw_chunk_max_bytes": provider_ref_raw_chunk_stats.max_bytes,
@@ -9040,7 +9237,7 @@ fn scan_compact_byte_top_level_parallel(
                             "provider_ref_queue_blocked_sends": provider_ref_raw_chunk_stats.queue_blocked_sends,
                             "provider_ref_peak_queued_bytes": provider_ref_raw_chunk_stats.queue_bytes.peak_bytes(),
                             "provider_ref_queued_bytes_at_finish": provider_ref_raw_chunk_stats.queue_bytes.current_bytes(),
-                            "provider_capture_bytes": provider_ref_raw_chunk_stats.capture_bytes,
+                            "provider_capture_bytes": provider_ref_raw_chunk_stats.total_bytes,
                             "provider_capture_seconds": provider_capture_seconds,
                             "provider_capture_compressed_bytes": provider_capture_compressed_bytes,
                             "provider_capture_compressed_mib_s": compressed_mib_per_second(provider_capture_compressed_bytes, provider_capture_seconds),
@@ -9159,7 +9356,6 @@ fn scan_compact_byte_top_level_parallel(
             if in_provider_refs && capture_depth == 0 && byte == b'{' && depth == active_array_depth
             {
                 capture_start = raw_refs.byte_len();
-                provider_capture_started_at = Some(Instant::now());
                 raw_refs.bytes.push(b'{');
                 capture_depth = 1;
                 depth += 1;
@@ -9184,18 +9380,14 @@ fn scan_compact_byte_top_level_parallel(
                                     0,
                                 ),
                             );
-                            provider_ref_raw_chunk_stats.record_capture(
-                                raw_refs.byte_len().saturating_sub(capture_start),
-                                provider_capture_started_at
-                                    .take()
-                                    .map_or(0, |started_at| started_at.elapsed().as_micros()),
-                            );
                             *object_counts
                                 .entry("provider_references".to_string())
                                 .or_insert(0) += 1;
                             if raw_refs.len() >= provider_ref_chunk_items
                                 || raw_refs.byte_len() >= provider_ref_raw_chunk_byte_limit
                             {
+                                provider_ref_raw_chunk_stats
+                                    .record_capture_batch(provider_capture_started_at.take());
                                 let batch = provider_ref_raw_chunk_stats.take_filled_chunk(
                                     &mut raw_refs,
                                     provider_ref_chunk_items,
@@ -9211,6 +9403,7 @@ fn scan_compact_byte_top_level_parallel(
                                     batch,
                                 )?;
                                 drain_copy_file_events(&event_rx, &mut writer)?;
+                                provider_capture_started_at = Some(Instant::now());
                             }
                             if !indexed_reorder_used {
                                 let bytes = compressed_bytes_read.load(Ordering::Relaxed);
@@ -9302,7 +9495,7 @@ fn scan_compact_struson_parallel(
     let mut next_progress_objects = progress_objects_interval;
     let mut object_counts: HashMap<String, u64> = HashMap::new();
     let started_at = Instant::now();
-    let mut provider_map: HashMap<String, ProviderEntry> = HashMap::new();
+    let mut provider_map: HashMap<ProviderRefKey, ProviderEntry> = HashMap::new();
     let negotiated_rate_chunk_size = split_interval(
         "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
         DEFAULT_SPLIT_NEGOTIATED_RATES,
@@ -9449,14 +9642,10 @@ fn scan_compact_struson_parallel(
                         provider_ref_raw_chunk_byte_limit.min(READ_BUF_SIZE),
                     );
                     json_reader.begin_array().map_err(to_io_error)?;
+                    let mut capture_batch_started_at = Some(Instant::now());
                     while json_reader.has_next().map_err(to_io_error)? {
                         let raw_start = raw_refs.byte_len();
-                        let capture_started_at = Instant::now();
                         transfer_next_value_to_bytes_append(&mut json_reader, &mut raw_refs.bytes)?;
-                        provider_ref_raw_chunk_stats.record_capture(
-                            raw_refs.byte_len().saturating_sub(raw_start),
-                            capture_started_at.elapsed().as_micros(),
-                        );
                         raw_refs.push_current_value_span_at(
                             raw_start,
                             SourceWitnessCoordinate::new(
@@ -9470,6 +9659,8 @@ fn scan_compact_struson_parallel(
                         if raw_refs.len() >= provider_ref_chunk_items
                             || raw_refs.byte_len() >= provider_ref_raw_chunk_byte_limit
                         {
+                            provider_ref_raw_chunk_stats
+                                .record_capture_batch(capture_batch_started_at.take());
                             let batch = provider_ref_raw_chunk_stats.take_filled_chunk(
                                 &mut raw_refs,
                                 provider_ref_chunk_items,
@@ -9485,10 +9676,13 @@ fn scan_compact_struson_parallel(
                                 batch,
                             )?;
                             drain_copy_file_events(&event_rx, &mut writer)?;
+                            capture_batch_started_at = Some(Instant::now());
                         }
                     }
                     json_reader.end_array().map_err(to_io_error)?;
                     if !raw_refs.is_empty() {
+                        provider_ref_raw_chunk_stats
+                            .record_capture_batch(capture_batch_started_at.take());
                         provider_ref_raw_chunk_stats.record(raw_refs.len(), raw_refs.byte_len());
                         send_provider_ref_batch(
                             &provider_tx,
@@ -9820,7 +10014,8 @@ fn scan_compact_struson_parallel(
                         "queued_bytes_at_finish": raw_chunk_stats.queue_bytes.current_bytes(),
                         "producer_byte_framing_seconds": seconds_from_micros(raw_chunk_stats.framing_micros),
                         "producer_byte_capture_seconds": seconds_from_micros(raw_chunk_stats.capture_micros),
-                        "producer_byte_capture_bytes": raw_chunk_stats.capture_bytes,
+                        "producer_byte_capture_bytes": raw_chunk_stats.total_bytes,
+                        "producer_byte_capture_timing_granularity": "raw_chunk",
                         "provider_ref_raw_chunk_count": provider_ref_raw_chunk_stats.chunk_count,
                         "provider_ref_raw_chunk_total_bytes": provider_ref_raw_chunk_stats.total_bytes,
                         "provider_ref_raw_chunk_max_bytes": provider_ref_raw_chunk_stats.max_bytes,
@@ -9831,7 +10026,7 @@ fn scan_compact_struson_parallel(
                         "provider_ref_queue_blocked_sends": provider_ref_raw_chunk_stats.queue_blocked_sends,
                         "provider_ref_peak_queued_bytes": provider_ref_raw_chunk_stats.queue_bytes.peak_bytes(),
                         "provider_ref_queued_bytes_at_finish": provider_ref_raw_chunk_stats.queue_bytes.current_bytes(),
-                        "provider_capture_bytes": provider_ref_raw_chunk_stats.capture_bytes,
+                        "provider_capture_bytes": provider_ref_raw_chunk_stats.total_bytes,
                         "provider_capture_seconds": provider_capture_seconds,
                         "provider_capture_compressed_bytes": provider_capture_compressed_bytes,
                         "provider_capture_compressed_mib_s": compressed_mib_per_second(provider_capture_compressed_bytes, provider_capture_seconds),
@@ -9918,7 +10113,7 @@ fn scan_compact_struson_parallel(
 enum CompactProviderReferenceOrder {
     None,
     BeforeInNetwork,
-    AfterInNetwork(HashMap<String, ProviderEntry>),
+    AfterInNetwork(HashMap<ProviderRefKey, ProviderEntry>),
     AfterInNetworkIndexed(CompactIndexedReorder),
     AfterInNetworkPlain(CompactPlainReorder),
 }
@@ -20226,10 +20421,11 @@ mod tests {
     fn provider_set_scope_cache_preserves_canonical_identity_and_checks_collisions() {
         let context = test_compact_context();
         let rate = RateLite {
-            provider_refs: vec!["7".to_string()],
+            provider_refs: vec!["7".into()],
             provider_groups: Vec::new(),
             network_names: vec!["A network".to_string(), "Shared".to_string()],
             prices: vec![test_price_lite("100.00")],
+            prepared_price_set: None,
         };
         let provider_entry = ProviderEntryView::Owned(ProviderEntry {
             entry_hash: 17,
@@ -20316,7 +20512,7 @@ mod tests {
         let provider_value: Value = serde_json::from_slice(raw_provider).unwrap();
         let mut provider_entry = build_provider_entry(&provider_value).unwrap();
         provider_entry.source_locator = Some(source_locator);
-        let provider_map = HashMap::from([("7".to_string(), provider_entry)]);
+        let provider_map = HashMap::from([(ProviderRefKey::from("7"), provider_entry)]);
         let rate = read_rate_lite_bytes(raw_rate).unwrap().unwrap();
         let procedure = json!({
             "billing_code_type": "CPT",
@@ -20453,6 +20649,7 @@ mod tests {
             provider_groups: Vec::new(),
             network_names: vec![" Rate Network ".to_string(), "Shared".to_string()],
             prices: Vec::new(),
+            prepared_price_set: None,
         };
         assert_eq!(
             rate_network_names(
@@ -20472,6 +20669,7 @@ mod tests {
                 provider_groups: Vec::new(),
                 network_names: Vec::new(),
                 prices: Vec::new(),
+                prepared_price_set: None,
             },
             &[],
             &context,
@@ -20776,7 +20974,7 @@ mod tests {
     fn provider_set_count_deduplicates_overlapping_npis_across_references() {
         let mut provider_map = HashMap::new();
         provider_map.insert(
-            "first".to_owned(),
+            ProviderRefKey::from("first"),
             build_provider_entry(&json!({
                 "provider_groups": [{
                     "tin": {"type": "ein", "value": "123456789"},
@@ -20786,7 +20984,7 @@ mod tests {
             .unwrap(),
         );
         provider_map.insert(
-            "second".to_owned(),
+            ProviderRefKey::from("second"),
             build_provider_entry(&json!({
                 "provider_groups": [{
                     "tin": {"type": "ein", "value": "987654321"},
@@ -20796,10 +20994,15 @@ mod tests {
             .unwrap(),
         );
 
-        let entry =
-            provider_set_from_ref_keys(&provider_map, &["first".to_owned(), "second".to_owned()])
-                .unwrap()
-                .unwrap();
+        let entry = provider_set_from_ref_keys(
+            &provider_map,
+            &[
+                ProviderRefKey::from("first"),
+                ProviderRefKey::from("second"),
+            ],
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(entry.provider_count, 3);
         assert_eq!(entry.npi, vec![1234567890, 1234567891, 1234567892]);
@@ -20809,7 +21012,7 @@ mod tests {
     fn provider_set_count_unions_npis_even_when_entry_hashes_match() {
         let mut provider_map = HashMap::new();
         provider_map.insert(
-            "first".to_owned(),
+            ProviderRefKey::from("first"),
             ProviderEntry {
                 entry_hash: 42,
                 provider_count: 2,
@@ -20821,7 +21024,7 @@ mod tests {
             },
         );
         provider_map.insert(
-            "second".to_owned(),
+            ProviderRefKey::from("second"),
             ProviderEntry {
                 entry_hash: 42,
                 provider_count: 2,
@@ -20833,10 +21036,15 @@ mod tests {
             },
         );
 
-        let entry =
-            provider_set_from_ref_keys(&provider_map, &["first".to_owned(), "second".to_owned()])
-                .unwrap()
-                .unwrap();
+        let entry = provider_set_from_ref_keys(
+            &provider_map,
+            &[
+                ProviderRefKey::from("first"),
+                ProviderRefKey::from("second"),
+            ],
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(entry.provider_count, 3);
         assert_eq!(entry.npi, vec![1234567890, 1234567891, 1234567892]);
@@ -21163,7 +21371,7 @@ mod tests {
         let valid_entry = build_provider_entry(&valid_provider_reference()).unwrap();
         assert_ne!(mixed_entry.entry_hash, valid_entry.entry_hash);
 
-        let provider_map = HashMap::from([("7".to_string(), mixed_entry)]);
+        let provider_map = HashMap::from([(ProviderRefKey::from("7"), mixed_entry)]);
         let payload = provider_identifier_quarantine_payload(
             &provider_map,
             ProviderIdentifierQuarantine::default(),
@@ -21280,12 +21488,12 @@ mod tests {
 
         let mut left = HashMap::new();
         left.insert(
-            "7".to_string(),
+            ProviderRefKey::from("7"),
             build_provider_entry(&provider_ref).unwrap(),
         );
         let mut right = HashMap::new();
         right.insert(
-            "7".to_string(),
+            ProviderRefKey::from("7"),
             build_provider_entry(&provider_ref).unwrap(),
         );
         let error = merge_provider_maps_pairwise(vec![(0, left), (1, right)]).unwrap_err();
@@ -21463,12 +21671,14 @@ mod tests {
         let combined =
             build_provider_entry(&json!({"provider_groups": [group_a, group_b]})).unwrap();
         let mut provider_map = HashMap::new();
-        provider_map.insert("a".to_string(), entry_a);
-        provider_map.insert("b".to_string(), entry_b);
-        let separate =
-            provider_set_from_ref_keys(&provider_map, &["a".to_string(), "b".to_string()])
-                .unwrap()
-                .unwrap();
+        provider_map.insert(ProviderRefKey::from("a"), entry_a);
+        provider_map.insert(ProviderRefKey::from("b"), entry_b);
+        let separate = provider_set_from_ref_keys(
+            &provider_map,
+            &[ProviderRefKey::from("a"), ProviderRefKey::from("b")],
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(
             separate.provider_group_hashes,
@@ -21539,17 +21749,17 @@ mod tests {
 
         assert_eq!(processed, 3);
         assert_eq!(provider_map.len(), 3);
-        assert!(provider_map.contains_key("7"));
-        assert!(provider_map.contains_key("8"));
-        assert!(provider_map.contains_key("121591448686103182592848195376305442061"));
-        assert_eq!(provider_map["7"].provider_count, 2);
-        assert_eq!(provider_map["8"].provider_count, 1);
-        assert_eq!(
-            provider_map["121591448686103182592848195376305442061"].provider_count,
-            1
-        );
-        assert_eq!(provider_map["7"].npi, vec![1234567890, 1234567891]);
-        assert!(!provider_map["7"].provider_group_hashes.is_empty());
+        let key_7 = ProviderRefKey::from("7");
+        let key_8 = ProviderRefKey::from("8");
+        let wide_key = ProviderRefKey::from("121591448686103182592848195376305442061");
+        assert!(provider_map.contains_key(&key_7));
+        assert!(provider_map.contains_key(&key_8));
+        assert!(provider_map.contains_key(&wide_key));
+        assert_eq!(provider_map[&key_7].provider_count, 2);
+        assert_eq!(provider_map[&key_8].provider_count, 1);
+        assert_eq!(provider_map[&wide_key].provider_count, 1);
+        assert_eq!(provider_map[&key_7].npi, vec![1234567890, 1234567891]);
+        assert!(!provider_map[&key_7].provider_group_hashes.is_empty());
     }
 
     fn assert_worker_handles_mixed_referenced_and_inline_rates(group_rates: bool) {
@@ -21579,33 +21789,37 @@ mod tests {
         });
         let mut provider_map = HashMap::new();
         provider_map.insert(
-            "top-level-ref".to_string(),
+            ProviderRefKey::from("top-level-ref"),
             build_provider_entry(&referenced_provider).unwrap(),
         );
         let rates = vec![
             RateLite {
-                provider_refs: vec!["top-level-ref".to_string()],
+                provider_refs: vec![ProviderRefKey::from("top-level-ref")],
                 provider_groups: Vec::new(),
                 network_names: Vec::new(),
                 prices: vec![test_price_lite("100.00")],
+                prepared_price_set: None,
             },
             RateLite {
                 provider_refs: Vec::new(),
                 provider_groups: vec![inline_group.clone()],
                 network_names: Vec::new(),
                 prices: vec![test_price_lite("101.00")],
+                prepared_price_set: None,
             },
             RateLite {
-                provider_refs: vec!["top-level-ref".to_string()],
+                provider_refs: vec![ProviderRefKey::from("top-level-ref")],
                 provider_groups: vec![inline_group.clone()],
                 network_names: Vec::new(),
                 prices: vec![test_price_lite("102.00")],
+                prepared_price_set: None,
             },
             RateLite {
                 provider_refs: Vec::new(),
                 provider_groups: vec![inline_group.clone()],
                 network_names: Vec::new(),
                 prices: vec![test_price_lite("101.00")],
+                prepared_price_set: None,
             },
         ];
         let procedure = json!({
@@ -21719,14 +21933,18 @@ mod tests {
         });
         let mut provider_map = HashMap::new();
         provider_map.insert(
-            "valid-ref".to_string(),
+            ProviderRefKey::from("valid-ref"),
             build_provider_entry(&provider_ref).unwrap(),
         );
         let rates = vec![RateLite {
-            provider_refs: vec!["valid-ref".to_string(), "dangling-ref".to_string()],
+            provider_refs: vec![
+                ProviderRefKey::from("valid-ref"),
+                ProviderRefKey::from("dangling-ref"),
+            ],
             provider_groups: Vec::new(),
             network_names: Vec::new(),
             prices: vec![test_price_lite("100.00")],
+            prepared_price_set: None,
         }];
         let procedure = json!({"billing_code_type": "CPT", "billing_code": "99213"});
         let paths = CopyPathConfig::default();
@@ -22405,23 +22623,25 @@ mod tests {
         });
         let mut provider_map = HashMap::new();
         provider_map.insert(
-            "1".to_string(),
+            ProviderRefKey::from("1"),
             build_provider_entry(&provider_ref_a).unwrap(),
         );
         provider_map.insert(
-            "2".to_string(),
+            ProviderRefKey::from("2"),
             build_provider_entry(&provider_ref_b).unwrap(),
         );
 
-        let single = provider_entry_view_from_ref_keys(&provider_map, &["1".to_string()])
+        let single = provider_entry_view_from_ref_keys(&provider_map, &[ProviderRefKey::from("1")])
             .unwrap()
             .expect("single ref should resolve");
         assert!(matches!(single, ProviderEntryView::Borrowed(_)));
 
-        let combined =
-            provider_entry_view_from_ref_keys(&provider_map, &["1".to_string(), "2".to_string()])
-                .unwrap()
-                .expect("combined refs should resolve");
+        let combined = provider_entry_view_from_ref_keys(
+            &provider_map,
+            &[ProviderRefKey::from("1"), ProviderRefKey::from("2")],
+        )
+        .unwrap()
+        .expect("combined refs should resolve");
         assert!(matches!(combined, ProviderEntryView::Owned(_)));
         assert_eq!(combined.provider_count(), 2);
     }

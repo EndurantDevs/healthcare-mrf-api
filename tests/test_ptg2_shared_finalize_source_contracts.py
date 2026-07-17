@@ -211,57 +211,25 @@ def test_finalizer_rejects_contract_missing_empty_partition_slot(tmp_path):
         )
 
 
-def test_finalizer_rejects_swapped_source_paths(tmp_path):
-    first_path = tmp_path / "first.ready"
-    second_path = tmp_path / "second.ready"
-    first_path.write_bytes(b"a" * 52)
-    second_path.write_bytes(b"b" * 52)
-    first = _contracted_entries(
-        [
-            {
-                "path": str(first_path),
-                "row_count": 1,
-                "bytes": 52,
-                "partition": 0,
-                "partition_count": 1,
-                "format": "ptg2_v3_serving_run",
-                "version": 1,
-            }
-        ],
-        _identity("a"),
-        partition_count=1,
-    )[0]
-    second = _contracted_entries(
-        [
-            {
-                "path": str(second_path),
-                "row_count": 1,
-                "bytes": 52,
-                "partition": 0,
-                "partition_count": 1,
-                "format": "ptg2_v3_serving_run",
-                "version": 1,
-            }
-        ],
-        _identity("b"),
-        partition_count=1,
-    )[0]
-    first["path"], second["path"] = second["path"], first["path"]
+def test_source_contract_requires_scanner_content_digest(tmp_path):
+    path = tmp_path / "run.ready"
+    path.write_bytes(b"a" * 52)
 
-    with pytest.raises(RuntimeError, match="content digest"):
-        write_v3_finalizer_input_manifest(
-            tmp_path / "swapped.json",
-            serving_run_entries=[first, second],
-            code_dictionary_entries=[
-                _entry(
-                    tmp_path / "codes.ready",
-                    row_count=1,
-                    bytes=64,
-                    format="ptg2_v3_serving_code_dictionary",
-                    version=4,
-                )
+    with pytest.raises(RuntimeError, match="invalid serving-run sha256"):
+        _contracted_entries(
+            [
+                {
+                    "path": str(path),
+                    "row_count": 1,
+                    "bytes": 52,
+                    "partition": 0,
+                    "partition_count": 1,
+                    "format": "ptg2_v3_serving_run",
+                    "version": 1,
+                }
             ],
-            expected_source_identities=[_identity("a"), _identity("b")],
+            _identity("a"),
+            partition_count=1,
         )
 
 

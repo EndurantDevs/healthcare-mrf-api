@@ -881,6 +881,7 @@ def test_python_bridge_collects_partition_paths_in_scanner_summary(tmp_path, mon
                 "bytes",
                 "format",
                 "version",
+                "sha256",
             )
         }
         for kind, frame_payload in scanner_frames
@@ -889,11 +890,18 @@ def test_python_bridge_collects_partition_paths_in_scanner_summary(tmp_path, mon
     assert summary["serving_run_code_dictionary_files"] == [
         {
             key: frame_payload[key]
-            for key in ("path", "row_count", "bytes", "format", "version")
+            for key in ("path", "row_count", "bytes", "format", "version", "sha256")
         }
         for kind, frame_payload in scanner_frames
         if kind == "v3_serving_code_dictionary_file"
     ]
+    for entry in (
+        summary["serving_run_partition_files"]
+        + summary["serving_run_code_dictionary_files"]
+    ):
+        assert entry["sha256"] == hashlib.sha256(
+            Path(entry["path"]).read_bytes()
+        ).hexdigest()
     source_identity_map = {
         "source_type": "in_network",
         "identity_kind": "logical_json_sha256_v1",
@@ -1165,3 +1173,30 @@ def test_direct_v3_finalizer_cli_emits_shared_block_staging_copy(tmp_path):
         codec=first[6].decode("ascii"),
         payload=first[9],
     )
+
+    tampered_partition_path = Path(scan["partition_frames"][0]["path"])
+    tampered_payload = bytearray(tampered_partition_path.read_bytes())
+    tampered_payload[-1] ^= 1
+    tampered_partition_path.write_bytes(tampered_payload)
+    tampered = subprocess.run(
+        [
+            str(scanner_binary),
+            "--finalize-v3-runs",
+            str(tmp_path / "tampered-finalized"),
+            *_v3_finalizer_test_resource_args(),
+            "--price-key-map-input",
+            str(price_key_map_input),
+            "--price-membership-input",
+            str(membership_input),
+            "--price-atom-input",
+            str(atom_input),
+            str(manifest_path),
+        ],
+        check=False,
+        env=finalizer_environment_map,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    assert tampered.returncode != 0
+    assert b"content digest mismatch" in tampered.stderr

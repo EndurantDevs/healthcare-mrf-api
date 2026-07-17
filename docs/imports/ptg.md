@@ -343,6 +343,12 @@ digest. Rust verifies these before allocating or decoding variable-length
 fields and charges the conservative dictionary resident estimate to the
 process identity-map limit.
 
+Serving-run and code-dictionary SHA-256 digests are accumulated by the scanner
+while it writes their canonical bytes. Python binds those declared digests into
+the source contracts without rereading the files. The Rust finalizer still
+recomputes and compares each digest during its required record scan, so removing
+the two Python passes does not weaken content or path-substitution detection.
+
 Physical-source keys are not caller-selected identifiers. Python normalizes
 each source identity as a lowercase ASCII token, one supported digest kind,
 and a 32-byte digest; sorting that tuple assigns the contiguous keys. Rust
