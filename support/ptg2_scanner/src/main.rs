@@ -8,6 +8,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, 
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use memchr::{memchr2, memchr3};
 use ptg2_scanner::address_canon::{canon_version_json, canonicalize_copy_file};
 use ptg2_scanner::config::{
     env_bool, env_usize, progress_interval, split_interval, DEFAULT_COMPACT_COPY_ROTATE_BYTES,
@@ -5674,6 +5675,74 @@ impl<R: Read> BufferedJsonByteReader<R> {
         Ok(())
     }
 
+    fn capture_object_bytes_append(&mut self, bytes: &mut Vec<u8>) -> io::Result<()> {
+        self.skip_whitespace()?;
+        if self.next_byte()? != Some(b'{') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected JSON object",
+            ));
+        }
+        bytes.push(b'{');
+        let mut depth = 1usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        'capture: loop {
+            if !self.fill()? {
+                break;
+            }
+            let start = self.pos;
+            while self.pos < self.filled {
+                if in_string {
+                    if escaped {
+                        self.pos += 1;
+                        escaped = false;
+                        continue;
+                    }
+                    let remaining = &self.buffer[self.pos..self.filled];
+                    let Some(offset) = memchr2(b'\\', b'"', remaining) else {
+                        self.pos = self.filled;
+                        break;
+                    };
+                    self.pos += offset + 1;
+                    if self.buffer[self.pos - 1] == b'\\' {
+                        escaped = true;
+                    } else {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                let remaining = &self.buffer[self.pos..self.filled];
+                let Some(offset) = memchr3(b'"', b'{', b'}', remaining) else {
+                    self.pos = self.filled;
+                    break;
+                };
+                self.pos += offset + 1;
+                match self.buffer[self.pos - 1] {
+                    b'"' => in_string = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            bytes.extend_from_slice(&self.buffer[start..self.pos]);
+                            break 'capture;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            bytes.extend_from_slice(&self.buffer[start..self.pos]);
+        }
+        if depth == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unterminated JSON object",
+            ))
+        }
+    }
+
     fn capture_string_tail(&mut self, bytes: &mut Vec<u8>) -> io::Result<()> {
         let mut escape = false;
         'capture: loop {
@@ -7241,7 +7310,7 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
                 while next_array_value(reader, &mut first_rate)? {
                     rate_count += 1;
                     let raw_start = raw_rate_chunk.byte_len();
-                    reader.capture_value_bytes_append(&mut raw_rate_chunk.bytes)?;
+                    reader.capture_object_bytes_append(&mut raw_rate_chunk.bytes)?;
                     raw_rate_chunk.push_current_value_span_at(
                         raw_start,
                         SourceWitnessCoordinate::new(
@@ -22646,6 +22715,120 @@ mod tests {
 
         assert_eq!(scratch, br#""tail""#);
         assert_eq!(scratch.capacity(), retained_capacity);
+    }
+
+    #[test]
+    fn capture_nested_values_handles_fragmented_escapes_and_delimiters() {
+        struct FragmentedReader<'a> {
+            bytes: &'a [u8],
+            offset: usize,
+        }
+
+        impl Read for FragmentedReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let Some(byte) = self.bytes.get(self.offset).copied() else {
+                    return Ok(0);
+                };
+                buffer[0] = byte;
+                self.offset += 1;
+                Ok(1)
+            }
+        }
+
+        let first = br#"{"message":"escaped quote: \" and slash: \\ and delimiters: } ]","nested":[{"value":"x"}]}"#;
+        let second = br#"[1,{"value":"tail"}]"#;
+        let mut input = Vec::new();
+        input.extend_from_slice(first);
+        input.push(b' ');
+        input.extend_from_slice(second);
+        let fragmented = FragmentedReader {
+            bytes: &input,
+            offset: 0,
+        };
+        let mut reader = BufferedJsonByteReader::new(fragmented);
+        let mut captured = Vec::new();
+
+        reader.capture_value_bytes_into(&mut captured).unwrap();
+        assert_eq!(captured, first);
+        reader.capture_value_bytes_into(&mut captured).unwrap();
+        assert_eq!(captured, second);
+
+        let fragmented = FragmentedReader {
+            bytes: &input,
+            offset: 0,
+        };
+        let mut reader = BufferedJsonByteReader::new(fragmented);
+        captured.clear();
+        reader.capture_object_bytes_append(&mut captured).unwrap();
+        assert_eq!(captured, first);
+    }
+
+    #[test]
+    fn capture_nested_values_rejects_mismatched_delimiters() {
+        let mut reader = BufferedJsonByteReader::new(br#"{"items":[1,2}}"#.as_slice());
+        let mut captured = Vec::new();
+
+        let error = reader.capture_value_bytes_into(&mut captured).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("mismatched JSON delimiter"));
+    }
+
+    #[test]
+    #[ignore = "manual byte-framing throughput probe"]
+    fn benchmark_nested_value_capture_throughput() {
+        fn capture(input: &[u8], object_fast_path: bool) -> (Duration, usize, usize) {
+            let mut reader = BufferedJsonByteReader::new(input);
+            let mut captured = Vec::with_capacity(input.len());
+            let mut first = true;
+            let mut captured_values = 0usize;
+            reader.expect_byte(b'[').unwrap();
+            let started_at = Instant::now();
+            while next_array_value(&mut reader, &mut first).unwrap() {
+                if object_fast_path {
+                    reader.capture_object_bytes_append(&mut captured).unwrap();
+                } else {
+                    reader.capture_value_bytes_append(&mut captured).unwrap();
+                }
+                captured_values += 1;
+            }
+            (started_at.elapsed(), captured_values, captured.len())
+        }
+
+        const TARGET_BYTES: usize = 128 * 1024 * 1024;
+        const RATE: &[u8] = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_type":"negotiated","negotiated_rate":123.45,"service_code":["11"],"billing_class":"professional","additional_information":"quoted \"text\" and delimiters } ]"}]}"#;
+        serde_json::from_slice::<Value>(RATE).unwrap();
+        let rate_count = TARGET_BYTES / (RATE.len() + 1);
+        let mut input = Vec::with_capacity(rate_count * (RATE.len() + 1) + 2);
+        input.push(b'[');
+        for index in 0..rate_count {
+            if index > 0 {
+                input.push(b',');
+            }
+            input.extend_from_slice(RATE);
+        }
+        input.push(b']');
+
+        let (baseline_elapsed, baseline_values, baseline_bytes) = capture(&input, false);
+        let (fast_elapsed, fast_values, fast_bytes) = capture(&input, true);
+        let baseline_mib_per_second =
+            input.len() as f64 / (1024.0 * 1024.0) / baseline_elapsed.as_secs_f64();
+        let fast_mib_per_second =
+            input.len() as f64 / (1024.0 * 1024.0) / fast_elapsed.as_secs_f64();
+
+        eprintln!(
+            "captured {} values / {:.1} MiB: baseline {:.3}s ({:.1} MiB/s), object fast path {:.3}s ({:.1} MiB/s)",
+            fast_values,
+            input.len() as f64 / (1024.0 * 1024.0),
+            baseline_elapsed.as_secs_f64(),
+            baseline_mib_per_second,
+            fast_elapsed.as_secs_f64(),
+            fast_mib_per_second,
+        );
+        assert_eq!(baseline_values, rate_count);
+        assert_eq!(fast_values, rate_count);
+        assert_eq!(baseline_bytes, rate_count * RATE.len());
+        assert_eq!(fast_bytes, baseline_bytes);
     }
 
     #[test]
