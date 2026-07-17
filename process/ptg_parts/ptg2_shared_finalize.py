@@ -344,11 +344,11 @@ def _validated_entries(
     *,
     label: str,
 ) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
+    validated_entries: list[dict[str, Any]] = []
     seen_paths: set[Path] = set()
     for raw_entry in entries:
-        entry = dict(raw_entry)
-        raw_path = str(entry.get("path") or "").strip()
+        entry_metadata_map = dict(raw_entry)
+        raw_path = str(entry_metadata_map.get("path") or "").strip()
         if not raw_path:
             raise RuntimeError(f"strict V3 {label} entry is missing path")
         path = Path(raw_path).resolve()
@@ -357,11 +357,11 @@ def _validated_entries(
         if not path.is_file() or path.stat().st_size <= 0:
             raise RuntimeError(f"strict V3 {label} file is missing or empty: {path}")
         seen_paths.add(path)
-        entry["path"] = str(path)
-        normalized.append(entry)
-    if not normalized:
+        entry_metadata_map["path"] = str(path)
+        validated_entries.append(entry_metadata_map)
+    if not validated_entries:
         raise RuntimeError(f"strict V3 finalizer requires at least one {label} entry")
-    return normalized
+    return validated_entries
 
 
 def _required_non_negative_integer(value: Any, *, field_name: str) -> int:
@@ -501,7 +501,7 @@ def attach_v3_source_run_contract(
             int(value["bytes"]),
         )
     )
-    contract = {
+    source_contract_map = {
         "version": PTG2_V3_SOURCE_RUN_CONTRACT_VERSION,
         "source_identity": identity.as_dict(),
         "partition_count": expected_partition_count,
@@ -511,10 +511,10 @@ def attach_v3_source_run_contract(
         "byte_count": expected_byte_count,
         "files": file_descriptors,
     }
-    contract_sha256 = _canonical_json_sha256(contract)
+    contract_sha256 = _canonical_json_sha256(source_contract_map)
     for entry in normalized:
         entry["source_run_contract_sha256"] = contract_sha256
-    normalized[0]["source_run_contract"] = contract
+    normalized[0]["source_run_contract"] = source_contract_map
     return normalized
 
 
@@ -743,12 +743,12 @@ def _prepare_serving_entries(
                 raise RuntimeError(
                     "strict V3 serving-run source contract must appear exactly once"
                 )
-            contract = dict(raw_contract)
-            if _canonical_json_sha256(contract) != contract_digest:
+            source_contract_map = dict(raw_contract)
+            if _canonical_json_sha256(source_contract_map) != contract_digest:
                 raise RuntimeError(
                     "strict V3 serving-run source contract digest is invalid"
                 )
-            contract_by_source[source_key] = contract
+            contract_by_source[source_key] = source_contract_map
         for field_name in _PHYSICAL_IDENTITY_FIELDS:
             entry.pop(field_name, None)
         entry.pop("source_run_contract", None)
@@ -772,18 +772,19 @@ def _prepare_serving_entries(
 
     prepared_contracts: list[dict[str, Any]] = []
     for source_key, identity in dense:
-        contract = contract_by_source.get(source_key)
-        if contract is None:
+        source_contract_map = contract_by_source.get(source_key)
+        if source_contract_map is None:
             raise RuntimeError(
                 "strict V3 finalizer is missing a complete source-run contract"
             )
-        if set(contract) != set(_SOURCE_RUN_CONTRACT_FIELDS):
+        if set(source_contract_map) != set(_SOURCE_RUN_CONTRACT_FIELDS):
             raise RuntimeError("strict V3 source-run contract fields are incompatible")
         if _required_non_negative_integer(
-            contract.get("version"), field_name="source-run contract version"
+            source_contract_map.get("version"),
+            field_name="source-run contract version",
         ) != PTG2_V3_SOURCE_RUN_CONTRACT_VERSION:
             raise RuntimeError("strict V3 source-run contract version is incompatible")
-        raw_contract_identity = contract.get("source_identity")
+        raw_contract_identity = source_contract_map.get("source_identity")
         if (
             not isinstance(raw_contract_identity, Mapping)
             or set(raw_contract_identity) != set(_PHYSICAL_IDENTITY_FIELDS)
@@ -793,14 +794,14 @@ def _prepare_serving_entries(
                 "strict V3 source-run contract is bound to another physical source"
             )
         contract_partition_count = _required_non_negative_integer(
-            contract.get("partition_count"),
+            source_contract_map.get("partition_count"),
             field_name="source-run contract partition_count",
         )
         if contract_partition_count != partition_count:
             raise RuntimeError(
                 "strict V3 source-run contract has incomplete partition coverage"
             )
-        raw_partition_rows = contract.get("partition_rows")
+        raw_partition_rows = source_contract_map.get("partition_rows")
         if not isinstance(raw_partition_rows, list) or len(raw_partition_rows) != int(
             contract_partition_count
         ):
@@ -809,9 +810,10 @@ def _prepare_serving_entries(
             )
         expected_partition_rows = [
             _required_non_negative_integer(
-                value, field_name="source-run contract partition row count"
+                partition_row_count,
+                field_name="source-run contract partition row count",
             )
-            for value in raw_partition_rows
+            for partition_row_count in raw_partition_rows
         ]
         observed_partition_rows = [0] * int(contract_partition_count)
         observed_files = entries_by_source[source_key]
@@ -825,13 +827,16 @@ def _prepare_serving_entries(
             )
 
         expected_file_count = _required_non_negative_integer(
-            contract.get("file_count"), field_name="source-run contract file_count"
+            source_contract_map.get("file_count"),
+            field_name="source-run contract file_count",
         )
         expected_row_count = _required_non_negative_integer(
-            contract.get("row_count"), field_name="source-run contract row_count"
+            source_contract_map.get("row_count"),
+            field_name="source-run contract row_count",
         )
         expected_byte_count = _required_non_negative_integer(
-            contract.get("byte_count"), field_name="source-run contract byte_count"
+            source_contract_map.get("byte_count"),
+            field_name="source-run contract byte_count",
         )
         if (
             expected_file_count != len(observed_files)
@@ -846,7 +851,7 @@ def _prepare_serving_entries(
                 "strict V3 serving-run aggregates do not match the complete source contract"
             )
 
-        raw_expected_files = contract.get("files")
+        raw_expected_files = source_contract_map.get("files")
         if not isinstance(raw_expected_files, list):
             raise RuntimeError("strict V3 source-run contract is missing file digests")
         expected_files: list[dict[str, Any]] = []
@@ -877,14 +882,16 @@ def _prepare_serving_entries(
                     ),
                 }
             )
-        def descriptor_key(value: Mapping[str, Any]) -> tuple[int, str, int, int]:
+        def descriptor_key(
+            descriptor: Mapping[str, Any],
+        ) -> tuple[int, str, int, int]:
             """Return the canonical sort key for a source-run file descriptor."""
 
             return (
-                int(value["partition"]),
-                str(value["sha256"]),
-                int(value["row_count"]),
-                int(value["bytes"]),
+                int(descriptor["partition"]),
+                str(descriptor["sha256"]),
+                int(descriptor["row_count"]),
+                int(descriptor["bytes"]),
             )
 
         if sorted(expected_files, key=descriptor_key) != sorted(
@@ -897,7 +904,7 @@ def _prepare_serving_entries(
             {
                 "source_key": source_key,
                 "contract_sha256": contract_digest_by_source[source_key],
-                **contract,
+                **source_contract_map,
             }
         )
     return normalized, source_count, prepared_contracts
@@ -1353,8 +1360,8 @@ def write_v3_finalizer_input_manifest(
 ) -> Path:
     """Write the small validated manifest consumed by the Rust finalizer."""
 
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path = Path(path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     prepared_serving_entries, source_count, source_run_contracts = _prepare_serving_entries(
         serving_run_entries,
         expected_source_identities=expected_source_identities,
@@ -1366,7 +1373,7 @@ def write_v3_finalizer_input_manifest(
         code_dictionary_entries,
         source_run_contracts=source_run_contracts,
     )
-    payload = {
+    manifest_payload_map = {
         "storage_generation": PTG2_V3_SHARED_GENERATION,
         "format_version": PTG2_V3_SHARED_FORMAT_VERSION,
         "source_count": source_count,
@@ -1377,16 +1384,22 @@ def write_v3_finalizer_input_manifest(
         ),
     }
     if resource_configuration is not None:
-        payload["resource_configuration"] = (
+        manifest_payload_map["resource_configuration"] = (
             resource_configuration.contract_metadata()
         )
-        payload["resource_validation"] = (
+        manifest_payload_map["resource_validation"] = (
             resource_configuration.validation_metadata()
         )
-    with target.open("x", encoding="ascii") as output:
-        json.dump(payload, output, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    with manifest_path.open("x", encoding="ascii") as output:
+        json.dump(
+            manifest_payload_map,
+            output,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         output.write("\n")
-    return target
+    return manifest_path
 
 
 def _validated_finalizer_resource_contract(
@@ -1418,23 +1431,23 @@ def _validated_finalizer_resource_contract(
 
 
 def validate_v3_finalizer_summary(
-    payload: Mapping[str, Any],
+    summary_payload: Mapping[str, Any],
     *,
     expected_source_count: int | None = None,
     expected_resource_configuration: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate the strict finalizer contract and return a shallow summary copy."""
 
-    summary = dict(payload)
-    if summary.get("format") != PTG2_V3_FINALIZER_FORMAT:
+    finalizer_summary_map = dict(summary_payload)
+    if finalizer_summary_map.get("format") != PTG2_V3_FINALIZER_FORMAT:
         raise RuntimeError("strict V3 finalizer returned an incompatible summary")
-    if summary.get("storage_generation") != PTG2_V3_SHARED_GENERATION:
+    if finalizer_summary_map.get("storage_generation") != PTG2_V3_SHARED_GENERATION:
         raise RuntimeError("strict V3 finalizer returned another storage generation")
-    if summary.get("cold_lookup_contract") != PTG2_V3_COLD_LOOKUP_CONTRACT:
+    if finalizer_summary_map.get("cold_lookup_contract") != PTG2_V3_COLD_LOOKUP_CONTRACT:
         raise RuntimeError("strict V3 finalizer returned another cold lookup contract")
-    if summary.get("shared_block_layout") != PTG2_V3_SHARED_BLOCK_LAYOUT:
+    if finalizer_summary_map.get("shared_block_layout") != PTG2_V3_SHARED_BLOCK_LAYOUT:
         raise RuntimeError("strict V3 finalizer returned another shared block layout")
-    observed_resources = summary.get("resource_configuration")
+    observed_resources = finalizer_summary_map.get("resource_configuration")
     normalized_observed_resources = (
         _validated_finalizer_resource_contract(
             observed_resources,
@@ -1453,14 +1466,14 @@ def validate_v3_finalizer_summary(
                 "strict V3 finalizer did not confirm the invoked resource configuration"
             )
     source_count = _required_non_negative_integer(
-        summary.get("source_count"), field_name="source_count"
+        finalizer_summary_map.get("source_count"), field_name="source_count"
     )
     if source_count <= 0 or (
         expected_source_count is not None
         and source_count != int(expected_source_count)
     ):
         raise RuntimeError("strict V3 finalizer returned an incompatible source_count")
-    blocks = summary.get("blocks")
+    blocks = finalizer_summary_map.get("blocks")
     if not isinstance(blocks, Mapping):
         raise RuntimeError("strict V3 finalizer summary is missing blocks")
     for section_name, expected_kinds in _FINALIZER_BLOCK_KINDS.items():
@@ -1487,9 +1500,9 @@ def validate_v3_finalizer_summary(
             raise RuntimeError(
                 f"strict V3 finalizer {section_name} object markers are incompatible"
             )
-    dense_keys = summary.get("dense_keys")
+    dense_keys = finalizer_summary_map.get("dense_keys")
     price_keys = dense_keys.get("price") if isinstance(dense_keys, Mapping) else None
-    price_key_map = summary.get("price_key_map")
+    price_key_map = finalizer_summary_map.get("price_key_map")
     if not isinstance(price_keys, Mapping) or not isinstance(price_key_map, Mapping):
         raise RuntimeError("strict V3 finalizer summary is missing its price-key contract")
     price_count = _required_non_negative_integer(
@@ -1511,7 +1524,7 @@ def validate_v3_finalizer_summary(
         != "minimum_negotiated_rate_then_global_id_128_v1"
     ):
         raise RuntimeError("strict V3 finalizer returned an incompatible price-key map")
-    return summary
+    return finalizer_summary_map
 
 
 def parse_v3_finalizer_stdout(stdout: bytes) -> dict[str, Any]:
@@ -1619,7 +1632,7 @@ async def run_v3_direct_finalizer(
     )
     manifest_payload = json.loads(manifest_path.read_text(encoding="ascii"))
     expected_source_count = int(manifest_payload["source_count"])
-    command = [
+    command_args = [
         str(binary),
         "--finalize-v3-runs",
         str(output_directory),
@@ -1628,16 +1641,18 @@ async def run_v3_direct_finalizer(
         *resource_configuration.command_arguments(),
     ]
     for path in price_membership_inputs:
-        command.extend(("--price-membership-input", str(Path(path).resolve())))
+        command_args.extend(
+            ("--price-membership-input", str(Path(path).resolve()))
+        )
     for path in price_atom_inputs:
-        command.extend(("--price-atom-input", str(Path(path).resolve())))
-    command.append(str(manifest_path))
+        command_args.extend(("--price-atom-input", str(Path(path).resolve())))
+    command_args.append(str(manifest_path))
     process: asyncio.subprocess.Process | None = None
     spawn_task: asyncio.Task[asyncio.subprocess.Process] | None = None
     try:
         spawn_task = asyncio.create_task(
             asyncio.create_subprocess_exec(
-                *command,
+                *command_args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 **_subprocess_session_options(asyncio.create_subprocess_exec),
