@@ -99,6 +99,9 @@ from api.ptg2_shared_blocks import (
     fetch_snapshot_source_provenance,
 )
 from process.ptg_parts.ptg2_shared_blocks import PTG2_V3_SHARED_GENERATION
+from process.ptg_parts.ptg2_candidate_attestation import (
+    PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+)
 from process.ext.contact_canon import canonicalize_one
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from api.ptg2_serving_utils import (
@@ -122,6 +125,11 @@ ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 _PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT = 25
 _PTG2_MULTI_NETWORK_CONCURRENCY_ENV = "HLTHPRT_PTG2_MULTI_NETWORK_CONCURRENCY"
 _PTG2_MULTI_NETWORK_CONCURRENCY_DEFAULT = 8
+_PTG2_NETWORK_SERVING_TABLES_CACHE_MAX_ENTRIES = 512
+_PTG2_NETWORK_SERVING_TABLES_CACHE: OrderedDict[
+    str,
+    PTG2ServingTables,
+] = OrderedDict()
 _PTG2_PROVIDER_NPI_PREFIX_CACHE_MAX_ENTRIES = 4096
 _PTG2_PROVIDER_NPI_PREFIX_CACHE: OrderedDict[
     tuple[int, str],
@@ -135,6 +143,48 @@ _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE: OrderedDict[
     tuple[int, int],
     tuple[str, ...],
 ] = OrderedDict()
+_PTG2_NETWORK_SERVING_TABLES_REVALIDATION_SQL = f"""
+    SELECT snapshot.snapshot_id,
+           binding.snapshot_key,
+           layout.layout_manifest->'serving_index'->>'shared_snapshot_key'
+               AS layout_snapshot_key,
+           layout.layout_manifest->'serving_index'->>'coverage_scope_id'
+               AS layout_coverage_scope_id,
+           layout.layout_manifest->'serving_index'->>'code_count'
+               AS layout_code_count,
+           layout.layout_manifest->'serving_index'->>'source_count'
+               AS layout_source_count,
+           snapshot_scope.plan_id AS snapshot_plan_id,
+           snapshot_scope.plan_market_type AS snapshot_plan_market_type,
+           encode(snapshot_scope.coverage_scope_id, 'hex')
+               AS snapshot_coverage_scope_id,
+           attestation.source_key AS attested_source_key,
+           encode(attestation.coverage_scope_id, 'hex')
+               AS attested_coverage_scope_id,
+           encode(attestation.source_set_digest, 'hex')
+               AS attested_source_set_digest,
+           encode(attestation.audit_sample_digest, 'hex')
+               AS attested_audit_sample_digest
+      FROM {PTG2_SCHEMA}.ptg2_snapshot snapshot
+      JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_binding binding
+        ON binding.snapshot_id = snapshot.snapshot_id
+      JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_layout layout
+        ON layout.snapshot_key = binding.snapshot_key
+      JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_scope snapshot_scope
+        ON snapshot_scope.snapshot_id = snapshot.snapshot_id
+      JOIN {PTG2_SCHEMA}.ptg2_v3_candidate_audit_attestation attestation
+        ON attestation.snapshot_id = snapshot.snapshot_id
+       AND attestation.snapshot_key = binding.snapshot_key
+       AND attestation.coverage_scope_id = snapshot_scope.coverage_scope_id
+     WHERE snapshot.snapshot_id = ANY(CAST(:snapshot_ids AS text[]))
+       AND snapshot.status = 'published'
+       AND layout.state = 'sealed'
+       AND layout.generation = :storage_generation
+       AND attestation.contract = :attestation_contract
+       AND attestation.activated_at IS NOT NULL
+       AND attestation.plan_id = snapshot_scope.plan_id
+       AND attestation.plan_market_type = snapshot_scope.plan_market_type
+"""
 
 
 def _safe_table_name(value: Any, *, default_schema: str = PTG2_SCHEMA) -> str | None:
@@ -3640,6 +3690,58 @@ def _ptg2_npi_member_id(npi: int) -> str:
     return (b"\x00" * 8 + int(npi).to_bytes(8, "big", signed=False)).hex()
 
 
+def _cached_provider_npi_prefixes(
+    serving_tables: PTG2ServingTables,
+    provider_set_ids: tuple[str, ...],
+    requested_limit: int,
+) -> tuple[dict[str, tuple[int, ...]], tuple[str, ...]]:
+    """Return reusable prefixes and provider sets that still need loading."""
+
+    shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
+    npis_by_set: dict[str, tuple[int, ...]] = {}
+    missing_provider_set_ids: list[str] = []
+    for provider_set_id in provider_set_ids:
+        cache_key = (shared_snapshot_key, provider_set_id)
+        cache_entry = _PTG2_PROVIDER_NPI_PREFIX_CACHE.get(cache_key)
+        if cache_entry is None:
+            missing_provider_set_ids.append(provider_set_id)
+            continue
+        cached_limit, cached_npis, is_complete = cache_entry
+        if not is_complete and cached_limit < requested_limit:
+            missing_provider_set_ids.append(provider_set_id)
+            continue
+        _PTG2_PROVIDER_NPI_PREFIX_CACHE.move_to_end(cache_key)
+        npis_by_set[provider_set_id] = cached_npis[:requested_limit]
+    return npis_by_set, tuple(missing_provider_set_ids)
+
+
+def _cache_provider_npi_prefix(
+    serving_tables: PTG2ServingTables,
+    provider_set_id: str,
+    requested_limit: int,
+    npis: tuple[int, ...],
+    *,
+    is_complete: bool,
+) -> None:
+    """Store one bounded provider-set prefix under its sealed snapshot key."""
+
+    cache_key = (
+        _required_shared_snapshot_key(serving_tables),
+        provider_set_id,
+    )
+    _PTG2_PROVIDER_NPI_PREFIX_CACHE[cache_key] = (
+        requested_limit,
+        npis,
+        is_complete,
+    )
+    _PTG2_PROVIDER_NPI_PREFIX_CACHE.move_to_end(cache_key)
+    while (
+        len(_PTG2_PROVIDER_NPI_PREFIX_CACHE)
+        > _PTG2_PROVIDER_NPI_PREFIX_CACHE_MAX_ENTRIES
+    ):
+        _PTG2_PROVIDER_NPI_PREFIX_CACHE.popitem(last=False)
+
+
 async def _provider_npis_for_sets(
     session,
     serving_tables: PTG2ServingTables,
@@ -3647,28 +3749,20 @@ async def _provider_npis_for_sets(
     *,
     limit_per_set: int | None = None,
 ) -> dict[str, tuple[int, ...]]:
+    """Load bounded NPI prefixes for sealed provider sets."""
+
     provider_set_ids = _ptg2_manifest_ids(tuple(provider_set_global_ids))
     if limit_per_set is None:
         uncached_provider_set_ids = provider_set_ids
         requested_limit = None
+        npis_by_set: dict[str, tuple[int, ...]] = {}
     else:
         requested_limit = max(int(limit_per_set), 1)
-        shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
-        uncached_provider_set_ids_list: list[str] = []
-        npis_by_set: dict[str, tuple[int, ...]] = {}
-        for provider_set_id in provider_set_ids:
-            cache_key = (shared_snapshot_key, provider_set_id)
-            cache_entry = _PTG2_PROVIDER_NPI_PREFIX_CACHE.get(cache_key)
-            if cache_entry is None:
-                uncached_provider_set_ids_list.append(provider_set_id)
-                continue
-            cached_limit, cached_npis, is_complete = cache_entry
-            if not is_complete and cached_limit < requested_limit:
-                uncached_provider_set_ids_list.append(provider_set_id)
-                continue
-            _PTG2_PROVIDER_NPI_PREFIX_CACHE.move_to_end(cache_key)
-            npis_by_set[provider_set_id] = cached_npis[:requested_limit]
-        uncached_provider_set_ids = tuple(uncached_provider_set_ids_list)
+        npis_by_set, uncached_provider_set_ids = _cached_provider_npi_prefixes(
+            serving_tables,
+            provider_set_ids,
+            requested_limit,
+        )
         if not uncached_provider_set_ids:
             return {
                 provider_set_id: npis_by_set.get(provider_set_id, ())
@@ -3680,8 +3774,6 @@ async def _provider_npis_for_sets(
         uncached_provider_set_ids,
         limit_per_set=requested_limit,
     )
-    if limit_per_set is None:
-        npis_by_set = {}
     for provider_set_id in uncached_provider_set_ids:
         npis = tuple(
             dict.fromkeys(
@@ -3694,22 +3786,16 @@ async def _provider_npis_for_sets(
             npis[:requested_limit] if requested_limit is not None else npis
         )
         if requested_limit is not None:
-            cache_key = (
-                _required_shared_snapshot_key(serving_tables),
+            _cache_provider_npi_prefix(
+                serving_tables,
                 provider_set_id,
-            )
-            _PTG2_PROVIDER_NPI_PREFIX_CACHE[cache_key] = (
                 requested_limit,
                 npis_by_set[provider_set_id],
-                len(member_ids_by_set.get(provider_set_id, ()))
-                < requested_limit,
+                is_complete=(
+                    len(member_ids_by_set.get(provider_set_id, ()))
+                    < requested_limit
+                ),
             )
-            _PTG2_PROVIDER_NPI_PREFIX_CACHE.move_to_end(cache_key)
-            while (
-                len(_PTG2_PROVIDER_NPI_PREFIX_CACHE)
-                > _PTG2_PROVIDER_NPI_PREFIX_CACHE_MAX_ENTRIES
-            ):
-                _PTG2_PROVIDER_NPI_PREFIX_CACHE.popitem(last=False)
     return {
         provider_set_id: npis_by_set.get(provider_set_id, ())
         for provider_set_id in provider_set_ids
@@ -6515,14 +6601,12 @@ async def _rank_filtered_provider_expansion_prefix(
     )
 
 
-async def _provider_set_ids_for_selected_npis(
-    session,
-    serving_tables: PTG2ServingTables,
+def _cached_provider_set_ids_for_npis(
+    shared_snapshot_key: int,
     npis: tuple[int, ...],
-) -> dict[int, tuple[str, ...]]:
-    if not npis:
-        return {}
-    shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
+) -> tuple[dict[int, tuple[str, ...]], tuple[int, ...]]:
+    """Return cached reverse memberships and NPIs that still need loading."""
+
     provider_set_ids_by_npi: dict[int, tuple[str, ...]] = {}
     uncached_npis: list[int] = []
     for npi in npis:
@@ -6535,6 +6619,42 @@ async def _provider_set_ids_for_selected_npis(
             continue
         _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE.move_to_end(cache_key)
         provider_set_ids_by_npi[npi] = cached_provider_set_ids
+    return provider_set_ids_by_npi, tuple(uncached_npis)
+
+
+def _cache_provider_set_ids_for_npis(
+    shared_snapshot_key: int,
+    provider_set_ids_by_npi: Mapping[int, tuple[str, ...]],
+) -> None:
+    """Cache reverse provider-set memberships for one sealed snapshot."""
+
+    for npi, provider_set_ids in provider_set_ids_by_npi.items():
+        cache_key = (shared_snapshot_key, npi)
+        _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE[cache_key] = provider_set_ids
+        _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE.move_to_end(cache_key)
+        while (
+            len(_PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE)
+            > _PTG2_PROVIDER_NPI_PREFIX_CACHE_MAX_ENTRIES
+        ):
+            _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE.popitem(last=False)
+
+
+async def _provider_set_ids_for_selected_npis(
+    session,
+    serving_tables: PTG2ServingTables,
+    npis: tuple[int, ...],
+) -> dict[int, tuple[str, ...]]:
+    """Resolve provider-set memberships for selected NPIs with sealed caching."""
+
+    if not npis:
+        return {}
+    shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
+    provider_set_ids_by_npi, uncached_npis = (
+        _cached_provider_set_ids_for_npis(
+            shared_snapshot_key,
+            npis,
+        )
+    )
     if not uncached_npis:
         return provider_set_ids_by_npi
     member_id_by_npi = {
@@ -6570,15 +6690,10 @@ async def _provider_set_ids_for_selected_npis(
         for npi, member_id in member_id_by_npi.items()
     }
     provider_set_ids_by_npi.update(resolved_provider_set_ids_by_npi)
-    for npi, provider_set_ids in resolved_provider_set_ids_by_npi.items():
-        cache_key = (shared_snapshot_key, npi)
-        _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE[cache_key] = provider_set_ids
-        _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE.move_to_end(cache_key)
-        while (
-            len(_PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE)
-            > _PTG2_PROVIDER_NPI_PREFIX_CACHE_MAX_ENTRIES
-        ):
-            _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE.popitem(last=False)
+    _cache_provider_set_ids_for_npis(
+        shared_snapshot_key,
+        resolved_provider_set_ids_by_npi,
+    )
     return provider_set_ids_by_npi
 
 
@@ -8631,6 +8746,7 @@ async def _has_snapshot_plan_code(
         plan_market_type=args.get("plan_market_type") or args.get("market_type") or "",
     )
 
+
 async def _search_one_ptg2_snapshot(
     session,
     snapshot_id: str,
@@ -8657,22 +8773,119 @@ async def _search_one_ptg2_snapshot(
     return None
 
 
-async def _search_plan_network_snapshot(
-    source_key: str,
-    snapshot_id: str,
-    args: dict[str, Any],
-    pagination,
-) -> tuple[str, str, dict[str, Any] | None]:
-    async with sa_db.session() as network_session:
-        serving_tables = await snapshot_serving_tables(network_session, snapshot_id)
-        response = await _search_one_ptg2_snapshot(
-            network_session,
-            snapshot_id,
-            args,
-            pagination,
-            serving_tables=serving_tables,
-        )
-    return source_key, snapshot_id, response
+def _cache_network_serving_tables(serving_tables: PTG2ServingTables) -> None:
+    """Remember immutable sealed metadata after its strict database validation."""
+
+    snapshot_id = str(serving_tables.snapshot_id)
+    _PTG2_NETWORK_SERVING_TABLES_CACHE[snapshot_id] = serving_tables
+    _PTG2_NETWORK_SERVING_TABLES_CACHE.move_to_end(snapshot_id)
+    while (
+        len(_PTG2_NETWORK_SERVING_TABLES_CACHE)
+        > _PTG2_NETWORK_SERVING_TABLES_CACHE_MAX_ENTRIES
+    ):
+        _PTG2_NETWORK_SERVING_TABLES_CACHE.popitem(last=False)
+
+
+def _is_network_serving_tables_current(
+    serving_tables: PTG2ServingTables,
+    row_fields: Mapping[str, Any],
+) -> bool:
+    """Match a cached descriptor to its current published/sealed database chain."""
+
+    try:
+        snapshot_key = int(row_fields.get("snapshot_key"))
+        layout_snapshot_key = int(row_fields.get("layout_snapshot_key"))
+        layout_code_count = int(row_fields.get("layout_code_count"))
+        layout_source_count = int(row_fields.get("layout_source_count"))
+    except (TypeError, ValueError):
+        return False
+    audit_sample = serving_tables.audit_sample or {}
+    source_set = serving_tables.source_set or {}
+    return (
+        snapshot_key == serving_tables.shared_snapshot_key
+        and layout_snapshot_key == serving_tables.shared_snapshot_key
+        and layout_code_count == serving_tables.code_count
+        and layout_source_count == serving_tables.source_count
+        and str(row_fields.get("snapshot_coverage_scope_id") or "")
+        == serving_tables.coverage_scope_id
+        and str(row_fields.get("layout_coverage_scope_id") or "")
+        == serving_tables.coverage_scope_id
+        and str(row_fields.get("attested_coverage_scope_id") or "")
+        == serving_tables.coverage_scope_id
+        and str(row_fields.get("snapshot_plan_id") or "").strip()
+        == serving_tables.plan_id
+        and str(row_fields.get("snapshot_plan_market_type") or "").strip()
+        == serving_tables.plan_market_type
+        and str(row_fields.get("attested_source_key") or "").strip()
+        == serving_tables.source_key
+        and str(row_fields.get("attested_audit_sample_digest") or "")
+        == str(audit_sample.get("sample_digest") or "")
+        and str(row_fields.get("attested_source_set_digest") or "")
+        == str(source_set.get("raw_container_sha256_digest") or "")
+    )
+
+
+async def _is_cached_network_serving_tables_current(
+    session,
+    serving_tables_by_snapshot_id: Mapping[str, PTG2ServingTables],
+) -> bool:
+    """Revalidate cached immutable metadata in one live database round trip."""
+
+    snapshot_ids = tuple(serving_tables_by_snapshot_id)
+    if not snapshot_ids:
+        return True
+    validation_result = await session.execute(
+        text(_PTG2_NETWORK_SERVING_TABLES_REVALIDATION_SQL),
+        {
+            "snapshot_ids": list(snapshot_ids),
+            "storage_generation": PTG2_V3_SHARED_GENERATION,
+            "attestation_contract": PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+        },
+    )
+    validated_snapshot_ids: set[str] = set()
+    for validation_row in validation_result:
+        row_fields = _row_mapping(validation_row)
+        snapshot_id = str(row_fields.get("snapshot_id") or "")
+        serving_tables = serving_tables_by_snapshot_id.get(snapshot_id)
+        if serving_tables is None or not _is_network_serving_tables_current(
+            serving_tables,
+            row_fields,
+        ):
+            return False
+        validated_snapshot_ids.add(snapshot_id)
+    return validated_snapshot_ids == set(snapshot_ids)
+
+
+async def _network_tables_by_snapshot_id(
+    session,
+    network_snapshots: Sequence[tuple[str, str]],
+) -> dict[str, PTG2ServingTables]:
+    """Load or cheaply revalidate every published network snapshot descriptor."""
+
+    snapshot_ids = tuple(
+        dict.fromkeys(str(snapshot_id) for _, snapshot_id in network_snapshots)
+    )
+    cached_tables_by_snapshot_id = {
+        snapshot_id: _PTG2_NETWORK_SERVING_TABLES_CACHE[snapshot_id]
+        for snapshot_id in snapshot_ids
+        if snapshot_id in _PTG2_NETWORK_SERVING_TABLES_CACHE
+    }
+    cache_is_current = await _is_cached_network_serving_tables_current(
+        session,
+        cached_tables_by_snapshot_id,
+    )
+    if not cache_is_current:
+        for snapshot_id in cached_tables_by_snapshot_id:
+            _PTG2_NETWORK_SERVING_TABLES_CACHE.pop(snapshot_id, None)
+        cached_tables_by_snapshot_id.clear()
+    for snapshot_id in snapshot_ids:
+        if snapshot_id in cached_tables_by_snapshot_id:
+            _PTG2_NETWORK_SERVING_TABLES_CACHE.move_to_end(snapshot_id)
+            continue
+        serving_tables = await snapshot_serving_tables(session, snapshot_id)
+        cached_tables_by_snapshot_id[snapshot_id] = serving_tables
+        _cache_network_serving_tables(serving_tables)
+    return cached_tables_by_snapshot_id
 
 
 async def _search_multi_ptg2_snapshots(
@@ -8707,20 +8920,23 @@ async def _search_multi_ptg2_snapshots(
     total = 0
     base_query_by_field: dict[str, Any] | None = None
     matched_networks: list[dict[str, str]] = []
+    serving_tables_by_snapshot_id = (
+        await _network_tables_by_snapshot_id(
+        session,
+        network_snapshots,
+        )
+    )
 
-    async def read_network(source_key: str, snapshot_id: str):
-        """Read one network through an independent database session."""
-        return await _search_plan_network_snapshot(
-            source_key,
+    network_responses = []
+    for source_key, snapshot_id in network_snapshots:
+        network_response = await _search_one_ptg2_snapshot(
+            session,
             snapshot_id,
             args,
             sub_pagination,
+            serving_tables=serving_tables_by_snapshot_id[snapshot_id],
         )
-
-    network_responses = await _gather_ptg2_network_reads(
-        network_snapshots,
-        read_network,
-    )
+        network_responses.append((source_key, snapshot_id, network_response))
     for source_key, snapshot_id, network_response in network_responses:
         if not network_response:
             continue

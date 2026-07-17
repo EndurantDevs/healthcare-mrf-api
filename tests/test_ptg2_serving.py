@@ -16,6 +16,15 @@ from process.ptg_parts.address_assurance import summarize_ptg_price_address_payl
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 
+@pytest.fixture(autouse=True)
+def clear_network_serving_tables_cache():
+    """Keep process-local sealed-snapshot metadata isolated between tests."""
+
+    ptg2_serving._PTG2_NETWORK_SERVING_TABLES_CACHE.clear()
+    yield
+    ptg2_serving._PTG2_NETWORK_SERVING_TABLES_CACHE.clear()
+
+
 class FakeResult:
     def __init__(self, scalar=None, result_rows=None):
         self._scalar = scalar
@@ -649,8 +658,10 @@ async def test_filtered_provider_prefix_cache_reuses_identical_filter(
             for selected_provider_set_id in provider_set_ids
         }
 
-    async def filter_npis(_session, args, npis, *, limit):
-        filter_calls.append((args["provider_sex_code"], tuple(npis), limit))
+    async def filter_npis(_session, args_by_name, npis, *, limit):
+        filter_calls.append(
+            (args_by_name["provider_sex_code"], tuple(npis), limit)
+        )
         return tuple(npi for npi in npis if npi % 2 == 0)[:limit]
 
     monkeypatch.setattr(
@@ -665,20 +676,23 @@ async def test_filtered_provider_prefix_cache_reuses_identical_filter(
     )
     ptg2_serving._PTG2_FILTERED_PROVIDER_PREFIX_CACHE.clear()
     serving_tables = _strict_v3_tables(shared_snapshot_key=92)
-    args = {"plan_id": "synthetic-plan", "provider_sex_code": "F"}
+    args_by_name = {
+        "plan_id": "synthetic-plan",
+        "provider_sex_code": "F",
+    }
     try:
         first_prefix = await ptg2_serving._filtered_provider_npis_for_expansion_set(
             object(),
             serving_tables,
             provider_set_id,
-            args,
+            args_by_name,
             target_count=2,
         )
         cached_prefix = await ptg2_serving._filtered_provider_npis_for_expansion_set(
             object(),
             serving_tables,
             provider_set_id,
-            args,
+            args_by_name,
             target_count=2,
         )
     finally:
@@ -720,7 +734,7 @@ async def test_strict_cost_provider_selection_bounds_demographic_filter_expansio
         shared_snapshot_key=93,
         source_key="synthetic-source",
     )
-    selection_args = {
+    selection_args_by_name = {
         "code_rows": [{"code_key": 7, "rate_count": 1}],
         "args": {
             "plan_id": "synthetic-plan",
@@ -738,14 +752,14 @@ async def test_strict_cost_provider_selection_bounds_demographic_filter_expansio
             await ptg2_serving._strict_cost_provider_expansion_selection(
                 object(),
                 serving_tables,
-                **selection_args,
+                **selection_args_by_name,
             )
         )
         cached_selection = (
             await ptg2_serving._strict_cost_provider_expansion_selection(
                 object(),
                 serving_tables,
-                **selection_args,
+                **selection_args_by_name,
             )
         )
     finally:
@@ -2498,16 +2512,82 @@ async def test_provider_reverse_response_uses_page_sentinel_and_honest_total(mon
 
 
 @pytest.mark.asyncio
-async def test_multi_network_forward_reads_use_independent_concurrent_sessions(monkeypatch):
-    session_factory = ConcurrentSessionFactory()
+async def test_network_serving_tables_cache_is_revalidated_and_reloads_on_mismatch(
+    monkeypatch,
+):
+    load_calls = []
+    validation_calls = []
+    is_cached_tables_current = True
 
     async def fake_snapshot_tables(_session, snapshot_id):
+        load_calls.append(snapshot_id)
+        return _strict_v3_tables(snapshot_id=snapshot_id)
+
+    async def is_cached_tables_valid(_session, serving_tables_by_snapshot_id):
+        validation_calls.append(tuple(serving_tables_by_snapshot_id))
+        return is_cached_tables_current
+
+    monkeypatch.setattr(
+        ptg2_serving,
+        "snapshot_serving_tables",
+        fake_snapshot_tables,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_is_cached_network_serving_tables_current",
+        is_cached_tables_valid,
+    )
+    network_snapshots = [
+        ("network-a", "snapshot-a"),
+        ("network-b", "snapshot-b"),
+    ]
+
+    first = await ptg2_serving._network_tables_by_snapshot_id(
+        object(),
+        network_snapshots,
+    )
+    second = await ptg2_serving._network_tables_by_snapshot_id(
+        object(),
+        network_snapshots,
+    )
+    is_cached_tables_current = False
+    third = await ptg2_serving._network_tables_by_snapshot_id(
+        object(),
+        network_snapshots,
+    )
+
+    assert tuple(first) == ("snapshot-a", "snapshot-b")
+    assert second == first
+    assert third == first
+    assert load_calls == [
+        "snapshot-a",
+        "snapshot-b",
+        "snapshot-a",
+        "snapshot-b",
+    ]
+    assert validation_calls == [
+        (),
+        ("snapshot-a", "snapshot-b"),
+        ("snapshot-a", "snapshot-b"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_multi_network_forward_reads_share_request_session_sequentially(
+    monkeypatch,
+):
+    request_session = object()
+    search_sessions = []
+
+    async def fake_snapshot_tables(_session, snapshot_id):
+        assert _session is request_session
         return _strict_v3_tables(snapshot_id=snapshot_id)
 
     async def has_fake_plan_code(*_args, **_kwargs):
         return True
 
     async def fake_search(_session, snapshot_id, _args, _pagination, **_kwargs):
+        search_sessions.append(_session)
         await asyncio.sleep(0.01)
         return {
             "items": [{"provider_name": snapshot_id, "prices": []}],
@@ -2515,20 +2595,18 @@ async def test_multi_network_forward_reads_use_independent_concurrent_sessions(m
             "query": {"snapshot_id": snapshot_id},
         }
 
-    monkeypatch.setattr(ptg2_serving.sa_db, "session", session_factory.session)
     monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot_tables)
     monkeypatch.setattr(ptg2_serving, "_has_snapshot_plan_code", has_fake_plan_code)
     monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_search)
 
     merged_response = await ptg2_serving._search_multi_ptg2_snapshots(
-        object(),
+        request_session,
         [("network-a", "snapshot-a"), ("network-b", "snapshot-b")],
         {"plan_id": "TEST-PLAN-001"},
         FakePagination(),
     )
 
-    assert session_factory.maximum_active == 2
-    assert len({id(session) for session in session_factory.sessions}) == 2
+    assert search_sessions == [request_session, request_session]
     assert merged_response["query"]["snapshots"] == ["snapshot-a", "snapshot-b"]
     assert {network_item["network"] for network_item in merged_response["items"]} == {
         "network-a",
@@ -2538,34 +2616,37 @@ async def test_multi_network_forward_reads_use_independent_concurrent_sessions(m
 
 @pytest.mark.asyncio
 async def test_multi_network_forward_failure_never_returns_partial_union(monkeypatch):
-    session_factory = ConcurrentSessionFactory()
+    request_session = object()
+    searched_snapshot_ids = []
 
     async def fake_snapshot_tables(_session, snapshot_id):
+        assert _session is request_session
         return _strict_v3_tables(snapshot_id=snapshot_id)
 
     async def has_fake_plan_code(*_args, **_kwargs):
         return True
 
     async def fake_search(_session, snapshot_id, _args, _pagination, **_kwargs):
+        assert _session is request_session
+        searched_snapshot_ids.append(snapshot_id)
         await asyncio.sleep(0.01)
         if snapshot_id == "snapshot-b":
             raise RuntimeError("network read failed")
         return {"items": [], "pagination": {"total": 0}, "query": {}}
 
-    monkeypatch.setattr(ptg2_serving.sa_db, "session", session_factory.session)
     monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot_tables)
     monkeypatch.setattr(ptg2_serving, "_has_snapshot_plan_code", has_fake_plan_code)
     monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_search)
 
     with pytest.raises(RuntimeError, match="network read failed"):
         await ptg2_serving._search_multi_ptg2_snapshots(
-            object(),
+            request_session,
             [("network-a", "snapshot-a"), ("network-b", "snapshot-b")],
             {"plan_id": "TEST-PLAN-001"},
             FakePagination(),
         )
 
-    assert session_factory.maximum_active == 2
+    assert searched_snapshot_ids == ["snapshot-a", "snapshot-b"]
 
 
 @pytest.mark.asyncio
