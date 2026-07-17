@@ -12,9 +12,9 @@ PTG2_V3_SOURCE_WITNESS_RECORD_CONTRACT = "ptg2_v3_source_witness_record_v2"
 PTG2_V3_SOURCE_WITNESS_SELECTION = (
     "bottom_k_independent_occurrence_provider_cohorts_v3"
 )
-PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT = "ptg2_v3_source_witness_payload_v4"
+PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT = "ptg2_v3_source_witness_payload_v5"
 PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION = (
-    "per_record_zlib_linked_provider_dictionary_v1"
+    "per_record_zlib_shared_evidence_dictionary_v1"
 )
 PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET = 10_000
 PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA = 1_000
@@ -31,7 +31,7 @@ PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES = 8 * 1024 * 1024
 PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES = 64 * 1024 * 1024
 SOURCE_BUNDLE_MAGIC = b"PTG2SW02"
 SOURCE_RECORD_MAGIC = b"PTG2SWR2"
-PERSISTED_PAYLOAD_MAGIC = b"PTG2SWP4"
+PERSISTED_PAYLOAD_MAGIC = b"PTG2SWP5"
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,7 @@ def _strict_manifest_digest(manifest: Mapping[str, Any], field_name: str) -> str
 def _validate_manifest_contract(manifest_by_field: Mapping[str, Any]) -> None:
     expected_value_by_field = {
         "contract": PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
-        "format_version": 4,
+        "format_version": 5,
         "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
         "unqueryable_rate_policy": PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
@@ -247,24 +247,24 @@ def validate_source_witness_manifest(
     )
     if payload_bytes > PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES:
         raise ValueError("source witness payload exceeds its bound")
-    dictionary_count = _strict_manifest_int(
+    evidence_count = _strict_manifest_int(
         manifest_by_field,
-        "linked_provider_dictionary_count",
+        "evidence_dictionary_count",
     )
     record_count = _strict_manifest_int(
         manifest_by_field,
         "record_count",
         positive=True,
     )
-    if dictionary_count > record_count:
-        raise ValueError("source witness provider dictionary count is invalid")
+    if evidence_count > record_count * 2:
+        raise ValueError("source witness evidence dictionary count is invalid")
     _strict_manifest_int(
         manifest_by_field,
-        "linked_provider_dictionary_raw_bytes",
+        "evidence_dictionary_raw_bytes",
     )
     _strict_manifest_int(
         manifest_by_field,
-        "linked_provider_dictionary_stored_bytes",
+        "evidence_dictionary_stored_bytes",
     )
     for digest_field in (
         "source_set_digest",

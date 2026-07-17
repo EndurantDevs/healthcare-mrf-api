@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from process.ptg_parts.ptg2_source_witness_codec import (
-    externalize_linked_provider_record,
+    externalize_source_evidence_record,
 )
 from process.ptg_parts.ptg2_source_witness_contract import (
     CompressedSourceWitnessRecord,
@@ -50,49 +50,45 @@ class _PersistedRecord:
 
 
 @dataclass(frozen=True)
-class _LinkedProviderEntry:
+class _EvidenceEntry:
     sha256: str
-    raw_json: bytes
+    raw_byte_count: int
     compressed: bytes
 
 
-def _linked_provider_entries(
-    linked_provider_raw_by_sha256: Mapping[str, bytes],
-) -> list[_LinkedProviderEntry]:
-    linked_provider_entries = [
-        _LinkedProviderEntry(
-            sha256=linked_provider_sha256,
-            raw_json=linked_provider_raw_by_sha256[linked_provider_sha256],
-            compressed=zlib.compress(
-                linked_provider_raw_by_sha256[linked_provider_sha256],
-                level=1,
-            ),
-        )
-        for linked_provider_sha256 in sorted(linked_provider_raw_by_sha256)
-    ]
-    if any(
-        not linked_provider.compressed
-        or len(linked_provider.compressed)
-        > PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES
-        for linked_provider in linked_provider_entries
-    ):
+def _insert_evidence(
+    evidence_by_sha256: dict[str, _EvidenceEntry],
+    evidence_sha256: str,
+    raw_json: bytes,
+) -> None:
+    if hashlib.sha256(raw_json).hexdigest() != evidence_sha256:
+        raise RuntimeError("strict V3 source evidence digest is inconsistent")
+    existing_evidence = evidence_by_sha256.get(evidence_sha256)
+    if existing_evidence is not None:
+        if zlib.decompress(existing_evidence.compressed) != raw_json:
+            raise RuntimeError("strict V3 source evidence digest is inconsistent")
+        return
+    compressed = zlib.compress(raw_json, level=6)
+    if not compressed or len(compressed) > PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES:
         raise RuntimeError(
-            "strict V3 linked provider dictionary entry exceeds its payload budget"
+            "strict V3 evidence dictionary entry exceeds its payload budget"
         )
-    return linked_provider_entries
+    evidence_by_sha256[evidence_sha256] = _EvidenceEntry(
+        sha256=evidence_sha256,
+        raw_byte_count=len(raw_json),
+        compressed=compressed,
+    )
 
 
-def _externalize_linked_provider_evidence(
+def _externalize_source_evidence(
     selected_records: Sequence[CompressedSourceWitnessRecord],
-) -> tuple[list[_PersistedRecord], list[_LinkedProviderEntry]]:
+) -> tuple[list[_PersistedRecord], list[_EvidenceEntry]]:
     persisted_records: list[_PersistedRecord] = []
-    linked_provider_raw_by_sha256: dict[str, bytes] = {}
+    evidence_by_sha256: dict[str, _EvidenceEntry] = {}
     for selected_record in selected_records:
-        persisted_record, linked_sha256, linked_json = (
-            externalize_linked_provider_record(
-                selected_record.compressed,
-                selected_record.raw_source_sha256,
-            )
+        persisted_record, record_evidence = externalize_source_evidence_record(
+            selected_record.compressed,
+            selected_record.raw_source_sha256,
         )
         persisted_records.append(
             _PersistedRecord(
@@ -100,26 +96,22 @@ def _externalize_linked_provider_evidence(
                 compressed=persisted_record,
             )
         )
-        if linked_sha256 is None:
-            continue
-        if linked_json is None:
-            raise RuntimeError("strict V3 linked provider evidence is incomplete")
-        existing_linked_json = linked_provider_raw_by_sha256.setdefault(
-            linked_sha256,
-            linked_json,
-        )
-        if existing_linked_json != linked_json:
-            raise RuntimeError("strict V3 linked provider digest is inconsistent")
+        for evidence_sha256, raw_json in record_evidence.items():
+            _insert_evidence(
+                evidence_by_sha256,
+                evidence_sha256,
+                raw_json,
+            )
     return (
         persisted_records,
-        _linked_provider_entries(linked_provider_raw_by_sha256),
+        [evidence_by_sha256[digest] for digest in sorted(evidence_by_sha256)],
     )
 
 
 def _payload_header(
     counts: SourceWitnessPayloadCounts,
     persisted_records: Sequence[_PersistedRecord],
-    linked_provider_entries: Sequence[_LinkedProviderEntry],
+    evidence_entries: Sequence[_EvidenceEntry],
 ) -> dict[str, Any]:
     sample_hasher = hashlib.sha256()
     for witness_record in persisted_records:
@@ -127,7 +119,7 @@ def _payload_header(
         sample_hasher.update(witness_record.compressed)
     return {
         "contract": PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
-        "format_version": 4,
+        "format_version": 5,
         "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
         "unqueryable_rate_policy": PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
@@ -144,14 +136,12 @@ def _payload_header(
         "provider_witness_count": counts.provider_count,
         "record_count": counts.record_count,
         "sample_digest": sample_hasher.hexdigest(),
-        "linked_provider_dictionary_count": len(linked_provider_entries),
-        "linked_provider_dictionary_raw_bytes": sum(
-            len(linked_provider.raw_json)
-            for linked_provider in linked_provider_entries
+        "evidence_dictionary_count": len(evidence_entries),
+        "evidence_dictionary_raw_bytes": sum(
+            evidence.raw_byte_count for evidence in evidence_entries
         ),
-        "linked_provider_dictionary_stored_bytes": sum(
-            len(linked_provider.compressed)
-            for linked_provider in linked_provider_entries
+        "evidence_dictionary_stored_bytes": sum(
+            len(evidence.compressed) for evidence in evidence_entries
         ),
     }
 
@@ -166,7 +156,7 @@ def _append_payload_part(witness_payload: bytearray, payload_part: bytes) -> Non
 
 def _encode_payload(
     header: Mapping[str, Any],
-    linked_provider_entries: Sequence[_LinkedProviderEntry],
+    evidence_entries: Sequence[_EvidenceEntry],
     persisted_records: Sequence[_PersistedRecord],
 ) -> bytes:
     header_bytes = json.dumps(
@@ -178,17 +168,17 @@ def _encode_payload(
     witness_payload = bytearray(PERSISTED_PAYLOAD_MAGIC)
     _append_payload_part(witness_payload, U32.pack(len(header_bytes)))
     _append_payload_part(witness_payload, header_bytes)
-    _append_payload_part(witness_payload, U32.pack(len(linked_provider_entries)))
-    for linked_provider in linked_provider_entries:
+    _append_payload_part(witness_payload, U32.pack(len(evidence_entries)))
+    for evidence in evidence_entries:
         _append_payload_part(
             witness_payload,
-            bytes.fromhex(linked_provider.sha256),
+            bytes.fromhex(evidence.sha256),
         )
         _append_payload_part(
             witness_payload,
-            U32.pack(len(linked_provider.compressed)),
+            U32.pack(len(evidence.compressed)),
         )
-        _append_payload_part(witness_payload, linked_provider.compressed)
+        _append_payload_part(witness_payload, evidence.compressed)
     _append_payload_part(witness_payload, U32.pack(len(persisted_records)))
     for witness_record in persisted_records:
         _append_payload_part(
@@ -207,19 +197,19 @@ def encode_persisted_source_witness(
     selected_records: Sequence[CompressedSourceWitnessRecord],
     counts: SourceWitnessPayloadCounts,
 ) -> tuple[bytes, dict[str, Any]]:
-    """Encode selected scanner records with linked-provider deduplication."""
+    """Encode selected scanner records with exact source-evidence deduplication."""
 
-    persisted_records, linked_provider_entries = (
-        _externalize_linked_provider_evidence(selected_records)
+    persisted_records, evidence_entries = _externalize_source_evidence(
+        selected_records
     )
     header = _payload_header(
         counts,
         persisted_records,
-        linked_provider_entries,
+        evidence_entries,
     )
     witness_payload = _encode_payload(
         header,
-        linked_provider_entries,
+        evidence_entries,
         persisted_records,
     )
     return witness_payload, {

@@ -34,8 +34,8 @@ NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload
 
 def _source_witness_by_field() -> dict[str, object]:
     return {
-        "contract": "ptg2_v3_source_witness_payload_v4",
-        "format_version": 4,
+        "contract": "ptg2_v3_source_witness_payload_v5",
+        "format_version": 5,
         "selection_method": "bottom_k_independent_occurrence_provider_cohorts_v3",
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
         "unqueryable_rate_policy": "count_but_exclude_from_npi_api_challenges_v1",
@@ -51,13 +51,13 @@ def _source_witness_by_field() -> dict[str, object]:
         "occurrence_witness_count": 10_000,
         "provider_witness_count": 1_000,
         "record_count": 11_000,
-        "linked_provider_dictionary_count": 1_000,
-        "linked_provider_dictionary_raw_bytes": 10_000,
-        "linked_provider_dictionary_stored_bytes": 5_000,
+        "evidence_dictionary_count": 1_000,
+        "evidence_dictionary_raw_bytes": 10_000,
+        "evidence_dictionary_stored_bytes": 5_000,
         "sample_digest": SOURCE_WITNESS_SAMPLE_DIGEST,
         "payload_sha256": SOURCE_WITNESS_DIGEST,
         "payload_bytes": 123_456,
-        "compression": "per_record_zlib_linked_provider_dictionary_v1",
+        "compression": "per_record_zlib_shared_evidence_dictionary_v1",
     }
 
 
