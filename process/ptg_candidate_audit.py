@@ -8,7 +8,7 @@ import json
 import os
 import re
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, AsyncIterator, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -47,6 +47,61 @@ AUTH_HEADER_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_AUTH_HEADER"
 AUTH_SCHEME_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_AUTH_SCHEME"
 TRUSTED_CLUSTER_HTTP_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_TRUSTED_CLUSTER_HTTP"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_CANDIDATE_TARGET_SQL = """
+    SELECT snapshot.snapshot_id,
+           snapshot.import_run_id,
+           snapshot.status,
+           snapshot.previous_snapshot_id,
+           snapshot.manifest,
+           binding.snapshot_key,
+           scope.plan_id,
+           scope.plan_market_type,
+           layout.state AS layout_state,
+           layout.generation AS layout_generation,
+           layout.layout_manifest,
+           current_pointer.snapshot_id AS current_snapshot_id,
+           attestation.report_digest AS audit_report_digest,
+           attestation.report AS audit_report,
+           attestation.activated_at AS audit_activated_at,
+           current_snapshot.import_run_id AS current_import_run_id,
+           current_snapshot.status AS current_status,
+           current_snapshot.previous_snapshot_id AS current_previous_snapshot_id,
+           current_snapshot.manifest AS current_manifest,
+           current_binding.snapshot_key AS current_snapshot_key,
+           current_scope.plan_id AS current_plan_id,
+           current_scope.plan_market_type AS current_plan_market_type,
+           current_layout.state AS current_layout_state,
+           current_layout.generation AS current_layout_generation,
+           current_layout.layout_manifest AS current_layout_manifest,
+           current_attestation.report_digest AS current_audit_report_digest,
+           current_attestation.report AS current_audit_report,
+           current_attestation.activated_at AS current_audit_activated_at
+      FROM {schema}.ptg2_snapshot AS snapshot
+      JOIN {schema}.ptg2_v3_snapshot_binding AS binding
+        ON binding.snapshot_id = snapshot.snapshot_id
+      JOIN {schema}.ptg2_v3_snapshot_scope AS scope
+        ON scope.snapshot_id = snapshot.snapshot_id
+      JOIN {schema}.ptg2_v3_snapshot_layout AS layout
+        ON layout.snapshot_key = binding.snapshot_key
+      LEFT JOIN {schema}.ptg2_current_source_snapshot AS current_pointer
+        ON current_pointer.source_key = lower(
+            snapshot.manifest->'activation'->>'source_key'
+        )
+      LEFT JOIN {schema}.ptg2_snapshot AS current_snapshot
+        ON current_snapshot.snapshot_id = current_pointer.snapshot_id
+      LEFT JOIN {schema}.ptg2_v3_snapshot_binding AS current_binding
+        ON current_binding.snapshot_id = current_snapshot.snapshot_id
+      LEFT JOIN {schema}.ptg2_v3_snapshot_scope AS current_scope
+        ON current_scope.snapshot_id = current_snapshot.snapshot_id
+      LEFT JOIN {schema}.ptg2_v3_snapshot_layout AS current_layout
+        ON current_layout.snapshot_key = current_binding.snapshot_key
+      LEFT JOIN {schema}.ptg2_v3_candidate_audit_attestation AS attestation
+        ON attestation.snapshot_id = snapshot.snapshot_id
+      LEFT JOIN {schema}.ptg2_v3_candidate_audit_attestation AS current_attestation
+        ON current_attestation.snapshot_id = current_snapshot.snapshot_id
+     WHERE snapshot.import_run_id = :candidate_run_id
+     ORDER BY snapshot.snapshot_id
+"""
 
 
 @dataclass(frozen=True)
@@ -67,6 +122,10 @@ class CandidateAuditTarget:
     activated: bool
     audit_report: Mapping[str, Any] | None = None
     audit_report_digest: str | None = None
+    equivalent_current_snapshot_id: str | None = None
+    equivalent_current_import_run_id: str | None = None
+    equivalent_audit_report: Mapping[str, Any] | None = None
+    equivalent_audit_report_digest: str | None = None
 
 
 class CandidateAuditReleaseGateError(RuntimeError):
@@ -127,40 +186,11 @@ def _validate_corroboration(
 
 
 async def _candidate_rows(candidate_run_id: str) -> list[dict[str, Any]]:
+    """Load one candidate and the current source pointer in the same query."""
+
     schema = _quote_ident(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     candidate_rows = await db.all(
-        f"""
-        SELECT snapshot.snapshot_id,
-               snapshot.import_run_id,
-               snapshot.status,
-               snapshot.previous_snapshot_id,
-               snapshot.manifest,
-               binding.snapshot_key,
-               scope.plan_id,
-               scope.plan_market_type,
-               layout.state AS layout_state,
-               layout.generation AS layout_generation,
-               layout.layout_manifest,
-               current_pointer.snapshot_id AS current_snapshot_id,
-               attestation.report_digest AS audit_report_digest,
-               attestation.report AS audit_report,
-               attestation.activated_at AS audit_activated_at
-          FROM {schema}.ptg2_snapshot AS snapshot
-          JOIN {schema}.ptg2_v3_snapshot_binding AS binding
-            ON binding.snapshot_id = snapshot.snapshot_id
-          JOIN {schema}.ptg2_v3_snapshot_scope AS scope
-            ON scope.snapshot_id = snapshot.snapshot_id
-          JOIN {schema}.ptg2_v3_snapshot_layout AS layout
-            ON layout.snapshot_key = binding.snapshot_key
-          LEFT JOIN {schema}.ptg2_current_source_snapshot AS current_pointer
-            ON current_pointer.source_key = lower(
-                snapshot.manifest->'activation'->>'source_key'
-            )
-          LEFT JOIN {schema}.ptg2_v3_candidate_audit_attestation AS attestation
-            ON attestation.snapshot_id = snapshot.snapshot_id
-         WHERE snapshot.import_run_id = :candidate_run_id
-         ORDER BY snapshot.snapshot_id
-        """,
+        _CANDIDATE_TARGET_SQL.format(schema=schema),
         candidate_run_id=candidate_run_id,
     )
     return [_row_mapping(candidate_row) for candidate_row in candidate_rows]
@@ -200,6 +230,7 @@ def _candidate_target_from_row(
     *,
     candidate_run_id: str,
     raw_container_sha256: tuple[str, ...],
+    allow_superseded: bool = False,
 ) -> CandidateAuditTarget:
     """Validate a resolved candidate row and return its exact audit target."""
 
@@ -288,11 +319,12 @@ def _candidate_target_from_row(
             or candidate_row.get("audit_activated_at") is None
         ):
             raise ValueError("activated candidate cannot be corroborated")
-    elif (
-        status != "validated"
-        or activation_state != "validated"
-        or current_snapshot != expected_current
-        or current_snapshot == snapshot_id
+    elif status != "validated" or activation_state != "validated":
+        raise ValueError("candidate is not validated with deferred activation")
+    elif current_snapshot == snapshot_id:
+        raise ValueError("candidate is not validated with deferred activation")
+    elif current_snapshot != expected_current and (
+        not allow_superseded or current_snapshot is None
     ):
         raise ValueError("candidate is not validated with deferred activation")
 
@@ -326,6 +358,86 @@ def _candidate_target_from_row(
     )
 
 
+def _current_snapshot_row(candidate_row: Mapping[str, Any]) -> dict[str, Any] | None:
+    snapshot_id = str(candidate_row.get("current_snapshot_id") or "").strip()
+    if not snapshot_id:
+        return None
+    return {
+        "snapshot_id": snapshot_id,
+        "import_run_id": candidate_row.get("current_import_run_id"),
+        "status": candidate_row.get("current_status"),
+        "previous_snapshot_id": candidate_row.get(
+            "current_previous_snapshot_id"
+        ),
+        "manifest": candidate_row.get("current_manifest"),
+        "snapshot_key": candidate_row.get("current_snapshot_key"),
+        "plan_id": candidate_row.get("current_plan_id"),
+        "plan_market_type": candidate_row.get("current_plan_market_type"),
+        "layout_state": candidate_row.get("current_layout_state"),
+        "layout_generation": candidate_row.get("current_layout_generation"),
+        "layout_manifest": candidate_row.get("current_layout_manifest"),
+        "current_snapshot_id": snapshot_id,
+        "audit_report_digest": candidate_row.get(
+            "current_audit_report_digest"
+        ),
+        "audit_report": candidate_row.get("current_audit_report"),
+        "audit_activated_at": candidate_row.get("current_audit_activated_at"),
+    }
+
+
+async def _reuse_equivalent_current_target(
+    candidate_row: Mapping[str, Any],
+    candidate_target: CandidateAuditTarget,
+) -> CandidateAuditTarget:
+    current_row = _current_snapshot_row(candidate_row)
+    if current_row is None:
+        raise ValueError("candidate is not validated with deferred activation")
+    current_run_id = str(current_row.get("import_run_id") or "").strip()
+    current_snapshot_id = str(current_row.get("snapshot_id") or "").strip()
+    if not current_run_id or not current_snapshot_id:
+        raise ValueError("candidate was superseded by an invalid snapshot")
+    current_raw_digests = await _candidate_raw_sources(current_snapshot_id)
+    current_target = _candidate_target_from_row(
+        current_row,
+        candidate_run_id=current_run_id,
+        raw_container_sha256=current_raw_digests,
+    )
+    equivalent_identity = (
+        candidate_target.snapshot_key,
+        candidate_target.source_key,
+        candidate_target.plan_id,
+        candidate_target.plan_market_type,
+        candidate_target.raw_container_sha256,
+        dict(candidate_target.provider_identifier_quarantine),
+        dict(candidate_target.source_witness),
+        dict(candidate_target.audit_sample),
+    )
+    current_identity = (
+        current_target.snapshot_key,
+        current_target.source_key,
+        current_target.plan_id,
+        current_target.plan_market_type,
+        current_target.raw_container_sha256,
+        dict(current_target.provider_identifier_quarantine),
+        dict(current_target.source_witness),
+        dict(current_target.audit_sample),
+    )
+    if not current_target.activated or equivalent_identity != current_identity:
+        raise ValueError("candidate was superseded by a non-equivalent snapshot")
+    if (
+        current_target.audit_report is None
+        or current_target.audit_report_digest is None
+    ):
+        raise ValueError("equivalent current snapshot has no audit attestation")
+    return replace(
+        candidate_target,
+        equivalent_current_snapshot_id=current_target.snapshot_id,
+        equivalent_current_import_run_id=current_target.candidate_run_id,
+        equivalent_audit_report=current_target.audit_report,
+        equivalent_audit_report_digest=current_target.audit_report_digest,
+    )
+
+
 async def load_candidate_audit_target(
     *,
     candidate_run_id: str,
@@ -337,12 +449,14 @@ async def load_candidate_audit_target(
     normalized_run_id = str(candidate_run_id or "").strip()
     if not normalized_run_id:
         raise ValueError("candidate_run_id is required")
-    rows = await _candidate_rows(normalized_run_id)
-    if not rows:
+    candidate_rows = await _candidate_rows(normalized_run_id)
+    if not candidate_rows:
         raise ValueError("candidate_run_id did not resolve a candidate")
-    if len(rows) != 1:
+    if len(candidate_rows) != 1:
         raise ValueError("candidate_run_id does not resolve exactly one candidate")
-    observed_snapshot_id = str(rows[0].get("snapshot_id") or "").strip()
+    observed_snapshot_id = str(
+        candidate_rows[0].get("snapshot_id") or ""
+    ).strip()
     _validate_corroboration(
         candidate_run_id=normalized_run_id,
         observed_snapshot_id=observed_snapshot_id,
@@ -350,11 +464,21 @@ async def load_candidate_audit_target(
         import_id=import_id,
     )
     raw_digests = await _candidate_raw_sources(observed_snapshot_id)
-    return _candidate_target_from_row(
-        rows[0],
+    candidate_target = _candidate_target_from_row(
+        candidate_rows[0],
         candidate_run_id=normalized_run_id,
         raw_container_sha256=raw_digests,
+        allow_superseded=True,
     )
+    if (
+        not candidate_target.activated
+        and candidate_target.current_snapshot_id
+        != candidate_target.expected_current_snapshot_id
+    ):
+        return await _reuse_equivalent_current_target(
+            candidate_rows[0], candidate_target
+        )
+    return candidate_target
 
 
 def _audit_configuration(snapshot_id: str) -> FastAuditHttpConfig:
@@ -504,20 +628,39 @@ def _audit_summary(report: Mapping[str, Any], report_digest: str) -> dict[str, A
 
 
 def _success_result(
-    target: CandidateAuditTarget,
+    candidate_audit_target: CandidateAuditTarget,
     *,
     report: Mapping[str, Any],
     report_digest: str,
     idempotent: bool,
 ) -> dict[str, Any]:
     summary = _audit_summary(report, report_digest)
+    is_equivalent_reuse = (
+        candidate_audit_target.equivalent_current_snapshot_id is not None
+    )
+    active_snapshot_id = (
+        candidate_audit_target.equivalent_current_snapshot_id
+        or candidate_audit_target.snapshot_id
+    )
+    active_import_run_id = (
+        candidate_audit_target.equivalent_current_import_run_id
+        or candidate_audit_target.candidate_run_id
+    )
     audit_metrics_by_name = {
         "arch_version": ARCH_VERSION,
         "snapshot_status": "published",
         "activation_status": "activated",
-        "snapshot_id": target.snapshot_id,
-        "import_run_id": target.candidate_run_id,
-        "candidate_run_id": target.candidate_run_id,
+        "snapshot_id": active_snapshot_id,
+        "candidate_snapshot_id": candidate_audit_target.snapshot_id,
+        "import_run_id": candidate_audit_target.candidate_run_id,
+        "candidate_run_id": candidate_audit_target.candidate_run_id,
+        "activated_import_run_id": active_import_run_id,
+        "activation_mode": (
+            "equivalent_current_layout"
+            if is_equivalent_reuse
+            else "audited_control"
+        ),
+        "equivalent_reuse": is_equivalent_reuse,
         "idempotent": idempotent,
         **summary,
     }
@@ -687,6 +830,15 @@ async def main(
                 candidate_target,
                 report=candidate_target.audit_report,
                 report_digest=candidate_target.audit_report_digest,
+                idempotent=True,
+            )
+        if candidate_target.equivalent_current_snapshot_id is not None:
+            assert candidate_target.equivalent_audit_report is not None
+            assert candidate_target.equivalent_audit_report_digest is not None
+            return _success_result(
+                candidate_target,
+                report=candidate_target.equivalent_audit_report,
+                report_digest=candidate_target.equivalent_audit_report_digest,
                 idempotent=True,
             )
 

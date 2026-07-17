@@ -44,9 +44,13 @@ _TERMINAL_RUN_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_
 
 async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     """Run one PTG control task with cancellation and heartbeat handling."""
-    payload = task if isinstance(task, dict) else {}
-    run_id = str(payload.get("run_id") or "").strip()
-    params = payload.get("params") if isinstance(payload.get("params"), dict) else payload
+    task_payload = task if isinstance(task, dict) else {}
+    run_id = str(task_payload.get("run_id") or "").strip()
+    params = (
+        task_payload.get("params")
+        if isinstance(task_payload.get("params"), dict)
+        else task_payload
+    )
     stale_result = await _stale_ptg_job_result(run_id)
     if stale_result is not None:
         return stale_result
@@ -60,10 +64,10 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 _live_progress_heartbeat(run_id, "ptg", "ptg_control_start", started_at)
             )
             heartbeat_stop = _start_threaded_ptg_heartbeat(run_id, started_at)
-        await raise_if_cancelled(ctx, payload)
+        await raise_if_cancelled(ctx, task_payload)
         _assert_expected_lane(params)
         with _ptg_lane_environment(params):
-            result = await ptg_main(
+            import_result = await ptg_main(
                 test_mode=bool(params.get("test_mode", params.get("test", False))),
                 toc_urls=_string_list(params.get("toc_urls") or params.get("toc_url")),
                 toc_list=params.get("toc_list"),
@@ -111,7 +115,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     finally:
         _stop_threaded_ptg_heartbeat(heartbeat_stop)
         await _stop_live_progress_heartbeat(heartbeat_task)
-    result_metrics = result if isinstance(result, dict) else {}
+    result_metrics = import_result if isinstance(import_result, dict) else {}
     await mark_control_run(
         run_id,
         status="succeeded",
@@ -202,7 +206,7 @@ def _assert_expected_lane(params: dict[str, Any]) -> None:
 
 @contextmanager
 def _ptg_lane_environment(params: dict[str, Any]):
-    overrides = {
+    lane_environment_by_name = {
         PTG2_RUST_WORKERS_ENV: _optional_env_value(params.get("_scanner_rust_workers")),
         PTG2_RUST_PARSE_IN_WORKERS_ENV: _bool_env_value(params.get("_scanner_parse_in_workers")),
         PTG2_RUST_TOP_LEVEL_BYTE_SCAN_ENV: _bool_env_value(params.get("_scanner_top_level_byte_scan")),
@@ -231,20 +235,20 @@ def _ptg_lane_environment(params: dict[str, Any]):
         ),
         PTG2_FILE_PROCESS_CONCURRENCY_ENV: _optional_env_value(params.get("_file_process_concurrency")),
     }
-    previous: dict[str, str | None] = {}
+    previous_environment_by_name: dict[str, str | None] = {}
     try:
-        for name, value in overrides.items():
-            if value is None:
+        for name, environment_value in lane_environment_by_name.items():
+            if environment_value is None:
                 continue
-            previous[name] = os.environ.get(name)
-            os.environ[name] = value
+            previous_environment_by_name[name] = os.environ.get(name)
+            os.environ[name] = environment_value
         yield
     finally:
-        for name, value in previous.items():
-            if value is None:
+        for name, environment_value in previous_environment_by_name.items():
+            if environment_value is None:
                 os.environ.pop(name, None)
             else:
-                os.environ[name] = value
+                os.environ[name] = environment_value
 
 
 def _optional_env_value(value: Any) -> str | None:
@@ -266,8 +270,10 @@ def _string_list(value: Any) -> list[str] | None:
         text = value.strip()
         return [text] if text else None
     if isinstance(value, (list, tuple)):
-        result = [str(item).strip() for item in value if str(item).strip()]
-        return result or None
+        normalized_values = [
+            str(item).strip() for item in value if str(item).strip()
+        ]
+        return normalized_values or None
     return None
 
 
