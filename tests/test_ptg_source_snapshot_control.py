@@ -52,7 +52,7 @@ def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypa
         lambda: clear_calls.append(True),
     )
 
-    result = asyncio.run(
+    promotion_result = asyncio.run(
         source_snapshot_control.promote_ptg2_source_snapshot(
             source_key="source_a",
             snapshot_id="snap_new",
@@ -60,7 +60,7 @@ def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypa
         )
     )
 
-    assert result == {
+    assert promotion_result == {
         "status": "promoted",
         "source_key": "source_a",
         "snapshot_id": "snap_new",

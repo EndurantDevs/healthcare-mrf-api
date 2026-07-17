@@ -42,7 +42,7 @@ def _load_scanner_support():
 
 
 def _source_payload() -> dict:
-    repeated_rate = {
+    repeated_rate_map = {
         "provider_references": [11],
         "negotiated_prices": [
             {
@@ -81,8 +81,8 @@ def _source_payload() -> dict:
                 "billing_code": "00042",
                 "negotiation_arrangement": "ffs",
                 "negotiated_rates": [
-                    repeated_rate,
-                    json.loads(json.dumps(repeated_rate)),
+                    repeated_rate_map,
+                    json.loads(json.dumps(repeated_rate_map)),
                     {
                         "provider_references": [22],
                         "negotiated_prices": [
@@ -108,20 +108,20 @@ def _unpack_int(field: bytes | None, fmt: str) -> int:
 
 def _forward_fragment_rows(copy_rows: list[list[bytes | None]]) -> list[dict]:
     fragments = []
-    for row in copy_rows:
-        if row[2] != _FORWARD_KIND.encode("ascii"):
+    for copy_row in copy_rows:
+        if copy_row[2] != _FORWARD_KIND.encode("ascii"):
             continue
-        assert row[6] == b"none"
-        payload = row[9]
+        assert copy_row[6] == b"none"
+        payload = copy_row[9]
         assert payload is not None
-        raw_payload_bytes = _unpack_int(row[7], ">q")
-        stored_payload_bytes = _unpack_int(row[8], ">q")
+        raw_payload_bytes = _unpack_int(copy_row[7], ">q")
+        stored_payload_bytes = _unpack_int(copy_row[8], ">q")
         assert raw_payload_bytes == stored_payload_bytes == len(payload)
         fragments.append(
             {
-                "block_key": _unpack_int(row[3], ">q"),
-                "block_no": _unpack_int(row[4], ">i"),
-                "entry_count": _unpack_int(row[5], ">q"),
+                "block_key": _unpack_int(copy_row[3], ">q"),
+                "block_no": _unpack_int(copy_row[4], ">i"),
+                "entry_count": _unpack_int(copy_row[5], ">q"),
                 "payload": payload,
                 "payload_compression": "none",
                 "raw_payload_bytes": raw_payload_bytes,
@@ -160,7 +160,7 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
     ]
     assert len(source_records) == 3
     assert sorted(Counter(source_records).values()) == [1, 2]
-    assert {record[3] for record in source_records} == {1, 2}
+    assert {source_record[3] for source_record in source_records} == {1, 2}
 
     repeated_provider_set_id = next(
         provider_set_id
@@ -185,7 +185,7 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
     assert single_provider_set_id < repeated_provider_set_id
     assert high_price_set_id < low_price_set_id
 
-    source_identity = {
+    source_identity_map = {
         "source_type": "in_network",
         "identity_kind": "logical_json_sha256_v1",
         "identity_sha256": hashlib.sha256(scan["artifact"].read_bytes()).hexdigest(),
@@ -195,13 +195,13 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
     scanner_config = scanner_support._single_frame(scan["frames"], "scanner_config")
     serving_run_entries = attach_v3_source_run_contract(
         scan["partition_frames"],
-        source_identity=source_identity,
+        source_identity=source_identity_map,
         scanner_summary=scanner_summary,
         scanner_config=scanner_config,
     )
     code_dictionary_entries = attach_v3_dictionary_contract(
         scan["code_dictionary_frames"],
-        source_identity=source_identity,
+        source_identity=source_identity_map,
         source_run_contract_sha256=serving_run_entries[0][
             "source_run_contract_sha256"
         ],
@@ -211,7 +211,7 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
         manifest_path,
         serving_run_entries=serving_run_entries,
         code_dictionary_entries=code_dictionary_entries,
-        expected_source_identities=[source_identity],
+        expected_source_identities=[source_identity_map],
     )
 
     price_key_by_id = {
@@ -222,7 +222,10 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
         [price_set_id, struct.pack(">q", price_key_by_id[price_set_id])]
         for price_set_id in sorted(price_key_by_id)
     ]
-    assert [struct.unpack(">q", row[1])[0] for row in price_map_rows] == [1, 0]
+    assert [
+        struct.unpack(">q", price_map_row[1])[0]
+        for price_map_row in price_map_rows
+    ] == [1, 0]
     price_key_map_path = tmp_path / "price-key-map.copy"
     price_key_map_path.write_bytes(scanner_support._pg_binary_copy_rows(price_map_rows))
     assert scanner_support._read_pg_binary_rows(
@@ -279,7 +282,7 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
     code_global_id = code_rows[0][1]
     assert code_key == 0
     assert code_global_id is not None
-    assert {record[0] for record in source_records} == {code_global_id}
+    assert {source_record[0] for source_record in source_records} == {code_global_id}
     assert code_rows[0][3:9] == [b"CPT", b"00042", b"FFS", b"2026", None, None]
     assert _unpack_int(code_rows[0][9], ">q") == 3
 
@@ -288,8 +291,11 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
     )
     assert len(provider_rows) == 2
     provider_dictionary = {
-        row[1]: (_unpack_int(row[0], ">i"), _unpack_int(row[2], ">q"))
-        for row in provider_rows
+        provider_row[1]: (
+            _unpack_int(provider_row[0], ">i"),
+            _unpack_int(provider_row[2], ">q"),
+        )
+        for provider_row in provider_rows
     }
     assert provider_dictionary == {
         single_provider_set_id: (0, 1),
@@ -303,7 +309,11 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
     shared_copy_path = output_directory / "shared_serving_blocks.copy"
     shared_copy_bytes = shared_copy_path.read_bytes()
     shared_copy_rows = scanner_support._read_pg_binary_rows(shared_copy_bytes, 10)
-    object_kinds = {row[2].decode("ascii") for row in shared_copy_rows if row[2]}
+    object_kinds = {
+        shared_copy_row[2].decode("ascii")
+        for shared_copy_row in shared_copy_rows
+        if shared_copy_row[2]
+    }
     assert _FORWARD_KIND in object_kinds
     assert _REMOVED_GROUPED_KIND not in object_kinds
     assert _REMOVED_GROUPED_KIND.encode("ascii") not in shared_copy_bytes
@@ -346,11 +356,11 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
         assert shared_snapshot_key == 73
         assert schema_name == "mrf"
         assert artifact_kind == _FORWARD_KIND
-        requested = {int(block_key) for block_key in block_keys}
+        requested_block_keys = {int(block_key) for block_key in block_keys}
         return [
             dict(fragment)
             for fragment in forward_fragments
-            if fragment["block_key"] in requested
+            if fragment["block_key"] in requested_block_keys
         ]
 
     async def discover_shards(
@@ -457,11 +467,16 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
     )
     assert decoded_rows == expected_rows
     assert Counter(
-        (row.provider_set_key, row.price_key, row.source_key) for row in decoded_rows
+        (
+            decoded_row.provider_set_key,
+            decoded_row.price_key,
+            decoded_row.source_key,
+        )
+        for decoded_row in decoded_rows
     ) == Counter({(0, 1, 0): 1, (1, 0, 0): 2})
-    assert {row.provider_set_key for row in decoded_rows} == {0, 1}
-    assert {row.price_key for row in decoded_rows} == {0, 1}
-    assert {row.source_key for row in decoded_rows} == {0}
+    assert {decoded_row.provider_set_key for decoded_row in decoded_rows} == {0, 1}
+    assert {decoded_row.price_key for decoded_row in decoded_rows} == {0, 1}
+    assert {decoded_row.source_key for decoded_row in decoded_rows} == {0}
     discovery_mock.assert_awaited_once()
 
     sparse_rows = await ptg2_db_sidecars.lookup_serving_binary_by_code_from_db(

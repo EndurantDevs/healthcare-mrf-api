@@ -59,7 +59,10 @@ def test_page_decodes_aligned_source_keys():
         entry_count=2,
         expected_source_count=2,
     )
-    assert [(row.price_key, row.source_key) for row in forward] == [(10, 0), (10, 1)]
+    assert [
+        (forward_row.price_key, forward_row.source_key)
+        for forward_row in forward
+    ] == [(10, 0), (10, 1)]
 
     provider_payload = b"".join(
         [
@@ -82,7 +85,10 @@ def test_page_decodes_aligned_source_keys():
         requested_provider_set_keys={3},
         expected_source_count=2,
     )
-    assert [(row.code_key, row.price_key, row.source_key) for row in provider[3].entries] == [
+    assert [
+        (provider_row.code_key, provider_row.price_key, provider_row.source_key)
+        for provider_row in provider[3].entries
+    ] == [
         (7, 10, 0),
         (7, 10, 1),
     ]

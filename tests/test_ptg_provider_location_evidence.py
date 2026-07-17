@@ -123,7 +123,7 @@ def test_audit_tic_provider_location_evidence_samples_provider_reference_address
 
 def test_audit_tic_provider_location_evidence_scans_gzip_inline_provider_groups(tmp_path):
     artifact = tmp_path / "rates.json.gz"
-    payload = {
+    source_payload_map = {
         "provider_references": [],
         "in_network": [
             {
@@ -143,7 +143,7 @@ def test_audit_tic_provider_location_evidence_scans_gzip_inline_provider_groups(
         ],
     }
     with gzip.open(artifact, "wt", encoding="utf-8") as fp:
-        json.dump(payload, fp)
+        json.dump(source_payload_map, fp)
 
     summary = audit_tic_provider_location_evidence(artifact)
 

@@ -260,7 +260,10 @@ async def remove_ptg2_source_snapshot(
             f"DELETE FROM {_quote_ident(schema)}.ptg2_v3_snapshot_binding WHERE snapshot_id = :snapshot_id",
             snapshot_id=snapshot_id,
         )
-        artifact_ids = [str(value) for value in plan.get("artifact_manifest_ids") or []]
+        artifact_ids = [
+            str(artifact_id)
+            for artifact_id in plan.get("artifact_manifest_ids") or []
+        ]
         deleted_artifact_chunks = 0
         if artifact_ids:
             await ensure_ptg2_artifact_blob_table(schema)

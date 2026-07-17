@@ -407,7 +407,7 @@ def test_public_fixture_is_generic_unsigned_and_non_release():
     assert len(example["raw_samples"]["peak_audit_events"]) == 7 * 24 * 8
     assert len(example["raw_samples"]["http_random"]) == 2_600
     signed_http_row = example["raw_samples"]["http_random"][0]
-    signed_payload = {
+    signed_payload_map = {
         field_name: signed_http_row[field_name]
         for field_name in gate._API_SIGNED_PAYLOAD_FIELDS
     }
@@ -415,7 +415,7 @@ def test_public_fixture_is_generic_unsigned_and_non_release():
         gate._base64url_decode_signature(
             signed_http_row["api_evidence_signature"], "api_evidence_signature"
         ),
-        gate._api_signature_message(signed_payload),
+        gate._api_signature_message(signed_payload_map),
     )
     assert not {
         "component_digests",

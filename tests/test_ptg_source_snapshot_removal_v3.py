@@ -82,7 +82,7 @@ async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(mon
     monkeypatch.setattr(source_snapshot_control, "build_ptg2_source_snapshot_remove_plan", fake_plan)
     monkeypatch.setattr(source_snapshot_control, "release_unbound_ptg2_shared_layouts", fake_release)
 
-    result = await source_snapshot_control.remove_ptg2_source_snapshot(
+    removal_result = await source_snapshot_control.remove_ptg2_source_snapshot(
         snapshot_id="shared-a",
         source_key="source_a",
     )
@@ -94,10 +94,10 @@ async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(mon
         "snapshot-delete",
         "layout-release",
     ]
-    assert result["deleted_v3_snapshot_scopes"] == 1
-    assert result["deleted_v3_snapshot_bindings"] == 1
-    assert result["deleted_snapshots"] == 1
-    assert result["released_shared_layouts"] == 1
+    assert removal_result["deleted_v3_snapshot_scopes"] == 1
+    assert removal_result["deleted_v3_snapshot_bindings"] == 1
+    assert removal_result["deleted_snapshots"] == 1
+    assert removal_result["released_shared_layouts"] == 1
 
 
 async def _create_production_shaped_schema(database, schema_name):
@@ -306,7 +306,7 @@ async def _create_production_shaped_schema(database, schema_name):
 async def _insert_shared_snapshots(database, schema_name):
     """Support the insert shared snapshots test fixture."""
     schema = f'"{schema_name}"'
-    manifests = {
+    manifest_json_by_snapshot = {
         snapshot_id: json.dumps(
             {
                 "serving_index": {
@@ -341,7 +341,7 @@ async def _insert_shared_snapshots(database, schema_name):
                 VALUES (:snapshot_id, DATE '2026-07-01', NULL, 'published', CAST(:manifest AS jsonb))
                 """,
                 snapshot_id=snapshot_id,
-                manifest=manifests[snapshot_id],
+                manifest=manifest_json_by_snapshot[snapshot_id],
             )
             await connection.status(
                 f"""
@@ -396,14 +396,14 @@ async def _insert_shared_snapshots(database, schema_name):
 async def _count(database, schema_name, table_name, *, snapshot_id=None):
     schema = f'"{schema_name}"'
     where_clause = ""
-    params = {}
+    query_param_map = {}
     if snapshot_id is not None:
         where_clause = " WHERE snapshot_id = :snapshot_id"
-        params["snapshot_id"] = snapshot_id
+        query_param_map["snapshot_id"] = snapshot_id
     return int(
         await database.scalar(
             f'SELECT COUNT(*) FROM {schema}."{table_name}"{where_clause}',
-            **params,
+            **query_param_map,
         )
         or 0
     )

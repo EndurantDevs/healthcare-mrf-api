@@ -197,28 +197,28 @@ def _coerce_json_payload(value: Any, default: Any) -> Any:
     return value
 
 
-def _coerce_numeric_rate(value: Any) -> Any:
-    if value is None or isinstance(value, bool):
-        return value
-    if isinstance(value, float):
-        return value
-    if isinstance(value, Decimal):
-        decimal_value = value
-    elif isinstance(value, int):
-        decimal_value = Decimal(value)
-    elif isinstance(value, str):
-        text_value = value.strip()
+def _coerce_numeric_rate(rate_value: Any) -> Any:
+    if rate_value is None or isinstance(rate_value, bool):
+        return rate_value
+    if isinstance(rate_value, float):
+        return rate_value
+    if isinstance(rate_value, Decimal):
+        decimal_value = rate_value
+    elif isinstance(rate_value, int):
+        decimal_value = Decimal(rate_value)
+    elif isinstance(rate_value, str):
+        text_value = rate_value.strip()
         if not text_value or not NUMERIC_PATTERN.fullmatch(text_value):
-            return value
+            return rate_value
         try:
             decimal_value = Decimal(text_value)
         except InvalidOperation:
-            return value
+            return rate_value
     else:
-        return value
+        return rate_value
 
     if not decimal_value.is_finite():
-        return value
+        return rate_value
     expanded = format(decimal_value, "f")
     if decimal_value.is_zero():
         expanded = "0"

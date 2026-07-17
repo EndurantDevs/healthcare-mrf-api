@@ -220,11 +220,11 @@ def test_server_signature_envelope_and_closed_row_are_independently_verified():
 
     wrong_envelope = _record()
     wrong_envelope_row = wrong_envelope["raw_samples"]["http_matched_positive"][0]
-    signed_payload = {
+    signed_payload_map = {
         name: wrong_envelope_row[name] for name in gate._API_SIGNED_PAYLOAD_FIELDS
     }
     wrong_envelope_row["api_evidence_signature"] = gate._base64url_encode(
-        TEST_API_PRIVATE_KEY.sign(gate.canonical_json_bytes(signed_payload))
+        TEST_API_PRIVATE_KEY.sign(gate.canonical_json_bytes(signed_payload_map))
     )
     assert _evaluation_error(wrong_envelope).code == "invalid_api_evidence_signature"
 

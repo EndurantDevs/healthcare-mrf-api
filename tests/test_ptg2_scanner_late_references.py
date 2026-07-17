@@ -185,7 +185,7 @@ def _recorded_pids(path: Path) -> tuple[int, ...]:
     return tuple(int(value) for value in path.read_text(encoding="utf-8").split())
 
 
-def _process_exists(process_id: int) -> bool:
+def _is_process_running(process_id: int) -> bool:
     try:
         os.kill(process_id, 0)
     except ProcessLookupError:
@@ -198,10 +198,14 @@ def _process_exists(process_id: int) -> bool:
 def _wait_for_process_cleanup(process_ids: tuple[int, ...]) -> None:
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        if not any(_process_exists(process_id) for process_id in process_ids):
+        if not any(_is_process_running(process_id) for process_id in process_ids):
             return
         time.sleep(0.02)
-    assert not [process_id for process_id in process_ids if _process_exists(process_id)]
+    assert not [
+        process_id
+        for process_id in process_ids
+        if _is_process_running(process_id)
+    ]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX-specific")

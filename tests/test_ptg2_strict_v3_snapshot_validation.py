@@ -86,7 +86,7 @@ async def test_strict_v3_import_rejects_retired_provider_lane_before_database_wo
 
 
 def _serving_index(*, npi_count: int = 3) -> dict[str, object]:
-    audit_sample = {
+    audit_sample_map = {
         "contract": "persisted_served_occurrence_sample_v2",
         "format_version": 2,
         "method": "publish_time_stratified_v1",
@@ -106,7 +106,7 @@ def _serving_index(*, npi_count: int = 3) -> dict[str, object]:
         "coverage_scope_id": "c" * 64,
         "serving_rates": 91,
         "atom_key_bits": 24,
-        "audit_sample": audit_sample,
+        "audit_sample": audit_sample_map,
         "provider_graph": {
             "owner_count": 8,
             "provider_group_count": 5,
@@ -207,8 +207,8 @@ async def test_strict_v3_snapshot_validation_detects_incomplete_physical_layout(
     monkeypatch,
 ):
     serving_index = _serving_index()
-    row = _layout_row(serving_index)
-    row.update(
+    layout_row = _layout_row(serving_index)
+    layout_row.update(
         {
             "resolved_mapping_count": 11,
             "has_price_attr": False,
@@ -218,7 +218,7 @@ async def test_strict_v3_snapshot_validation_detects_incomplete_physical_layout(
         }
     )
     monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=True))
-    monkeypatch.setattr(snapshot_cleanup.db, "all", _layout_query([row]))
+    monkeypatch.setattr(snapshot_cleanup.db, "all", _layout_query([layout_row]))
 
     _missing_tables, contract_errors = (
         await snapshot_cleanup._missing_snapshot_serving_resources(
@@ -465,7 +465,7 @@ async def test_published_redelivery_does_not_replace_newer_source_pointer(
     )
     monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", publish)
 
-    result = await process_ptg._reconcile_already_published_snapshot(
+    reconciliation_result = await process_ptg._reconcile_already_published_snapshot(
         snapshot_attributes={
             "previous_snapshot_id": "ptg2:older",
             "manifest": {
@@ -480,7 +480,7 @@ async def test_published_redelivery_does_not_replace_newer_source_pointer(
         import_month=process_ptg.normalize_import_month("2026-07"),
     )
 
-    assert result == {
+    assert reconciliation_result == {
         "status": "superseded",
         "source_key": "source-a",
         "snapshot_id": "ptg2:redelivered",

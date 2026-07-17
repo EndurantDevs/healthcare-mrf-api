@@ -40,7 +40,7 @@ def test_placeholder_carrier_detection():
 
 
 def test_audit_carrier_rows_reports_importable_catalog_and_unmatched_counts():
-    rows = [
+    carrier_rows = [
         {
             "MEDICAL_CARRIERS": '["Example Medical", "Example Evidence Only", "Missing Medical"]',
             "DENTAL_CARRIERS": '["Example Dental", "N/A"]',
@@ -56,12 +56,12 @@ def test_audit_carrier_rows_reports_importable_catalog_and_unmatched_counts():
     importable_candidates = ["Example Medical", "Example Dental"]
 
     stats, unmatched = audit_carrier_rows(
-        rows,
+        carrier_rows,
         all_candidates=all_candidates,
         importable_candidates=importable_candidates,
         matcher=lambda candidate, carrier: str(candidate).lower() == carrier.lower(),
     )
-    by_line = {item.line: item for item in stats}
+    by_line = {line_stat.line: line_stat for line_stat in stats}
 
     assert by_line["medical"].mentions_total == 4
     assert by_line["medical"].importable_mentions == 2
