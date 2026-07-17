@@ -80,7 +80,7 @@ async def test_v3_price_hydration_reads_dense_atoms_without_price_atom_table(mon
     session = FakeSession(dictionary_rows)
     tables = _version_three_tables()
 
-    prices_by_set = await ptg2_serving._ptg2_manifest_prices_for_price_sets(
+    prices_by_set = await ptg2_serving._prices_for_price_sets(
         session,
         tables,
         ["00000000000000000000000000000011", "00000000000000000000000000000012"],
@@ -163,7 +163,7 @@ async def test_v3_price_hydration_raises_when_atom_key_is_missing(monkeypatch):
 @pytest.mark.asyncio
 async def test_v3_price_hydration_requires_forward_price_key():
     with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="forward row"):
-        await ptg2_serving._ptg2_manifest_prices_for_price_sets(
+        await ptg2_serving._prices_for_price_sets(
             object(),
             _version_three_tables(),
             ["00000000000000000000000000000011"],
