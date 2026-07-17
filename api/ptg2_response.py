@@ -124,15 +124,15 @@ def _shape_ptg2_response(payload: dict[str, Any], args: dict[str, Any]) -> dict[
     if not include_sources:
         hidden_query_fields.update(PTG2_QUERY_SOURCE_FIELDS)
 
-    shaped = dict(payload)
-    shaped["items"] = [
+    shaped_response_by_field = dict(payload)
+    shaped_response_by_field["items"] = [
         {key: value for key, value in dict(item).items() if key not in hidden_item_fields}
         for item in payload.get("items", [])
     ]
-    shaped["query"] = {
+    shaped_response_by_field["query"] = {
         key: value for key, value in dict(payload.get("query") or {}).items() if key not in hidden_query_fields
     }
-    return _fragment_exact_numbers(shaped)
+    return _fragment_exact_numbers(shaped_response_by_field)
 
 
 def _fragment_exact_numbers(value: Any) -> Any:
@@ -254,17 +254,17 @@ def _normalize_string_list(value: Any) -> list[str]:
 
 
 def _canonical_price_row(row: dict[str, Any]) -> dict[str, Any]:
-    normalized_row = dict(row)
-    normalized_row["negotiated_rate"] = _coerce_numeric_rate(normalized_row.get("negotiated_rate"))
-    if "service_code" in normalized_row:
-        normalized_row["service_code"] = sorted(
-            {_canonical_catalog_code("POS", code) for code in _normalize_string_list(normalized_row.get("service_code"))}
+    normalized_price_by_field = dict(row)
+    normalized_price_by_field["negotiated_rate"] = _coerce_numeric_rate(normalized_price_by_field.get("negotiated_rate"))
+    if "service_code" in normalized_price_by_field:
+        normalized_price_by_field["service_code"] = sorted(
+            {_canonical_catalog_code("POS", code) for code in _normalize_string_list(normalized_price_by_field.get("service_code"))}
         )
-    if "billing_code_modifier" in normalized_row:
-        normalized_row["billing_code_modifier"] = sorted(
-            {modifier.upper() for modifier in _normalize_string_list(normalized_row.get("billing_code_modifier"))}
+    if "billing_code_modifier" in normalized_price_by_field:
+        normalized_price_by_field["billing_code_modifier"] = sorted(
+            {modifier.upper() for modifier in _normalize_string_list(normalized_price_by_field.get("billing_code_modifier"))}
         )
-    return normalized_row
+    return normalized_price_by_field
 
 
 def _price_row_key(row: dict[str, Any]) -> str:
@@ -273,15 +273,15 @@ def _price_row_key(row: dict[str, Any]) -> str:
 
 def _normalize_price_payload(prices: Any) -> list[dict[str, Any]]:
     payload = _coerce_json_payload(prices, [])
-    normalized: list[dict[str, Any]] = []
+    normalized_prices: list[dict[str, Any]] = []
     if not isinstance(payload, list):
-        return normalized
+        return normalized_prices
     for row in payload:
         if not isinstance(row, dict):
             continue
-        normalized_row = _canonical_price_row(row)
-        normalized.append(normalized_row)
-    return normalized
+        normalized_price_by_field = _canonical_price_row(row)
+        normalized_prices.append(normalized_price_by_field)
+    return normalized_prices
 
 
 def _normalize_filter_string_list(value: Any, *, upper: bool = True, code_system: str | None = None) -> list[str]:
@@ -300,18 +300,18 @@ def _normalize_filter_string_list(value: Any, *, upper: bool = True, code_system
 
 
 def _price_component(modifiers: list[str]) -> str:
-    normalized = {modifier.upper() for modifier in modifiers}
-    if not normalized:
+    normalized_modifiers = {modifier.upper() for modifier in modifiers}
+    if not normalized_modifiers:
         return "global"
-    if normalized == {"26"}:
+    if normalized_modifiers == {"26"}:
         return "professional"
-    if normalized == {"TC"}:
+    if normalized_modifiers == {"TC"}:
         return "technical"
     return "modifier"
 
 
 def _summarize_normalized_price_payload(normalized_prices: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    summaries_by_group: dict[tuple[Any, ...], dict[str, Any]] = {}
     for price in normalized_prices:
         modifiers = sorted({modifier.upper() for modifier in _normalize_string_list(price.get("billing_code_modifier"))})
         service_codes = sorted({_canonical_catalog_code("POS", code) for code in _normalize_string_list(price.get("service_code"))})
@@ -324,7 +324,7 @@ def _summarize_normalized_price_payload(normalized_prices: list[dict[str, Any]])
             price.get("billing_class"),
             price.get("setting"),
         )
-        summary = grouped.setdefault(
+        summary = summaries_by_group.setdefault(
             key,
             {
                 "component": key[0],
@@ -340,11 +340,11 @@ def _summarize_normalized_price_payload(normalized_prices: list[dict[str, Any]])
         summary["raw_price_count"] += 1
         summary["service_code"] = sorted(set(summary["service_code"]) | set(service_codes))
 
-    component_order = {"global": 0, "professional": 1, "technical": 2, "modifier": 3}
+    component_rank_by_name = {"global": 0, "professional": 1, "technical": 2, "modifier": 3}
     return sorted(
-        grouped.values(),
+        summaries_by_group.values(),
         key=lambda item: (
-            component_order.get(str(item.get("component")), 99),
+            component_rank_by_name.get(str(item.get("component")), 99),
             str(item.get("billing_class") or ""),
             str(item.get("setting") or ""),
             str(item.get("modifier") or ""),

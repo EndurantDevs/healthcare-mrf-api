@@ -36,10 +36,10 @@ def ein_plan_id_variants(value: Any) -> list[str]:
 
 
 def _provider_payload(index: PTG2ServingIndex, ordinal: Any) -> dict[str, Any]:
-    provider = dict(index.providers.get(str(ordinal)) or {})
-    if "provider_ordinal" not in provider:
-        provider["provider_ordinal"] = ordinal
-    return provider
+    provider_fields_by_name = dict(index.providers.get(str(ordinal)) or {})
+    if "provider_ordinal" not in provider_fields_by_name:
+        provider_fields_by_name["provider_ordinal"] = ordinal
+    return provider_fields_by_name
 
 
 def _row_mapping(row: Any) -> dict[str, Any]:
@@ -78,7 +78,7 @@ def _price_filter_clauses(
     service_alias: str = "service_set",
     modifier_alias: str = "modifier_set",
 ) -> tuple[list[str], dict[str, Any]]:
-    query_payload: dict[str, Any] = {}
+    query_values_by_field: dict[str, Any] = {}
     clauses: list[str] = []
 
     service_codes = _normalize_filter_string_list(
@@ -87,8 +87,8 @@ def _price_filter_clauses(
     )
     if service_codes:
         params["price_service_codes"] = service_codes
-        query_payload["service_code"] = service_codes
-        query_payload["pos"] = service_codes[0] if len(service_codes) == 1 else service_codes
+        query_values_by_field["service_code"] = service_codes
+        query_values_by_field["pos"] = service_codes[0] if len(service_codes) == 1 else service_codes
         clauses.append(
             f"COALESCE({service_alias}.codes, ARRAY[]::varchar[]) && CAST(:price_service_codes AS varchar[])"
         )
@@ -99,7 +99,7 @@ def _price_filter_clauses(
     )
     if modifier_codes:
         params["price_modifier_codes"] = modifier_codes
-        query_payload["billing_code_modifier"] = modifier_codes
+        query_values_by_field["billing_code_modifier"] = modifier_codes
         clauses.append(
             f"""
             COALESCE({modifier_alias}.codes, ARRAY[]::varchar[]) @> CAST(:price_modifier_codes AS varchar[])
@@ -114,8 +114,8 @@ def _price_filter_clauses(
             tolerance = Decimal("0.01")
         params["price_negotiated_rate"] = requested_rate
         params["price_rate_tolerance"] = tolerance
-        query_payload["negotiated_rate"] = _coerce_numeric_rate(requested_rate)
-        query_payload["rate_tolerance"] = _coerce_numeric_rate(tolerance)
+        query_values_by_field["negotiated_rate"] = _coerce_numeric_rate(requested_rate)
+        query_values_by_field["rate_tolerance"] = _coerce_numeric_rate(tolerance)
         clauses.append(
             f"""
             {atom_alias}.negotiated_rate ~ '^-?[0-9]+(\\.[0-9]+)?$'
@@ -123,4 +123,4 @@ def _price_filter_clauses(
             """
         )
 
-    return clauses, query_payload
+    return clauses, query_values_by_field
