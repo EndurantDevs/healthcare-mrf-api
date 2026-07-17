@@ -39,12 +39,12 @@ def _iter_top_level_objects(
     active_prefix = None
     builder = None
     event_count = 0
-    for prefix, event, value in ijson.parse(file_obj, use_float=use_float):
+    for prefix, event, event_value in ijson.parse(file_obj, use_float=use_float):
         event_count += 1
         if progress_callback is not None and event_count % 100000 == 0:
             progress_callback()
         if builder is not None:
-            builder.event(event, value)
+            builder.event(event, event_value)
             if prefix == active_prefix and event in {"end_map", "end_array"}:
                 yield active_name, builder.value
                 active_name = None
@@ -58,7 +58,7 @@ def _iter_top_level_objects(
                 active_name = name
                 active_prefix = item_prefix
                 builder = ObjectBuilder()
-                builder.event(event, value)
+                builder.event(event, event_value)
                 break
 
 
@@ -77,14 +77,14 @@ def _iter_top_level_object_bytes(
     object keys and then captures complete object values inside selected arrays.
     """
     chunk_size = chunk_size or _stream_buffer_bytes()
-    targets = {name.encode("utf-8"): name for name in array_names}
+    target_name_by_token = {name.encode("utf-8"): name for name in array_names}
     depth = 0
     active_name: str | None = None
     active_array_depth = 0
     capture = bytearray()
     capture_depth = 0
-    in_string = False
-    escape = False
+    is_inside_string = False
+    is_escape_pending = False
     string_buffer: bytearray | None = None
     candidate_key: bytes | None = None
     pending_key: bytes | None = None
@@ -102,23 +102,23 @@ def _iter_top_level_object_bytes(
             char = byte
             if capture_depth:
                 capture.append(char)
-            if in_string:
+            if is_inside_string:
                 if string_buffer is not None:
                     string_buffer.append(char)
-                if escape:
-                    escape = False
+                if is_escape_pending:
+                    is_escape_pending = False
                 elif char == 0x5C:  # backslash
-                    escape = True
+                    is_escape_pending = True
                 elif char == 0x22:  # quote
-                    in_string = False
+                    is_inside_string = False
                     if string_buffer is not None:
                         candidate_key = bytes(string_buffer[:-1])
                         string_buffer = None
                 continue
 
             if char == 0x22:  # quote
-                in_string = True
-                escape = False
+                is_inside_string = True
+                is_escape_pending = False
                 if depth == 1 and not active_name and not capture_depth:
                     string_buffer = bytearray()
                 else:
@@ -137,9 +137,9 @@ def _iter_top_level_object_bytes(
             if pending_key is not None:
                 if char in (0x20, 0x09, 0x0A, 0x0D):
                     continue
-                if char == 0x5B and pending_key in targets and depth == 1:  # [
+                if char == 0x5B and pending_key in target_name_by_token and depth == 1:  # [
                     depth += 1
-                    active_name = targets[pending_key]
+                    active_name = target_name_by_token[pending_key]
                     active_array_depth = depth
                     pending_key = None
                     continue
@@ -194,15 +194,17 @@ def _iter_top_level_objects_jsondecoder(
     find each object boundary while parsing the object payload.
     """
     chunk_size = chunk_size or _stream_buffer_bytes()
-    array_to_name = {
+    object_name_by_array = {
         item_prefix.removesuffix(".item"): name
         for name, item_prefix in item_prefixes.items()
         if item_prefix.endswith(".item")
     }
-    if not array_to_name:
+    if not object_name_by_array:
         return
-    key_tokens = {array_name: f'"{array_name}"' for array_name in array_to_name}
-    max_key_len = max(len(token) for token in key_tokens.values())
+    key_token_by_array = {
+        array_name: f'"{array_name}"' for array_name in object_name_by_array
+    }
+    max_key_len = max(len(token) for token in key_token_by_array.values())
     utf8_decoder = codecs.getincrementaldecoder("utf-8")()
     json_decoder = json.JSONDecoder()
     buffer = ""
@@ -246,7 +248,7 @@ def _iter_top_level_objects_jsondecoder(
             while True:
                 matches = [
                     (found_at, array_name, token)
-                    for array_name, token in key_tokens.items()
+                    for array_name, token in key_token_by_array.items()
                     for found_at in [buffer.find(token, pos)]
                     if found_at >= 0
                 ]
@@ -302,18 +304,18 @@ def _iter_top_level_objects_jsondecoder(
 
         start_pos = pos
         try:
-            payload, end_pos = json_decoder.raw_decode(buffer, pos)
+            decoded_object, end_pos = json_decoder.raw_decode(buffer, pos)
         except json.JSONDecodeError:
             if eof:
                 raise
             read_more()
             continue
-        object_name = array_to_name[active_array]
+        object_name = object_name_by_array[active_array]
         if raw_object_names and object_name in raw_object_names:
             yield object_name, buffer[start_pos:end_pos].encode("utf-8")
-            del payload
+            del decoded_object
         else:
-            yield object_name, payload
+            yield object_name, decoded_object
         pos = end_pos
         compact_buffer()
 
@@ -338,10 +340,13 @@ def _iter_top_level_objects_fast(
         for item_prefix in item_prefixes.values()
         if item_prefix.endswith(".item")
     }
-    prefix_to_name = {item_prefix.removesuffix(".item"): name for name, item_prefix in item_prefixes.items()}
+    object_name_by_prefix = {
+        item_prefix.removesuffix(".item"): name
+        for name, item_prefix in item_prefixes.items()
+    }
     for array_name, raw_object in _iter_top_level_object_bytes(
         file_obj,
         array_names,
         progress_callback=progress_callback,
     ):
-        yield prefix_to_name[array_name], _json_loads(raw_object)
+        yield object_name_by_prefix[array_name], _json_loads(raw_object)

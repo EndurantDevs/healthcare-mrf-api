@@ -158,13 +158,13 @@ def _reset_partial_download(path: Path) -> None:
 def _validated_resume_offset(path: Path, *, total_bytes: int | None, etag: str | None) -> int:
     if not path.exists() or not total_bytes or not _is_strong_etag(etag):
         return 0
-    completed = _load_completed_ranges(
+    completed_ranges = _load_completed_ranges(
         _range_sidecar_path(path),
         total_bytes=total_bytes,
         etag=etag,
     )
     size = path.stat().st_size
-    if 0 < size < total_bytes and completed == {(0, size - 1)}:
+    if 0 < size < total_bytes and completed_ranges == {(0, size - 1)}:
         return size
     return 0
 
@@ -188,13 +188,13 @@ def _request_ssl_kwargs(url: str | None) -> dict[str, object]:
     return {}
 
 
-def _expected_gzip_artifact(url: str, path: str | Path) -> bool:
+def _is_expected_gzip_artifact(url: str, path: str | Path) -> bool:
     url_suffixes = {suffix.lower() for suffix in Path(urlsplit(url).path).suffixes}
     return ".gz" in url_suffixes or Path(path).suffix.lower() == ".gz"
 
 
 def _gzip_magic_error(url: str, path: str | Path) -> str | None:
-    if not _expected_gzip_artifact(url, path):
+    if not _is_expected_gzip_artifact(url, path):
         return None
     artifact_path = Path(path)
     try:
@@ -215,7 +215,7 @@ def _gzip_integrity_error(url: str, path: str | Path, *, max_bytes: int | None =
     magic_error = _gzip_magic_error(url, path)
     if magic_error:
         return magic_error
-    if not _expected_gzip_artifact(url, path):
+    if not _is_expected_gzip_artifact(url, path):
         return None
     artifact_path = Path(path)
     if max_bytes is not None and max_bytes >= 0:
@@ -244,13 +244,13 @@ async def _open_validated_request(
     current_method = method.upper()
     for _ in range(_MAX_REDIRECTS + 1):
         await assert_safe_url(current_url)
-        request_kwargs = dict(kwargs)
-        request_kwargs.update(_request_ssl_kwargs(current_url))
+        request_options_map = dict(kwargs)
+        request_options_map.update(_request_ssl_kwargs(current_url))
         response = await session.request(
             current_method,
             current_url,
             allow_redirects=False,
-            **request_kwargs,
+            **request_options_map,
         )
         if response.status not in _REDIRECT_STATUSES:
             await assert_safe_url(str(response.url))
@@ -378,16 +378,16 @@ async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMe
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with _validated_request(session, "HEAD", url) as response:
-                headers = response.headers
-                length = headers.get("Content-Length")
+                response_headers_by_name = response.headers
+                length = response_headers_by_name.get("Content-Length")
                 return PTG2HeadMetadata(
                     url=str(response.url),
                     status=response.status,
-                    etag=headers.get("ETag"),
+                    etag=response_headers_by_name.get("ETag"),
                     content_length=int(length) if length and length.isdigit() else None,
-                    last_modified=headers.get("Last-Modified"),
-                    content_encoding=headers.get("Content-Encoding"),
-                    content_type=headers.get("Content-Type"),
+                    last_modified=response_headers_by_name.get("Last-Modified"),
+                    content_encoding=response_headers_by_name.get("Content-Encoding"),
+                    content_type=response_headers_by_name.get("Content-Type"),
                     supports_head=response.status < 400,
                 )
     except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -435,7 +435,7 @@ async def _download_raw_artifact_ranges(
     etag: str | None,
     max_bytes: int | None,
     started_at: float,
-) -> bool:
+) -> None:
     """Download a raw artifact through bounded byte ranges."""
     if not _is_strong_etag(etag):
         raise RuntimeError(f"Range download for {url} requires a strong ETag")
@@ -447,34 +447,47 @@ async def _download_raw_artifact_ranges(
         for start in range(0, total_bytes, chunk_size)
     ]
     sidecar_path = _range_sidecar_path(partial_path)
-    completed = _load_completed_ranges(sidecar_path, total_bytes=total_bytes, etag=etag)
+    completed_ranges = _load_completed_ranges(
+        sidecar_path,
+        total_bytes=total_bytes,
+        etag=etag,
+    )
     if partial_path.exists() and partial_path.stat().st_size > total_bytes:
         partial_path.unlink(missing_ok=True)
         sidecar_path.unlink(missing_ok=True)
-        completed = set()
+        completed_ranges = set()
     partial_path.parent.mkdir(parents=True, exist_ok=True)
     with open(partial_path, "ab") as fp:
         fp.truncate(total_bytes)
-    completed_bytes = sum(end - start + 1 for start, end in completed)
+    completed_bytes = sum(end - start + 1 for start, end in completed_ranges)
     next_progress_bytes = _download_progress_interval_bytes()
     while completed_bytes >= next_progress_bytes:
         next_progress_bytes += _download_progress_interval_bytes()
     progress = RangeDownloadProgress(completed_bytes, next_progress_bytes)
     lock = asyncio.Lock()
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
-    pending_ranges = [item for item in ranges if item not in completed]
-    async def fetch_range(session: aiohttp.ClientSession, item: tuple[int, int]) -> None:
+    pending_ranges = [byte_range for byte_range in ranges if byte_range not in completed_ranges]
+
+    async def fetch_range(
+        session: aiohttp.ClientSession,
+        byte_range: tuple[int, int],
+    ) -> None:
         """Fetch and persist one pending byte range."""
-        start, end = item
-        headers = {"Range": f"bytes={start}-{end}"}
+        start, end = byte_range
+        request_headers_by_name = {"Range": f"bytes={start}-{end}"}
         if etag:
-            headers["If-Match"] = etag
+            request_headers_by_name["If-Match"] = etag
         expected_length = end - start + 1
         received = 0
         counted = 0
-        completed_ok = False
+        is_completed_ok = False
         try:
-            async with _validated_request(session, "GET", url, headers=headers) as response:
+            async with _validated_request(
+                session,
+                "GET",
+                url,
+                headers=request_headers_by_name,
+            ) as response:
                 _validate_range_response(
                     response,
                     url=url,
@@ -512,12 +525,17 @@ async def _download_raw_artifact_ranges(
                     raise RuntimeError(
                         f"Range download for {url} returned {received} bytes, expected {expected_length}"
                     )
-                completed_ok = True
+                is_completed_ok = True
                 async with lock:
-                    completed.add(item)
-                    _write_completed_ranges(sidecar_path, total_bytes=total_bytes, etag=etag, completed=completed)
+                    completed_ranges.add(byte_range)
+                    _write_completed_ranges(
+                        sidecar_path,
+                        total_bytes=total_bytes,
+                        etag=etag,
+                        completed=completed_ranges,
+                    )
         finally:
-            if not completed_ok and counted:
+            if not is_completed_ok and counted:
                 async with lock:
                     progress.completed_bytes = max(0, progress.completed_bytes - counted)
                     while progress.next_progress_bytes > _download_progress_interval_bytes() and (
@@ -527,20 +545,23 @@ async def _download_raw_artifact_ranges(
 
     semaphore = asyncio.Semaphore(_range_download_tasks())
 
-    async def bounded_fetch(session: aiohttp.ClientSession, item: tuple[int, int]) -> None:
+    async def bounded_fetch(
+        session: aiohttp.ClientSession,
+        byte_range: tuple[int, int],
+    ) -> None:
         """Fetch one byte range while applying retry and concurrency limits."""
         async with semaphore:
             retries = _download_retry_count()
             for attempt in range(retries + 1):
                 try:
-                    await fetch_range(session, item)
+                    await fetch_range(session, byte_range)
                     return
                 except Exception as exc:
                     if attempt >= retries:
                         raise
                     delay = _download_retry_delay_seconds() * (2 ** attempt)
                     message = (
-                        f"PTG2_DOWNLOAD_RETRY url={url} range={item[0]}-{item[1]} "
+                        f"PTG2_DOWNLOAD_RETRY url={url} range={byte_range[0]}-{byte_range[1]} "
                         f"attempt={attempt + 1} next_attempt={attempt + 2} delay_seconds={delay:.2f} error={exc}"
                     )
                     _emit_screen_line(message, stderr=True)
@@ -549,7 +570,10 @@ async def _download_raw_artifact_ranges(
                         await asyncio.sleep(delay)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        range_tasks = [asyncio.create_task(bounded_fetch(session, item)) for item in pending_ranges]
+        range_tasks = [
+            asyncio.create_task(bounded_fetch(session, byte_range))
+            for byte_range in pending_ranges
+        ]
         try:
             await asyncio.gather(*range_tasks)
         except BaseException:
@@ -565,7 +589,6 @@ async def _download_raw_artifact_ranges(
         started_at=started_at,
         done=False,
     )
-    return True
 
 
 @dataclass
@@ -838,7 +861,7 @@ async def _download_raw_artifact_locked(
     progress_started_at = time.monotonic()
     progress_interval_bytes = _download_progress_interval_bytes()
     next_progress_bytes = progress_interval_bytes
-    validate_downloaded_gzip = _env_bool(_GZIP_VALIDATE_FRESH_ENV, False)
+    should_validate_downloaded_gzip = _env_bool(_GZIP_VALIDATE_FRESH_ENV, False)
     if reuse_raw_artifacts:
         candidates = store.find_candidates(canonical_url)
         for reuse_candidate in candidates:
@@ -856,12 +879,12 @@ async def _download_raw_artifact_locked(
             candidate_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
             candidate_path = store.path_from_uri(candidate_uri)
             try:
-                protected = protect_existing_artifact(store, candidate_path)
+                is_protected = protect_existing_artifact(store, candidate_path)
             except ValueError:
                 # Older manifests can point outside the current managed root. The
                 # collector cannot delete those paths, so normal reuse remains safe.
-                protected = candidate_path.exists()
-            if not protected:
+                is_protected = candidate_path.exists()
+            if not is_protected:
                 candidate = None
                 mode = None
         if candidate is not None and mode is not None:
@@ -875,7 +898,7 @@ async def _download_raw_artifact_locked(
                 max_bytes=_gzip_reuse_validate_max_bytes(),
             )
             if expected and actual != expected:
-                validate_downloaded_gzip = True
+                should_validate_downloaded_gzip = True
                 store.record_manifest(
                     {
                         "artifact_kind": PTG2_ARTIFACT_RAW,
@@ -887,7 +910,7 @@ async def _download_raw_artifact_locked(
                     }
                 )
             elif gzip_error:
-                validate_downloaded_gzip = True
+                should_validate_downloaded_gzip = True
                 store.record_manifest(
                     {
                         "artifact_kind": PTG2_ARTIFACT_RAW,
@@ -960,7 +983,7 @@ async def _download_raw_artifact_locked(
                         while byte_count >= next_progress_bytes:
                             next_progress_bytes += progress_interval_bytes
         else:
-            used_range_download = False
+            use_range_download = False
             range_total = head.content_length if head and head.content_length else None
             if (
                 _env_bool(PTG2_RANGE_DOWNLOADS_ENV, True)
@@ -999,8 +1022,8 @@ async def _download_raw_artifact_locked(
                         download_etag = probed_etag
                         download_content_length = probed_total
                         download_last_modified = head.last_modified if probed_etag == head.etag else None
-                        used_range_download = True
-            if not used_range_download:
+                        use_range_download = True
+            if not use_range_download:
                 (
                     digest,
                     byte_count,
@@ -1030,7 +1053,7 @@ async def _download_raw_artifact_locked(
             raise RuntimeError(f"Checksum verification failed for {final_path}")
         gzip_error = (
             _gzip_integrity_error(url, final_path, max_bytes=None)
-            if validate_downloaded_gzip
+            if should_validate_downloaded_gzip
             else _gzip_magic_error(url, final_path)
         )
         if gzip_error:
@@ -1059,7 +1082,7 @@ async def _download_raw_artifact_locked(
             done=True,
         )
         raw_uri = store.storage_uri(final_path)
-        manifest_payload = {
+        raw_artifact_manifest_map = {
             "artifact_kind": PTG2_ARTIFACT_RAW,
             "canonical_url": canonical_url,
             "original_url": url,
@@ -1072,7 +1095,7 @@ async def _download_raw_artifact_locked(
             "last_modified": download_last_modified,
             "status": "available",
         }
-        store.record_manifest(manifest_payload)
+        store.record_manifest(raw_artifact_manifest_map)
         verified_head = PTG2HeadMetadata(
             url=head.url,
             status=head.status,
@@ -1178,15 +1201,18 @@ async def _retained_logical_artifact(
             logical_path = store.path_from_uri(str(logical_uri))
             try:
                 expected_size = int(candidate.get("byte_count"))
-                size_matches = logical_path.stat().st_size == expected_size
+                is_size_matching = logical_path.stat().st_size == expected_size
             except (OSError, TypeError, ValueError):
-                size_matches = False
+                is_size_matching = False
             try:
-                protected = size_matches and protect_existing_artifact(store, logical_path)
+                is_protected = is_size_matching and protect_existing_artifact(
+                    store,
+                    logical_path,
+                )
             except ValueError:
                 # Ignore migrated logical records outside this managed store.
-                protected = False
-            if protected:
+                is_protected = False
+            if is_protected:
                 actual_sha256, _actual_size = sha256_file(logical_path)
                 if actual_sha256 != logical_sha256:
                     store.record_manifest(
@@ -1320,7 +1346,7 @@ async def _iter_downloaded_ptg_jobs(
         max_workers=download_tasks,
         thread_name_prefix="ptg2-download",
     )
-    pending: set[asyncio.Future[PTG2DownloadedJob]] = set()
+    pending_tasks: set[asyncio.Future[PTG2DownloadedJob]] = set()
     job_iter = iter(jobs)
     base_live_progress_context = current_live_progress_context()
     artifact_lease_id = current_artifact_lease_id()
@@ -1328,7 +1354,7 @@ async def _iter_downloaded_ptg_jobs(
 
     def schedule_more() -> None:
         """Start downloads until the configured in-flight task limit is reached."""
-        while len(pending) < download_tasks:
+        while len(pending_tasks) < download_tasks:
             try:
                 job = next(job_iter)
             except StopIteration:
@@ -1337,12 +1363,12 @@ async def _iter_downloaded_ptg_jobs(
             job_total = max(_progress_job_total(job, job_count), 1)
             progress_start = 5.0 + (job_index / job_total) * 15.0
             progress_end = 5.0 + ((job_index + 1) / job_total) * 15.0
-            live_progress_context = {
+            job_live_progress_context_map = {
                 **base_live_progress_context,
                 "overall_progress_start_pct": progress_start,
                 "overall_progress_end_pct": progress_end,
             }
-            pending.add(
+            pending_tasks.add(
                 asyncio.wrap_future(
                     executor.submit(
                         _download_ptg_job_artifact_sync_from_facade,
@@ -1350,7 +1376,7 @@ async def _iter_downloaded_ptg_jobs(
                         reuse_raw_artifacts=reuse_raw_artifacts,
                         max_bytes=max_bytes,
                         keep_partial_artifacts=keep_partial_artifacts,
-                        live_progress_context=live_progress_context,
+                        live_progress_context=job_live_progress_context_map,
                         artifact_lease_id=artifact_lease_id,
                     )
                 )
@@ -1358,16 +1384,19 @@ async def _iter_downloaded_ptg_jobs(
 
     schedule_more()
     try:
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        while pending_tasks:
+            done_tasks, pending_tasks = await asyncio.wait(
+                pending_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
             schedule_more()
-            for task in done:
+            for task in done_tasks:
                 yield task.result()
     finally:
-        for task in pending:
+        for task in pending_tasks:
             task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
         # Running thread-pool calls cannot be cancelled by their asyncio
         # wrappers. Wait for them before the import-level artifact lease is
         # released, otherwise GC could reclaim a file a worker still uses.
