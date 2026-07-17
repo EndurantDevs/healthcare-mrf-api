@@ -60,6 +60,8 @@ class _DigestingReader:
         self._sha256 = hashlib.sha256()
 
     def read(self, size: int = -1) -> bytes:
+        """Read and account for one chunk requested by the COPY driver."""
+
         chunk = self._source.read(size)
         if chunk:
             self.byte_count += len(chunk)
@@ -68,6 +70,8 @@ class _DigestingReader:
 
     @property
     def sha256(self) -> str:
+        """Return the digest of exactly the bytes consumed so far."""
+
         return self._sha256.hexdigest()
 
 
@@ -241,17 +245,17 @@ async def copy_shared_block_binary_file(
         if copy_to_table is None:
             raise NotImplementedError("active database driver does not expose binary COPY")
         with path.open("rb") as source_file:
-            source = _DigestingReader(source_file)
+            copy_source = _DigestingReader(source_file)
             await copy_to_table(
                 _safe_identifier(stage_table),
-                source=source,
+                source=copy_source,
                 schema_name=_safe_identifier(schema_name),
                 columns=list(_SHARED_BLOCK_STAGE_COLUMNS),
                 format="binary",
             )
             if expected_copy_bytes is not None and (
-                source.byte_count != int(expected_copy_bytes)
-                or source.sha256 != expected_copy_sha256
+                copy_source.byte_count != int(expected_copy_bytes)
+                or copy_source.sha256 != expected_copy_sha256
             ):
                 raise RuntimeError(
                     "strict V3 shared-block COPY content changed during publication"
