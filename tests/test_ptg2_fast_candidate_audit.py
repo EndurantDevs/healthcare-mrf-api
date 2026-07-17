@@ -19,6 +19,11 @@ from process.ptg_parts.ptg2_provider_quarantine import (
 )
 from process.ptg_parts.ptg2_source_witness import (
     LoadedSourceWitness,
+    PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
+    PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
+    PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
+    PTG2_V3_SOURCE_WITNESS_SELECTION,
+    PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
     SourceWitnessRecord,
 )
 
@@ -140,15 +145,16 @@ def _witness(
     witness_records = (*occurrences, *providers)
     return LoadedSourceWitness(
         metadata={
-            "contract": "ptg2_v3_source_witness_payload_v3",
-            "format_version": 3,
-            "selection_method": "bottom_k_atomic_occurrence_exponential_priority_v2",
+            "contract": PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
+            "format_version": 4,
+            "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
             "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
             "unqueryable_rate_policy": "count_but_exclude_from_npi_api_challenges_v1",
             "source_count": 1,
             "source_set_digest": SOURCE_SET_DIGEST,
-            "total_target": 2_048,
-            "provider_quota": 48,
+            "occurrence_target": PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
+            "total_target": PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
+            "provider_quota": PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
             "sample_digest": SAMPLE_DIGEST,
             "payload_sha256": PAYLOAD_DIGEST,
             "payload_bytes": 1024,
@@ -504,7 +510,7 @@ async def test_source_challenge_uses_candidate_api_with_exact_filters(
 
 
 @pytest.mark.asyncio
-async def test_fast_audit_executes_2000_api_challenges_with_48_provider_checks(
+async def test_fast_audit_executes_full_release_witness_contract(
     monkeypatch,
 ):
     observed_fingerprints: list[str] = []
@@ -524,23 +530,26 @@ async def test_fast_audit_executes_2000_api_challenges_with_48_provider_checks(
     monkeypatch.setattr(audit, "_run_challenge", challenge)
 
     report = await audit.run_fast_candidate_audit(
-        witness=_witness(2_000, 48),
+        witness=_witness(
+            PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
+            PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
+        ),
         audit_target=_target(),
         http=_http(),
     )
 
-    assert len(observed_fingerprints) == 2_000
+    assert len(observed_fingerprints) == 10_000
     assert report["status"] == "pass"
-    assert report["duration_seconds"] < 1.0
-    assert report["checks"]["source_witnesses"] == 2_048
-    assert report["checks"]["api_witnesses_matched"] == 2_000
-    assert report["checks"]["provider_witnesses_validated"] == 48
-    assert report["http"]["standard_api_actual_http_requests"] == 2_001
+    assert report["duration_seconds"] < audit.FAST_AUDIT_DEADLINE_SECONDS
+    assert report["checks"]["source_witnesses"] == 11_000
+    assert report["checks"]["api_witnesses_matched"] == 10_000
+    assert report["checks"]["provider_witnesses_validated"] == 1_000
+    assert report["http"]["standard_api_actual_http_requests"] == 10_001
     assert report["latency"]["request_p95_ceiling_ms"] == 250.0
     assert report["latency"]["request_p95_within_ceiling"] is True
     assert report["random_api_requests"] == {
-        "requested": 2_000,
-        "executed": 2_000,
+        "requested": 10_000,
+        "executed": 10_000,
     }
 
 

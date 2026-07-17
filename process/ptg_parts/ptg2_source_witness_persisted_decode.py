@@ -15,6 +15,7 @@ from process.ptg_parts.ptg2_source_witness_contract import (
     PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES,
     PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES,
     PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES,
+    PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
     PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION,
     PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
     PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
@@ -55,10 +56,11 @@ def _read_header(witness_payload: bytes) -> tuple[dict[str, Any], int]:
 def _validate_header_contract(header: Mapping[str, Any]) -> None:
     required_value_by_field = {
         "contract": PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
-        "format_version": 3,
+        "format_version": 4,
         "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
         "unqueryable_rate_policy": PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
+        "occurrence_target": PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
         "total_target": PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
         "provider_quota": PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
     }

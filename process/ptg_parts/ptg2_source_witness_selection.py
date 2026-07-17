@@ -10,6 +10,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from process.ptg_parts.ptg2_source_witness_contract import (
     CompressedSourceWitnessRecord,
+    PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
+    PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
     source_witness_targets,
 )
 from process.ptg_parts.ptg2_source_witness_primitives import (
@@ -113,6 +115,31 @@ def local_source_witness_targets(
     )
 
 
+def retain_source_witness_candidates(
+    candidate_records: Iterable[CompressedSourceWitnessRecord],
+) -> list[CompressedSourceWitnessRecord]:
+    """Bound an intermediate global merge to each cohort's release target."""
+
+    records = tuple(candidate_records)
+    selected_records: list[CompressedSourceWitnessRecord] = []
+    for cohort_name, cohort_target in (
+        ("rate_occurrence", PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET),
+        ("provider_reference", PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA),
+    ):
+        selected_records.extend(
+            heapq.nsmallest(
+                cohort_target,
+                (
+                    witness_record
+                    for witness_record in records
+                    if witness_record.kind == cohort_name
+                ),
+                key=lambda witness_record: witness_record.selection_key,
+            )
+        )
+    return selected_records
+
+
 def select_source_witness_records(
     candidate_records: Sequence[CompressedSourceWitnessRecord],
     *,
@@ -163,6 +190,7 @@ def select_source_witness_records(
 __all__ = [
     "SourceWitnessPopulation",
     "local_source_witness_targets",
+    "retain_source_witness_candidates",
     "select_source_witness_records",
     "source_population",
     "source_set_digest",

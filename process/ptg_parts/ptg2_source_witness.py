@@ -12,6 +12,7 @@ from process.ptg_parts.ptg2_source_witness_contract import (
     LoadedSourceWitness,
     PTG2_V3_SOURCE_WITNESS_CONTRACT,
     PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES,
+    PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
     PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
     PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
     PTG2_V3_SOURCE_WITNESS_RECORD_CONTRACT,
@@ -29,6 +30,7 @@ from process.ptg_parts.ptg2_source_witness_persisted_encode import (
 )
 from process.ptg_parts.ptg2_source_witness_primitives import sha256_hex
 from process.ptg_parts.ptg2_source_witness_selection import (
+    retain_source_witness_candidates,
     select_source_witness_records,
     source_population,
     source_set_digest,
@@ -46,7 +48,9 @@ def _read_source_bundles(
     for bundle_entry in bundle_entries:
         bundle_header, bundle_records = read_scanner_bundle(bundle_entry)
         bundle_headers.append(bundle_header)
-        candidate_records.extend(bundle_records)
+        candidate_records = retain_source_witness_candidates(
+            (*candidate_records, *bundle_records)
+        )
     observed_sources = sorted(
         sha256_hex(
             bundle_header.get("raw_source_sha256"),
@@ -104,6 +108,7 @@ __all__ = [
     "LoadedSourceWitness",
     "PTG2_V3_SOURCE_WITNESS_CONTRACT",
     "PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES",
+    "PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET",
     "PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT",
     "PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA",
     "PTG2_V3_SOURCE_WITNESS_RECORD_CONTRACT",

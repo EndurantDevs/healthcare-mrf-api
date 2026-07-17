@@ -141,6 +141,7 @@ def _bundle(
         "selection_method": witness.PTG2_V3_SOURCE_WITNESS_SELECTION,
         "unqueryable_rate_policy": witness.PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
         "raw_source_sha256": source_digest,
+        "occurrence_target": witness.PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
         "total_target": witness.PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
         "provider_quota": witness.PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
         "rate_occurrence": {
@@ -230,16 +231,16 @@ def test_persisted_witness_is_deterministic_and_preserves_exact_raw_tokens(tmp_p
             item_ordinal=index,
             raw_json=marker_raw if index == 0 else f'{{"rate":{index}}}'.encode(),
         )
-        for index in range(1_025)
+        for index in range(5_025)
     ]
     second_compressed_records = [
         _record(
             kind="rate_occurrence",
             priority=index * 2 + 1,
             item_ordinal=index,
-            raw_json=f'{{"rate":{index + 1025}}}'.encode(),
+            raw_json=f'{{"rate":{index + 5025}}}'.encode(),
         )
-        for index in range(1_025)
+        for index in range(5_025)
     ]
     entry_a = _bundle(
         tmp_path,
@@ -267,15 +268,15 @@ def test_persisted_witness_is_deterministic_and_preserves_exact_raw_tokens(tmp_p
 
     assert first_payload == second_payload
     assert first_metadata == second_metadata
-    assert first_metadata["queryable_occurrence_population_count"] == 2_050
-    assert first_metadata["occurrence_witness_count"] == 2_048
-    assert first_metadata["record_count"] == 2_048
+    assert first_metadata["queryable_occurrence_population_count"] == 10_050
+    assert first_metadata["occurrence_witness_count"] == 10_000
+    assert first_metadata["record_count"] == 10_000
     loaded = witness.decode_persisted_source_witness(
         first_payload,
         expected_raw_source_sha256=[SOURCE_A, SOURCE_B],
         expected_metadata=first_metadata,
     )
-    assert len(loaded.occurrence_records) == 2_048
+    assert len(loaded.occurrence_records) == 10_000
     assert marker_raw in {
         witness_record.raw_json
         for witness_record in loaded.occurrence_records
@@ -283,7 +284,7 @@ def test_persisted_witness_is_deterministic_and_preserves_exact_raw_tokens(tmp_p
     assert max(
         witness_record.priority
         for witness_record in loaded.occurrence_records
-    ) == 2_047
+    ) == 9_999
 
 
 def test_source_witness_accepts_large_exact_record_within_aggregate_budget():
@@ -321,18 +322,18 @@ def test_source_witness_decode_limit_is_enforced_before_flush(monkeypatch):
         witness_codec.decode_record(compressed_record, SOURCE_A)
 
 
-def test_exact_total_budget_reserves_provider_quota_and_backfills(tmp_path):
-    occurrence_records = [_occurrence_record(index) for index in range(2_000)]
+def test_independent_cohort_targets_are_both_filled(tmp_path):
+    occurrence_records = [_occurrence_record(index) for index in range(10_000)]
     provider_records = [
-        _provider_record(index, priority=10_000 + index) for index in range(48)
+        _provider_record(index, priority=20_000 + index) for index in range(1_000)
     ]
     entry = _bundle(
         tmp_path,
         source_digest=SOURCE_A,
         name="quota.bin",
         compressed_records=[*occurrence_records, *provider_records],
-        occurrence_population_count=2_048,
-        provider_population_count=80,
+        occurrence_population_count=20_000,
+        provider_population_count=5_000,
     )
 
     witness_payload, witness_metadata = witness.build_persisted_source_witness(
@@ -345,9 +346,9 @@ def test_exact_total_budget_reserves_provider_quota_and_backfills(tmp_path):
         expected_metadata=witness_metadata,
     )
 
-    assert len(loaded.occurrence_records) == 2_000
-    assert len(loaded.provider_records) == 48
-    assert len(loaded.records) == 2_048
+    assert len(loaded.occurrence_records) == 10_000
+    assert len(loaded.provider_records) == 1_000
+    assert len(loaded.records) == 11_000
 
 
 def test_persisted_witness_rejects_corruption_and_manifest_drift(tmp_path):

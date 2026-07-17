@@ -12,14 +12,15 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, OnceLock};
 use xxhash_rust::xxh3::Xxh3;
 
-pub const SOURCE_WITNESS_CONTRACT: &str = "ptg2_v3_source_witness_v2";
+pub const SOURCE_WITNESS_CONTRACT: &str = "ptg2_v3_source_witness_v3";
 pub const SOURCE_WITNESS_RECORD_CONTRACT: &str = "ptg2_v3_source_witness_record_v2";
-pub const SOURCE_WITNESS_SELECTION: &str = "bottom_k_atomic_occurrence_exponential_priority_v2";
+pub const SOURCE_WITNESS_SELECTION: &str = "bottom_k_independent_occurrence_provider_cohorts_v3";
 pub const SOURCE_WITNESS_FORMAT_VERSION: u32 = 2;
-pub const SOURCE_WITNESS_TOTAL_TARGET: usize = 2_048;
-pub const SOURCE_WITNESS_PROVIDER_QUOTA: usize = 48;
+pub const SOURCE_WITNESS_OCCURRENCE_TARGET: usize = 10_000;
+pub const SOURCE_WITNESS_PROVIDER_QUOTA: usize = 1_000;
+pub const SOURCE_WITNESS_TOTAL_TARGET: usize =
+    SOURCE_WITNESS_OCCURRENCE_TARGET + SOURCE_WITNESS_PROVIDER_QUOTA;
 pub const SOURCE_WITNESS_UNQUERYABLE_POLICY: &str = "count_but_exclude_from_npi_api_challenges_v1";
-const SOURCE_WITNESS_LOCAL_CANDIDATE_TARGET: usize = SOURCE_WITNESS_TOTAL_TARGET;
 const SOURCE_WITNESS_MAGIC: &[u8; 8] = b"PTG2SW02";
 const SOURCE_WITNESS_RECORD_MAGIC: &[u8; 8] = b"PTG2SWR2";
 const SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES: usize = 8 * 1024 * 1024;
@@ -482,10 +483,10 @@ impl SourceWitnessCollector {
             raw_source_sha256: digest,
             raw_source_sha256_hex: normalized,
             rate_occurrences: SourceWitnessSampler::new(
-                SOURCE_WITNESS_LOCAL_CANDIDATE_TARGET,
+                SOURCE_WITNESS_OCCURRENCE_TARGET,
                 SOURCE_WITNESS_MAX_COMPRESSED_RATE_CANDIDATE_BYTES,
             ),
-            provider_references: ProviderWitnessSampler::new(SOURCE_WITNESS_LOCAL_CANDIDATE_TARGET),
+            provider_references: ProviderWitnessSampler::new(SOURCE_WITNESS_PROVIDER_QUOTA),
             rate_rows: AtomicU64::new(0),
             unqueryable_rate_rows: AtomicU64::new(0),
             provider_spools: OnceLock::new(),
@@ -574,7 +575,7 @@ impl SourceWitnessCollector {
             return Ok(Vec::new());
         }
         let seed = self.rate_block_seed(coordinate, procedure_json, raw_rate);
-        let limit = occurrence_count.min(SOURCE_WITNESS_LOCAL_CANDIDATE_TARGET as u64);
+        let limit = occurrence_count.min(SOURCE_WITNESS_OCCURRENCE_TARGET as u64);
         let mut permutation = HashMap::<u64, u64>::new();
         let mut elapsed_priority = 0.0f64;
         let mut candidates = Vec::new();
@@ -744,7 +745,8 @@ impl SourceWitnessCollector {
             "selection_method": SOURCE_WITNESS_SELECTION,
             "unqueryable_rate_policy": SOURCE_WITNESS_UNQUERYABLE_POLICY,
             "raw_source_sha256": self.raw_source_sha256_hex,
-            "total_target": SOURCE_WITNESS_TOTAL_TARGET,
+        "occurrence_target": SOURCE_WITNESS_OCCURRENCE_TARGET,
+        "total_target": SOURCE_WITNESS_TOTAL_TARGET,
             "provider_quota": SOURCE_WITNESS_PROVIDER_QUOTA,
             "rate_occurrence": rate_metrics,
             "provider_reference": self.provider_references.metrics(provider_records.len(), provider_bytes),
@@ -1021,26 +1023,11 @@ fn local_source_witness_targets(
     occurrence_population: u64,
     provider_population: u64,
 ) -> io::Result<(usize, usize, usize)> {
-    let total_population = occurrence_population
-        .checked_add(provider_population)
-        .ok_or_else(|| io::Error::other("source witness population overflow"))?;
-    let total_target = total_population.min(SOURCE_WITNESS_TOTAL_TARGET as u64);
-    let mut provider_target = provider_population
-        .min(SOURCE_WITNESS_PROVIDER_QUOTA as u64)
-        .min(total_target);
-    let occurrence_target = occurrence_population.min(total_target.saturating_sub(provider_target));
-    provider_target = provider_target.saturating_add(
-        provider_population.saturating_sub(provider_target).min(
-            total_target
-                .saturating_sub(provider_target)
-                .saturating_sub(occurrence_target),
-        ),
-    );
-    if occurrence_target.saturating_add(provider_target) != total_target {
-        return Err(io::Error::other(
-            "strict V3 source witness quota cannot be satisfied",
-        ));
-    }
+    let occurrence_target = occurrence_population.min(SOURCE_WITNESS_OCCURRENCE_TARGET as u64);
+    let provider_target = provider_population.min(SOURCE_WITNESS_PROVIDER_QUOTA as u64);
+    let total_target = occurrence_target
+        .checked_add(provider_target)
+        .ok_or_else(|| io::Error::other("source witness target overflow"))?;
     Ok((
         occurrence_target as usize,
         provider_target as usize,
@@ -1362,20 +1349,24 @@ mod tests {
     }
 
     #[test]
-    fn provider_sampler_keeps_enough_candidates_for_local_backfill() {
+    fn samplers_use_independent_release_targets() {
         let collector = SourceWitnessCollector::new(&"ab".repeat(32)).unwrap();
 
         assert_eq!(
+            collector.rate_occurrences.target,
+            SOURCE_WITNESS_OCCURRENCE_TARGET,
+        );
+        assert_eq!(
             collector.provider_references.target,
-            SOURCE_WITNESS_LOCAL_CANDIDATE_TARGET,
+            SOURCE_WITNESS_PROVIDER_QUOTA,
         );
     }
 
     #[test]
-    fn local_targets_preserve_quota_and_backfill_contract() {
+    fn local_targets_preserve_independent_cohort_contract() {
         assert_eq!(
-            local_source_witness_targets(10_000, 80).unwrap(),
-            (2_000, 48, 2_048),
+            local_source_witness_targets(20_000, 80).unwrap(),
+            (10_000, 80, 10_080),
         );
         assert_eq!(
             local_source_witness_targets(2_040, 8).unwrap(),
@@ -1387,7 +1378,7 @@ mod tests {
         );
         assert_eq!(
             local_source_witness_targets(10, 10_000).unwrap(),
-            (10, 2_038, 2_048),
+            (10, 1_000, 1_010),
         );
     }
 
