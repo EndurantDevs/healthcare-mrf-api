@@ -432,6 +432,30 @@ class Database:
             raw_connection = await connection.get_raw_connection()
             proxy = ConnectionProxy(self, connection, raw_connection)
             yield proxy
+
+    @asynccontextmanager
+    async def acquire_driver(self) -> AsyncIterator[Any]:
+        """Yield a raw driver connection without a SQLAlchemy-owned transaction."""
+
+        if self.engine is None:
+            await self.connect()
+        assert self.engine is not None
+        async with self.engine.connect() as connection:
+            raw_connection = await connection.get_raw_connection()
+            driver_connection = getattr(
+                raw_connection,
+                "driver_connection",
+                raw_connection,
+            )
+            try:
+                yield driver_connection
+            except BaseException:
+                invalidate_task = asyncio.create_task(connection.invalidate())
+                try:
+                    await asyncio.shield(invalidate_task)
+                except asyncio.CancelledError:
+                    await invalidate_task
+                raise
     def init_app(self, app) -> None:
         """Register database lifecycle and request-session hooks on an app."""
         if _ASYNC_IMPORT_ERROR is not None:
