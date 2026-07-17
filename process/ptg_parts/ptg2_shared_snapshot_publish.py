@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
@@ -89,6 +90,28 @@ class SharedSnapshotPublication:
     finalizer_summary: Mapping[str, Any]
     layout_reused_at_seal: bool
     stored_byte_count: int
+
+
+async def _run_independent_publication_lanes(
+    *,
+    finalizer_blocks: Callable[[], Awaitable[Any]],
+    provider_graph: Callable[[], Awaitable[Any]],
+    price: Callable[[], Awaitable[Any]],
+    source_witness: Callable[[], Awaitable[Any]],
+) -> tuple[Any, Any, Any, Any]:
+    """Run independent durable outputs concurrently and fail as one unit."""
+
+    async with asyncio.TaskGroup() as task_group:
+        finalizer_block_task = task_group.create_task(finalizer_blocks())
+        provider_graph_task = task_group.create_task(provider_graph())
+        price_task = task_group.create_task(price())
+        source_witness_task = task_group.create_task(source_witness())
+    return (
+        finalizer_block_task.result(),
+        provider_graph_task.result(),
+        price_task.result(),
+        source_witness_task.result(),
+    )
 
 
 def _row_mapping(row: Any) -> dict[str, Any]:
@@ -487,10 +510,10 @@ def _physical_serving_index(
         "price dictionary encoder",
     )
     assigned_encoder = _mapping(blocks.get("assigned_encoder"), "assigned encoder")
-    membership_summary = dict(
+    membership_summary_map = dict(
         price_publication.stream_summaries["price_set_atom_memberships_v3"]
     )
-    atom_summary = dict(price_publication.stream_summaries["price_atoms_v3"])
+    atom_summary_map = dict(price_publication.stream_summaries["price_atoms_v3"])
     serving_rate_count = _integer(
         _mapping(finalizer_summary.get("preservation"), "preservation").get(
             "encoded_records"
@@ -538,8 +561,8 @@ def _physical_serving_index(
         "serving_binary": {
             "format": "postgres_binary_v3",
             "price_dictionary": price_dictionary,
-            "price_set_atom_memberships_v3": membership_summary,
-            "price_atoms_v3": atom_summary,
+            "price_set_atom_memberships_v3": membership_summary_map,
+            "price_atoms_v3": atom_summary_map,
             "assigned_encoder": assigned_encoder,
         },
         "provider_graph": {
@@ -581,14 +604,14 @@ async def _publish_strict_shared_v3_layout_prepared(
 ) -> SharedSnapshotPublication:
     """Finalize, validate, publish, and atomically seal one physical layout."""
 
-    publication_timings: dict[str, float] = {
+    publication_timing_map: dict[str, float] = {
         "price_prepare_seconds": float(price_prepare_seconds),
     }
 
     def record_stage(stage_name: str, started_at: float) -> None:
         """Record elapsed wall time for a named publication stage."""
 
-        publication_timings[f"{stage_name}_seconds"] = time.monotonic() - started_at
+        publication_timing_map[f"{stage_name}_seconds"] = time.monotonic() - started_at
 
     configured_schema = str(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf").strip()
     if str(schema_name).strip() != configured_schema:
@@ -641,35 +664,6 @@ async def _publish_strict_shared_v3_layout_prepared(
             finalizer_blocks.get("price_dictionary"),
             "price dictionary blocks",
         )
-        block_stage = shared_block_stage_name(f"final-{reserved_snapshot_key}")
-        stage_started_at = time.monotonic()
-        await create_shared_block_stage(
-            schema_name=schema_name, stage_table=block_stage
-        )
-        try:
-            await copy_shared_block_binary_file(
-                _output_file(finalizer_summary, serving_block_summary),
-                schema_name=schema_name,
-                stage_table=block_stage,
-            )
-            await copy_shared_block_binary_file(
-                _output_file(finalizer_summary, price_block_summary),
-                schema_name=schema_name,
-                stage_table=block_stage,
-            )
-            finalizer_block_publication = await publish_shared_block_stage(
-                schema_name=schema_name,
-                stage_table=block_stage,
-                snapshot_key=int(reserved_snapshot_key),
-                build_token=build_token,
-            )
-            await touch_build()
-        finally:
-            await db.status(
-                f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(block_stage)};"
-            )
-        record_stage("serving_block_publish", stage_started_at)
-
         stage_started_at = time.monotonic()
         dictionary_publication = await publish_shared_finalizer_dictionaries(
             dict(finalizer_summary),
@@ -695,46 +689,113 @@ async def _publish_strict_shared_v3_layout_prepared(
             work_directory=Path(raw_work_directory),
         )
         record_stage("provider_graph_convert", stage_started_at)
-        try:
+
+        block_stage = shared_block_stage_name(f"final-{reserved_snapshot_key}")
+
+        async def publish_finalizer_blocks() -> Any:
+            """Publish finalizer serving and price blocks."""
+
             stage_started_at = time.monotonic()
-            graph_publication = await publish_shared_graph(
-                graph_conversion,
+            await create_shared_block_stage(
                 schema_name=schema_name,
-                snapshot_key=int(reserved_snapshot_key),
-                build_token=build_token,
+                stage_table=block_stage,
             )
-            record_stage("provider_graph_publish", stage_started_at)
-        finally:
-            graph_conversion.cleanup()
-        await touch_build()
+            try:
+                await copy_shared_block_binary_file(
+                    _output_file(finalizer_summary, serving_block_summary),
+                    schema_name=schema_name,
+                    stage_table=block_stage,
+                )
+                await copy_shared_block_binary_file(
+                    _output_file(finalizer_summary, price_block_summary),
+                    schema_name=schema_name,
+                    stage_table=block_stage,
+                )
+                return await publish_shared_block_stage(
+                    schema_name=schema_name,
+                    stage_table=block_stage,
+                    snapshot_key=int(reserved_snapshot_key),
+                    build_token=build_token,
+                )
+            finally:
+                await db.status(
+                    "DROP TABLE IF EXISTS "
+                    f"{_quote_ident(schema_name)}.{_quote_ident(block_stage)};"
+                )
+                record_stage("serving_block_publish", stage_started_at)
+
+        async def publish_provider_graph() -> Any:
+            """Publish provider graph blocks and relational owner metadata."""
+
+            stage_started_at = time.monotonic()
+            try:
+                return await publish_shared_graph(
+                    graph_conversion,
+                    schema_name=schema_name,
+                    snapshot_key=int(reserved_snapshot_key),
+                    build_token=build_token,
+                )
+            finally:
+                record_stage("provider_graph_publish", stage_started_at)
 
         dense_keys = _mapping(finalizer_summary.get("dense_keys"), "dense keys")
         price_dense = _mapping(dense_keys.get("price"), "dense price keys")
-        stage_started_at = time.monotonic()
-        price_publication = await publish_shared_price_artifacts(
-            schema_name=schema_name,
-            manifest_stage_table=manifest_stage_table,
-            snapshot_key=int(reserved_snapshot_key),
-            build_token=build_token,
-            expected_price_set_count=_integer(
-                price_dense.get("count"), "price key count"
-            ),
-            expected_price_key_order=str(price_dense.get("ordering") or ""),
-            prepared=prepared_price,
+
+        async def publish_price() -> Any:
+            """Publish dense price dictionaries and membership blocks."""
+
+            stage_started_at = time.monotonic()
+            try:
+                return await publish_shared_price_artifacts(
+                    schema_name=schema_name,
+                    manifest_stage_table=manifest_stage_table,
+                    snapshot_key=int(reserved_snapshot_key),
+                    build_token=build_token,
+                    expected_price_set_count=_integer(
+                        price_dense.get("count"), "price key count"
+                    ),
+                    expected_price_key_order=str(price_dense.get("ordering") or ""),
+                    prepared=prepared_price,
+                )
+            finally:
+                record_stage("price_publish", stage_started_at)
+
+        async def publish_source_witness() -> Any:
+            """Publish the bounded source-fidelity witness."""
+
+            stage_started_at = time.monotonic()
+            try:
+                return await publish_shared_source_witness(
+                    schema_name=schema_name,
+                    build_ownership=SharedLayoutBuildOwnership(
+                        snapshot_key=int(reserved_snapshot_key),
+                        build_token=build_token,
+                    ),
+                    entries=tuple(source_audit_witness_entries),
+                    expected_raw_source_sha256=tuple(expected_raw_source_sha256),
+                )
+            finally:
+                record_stage("source_witness_publish", stage_started_at)
+
+        independent_publish_started_at = time.monotonic()
+        try:
+            (
+                finalizer_block_publication,
+                graph_publication,
+                price_publication,
+                source_witness_publication,
+            ) = await _run_independent_publication_lanes(
+                finalizer_blocks=publish_finalizer_blocks,
+                provider_graph=publish_provider_graph,
+                price=publish_price,
+                source_witness=publish_source_witness,
+            )
+        finally:
+            graph_conversion.cleanup()
+        record_stage(
+            "independent_publish_wall",
+            independent_publish_started_at,
         )
-        record_stage("price_publish", stage_started_at)
-        await touch_build()
-        stage_started_at = time.monotonic()
-        source_witness_publication = await publish_shared_source_witness(
-            schema_name=schema_name,
-            build_ownership=SharedLayoutBuildOwnership(
-                snapshot_key=int(reserved_snapshot_key),
-                build_token=build_token,
-            ),
-            entries=tuple(source_audit_witness_entries),
-            expected_raw_source_sha256=tuple(expected_raw_source_sha256),
-        )
-        record_stage("source_witness_publish", stage_started_at)
         await touch_build()
         references = tuple(
             [
@@ -749,7 +810,7 @@ async def _publish_strict_shared_v3_layout_prepared(
             raise RuntimeError(
                 f"strict V3 physical layout is missing required blocks: {sorted(missing_kinds)}"
             )
-        core_support = {
+        core_support_map = {
             "contract_version": 1,
             "serving_multiplicity_semantics": (PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS),
             "finalizer_dictionaries": dictionary_publication.support_digest.hex(),
@@ -758,7 +819,7 @@ async def _publish_strict_shared_v3_layout_prepared(
             "source_witness": source_witness_publication.support_digest.hex(),
             "provider_identifier_quarantine": quarantine["sha256"],
         }
-        core_support_digest = shared_support_digest(core_support)
+        core_support_digest = shared_support_digest(core_support_map)
         price_membership_summary = _mapping(
             price_publication.stream_summaries.get("price_set_atom_memberships_v3"),
             "price membership stream summary",
@@ -787,7 +848,7 @@ async def _publish_strict_shared_v3_layout_prepared(
         await touch_build()
         support_digest = shared_support_digest(
             {
-                **core_support,
+                **core_support_map,
                 "audit_sample": dict(audit_publication.metadata),
                 "source_witness": dict(source_witness_publication.metadata),
             }
@@ -812,7 +873,7 @@ async def _publish_strict_shared_v3_layout_prepared(
         )
         provisional_serving_index["timings"] = {
             **dict(provisional_serving_index.get("timings") or {}),
-            **publication_timings,
+            **publication_timing_map,
         }
         stage_started_at = time.monotonic()
         async with db.transaction() as session:
@@ -836,13 +897,13 @@ async def _publish_strict_shared_v3_layout_prepared(
                 else dict(audit_publication.metadata)
             )
         record_stage("seal", stage_started_at)
-        publication_timings["shared_publish_total_seconds"] = (
+        publication_timing_map["shared_publish_total_seconds"] = (
             time.monotonic() - publication_started_at
         )
         serving_index = dict(provisional_serving_index)
         serving_index["timings"] = {
             **dict(serving_index.get("timings") or {}),
-            **publication_timings,
+            **publication_timing_map,
         }
         serving_index["shared_snapshot_key"] = int(sealed.snapshot_key)
         serving_index["audit_sample"] = sealed_audit_sample

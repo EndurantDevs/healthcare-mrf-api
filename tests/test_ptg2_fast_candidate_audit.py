@@ -536,10 +536,39 @@ async def test_fast_audit_executes_2000_api_challenges_with_48_provider_checks(
     assert report["checks"]["api_witnesses_matched"] == 2_000
     assert report["checks"]["provider_witnesses_validated"] == 48
     assert report["http"]["standard_api_actual_http_requests"] == 2_001
+    assert report["latency"]["request_p95_ceiling_ms"] == 250.0
+    assert report["latency"]["request_p95_within_ceiling"] is True
     assert report["random_api_requests"] == {
         "requested": 2_000,
         "executed": 2_000,
     }
+
+
+@pytest.mark.asyncio
+async def test_fast_audit_fails_unrounded_p95_above_audit_only_ceiling(monkeypatch):
+    async def preflight(_client, _semaphore, metrics, target):
+        metrics.request_count += 1
+        metrics.latencies_ms.append(1.0)
+        return dict(target.audit_sample)
+
+    async def challenge(_client, _semaphore, metrics, _target, _selected):
+        metrics.request_count += 1
+        metrics.latencies_ms.append(250.0004)
+
+    monkeypatch.setattr(audit, "_validate_audit_sample_preflight", preflight)
+    monkeypatch.setattr(audit, "_run_challenge", challenge)
+
+    report = await audit.run_fast_candidate_audit(
+        witness=_witness(20),
+        audit_target=_target(),
+        http=_http(),
+    )
+
+    assert report["latency"]["request_p95_ms"] == 250.0
+    assert report["latency"]["request_p95_within_ceiling"] is False
+    assert report["status"] == "fail"
+    assert report["release_gate_eligible"] is False
+    assert report["failures"]["counts"] == {"audit_request_p95_exceeded": 1}
 
 
 @pytest.mark.asyncio

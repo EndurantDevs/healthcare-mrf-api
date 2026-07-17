@@ -421,17 +421,19 @@ Negotiated or mixed publication proceeds in this order:
    including complete partition and shard vectors, aggregate rows and bytes,
    file hashes, deterministic dense source keys, physical source identity, and
    exact malformed-provider-identifier quarantine evidence.
-6. Finalize dense blocks, dictionaries, prices, and all provider-graph
-   directions.
-7. Build and persist the served-occurrence audit sample and exact source
+6. Build the exact cost-ranked price keys and finalize dense serving blocks
+   and dictionaries.
+7. Publish the independent serving-block, price, provider-graph, and source-
+   witness lanes concurrently under the same fenced build ownership.
+8. Build and persist the served-occurrence audit sample and exact source
    witnesses captured during the normal scanner pass.
-8. Validate every block mapping and support digest, then atomically seal the
+9. Validate every block mapping and support digest, then atomically seal the
    immutable layout.
-9. Bind the logical snapshot and scope as a `validated` candidate without
+10. Bind the logical snapshot and scope as a `validated` candidate without
    changing source, plan, or global serving pointers.
-10. Queue the bounded PostgreSQL-witness-to-API release audit.
-11. Persist a fresh passing attestation and atomically activate the candidate.
-12. Remove temporary files and stages.
+11. Queue the bounded PostgreSQL-witness-to-API release audit.
+12. Persist a fresh passing attestation and atomically activate the candidate.
+13. Remove temporary files and stages.
 
 For a mixed import, allowed evidence is parsed and persisted before negotiated
 layout publication. Its manifest index, metrics, source-file versions, and

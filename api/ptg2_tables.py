@@ -400,7 +400,7 @@ async def snapshot_serving_tables(
             candidate_plan_market_type=candidate_audit_access.plan_market_type,
         )
         query_sql = f"""
-            SELECT snapshot.manifest,
+            SELECT snapshot.manifest->'serving_index' AS candidate_serving_index,
                    layout.layout_manifest->'serving_index'->'audit_sample'
                        AS layout_audit_sample,
                    layout.layout_manifest->'serving_index'->>'coverage_scope_id'
@@ -530,17 +530,14 @@ async def snapshot_serving_tables(
         else snapshot_record._mapping
     )
     if candidate_audit_access is not None:
-        snapshot_manifest = row_fields.get("manifest")
-        if isinstance(snapshot_manifest, str):
+        serving_index = row_fields.get("candidate_serving_index")
+        if isinstance(serving_index, str):
             try:
-                snapshot_manifest = json.loads(snapshot_manifest)
+                serving_index = json.loads(serving_index)
             except json.JSONDecodeError as exc:
                 raise PTG2ManifestArtifactError(
-                    "PTG2 snapshot manifest is malformed"
+                    "PTG2 serving_index manifest is malformed"
                 ) from exc
-        if not isinstance(snapshot_manifest, dict):
-            raise PTG2ManifestArtifactError("PTG2 snapshot manifest is malformed")
-        serving_index = snapshot_manifest.get("serving_index")
     else:
         serving_index = row_fields.get("layout_serving_index")
     if isinstance(serving_index, str):
