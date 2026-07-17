@@ -666,6 +666,16 @@ candidate. Source-artifact leases are not part of activation because the audit
 reads only the sealed PostgreSQL witness. Abandoned candidates require
 explicit authenticated removal rather than an unsafe time-only guess.
 
+Two equivalent candidates may finish while both still name the same predecessor.
+If one activates before the other's audit starts, the redundant audit resolves
+as a successful reuse only when the current snapshot has the same immutable
+layout key, logical source and plan scope, ordered raw-container digest set,
+provider-identifier quarantine, source-witness identity, and served-audit-sample
+identity. The result names the already-active snapshot and its existing
+attestation, while retaining the redundant candidate identity for lifecycle
+accounting; it does not issue another 2,000 HTTP challenges. Any difference,
+missing attestation, or non-activated current snapshot fails closed.
+
 The bounded PostgreSQL witness audit is the sole automated release verifier.
 Activation never rereads or decompresses complete source files. The witness
 contains authenticated raw source fragments captured at the actual V3 emission

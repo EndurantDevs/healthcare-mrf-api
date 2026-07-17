@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -121,6 +122,30 @@ def _candidate_row(
         ),
         "audit_activated_at": "2026-07-13T12:00:00+00:00" if activated else None,
     }
+
+
+def _candidate_row_with_equivalent_current() -> dict[str, object]:
+    candidate_row = _candidate_row()
+    current_row = _candidate_row(activated=True)
+    candidate_row.update(
+        {
+            "current_snapshot_id": "active-snapshot",
+            "current_import_run_id": "ptg2:active-import",
+            "current_status": current_row["status"],
+            "current_previous_snapshot_id": current_row["previous_snapshot_id"],
+            "current_manifest": current_row["manifest"],
+            "current_snapshot_key": current_row["snapshot_key"],
+            "current_plan_id": current_row["plan_id"],
+            "current_plan_market_type": current_row["plan_market_type"],
+            "current_layout_state": current_row["layout_state"],
+            "current_layout_generation": current_row["layout_generation"],
+            "current_layout_manifest": current_row["layout_manifest"],
+            "current_audit_report_digest": current_row["audit_report_digest"],
+            "current_audit_report": current_row["audit_report"],
+            "current_audit_activated_at": current_row["audit_activated_at"],
+        }
+    )
+    return candidate_row
 
 
 def _passing_report(
@@ -281,6 +306,55 @@ async def test_candidate_scope_is_derived_and_corroboration_cannot_spoof(monkeyp
         await ptg_candidate_audit.load_candidate_audit_target(
             candidate_run_id="ptg2:derived-import",
             import_id="caller-spoofed-import",
+        )
+
+
+@pytest.mark.asyncio
+async def test_equivalent_current_snapshot_reuses_existing_attestation(monkeypatch):
+    candidate_row = _candidate_row_with_equivalent_current()
+    raw_sources = AsyncMock(side_effect=[(RAW_DIGEST,), (RAW_DIGEST,)])
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_rows",
+        AsyncMock(return_value=[candidate_row]),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        raw_sources,
+    )
+
+    target = await ptg_candidate_audit.load_candidate_audit_target(
+        candidate_run_id="ptg2:derived-import",
+    )
+
+    assert target.snapshot_id == "candidate-snapshot"
+    assert target.equivalent_current_snapshot_id == "active-snapshot"
+    assert target.equivalent_current_import_run_id == "ptg2:active-import"
+    assert target.equivalent_audit_report == _passing_report()
+    assert target.equivalent_audit_report_digest == "cd" * 32
+    assert raw_sources.await_args_list[0].args == ("candidate-snapshot",)
+    assert raw_sources.await_args_list[1].args == ("active-snapshot",)
+
+
+@pytest.mark.asyncio
+async def test_non_equivalent_current_snapshot_fails_closed(monkeypatch):
+    candidate_row = _candidate_row_with_equivalent_current()
+    candidate_row["current_snapshot_key"] = 18
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_rows",
+        AsyncMock(return_value=[candidate_row]),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        AsyncMock(side_effect=[(RAW_DIGEST,), (RAW_DIGEST,)]),
+    )
+
+    with pytest.raises(ValueError, match="non-equivalent snapshot"):
+        await ptg_candidate_audit.load_candidate_audit_target(
+            candidate_run_id="ptg2:derived-import",
         )
 
 
@@ -533,14 +607,65 @@ async def test_already_active_redelivery_returns_corroborated_success(monkeypatc
     audit_configuration.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_equivalent_current_redelivery_returns_reused_success(monkeypatch):
+    @asynccontextmanager
+    async def guard(_candidate_run_id):
+        yield
+
+    equivalent_target = replace(
+        _target(),
+        current_snapshot_id="active-snapshot",
+        equivalent_current_snapshot_id="active-snapshot",
+        equivalent_current_import_run_id="ptg2:active-import",
+        equivalent_audit_report=_passing_report(),
+        equivalent_audit_report_digest="cd" * 32,
+    )
+    audit_configuration = Mock(
+        side_effect=AssertionError("equivalent reuse must not call the API")
+    )
+    audit = AsyncMock()
+    monkeypatch.setattr(ptg_candidate_audit, "candidate_audit_guard", guard)
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_candidate_audit_target",
+        AsyncMock(return_value=equivalent_target),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_audit_configuration",
+        audit_configuration,
+    )
+    monkeypatch.setattr(ptg_candidate_audit, "_audit_and_activate", audit)
+    monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
+
+    response = await ptg_candidate_audit.main(
+        candidate_run_id="ptg2:derived-import",
+        snapshot_id="candidate-snapshot",
+        import_id="derived-import",
+        run_id="control-run",
+    )
+
+    assert response["activation_status"] == "activated"
+    assert response["snapshot_id"] == "active-snapshot"
+    assert response["candidate_snapshot_id"] == "candidate-snapshot"
+    assert response["candidate_run_id"] == "ptg2:derived-import"
+    assert response["activated_import_run_id"] == "ptg2:active-import"
+    assert response["activation_mode"] == "equivalent_current_layout"
+    assert response["equivalent_reuse"] is True
+    assert response["idempotent"] is True
+    audit.assert_not_awaited()
+    audit_configuration.assert_not_called()
+
+
 def test_scheduler_result_is_redacted():
-    result = ptg_candidate_audit._success_result(
+    scheduler_result_map = ptg_candidate_audit._success_result(
         _target(),
         report=_passing_report(),
         report_digest="ef" * 32,
         idempotent=False,
     )
-    encoded = json.dumps(result, sort_keys=True)
+    encoded = json.dumps(scheduler_result_map, sort_keys=True)
 
     assert "must-not-leak" not in encoded
     assert "derived-source" not in encoded
@@ -548,13 +673,17 @@ def test_scheduler_result_is_redacted():
     assert "source_path" not in encoded
     assert "Authorization" not in encoded
     assert "response" not in encoded
-    assert set(result) == {
+    assert set(scheduler_result_map) == {
         "arch_version",
         "snapshot_status",
         "activation_status",
         "snapshot_id",
+        "candidate_snapshot_id",
         "import_run_id",
         "candidate_run_id",
+        "activated_import_run_id",
+        "activation_mode",
+        "equivalent_reuse",
         "idempotent",
         "audit_report_digest",
         "audit_counts",
