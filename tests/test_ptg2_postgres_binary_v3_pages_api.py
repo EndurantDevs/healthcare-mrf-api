@@ -175,7 +175,7 @@ async def test_forward_page_materializes_without_full_code_lookup(monkeypatch):
     monkeypatch.setattr(ptg2_serving, "lookup_shared_code_page_from_db", AsyncMock(return_value=page_entries))
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_set_ids_for_keys",
+        "_provider_set_ids_for_keys",
         AsyncMock(return_value={3: PROVIDER_ID}),
     )
     monkeypatch.setattr(
@@ -227,7 +227,7 @@ async def test_forward_page_resolves_only_requested_window(monkeypatch):
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_set_ids_for_keys",
+        "_provider_set_ids_for_keys",
         provider_lookup,
     )
     monkeypatch.setattr(ptg2_serving, "lookup_price_ids_from_db", price_lookup)
@@ -291,7 +291,7 @@ def install_reverse_page_stubs(monkeypatch, *, metadata_rows):
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_set_keys_for_ids",
+        "_provider_set_keys_for_ids",
         AsyncMock(return_value={PROVIDER_ID: 3}),
     )
     monkeypatch.setattr(
@@ -301,7 +301,7 @@ def install_reverse_page_stubs(monkeypatch, *, metadata_rows):
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_code_rows_for_provider_reverse",
+        "_manifest_reverse_code_rows",
         AsyncMock(return_value=metadata_rows),
     )
     monkeypatch.setattr(
@@ -418,7 +418,7 @@ async def test_reverse_page_falls_back_when_snapshot_contains_mixed_plan_order(m
     provider_lookup = AsyncMock(side_effect=AssertionError("mixed-plan page must not be read"))
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_set_keys_for_ids",
+        "_provider_set_keys_for_ids",
         provider_lookup,
     )
 
@@ -442,7 +442,7 @@ async def test_unsupported_snapshot_contract_fails_before_page_queries(monkeypat
     monkeypatch.setattr(ptg2_serving, "_has_single_plan_page_order", plan_order)
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_set_keys_for_ids",
+        "_provider_set_keys_for_ids",
         provider_lookup,
     )
 
@@ -487,7 +487,7 @@ async def test_reverse_page_caps_provider_set_fanout(monkeypatch):
     monkeypatch.setattr(ptg2_serving, "_has_single_plan_page_order", plan_order)
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_set_keys_for_ids",
+        "_provider_set_keys_for_ids",
         provider_lookup,
     )
     oversized_query = replace(

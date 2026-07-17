@@ -107,10 +107,10 @@ class FilteredProviderExpansionHarness:
     def install(self, monkeypatch):
         patch_values_by_name = {
             "_merge_manifest_code_variant_rows": self.merge_rates,
-            "_ptg2_manifest_provider_npis_for_provider_sets": self.provider_npis,
-            "_ptg2_manifest_filter_npis_by_provider_taxonomy": self.filter_npis,
+            "_provider_npis_for_sets": self.provider_npis,
+            "_filter_npis_by_taxonomy": self.filter_npis,
             "_provider_set_ids_for_selected_npis": self.reverse_sets,
-            "_ptg2_manifest_provider_set_keys_for_ids": self.provider_set_keys,
+            "_provider_set_keys_for_ids": self.provider_set_keys,
             "_selected_provider_rows_by_set": self.provider_rows,
         }
         for function_name, replacement in patch_values_by_name.items():
@@ -508,7 +508,7 @@ async def test_strict_cost_provider_selection_grows_until_page_is_contained(
     monkeypatch.setattr(ptg2_serving, "_merge_manifest_code_variant_rows", fake_merge)
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_npis_for_provider_sets",
+        "_provider_npis_for_sets",
         fake_npis,
     )
     monkeypatch.setattr(
@@ -518,7 +518,7 @@ async def test_strict_cost_provider_selection_grows_until_page_is_contained(
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_set_keys_for_ids",
+        "_provider_set_keys_for_ids",
         fake_set_keys,
     )
     monkeypatch.setattr(
@@ -609,9 +609,9 @@ async def test_taxonomy_enrichment_is_optional_when_reference_tables_are_absent(
     async def is_relation_available(_session, _table_name):
         return False
 
-    monkeypatch.setattr(ptg2_serving, "_relation_available", is_relation_available)
+    monkeypatch.setattr(ptg2_serving, "_is_relation_available", is_relation_available)
 
-    assert await ptg2_serving._ptg2_manifest_taxonomy_rows_for_npis(
+    assert await ptg2_serving._taxonomy_rows_for_npis(
         session,
         [1234567890],
     ) == {}
@@ -638,7 +638,7 @@ def test_strict_shared_v3_guard_rejects_legacy_serving_contracts():
 async def test_strict_shared_v3_search_scopes_code_lookup_to_shared_snapshot():
     session = FakeSession([FakeResult(result_rows=[])])
 
-    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    response = await ptg2_serving._search_manifest_serving_table(
         session,
         "ptg2:209901:synthetic",
         {"plan_id": "SYNTHETIC-PLAN", "code": "70551", "code_system": "CPT"},
@@ -661,7 +661,7 @@ async def test_strict_shared_v3_search_scopes_code_lookup_to_shared_snapshot():
 async def test_strict_shared_v3_search_matches_persisted_code_system_aliases():
     session = FakeSession([FakeResult(result_rows=[])])
 
-    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    response = await ptg2_serving._search_manifest_serving_table(
         session,
         "ptg2:209901:synthetic",
         {
@@ -704,7 +704,7 @@ async def test_strict_shared_v3_reverse_lookup_matches_revenue_code_forms():
         ]
     )
 
-    code_rows = await ptg2_serving._ptg2_manifest_code_rows_for_provider_reverse(
+    code_rows = await ptg2_serving._manifest_reverse_code_rows(
         session,
         _strict_v3_tables(),
         requested_plan="SYNTHETIC-PLAN",
@@ -899,7 +899,7 @@ def test_manifest_code_filter_uses_resolved_external_context():
 async def test_taxonomy_filter_uses_primary_specialty_codes():
     session = FakeSession([FakeResult(result_rows=[{"npi": 1234567890}])])
 
-    filtered = await ptg2_serving._ptg2_manifest_filter_npis_by_provider_taxonomy(
+    filtered = await ptg2_serving._filter_npis_by_taxonomy(
         session,
         {"specialty": "Family Medicine"},
         [1234567890, 1234567891],
@@ -919,7 +919,7 @@ async def test_taxonomy_filter_uses_primary_specialty_codes():
 async def test_provider_filter_applies_provider_sex_before_limit():
     session = FakeSession([FakeResult(result_rows=[{"npi": 1234567890}])])
 
-    filtered = await ptg2_serving._ptg2_manifest_filter_npis_by_provider_taxonomy(
+    filtered = await ptg2_serving._filter_npis_by_taxonomy(
         session,
         {"provider_sex_code": "F"},
         [1234567890, 1234567891],
@@ -939,7 +939,7 @@ async def test_provider_filter_applies_provider_sex_before_limit():
 async def test_inferred_taxonomy_filter_requires_individual_npi():
     session = FakeSession([FakeResult(result_rows=[{"npi": 1234567890}])])
 
-    filtered = await ptg2_serving._ptg2_manifest_filter_npis_by_provider_taxonomy(
+    filtered = await ptg2_serving._filter_npis_by_taxonomy(
         session,
         {"code": "29888", "code_system": "CPT"},
         [1234567890, 1234567891],
@@ -2034,7 +2034,7 @@ async def test_reverse_price_filter_scans_past_old_candidate_guess(monkeypatch):
 
     monkeypatch.setattr(ptg2_serving, "_version_three_reverse_scope", fake_reverse_scope)
     monkeypatch.setattr(ptg2_serving, "_version_three_candidate_batch", fake_candidate_batch)
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", fake_prices)
+    monkeypatch.setattr(ptg2_serving, "_prices_for_price_sets", fake_prices)
 
     selection = await ptg2_serving._version_three_filtered_reverse_selection(
         object(),
@@ -2142,7 +2142,7 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
 
     monkeypatch.setattr(ptg2_serving, "_merge_manifest_code_variant_rows", fake_merge)
     monkeypatch.setattr(ptg2_serving, "_hydrate_provider_set_network_names", fake_noop)
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", fake_prices)
+    monkeypatch.setattr(ptg2_serving, "_prices_for_price_sets", fake_prices)
     monkeypatch.setattr(
         ptg2_serving,
         "_ptg2_manifest_location_provider_matches",
@@ -2150,7 +2150,7 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_procedure_details_for_rows",
+        "_procedure_details_for_rows",
         fake_details,
     )
     session = FakeSession(
@@ -2171,7 +2171,7 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
         ]
     )
 
-    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    response = await ptg2_serving._search_manifest_serving_table(
         session,
         "ptg2:209901:synthetic",
         {
@@ -2214,7 +2214,7 @@ async def test_geo_cost_order_requires_exhaustive_location_selection(monkeypatch
         fake_location,
     )
 
-    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    response = await ptg2_serving._search_manifest_serving_table(
         object(),
         "ptg2:209901:synthetic",
         {
@@ -2281,21 +2281,21 @@ async def test_provider_reverse_response_uses_page_sentinel_and_honest_total(mon
 
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_sets_for_npi",
+        "_provider_sets_for_npi",
         fake_provider_sets,
     )
     monkeypatch.setattr(ptg2_serving, "_resolve_ptg2_code_search_context", fake_code_context)
     monkeypatch.setattr(ptg2_serving, "_version_three_reverse_selection", fake_reverse_selection)
     monkeypatch.setattr(ptg2_serving, "_hydrate_provider_set_network_names", fake_noop)
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", fake_prices)
+    monkeypatch.setattr(ptg2_serving, "_prices_for_price_sets", fake_prices)
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_procedure_details_for_rows",
+        "_procedure_details_for_rows",
         fake_details,
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_enriched_provider_rows_for_npis",
+        "_enriched_provider_rows_for_npis",
         fake_provider_context,
     )
     monkeypatch.setattr(
@@ -2350,7 +2350,7 @@ async def test_multi_network_forward_reads_use_independent_concurrent_sessions(m
 
     monkeypatch.setattr(ptg2_serving.sa_db, "session", session_factory.session)
     monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot_tables)
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_snapshot_has_plan_code", has_fake_plan_code)
+    monkeypatch.setattr(ptg2_serving, "_has_snapshot_plan_code", has_fake_plan_code)
     monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_search)
 
     merged_response = await ptg2_serving._search_multi_ptg2_snapshots(
@@ -2387,7 +2387,7 @@ async def test_multi_network_forward_failure_never_returns_partial_union(monkeyp
 
     monkeypatch.setattr(ptg2_serving.sa_db, "session", session_factory.session)
     monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot_tables)
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_snapshot_has_plan_code", has_fake_plan_code)
+    monkeypatch.setattr(ptg2_serving, "_has_snapshot_plan_code", has_fake_plan_code)
     monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_search)
 
     with pytest.raises(RuntimeError, match="network read failed"):

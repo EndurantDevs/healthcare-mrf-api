@@ -220,7 +220,7 @@ async def test_v3_forward_uses_existing_forward_rows_and_keeps_price_key(monkeyp
         return {3: "00000000000000000000000000000003"}
 
     monkeypatch.setattr(ptg2_serving, "lookup_serving_binary_by_code_from_db", forward_rows)
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_set_ids_for_keys", provider_sets)
+    monkeypatch.setattr(ptg2_serving, "_provider_set_ids_for_keys", provider_sets)
 
     serving_rows = await ptg2_serving._shared_rows_for_code(
         object(),
@@ -279,7 +279,7 @@ async def test_v3_forward_raises_when_provider_dictionary_key_is_missing(monkeyp
         return {}
 
     monkeypatch.setattr(ptg2_serving, "lookup_serving_binary_by_code_from_db", forward_rows)
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_set_ids_for_keys", missing_provider_set)
+    monkeypatch.setattr(ptg2_serving, "_provider_set_ids_for_keys", missing_provider_set)
 
     with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="provider-set dictionary"):
         await ptg2_serving._shared_rows_for_code(
@@ -337,9 +337,9 @@ async def _stub_reverse_forward_entries(
 
 
 def _configure_version_three_reverse(monkeypatch):
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_set_keys_for_ids", _stub_reverse_provider_keys)
+    monkeypatch.setattr(ptg2_serving, "_provider_set_keys_for_ids", _stub_reverse_provider_keys)
     monkeypatch.setattr(ptg2_serving, "lookup_shared_provider_code_keys_from_db", _stub_reverse_provider_codes)
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_code_rows_for_provider_reverse", _stub_reverse_code_metadata)
+    monkeypatch.setattr(ptg2_serving, "_manifest_reverse_code_rows", _stub_reverse_code_metadata)
     monkeypatch.setattr(ptg2_serving, "lookup_binary_code_batch_from_db", _stub_reverse_forward_entries)
     monkeypatch.setattr(
         ptg2_serving,
@@ -386,7 +386,7 @@ async def test_v3_reverse_batches_forward_rows_and_preserves_duplicate_paginatio
 async def test_v3_reverse_raises_when_provider_code_membership_is_missing(monkeypatch):
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_set_keys_for_ids",
+        "_provider_set_keys_for_ids",
         _stub_reverse_provider_keys,
     )
 
@@ -499,9 +499,9 @@ class VersionThreeBatchHarness:
         return expected_calls
 
     def install(self, monkeypatch):
-        monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_set_keys_for_ids", self.provider_keys)
+        monkeypatch.setattr(ptg2_serving, "_provider_set_keys_for_ids", self.provider_keys)
         monkeypatch.setattr(ptg2_serving, "lookup_shared_provider_code_keys_from_db", self.provider_codes)
-        monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_code_rows_for_provider_reverse", self.code_metadata)
+        monkeypatch.setattr(ptg2_serving, "_manifest_reverse_code_rows", self.code_metadata)
         monkeypatch.setattr(ptg2_serving, "lookup_binary_code_batch_from_db", self.forward_entries)
         monkeypatch.setattr(
             ptg2_serving,

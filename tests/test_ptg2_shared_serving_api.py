@@ -473,7 +473,7 @@ async def test_shared_code_and_provider_support_queries_are_snapshot_scoped():
             }
         ]
     )
-    provider_ids = await ptg2_serving._ptg2_manifest_provider_set_ids_for_keys(
+    provider_ids = await ptg2_serving._provider_set_ids_for_keys(
         provider_session,
         _strict_tables(),
         (3,),
@@ -491,7 +491,7 @@ async def test_shared_code_and_provider_support_queries_are_snapshot_scoped():
             }
         ]
     )
-    code_rows = await ptg2_serving._ptg2_manifest_code_rows_for_provider_reverse(
+    code_rows = await ptg2_serving._manifest_reverse_code_rows(
         code_session,
         _strict_tables(),
         requested_plan="plan",
@@ -554,7 +554,7 @@ async def test_forward_search_scopes_shared_layout_rows_to_each_logical_plan(
                 }
             ]
         )
-        response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        response = await ptg2_serving._search_manifest_serving_table(
             session,
             logical_snapshot_id,
             {
@@ -654,7 +654,7 @@ def _stub_exact_npi_graph(monkeypatch, provider_set_id):
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_rows_for_provider_sets",
+        "_provider_rows_for_sets",
         expand_provider_members,
     )
     monkeypatch.setattr(
@@ -701,12 +701,12 @@ def _stub_exact_npi_price_rows(monkeypatch, provider_set_id, price_set_id):
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_prices_for_price_sets",
+        "_prices_for_price_sets",
         AsyncMock(return_value={price_set_id: [{"negotiated_rate": "125.00"}]}),
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_procedure_details_for_rows",
+        "_procedure_details_for_rows",
         AsyncMock(return_value={}),
     )
     return merge_code_rows
@@ -737,7 +737,7 @@ async def test_explicit_npi_search_intersects_provider_sets_before_reading_rows(
     )
     session = _single_code_metadata_session()
 
-    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    response = await ptg2_serving._search_manifest_serving_table(
         session,
         "logical-plan-a",
         {
@@ -778,7 +778,7 @@ async def test_exact_npi_rate_lookup_skips_generic_provider_traversal(
         provider_set_id,
     )
 
-    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    response = await ptg2_serving._search_manifest_serving_table(
         _single_code_metadata_session(),
         "logical-plan-a",
         {
@@ -832,7 +832,7 @@ async def test_exact_npi_with_geo_filter_keeps_location_validation(
         location_matches,
     )
 
-    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    response = await ptg2_serving._search_manifest_serving_table(
         _Session([]),
         "logical-plan-a",
         {
@@ -870,7 +870,7 @@ async def test_explicit_npi_search_does_not_expand_other_provider_set_members(
     )
     session = _single_code_metadata_session()
 
-    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    response = await ptg2_serving._search_manifest_serving_table(
         session,
         "logical-plan-a",
         {
@@ -925,7 +925,7 @@ def _stub_candidate_audit_npi_without_address(
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_rows_for_provider_sets",
+        "_provider_rows_for_sets",
         broad_rows,
     )
     enrichment = AsyncMock(
@@ -935,7 +935,7 @@ def _stub_candidate_audit_npi_without_address(
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_enriched_provider_rows_for_npis",
+        "_enriched_provider_rows_for_npis",
         enrichment,
     )
     monkeypatch.setattr(
@@ -996,7 +996,7 @@ async def test_candidate_audit_exact_npi_does_not_require_an_address(
     )
     session = _single_code_metadata_session()
 
-    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    response = await ptg2_serving._search_manifest_serving_table(
         session,
         "logical-plan-a",
         _candidate_audit_query_args(),
@@ -1055,12 +1055,12 @@ async def test_default_forward_response_skips_exact_provenance_query(monkeypatch
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_prices_for_price_sets",
+        "_prices_for_price_sets",
         AsyncMock(return_value={price_set_id: []}),
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_procedure_details_for_rows",
+        "_procedure_details_for_rows",
         AsyncMock(return_value={}),
     )
     session = _Session(
@@ -1077,7 +1077,7 @@ async def test_default_forward_response_skips_exact_provenance_query(monkeypatch
         ]
     )
 
-    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    response = await ptg2_serving._search_manifest_serving_table(
         session,
         "logical-plan-a",
         {
@@ -1149,12 +1149,12 @@ async def test_source_enabled_forward_response_separates_logical_and_artifact_ke
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_prices_for_price_sets",
+        "_prices_for_price_sets",
         AsyncMock(return_value={price_set_id: []}),
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_procedure_details_for_rows",
+        "_procedure_details_for_rows",
         AsyncMock(return_value={}),
     )
     session = _Session(
@@ -1179,7 +1179,7 @@ async def test_source_enabled_forward_response_separates_logical_and_artifact_ke
         "include_sources": True,
     }
 
-    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    response = await ptg2_serving._search_manifest_serving_table(
         session,
         "logical-plan-a",
         query_by_name,
@@ -1251,12 +1251,12 @@ async def test_multi_file_forward_rows_keep_per_artifact_source_provenance(
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_prices_for_price_sets",
+        "_prices_for_price_sets",
         AsyncMock(return_value={price_set_id: [] for price_set_id in price_set_ids}),
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_procedure_details_for_rows",
+        "_procedure_details_for_rows",
         AsyncMock(return_value={}),
     )
     session = _Session(
@@ -1273,7 +1273,7 @@ async def test_multi_file_forward_rows_keep_per_artifact_source_provenance(
         ]
     )
 
-    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    response = await ptg2_serving._search_manifest_serving_table(
         session,
         "logical-plan-a",
         {
@@ -1531,7 +1531,7 @@ async def test_plan_code_proof_never_bypasses_strict_validation_for_session_shap
     session = object()
     tables = _strict_tables()
 
-    has_route = await ptg2_serving._ptg2_manifest_snapshot_has_plan_code(
+    has_route = await ptg2_serving._has_snapshot_plan_code(
         session,
         "snapshot-id",
         {"plan_id": "plan", "code_system": "CPT", "code": "99213"},
@@ -1557,7 +1557,7 @@ async def test_route_proof_joins_logical_scope_and_fails_closed_on_no_row():
             return _ScalarResult()
 
     session = _ScalarSession()
-    has_route = await ptg2_serving._ptg2_manifest_snapshot_has_plan_code(
+    has_route = await ptg2_serving._has_snapshot_plan_code(
         session,
         "logical-plan-a",
         {
@@ -1605,7 +1605,7 @@ async def test_route_proof_does_not_swallow_schema_errors():
 
     session = _SchemaErrorSession()
     with pytest.raises(RuntimeError, match="undefined column"):
-        await ptg2_serving._ptg2_manifest_snapshot_has_plan_code(
+        await ptg2_serving._has_snapshot_plan_code(
             session,
             "logical-plan-a",
             {"plan_id": "plan-a", "code_system": "CPT", "code": "99213"},
@@ -1645,7 +1645,7 @@ async def test_shared_page_call_site_passes_snapshot_key(monkeypatch):
 async def test_shared_dispatch_has_no_filesystem_manifest_loader(monkeypatch):
     db_search = AsyncMock(return_value={"items": []})
     monkeypatch.setattr(
-        ptg2_serving, "_search_ptg2_manifest_db_serving_table", db_search
+        ptg2_serving, "_search_manifest_serving_table", db_search
     )
     assert not hasattr(ptg2_serving, "search_ptg2_manifest_serving_snapshot")
     assert not hasattr(ptg2_serving, "_resolve_ptg2_manifest_sidecar_path")
@@ -1676,7 +1676,7 @@ async def test_shared_dispatch_has_no_filesystem_manifest_loader(monkeypatch):
 async def test_exact_source_mode_uses_the_strict_shared_dispatch(monkeypatch):
     db_search = AsyncMock(return_value={"items": []})
     monkeypatch.setattr(
-        ptg2_serving, "_search_ptg2_manifest_db_serving_table", db_search
+        ptg2_serving, "_search_manifest_serving_table", db_search
     )
     session = object()
     pagination = object()
@@ -1751,12 +1751,12 @@ async def test_all_four_serving_graph_directions_use_dense_keys(monkeypatch):
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_set_keys_for_ids",
+        "_provider_set_keys_for_ids",
         AsyncMock(return_value={provider_set_id: 7}),
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_provider_set_ids_for_keys",
+        "_provider_set_ids_for_keys",
         AsyncMock(return_value={7: provider_set_id}),
     )
     monkeypatch.setattr(
