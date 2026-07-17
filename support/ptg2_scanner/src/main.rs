@@ -22,8 +22,8 @@ use ptg2_scanner::dedupe::{
     dedupe_summary_payload, emit_dedupe_summary, ProviderIdentifierQuarantine, SharedDedupe,
 };
 use ptg2_scanner::hashing::{
-    checksum_i64_list, finish_hash_hex, hash_i64_list, hash_string_list, hash_text, make_checksum,
-    semantic_hash, update_hash_optional_str, update_hash_string_list, xxh3_63,
+    checksum_i64_list, hash_i64_list, hash_string_list, hash_text, make_checksum, semantic_hash,
+    xxh3_63,
 };
 use ptg2_scanner::input::{
     is_gzip, open_full_scan_json_reader, open_full_scan_reader,
@@ -56,12 +56,12 @@ use ptg2_scanner::v3_runs::{
     external_sort_provider_identities, merge_sorted_provider_identities, parse_coverage_scope_id,
     partition_for_record, read_code_dictionary_exact, source_key_bits, source_key_bytes,
     write_audit_candidate_file, AuditCandidateSelector, MultiFileSortStats, NaturalLeanCode,
-    NaturalLeanCodeFields, ServingRunPartitionWriter, ServingRunRecord, TaggedServingRunCodec,
-    AUDIT_CANDIDATE_FORMAT, AUDIT_CANDIDATE_FORMAT_VERSION, AUDIT_CANDIDATE_MAX_RECORDS,
-    AUDIT_CANDIDATE_RECORD_BYTES, AUDIT_CANDIDATE_SELECTION, CODE_DICTIONARY_FORMAT,
-    CODE_DICTIONARY_FORMAT_VERSION, COVERAGE_SCOPE_ID_BYTES, PROVIDER_CODE_PAIR_RECORD_BYTES,
-    PROVIDER_IDENTITY_RECORD_BYTES, SERVING_RUN_FORMAT, SERVING_RUN_FORMAT_VERSION,
-    SERVING_RUN_RECORD_BYTES,
+    NaturalLeanCodeFields, PreparedNaturalLeanCode, ServingRunPartitionWriter, ServingRunRecord,
+    TaggedServingRunCodec, AUDIT_CANDIDATE_FORMAT, AUDIT_CANDIDATE_FORMAT_VERSION,
+    AUDIT_CANDIDATE_MAX_RECORDS, AUDIT_CANDIDATE_RECORD_BYTES, AUDIT_CANDIDATE_SELECTION,
+    CODE_DICTIONARY_FORMAT, CODE_DICTIONARY_FORMAT_VERSION, COVERAGE_SCOPE_ID_BYTES,
+    PROVIDER_CODE_PAIR_RECORD_BYTES, PROVIDER_IDENTITY_RECORD_BYTES, SERVING_RUN_FORMAT,
+    SERVING_RUN_FORMAT_VERSION, SERVING_RUN_RECORD_BYTES,
 };
 #[cfg(test)]
 use ptg2_scanner::v3_runs::{natural_lean_code_identity, read_code_dictionary};
@@ -90,7 +90,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use struson::reader::{JsonReader, JsonStreamReader, ValueType};
 use struson::writer::{JsonStreamWriter, JsonWriter};
-use xxhash_rust::xxh3::Xxh3;
 
 const DEFAULT_PROVIDER_REF_CHUNK_ITEMS: usize = 1024;
 const DEFAULT_INDEXED_RANGE_PRODUCERS: usize = 4;
@@ -503,32 +502,27 @@ impl StringOrStrings {
 
 #[derive(Clone, Debug)]
 struct PriceAtomLite {
-    price_atom_hash: String,
+    global_id: GlobalId128,
     negotiated_type: Option<String>,
     negotiated_rate: String,
     expiration_date: Option<String>,
-    service_code_set_hash: String,
     service_code: Vec<String>,
     billing_class: Option<String>,
     setting: Option<String>,
-    billing_code_modifier_set_hash: String,
     billing_code_modifier: Vec<String>,
     additional_information: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 struct PriceSetLite {
-    price_set_hash: String,
+    global_id: GlobalId128,
     atoms: Vec<PriceAtomLite>,
-    price_atom_hashes: Vec<String>,
+    atom_ids: Vec<GlobalId128>,
 }
-
-type PriceCodeSetHashCache = HashMap<Vec<String>, String>;
 
 #[derive(Default)]
 struct ManifestGlobalIdCache {
     provider_sets: HashMap<String, (GlobalId128, String)>,
-    price_sets: HashMap<String, (GlobalId128, String)>,
 }
 
 impl ManifestGlobalIdCache {
@@ -573,14 +567,7 @@ impl ManifestGlobalIdCache {
     }
 
     fn price_set_id(&mut self, price_set: &PriceSetLite) -> GlobalId128 {
-        if let Some((global_id, _hex)) = self.price_sets.get(&price_set.price_set_hash) {
-            return *global_id;
-        }
-        let global_id = price_set_global_id(price_set);
-        let global_id_hex = global_id.to_hex();
-        self.price_sets
-            .insert(price_set.price_set_hash.clone(), (global_id, global_id_hex));
-        global_id
+        price_set.global_id
     }
 }
 
@@ -1422,97 +1409,55 @@ fn provider_entry_view_from_ref_keys<'a>(
     Ok(provider_set_from_ref_keys(provider_map, refs)?.map(ProviderEntryView::Owned))
 }
 
-fn price_atom_from_lite(
-    price: &PriceLite,
-    price_code_set_hash_cache: &mut PriceCodeSetHashCache,
-) -> PriceAtomLite {
-    let price_atom_hash = price_atom_hash(price);
-    let service_code_set_hash =
-        price_code_set_hash_cached(&price.service_code, price_code_set_hash_cache);
-    let billing_code_modifier_set_hash =
-        price_code_set_hash_cached(&price.billing_code_modifier, price_code_set_hash_cache);
+fn price_atom_from_lite(price: &PriceLite) -> PriceAtomLite {
+    let global_id = GlobalId128::from_price_atom_parts(
+        price.negotiated_type.as_deref(),
+        Some(&price.negotiated_rate),
+        price.expiration_date.as_deref(),
+        &price.service_code,
+        price.billing_class.as_deref(),
+        price.setting.as_deref(),
+        &price.billing_code_modifier,
+        price.additional_information.as_deref(),
+    );
     PriceAtomLite {
-        price_atom_hash,
+        global_id,
         negotiated_type: price.negotiated_type.clone(),
         negotiated_rate: price.negotiated_rate.clone(),
         expiration_date: price.expiration_date.clone(),
-        service_code_set_hash,
         service_code: price.service_code.clone(),
         billing_class: price.billing_class.clone(),
         setting: price.setting.clone(),
-        billing_code_modifier_set_hash,
         billing_code_modifier: price.billing_code_modifier.clone(),
         additional_information: price.additional_information.clone(),
     }
-}
-
-fn price_atom_hash(price: &PriceLite) -> String {
-    let mut hasher = Xxh3::new();
-    hasher.update(b"price_atom");
-    update_hash_optional_str(&mut hasher, price.negotiated_type.as_deref());
-    update_hash_optional_str(&mut hasher, Some(price.negotiated_rate.as_str()));
-    update_hash_optional_str(&mut hasher, price.expiration_date.as_deref());
-    update_hash_string_list(&mut hasher, &price.service_code);
-    update_hash_optional_str(&mut hasher, price.billing_class.as_deref());
-    update_hash_optional_str(&mut hasher, price.setting.as_deref());
-    update_hash_string_list(&mut hasher, &price.billing_code_modifier);
-    update_hash_optional_str(&mut hasher, price.additional_information.as_deref());
-    finish_hash_hex(hasher)
 }
 
 fn price_code_set_hash(codes: &[String]) -> String {
     hash_string_list("price_code_set", codes)
 }
 
-fn price_code_set_hash_cached(codes: &[String], cache: &mut PriceCodeSetHashCache) -> String {
-    if let Some(hash) = cache.get(codes) {
-        return hash.clone();
-    }
-    let hash = price_code_set_hash(codes);
-    cache.insert(codes.to_vec(), hash.clone());
-    hash
-}
-
-fn price_lite_set(
-    prices: &[PriceLite],
-    price_code_set_hash_cache: &mut PriceCodeSetHashCache,
-) -> Option<PriceSetLite> {
-    let mut atoms: Vec<PriceAtomLite> = Vec::new();
-    for price in prices {
-        atoms.push(price_atom_from_lite(price, price_code_set_hash_cache));
-    }
+fn price_lite_set(prices: &[PriceLite]) -> Option<PriceSetLite> {
+    let atoms = prices.iter().map(price_atom_from_lite).collect::<Vec<_>>();
     if atoms.is_empty() {
         return None;
     }
-    let mut atom_hashes: Vec<String> = atoms
-        .iter()
-        .map(|atom| atom.price_atom_hash.clone())
-        .collect();
-    atom_hashes.sort_unstable();
-    let price_set_hash = hash_string_list("price_set_multiset_v1", &atom_hashes);
+    let mut atom_ids = atoms.iter().map(|atom| atom.global_id).collect::<Vec<_>>();
+    atom_ids.sort_unstable();
+    let global_id = price_set_global_id_from_atom_ids(&atom_ids);
     Some(PriceSetLite {
-        price_set_hash,
+        global_id,
         atoms,
-        price_atom_hashes: atom_hashes,
+        atom_ids,
     })
 }
 
 fn price_atom_global_id(atom: &PriceAtomLite) -> GlobalId128 {
-    GlobalId128::from_price_atom_parts(
-        atom.negotiated_type.as_deref(),
-        Some(&atom.negotiated_rate),
-        atom.expiration_date.as_deref(),
-        &atom.service_code,
-        atom.billing_class.as_deref(),
-        atom.setting.as_deref(),
-        &atom.billing_code_modifier,
-        atom.additional_information.as_deref(),
-    )
+    atom.global_id
 }
 
 fn price_set_global_id(price_set: &PriceSetLite) -> GlobalId128 {
-    let atom_ids: Vec<GlobalId128> = price_set.atoms.iter().map(price_atom_global_id).collect();
-    price_set_global_id_from_atom_ids(&atom_ids)
+    price_set.global_id
 }
 
 fn provider_group_global_id_from_hash(provider_group_hash: i64) -> GlobalId128 {
@@ -1527,17 +1472,25 @@ fn npi_member_id(npi: i64) -> GlobalId128 {
 }
 
 struct V3ServingOutputRecord<'a> {
-    reported_code_system: Option<&'a str>,
-    reported_code: Option<&'a str>,
-    negotiation_arrangement: Option<&'a str>,
-    billing_code_type_version: Option<&'a str>,
-    procedure_name: Option<&'a str>,
-    procedure_description: Option<&'a str>,
+    code: PreparedNaturalLeanCode,
     provider_set_hash: &'a str,
     sorted_provider_group_hashes: &'a [i64],
     network_names: &'a [String],
     provider_count: i64,
     price_set: &'a PriceSetLite,
+}
+
+fn prepare_v3_serving_code_once(
+    sink: &mut V3ServingRunSink,
+    prepared: &mut Option<PreparedNaturalLeanCode>,
+    fields: V3ServingCodeFields<'_>,
+) -> io::Result<PreparedNaturalLeanCode> {
+    if let Some(code) = *prepared {
+        return Ok(code);
+    }
+    let code = sink.prepare_code(fields)?;
+    *prepared = Some(code);
+    Ok(code)
 }
 
 fn write_v3_serving_output(
@@ -1552,14 +1505,7 @@ fn write_v3_serving_output(
     );
     let price_set_id = cache.price_set_id(output.price_set);
     sink.write_record(
-        V3ServingCodeFields {
-            reported_code_system: output.reported_code_system,
-            reported_code: output.reported_code,
-            negotiation_arrangement: output.negotiation_arrangement,
-            billing_code_type_version: output.billing_code_type_version,
-            procedure_name: output.procedure_name,
-            procedure_description: output.procedure_description,
-        },
+        output.code,
         provider_set_id,
         output.provider_count,
         price_set_id,
@@ -2202,14 +2148,9 @@ impl ManifestSidecarCollector {
 
     fn record_price_set(&mut self, price_set: &PriceSetLite) -> io::Result<()> {
         let price_set_global_id = price_set_global_id(price_set);
-        let price_atom_ids = price_set
-            .atoms
-            .iter()
-            .map(price_atom_global_id)
-            .collect::<Vec<_>>();
         if let Some(spools) = self.spools.as_mut() {
             if let Some(spool) = spools.price_forward.as_mut() {
-                for price_atom_id in price_atom_ids {
+                for &price_atom_id in &price_set.atom_ids {
                     spool.push(price_set_global_id, price_atom_id)?;
                 }
             }
@@ -2217,7 +2158,7 @@ impl ManifestSidecarCollector {
             self.price_forward
                 .entry(price_set_global_id)
                 .or_default()
-                .extend(price_atom_ids);
+                .extend(price_set.atom_ids.iter().copied());
         }
         Ok(())
     }
@@ -2903,9 +2844,25 @@ impl V3ServingRunSink {
         })
     }
 
-    fn write_record(
+    fn prepare_code(
         &mut self,
         code: V3ServingCodeFields<'_>,
+    ) -> io::Result<PreparedNaturalLeanCode> {
+        self.writer
+            .register_natural_lean_code(NaturalLeanCodeFields {
+                coverage_scope_id: &self.coverage_scope_id,
+                reported_code_system: code.reported_code_system,
+                reported_code: code.reported_code,
+                negotiation_arrangement: code.negotiation_arrangement,
+                billing_code_type_version: code.billing_code_type_version,
+                name: code.procedure_name,
+                description: code.procedure_description,
+            })
+    }
+
+    fn write_record(
+        &mut self,
+        code: PreparedNaturalLeanCode,
         provider_set_id: GlobalId128,
         provider_count: i64,
         price_set_id: GlobalId128,
@@ -2916,23 +2873,14 @@ impl V3ServingRunSink {
                 format!("provider_count is outside the v3 u32 range: {provider_count}"),
             )
         })?;
-        let code_fields = NaturalLeanCodeFields {
-            coverage_scope_id: &self.coverage_scope_id,
-            reported_code_system: code.reported_code_system,
-            reported_code: code.reported_code,
-            negotiation_arrangement: code.negotiation_arrangement,
-            billing_code_type_version: code.billing_code_type_version,
-            name: code.procedure_name,
-            description: code.procedure_description,
-        };
         let record = ServingRunRecord {
-            code_id: code_fields.identity(),
+            code_id: code.code_id(),
             provider_set_id: provider_set_id.0,
             price_set_id: price_set_id.0,
             provider_count,
         };
         self.writer
-            .write_natural_lean_record(&record, code_fields)?;
+            .write_prepared_natural_lean_record(&record, code)?;
         Ok(())
     }
 
@@ -3392,15 +3340,18 @@ impl DictionaryCopySinks {
         let Some(sink) = self.price_atom.as_mut() else {
             return Ok(false);
         };
+        let price_atom_id = atom.global_id.to_hex();
+        let service_code_set_hash = price_code_set_hash(&atom.service_code);
+        let billing_code_modifier_set_hash = price_code_set_hash(&atom.billing_code_modifier);
         let fields = [
-            pg_text_copy_field(Some(&atom.price_atom_hash)),
+            pg_text_copy_field(Some(&price_atom_id)),
             pg_text_copy_field(atom.negotiated_type.as_deref()),
             pg_text_copy_field(Some(&atom.negotiated_rate)),
             pg_text_copy_field(atom.expiration_date.as_deref()),
-            pg_text_copy_field(Some(&atom.service_code_set_hash)),
+            pg_text_copy_field(Some(&service_code_set_hash)),
             pg_text_copy_field(atom.billing_class.as_deref()),
             pg_text_copy_field(atom.setting.as_deref()),
-            pg_text_copy_field(Some(&atom.billing_code_modifier_set_hash)),
+            pg_text_copy_field(Some(&billing_code_modifier_set_hash)),
             pg_text_copy_field(atom.additional_information.as_deref()),
         ];
         let writer = sink.writer.as_mut().ok_or_else(|| {
@@ -3490,14 +3441,16 @@ impl DictionaryCopySinks {
         atom: &PriceAtomLite,
         emitted_price_code_sets: &mut HashSet<String>,
     ) -> io::Result<()> {
-        if emitted_price_code_sets.insert(atom.service_code_set_hash.clone()) {
-            self.write_price_code_set(&atom.service_code_set_hash, &atom.service_code)?;
+        if self.price_code_set.is_none() {
+            return Ok(());
         }
-        if emitted_price_code_sets.insert(atom.billing_code_modifier_set_hash.clone()) {
-            self.write_price_code_set(
-                &atom.billing_code_modifier_set_hash,
-                &atom.billing_code_modifier,
-            )?;
+        let service_code_set_hash = price_code_set_hash(&atom.service_code);
+        if emitted_price_code_sets.insert(service_code_set_hash.clone()) {
+            self.write_price_code_set(&service_code_set_hash, &atom.service_code)?;
+        }
+        let modifier_set_hash = price_code_set_hash(&atom.billing_code_modifier);
+        if emitted_price_code_sets.insert(modifier_set_hash.clone()) {
+            self.write_price_code_set(&modifier_set_hash, &atom.billing_code_modifier)?;
         }
         Ok(())
     }
@@ -3507,14 +3460,16 @@ impl DictionaryCopySinks {
         atom: &PriceAtomLite,
         dedupe: &SharedDedupe,
     ) -> io::Result<()> {
-        if dedupe.insert_price_code_set(&atom.service_code_set_hash) {
-            self.write_price_code_set(&atom.service_code_set_hash, &atom.service_code)?;
+        if self.price_code_set.is_none() {
+            return Ok(());
         }
-        if dedupe.insert_price_code_set(&atom.billing_code_modifier_set_hash) {
-            self.write_price_code_set(
-                &atom.billing_code_modifier_set_hash,
-                &atom.billing_code_modifier,
-            )?;
+        let service_code_set_hash = price_code_set_hash(&atom.service_code);
+        if dedupe.insert_price_code_set(&service_code_set_hash) {
+            self.write_price_code_set(&service_code_set_hash, &atom.service_code)?;
+        }
+        let modifier_set_hash = price_code_set_hash(&atom.billing_code_modifier);
+        if dedupe.insert_price_code_set(&modifier_set_hash) {
+            self.write_price_code_set(&modifier_set_hash, &atom.billing_code_modifier)?;
         }
         Ok(())
     }
@@ -3523,10 +3478,10 @@ impl DictionaryCopySinks {
         &mut self,
         atoms: &[PriceAtomLite],
         emitted_price_code_sets: &mut HashSet<String>,
-        emitted_price_atoms: &mut HashSet<String>,
+        emitted_price_atoms: &mut HashSet<GlobalId128>,
     ) -> io::Result<()> {
         for atom in atoms {
-            if emitted_price_atoms.insert(atom.price_atom_hash.clone()) {
+            if emitted_price_atoms.insert(atom.global_id) {
                 self.write_price_code_sets_for_atom(atom, emitted_price_code_sets)?;
                 self.write_price_atom(atom)?;
                 self.write_manifest_price_atom(atom)?;
@@ -3541,7 +3496,7 @@ impl DictionaryCopySinks {
         dedupe: &SharedDedupe,
     ) -> io::Result<()> {
         for atom in atoms {
-            if dedupe.insert_price_atom(&atom.price_atom_hash) {
+            if dedupe.insert_price_atom(atom.global_id) {
                 self.write_price_code_sets_for_atom_shared(atom, dedupe)?;
                 self.write_price_atom(atom)?;
                 self.write_manifest_price_atom(atom)?;
@@ -3552,9 +3507,9 @@ impl DictionaryCopySinks {
 
     fn write_price_set_entries(
         &mut self,
-        price_set_hash: &str,
-        price_atom_hashes: &[String],
-        emitted_price_set_entries: &mut HashSet<(String, String)>,
+        price_set_id: GlobalId128,
+        price_atom_ids: &[GlobalId128],
+        emitted_price_set_entries: &mut HashSet<(GlobalId128, GlobalId128)>,
     ) -> io::Result<()> {
         let Some(sink) = self.price_set_entry.as_mut() else {
             return Ok(());
@@ -3565,16 +3520,16 @@ impl DictionaryCopySinks {
                 "price set entry copy writer is closed",
             )
         })?;
+        let price_set_id_hex = price_set_id.to_hex();
         let mut rows_written = 0u64;
-        for price_atom_hash in price_atom_hashes {
-            if !emitted_price_set_entries
-                .insert((price_set_hash.to_string(), price_atom_hash.clone()))
-            {
+        for price_atom_id in price_atom_ids {
+            if !emitted_price_set_entries.insert((price_set_id, *price_atom_id)) {
                 continue;
             }
+            let price_atom_id_hex = price_atom_id.to_hex();
             let fields = [
-                pg_text_copy_field(Some(price_set_hash)),
-                pg_text_copy_field(Some(price_atom_hash)),
+                pg_text_copy_field(Some(&price_set_id_hex)),
+                pg_text_copy_field(Some(&price_atom_id_hex)),
             ];
             write_copy_fields(writer, &fields)?;
             rows_written += 1;
@@ -3585,8 +3540,8 @@ impl DictionaryCopySinks {
 
     fn write_price_set_entries_shared(
         &mut self,
-        price_set_hash: &str,
-        price_atom_hashes: &[String],
+        price_set_id: GlobalId128,
+        price_atom_ids: &[GlobalId128],
         dedupe: &SharedDedupe,
     ) -> io::Result<()> {
         let Some(sink) = self.price_set_entry.as_mut() else {
@@ -3598,14 +3553,16 @@ impl DictionaryCopySinks {
                 "price set entry copy writer is closed",
             )
         })?;
+        let price_set_id_hex = price_set_id.to_hex();
         let mut rows_written = 0u64;
-        for price_atom_hash in price_atom_hashes {
-            if !dedupe.insert_price_set_entry(price_set_hash, price_atom_hash) {
+        for price_atom_id in price_atom_ids {
+            if !dedupe.insert_price_set_entry(price_set_id, *price_atom_id) {
                 continue;
             }
+            let price_atom_id_hex = price_atom_id.to_hex();
             let fields = [
-                pg_text_copy_field(Some(price_set_hash)),
-                pg_text_copy_field(Some(price_atom_hash)),
+                pg_text_copy_field(Some(&price_set_id_hex)),
+                pg_text_copy_field(Some(&price_atom_id_hex)),
             ];
             write_copy_fields(writer, &fields)?;
             rows_written += 1;
@@ -4084,9 +4041,9 @@ struct LocalCompactOutputs<'a, W: Write> {
 
 struct LocalCompactDedupe<'a> {
     price_code_sets: &'a mut HashSet<String>,
-    price_atoms: &'a mut HashSet<String>,
-    price_sets: &'a mut HashSet<String>,
-    price_set_entries: &'a mut HashSet<(String, String)>,
+    price_atoms: &'a mut HashSet<GlobalId128>,
+    price_sets: &'a mut HashSet<GlobalId128>,
+    price_set_entries: &'a mut HashSet<(GlobalId128, GlobalId128)>,
     provider_sets: &'a mut HashSet<String>,
     provider_set_components: &'a mut HashSet<(String, i64)>,
     provider_set_entries: &'a mut HashSet<(String, i64)>,
@@ -4098,7 +4055,6 @@ struct LocalCompactDedupe<'a> {
 
 struct CompactRateBatch<'a> {
     provider_map: &'a HashMap<String, ProviderEntry>,
-    price_code_set_hash_cache: &'a mut PriceCodeSetHashCache,
     manifest_global_id_cache: &'a mut ManifestGlobalIdCache,
     rates: &'a [RateLite],
     procedure_value: &'a Value,
@@ -4183,7 +4139,6 @@ fn process_compact_rate_lites<W: Write>(
     let manifest_serving_copy_writer = &mut outputs.manifest_serving_copy_writer;
     let dictionary_copy_sinks = &mut outputs.dictionary_copy_sinks;
     let provider_map = batch.provider_map;
-    let price_code_set_hash_cache = &mut batch.price_code_set_hash_cache;
     let manifest_global_id_cache = &mut batch.manifest_global_id_cache;
     let rates = batch.rates;
     let procedure_value = batch.procedure_value;
@@ -4213,6 +4168,15 @@ fn process_compact_rate_lites<W: Write>(
     let procedure_name = strict_optional_source_metadata_text(procedure_value, "name")?;
     let procedure_description =
         strict_optional_source_metadata_text(procedure_value, "description")?;
+    let v3_serving_code_fields = V3ServingCodeFields {
+        reported_code_system: reported_code_system.as_deref(),
+        reported_code: reported_code.as_deref(),
+        negotiation_arrangement: negotiation_arrangement.as_deref(),
+        billing_code_type_version: billing_code_type_version.as_deref(),
+        procedure_name: procedure_name.as_deref(),
+        procedure_description: procedure_description.as_deref(),
+    };
+    let mut prepared_v3_serving_code = None;
     let procedure_payload = procedure_identity_payload(procedure_value);
     let procedure_hash = semantic_hash("procedure", procedure_payload.clone());
     if dedupe.procedures.insert(procedure_hash.clone())
@@ -4265,7 +4229,7 @@ fn process_compact_rate_lites<W: Write>(
                 None => continue,
             }
         };
-        let Some(price_set) = price_lite_set(&rate.prices, price_code_set_hash_cache) else {
+        let Some(price_set) = price_lite_set(&rate.prices) else {
             continue;
         };
         let network_names = rate_network_names(rate, &provider_entry.network_names, context);
@@ -4349,19 +4313,17 @@ fn process_compact_rate_lites<W: Write>(
         } else {
             i64::try_from(sorted_provider_npis.len()).unwrap_or(i64::MAX)
         };
+        let legacy_price_set_id =
+            (!outputs.suppress_legacy_row_output).then(|| group.price_set.global_id.to_hex());
         let legacy_identity = legacy_serving_identity(
             outputs.suppress_legacy_row_output,
             context,
             &procedure_hash,
             &provider_set_hash,
-            &group.price_set.price_set_hash,
+            legacy_price_set_id.as_deref().unwrap_or_default(),
             &billing_code,
         );
-        let price_set_hash = group.price_set.price_set_hash.clone();
-        if dedupe
-            .price_sets
-            .insert(group.price_set.price_set_hash.clone())
-        {
+        if dedupe.price_sets.insert(group.price_set.global_id) {
             if outputs.record_price_forward_sidecar {
                 let sidecars = outputs.manifest_sidecars.as_deref_mut().ok_or_else(|| {
                     io::Error::new(
@@ -4378,8 +4340,8 @@ fn process_compact_rate_lites<W: Write>(
             )?;
             dictionary_copy_sinks.write_manifest_price_set_atoms(&group.price_set)?;
             dictionary_copy_sinks.write_price_set_entries(
-                &group.price_set.price_set_hash,
-                &group.price_set.price_atom_hashes,
+                group.price_set.global_id,
+                &group.price_set.atom_ids,
                 dedupe.price_set_entries,
             )?;
         }
@@ -4457,6 +4419,12 @@ fn process_compact_rate_lites<W: Write>(
             }
         }
         if let Some(legacy_identity) = legacy_identity {
+            let price_set_hash = legacy_price_set_id.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy serving identity is missing its price-set key",
+                )
+            })?;
             if let Some(copy_writer) = compact_copy_writer.as_mut() {
                 copy_writer.write_row(&CompactCopyRow {
                     serving_rate_id: &legacy_identity.serving_rate_id,
@@ -4468,7 +4436,7 @@ fn process_compact_rate_lites<W: Write>(
                     reported_code: reported_code.as_deref(),
                     provider_set_hash: &provider_set_hash,
                     provider_count,
-                    price_set_hash: &price_set_hash,
+                    price_set_hash,
                     source_trace_set_hash: &context.source_trace_set_hash,
                     network_names: &network_names,
                 })?;
@@ -4499,15 +4467,15 @@ fn process_compact_rate_lites<W: Write>(
             }
         }
         if let Some(copy_writer) = manifest_serving_copy_writer.as_mut() {
+            let code = prepare_v3_serving_code_once(
+                copy_writer,
+                &mut prepared_v3_serving_code,
+                v3_serving_code_fields,
+            )?;
             write_v3_serving_output(
                 copy_writer,
                 V3ServingOutputRecord {
-                    reported_code_system: reported_code_system.as_deref(),
-                    reported_code: reported_code.as_deref(),
-                    negotiation_arrangement: negotiation_arrangement.as_deref(),
-                    billing_code_type_version: billing_code_type_version.as_deref(),
-                    procedure_name: procedure_name.as_deref(),
-                    procedure_description: procedure_description.as_deref(),
+                    code,
                     provider_set_hash: &provider_set_hash,
                     sorted_provider_group_hashes: &sorted_provider_hashes,
                     network_names: &network_names,
@@ -4531,6 +4499,54 @@ struct CompactContext {
     source_witness: Arc<SourceWitnessCollector>,
 }
 
+#[derive(Default)]
+struct SourceWitnessPopulationDelta {
+    rate_rows: u64,
+    unqueryable_rate_rows: u64,
+    occurrence_count: u64,
+}
+
+impl SourceWitnessPopulationDelta {
+    fn record_rate(&mut self, occurrence_count: u64) -> io::Result<()> {
+        self.rate_rows = self.rate_rows.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "source witness rate-row population overflow",
+            )
+        })?;
+        if occurrence_count == 0 {
+            self.unqueryable_rate_rows =
+                self.unqueryable_rate_rows.checked_add(1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "source witness unqueryable population overflow",
+                    )
+                })?;
+        }
+        self.occurrence_count = self
+            .occurrence_count
+            .checked_add(occurrence_count)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "source witness occurrence population overflow",
+                )
+            })?;
+        Ok(())
+    }
+
+    fn flush(self, collector: &SourceWitnessCollector) -> io::Result<()> {
+        if self.rate_rows == 0 {
+            return Ok(());
+        }
+        collector.record_rate_population(
+            self.rate_rows,
+            self.unqueryable_rate_rows,
+            self.occurrence_count,
+        )
+    }
+}
+
 fn rate_network_names(
     rate: &RateLite,
     provider_network_names: &[String],
@@ -4548,19 +4564,9 @@ fn source_rate_witness_expected() -> Value {
 }
 
 fn mark_source_rate_unqueryable(
-    context: &CompactContext,
-    procedure_json: &[u8],
-    source_input: SourceRateWitnessInput<'_>,
+    population_delta: &mut SourceWitnessPopulationDelta,
 ) -> io::Result<()> {
-    context
-        .source_witness
-        .rate_occurrence_candidates(
-            source_input.coordinate,
-            procedure_json,
-            source_input.raw_rate,
-            0,
-        )
-        .map(|_| ())
+    population_delta.record_rate(0)
 }
 
 fn npi_source_coordinate(groups: &[Value], selected_npi: i64) -> Option<(usize, usize)> {
@@ -4665,6 +4671,7 @@ struct EmittedSourceRateWitnessInput<'a> {
     coordinate: SourceWitnessCoordinate,
     procedure_json: &'a [u8],
     raw_rate: &'a [u8],
+    population_delta: &'a mut SourceWitnessPopulationDelta,
 }
 
 fn capture_emitted_source_rate_occurrences(
@@ -4680,6 +4687,7 @@ fn capture_emitted_source_rate_occurrences(
         coordinate,
         procedure_json,
         raw_rate,
+        population_delta,
     } = input;
     if emitted_price_count != rate.prices.len() {
         return Err(io::Error::new(
@@ -4687,15 +4695,8 @@ fn capture_emitted_source_rate_occurrences(
             "source witness price population differs from emitted V3 prices",
         ));
     }
-    if normalize_code(procedure.get("billing_code_type")).is_none()
-        || normalize_code(procedure.get("billing_code")).is_none()
-        || emitted_provider_npis.is_empty()
-        || emitted_price_count == 0
-    {
-        return context
-            .source_witness
-            .rate_occurrence_candidates(coordinate, procedure_json, raw_rate, 0)
-            .map(|_| ());
+    if emitted_provider_npis.is_empty() || emitted_price_count == 0 {
+        return population_delta.record_rate(0);
     }
     let provider_count = u64::try_from(emitted_provider_npis.len()).map_err(to_io_error)?;
     let price_count = u64::try_from(emitted_price_count).map_err(to_io_error)?;
@@ -4705,12 +4706,16 @@ fn capture_emitted_source_rate_occurrences(
             "queryable source occurrence population overflow",
         )
     })?;
-    for candidate in context.source_witness.rate_occurrence_candidates(
-        coordinate,
-        procedure_json,
-        raw_rate,
-        occurrence_count,
-    )? {
+    population_delta.record_rate(occurrence_count)?;
+    for candidate in context
+        .source_witness
+        .rate_occurrence_candidates_untracked(
+            coordinate,
+            procedure_json,
+            raw_rate,
+            occurrence_count,
+        )?
+    {
         let price_ordinal = candidate.occurrence_index / provider_count;
         let provider_ordinal = candidate.occurrence_index % provider_count;
         let selected_npi = emitted_provider_npis[provider_ordinal as usize];
@@ -4751,6 +4756,70 @@ fn provider_set_scope_hash(
             hash_string_list("provider_set_network_names_v1", sorted_network_names),
         ],
     )
+}
+
+#[derive(Default)]
+struct ProviderSetScopeCache {
+    buckets: HashMap<i64, Vec<ProviderSetScopeCacheEntry>>,
+    entry_count: usize,
+}
+
+const PROVIDER_SET_SCOPE_CACHE_MAX_ENTRIES: usize = 131_072;
+
+struct ProviderSetScopeCacheEntry {
+    provider_group_hashes: Vec<i64>,
+    provider_network_names: Vec<String>,
+    rate_network_names: Vec<String>,
+    provider_set_hash: String,
+    network_names: Vec<String>,
+}
+
+struct CachedProviderSetScope<'a> {
+    provider_set_hash: &'a str,
+    network_names: &'a [String],
+}
+
+impl ProviderSetScopeCache {
+    fn resolve<'a>(
+        &'a mut self,
+        provider_entry: &ProviderEntryView<'_>,
+        rate: &RateLite,
+        context: &CompactContext,
+    ) -> CachedProviderSetScope<'a> {
+        if self.entry_count >= PROVIDER_SET_SCOPE_CACHE_MAX_ENTRIES {
+            self.buckets.clear();
+            self.entry_count = 0;
+        }
+        let bucket = self.buckets.entry(provider_entry.entry_hash()).or_default();
+        let entry_index = bucket.iter().position(|entry| {
+            entry.provider_group_hashes == provider_entry.provider_group_hashes()
+                && entry.provider_network_names == provider_entry.network_names()
+                && entry.rate_network_names == rate.network_names
+        });
+        let entry_index = match entry_index {
+            Some(entry_index) => entry_index,
+            None => {
+                let network_names =
+                    rate_network_names(rate, provider_entry.network_names(), context);
+                let provider_set_hash =
+                    provider_set_scope_hash(provider_entry.provider_group_hashes(), &network_names);
+                bucket.push(ProviderSetScopeCacheEntry {
+                    provider_group_hashes: provider_entry.provider_group_hashes().to_vec(),
+                    provider_network_names: provider_entry.network_names().to_vec(),
+                    rate_network_names: rate.network_names.clone(),
+                    provider_set_hash,
+                    network_names,
+                });
+                self.entry_count += 1;
+                bucket.len() - 1
+            }
+        };
+        let entry = &bucket[entry_index];
+        CachedProviderSetScope {
+            provider_set_hash: &entry.provider_set_hash,
+            network_names: &entry.network_names,
+        }
+    }
 }
 
 enum WorkerJob {
@@ -5767,7 +5836,7 @@ struct SharedCompactState<'a, W: Write> {
     suppress_legacy_row_output: bool,
     provider_map: &'a HashMap<String, ProviderEntry>,
     dedupe: &'a SharedDedupe,
-    price_code_set_hash_cache: &'a mut PriceCodeSetHashCache,
+    provider_set_scope_cache: &'a mut ProviderSetScopeCache,
     manifest_global_id_cache: &'a mut ManifestGlobalIdCache,
     context: &'a CompactContext,
 }
@@ -5883,7 +5952,7 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
     let manifest_sidecars = state.manifest_sidecars.as_ref();
     let provider_map = state.provider_map;
     let dedupe = state.dedupe;
-    let price_code_set_hash_cache = &mut state.price_code_set_hash_cache;
+    let provider_set_scope_cache = &mut state.provider_set_scope_cache;
     let manifest_global_id_cache = &mut state.manifest_global_id_cache;
     let context = state.context;
     if rates.is_empty() {
@@ -5895,14 +5964,14 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
             "procedure must be a JSON object",
         )
     })?;
+    let mut source_witness_population = SourceWitnessPopulationDelta::default();
     if !procedure_has_queryable_code(procedure) {
-        if let (Some(source_inputs), Some(source_procedure_json)) =
-            (source_inputs, source_procedure_json.as_deref())
-        {
-            for source_input in source_inputs {
-                mark_source_rate_unqueryable(context, source_procedure_json, *source_input)?;
+        if let Some(source_inputs) = source_inputs {
+            for _source_input in source_inputs {
+                mark_source_rate_unqueryable(&mut source_witness_population)?;
             }
         }
+        source_witness_population.flush(&context.source_witness)?;
         return Ok(());
     }
     let reported_code_system = normalize_code_system(procedure_value.get("billing_code_type"));
@@ -5918,6 +5987,15 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
     let procedure_name = strict_optional_source_metadata_text(procedure_value, "name")?;
     let procedure_description =
         strict_optional_source_metadata_text(procedure_value, "description")?;
+    let v3_serving_code_fields = V3ServingCodeFields {
+        reported_code_system: reported_code_system.as_deref(),
+        reported_code: reported_code.as_deref(),
+        negotiation_arrangement: negotiation_arrangement.as_deref(),
+        billing_code_type_version: billing_code_type_version.as_deref(),
+        procedure_name: procedure_name.as_deref(),
+        procedure_description: procedure_description.as_deref(),
+    };
+    let mut prepared_v3_serving_code = None;
     let procedure_payload = procedure_identity_payload(procedure_value);
     let procedure_hash = semantic_hash("procedure", procedure_payload.clone());
     if dedupe.insert_procedure(&procedure_hash)
@@ -5953,14 +6031,8 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                 .iter()
                 .find(|provider_reference| !provider_map.contains_key(*provider_reference))
             {
-                if let Some(source_input) = source_input {
-                    mark_source_rate_unqueryable(
-                        context,
-                        source_procedure_json
-                            .as_deref()
-                            .expect("source procedure JSON created above"),
-                        source_input,
-                    )?;
+                if source_input.is_some() {
+                    mark_source_rate_unqueryable(&mut source_witness_population)?;
                     continue;
                 }
                 return Err(io::Error::new(
@@ -5975,30 +6047,17 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                 dedupe,
             )?
             else {
-                if let Some(source_input) = source_input {
-                    mark_source_rate_unqueryable(
-                        context,
-                        source_procedure_json
-                            .as_deref()
-                            .expect("source procedure JSON created above"),
-                        source_input,
-                    )?;
+                if source_input.is_some() {
+                    mark_source_rate_unqueryable(&mut source_witness_population)?;
                 }
                 continue;
             };
-            let Some(price_set) = price_lite_set(&rate.prices, price_code_set_hash_cache) else {
-                if let Some(source_input) = source_input {
-                    mark_source_rate_unqueryable(
-                        context,
-                        source_procedure_json
-                            .as_deref()
-                            .expect("source procedure JSON created above"),
-                        source_input,
-                    )?;
+            let Some(price_set) = price_lite_set(&rate.prices) else {
+                if source_input.is_some() {
+                    mark_source_rate_unqueryable(&mut source_witness_population)?;
                 }
                 continue;
             };
-            let network_names = rate_network_names(rate, provider_entry.network_names(), context);
             let sorted_provider_entry_hashes = [provider_entry.entry_hash()];
             let sorted_provider_hashes = provider_entry.provider_group_hashes();
             let sorted_provider_npis = provider_entry.npi();
@@ -6007,17 +6066,21 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
             } else {
                 i64::try_from(sorted_provider_npis.len()).unwrap_or(i64::MAX)
             };
-            let provider_set_hash = provider_set_scope_hash(sorted_provider_hashes, &network_names);
+            let provider_set_scope =
+                provider_set_scope_cache.resolve(&provider_entry, rate, context);
+            let provider_set_hash = provider_set_scope.provider_set_hash;
+            let network_names = provider_set_scope.network_names;
+            let legacy_price_set_id =
+                (!state.suppress_legacy_row_output).then(|| price_set.global_id.to_hex());
             let legacy_identity = legacy_serving_identity(
                 state.suppress_legacy_row_output,
                 context,
                 &procedure_hash,
-                &provider_set_hash,
-                &price_set.price_set_hash,
+                provider_set_hash,
+                legacy_price_set_id.as_deref().unwrap_or_default(),
                 &billing_code,
             );
-            let price_set_hash = price_set.price_set_hash.clone();
-            if dedupe.insert_price_set(&price_set.price_set_hash) {
+            if dedupe.insert_price_set(price_set.global_id) {
                 if state.record_price_forward_sidecar {
                     let sidecars = manifest_sidecars.ok_or_else(|| {
                         io::Error::new(
@@ -6030,26 +6093,26 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                 dictionary_copy_sinks.write_price_atoms_shared(&price_set.atoms, dedupe)?;
                 dictionary_copy_sinks.write_manifest_price_set_atoms(&price_set)?;
                 dictionary_copy_sinks.write_price_set_entries_shared(
-                    &price_set.price_set_hash,
-                    &price_set.price_atom_hashes,
+                    price_set.global_id,
+                    &price_set.atom_ids,
                     dedupe,
                 )?;
             }
-            if dedupe.insert_provider_set(&provider_set_hash) {
+            if dedupe.insert_provider_set(provider_set_hash) {
                 let provider_set_global_id_128 = manifest_global_id_cache.provider_set_id_hex(
-                    &provider_set_hash,
+                    provider_set_hash,
                     sorted_provider_hashes,
-                    &network_names,
+                    network_names,
                 );
                 dictionary_copy_sinks.write_manifest_provider_set_dictionary(
                     &provider_set_global_id_128,
-                    &network_names,
+                    network_names,
                 )?;
                 if let Some(sidecars) = manifest_sidecars {
                     let provider_set_global_id = manifest_global_id_cache.provider_set_id(
-                        &provider_set_hash,
+                        provider_set_hash,
                         sorted_provider_hashes,
-                        &network_names,
+                        network_names,
                     );
                     lock_manifest_sidecars(sidecars).record_provider_set(
                         provider_set_global_id,
@@ -6058,7 +6121,7 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                     )?;
                 }
                 if !dictionary_copy_sinks.write_provider_set(
-                    &provider_set_hash,
+                    provider_set_hash,
                     provider_count,
                     sorted_provider_hashes,
                 )? && !state.suppress_legacy_row_output
@@ -6086,12 +6149,12 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                     )?;
                 }
                 dictionary_copy_sinks.write_provider_set_entries_shared(
-                    &provider_set_hash,
+                    provider_set_hash,
                     &sorted_provider_entry_hashes,
                     dedupe,
                 )?;
                 dictionary_copy_sinks.write_provider_set_components_shared(
-                    &provider_set_hash,
+                    provider_set_hash,
                     sorted_provider_hashes,
                     dedupe,
                 )?;
@@ -6103,6 +6166,12 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
             }
             let unique_for_legacy = match legacy_identity {
                 Some(legacy_identity) => {
+                    let price_set_hash = legacy_price_set_id.as_deref().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "legacy serving identity is missing its price-set key",
+                        )
+                    })?;
                     let unique = dedupe
                         .insert_serving_rate(&legacy_identity.serving_rate_id)
                         .ok_or_else(|| {
@@ -6120,11 +6189,11 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                                 procedure_code: None,
                                 reported_code_system: reported_code_system.as_deref(),
                                 reported_code: reported_code.as_deref(),
-                                provider_set_hash: &provider_set_hash,
+                                provider_set_hash,
                                 provider_count,
-                                price_set_hash: &price_set_hash,
+                                price_set_hash,
                                 source_trace_set_hash: &context.source_trace_set_hash,
-                                network_names: &network_names,
+                                network_names,
                             })?;
                         } else {
                             emit_json_record(
@@ -6146,7 +6215,7 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                                     "provider_count": provider_count,
                                     "price_set_hash": price_set_hash,
                                     "source_trace_set_hash": context.source_trace_set_hash.clone(),
-                                    "network_names": network_names.clone(),
+                                    "network_names": network_names,
                                     "confidence_code": context.confidence_code.clone(),
                                 }),
                             )?;
@@ -6158,18 +6227,18 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
             };
             if let Some(copy_writer) = manifest_serving_copy_writer.as_mut() {
                 code_count_rows += 1;
+                let code = prepare_v3_serving_code_once(
+                    copy_writer,
+                    &mut prepared_v3_serving_code,
+                    v3_serving_code_fields,
+                )?;
                 write_v3_serving_output(
                     copy_writer,
                     V3ServingOutputRecord {
-                        reported_code_system: reported_code_system.as_deref(),
-                        reported_code: reported_code.as_deref(),
-                        negotiation_arrangement: negotiation_arrangement.as_deref(),
-                        billing_code_type_version: billing_code_type_version.as_deref(),
-                        procedure_name: procedure_name.as_deref(),
-                        procedure_description: procedure_description.as_deref(),
-                        provider_set_hash: &provider_set_hash,
+                        code,
+                        provider_set_hash,
                         sorted_provider_group_hashes: sorted_provider_hashes,
-                        network_names: &network_names,
+                        network_names,
                         provider_count,
                         price_set: &price_set,
                     },
@@ -6188,6 +6257,7 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                             .as_deref()
                             .expect("source procedure JSON created above"),
                         raw_rate: source_input.raw_rate,
+                        population_delta: &mut source_witness_population,
                     })?;
                 }
             } else if unique_for_legacy {
@@ -6200,22 +6270,23 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
             reported_code.as_deref(),
             code_count_rows,
         )?;
+        source_witness_population.flush(&context.source_witness)?;
         return Ok(());
     }
 
-    let mut by_price_set: BTreeMap<String, GroupedPriceSet> = BTreeMap::new();
+    let mut by_price_set: BTreeMap<GlobalId128, GroupedPriceSet> = BTreeMap::new();
     for rate in rates {
         let Some(provider_entry) =
             provider_entry_view_for_worker_rate(provider_map, rate, dictionary_copy_sinks, dedupe)?
         else {
             continue;
         };
-        let Some(price_set) = price_lite_set(&rate.prices, price_code_set_hash_cache) else {
+        let Some(price_set) = price_lite_set(&rate.prices) else {
             continue;
         };
         let provider_entry_hash = provider_entry.entry_hash();
         let group = by_price_set
-            .entry(price_set.price_set_hash.clone())
+            .entry(price_set.global_id)
             .or_insert_with(|| GroupedPriceSet {
                 price_set,
                 provider_entry_hashes: HashSet::new(),
@@ -6264,16 +6335,17 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
         } else {
             i64::try_from(sorted_provider_npis.len()).unwrap_or(i64::MAX)
         };
+        let legacy_price_set_id =
+            (!state.suppress_legacy_row_output).then(|| group.price_set.global_id.to_hex());
         let legacy_identity = legacy_serving_identity(
             state.suppress_legacy_row_output,
             context,
             &procedure_hash,
             &provider_set_hash,
-            &group.price_set.price_set_hash,
+            legacy_price_set_id.as_deref().unwrap_or_default(),
             &billing_code,
         );
-        let price_set_hash = group.price_set.price_set_hash.clone();
-        if dedupe.insert_price_set(&group.price_set.price_set_hash) {
+        if dedupe.insert_price_set(group.price_set.global_id) {
             if state.record_price_forward_sidecar {
                 let sidecars = manifest_sidecars.ok_or_else(|| {
                     io::Error::new(
@@ -6286,8 +6358,8 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
             dictionary_copy_sinks.write_price_atoms_shared(&group.price_set.atoms, dedupe)?;
             dictionary_copy_sinks.write_manifest_price_set_atoms(&group.price_set)?;
             dictionary_copy_sinks.write_price_set_entries_shared(
-                &group.price_set.price_set_hash,
-                &group.price_set.price_atom_hashes,
+                group.price_set.global_id,
+                &group.price_set.atom_ids,
                 dedupe,
             )?;
         }
@@ -6366,6 +6438,12 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
         }
         let unique_for_legacy = match legacy_identity {
             Some(legacy_identity) => {
+                let price_set_hash = legacy_price_set_id.as_deref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "legacy serving identity is missing its price-set key",
+                    )
+                })?;
                 let unique = dedupe
                     .insert_serving_rate(&legacy_identity.serving_rate_id)
                     .ok_or_else(|| {
@@ -6383,7 +6461,7 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                             reported_code: reported_code.as_deref(),
                             provider_set_hash: &provider_set_hash,
                             provider_count,
-                            price_set_hash: &price_set_hash,
+                            price_set_hash,
                             source_trace_set_hash: &context.source_trace_set_hash,
                             network_names: &network_names,
                         })?;
@@ -6419,15 +6497,15 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
         };
         if let Some(copy_writer) = manifest_serving_copy_writer.as_mut() {
             code_count_rows += 1;
+            let code = prepare_v3_serving_code_once(
+                copy_writer,
+                &mut prepared_v3_serving_code,
+                v3_serving_code_fields,
+            )?;
             write_v3_serving_output(
                 copy_writer,
                 V3ServingOutputRecord {
-                    reported_code_system: reported_code_system.as_deref(),
-                    reported_code: reported_code.as_deref(),
-                    negotiation_arrangement: negotiation_arrangement.as_deref(),
-                    billing_code_type_version: billing_code_type_version.as_deref(),
-                    procedure_name: procedure_name.as_deref(),
-                    procedure_description: procedure_description.as_deref(),
+                    code,
                     provider_set_hash: &provider_set_hash,
                     sorted_provider_group_hashes: &sorted_provider_hashes,
                     network_names: &network_names,
@@ -6761,7 +6839,6 @@ struct InNetworkStreamState<'a, W: Write> {
     suppress_legacy_row_output: bool,
     provider_map: &'a HashMap<String, ProviderEntry>,
     dedupe: LocalCompactDedupe<'a>,
-    price_code_set_hash_cache: &'a mut PriceCodeSetHashCache,
     manifest_global_id_cache: &'a mut ManifestGlobalIdCache,
     context: CompactContext,
     chunk_size: usize,
@@ -6863,7 +6940,6 @@ fn process_in_network_struson<R: Read, W: Write>(
                             };
                             let mut batch = CompactRateBatch {
                                 provider_map: state.provider_map,
-                                price_code_set_hash_cache: state.price_code_set_hash_cache,
                                 manifest_global_id_cache: state.manifest_global_id_cache,
                                 rates: &rate_chunk,
                                 procedure_value: &procedure_value,
@@ -6902,7 +6978,6 @@ fn process_in_network_struson<R: Read, W: Write>(
         };
         let mut batch = CompactRateBatch {
             provider_map: state.provider_map,
-            price_code_set_hash_cache: state.price_code_set_hash_cache,
             manifest_global_id_cache: state.manifest_global_id_cache,
             rates: &rate_chunk,
             procedure_value: &procedure_value,
@@ -7290,7 +7365,7 @@ fn compact_worker_loop(
     let mut dictionary_copy_sinks =
         DictionaryCopySinks::from_paths(&worker_paths, config.rotate_bytes)?;
     let mut sink = io::sink();
-    let mut price_code_set_hash_cache: PriceCodeSetHashCache = HashMap::new();
+    let mut provider_set_scope_cache = ProviderSetScopeCache::default();
     let mut manifest_global_id_cache = ManifestGlobalIdCache::default();
     let mut metrics = CompactWorkerMetrics {
         worker_id,
@@ -7324,7 +7399,7 @@ fn compact_worker_loop(
                     suppress_legacy_row_output: config.copy_paths.manifest_only,
                     provider_map: &config.provider_map,
                     dedupe: &config.dedupe,
-                    price_code_set_hash_cache: &mut price_code_set_hash_cache,
+                    provider_set_scope_cache: &mut provider_set_scope_cache,
                     manifest_global_id_cache: &mut manifest_global_id_cache,
                     context: &config.context,
                 };
@@ -7398,7 +7473,7 @@ fn compact_worker_loop(
                     suppress_legacy_row_output: config.copy_paths.manifest_only,
                     provider_map: &config.provider_map,
                     dedupe: &config.dedupe,
-                    price_code_set_hash_cache: &mut price_code_set_hash_cache,
+                    provider_set_scope_cache: &mut provider_set_scope_cache,
                     manifest_global_id_cache: &mut manifest_global_id_cache,
                     context: &config.context,
                 };
@@ -10815,9 +10890,9 @@ fn scan_compact_struson_inner(
     };
     let mut preloaded_provider_definition_keys = HashSet::new();
     let mut emitted_price_code_sets: HashSet<String> = HashSet::new();
-    let mut emitted_price_atoms: HashSet<String> = HashSet::new();
-    let mut emitted_price_sets: HashSet<String> = HashSet::new();
-    let mut emitted_price_set_entries: HashSet<(String, String)> = HashSet::new();
+    let mut emitted_price_atoms: HashSet<GlobalId128> = HashSet::new();
+    let mut emitted_price_sets: HashSet<GlobalId128> = HashSet::new();
+    let mut emitted_price_set_entries: HashSet<(GlobalId128, GlobalId128)> = HashSet::new();
     let mut emitted_provider_sets: HashSet<String> = HashSet::new();
     let mut emitted_provider_set_components: HashSet<(String, i64)> = HashSet::new();
     let mut emitted_provider_set_entries: HashSet<(String, i64)> = HashSet::new();
@@ -10825,7 +10900,6 @@ fn scan_compact_struson_inner(
     let mut emitted_procedures: HashSet<String> = HashSet::new();
     let mut emitted_provider_group_members: HashSet<(i64, i64)> = HashSet::new();
     let mut provider_identifier_quarantine = ProviderIdentifierQuarantine::default();
-    let mut price_code_set_hash_cache: PriceCodeSetHashCache = HashMap::new();
     let mut manifest_global_id_cache = ManifestGlobalIdCache::default();
     let negotiated_rate_chunk_size = split_interval(
         "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
@@ -10946,7 +11020,6 @@ fn scan_compact_struson_inner(
                             provider_group_members: &mut emitted_provider_group_members,
                             provider_identifier_quarantine: &mut provider_identifier_quarantine,
                         },
-                        price_code_set_hash_cache: &mut price_code_set_hash_cache,
                         manifest_global_id_cache: &mut manifest_global_id_cache,
                         context: CompactContext {
                             snapshot_id: snapshot_id.clone(),
@@ -20082,6 +20155,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn price_lite_set_caches_canonical_v3_atom_and_set_ids() {
+        let first = test_price_lite("100.00");
+        let mut second = test_price_lite("250.50");
+        second.service_code = vec!["22".to_string(), "11".to_string()];
+        second.billing_code_modifier = vec!["GT".to_string()];
+        let prices = vec![first.clone(), second.clone(), first.clone()];
+
+        let price_set = price_lite_set(&prices).unwrap();
+        let expected_atom_ids = prices
+            .iter()
+            .map(|price| {
+                GlobalId128::from_price_atom_parts(
+                    price.negotiated_type.as_deref(),
+                    Some(&price.negotiated_rate),
+                    price.expiration_date.as_deref(),
+                    &price.service_code,
+                    price.billing_class.as_deref(),
+                    price.setting.as_deref(),
+                    &price.billing_code_modifier,
+                    price.additional_information.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut expected_sorted_atom_ids = expected_atom_ids.clone();
+        expected_sorted_atom_ids.sort_unstable();
+
+        assert_eq!(
+            price_set
+                .atoms
+                .iter()
+                .map(price_atom_global_id)
+                .collect::<Vec<_>>(),
+            expected_atom_ids
+        );
+        assert_eq!(price_set.atom_ids, expected_sorted_atom_ids);
+        assert_eq!(
+            price_set_global_id(&price_set),
+            price_set_global_id_from_atom_ids(&expected_atom_ids)
+        );
+    }
+
+    #[test]
+    fn price_set_identity_is_order_independent_and_multiplicity_sensitive() {
+        let first = test_price_lite("100.00");
+        let second = test_price_lite("250.50");
+        let ordered = price_lite_set(&[first.clone(), second.clone()]).unwrap();
+        let reordered = price_lite_set(&[second, first.clone()]).unwrap();
+        let repeated = price_lite_set(&[first.clone(), first]).unwrap();
+
+        assert_eq!(ordered.global_id, reordered.global_id);
+        assert_eq!(ordered.atom_ids, reordered.atom_ids);
+        assert_ne!(ordered.global_id, repeated.global_id);
+        assert_eq!(repeated.atom_ids[0], repeated.atom_ids[1]);
+    }
+
     fn test_compact_context() -> CompactContext {
         CompactContext {
             snapshot_id: "snapshot-test".to_string(),
@@ -20091,6 +20220,53 @@ mod tests {
             confidence_code: "test".to_string(),
             source_witness: Arc::new(SourceWitnessCollector::new(&"00".repeat(32)).unwrap()),
         }
+    }
+
+    #[test]
+    fn provider_set_scope_cache_preserves_canonical_identity_and_checks_collisions() {
+        let context = test_compact_context();
+        let rate = RateLite {
+            provider_refs: vec!["7".to_string()],
+            provider_groups: Vec::new(),
+            network_names: vec!["A network".to_string(), "Shared".to_string()],
+            prices: vec![test_price_lite("100.00")],
+        };
+        let provider_entry = ProviderEntryView::Owned(ProviderEntry {
+            entry_hash: 17,
+            provider_count: 1,
+            provider_group_hashes: vec![101],
+            npi: vec![1234567890],
+            quarantined_npi: Vec::new(),
+            network_names: vec!["Shared".to_string(), "Z network".to_string()],
+            source_locator: None,
+        });
+        let expected_network_names =
+            rate_network_names(&rate, provider_entry.network_names(), &context);
+        let expected_hash = provider_set_scope_hash(
+            provider_entry.provider_group_hashes(),
+            &expected_network_names,
+        );
+        let mut cache = ProviderSetScopeCache::default();
+
+        for _ in 0..2 {
+            let cached = cache.resolve(&provider_entry, &rate, &context);
+            assert_eq!(cached.network_names, expected_network_names);
+            assert_eq!(cached.provider_set_hash, expected_hash);
+        }
+        assert_eq!(cache.buckets[&17].len(), 1);
+
+        let colliding_entry = ProviderEntryView::Owned(ProviderEntry {
+            entry_hash: 17,
+            provider_count: 1,
+            provider_group_hashes: vec![202],
+            npi: vec![1234567891],
+            quarantined_npi: Vec::new(),
+            network_names: Vec::new(),
+            source_locator: None,
+        });
+        let colliding_scope = cache.resolve(&colliding_entry, &rate, &context);
+        assert_ne!(colliding_scope.provider_set_hash, expected_hash);
+        assert_eq!(cache.buckets[&17].len(), 2);
     }
 
     fn source_witness_record_metadata(bundle: &[u8]) -> Vec<Value> {
@@ -20168,7 +20344,7 @@ mod tests {
         );
         let mut dictionary_copy_sinks = DictionaryCopySinks::from_paths(&paths, 0).unwrap();
         let dedupe = SharedDedupe::new(1);
-        let mut price_code_set_hash_cache = PriceCodeSetHashCache::new();
+        let mut provider_set_scope_cache = ProviderSetScopeCache::default();
         let mut manifest_global_id_cache = ManifestGlobalIdCache::default();
         let rates = [rate];
         let source_inputs = [SourceRateWitnessInput {
@@ -20185,7 +20361,7 @@ mod tests {
             suppress_legacy_row_output: true,
             provider_map: &provider_map,
             dedupe: &dedupe,
-            price_code_set_hash_cache: &mut price_code_set_hash_cache,
+            provider_set_scope_cache: &mut provider_set_scope_cache,
             manifest_global_id_cache: &mut manifest_global_id_cache,
             context: &context,
         };
@@ -21444,7 +21620,7 @@ mod tests {
         let mut dictionary_copy_sinks = DictionaryCopySinks::from_paths(&paths, 0).unwrap();
         let manifest_sidecars = Arc::new(Mutex::new(ManifestSidecarCollector::default()));
         let dedupe = SharedDedupe::new(2);
-        let mut price_code_set_hash_cache = PriceCodeSetHashCache::new();
+        let mut provider_set_scope_cache = ProviderSetScopeCache::default();
         let mut manifest_global_id_cache = ManifestGlobalIdCache::default();
         let context = test_compact_context();
 
@@ -21459,7 +21635,7 @@ mod tests {
                 suppress_legacy_row_output: false,
                 provider_map: &provider_map,
                 dedupe: &dedupe,
-                price_code_set_hash_cache: &mut price_code_set_hash_cache,
+                provider_set_scope_cache: &mut provider_set_scope_cache,
                 manifest_global_id_cache: &mut manifest_global_id_cache,
                 context: &context,
             };
@@ -21570,7 +21746,6 @@ mod tests {
         let mut emitted_procedures = HashSet::new();
         let mut emitted_provider_group_members = HashSet::new();
         let mut provider_identifier_quarantine = ProviderIdentifierQuarantine::default();
-        let mut serial_price_code_set_hash_cache = PriceCodeSetHashCache::new();
         let mut serial_manifest_global_id_cache = ManifestGlobalIdCache::default();
         let context = test_compact_context();
         let mut outputs = LocalCompactOutputs {
@@ -21597,7 +21772,6 @@ mod tests {
         };
         let mut batch = CompactRateBatch {
             provider_map: &provider_map,
-            price_code_set_hash_cache: &mut serial_price_code_set_hash_cache,
             manifest_global_id_cache: &mut serial_manifest_global_id_cache,
             rates: &rates,
             procedure_value: &procedure,
@@ -21617,7 +21791,7 @@ mod tests {
         let mut worker_manifest_serving_copy_writer = None;
         let mut worker_dictionary_copy_sinks = DictionaryCopySinks::from_paths(&paths, 0).unwrap();
         let worker_dedupe = SharedDedupe::new(1);
-        let mut worker_price_code_set_hash_cache = PriceCodeSetHashCache::new();
+        let mut worker_provider_set_scope_cache = ProviderSetScopeCache::default();
         let mut worker_manifest_global_id_cache = ManifestGlobalIdCache::default();
         let mut worker_state = SharedCompactState {
             writer: &mut worker_writer,
@@ -21629,7 +21803,7 @@ mod tests {
             suppress_legacy_row_output: false,
             provider_map: &provider_map,
             dedupe: &worker_dedupe,
-            price_code_set_hash_cache: &mut worker_price_code_set_hash_cache,
+            provider_set_scope_cache: &mut worker_provider_set_scope_cache,
             manifest_global_id_cache: &mut worker_manifest_global_id_cache,
             context: &context,
         };
@@ -21864,25 +22038,17 @@ mod tests {
             manifest_only: true,
         };
         let mut sinks = DictionaryCopySinks::from_paths(&paths, 0).unwrap();
-        let mut price_code_set_hash_cache = PriceCodeSetHashCache::new();
-        let atom = price_atom_from_lite(
-            &PriceLite {
-                negotiated_type: Some("negotiated".to_string()),
-                negotiated_rate: "123.45".to_string(),
-                expiration_date: Some("2026-12-31".to_string()),
-                service_code: vec!["11".to_string()],
-                billing_class: Some("professional".to_string()),
-                setting: None,
-                billing_code_modifier: vec![],
-                additional_information: None,
-            },
-            &mut price_code_set_hash_cache,
-        );
-        let price_set = PriceSetLite {
-            price_set_hash: "unused-hash".to_string(),
-            price_atom_hashes: vec![atom.price_atom_hash.clone()],
-            atoms: vec![atom],
-        };
+        let price_set = price_lite_set(&[PriceLite {
+            negotiated_type: Some("negotiated".to_string()),
+            negotiated_rate: "123.45".to_string(),
+            expiration_date: Some("2026-12-31".to_string()),
+            service_code: vec!["11".to_string()],
+            billing_class: Some("professional".to_string()),
+            setting: None,
+            billing_code_modifier: vec![],
+            additional_information: None,
+        }])
+        .unwrap();
 
         sinks.write_manifest_price_set_atoms(&price_set).unwrap();
         let events = sinks.finish_silent().unwrap();

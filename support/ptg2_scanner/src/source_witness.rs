@@ -523,6 +523,7 @@ impl SourceWitnessCollector {
             .read(locator)
     }
 
+    #[cfg(test)]
     pub fn rate_occurrence_candidates(
         &self,
         coordinate: SourceWitnessCoordinate,
@@ -530,13 +531,48 @@ impl SourceWitnessCollector {
         raw_rate: &[u8],
         occurrence_count: u64,
     ) -> io::Result<Vec<RateOccurrenceCandidate>> {
-        self.rate_rows.fetch_add(1, AtomicOrdering::Relaxed);
+        self.record_rate_population(1, u64::from(occurrence_count == 0), occurrence_count)?;
+        self.rate_occurrence_candidates_untracked(
+            coordinate,
+            procedure_json,
+            raw_rate,
+            occurrence_count,
+        )
+    }
+
+    pub fn record_rate_population(
+        &self,
+        rate_rows: u64,
+        unqueryable_rate_rows: u64,
+        occurrence_count: u64,
+    ) -> io::Result<()> {
+        self.rate_rows
+            .fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |current| current.checked_add(rate_rows),
+            )
+            .map_err(|_| io::Error::other("source witness rate-row population overflow"))?;
+        self.unqueryable_rate_rows
+            .fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |current| current.checked_add(unqueryable_rate_rows),
+            )
+            .map_err(|_| io::Error::other("source witness unqueryable population overflow"))?;
+        self.rate_occurrences.add_population(occurrence_count)
+    }
+
+    pub fn rate_occurrence_candidates_untracked(
+        &self,
+        coordinate: SourceWitnessCoordinate,
+        procedure_json: &[u8],
+        raw_rate: &[u8],
+        occurrence_count: u64,
+    ) -> io::Result<Vec<RateOccurrenceCandidate>> {
         if occurrence_count == 0 {
-            self.unqueryable_rate_rows
-                .fetch_add(1, AtomicOrdering::Relaxed);
             return Ok(Vec::new());
         }
-        self.rate_occurrences.add_population(occurrence_count)?;
         let seed = self.rate_block_seed(coordinate, procedure_json, raw_rate);
         let limit = occurrence_count.min(SOURCE_WITNESS_LOCAL_CANDIDATE_TARGET as u64);
         let mut permutation = HashMap::<u64, u64>::new();
@@ -1124,6 +1160,69 @@ mod tests {
             second
                 .rate_occurrence_candidates(coordinate, procedure, rate, 10_000)
                 .unwrap(),
+        );
+    }
+
+    #[test]
+    fn batched_rate_population_preserves_candidates_and_exact_counts() {
+        let direct = SourceWitnessCollector::new(&"ef".repeat(32)).unwrap();
+        let batched = SourceWitnessCollector::new(&"ef".repeat(32)).unwrap();
+        let procedure = br#"{"billing_code":"99213"}"#;
+        let occurrence_counts = [0, 1, 8, 64, 10_000];
+        let mut direct_candidates = Vec::new();
+        let mut batched_candidates = Vec::new();
+        let mut occurrence_population = 0u64;
+
+        for (object_ordinal, occurrence_count) in occurrence_counts.into_iter().enumerate() {
+            let coordinate = SourceWitnessCoordinate::new(object_ordinal as u64, 0);
+            let raw_rate = format!(
+                "{{\"provider_references\":[7],\"negotiated_prices\":[{{\"negotiated_rate\":{object_ordinal}}}]}}"
+            );
+            direct_candidates.extend(
+                direct
+                    .rate_occurrence_candidates(
+                        coordinate,
+                        procedure,
+                        raw_rate.as_bytes(),
+                        occurrence_count,
+                    )
+                    .unwrap(),
+            );
+            batched_candidates.extend(
+                batched
+                    .rate_occurrence_candidates_untracked(
+                        coordinate,
+                        procedure,
+                        raw_rate.as_bytes(),
+                        occurrence_count,
+                    )
+                    .unwrap(),
+            );
+            occurrence_population += occurrence_count;
+        }
+        batched
+            .record_rate_population(
+                occurrence_counts.len() as u64,
+                occurrence_counts
+                    .iter()
+                    .filter(|occurrence_count| **occurrence_count == 0)
+                    .count() as u64,
+                occurrence_population,
+            )
+            .unwrap();
+
+        assert_eq!(direct_candidates, batched_candidates);
+        assert_eq!(
+            direct.rate_rows.load(AtomicOrdering::Relaxed),
+            batched.rate_rows.load(AtomicOrdering::Relaxed)
+        );
+        assert_eq!(
+            direct.unqueryable_rate_rows.load(AtomicOrdering::Relaxed),
+            batched.unqueryable_rate_rows.load(AtomicOrdering::Relaxed)
+        );
+        assert_eq!(
+            direct.rate_occurrences.population(),
+            batched.rate_occurrences.population()
         );
     }
 
