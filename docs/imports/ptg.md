@@ -810,6 +810,14 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
 - Audit-only source-witness endpoints may use the separate 250 ms p95 ceiling.
   That allowance does not relax the 40 ms cold ceiling for standard pricing
   endpoints.
+- Price-key publication casts negotiated rates once into a temporary numeric
+  work column during the lean atom rewrite, analyzes that physical table, and
+  ranks through a direct typed join. Exact CTAS row counts, unique ID/key
+  indexes, and index-backed minimum/maximum probes replace repeated full
+  dense-map validation scans. The work column is dropped before retention, so
+  this speedup does not increase finalized snapshot storage. Exact physical
+  layout reuse also skips GC queue work for block hashes still referenced by
+  the reused sealed layout.
 - The authenticated schema-v7 monthly capacity report passes with at least 30
   qualifying large builds, 30 reuse-only samples, committed end-to-end timing
   for every logical sample, reconciled candidate-audit traffic, signed raw

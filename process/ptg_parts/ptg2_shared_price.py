@@ -372,14 +372,14 @@ async def _stream_shared_price_copy(
         raise RuntimeError("PTG2 strict price encoder did not expose complete stdio pipes")
     stderr_task = asyncio.create_task(process.stderr.read())
     started_at = time.monotonic()
-    metrics: dict[str, Any] = {}
+    copy_metric_map: dict[str, Any] = {}
     try:
         await _copy_through_price_encoder(
             process=process,
             sql=sql,
             schema_name=schema_name,
             target_table=target_table,
-            metrics=metrics,
+            metrics=copy_metric_map,
             started_at=started_at,
         )
         await _close_encoder_stdin(process)
@@ -394,18 +394,46 @@ async def _stream_shared_price_copy(
             f"stderr={stderr.decode('utf-8', errors='replace')[-2000:]}"
         )
     summary = _parse_shared_price_stream_summary(stderr)
-    summary.update(metrics)
+    summary.update(copy_metric_map)
     summary["pipeline_seconds"] = time.monotonic() - started_at
     return summary
 
 
-async def _validate_v3_dense_map(
+async def _read_v3_dense_map_metrics(
     *,
     schema_name: str,
     table_name: str,
     id_column: str,
     key_column: str,
+    expected_row_count: int | None = None,
 ) -> dict[str, int | None]:
+    """Read dense-map metrics using index probes when CTAS gave an exact count."""
+
+    if expected_row_count is not None and expected_row_count >= 0:
+        bounds_row = await db.first(
+            f"""
+            SELECT
+                (
+                    SELECT {_quote_ident(key_column)}::bigint
+                    FROM {_qualified(schema_name, table_name)}
+                    ORDER BY {_quote_ident(key_column)} ASC
+                    LIMIT 1
+                ) AS minimum_key,
+                (
+                    SELECT {_quote_ident(key_column)}::bigint
+                    FROM {_qualified(schema_name, table_name)}
+                    ORDER BY {_quote_ident(key_column)} DESC
+                    LIMIT 1
+                ) AS maximum_key
+            """
+        )
+        return {
+            "row_count": expected_row_count,
+            "distinct_id_count": expected_row_count,
+            "distinct_key_count": expected_row_count,
+            "minimum_key": _row_value(bounds_row, "minimum_key", 0),
+            "maximum_key": _row_value(bounds_row, "maximum_key", 1),
+        }
     dense_row = await db.first(
         f"""
         SELECT
@@ -417,7 +445,7 @@ async def _validate_v3_dense_map(
         FROM {_qualified(schema_name, table_name)}
         """
     )
-    dense_stats = {
+    return {
         "row_count": int(_row_value(dense_row, "row_count", 0) or 0),
         "distinct_id_count": int(
             _row_value(dense_row, "distinct_id_count", 1) or 0
@@ -428,27 +456,46 @@ async def _validate_v3_dense_map(
         "minimum_key": _row_value(dense_row, "minimum_key", 3),
         "maximum_key": _row_value(dense_row, "maximum_key", 4),
     }
-    expected_count = int(dense_stats["row_count"] or 0)
+
+
+async def _validate_v3_dense_map(
+    *,
+    schema_name: str,
+    table_name: str,
+    id_column: str,
+    key_column: str,
+    expected_row_count: int | None = None,
+) -> dict[str, int | None]:
+    """Validate unique dense identifiers and contiguous zero-based keys."""
+
+    dense_map_metrics = await _read_v3_dense_map_metrics(
+        schema_name=schema_name,
+        table_name=table_name,
+        id_column=id_column,
+        key_column=key_column,
+        expected_row_count=expected_row_count,
+    )
+    expected_count = int(dense_map_metrics["row_count"] or 0)
     if {
-        dense_stats["row_count"],
-        dense_stats["distinct_id_count"],
-        dense_stats["distinct_key_count"],
+        dense_map_metrics["row_count"],
+        dense_map_metrics["distinct_id_count"],
+        dense_map_metrics["distinct_key_count"],
     } != {expected_count}:
         raise RuntimeError(
             f"PTG2 v3 dense map count mismatch for {schema_name}.{table_name}: "
-            f"{dense_stats}"
+            f"{dense_map_metrics}"
         )
     expected_minimum = 0 if expected_count else None
     expected_maximum = expected_count - 1 if expected_count else None
     if (
-        dense_stats["minimum_key"] != expected_minimum
-        or dense_stats["maximum_key"] != expected_maximum
+        dense_map_metrics["minimum_key"] != expected_minimum
+        or dense_map_metrics["maximum_key"] != expected_maximum
     ):
         raise RuntimeError(
             f"PTG2 v3 dense map bounds mismatch for {schema_name}.{table_name}: "
-            f"{dense_stats}"
+            f"{dense_map_metrics}"
         )
-    return dense_stats
+    return dense_map_metrics
 
 
 async def _create_v3_price_key_stage(
@@ -468,22 +515,16 @@ async def _create_v3_price_key_stage(
             f"(n_distinct = {max(int(expected_price_set_count), 0)});"
         )
     await db.status(f"ANALYZE {_qualified(schema_name, price_set_atom_table)};")
-    await db.status(
+    created_row_count = await db.status(
         f"""
         CREATE UNLOGGED TABLE {_qualified(schema_name, stage_table)} AS
-        WITH atom_rate AS MATERIALIZED (
-            SELECT
-                price_atom_global_id_128,
-                NULLIF(BTRIM(negotiated_rate), '')::numeric AS negotiated_rate
-            FROM {_qualified(schema_name, price_atom_table)}
-        ),
-        price_rank AS MATERIALIZED (
+        WITH price_rank AS MATERIALIZED (
             SELECT
                 membership.price_set_global_id_128,
-                MIN(atom_rate.negotiated_rate) AS minimum_negotiated_rate
+                MIN(price_atom.negotiated_rate_numeric) AS minimum_negotiated_rate
             FROM {_qualified(schema_name, price_set_atom_table)} AS membership
-            JOIN atom_rate
-              ON atom_rate.price_atom_global_id_128 = membership.price_atom_global_id_128
+            JOIN {_qualified(schema_name, price_atom_table)} AS price_atom
+              ON price_atom.price_atom_global_id_128 = membership.price_atom_global_id_128
             GROUP BY membership.price_set_global_id_128
         )
         SELECT
@@ -519,6 +560,13 @@ async def _create_v3_price_key_stage(
         table_name=stage_table,
         id_column="price_set_global_id_128",
         key_column="price_key",
+        expected_row_count=(
+            int(created_row_count)
+            if isinstance(created_row_count, int)
+            and not isinstance(created_row_count, bool)
+            and created_row_count >= 0
+            else None
+        ),
     )
     if int(dense_stats["row_count"] or 0) > _MAX_DENSE_KEY_COUNT:
         raise RuntimeError("PTG2 v3 supports at most 2^32 canonical price keys")
@@ -531,7 +579,7 @@ async def _create_v3_atom_key_stage(
     price_atom_table: str,
     stage_table: str,
 ) -> dict[str, int | None]:
-    await db.status(
+    created_row_count = await db.status(
         f"""
         CREATE UNLOGGED TABLE {_qualified(schema_name, stage_table)} AS
         SELECT
@@ -551,12 +599,24 @@ async def _create_v3_atom_key_stage(
         f"{_quote_ident(_ptg2_snapshot_index_name(stage_table, 'id_uidx'))} "
         f"ON {_qualified(schema_name, stage_table)} (price_atom_global_id_128);"
     )
+    await db.status(
+        f"CREATE UNIQUE INDEX "
+        f"{_quote_ident(_ptg2_snapshot_index_name(stage_table, 'key_uidx'))} "
+        f"ON {_qualified(schema_name, stage_table)} (atom_key);"
+    )
     await db.status(f"ANALYZE {_qualified(schema_name, stage_table)};")
     dense_stats = await _validate_v3_dense_map(
         schema_name=schema_name,
         table_name=stage_table,
         id_column="price_atom_global_id_128",
         key_column="atom_key",
+        expected_row_count=(
+            int(created_row_count)
+            if isinstance(created_row_count, int)
+            and not isinstance(created_row_count, bool)
+            and created_row_count >= 0
+            else None
+        ),
     )
     select_atom_key_bits(int(dense_stats["row_count"] or 0))
     return dense_stats
@@ -819,7 +879,7 @@ async def _publish_price_attributes(
 ) -> tuple[int, bytes]:
     """Persist price attributes and return their row count and support digest."""
 
-    rows: list[dict[str, Any]] = []
+    attribute_rows: list[dict[str, Any]] = []
     if dictionary_table:
         raw_rows = await db.all(
             f"""
@@ -834,17 +894,17 @@ async def _publish_price_attributes(
             attr_key = mapping["attr_key"] if mapping is not None else raw_row[1]
             text_value = mapping["text_value"] if mapping is not None else raw_row[2]
             text_array = mapping["text_array"] if mapping is not None else raw_row[3]
-            value = (
+            attribute_value = (
                 json.dumps(list(text_array or []), ensure_ascii=True, separators=(",", ":"))
                 if attr_kind in {"service_code", "billing_code_modifier"}
                 else text_value
             )
-            rows.append(
+            attribute_rows.append(
                 {
                     "snapshot_key": int(snapshot_key),
                     "attribute_kind": attr_kind,
                     "attribute_key": int(attr_key),
-                    "value": value,
+                    "value": attribute_value,
                 }
             )
     schema = _quote_ident(schema_name)
@@ -856,7 +916,7 @@ async def _publish_price_attributes(
             snapshot_key=int(snapshot_key),
             build_token=build_token,
         )
-        for start in range(0, len(rows), batch_size):
+        for start in range(0, len(attribute_rows), batch_size):
             await session.execute(
                 db.text(
                     f"""
@@ -866,22 +926,22 @@ async def _publish_price_attributes(
                         (:snapshot_key, :attribute_kind, :attribute_key, :value)
                     """
                 ),
-                rows[start : start + batch_size],
+                attribute_rows[start : start + batch_size],
             )
     digest = shared_support_digest(
         {
             "price_attributes": [
                 {
-                    "attribute_kind": row["attribute_kind"],
-                    "attribute_key": row["attribute_key"],
-                    "value": row["value"],
+                    "attribute_kind": attribute_row["attribute_kind"],
+                    "attribute_key": attribute_row["attribute_key"],
+                    "value": attribute_row["value"],
                 }
-                for row in rows
+                for attribute_row in attribute_rows
             ],
             "constant_values": dict(constant_values),
         }
     )
-    return len(rows), digest
+    return len(attribute_rows), digest
 
 
 async def prepare_shared_price_artifacts(
@@ -940,21 +1000,27 @@ async def prepare_shared_price_artifacts(
                 "strict V3 price atom rewrite did not produce a dictionary contract"
             )
         stage_started_at = time.monotonic()
-        async with asyncio.TaskGroup() as task_group:
-            price_map_task = task_group.create_task(
-                _create_v3_price_key_stage(
-                    schema_name=schema_name,
-                    price_atom_table=price_atom_table,
-                    price_set_atom_table=price_set_atom_table,
-                    stage_table=price_key_map,
+        try:
+            async with asyncio.TaskGroup() as task_group:
+                price_map_task = task_group.create_task(
+                    _create_v3_price_key_stage(
+                        schema_name=schema_name,
+                        price_atom_table=price_atom_table,
+                        price_set_atom_table=price_set_atom_table,
+                        stage_table=price_key_map,
+                    )
                 )
-            )
-            atom_map_task = task_group.create_task(
-                _create_v3_atom_key_stage(
-                    schema_name=schema_name,
-                    price_atom_table=price_atom_table,
-                    stage_table=atom_key_map,
+                atom_map_task = task_group.create_task(
+                    _create_v3_atom_key_stage(
+                        schema_name=schema_name,
+                        price_atom_table=price_atom_table,
+                        stage_table=atom_key_map,
+                    )
                 )
+        finally:
+            await db.status(
+                f"ALTER TABLE {_qualified(schema_name, price_atom_table)} "
+                "DROP COLUMN IF EXISTS negotiated_rate_numeric;"
             )
         price_map_stats = price_map_task.result()
         atom_map_stats = atom_map_task.result()
@@ -1053,13 +1119,17 @@ async def publish_shared_price_artifacts(
     price_key_map = prepared.price_key_map
     atom_key_map = prepared.atom_key_map
     block_stage = shared_block_stage_name(f"price-{snapshot_key}")
-    lean_manifest = dict(prepared.lean_manifest)
+    lean_layout_map = dict(prepared.lean_manifest)
     try:
         price_set_count = prepared.price_set_count
         atom_count = prepared.atom_count
         atom_key_bits = prepared.atom_key_bits
-        constant_keys = dict(lean_manifest.get("price_atom_constant_keys") or {})
-        constant_values = dict(lean_manifest.get("price_atom_constant_values") or {})
+        price_atom_constant_key_by_column = dict(
+            lean_layout_map.get("price_atom_constant_keys") or {}
+        )
+        price_atom_constant_value_by_kind = dict(
+            lean_layout_map.get("price_atom_constant_values") or {}
+        )
         await create_shared_block_stage(
             schema_name=schema_name,
             stage_table=block_stage,
@@ -1072,7 +1142,7 @@ async def publish_shared_price_artifacts(
         atom_sql = _v3_price_atom_sql(
             qualified_price_atom_table=_qualified(schema_name, price_atom_table),
             qualified_atom_key_map=_qualified(schema_name, atom_key_map),
-            constant_key_by_column=constant_keys,
+            constant_key_by_column=price_atom_constant_key_by_column,
         )
         membership_summary, atom_summary = await asyncio.gather(
             _stream_shared_price_copy(
@@ -1107,13 +1177,13 @@ async def publish_shared_price_artifacts(
             snapshot_key=int(snapshot_key),
             build_token=build_token,
         )
-        dictionary_table = lean_manifest.get("price_atom_dictionary_table")
+        dictionary_table = lean_layout_map.get("price_atom_dictionary_table")
         price_attribute_count, price_support_digest = await _publish_price_attributes(
             schema_name=schema_name,
             snapshot_key=int(snapshot_key),
             build_token=build_token,
             dictionary_table=str(dictionary_table) if dictionary_table else None,
-            constant_values=constant_values,
+            constant_values=price_atom_constant_value_by_kind,
         )
         return SharedPricePublication(
             references=block_publication.references,
@@ -1121,8 +1191,8 @@ async def publish_shared_price_artifacts(
             atom_count=atom_count,
             atom_key_bits=atom_key_bits,
             price_attribute_count=price_attribute_count,
-            price_atom_constant_keys=constant_keys,
-            price_atom_constant_values=constant_values,
+            price_atom_constant_keys=price_atom_constant_key_by_column,
+            price_atom_constant_values=price_atom_constant_value_by_kind,
             support_digest=price_support_digest,
             stream_summaries={
                 _PRICE_MEMBERSHIP_ARTIFACT_KIND: membership_summary,

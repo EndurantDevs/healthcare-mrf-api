@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process.ptg_parts import ptg2_manifest_publish as manifest_publish
 from process.ptg_parts import ptg2_shared_price as shared_price
 from process.ptg_parts.ptg2_serving_binary_v3 import (
     decode_price_memberships,
@@ -98,14 +99,99 @@ async def test_price_keys_use_exact_minimum_rate_order(monkeypatch):
     )
 
     sql = "\n".join(call.args[0] for call in status.await_args_list)
-    assert "atom_rate AS MATERIALIZED" in sql
-    assert sql.count("NULLIF(BTRIM(negotiated_rate), '')::numeric") == 1
-    assert "MIN(atom_rate.negotiated_rate)" in sql
-    assert "JOIN atom_rate" in sql
+    assert "atom_rate AS MATERIALIZED" not in sql
+    assert "MIN(price_atom.negotiated_rate_numeric)" in sql
+    assert 'JOIN "mrf"."price_atoms" AS price_atom' in sql
     assert "ORDER BY minimum_negotiated_rate ASC NULLS LAST" in sql
     assert "price_set_global_id_128" in sql
     assert "CREATE UNIQUE INDEX" in sql
     assert "(price_key)" in sql
+
+
+@pytest.mark.asyncio
+async def test_dense_map_uses_exact_ctas_count_and_index_bounds(monkeypatch):
+    first = AsyncMock(return_value={"minimum_key": 0, "maximum_key": 4})
+    monkeypatch.setattr(shared_price.db, "first", first)
+
+    dense_stats = await shared_price._validate_v3_dense_map(
+        schema_name="mrf",
+        table_name="price_keys",
+        id_column="price_set_global_id_128",
+        key_column="price_key",
+        expected_row_count=5,
+    )
+
+    assert dense_stats == {
+        "row_count": 5,
+        "distinct_id_count": 5,
+        "distinct_key_count": 5,
+        "minimum_key": 0,
+        "maximum_key": 4,
+    }
+    validation_sql = first.await_args.args[0]
+    assert "COUNT(" not in validation_sql
+    assert "ORDER BY \"price_key\" ASC" in validation_sql
+    assert "ORDER BY \"price_key\" DESC" in validation_sql
+
+
+@pytest.mark.asyncio
+async def test_lean_price_atom_materializes_numeric_rate_once(monkeypatch):
+    status = AsyncMock()
+    monkeypatch.setattr(manifest_publish.db, "status", status)
+    monkeypatch.setattr(manifest_publish.db, "scalar", AsyncMock(return_value=0))
+    monkeypatch.setattr(manifest_publish.db, "all", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        manifest_publish,
+        "_table_exists",
+        AsyncMock(return_value=True),
+    )
+
+    await manifest_publish._rewrite_ptg2_manifest_price_atom_table_lean_dict(
+        schema_name="mrf",
+        price_atom_table="price_atoms",
+        price_atom_dictionary_table="price_attributes",
+    )
+
+    sql = "\n".join(call.args[0] for call in status.await_args_list)
+    assert sql.count("NULLIF(BTRIM(price_atom.negotiated_rate::text), '')::numeric") == 1
+    assert "AS negotiated_rate_numeric" in sql
+    assert 'ANALYZE "mrf"."price_atoms"' in sql
+
+
+@pytest.mark.asyncio
+async def test_prepared_price_artifacts_drop_numeric_work_column(monkeypatch):
+    status = AsyncMock()
+    monkeypatch.setattr(shared_price.db, "status", status)
+    monkeypatch.setattr(
+        shared_price,
+        "_normalize_strict_v3_price_atom_stage",
+        AsyncMock(return_value={"rows_after": 2}),
+    )
+    monkeypatch.setattr(
+        shared_price,
+        "_rewrite_ptg2_manifest_price_atom_table_lean_dict",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        shared_price,
+        "_create_v3_price_key_stage",
+        AsyncMock(return_value={"row_count": 2}),
+    )
+    monkeypatch.setattr(
+        shared_price,
+        "_create_v3_atom_key_stage",
+        AsyncMock(return_value={"row_count": 2}),
+    )
+
+    await shared_price.prepare_shared_price_artifacts(
+        schema_name="mrf",
+        manifest_stage_table="manifest_stage",
+    )
+
+    assert any(
+        "DROP COLUMN IF EXISTS negotiated_rate_numeric" in call.args[0]
+        for call in status.await_args_list
+    )
 
 
 @pytest.mark.asyncio

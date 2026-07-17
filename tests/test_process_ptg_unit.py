@@ -5370,7 +5370,7 @@ async def test_ptg2_manifest_serving_sidecars_use_rust_copy_fast_path(monkeypatc
         else:
             artifact_helpers.write_serving_by_provider_set_sidecar(output_path, rows)
 
-    monkeypatch.setattr(ptg_manifest_publish, "_ptg2_manifest_serving_sidecar_rust_enabled", lambda: True)
+    monkeypatch.setattr(ptg_manifest_publish, "_is_rust_sidecar_enabled", lambda: True)
     monkeypatch.setattr(ptg_manifest_publish, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
     monkeypatch.setattr(ptg_manifest_publish, "_copy_ptg2_query_to_file", fake_copy_query_to_file)
     monkeypatch.setattr(ptg_manifest_publish, "_run_ptg2_serving_sidecar_from_key_copy", fake_runner)

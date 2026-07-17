@@ -360,6 +360,54 @@ async def test_seal_still_rejects_mapping_hash_mismatch_without_block_join():
         )
 
 
+@pytest.mark.asyncio
+async def test_seal_exact_reuse_does_not_queue_still_referenced_blocks_for_gc():
+    expected = SharedBlock("page_v4", 7, 0, 1, "none", 1, b"a").reference()
+    session = _ScriptedSession(
+        [
+            _Result(scalar_value=41),
+            _Result(
+                rows=[
+                    {
+                        "object_kind": expected.object_kind,
+                        "block_key": expected.block_key,
+                        "fragment_no": expected.fragment_no,
+                        "entry_count": expected.entry_count,
+                        "block_hash": expected.block_hash,
+                    }
+                ]
+            ),
+            _Result(),
+            _Result(scalar_value=17),
+            _Result(),
+            _Result(),
+            *[_Result() for _ in PTG2_V3_DENSE_LAYOUT_TABLES],
+            _Result(),
+        ]
+    )
+
+    sealed = await seal_shared_layout(
+        session,
+        schema_name="mrf",
+        snapshot_key=41,
+        build_token="attempt-41",
+        expected_blocks=(expected,),
+        support_digest=b"s" * 32,
+        layout_manifest={"contract": "strict-v3"},
+    )
+
+    assert sealed.snapshot_key == 17
+    assert sealed.reused is True
+    assert not any(
+        "ptg2_v3_gc_candidate" in sql
+        for sql, _params in session.calls
+    )
+    assert any(
+        "DELETE FROM \"mrf\".ptg2_v3_snapshot_layout" in sql
+        for sql, _params in session.calls
+    )
+
+
 def test_decode_shared_block_payload_is_strict():
     raw = b"payload" * 100
     compressed = zlib.compress(raw, 1)

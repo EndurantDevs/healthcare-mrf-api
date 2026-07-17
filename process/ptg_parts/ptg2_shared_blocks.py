@@ -875,11 +875,6 @@ async def seal_shared_layout(
             schema_name=schema_name,
             snapshot_key=int(snapshot_key),
         )
-        await _queue_snapshot_blocks_for_gc(
-            session,
-            schema_name=schema_name,
-            snapshot_key=int(snapshot_key),
-        )
         await session.execute(
             text(
                 f"""
