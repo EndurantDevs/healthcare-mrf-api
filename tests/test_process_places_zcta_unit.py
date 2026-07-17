@@ -89,7 +89,7 @@ async def test_process_data_dedupes_rows_latest_year(monkeypatch, places_module,
     assert captured["cls"].__tablename__ == "pricing_places_zcta_20260319"
     assert captured["kwargs"] == {"rewrite": True, "use_copy": False}
     assert len(captured["rows"]) == 2
-    by_measure = {row["measure_id"]: row for row in captured["rows"]}
+    by_measure = {measure_row["measure_id"]: measure_row for measure_row in captured["rows"]}
     assert by_measure["CSMOKING"]["measure_name"] == "Smoking B"
     assert by_measure["CSMOKING"]["data_value"] == 11.0
     assert by_measure["BPHIGH"]["data_value"] == 20.0

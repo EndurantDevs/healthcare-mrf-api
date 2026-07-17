@@ -490,7 +490,7 @@ def test_provider_directory_adoption_migrations_compile_offline_sql():
             "DB_SCHEMA": "mrf",
         }
     )
-    result = subprocess.run(
+    offline_sql_compile_process = subprocess.run(
         [
             sys.executable,
             "-m",
@@ -505,5 +505,5 @@ def test_provider_directory_adoption_migrations_compile_offline_sql():
         capture_output=True,
         text=True,
     )
-    assert "provider_directory_dataset_resource_plan_lookup_idx" in result.stdout
-    assert "import_run_provider_directory_retry_child_idx" in result.stdout
+    assert "provider_directory_dataset_resource_plan_lookup_idx" in offline_sql_compile_process.stdout
+    assert "import_run_provider_directory_retry_child_idx" in offline_sql_compile_process.stdout

@@ -1250,6 +1250,34 @@ def test_ptg2_dedupe_jobs_uses_canonical_url_and_merges_plans():
     assert deduped[1]["type"] == "allowed_amounts"
 
 
+def test_ptg2_job_dedupe_merges_plans_in_linear_work(monkeypatch):
+    plan_count = 250
+    shared_url = "https://files.example.test/shared-rates.json.gz"
+    source_jobs = [
+        {
+            "type": "in_network",
+            "url": shared_url,
+            "plan_info": [{"plan_id": f"PLAN-{plan_index}"}],
+        }
+        for plan_index in range(plan_count)
+    ]
+    original_dumps = ptg_source_jobs.canonical_json_dumps
+    serialized_plan_payloads = []
+
+    def tracked_dumps(plan_payload):
+        serialized_plan_payloads.append(plan_payload)
+        return original_dumps(plan_payload)
+
+    monkeypatch.setattr(ptg_source_jobs, "canonical_json_dumps", tracked_dumps)
+
+    deduped_jobs, duplicate_count = process_ptg._dedupe_ptg_jobs(source_jobs)
+
+    assert duplicate_count == plan_count - 1
+    assert len(deduped_jobs) == 1
+    assert len(deduped_jobs[0]["plan_info"]) == plan_count
+    assert len(serialized_plan_payloads) == plan_count
+
+
 
 
 def test_ptg2_rust_compact_stage_preserves_serving_parent_shape_for_inheritance(monkeypatch):
@@ -2069,6 +2097,66 @@ def test_ptg2_toc_jobs_normalize_asr_download_links(monkeypatch):
     )
     assert jobs[0]["url"] == expected_url
     assert any(job_row["url"] == expected_url and job_row["file_type"] == "in-network" for job_row in pushed_file_rows)
+
+
+def test_toc_limit_merges_shared_file_plan_scopes(monkeypatch):
+    """Keep every logical plan when one selected physical file is shared."""
+
+    shared_url = "https://files.example.test/selected-rates.json.gz"
+    toc_map = {
+        "reporting_entity_name": "Example Payer",
+        "reporting_entity_type": "payer",
+        "reporting_structure": [
+            {
+                "reporting_plans": [
+                    {
+                        "plan_name": f"Example Plan {suffix}",
+                        "plan_id": f"PLAN-{suffix}",
+                        "plan_market_type": "group",
+                    }
+                ],
+                "in_network_files": [{"location": shared_url}],
+            }
+            for suffix in ("A", "B")
+        ],
+    }
+    pushed_file_rows = []
+
+    async def fake_materialize(*_args, **_kwargs):
+        artifact = SimpleNamespace(logical_path="/tmp/example-toc.json")
+        return artifact, artifact
+
+    async def fake_push_objects(file_rows_to_push, _cls, **_kwargs):
+        pushed_file_rows.extend(file_rows_to_push)
+
+    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
+    monkeypatch.setattr(process_ptg, "load_json_artifact", lambda _path: toc_map)
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    selected_jobs = asyncio.run(
+        process_ptg._process_table_of_contents(
+            "https://files.example.test/toc.json",
+            {"PTGFile": object, "ImportLog": object},
+            test_mode=False,
+            file_url_contains=["selected-rates"],
+            max_files=1,
+        )
+    )
+
+    deduped_jobs, duplicate_count = process_ptg._dedupe_ptg_jobs(selected_jobs)
+
+    assert duplicate_count == 1
+    assert len(deduped_jobs) == 1
+    assert deduped_jobs[0]["url"] == shared_url
+    assert {plan["plan_id"] for plan in deduped_jobs[0]["plan_info"]} == {
+        "PLAN-A",
+        "PLAN-B",
+    }
+    assert [file_row["plan_id"] for file_row in pushed_file_rows[1:]] == [
+        "PLAN-A",
+        "PLAN-B",
+    ]
 
 
 def test_ptg2_toc_repairs_missing_array_commas_and_ignores_unsupported_files(

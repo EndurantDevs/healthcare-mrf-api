@@ -143,15 +143,15 @@ async def test_get_facility_connected_providers_returns_providers_and_specialty_
         ctx=types.SimpleNamespace(sa_session=None),
     )
     response = await npi_module.get_facility_connected_providers(request)
-    payload = json.loads(response.body)
+    connected_providers_payload = json.loads(response.body)
 
-    assert payload["query"]["facility_type"] == "hospital"
-    assert payload["total_providers"] == 2
-    assert payload["matched_facilities"][0]["organization_name"] == "General Hospital"
-    assert payload["providers"][0]["provider_name"] == "Anna Smith"
-    assert payload["providers"][1]["provider_name"] == "Ocean Group Practice"
-    assert payload["providers"][1]["specialty"] == "Unknown"
-    assert payload["specialty_stats"][0]["specialty"] == "Internal Medicine"
+    assert connected_providers_payload["query"]["facility_type"] == "hospital"
+    assert connected_providers_payload["total_providers"] == 2
+    assert connected_providers_payload["matched_facilities"][0]["organization_name"] == "General Hospital"
+    assert connected_providers_payload["providers"][0]["provider_name"] == "Anna Smith"
+    assert connected_providers_payload["providers"][1]["provider_name"] == "Ocean Group Practice"
+    assert connected_providers_payload["providers"][1]["specialty"] == "Unknown"
+    assert connected_providers_payload["specialty_stats"][0]["specialty"] == "Internal Medicine"
     assert len(fake_session.calls) == 4
 
 

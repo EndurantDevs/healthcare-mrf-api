@@ -84,12 +84,12 @@ def test_acquisition_cli_verifies_local_operator_input(tmp_path, capsys):
             str(report_path),
         ]
     )
-    payload = json.loads(capsys.readouterr().out)
+    cli_report = json.loads(capsys.readouterr().out)
 
     assert exit_code == 0
-    assert payload["ok"] is True
-    assert payload["entries"][entry["entry_id"]]["status"] == "passed"
-    assert json.loads(report_path.read_text(encoding="utf-8")) == payload
+    assert cli_report["ok"] is True
+    assert cli_report["entries"][entry["entry_id"]]["status"] == "passed"
+    assert json.loads(report_path.read_text(encoding="utf-8")) == cli_report
 
 
 def test_acquisition_cli_is_directly_executable():

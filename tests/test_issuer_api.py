@@ -103,13 +103,13 @@ async def test_get_issuer_data(monkeypatch):
     response = await get_issuer_data(
         types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=session)), "1001"
     )
-    payload = json.loads(response.body)
-    assert payload["import_errors"] == 2
-    assert payload["plans_count"] == 1
-    assert payload["drug_summary"]["total_drugs"] == 10
-    assert payload["drug_summary"]["quantity_limits"]["has_limit"] == 3
-    assert payload["drug_summary"]["tiers"][0]["tier_slug"] == "tier_1"
-    assert payload["drug_summary"]["tiers"][1]["tier_slug"] == "other"
+    issuer_data_payload = json.loads(response.body)
+    assert issuer_data_payload["import_errors"] == 2
+    assert issuer_data_payload["plans_count"] == 1
+    assert issuer_data_payload["drug_summary"]["total_drugs"] == 10
+    assert issuer_data_payload["drug_summary"]["quantity_limits"]["has_limit"] == 3
+    assert issuer_data_payload["drug_summary"]["tiers"][0]["tier_slug"] == "tier_1"
+    assert issuer_data_payload["drug_summary"]["tiers"][1]["tier_slug"] == "other"
 
 
 @pytest.mark.asyncio

@@ -117,17 +117,17 @@ def test_build_clinical_area_rows_maps_mesh_and_rxnorm_to_areas():
 
     areas, area_conditions, area_treatments = _build_clinical_area_rows(concepts, relationships)
 
-    assert {row["clinical_area_id"] for row in areas} == {"mesh:C14", "mesh:E04"}
+    assert {clinical_area_row["clinical_area_id"] for clinical_area_row in areas} == {"mesh:C14", "mesh:E04"}
     assert {
-        (row["clinical_area_id"], row["condition_system"], row["condition_code"])
-        for row in area_conditions
+        (area_condition_row["clinical_area_id"], area_condition_row["condition_system"], area_condition_row["condition_code"])
+        for area_condition_row in area_conditions
     } == {
         ("mesh:C14", "MESH", "D006331"),
         ("mesh:C14", "MESH", "D002318"),
     }
     assert {
-        (row["clinical_area_id"], row["treatment_system"], row["treatment_code"], row["source"])
-        for row in area_treatments
+        (area_treatment_row["clinical_area_id"], area_treatment_row["treatment_system"], area_treatment_row["treatment_code"], area_treatment_row["source"])
+        for area_treatment_row in area_treatments
     } == {
         ("mesh:E04", "MESH", "D013514", "nlm_mesh_tree"),
         ("mesh:E04", "MESH", "D000001", "nlm_mesh_tree"),

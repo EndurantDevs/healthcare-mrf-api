@@ -346,8 +346,8 @@ async def test_split_provider_service_chunks_partition_by_npi(monkeypatch):
         for chunk in chunks:
             with open(chunk["chunk_path"], "r", encoding="utf-8-sig", newline="") as handle:
                 reader = csv.DictReader(handle)
-                for row in reader:
-                    npi = row["Rndrng_NPI"]
+                for provider_service_row in reader:
+                    npi = provider_service_row["Rndrng_NPI"]
                     existing = npi_to_chunk.get(npi)
                     if existing is None:
                         npi_to_chunk[npi] = chunk["chunk_path"]
@@ -392,8 +392,8 @@ async def test_split_provider_service_chunks_ignores_overflow_fields(monkeypatch
                     "Rndrng_Prvdr_City",
                     "Rndrng_Prvdr_State_Abrvtn",
                 ]
-                for row in reader:
-                    assert None not in row
+                for provider_service_row in reader:
+                    assert None not in provider_service_row
 
 
 @pytest.mark.asyncio

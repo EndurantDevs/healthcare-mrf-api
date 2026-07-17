@@ -49,8 +49,8 @@ async def test_plan_attributes_main_enqueues_test_context(monkeypatch):
     assert kwargs["job_deserializer"] is process_attributes.deserialize_job
     assert fake_pool.enqueue_job.await_count == 4
     for call in fake_pool.enqueue_job.await_args_list:
-        payload = call.args[1]
-        assert payload["context"]["test_mode"] is True
+        enqueued_job_payload = call.args[1]
+        assert enqueued_job_payload["context"]["test_mode"] is True
 
 
 @pytest.mark.asyncio
@@ -94,10 +94,10 @@ async def test_plan_attributes_control_start_runs_inline_fanout(monkeypatch):
     monkeypatch.setattr(process_attributes, "save_attributes", fake_save)
     monkeypatch.setattr(process_attributes, "shutdown", fake_shutdown)
 
-    result = await process_attributes.plan_attributes_control_start({}, {"test_mode": True})
+    control_start_summary = await process_attributes.plan_attributes_control_start({}, {"test_mode": True})
 
-    assert result["test_mode"] is True
-    assert result["inline_save_jobs"] == 1
+    assert control_start_summary["test_mode"] is True
+    assert control_start_summary["inline_save_jobs"] == 1
     assert calls == [
         ("state", True),
         ("attributes", True),

@@ -218,14 +218,14 @@ async def test_snapshot_crosswalk_uses_durable_stage_tables(monkeypatch):
 
     monkeypatch.setattr(drug_claims, "db", _FakeDB())
 
-    result = await drug_claims._enrich_rx_crosswalk_from_snapshot(
+    crosswalk_summary = await drug_claims._enrich_rx_crosswalk_from_snapshot(
         schema="mrf",
         prescription_table="pricing_prescription_stage",
         code_catalog_table="code_catalog_stage",
         code_crosswalk_table="code_crosswalk_stage",
     )
 
-    assert result == {"mapped_codes": 2, "edges": 8}
+    assert crosswalk_summary == {"mapped_codes": 2, "edges": 8}
     assert not any("CREATE TEMP TABLE" in sql for sql in statements)
     assert any("CREATE UNLOGGED TABLE mrf.tmp_hp_rx_codes_abc123" in sql for sql in statements)
     assert any("CREATE UNLOGGED TABLE mrf.tmp_rx_snapshot_codes_abc123" in sql for sql in statements)
@@ -279,14 +279,14 @@ async def test_snapshot_crosswalk_falls_back_to_scalar_rxnorm_column(monkeypatch
 
     monkeypatch.setattr(drug_claims, "db", _FakeDB())
 
-    result = await drug_claims._enrich_rx_crosswalk_from_snapshot(
+    crosswalk_summary = await drug_claims._enrich_rx_crosswalk_from_snapshot(
         schema="mrf",
         prescription_table="pricing_prescription_stage",
         code_catalog_table="code_catalog_stage",
         code_crosswalk_table="code_crosswalk_stage",
     )
 
-    assert result == {"mapped_codes": 2, "edges": 8}
+    assert crosswalk_summary == {"mapped_codes": 2, "edges": 8}
     sql_blob = "\n".join(statements)
     assert "p.rxnorm_id::varchar" in sql_blob
     assert "unnest(COALESCE(p.rxnorm_ids, ARRAY[]::varchar[]))" not in sql_blob

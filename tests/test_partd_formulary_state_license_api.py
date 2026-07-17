@@ -109,11 +109,11 @@ async def test_activity_response_includes_dispensing_fees(monkeypatch):
         args={"as_of": "2026-03-10"},
     )
     response = await partd_formulary.get_pharmacy_partd_activity(request, "1518379601")
-    payload = json.loads(response.body)
+    activity_payload = json.loads(response.body)
 
-    assert payload["medicare_active"] is True
-    assert len(payload["items"]) == 1
-    item = payload["items"][0]
-    assert item["dispensing_fee_brand_30"] == 1.1
-    assert item["dispensing_fee_generic_90"] == 0.3
-    assert item["dispensing_fee_selected_drug_60"] == 2.2
+    assert activity_payload["medicare_active"] is True
+    assert len(activity_payload["items"]) == 1
+    activity_item = activity_payload["items"][0]
+    assert activity_item["dispensing_fee_brand_30"] == 1.1
+    assert activity_item["dispensing_fee_generic_90"] == 0.3
+    assert activity_item["dispensing_fee_selected_drug_60"] == 2.2

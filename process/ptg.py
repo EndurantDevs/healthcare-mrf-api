@@ -1375,9 +1375,24 @@ def _is_requested_toc_body_file_url(location: str, file_url_match_tokens: list[s
     return any(token in normalized_location for token in file_url_match_tokens)
 
 
-def _has_reached_toc_file_limit(jobs: list[dict[str, Any]], max_files: int | None) -> bool:
-    """Return whether TOC processing has selected enough body-file jobs."""
-    return max_files is not None and len(jobs) >= max_files
+def _include_toc_job_with_limit(
+    jobs: list[dict[str, Any]],
+    selected_job_identities: set[tuple[str, str]],
+    job: dict[str, Any],
+    max_files: int | None,
+) -> bool:
+    """Select one physical file while retaining every matching plan scope."""
+
+    identity = _ptg_job_identity(job)
+    if (
+        identity not in selected_job_identities
+        and max_files is not None
+        and len(selected_job_identities) >= max_files
+    ):
+        return False
+    selected_job_identities.add(identity)
+    jobs.append(job)
+    return True
 
 
 async def _process_table_of_contents(
@@ -1399,9 +1414,16 @@ async def _process_table_of_contents(
     file_cls = classes["PTGFile"]
     import_log_cls = classes["ImportLog"]
     jobs: list[dict[str, Any]] = []
+    selected_job_identities: set[tuple[str, str]] = set()
     file_rows: list[dict[str, Any]] = []
     allowed_job_candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
     seen_files: set[int] = set()
+    body_file_limit = max_files
+    if test_mode:
+        body_file_limit = min(
+            TEST_TOC_JOBS,
+            body_file_limit if body_file_limit is not None else TEST_TOC_JOBS,
+        )
 
     with tempfile.TemporaryDirectory(dir=ptg2_temp_parent()) as tmpdir:
         try:
@@ -1492,8 +1514,6 @@ async def _process_table_of_contents(
 
     if not toc_content.get("reporting_structure"):
         for catalog_entry in parsed_catalog_entries:
-            if _has_reached_toc_file_limit(jobs, max_files):
-                break
             if catalog_entry.domain == PTG2_DOMAIN_IN_NETWORK:
                 job_type = "in_network"
                 file_type = "in-network"
@@ -1529,16 +1549,18 @@ async def _process_table_of_contents(
             if job_type == "allowed_amounts":
                 allowed_job_candidates.append((job_by_field, file_row))
                 continue
+            if not _include_toc_job_with_limit(
+                jobs,
+                selected_job_identities,
+                job_by_field,
+                body_file_limit,
+            ):
+                continue
             if file_row["file_id"] not in seen_files:
                 file_rows.append(file_row)
                 seen_files.add(file_row["file_id"])
-            jobs.append(job_by_field)
-            if test_mode and len(jobs) >= TEST_TOC_JOBS:
-                break
 
     for structure in toc_content.get("reporting_structure", []):
-        if _has_reached_toc_file_limit(jobs, max_files):
-            break
         plans = _filter_reporting_plans(
             [_normalize_plan_payload(plan) for plan in (structure.get("reporting_plans") or [])],
             plan_ids=plan_ids,
@@ -1568,23 +1590,24 @@ async def _process_table_of_contents(
                 entry.get("description"),
                 toc_url,
             )
+            job_by_field = {
+                "type": "in_network",
+                "url": location,
+                "description": entry.get("description"),
+                "plan_info": plans,
+                "from_index_url": toc_url,
+                "meta": file_metadata_by_field,
+            }
+            if not _include_toc_job_with_limit(
+                jobs,
+                selected_job_identities,
+                job_by_field,
+                body_file_limit,
+            ):
+                continue
             if file_row["file_id"] not in seen_files:
                 file_rows.append(file_row)
                 seen_files.add(file_row["file_id"])
-            jobs.append(
-                {
-                    "type": "in_network",
-                    "url": location,
-                    "description": entry.get("description"),
-                    "plan_info": plans,
-                    "from_index_url": toc_url,
-                    "meta": file_metadata_by_field,
-                }
-            )
-            if test_mode and len(jobs) >= TEST_TOC_JOBS:
-                break
-            if _has_reached_toc_file_limit(jobs, max_files):
-                break
 
         allowed_amount_files = _as_list(
             structure.get("allowed_amount_file")
@@ -1624,18 +1647,17 @@ async def _process_table_of_contents(
                 )
             )
 
-        if test_mode and len(jobs) >= TEST_TOC_JOBS:
-            break
-
     for allowed_job, file_row in allowed_job_candidates:
-        if _has_reached_toc_file_limit(jobs, max_files):
-            break
+        if not _include_toc_job_with_limit(
+            jobs,
+            selected_job_identities,
+            allowed_job,
+            body_file_limit,
+        ):
+            continue
         if file_row["file_id"] not in seen_files:
             file_rows.append(file_row)
             seen_files.add(file_row["file_id"])
-        jobs.append(allowed_job)
-        if test_mode and len(jobs) >= TEST_TOC_JOBS:
-            break
 
     if file_rows:
         await push_objects(file_rows, file_cls, rewrite=True)

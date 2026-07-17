@@ -157,7 +157,7 @@ async def test_fetch_other_names_deduplicates(monkeypatch):
         def scalars(self):
             return self._rows
 
-    rows = [
+    other_name_rows = [
         FakeRow(
             {
                 "npi": 1,
@@ -180,11 +180,11 @@ async def test_fetch_other_names_deduplicates(monkeypatch):
         ),
     ]
 
-    fake_result = FakeResult(rows)
+    fake_result = FakeResult(other_name_rows)
     monkeypatch.setattr(npi_module.db, "execute", AsyncMock(return_value=fake_result))
 
-    result = await npi_module._fetch_other_names(1)
-    assert result == [
+    other_names = await npi_module._fetch_other_names(1)
+    assert other_names == [
         {
             "other_provider_identifier": "Name One",
             "other_provider_identifier_type_code": "3",

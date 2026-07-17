@@ -228,16 +228,16 @@ def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
             current_param = None
             in_parameters = in_parameters and stripped == "parameters:"
 
-    result: dict[tuple[str, str], dict[str, set[str]]] = {}
+    spec_routes_by_operation: dict[tuple[str, str], dict[str, set[str]]] = {}
     for (_, path), methods in spec_routes.items():
         for method, params in methods.items():
             query_params = {p["name"] for p in params if p.get("in") == "query"}
             path_params = {p["name"] for p in params if p.get("in") == "path"}
-            result[(method, path)] = {
+            spec_routes_by_operation[(method, path)] = {
                 "query_params": query_params,
                 "path_params": path_params,
             }
-    return result
+    return spec_routes_by_operation
 
 
 def test_openapi_routes_match_code():
