@@ -1487,6 +1487,20 @@ def validate_v3_finalizer_summary(
             raise RuntimeError(
                 f"strict V3 finalizer {section_name} object markers are missing"
             )
+        if (
+            _required_non_negative_integer(
+                section.get("copy_bytes"),
+                field_name=f"{section_name} COPY bytes",
+            )
+            <= 0
+        ):
+            raise RuntimeError(
+                f"strict V3 finalizer {section_name} COPY is empty"
+            )
+        _required_sha256(
+            section.get("copy_sha256"),
+            field_name=f"{section_name} COPY sha256",
+        )
         observed_kinds = {
             str(kind)
             for kind, count in artifact_counts.items()

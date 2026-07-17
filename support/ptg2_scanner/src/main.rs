@@ -4,6 +4,7 @@ mod source_witness;
 mod source_witness_spool;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
+#[cfg(test)]
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -11781,6 +11782,7 @@ fn pg_binary_nonnegative_int8(field: &[u8], name: &str) -> io::Result<u64> {
     Ok(value as u64)
 }
 
+#[cfg(test)]
 fn pg_binary_nonnegative_i32(field: &[u8], name: &str) -> io::Result<i32> {
     let value = pg_binary_nonnegative_i64(field, name)?;
     i32::try_from(value).map_err(|_| {
@@ -13225,6 +13227,8 @@ fn write_serving_binary_copy_trailer<W: Write>(
 struct CountingWriter<W: Write> {
     inner: W,
     byte_count: u64,
+    sha256: Sha256,
+    shared_blocks: SharedBlockCopySummary,
 }
 
 impl<W: Write> CountingWriter<W> {
@@ -13232,11 +13236,21 @@ impl<W: Write> CountingWriter<W> {
         Self {
             inner,
             byte_count: 0,
+            sha256: Sha256::new(),
+            shared_blocks: SharedBlockCopySummary::default(),
         }
     }
 
     fn byte_count(&self) -> u64 {
         self.byte_count
+    }
+
+    fn shared_block_summary(&self, path: &Path) -> Value {
+        self.shared_blocks.to_json(
+            path,
+            self.byte_count,
+            sha256_hex(&self.sha256.clone().finalize()),
+        )
     }
 }
 
@@ -13244,6 +13258,7 @@ impl<W: Write> Write for CountingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.inner.write(buf)?;
         self.byte_count = self.byte_count.saturating_add(written as u64);
+        self.sha256.update(&buf[..written]);
         Ok(written)
     }
 
@@ -13257,6 +13272,95 @@ struct ServingBinaryCopyRecordStats {
     stored_payload_bytes: u64,
     raw_payload_bytes: u64,
     compressed: bool,
+}
+
+struct SharedBlockCopyRecord<'a> {
+    block_hash: &'a [u8; 32],
+    object_kind: &'a str,
+    block_key: i64,
+    fragment_no: i32,
+    entry_count: u64,
+    raw_payload_bytes: u64,
+    stored_payload_bytes: u64,
+}
+
+struct SharedBlockCopySummary {
+    row_count: u64,
+    entry_count: u64,
+    raw_payload_bytes: u64,
+    stored_payload_bytes: u64,
+    artifact_record_counts: BTreeMap<String, u64>,
+    block_hash_digest: Sha256,
+}
+
+impl Default for SharedBlockCopySummary {
+    fn default() -> Self {
+        let mut block_hash_digest = Sha256::new();
+        block_hash_digest.update(b"PTG2V3FINALBLOCKS\x01");
+        Self {
+            row_count: 0,
+            entry_count: 0,
+            raw_payload_bytes: 0,
+            stored_payload_bytes: 0,
+            artifact_record_counts: BTreeMap::new(),
+            block_hash_digest,
+        }
+    }
+}
+
+impl SharedBlockCopySummary {
+    fn record(&mut self, record: SharedBlockCopyRecord<'_>) -> io::Result<()> {
+        self.block_hash_digest.update(record.block_hash);
+        update_sha256_length_prefixed(&mut self.block_hash_digest, record.object_kind.as_bytes())?;
+        self.block_hash_digest
+            .update(record.block_key.to_be_bytes());
+        self.block_hash_digest
+            .update(record.fragment_no.to_be_bytes());
+        self.block_hash_digest
+            .update(record.entry_count.to_be_bytes());
+        *self
+            .artifact_record_counts
+            .entry(record.object_kind.to_owned())
+            .or_insert(0) += 1;
+        self.row_count = self.row_count.saturating_add(1);
+        self.entry_count = self.entry_count.saturating_add(record.entry_count);
+        self.raw_payload_bytes = self
+            .raw_payload_bytes
+            .saturating_add(record.raw_payload_bytes);
+        self.stored_payload_bytes = self
+            .stored_payload_bytes
+            .saturating_add(record.stored_payload_bytes);
+        Ok(())
+    }
+
+    fn to_json(&self, path: &Path, copy_bytes: u64, copy_sha256: String) -> Value {
+        json!({
+            "path": path.file_name().and_then(|value| value.to_str()).unwrap_or_default(),
+            "copy_format": "postgresql_binary_copy",
+            "field_count": 10,
+            "fields": ["block_hash", "format_version", "object_kind", "block_key", "fragment_no", "entry_count", "codec", "raw_byte_count", "stored_byte_count", "payload"],
+            "mapping_identity_fields": ["object_kind", "block_key", "fragment_no", "entry_count", "block_hash"],
+            "snapshot_key_included": false,
+            "copy_bytes": copy_bytes,
+            "copy_sha256": copy_sha256,
+            "row_count": self.row_count,
+            "entry_count": self.entry_count,
+            "raw_payload_bytes": self.raw_payload_bytes,
+            "stored_payload_bytes": self.stored_payload_bytes,
+            "block_hash_digest": sha256_hex(&self.block_hash_digest.clone().finalize()),
+            "artifact_record_counts": self.artifact_record_counts,
+        })
+    }
+}
+
+trait SharedBlockCopyWriter: Write {
+    fn record_shared_block(&mut self, record: SharedBlockCopyRecord<'_>) -> io::Result<()>;
+}
+
+impl<W: Write> SharedBlockCopyWriter for CountingWriter<W> {
+    fn record_shared_block(&mut self, record: SharedBlockCopyRecord<'_>) -> io::Result<()> {
+        self.shared_blocks.record(record)
+    }
 }
 
 const PTG2_V3_SHARED_BLOCK_FORMAT_VERSION: i16 = 2;
@@ -13303,7 +13407,7 @@ fn shared_v3_block_hash(
     Ok(hasher.finalize().into())
 }
 
-fn write_serving_binary_copy_record_with_stats<W: Write>(
+fn write_serving_binary_copy_record_with_stats<W: SharedBlockCopyWriter>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     kind: &str,
@@ -13323,7 +13427,7 @@ fn write_serving_binary_copy_record_with_stats<W: Write>(
     )
 }
 
-fn write_serving_binary_copy_record_with_i64_key_and_stats<W: Write>(
+fn write_serving_binary_copy_record_with_i64_key_and_stats<W: SharedBlockCopyWriter>(
     writer: &mut W,
     _target_format: ServingBinaryTargetCopyFormat,
     kind: &str,
@@ -13376,6 +13480,20 @@ fn write_serving_binary_copy_record_with_i64_key_and_stats<W: Write>(
     write_pg_binary_copy_i64_field(writer, shared_raw_payload_bytes)?;
     write_pg_binary_copy_i64_field(writer, stored_payload_bytes)?;
     write_pg_binary_copy_field(writer, &stored_payload)?;
+    writer.record_shared_block(SharedBlockCopyRecord {
+        block_hash: &block_hash,
+        object_kind: kind,
+        block_key,
+        fragment_no: block_no,
+        entry_count: u64::try_from(entry_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "shared block entry count cannot be negative",
+            )
+        })?,
+        raw_payload_bytes: record_stats.raw_payload_bytes,
+        stored_payload_bytes: record_stats.stored_payload_bytes,
+    })?;
     Ok(record_stats)
 }
 
@@ -13409,7 +13527,7 @@ struct ServingBinaryV3LogicalBlock<'a> {
     payload: &'a [u8],
 }
 
-fn write_serving_binary_v3_logical_block<W: Write>(
+fn write_serving_binary_v3_logical_block<W: SharedBlockCopyWriter>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     max_payload_bytes: usize,
@@ -13472,7 +13590,7 @@ struct ServingBinaryV3SpoolBlock<'a> {
     spool_bytes: u64,
 }
 
-fn write_serving_binary_v3_spooled_logical_block<W: Write, R: Read + Seek>(
+fn write_serving_binary_v3_spooled_logical_block<W: SharedBlockCopyWriter, R: Read + Seek>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     max_payload_bytes: usize,
@@ -13714,7 +13832,7 @@ impl ServingBinaryV3ProviderCodeState {
         })
     }
 
-    fn push<W: Write>(
+    fn push<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13770,7 +13888,7 @@ impl ServingBinaryV3ProviderCodeState {
         Ok(())
     }
 
-    fn finish_provider<W: Write>(
+    fn finish_provider<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13859,7 +13977,7 @@ impl ServingBinaryV3ProviderCodeState {
         Ok(())
     }
 
-    fn flush_block<W: Write>(
+    fn flush_block<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13898,7 +14016,7 @@ impl ServingBinaryV3ProviderCodeState {
         Ok(())
     }
 
-    fn finish<W: Write>(
+    fn finish<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13939,7 +14057,7 @@ impl ServingBinaryV3PriceMembershipState {
         }
     }
 
-    fn push<W: Write>(
+    fn push<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13971,7 +14089,7 @@ impl ServingBinaryV3PriceMembershipState {
         Ok(())
     }
 
-    fn finish_membership<W: Write>(
+    fn finish_membership<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -13997,7 +14115,7 @@ impl ServingBinaryV3PriceMembershipState {
         Ok(())
     }
 
-    fn flush_block<W: Write>(
+    fn flush_block<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -14028,7 +14146,7 @@ impl ServingBinaryV3PriceMembershipState {
         )
     }
 
-    fn finish<W: Write>(
+    fn finish<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -14059,7 +14177,7 @@ impl ServingBinaryV3PriceAtomState {
         }
     }
 
-    fn push<W: Write>(
+    fn push<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -14111,7 +14229,7 @@ impl ServingBinaryV3PriceAtomState {
         Ok(())
     }
 
-    fn flush_block<W: Write>(
+    fn flush_block<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -14141,7 +14259,7 @@ impl ServingBinaryV3PriceAtomState {
         )
     }
 
-    fn finish<W: Write>(
+    fn finish<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -14601,7 +14719,7 @@ impl ServingBinaryByCodeProviderShardState {
     }
 }
 
-fn flush_serving_binary_by_code_provider_shard_fragment<W: Write>(
+fn flush_serving_binary_by_code_provider_shard_fragment<W: SharedBlockCopyWriter>(
     writer: &mut W,
     state: &mut ServingBinaryByCodeProviderShardState,
     target_format: ServingBinaryTargetCopyFormat,
@@ -14630,7 +14748,7 @@ fn flush_serving_binary_by_code_provider_shard_fragment<W: Write>(
     Ok(())
 }
 
-fn append_serving_binary_by_code_provider_group<W: Write>(
+fn append_serving_binary_by_code_provider_group<W: SharedBlockCopyWriter>(
     writer: &mut W,
     state: &mut ServingBinaryByCodeProviderShardState,
     target_format: ServingBinaryTargetCopyFormat,
@@ -14709,7 +14827,7 @@ fn append_serving_binary_by_code_provider_group<W: Write>(
     Ok(())
 }
 
-fn push_serving_binary_by_code_occurrence<W: Write>(
+fn push_serving_binary_by_code_occurrence<W: SharedBlockCopyWriter>(
     writer: &mut W,
     state: &mut ServingBinaryByCodeProviderShardState,
     target_format: ServingBinaryTargetCopyFormat,
@@ -14835,7 +14953,7 @@ fn push_serving_binary_v3_forward_page_candidate(
     }
 }
 
-fn write_serving_binary_v3_forward_page<W: Write>(
+fn write_serving_binary_v3_forward_page<W: SharedBlockCopyWriter>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     max_payload_bytes: usize,
@@ -14997,7 +15115,7 @@ fn serving_binary_v3_provider_page_block_payload(
     Ok(payload)
 }
 
-fn write_serving_binary_v3_provider_pages<W: Write>(
+fn write_serving_binary_v3_provider_pages<W: SharedBlockCopyWriter>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     max_payload_bytes: usize,
@@ -15116,7 +15234,7 @@ impl ServingBinaryV3ProviderCodeSpool {
         Ok(())
     }
 
-    fn emit_sorted_unique<W: Write>(
+    fn emit_sorted_unique<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -15192,7 +15310,7 @@ impl ServingBinaryV3ProviderCodeSpool {
         })
     }
 
-    fn emit_in_memory<W: Write>(
+    fn emit_in_memory<W: SharedBlockCopyWriter>(
         &self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -15254,7 +15372,7 @@ fn read_provider_code_pair<R: Read>(
     Ok(Some(pair))
 }
 
-fn emit_provider_code_pair<W: Write>(
+fn emit_provider_code_pair<W: SharedBlockCopyWriter>(
     writer: &mut W,
     target_format: ServingBinaryTargetCopyFormat,
     state: &mut ServingBinaryV3ProviderCodeState,
@@ -15817,7 +15935,7 @@ impl ServingBinaryV3PriceDictionaryState {
         })
     }
 
-    fn push<W: Write>(
+    fn push<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -15855,7 +15973,7 @@ impl ServingBinaryV3PriceDictionaryState {
         Ok(())
     }
 
-    fn flush_block<W: Write>(
+    fn flush_block<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -15897,7 +16015,7 @@ impl ServingBinaryV3PriceDictionaryState {
         Ok(())
     }
 
-    fn finish<W: Write>(
+    fn finish<W: SharedBlockCopyWriter>(
         &mut self,
         writer: &mut W,
         target_format: ServingBinaryTargetCopyFormat,
@@ -15923,6 +16041,33 @@ impl ServingBinaryV3PriceDictionaryState {
     }
 }
 
+fn serving_binary_v3_price_dictionary_summary<W: Write>(
+    state: &ServingBinaryV3PriceDictionaryState,
+    writer: &CountingWriter<W>,
+    target_format: ServingBinaryTargetCopyFormat,
+    max_payload_bytes: usize,
+    source_copy_format: &str,
+) -> Value {
+    json!({
+        "name": "serving_binary_v3_price_dictionary",
+        "format": PTG2_SERVING_BINARY_V3_FORMAT,
+        "encoder_kind": PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND,
+        "artifact_kind": PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
+        "dense_price_ordering": "minimum_negotiated_rate_then_global_id_128_v1",
+        "price_set_count": state.expected_price_key,
+        "row_count": state.expected_price_key,
+        "id_bytes": GLOBAL_ID_BYTES,
+        "block_count": state.block_stats.logical_block_count,
+        "copy_record_count": state.block_stats.copy_record_count,
+        "byte_count": writer.byte_count(),
+        "block_bytes": max_payload_bytes,
+        "source_copy_format": source_copy_format,
+        "target_copy_format": target_format.label(),
+        "storage": state.block_stats.storage_summary(),
+    })
+}
+
+#[cfg(test)]
 fn write_serving_binary_v3_price_dictionary_copy_from_pg_binary_reader<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut CountingWriter<W>,
@@ -15950,23 +16095,36 @@ fn write_serving_binary_v3_price_dictionary_copy_from_pg_binary_reader<R: Read, 
     state.finish(writer, target_format)?;
     write_serving_binary_copy_trailer(writer, target_format)?;
     writer.flush()?;
-    Ok(json!({
-        "name": "serving_binary_v3_price_dictionary",
-        "format": PTG2_SERVING_BINARY_V3_FORMAT,
-        "encoder_kind": PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND,
-        "artifact_kind": PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
-        "dense_price_ordering": "minimum_negotiated_rate_then_global_id_128_v1",
-        "price_set_count": state.expected_price_key,
-        "row_count": state.expected_price_key,
-        "id_bytes": GLOBAL_ID_BYTES,
-        "block_count": state.block_stats.logical_block_count,
-        "copy_record_count": state.block_stats.copy_record_count,
-        "byte_count": writer.byte_count(),
-        "block_bytes": max_payload_bytes,
-        "source_copy_format": "postgres_binary",
-        "target_copy_format": target_format.label(),
-        "storage": state.block_stats.storage_summary(),
-    }))
+    Ok(serving_binary_v3_price_dictionary_summary(
+        &state,
+        writer,
+        target_format,
+        max_payload_bytes,
+        "postgres_binary",
+    ))
+}
+
+fn write_serving_binary_v3_price_dictionary_copy_from_fixed_reader<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut CountingWriter<W>,
+    target_format: ServingBinaryTargetCopyFormat,
+    max_payload_bytes: usize,
+) -> io::Result<Value> {
+    write_serving_binary_copy_header(writer, target_format)?;
+    let mut state = ServingBinaryV3PriceDictionaryState::new(max_payload_bytes)?;
+    while let Some((price_key, price_set_id)) = read_v3_price_key_map_by_key_record(reader)? {
+        state.push(writer, target_format, u64::from(price_key), price_set_id)?;
+    }
+    state.finish(writer, target_format)?;
+    write_serving_binary_copy_trailer(writer, target_format)?;
+    writer.flush()?;
+    Ok(serving_binary_v3_price_dictionary_summary(
+        &state,
+        writer,
+        target_format,
+        max_payload_bytes,
+        "price_key_map_by_key_fixed_v1",
+    ))
 }
 
 #[cfg(test)]
@@ -18052,69 +18210,6 @@ impl AssignedV3RowSource for AssignedFixedRecordStream {
     }
 }
 
-struct PriceDictionaryPgBinaryStream {
-    reader: BufReader<File>,
-    pending: Vec<u8>,
-    pending_offset: usize,
-    phase: u8,
-}
-
-impl PriceDictionaryPgBinaryStream {
-    fn new(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            reader: BufReader::new(File::open(path)?),
-            pending: Vec::new(),
-            pending_offset: 0,
-            phase: 0,
-        })
-    }
-
-    fn fill_pending(&mut self) -> io::Result<bool> {
-        self.pending.clear();
-        self.pending_offset = 0;
-        match self.phase {
-            0 => {
-                write_pg_binary_copy_header(&mut self.pending)?;
-                self.phase = 1;
-            }
-            1 => {
-                if let Some((price_key, price_id)) =
-                    read_v3_price_key_map_by_key_record(&mut self.reader)?
-                {
-                    self.pending.write_all(&2i16.to_be_bytes())?;
-                    write_pg_binary_copy_i64_field(&mut self.pending, i64::from(price_key))?;
-                    write_pg_binary_copy_field(&mut self.pending, &price_id)?;
-                } else {
-                    self.phase = 2;
-                    return self.fill_pending();
-                }
-            }
-            2 => {
-                write_pg_binary_copy_trailer(&mut self.pending)?;
-                self.phase = 3;
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
-}
-
-impl Read for PriceDictionaryPgBinaryStream {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-        if self.pending_offset >= self.pending.len() && !self.fill_pending()? {
-            return Ok(0);
-        }
-        let available = &self.pending[self.pending_offset..];
-        let copied = available.len().min(output.len());
-        output[..copied].copy_from_slice(&available[..copied]);
-        self.pending_offset += copied;
-        Ok(copied)
-    }
-}
-
 struct V3StageWriteSummary {
     row_count: u64,
     code_count: u64,
@@ -18810,6 +18905,7 @@ fn assign_v3_partition(
     })
 }
 
+#[cfg(test)]
 fn pg_binary_i16(field: &[u8], name: &str) -> io::Result<i16> {
     if field.len() != 2 {
         return Err(io::Error::new(
@@ -18820,6 +18916,7 @@ fn pg_binary_i16(field: &[u8], name: &str) -> io::Result<i16> {
     Ok(i16::from_be_bytes(field.try_into().map_err(to_io_error)?))
 }
 
+#[cfg(test)]
 fn summarize_shared_block_copy(path: &Path) -> io::Result<Value> {
     let mut reader = BufReader::new(File::open(path)?);
     read_pg_binary_copy_header(&mut reader)?;
@@ -18938,6 +19035,7 @@ fn summarize_shared_block_copy(path: &Path) -> io::Result<Value> {
         "mapping_identity_fields": ["object_kind", "block_key", "fragment_no", "entry_count", "block_hash"],
         "snapshot_key_included": false,
         "copy_bytes": path.metadata()?.len(),
+        "copy_sha256": sha256_hex(&sha256_file(path)?),
         "row_count": row_count,
         "entry_count": entry_count,
         "raw_payload_bytes": raw_bytes,
@@ -19436,6 +19534,7 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
     let assignment_seconds = assignment_started_at.elapsed().as_secs_f64();
 
     let encode_started_at = Instant::now();
+    let serving_encode_started_at = Instant::now();
     let serving_blocks_path = output.path("shared_serving_blocks.copy");
     let serving_blocks_file = OpenOptions::new()
         .write(true)
@@ -19461,6 +19560,8 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         },
     )?;
     sync_counting_writer(&mut serving_blocks_writer)?;
+    let serving_block_summary = serving_blocks_writer.shared_block_summary(&serving_blocks_path);
+    let serving_encode_seconds = serving_encode_started_at.elapsed().as_secs_f64();
 
     let audit_candidate_path = output.path("audit_candidates.bin");
     let distinct_serving_records = assigned_stream.distinct_record_count();
@@ -19480,22 +19581,23 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
     )?;
 
     let price_blocks_path = output.path("shared_price_dictionary_blocks.copy");
+    let price_dictionary_encode_started_at = Instant::now();
     let price_blocks_file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&price_blocks_path)?;
     let mut price_blocks_writer = CountingWriter::new(BufWriter::new(price_blocks_file));
-    let mut price_stream = PriceDictionaryPgBinaryStream::new(&price_key_map_by_key_path)?;
-    let price_dictionary_summary =
-        write_serving_binary_v3_price_dictionary_copy_from_pg_binary_reader(
-            &mut price_stream,
-            &mut price_blocks_writer,
-            ServingBinaryTargetCopyFormat::SharedBinary,
-            V3_FINALIZER_HOT_BLOCK_BYTES,
-        )?;
+    let mut price_stream = BufReader::new(File::open(&price_key_map_by_key_path)?);
+    let price_dictionary_summary = write_serving_binary_v3_price_dictionary_copy_from_fixed_reader(
+        &mut price_stream,
+        &mut price_blocks_writer,
+        ServingBinaryTargetCopyFormat::SharedBinary,
+        V3_FINALIZER_HOT_BLOCK_BYTES,
+    )?;
     sync_counting_writer(&mut price_blocks_writer)?;
-    let serving_block_summary = summarize_shared_block_copy(&serving_blocks_path)?;
-    let price_block_summary = summarize_shared_block_copy(&price_blocks_path)?;
+    let price_block_summary = price_blocks_writer.shared_block_summary(&price_blocks_path);
+    let price_dictionary_encode_seconds =
+        price_dictionary_encode_started_at.elapsed().as_secs_f64();
     let encode_seconds = encode_started_at.elapsed().as_secs_f64();
 
     let support_digest = v3_support_digest(
@@ -19804,6 +19906,8 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "stage_seconds": stage_seconds,
             "identity_sort_seconds": identity_sort_seconds,
             "assignment_seconds": assignment_seconds,
+            "serving_encode_seconds": serving_encode_seconds,
+            "price_dictionary_encode_seconds": price_dictionary_encode_seconds,
             "encode_seconds": encode_seconds,
             "elapsed_seconds": started_at.elapsed().as_secs_f64(),
         },
@@ -23569,6 +23673,56 @@ mod tests {
     }
 
     #[test]
+    fn shared_block_writer_summary_matches_reread_oracle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared-blocks.copy");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let mut writer = CountingWriter::new(BufWriter::new(file));
+        write_serving_binary_copy_header(&mut writer, ServingBinaryTargetCopyFormat::SharedBinary)
+            .unwrap();
+        let mut stats = ServingBinaryV3BlockStats::default();
+        write_serving_binary_v3_logical_block(
+            &mut writer,
+            ServingBinaryTargetCopyFormat::SharedBinary,
+            32,
+            ServingBinaryV3LogicalBlock {
+                artifact_kind: PTG2_SERVING_BINARY_BY_CODE_PRICE_PAGE_V4_KIND,
+                block_key: 7,
+                entry_count: 3,
+                payload: &[42; 96],
+            },
+            &mut stats,
+        )
+        .unwrap();
+        let compressible_payload = vec![7u8; 8192];
+        write_serving_binary_v3_logical_block(
+            &mut writer,
+            ServingBinaryTargetCopyFormat::SharedBinary,
+            64 * 1024,
+            ServingBinaryV3LogicalBlock {
+                artifact_kind: PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND,
+                block_key: 8,
+                entry_count: 1,
+                payload: &compressible_payload,
+            },
+            &mut stats,
+        )
+        .unwrap();
+        write_serving_binary_copy_trailer(&mut writer, ServingBinaryTargetCopyFormat::SharedBinary)
+            .unwrap();
+        sync_counting_writer(&mut writer).unwrap();
+
+        assert_eq!(
+            writer.shared_block_summary(&path),
+            summarize_shared_block_copy(&path).unwrap(),
+        );
+    }
+
+    #[test]
     fn code_dictionary_support_digest_covers_all_ten_fields() {
         let support_digest = |code_key: i32, code: NaturalLeanCode, rate_count: u64| {
             let mut copy_row = Vec::new();
@@ -26236,10 +26390,29 @@ mod tests {
             32,
         )
         .unwrap();
-        let records = read_test_shared_binary_records(writer.inner);
+        let pg_binary_output = writer.inner;
+        let records = read_test_shared_binary_records(pg_binary_output.clone());
         let expected_payload = price_ids.into_iter().flatten().collect::<Vec<_>>();
 
+        let mut fixed_input = Vec::new();
+        for (price_key, price_id) in price_ids.iter().enumerate() {
+            fixed_input.extend_from_slice(&(price_key as u32).to_be_bytes());
+            fixed_input.extend_from_slice(price_id);
+        }
+        let mut fixed_reader = Cursor::new(fixed_input);
+        let mut fixed_writer = CountingWriter::new(Vec::new());
+        let fixed_summary = write_serving_binary_v3_price_dictionary_copy_from_fixed_reader(
+            &mut fixed_reader,
+            &mut fixed_writer,
+            ServingBinaryTargetCopyFormat::SharedBinary,
+            32,
+        )
+        .unwrap();
+
         assert_eq!(records.len(), 2);
+        assert_eq!(fixed_writer.inner, pg_binary_output);
+        assert_eq!(fixed_summary["price_set_count"], summary["price_set_count"]);
+        assert_eq!(fixed_summary["storage"], summary["storage"]);
         assert!(records
             .iter()
             .all(|record| record.kind == PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND));

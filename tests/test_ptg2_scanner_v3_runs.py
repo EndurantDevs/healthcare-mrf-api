@@ -1136,6 +1136,15 @@ def test_direct_v3_finalizer_cli_emits_shared_block_staging_copy(tmp_path):
         "payload",
     ]
     assert summary["blocks"]["serving"]["snapshot_key_included"] is False
+    for section_name, file_name in (
+        ("serving", "shared_serving_blocks.copy"),
+        ("price_dictionary", "shared_price_dictionary_blocks.copy"),
+    ):
+        copy_bytes = (output_directory / file_name).read_bytes()
+        assert summary["blocks"][section_name]["copy_bytes"] == len(copy_bytes)
+        assert summary["blocks"][section_name]["copy_sha256"] == hashlib.sha256(
+            copy_bytes
+        ).hexdigest()
 
     shared_rows = _read_pg_binary_rows(
         (output_directory / "shared_serving_blocks.copy").read_bytes(), 10

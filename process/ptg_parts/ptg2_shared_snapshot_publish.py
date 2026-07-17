@@ -705,11 +705,25 @@ async def _publish_strict_shared_v3_layout_prepared(
                     _output_file(finalizer_summary, serving_block_summary),
                     schema_name=schema_name,
                     stage_table=block_stage,
+                    expected_copy_bytes=_integer(
+                        serving_block_summary.get("copy_bytes"),
+                        "serving block COPY bytes",
+                    ),
+                    expected_copy_sha256=str(
+                        serving_block_summary.get("copy_sha256") or ""
+                    ),
                 )
                 await copy_shared_block_binary_file(
                     _output_file(finalizer_summary, price_block_summary),
                     schema_name=schema_name,
                     stage_table=block_stage,
+                    expected_copy_bytes=_integer(
+                        price_block_summary.get("copy_bytes"),
+                        "price block COPY bytes",
+                    ),
+                    expected_copy_sha256=str(
+                        price_block_summary.get("copy_sha256") or ""
+                    ),
                 )
                 return await publish_shared_block_stage(
                     schema_name=schema_name,

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import uuid
@@ -48,6 +49,26 @@ class SharedBlockStagePublication:
     unique_block_count: int
     logical_byte_count: int
     stored_byte_count: int
+
+
+class _DigestingReader:
+    """Account for the exact bytes consumed by PostgreSQL COPY."""
+
+    def __init__(self, source: Any) -> None:
+        self._source = source
+        self.byte_count = 0
+        self._sha256 = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._source.read(size)
+        if chunk:
+            self.byte_count += len(chunk)
+            self._sha256.update(chunk)
+        return chunk
+
+    @property
+    def sha256(self) -> str:
+        return self._sha256.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -187,19 +208,40 @@ async def copy_shared_block_binary_file(
     *,
     schema_name: str,
     stage_table: str,
+    expected_copy_bytes: int | None = None,
+    expected_copy_sha256: str | None = None,
 ) -> None:
     """Validate and binary-COPY a shared-block file into the staging table."""
 
     path = Path(copy_path)
     if not path.is_file() or path.stat().st_size <= 0:
         raise RuntimeError(f"strict V3 shared-block COPY is missing or empty: {path}")
+    if (expected_copy_bytes is None) != (expected_copy_sha256 is None):
+        raise RuntimeError(
+            "strict V3 shared-block COPY requires both byte and digest expectations"
+        )
+    if expected_copy_bytes is not None:
+        if isinstance(expected_copy_bytes, bool) or int(expected_copy_bytes) <= 0:
+            raise RuntimeError("strict V3 shared-block COPY has invalid expected bytes")
+        if path.stat().st_size != int(expected_copy_bytes):
+            raise RuntimeError("strict V3 shared-block COPY byte count changed before COPY")
+        if (
+            not isinstance(expected_copy_sha256, str)
+            or len(expected_copy_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_copy_sha256
+            )
+        ):
+            raise RuntimeError("strict V3 shared-block COPY has invalid expected digest")
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection
         driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
         copy_to_table = getattr(driver_conn, "copy_to_table", None)
         if copy_to_table is None:
             raise NotImplementedError("active database driver does not expose binary COPY")
-        with path.open("rb") as source:
+        with path.open("rb") as source_file:
+            source = _DigestingReader(source_file)
             await copy_to_table(
                 _safe_identifier(stage_table),
                 source=source,
@@ -207,6 +249,13 @@ async def copy_shared_block_binary_file(
                 columns=list(_SHARED_BLOCK_STAGE_COLUMNS),
                 format="binary",
             )
+            if expected_copy_bytes is not None and (
+                source.byte_count != int(expected_copy_bytes)
+                or source.sha256 != expected_copy_sha256
+            ):
+                raise RuntimeError(
+                    "strict V3 shared-block COPY content changed during publication"
+                )
 
 
 def _required_summary_mapping(value: Any, name: str) -> dict[str, Any]:
