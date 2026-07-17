@@ -753,6 +753,27 @@ impl NaturalLeanCodeFields<'_> {
             description: self.description.map(str::to_owned),
         }
     }
+
+    fn matches(self, code: &NaturalLeanCode) -> bool {
+        code.coverage_scope_id == *self.coverage_scope_id
+            && code.reported_code_system.as_deref() == self.reported_code_system
+            && code.reported_code.as_deref() == self.reported_code
+            && code.negotiation_arrangement.as_deref() == self.negotiation_arrangement
+            && code.billing_code_type_version.as_deref() == self.billing_code_type_version
+            && code.name.as_deref() == self.name
+            && code.description.as_deref() == self.description
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedNaturalLeanCode {
+    code_id: [u8; 16],
+}
+
+impl PreparedNaturalLeanCode {
+    pub fn code_id(self) -> [u8; 16] {
+        self.code_id
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -878,18 +899,49 @@ impl ServingRunPartitionWriter {
                 "serving run code identity does not match its natural-lean tuple",
             ));
         }
-        let code = code_fields.into_owned(record.code_id);
-        if let Some(existing) = self.code_dictionary.get(&record.code_id) {
-            if existing != &code {
+        let prepared = self.register_natural_lean_code_with_id(expected_code_id, code_fields)?;
+        self.write_prepared_natural_lean_record(record, prepared)
+    }
+
+    pub fn register_natural_lean_code(
+        &mut self,
+        code_fields: NaturalLeanCodeFields<'_>,
+    ) -> io::Result<PreparedNaturalLeanCode> {
+        let code_id = code_fields.identity();
+        self.register_natural_lean_code_with_id(code_id, code_fields)
+    }
+
+    pub fn write_prepared_natural_lean_record(
+        &mut self,
+        record: &ServingRunRecord,
+        prepared: PreparedNaturalLeanCode,
+    ) -> io::Result<usize> {
+        if record.code_id != prepared.code_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serving run code identity does not match its prepared natural-lean code",
+            ));
+        }
+        self.write_record(record)
+    }
+
+    fn register_natural_lean_code_with_id(
+        &mut self,
+        code_id: [u8; 16],
+        code_fields: NaturalLeanCodeFields<'_>,
+    ) -> io::Result<PreparedNaturalLeanCode> {
+        if let Some(existing) = self.code_dictionary.get(&code_id) {
+            if !code_fields.matches(existing) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "serving run code identity collision has conflicting natural-lean tuples",
                 ));
             }
         } else {
-            self.code_dictionary.insert(record.code_id, code);
+            self.code_dictionary
+                .insert(code_id, code_fields.into_owned(code_id));
         }
-        self.write_record(record)
+        Ok(PreparedNaturalLeanCode { code_id })
     }
 
     pub fn finish(mut self) -> io::Result<ServingRunOutput> {
@@ -3374,11 +3426,13 @@ mod tests {
             price_set_id: [2; 16],
             provider_count: 3,
         };
+        let prepared = writer.register_natural_lean_code(code_fields).unwrap();
+        assert_eq!(prepared.code_id(), code_id);
         writer
-            .write_natural_lean_record(&record, code_fields)
+            .write_prepared_natural_lean_record(&record, prepared)
             .unwrap();
         writer
-            .write_natural_lean_record(&record, code_fields)
+            .write_prepared_natural_lean_record(&record, prepared)
             .unwrap();
         let output = writer.finish().unwrap();
         let dictionary = output.code_dictionary_file.unwrap();

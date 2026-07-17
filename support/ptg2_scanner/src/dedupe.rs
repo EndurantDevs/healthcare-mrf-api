@@ -1,8 +1,9 @@
 use crate::config::env_bool;
 use crate::hashing::{
-    hash_text_key, price_set_entry_key, provider_entry_component_key, provider_group_member_key,
+    hash_text_key, provider_entry_component_key, provider_group_member_key,
     provider_set_component_key, provider_set_entry_key, shard_for_u128, shard_for_u64,
 };
+use crate::manifest::GlobalId128;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -11,6 +12,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
 };
+use xxhash_rust::xxh3::Xxh3;
 
 struct ShardedDedupe64 {
     shards: Vec<Mutex<HashSet<u64>>>,
@@ -192,8 +194,8 @@ pub struct SharedDedupe {
     serving_rate: Option<ShardedDedupe64>,
     procedure: ShardedDedupe64,
     price_code_set: ShardedDedupe64,
-    price_atom: ShardedDedupe64,
-    price_set: ShardedDedupe64,
+    price_atom: ShardedDedupe128,
+    price_set: ShardedDedupe128,
     price_set_entry: Option<ShardedDedupe128>,
     provider_set: ShardedDedupe64,
     provider_set_component: ShardedDedupe128,
@@ -232,8 +234,8 @@ impl SharedDedupe {
             serving_rate: serving_rate_dedupe_enabled.then(|| ShardedDedupe64::new(shard_count)),
             procedure: ShardedDedupe64::new(shard_count),
             price_code_set: ShardedDedupe64::new(shard_count),
-            price_atom: ShardedDedupe64::new(shard_count),
-            price_set: ShardedDedupe64::new(shard_count),
+            price_atom: ShardedDedupe128::new(shard_count),
+            price_set: ShardedDedupe128::new(shard_count),
             price_set_entry: dedupe_high_cardinality_entries
                 .then(|| ShardedDedupe128::new(shard_count)),
             provider_set: ShardedDedupe64::new(shard_count),
@@ -276,14 +278,14 @@ impl SharedDedupe {
         inserted
     }
 
-    pub fn insert_price_set(&self, key: &str) -> bool {
-        let inserted = self.price_set.insert_hash_text(key);
+    pub fn insert_price_set(&self, key: GlobalId128) -> bool {
+        let inserted = self.price_set.insert(u128::from_le_bytes(key.0));
         self.price_set_counter.record(inserted);
         inserted
     }
 
-    pub fn insert_price_atom(&self, key: &str) -> bool {
-        let inserted = self.price_atom.insert_hash_text(key);
+    pub fn insert_price_atom(&self, key: GlobalId128) -> bool {
+        let inserted = self.price_atom.insert(u128::from_le_bytes(key.0));
         self.price_atom_counter.record(inserted);
         inserted
     }
@@ -292,9 +294,19 @@ impl SharedDedupe {
         self.price_code_set.insert_hash_text(key)
     }
 
-    pub fn insert_price_set_entry(&self, price_set_hash: &str, price_atom_hash: &str) -> bool {
+    pub fn insert_price_set_entry(
+        &self,
+        price_set_id: GlobalId128,
+        price_atom_id: GlobalId128,
+    ) -> bool {
         let inserted = match &self.price_set_entry {
-            Some(dedupe) => dedupe.insert(price_set_entry_key(price_set_hash, price_atom_hash)),
+            Some(dedupe) => {
+                let mut hasher = Xxh3::new();
+                hasher.update(b"price_set_entry_manifest_v3");
+                hasher.update(&price_set_id.0);
+                hasher.update(&price_atom_id.0);
+                dedupe.insert(hasher.digest128())
+            }
             None => true,
         };
         self.price_set_entry_counter.record(inserted);
@@ -527,6 +539,7 @@ pub fn emit_dedupe_summary(dedupe: &SharedDedupe, object_counts: &HashMap<String
 #[cfg(test)]
 mod tests {
     use super::{dedupe_summary_payload, SharedDedupe};
+    use crate::manifest::GlobalId128;
     use serde_json::Value;
     use std::collections::HashMap;
 
@@ -580,5 +593,27 @@ mod tests {
         assert_eq!(payload["provider_group_member_attempted"], 3);
         assert_eq!(payload["provider_group_member_unique"], 2);
         assert_eq!(payload["provider_group_member_duplicate"], 1);
+    }
+
+    #[test]
+    fn shared_dedupe_uses_complete_v3_price_ids() {
+        let dedupe = SharedDedupe::new(2);
+        let low = GlobalId128([0; 16]);
+        let mut high_bytes = [0; 16];
+        high_bytes[15] = 1;
+        let high = GlobalId128(high_bytes);
+
+        assert!(dedupe.insert_price_atom(low));
+        assert!(dedupe.insert_price_atom(high));
+        assert!(!dedupe.insert_price_atom(low));
+        assert!(dedupe.insert_price_set(low));
+        assert!(dedupe.insert_price_set(high));
+        assert!(!dedupe.insert_price_set(high));
+
+        let payload = dedupe_summary_payload(&dedupe, &HashMap::new());
+        assert_eq!(payload["price_atom_attempted"], 3);
+        assert_eq!(payload["price_atom_unique"], 2);
+        assert_eq!(payload["price_set_attempted"], 3);
+        assert_eq!(payload["price_set_unique"], 2);
     }
 }
