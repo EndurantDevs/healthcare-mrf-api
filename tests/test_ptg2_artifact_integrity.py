@@ -3,6 +3,8 @@
 import asyncio
 import binascii
 import gzip
+import hashlib
+import io
 import struct
 import zipfile
 from pathlib import Path
@@ -23,7 +25,7 @@ def _configure_range_downloads(monkeypatch) -> None:
     monkeypatch.setenv(config.PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV, "0")
 
 
-async def _download_from_handler(tmp_path: Path, handler, prepare=None):
+async def _download_from_handler(tmp_path: Path, handler, prepare=None, *, query: str = ""):
     app = web.Application()
     app.router.add_route("*", "/artifact.bin", handler)
     runner = web.AppRunner(app)
@@ -31,7 +33,7 @@ async def _download_from_handler(tmp_path: Path, handler, prepare=None):
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
-    url = f"http://127.0.0.1:{port}/artifact.bin"
+    url = f"http://127.0.0.1:{port}/artifact.bin{query}"
     store = artifacts.PTG2ArtifactStore(tmp_path)
     if prepare is not None:
         prepare(store, url)
@@ -39,6 +41,158 @@ async def _download_from_handler(tmp_path: Path, handler, prepare=None):
         return await source_download.download_raw_artifact(url, store=store)
     finally:
         await runner.cleanup()
+
+
+def _zip_bytes(payload: bytes = b'{"in_network":[]}') -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("rates.json", payload)
+    return output.getvalue()
+
+
+def _configure_single_get_downloads(monkeypatch, *, retries: int = 1) -> None:
+    monkeypatch.setenv("HLTHPRT_FETCH_ALLOW_LOCAL", "true")
+    monkeypatch.setenv(config.PTG2_RANGE_DOWNLOADS_ENV, "false")
+    monkeypatch.setenv(config.PTG2_DOWNLOAD_RETRIES_ENV, str(retries))
+    monkeypatch.setenv(config.PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV, "0")
+
+
+@pytest.mark.parametrize(
+    ("filename", "artifact_bytes"),
+    [
+        ("rates.zip", _zip_bytes()),
+        ("rates.json.gz", gzip.compress(b'{"in_network":[]}')),
+    ],
+)
+def test_query_named_container_retries_http_200_html(
+    monkeypatch,
+    tmp_path,
+    filename,
+    artifact_bytes,
+):
+    html_bytes = b"<html><body>temporary upstream error</body></html>"
+    get_requests = []
+
+    async def handle(request):
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": str(len(artifact_bytes))})
+        get_requests.append(request.path_qs)
+        if len(get_requests) == 1:
+            return web.Response(body=html_bytes, content_type="text/html")
+        return web.Response(body=artifact_bytes)
+
+    _configure_single_get_downloads(monkeypatch)
+    artifact = asyncio.run(
+        _download_from_handler(
+            tmp_path,
+            handle,
+            query=f"?FileName={filename}",
+        )
+    )
+
+    assert Path(artifact.raw_path).read_bytes() == artifact_bytes
+    assert len(get_requests) == 2
+    available_manifest_entries = [
+        entry
+        for entry in artifacts.PTG2ArtifactStore(tmp_path)._manifest_entries()
+        if entry.get("status") == "available"
+    ]
+    assert [entry["raw_sha256"] for entry in available_manifest_entries] == [
+        hashlib.sha256(artifact_bytes).hexdigest()
+    ]
+
+
+def test_query_named_zip_rejects_cached_html(monkeypatch, tmp_path):
+    html_bytes = b"<html><body>cached upstream error</body></html>"
+    zip_bytes = _zip_bytes()
+    get_requests = []
+
+    async def handle(request):
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": str(len(zip_bytes))})
+        get_requests.append(request.path_qs)
+        return web.Response(body=zip_bytes)
+
+    def prepare(store, url):
+        digest = hashlib.sha256(html_bytes).hexdigest()
+        raw_path = store.artifact_path(digest, kind=PTG2_ARTIFACT_RAW)
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path.write_bytes(html_bytes)
+        store.record_manifest(
+            {
+                "artifact_kind": PTG2_ARTIFACT_RAW,
+                "canonical_url": source_download.canonicalize_url(url),
+                "raw_storage_uri": store.storage_uri(raw_path),
+                "raw_sha256": digest,
+                "content_length": len(html_bytes),
+                "status": "available",
+            }
+        )
+
+    _configure_single_get_downloads(monkeypatch, retries=0)
+    artifact = asyncio.run(
+        _download_from_handler(
+            tmp_path,
+            handle,
+            prepare=prepare,
+            query="?FileName=rates.zip",
+        )
+    )
+
+    assert Path(artifact.raw_path).read_bytes() == zip_bytes
+    assert len(get_requests) == 1
+    manifest_entries = artifacts.PTG2ArtifactStore(tmp_path)._manifest_entries()
+    assert any(
+        entry.get("status") == "corrupt"
+        and entry.get("raw_sha256") == hashlib.sha256(html_bytes).hexdigest()
+        for entry in manifest_entries
+    )
+
+
+def test_query_named_zip_rejects_ranges_before_full_get(monkeypatch, tmp_path):
+    invalid_range_bytes = b"<html><body>temporary upstream error</body></html>"
+    zip_bytes = _zip_bytes()
+    requests = []
+
+    async def handle(request):
+        if request.method == "HEAD":
+            return web.Response(
+                headers={
+                    "Content-Length": str(len(invalid_range_bytes)),
+                    "ETag": '"stable"',
+                }
+            )
+        range_header = request.headers.get("Range")
+        requests.append(range_header)
+        if range_header:
+            start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+            start = int(start_text)
+            end = int(end_text or len(invalid_range_bytes) - 1)
+            return web.Response(
+                status=206,
+                body=invalid_range_bytes[start : end + 1],
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{len(invalid_range_bytes)}",
+                    "ETag": '"stable"',
+                },
+            )
+        return web.Response(body=zip_bytes)
+
+    _configure_range_downloads(monkeypatch)
+    artifact = asyncio.run(
+        _download_from_handler(
+            tmp_path,
+            handle,
+            query="?FileName=rates.zip",
+        )
+    )
+
+    assert Path(artifact.raw_path).read_bytes() == zip_bytes
+    assert requests == [
+        "bytes=0-0",
+        f"bytes=0-{len(invalid_range_bytes) - 1}",
+        None,
+    ]
 
 
 def test_shifted_content_range_falls_back_to_full_get(monkeypatch, tmp_path):

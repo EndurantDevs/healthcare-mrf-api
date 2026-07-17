@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, urljoin, urlsplit
 
 import aiohttp
 
@@ -92,6 +92,7 @@ _GZIP_VALIDATE_FRESH_ENV = "HLTHPRT_PTG2_VALIDATE_FRESH_GZIP"
 INCOMPLETE_TLS_CHAIN_HOSTS_ENV = "HLTHPRT_INCOMPLETE_TLS_CHAIN_HOSTS"
 DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS = frozenset({"api.midlandschoice.com"})
 _CONTENT_RANGE_PATTERN = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)$", re.IGNORECASE)
+_ARTIFACT_FILENAME_QUERY_KEYS = frozenset({"file", "filename", "file_name", "name"})
 
 
 @dataclass
@@ -101,6 +102,10 @@ class RangeDownloadProgress:
 
 
 class _UnsafeRangeResponseError(RuntimeError):
+    pass
+
+
+class _UnexpectedArtifactContainerError(RuntimeError):
     pass
 
 
@@ -188,9 +193,29 @@ def _request_ssl_kwargs(url: str | None) -> dict[str, object]:
     return {}
 
 
+def _artifact_name_candidates(url: str, path: str | Path) -> tuple[str, ...]:
+    parsed_url = urlsplit(url)
+    query_names = tuple(
+        value
+        for key, value in parse_qsl(parsed_url.query, keep_blank_values=False)
+        if key.casefold() in _ARTIFACT_FILENAME_QUERY_KEYS
+    )
+    return (*query_names, parsed_url.path, str(path))
+
+
+def _expected_artifact_container(url: str, path: str | Path) -> str | None:
+    for artifact_name in _artifact_name_candidates(url, path):
+        candidate_path = urlsplit(artifact_name).path or artifact_name
+        suffixes = {suffix.lower() for suffix in Path(candidate_path).suffixes}
+        if ".zip" in suffixes:
+            return "zip"
+        if ".gz" in suffixes:
+            return "gzip"
+    return None
+
+
 def _is_expected_gzip_artifact(url: str, path: str | Path) -> bool:
-    url_suffixes = {suffix.lower() for suffix in Path(urlsplit(url).path).suffixes}
-    return ".gz" in url_suffixes or Path(path).suffix.lower() == ".gz"
+    return _expected_artifact_container(url, path) == "gzip"
 
 
 def _gzip_magic_error(url: str, path: str | Path) -> str | None:
@@ -232,6 +257,42 @@ def _gzip_integrity_error(url: str, path: str | Path, *, max_bytes: int | None =
     except (EOFError, OSError, zlib.error) as exc:
         return f"raw gzip artifact failed integrity check: {exc}"
     return None
+
+
+def _zip_container_error(url: str, path: str | Path) -> str | None:
+    if _expected_artifact_container(url, path) != "zip":
+        return None
+    artifact_path = Path(path)
+    try:
+        with zipfile.ZipFile(artifact_path) as archive:
+            if not any(not member.is_dir() for member in archive.infolist()):
+                return f"raw ZIP artifact has no file members: {artifact_path}"
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        return f"raw artifact for ZIP reference is not a readable ZIP container: {exc}"
+    return None
+
+
+def _artifact_container_error(
+    url: str,
+    path: str | Path,
+    *,
+    validate_gzip_integrity: bool = False,
+    gzip_max_bytes: int | None = None,
+) -> str | None:
+    container_kind = _expected_artifact_container(url, path)
+    if container_kind == "gzip":
+        if validate_gzip_integrity:
+            return _gzip_integrity_error(url, path, max_bytes=gzip_max_bytes)
+        return _gzip_magic_error(url, path)
+    if container_kind == "zip":
+        return _zip_container_error(url, path)
+    return None
+
+
+def _raise_for_unexpected_artifact_container(url: str, path: str | Path) -> None:
+    container_error = _artifact_container_error(url, path)
+    if container_error:
+        raise _UnexpectedArtifactContainerError(container_error)
 
 
 async def _open_validated_request(
@@ -747,6 +808,7 @@ async def _run_single_get_attempt(
         raise RuntimeError(
             f"Download for {url} ended at {state.byte_count} bytes, expected {state.total_bytes}"
         )
+    _raise_for_unexpected_artifact_container(url, state.path)
     _range_sidecar_path(state.path).unlink(missing_ok=True)
 
 
@@ -892,10 +954,11 @@ async def _download_raw_artifact_locked(
             raw_path = store.path_from_uri(raw_uri)
             expected = str(candidate["raw_sha256"]).lower()
             actual, byte_count = sha256_file(raw_path)
-            gzip_error = _gzip_integrity_error(
+            container_error = _artifact_container_error(
                 url,
                 raw_path,
-                max_bytes=_gzip_reuse_validate_max_bytes(),
+                validate_gzip_integrity=True,
+                gzip_max_bytes=_gzip_reuse_validate_max_bytes(),
             )
             if expected and actual != expected:
                 should_validate_downloaded_gzip = True
@@ -909,7 +972,7 @@ async def _download_raw_artifact_locked(
                         "actual_sha256": actual,
                     }
                 )
-            elif gzip_error:
+            elif container_error:
                 should_validate_downloaded_gzip = True
                 store.record_manifest(
                     {
@@ -919,7 +982,7 @@ async def _download_raw_artifact_locked(
                         "raw_sha256": expected or actual,
                         "status": "corrupt",
                         "actual_sha256": actual,
-                        "error": gzip_error,
+                        "error": container_error,
                     }
                 )
             else:
@@ -982,6 +1045,7 @@ async def _download_raw_artifact_locked(
                         )
                         while byte_count >= next_progress_bytes:
                             next_progress_bytes += progress_interval_bytes
+            _raise_for_unexpected_artifact_container(url, tmp_path)
         else:
             use_range_download = False
             range_total = head.content_length if head and head.content_length else None
@@ -1007,6 +1071,7 @@ async def _download_raw_artifact_locked(
                             max_bytes=max_bytes,
                             started_at=progress_started_at,
                         )
+                        _raise_for_unexpected_artifact_container(url, tmp_path)
                     except UnsafeUrlError:
                         raise
                     except Exception as exc:
@@ -1037,6 +1102,10 @@ async def _download_raw_artifact_locked(
                     max_bytes=max_bytes,
                     started_at=progress_started_at,
                 )
+        if should_validate_downloaded_gzip:
+            gzip_error = _gzip_integrity_error(url, tmp_path, max_bytes=None)
+            if gzip_error:
+                raise _UnexpectedArtifactContainerError(gzip_error)
         raw_sha = digest.hexdigest()
         # The digest is the complete physical identity. Omitting URL-derived
         # suffixes lets different source URLs with identical bytes share one
@@ -1051,29 +1120,6 @@ async def _download_raw_artifact_locked(
         actual_sha, actual_size = sha256_file(final_path)
         if actual_sha != raw_sha:
             raise RuntimeError(f"Checksum verification failed for {final_path}")
-        gzip_error = (
-            _gzip_integrity_error(url, final_path, max_bytes=None)
-            if should_validate_downloaded_gzip
-            else _gzip_magic_error(url, final_path)
-        )
-        if gzip_error:
-            raw_uri = store.storage_uri(final_path)
-            store.record_manifest(
-                {
-                    "artifact_kind": PTG2_ARTIFACT_RAW,
-                    "canonical_url": canonical_url,
-                    "raw_storage_uri": raw_uri,
-                    "raw_sha256": actual_sha,
-                    "sha256": actual_sha,
-                    "status": "corrupt",
-                    "actual_sha256": actual_sha,
-                    "error": gzip_error,
-                }
-            )
-            # This digest path may already be leased by another URL/import.
-            # The failed observation is non-reusable; reference-aware GC owns
-            # physical deletion after every valid lease has ended.
-            raise RuntimeError(gzip_error)
         _emit_download_progress(
             url=url,
             bytes_read=actual_size,
