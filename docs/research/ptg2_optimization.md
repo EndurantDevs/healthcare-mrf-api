@@ -50,6 +50,20 @@ payloads and fixed support rows in PostgreSQL, validates the complete mapping,
 persists the audit sample, and atomically changes the layout from `building` to
 `sealed`.
 
+Price publication keeps canonical decimal text in the durable atom relation and
+adds a numeric work column only while assigning cost-ranked dense keys. The
+lean-table rewrite performs that cast once, analyzes the physical relation, and
+the ranking query joins the typed column directly. Dense-map CTAS row counts and
+unique ID/key indexes prove cardinality and uniqueness; two index-backed bound
+probes prove zero-based contiguity without another full-table aggregate scan.
+The numeric work column is dropped before the finalized snapshot is retained.
+
+When a completed build has the same mapping and support digests as a sealed
+layout, publication rebinds the logical fingerprint and removes only the losing
+build's dense rows and mapping. It does not enqueue those immutable block hashes
+for garbage collection because the selected sealed layout still references
+every one of them.
+
 Completeness is source-bound rather than inferred from top-level totals. Each
 physical source has one deterministic dense key, one complete partition-run
 contract, and one complete code-dictionary shard contract. Python constructs

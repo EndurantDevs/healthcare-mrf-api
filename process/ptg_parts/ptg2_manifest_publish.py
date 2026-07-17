@@ -115,7 +115,7 @@ def _emit_ptg2_manifest_publish_progress(
             * (_MANIFEST_PUBLISH_DETAIL_END_PCT - _MANIFEST_PUBLISH_DETAIL_START_PCT)
         )
     progress_message = message or f"publishing {publish_step}"
-    payload = {
+    progress_payload_map = {
         "phase": f"publishing: {publish_step}"[:128],
         "unit": "manifest_publish_steps",
         "done": completed_steps,
@@ -127,10 +127,14 @@ def _emit_ptg2_manifest_publish_progress(
         "source": "ptg2-manifest-publish-progress",
         "confidence": "live",
         "publish_step": publish_step,
-        **{key: value for key, value in progress_details.items() if value is not None},
+        **{
+            key: detail_value
+            for key, detail_value in progress_details.items()
+            if detail_value is not None
+        },
     }
     try:
-        write_live_progress(**payload)
+        write_live_progress(**progress_payload_map)
     except Exception:
         logger.debug("Failed to write PTG2 manifest publish live progress", exc_info=True)
 
@@ -337,7 +341,7 @@ def _ptg2_manifest_price_atom_layout() -> str:
     return PTG2_MANIFEST_PRICE_ATOM_LAYOUT_LEAN_DICT_V2
 
 
-def _ptg2_manifest_provider_group_location_enabled() -> bool:
+def _is_provider_location_enabled() -> bool:
     return False
 
 
@@ -364,23 +368,23 @@ def _ptg2_manifest_snapshot_arch() -> str:
     return _ptg2_snapshot_arch_from_env()
 
 
-def _ptg2_manifest_lean_rewrite_parallel_dictionaries() -> bool:
+def _use_parallel_dictionary_rewrite() -> bool:
     if os.getenv(PTG2_MANIFEST_LEAN_REWRITE_PARALLEL_DICTS_ENV) is not None:
         return _env_bool(PTG2_MANIFEST_LEAN_REWRITE_PARALLEL_DICTS_ENV, True)
     return _is_postgres_binary_snapshot_arch(_ptg2_manifest_snapshot_arch())
 
 
-def _ptg2_manifest_postgres_binary_natural_lean_stream_enabled() -> bool:
+def _is_natural_lean_stream_enabled() -> bool:
     if os.getenv(PTG2_MANIFEST_POSTGRES_BINARY_NATURAL_LEAN_STREAM_ENV) is not None:
         return _env_bool(PTG2_MANIFEST_POSTGRES_BINARY_NATURAL_LEAN_STREAM_ENV, True)
     return _is_postgres_binary_snapshot_arch(_ptg2_manifest_snapshot_arch())
 
 
-def _ptg2_manifest_provider_set_component_enabled() -> bool:
+def _is_provider_component_enabled() -> bool:
     return False
 
 
-def _ptg2_manifest_provider_group_rate_scope_enabled() -> bool:
+def _is_provider_rate_scope_enabled() -> bool:
     return False
 
 
@@ -632,7 +636,7 @@ async def _copy_ptg2_manifest_file(copy_path: Path, *, target_table: str, column
             )
 
 
-def _looks_like_unique_index_duplicate(exc: Exception) -> bool:
+def _is_unique_index_duplicate(exc: Exception) -> bool:
     parts = [str(exc)]
     orig = getattr(exc, "orig", None)
     if orig is not None:
@@ -689,16 +693,16 @@ def _ptg2_manifest_publish_sidecar_path(
     return path
 
 
-def _ptg2_manifest_serving_sidecars_enabled() -> bool:
+def _is_serving_sidecars_enabled() -> bool:
     return _env_bool(PTG2_MANIFEST_SERVING_SIDECARS_ENABLED_ENV, True)
 
 
-def _ptg2_manifest_drop_serving_table_after_sidecars() -> bool:
+def _should_drop_serving_table() -> bool:
     return _env_bool(PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS_ENV, True)
 
 
 def _should_drop_manifest_serving_table(arch_version: str | None) -> bool:
-    return _is_postgres_binary_v3_arch(arch_version) or _ptg2_manifest_drop_serving_table_after_sidecars()
+    return _is_postgres_binary_v3_arch(arch_version) or _should_drop_serving_table()
 
 
 def _should_analyze_manifest_serving_table(
@@ -746,7 +750,7 @@ async def _iter_ptg2_serving_sidecar_rows(sql: str):
             yield row
 
 
-def _ptg2_manifest_serving_sidecar_rust_enabled() -> bool:
+def _is_rust_sidecar_enabled() -> bool:
     return _env_bool(PTG2_MANIFEST_SERVING_SIDECAR_RUST_ENV, True)
 
 
@@ -809,7 +813,7 @@ async def _write_ptg2_manifest_serving_sidecars_rust(
     expected_row_count: int | None,
 ) -> dict[str, Any] | None:
     """Write or reuse both serving sidecars with Rust when available."""
-    if not _ptg2_manifest_serving_sidecar_rust_enabled() or _ptg2_rust_scanner_binary() is None:
+    if not _is_rust_sidecar_enabled() or _ptg2_rust_scanner_binary() is None:
         return None
 
     qualified_table = f"{_quote_ident(schema_name)}.{_quote_ident(final_table)}"
@@ -974,7 +978,7 @@ async def _write_ptg2_manifest_serving_sidecars(
     expected_row_count: int | None = None,
 ) -> dict[str, Any]:
     """Write serving sidecars with Rust, falling back to Python streaming."""
-    if not _ptg2_manifest_serving_sidecars_enabled():
+    if not _is_serving_sidecars_enabled():
         return {}
     artifact_dir = _ptg2_manifest_serving_sidecar_dir(
         artifacts=artifacts,
@@ -1083,26 +1087,33 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
     upload_total = _ptg2_manifest_sidecar_upload_count(sidecar_artifacts)
     upload_progress_by_name = {"done": 0}
 
-    async def upload_entry(default_name: str, value: Any) -> dict[str, Any] | None:
+    async def upload_entry(
+        default_name: str, artifact_data: Any
+    ) -> dict[str, Any] | None:
         """Store one local artifact once and return its durable manifest form."""
-        if not isinstance(value, Mapping):
+        if not isinstance(artifact_data, Mapping):
             return None
-        entry = dict(value)
-        storage_uri = str(entry.get("storage_uri") or "").strip()
+        artifact_entry_map = dict(artifact_data)
+        storage_uri = str(artifact_entry_map.get("storage_uri") or "").strip()
         if ptg2_artifact_id_from_db_uri(storage_uri):
-            return _postgresql_artifact_manifest_entry(entry)
-        raw_path = str(entry.get("path") or "").strip()
+            return _postgresql_artifact_manifest_entry(artifact_entry_map)
+        raw_path = str(artifact_entry_map.get("path") or "").strip()
         if not raw_path:
-            return entry
+            return artifact_entry_map
         path = Path(raw_path)
-        artifact_name = str(entry.get("name") or default_name).strip() or default_name
+        artifact_name = (
+            str(artifact_entry_map.get("name") or default_name).strip()
+            or default_name
+        )
         if (
             require_db_storage
             and artifact_name in _PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES
         ):
-            entry.update(membership_index_fence_metadata(path))
+            artifact_entry_map.update(membership_index_fence_metadata(path))
         if require_db_storage and artifact_name in _PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES:
-            entry["chunk_bytes"] = PTG2_PROVIDER_MEMBERSHIP_GRAPH_CHUNK_BYTES
+            artifact_entry_map["chunk_bytes"] = (
+                PTG2_PROVIDER_MEMBERSHIP_GRAPH_CHUNK_BYTES
+            )
         if upload_total:
             _emit_ptg2_manifest_publish_progress(
                 "artifact upload",
@@ -1113,13 +1124,19 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
                 artifact_name=artifact_name,
                 artifact_bytes=_path_byte_count(path),
             )
-        cache_key = (str(path), str(entry.get("sha256") or ""), artifact_name)
+        cache_key = (
+            str(path),
+            str(artifact_entry_map.get("sha256") or ""),
+            artifact_name,
+        )
         cached = uploaded_by_key.get(cache_key)
         if cached is not None:
-            merged = dict(cached)
-            merged["name"] = artifact_name
-            if "source_shard_id" in entry:
-                merged["source_shard_id"] = entry["source_shard_id"]
+            merged_entry_map = dict(cached)
+            merged_entry_map["name"] = artifact_name
+            if "source_shard_id" in artifact_entry_map:
+                merged_entry_map["source_shard_id"] = artifact_entry_map[
+                    "source_shard_id"
+                ]
             if upload_total:
                 upload_progress_by_name["done"] += 1
                 _emit_ptg2_manifest_publish_progress(
@@ -1129,10 +1146,10 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
                     message=f"reused uploaded {artifact_name} sidecar",
                     pct=_MANIFEST_PUBLISH_DETAIL_END_PCT,
                     artifact_name=artifact_name,
-                    artifact_bytes=merged.get("byte_count"),
-                    artifact_chunks=_artifact_chunk_count(merged),
+                    artifact_bytes=merged_entry_map.get("byte_count"),
+                    artifact_chunks=_artifact_chunk_count(merged_entry_map),
                 )
-            return merged
+            return merged_entry_map
         if not path.exists() or path.stat().st_size <= 0:
             if upload_total:
                 upload_progress_by_name["done"] += 1
@@ -1144,14 +1161,14 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
                     pct=_MANIFEST_PUBLISH_DETAIL_END_PCT,
                     artifact_name=artifact_name,
                 )
-            return entry
+            return artifact_entry_map
         uploaded = await store_ptg2_artifact_file_in_db(
             path,
             snapshot_id=snapshot_id,
-            artifact_kind=str(entry.get("kind") or artifact_name),
+            artifact_kind=str(artifact_entry_map.get("kind") or artifact_name),
             name=artifact_name,
             schema_name=schema_name,
-            metadata=entry,
+            metadata=artifact_entry_map,
         )
         uploaded = _postgresql_artifact_manifest_entry(uploaded)
         uploaded_by_key[cache_key] = uploaded
@@ -1170,38 +1187,40 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
             )
         return dict(uploaded)
 
-    stored: dict[str, Any] = {}
-    for name, value in sidecar_artifacts.items():
-        if name == "sidecars" and isinstance(value, list):
+    stored_artifact_map: dict[str, Any] = {}
+    for name, artifact_data in sidecar_artifacts.items():
+        if name == "sidecars" and isinstance(artifact_data, list):
             sidecars: list[Any] = []
-            for index, sidecar in enumerate(value):
+            for index, sidecar in enumerate(artifact_data):
                 sidecars.append(await upload_entry(f"sidecar_{index}", sidecar) or sidecar)
-            stored[name] = sidecars
+            stored_artifact_map[name] = sidecars
             continue
-        stored_entry = await upload_entry(str(name), value)
-        stored[name] = stored_entry if stored_entry is not None else value
-    return stored
+        stored_entry = await upload_entry(str(name), artifact_data)
+        stored_artifact_map[name] = (
+            stored_entry if stored_entry is not None else artifact_data
+        )
+    return stored_artifact_map
 
 
 def _merge_ptg2_manifest_sidecar_artifacts(
     *sidecar_artifacts: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    combined: dict[str, Any] = {}
+    combined_artifact_map: dict[str, Any] = {}
     for artifacts in sidecar_artifacts:
         if not artifacts:
             continue
         for name, value in artifacts.items():
             if name == "sidecars" and isinstance(value, list):
-                existing = combined.get("sidecars")
+                existing = combined_artifact_map.get("sidecars")
                 if isinstance(existing, list):
                     existing.extend(value)
                 elif existing is None:
-                    combined["sidecars"] = list(value)
+                    combined_artifact_map["sidecars"] = list(value)
                 else:
-                    combined["sidecars"] = [existing, *value]
+                    combined_artifact_map["sidecars"] = [existing, *value]
                 continue
-            combined[name] = value
-    return combined
+            combined_artifact_map[name] = value
+    return combined_artifact_map
 
 
 def _ptg2_sidecar_entry_name(name: str, value: Any) -> str:
@@ -1400,15 +1419,15 @@ def _serving_binary_atom_key_bits(serving_binary_manifest: Mapping[str, Any] | N
 def _split_ptg2_manifest_base_artifacts(
     artifacts: Mapping[str, Any] | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    base_artifacts = dict(artifacts or {})
-    raw_sidecars = base_artifacts.pop("sidecars", None)
+    base_artifact_map = dict(artifacts or {})
+    raw_sidecars = base_artifact_map.pop("sidecars", None)
     if isinstance(raw_sidecars, list):
-        return base_artifacts, {"sidecars": list(raw_sidecars)}
+        return base_artifact_map, {"sidecars": list(raw_sidecars)}
     if isinstance(raw_sidecars, Mapping):
-        return base_artifacts, dict(raw_sidecars)
+        return base_artifact_map, dict(raw_sidecars)
     if raw_sidecars:
-        return base_artifacts, {"sidecars": [raw_sidecars]}
-    return base_artifacts, {}
+        return base_artifact_map, {"sidecars": [raw_sidecars]}
+    return base_artifact_map, {}
 
 
 def _manifest_sql_id(value: bytes) -> str:
@@ -1484,7 +1503,7 @@ async def _create_inferred_taxonomy_zip_indexes(
         if not rule.taxonomy_codes or len(rule.taxonomy_codes) > _MAX_PARTIAL_ZIP_TAXONOMY_INDEX_CODES:
             continue
         try:
-            rows = await db.all(
+            taxonomy_rows = await db.all(
                 f"""
                 SELECT int_code
                   FROM {_quote_ident(schema_name)}.nucc_taxonomy
@@ -1496,9 +1515,12 @@ async def _create_inferred_taxonomy_zip_indexes(
             )
             int_codes = sorted(
                 {
-                    int(value)
-                    for row in rows
-                    if (value := _row_value(row, "int_code")) is not None
+                    int(int_code_value)
+                    for taxonomy_row in taxonomy_rows
+                    if (
+                        int_code_value := _row_value(taxonomy_row, "int_code")
+                    )
+                    is not None
                 }
             )
             if not int_codes:
@@ -2079,6 +2101,8 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
     select_columns = [
         f"price_atom.price_atom_global_id_128::{id_type} AS price_atom_global_id_128",
         "price_atom.negotiated_rate::text AS negotiated_rate",
+        "NULLIF(BTRIM(price_atom.negotiated_rate::text), '')::numeric "
+        "AS negotiated_rate_numeric",
     ]
     join_sql_parts: list[str] = []
     dictionary_join_specs = [
@@ -2140,6 +2164,9 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
         ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)}
         RENAME TO {_quote_ident(price_atom_table)};
         """
+    )
+    await db.status(
+        f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)};"
     )
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)};")
     should_keep_dictionary_table = (
@@ -2646,7 +2673,7 @@ async def _rewrite_direct_lean_manifest_stage(
     """Rewrite the narrow direct-copy stage into lean provider-key serving tables."""
     temporary_storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     lean_table = _ptg2_snapshot_index_name(final_table, "lean")
-    if _ptg2_manifest_lean_rewrite_parallel_dictionaries():
+    if _use_parallel_dictionary_rewrite():
         await asyncio.gather(
             _build_direct_lean_code_counts(
                 schema_name=schema_name,
@@ -2713,29 +2740,31 @@ def _ptg2_manifest_artifacts_manifest(
     artifacts: Mapping[str, Any] | None = None,
     sidecar_artifacts: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    manifest = dict(artifacts or {})
+    artifact_manifest_map = dict(artifacts or {})
     if not sidecar_artifacts:
-        return manifest
-    existing_sidecars = manifest.get("sidecars")
+        return artifact_manifest_map
+    existing_sidecars = artifact_manifest_map.get("sidecars")
     sidecars: list[Any] = list(existing_sidecars) if isinstance(existing_sidecars, list) else []
     for name, value in sidecar_artifacts.items():
         if value is None:
             continue
         if name == "sidecars" and isinstance(value, list):
-            for index, item in enumerate(value):
-                if isinstance(item, Mapping):
-                    sidecars.append(dict(item))
+            for index, sidecar_data in enumerate(value):
+                if isinstance(sidecar_data, Mapping):
+                    sidecars.append(dict(sidecar_data))
                 else:
-                    sidecars.append({"name": f"sidecar_{index}", "path": str(item)})
+                    sidecars.append(
+                        {"name": f"sidecar_{index}", "path": str(sidecar_data)}
+                    )
             continue
         if isinstance(value, Mapping):
-            entry = dict(value)
-            entry.setdefault("name", str(name))
-            sidecars.append(entry)
+            artifact_entry_map = dict(value)
+            artifact_entry_map.setdefault("name", str(name))
+            sidecars.append(artifact_entry_map)
         else:
             sidecars.append({"name": str(name), "path": str(value)})
-    manifest["sidecars"] = sidecars
-    return manifest
+    artifact_manifest_map["sidecars"] = sidecars
+    return artifact_manifest_map
 
 
 PTG2_MANIFEST_LEAN_SOURCE_UNIQUE_GUARD_ENV = "HLTHPRT_PTG2_MANIFEST_LEAN_SOURCE_UNIQUE_GUARD"
