@@ -28710,6 +28710,14 @@ mod tests {
             0
         );
         assert_eq!(
+            serving_binary_by_code_provider_shard_block_key(0, 1023).unwrap(),
+            0
+        );
+        assert_eq!(
+            serving_binary_by_code_provider_shard_block_key(0, 1024).unwrap(),
+            0
+        );
+        assert_eq!(
             serving_binary_by_code_provider_shard_block_key(0, 8191).unwrap(),
             0
         );
