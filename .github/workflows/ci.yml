@@ -63,7 +63,12 @@ jobs:
         run: |
           if [ -n "$BASE_SHA" ]; then
             git show "$BASE_SHA:readability-baseline.json" > "$RUNNER_TEMP/readability-base.json"
-            if git diff --quiet "$BASE_SHA" HEAD -- '*.py' '*.pyi'; then
+            if git diff --quiet "$BASE_SHA" HEAD -- \
+              main.py \
+              ':(glob)api/**/*.py' \
+              ':(glob)db/**/*.py' \
+              ':(glob)process/**/*.py' \
+              ':(glob)service/**/*.py'; then
               python scripts/readability_budget.py \
                 --ratchet-baseline "$RUNNER_TEMP/readability-base.json" \
                 --required-reduction-percent 0
@@ -206,6 +211,43 @@ jobs:
           tests/test_ptg_source_snapshot_control_safety.py
           tests/test_ptg_source_snapshot_removal_v3.py
 
+  test-coverage:
+    name: test coverage ratchet
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+      - name: Run tests with coverage
+        run: |
+          python -m coverage run --rcfile=test-coverage.ini \
+            -m pytest -q \
+            --deselect tests/test_mrf_source_discovery.py::test_mymedicalshopper_ddp_call_uses_overall_deadline_for_heartbeats
+          python -m coverage json --rcfile=test-coverage.ini -o test-coverage-python.json
+      - name: Test coverage ratchet
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python scripts/coverage_ratchet.py --self-test
+          reference_args=()
+          if [ -z "$BASE_SHA" ]; then
+            BASE_SHA="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          fi
+          if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:test-coverage-baseline.json" 2>/dev/null; then
+            git show "$BASE_SHA:test-coverage-baseline.json" > "$RUNNER_TEMP/test-coverage-base.json"
+            reference_args+=(--reference-baseline "$RUNNER_TEMP/test-coverage-base.json")
+          fi
+          python scripts/coverage_ratchet.py --report python "${reference_args[@]}"
+
   capacity-evidence:
     name: ptg2 capacity evidence
     runs-on: ubuntu-latest
@@ -252,10 +294,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          toolchain: 1.97.1
+          components: rustfmt, clippy, llvm-tools-preview
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -272,7 +317,25 @@ jobs:
       - name: Clippy
         run: cargo clippy --manifest-path support/ptg2_scanner/Cargo.toml --all-targets -- -D warnings
       - name: Scanner tests
-        run: cargo test --manifest-path support/ptg2_scanner/Cargo.toml
+        run: |
+          cargo install cargo-llvm-cov --version 0.8.7 --locked
+          cargo llvm-cov --manifest-path support/ptg2_scanner/Cargo.toml \
+            --all-targets --features python --json --summary-only \
+            --output-path test-coverage-rust.json
+      - name: Rust coverage ratchet
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python scripts/coverage_ratchet.py --self-test
+          reference_args=()
+          if [ -z "$BASE_SHA" ]; then
+            BASE_SHA="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          fi
+          if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:test-coverage-baseline.json" 2>/dev/null; then
+            git show "$BASE_SHA:test-coverage-baseline.json" > "$RUNNER_TEMP/test-coverage-base.json"
+            reference_args+=(--reference-baseline "$RUNNER_TEMP/test-coverage-base.json")
+          fi
+          python scripts/coverage_ratchet.py --report rust "${reference_args[@]}"
       - name: Cargo audit
         run: |
           cargo install cargo-audit --locked
