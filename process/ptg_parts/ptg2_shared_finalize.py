@@ -1728,8 +1728,7 @@ async def run_v3_direct_finalizer(
         Mapping[str, Any] | SharedPhysicalArtifactIdentity
     ],
     price_key_map_input: str | Path,
-    price_membership_inputs: Sequence[str | Path] = (),
-    price_atom_inputs: Sequence[str | Path] = (),
+    price_key_map_row_count: int,
 ) -> dict[str, Any]:
     """Run the bounded Rust external-sort/finalize path without Python row materialization."""
 
@@ -1747,6 +1746,8 @@ async def run_v3_direct_finalizer(
     price_key_map_path = Path(price_key_map_input).resolve()
     if not price_key_map_path.is_file() or price_key_map_path.stat().st_size <= 0:
         raise RuntimeError("strict V3 finalization requires a non-empty price-key map")
+    if int(price_key_map_row_count) <= 0:
+        raise RuntimeError("strict V3 finalization requires a positive price-key map row count")
     manifest_path = write_v3_finalizer_input_manifest(
         work_root / "scanner-summary.json",
         serving_run_entries=serving_run_entries,
@@ -1763,14 +1764,10 @@ async def run_v3_direct_finalizer(
         str(output_directory),
         "--price-key-map-input",
         str(price_key_map_path),
+        "--price-key-map-row-count",
+        str(int(price_key_map_row_count)),
         *resource_configuration.command_arguments(),
     ]
-    for path in price_membership_inputs:
-        command_args.extend(
-            ("--price-membership-input", str(Path(path).resolve()))
-        )
-    for path in price_atom_inputs:
-        command_args.extend(("--price-atom-input", str(Path(path).resolve())))
     command_args.append(str(manifest_path))
     process: asyncio.subprocess.Process | None = None
     spawn_task: asyncio.Task[asyncio.subprocess.Process] | None = None

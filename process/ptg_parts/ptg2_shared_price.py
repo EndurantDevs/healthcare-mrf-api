@@ -1183,13 +1183,13 @@ async def export_shared_price_key_map(
     prepared: PreparedSharedPriceArtifacts | PreparedSharedPriceKeyMap,
     output_path: str | Path,
 ) -> Path:
-    """Export the authoritative ID-to-cost-rank map as PostgreSQL binary COPY."""
+    """Export the authoritative map once in its existing dense price-key order."""
 
     path = Path(output_path)
     query = f"""
         SELECT price_set_global_id_128, price_key
           FROM {_qualified(prepared.schema_name, prepared.price_key_map)}
-         ORDER BY price_set_global_id_128
+         ORDER BY price_key
     """
     async with db.acquire_driver() as driver_conn:
         copy_from_query = getattr(driver_conn, "copy_from_query", None)

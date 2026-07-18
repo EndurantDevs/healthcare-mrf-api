@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,6 +12,41 @@ from process.ptg_parts.ptg2_serving_binary_v3 import (
     decode_price_memberships,
     encode_price_memberships,
 )
+
+
+@pytest.mark.asyncio
+async def test_price_key_map_export_is_dense_key_ordered(monkeypatch, tmp_path):
+    observed_queries = []
+
+    class DriverConnection:
+        async def copy_from_query(self, query, *, output, **copy_options):
+            observed_queries.append(query)
+            assert copy_options == {"format": "binary"}
+            output.write(b"postgres-binary-copy")
+
+    @asynccontextmanager
+    async def acquire_driver():
+        yield DriverConnection()
+
+    monkeypatch.setattr(shared_price.db, "acquire_driver", acquire_driver)
+    output_path = tmp_path / "price-key-map.copy"
+
+    exported_path = await shared_price.export_shared_price_key_map(
+        shared_price.PreparedSharedPriceKeyMap(
+            schema_name="mrf",
+            price_key_map="prepared_price_keys",
+            price_set_count=2,
+        ),
+        output_path,
+    )
+
+    assert exported_path == output_path
+    assert output_path.read_bytes() == b"postgres-binary-copy"
+    assert len(observed_queries) == 1
+    normalized_query = " ".join(observed_queries[0].split())
+    assert "SELECT price_set_global_id_128, price_key" in normalized_query
+    assert 'FROM "mrf"."prepared_price_keys"' in normalized_query
+    assert normalized_query.endswith("ORDER BY price_key")
 
 
 @pytest.mark.asyncio

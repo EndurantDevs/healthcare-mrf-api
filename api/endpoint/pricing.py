@@ -1941,7 +1941,7 @@ async def _resolve_provider_type_terms(
     seen_provider_types: set[str] = set()
     seen_match_keys: set[tuple[str, str, str]] = set()
     for term in terms:
-        rows = await _query_terminology(
+        terminology_rows = await _query_terminology(
             session,
             domain="provider_type",
             term=term,
@@ -1949,21 +1949,25 @@ async def _resolve_provider_type_terms(
             include_broad=True,
             limit=25,
         )
-        for row in rows:
+        for terminology_match in terminology_rows:
             match_key = (
-                str(row.get("target_system") or ""),
-                str(row.get("target_code") or ""),
-                str(row.get("term_key") or ""),
+                str(terminology_match.get("target_system") or ""),
+                str(terminology_match.get("target_code") or ""),
+                str(terminology_match.get("term_key") or ""),
             )
             if match_key not in seen_match_keys:
                 seen_match_keys.add(match_key)
-                matches.append(row)
-            if str(row.get("target_system") or "").upper() != "PROVIDER_TYPE":
-                if str(row.get("target_system") or "").upper() != "NUCC":
+                matches.append(terminology_match)
+            if str(terminology_match.get("target_system") or "").upper() != "PROVIDER_TYPE":
+                if str(terminology_match.get("target_system") or "").upper() != "NUCC":
                     continue
-                provider_type = str(row.get("canonical_term") or row.get("target_display") or "").strip()
+                provider_type = str(
+                    terminology_match.get("canonical_term")
+                    or terminology_match.get("target_display")
+                    or ""
+                ).strip()
             else:
-                provider_type = str(row.get("target_code") or "").strip()
+                provider_type = str(terminology_match.get("target_code") or "").strip()
             provider_type_key = provider_type.lower()
             if provider_type and provider_type_key not in seen_provider_types:
                 seen_provider_types.add(provider_type_key)
@@ -2269,7 +2273,7 @@ def _cohort_context_from_score_row(
             or score_data.get("cohort_procedure_bucket"),
             "procedure_match_threshold": score_data.get("procedure_match_threshold"),
         }
-        if not any(value is not None for value in context.values()):
+        if not any(context_entry is not None for context_entry in context.values()):
             return None
 
     threshold_value = _as_float(context.get("procedure_match_threshold"))
@@ -3199,7 +3203,7 @@ async def _load_provider_quality_profile(
             ),
         """
     )
-    result = await session.execute(
+    profile_query_result = await session.execute(
         text(
             f"""
             WITH provider_choice AS (
@@ -3261,10 +3265,10 @@ async def _load_provider_quality_profile(
         ),
         {"npi": npi, "year": year},
     )
-    row = result.first()
-    if row is None:
+    profile_row = profile_query_result.first()
+    if profile_row is None:
         return None
-    row_data = _row_to_dict(row)
+    row_data = _row_to_dict(profile_row)
     specialty_key = _parse_specialty_key(row_data.get("specialty_key"))
     taxonomy_code = str(row_data.get("taxonomy_code") or "").strip().upper() or None
     return {
@@ -3727,17 +3731,26 @@ async def _load_quality_peer_targets(
     """
 
     try:
-        result = await session.execute(text(fast_query), params)
-        rows = [_row_to_dict(row) for row in result]
-        if rows:
-            return rows
+        peer_target_query_result = await session.execute(text(fast_query), params)
+        peer_target_rows = [
+            _row_to_dict(peer_target_row)
+            for peer_target_row in peer_target_query_result
+        ]
+        if peer_target_rows:
+            return peer_target_rows
         # Safety fallback for unexpected geography-key formats.
         fallback_result = await session.execute(text(select_sql + geography_clause), params)
-        fallback_rows = [_row_to_dict(row) for row in fallback_result]
+        fallback_rows = [
+            _row_to_dict(peer_target_row)
+            for peer_target_row in fallback_result
+        ]
         if fallback_rows:
             return fallback_rows
         fallback_result = await session.execute(text(select_sql), params)
-        return [_row_to_dict(row) for row in fallback_result]
+        return [
+            _row_to_dict(peer_target_row)
+            for peer_target_row in fallback_result
+        ]
     except Exception:
         return []
 
@@ -7361,14 +7374,17 @@ async def get_pricing_provider(request, npi: str):
             and_(location_table.c.npi == provider_npi, location_table.c.year == year)
         )
     )
-    payload = _normalize_provider_payload(_row_to_dict(provider_row), include_legacy=include_legacy_fields)
-    payload["year_used"] = year
-    payload["year_source"] = year_source
-    payload["summary"] = {
+    provider_payload = _normalize_provider_payload(
+        _row_to_dict(provider_row),
+        include_legacy=include_legacy_fields,
+    )
+    provider_payload["year_used"] = year
+    provider_payload["year_source"] = year_source
+    provider_payload["summary"] = {
         "service_count": int(service_count_result.scalar() or 0),
         "location_count": int(location_count_result.scalar() or 0),
     }
-    return response.json(payload)
+    return response.json(provider_payload)
 
 
 @blueprint.get("/providers/<npi>/score", name="pricing.providers.score")
@@ -7656,15 +7672,15 @@ async def get_pricing_provider_score(request, npi: str):
         """
     )
     score_result = await session.execute(score_query, {"npi": provider_npi, "year": year})
-    score_rows = [_row_to_dict(row) for row in score_result]
+    score_rows = [_row_to_dict(score_row) for score_row in score_result]
     if not score_rows:
         return await _fallback_response(year_used=year, year_source_value=year_source)
 
     scores_by_mode_raw: dict[str, dict[str, Any]] = {}
-    for row in score_rows:
-        mode = str(row.get("benchmark_mode") or "").strip().lower()
+    for score_entry in score_rows:
+        mode = str(score_entry.get("benchmark_mode") or "").strip().lower()
         if mode in QUALITY_BENCHMARK_MODE_ORDER and mode not in scores_by_mode_raw:
-            scores_by_mode_raw[mode] = row
+            scores_by_mode_raw[mode] = score_entry
 
     if benchmark_mode is not None:
         selected_mode = benchmark_mode
@@ -7718,8 +7734,8 @@ async def get_pricing_provider_score(request, npi: str):
         """
     )
     domain_result = await session.execute(domain_query, {"npi": provider_npi, "year": year})
-    for row in domain_result:
-        row_data = _row_to_dict(row)
+    for domain_row in domain_result:
+        row_data = _row_to_dict(domain_row)
         mode = str(row_data.get("benchmark_mode") or "").strip().lower()
         if mode not in QUALITY_BENCHMARK_MODE_ORDER:
             continue
@@ -8041,18 +8057,23 @@ async def _provider_procedure_detail(
         .limit(1)
     )
 
-    result = await session.execute(query)
-    row = result.first()
-    if row is None:
+    procedure_query_result = await session.execute(query)
+    procedure_row = procedure_query_result.first()
+    if procedure_row is None:
         raise sanic.exceptions.NotFound("Provider procedure not found")
 
-    payload = _normalize_service_payload({**_row_to_dict(row), "__include_legacy_fields__": include_legacy_fields})
-    payload["year_used"] = year
-    payload["year_source"] = year_source
-    payload["input_code"] = code_context["input_code"]
-    payload["resolved_codes"] = code_context["resolved_codes"]
-    payload["matched_via"] = code_context["matched_via"]
-    return response.json(payload)
+    procedure_payload = _normalize_service_payload(
+        {
+            **_row_to_dict(procedure_row),
+            "__include_legacy_fields__": include_legacy_fields,
+        }
+    )
+    procedure_payload["year_used"] = year
+    procedure_payload["year_source"] = year_source
+    procedure_payload["input_code"] = code_context["input_code"]
+    procedure_payload["resolved_codes"] = code_context["resolved_codes"]
+    procedure_payload["matched_via"] = code_context["matched_via"]
+    return response.json(procedure_payload)
 
 
 @blueprint.get("/providers/<npi>/procedures/<procedure_code>", name="pricing.providers.procedures.get")
@@ -8541,15 +8562,20 @@ async def _provider_procedure_locations(
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
 
-    result = await session.execute(query)
-    items = [
-        _normalize_service_payload({**_row_to_dict(row), "__include_legacy_fields__": include_legacy_fields})
-        for row in result
+    location_query_result = await session.execute(query)
+    location_entries = [
+        _normalize_service_payload(
+            {
+                **_row_to_dict(location_row),
+                "__include_legacy_fields__": include_legacy_fields,
+            }
+        )
+        for location_row in location_query_result
     ]
 
     return response.json(
         {
-            "items": items,
+            "items": location_entries,
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,
@@ -8893,14 +8919,19 @@ async def get_procedure_geo_benchmarks(request, code_system: str, code: str):
         default_system=code_system,
     )
 
-    async def _fetch_scope(scope: str, value: str | None) -> dict[str, Any] | None:
+    async def _fetch_scope(
+        scope: str,
+        geography_value: str | None,
+    ) -> dict[str, Any] | None:
         filters = [
             procedure_geo_benchmark_table.c.year == year,
             procedure_geo_benchmark_table.c.procedure_code.in_(internal_codes),
             procedure_geo_benchmark_table.c.geography_scope == scope,
         ]
-        if value is not None:
-            filters.append(procedure_geo_benchmark_table.c.geography_value == value)
+        if geography_value is not None:
+            filters.append(
+                procedure_geo_benchmark_table.c.geography_value == geography_value
+            )
 
         total_services_expr = func.sum(procedure_geo_benchmark_table.c.total_services)
         query = (
@@ -8929,17 +8960,22 @@ async def get_procedure_geo_benchmarks(request, code_system: str, code: str):
             .select_from(procedure_geo_benchmark_table)
             .where(and_(*filters))
         )
-        result = await session.execute(query)
-        row = _row_to_dict(result.first() or {})
-        if int(row.get("rows") or 0) <= 0:
+        benchmark_query_result = await session.execute(query)
+        benchmark_row = _row_to_dict(benchmark_query_result.first() or {})
+        if int(benchmark_row.get("rows") or 0) <= 0:
             return None
         return {
             "geography_scope": scope,
-            "geography_value": value or ("US" if scope == "national" else None),
-            "total_services": _as_float(row.get("total_services")),
-            "avg_submitted_charge": _as_float(row.get("avg_submitted_charge")),
-            "avg_payment_amount": _as_float(row.get("avg_payment_amount")),
-            "avg_standardized_amount": _as_float(row.get("avg_standardized_amount")),
+            "geography_value": geography_value
+            or ("US" if scope == "national" else None),
+            "total_services": _as_float(benchmark_row.get("total_services")),
+            "avg_submitted_charge": _as_float(
+                benchmark_row.get("avg_submitted_charge")
+            ),
+            "avg_payment_amount": _as_float(benchmark_row.get("avg_payment_amount")),
+            "avg_standardized_amount": _as_float(
+                benchmark_row.get("avg_standardized_amount")
+            ),
         }
 
     national = await _fetch_scope("national", "US")
@@ -9568,11 +9604,11 @@ async def list_provider_specialties(request):
             radius_miles=zip_radius_miles,
             state_hint=state or None,
         )
-        for row in sorted(
+        for zip_row in sorted(
             zip_rows,
             key=lambda item: (_as_float(item.get("distance_miles")) or 0.0, str(item.get("zip5") or "")),
         ):
-            candidate_zip = _normalize_zip5(row.get("zip5"))
+            candidate_zip = _normalize_zip5(zip_row.get("zip5"))
             if candidate_zip is None or candidate_zip in zip_filter_values:
                 continue
             zip_filter_values.append(candidate_zip)
@@ -9636,7 +9672,10 @@ async def list_provider_specialties(request):
         .limit(pagination.limit)
         .offset(pagination.offset)
     )
-    rows = [_row_to_dict(row) for row in await session.execute(query)]
+    specialty_rows = [
+        _row_to_dict(specialty_row)
+        for specialty_row in await session.execute(query)
+    ]
 
     count_query = (
         select(func.count())
@@ -9651,14 +9690,16 @@ async def list_provider_specialties(request):
     count_result = await session.execute(count_query)
     total = int(count_result.scalar() or 0)
 
-    items = [
+    specialty_entries = [
         {
-            "specialty": str(row.get("specialty") or "").strip(),
-            "specialty_key": str(row.get("specialty_key") or "").strip().lower(),
-            "provider_count": int(row.get("provider_count") or 0),
-            "total_services": _as_float(row.get("total_services")),
+            "specialty": str(specialty_row.get("specialty") or "").strip(),
+            "specialty_key": str(specialty_row.get("specialty_key") or "")
+            .strip()
+            .lower(),
+            "provider_count": int(specialty_row.get("provider_count") or 0),
+            "total_services": _as_float(specialty_row.get("total_services")),
         }
-        for row in rows
+        for specialty_row in specialty_rows
     ]
 
     query_payload: dict[str, Any] = {
@@ -9685,7 +9726,7 @@ async def list_provider_specialties(request):
 
     return response.json(
         {
-            "items": items,
+            "items": specialty_entries,
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,
@@ -10852,6 +10893,8 @@ async def _provider_prescription_detail(
     rx_code_system: str,
     rx_code: str,
 ):
+    """Build one provider prescription response for a resolved drug code."""
+
     session = _get_session(request)
     args = request.args
 
@@ -10884,26 +10927,26 @@ async def _provider_prescription_detail(
         .limit(1)
     )
 
-    result = await session.execute(query)
-    row = result.first()
-    if row is None:
+    prescription_query_result = await session.execute(query)
+    prescription_row = prescription_query_result.first()
+    if prescription_row is None:
         raise sanic.exceptions.NotFound("Provider prescription not found")
 
-    payload = _normalize_prescription_payload(_row_to_dict(row))
+    prescription_payload = _normalize_prescription_payload(_row_to_dict(prescription_row))
     try:
         external_codes_by_internal = await _resolve_external_rx_codes_for_internal(
             session,
-            [str(payload.get("rx_code") or "")],
+            [str(prescription_payload.get("rx_code") or "")],
         )
     except Exception:  # pragma: no cover - defensive fallback for missing/migrating crosswalk table
         external_codes_by_internal = {}
-    _apply_prescription_code_preferences([payload], external_codes_by_internal)
-    payload["year_used"] = year
-    payload["year_source"] = year_source
-    payload["input_code"] = code_context["input_code"]
-    payload["resolved_codes"] = code_context["resolved_codes"]
-    payload["matched_via"] = code_context["matched_via"]
-    return response.json(payload)
+    _apply_prescription_code_preferences([prescription_payload], external_codes_by_internal)
+    prescription_payload["year_used"] = year
+    prescription_payload["year_source"] = year_source
+    prescription_payload["input_code"] = code_context["input_code"]
+    prescription_payload["resolved_codes"] = code_context["resolved_codes"]
+    prescription_payload["matched_via"] = code_context["matched_via"]
+    return response.json(prescription_payload)
 
 
 @blueprint.get(
@@ -11046,12 +11089,17 @@ async def list_prescription_providers(request, rx_code_system: str, rx_code: str
         },
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
-    result = await session.execute(query)
-    items = [_normalize_prescription_provider_aggregate(_row_to_dict(row)) for row in result]
+    prescription_provider_query_result = await session.execute(query)
+    prescription_provider_entries = [
+        _normalize_prescription_provider_aggregate(
+            _row_to_dict(prescription_provider_row)
+        )
+        for prescription_provider_row in prescription_provider_query_result
+    ]
 
     return response.json(
         {
-            "items": items,
+            "items": prescription_provider_entries,
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,

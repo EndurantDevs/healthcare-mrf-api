@@ -62,6 +62,7 @@ async def test_finalizer_starts_before_independent_atom_preparation_finishes(
     atom_release = asyncio.Event()
     finalizer_started = asyncio.Event()
     finalizer_release = asyncio.Event()
+    finalizer_calls = []
     price_publish_started = asyncio.Event()
     price_publish_release = asyncio.Event()
 
@@ -76,7 +77,8 @@ async def test_finalizer_starts_before_independent_atom_preparation_finishes(
         await atom_release.wait()
         return prepared_price
 
-    async def run_finalizer(**_kwargs):
+    async def run_finalizer(**kwargs):
+        finalizer_calls.append(kwargs)
         finalizer_started.set()
         await finalizer_release.wait()
         return {"blocks": {}}
@@ -136,6 +138,7 @@ async def test_finalizer_starts_before_independent_atom_preparation_finishes(
     assert prepared_finalizer.summary == {"blocks": {}}
     assert prepared_finalizer.price_key_map_export_seconds >= 0
     assert prepared_finalizer.finalizer_seconds >= 0
+    assert finalizer_calls[0]["price_key_map_row_count"] == 3
     assert prepared_price_publication.publication == "published-price"
     assert prepared_price_publication.publish_seconds >= 0
 

@@ -223,6 +223,7 @@ async def _export_price_map_and_run_finalizer(
         provider_set_metadata_entries=provider_set_metadata_entries,
         expected_source_identities=expected_source_identities,
         price_key_map_input=price_key_map_path,
+        price_key_map_row_count=prepared_price_key.price_set_count,
     )
     return _PreparedFinalizer(
         summary=dict(finalizer_summary),
@@ -923,6 +924,7 @@ async def _publish_prepared_shared_layout(
                 provider_set_metadata_entries=provider_set_metadata_entries,
                 expected_source_identities=expected_source_identities,
                 price_key_map_input=price_key_map_path,
+                price_key_map_row_count=prepared_price.price_set_count,
             )
             record_stage("finalizer", stage_started_at)
         else:

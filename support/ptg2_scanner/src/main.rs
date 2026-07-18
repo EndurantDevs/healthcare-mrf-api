@@ -17490,6 +17490,7 @@ fn write_serving_binary_v3_price_dictionary_copy_from_pg_binary_reader<R: Read, 
     ))
 }
 
+#[cfg(test)]
 fn write_serving_binary_v3_price_dictionary_copy_from_fixed_reader<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut CountingWriter<W>,
@@ -17525,6 +17526,7 @@ const V3_FINALIZER_SORT_MEMORY_SCOPE: &str = "process_total_across_workers_v1";
 const V3_FINALIZER_SORT_OVERHEAD_BYTES_PER_ACTIVE_WORKER: usize = 4 * 1024 * 1024;
 const V3_FINALIZER_HOT_BLOCK_BYTES: usize = 64 * 1024;
 const V3_FINALIZER_ASSIGNED_BYTES: usize = 20;
+#[cfg(test)]
 const V3_FINALIZER_PRICE_KEY_MAP_RECORD_BYTES: usize = GLOBAL_ID_BYTES + 4;
 const V3_FINALIZER_PROVIDER_PROJECTION_MAX_BYTES_PER_ENTRY: usize = 1024;
 const V3_FINALIZER_PROVIDER_CODE_BITMAP_MAX_BYTES: usize = 256 * 1024 * 1024;
@@ -17687,12 +17689,13 @@ struct V3FinalizerOptions {
     workers: usize,
     identity_map_max_bytes: usize,
     price_key_map_input: PathBuf,
+    price_key_map_row_count: u64,
     price_membership_inputs: Vec<PathBuf>,
     price_atom_inputs: Vec<PathBuf>,
 }
 
 fn v3_finalizer_usage() -> &'static str {
-    "usage: ptg2_scanner --finalize-v3-runs <output_directory> --price-key-map-input PATH --workers N --identity-map-max-bytes N --total-sort-memory-bytes N [--price-membership-input PATH]... [--price-atom-input PATH]... <scanner_summary.json>..."
+    "usage: ptg2_scanner --finalize-v3-runs <output_directory> --price-key-map-input PATH --price-key-map-row-count N --workers N --identity-map-max-bytes N --total-sort-memory-bytes N [--price-membership-input PATH]... [--price-atom-input PATH]... <scanner_summary.json>..."
 }
 
 fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOptions> {
@@ -17712,6 +17715,7 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
     let mut workers = None;
     let mut identity_map_max_bytes = None;
     let mut price_key_map_input = None;
+    let mut price_key_map_row_count = None;
     let mut price_membership_inputs = Vec::new();
     let mut price_atom_inputs = Vec::new();
     let mut manifest_paths = Vec::new();
@@ -17808,6 +17812,30 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
                     ));
                 }
             }
+            "--price-key-map-row-count" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, v3_finalizer_usage())
+                })?;
+                let parsed = value.parse::<u64>().map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid --price-key-map-row-count value: {error}"),
+                    )
+                })?;
+                if parsed == 0 || parsed > u64::from(u32::MAX) + 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--price-key-map-row-count must be between 1 and 4294967296",
+                    ));
+                }
+                if price_key_map_row_count.replace(parsed).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--price-key-map-row-count may be specified only once",
+                    ));
+                }
+            }
             "--price-membership-input" => {
                 index += 1;
                 price_membership_inputs.push(PathBuf::from(arguments.get(index).ok_or_else(
@@ -17840,6 +17868,12 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "v3 finalizer requires --price-key-map-input PATH",
+        )
+    })?;
+    let price_key_map_row_count = price_key_map_row_count.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "v3 finalizer requires --price-key-map-row-count N",
         )
     })?;
     let workers = workers.ok_or_else(|| {
@@ -17884,6 +17918,7 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
         workers,
         identity_map_max_bytes,
         price_key_map_input,
+        price_key_map_row_count,
         price_membership_inputs,
         price_atom_inputs,
     })
@@ -19416,24 +19451,6 @@ fn read_provider_identity_record<R: Read>(reader: &mut R) -> io::Result<Option<(
 }
 
 #[cfg(test)]
-fn read_dense_id_record<R: Read>(reader: &mut R) -> io::Result<Option<[u8; 16]>> {
-    let mut id = [0u8; GLOBAL_ID_BYTES];
-    read_exact_optional(reader, &mut id).map(|present| present.then_some(id))
-}
-
-fn read_v3_price_key_map_by_id_record<R: Read>(
-    reader: &mut R,
-) -> io::Result<Option<([u8; GLOBAL_ID_BYTES], u32)>> {
-    let mut record = [0u8; V3_FINALIZER_PRICE_KEY_MAP_RECORD_BYTES];
-    if !read_exact_optional(reader, &mut record)? {
-        return Ok(None);
-    }
-    let mut price_set_id = [0u8; GLOBAL_ID_BYTES];
-    price_set_id.copy_from_slice(&record[..GLOBAL_ID_BYTES]);
-    let price_key = u32::from_be_bytes(record[GLOBAL_ID_BYTES..].try_into().map_err(to_io_error)?);
-    Ok(Some((price_set_id, price_key)))
-}
-
 fn read_v3_price_key_map_by_key_record<R: Read>(
     reader: &mut R,
 ) -> io::Result<Option<(u32, [u8; GLOBAL_ID_BYTES])>> {
@@ -19454,33 +19471,43 @@ struct V3PriceKeyMapStageSummary {
     row_digest: [u8; 32],
 }
 
-fn stage_v3_price_key_map(
+fn load_v3_price_key_map_and_write_dictionary<W: Write>(
     input_path: &Path,
-    by_id_path: &Path,
-) -> io::Result<V3PriceKeyMapStageSummary> {
+    expected_rows: u64,
+    writer: &mut CountingWriter<W>,
+) -> io::Result<(DenseIdentityMap, V3PriceKeyMapStageSummary, Value)> {
+    let capacity = usize::try_from(expected_rows).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "price identity map exceeds usize",
+        )
+    })?;
+    let mut map = DenseIdentityMap::with_capacity(capacity)?;
     let input_bytes = input_path.metadata()?.len();
     let mut reader = BufReader::new(File::open(input_path)?);
-    let mut by_id = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(by_id_path)?,
-    );
     read_pg_binary_copy_header(&mut reader)?;
-    let mut previous_price_set_id = None;
+    write_serving_binary_copy_header(writer, ServingBinaryTargetCopyFormat::SharedBinary)?;
+    let mut dictionary_state =
+        ServingBinaryV3PriceDictionaryState::new(V3_FINALIZER_HOT_BLOCK_BYTES)?;
     let mut row_count = 0u64;
     let mut digest = Sha256::new();
     digest.update(V3_FINALIZER_PRICE_KEY_MAP_HASH_DOMAIN);
     while let Some(fields) = read_pg_binary_copy_row(&mut reader, 2, "PTG2 v3 price-key map")? {
+        if row_count >= expected_rows {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("PTG2 v3 price-key map exceeds its declared row count {expected_rows}"),
+            ));
+        }
         let price_set_id = serving_parse_global_id_binary(required_pg_binary_field(
             &fields,
             0,
             "price_set_global_id_128",
         )?)?;
-        if previous_price_set_id.is_some_and(|previous| price_set_id <= previous) {
+        if is_zero_identity(&price_set_id) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "PTG2 v3 price-key map global IDs must be strictly increasing",
+                "price-key map contains a zero global identity",
             ));
         }
         let price_key = u32::try_from(pg_binary_nonnegative_int8(
@@ -19493,11 +19520,35 @@ fn stage_v3_price_key_map(
                 "PTG2 v3 price-key map price_key exceeds u32",
             )
         })?;
-        by_id.write_all(&price_set_id)?;
-        by_id.write_all(&price_key.to_be_bytes())?;
+        let expected_key = u32::try_from(row_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTG2 v3 price-key map row count exceeds u32",
+            )
+        })?;
+        if price_key != expected_key {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "PTG2 v3 price-key map keys must be dense and ordered from zero: expected {expected_key}, got {price_key}"
+                ),
+            ));
+        }
+        map.insert(
+            price_set_id,
+            DenseIdentityValue {
+                key: price_key,
+                auxiliary: 0,
+            },
+        )?;
+        dictionary_state.push(
+            writer,
+            ServingBinaryTargetCopyFormat::SharedBinary,
+            u64::from(price_key),
+            price_set_id,
+        )?;
         digest.update(price_set_id);
         digest.update(price_key.to_be_bytes());
-        previous_price_set_id = Some(price_set_id);
         row_count = row_count.checked_add(1).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -19512,76 +19563,37 @@ fn stage_v3_price_key_map(
             "PTG2 v3 price-key map has bytes after its COPY trailer",
         ));
     }
-    by_id.flush()?;
-    by_id.get_ref().sync_all()?;
-    Ok(V3PriceKeyMapStageSummary {
-        row_count,
-        input_bytes,
-        row_digest: digest.finalize().into(),
-    })
-}
-
-#[cfg(test)]
-fn validate_v3_price_key_map_source_ids(
-    source_price_ids_path: &Path,
-    price_key_map_by_id_path: &Path,
-) -> io::Result<u64> {
-    let mut source_reader = BufReader::new(File::open(source_price_ids_path)?);
-    let mut map_reader = BufReader::new(File::open(price_key_map_by_id_path)?);
-    let mut source_id = read_dense_id_record(&mut source_reader)?;
-    let mut map_record = read_v3_price_key_map_by_id_record(&mut map_reader)?;
-    let mut matched_rows = 0u64;
-    loop {
-        match (source_id, map_record) {
-            (None, None) => return Ok(matched_rows),
-            (Some(missing_source_id), None) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "source price-set ID {} is missing from the authoritative price-key map",
-                        sha256_hex(&missing_source_id)
-                    ),
-                ));
-            }
-            (None, Some((extra_map_id, _))) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "authoritative price-key map contains extra price-set ID {}",
-                        sha256_hex(&extra_map_id)
-                    ),
-                ));
-            }
-            (Some(expected_source_id), Some((mapped_id, _))) if expected_source_id == mapped_id => {
-                matched_rows = matched_rows.checked_add(1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "price-key map match count overflow",
-                    )
-                })?;
-                source_id = read_dense_id_record(&mut source_reader)?;
-                map_record = read_v3_price_key_map_by_id_record(&mut map_reader)?;
-            }
-            (Some(expected_source_id), Some((mapped_id, _))) if expected_source_id < mapped_id => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "source price-set ID {} is missing from the authoritative price-key map",
-                        sha256_hex(&expected_source_id)
-                    ),
-                ));
-            }
-            (Some(_), Some((extra_map_id, _))) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "authoritative price-key map contains extra price-set ID {}",
-                        sha256_hex(&extra_map_id)
-                    ),
-                ));
-            }
-        }
+    if row_count != expected_rows || map.len() as u64 != expected_rows {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "PTG2 v3 price-key map row count mismatch: expected {expected_rows}, got {row_count}"
+            ),
+        ));
     }
+    dictionary_state.finish(writer, ServingBinaryTargetCopyFormat::SharedBinary)?;
+    write_serving_binary_copy_trailer(writer, ServingBinaryTargetCopyFormat::SharedBinary)?;
+    writer.hydrate_shared_block_stats(
+        PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
+        &mut dictionary_state.block_stats,
+    )?;
+    writer.flush()?;
+    let dictionary_summary = serving_binary_v3_price_dictionary_summary(
+        &dictionary_state,
+        writer,
+        ServingBinaryTargetCopyFormat::SharedBinary,
+        V3_FINALIZER_HOT_BLOCK_BYTES,
+        "postgres_binary_dense_price_key_v1",
+    );
+    Ok((
+        map,
+        V3PriceKeyMapStageSummary {
+            row_count,
+            input_bytes,
+            row_digest: digest.finalize().into(),
+        },
+        dictionary_summary,
+    ))
 }
 
 fn write_v3_provider_dictionary_copy(
@@ -20398,96 +20410,6 @@ fn stage_v3_provider_metadata(
     Ok(stats)
 }
 
-fn build_v3_price_identity_map_and_dictionary(
-    path: &Path,
-    expected_rows: u64,
-    by_key_path: &Path,
-) -> io::Result<DenseIdentityMap> {
-    let capacity = usize::try_from(expected_rows).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "price identity map exceeds usize",
-        )
-    })?;
-    let mut map = DenseIdentityMap::with_capacity(capacity)?;
-    let reverse_bytes = capacity.checked_mul(GLOBAL_ID_BYTES).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "price key dictionary memory estimate overflow",
-        )
-    })?;
-    let mut identities_by_key = Vec::new();
-    identities_by_key
-        .try_reserve_exact(capacity)
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                format!(
-                    "unable to reserve {reverse_bytes} bytes for price key dictionary: {error}"
-                ),
-            )
-        })?;
-    identities_by_key.resize(capacity, [0u8; GLOBAL_ID_BYTES]);
-    let mut reader = BufReader::new(File::open(path)?);
-    while let Some((identity, key)) = read_v3_price_key_map_by_id_record(&mut reader)? {
-        if is_zero_identity(&identity) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "price-key map contains a zero global identity",
-            ));
-        }
-        let slot = identities_by_key.get_mut(key as usize).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "price-key map key {key} is outside its declared row count {expected_rows}"
-                ),
-            )
-        })?;
-        if !is_zero_identity(slot) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("price-key map contains duplicate dense key {key}"),
-            ));
-        }
-        *slot = identity;
-        map.insert(identity, DenseIdentityValue { key, auxiliary: 0 })?;
-    }
-    if map.len() as u64 != expected_rows {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "price identity map row count mismatch",
-        ));
-    }
-    if let Some(missing_key) = identities_by_key.iter().position(is_zero_identity) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "price-key map keys must be unique, dense, and contiguous from zero: missing {missing_key}"
-            ),
-        ));
-    }
-    let mut writer = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(by_key_path)?,
-    );
-    for (key, identity) in identities_by_key.iter().enumerate() {
-        let key = u32::try_from(key).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "price-key map key exceeds uint32",
-            )
-        })?;
-        writer.write_all(&key.to_be_bytes())?;
-        writer.write_all(identity)?;
-    }
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
-    Ok(map)
-}
-
 fn write_v3_code_dictionary_copy(
     code_dictionary: &BTreeMap<[u8; 16], NaturalLeanCode>,
     partitions: &[V3AssignedPartition],
@@ -21090,6 +21012,17 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         .collect::<Vec<_>>();
     let active_workers = options.workers.min(partition_jobs.len().max(1));
     let sort_memory = v3_sort_memory_budget(options.total_sort_memory_bytes, active_workers)?;
+    let worker_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(active_workers)
+        .thread_name(|index| format!("ptg2-v3-finalizer-{index:02}"))
+        .build()
+        .map_err(to_io_error)?;
+    let grouped_payload_bytes = serving_binary_block_bytes();
+    let encoder_workspace_max_bytes = v3_finalizer_encoder_workspace_max_bytes(
+        grouped_payload_bytes,
+        code_dictionary.len(),
+        active_workers,
+    )?;
     let code_map_estimate = DenseIdentityMap::estimated_memory_bytes(code_dictionary.len())?;
     let code_identity_peak_bytes = code_dictionary_memory_estimate
         .checked_add(code_map_estimate)
@@ -21120,28 +21053,17 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
                 "partition code-count memory estimate overflow",
             )
         })?;
-    let price_key_map_by_id_path = work_directory.path().join("price-key-map.by-id");
-    let price_key_map_stage =
-        stage_v3_price_key_map(&options.price_key_map_input, &price_key_map_by_id_path)?;
-    let price_map_entries = usize::try_from(price_key_map_stage.row_count).map_err(|_| {
+    let price_map_entries = usize::try_from(options.price_key_map_row_count).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "price identity map exceeds usize",
         )
     })?;
     let price_map_bytes = DenseIdentityMap::estimated_memory_bytes(price_map_entries)?;
-    let price_reverse_bytes = price_map_entries
-        .checked_mul(GLOBAL_ID_BYTES)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "price dictionary memory estimate overflow",
-            )
-        })?;
     let price_build_peak_bytes = code_dictionary_memory_estimate
         .checked_add(code_map.memory_bytes())
         .and_then(|value| value.checked_add(price_map_bytes))
-        .and_then(|value| value.checked_add(price_reverse_bytes))
+        .and_then(|value| value.checked_add(encoder_workspace_max_bytes))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -21157,12 +21079,30 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             ),
         ));
     }
-    let price_key_map_by_key_path = work_directory.path().join("price-key-map.by-key");
-    let price_map = Arc::new(build_v3_price_identity_map_and_dictionary(
-        &price_key_map_by_id_path,
-        price_key_map_stage.row_count,
-        &price_key_map_by_key_path,
-    )?);
+    let price_key_map_load_started_at = Instant::now();
+    let price_blocks_path = output.path("shared_price_dictionary_blocks.copy");
+    let price_blocks_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&price_blocks_path)?;
+    let mut price_blocks_writer = CountingWriter::with_shared_block_preparation_batch(
+        BufWriter::new(price_blocks_file),
+        SharedBlockPreparationBatchLimits::finalizer_default(),
+    )?;
+    let (price_map, price_key_map_stage, price_dictionary_summary) = worker_pool.install(|| {
+        load_v3_price_key_map_and_write_dictionary(
+            &options.price_key_map_input,
+            options.price_key_map_row_count,
+            &mut price_blocks_writer,
+        )
+    })?;
+    sync_counting_writer(&mut price_blocks_writer)?;
+    let price_block_summary = price_blocks_writer.shared_block_summary(&price_blocks_path);
+    drop(price_blocks_writer);
+    let price_key_map_and_dictionary_seconds =
+        price_key_map_load_started_at.elapsed().as_secs_f64();
+    let price_dictionary_encode_seconds = price_key_map_and_dictionary_seconds;
+    let price_map = Arc::new(price_map);
     #[cfg(any())]
     {
         let price_bitmap_bytes_per_worker = price_map_entries
@@ -21482,12 +21422,6 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
                 "dense provider projection index memory estimate overflow",
             )
         })?;
-    let grouped_payload_bytes = serving_binary_block_bytes();
-    let encoder_workspace_max_bytes = v3_finalizer_encoder_workspace_max_bytes(
-        grouped_payload_bytes,
-        code_map.len(),
-        active_workers,
-    )?;
     let provider_bitmap_bytes_per_worker = provider_map_entries
         .saturating_add(63)
         .checked_div(64)
@@ -21584,11 +21518,6 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         price_map_entries.saturating_add(63) / 64,
         "combined price coverage bitmap",
     )?));
-    let worker_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(active_workers)
-        .thread_name(|index| format!("ptg2-v3-finalizer-{index:02}"))
-        .build()
-        .map_err(to_io_error)?;
     let assignment_started_at = Instant::now();
     let mut assigned_partitions = {
         let assignment_context = V3AssignmentContext {
@@ -21687,7 +21616,6 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
     }
     let stage_seconds = stage_started_at.elapsed().as_secs_f64();
 
-    let encode_started_at = Instant::now();
     let serving_encode_started_at = Instant::now();
     let serving_blocks_path = output.path("shared_serving_blocks.copy");
     let serving_blocks_file = OpenOptions::new()
@@ -21744,30 +21672,7 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         audit_candidate_records,
     )?;
 
-    let price_blocks_path = output.path("shared_price_dictionary_blocks.copy");
-    let price_dictionary_encode_started_at = Instant::now();
-    let price_blocks_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&price_blocks_path)?;
-    let mut price_blocks_writer = CountingWriter::with_shared_block_preparation_batch(
-        BufWriter::new(price_blocks_file),
-        SharedBlockPreparationBatchLimits::finalizer_default(),
-    )?;
-    let mut price_stream = BufReader::new(File::open(&price_key_map_by_key_path)?);
-    let price_dictionary_summary = worker_pool.install(|| {
-        write_serving_binary_v3_price_dictionary_copy_from_fixed_reader(
-            &mut price_stream,
-            &mut price_blocks_writer,
-            ServingBinaryTargetCopyFormat::SharedBinary,
-            V3_FINALIZER_HOT_BLOCK_BYTES,
-        )
-    })?;
-    sync_counting_writer(&mut price_blocks_writer)?;
-    let price_block_summary = price_blocks_writer.shared_block_summary(&price_blocks_path);
-    let price_dictionary_encode_seconds =
-        price_dictionary_encode_started_at.elapsed().as_secs_f64();
-    let encode_seconds = encode_started_at.elapsed().as_secs_f64();
+    let encode_seconds = serving_encode_seconds + price_dictionary_encode_seconds;
 
     let support_digest = v3_support_digest(
         &stage_summary.code_digest,
@@ -21817,9 +21722,6 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         ));
     }
 
-    let price_map_stage_bytes = price_key_map_stage
-        .row_count
-        .saturating_mul(V3_FINALIZER_PRICE_KEY_MAP_RECORD_BYTES as u64);
     let provider_metadata_source_bytes = inputs
         .provider_metadata
         .iter()
@@ -21830,13 +21732,11 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             .saturating_add(provider_sort_stats.input_bytes)
             .saturating_add(provider_sort_stats.spill_bytes)
             .saturating_add(provider_sort_stats.output_bytes.saturating_mul(2))
-            .saturating_add(price_key_map_stage.input_bytes)
-            .saturating_add(price_map_stage_bytes),
+            .saturating_add(price_key_map_stage.input_bytes),
         written: provider_sort_stats
             .input_bytes
             .saturating_add(provider_sort_stats.spill_bytes)
-            .saturating_add(provider_sort_stats.output_bytes)
-            .saturating_add(price_map_stage_bytes.saturating_mul(2)),
+            .saturating_add(provider_sort_stats.output_bytes),
     };
     let provider_code_scratch_read = assigned_summary
         .pointer("/provider_set_codes/scratch_bytes_read")
@@ -21849,7 +21749,6 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
     let encoding_scratch = V3ScratchBytes {
         read: assigned_sort_stats
             .output_bytes
-            .saturating_add(price_map_stage_bytes)
             .saturating_add(provider_code_scratch_read),
         written: provider_code_scratch_written,
     };
@@ -21934,12 +21833,14 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "row_count": price_key_map_stage.row_count,
             "byte_count": price_key_map_stage.input_bytes,
             "row_digest": sha256_hex(&price_key_map_stage.row_digest),
-            "input_id_ordering": "global_id_128_unsigned_lexicographic_strict",
+            "input_ordering": "price_key_dense_ascending_v1",
             "dense_price_ordering": "minimum_negotiated_rate_then_global_id_128_v1",
             "keys_unique_dense_contiguous": true,
             "source_ids_exact_match": true,
-            "dictionary_strategy": "dense_key_vector_direct_write_v1",
+            "dictionary_strategy": "single_pass_map_and_shared_blocks_v1",
             "dictionary_external_sort": false,
+            "input_passes": 1,
+            "fixed_map_scratch_files": 0,
         },
         "partition_assignment_sorts": {
             "strategy": "immutable_dense_maps_bounded_direct_runs_v2",
@@ -22091,6 +21992,8 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "assignment_seconds": assignment_seconds,
             "serving_encode_seconds": serving_encode_seconds,
             "price_dictionary_encode_seconds": price_dictionary_encode_seconds,
+            "price_dictionary_encode_contract": "includes_price_key_map_load_single_pass_v1",
+            "price_key_map_and_dictionary_seconds": price_key_map_and_dictionary_seconds,
             "encode_seconds": encode_seconds,
             "elapsed_seconds": started_at.elapsed().as_secs_f64(),
         },
@@ -25390,12 +25293,11 @@ mod tests {
         label: &str,
         price_ids_in_key_order: &[[u8; GLOBAL_ID_BYTES]],
     ) -> PathBuf {
-        let mut rows = price_ids_in_key_order
+        let rows = price_ids_in_key_order
             .iter()
             .enumerate()
             .map(|(price_key, price_set_id)| (*price_set_id, price_key as i64))
             .collect::<Vec<_>>();
-        rows.sort_unstable_by_key(|(price_set_id, _)| *price_set_id);
         let copy_rows = rows
             .into_iter()
             .map(|(price_set_id, price_key)| {
@@ -26955,6 +26857,7 @@ mod tests {
             workers: 2,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input: price_key_map_input.clone(),
+            price_key_map_row_count: price_ids_in_key_order.len() as u64,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
         })
@@ -26967,6 +26870,7 @@ mod tests {
             workers: 2,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
+            price_key_map_row_count: price_ids_in_key_order.len() as u64,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
         })
@@ -27046,8 +26950,14 @@ mod tests {
         );
         assert_eq!(
             summary_a["price_key_map"]["dictionary_strategy"],
-            "dense_key_vector_direct_write_v1"
+            "single_pass_map_and_shared_blocks_v1"
         );
+        assert_eq!(
+            summary_a["price_key_map"]["input_ordering"],
+            "price_key_dense_ascending_v1"
+        );
+        assert_eq!(summary_a["price_key_map"]["input_passes"], 1);
+        assert_eq!(summary_a["price_key_map"]["fixed_map_scratch_files"], 0);
         assert_eq!(summary_a["dictionaries"]["code"]["field_count"], 10);
         assert_eq!(
             summary_a["dictionaries"]["code"]["fields"],
@@ -27239,6 +27149,7 @@ mod tests {
                 workers,
                 identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
                 price_key_map_input: price_key_map_input.clone(),
+                price_key_map_row_count: 1,
                 price_membership_inputs: Vec::new(),
                 price_atom_inputs: Vec::new(),
             })
@@ -27328,6 +27239,7 @@ mod tests {
             workers: 4,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
+            price_key_map_row_count: price_ids_in_key_order.len() as u64,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
         })
@@ -27440,6 +27352,7 @@ mod tests {
             workers: 8,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
+            price_key_map_row_count: price_ids.len() as u64,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
         })
@@ -27494,6 +27407,7 @@ mod tests {
             workers: 16,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
+            price_key_map_row_count: price_cardinality as u64,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
         })
@@ -27585,6 +27499,7 @@ mod tests {
             workers: 2,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
+            price_key_map_row_count: 1,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
         })
@@ -28383,6 +28298,7 @@ mod tests {
             workers: 1,
             identity_map_max_bytes: required - 1,
             price_key_map_input,
+            price_key_map_row_count: 1,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
         })
@@ -28427,6 +28343,7 @@ mod tests {
             workers: 16,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
+            price_key_map_row_count: 1,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
         })
@@ -28469,10 +28386,49 @@ mod tests {
         .unwrap_err();
         assert!(duplicate.to_string().contains("only once"));
 
+        let missing_count = parse_v3_finalizer_options(&[
+            output.clone(),
+            "--price-key-map-input".to_owned(),
+            map_path.display().to_string(),
+            manifest.clone(),
+        ])
+        .unwrap_err();
+        assert!(missing_count
+            .to_string()
+            .contains("requires --price-key-map-row-count"));
+
+        for invalid_count in ["0", "4294967297"] {
+            let invalid = parse_v3_finalizer_options(&[
+                output.clone(),
+                "--price-key-map-input".to_owned(),
+                map_path.display().to_string(),
+                "--price-key-map-row-count".to_owned(),
+                invalid_count.to_owned(),
+                manifest.clone(),
+            ])
+            .unwrap_err();
+            assert!(invalid.to_string().contains("must be between 1 and"));
+        }
+
+        let duplicate_count = parse_v3_finalizer_options(&[
+            output.clone(),
+            "--price-key-map-input".to_owned(),
+            map_path.display().to_string(),
+            "--price-key-map-row-count".to_owned(),
+            "1".to_owned(),
+            "--price-key-map-row-count".to_owned(),
+            "1".to_owned(),
+            manifest.clone(),
+        ])
+        .unwrap_err();
+        assert!(duplicate_count.to_string().contains("only once"));
+
         let options = parse_v3_finalizer_options(&[
             output,
             "--price-key-map-input".to_owned(),
             map_path.display().to_string(),
+            "--price-key-map-row-count".to_owned(),
+            "1".to_owned(),
             "--workers".to_owned(),
             "2".to_owned(),
             "--identity-map-max-bytes".to_owned(),
@@ -28483,6 +28439,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(options.price_key_map_input, map_path);
+        assert_eq!(options.price_key_map_row_count, 1);
         assert_eq!(options.workers, 2);
         assert_eq!(options.identity_map_max_bytes, 64 * 1024 * 1024);
         assert_eq!(options.total_sort_memory_bytes, 32 * 1024 * 1024);
@@ -28536,41 +28493,80 @@ mod tests {
         let id_a = prefixed_test_id(2, 1);
         let id_b = prefixed_test_id(2, 2);
 
-        let validate = |label: &str, rows: Vec<Vec<Option<Vec<u8>>>>| -> io::Result<()> {
+        #[derive(Debug)]
+        struct ValidatedPriceMap {
+            mapped_a: Option<DenseIdentityValue>,
+            mapped_b: Option<DenseIdentityValue>,
+            summary: Value,
+            output: Vec<u8>,
+        }
+
+        let validate = |label: &str,
+                        rows: Vec<Vec<Option<Vec<u8>>>>,
+                        expected_rows: u64|
+         -> io::Result<ValidatedPriceMap> {
             let input = base.join(format!("{label}.copy"));
-            let by_id = base.join(format!("{label}.by-id"));
-            let by_key = base.join(format!("{label}.by-key"));
             std::fs::write(&input, pg_binary_copy_rows(&rows))?;
-            let staged = stage_v3_price_key_map(&input, &by_id)?;
-            build_v3_price_identity_map_and_dictionary(&by_id, staged.row_count, &by_key)
-                .map(|_| ())
+            let mut writer = CountingWriter::new(Vec::new());
+            let (map, stage, summary) =
+                load_v3_price_key_map_and_write_dictionary(&input, expected_rows, &mut writer)?;
+            assert_eq!(stage.row_count, expected_rows);
+            Ok(ValidatedPriceMap {
+                mapped_a: map.get(&id_a),
+                mapped_b: map.get(&id_b),
+                summary,
+                output: writer.inner,
+            })
         };
 
-        validate(
-            "valid-cost-order",
+        let valid = validate(
+            "valid-key-order-with-nonmonotonic-ids",
             vec![
-                vec![Some(id_a.to_vec()), pg_i64_field(1)],
                 vec![Some(id_b.to_vec()), pg_i64_field(0)],
+                vec![Some(id_a.to_vec()), pg_i64_field(1)],
             ],
+            2,
         )
         .unwrap();
+        assert_eq!(valid.mapped_b.unwrap().key, 0);
+        assert_eq!(valid.mapped_a.unwrap().key, 1);
+        assert_eq!(valid.summary["price_set_count"], 2);
+
+        let mut fixed_input = Vec::new();
+        for (price_key, price_set_id) in [id_b, id_a].iter().enumerate() {
+            fixed_input.extend_from_slice(&(price_key as u32).to_be_bytes());
+            fixed_input.extend_from_slice(price_set_id);
+        }
+        let mut fixed_reader = Cursor::new(fixed_input);
+        let mut fixed_writer = CountingWriter::new(Vec::new());
+        let fixed_summary = write_serving_binary_v3_price_dictionary_copy_from_fixed_reader(
+            &mut fixed_reader,
+            &mut fixed_writer,
+            ServingBinaryTargetCopyFormat::SharedBinary,
+            V3_FINALIZER_HOT_BLOCK_BYTES,
+        )
+        .unwrap();
+        assert_eq!(valid.output, fixed_writer.inner);
+        assert_eq!(valid.summary["storage"], fixed_summary["storage"]);
 
         let malformed = validate(
             "malformed-int4",
             vec![vec![Some(id_a.to_vec()), pg_i32_field(0)]],
+            1,
         )
         .unwrap_err();
         assert!(malformed.to_string().contains("must be int8"));
 
-        let unordered = validate(
-            "unordered-ids",
+        let swapped = validate(
+            "swapped-keys",
             vec![
-                vec![Some(id_b.to_vec()), pg_i64_field(0)],
                 vec![Some(id_a.to_vec()), pg_i64_field(1)],
+                vec![Some(id_b.to_vec()), pg_i64_field(0)],
             ],
+            2,
         )
         .unwrap_err();
-        assert!(unordered.to_string().contains("strictly increasing"));
+        assert!(swapped.to_string().contains("expected 0, got 1"));
 
         let gap = validate(
             "noncontiguous-keys",
@@ -28578,24 +28574,86 @@ mod tests {
                 vec![Some(id_a.to_vec()), pg_i64_field(0)],
                 vec![Some(id_b.to_vec()), pg_i64_field(2)],
             ],
+            2,
         )
         .unwrap_err();
-        assert!(gap.to_string().contains("outside its declared row count"));
+        assert!(gap.to_string().contains("expected 1, got 2"));
 
-        let duplicate = validate(
+        let duplicate_key = validate(
             "duplicate-keys",
             vec![
                 vec![Some(id_a.to_vec()), pg_i64_field(0)],
                 vec![Some(id_b.to_vec()), pg_i64_field(0)],
             ],
+            2,
         )
         .unwrap_err();
-        assert!(duplicate.to_string().contains("duplicate dense key"));
+        assert!(duplicate_key.to_string().contains("expected 1, got 0"));
+
+        let duplicate_id = validate(
+            "duplicate-id",
+            vec![
+                vec![Some(id_a.to_vec()), pg_i64_field(0)],
+                vec![Some(id_a.to_vec()), pg_i64_field(1)],
+            ],
+            2,
+        )
+        .unwrap_err();
+        assert!(duplicate_id
+            .to_string()
+            .contains("duplicate identity in immutable dense map"));
+
+        let zero_id = validate(
+            "zero-id",
+            vec![vec![Some(vec![0; GLOBAL_ID_BYTES]), pg_i64_field(0)]],
+            1,
+        )
+        .unwrap_err();
+        assert!(zero_id.to_string().contains("zero global identity"));
+
+        let too_many = validate(
+            "more-than-declared",
+            vec![
+                vec![Some(id_a.to_vec()), pg_i64_field(0)],
+                vec![Some(id_b.to_vec()), pg_i64_field(1)],
+            ],
+            1,
+        )
+        .unwrap_err();
+        assert!(too_many
+            .to_string()
+            .contains("exceeds its declared row count 1"));
+
+        let too_few = validate(
+            "fewer-than-declared",
+            vec![vec![Some(id_a.to_vec()), pg_i64_field(0)]],
+            2,
+        )
+        .unwrap_err();
+        assert!(too_few
+            .to_string()
+            .contains("row count mismatch: expected 2, got 1"));
+
+        let trailing_path = base.join("trailing.copy");
+        let mut trailing_copy = pg_binary_copy_rows(&[vec![Some(id_a.to_vec()), pg_i64_field(0)]]);
+        trailing_copy.push(0);
+        std::fs::write(&trailing_path, trailing_copy).unwrap();
+        let trailing_error = load_v3_price_key_map_and_write_dictionary(
+            &trailing_path,
+            1,
+            &mut CountingWriter::new(Vec::new()),
+        )
+        .err()
+        .expect("trailing COPY bytes must fail");
+        assert!(trailing_error
+            .to_string()
+            .contains("bytes after its COPY trailer"));
         let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
     fn v3_price_key_map_requires_exact_source_id_coverage() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
         let base = std::env::temp_dir().join(format!(
             "ptg2-direct-v3-finalizer-price-map-coverage-{}",
             std::process::id()
@@ -28605,32 +28663,59 @@ mod tests {
         let id_a = prefixed_test_id(2, 1);
         let id_b = prefixed_test_id(2, 2);
         let id_c = prefixed_test_id(2, 3);
-        let source_path = base.join("source-ids.sorted");
-        let mut source_ids = Vec::new();
-        source_ids.extend_from_slice(&id_a);
-        source_ids.extend_from_slice(&id_b);
-        std::fs::write(&source_path, source_ids).unwrap();
+        let rows = [
+            V3FinalizerTestRow {
+                coverage_scope_id: [0x62; COVERAGE_SCOPE_ID_BYTES],
+                code_system: Some("CPT"),
+                code: Some("99213"),
+                negotiation_arrangement: Some("FFS"),
+                provider_id: prefixed_test_id(1, 1),
+                price_id: id_a,
+                provider_count: 1,
+            },
+            V3FinalizerTestRow {
+                coverage_scope_id: [0x62; COVERAGE_SCOPE_ID_BYTES],
+                code_system: Some("CPT"),
+                code: Some("99213"),
+                negotiation_arrangement: Some("FFS"),
+                provider_id: prefixed_test_id(1, 1),
+                price_id: id_b,
+                provider_count: 1,
+            },
+        ];
+        let manifest = write_v3_finalizer_test_manifest(&base, "coverage", &rows);
+        let finalize =
+            |label: &str, ids_in_key_order: &[[u8; GLOBAL_ID_BYTES]]| -> io::Result<Value> {
+                let price_key_map_input =
+                    write_v3_finalizer_test_price_key_map(&base, label, ids_in_key_order);
+                finalize_v3_runs(&V3FinalizerOptions {
+                    output_directory: base.join(format!("{label}-output")),
+                    manifest_paths: vec![manifest.clone()],
+                    total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(1, 2),
+                    workers: 1,
+                    identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
+                    price_key_map_input,
+                    price_key_map_row_count: ids_in_key_order.len() as u64,
+                    price_membership_inputs: Vec::new(),
+                    price_atom_inputs: Vec::new(),
+                })
+            };
 
-        let stage_map = |label: &str, ids_in_key_order: &[[u8; GLOBAL_ID_BYTES]]| -> PathBuf {
-            let input = write_v3_finalizer_test_price_key_map(&base, label, ids_in_key_order);
-            let by_id = base.join(format!("{label}.by-id"));
-            stage_v3_price_key_map(&input, &by_id).unwrap();
-            by_id
-        };
+        let exact = finalize("exact", &[id_b, id_a]).unwrap();
+        assert_eq!(exact["dense_keys"]["price"]["count"], 2);
+        assert_eq!(exact["price_key_map"]["source_ids_exact_match"], true);
 
-        let exact = stage_map("exact", &[id_b, id_a]);
-        assert_eq!(
-            validate_v3_price_key_map_source_ids(&source_path, &exact).unwrap(),
-            2
-        );
+        let missing = finalize("missing", &[id_a]).unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("assigned price identity is absent"));
+        assert!(!base.join("missing-output").exists());
 
-        let missing = stage_map("missing", &[id_a]);
-        let error = validate_v3_price_key_map_source_ids(&source_path, &missing).unwrap_err();
-        assert!(error.to_string().contains("missing"));
-
-        let extra = stage_map("extra", &[id_c, id_b, id_a]);
-        let error = validate_v3_price_key_map_source_ids(&source_path, &extra).unwrap_err();
-        assert!(error.to_string().contains("extra"));
+        let extra = finalize("extra", &[id_b, id_a, id_c]).unwrap_err();
+        assert!(extra
+            .to_string()
+            .contains("authoritative price-key map contains unused price key 2"));
+        assert!(!base.join("extra-output").exists());
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -28687,6 +28772,7 @@ mod tests {
             workers: 2,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
             price_key_map_input,
+            price_key_map_row_count: 2,
             price_membership_inputs: Vec::new(),
             price_atom_inputs: Vec::new(),
         })

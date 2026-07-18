@@ -187,6 +187,7 @@ async def test_finalizer_cancellation_reaps_group_and_allows_same_directory_retr
         provider_set_metadata_entries=provider_metadata_entries,
         expected_source_identities=[identity],
         price_key_map_input=price_key_map,
+        price_key_map_row_count=1,
     )
 
     first_attempt = asyncio.create_task(
