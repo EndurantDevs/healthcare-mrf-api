@@ -134,6 +134,14 @@ class _Rows:
         return iter(self.rows)
 
 
+class _OneOrNoneResult:
+    def __init__(self, row_fields):
+        self.row_fields = row_fields
+
+    def one_or_none(self):
+        return self.row_fields
+
+
 class _Session:
     def __init__(self, rows=()):
         self.rows = list(rows)
@@ -142,6 +150,47 @@ class _Session:
     async def execute(self, statement, params):
         self.calls.append((str(statement), dict(params)))
         return _Rows(self.rows)
+
+
+class _RecordingOneRowSession:
+    sync_session = object()
+
+    def __init__(self, row_fields):
+        self.row_fields = row_fields
+        self.calls = []
+
+    async def execute(self, statement, params):
+        self.calls.append((str(statement), dict(params)))
+        return _OneOrNoneResult(self.row_fields)
+
+
+def _candidate_audit_access():
+    return ptg2_candidate_audit.PTG2CandidateAuditAccess(
+        snapshot_id="logical-candidate",
+        source_key="logical-source",
+        plan_id="plan-a",
+        plan_market_type="group",
+    )
+
+
+def _candidate_descriptor_row(manifest_source_key: str):
+    serving_index = {
+        **_strict_serving_index(),
+        "source_key": manifest_source_key,
+    }
+    return {
+        "candidate_serving_index": serving_index,
+        "layout_audit_sample": serving_index["audit_sample"],
+        "layout_coverage_scope_id": serving_index["coverage_scope_id"],
+        "layout_code_count": serving_index["code_count"],
+        "snapshot_plan_id": "plan-a",
+        "snapshot_plan_market_type": "group",
+        "snapshot_coverage_scope_id": serving_index["coverage_scope_id"],
+        "postgres_server_version_num": 160004,
+        "database_selected": True,
+        "backend_session_active": True,
+        "transaction_snapshot_observed": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -239,6 +288,163 @@ async def test_shared_snapshot_metadata_is_never_process_cached():
     assert first.shared_snapshot_key == 41
     assert second.shared_snapshot_key == 42
     assert not hasattr(ptg2_tables, "_PTG2_SNAPSHOT_TABLES_CACHE")
+
+
+@pytest.mark.asyncio
+async def test_candidate_snapshot_descriptor_requires_manifest_source_binding():
+    access = _candidate_audit_access()
+    session = _RecordingOneRowSession(
+        _candidate_descriptor_row(access.source_key)
+    )
+    tables = await ptg2_tables.snapshot_serving_tables(
+        session,
+        access.snapshot_id,
+        candidate_audit_access=access,
+    )
+
+    assert tables.source_key == access.source_key
+    assert len(session.calls) == 1
+    sql, params = session.calls[0]
+    assert "snapshot.manifest->'serving_index'->>'source_key'" in sql
+    assert params["candidate_source_key"] == access.source_key
+
+
+@pytest.mark.asyncio
+async def test_candidate_snapshot_descriptor_rejects_mismatched_manifest_source():
+    access = _candidate_audit_access()
+    session = _RecordingOneRowSession(
+        _candidate_descriptor_row("another-source")
+    )
+    with pytest.raises(
+        ptg2_tables.PTG2ManifestArtifactError,
+        match="candidate source does not match",
+    ):
+        await ptg2_tables.snapshot_serving_tables(
+            session,
+            access.snapshot_id,
+            candidate_audit_access=access,
+        )
+
+
+@pytest.mark.asyncio
+async def test_candidate_search_reuses_one_validated_snapshot_descriptor(monkeypatch):
+    session = object()
+    pagination = SimpleNamespace(limit=100, offset=0)
+    access = _candidate_audit_access()
+    query_args_by_name = {
+        "snapshot_id": access.snapshot_id,
+        "source_key": access.source_key,
+        "plan_id": access.plan_id,
+        "plan_market_type": access.plan_market_type,
+        ptg2_candidate_audit.PTG2_CANDIDATE_AUDIT_ACCESS_ARG: access,
+    }
+    tables = _strict_tables(snapshot_id=access.snapshot_id)
+    descriptor = AsyncMock(return_value=tables)
+    resolver = AsyncMock(
+        side_effect=AssertionError("candidate search must not resolve the snapshot twice")
+    )
+    one_snapshot_search = AsyncMock(return_value={"items": []})
+    monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", descriptor)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "resolve_current_ptg2_snapshot_id",
+        resolver,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_search_one_ptg2_snapshot",
+        one_snapshot_search,
+    )
+
+    search_response = await ptg2_serving.search_current_ptg2_index(
+        session,
+        query_args_by_name,
+        pagination,
+    )
+
+    assert search_response == {"items": []}
+    resolver.assert_not_awaited()
+    descriptor.assert_awaited_once_with(
+        session,
+        access.snapshot_id,
+        candidate_audit_access=access,
+    )
+    one_snapshot_search.assert_awaited_once_with(
+        session,
+        access.snapshot_id,
+        query_args_by_name,
+        pagination,
+        serving_tables=tables,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("omitted_coordinate", ["snapshot_id", "source_key"])
+async def test_candidate_search_rejects_missing_coordinates_before_network_lookup(
+    monkeypatch,
+    omitted_coordinate,
+):
+    access = _candidate_audit_access()
+    query_args_by_name = {
+        "snapshot_id": access.snapshot_id,
+        "source_key": access.source_key,
+        "plan_id": access.plan_id,
+        "plan_market_type": access.plan_market_type,
+        ptg2_candidate_audit.PTG2_CANDIDATE_AUDIT_ACCESS_ARG: access,
+    }
+    query_args_by_name.pop(omitted_coordinate)
+    descriptor = AsyncMock()
+    network_lookup = AsyncMock()
+    monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", descriptor)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "current_network_snapshots_for_plan",
+        network_lookup,
+    )
+
+    search_response = await ptg2_serving.search_current_ptg2_index(
+        object(),
+        query_args_by_name,
+        SimpleNamespace(limit=100, offset=0),
+    )
+
+    assert search_response is None
+    descriptor.assert_not_awaited()
+    network_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_explicit_snapshot_search_keeps_resolver_revalidation(monkeypatch):
+    session = object()
+    pagination = SimpleNamespace(limit=100, offset=0)
+    query_args_by_name = {"snapshot_id": "published-snapshot"}
+    resolver = AsyncMock(return_value="published-snapshot")
+    one_snapshot_search = AsyncMock(return_value={"items": []})
+    monkeypatch.setattr(
+        ptg2_serving,
+        "resolve_current_ptg2_snapshot_id",
+        resolver,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_search_one_ptg2_snapshot",
+        one_snapshot_search,
+    )
+
+    search_response = await ptg2_serving.search_current_ptg2_index(
+        session,
+        query_args_by_name,
+        pagination,
+    )
+
+    assert search_response == {"items": []}
+    resolver.assert_awaited_once_with(session, query_args_by_name)
+    one_snapshot_search.assert_awaited_once_with(
+        session,
+        "published-snapshot",
+        query_args_by_name,
+        pagination,
+    )
 
 
 def test_snapshot_availability_branches_v3_to_binding_and_layout():
@@ -972,6 +1178,7 @@ def _candidate_audit_query_args():
         plan_market_type="group",
     )
     return {
+        "snapshot_id": "logical-plan-a",
         "plan_id": "plan-a",
         "plan_market_type": "group",
         "source_key": "logical-source",
@@ -999,6 +1206,15 @@ async def test_candidate_audit_exact_npi_does_not_require_an_address(
         price_set_id,
     )
     session = _single_code_metadata_session()
+    ptg_caches = (
+        ptg2_serving._PTG2_NETWORK_SERVING_TABLES_CACHE,
+        ptg2_serving._PTG2_PROVIDER_NPI_PREFIX_CACHE,
+        ptg2_serving._PTG2_FILTERED_PROVIDER_PREFIX_CACHE,
+        ptg2_serving._PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE,
+        ptg2_serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE,
+    )
+    for cache in ptg_caches:
+        cache.clear()
 
     response = await ptg2_serving._search_manifest_serving_table(
         session,
@@ -1017,6 +1233,7 @@ async def test_candidate_audit_exact_npi_does_not_require_an_address(
     location_matches.assert_not_awaited()
     broad_rows.assert_not_awaited()
     enrichment.assert_not_awaited()
+    assert all(not cache for cache in ptg_caches)
 
 
 @pytest.mark.asyncio

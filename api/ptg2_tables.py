@@ -432,6 +432,9 @@ async def snapshot_serving_tables(
                AND lower(btrim(COALESCE(
                    snapshot.manifest->'activation'->>'source_key', ''
                ))) = :candidate_source_key
+               AND lower(btrim(COALESCE(
+                   snapshot.manifest->'serving_index'->>'source_key', ''
+               ))) = :candidate_source_key
                AND layout.state = 'sealed'
                AND layout.generation = :storage_generation
                AND EXISTS (
@@ -594,7 +597,13 @@ async def snapshot_serving_tables(
             serving_index,
             source_count=int(source_count or 0),
         )
-        source_key = str(serving_index.get("source_key") or "").strip() or None
+        source_key = (
+            str(serving_index.get("source_key") or "").strip().lower() or None
+        )
+        if source_key != candidate_audit_access.source_key:
+            raise PTG2ManifestArtifactError(
+                "PTG2 candidate source does not match its snapshot manifest"
+            )
     else:
         bound_snapshot_key = _optional_integer(row_fields.get("bound_snapshot_key"))
         if bound_snapshot_key != shared_snapshot_key:

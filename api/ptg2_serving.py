@@ -42,7 +42,10 @@ from api.ptg2_code_filters import (
     _ptg2_code_query_fields,
 )
 from api.ptg2_code_details import _enrich_ptg2_code_details
-from api.ptg2_candidate_audit import candidate_audit_access_from_args
+from api.ptg2_candidate_audit import (
+    PTG2CandidateAuditAccess,
+    candidate_audit_access_from_args,
+)
 from api.ptg2_code_context import (
     _resolve_ptg2_code_search_context,
 )
@@ -9025,6 +9028,44 @@ async def _search_one_ptg2_snapshot(
     return None
 
 
+async def _search_candidate_ptg2_snapshot(
+    session,
+    args: dict[str, Any],
+    pagination,
+    *,
+    explicit_snapshot: str,
+    explicit_source: str,
+    candidate_audit_access: PTG2CandidateAuditAccess,
+) -> dict[str, Any] | None:
+    """Search one validated candidate without resolving its descriptor twice."""
+
+    requested_plan_id = str(
+        args.get("plan_id") or args.get("plan_external_id") or ""
+    ).strip()
+    requested_market_type = str(
+        args.get("plan_market_type") or args.get("market_type") or ""
+    ).strip()
+    if not candidate_audit_access.matches(
+        snapshot_id=explicit_snapshot,
+        source_key=explicit_source,
+        plan_id=requested_plan_id,
+        plan_market_type=requested_market_type,
+    ):
+        return None
+    serving_tables = await snapshot_serving_tables(
+        session,
+        candidate_audit_access.snapshot_id,
+        candidate_audit_access=candidate_audit_access,
+    )
+    return await _search_one_ptg2_snapshot(
+        session,
+        candidate_audit_access.snapshot_id,
+        args,
+        pagination,
+        serving_tables=serving_tables,
+    )
+
+
 def _cache_network_serving_tables(serving_tables: PTG2ServingTables) -> None:
     """Remember immutable sealed metadata after its strict database validation."""
 
@@ -9251,6 +9292,16 @@ async def search_current_ptg2_index(session, args: dict[str, Any], pagination) -
     explicit_snapshot = str(args.get("snapshot_id") or "").strip()
     explicit_source = str(args.get("source_key") or "").strip()
     plan_scoped = bool(str(args.get("plan_id") or args.get("plan_external_id") or "").strip())
+    candidate_audit_access = candidate_audit_access_from_args(args)
+    if candidate_audit_access is not None:
+        return await _search_candidate_ptg2_snapshot(
+            session,
+            args,
+            pagination,
+            explicit_snapshot=explicit_snapshot,
+            explicit_source=explicit_source,
+            candidate_audit_access=candidate_audit_access,
+        )
     # Plan-scoped queries with no pinned snapshot/network fan out across every
     # network in the plan (a plan can be served by multiple networks, each with
     # its own snapshot) and combine results. A pinned snapshot_id or source_key,
