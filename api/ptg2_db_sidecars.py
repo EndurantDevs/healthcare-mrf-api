@@ -19,6 +19,7 @@ from api.ptg2_shared_blocks import (
     fetch_shared_graph_members,
     read_strict_uvarint,
     stream_shared_blocks,
+    validate_shared_block_row,
 )
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_manifest_artifacts import (
@@ -37,6 +38,15 @@ class PTG2ServingBinaryRow:
     price_set_global_id_128: str
     source_key: int
     price_key: int | None = None
+
+
+@dataclass(frozen=True)
+class PTG2V3ProviderPageBundle:
+    """Selective provider pages with their durable relational metadata."""
+
+    pages_by_key: Mapping[int, Any]
+    provider_set_ids_by_key: Mapping[int, str]
+    network_names_by_key: Mapping[int, tuple[str, ...]]
 
 
 @dataclass(frozen=True)
@@ -1959,6 +1969,168 @@ async def lookup_shared_provider_pages_from_db(
             )
         )
     return pages_by_provider_key
+
+
+async def lookup_shared_provider_code_pages_from_db(
+    session: Any,
+    shared_snapshot_key: int,
+    provider_set_keys: Iterable[int],
+    code_keys: Iterable[int],
+    *,
+    source_count: int | None = None,
+    schema_name: str = "mrf",
+) -> PTG2V3ProviderPageBundle | None:
+    """Read selective provider pages and provider metadata with one statement."""
+
+    from api.ptg2_db_serving_v3 import _logical_block_bytes, _requested_keys
+    from api.ptg2_db_serving_v3_pages import (
+        PTG2_SERVING_BINARY_V3_PROVIDER_PAGE_BLOCK_SPAN,
+        PTG2_SERVING_BINARY_V3_PROVIDER_SET_PAGE_KIND,
+        _decode_provider_page_block,
+    )
+
+    requested_provider_keys = _requested_keys(provider_set_keys)
+    requested_code_keys = _requested_keys(code_keys)
+    if not requested_provider_keys or not requested_code_keys:
+        return PTG2V3ProviderPageBundle({}, {}, {})
+    block_span = PTG2_SERVING_BINARY_V3_PROVIDER_PAGE_BLOCK_SPAN
+    block_keys = tuple(
+        sorted(
+            {
+                provider_set_key // block_span
+                for provider_set_key in requested_provider_keys
+            }
+        )
+    )
+    schema = _quote_ident(schema_name)
+    query_result = await session.execute(
+        text(
+            f"""
+            SELECT mapping.object_kind, mapping.block_key, mapping.fragment_no,
+                   mapping.entry_count AS mapping_entry_count, mapping.block_hash,
+                   block.format_version, block.codec,
+                   block.entry_count AS block_entry_count,
+                   block.raw_byte_count, block.payload,
+                   provider_set.provider_set_key AS metadata_provider_set_key,
+                   provider_set.provider_set_global_id_128,
+                   provider_set.provider_count AS metadata_provider_count,
+                   provider_set.network_names
+              FROM {schema}.ptg2_v3_snapshot_layout layout
+              JOIN {schema}.ptg2_v3_snapshot_block mapping
+                ON mapping.snapshot_key = layout.snapshot_key
+              JOIN {schema}.ptg2_v3_block block
+                ON block.block_hash = mapping.block_hash
+              JOIN {schema}.ptg2_v3_provider_set provider_set
+                ON provider_set.snapshot_key = layout.snapshot_key
+               AND provider_set.provider_set_key = mapping.block_key
+             WHERE layout.snapshot_key = :snapshot_key
+               AND layout.state = 'sealed'
+               AND layout.generation = :generation
+               AND mapping.object_kind = :object_kind
+               AND mapping.block_key = ANY(CAST(:block_keys AS bigint[]))
+             ORDER BY mapping.block_key, mapping.fragment_no
+            """
+        ),
+        {
+            "snapshot_key": _required_shared_snapshot_key(shared_snapshot_key),
+            "generation": PTG2_V3_SHARED_GENERATION,
+            "object_kind": PTG2_SERVING_BINARY_V3_PROVIDER_SET_PAGE_KIND,
+            "block_keys": block_keys,
+        },
+    )
+    fragments_by_key: dict[int, dict[int, Mapping[str, Any]]] = {
+        block_key: {} for block_key in block_keys
+    }
+    metadata_by_key: dict[int, tuple[str, int, tuple[str, ...]]] = {}
+    previous_fragment_key: tuple[int, int] | None = None
+    for raw_row in query_result:
+        row = _row_mapping(raw_row)
+        try:
+            payload = validate_shared_block_row(
+                row,
+                expected_kind=PTG2_SERVING_BINARY_V3_PROVIDER_SET_PAGE_KIND,
+            )
+            provider_set_id = _id_text(row.get("provider_set_global_id_128") or b"")
+        except (PTG2SharedBlockError, PTG2ManifestArtifactError) as exc:
+            raise PTG2ManifestArtifactError(str(exc)) from exc
+        fragment_key = (payload.block_key, payload.fragment_no)
+        fragments = fragments_by_key.get(payload.block_key)
+        if (
+            fragments is None
+            or payload.fragment_no < 0
+            or payload.fragment_no in fragments
+            or (
+                previous_fragment_key is not None
+                and fragment_key <= previous_fragment_key
+            )
+            or row.get("metadata_provider_set_key") is None
+            or int(row["metadata_provider_set_key"]) != payload.block_key
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 provider-page bundle returned an invalid fragment"
+            )
+        previous_fragment_key = fragment_key
+        network_names = tuple(
+            str(network_name)
+            for network_name in (row.get("network_names") or ())
+        )
+        metadata = (
+            provider_set_id,
+            int(row.get("metadata_provider_count") or 0),
+            network_names,
+        )
+        if (
+            payload.block_key in metadata_by_key
+            and metadata_by_key[payload.block_key] != metadata
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 provider-page bundle metadata changed across fragments"
+            )
+        metadata_by_key[payload.block_key] = metadata
+        fragments[payload.fragment_no] = {
+            "block_key": payload.block_key,
+            "block_no": payload.fragment_no,
+            "entry_count": payload.entry_count,
+            "payload": payload.payload,
+            "payload_compression": "none",
+            "raw_payload_bytes": len(payload.payload),
+            "_decoded_payload": payload.payload,
+        }
+    requested_provider_key_set = set(requested_provider_keys)
+    requested_code_key_set = set(requested_code_keys)
+    pages_by_key: dict[int, Any] = {}
+    provider_set_ids_by_key: dict[int, str] = {}
+    network_names_by_key: dict[int, tuple[str, ...]] = {}
+    for block_key, fragments in fragments_by_key.items():
+        if not fragments:
+            continue
+        page_bytes, entry_count = _logical_block_bytes(
+            fragments,
+            artifact_kind=PTG2_SERVING_BINARY_V3_PROVIDER_SET_PAGE_KIND,
+            block_key=block_key,
+        )
+        decoded_pages = _decode_provider_page_block(
+            page_bytes,
+            block_key=block_key,
+            entry_count=entry_count,
+            requested_provider_set_keys=requested_provider_key_set,
+            requested_code_keys=requested_code_key_set,
+            expected_source_count=source_count,
+        )
+        for provider_set_key, provider_page in decoded_pages.items():
+            metadata = metadata_by_key.get(provider_set_key)
+            if metadata is None or metadata[1] != provider_page.provider_count:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 provider-page bundle metadata disagrees with its page"
+                )
+            pages_by_key[provider_set_key] = provider_page
+            provider_set_ids_by_key[provider_set_key] = metadata[0]
+            network_names_by_key[provider_set_key] = metadata[2]
+    return PTG2V3ProviderPageBundle(
+        pages_by_key,
+        provider_set_ids_by_key,
+        network_names_by_key,
+    )
 
 
 async def has_shared_provider_pages_in_db(

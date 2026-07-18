@@ -34,14 +34,39 @@ class PTG2V3PageRecord:
 class PTG2V3ProviderPage:
     entries: tuple[PTG2V3PageRecord, ...]
     total_row_count: int
+    encoded_row_count: int | None = None
+    declared_provider_count: int | None = None
+    last_encoded_code_key: int | None = None
 
     @property
     def provider_count(self) -> int:
         """Return the provider count repeated by every projected row."""
 
+        if self.declared_provider_count is not None:
+            return self.declared_provider_count
         if not self.entries:
             raise PTG2ManifestArtifactError("PTG2 v3 provider page has no projected rows")
         return self.entries[0].provider_count
+
+    @property
+    def page_row_count(self) -> int:
+        """Return the validated encoded row count, including skipped rows."""
+
+        return (
+            self.encoded_row_count
+            if self.encoded_row_count is not None
+            else len(self.entries)
+        )
+
+    @property
+    def last_code_key(self) -> int:
+        """Return the final encoded code key used for page-boundary proofs."""
+
+        if self.last_encoded_code_key is not None:
+            return self.last_encoded_code_key
+        if not self.entries:
+            raise PTG2ManifestArtifactError("PTG2 v3 provider page has no projected rows")
+        return self.entries[-1].code_key
 
 
 def _page_entry_count(
@@ -125,6 +150,7 @@ def _read_provider_page_entry(
     block_key: int,
     previous_provider_set_key: int | None,
     requested_provider_set_keys: set[int],
+    requested_code_keys: set[int] | None,
     source_count: int,
     source_bits: int,
 ) -> tuple[int, PTG2V3ProviderPage | None, int]:
@@ -171,7 +197,9 @@ def _read_provider_page_entry(
         current_pair = (current_code_key, price_key, source_key)
         if previous_pair is not None and current_pair < previous_pair:
             raise ValueError("provider page rows are not ordered")
-        if provider_set_key in requested_provider_set_keys:
+        if provider_set_key in requested_provider_set_keys and (
+            requested_code_keys is None or current_code_key in requested_code_keys
+        ):
             page_entries.append(
                 PTG2V3PageRecord(
                     code_key=current_code_key,
@@ -187,6 +215,15 @@ def _read_provider_page_entry(
         provider_page = PTG2V3ProviderPage(
             entries=tuple(page_entries),
             total_row_count=total_row_count,
+            encoded_row_count=(
+                page_row_count if requested_code_keys is not None else None
+            ),
+            declared_provider_count=(
+                provider_count if requested_code_keys is not None else None
+            ),
+            last_encoded_code_key=(
+                current_code_key if requested_code_keys is not None else None
+            ),
         )
     return provider_set_key, provider_page, cursor
 
@@ -197,9 +234,15 @@ def _decode_provider_page_block(
     block_key: int,
     entry_count: int,
     requested_provider_set_keys: set[int],
+    requested_code_keys: set[int] | None = None,
     expected_source_count: int | None = None,
 ) -> dict[int, PTG2V3ProviderPage]:
     try:
+        if requested_code_keys is not None and any(
+            code_key < 0 or code_key > 2**31 - 1
+            for code_key in requested_code_keys
+        ):
+            raise ValueError("requested provider-page code key is out of range")
         encoded_entry_count, source_count, source_bits, cursor = _page_entry_count(
             block_bytes,
             entry_count,
@@ -216,6 +259,7 @@ def _decode_provider_page_block(
                 block_key=block_key,
                 previous_provider_set_key=previous_provider_set_key,
                 requested_provider_set_keys=requested_provider_set_keys,
+                requested_code_keys=requested_code_keys,
                 source_count=source_count,
                 source_bits=source_bits,
             )

@@ -85,6 +85,7 @@ from api.ptg2_db_sidecars import (
     lookup_shared_graph_members_from_db,
     lookup_shared_price_atom_memberships_from_db,
     lookup_shared_price_atoms_from_db,
+    lookup_shared_provider_code_pages_from_db,
     lookup_shared_provider_code_keys_from_db,
     lookup_shared_provider_pages_from_db,
 )
@@ -1765,7 +1766,11 @@ async def _hydrate_provider_set_network_names(
     serving_tables: PTG2ServingTables,
     provider_rows: Iterable[dict[str, Any]],
 ) -> None:
-    provider_entries = list(provider_rows)
+    provider_entries = [
+        provider_entry
+        for provider_entry in provider_rows
+        if not provider_entry.get("_ptg_network_names_hydrated")
+    ]
     provider_set_ids = sorted(
         {
             provider_set_id
@@ -1993,6 +1998,8 @@ def _version_three_forward_page_payloads(
     network_names: list[str],
     limit: int,
     offset: int,
+    *,
+    provider_network_names_by_key: Mapping[int, tuple[str, ...]] | None = None,
 ) -> list[dict[str, Any]]:
     """Shape a validated forward projection window as serving rows."""
 
@@ -2022,7 +2029,15 @@ def _version_three_forward_page_payloads(
             "price_set_global_id_128": price_ids_by_key[page_entry.price_key],
             "price_key": page_entry.price_key,
             "source_key": page_entry.source_key,
-            "network_names": network_names,
+            "network_names": list(
+                provider_network_names_by_key.get(
+                    page_entry.provider_set_key,
+                    tuple(network_names),
+                )
+            )
+            if provider_network_names_by_key is not None
+            else network_names,
+            "_ptg_network_names_hydrated": provider_network_names_by_key is not None,
         }
         for page_entry in page_entries[start : start + max(int(limit), 0)]
     ]
@@ -2032,14 +2047,24 @@ async def _version_three_forward_page_ids(
     session,
     serving_tables: PTG2ServingTables,
     selected_entries: Sequence[Any],
+    *,
+    provider_ids_by_key: Mapping[int, str] | None = None,
 ) -> tuple[dict[int, str], dict[int, str]]:
     provider_keys = {
         page_entry.provider_set_key for page_entry in selected_entries
     }
-    provider_ids_by_key = await _provider_set_ids_for_keys(
-        session,
-        serving_tables,
-        provider_keys,
+    provider_ids_by_key = (
+        {
+            provider_key: provider_ids_by_key[provider_key]
+            for provider_key in provider_keys
+            if provider_key in provider_ids_by_key
+        }
+        if provider_ids_by_key is not None
+        else await _provider_set_ids_for_keys(
+            session,
+            serving_tables,
+            provider_keys,
+        )
     )
     if set(provider_ids_by_key) != provider_keys:
         raise PTG2ManifestArtifactError(
@@ -2070,18 +2095,14 @@ def _version_three_provider_code_entries(
     for provider_set_key in sorted(provider_pages_by_key):
         provider_page = provider_pages_by_key[provider_set_key]
         page_entries = provider_page.entries
-        if not page_entries:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 provider-page projection has no rows"
-            )
         selected_entries.extend(
             page_entry
             for page_entry in page_entries
             if page_entry.code_key == code_key
         )
         if (
-            provider_page.total_row_count > len(page_entries)
-            and page_entries[-1].code_key <= code_key
+            provider_page.total_row_count > provider_page.page_row_count
+            and provider_page.last_code_key <= code_key
         ):
             return None
     selected_entries.sort(
@@ -2101,6 +2122,8 @@ async def _version_three_provider_filtered_page_rows(
     *,
     code_metadata: Mapping[str, Any],
     provider_pages_by_key: Mapping[int, PTG2V3ProviderPage],
+    provider_set_ids_by_key: Mapping[int, str] | None,
+    provider_network_names_by_key: Mapping[int, tuple[str, ...]] | None,
     network_names: list[str],
     limit: int | None,
     offset: int,
@@ -2128,6 +2151,7 @@ async def _version_three_provider_filtered_page_rows(
         session,
         serving_tables,
         selected_entries,
+        provider_ids_by_key=provider_set_ids_by_key,
     )
     return _version_three_forward_page_payloads(
         selected_entries,
@@ -2137,6 +2161,7 @@ async def _version_three_provider_filtered_page_rows(
         network_names,
         len(selected_entries),
         0,
+        provider_network_names_by_key=provider_network_names_by_key,
     )
 
 
@@ -2199,6 +2224,8 @@ async def _shared_rows_for_code(
     code_data: Mapping[str, Any],
     provider_set_keys: Iterable[int] | None,
     provider_pages_by_key: Mapping[int, PTG2V3ProviderPage] | None = None,
+    provider_set_ids_by_key: Mapping[int, str] | None = None,
+    provider_network_names_by_key: Mapping[int, tuple[str, ...]] | None = None,
     source_trace_set_hash: str | None,
     network_names: list[str],
     limit: int | None = None,
@@ -2269,6 +2296,8 @@ async def _shared_rows_for_code(
         code_data=code_data,
         provider_set_keys=provider_set_keys,
         provider_pages_by_key=provider_pages_by_key,
+        provider_set_ids_by_key=provider_set_ids_by_key,
+        provider_network_names_by_key=provider_network_names_by_key,
         source_trace_set_hash=source_trace_set_hash,
         network_names=network_names,
         limit=limit,
@@ -2310,6 +2339,8 @@ def _manifest_response_row_order_for_direction(
 class _ManifestCodeReadScope:
     provider_set_keys: tuple[int, ...] | None
     provider_pages_by_key: Mapping[int, PTG2V3ProviderPage] | None
+    provider_set_ids_by_key: Mapping[int, str] | None
+    provider_network_names_by_key: Mapping[int, tuple[str, ...]] | None
     source_trace_set_hash: str | None
     network_names: list[str]
     descending: bool
@@ -2321,6 +2352,7 @@ async def _version_three_provider_filter_scope(
     provider_set_keys: Iterable[int] | None,
     source_trace_set_hash: str | None,
     network_names: list[str],
+    requested_code_keys: Iterable[int],
     *,
     descending: bool,
 ) -> _ManifestCodeReadScope:
@@ -2331,20 +2363,44 @@ async def _version_three_provider_filter_scope(
         if provider_set_keys is not None
         else None
     )
-    provider_pages_by_key = (
-        await _version_three_provider_pages_for_keys(
+    provider_page_bundle = (
+        await lookup_shared_provider_code_pages_from_db(
             session,
-            serving_tables,
+            _required_shared_snapshot_key(serving_tables),
             normalized_keys,
+            requested_code_keys,
+            source_count=_required_source_count(serving_tables),
+            schema_name=PTG2_SCHEMA,
         )
         if normalized_keys
         and len(normalized_keys) <= _PTG2_VERSION_THREE_PAGE_PROVIDER_SET_LIMIT
         and not descending
         else None
     )
+    provider_pages_by_key = (
+        provider_page_bundle.pages_by_key
+        if provider_page_bundle is not None
+        else None
+    )
+    if provider_pages_by_key is not None and set(provider_pages_by_key) != set(
+        normalized_keys or ()
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider-page projection is missing a referenced provider set"
+        )
     return _ManifestCodeReadScope(
         provider_set_keys=normalized_keys,
         provider_pages_by_key=provider_pages_by_key,
+        provider_set_ids_by_key=(
+            provider_page_bundle.provider_set_ids_by_key
+            if provider_page_bundle is not None
+            else None
+        ),
+        provider_network_names_by_key=(
+            provider_page_bundle.network_names_by_key
+            if provider_page_bundle is not None
+            else None
+        ),
         source_trace_set_hash=source_trace_set_hash,
         network_names=network_names,
         descending=descending,
@@ -2366,6 +2422,8 @@ async def _shared_rows_for_scope(
         session, serving_tables, code_data=code_data,
         provider_set_keys=read_scope.provider_set_keys,
         provider_pages_by_key=read_scope.provider_pages_by_key,
+        provider_set_ids_by_key=read_scope.provider_set_ids_by_key,
+        provider_network_names_by_key=read_scope.provider_network_names_by_key,
         source_trace_set_hash=read_scope.source_trace_set_hash,
         network_names=read_scope.network_names, limit=limit, offset=offset,
         descending=read_scope.descending,
@@ -2388,7 +2446,13 @@ async def _merge_manifest_code_variant_rows(
 
     read_scope = await _version_three_provider_filter_scope(
         session, serving_tables, provider_set_keys,
-        source_trace_set_hash, network_names, descending=descending,
+        source_trace_set_hash, network_names,
+        (
+            int(code_row["code_key"])
+            for code_row in code_rows
+            if code_row.get("code_key") is not None
+        ),
+        descending=descending,
     )
     if len(code_rows) == 1:
         return await _shared_rows_for_scope(
@@ -2436,6 +2500,8 @@ async def _version_three_projected_code_rows(
     serving_tables: PTG2ServingTables,
     code_data: Mapping[str, Any],
     provider_pages_by_key: Mapping[int, PTG2V3ProviderPage] | None,
+    provider_set_ids_by_key: Mapping[int, str] | None,
+    provider_network_names_by_key: Mapping[int, tuple[str, ...]] | None,
     network_names: list[str],
     limit: int | None,
     offset: int,
@@ -2450,6 +2516,8 @@ async def _version_three_projected_code_rows(
         serving_tables,
         code_metadata=code_data,
         provider_pages_by_key=provider_pages_by_key,
+        provider_set_ids_by_key=provider_set_ids_by_key,
+        provider_network_names_by_key=provider_network_names_by_key,
         network_names=network_names,
         limit=limit,
         offset=offset,
@@ -2470,6 +2538,8 @@ async def _full_shared_code_rows(
     code_data: Mapping[str, Any],
     provider_set_keys: Iterable[int] | None,
     provider_pages_by_key: Mapping[int, PTG2V3ProviderPage] | None,
+    provider_set_ids_by_key: Mapping[int, str] | None,
+    provider_network_names_by_key: Mapping[int, tuple[str, ...]] | None,
     source_trace_set_hash: str | None,
     network_names: list[str],
     limit: int | None,
@@ -2481,6 +2551,7 @@ async def _full_shared_code_rows(
     code_key = int(code_data["code_key"])
     projected_rows, provider_counts_by_key = await _version_three_projected_code_rows(
         session, serving_tables, code_data, provider_pages_by_key,
+        provider_set_ids_by_key, provider_network_names_by_key,
         network_names, limit, offset, descending,
     )
     if projected_rows is not None:
@@ -6192,6 +6263,8 @@ async def _version_three_explicit_npi_graph_scope(
     session,
     serving_tables: PTG2ServingTables,
     args: Mapping[str, Any],
+    *,
+    include_group_ids: bool = True,
 ) -> _ExplicitNpiGraphScope | None:
     """Resolve one NPI to dense provider-set keys before reading a code block."""
 
@@ -6210,15 +6283,17 @@ async def _version_three_explicit_npi_graph_scope(
     group_keys = tuple(sorted(group_keys_by_npi.get(requested_npi, ())))
     if not group_keys:
         return _ExplicitNpiGraphScope(requested_npi, (), ())
-    group_id_by_key = await _shared_provider_group_ids_for_keys(
-        session,
-        serving_tables,
-        group_keys,
-    )
-    if set(group_id_by_key) != set(group_keys):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 provider-group dictionary is missing an NPI-referenced group"
+    group_id_by_key: Mapping[int, str] = {}
+    if include_group_ids:
+        group_id_by_key = await _shared_provider_group_ids_for_keys(
+            session,
+            serving_tables,
+            group_keys,
         )
+        if set(group_id_by_key) != set(group_keys):
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 provider-group dictionary is missing an NPI-referenced group"
+            )
     provider_set_keys_by_group = await lookup_shared_graph_members_from_db(
         session,
         shared_snapshot_key,
@@ -6237,7 +6312,11 @@ async def _version_three_explicit_npi_graph_scope(
     )
     return _ExplicitNpiGraphScope(
         requested_npi,
-        tuple(group_id_by_key[group_key] for group_key in group_keys),
+        (
+            tuple(group_id_by_key[group_key] for group_key in group_keys)
+            if include_group_ids
+            else ()
+        ),
         provider_set_keys,
     )
 
@@ -7461,6 +7540,7 @@ async def _search_manifest_serving_table(
         session,
         serving_tables,
         args,
+        include_group_ids=location_filter_requested,
     )
     if explicit_npi_scope is not None:
         if not explicit_npi_scope.provider_set_keys:

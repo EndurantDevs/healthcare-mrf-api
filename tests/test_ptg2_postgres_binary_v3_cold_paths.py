@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import ptg2_serving
+from api.ptg2_db_sidecars import PTG2V3ProviderPageBundle
 
 
 def _version_three_tables():
@@ -172,11 +173,17 @@ async def test_v3_partial_page_fails(monkeypatch):
 @pytest.mark.asyncio
 async def test_v3_variants_share_page(monkeypatch):
     page = _provider_page(3, ((7, 2), (8, 3)))
-    page_probe = AsyncMock(return_value={3: page})
+    page_probe = AsyncMock(
+        return_value=PTG2V3ProviderPageBundle(
+            pages_by_key={3: page},
+            provider_set_ids_by_key={3: "03" * 16},
+            network_names_by_key={3: ("Network A",)},
+        )
+    )
     row_probe = AsyncMock(return_value=[])
     monkeypatch.setattr(
         ptg2_serving,
-        "_version_three_provider_pages_for_keys",
+        "lookup_shared_provider_code_pages_from_db",
         page_probe,
     )
     monkeypatch.setattr(ptg2_serving, "_shared_rows_for_code", row_probe)
@@ -199,6 +206,11 @@ async def test_v3_variants_share_page(monkeypatch):
         call.kwargs["provider_pages_by_key"] == {3: page}
         for call in row_probe.await_args_list
     )
+    assert all(
+        call.kwargs["provider_set_ids_by_key"] == {3: "03" * 16}
+        and call.kwargs["provider_network_names_by_key"] == {3: ("Network A",)}
+        for call in row_probe.await_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -208,7 +220,7 @@ async def test_v3_large_scope_skips_pages(monkeypatch):
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_version_three_provider_pages_for_keys",
+        "lookup_shared_provider_code_pages_from_db",
         page_probe,
     )
 
@@ -218,6 +230,7 @@ async def test_v3_large_scope_skips_pages(monkeypatch):
         range(ptg2_serving._PTG2_VERSION_THREE_PAGE_PROVIDER_SET_LIMIT + 1),
         None,
         [],
+        (7,),
         descending=False,
     )
 
@@ -270,6 +283,49 @@ async def test_v3_page_skips_forward_block(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_v3_fused_page_skips_provider_metadata_queries(monkeypatch):
+    page = _provider_page(3, ((7, 2),))
+    provider_id_probe = AsyncMock(
+        side_effect=AssertionError("fused page must reuse provider ids")
+    )
+    price_id_probe = AsyncMock(return_value={2: "02" * 16})
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_provider_set_ids_for_keys",
+        provider_id_probe,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_price_ids_from_db",
+        price_id_probe,
+    )
+
+    rows = await ptg2_serving._version_three_provider_filtered_page_rows(
+        object(),
+        _version_three_tables(),
+        code_metadata={"code_key": 7, "reported_code": "00001"},
+        provider_pages_by_key={3: page},
+        provider_set_ids_by_key={3: "03" * 16},
+        provider_network_names_by_key={3: ("Network A",)},
+        network_names=[],
+        limit=100,
+        offset=0,
+        descending=False,
+    )
+
+    assert rows is not None
+    assert rows[0]["provider_set_global_id_128"] == "03" * 16
+    assert rows[0]["network_names"] == ["Network A"]
+    await ptg2_serving._hydrate_provider_set_network_names(
+        object(),
+        _version_three_tables(),
+        rows,
+    )
+    provider_id_probe.assert_not_awaited()
+    price_id_probe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_v3_explicit_npi_scope_resolves_dense_provider_keys(monkeypatch):
     group_id = "00000000000000000000000000000021"
     serving_tables = _version_three_tables()
@@ -309,6 +365,44 @@ async def test_v3_explicit_npi_scope_resolves_dense_provider_keys(monkeypatch):
         (1234567890,),
         (2,),
     ]
+
+
+@pytest.mark.asyncio
+async def test_v3_direct_npi_scope_skips_unused_group_ids(monkeypatch):
+    serving_tables = _version_three_tables()
+    graph_probe = AsyncMock(
+        side_effect=(
+            {1234567890: (2,)},
+            {2: (3,)},
+        )
+    )
+    group_id_probe = AsyncMock(
+        side_effect=AssertionError("direct NPI scope must not hydrate group ids")
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_shared_graph_members_from_db",
+        graph_probe,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_shared_provider_group_ids_for_keys",
+        group_id_probe,
+    )
+
+    scope = await ptg2_serving._version_three_explicit_npi_graph_scope(
+        object(),
+        serving_tables,
+        {"npi": "1234567890"},
+        include_group_ids=False,
+    )
+
+    assert scope == ptg2_serving._ExplicitNpiGraphScope(
+        npi=1234567890,
+        group_ids=(),
+        provider_set_keys=(3,),
+    )
+    group_id_probe.assert_not_awaited()
 
 
 @pytest.mark.asyncio

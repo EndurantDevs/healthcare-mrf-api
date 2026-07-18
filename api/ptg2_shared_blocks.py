@@ -202,7 +202,7 @@ class SharedBlockPayload:
     payload: bytes
 
 
-def _validated_payload(
+def validate_shared_block_row(
     block_row: Mapping[str, Any],
     *,
     expected_kind: str,
@@ -250,6 +250,9 @@ def _validated_payload(
         entry_count=mapping_entry_count,
         payload=raw_payload,
     )
+
+
+_validated_payload = validate_shared_block_row
 
 
 async def fetch_shared_blocks(
@@ -356,7 +359,7 @@ async def stream_shared_blocks(
             yield raw_row
 
     async for raw_row in _validated_rows():
-        block_payload = _validated_payload(
+        block_payload = validate_shared_block_row(
             _row_mapping(raw_row),
             expected_kind=str(object_kind),
         )

@@ -5,8 +5,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from api import ptg2_db_serving_v3_pages, ptg2_serving
+from api import ptg2_db_serving_v3_pages, ptg2_db_sidecars, ptg2_serving
 from api.ptg2_db_serving_v3_pages import PTG2V3PageRecord, PTG2V3ProviderPage
+from api.ptg2_shared_blocks import SharedBlockPayload
 
 
 PROVIDER_ID = "00000000000000000000000000000003"
@@ -93,6 +94,19 @@ def test_page_decodes_aligned_source_keys():
         (7, 10, 1),
     ]
 
+    selective = ptg2_db_serving_v3_pages._decode_provider_page_block(
+        provider_payload,
+        block_key=3,
+        entry_count=1,
+        requested_provider_set_keys={3},
+        requested_code_keys={8},
+        expected_source_count=2,
+    )[3]
+    assert selective.entries == ()
+    assert selective.provider_count == 9
+    assert selective.page_row_count == 2
+    assert selective.last_code_key == 7
+
 
 def test_page_rejects_bad_source_layout():
     payload = b"".join(
@@ -118,6 +132,57 @@ def test_page_rejects_bad_source_layout():
             entry_count=1,
             expected_source_count=2,
         )
+
+
+@pytest.mark.asyncio
+async def test_provider_page_bundle_fuses_metadata_and_selects_codes(monkeypatch):
+    provider_payload = b"".join(
+        [
+            _page_header(2, 1),
+            _uvarint(0),
+            _uvarint(9),
+            _uvarint(2),
+            _uvarint(2),
+            _uvarint(7),
+            _uvarint(10),
+            _uvarint(1),
+            _uvarint(11),
+            _source_vector([0, 1], 2),
+        ]
+    )
+    session = AsyncMock()
+    session.execute.return_value = [
+        {
+            "metadata_provider_set_key": 3,
+            "provider_set_global_id_128": b"\x03" * 16,
+            "metadata_provider_count": 9,
+            "network_names": ["Network A"],
+        }
+    ]
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "validate_shared_block_row",
+        lambda row, *, expected_kind: SharedBlockPayload(
+            block_key=3,
+            fragment_no=0,
+            entry_count=1,
+            payload=provider_payload,
+        ),
+    )
+
+    bundle = await ptg2_db_sidecars.lookup_shared_provider_code_pages_from_db(
+        session,
+        41,
+        (3,),
+        (8,),
+        source_count=2,
+    )
+
+    assert bundle is not None
+    assert [entry.code_key for entry in bundle.pages_by_key[3].entries] == [8]
+    assert bundle.provider_set_ids_by_key == {3: "03" * 16}
+    assert bundle.network_names_by_key == {3: ("Network A",)}
+    session.execute.assert_awaited_once()
 
 
 class ScalarResult:
