@@ -288,8 +288,12 @@ release attestation. It must not deserialize the multi-megabyte snapshot
 manifest for every request. Candidate validation may still inspect that full
 manifest before activation. Exact-NPI graph traversal should remain in dense
 integer keys across NPI-to-group, group-to-provider-set, and
-code-shard intersection. A plain exact-NPI filter must not decode the generic
-provider-page projection or round-trip through stable provider-group IDs.
+code-shard intersection. A plain exact-NPI filter must not decode a generic
+full provider-page projection or round-trip through stable provider-group IDs.
+It may use a bounded selective provider-page projection when the page boundary
+proves completeness; that read must validate all encoded rows, materialize only
+the requested code, and fetch provider response metadata in the same PostgreSQL
+statement.
 Convert to stable 128-bit IDs only where the response contract requires them;
 retain the broader traversal only when geographic or taxonomy validation is
 also requested.

@@ -633,7 +633,10 @@ provider-set keys directly with the requested code. For at most 64 provider sets
 the reader may use their bounded provider-page projection when the page boundary
 proves that every row for the requested code is present. A truncated page ending
 at or before that code falls back to the complete filtered code shard; larger
-provider scopes and descending requests also use that fallback. Provider
+provider scopes and descending requests also use that fallback. The bounded
+reader fetches page blocks with provider IDs, counts, and network names in one
+PostgreSQL statement, validates every encoded row, and materializes only rows
+for the requested code. Provider
 expansion enriches only the requested NPI. Exact-NPI requests that also carry
 geographic or taxonomy filters retain the full address or taxonomy validation
 path. The internal candidate-audit route materializes only the challenged NPI
