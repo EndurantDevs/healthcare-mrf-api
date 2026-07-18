@@ -1182,7 +1182,7 @@ def _build_shard_runs(
     )
 
 
-def convert_v3_provider_membership_shards_to_shared_graph(
+def convert_membership_shards_to_shared_graph(
     *,
     shards: Sequence[SharedGraphShardBundle],
     provider_set_key_by_global_id: Mapping[bytes | bytearray | memoryview | str, int] | str | Path,
@@ -1497,7 +1497,7 @@ def convert_v3_provider_membership_shards_to_shared_graph(
         raise
 
 
-def convert_v3_provider_memberships_to_shared_graph(
+def convert_memberships_to_shared_graph(
     *,
     group_npi: MembershipArtifact,
     npi_group: MembershipArtifact,
@@ -1520,7 +1520,7 @@ def convert_v3_provider_memberships_to_shared_graph(
     if len(metadata_ids) > 1:
         raise PTG2ManifestArtifactError("single shared graph bundle has contradictory shard identities")
     shard_id = next(iter(metadata_ids), "single-shard")
-    return convert_v3_provider_membership_shards_to_shared_graph(
+    return convert_membership_shards_to_shared_graph(
         shards=(
             SharedGraphShardBundle(
                 shard_id=shard_id,
@@ -1544,6 +1544,6 @@ __all__ = [
     "SharedGraphIntegrityMetrics",
     "SharedGraphOwnerRow",
     "SharedGraphShardBundle",
-    "convert_v3_provider_membership_shards_to_shared_graph",
-    "convert_v3_provider_memberships_to_shared_graph",
+    "convert_membership_shards_to_shared_graph",
+    "convert_memberships_to_shared_graph",
 ]

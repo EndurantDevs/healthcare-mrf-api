@@ -35,7 +35,7 @@ from db.models import (
     PTG2V3SourceAuditWitness,
 )
 from process.ptg_parts.ptg2_shared_gc import (
-    require_ptg2_v3_migration_owned_tables,
+    require_migration_owned_tables,
 )
 
 
@@ -213,7 +213,7 @@ async def test_real_postgres_fresh_v3_migrations_have_gc_contract():
         for statement in followup_recorder.executed:
             await database.execute_ddl(statement)
 
-        await require_ptg2_v3_migration_owned_tables(database, schema_name)
+        await require_migration_owned_tables(database, schema_name)
         assert await database.scalar(
             """
             SELECT EXISTS (

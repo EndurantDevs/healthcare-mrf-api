@@ -1028,7 +1028,7 @@ def _log_ptg2_rust_scanner_binary(binary: Path) -> None:
     )
 
 
-async def convert_v3_provider_membership_shards_to_shared_graph_rust(
+async def convert_membership_shards_to_shared_graph_rust(
     *,
     shards: Iterable[SharedGraphShardBundle],
     provider_set_key_map_path: str | Path,

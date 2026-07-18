@@ -216,7 +216,7 @@ async def test_native_shared_graph_bridge_writes_manifest_and_validates_result(
     _install_fake_converter(monkeypatch, binary=binary, capture_map=capture_map)
 
     conversion_result = (
-        await rust_scanner.convert_v3_provider_membership_shards_to_shared_graph_rust(
+        await rust_scanner.convert_membership_shards_to_shared_graph_rust(
             shards=(bundle,),
             provider_set_key_map_path=provider_map,
             output_directory=output_directory,
@@ -279,7 +279,7 @@ async def test_native_shared_graph_bridge_rejects_trailing_stdout_and_cleans(
     )
 
     with pytest.raises(RuntimeError, match="truncated or trailing frame"):
-        await rust_scanner.convert_v3_provider_membership_shards_to_shared_graph_rust(
+        await rust_scanner.convert_membership_shards_to_shared_graph_rust(
             shards=(_graph_bundle(tmp_path),),
             provider_set_key_map_path=provider_map,
             output_directory=output_directory,
@@ -339,7 +339,7 @@ async def test_native_shared_graph_bridge_matches_real_cli_when_built(
     monkeypatch.setattr(rust_scanner, "_ptg2_rust_scanner_binary", lambda: binary)
 
     conversion_result = (
-        await rust_scanner.convert_v3_provider_membership_shards_to_shared_graph_rust(
+        await rust_scanner.convert_membership_shards_to_shared_graph_rust(
             shards=shared_graph_bundles_from_artifacts(artifact_entries),
             provider_set_key_map_path=provider_map,
             output_directory=output_directory,
@@ -391,7 +391,7 @@ async def test_snapshot_publish_passes_bundles_and_key_map_to_native_bridge(
 
     monkeypatch.setattr(
         ptg2_shared_snapshot_publish,
-        "convert_v3_provider_membership_shards_to_shared_graph_rust",
+        "convert_membership_shards_to_shared_graph_rust",
         native_bridge,
     )
 

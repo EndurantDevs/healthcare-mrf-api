@@ -945,7 +945,7 @@ def _decode_serving_binary_code_records(
     price_item_count: int | None = None,
 ) -> list[tuple[int, int, int]]:
     decoded_keys, _source_count = (
-        _decode_serving_binary_code_records_with_source_count(
+        _decode_code_records_with_source_count(
             fragment_rows,
             provider_set_keys=provider_set_keys,
             expected_source_count=expected_source_count,
@@ -957,7 +957,7 @@ def _decode_serving_binary_code_records(
     return decoded_keys
 
 
-def _decode_serving_binary_code_records_with_source_count(
+def _decode_code_records_with_source_count(
     fragment_rows: Iterable[Mapping[str, Any]],
     *,
     provider_set_keys: Iterable[int] | None,
@@ -1053,7 +1053,7 @@ def _decode_forward_shards_for_code(
             )
         )
         shard_decoded, shard_source_count = (
-            _decode_serving_binary_code_records_with_source_count(
+            _decode_code_records_with_source_count(
                 fragments_by_block[block_key],
                 provider_set_keys=provider_set_keys,
                 expected_source_count=expected_source_count,
@@ -1311,7 +1311,7 @@ def _forward_prefix_rank(
     )
 
 
-async def lookup_serving_binary_by_code_prefix_from_db(
+async def lookup_code_prefix_rows_from_db(
     session: Any,
     code_key: int,
     *,

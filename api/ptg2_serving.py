@@ -76,7 +76,7 @@ from api.ptg2_tables import (
 from api.ptg2_types import PTG2ServingTables
 from api.ptg2_db_sidecars import (
     lookup_serving_binary_by_code_from_db,
-    lookup_serving_binary_by_code_prefix_from_db,
+    lookup_code_prefix_rows_from_db,
     lookup_binary_code_batch_from_db,
     lookup_price_ids_from_db,
     serving_binary_code_block_exists,
@@ -2225,7 +2225,7 @@ async def _shared_rows_for_code(
             return page_rows
         prefix_end = max(int(offset), 0) + max(int(limit), 0)
         if prefix_end > 0:
-            prefix_rows = await lookup_serving_binary_by_code_prefix_from_db(
+            prefix_rows = await lookup_code_prefix_rows_from_db(
                 session,
                 int(code_key),
                 limit=prefix_end,
@@ -7345,17 +7345,17 @@ async def _search_manifest_serving_table(
         else None
     )
     requested_npi = _normalize_npi(args.get("npi"))
-    geographic_filter_requested = _has_location_filter(
+    has_geographic_filter = _has_location_filter(
         args,
         include_npi=False,
     )
     direct_npi_filter_requested = bool(
         requested_npi is not None
-        and not geographic_filter_requested
+        and not has_geographic_filter
         and not _is_ptg2_provider_filter_requested(args)
     )
     location_filter_requested = bool(
-        geographic_filter_requested
+        has_geographic_filter
         or (requested_npi is not None and not direct_npi_filter_requested)
     )
     price_filter_requested = any(

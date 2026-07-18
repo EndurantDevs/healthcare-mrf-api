@@ -21,9 +21,9 @@ from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_tabl
 from process.ptg_parts.ptg2_lifecycle_lock import PTG2_SOURCE_POINTER_GC_LOCK_KEY
 from process.ptg_parts.ptg2_shared_gc import (
     PTG2_V3_MIGRATION_OWNED_TABLE_NAMES,
-    build_ptg2_shared_layout_release_plan,
+    build_shared_layout_release_plan,
     release_unbound_ptg2_shared_layouts,
-    require_ptg2_v3_migration_owned_tables,
+    require_migration_owned_tables,
     resolve_ptg2_schema,
 )
 from process.ptg_parts.snapshot_cleanup import (
@@ -458,7 +458,7 @@ async def _shared_gc_metrics(
     )
     if not shared_snapshot_ids:
         return shared_snapshot_ids, 0, 0, 0
-    shared_plan = await build_ptg2_shared_layout_release_plan(
+    shared_plan = await build_shared_layout_release_plan(
         schema_name=plan_context.schema_name,
         executor=plan_context.executor,
         removing_snapshot_ids=shared_snapshot_ids,
@@ -549,7 +549,7 @@ async def build_ptg2_source_snapshot_gc_plan(
     """Build a bounded plan while retaining lineage behind every current pointer."""
     schema_name = resolve_ptg2_schema(schema_name)
     executor = executor or db
-    await require_ptg2_v3_migration_owned_tables(executor, schema_name)
+    await require_migration_owned_tables(executor, schema_name)
     current_snapshot_ids = await _load_current_snapshot_ids(
         executor,
         schema_name,

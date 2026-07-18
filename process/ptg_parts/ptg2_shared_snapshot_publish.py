@@ -38,7 +38,7 @@ from process.ptg_parts.ptg2_provider_quarantine import (
     validate_provider_identifier_quarantine,
 )
 from process.ptg_parts.rust_scanner import (
-    convert_v3_provider_membership_shards_to_shared_graph_rust,
+    convert_membership_shards_to_shared_graph_rust,
 )
 from process.ptg_parts.ptg2_shared_price import (
     PTG2_V3_PRICE_KEY_ORDER,
@@ -587,7 +587,7 @@ async def publish_shared_v3_snapshot_sources(
     return tuple(source_records)
 
 
-async def delete_unpublished_shared_v3_snapshot_sources(
+async def delete_unpublished_snapshot_sources(
     *,
     schema_name: str,
     snapshot_id: str,
@@ -650,7 +650,7 @@ async def delete_unpublished_shared_v3_snapshot_sources(
         )
 
 
-async def validate_reused_shared_v3_snapshot_sources(
+async def validate_reused_snapshot_sources(
     *,
     schema_name: str,
     snapshot_key: int,
@@ -740,7 +740,7 @@ async def _convert_shared_graph_natively(
     work_directory: Path,
 ) -> SharedGraphConversionResult:
     graph_bundles = shared_graph_bundles_from_artifacts(graph_artifact_entries)
-    return await convert_v3_provider_membership_shards_to_shared_graph_rust(
+    return await convert_membership_shards_to_shared_graph_rust(
         shards=graph_bundles,
         provider_set_key_map_path=Path(provider_set_key_map_path),
         output_directory=Path(work_directory) / "provider-graph-native",
@@ -839,7 +839,7 @@ def _physical_serving_index(
     }
 
 
-async def _publish_strict_shared_v3_layout_prepared(
+async def _publish_prepared_shared_layout(
     *,
     schema_name: str,
     manifest_stage_table: str,
@@ -1320,7 +1320,7 @@ async def publish_strict_shared_v3_layout(
             publish_prepared_price=publish_prepared_price_early,
         )
         try:
-            publication = await _publish_strict_shared_v3_layout_prepared(
+            publication = await _publish_prepared_shared_layout(
                 schema_name=schema_name,
                 manifest_stage_table=manifest_stage_table,
                 reserved_snapshot_key=int(reserved_snapshot_key),
@@ -1358,8 +1358,8 @@ async def publish_strict_shared_v3_layout(
 
 __all__ = [
     "SharedSnapshotPublication",
-    "delete_unpublished_shared_v3_snapshot_sources",
+    "delete_unpublished_snapshot_sources",
     "publish_shared_v3_snapshot_sources",
     "publish_strict_shared_v3_layout",
-    "validate_reused_shared_v3_snapshot_sources",
+    "validate_reused_snapshot_sources",
 ]

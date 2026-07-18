@@ -39,8 +39,8 @@ from process.ptg_parts.ptg2_manifest_artifacts import write_global_membership_si
 from process.ptg_parts.ptg2_manifest_publish import (
     _copy_price_atom_member_file,
     _copy_price_set_summary_file,
-    _copy_ptg2_manifest_price_atom_file,
-    _create_ptg2_manifest_serving_stage_table,
+    _copy_price_atom_file,
+    _create_serving_stage_table,
     _ptg2_manifest_support_stage_table,
 )
 from process.ptg_parts.ptg2_shared_blocks import (
@@ -61,7 +61,7 @@ from process.ptg_parts.ptg2_shared_reuse import (
 from process.ptg_parts.ptg2_shared_snapshot_publish import (
     publish_shared_v3_snapshot_sources,
     publish_strict_shared_v3_layout,
-    validate_reused_shared_v3_snapshot_sources,
+    validate_reused_snapshot_sources,
 )
 from process.ptg_parts.snapshot_cleanup import _drop_ptg2_snapshot_table_names
 from process.ptg_parts.source_pointers import _stage_ptg2_source_candidate
@@ -884,11 +884,11 @@ async def test_v3_lifecycle_fails_closed(
             )
         assert first_reservation.reused is False
 
-        stage_table = await _create_ptg2_manifest_serving_stage_table(
+        stage_table = await _create_serving_stage_table(
             f"lifecycle_{first_reservation.snapshot_key}_{uuid.uuid4().hex[:8]}"
         )
         for frame in scan["price_atom_frames"]:
-            await _copy_ptg2_manifest_price_atom_file(
+            await _copy_price_atom_file(
                 Path(frame["path"]),
                 target_table=_ptg2_manifest_support_stage_table(
                     stage_table,
@@ -1211,7 +1211,7 @@ async def test_v3_lifecycle_fails_closed(
                 "network_names": ["Migrated Lifecycle Network"],
             }
         )
-        reused_audit_sample = await validate_reused_shared_v3_snapshot_sources(
+        reused_audit_sample = await validate_reused_snapshot_sources(
             schema_name=SCHEMA_NAME,
             snapshot_key=publication.snapshot_key,
             logical_snapshot_id=snapshot_b,

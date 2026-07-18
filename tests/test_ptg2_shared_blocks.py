@@ -837,7 +837,7 @@ def test_decode_shared_block_payload_is_strict():
     assert (
         decode_shared_block_payload(
             codec="zlib",
-            payload=compressed,
+            stored_payload=compressed,
             raw_byte_count=len(raw),
         )
         == raw
@@ -845,13 +845,13 @@ def test_decode_shared_block_payload_is_strict():
     with pytest.raises(PTG2SharedBlockError, match="length mismatch"):
         decode_shared_block_payload(
             codec="none",
-            payload=b"x",
+            stored_payload=b"x",
             raw_byte_count=2,
         )
     with pytest.raises(PTG2SharedBlockError, match="unsupported"):
         decode_shared_block_payload(
             codec="gzip",
-            payload=b"x",
+            stored_payload=b"x",
             raw_byte_count=1,
         )
 

@@ -160,8 +160,8 @@ from process.ptg_parts.ptg2_manifest_publish import (
     PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     _copy_price_atom_member_file,
     _copy_price_set_summary_file,
-    _copy_ptg2_manifest_price_atom_file,
-    _create_ptg2_manifest_serving_stage_table,
+    _copy_price_atom_file,
+    _create_serving_stage_table,
     _ptg2_manifest_stage_table_name,
     _ptg2_manifest_support_stage_table)
 from process.ptg_parts.ptg2_provider_quarantine import (
@@ -192,10 +192,10 @@ from process.ptg_parts.ptg2_shared_reuse import (
     shared_source_set_metadata,
 )
 from process.ptg_parts.ptg2_shared_snapshot_publish import (
-    delete_unpublished_shared_v3_snapshot_sources,
+    delete_unpublished_snapshot_sources,
     publish_shared_v3_snapshot_sources,
     publish_strict_shared_v3_layout,
-    validate_reused_shared_v3_snapshot_sources,
+    validate_reused_snapshot_sources,
 )
 from process.ptg_parts.ptg2_source_witness_contract import (
     validate_source_witness_manifest,
@@ -1056,7 +1056,7 @@ async def _merge_and_copy_ptg2_manifest_files(
                 ),
             }
             copy_func_by_kind = {
-                "price_atom": _copy_ptg2_manifest_price_atom_file,
+                "price_atom": _copy_price_atom_file,
                 "price_set_atom": _copy_price_atom_member_file,
                 "price_set_summary": _copy_price_set_summary_file,
             }
@@ -2408,7 +2408,7 @@ async def _cleanup_failed_ptg2_source_state(
     except Exception:
         logger.debug("Failed to clean PTG2 artifacts for failed import", exc_info=True)
     try:
-        await delete_unpublished_shared_v3_snapshot_sources(
+        await delete_unpublished_snapshot_sources(
             schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
             snapshot_id=snapshot_id,
         )
@@ -3640,7 +3640,7 @@ async def _publish_reused_shared_v3_snapshot(
         snapshot_id=snapshot_id,
     )
     serving_index["source_set"] = source_set
-    await validate_reused_shared_v3_snapshot_sources(
+    await validate_reused_snapshot_sources(
         schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
         snapshot_key=int(shared_snapshot_key),
         logical_snapshot_id=snapshot_id,
@@ -4874,7 +4874,7 @@ async def _main_with_artifact_lease(
         ptg2_manifest_stage_table = _ptg2_manifest_stage_table_name(
             stage_token
         )
-        await _create_ptg2_manifest_serving_stage_table(stage_token)
+        await _create_serving_stage_table(stage_token)
         setup_stage_timer.mark("manifest_stage_table")
         processed_file_count_map = {"done": 0}
         attempted_files = len(selected_jobs)

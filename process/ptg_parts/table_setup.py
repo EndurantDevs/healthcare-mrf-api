@@ -77,7 +77,7 @@ from process.ptg_parts.config import (
 from process.ptg_parts.copy_load import _primary_key_column_names
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_shared_gc import (
-    require_ptg2_v3_migration_owned_tables,
+    require_migration_owned_tables,
     resolve_ptg2_schema,
 )
 
@@ -462,7 +462,7 @@ async def _ensure_ptg2_serving_rate_stage_table(db_schema: str) -> None:
 async def ensure_ptg2_tables() -> None:
     """Create PTG2 tables and apply their required schema migrations."""
     db_schema = resolve_ptg2_schema()
-    await require_ptg2_v3_migration_owned_tables(db, db_schema)
+    await require_migration_owned_tables(db, db_schema)
     await _require_allowed_amount_migration_tables(db_schema)
     try:
         await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")

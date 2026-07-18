@@ -410,7 +410,7 @@ async def test_prepared_price_cleanup_survives_repeated_cancellation_on_every_ex
     )
     monkeypatch.setattr(
         shared_snapshot_publish,
-        "_publish_strict_shared_v3_layout_prepared",
+        "_publish_prepared_shared_layout",
         publish_prepared,
     )
     monkeypatch.setattr(

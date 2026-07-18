@@ -109,7 +109,7 @@ def decode_dense_source_header(
 
 
 def decode_dense_source_vector(
-    payload: bytes | bytearray | memoryview,
+    encoded_vector: bytes | bytearray | memoryview,
     offset: int,
     *,
     entry_count: int,
@@ -127,9 +127,9 @@ def decode_dense_source_vector(
     byte_count = (total_bits + 7) // 8
     cursor = int(offset)
     end = cursor + byte_count
-    if end > len(payload):
+    if end > len(encoded_vector):
         raise PTG2SharedBlockError("shared PTG source vector is truncated")
-    encoded = payload[cursor:end]
+    encoded = encoded_vector[cursor:end]
     if total_bits % 8 and encoded and int(encoded[-1]) >> (total_bits % 8):
         raise PTG2SharedBlockError(
             "shared PTG source vector has non-zero padding bits"
@@ -162,18 +162,18 @@ def _row_mapping(row: Any) -> dict[str, Any]:
 def decode_shared_block_payload(
     *,
     codec: str,
-    payload: bytes,
+    stored_payload: bytes,
     raw_byte_count: int,
 ) -> bytes:
     """Decode one independently compressed block without retaining it globally."""
 
     normalized_codec = str(codec or "").strip().lower()
     if normalized_codec == "none":
-        raw_payload = bytes(payload)
+        raw_payload = bytes(stored_payload)
     elif normalized_codec == "zlib":
         try:
             decompressor = zlib.decompressobj()
-            raw_payload = decompressor.decompress(bytes(payload))
+            raw_payload = decompressor.decompress(bytes(stored_payload))
             raw_payload += decompressor.flush()
         except zlib.error as exc:
             raise PTG2SharedBlockError(f"invalid shared PTG zlib block: {exc}") from exc
@@ -241,7 +241,7 @@ def _validated_payload(
         raise PTG2SharedBlockError("shared PTG block entry count validation failed")
     raw_payload = decode_shared_block_payload(
         codec=codec,
-        payload=stored_payload,
+        stored_payload=stored_payload,
         raw_byte_count=int(block_row.get("raw_byte_count") or 0),
     )
     return SharedBlockPayload(

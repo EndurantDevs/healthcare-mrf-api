@@ -134,7 +134,7 @@ def resolve_ptg2_schema(schema_name: str | None = None) -> str:
     return runtime_schema or legacy_schema or "mrf"
 
 
-async def missing_ptg2_v3_migration_owned_tables(
+async def missing_migration_owned_tables(
     executor: Any,
     schema_name: str,
 ) -> tuple[str, ...]:
@@ -160,13 +160,13 @@ async def missing_ptg2_v3_migration_owned_tables(
     )
 
 
-async def require_ptg2_v3_migration_owned_tables(
+async def require_migration_owned_tables(
     executor: Any,
     schema_name: str,
 ) -> None:
     """Fail before runtime DDL or cleanup when the V3 migration is absent."""
 
-    missing = await missing_ptg2_v3_migration_owned_tables(
+    missing = await missing_migration_owned_tables(
         executor,
         schema_name,
     )
@@ -436,7 +436,7 @@ async def _build_layout_release_plan_ready(
     )
 
 
-async def build_ptg2_shared_layout_release_plan(
+async def build_shared_layout_release_plan(
     *,
     schema_name: str | None = None,
     executor: Any | None = None,
@@ -736,7 +736,7 @@ async def _build_sweep_plan_ready(
     return _select_hashes_under_byte_cap(rows, max_bytes=max_bytes)
 
 
-async def build_ptg2_shared_block_sweep_plan(
+async def build_shared_block_sweep_plan(
     *,
     schema_name: str | None = None,
     executor: Any | None = None,

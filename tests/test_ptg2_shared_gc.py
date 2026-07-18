@@ -290,12 +290,12 @@ async def test_migration_preflight_requires_candidate_attestation_table():
         RuntimeError,
         match="ptg2_v3_candidate_audit_attestation.*alembic upgrade head",
     ):
-        await shared_gc.require_ptg2_v3_migration_owned_tables(executor, "mrf")
+        await shared_gc.require_migration_owned_tables(executor, "mrf")
     with pytest.raises(
         RuntimeError,
         match="complete shared schema.*ptg2_v3_candidate_audit_attestation",
     ):
-        await shared_gc.build_ptg2_shared_layout_release_plan(
+        await shared_gc.build_shared_layout_release_plan(
             executor=executor,
             require_shared=True,
         )
@@ -314,7 +314,7 @@ async def test_candidate_projection_excludes_unrelated_unbound_layouts():
     executor.map_block(20, unrelated_hash)
     executor.bindings["selected-snapshot"] = 10
 
-    plan = await shared_gc.build_ptg2_shared_layout_release_plan(
+    plan = await shared_gc.build_shared_layout_release_plan(
         executor=executor,
         removing_snapshot_ids=("selected-snapshot",),
         all_eligible_layouts=True,
@@ -485,7 +485,7 @@ async def test_sweep_respects_aggregate_byte_cap_and_reports_exact_hashes():
         executor.add_block(block_hash, stored_bytes)
         executor.candidates[block_hash] = executor.now - timedelta(seconds=1)
 
-    plan = await shared_gc.build_ptg2_shared_block_sweep_plan(
+    plan = await shared_gc.build_shared_block_sweep_plan(
         executor=executor,
         max_bytes=100,
         max_rows=10,
@@ -946,7 +946,7 @@ async def test_real_postgres_candidate_scoped_release_and_sweep_sql():
             )
 
         async with database.acquire() as connection:
-            dry_run = await shared_gc.build_ptg2_shared_layout_release_plan(
+            dry_run = await shared_gc.build_shared_layout_release_plan(
                 schema_name=schema_name,
                 executor=connection,
                 removing_snapshot_ids=("selected-snapshot",),

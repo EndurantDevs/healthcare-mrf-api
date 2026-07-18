@@ -29,7 +29,10 @@ class PTG2ServingIndex:
             plans=dict(payload.get("plans") or {}),
             procedures=dict(payload.get("procedures") or {}),
             providers={
-                str(k): v for k, v in dict(payload.get("providers") or {}).items()
+                str(provider_key): provider_payload
+                for provider_key, provider_payload in dict(
+                    payload.get("providers") or {}
+                ).items()
             },
             rates=dict(payload.get("rates") or {}),
             source_uri=source_uri,

@@ -30,8 +30,8 @@ from process.ptg_parts.ptg2_manifest_publish import (
     PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     _copy_price_atom_member_file,
     _copy_price_set_summary_file,
-    _copy_ptg2_manifest_price_atom_file,
-    _create_ptg2_manifest_serving_stage_table,
+    _copy_price_atom_file,
+    _create_serving_stage_table,
     _ptg2_manifest_support_stage_table,
 )
 from process.ptg_parts.ptg2_candidate_attestation import (
@@ -805,14 +805,14 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             )
         assert reservation.reused is False
 
-        stage_table = await _create_ptg2_manifest_serving_stage_table(
+        stage_table = await _create_serving_stage_table(
             f"shared_{reservation.snapshot_key}"
         )
         # Duplicate dictionary rows to exercise atom dedupe. Membership rows are
         # copied once because duplicate physical source files never reach scanning.
         for _duplicate_source in range(2):
             for frame in scan["price_atom_frames"]:
-                await _copy_ptg2_manifest_price_atom_file(
+                await _copy_price_atom_file(
                     Path(frame["path"]),
                     target_table=_ptg2_manifest_support_stage_table(
                         stage_table, "price_atom"
@@ -1290,12 +1290,12 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             )
         assert second_reservation.reused is False
         discarded_snapshot_key = second_reservation.snapshot_key
-        reused_stage = await _create_ptg2_manifest_serving_stage_table(
+        reused_stage = await _create_serving_stage_table(
             f"shared_{discarded_snapshot_key}"
         )
         for _duplicate_source in range(2):
             for frame in scan["price_atom_frames"]:
-                await _copy_ptg2_manifest_price_atom_file(
+                await _copy_price_atom_file(
                     Path(frame["path"]),
                     target_table=_ptg2_manifest_support_stage_table(
                         reused_stage,

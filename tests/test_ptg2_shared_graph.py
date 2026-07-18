@@ -18,8 +18,8 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
 from process.ptg_parts.ptg2_shared_graph import (
     MembershipArtifact,
     SharedGraphShardBundle,
-    convert_v3_provider_membership_shards_to_shared_graph,
-    convert_v3_provider_memberships_to_shared_graph,
+    convert_membership_shards_to_shared_graph,
+    convert_memberships_to_shared_graph,
 )
 
 
@@ -164,7 +164,7 @@ def _fixtures(tmp_path: Path, *, dense_directions=frozenset(), boundary=False):
 
 
 def _convert(artifacts, provider_keys, **kwargs):
-    return convert_v3_provider_memberships_to_shared_graph(
+    return convert_memberships_to_shared_graph(
         group_npi=artifacts[0],
         npi_group=artifacts[1],
         group_provider_set=artifacts[2],
@@ -441,7 +441,7 @@ def test_invalid_npi_global_id_fails_closed(tmp_path):
 def test_multi_shard_merge_deduplicates_overlapping_graphs(tmp_path):
     bundles, provider_keys, groups = _overlapping_bundles(tmp_path)
 
-    graph_result = convert_v3_provider_membership_shards_to_shared_graph(
+    graph_result = convert_membership_shards_to_shared_graph(
         shards=bundles,
         provider_set_key_by_global_id=provider_keys,
         external_sort_chunk_bytes=32,
@@ -485,7 +485,7 @@ def test_duplicate_only_shard_contributes_no_new_edges(tmp_path):
         dense_directions=frozenset({0, 1, 2, 3}),
     )
 
-    graph_result = convert_v3_provider_membership_shards_to_shared_graph(
+    graph_result = convert_membership_shards_to_shared_graph(
         shards=(first, duplicate),
         provider_set_key_by_global_id={provider: 0},
     )
@@ -511,7 +511,7 @@ def test_incomplete_multi_shard_bundle_fails_closed(tmp_path):
     )
 
     with pytest.raises(PTG2ManifestArtifactError, match="incomplete.*four directions"):
-        convert_v3_provider_membership_shards_to_shared_graph(
+        convert_membership_shards_to_shared_graph(
             shards=(incomplete,),
             provider_set_key_by_global_id=provider_keys,
         )
@@ -537,7 +537,7 @@ def test_contradictory_multi_shard_directions_fail_before_global_merge(tmp_path)
     )
 
     with pytest.raises(PTG2ManifestArtifactError, match="source-a.*not reciprocal"):
-        convert_v3_provider_membership_shards_to_shared_graph(
+        convert_membership_shards_to_shared_graph(
             shards=(contradictory,),
             provider_set_key_by_global_id=provider_keys,
             external_sort_chunk_bytes=32,
@@ -547,12 +547,12 @@ def test_contradictory_multi_shard_directions_fail_before_global_merge(tmp_path)
 def test_multi_shard_output_is_independent_of_bundle_order(tmp_path):
     bundles, provider_keys, _groups = _overlapping_bundles(tmp_path)
 
-    forward = convert_v3_provider_membership_shards_to_shared_graph(
+    forward = convert_membership_shards_to_shared_graph(
         shards=bundles,
         provider_set_key_by_global_id=provider_keys,
         external_sort_chunk_bytes=32,
     )
-    reverse = convert_v3_provider_membership_shards_to_shared_graph(
+    reverse = convert_membership_shards_to_shared_graph(
         shards=tuple(reversed(bundles)),
         provider_set_key_by_global_id=provider_keys,
         external_sort_chunk_bytes=4096,
@@ -571,7 +571,7 @@ def test_conversion_keeps_cardinality_dependent_outputs_on_disk(tmp_path):
     bundles, provider_keys, _groups = _overlapping_bundles(tmp_path)
     spill = tmp_path / "spill"
 
-    graph_result = convert_v3_provider_membership_shards_to_shared_graph(
+    graph_result = convert_membership_shards_to_shared_graph(
         shards=bundles,
         provider_set_key_by_global_id=provider_keys,
         spill_directory=spill,
@@ -652,7 +652,7 @@ def test_multi_shard_external_runs_respect_spill_bound(monkeypatch, tmp_path):
     monkeypatch.setattr(shared_graph_module, "_write_sorted_run", tracking_write)
     monkeypatch.setattr(shared_graph_module, "_merge_runs", tracking_merge)
 
-    graph_result = convert_v3_provider_membership_shards_to_shared_graph(
+    graph_result = convert_membership_shards_to_shared_graph(
         shards=bundles,
         provider_set_key_by_global_id={provider: 0},
         spill_directory=spill_dir,
@@ -673,7 +673,7 @@ def test_multi_shard_identity_must_be_unique_and_match_metadata(tmp_path):
     bundles, provider_keys, _groups = _overlapping_bundles(tmp_path)
 
     with pytest.raises(PTG2ManifestArtifactError, match="duplicate.*identity"):
-        convert_v3_provider_membership_shards_to_shared_graph(
+        convert_membership_shards_to_shared_graph(
             shards=(bundles[0], bundles[0]),
             provider_set_key_by_global_id=provider_keys,
         )
@@ -686,7 +686,7 @@ def test_multi_shard_identity_must_be_unique_and_match_metadata(tmp_path):
         provider_set_group=bundles[0].provider_set_group,
     )
     with pytest.raises(PTG2ManifestArtifactError, match="identity mismatch"):
-        convert_v3_provider_membership_shards_to_shared_graph(
+        convert_membership_shards_to_shared_graph(
             shards=(mismatched,),
             provider_set_key_by_global_id=provider_keys,
         )

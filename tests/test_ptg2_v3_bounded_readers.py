@@ -7,7 +7,7 @@ import pytest
 from api import ptg2_db_sidecars
 from api.ptg2_db_sidecars import (
     PTG2ManifestArtifactError,
-    lookup_serving_binary_by_code_prefix_from_db,
+    lookup_code_prefix_rows_from_db,
 )
 from api.ptg2_shared_blocks import (
     PTG2_V3_GRAPH_NPI_TO_GROUP,
@@ -151,7 +151,7 @@ async def _prefix_rows(
         "_discover_forward_shard_keys",
         AsyncMock(return_value={7: block_keys}),
     )
-    prefix_rows = await lookup_serving_binary_by_code_prefix_from_db(
+    prefix_rows = await lookup_code_prefix_rows_from_db(
         object(),
         7,
         limit=limit,
@@ -798,7 +798,7 @@ async def test_bounded_code_prefix_validates_unretained_price_keys(monkeypatch):
 @pytest.mark.parametrize("limit", [0, -1, True])
 async def test_bounded_code_prefix_requires_positive_integer_limit(limit):
     with pytest.raises(ValueError, match="limit must be positive"):
-        await lookup_serving_binary_by_code_prefix_from_db(
+        await lookup_code_prefix_rows_from_db(
             object(),
             7,
             limit=limit,
