@@ -2051,7 +2051,7 @@ async def resolve_into_archive(
                 f"stamped={mismatch.staged_address_key} expected={mismatch.computed_address_key} "
                 f"identity={mismatch.identity_key!r}"
             )
-        alias_stats: dict[str, int] = {}
+        alias_stats_by_kind: dict[str, int] = {}
         completion_alias_rows = 0
         await session.execute(text("SAVEPOINT address_completion_alias_repair;"))
         completion_alias_timeout = os.getenv(ADDRESS_COMPLETION_ALIAS_TIMEOUT_ENV, "2min")
@@ -2072,10 +2072,12 @@ async def resolve_into_archive(
                 """))
             ).scalar() or {}
             if isinstance(alias_stats_raw, str):
-                alias_stats = json.loads(alias_stats_raw)
+                alias_stats_by_kind = json.loads(alias_stats_raw)
             else:
-                alias_stats = dict(alias_stats_raw)
-            completion_alias_rows = int(alias_stats.get("completion_aliases") or 0)
+                alias_stats_by_kind = dict(alias_stats_raw)
+            completion_alias_rows = int(
+                alias_stats_by_kind.get("completion_aliases") or 0
+            )
             if completion_alias_rows:
                 await session.execute(text(f"""
                     UPDATE {keyed_table} AS keyed
@@ -2123,7 +2125,10 @@ async def resolve_into_archive(
                 raise
             if not _is_statement_timeout_error(exc):
                 raise
-            alias_stats = {"completion_aliases": 0, "completion_alias_repair_skipped": 1}
+            alias_stats_by_kind = {
+                "completion_aliases": 0,
+                "completion_alias_repair_skipped": 1,
+            }
             logger.warning("Skipping address completion alias repair after statement timeout: %s", exc)
             _emit_progress(
                 phase="address archive resolve",
@@ -2167,13 +2172,16 @@ async def resolve_into_archive(
         )
         raw_reason_buckets = (await session.execute(text(reason_sql))).scalar() or {}
         if isinstance(raw_reason_buckets, str):
-            reason_buckets = json.loads(raw_reason_buckets)
+            reason_buckets_by_reason = json.loads(raw_reason_buckets)
         else:
-            reason_buckets = dict(raw_reason_buckets)
-        reason_buckets = {str(key): int(value or 0) for key, value in reason_buckets.items()}
-        reason_buckets.update({
+            reason_buckets_by_reason = dict(raw_reason_buckets)
+        reason_buckets_by_reason = {
             str(key): int(value or 0)
-            for key, value in alias_stats.items()
+            for key, value in reason_buckets_by_reason.items()
+        }
+        reason_buckets_by_reason.update({
+            str(key): int(value or 0)
+            for key, value in alias_stats_by_kind.items()
         })
         distinct_keys = int((
             await session.execute(text(f"SELECT count(*) FROM ({dedup_cte}) d;"))
@@ -2419,7 +2427,7 @@ async def resolve_into_archive(
         null_key_rows=null_key_rows,
         eligible_key_rows=eligible_key_rows,
         eligible_null_key_rows=eligible_null_key_rows,
-        reason_buckets=reason_buckets,
+        reason_buckets=reason_buckets_by_reason,
         gate_violations=gate_violations,
         gate_sample_rows=gate_sample_rows,
         elapsed_seconds=round(time.monotonic() - started, 3),
@@ -3002,16 +3010,16 @@ async def swap_archive_v2_to_current(
         if missing_map_targets:
             raise RuntimeError(f"checksum bridge has {missing_map_targets} missing canonical target(s)")
 
-        swapped = False
+        is_swapped = False
         if not dry_run:
             if backup_exists and allow_replace_backup:
                 await session.execute(text(f"DROP TABLE {backup};"))
             await session.execute(text(f"ALTER TABLE {current} RENAME TO {_quote_ident(backup_table)};"))
             await session.execute(text(f"ALTER TABLE {archive} RENAME TO {_quote_ident(current_table)};"))
-            swapped = True
+            is_swapped = True
 
-        after_legacy_table = backup if swapped else current
-        after_current_table = current if swapped else archive
+        after_legacy_table = backup if is_swapped else current
+        after_current_table = current if is_swapped else archive
         after_fingerprint = await _legacy_archive_fingerprint(session, after_legacy_table)
         legacy_rows_after = int(after_fingerprint["rows"] or 0)
         current_rows_after = int((await session.execute(text(f"SELECT count(*) FROM {after_current_table};"))).scalar() or 0)
@@ -3034,7 +3042,7 @@ async def swap_archive_v2_to_current(
         checksum_map_rows=checksum_map_rows,
         checksum_collision_rows=checksum_collision_rows,
         missing_map_targets=missing_map_targets,
-        swapped=swapped,
+        swapped=is_swapped,
         runtime_seconds=round(time.monotonic() - started, 3),
         dry_run=dry_run,
     )

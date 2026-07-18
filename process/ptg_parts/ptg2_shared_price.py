@@ -1009,7 +1009,7 @@ async def prepare_shared_price_artifacts(
     price_set_summary_source_count: int | None = None,
     price_key_ready: Callable[[PreparedSharedPriceKeyMap], None] | None = None,
 ) -> PreparedSharedPriceArtifacts:
-    """Normalize price stages and assign exact cost-ranked dense keys once.
+    """Normalize cross-source price stages and assign exact dense keys once.
 
     ``price_key_ready`` is called synchronously after the independent price-key
     stage commits successfully.  Callers may use that immutable stage while the
@@ -1055,25 +1055,33 @@ async def prepare_shared_price_artifacts(
                 "single_scanner_fast_path"
                 if normalized_summary_source_count == 1
                 else "cross_file_canonicalize"
-            )
+            ),
+            "price_atom_source_mode": (
+                "single_scanner_unique_provenance"
+                if normalized_summary_source_count == 1
+                else "cross_file_canonicalize"
+            ),
         }
         parallel_started_at = time.monotonic()
 
         async def prepare_atom_stages() -> tuple[
             Mapping[str, Any], dict[str, int | None], float
         ]:
-            """Normalize atoms, rewrite attributes, and build dense atom keys."""
+            """Canonicalize when needed, rewrite attributes, and build atom keys."""
 
-            stage_started_at = time.monotonic()
-            stage_metrics_map.update(
-                await _normalize_strict_price_atom_stage(
-                    schema_name=schema_name,
-                    price_atom_table=price_atom_table,
+            if normalized_summary_source_count == 1:
+                stage_metrics_map["normalization_seconds"] = 0.0
+            else:
+                stage_started_at = time.monotonic()
+                stage_metrics_map.update(
+                    await _normalize_strict_price_atom_stage(
+                        schema_name=schema_name,
+                        price_atom_table=price_atom_table,
+                    )
                 )
-            )
-            stage_metrics_map["normalization_seconds"] = (
-                time.monotonic() - stage_started_at
-            )
+                stage_metrics_map["normalization_seconds"] = (
+                    time.monotonic() - stage_started_at
+                )
             stage_started_at = time.monotonic()
             lean_price_manifest = (
                 await _rewrite_price_atom_lean_dictionary(
@@ -1095,6 +1103,16 @@ async def prepare_shared_price_artifacts(
                 price_atom_table=price_atom_table,
                 stage_table=atom_key_map,
             )
+            if normalized_summary_source_count == 1:
+                atom_row_count = int(atom_stats.get("row_count") or 0)
+                stage_metrics_map.update(
+                    {
+                        "rows_before": atom_row_count,
+                        "rows_after": atom_row_count,
+                        "duplicate_rows_removed": 0,
+                        "conflicting_ids": 0,
+                    }
+                )
             return lean_price_manifest, atom_stats, atom_map_started_at
 
         async def prepare_price_key_stage() -> dict[str, int | None]:
