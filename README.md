@@ -60,6 +60,9 @@ message rules live in `docs/commit-messages.md`; run
 `python3 scripts/check_commit_messages.py --last 1` before pushing hand-written
 commits.
 
+Current Python and PTG2 scanner coverage, their measured scopes, and the
+no-regression CI rule are documented in `docs/test-coverage.md`.
+
 ## Importers
 
 Each importer is a separate operational pipeline. Together, they build the canonical data used by the API.
