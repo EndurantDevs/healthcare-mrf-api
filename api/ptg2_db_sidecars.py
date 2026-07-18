@@ -2023,3 +2023,7 @@ async def lookup_shared_graph_members_from_db(
         )
     except PTG2SharedBlockError as exc:
         raise PTG2ManifestArtifactError(str(exc)) from exc
+
+
+# Compatibility for callers that imported the pre-readability-ratchet name.
+lookup_serving_binary_by_code_prefix_from_db = lookup_code_prefix_rows_from_db

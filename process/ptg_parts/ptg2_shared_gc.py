@@ -914,6 +914,12 @@ async def build_ptg2_shared_gc_plan(
     return PTG2SharedGCPlan(layouts=layouts, sweep=sweep)
 
 
+missing_ptg2_v3_migration_owned_tables = missing_migration_owned_tables
+require_ptg2_v3_migration_owned_tables = require_migration_owned_tables
+build_ptg2_shared_layout_release_plan = build_shared_layout_release_plan
+build_ptg2_shared_block_sweep_plan = build_shared_block_sweep_plan
+
+
 def _print_plan(plan: PTG2SharedGCPlan) -> None:
     print(f"shared_tables_available={str(plan.layouts.tables_available).lower()}")
     print(f"logical_layouts={plan.logical_layout_count}")

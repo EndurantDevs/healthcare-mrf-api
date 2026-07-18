@@ -1536,6 +1536,12 @@ def convert_memberships_to_shared_graph(
     )
 
 
+convert_v3_provider_membership_shards_to_shared_graph = (
+    convert_membership_shards_to_shared_graph
+)
+convert_v3_provider_memberships_to_shared_graph = convert_memberships_to_shared_graph
+
+
 __all__ = [
     "MembershipArtifact",
     "SharedGraphConversionResult",
@@ -1546,4 +1552,6 @@ __all__ = [
     "SharedGraphShardBundle",
     "convert_membership_shards_to_shared_graph",
     "convert_memberships_to_shared_graph",
+    "convert_v3_provider_membership_shards_to_shared_graph",
+    "convert_v3_provider_memberships_to_shared_graph",
 ]

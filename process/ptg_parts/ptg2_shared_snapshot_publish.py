@@ -1356,10 +1356,16 @@ async def publish_strict_shared_v3_layout(
         return publication
 
 
+delete_unpublished_shared_v3_snapshot_sources = delete_unpublished_snapshot_sources
+validate_reused_shared_v3_snapshot_sources = validate_reused_snapshot_sources
+
+
 __all__ = [
     "SharedSnapshotPublication",
+    "delete_unpublished_shared_v3_snapshot_sources",
     "delete_unpublished_snapshot_sources",
     "publish_shared_v3_snapshot_sources",
     "publish_strict_shared_v3_layout",
+    "validate_reused_shared_v3_snapshot_sources",
     "validate_reused_snapshot_sources",
 ]

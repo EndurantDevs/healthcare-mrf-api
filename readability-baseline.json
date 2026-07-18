@@ -1,7 +1,7 @@
 {
   "issue_counts": {
     "ambiguous_function_names": 43,
-    "ambiguous_variable_names": 491,
+    "ambiguous_variable_names": 493,
     "boolean_name_mismatch": 269,
     "builtin_shadowing": 1,
     "class_name_shape": 2,
@@ -236,6 +236,8 @@
       "ambiguous_variable_name:api/metrics.py:render_prometheus_metrics:item",
       "ambiguous_variable_name:api/provider_specialty_cache_entries.py:load_dynamic_specialty_entry:row",
       "ambiguous_variable_name:api/provider_specialty_cache_entries.py:load_dynamic_specialty_entry:rows",
+      "ambiguous_variable_name:api/ptg2_shared_blocks.py:decode_dense_source_vector:payload",
+      "ambiguous_variable_name:api/ptg2_shared_blocks.py:decode_shared_block_payload:payload",
       "ambiguous_variable_name:api/tier_utils.py:normalize_drug_tier_slug:value",
       "ambiguous_variable_name:process/address_archive_migration.py:main:payload",
       "ambiguous_variable_name:process/address_archive_migration.py:process_data:payload",

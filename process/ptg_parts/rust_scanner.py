@@ -2042,3 +2042,8 @@ def _is_scanner_sigterm_after_dedupe(
         and has_stdout_terminal_summary
         and any(line.startswith("PTG2_DEDUPE_SUMMARY\t") for line in stderr_tail)
     )
+
+
+convert_v3_provider_membership_shards_to_shared_graph_rust = (
+    convert_membership_shards_to_shared_graph_rust
+)
