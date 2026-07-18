@@ -12,7 +12,7 @@ control_imports = importlib.import_module("api.control_imports")
 
 
 def test_openaddresses_record_uses_us_source_state_and_canonical_keys():
-    feature = {
+    feature_by_field = {
         "type": "Feature",
         "properties": {
             "number": "123",
@@ -27,7 +27,7 @@ def test_openaddresses_record_uses_us_source_state_and_canonical_keys():
     }
 
     address_record = openaddresses._record_from_feature(
-        feature,
+        feature_by_field,
         source_name="us/tx/austin",
         data_id=10,
         job_id=20,
@@ -45,7 +45,7 @@ def test_openaddresses_record_uses_us_source_state_and_canonical_keys():
 
 
 def test_openaddresses_missing_zip_point_is_staged_for_zip_recovery():
-    feature = {
+    feature_by_field = {
         "type": "Feature",
         "properties": {
             "number": "123",
@@ -60,7 +60,7 @@ def test_openaddresses_missing_zip_point_is_staged_for_zip_recovery():
     }
 
     recovery_record, reason = openaddresses._zip_recovery_record_from_feature(
-        feature,
+        feature_by_field,
         source_name="us/tx/austin",
         data_id=10,
         job_id=20,
@@ -79,7 +79,7 @@ def test_openaddresses_missing_zip_point_is_staged_for_zip_recovery():
 
 
 def test_openaddresses_record_rejects_non_us_coordinates():
-    feature = {
+    feature_by_field = {
         "type": "Feature",
         "properties": {
             "number": "123",
@@ -92,7 +92,7 @@ def test_openaddresses_record_rejects_non_us_coordinates():
 
     assert (
         openaddresses._record_from_feature(
-            feature,
+            feature_by_field,
             source_name="us/tx/austin",
             data_id=10,
             job_id=20,
@@ -318,12 +318,12 @@ def test_openaddresses_progress_run_id_prefers_task_then_context():
 
 @pytest.mark.asyncio
 async def test_openaddresses_backfill_plans_state_zip_prefix_shards(monkeypatch):
-    seen = {}
+    seen_by_field = {}
 
     class FakeDb:
         async def all(self, stmt, **params):
-            seen["stmt"] = stmt
-            seen["params"] = params
+            seen_by_field["stmt"] = stmt
+            seen_by_field["params"] = params
             return [
                 {"state_code": "TX", "zip_prefix": "75", "candidate_count": 100},
                 {"state_code": "CA", "zip_prefix": "90", "candidate_count": 50},
@@ -337,8 +337,8 @@ async def test_openaddresses_backfill_plans_state_zip_prefix_shards(monkeypatch)
         zip_prefix_length=2,
     )
 
-    assert seen["params"] == {"backfill_state_code": None, "backfill_zip_prefix_length": 2}
-    assert "substring(zip5 from 1 for :backfill_zip_prefix_length)" in seen["stmt"]
+    assert seen_by_field["params"] == {"backfill_state_code": None, "backfill_zip_prefix_length": 2}
+    assert "substring(zip5 from 1 for :backfill_zip_prefix_length)" in seen_by_field["stmt"]
     assert shards == [
         openaddresses.OpenAddressesBackfillShard(state_code="TX", zip_prefix="75", candidate_count=100),
         openaddresses.OpenAddressesBackfillShard(state_code="CA", zip_prefix="90", candidate_count=50),
@@ -805,32 +805,32 @@ async def test_openaddresses_remote_test_mode_honors_source_concurrency(monkeypa
 
 @pytest.mark.asyncio
 async def test_openaddresses_task_import_id_controls_stage_suffix():
-    ctx = {"context": {}, "import_date": "old"}
+    context_by_field = {"context": {}, "import_date": "old"}
 
     await openaddresses.process_data(
-        ctx,
+        context_by_field,
         {"publish_only": True, "import_id": "oa-dev-2026/06/19"},
     )
 
-    assert ctx["import_date"] == "oadev20260619"
-    assert ctx["context"]["import_date"] == "oadev20260619"
-    assert ctx["context"]["publish_only"] is True
+    assert context_by_field["import_date"] == "oadev20260619"
+    assert context_by_field["context"]["import_date"] == "oadev20260619"
+    assert context_by_field["context"]["publish_only"] is True
 
 
 @pytest.mark.asyncio
 async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(monkeypatch):
     """Verify openaddresses shutdown uses job import id from shared context."""
-    seen = {}
+    seen_by_field = {}
 
     async def fake_ensure_database(_test_mode):
         return None
 
     async def fake_table_exists(schema, table_name):
-        seen["table_exists"] = (schema, table_name)
+        seen_by_field["table_exists"] = (schema, table_name)
         return True
 
     async def fake_create_indexes(table_name, schema):
-        seen["create_indexes"] = (schema, table_name)
+        seen_by_field["create_indexes"] = (schema, table_name)
 
     async def fake_refresh_archive_geocodes_sharded(**_kwargs):
         return openaddresses.OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
@@ -887,8 +887,8 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
         }
     )
 
-    assert seen["table_exists"] == ("mrf", "openaddresses_geocode_oadev20260619")
-    assert seen["create_indexes"] == ("mrf", "openaddresses_geocode_oadev20260619")
+    assert seen_by_field["table_exists"] == ("mrf", "openaddresses_geocode_oadev20260619")
+    assert seen_by_field["create_indexes"] == ("mrf", "openaddresses_geocode_oadev20260619")
 
 
 @pytest.mark.asyncio

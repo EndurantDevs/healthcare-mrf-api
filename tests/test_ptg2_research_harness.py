@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
+from threading import Thread
 
 import pytest
 
@@ -83,6 +86,58 @@ def test_parse_ps_memory_parses_rss_and_vsz():
     assert harness.parse_ps_memory("bad output") == {}
 
 
+def test_run_with_sampling_drains_large_stdout_and_stderr_without_deadlock(
+    tmp_path, monkeypatch
+):
+    real_popen = subprocess.Popen
+    processes = []
+
+    def tracking_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(harness.subprocess, "Popen", tracking_popen)
+    payload_size = 256 * 1024
+    command_arguments = [
+        sys.executable,
+        "-c",
+        (
+            "import os; "
+            f"os.write(1, b'o' * {payload_size}); "
+            f"os.write(2, b'e' * {payload_size})"
+        ),
+    ]
+    result_by_key = {}
+    error_by_key = {}
+
+    def run_sampled_command():
+        try:
+            result_by_key["result"] = harness.run_with_sampling(
+                command_arguments,
+                {"HLTHPRT_PTG2_RESEARCH_SAMPLE_SECONDS": "0.01"},
+                cwd=tmp_path,
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            error_by_key["error"] = exc
+
+    runner = Thread(target=run_sampled_command, daemon=True)
+    runner.start()
+    runner.join(timeout=5)
+    if runner.is_alive():
+        for process in processes:
+            process.terminate()
+        runner.join(timeout=5)
+        pytest.fail("run_with_sampling blocked on full stdout/stderr pipes")
+    if error_by_key:
+        raise error_by_key["error"]
+
+    completed, _elapsed, _memory = result_by_key["result"]
+    assert completed.returncode == 0
+    assert completed.stdout == b"o" * payload_size
+    assert completed.stderr == b"e" * payload_size
+
+
 def test_suite_validation_and_env_expansion(tmp_path):
     suite_path = tmp_path / "suite.json"
     suite_path.write_text(
@@ -155,6 +210,48 @@ def test_copy_output_gate_detects_digest_mismatch():
     )
 
     assert result == {"status": "failed", "mismatches": ["serving"]}
+
+
+def test_collect_copy_outputs_includes_price_set_summary_shards(tmp_path):
+    first = tmp_path / "price_set_summary.copy"
+    second = tmp_path / "price_set_summary.copy.worker-1"
+    first.write_text("set-b\t2.00\n", encoding="utf-8")
+    second.write_text("set-a\t1.00\nset-c\t3.00\n", encoding="utf-8")
+
+    outputs = harness.collect_copy_outputs(tmp_path)
+
+    summary = outputs["price_set_summary"]
+    assert summary["files"] == [str(first), str(second)]
+    assert summary["rows"] == 3
+    assert summary["sha256"] == harness.digest_lines(
+        ["set-a\t1.00", "set-b\t2.00", "set-c\t3.00"]
+    )
+
+
+def test_dedupe_gate_detects_price_and_provider_set_mismatch():
+    baseline_dedupe_by_metric = {
+        "price_set_attempted": 10,
+        "price_set_unique": 4,
+        "price_set_duplicate": 6,
+        "provider_set_attempted": 10,
+        "provider_set_unique": 2,
+        "provider_set_duplicate": 8,
+    }
+    candidate_dedupe_by_metric = {
+        **baseline_dedupe_by_metric,
+        "price_set_duplicate": 5,
+        "provider_set_unique": 3,
+    }
+
+    result = harness.compare_dedupe(
+        baseline_dedupe_by_metric,
+        candidate_dedupe_by_metric,
+    )
+
+    assert result == {
+        "status": "failed",
+        "mismatches": ["price_set_duplicate", "provider_set_unique"],
+    }
 
 
 def test_gate_evaluation_accepts_matching_correctness_and_fast_candidate():
@@ -761,7 +858,16 @@ def test_dry_run_writes_report(tmp_path):
     )
 
     report_paths = list(Path(tmp_path).glob("run-*/report.json"))
-    assert report["results"][0]["status"] == "dry_run"
+    result = report["results"][0]
+    assert result["status"] == "dry_run"
+    assert result["env_overrides"]["HLTHPRT_PTG2_SNAPSHOT_ARCH"] == "postgres_binary_v3"
+    summary_path = Path(
+        result["env_overrides"][
+            "HLTHPRT_PTG2_MANIFEST_PRICE_SET_SUMMARY_COPY_PATH"
+        ]
+    )
+    assert summary_path.name == "price_set_summary.copy"
+    assert summary_path.parent.name == "baseline"
     assert report_paths
 
 

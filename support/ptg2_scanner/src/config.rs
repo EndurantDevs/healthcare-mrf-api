@@ -36,6 +36,13 @@ pub fn env_usize(name: &str, default_value: usize) -> usize {
         .unwrap_or(default_value)
 }
 
+pub fn env_usize_allow_zero(name: &str, default_value: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default_value)
+}
+
 pub fn env_bool(name: &str, default_value: bool) -> bool {
     match env::var(name) {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
@@ -75,6 +82,19 @@ mod tests {
         });
         scoped_env("PTG2_SCANNER_TEST_USIZE", Some("nope"), || {
             assert_eq!(env_usize("PTG2_SCANNER_TEST_USIZE", 4), 4);
+        });
+    }
+
+    #[test]
+    fn env_usize_allow_zero_preserves_explicit_disable() {
+        scoped_env("PTG2_SCANNER_TEST_USIZE_ZERO", Some("0"), || {
+            assert_eq!(env_usize_allow_zero("PTG2_SCANNER_TEST_USIZE_ZERO", 4), 0);
+        });
+        scoped_env("PTG2_SCANNER_TEST_USIZE_ZERO", Some("12"), || {
+            assert_eq!(env_usize_allow_zero("PTG2_SCANNER_TEST_USIZE_ZERO", 4), 12);
+        });
+        scoped_env("PTG2_SCANNER_TEST_USIZE_ZERO", Some("nope"), || {
+            assert_eq!(env_usize_allow_zero("PTG2_SCANNER_TEST_USIZE_ZERO", 4), 4);
         });
     }
 

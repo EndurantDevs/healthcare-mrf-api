@@ -1165,7 +1165,6 @@ async def push_objects(
                     columns=list(obj_list[0].keys()),
                     records=IterateList(obj_list, obj_list[0].keys()),
                 )
-            # print("All good!")
         except ValueError as exc:
             print(f"INPUT arr: {obj_list}")
             print(exc)

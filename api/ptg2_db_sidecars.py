@@ -46,6 +46,7 @@ class _ForwardLookupOptions:
     shared_snapshot_key: int
     price_dictionary_item_count: int
     price_dictionary_block_bytes: int
+    provider_shard_span: int | None = None
     provider_set_keys: Iterable[int] | None = None
     provider_counts_by_key: Mapping[int, int] | None = None
     source_count: int | None = None
@@ -60,6 +61,7 @@ class _ForwardBatchOptions:
     source_count: int
     price_dictionary_item_count: int
     price_dictionary_block_bytes: int
+    provider_shard_span: int | None = None
     provider_set_keys: Iterable[int] | None = None
     provider_counts_by_key: Mapping[int, int] | None = None
     schema_name: str = "mrf"
@@ -86,13 +88,9 @@ class _ForwardFragmentValidation:
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND = "by_code_provider_shard_v1"
 _SERVING_BINARY_BY_CODE_DICTIONARY_KIND = "by_code_price_dictionary"
-_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN = 1024
+_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN_DEFAULT = 1024
 _SERVING_BINARY_BY_CODE_BLOCK_SPAN = 1 << 31
 _SERVING_BINARY_MAX_DENSE_KEY = 2**31 - 1
-_SERVING_BINARY_MAX_PROVIDER_SHARD = (
-    _SERVING_BINARY_MAX_DENSE_KEY
-    // _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN
-)
 
 
 def _required_shared_snapshot_key(shared_snapshot_key: int | None) -> int:
@@ -168,6 +166,24 @@ def _normalized_provider_set_filter(
     return tuple(sorted(normalized_keys))
 
 
+def _normalized_provider_shard_span(provider_shard_span: int | None) -> int:
+    normalized_span = (
+        _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN_DEFAULT
+        if provider_shard_span is None
+        else int(provider_shard_span)
+    )
+    if (
+        isinstance(provider_shard_span, bool)
+        or normalized_span <= 0
+        or normalized_span > 1 << 24
+        or normalized_span & (normalized_span - 1)
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider shard span must be a bounded power of two"
+        )
+    return normalized_span
+
+
 def _forward_code_block_bounds(code_key: int) -> tuple[int, int]:
     normalized_code_key = _normalized_code_key(code_key)
     lower_bound = normalized_code_key * _SERVING_BINARY_BY_CODE_BLOCK_SPAN
@@ -177,21 +193,21 @@ def _forward_code_block_bounds(code_key: int) -> tuple[int, int]:
 def _forward_provider_shard_block_key(
     code_key: int,
     provider_set_key: int,
+    provider_shard_span: int | None = None,
 ) -> int:
     normalized_provider_keys = _normalized_provider_set_filter(
         (provider_set_key,)
     )
     assert normalized_provider_keys is not None
+    normalized_span = _normalized_provider_shard_span(provider_shard_span)
     lower_bound, _upper_bound = _forward_code_block_bounds(code_key)
-    return lower_bound + (
-        normalized_provider_keys[0]
-        // _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN
-    )
+    return lower_bound + (normalized_provider_keys[0] // normalized_span)
 
 
 def _forward_provider_range_for_block(
     code_key: int,
     block_key: int,
+    provider_shard_span: int | None = None,
 ) -> tuple[int, int]:
     lower_bound, upper_bound = _forward_code_block_bounds(code_key)
     normalized_block_key = int(block_key)
@@ -200,28 +216,28 @@ def _forward_provider_range_for_block(
             "PTG2 v3 provider-shard block key is outside its code range"
         )
     shard_no = normalized_block_key - lower_bound
-    if shard_no > _SERVING_BINARY_MAX_PROVIDER_SHARD:
+    normalized_span = _normalized_provider_shard_span(provider_shard_span)
+    if shard_no > _SERVING_BINARY_MAX_DENSE_KEY // normalized_span:
         raise PTG2ManifestArtifactError(
             "PTG2 v3 provider-shard block key has an invalid shard number"
         )
-    provider_key_min = (
-        shard_no * _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN
-    )
+    provider_key_min = shard_no * normalized_span
     return (
         provider_key_min,
-        provider_key_min + _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN,
+        provider_key_min + normalized_span,
     )
 
 
 def _computed_forward_shard_keys(
     code_keys: Iterable[int],
     provider_set_keys: tuple[int, ...],
+    provider_shard_span: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
+    normalized_span = _normalized_provider_shard_span(provider_shard_span)
     shard_numbers = tuple(
         sorted(
             {
-                provider_set_key
-                // _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN
+                provider_set_key // normalized_span
                 for provider_set_key in provider_set_keys
             }
         )
@@ -232,7 +248,8 @@ def _computed_forward_shard_keys(
         shard_keys_by_code[normalized_code_key] = tuple(
             _forward_provider_shard_block_key(
                 normalized_code_key,
-                shard_no * _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN,
+                shard_no * normalized_span,
+                normalized_span,
             )
             for shard_no in shard_numbers
         )
@@ -245,6 +262,7 @@ async def _discover_forward_shard_keys(
     shared_snapshot_key: int,
     schema_name: str,
     code_keys: Iterable[int],
+    provider_shard_span: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Discover every immutable provider shard in exact code-key ranges."""
 
@@ -299,7 +317,11 @@ async def _discover_forward_shard_keys(
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 shard discovery returned an unexpected code key"
             )
-        _forward_provider_range_for_block(code_key, block_key)
+        _forward_provider_range_for_block(
+            code_key,
+            block_key,
+            provider_shard_span,
+        )
         pair = (code_key, block_key)
         if pair in observed_pairs:
             raise PTG2ManifestArtifactError(
@@ -324,11 +346,15 @@ async def _forward_shard_keys_for_read(
     provider_filter = _normalized_provider_set_filter(
         options.provider_set_keys
     )
+    provider_shard_span = _normalized_provider_shard_span(
+        options.provider_shard_span
+    )
     if provider_filter is not None:
         return (
             _computed_forward_shard_keys(
                 normalized_code_keys,
                 provider_filter,
+                provider_shard_span,
             ),
             provider_filter,
             False,
@@ -339,6 +365,7 @@ async def _forward_shard_keys_for_read(
             shared_snapshot_key=options.shared_snapshot_key,
             schema_name=options.schema_name,
             code_keys=normalized_code_keys,
+            provider_shard_span=provider_shard_span,
         ),
         None,
         True,
@@ -996,6 +1023,7 @@ def _decode_forward_shards_for_code(
     provider_set_keys: Iterable[int] | None,
     expected_source_count: int | None,
     price_item_count: int,
+    provider_shard_span: int | None = None,
 ) -> list[tuple[int, int, int]]:
     normalized_code_key = _normalized_code_key(code_key)
     expected_keys = tuple(sorted({int(key) for key in expected_block_keys}))
@@ -1007,7 +1035,11 @@ def _decode_forward_shards_for_code(
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 forward read returned an unexpected shard block"
             )
-        _forward_provider_range_for_block(normalized_code_key, block_key)
+        _forward_provider_range_for_block(
+            normalized_code_key,
+            block_key,
+            provider_shard_span,
+        )
         fragments_by_block.setdefault(block_key, []).append(fragment_row)
 
     decoded_keys: list[tuple[int, int, int]] = []
@@ -1017,6 +1049,7 @@ def _decode_forward_shards_for_code(
             _forward_provider_range_for_block(
                 normalized_code_key,
                 block_key,
+                provider_shard_span,
             )
         )
         shard_decoded, shard_source_count = (
@@ -1175,6 +1208,7 @@ def _flatten_forward_shard_keys(
 def _group_forward_fragments_by_code(
     fragment_rows: Iterable[Mapping[str, Any]],
     shard_keys_by_code: Mapping[int, Iterable[int]],
+    provider_shard_span: int | None = None,
 ) -> dict[int, list[Mapping[str, Any]]]:
     code_by_block: dict[int, int] = {}
     fragments_by_code: dict[int, list[Mapping[str, Any]]] = {
@@ -1187,6 +1221,7 @@ def _group_forward_fragments_by_code(
             _forward_provider_range_for_block(
                 normalized_code_key,
                 normalized_block_key,
+                provider_shard_span,
             )
             previous_code_key = code_by_block.setdefault(
                 normalized_block_key,
@@ -1246,6 +1281,7 @@ async def lookup_code_rows_from_db(
         provider_set_keys=provider_filter,
         expected_source_count=options.source_count,
         price_item_count=price_item_count,
+        provider_shard_span=options.provider_shard_span,
     )
     provider_counts_by_key, price_ids_by_key = await _lookup_forward_references(
         session, options, decoded_keys
@@ -1373,6 +1409,7 @@ async def lookup_serving_binary_by_code_prefix_from_db(
                     _forward_provider_range_for_block(
                         normalized_code_key,
                         fragment.block_key,
+                        options.provider_shard_span,
                     )
                 )
             if fragment.fragment_no != expected_fragment_no:
@@ -1576,6 +1613,7 @@ async def lookup_binary_code_batch_from_db(
     fragments_by_code = _group_forward_fragments_by_code(
         fragment_rows,
         shard_keys_by_code,
+        options.provider_shard_span,
     )
     decoded_by_code = {
         code_key: _decode_forward_shards_for_code(
@@ -1585,6 +1623,7 @@ async def lookup_binary_code_batch_from_db(
             provider_set_keys=provider_filter,
             expected_source_count=options.source_count,
             price_item_count=price_item_count,
+            provider_shard_span=options.provider_shard_span,
         )
         for code_key in normalized_code_keys
     }

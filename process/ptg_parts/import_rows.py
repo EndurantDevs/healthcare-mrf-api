@@ -474,6 +474,8 @@ def _ptg2_plan_rows(
     snapshot_id: str,
     import_month: datetime.date,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """Build canonical plan, alternate-id, and snapshot-plan rows."""
+
     plan_identity_by_field = {
         "plan_id": plan_fields.get("plan_id"),
         "plan_id_type": plan_fields.get("plan_id_type"),

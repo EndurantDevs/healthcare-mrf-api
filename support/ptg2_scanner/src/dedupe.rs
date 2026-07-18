@@ -197,7 +197,7 @@ pub struct SharedDedupe {
     price_atom: ShardedDedupe128,
     price_set: ShardedDedupe128,
     price_set_entry: Option<ShardedDedupe128>,
-    provider_set: ShardedDedupe64,
+    provider_set: ShardedDedupe128,
     provider_set_component: ShardedDedupe128,
     provider_set_entry: ShardedDedupe128,
     provider_entry_component: Option<ShardedDedupe128>,
@@ -238,7 +238,7 @@ impl SharedDedupe {
             price_set: ShardedDedupe128::new(shard_count),
             price_set_entry: dedupe_high_cardinality_entries
                 .then(|| ShardedDedupe128::new(shard_count)),
-            provider_set: ShardedDedupe64::new(shard_count),
+            provider_set: ShardedDedupe128::new(shard_count),
             provider_set_component: ShardedDedupe128::new(shard_count),
             provider_set_entry: ShardedDedupe128::new(shard_count),
             provider_entry_component: dedupe_high_cardinality_entries
@@ -284,6 +284,14 @@ impl SharedDedupe {
         inserted
     }
 
+    pub fn record_local_price_set_duplicates(&self, count: u64) {
+        self.price_set_counter.record_attempted(count);
+    }
+
+    pub fn record_local_price_atom_duplicates(&self, count: u64) {
+        self.price_atom_counter.record_attempted(count);
+    }
+
     pub fn insert_price_atom(&self, key: GlobalId128) -> bool {
         let inserted = self.price_atom.insert(u128::from_le_bytes(key.0));
         self.price_atom_counter.record(inserted);
@@ -313,10 +321,14 @@ impl SharedDedupe {
         inserted
     }
 
-    pub fn insert_provider_set(&self, key: &str) -> bool {
-        let inserted = self.provider_set.insert_hash_text(key);
+    pub fn insert_provider_set(&self, key: GlobalId128) -> bool {
+        let inserted = self.provider_set.insert(u128::from_le_bytes(key.0));
         self.provider_set_counter.record(inserted);
         inserted
+    }
+
+    pub fn record_local_provider_set_duplicates(&self, count: u64) {
+        self.provider_set_counter.record_attempted(count);
     }
 
     pub fn insert_provider_set_component(

@@ -68,6 +68,8 @@ def _assert_pid_exits(process_id: int, timeout: float = 5.0) -> None:
 
 
 def _finalizer_inputs(tmp_path: Path):
+    """Build authenticated finalizer inputs for cancellation tests."""
+
     source_identity_map = {
         "source_type": "in_network",
         "identity_kind": "logical_json_sha256_v1",
@@ -119,9 +121,32 @@ def _finalizer_inputs(tmp_path: Path):
             "serving_code_dictionary_bytes": 64,
         },
     )
+    provider_metadata_path = tmp_path / "provider-metadata.copy"
+    provider_metadata_payload = b"00000000000000000000000000000001\t1\t{}\n"
+    provider_metadata_path.write_bytes(provider_metadata_payload)
+    provider_metadata_entries = [
+        {
+            "path": str(provider_metadata_path),
+            "row_count": 1,
+            "bytes": len(provider_metadata_payload),
+            "sha256": hashlib.sha256(provider_metadata_payload).hexdigest(),
+            "format": "ptg2_v3_provider_set_metadata_copy",
+            "version": 1,
+            **source_identity_map,
+            "source_run_contract_sha256": serving_entries[0][
+                "source_run_contract_sha256"
+            ],
+        }
+    ]
     price_key_map = tmp_path / "price-key-map.copy"
     price_key_map.write_bytes(b"map")
-    return source_identity_map, serving_entries, code_entries, price_key_map
+    return (
+        source_identity_map,
+        serving_entries,
+        code_entries,
+        provider_metadata_entries,
+        price_key_map,
+    )
 
 
 @pytest.mark.parametrize("cancel_mode", ["cancel", "timeout"])
@@ -131,6 +156,8 @@ async def test_finalizer_cancellation_reaps_group_and_allows_same_directory_retr
     monkeypatch,
     cancel_mode,
 ):
+    """Cancel or time out a process group, then prove the workdir is reusable."""
+
     binary = write_retrying_finalizer_binary(tmp_path)
     work_directory = tmp_path / "work"
     parent_pid_path = tmp_path / "finalizer-parent.pid"
@@ -146,13 +173,18 @@ async def test_finalizer_cancellation_reaps_group_and_allows_same_directory_retr
     )
     monkeypatch.setattr(rust_scanner, "_PROCESS_GROUP_TERM_TIMEOUT_SECONDS", 0.1)
     monkeypatch.setattr(rust_scanner, "_PROCESS_GROUP_KILL_TIMEOUT_SECONDS", 2.0)
-    identity, serving_entries, code_entries, price_key_map = _finalizer_inputs(
-        tmp_path
-    )
+    (
+        identity,
+        serving_entries,
+        code_entries,
+        provider_metadata_entries,
+        price_key_map,
+    ) = _finalizer_inputs(tmp_path)
     finalizer_argument_map = dict(
         work_directory=work_directory,
         serving_run_entries=serving_entries,
         code_dictionary_entries=code_entries,
+        provider_set_metadata_entries=provider_metadata_entries,
         expected_source_identities=[identity],
         price_key_map_input=price_key_map,
     )

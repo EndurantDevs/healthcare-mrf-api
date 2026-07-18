@@ -55,6 +55,8 @@ PTG2_V3_CODE_DICTIONARY_FORMAT = "ptg2_v3_serving_code_dictionary"
 PTG2_V3_CODE_DICTIONARY_VERSION = 4
 PTG2_V3_SOURCE_RUN_CONTRACT_VERSION = 1
 PTG2_V3_CODE_DICTIONARY_SOURCE_CONTRACT_VERSION = 1
+PTG2_V3_PROVIDER_SET_METADATA_FORMAT = "ptg2_v3_provider_set_metadata_copy"
+PTG2_V3_PROVIDER_SET_METADATA_VERSION = 1
 _SOURCE_RUN_CONTRACT_FIELDS = frozenset(
     {
         "version",
@@ -1277,6 +1279,73 @@ def _prepare_code_dictionary_entries(
     return normalized, prepared_contracts
 
 
+def _prepare_provider_set_metadata_entries(
+    entries: Iterable[Mapping[str, Any]],
+    *,
+    source_run_contracts: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Bind authenticated provider/count metadata shards to every physical source."""
+
+    normalized = _validated_entries(entries, label="provider-set metadata")
+    source_count = len(source_run_contracts)
+    contract_by_identity = _source_contracts_by_identity(source_run_contracts)
+    observed_source_keys: set[int] = set()
+    for entry in normalized:
+        _validate_file_metadata(
+            entry,
+            label="provider-set metadata",
+            expected_format=PTG2_V3_PROVIDER_SET_METADATA_FORMAT,
+            expected_version=PTG2_V3_PROVIDER_SET_METADATA_VERSION,
+        )
+        if not all(field_name in entry for field_name in _PHYSICAL_IDENTITY_FIELDS):
+            raise RuntimeError(
+                "strict V3 provider-set metadata has an incomplete physical identity"
+            )
+        identity = normalized_physical_artifact_identity(entry)
+        try:
+            source_contract = contract_by_identity[identity]
+        except KeyError as exc:
+            raise RuntimeError(
+                "strict V3 provider-set metadata is outside the complete physical input set"
+            ) from exc
+        source_key, _identity, source_run_digest = _source_run_contract_binding(
+            source_contract
+        )
+        if (
+            _required_sha256(
+                entry.get("source_run_contract_sha256"),
+                field_name="provider-set metadata source_run_contract_sha256",
+            )
+            != source_run_digest
+        ):
+            raise RuntimeError(
+                "strict V3 provider-set metadata is bound to another source contract"
+            )
+        for field_name in _PHYSICAL_IDENTITY_FIELDS:
+            entry.pop(field_name, None)
+        entry["source_key"] = source_key
+        entry["source_count"] = source_count
+        entry["sha256"] = _required_sha256(
+            entry.get("sha256"), field_name="provider-set metadata sha256"
+        )
+        entry["source_run_contract_sha256"] = source_run_digest
+        observed_source_keys.add(source_key)
+    if observed_source_keys != set(range(source_count)):
+        raise RuntimeError(
+            "strict V3 finalizer requires complete dense provider-set metadata source keys"
+        )
+    normalized.sort(
+        key=lambda entry: (
+            int(entry["source_key"]),
+            str(entry["sha256"]),
+            int(entry["row_count"]),
+            int(entry["bytes"]),
+            str(entry["path"]),
+        )
+    )
+    return normalized
+
+
 def _source_run_manifest_fields(
     source_run_contracts: Sequence[Mapping[str, Any]],
     prepared_serving_entries: Sequence[Mapping[str, Any]],
@@ -1348,11 +1417,44 @@ def _code_dictionary_manifest_fields(
     }
 
 
+def _provider_set_metadata_manifest_fields(
+    prepared_entries: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build the path-independent authenticated provider metadata contract."""
+
+    descriptors = [
+        {
+            "source_key": int(entry["source_key"]),
+            "row_count": int(entry["row_count"]),
+            "bytes": int(entry["bytes"]),
+            "sha256": str(entry["sha256"]),
+            "source_run_contract_sha256": str(
+                entry["source_run_contract_sha256"]
+            ),
+        }
+        for entry in prepared_entries
+    ]
+    return {
+        "expected_provider_set_metadata_files": len(prepared_entries),
+        "expected_provider_set_metadata_rows": sum(
+            int(entry["row_count"]) for entry in prepared_entries
+        ),
+        "expected_provider_set_metadata_bytes": sum(
+            int(entry["bytes"]) for entry in prepared_entries
+        ),
+        "provider_set_metadata_contract_set_sha256": _canonical_json_sha256(
+            {"provider_set_metadata_contracts": descriptors}
+        ),
+        "provider_set_metadata_files": prepared_entries,
+    }
+
+
 def write_v3_finalizer_input_manifest(
     path: str | Path,
     *,
     serving_run_entries: Iterable[Mapping[str, Any]],
     code_dictionary_entries: Iterable[Mapping[str, Any]],
+    provider_set_metadata_entries: Iterable[Mapping[str, Any]],
     expected_source_identities: Iterable[
         Mapping[str, Any] | SharedPhysicalArtifactIdentity
     ],
@@ -1373,6 +1475,10 @@ def write_v3_finalizer_input_manifest(
         code_dictionary_entries,
         source_run_contracts=source_run_contracts,
     )
+    prepared_provider_set_metadata_entries = _prepare_provider_set_metadata_entries(
+        provider_set_metadata_entries,
+        source_run_contracts=source_run_contracts,
+    )
     manifest_payload_map = {
         "storage_generation": PTG2_V3_SHARED_GENERATION,
         "format_version": PTG2_V3_SHARED_FORMAT_VERSION,
@@ -1381,6 +1487,9 @@ def write_v3_finalizer_input_manifest(
         **_code_dictionary_manifest_fields(
             prepared_code_dictionary_entries,
             code_dictionary_source_contracts,
+        ),
+        **_provider_set_metadata_manifest_fields(
+            prepared_provider_set_metadata_entries
         ),
     }
     if resource_configuration is not None:
@@ -1614,6 +1723,7 @@ async def run_v3_direct_finalizer(
     work_directory: str | Path,
     serving_run_entries: Iterable[Mapping[str, Any]],
     code_dictionary_entries: Iterable[Mapping[str, Any]],
+    provider_set_metadata_entries: Iterable[Mapping[str, Any]],
     expected_source_identities: Iterable[
         Mapping[str, Any] | SharedPhysicalArtifactIdentity
     ],
@@ -1641,6 +1751,7 @@ async def run_v3_direct_finalizer(
         work_root / "scanner-summary.json",
         serving_run_entries=serving_run_entries,
         code_dictionary_entries=code_dictionary_entries,
+        provider_set_metadata_entries=provider_set_metadata_entries,
         expected_source_identities=expected_source_identities,
         resource_configuration=resource_configuration,
     )

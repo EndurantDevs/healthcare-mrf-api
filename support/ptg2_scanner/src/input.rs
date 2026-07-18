@@ -38,11 +38,15 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
+// Valid input is read and validated directly in the caller's buffer. These
+// fixed-size buffers are only used while resolving the BOM or a split codepoint.
 struct StrictUtf8Reader<R: Read> {
     inner: R,
-    pending: Vec<u8>,
-    output: Vec<u8>,
+    pending: [u8; 4],
+    pending_len: usize,
+    output: [u8; 4],
     output_pos: usize,
+    output_len: usize,
     eof: bool,
     checked_bom: bool,
 }
@@ -51,9 +55,11 @@ impl<R: Read> StrictUtf8Reader<R> {
     fn new(inner: R) -> Self {
         Self {
             inner,
-            pending: Vec::with_capacity(4),
-            output: Vec::new(),
+            pending: [0; 4],
+            pending_len: 0,
+            output: [0; 4],
             output_pos: 0,
+            output_len: 0,
             eof: false,
             checked_bom: false,
         }
@@ -62,87 +68,92 @@ impl<R: Read> StrictUtf8Reader<R> {
     fn preserving_bom(inner: R) -> Self {
         Self {
             inner,
-            pending: Vec::with_capacity(4),
-            output: Vec::new(),
+            pending: [0; 4],
+            pending_len: 0,
+            output: [0; 4],
             output_pos: 0,
+            output_len: 0,
             eof: false,
             checked_bom: true,
         }
     }
 
-    fn append_initial_bytes(&mut self, bytes: &[u8], eof: bool) -> io::Result<()> {
-        self.checked_bom = true;
-        let json_bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-        self.append_valid_utf8(json_bytes, eof)
-    }
-
-    fn append_valid_utf8(&mut self, bytes: &[u8], eof: bool) -> io::Result<()> {
+    fn stage_valid_utf8(&mut self, bytes: &[u8], eof: bool) -> io::Result<()> {
+        debug_assert!(bytes.len() <= self.output.len());
+        self.output_pos = 0;
+        self.output_len = 0;
+        self.pending_len = 0;
         match std::str::from_utf8(bytes) {
-            Ok(valid) => {
-                self.output.extend_from_slice(valid.as_bytes());
-                self.pending.clear();
+            Ok(_) => {
+                self.output[..bytes.len()].copy_from_slice(bytes);
+                self.output_len = bytes.len();
                 Ok(())
             }
             Err(error) => {
                 let valid_up_to = error.valid_up_to();
-                self.output.extend_from_slice(&bytes[..valid_up_to]);
                 if error.error_len().is_some() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "PTG JSON contains invalid UTF-8",
                     ));
                 }
-                self.pending.clear();
                 if eof {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "PTG JSON ends with incomplete UTF-8",
                     ));
                 }
-                self.pending.extend_from_slice(&bytes[valid_up_to..]);
+                self.output[..valid_up_to].copy_from_slice(&bytes[..valid_up_to]);
+                self.output_len = valid_up_to;
+                let pending = &bytes[valid_up_to..];
+                self.pending[..pending.len()].copy_from_slice(pending);
+                self.pending_len = pending.len();
                 Ok(())
             }
         }
     }
 
-    fn fill_output(&mut self) -> io::Result<bool> {
-        self.output.clear();
-        self.output_pos = 0;
-        let mut raw = [0u8; 8192];
-        while self.output.is_empty() && !self.eof {
-            let read = self.inner.read(&mut raw)?;
+    fn initialize_bom(&mut self) -> io::Result<()> {
+        while self.pending_len < 3 && !self.eof {
+            let read = self.inner.read(&mut self.pending[self.pending_len..3])?;
             if read == 0 {
                 self.eof = true;
-                if !self.pending.is_empty() {
-                    let pending = std::mem::take(&mut self.pending);
-                    if self.checked_bom {
-                        self.append_valid_utf8(&pending, true)?;
-                    } else {
-                        self.append_initial_bytes(&pending, true)?;
-                    }
-                }
-                break;
-            }
-            if !self.checked_bom {
-                let mut initial_bytes = std::mem::take(&mut self.pending);
-                initial_bytes.extend_from_slice(&raw[..read]);
-                if initial_bytes.len() < 3 {
-                    self.pending = initial_bytes;
-                    continue;
-                }
-                self.append_initial_bytes(&initial_bytes, false)?;
-                continue;
-            }
-            if self.pending.is_empty() {
-                self.append_valid_utf8(&raw[..read], false)?;
             } else {
-                let mut bytes = Vec::with_capacity(self.pending.len() + read);
-                bytes.extend_from_slice(&self.pending);
-                bytes.extend_from_slice(&raw[..read]);
-                self.append_valid_utf8(&bytes, false)?;
+                self.pending_len += read;
             }
         }
-        Ok(!self.output.is_empty())
+        self.checked_bom = true;
+        let mut initial = [0; 3];
+        let initial_len = self.pending_len;
+        initial[..initial_len].copy_from_slice(&self.pending[..initial_len]);
+        self.pending_len = 0;
+        let json_bytes = initial[..initial_len]
+            .strip_prefix(b"\xEF\xBB\xBF")
+            .unwrap_or(&initial[..initial_len]);
+        self.stage_valid_utf8(json_bytes, self.eof)
+    }
+
+    fn complete_pending(&mut self) -> io::Result<()> {
+        while self.pending_len > 0 {
+            let read = self.inner.read(&mut self.pending[self.pending_len..])?;
+            if read == 0 {
+                self.eof = true;
+                self.pending_len = 0;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PTG JSON ends with incomplete UTF-8",
+                ));
+            }
+            self.pending_len += read;
+            let mut staged = [0; 4];
+            let staged_len = self.pending_len;
+            staged[..staged_len].copy_from_slice(&self.pending[..staged_len]);
+            self.stage_valid_utf8(&staged[..staged_len], false)?;
+            if self.output_len > 0 {
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -151,14 +162,49 @@ impl<R: Read> Read for StrictUtf8Reader<R> {
         if buf.is_empty() {
             return Ok(0);
         }
-        if self.output_pos >= self.output.len() && !self.fill_output()? {
-            return Ok(0);
+        loop {
+            if self.output_pos < self.output_len {
+                let count = (self.output_len - self.output_pos).min(buf.len());
+                buf[..count]
+                    .copy_from_slice(&self.output[self.output_pos..self.output_pos + count]);
+                self.output_pos += count;
+                return Ok(count);
+            }
+            if !self.checked_bom {
+                self.initialize_bom()?;
+                continue;
+            }
+            if self.pending_len > 0 {
+                self.complete_pending()?;
+                continue;
+            }
+            if self.eof {
+                return Ok(0);
+            }
+            let read = self.inner.read(buf)?;
+            if read == 0 {
+                self.eof = true;
+                return Ok(0);
+            }
+            match std::str::from_utf8(&buf[..read]) {
+                Ok(_) => return Ok(read),
+                Err(error) if error.error_len().is_some() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "PTG JSON contains invalid UTF-8",
+                    ));
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    let pending = &buf[valid_up_to..read];
+                    self.pending[..pending.len()].copy_from_slice(pending);
+                    self.pending_len = pending.len();
+                    if valid_up_to > 0 {
+                        return Ok(valid_up_to);
+                    }
+                }
+            }
         }
-        let available = &self.output[self.output_pos..];
-        let count = available.len().min(buf.len());
-        buf[..count].copy_from_slice(&available[..count]);
-        self.output_pos += count;
-        Ok(count)
     }
 }
 
@@ -270,6 +316,50 @@ mod tests {
         encoder.finish().expect("finish gzip payload");
     }
 
+    struct ChunkedReader {
+        inner: Cursor<Vec<u8>>,
+        max_chunk: usize,
+    }
+
+    impl ChunkedReader {
+        fn new(bytes: &[u8], max_chunk: usize) -> Self {
+            Self {
+                inner: Cursor::new(bytes.to_vec()),
+                max_chunk,
+            }
+        }
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let limit = buf.len().min(self.max_chunk);
+            self.inner.read(&mut buf[..limit])
+        }
+    }
+
+    fn read_strict_chunks(
+        payload: &[u8],
+        inner_chunk: usize,
+        caller_chunk: usize,
+        preserve_bom: bool,
+    ) -> io::Result<Vec<u8>> {
+        let inner = ChunkedReader::new(payload, inner_chunk);
+        let mut reader = if preserve_bom {
+            StrictUtf8Reader::preserving_bom(inner)
+        } else {
+            StrictUtf8Reader::new(inner)
+        };
+        let mut buf = vec![0; caller_chunk];
+        let mut output = Vec::new();
+        loop {
+            let read = reader.read(&mut buf)?;
+            if read == 0 {
+                return Ok(output);
+            }
+            output.extend_from_slice(&buf[..read]);
+        }
+    }
+
     #[test]
     fn open_reader_reads_plain_files_and_counts_bytes() {
         let path = temp_path("plain.json");
@@ -322,6 +412,39 @@ mod tests {
         reader.read_to_string(&mut text).expect("read json file");
         assert_eq!(text, "{\"ok\":true}");
         assert_eq!(bytes_read.load(Ordering::Relaxed), 14);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn open_json_reader_validates_gzip_utf8_and_strips_bom() {
+        let path = temp_path("valid_utf8.json.gz");
+        let payload = "\u{feff}{\"name\":\"Café 😀\"}".as_bytes();
+        write_gzip(&path, payload);
+
+        let bytes_read = Arc::new(AtomicU64::new(0));
+        let mut reader =
+            open_json_reader(&path, Arc::clone(&bytes_read)).expect("open gzip json reader");
+        let mut text = String::new();
+        reader
+            .read_to_string(&mut text)
+            .expect("read valid gzip UTF-8");
+        assert_eq!(text, "{\"name\":\"Café 😀\"}");
+        assert!(bytes_read.load(Ordering::Relaxed) > 0);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn open_json_reader_rejects_invalid_utf8_in_gzip() {
+        let path = temp_path("invalid_utf8.json.gz");
+        write_gzip(&path, b"{\"name\":\"A\xFFB\"}");
+
+        let bytes_read = Arc::new(AtomicU64::new(0));
+        let mut reader =
+            open_json_reader(&path, Arc::clone(&bytes_read)).expect("open gzip json reader");
+        let mut text = String::new();
+        let error = reader.read_to_string(&mut text).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(bytes_read.load(Ordering::Relaxed) > 0);
         std::fs::remove_file(path).ok();
     }
 
@@ -400,5 +523,73 @@ mod tests {
         let mut output = Vec::new();
         reader.read_to_end(&mut output).expect("read valid UTF-8");
         assert_eq!(output, payload);
+    }
+
+    #[test]
+    fn strict_utf8_reader_handles_all_small_input_and_output_boundaries() {
+        let payload = "\u{feff}Aé中😀Z".as_bytes();
+        let stripped = "Aé中😀Z".as_bytes();
+        for inner_chunk in 1..=9 {
+            for caller_chunk in 1..=11 {
+                let output = read_strict_chunks(payload, inner_chunk, caller_chunk, false)
+                    .expect("read strict UTF-8 with stripped BOM");
+                assert_eq!(output, stripped);
+
+                let output = read_strict_chunks(payload, inner_chunk, caller_chunk, true)
+                    .expect("read strict UTF-8 with preserved BOM");
+                assert_eq!(output, payload);
+            }
+        }
+    }
+
+    #[test]
+    fn strict_utf8_reader_handles_short_inputs_and_bom_only() {
+        for (payload, expected) in [
+            (&b""[..], &b""[..]),
+            (&b"A"[..], &b"A"[..]),
+            (&b"AB"[..], &b"AB"[..]),
+            (&b"\xEF\xBB\xBF"[..], &b""[..]),
+            (&b"\xEF\xBB\xBFA"[..], &b"A"[..]),
+        ] {
+            for inner_chunk in 1..=4 {
+                for caller_chunk in 1..=4 {
+                    let output = read_strict_chunks(payload, inner_chunk, caller_chunk, false)
+                        .expect("read short strict UTF-8 input");
+                    assert_eq!(output, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strict_utf8_reader_rejects_invalid_and_incomplete_utf8_at_all_boundaries() {
+        let invalid_inputs: &[&[u8]] = &[
+            b"AB\xC3(C",
+            b"AB\xF0\x28\x8C\xBC",
+            b"AB\xF0\x9F\x98",
+            b"\xEF",
+            b"\xEF\xBB",
+        ];
+        for payload in invalid_inputs {
+            for inner_chunk in 1..=6 {
+                for caller_chunk in 1..=7 {
+                    let error = read_strict_chunks(payload, inner_chunk, caller_chunk, false)
+                        .expect_err("reject malformed strict UTF-8 input");
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strict_utf8_reader_only_strips_a_leading_bom() {
+        let payload = "ABC\u{feff}DEF".as_bytes();
+        for inner_chunk in 1..=5 {
+            for caller_chunk in 1..=6 {
+                let output = read_strict_chunks(payload, inner_chunk, caller_chunk, false)
+                    .expect("read UTF-8 containing an interior BOM");
+                assert_eq!(output, payload);
+            }
+        }
     }
 }

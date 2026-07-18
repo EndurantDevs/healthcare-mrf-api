@@ -159,6 +159,7 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
 from process.ptg_parts.ptg2_manifest_publish import (
     PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     _copy_price_atom_member_file,
+    _copy_price_set_summary_file,
     _copy_ptg2_manifest_price_atom_file,
     _create_ptg2_manifest_serving_stage_table,
     _ptg2_manifest_stage_table_name,
@@ -657,6 +658,77 @@ def _collect_manifest_copy_files(
     return copy_files_by_kind, emitted_rows_by_kind
 
 
+def _count_manifest_copy_sources(
+    successful_files: list[dict[str, Any]],
+    copy_kinds: Sequence[str],
+    *,
+    require_complete_sources: bool = False,
+) -> dict[str, int]:
+    """Count logical scanner sources, independent of worker/rotation shards."""
+
+    ordered_kinds = tuple(copy_kinds)
+    required_kinds = set(ordered_kinds)
+    source_count_by_kind = {kind: 0 for kind in ordered_kinds}
+    for file_index, file_summary in enumerate(successful_files):
+        summary_payload = (
+            file_summary.get("summary") if isinstance(file_summary, dict) else None
+        )
+        manifest_payload = (
+            summary_payload.get("manifest")
+            if isinstance(summary_payload, dict)
+            else None
+        )
+        copy_files_by_kind = (
+            manifest_payload.get("copy_files")
+            if isinstance(manifest_payload, dict)
+            else None
+        )
+        if not isinstance(copy_files_by_kind, dict):
+            copy_files_by_kind = {}
+        present_kinds: set[str] = set()
+        for kind in ordered_kinds:
+            if any(
+                isinstance(entry, dict)
+                and str(entry.get("path") or "").strip()
+                for entry in (copy_files_by_kind.get(kind) or ())
+            ):
+                present_kinds.add(kind)
+                source_count_by_kind[kind] += 1
+        try:
+            serving_rows = int(
+                (
+                    manifest_payload.get("serving_rows")
+                    if isinstance(manifest_payload, dict)
+                    else None
+                )
+                or (
+                    summary_payload.get("serving_rates")
+                    if isinstance(summary_payload, dict)
+                    else None
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            serving_rows = 0
+        if (
+            require_complete_sources
+            and (present_kinds or serving_rows > 0)
+            and present_kinds != required_kinds
+        ):
+            source_label = str(
+                file_summary.get("url")
+                or file_summary.get("file_id")
+                or f"index {file_index}"
+            )
+            missing_kinds = sorted(required_kinds - present_kinds)
+            raise RuntimeError(
+                "strict V3 scanner source "
+                f"{source_label!r} omitted required price COPY artifacts: "
+                + ", ".join(missing_kinds)
+            )
+    return source_count_by_kind
+
+
 def _collect_manifest_copy_entries(
     successful_files: list[dict[str, Any]],
     copy_kinds: Sequence[str],
@@ -683,6 +755,25 @@ def _collect_manifest_copy_entries(
                 seen_paths_by_kind[kind].add(path)
                 entries_by_kind[kind].append(dict(raw_entry))
     return entries_by_kind
+
+
+def _pending_strict_v3_copy_entries(
+    successful_files: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Register every strict-V3 scratch file for import-level failure cleanup."""
+
+    return _collect_manifest_copy_entries(
+        successful_files,
+        (
+            "serving_run",
+            "serving_code_dictionary",
+            "source_audit_witness",
+            "provider_set_metadata",
+            "price_atom",
+            "price_set_atom",
+            "price_set_summary",
+        ),
+    )
 
 
 async def _copy_manifest_files_direct_with_progress(
@@ -917,36 +1008,68 @@ async def _merge_and_copy_ptg2_manifest_files(
     successful_files: list[dict[str, Any]],
     manifest_stage_table: str,
 ) -> dict[str, Any]:
+    """Merge validated per-source price COPY families into the shared stage."""
+
     if _is_postgres_binary_v3_arch(_ptg2_snapshot_arch_from_env()):
-        copy_kinds = ("price_atom", "price_set_atom")
+        copy_kinds = ("price_atom", "price_set_atom", "price_set_summary")
         copy_files_by_kind, emitted_rows_by_kind = _collect_manifest_copy_files(
             successful_files,
             list(copy_kinds),
         )
-        if not any(copy_files_by_kind.values()):
-            return {"enabled": False, "reason": "no_strict_v3_price_copy_files"}
-        target_by_kind = {
-            "price_atom": _ptg2_manifest_support_stage_table(
-                manifest_stage_table,
-                "price_atom",
-            ),
-            "price_set_atom": _ptg2_manifest_support_stage_table(
-                manifest_stage_table,
-                "price_set_atom",
-            ),
-        }
-        copy_func_by_kind = {
-            "price_atom": _copy_ptg2_manifest_price_atom_file,
-            "price_set_atom": _copy_price_atom_member_file,
-        }
-        copy_report_map: dict[str, Any] = {
-            "enabled": True,
-            "strict_v3_price_only": True,
-            "kinds": {},
-            "emitted_rows": emitted_rows_by_kind,
-        }
-        active_kinds = [kind for kind in copy_kinds if copy_files_by_kind[kind]]
         try:
+            source_files_by_kind = _count_manifest_copy_sources(
+                successful_files,
+                copy_kinds,
+                require_complete_sources=True,
+            )
+            if len(set(source_files_by_kind.values())) > 1:
+                raise RuntimeError(
+                    "strict V3 price COPY artifact source counts disagree: "
+                    + json.dumps(source_files_by_kind, sort_keys=True)
+                )
+            if not any(copy_files_by_kind.values()):
+                return {
+                    "enabled": False,
+                    "reason": "no_strict_v3_price_copy_files",
+                    "source_files_by_kind": source_files_by_kind,
+                }
+            missing_kinds = [
+                kind for kind in copy_kinds if not copy_files_by_kind[kind]
+            ]
+            if missing_kinds:
+                raise RuntimeError(
+                    "strict V3 scanner omitted required price COPY artifacts: "
+                    + ", ".join(missing_kinds)
+                )
+            target_by_kind = {
+                "price_atom": _ptg2_manifest_support_stage_table(
+                    manifest_stage_table,
+                    "price_atom",
+                ),
+                "price_set_atom": _ptg2_manifest_support_stage_table(
+                    manifest_stage_table,
+                    "price_set_atom",
+                ),
+                "price_set_summary": _ptg2_manifest_support_stage_table(
+                    manifest_stage_table,
+                    "price_set_summary",
+                ),
+            }
+            copy_func_by_kind = {
+                "price_atom": _copy_ptg2_manifest_price_atom_file,
+                "price_set_atom": _copy_price_atom_member_file,
+                "price_set_summary": _copy_price_set_summary_file,
+            }
+            copy_report_map: dict[str, Any] = {
+                "enabled": True,
+                "strict_v3_price_only": True,
+                "kinds": {},
+                "emitted_rows": emitted_rows_by_kind,
+                "source_files_by_kind": source_files_by_kind,
+            }
+            active_kinds = [
+                kind for kind in copy_kinds if copy_files_by_kind[kind]
+            ]
             for completed_steps, kind in enumerate(active_kinds):
                 copy_report_map["kinds"][kind] = await _copy_manifest_files_direct_with_progress(
                     kind,
@@ -1041,6 +1164,7 @@ async def _parse_strict_v3_file(
         "source_audit_witness": [],
         "price_atom": [],
         "price_set_atom": [],
+        "price_set_summary": [],
         "provider_group_member": [],
         "provider_set_metadata": [],
     }
@@ -1060,15 +1184,42 @@ async def _parse_strict_v3_file(
         except Exception:
             return str(copy_file)
 
-    def _record_deferred_copy_file_once(kind: str, copy_file: Path, row_count: int) -> int:
+    def _record_deferred_copy_file_once(
+        kind: str,
+        copy_file: Path,
+        row_count: int,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> int:
         path_key = _copy_file_key(copy_file)
         seen_paths = deferred_copy_file_paths_by_kind.setdefault(kind, set())
         if path_key in seen_paths:
             return 0
         seen_paths.add(path_key)
-        deferred_copy_entries_by_kind[kind].append(
-            {"path": str(copy_file), "row_count": row_count}
-        )
+        copy_entry_by_field: dict[str, Any] = {
+            "path": str(copy_file),
+            "row_count": row_count,
+        }
+        if kind == "provider_set_metadata":
+            file_size = copy_file.stat().st_size
+            expected_size = int((metadata or {}).get("bytes") or 0)
+            if expected_size > 0 and expected_size != file_size:
+                raise RuntimeError(
+                    "strict V3 provider-set metadata size changed after scanner close"
+                )
+            digest = hashlib.sha256()
+            with copy_file.open("rb") as source_stream:
+                while chunk := source_stream.read(1024 * 1024):
+                    digest.update(chunk)
+            copy_entry_by_field.update(
+                {
+                    "bytes": file_size,
+                    "sha256": digest.hexdigest(),
+                    "format": "ptg2_v3_provider_set_metadata_copy",
+                    "version": 1,
+                    "final": bool((metadata or {}).get("final", True)),
+                }
+            )
+        deferred_copy_entries_by_kind[kind].append(copy_entry_by_field)
         return row_count
 
     def _manifest_copy_candidates(copy_path: Path) -> list[Path]:
@@ -1089,6 +1240,9 @@ async def _parse_strict_v3_file(
 
     manifest_price_atom_copy_path = _new_copy_path("ptg2_manifest_price_atom_")
     manifest_price_set_atom_copy_path = _new_copy_path("ptg2_manifest_price_set_atom_")
+    manifest_price_set_summary_copy_path = _new_copy_path(
+        "ptg2_manifest_price_set_summary_"
+    )
     manifest_provider_group_member_copy_path = _new_copy_path("ptg2_manifest_provider_group_member_")
     manifest_provider_set_metadata_copy_path = _new_copy_path(
         "ptg2_v3_provider_set_metadata_"
@@ -1126,6 +1280,7 @@ async def _parse_strict_v3_file(
         for copy_path in (
             manifest_price_atom_copy_path,
             manifest_price_set_atom_copy_path,
+            manifest_price_set_summary_copy_path,
             manifest_provider_group_member_copy_path,
             manifest_provider_set_metadata_copy_path,
         ):
@@ -1139,6 +1294,7 @@ async def _parse_strict_v3_file(
         if kind not in {
             "price_atom",
             "price_set_atom",
+            "price_set_summary",
             "provider_group_member",
             "provider_set_metadata",
         }:
@@ -1150,7 +1306,12 @@ async def _parse_strict_v3_file(
         copied_rows = int(copy_row.get("row_count") or 0)
         if copied_rows <= 0:
             copied_rows = _ptg2_copy_file_row_count(copy_file)
-        _record_deferred_copy_file_once(kind, copy_file, copied_rows)
+        _record_deferred_copy_file_once(
+            kind,
+            copy_file,
+            copied_rows,
+            metadata=copy_row,
+        )
 
     try:
         raw_source_sha256 = str(
@@ -1184,6 +1345,7 @@ async def _parse_strict_v3_file(
             manifest_price_forward_sidecar_path=None,
             manifest_price_atom_copy_path=manifest_price_atom_copy_path,
             manifest_price_set_atom_copy_path=manifest_price_set_atom_copy_path,
+            manifest_price_set_summary_copy_path=manifest_price_set_summary_copy_path,
             manifest_provider_group_member_copy_path=manifest_provider_group_member_copy_path,
             manifest_code_count_copy_path=None,
             manifest_provider_set_dictionary_copy_path=manifest_provider_set_metadata_copy_path,
@@ -1222,6 +1384,8 @@ async def _parse_strict_v3_file(
                 record_ready_manifest_file("price_atom", record_row)
             if record_kind == "manifest_price_set_atom_copy_file":
                 record_ready_manifest_file("price_set_atom", record_row)
+            if record_kind == "manifest_price_set_summary_copy_file":
+                record_ready_manifest_file("price_set_summary", record_row)
             if record_kind == "manifest_provider_group_member_copy_file":
                 record_ready_manifest_file("provider_group_member", record_row)
             if record_kind == "manifest_provider_set_dictionary_copy_file":
@@ -1231,6 +1395,7 @@ async def _parse_strict_v3_file(
         for copy_path, kind in (
             (manifest_price_atom_copy_path, "price_atom"),
             (manifest_price_set_atom_copy_path, "price_set_atom"),
+            (manifest_price_set_summary_copy_path, "price_set_summary"),
             (manifest_provider_group_member_copy_path, "provider_group_member"),
             (manifest_provider_set_metadata_copy_path, "provider_set_metadata"),
         ):
@@ -1245,6 +1410,7 @@ async def _parse_strict_v3_file(
         manifest_copy_paths = (
             manifest_price_atom_copy_path,
             manifest_price_set_atom_copy_path,
+            manifest_price_set_summary_copy_path,
             manifest_provider_group_member_copy_path,
             manifest_provider_set_metadata_copy_path,
         )
@@ -1356,6 +1522,107 @@ class _StageTimer:
 class _PendingStrictV3State:
     copy_entries_by_kind: dict[str, list[dict[str, Any]]]
     graph_artifacts_map: dict[str, Any]
+
+
+def _register_strict_v3_pending_file(
+    pending_state: _PendingStrictV3State,
+    file_summary: Mapping[str, Any],
+) -> None:
+    """Transfer one completed file's scratch ownership to import cleanup."""
+
+    incoming_entries = _pending_strict_v3_copy_entries(
+        [dict(file_summary)]
+    )
+    for kind, entries in incoming_entries.items():
+        pending_entries = pending_state.copy_entries_by_kind.setdefault(kind, [])
+        seen_paths = {
+            str(entry.get("path") or "").strip()
+            for entry in pending_entries
+            if isinstance(entry, Mapping)
+        }
+        for entry in entries:
+            path = str(entry.get("path") or "").strip()
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            pending_entries.append(dict(entry))
+
+    summary_payload = file_summary.get("summary")
+    manifest_payload = (
+        summary_payload.get("manifest")
+        if isinstance(summary_payload, Mapping)
+        else None
+    )
+    if not isinstance(manifest_payload, Mapping):
+        return
+    raw_sidecars = manifest_payload.get("sidecars") or ()
+    if isinstance(raw_sidecars, Mapping):
+        sidecar_entries = [
+            dict(entry) for entry in raw_sidecars.values() if isinstance(entry, Mapping)
+        ]
+    elif isinstance(raw_sidecars, Sequence) and not isinstance(
+        raw_sidecars, (str, bytes, bytearray)
+    ):
+        sidecar_entries = [
+            dict(entry) for entry in raw_sidecars if isinstance(entry, Mapping)
+        ]
+    else:
+        sidecar_entries = []
+    if not sidecar_entries:
+        raw_sidecar_paths = manifest_payload.get("sidecar_paths")
+        if isinstance(raw_sidecar_paths, Mapping):
+            sidecar_entries = [
+                {"name": str(name), "path": str(path)}
+                for name, path in raw_sidecar_paths.items()
+                if str(path or "").strip()
+            ]
+
+    pending_sidecars = pending_state.graph_artifacts_map.setdefault("sidecars", [])
+    if not isinstance(pending_sidecars, list):
+        pending_sidecars = []
+        pending_state.graph_artifacts_map["sidecars"] = pending_sidecars
+    seen_sidecar_paths = {
+        str(entry.get("path") or "").strip()
+        for entry in pending_sidecars
+        if isinstance(entry, Mapping)
+    }
+    for entry in sidecar_entries:
+        path = str(entry.get("path") or "").strip()
+        if not path or path in seen_sidecar_paths:
+            continue
+        seen_sidecar_paths.add(path)
+        pending_sidecars.append(entry)
+
+
+def _claim_strict_v3_file_scratch(
+    pending_state: _PendingStrictV3State,
+    file_result: PTG2FileProcessResult | None,
+) -> None:
+    """Claim completed-file scratch before its task result can be discarded."""
+
+    if file_result is None or not file_result.success or file_result.skipped:
+        return
+    _register_strict_v3_pending_file(pending_state, asdict(file_result))
+
+
+def _claim_strict_v3_file_result(
+    pending_state: _PendingStrictV3State,
+    file_result: PTG2FileProcessResult,
+    physical_identity: SharedPhysicalArtifactIdentity,
+    logical_artifact_metadata: Mapping[str, Any],
+) -> PTG2FileProcessResult:
+    """Keep completed scratch owned even when source-contract annotation fails."""
+
+    claimed_result = file_result
+    try:
+        claimed_result = _annotate_v3_file_result_source_identity(
+            file_result,
+            physical_identity,
+            logical_artifact_metadata,
+        )
+        return claimed_result
+    finally:
+        _claim_strict_v3_file_scratch(pending_state, claimed_result)
 
 
 def _toc_file_url_match_tokens(file_url_contains: list[str] | None) -> list[str]:
@@ -2757,6 +3024,7 @@ async def _resume_validated_candidate(
 _PTG2_MANIFEST_STAGE_SUPPORT_KINDS = (
     "price_atom",
     "price_set_atom",
+    "price_set_summary",
 )
 
 
@@ -3035,6 +3303,21 @@ def _annotate_v3_result_identity(
         source_run_contract_sha256=source_run_contract_sha256,
         scanner_summary=scanner_summary,
     )
+    provider_metadata_entries = _bind_v3_entry_identity(
+        copy_files.get("provider_set_metadata") or [],
+        identity_payload=identity_payload,
+        label="provider-set metadata",
+    )
+    for entry in provider_metadata_entries:
+        existing_digest = entry.setdefault(
+            "source_run_contract_sha256",
+            source_run_contract_sha256,
+        )
+        if existing_digest != source_run_contract_sha256:
+            raise RuntimeError(
+                "strict V3 provider-set metadata has a conflicting source-run contract"
+            )
+    copy_files["provider_set_metadata"] = provider_metadata_entries
     return file_result
 
 
@@ -4703,11 +4986,13 @@ async def _main_with_artifact_lease(
                         raw_artifact=downloaded.raw_artifact,
                         logical_artifact=downloaded.logical_artifact,
                     )
-                    return _annotate_v3_file_result_source_identity(
+                    file_result = _claim_strict_v3_file_result(
+                        pending_strict_v3,
                         file_result,
                         shared_physical_artifact_identity(downloaded),
                         shared_logical_artifact_metadata(downloaded),
                     )
+                    return file_result
                 return None
             finally:
                 reset_live_progress_context(token)
@@ -4979,14 +5264,8 @@ async def _main_with_artifact_lease(
                     "shared_layout_reused": shared_layout_reservation.reused,
                 }
             )
-        pending_strict_v3.copy_entries_by_kind = _collect_manifest_copy_entries(
-            successful_files,
-            (
-                "serving_run",
-                "serving_code_dictionary",
-                "source_audit_witness",
-                "provider_set_metadata",
-            ),
+        pending_strict_v3.copy_entries_by_kind = (
+            _pending_strict_v3_copy_entries(successful_files)
         )
         if failed_files:
             raise RuntimeError(
@@ -5110,6 +5389,15 @@ async def _main_with_artifact_lease(
                     code_dictionary_entries=code_dictionary_entries,
                     provider_set_metadata_entries=provider_set_metadata_entries,
                     source_audit_witness_entries=source_audit_witness_entries,
+                    price_set_summary_source_count=int(
+                        (
+                            manifest_merge_metrics_by_name.get(
+                                "source_files_by_kind"
+                            )
+                            or {}
+                        ).get("price_set_summary")
+                        or 0
+                    ),
                     expected_raw_source_sha256=tuple(
                         str(pair.get("raw_container_sha256") or "")
                         for pair in source_identity_traces

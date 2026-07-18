@@ -12,6 +12,10 @@ from process.ptg_parts import ptg2_manifest_publish
 from process.ptg_parts.domain import PTG2FileProcessResult
 from process.ptg_parts.ptg2_shared_publish import (
     _SHARED_BLOCK_STAGE_COLUMNS,
+    _upsert_shared_block_mappings,
+    _validate_shared_block_stage,
+    create_shared_block_stage,
+    publish_shared_block_stage,
     publish_shared_finalizer_dictionaries,
     shared_block_stage_name,
 )
@@ -67,8 +71,18 @@ def _provider_set_metadata_entries(tmp_path, *, row_count: int = 1):
     if row_count == 0:
         return ()
     path = tmp_path / "provider-set-metadata.copy"
-    path.write_text(f"{'01' * 16}\t{{}}\n", encoding="ascii")
-    return ({"path": str(path), "row_count": row_count},)
+    path.write_text(f"{'01' * 16}\t1\t{{}}\n", encoding="ascii")
+    payload = path.read_bytes()
+    return (
+        {
+            "path": str(path),
+            "row_count": row_count,
+            "bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "format": "ptg2_v3_provider_set_metadata_copy",
+            "version": 1,
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -85,6 +99,8 @@ async def test_strict_v3_stage_creates_only_price_inputs(monkeypatch):
     assert stage_table == "ptg2_manifest_stage_serving_strict_run"
     assert "ptg2_manifest_stage_price_atom_strict_run" in statements
     assert "ptg2_manifest_stage_price_set_atom_strict_run" in statements
+    assert "ptg2_manifest_stage_price_set_summary_strict_run" in statements
+    assert "minimum_negotiated_rate numeric NOT NULL" in statements
     for retired_kind in (
         "provider_group_member",
         "provider_npi_scope",
@@ -102,6 +118,7 @@ async def test_strict_v3_precopy_loads_only_price_inputs(tmp_path, monkeypatch):
         "manifest_lean_serving",
         "price_atom",
         "price_set_atom",
+        "price_set_summary",
         "provider_group_member",
         "provider_npi_scope",
         "code_count",
@@ -112,9 +129,15 @@ async def test_strict_v3_precopy_loads_only_price_inputs(tmp_path, monkeypatch):
         copy_files_by_kind[kind] = [{"path": str(path), "row_count": 3}]
     price_atom_copy = AsyncMock()
     price_set_atom_copy = AsyncMock()
+    price_set_summary_copy = AsyncMock()
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
     monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_price_atom_file", price_atom_copy)
     monkeypatch.setattr(process_ptg, "_copy_price_atom_member_file", price_set_atom_copy)
+    monkeypatch.setattr(
+        process_ptg,
+        "_copy_price_set_summary_file",
+        price_set_summary_copy,
+    )
 
     metrics = await process_ptg._merge_and_copy_ptg2_manifest_files(
         successful_files=[
@@ -124,14 +147,81 @@ async def test_strict_v3_precopy_loads_only_price_inputs(tmp_path, monkeypatch):
     )
 
     assert metrics["strict_v3_price_only"] is True
-    assert set(metrics["kinds"]) == {"price_atom", "price_set_atom"}
+    assert set(metrics["kinds"]) == {
+        "price_atom",
+        "price_set_atom",
+        "price_set_summary",
+    }
+    assert metrics["source_files_by_kind"]["price_set_summary"] == 1
     price_atom_copy.assert_awaited_once()
     price_set_atom_copy.assert_awaited_once()
+    price_set_summary_copy.assert_awaited_once()
     assert not hasattr(process_ptg, "_copy_lean_manifest_serving_file")
     assert not hasattr(process_ptg, "_copy_ptg2_manifest_provider_group_member_file")
     assert not (tmp_path / "price_atom.copy").exists()
     assert not (tmp_path / "price_set_atom.copy").exists()
+    assert not (tmp_path / "price_set_summary.copy").exists()
     assert (tmp_path / "manifest_lean_serving.copy").exists()
+
+
+@pytest.mark.asyncio
+async def test_strict_v3_precopy_missing_kind_still_cleans_present_price_files(
+    tmp_path,
+    monkeypatch,
+):
+    price_atom_path = tmp_path / "price-atom.copy"
+    price_set_atom_path = tmp_path / "price-set-atom.copy"
+    price_atom_path.write_bytes(b"atom")
+    price_set_atom_path.write_bytes(b"membership")
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
+
+    with pytest.raises(RuntimeError, match="price_set_summary"):
+        await process_ptg._merge_and_copy_ptg2_manifest_files(
+            successful_files=[
+                {
+                    "summary": {
+                        "manifest": {
+                            "copy_files": {
+                                "price_atom": [
+                                    {"path": str(price_atom_path), "row_count": 1}
+                                ],
+                                "price_set_atom": [
+                                    {"path": str(price_set_atom_path), "row_count": 1}
+                                ],
+                            }
+                        }
+                    }
+                }
+            ],
+            manifest_stage_table="ptg2_manifest_stage_serving_strict",
+        )
+
+    assert not price_atom_path.exists()
+    assert not price_set_atom_path.exists()
+
+
+def test_strict_v3_pending_cleanup_registers_price_copy_artifacts(tmp_path):
+    copy_entries_by_kind = {}
+    for kind in (
+        "serving_run",
+        "serving_code_dictionary",
+        "source_audit_witness",
+        "provider_set_metadata",
+        "price_atom",
+        "price_set_atom",
+        "price_set_summary",
+    ):
+        path = tmp_path / f"{kind}.copy"
+        path.write_bytes(b"scratch")
+        copy_entries_by_kind[kind] = [{"path": str(path), "row_count": 1}]
+
+    entries = process_ptg._pending_strict_v3_copy_entries(
+        [{"summary": {"manifest": {"copy_files": copy_entries_by_kind}}}]
+    )
+
+    assert set(entries) == set(copy_entries_by_kind)
+    process_ptg._cleanup_manifest_copy_entries(entries)
+    assert not any(tmp_path.iterdir())
 
 
 def test_shared_block_stage_name_is_bounded_and_identifier_safe():
@@ -154,6 +244,118 @@ def test_shared_block_binary_copy_contract_is_explicit_and_stable():
         "stored_byte_count",
         "payload",
     )
+
+
+@pytest.mark.asyncio
+async def test_shared_block_stage_allows_metadata_only_reused_rows(monkeypatch):
+    status = AsyncMock()
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", status)
+
+    await create_shared_block_stage(
+        schema_name="mrf",
+        stage_table="ptg2_v3_block_stage_proof",
+    )
+
+    ddl = status.await_args_list[1].args[0]
+    assert "payload bytea CHECK" in ddl
+    assert "payload IS NULL OR octet_length(payload) = stored_byte_count" in ddl
+
+
+@pytest.mark.asyncio
+async def test_shared_block_validation_defers_uniqueness_to_mutation_checks():
+    session = SimpleNamespace(scalar=AsyncMock(return_value=False))
+
+    await _validate_shared_block_stage(
+        session,
+        schema_name="mrf",
+        stage_table="ptg2_v3_block_stage_proof",
+    )
+
+    statement = str(session.scalar.await_args.args[0])
+    assert "format_version <> :format_version" in statement
+    assert "GROUP BY" not in statement
+    assert "block_hash" not in statement
+    assert session.scalar.await_args.args[1] == {
+        "format_version": ptg2_shared_publish.PTG2_V3_SHARED_FORMAT_VERSION
+    }
+    session.scalar.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shared_block_validation_still_rejects_incompatible_format_version():
+    session = SimpleNamespace(scalar=AsyncMock(return_value=True))
+
+    with pytest.raises(RuntimeError, match="incompatible format version"):
+        await _validate_shared_block_stage(
+            session,
+            schema_name="mrf",
+            stage_table="ptg2_v3_block_stage_proof",
+        )
+
+
+@pytest.mark.asyncio
+async def test_shared_block_mapping_upsert_combines_insert_and_conflict_check():
+    session = SimpleNamespace(
+        scalar=AsyncMock(side_effect=(False, 11)),
+        execute=AsyncMock(return_value=_OneRowResult((11, 11), rowcount=11)),
+    )
+
+    await _upsert_shared_block_mappings(
+        session,
+        schema_name="mrf",
+        stage_table="ptg2_v3_block_stage_proof",
+        snapshot_key=42,
+    )
+
+    statement = str(session.execute.await_args.args[0])
+    assert "canonical_mapping" not in statement
+    assert "applied_mapping" not in statement
+    assert "ON CONFLICT (snapshot_key, object_kind, block_key, fragment_no)" in statement
+    assert "DO NOTHING" in statement
+    assert "DO UPDATE" not in statement
+    assert 'FROM "mrf"."ptg2_v3_block_stage_proof"' in statement
+    assert session.execute.await_args.args[1] == {"snapshot_key": 42}
+    assert session.scalar.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_block_mapping_upsert_rejects_conflicting_existing_mapping():
+    session = SimpleNamespace(
+        scalar=AsyncMock(side_effect=(False, 11)),
+        execute=AsyncMock(return_value=_OneRowResult((11, 10), rowcount=10)),
+    )
+
+    with pytest.raises(RuntimeError, match="mapping conflicts"):
+        await _upsert_shared_block_mappings(
+            session,
+            schema_name="mrf",
+            stage_table="ptg2_v3_block_stage_proof",
+            snapshot_key=42,
+        )
+
+
+@pytest.mark.asyncio
+async def test_shared_block_mapping_upsert_uses_read_only_identical_retry_path():
+    session = SimpleNamespace(
+        scalar=AsyncMock(return_value=True),
+        execute=AsyncMock(return_value=_OneRowResult((11, 11))),
+    )
+
+    await _upsert_shared_block_mappings(
+        session,
+        schema_name="mrf",
+        stage_table="ptg2_v3_block_stage_proof",
+        snapshot_key=42,
+    )
+
+    statement = str(session.execute.await_args.args[0])
+    assert "existing_mapping AS MATERIALIZED" in statement
+    assert "WHERE NOT mapping_exists" in statement
+    assert "DO NOTHING" in statement
+    assert "DO UPDATE" not in statement
+    assert "existing_entry_count = entry_count" in statement
+    assert "existing_block_hash = block_hash" in statement
+    assert 'SELECT COUNT(*) FROM "mrf"."ptg2_v3_block_stage_proof"' in statement
 
 
 def _serving_run_entries(tmp_path):
@@ -320,14 +522,74 @@ async def test_finalizer_code_stage_uses_fixed_coverage_scope_id(tmp_path, monke
 
 
 class _OneRowResult:
-    def __init__(self, row):
+    def __init__(self, row, *, rowcount=None):
         self.row = row
+        self.rowcount = rowcount
 
     def one(self):
         return self.row
 
     def scalar(self):
         return self.row[0]
+
+
+@pytest.mark.asyncio
+async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatch):
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[None, _OneRowResult((3, 2, 30, 20, ["a_kind", "z_kind"]))]
+        ),
+        scalar=AsyncMock(return_value=False),
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_shared_layout_for_dense_write",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_validate_shared_block_stage",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_upsert_shared_block_mappings",
+        AsyncMock(),
+    )
+
+    publication = await publish_shared_block_stage(
+        schema_name="mrf",
+        stage_table="ptg2_v3_block_stage_proof",
+        snapshot_key=42,
+        build_token="build-42",
+    )
+
+    assert publication.object_kinds == ("a_kind", "z_kind")
+    assert publication.mapping_count == 3
+    assert publication.unique_block_count == 2
+    assert publication.logical_byte_count == 30
+    assert publication.stored_byte_count == 20
+    block_insert_sql = str(session.execute.await_args_list[0].args[0])
+    assert "NOT EXISTS" in block_insert_sql
+    assert "staged.payload IS NOT NULL" in block_insert_sql
+    assert "stored.block_hash = staged.block_hash" in block_insert_sql
+    assert "ON CONFLICT (block_hash) DO NOTHING" in block_insert_sql
+    mismatch_sql = str(session.scalar.await_args_list[-1].args[0])
+    assert "LEFT JOIN" in mismatch_sql
+    assert "stored.block_hash IS NULL" in mismatch_sql
+    assert "staged.payload IS NOT NULL" in mismatch_sql
+    aggregate_sql = str(session.execute.await_args_list[-1].args[0])
+    assert "COUNT(DISTINCT block_hash)" in aggregate_sql
+    assert "ARRAY_AGG(DISTINCT object_kind ORDER BY object_kind)" in aggregate_sql
+    assert "canonical_mapping" not in aggregate_sql
+    assert 'FROM "mrf"."ptg2_v3_block_stage_proof"' in aggregate_sql
 
 
 def _dictionary_summary(tmp_path, *, row_count: int) -> dict[str, object]:

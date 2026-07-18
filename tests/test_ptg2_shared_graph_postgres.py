@@ -123,6 +123,14 @@ async def test_real_postgres_graph_binary_copy_publish_and_reads(tmp_path):
             build_token="graph-smoke",
         )
         assert publication.block_count == conversion.block_count
+        assert publication.mapping_count == conversion.block_count
+        assert 0 < publication.unique_block_count <= publication.mapping_count
+        assert publication.object_kinds == (
+            "graph_group_npis_v1",
+            "graph_group_provider_sets_v1",
+            "graph_npi_groups_v1",
+            "graph_provider_set_groups_v1",
+        )
         assert publication.owner_count == conversion.owner_count
         assert publication.provider_group_count == 3
         assert publication.npi_count == 3

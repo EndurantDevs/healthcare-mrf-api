@@ -311,7 +311,6 @@ async def process_attributes(ctx, task):
         attr_obj_list = []
 
         count = 0
-        # return 1
         async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
                 plan_id, full_plan_id = _normalize_plan_ids(
@@ -382,7 +381,6 @@ async def process_benefits(ctx, task):
         attr_obj_list = []
 
         count = 0
-        # return 1
         async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
                 plan_id, full_plan_id = _normalize_plan_ids(
@@ -631,7 +629,6 @@ async def process_prices(ctx, task):
 
         #     obj_list = []
         #     for ws_name in xls_file.ws_names:
-        #         print(ws_name)
         #         if not ws_name.startswith('Transparency'):
         #             continue
         #         count = 0
@@ -753,8 +750,6 @@ async def process_state_attributes(ctx, task):
         attr_obj_list = []
 
         count = 0
-        # return 1
-
         async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
                 plan_id, full_plan_id = _normalize_plan_ids(

@@ -132,7 +132,7 @@ def test_scanner_indexes_reversed_top_level_arrays_for_parallel_workers(tmp_path
             "provider_references": fixture_payload["provider_references"],
         },
     )
-    copy_kinds = ("price_atom", "provider_group_member")
+    copy_kinds = ("price_atom", "price_set_summary", "provider_group_member")
     normal_scanner_run = _run_parallel_scanner(
         scanner_binary,
         normal_artifact,
@@ -190,7 +190,7 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
     )
     fake_rapidgzip = tmp_path / "rapidgzip-ranges"
     _write_fake_rapidgzip(fake_rapidgzip)
-    copy_kinds = ("price_atom", "provider_group_member")
+    copy_kinds = ("price_atom", "price_set_summary", "provider_group_member")
 
     runs_by_producer_count = {
         producer_count: _run_parallel_scanner(
@@ -220,6 +220,7 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
         for kind, copy_rows in runs_by_producer_count[4]["copy_rows"].items()
     } == {
         "price_atom": 168,
+        "price_set_summary": 168,
         "provider_group_member": 64,
     }
     source_rate_occurrences = sum(
@@ -267,6 +268,8 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
         assert summary["indexed_range_completed_object_count"] == 24
         assert summary["indexed_range_completed_rate_count"] == 24 * 8
         assert summary["indexed_range_completed_raw_bytes"] > 0
+        if producer_count == 4:
+            assert summary["raw_buffer_reuses"] > 0
         assert all(
             range_info["length"] > 0
             for range_info in summary["indexed_ranges"]
@@ -285,8 +288,6 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
                 summary["indexed_ranges"], summary["indexed_ranges"][1:]
             )
         )
-
-
 def test_delayed_indexed_range_emits_object_coverage_progress(tmp_path):
     """Verify delayed indexed range emits object coverage progress."""
     fixture_document = _mixed_inline_referenced_payload()
@@ -535,6 +536,7 @@ def test_indexed_workers_drain_bounded_rotation_events_before_join(tmp_path):
         copy_kinds=(
             "price_atom",
             "price_set_atom",
+            "price_set_summary",
             "provider_group_member",
         ),
         sidecar_kinds=("provider_forward", "provider_inverted"),
@@ -558,6 +560,7 @@ def test_indexed_workers_drain_bounded_rotation_events_before_join(tmp_path):
             "v3_serving_code_dictionary_file",
             "manifest_price_atom_copy_file",
             "manifest_price_set_atom_copy_file",
+            "manifest_price_set_summary_copy_file",
             "manifest_provider_group_member_copy_file",
             "manifest_provider_forward_sidecar_file",
             "manifest_provider_inverted_sidecar_file",

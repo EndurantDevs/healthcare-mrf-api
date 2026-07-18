@@ -20,11 +20,9 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
     PTG2_V3_SHARED_FORMAT_VERSION,
     PTG2_V3_SHARED_GENERATION,
-    SharedBlockReference,
     SharedLayoutBuildOwnership,
     lock_shared_layout_for_dense_write,
     shared_block_hash,
-    shared_mapping_digest,
     shared_support_digest,
 )
 from process.ptg_parts.ptg2_shared_graph import (
@@ -1275,7 +1273,7 @@ async def publish_shared_audit_sample(
     build_ownership: SharedLayoutBuildOwnership,
     logical_snapshot_id: str,
     finalizer_summary: Mapping[str, Any],
-    expected_blocks: Sequence[SharedBlockReference],
+    mapping_digest: bytes,
     core_support_digest: bytes,
     atom_key_bits: int,
     price_membership_block_span: int,
@@ -1285,11 +1283,13 @@ async def publish_shared_audit_sample(
     normalized_core_support = bytes(core_support_digest)
     if len(normalized_core_support) != 32:
         raise ValueError("strict V3 audit core support digest must contain 32 bytes")
+    normalized_mapping_digest = bytes(mapping_digest)
+    if len(normalized_mapping_digest) != 32:
+        raise ValueError("strict V3 audit mapping digest must contain 32 bytes")
     candidates, candidate_summary = load_audit_candidates(finalizer_summary)
     source_count = _integer(finalizer_summary.get("source_count"), "source_count")
-    mapping_digest = shared_mapping_digest(expected_blocks)
     core_layout_id = hashlib.sha256(
-        _CORE_LAYOUT_DOMAIN + mapping_digest + normalized_core_support
+        _CORE_LAYOUT_DOMAIN + normalized_mapping_digest + normalized_core_support
     ).digest()
     audit_occurrences, budget = await _persist_publication_occurrences(
         schema_name=schema_name,

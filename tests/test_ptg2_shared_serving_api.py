@@ -465,6 +465,8 @@ async def test_large_shared_dictionary_reads_only_the_requested_tail_fragment(
 
 @pytest.mark.asyncio
 async def test_shared_code_and_provider_support_queries_are_snapshot_scoped():
+    """Keep shared-code and provider support reads within one snapshot."""
+
     provider_session = _Session(
         [
             {
@@ -902,6 +904,8 @@ def _stub_candidate_audit_npi_without_address(
     provider_set_id,
     price_set_id,
 ):
+    """Stub an exact-NPI candidate audit without address matching."""
+
     _stub_exact_npi_price_rows(monkeypatch, provider_set_id, price_set_id)
     monkeypatch.setattr(
         ptg2_serving,

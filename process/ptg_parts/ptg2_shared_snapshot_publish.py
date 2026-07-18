@@ -7,6 +7,7 @@ import asyncio
 import os
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping
@@ -19,10 +20,11 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
     PTG2_V3_SHARED_BLOCK_LAYOUT,
     PTG2_V3_SHARED_GENERATION,
-    SharedBlockReference,
     SharedLayoutBuildOwnership,
+    SharedMappingDigestSummary,
     seal_shared_layout,
     shared_support_digest,
+    summarize_shared_snapshot_mappings,
     touch_shared_layout_build,
 )
 from process.ptg_parts.ptg2_shared_audit import (
@@ -39,7 +41,10 @@ from process.ptg_parts.rust_scanner import (
     convert_v3_provider_membership_shards_to_shared_graph_rust,
 )
 from process.ptg_parts.ptg2_shared_price import (
+    PTG2_V3_PRICE_KEY_ORDER,
     PreparedSharedPriceArtifacts,
+    PreparedSharedPriceKeyMap,
+    _await_cleanup_task,
     cleanup_prepared_shared_price_artifacts,
     export_shared_price_key_map,
     prepare_shared_price_artifacts,
@@ -86,10 +91,86 @@ _REQUIRED_OBJECT_KINDS = frozenset(
 class SharedSnapshotPublication:
     snapshot_key: int
     serving_index: Mapping[str, Any]
-    references: tuple[SharedBlockReference, ...]
+    object_kinds: tuple[str, ...]
+    mapping_count: int
+    unique_block_count: int
+    mapping_digest: bytes
     finalizer_summary: Mapping[str, Any]
     layout_reused_at_seal: bool
     stored_byte_count: int
+
+
+@dataclass(frozen=True)
+class _PreparedFinalizer:
+    """Finalizer output produced while independent price stages are still running."""
+
+    summary: Mapping[str, Any]
+    price_key_map_export_seconds: float
+    finalizer_seconds: float
+    overlap_wall_seconds: float
+
+
+@dataclass(frozen=True)
+class _PreparedPricePublication:
+    """Price blocks published while the Rust finalizer is still running."""
+
+    publication: Any
+    publish_seconds: float
+
+
+def _completed_prepared_price(
+    prepare_task: asyncio.Task[tuple[PreparedSharedPriceArtifacts, float]],
+) -> PreparedSharedPriceArtifacts | None:
+    """Return a successful completed preparation without masking its caller's error."""
+
+    if not prepare_task.done() or prepare_task.cancelled():
+        return None
+    try:
+        return prepare_task.result()[0]
+    except BaseException:
+        return None
+
+
+def _validate_authoritative_mapping_summary(
+    summary: SharedMappingDigestSummary,
+    *lane_publications: Any,
+) -> None:
+    """Cross-check bounded lane aggregates against the authoritative mapping set."""
+
+    lane_kinds: list[str] = []
+    expected_mapping_count = 0
+    expected_unique_block_count = 0
+    expected_logical_byte_count = 0
+    for publication in lane_publications:
+        publication_kinds = tuple(publication.object_kinds)
+        if publication_kinds != tuple(sorted(set(publication_kinds))):
+            raise RuntimeError("strict V3 publication lane returned invalid object kinds")
+        duplicate_kinds = set(lane_kinds).intersection(publication_kinds)
+        if duplicate_kinds:
+            raise RuntimeError(
+                "strict V3 publication lanes overlap object kinds: "
+                f"{sorted(duplicate_kinds)}"
+            )
+        lane_kinds.extend(publication_kinds)
+        expected_mapping_count += int(publication.mapping_count)
+        expected_unique_block_count += int(publication.unique_block_count)
+        expected_logical_byte_count += int(publication.logical_byte_count)
+
+    expected_kinds = tuple(sorted(lane_kinds))
+    expected_by_field = {
+        "object_kinds": expected_kinds,
+        "mapping_count": expected_mapping_count,
+        "unique_block_count": expected_unique_block_count,
+        "logical_byte_count": expected_logical_byte_count,
+    }
+    for field_name, expected_value in expected_by_field.items():
+        observed_value = getattr(summary, field_name)
+        if observed_value != expected_value:
+            raise RuntimeError(
+                "strict V3 authoritative mapping summary disagrees with publication "
+                f"lanes for {field_name}: expected {expected_value!r}, "
+                f"observed {observed_value!r}"
+            )
 
 
 async def _run_independent_publication_lanes(
@@ -111,6 +192,185 @@ async def _run_independent_publication_lanes(
         provider_graph_task.result(),
         price_task.result(),
         source_witness_task.result(),
+    )
+
+
+async def _export_price_map_and_run_finalizer(
+    *,
+    prepared_price_key: PreparedSharedPriceKeyMap,
+    raw_work_directory: str | Path,
+    serving_run_entries: Iterable[Mapping[str, Any]],
+    code_dictionary_entries: Iterable[Mapping[str, Any]],
+    provider_set_metadata_entries: Iterable[Mapping[str, Any]],
+    expected_source_identities: Iterable[
+        Mapping[str, Any] | SharedPhysicalArtifactIdentity
+    ],
+) -> _PreparedFinalizer:
+    """Export and finalize as soon as the independent price-key map is ready."""
+
+    overlap_started_at = time.monotonic()
+    stage_started_at = time.monotonic()
+    price_key_map_path = await export_shared_price_key_map(
+        prepared_price_key,
+        Path(raw_work_directory) / "price-key-map.copy",
+    )
+    price_key_map_export_seconds = time.monotonic() - stage_started_at
+    stage_started_at = time.monotonic()
+    finalizer_summary = await run_v3_direct_finalizer(
+        work_directory=raw_work_directory,
+        serving_run_entries=serving_run_entries,
+        code_dictionary_entries=code_dictionary_entries,
+        provider_set_metadata_entries=provider_set_metadata_entries,
+        expected_source_identities=expected_source_identities,
+        price_key_map_input=price_key_map_path,
+    )
+    return _PreparedFinalizer(
+        summary=dict(finalizer_summary),
+        price_key_map_export_seconds=price_key_map_export_seconds,
+        finalizer_seconds=time.monotonic() - stage_started_at,
+        overlap_wall_seconds=time.monotonic() - overlap_started_at,
+    )
+
+
+async def _prepare_price_with_early_finalizer(
+    *,
+    schema_name: str,
+    manifest_stage_table: str,
+    price_set_summary_source_count: int | None,
+    raw_work_directory: str | Path,
+    serving_run_entries: Iterable[Mapping[str, Any]],
+    code_dictionary_entries: Iterable[Mapping[str, Any]],
+    provider_set_metadata_entries: Iterable[Mapping[str, Any]],
+    expected_source_identities: Iterable[
+        Mapping[str, Any] | SharedPhysicalArtifactIdentity
+    ],
+    publish_prepared_price: Callable[
+        [PreparedSharedPriceArtifacts], Awaitable[Any]
+    ]
+    | None = None,
+) -> tuple[
+    PreparedSharedPriceArtifacts,
+    float,
+    _PreparedFinalizer | None,
+    _PreparedPricePublication | None,
+]:
+    """Prepare price stages and overlap the finalizer when early readiness exists."""
+
+    loop = asyncio.get_running_loop()
+    price_key_ready: asyncio.Future[PreparedSharedPriceKeyMap] = loop.create_future()
+
+    def notify_price_key_ready(prepared_key: PreparedSharedPriceKeyMap) -> None:
+        """Announce the single validated price-key map to the finalizer lane."""
+
+        if price_key_ready.done():
+            raise RuntimeError("strict V3 price-key stage reported readiness twice")
+        price_key_ready.set_result(prepared_key)
+
+    price_prepare_started_at = time.monotonic()
+
+    async def prepare_price() -> tuple[PreparedSharedPriceArtifacts, float]:
+        """Prepare price artifacts and retain their measured wall time."""
+
+        prepared = await prepare_shared_price_artifacts(
+            schema_name=schema_name,
+            manifest_stage_table=manifest_stage_table,
+            price_set_summary_source_count=price_set_summary_source_count,
+            price_key_ready=notify_price_key_ready,
+        )
+        return prepared, time.monotonic() - price_prepare_started_at
+
+    prepare_task = asyncio.create_task(prepare_price())
+    try:
+        completed, _pending = await asyncio.wait(
+            (prepare_task, price_key_ready),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except BaseException:
+        prepare_task.cancel()
+        await _await_cleanup_task(
+            asyncio.gather(prepare_task, return_exceptions=True)
+        )
+        prepared_after_cancellation = _completed_prepared_price(prepare_task)
+        if prepared_after_cancellation is not None:
+            await _await_cleanup_task(
+                asyncio.create_task(
+                    cleanup_prepared_shared_price_artifacts(
+                        prepared_after_cancellation
+                    )
+                )
+            )
+        if not price_key_ready.done():
+            price_key_ready.cancel()
+        raise
+    if price_key_ready not in completed:
+        prepared, price_prepare_seconds = await prepare_task
+        prepared_price_publication = None
+        if publish_prepared_price is not None:
+            price_publish_started_at = time.monotonic()
+            prepared_price_publication = _PreparedPricePublication(
+                publication=await publish_prepared_price(prepared),
+                publish_seconds=time.monotonic() - price_publish_started_at,
+            )
+        return prepared, price_prepare_seconds, None, prepared_price_publication
+
+    finalizer_task = asyncio.create_task(
+        _export_price_map_and_run_finalizer(
+            prepared_price_key=price_key_ready.result(),
+            raw_work_directory=raw_work_directory,
+            serving_run_entries=serving_run_entries,
+            code_dictionary_entries=code_dictionary_entries,
+            provider_set_metadata_entries=provider_set_metadata_entries,
+            expected_source_identities=expected_source_identities,
+        )
+    )
+    early_price_task: asyncio.Task[_PreparedPricePublication] | None = None
+    if publish_prepared_price is not None:
+
+        async def publish_after_price_preparation() -> _PreparedPricePublication:
+            """Publish prepared price blocks while the finalizer remains active."""
+
+            prepared, _price_prepare_seconds = await prepare_task
+            price_publish_started_at = time.monotonic()
+            return _PreparedPricePublication(
+                publication=await publish_prepared_price(prepared),
+                publish_seconds=time.monotonic() - price_publish_started_at,
+            )
+
+        early_price_task = asyncio.create_task(publish_after_price_preparation())
+    try:
+        gathered = await asyncio.gather(
+            prepare_task,
+            finalizer_task,
+            *([early_price_task] if early_price_task is not None else []),
+        )
+    except BaseException:
+        active_tasks = tuple(
+            task
+            for task in (prepare_task, finalizer_task, early_price_task)
+            if task is not None
+        )
+        for task in active_tasks:
+            task.cancel()
+        await _await_cleanup_task(
+            asyncio.gather(*active_tasks, return_exceptions=True)
+        )
+        prepared_after_failure = _completed_prepared_price(prepare_task)
+        if prepared_after_failure is not None:
+            await _await_cleanup_task(
+                asyncio.create_task(
+                    cleanup_prepared_shared_price_artifacts(prepared_after_failure)
+                )
+            )
+        raise
+    prepare_result = gathered[0]
+    prepared_finalizer = gathered[1]
+    prepared_price_publication = gathered[2] if early_price_task is not None else None
+    prepared, price_prepare_seconds = prepare_result
+    return (
+        prepared,
+        price_prepare_seconds,
+        prepared_finalizer,
+        prepared_price_publication,
     )
 
 
@@ -601,6 +861,9 @@ async def _publish_strict_shared_v3_layout_prepared(
     publication_started_at: float,
     price_prepare_seconds: float,
     scratch_parent: str | Path | None = None,
+    prepared_work_directory: str | Path | None = None,
+    prepared_finalizer: _PreparedFinalizer | None = None,
+    prepared_price_publication: _PreparedPricePublication | None = None,
 ) -> SharedSnapshotPublication:
     """Finalize, validate, publish, and atomically seal one physical layout."""
 
@@ -636,27 +899,50 @@ async def _publish_strict_shared_v3_layout_prepared(
 
     await touch_build()
 
-    with tempfile.TemporaryDirectory(
-        prefix="ptg2-v3-shared-publish-",
-        dir=str(scratch_parent) if scratch_parent is not None else None,
-    ) as raw_work_directory:
-        stage_started_at = time.monotonic()
-        price_key_map_path = await export_shared_price_key_map(
-            prepared_price,
-            Path(raw_work_directory) / "price-key-map.copy",
+    work_directory_context = (
+        tempfile.TemporaryDirectory(
+            prefix="ptg2-v3-shared-publish-",
+            dir=str(scratch_parent) if scratch_parent is not None else None,
         )
-        record_stage("price_key_map_export", stage_started_at)
-        stage_started_at = time.monotonic()
-        finalizer_summary = await run_v3_direct_finalizer(
-            work_directory=raw_work_directory,
-            serving_run_entries=serving_run_entries,
-            code_dictionary_entries=code_dictionary_entries,
-            expected_source_identities=expected_source_identities,
-            price_key_map_input=price_key_map_path,
-        )
-        record_stage("finalizer", stage_started_at)
+        if prepared_work_directory is None
+        else nullcontext(str(prepared_work_directory))
+    )
+    with work_directory_context as raw_work_directory:
+        if prepared_finalizer is None:
+            stage_started_at = time.monotonic()
+            price_key_map_path = await export_shared_price_key_map(
+                prepared_price,
+                Path(raw_work_directory) / "price-key-map.copy",
+            )
+            record_stage("price_key_map_export", stage_started_at)
+            stage_started_at = time.monotonic()
+            finalizer_summary_by_field = await run_v3_direct_finalizer(
+                work_directory=raw_work_directory,
+                serving_run_entries=serving_run_entries,
+                code_dictionary_entries=code_dictionary_entries,
+                provider_set_metadata_entries=provider_set_metadata_entries,
+                expected_source_identities=expected_source_identities,
+                price_key_map_input=price_key_map_path,
+            )
+            record_stage("finalizer", stage_started_at)
+        else:
+            finalizer_summary_by_field = dict(prepared_finalizer.summary)
+            publication_timing_map.update(
+                {
+                    "price_key_map_export_seconds": float(
+                        prepared_finalizer.price_key_map_export_seconds
+                    ),
+                    "finalizer_seconds": float(prepared_finalizer.finalizer_seconds),
+                    "price_key_ready_finalizer_wall_seconds": float(
+                        prepared_finalizer.overlap_wall_seconds
+                    ),
+                }
+            )
         await touch_build()
-        finalizer_blocks = _mapping(finalizer_summary.get("blocks"), "blocks")
+        finalizer_blocks = _mapping(
+            finalizer_summary_by_field.get("blocks"),
+            "blocks",
+        )
         serving_block_summary = _mapping(
             finalizer_blocks.get("serving"), "serving blocks"
         )
@@ -666,7 +952,7 @@ async def _publish_strict_shared_v3_layout_prepared(
         )
         stage_started_at = time.monotonic()
         dictionary_publication = await publish_shared_finalizer_dictionaries(
-            dict(finalizer_summary),
+            dict(finalizer_summary_by_field),
             schema_name=schema_name,
             snapshot_key=int(reserved_snapshot_key),
             build_token=build_token,
@@ -702,7 +988,7 @@ async def _publish_strict_shared_v3_layout_prepared(
             )
             try:
                 await copy_shared_block_binary_file(
-                    _output_file(finalizer_summary, serving_block_summary),
+                    _output_file(finalizer_summary_by_field, serving_block_summary),
                     schema_name=schema_name,
                     stage_table=block_stage,
                     expected_copy_bytes=_integer(
@@ -714,7 +1000,7 @@ async def _publish_strict_shared_v3_layout_prepared(
                     ),
                 )
                 await copy_shared_block_binary_file(
-                    _output_file(finalizer_summary, price_block_summary),
+                    _output_file(finalizer_summary_by_field, price_block_summary),
                     schema_name=schema_name,
                     stage_table=block_stage,
                     expected_copy_bytes=_integer(
@@ -752,12 +1038,31 @@ async def _publish_strict_shared_v3_layout_prepared(
             finally:
                 record_stage("provider_graph_publish", stage_started_at)
 
-        dense_keys = _mapping(finalizer_summary.get("dense_keys"), "dense keys")
+        dense_keys = _mapping(
+            finalizer_summary_by_field.get("dense_keys"),
+            "dense keys",
+        )
         price_dense = _mapping(dense_keys.get("price"), "dense price keys")
+        expected_price_set_count = _integer(
+            price_dense.get("count"), "price key count"
+        )
+        expected_price_key_order = str(price_dense.get("ordering") or "")
+        if (
+            prepared_price.price_set_count != expected_price_set_count
+            or expected_price_key_order != PTG2_V3_PRICE_KEY_ORDER
+        ):
+            raise RuntimeError(
+                "strict V3 finalizer price keys disagree with prepared price publication"
+            )
 
         async def publish_price() -> Any:
             """Publish dense price dictionaries and membership blocks."""
 
+            if prepared_price_publication is not None:
+                publication_timing_map["price_publish_seconds"] = float(
+                    prepared_price_publication.publish_seconds
+                )
+                return prepared_price_publication.publication
             stage_started_at = time.monotonic()
             try:
                 return await publish_shared_price_artifacts(
@@ -765,10 +1070,8 @@ async def _publish_strict_shared_v3_layout_prepared(
                     manifest_stage_table=manifest_stage_table,
                     snapshot_key=int(reserved_snapshot_key),
                     build_token=build_token,
-                    expected_price_set_count=_integer(
-                        price_dense.get("count"), "price key count"
-                    ),
-                    expected_price_key_order=str(price_dense.get("ordering") or ""),
+                    expected_price_set_count=expected_price_set_count,
+                    expected_price_key_order=expected_price_key_order,
                     prepared=prepared_price,
                 )
             finally:
@@ -811,14 +1114,21 @@ async def _publish_strict_shared_v3_layout_prepared(
             independent_publish_started_at,
         )
         await touch_build()
-        references = tuple(
-            [
-                *finalizer_block_publication.references,
-                *graph_publication.references,
-                *price_publication.references,
-            ]
+        stage_started_at = time.monotonic()
+        async with db.transaction() as session:
+            mapping_summary = await summarize_shared_snapshot_mappings(
+                session,
+                schema_name=schema_name,
+                snapshot_key=int(reserved_snapshot_key),
+            )
+        record_stage("mapping_summary", stage_started_at)
+        _validate_authoritative_mapping_summary(
+            mapping_summary,
+            finalizer_block_publication,
+            graph_publication,
+            price_publication,
         )
-        observed_kinds = {reference.object_kind for reference in references}
+        observed_kinds = set(mapping_summary.object_kinds)
         missing_kinds = _REQUIRED_OBJECT_KINDS - observed_kinds
         if missing_kinds:
             raise RuntimeError(
@@ -852,8 +1162,8 @@ async def _publish_strict_shared_v3_layout_prepared(
                 build_token=build_token,
             ),
             logical_snapshot_id=str(logical_snapshot_id),
-            finalizer_summary=finalizer_summary,
-            expected_blocks=references,
+            finalizer_summary=finalizer_summary_by_field,
+            mapping_digest=mapping_summary.mapping_digest,
             core_support_digest=core_support_digest,
             atom_key_bits=int(price_publication.atom_key_bits),
             price_membership_block_span=price_membership_block_span,
@@ -876,7 +1186,7 @@ async def _publish_strict_shared_v3_layout_prepared(
         provisional_serving_index = _physical_serving_index(
             snapshot_key=int(reserved_snapshot_key),
             coverage_scope_id=coverage_scope_id,
-            finalizer_summary=finalizer_summary,
+            finalizer_summary=finalizer_summary_by_field,
             price_publication=price_publication,
             graph_publication=graph_publication,
             code_count=dictionary_publication.code_count,
@@ -896,7 +1206,7 @@ async def _publish_strict_shared_v3_layout_prepared(
                 schema_name=schema_name,
                 snapshot_key=int(reserved_snapshot_key),
                 build_token=str(build_token),
-                expected_blocks=references,
+                expected_summary=mapping_summary,
                 support_digest=support_digest,
                 layout_manifest={"serving_index": provisional_serving_index},
             )
@@ -924,8 +1234,11 @@ async def _publish_strict_shared_v3_layout_prepared(
         return SharedSnapshotPublication(
             snapshot_key=int(sealed.snapshot_key),
             serving_index=serving_index,
-            references=references,
-            finalizer_summary=dict(finalizer_summary),
+            object_kinds=mapping_summary.object_kinds,
+            mapping_count=mapping_summary.mapping_count,
+            unique_block_count=mapping_summary.unique_block_count,
+            mapping_digest=mapping_summary.mapping_digest,
+            finalizer_summary=dict(finalizer_summary_by_field),
             layout_reused_at_seal=bool(sealed.reused),
             stored_byte_count=stored_byte_count,
         )
@@ -946,6 +1259,7 @@ async def publish_strict_shared_v3_layout(
     code_dictionary_entries: Iterable[Mapping[str, Any]],
     provider_set_metadata_entries: Iterable[Mapping[str, Any]],
     source_audit_witness_entries: Iterable[Mapping[str, Any]],
+    price_set_summary_source_count: int | None = None,
     expected_raw_source_sha256: Iterable[str],
     graph_artifact_entries: Iterable[dict[str, Any]],
     provider_identifier_quarantine: Mapping[str, Any],
@@ -953,6 +1267,10 @@ async def publish_strict_shared_v3_layout(
 ) -> SharedSnapshotPublication:
     """Prepare exact price ranks once, then publish and clean every temporary map."""
 
+    serving_run_entries = tuple(serving_run_entries)
+    code_dictionary_entries = tuple(code_dictionary_entries)
+    provider_set_metadata_entries = tuple(provider_set_metadata_entries)
+    expected_source_identities = tuple(expected_source_identities)
     publication_started_at = time.monotonic()
     configured_schema = str(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf").strip()
     if str(schema_name).strip() != configured_schema:
@@ -966,35 +1284,76 @@ async def publish_strict_shared_v3_layout(
             snapshot_key=int(reserved_snapshot_key),
             build_token=str(build_token),
         )
-    price_prepare_started_at = time.monotonic()
-    prepared_price = await prepare_shared_price_artifacts(
-        schema_name=schema_name,
-        manifest_stage_table=manifest_stage_table,
-    )
-    price_prepare_seconds = time.monotonic() - price_prepare_started_at
-    try:
-        return await _publish_strict_shared_v3_layout_prepared(
+    with tempfile.TemporaryDirectory(
+        prefix="ptg2-v3-shared-publish-",
+        dir=str(scratch_parent) if scratch_parent is not None else None,
+    ) as raw_work_directory:
+        async def publish_prepared_price_early(
+            prepared: PreparedSharedPriceArtifacts,
+        ) -> Any:
+            """Publish price blocks while the independent finalizer is active."""
+
+            return await publish_shared_price_artifacts(
+                schema_name=schema_name,
+                manifest_stage_table=manifest_stage_table,
+                snapshot_key=int(reserved_snapshot_key),
+                build_token=build_token,
+                expected_price_set_count=int(prepared.price_set_count),
+                expected_price_key_order=PTG2_V3_PRICE_KEY_ORDER,
+                prepared=prepared,
+            )
+
+        (
+            prepared_price,
+            price_prepare_seconds,
+            prepared_finalizer,
+            prepared_price_publication,
+        ) = await _prepare_price_with_early_finalizer(
             schema_name=schema_name,
             manifest_stage_table=manifest_stage_table,
-            reserved_snapshot_key=int(reserved_snapshot_key),
-            build_token=build_token,
-            expected_coverage_scope_id=expected_coverage_scope_id,
-            logical_snapshot_id=logical_snapshot_id,
-            expected_source_identities=expected_source_identities,
+            price_set_summary_source_count=price_set_summary_source_count,
+            raw_work_directory=raw_work_directory,
             serving_run_entries=serving_run_entries,
             code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
-            source_audit_witness_entries=source_audit_witness_entries,
-            expected_raw_source_sha256=expected_raw_source_sha256,
-            graph_artifact_entries=graph_artifact_entries,
-            provider_identifier_quarantine=provider_identifier_quarantine,
-            prepared_price=prepared_price,
-            publication_started_at=publication_started_at,
-            price_prepare_seconds=price_prepare_seconds,
-            scratch_parent=scratch_parent,
+            expected_source_identities=expected_source_identities,
+            publish_prepared_price=publish_prepared_price_early,
         )
-    finally:
-        await cleanup_prepared_shared_price_artifacts(prepared_price)
+        try:
+            publication = await _publish_strict_shared_v3_layout_prepared(
+                schema_name=schema_name,
+                manifest_stage_table=manifest_stage_table,
+                reserved_snapshot_key=int(reserved_snapshot_key),
+                build_token=build_token,
+                expected_coverage_scope_id=expected_coverage_scope_id,
+                logical_snapshot_id=logical_snapshot_id,
+                expected_source_identities=expected_source_identities,
+                serving_run_entries=serving_run_entries,
+                code_dictionary_entries=code_dictionary_entries,
+                provider_set_metadata_entries=provider_set_metadata_entries,
+                source_audit_witness_entries=source_audit_witness_entries,
+                expected_raw_source_sha256=expected_raw_source_sha256,
+                graph_artifact_entries=graph_artifact_entries,
+                provider_identifier_quarantine=provider_identifier_quarantine,
+                prepared_price=prepared_price,
+                publication_started_at=publication_started_at,
+                price_prepare_seconds=price_prepare_seconds,
+                scratch_parent=scratch_parent,
+                prepared_work_directory=raw_work_directory,
+                prepared_finalizer=prepared_finalizer,
+                prepared_price_publication=prepared_price_publication,
+            )
+        except BaseException:
+            cleanup_task = asyncio.create_task(
+                cleanup_prepared_shared_price_artifacts(prepared_price)
+            )
+            await _await_cleanup_task(cleanup_task)
+            raise
+        cleanup_task = asyncio.create_task(
+            cleanup_prepared_shared_price_artifacts(prepared_price)
+        )
+        await _await_cleanup_task(cleanup_task, propagate_cancellation=True)
+        return publication
 
 
 __all__ = [

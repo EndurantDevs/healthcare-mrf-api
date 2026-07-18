@@ -210,6 +210,10 @@ PTG2_MANIFEST_PRICE_SET_ATOM_COLUMNS = [
     "price_set_global_id_128",
     "price_atom_global_id_128",
 ]
+PTG2_MANIFEST_PRICE_SET_SUMMARY_COLUMNS = [
+    "price_set_global_id_128",
+    "minimum_negotiated_rate",
+]
 PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COLUMNS = [
     "provider_group_global_id_128",
     "npi",
@@ -403,7 +407,7 @@ def _ptg2_manifest_support_stage_table(serving_stage_table: str, kind: str) -> s
 
 
 async def _create_ptg2_manifest_serving_stage_table(token: str) -> str:
-    """Create only the two PostgreSQL stages consumed by strict V3 publish."""
+    """Create the PostgreSQL stages consumed by strict V3 publish."""
 
     if _ptg2_manifest_snapshot_arch() != PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3:
         raise RuntimeError("only postgres_binary_v3 staging is supported")
@@ -412,6 +416,7 @@ async def _create_ptg2_manifest_serving_stage_table(token: str) -> str:
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
     await _create_ptg2_manifest_price_atom_stage_table(stage_table)
     await _create_price_atom_member_stage_table(stage_table)
+    await _create_price_set_summary_stage_table(stage_table)
     return stage_table
 
 
@@ -450,6 +455,28 @@ async def _create_price_atom_member_stage_table(serving_stage_table: str) -> str
         CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
             price_set_global_id_128 {id_type} NOT NULL,
             price_atom_global_id_128 {id_type} NOT NULL
+        );
+        """
+    )
+    return stage_table
+
+
+async def _create_price_set_summary_stage_table(serving_stage_table: str) -> str:
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    stage_table = _ptg2_manifest_support_stage_table(
+        serving_stage_table,
+        "price_set_summary",
+    )
+    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    id_type = _ptg2_id_sql_type()
+    await db.status(
+        f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};"
+    )
+    await db.status(
+        f"""
+        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
+            price_set_global_id_128 {id_type} NOT NULL,
+            minimum_negotiated_rate numeric NOT NULL
         );
         """
     )
@@ -577,6 +604,14 @@ async def _copy_ptg2_manifest_price_atom_file(copy_path: Path, *, target_table: 
 
 async def _copy_price_atom_member_file(copy_path: Path, *, target_table: str) -> None:
     await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PRICE_SET_ATOM_COLUMNS)
+
+
+async def _copy_price_set_summary_file(copy_path: Path, *, target_table: str) -> None:
+    await _copy_ptg2_manifest_file(
+        copy_path,
+        target_table=target_table,
+        columns=PTG2_MANIFEST_PRICE_SET_SUMMARY_COLUMNS,
+    )
 
 
 async def _copy_ptg2_manifest_provider_group_member_file(copy_path: Path, *, target_table: str) -> None:
@@ -1985,7 +2020,7 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} CASCADE;")
     await db.status(
         f"""
-        CREATE TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} AS
+        CREATE {temporary_storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} AS
         WITH dictionary_source AS (
             SELECT 'negotiated_type'::varchar(64) AS attr_kind,
                    negotiated_type::text AS text_value,
@@ -2034,15 +2069,17 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
         SELECT
             attr_kind,
             attr_key,
+            text_value,
+            text_array,
             CASE
                 WHEN attr_kind IN ('service_code', 'billing_code_modifier') THEN NULL
-                WHEN text_value IS NULL THEN 'NULL'
-                ELSE 'TEXT:' || md5(text_value)
+                WHEN text_value IS NULL THEN 0::bigint
+                ELSE hashtextextended(text_value, 0)
             END AS text_lookup_key,
             CASE
                 WHEN attr_kind NOT IN ('service_code', 'billing_code_modifier') THEN NULL
-                WHEN text_array IS NULL THEN 'NULL'
-                ELSE 'ARRAY:' || md5(to_json(text_array)::text)
+                WHEN text_array IS NULL THEN 0::bigint
+                ELSE hash_array_extended(text_array, 0)
             END AS array_lookup_key
         FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)};
         """
@@ -2101,8 +2138,6 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
     select_columns = [
         f"price_atom.price_atom_global_id_128::{id_type} AS price_atom_global_id_128",
         "price_atom.negotiated_rate::text AS negotiated_rate",
-        "NULLIF(BTRIM(price_atom.negotiated_rate::text), '')::numeric "
-        "AS negotiated_rate_numeric",
     ]
     join_sql_parts: list[str] = []
     dictionary_join_specs = [
@@ -2119,25 +2154,28 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
         if key_column in constant_key_by_column:
             continue
         select_columns.append(f"{attr_kind}.attr_key::integer AS {key_column}")
-        lookup_prefix = "ARRAY" if lookup_column == "array_lookup_key" else "TEXT"
+        is_array_lookup = lookup_column == "array_lookup_key"
         source_lookup_expr = (
-            f"to_json(price_atom.{source_column})::text"
-            if lookup_column == "array_lookup_key"
-            else f"price_atom.{source_column}"
+            f"hash_array_extended(price_atom.{source_column}, 0)"
+            if is_array_lookup
+            else f"hashtextextended(price_atom.{source_column}, 0)"
         )
+        dictionary_value_column = "text_array" if is_array_lookup else "text_value"
         join_sql_parts.append(
             f"""
             JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} {attr_kind}
               ON {attr_kind}.attr_kind = '{attr_kind}'
              AND {attr_kind}.{lookup_column} = CASE
-                    WHEN price_atom.{source_column} IS NULL THEN 'NULL'
-                    ELSE '{lookup_prefix}:' || md5({source_lookup_expr})
+                    WHEN price_atom.{source_column} IS NULL THEN 0::bigint
+                    ELSE {source_lookup_expr}
                  END
+             AND {attr_kind}.{dictionary_value_column}
+                    IS NOT DISTINCT FROM price_atom.{source_column}
             """
         )
     await db.status(
         f"""
-        CREATE TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)} AS
+        CREATE {temporary_storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)} AS
         SELECT
             {", ".join(select_columns)}
         FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)} price_atom

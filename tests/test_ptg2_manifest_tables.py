@@ -71,6 +71,7 @@ def strict_serving_index(snapshot_key=41):
         "audit_sample": audit_sample_map,
         "serving_binary": {
             "format": "postgres_binary_v3",
+            "assigned_encoder": {"provider_shard_span": 8192},
             "price_set_atom_memberships_v3": {"block_span": 512},
             "price_atoms_v3": {"block_span": 512},
             "price_dictionary": {
@@ -185,6 +186,7 @@ async def test_snapshot_serving_tables_reads_strict_shared_v3_contract():
     assert tables.atom_key_block_span == 512
     assert tables.price_dictionary_item_count == 29_000_000
     assert tables.price_dictionary_block_bytes == 65_536
+    assert tables.provider_shard_span == 8192
     assert tables.source_count == 2
     assert tables.source_set == strict_serving_index()["source_set"]
     assert tables.database_evidence["server_version_num"] == 160004

@@ -266,7 +266,7 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
     monkeypatch.setattr(process_initial, "make_class", lambda *_args, **_kwargs: SimpleNamespace())
 
     redis = FakeRedis()
-    ctx = {
+    context_by_field = {
         "redis": redis,
         "context": {
             "import_date": "20260613",
@@ -276,11 +276,11 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
     }
 
     await process_initial.process_json_index(
-        ctx,
+        context_by_field,
         {
             "url": "https://example.test/index.json",
             "issuer_array": [11111, 22222],
-            "context": ctx["context"],
+            "context": context_by_field["context"],
         },
     )
 
@@ -357,7 +357,7 @@ async def test_process_json_index_test_limit_counts_unique_registered_jobs(monke
     monkeypatch.setattr(process_initial, "make_class", lambda *_args, **_kwargs: SimpleNamespace())
 
     redis = FakeRedis()
-    ctx = {
+    context_by_field = {
         "redis": redis,
         "context": {
             "import_date": "20260613",
@@ -367,11 +367,11 @@ async def test_process_json_index_test_limit_counts_unique_registered_jobs(monke
     }
 
     await process_initial.process_json_index(
-        ctx,
+        context_by_field,
         {
             "url": "https://example.test/index.json",
             "issuer_array": [11111],
-            "context": ctx["context"],
+            "context": context_by_field["context"],
         },
     )
 
@@ -508,7 +508,7 @@ async def test_process_json_index_marks_terminal_parse_error_done(monkeypatch):
     monkeypatch.setattr(process_initial, "log_error", AsyncMock())
 
     redis = FakeRedis()
-    ctx = {
+    context_by_field = {
         "redis": redis,
         "context": {
             "import_date": "20260613",
@@ -518,11 +518,11 @@ async def test_process_json_index_marks_terminal_parse_error_done(monkeypatch):
     }
 
     await process_initial.process_json_index(
-        ctx,
+        context_by_field,
         {
             "url": "https://example.test/bad-index.json",
             "issuer_array": [11111],
-            "context": ctx["context"],
+            "context": context_by_field["context"],
         },
     )
 
@@ -606,7 +606,7 @@ async def test_mrf_shutdown_requeues_while_parser_jobs_run(monkeypatch):
         ),
     )
 
-    ctx = {
+    context_by_field = {
         "redis": FakeRedis(),
         "context": {
             "import_date": "20260618",
@@ -615,11 +615,11 @@ async def test_mrf_shutdown_requeues_while_parser_jobs_run(monkeypatch):
         },
     }
 
-    outcome_by_field = await process_initial.shutdown(ctx, {"context": ctx["context"], "test_mode": True})
+    outcome_by_field = await process_initial.shutdown(context_by_field, {"context": context_by_field["context"], "test_mode": True})
 
     assert outcome_by_field == 1
-    assert ctx["redis"].enqueued
-    args, kwargs = ctx["redis"].enqueued[0]
+    assert context_by_field["redis"].enqueued
+    args, kwargs = context_by_field["redis"].enqueued[0]
     assert args[0] == "shutdown"
     assert args[1]["mrf_finalize_waits"] == 1
     assert kwargs["_queue_name"] == process_initial.MRF_FINISH_QUEUE_NAME
@@ -706,7 +706,7 @@ async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(mo
     mark_run = AsyncMock()
     monkeypatch.setattr(process_initial, "mark_control_run", mark_run)
 
-    ctx = {
+    context_by_field = {
         "redis": FakeRedis(),
         "context": {
             "import_date": "20260626",
@@ -715,15 +715,15 @@ async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(mo
         },
     }
 
-    outcome_by_field = await process_initial.shutdown(ctx, {"context": ctx["context"], "test_mode": True})
+    outcome_by_field = await process_initial.shutdown(context_by_field, {"context": context_by_field["context"], "test_mode": True})
 
     assert outcome_by_field == 1
-    assert set(ctx["redis"].zrem_calls) == {
+    assert set(context_by_field["redis"].zrem_calls) == {
         (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626"),
         (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626_wait_12"),
         (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626_lock_wait_13"),
     }
-    assert ctx["redis"].delete_calls == [
+    assert context_by_field["redis"].delete_calls == [
         (
             "arq:job:shutdown_mrf_20260626",
             "arq:result:shutdown_mrf_20260626",
@@ -822,12 +822,12 @@ async def test_mrf_startup_sets_utc_time(monkeypatch):
         __my_index_elements__=["id"]
     ))
 
-    ctx = {}
-    await process_initial.startup(ctx)
+    context_by_field = {}
+    await process_initial.startup(context_by_field)
 
-    delta = datetime.datetime.utcnow() - ctx["context"]["start"]
+    delta = datetime.datetime.utcnow() - context_by_field["context"]["start"]
     assert delta.total_seconds() < 2
-    assert ctx["context"]["control_run_id"] == "run_worker_context"
+    assert context_by_field["context"]["control_run_id"] == "run_worker_context"
 
 
 @pytest.mark.asyncio
@@ -1010,7 +1010,7 @@ def test_postgres_setting_value_rejects_unsafe_env(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_plan_summary_dependencies_ready(monkeypatch):
-    values = {
+    dependency_values_by_name = {
         "mrf.plan_attributes": "mrf.plan_attributes",
         "mrf.plan_benefits": "mrf.plan_benefits",
         "mrf.plan_prices": None,
@@ -1018,7 +1018,7 @@ async def test_plan_summary_dependencies_ready(monkeypatch):
 
     async def fake_scalar(stmt, **params):
         assert "to_regclass" in stmt
-        return values[params["qualified_name"]]
+        return dependency_values_by_name[params["qualified_name"]]
 
     monkeypatch.setattr(process_initial.db, "scalar", fake_scalar)
 
@@ -1172,9 +1172,9 @@ async def test_refresh_do_business_as(monkeypatch):
 
     sql_strings = [str(sql) for sql in calls]
     assert result == (0, 0)
-    assert not any(s.strip().startswith("UPDATE mrf.npi") for s in sql_strings)
-    assert any("IS DISTINCT FROM" in s for s in sql_strings)
-    assert any("NOT EXISTS" in s for s in sql_strings)
+    assert not any(sql_text.strip().startswith("UPDATE mrf.npi") for sql_text in sql_strings)
+    assert any("IS DISTINCT FROM" in sql_text for sql_text in sql_strings)
+    assert any("NOT EXISTS" in sql_text for sql_text in sql_strings)
     assert any("do_business_as_text = COALESCE" in str(sql) for sql in calls)
 
 

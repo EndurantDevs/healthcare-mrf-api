@@ -38,6 +38,7 @@ from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 from process.ptg_parts.ptg2_manifest_artifacts import write_global_membership_sidecar
 from process.ptg_parts.ptg2_manifest_publish import (
     _copy_price_atom_member_file,
+    _copy_price_set_summary_file,
     _copy_ptg2_manifest_price_atom_file,
     _create_ptg2_manifest_serving_stage_table,
     _ptg2_manifest_support_stage_table,
@@ -902,10 +903,18 @@ async def test_v3_lifecycle_fails_closed(
                     "price_set_atom",
                 ),
             )
+        for frame in scan["price_set_summary_frames"]:
+            await _copy_price_set_summary_file(
+                Path(frame["path"]),
+                target_table=_ptg2_manifest_support_stage_table(
+                    stage_table,
+                    "price_set_summary",
+                ),
+            )
 
         provider_set_metadata_path = tmp_path / "provider-set-metadata.copy"
         provider_set_metadata_path.write_text(
-            f"{provider_set_id.hex()}\t{{}}\n",
+            f"{provider_set_id.hex()}\t{serving_records[0][3]}\t{{}}\n",
             encoding="ascii",
         )
         graph_entries = _graph_artifacts(
@@ -934,6 +943,25 @@ async def test_v3_lifecycle_fails_closed(
             ],
             scanner_summary=scanner_summary,
         )
+        provider_set_metadata_payload = provider_set_metadata_path.read_bytes()
+        provider_set_metadata_entries = (
+            {
+                "path": str(provider_set_metadata_path),
+                "row_count": 1,
+                "bytes": len(provider_set_metadata_payload),
+                "sha256": hashlib.sha256(
+                    provider_set_metadata_payload
+                ).hexdigest(),
+                "format": "ptg2_v3_provider_set_metadata_copy",
+                "version": 1,
+                "source_type": identity.source_type,
+                "identity_kind": identity.identity_kind,
+                "identity_sha256": identity.identity_sha256,
+                "source_run_contract_sha256": serving_run_entries[0][
+                    "source_run_contract_sha256"
+                ],
+            },
+        )
         publication = await publish_strict_shared_v3_layout(
             schema_name=SCHEMA_NAME,
             manifest_stage_table=stage_table,
@@ -944,12 +972,8 @@ async def test_v3_lifecycle_fails_closed(
             expected_source_identities=[identity],
             serving_run_entries=serving_run_entries,
             code_dictionary_entries=code_dictionary_entries,
-            provider_set_metadata_entries=(
-                {
-                    "path": str(provider_set_metadata_path),
-                    "row_count": 1,
-                },
-            ),
+            provider_set_metadata_entries=provider_set_metadata_entries,
+            price_set_summary_source_count=1,
             graph_artifact_entries=graph_entries,
             source_audit_witness_entries=(
                 scanner_support._single_frame(
@@ -991,8 +1015,8 @@ async def test_v3_lifecycle_fails_closed(
         )
         assert await _physical_counts(publication.snapshot_key) == {
             "layouts": 1,
-            "blocks": len({reference.block_hash for reference in publication.references}),
-            "mappings": len(publication.references),
+            "blocks": publication.unique_block_count,
+            "mappings": publication.mapping_count,
             "codes": 2,
             "provider_sets": 1,
             "npis": len(NPIS),

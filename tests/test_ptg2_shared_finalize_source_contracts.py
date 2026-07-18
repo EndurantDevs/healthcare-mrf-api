@@ -14,6 +14,7 @@ from tests.ptg2_shared_finalize_test_support import (
     _contracted_entries,
     _entry,
     _identity,
+    _provider_metadata_entries,
     _summary_payload,
 )
 
@@ -41,6 +42,7 @@ def test_finalizer_input_manifest_rejects_duplicate_paths(tmp_path):
                     version=4,
                 )
             ],
+            provider_set_metadata_entries=[],
             expected_source_identities=[_identity("a")],
         )
 
@@ -100,6 +102,11 @@ def test_identical_run_rows_from_distinct_artifacts_keep_distinct_source_keys(tm
             _source_dictionary_entry(tmp_path, "second", "b", second),
             _source_dictionary_entry(tmp_path, "first", "a", first),
         ],
+        provider_set_metadata_entries=_provider_metadata_entries(
+            tmp_path,
+            (_identity("b"), second),
+            (_identity("a"), first),
+        ),
         expected_source_identities=[_identity("b"), _identity("a")],
     )
     run_rows = json.loads(manifest.read_text(encoding="ascii"))[
@@ -167,6 +174,7 @@ def test_finalizer_rejects_missing_nonempty_source_partition_file(tmp_path):
                     version=4,
                 )
             ],
+            provider_set_metadata_entries=[],
             expected_source_identities=[identity],
         )
 
@@ -207,6 +215,7 @@ def test_finalizer_rejects_contract_missing_empty_partition_slot(tmp_path):
                     version=4,
                 )
             ],
+            provider_set_metadata_entries=[],
             expected_source_identities=[identity],
         )
 
@@ -280,6 +289,7 @@ def test_finalizer_rejects_swapped_source_identity_metadata(tmp_path):
                     version=4,
                 )
             ],
+            provider_set_metadata_entries=[],
             expected_source_identities=[_identity("a"), _identity("b")],
         )
 

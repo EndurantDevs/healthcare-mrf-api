@@ -86,13 +86,13 @@ def test_nearby_count_sql_matches_page_filters_and_identity():
 
 
 def test_npi_address_contact_fallback_derives_canonical_digits_from_raw_fields():
-    address = {
+    address_by_field = {
         "telephone_number": "1 (312) 555-1212 ext. 34",
         "fax_number": "(312) 555-0199",
         "country_code": "US",
     }
 
-    normalized = npi_module._add_canonical_contact_fields_to_address(address)
+    normalized = npi_module._add_canonical_contact_fields_to_address(address_by_field)
 
     assert normalized["telephone_number"] == "1 (312) 555-1212 ext. 34"
     assert normalized["phone_number"] == "3125551212"
@@ -102,7 +102,7 @@ def test_npi_address_contact_fallback_derives_canonical_digits_from_raw_fields()
 
 
 def test_npi_address_contact_fallback_does_not_overwrite_canonical_digits():
-    address = {
+    address_by_field = {
         "telephone_number": "(312) 555-1212",
         "phone_number": "2175550100",
         "fax_number": "(312) 555-0199",
@@ -110,7 +110,7 @@ def test_npi_address_contact_fallback_does_not_overwrite_canonical_digits():
         "country_code": "US",
     }
 
-    normalized = npi_module._add_canonical_contact_fields_to_address(address)
+    normalized = npi_module._add_canonical_contact_fields_to_address(address_by_field)
 
     assert normalized["phone_number"] == "2175550100"
     assert normalized["fax_number_digits"] == "2175550199"
@@ -201,14 +201,14 @@ async def test_pharmacists_per_pharmacy_invalid_state(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pharmacists_per_pharmacy_state_and_name(monkeypatch):
-    captured = {}
+    captured_by_field = {}
 
     class RecordingConnection:
         async def all(self, sql, **params):
             # first call histogram, second detail
             if "pharmacist_group" in str(sql):
-                captured['sql'] = sql
-                captured['params'] = params
+                captured_by_field['sql'] = sql
+                captured_by_field['params'] = params
                 return [("1", 2)]
             return [("201", "Clinic", 2)]
 
@@ -223,16 +223,16 @@ async def test_pharmacists_per_pharmacy_state_and_name(monkeypatch):
 
     assert pharmacists_per_pharmacy_payload["histogram"][0]['pharmacist_group'] == '1'
     # name params now use indexed placeholders
-    assert captured['params']['state'] == 'NY'
-    assert any(v == '%clinic%' for k, v in captured['params'].items() if k.startswith('name_like'))
-    sql_text = str(captured['sql'])
+    assert captured_by_field['params']['state'] == 'NY'
+    assert any(field_value == '%clinic%' for k, field_value in captured_by_field['params'].items() if k.startswith('name_like'))
+    sql_text = str(captured_by_field['sql'])
     assert 'ph.state_name = :state' in sql_text
     assert 'LIKE :name_like_0' in sql_text
 
 
 @pytest.mark.asyncio
 async def test_pharmacists_per_pharmacy_uses_unified_address_table_when_compatible(monkeypatch):
-    captured = {}
+    captured_by_field = {}
 
     async def fake_table_columns(table_name, *, session=None):
         assert session is None
@@ -242,8 +242,8 @@ async def test_pharmacists_per_pharmacy_uses_unified_address_table_when_compatib
 
     class RecordingConnection:
         async def all(self, sql, **params):
-            captured.setdefault("sql", str(sql))
-            captured.setdefault("params", params)
+            captured_by_field.setdefault("sql", str(sql))
+            captured_by_field.setdefault("params", params)
             if "pharmacist_group" in str(sql):
                 return [("1", 2)]
             return []
@@ -257,10 +257,10 @@ async def test_pharmacists_per_pharmacy_uses_unified_address_table_when_compatib
 
     request = types.SimpleNamespace(args={'state': 'ny'})
     response = await pharmacists_per_pharmacy(request)
-    payload = json.loads(response.body)
+    response_payload_by_field = json.loads(response.body)
 
-    assert payload["histogram"][0]['pharmacist_group'] == '1'
-    sql_text = captured["sql"]
+    assert response_payload_by_field["histogram"][0]['pharmacist_group'] == '1'
+    sql_text = captured_by_field["sql"]
     assert "FROM mrf.entity_address_unified AS a" in sql_text
     assert "FROM mrf.npi_address AS a" not in sql_text
 

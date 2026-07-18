@@ -221,8 +221,9 @@ layout.
 
 The authoritative by-code writer emits only `by_code_provider_shard_v1`
 objects. It does not emit a monolithic or legacy by-code membership object.
-Each shard covers a 1,024-key `provider_set_key` interval, with
-`shard_id = provider_set_key // 1024` and
+Each shard covers the versioned `provider_shard_span` recorded by the artifact
+(currently 1,024 provider-set keys), with
+`shard_id = provider_set_key // provider_shard_span` and
 `block_key = (code_key << 31) | shard_id`. Fragments within each block are
 numbered contiguously from `0`; a missing, repeated, or out-of-order fragment
 fails the strict reader.
@@ -331,6 +332,14 @@ weaker validation. `typed_rate_parses` and
 `streaming_rate_parse_fallbacks` in the scanner summary expose which path
 handled every successfully parsed rate.
 
+Each scanner worker also keeps bounded exact caches for recently observed
+price-atom, price-set, and provider-set identities. Cache hits are accumulated
+locally and merged into the exact global counters once when the worker exits,
+without acquiring the shared sharded-set lock or updating a shared atomic per
+row; cache misses still pass through the authoritative process-wide dedupe set.
+`HLTHPRT_PTG2_RUST_LOCAL_DEDUPE_ENTRIES` controls the per-kind, per-worker
+bound and `0` disables the cache. Worker summaries expose hit and reset counts.
+
 Gzip scanning uses `rapidgzip` by default. When `provider_references` appears
 after `in_network`, the scanner builds a temporary seek index, reads the
 provider range first, and then processes indexed in-network ranges in parallel.
@@ -362,6 +371,18 @@ inflated every zlib payload, and recomputed every block hash.
 The price dictionary encoder also consumes the finalizer's native fixed-width
 key records directly instead of wrapping them as an in-memory PostgreSQL COPY
 stream and immediately parsing that stream back into the same two fields.
+The cost-ranked price-key stage and the price-atom dictionary stages use
+disjoint PostgreSQL tables. Once the price-key table is complete, indexed, and
+validated, its COPY export and the Rust finalizer start immediately while atom
+normalization and dictionary rewriting continue. Either lane failing cancels
+and drains the other lane and removes every disposable stage.
+
+Content-addressed serving and price blocks are reused at publication without
+resending their payloads to PostgreSQL. Publication still scans and hashes the
+complete binary COPY source, performs exact batched lookups of durable block
+hashes, and sends full rows for missing blocks; rows already present carry only
+validated metadata through the temporary stage. Promotion fails if any hash is
+unresolved or its immutable metadata conflicts.
 
 Physical-source keys are not caller-selected identifiers. Python normalizes
 each source identity as a lowercase ASCII token, one supported digest kind,

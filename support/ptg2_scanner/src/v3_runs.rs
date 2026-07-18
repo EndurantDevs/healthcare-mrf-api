@@ -1390,6 +1390,7 @@ pub struct MultiFileSortStats {
     pub spill_bytes: u64,
     pub chunk_count: u64,
     pub output_bytes: u64,
+    pub final_copy_bytes: u64,
 }
 
 trait TemporaryRunMerger {
@@ -1643,6 +1644,7 @@ fn external_sort_partition_files_with_mode(
         spill_bytes,
         chunk_count: initial_chunk_count,
         output_bytes,
+        final_copy_bytes: output_bytes,
     })
 }
 
@@ -1780,6 +1782,7 @@ pub fn external_sort_tagged_partition_files(
         spill_bytes,
         chunk_count: initial_chunk_count,
         output_bytes,
+        final_copy_bytes: output_bytes,
     })
 }
 
@@ -2012,6 +2015,7 @@ pub fn merge_sorted_provider_identities(
         spill_bytes: 0,
         chunk_count: 0,
         output_bytes,
+        final_copy_bytes: output_bytes,
     })
 }
 
@@ -2045,6 +2049,213 @@ pub fn external_sort_assigned_serving_records(
         in_memory_record_limit,
         false,
     )
+}
+
+/// Builds bounded sorted assigned-row runs directly, without materializing an
+/// unsorted input file or copying a final merged file.
+pub struct AssignedServingRunBuilder {
+    temporary_directory: PathBuf,
+    record_limit: usize,
+    records: Vec<AssignedServingRecord>,
+    runs: BoundedRunAccumulator,
+    temporary_files: TemporaryFiles,
+    input_records: u64,
+    input_bytes: u64,
+    merge_bytes: u64,
+}
+
+impl AssignedServingRunBuilder {
+    pub fn new(temporary_directory: impl AsRef<Path>, record_limit: usize) -> io::Result<Self> {
+        if record_limit == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "assigned serving run record limit must be greater than zero",
+            ));
+        }
+        let temporary_directory = temporary_directory.as_ref().to_path_buf();
+        fs::create_dir_all(&temporary_directory)?;
+        let allocation_bytes = record_limit
+            .checked_mul(std::mem::size_of::<AssignedServingRecord>())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "assigned serving run allocation size overflow",
+                )
+            })?;
+        let mut records = Vec::new();
+        records.try_reserve_exact(record_limit).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "unable to reserve {allocation_bytes} bytes for assigned serving runs: {error}"
+                ),
+            )
+        })?;
+        Ok(Self {
+            temporary_directory,
+            record_limit,
+            records,
+            runs: BoundedRunAccumulator::new(DEFAULT_SORT_MERGE_FAN_IN),
+            temporary_files: TemporaryFiles::default(),
+            input_records: 0,
+            input_bytes: 0,
+            merge_bytes: 0,
+        })
+    }
+
+    pub fn push(&mut self, encoded: [u8; ASSIGNED_SERVING_RECORD_BYTES]) -> io::Result<()> {
+        self.records.push(AssignedServingRecord(encoded));
+        self.input_records = self.input_records.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "assigned serving run record count overflow",
+            )
+        })?;
+        self.input_bytes = self
+            .input_bytes
+            .checked_add(ASSIGNED_SERVING_RECORD_BYTES as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "assigned serving run byte count overflow",
+                )
+            })?;
+        if self.records.len() == self.record_limit {
+            self.spill_current_run()?;
+        }
+        Ok(())
+    }
+
+    fn spill_current_run(&mut self) -> io::Result<()> {
+        if self.records.is_empty() {
+            return Ok(());
+        }
+        let path = spill_fixed_sort_run(
+            &mut self.records,
+            &self.temporary_directory,
+            &mut self.temporary_files,
+        )?;
+        let mut merger = FixedRunMerger::<AssignedServingRecord> {
+            temporary_directory: &self.temporary_directory,
+            temporary_files: &mut self.temporary_files,
+            dedupe: false,
+            duplicate_records: 0,
+            spill_bytes: 0,
+            record: std::marker::PhantomData,
+        };
+        self.runs.push_initial(path, &mut merger)?;
+        self.merge_bytes = self.merge_bytes.saturating_add(merger.spill_bytes);
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> io::Result<AssignedServingRunSet> {
+        self.spill_current_run()?;
+        let initial_chunk_count = self.runs.initial_run_count();
+        let AssignedServingRunBuilder {
+            temporary_directory,
+            records: _,
+            runs,
+            mut temporary_files,
+            input_records,
+            input_bytes,
+            mut merge_bytes,
+            ..
+        } = self;
+        let mut merger = FixedRunMerger::<AssignedServingRecord> {
+            temporary_directory: &temporary_directory,
+            temporary_files: &mut temporary_files,
+            dedupe: false,
+            duplicate_records: 0,
+            spill_bytes: 0,
+            record: std::marker::PhantomData,
+        };
+        let paths = runs.finish(&mut merger)?;
+        merge_bytes = merge_bytes.saturating_add(merger.spill_bytes);
+        let output_bytes = paths.iter().try_fold(0u64, |total, path| {
+            path.metadata()
+                .map(|metadata| total.saturating_add(metadata.len()))
+        })?;
+        if output_bytes != input_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "assigned serving run builder changed the input population",
+            ));
+        }
+        for path in &paths {
+            File::open(path)?.sync_all()?;
+            temporary_files.release(path);
+        }
+        Ok(AssignedServingRunSet {
+            paths,
+            stats: MultiFileSortStats {
+                input_file_count: 0,
+                input_records,
+                unique_records: input_records,
+                duplicate_records: 0,
+                input_bytes,
+                spill_bytes: input_bytes.saturating_add(merge_bytes),
+                chunk_count: initial_chunk_count,
+                output_bytes,
+                final_copy_bytes: merge_bytes,
+            },
+        })
+    }
+}
+
+pub struct AssignedServingRunSet {
+    pub paths: Vec<PathBuf>,
+    pub stats: MultiFileSortStats,
+}
+
+/// K-way reader for one partition's bounded assigned-row runs.
+pub struct AssignedServingRunMerger {
+    readers: Vec<BufReader<File>>,
+    heap: BinaryHeap<Reverse<(AssignedServingRecord, usize)>>,
+}
+
+impl AssignedServingRunMerger {
+    pub fn new(paths: &[PathBuf]) -> io::Result<Self> {
+        let mut readers = Vec::with_capacity(paths.len());
+        for path in paths {
+            let bytes = path.metadata()?.len();
+            if bytes % ASSIGNED_SERVING_RECORD_BYTES as u64 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "assigned serving run {} is not aligned to {} bytes",
+                        path.display(),
+                        ASSIGNED_SERVING_RECORD_BYTES
+                    ),
+                ));
+            }
+            readers.push(BufReader::new(File::open(path)?));
+        }
+        let mut heap = BinaryHeap::with_capacity(readers.len());
+        for (reader_index, reader) in readers.iter_mut().enumerate() {
+            if let Some(record) = AssignedServingRecord::read_from(reader)? {
+                heap.push(Reverse((record, reader_index)));
+            }
+        }
+        Ok(Self { readers, heap })
+    }
+
+    pub fn next_record(&mut self) -> io::Result<Option<[u8; ASSIGNED_SERVING_RECORD_BYTES]>> {
+        let Some(Reverse((record, reader_index))) = self.heap.pop() else {
+            return Ok(None);
+        };
+        if let Some(next_record) =
+            AssignedServingRecord::read_from(&mut self.readers[reader_index])?
+        {
+            if next_record < record {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "assigned serving run input is not sorted",
+                ));
+            }
+            self.heap.push(Reverse((next_record, reader_index)));
+        }
+        Ok(Some(record.0))
+    }
 }
 
 pub fn external_sort_lexicographic_records(
@@ -2150,6 +2361,7 @@ pub fn external_sort_lexicographic_records(
         spill_bytes,
         chunk_count: initial_chunk_count,
         output_bytes,
+        final_copy_bytes: output_bytes,
     })
 }
 
@@ -2370,6 +2582,41 @@ fn external_sort_fixed_records<T: FixedSortRecord>(
     let intermediate_duplicates = merger.duplicate_records;
     let spill_bytes = merger.spill_bytes;
     fs::create_dir_all(usable_parent(output_path))?;
+    if !dedupe && run_paths.len() == 1 {
+        let promoted_path = &run_paths[0];
+        let output_bytes = promoted_path.metadata()?.len();
+        if output_bytes
+            != input_records
+                .checked_mul(T::BYTE_COUNT as u64)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "output byte count overflow")
+                })?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "single fixed-record sort run changed the input population",
+            ));
+        }
+        File::open(promoted_path)?.sync_all()?;
+        match fs::rename(promoted_path, output_path) {
+            Ok(()) => {
+                temporary_files.release(promoted_path);
+                return Ok(MultiFileSortStats {
+                    input_file_count: input_paths.len() as u64,
+                    input_records,
+                    unique_records: input_records,
+                    duplicate_records: 0,
+                    input_bytes,
+                    spill_bytes,
+                    chunk_count: 1,
+                    output_bytes,
+                    final_copy_bytes: 0,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {}
+            Err(error) => return Err(error),
+        }
+    }
     let (staged_path, staged_file) =
         create_unique_file(usable_parent(output_path), "dense-output")?;
     temporary_files.track(staged_path.clone());
@@ -2401,6 +2648,7 @@ fn external_sort_fixed_records<T: FixedSortRecord>(
         spill_bytes,
         chunk_count: initial_chunk_count,
         output_bytes,
+        final_copy_bytes: output_bytes,
     })
 }
 
@@ -3743,10 +3991,107 @@ mod tests {
         assert_eq!(stats.unique_records, 5);
         assert_eq!(stats.duplicate_records, 0);
         assert_eq!(stats.output_bytes, 5 * ASSIGNED_SERVING_RECORD_BYTES as u64);
+        assert_eq!(stats.final_copy_bytes, stats.output_bytes);
         assert_eq!(
             fs::read(output).unwrap(),
             [first, first, first, second, second].concat()
         );
+    }
+
+    #[test]
+    fn assigned_sort_promotes_a_single_sorted_run_without_a_final_copy() {
+        let base = TestDirectory::new("assigned-single-run-promotion");
+        let input = base.join("assigned.bin");
+        let output = base.join("assigned.sorted");
+        let temporary = base.join("temporary");
+        let mut first = [0u8; ASSIGNED_SERVING_RECORD_BYTES];
+        first[3] = 1;
+        let mut second = [0u8; ASSIGNED_SERVING_RECORD_BYTES];
+        second[3] = 2;
+        let mut writer = BufWriter::new(File::create(&input).unwrap());
+        for record in [second, first, first] {
+            writer.write_all(&record).unwrap();
+        }
+        writer.flush().unwrap();
+
+        let stats =
+            external_sort_assigned_serving_records(&[input], &output, &temporary, 3).unwrap();
+
+        assert_eq!(stats.input_records, 3);
+        assert_eq!(stats.unique_records, 3);
+        assert_eq!(stats.duplicate_records, 0);
+        assert_eq!(stats.chunk_count, 1);
+        assert_eq!(stats.spill_bytes, 3 * ASSIGNED_SERVING_RECORD_BYTES as u64);
+        assert_eq!(stats.output_bytes, stats.spill_bytes);
+        assert_eq!(stats.final_copy_bytes, 0);
+        assert_eq!(fs::read(output).unwrap(), [first, first, second].concat());
+        assert!(fs::read_dir(temporary).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn assigned_run_builder_streams_multiple_sorted_runs_without_materialized_copies() {
+        let base = TestDirectory::new("assigned-direct-runs");
+        let temporary = base.join("temporary");
+        let mut first = [0u8; ASSIGNED_SERVING_RECORD_BYTES];
+        first[3] = 1;
+        let mut second = [0u8; ASSIGNED_SERVING_RECORD_BYTES];
+        second[3] = 2;
+        let mut builder = AssignedServingRunBuilder::new(&temporary, 2).unwrap();
+        for record in [second, first, first, second, first] {
+            builder.push(record).unwrap();
+        }
+
+        let run_set = builder.finish().unwrap();
+
+        assert_eq!(run_set.stats.input_records, 5);
+        assert_eq!(run_set.stats.unique_records, 5);
+        assert_eq!(run_set.stats.duplicate_records, 0);
+        assert_eq!(run_set.stats.chunk_count, 3);
+        assert_eq!(
+            run_set.stats.input_bytes,
+            5 * ASSIGNED_SERVING_RECORD_BYTES as u64
+        );
+        assert_eq!(run_set.stats.spill_bytes, run_set.stats.input_bytes);
+        assert_eq!(run_set.stats.output_bytes, run_set.stats.input_bytes);
+        assert_eq!(run_set.stats.final_copy_bytes, 0);
+        assert_eq!(run_set.paths.len(), 3);
+        assert!(!temporary.join("assigned.unsorted").exists());
+        assert!(!temporary.join("assigned.sorted").exists());
+
+        let mut merger = AssignedServingRunMerger::new(&run_set.paths).unwrap();
+        let mut actual = Vec::new();
+        while let Some(record) = merger.next_record().unwrap() {
+            actual.push(record);
+        }
+        assert_eq!(actual, vec![first, first, first, second, second]);
+    }
+
+    #[test]
+    fn assigned_run_builder_bounds_final_merge_fan_in() {
+        let base = TestDirectory::new("assigned-direct-runs-fan-in");
+        let temporary = base.join("temporary");
+        let row_count = DEFAULT_SORT_MERGE_FAN_IN + 1;
+        let mut expected = Vec::with_capacity(row_count);
+        let mut builder = AssignedServingRunBuilder::new(&temporary, 1).unwrap();
+        for index in (0..row_count).rev() {
+            let mut record = [0u8; ASSIGNED_SERVING_RECORD_BYTES];
+            record[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            expected.push(record);
+            builder.push(record).unwrap();
+        }
+        expected.sort_unstable();
+
+        let run_set = builder.finish().unwrap();
+
+        assert_eq!(run_set.stats.chunk_count, row_count as u64);
+        assert!(run_set.paths.len() <= DEFAULT_SORT_MERGE_FAN_IN);
+        assert!(run_set.stats.final_copy_bytes > 0);
+        let mut merger = AssignedServingRunMerger::new(&run_set.paths).unwrap();
+        let mut actual = Vec::new();
+        while let Some(record) = merger.next_record().unwrap() {
+            actual.push(record);
+        }
+        assert_eq!(actual, expected);
     }
 
     #[test]

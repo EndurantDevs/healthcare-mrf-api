@@ -11,7 +11,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
@@ -21,7 +21,6 @@ from process.ptg_parts.ptg2_manifest_publish import (
 )
 from process.ptg_parts.ptg2_serving_binary_v3 import select_atom_key_bits
 from process.ptg_parts.ptg2_shared_blocks import (
-    SharedBlockReference,
     lock_shared_layout_for_dense_write,
     shared_support_digest,
 )
@@ -62,7 +61,9 @@ _V3_ATTRIBUTE_KEY_COLUMNS = (
 
 @dataclass(frozen=True)
 class SharedPricePublication:
-    references: tuple[SharedBlockReference, ...]
+    object_kinds: tuple[str, ...]
+    mapping_count: int
+    unique_block_count: int
     price_set_count: int
     atom_count: int
     atom_key_bits: int
@@ -89,6 +90,34 @@ class PreparedSharedPriceArtifacts:
     atom_key_bits: int
     lean_manifest: Mapping[str, Any]
     stage_metrics: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class PreparedSharedPriceKeyMap:
+    """Price-key stage that is safe to consume before atom preparation finishes."""
+
+    schema_name: str
+    price_key_map: str
+    price_set_count: int
+
+
+async def _await_cleanup_task(
+    task: asyncio.Future[Any],
+    *,
+    propagate_cancellation: bool = False,
+) -> Any:
+    """Finish cleanup, optionally re-delivering cancellation afterward."""
+
+    pending_cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            pending_cancellation = exc
+    result = task.result()
+    if pending_cancellation is not None and propagate_cancellation:
+        raise pending_cancellation
+    return result
 
 
 def _qualified(schema_name: str, table_name: str) -> str:
@@ -497,60 +526,93 @@ async def _validate_v3_dense_map(
 async def _create_v3_price_key_stage(
     *,
     schema_name: str,
-    price_atom_table: str,
-    price_set_atom_table: str,
+    price_set_summary_table: str,
+    price_set_summary_source_count: int | None = None,
     stage_table: str,
-    expected_price_set_count: int | None = None,
 ) -> dict[str, int | None]:
-    """Create and validate dense price keys ordered by minimum negotiated rate."""
+    """Create dense price keys from scanner-computed exact minimum rates."""
 
-    if expected_price_set_count is not None:
-        await db.status(
-            f"ALTER TABLE {_qualified(schema_name, price_set_atom_table)} "
-            "ALTER COLUMN price_set_global_id_128 SET "
-            f"(n_distinct = {max(int(expected_price_set_count), 0)});"
-        )
-    await db.status(f"ANALYZE {_qualified(schema_name, price_set_atom_table)};")
-    created_row_count = await db.status(
-        f"""
-        CREATE UNLOGGED TABLE {_qualified(schema_name, stage_table)} AS
-        WITH price_rank AS MATERIALIZED (
-            SELECT
-                membership.price_set_global_id_128,
-                MIN(price_atom.negotiated_rate_numeric) AS minimum_negotiated_rate
-            FROM {_qualified(schema_name, price_set_atom_table)} AS membership
-            JOIN {_qualified(schema_name, price_atom_table)} AS price_atom
-              ON price_atom.price_atom_global_id_128 = membership.price_atom_global_id_128
-            GROUP BY membership.price_set_global_id_128
-        )
-        SELECT
-            price_set_global_id_128,
-            (ROW_NUMBER() OVER (
-                ORDER BY minimum_negotiated_rate ASC NULLS LAST,
-                         price_set_global_id_128
-            ) - 1)::bigint AS price_key,
-            minimum_negotiated_rate
-        FROM price_rank
-        ORDER BY minimum_negotiated_rate ASC NULLS LAST,
-                 price_set_global_id_128;
-        """
+    source_count = (
+        int(price_set_summary_source_count)
+        if price_set_summary_source_count is not None
+        else None
     )
+    if source_count is not None and source_count <= 0:
+        raise RuntimeError("strict V3 price-set summary source count must be positive")
+    qualified_summary = _qualified(schema_name, price_set_summary_table)
+    qualified_stage = _qualified(schema_name, stage_table)
+    await db.status(f"ANALYZE {qualified_summary};")
+    if source_count == 1:
+        created_row_count = await db.status(
+            f"""
+            CREATE UNLOGGED TABLE {qualified_stage} AS
+            SELECT
+                price_set_global_id_128,
+                (ROW_NUMBER() OVER (
+                    ORDER BY minimum_negotiated_rate ASC NULLS LAST,
+                             price_set_global_id_128
+                ) - 1)::bigint AS price_key,
+                minimum_negotiated_rate
+            FROM {qualified_summary}
+            ORDER BY minimum_negotiated_rate ASC NULLS LAST,
+                     price_set_global_id_128;
+            """
+        )
+    else:
+        created_row_count = await db.status(
+            f"""
+            CREATE UNLOGGED TABLE {qualified_stage} AS
+            WITH canonical AS MATERIALIZED (
+                SELECT
+                    price_set_global_id_128,
+                    MIN(minimum_negotiated_rate) AS minimum_negotiated_rate,
+                    MIN(minimum_negotiated_rate) IS DISTINCT FROM
+                        MAX(minimum_negotiated_rate) AS payload_conflict
+                FROM {qualified_summary}
+                GROUP BY price_set_global_id_128
+            )
+            SELECT
+                price_set_global_id_128,
+                (ROW_NUMBER() OVER (
+                    ORDER BY minimum_negotiated_rate ASC NULLS LAST,
+                             price_set_global_id_128
+                ) - 1)::bigint AS price_key,
+                minimum_negotiated_rate,
+                payload_conflict
+            FROM canonical
+            ORDER BY minimum_negotiated_rate ASC NULLS LAST,
+                     price_set_global_id_128;
+            """
+        )
+        if bool(
+            await db.scalar(
+                f"SELECT EXISTS (SELECT 1 FROM {qualified_stage} "
+                "WHERE payload_conflict LIMIT 1)"
+            )
+        ):
+            await db.status(f"DROP TABLE IF EXISTS {qualified_stage} CASCADE;")
+            raise RuntimeError(
+                "strict V3 observed one price-set ID with conflicting minimum rates"
+            )
+        await db.status(
+            f"ALTER TABLE {qualified_stage} DROP COLUMN payload_conflict;"
+        )
     await db.status(
-        f"ALTER TABLE {_qualified(schema_name, stage_table)} "
+        f"ALTER TABLE {qualified_stage} "
         "ALTER COLUMN price_set_global_id_128 SET NOT NULL, "
         "ALTER COLUMN price_key SET NOT NULL;"
     )
     await db.status(
         f"CREATE UNIQUE INDEX "
         f"{_quote_ident(_ptg2_snapshot_index_name(stage_table, 'id_uidx'))} "
-        f"ON {_qualified(schema_name, stage_table)} (price_set_global_id_128);"
+        f"ON {qualified_stage} (price_set_global_id_128);"
     )
     await db.status(
         f"CREATE UNIQUE INDEX "
         f"{_quote_ident(_ptg2_snapshot_index_name(stage_table, 'key_uidx'))} "
-        f"ON {_qualified(schema_name, stage_table)} (price_key);"
+        f"ON {qualified_stage} (price_key);"
     )
-    await db.status(f"ANALYZE {_qualified(schema_name, stage_table)};")
+    await db.status(f"ANALYZE {qualified_stage};")
     dense_stats = await _validate_v3_dense_map(
         schema_name=schema_name,
         table_name=stage_table,
@@ -944,8 +1006,15 @@ async def prepare_shared_price_artifacts(
     *,
     schema_name: str,
     manifest_stage_table: str,
+    price_set_summary_source_count: int | None = None,
+    price_key_ready: Callable[[PreparedSharedPriceKeyMap], None] | None = None,
 ) -> PreparedSharedPriceArtifacts:
-    """Normalize price stages and assign exact cost-ranked dense keys once."""
+    """Normalize price stages and assign exact cost-ranked dense keys once.
+
+    ``price_key_ready`` is called synchronously after the independent price-key
+    stage commits successfully.  Callers may use that immutable stage while the
+    atom dictionary and atom-key stages continue preparing in parallel.
+    """
 
     price_atom_table = _ptg2_manifest_support_stage_table(
         manifest_stage_table,
@@ -954,6 +1023,10 @@ async def prepare_shared_price_artifacts(
     price_set_atom_table = _ptg2_manifest_support_stage_table(
         manifest_stage_table,
         "price_set_atom",
+    )
+    price_set_summary_table = _ptg2_manifest_support_stage_table(
+        manifest_stage_table,
+        "price_set_summary",
     )
     price_attr_dictionary_table = _ptg2_manifest_support_stage_table(
         manifest_stage_table,
@@ -972,61 +1045,113 @@ async def prepare_shared_price_artifacts(
             f"DROP TABLE IF EXISTS {_qualified(schema_name, table_name)} CASCADE;"
         )
     try:
-        stage_started_at = time.monotonic()
-        stage_metrics_map = dict(
-            await _normalize_strict_v3_price_atom_stage(
+        normalized_summary_source_count = (
+            int(price_set_summary_source_count)
+            if price_set_summary_source_count is not None
+            else None
+        )
+        stage_metrics_map: dict[str, Any] = {
+            "price_key_source_mode": (
+                "single_scanner_fast_path"
+                if normalized_summary_source_count == 1
+                else "cross_file_canonicalize"
+            )
+        }
+        parallel_started_at = time.monotonic()
+
+        async def prepare_atom_stages() -> tuple[
+            Mapping[str, Any], dict[str, int | None], float
+        ]:
+            """Normalize atoms, rewrite attributes, and build dense atom keys."""
+
+            stage_started_at = time.monotonic()
+            stage_metrics_map.update(
+                await _normalize_strict_v3_price_atom_stage(
+                    schema_name=schema_name,
+                    price_atom_table=price_atom_table,
+                )
+            )
+            stage_metrics_map["normalization_seconds"] = (
+                time.monotonic() - stage_started_at
+            )
+            stage_started_at = time.monotonic()
+            lean_price_manifest = (
+                await _rewrite_ptg2_manifest_price_atom_table_lean_dict(
+                    schema_name=schema_name,
+                    price_atom_table=price_atom_table,
+                    price_atom_dictionary_table=price_attr_dictionary_table,
+                )
+            )
+            stage_metrics_map["dictionary_rewrite_seconds"] = (
+                time.monotonic() - stage_started_at
+            )
+            if not isinstance(lean_price_manifest, dict):
+                raise RuntimeError(
+                    "strict V3 price atom rewrite did not produce a dictionary contract"
+                )
+            atom_map_started_at = time.monotonic()
+            atom_stats = await _create_v3_atom_key_stage(
                 schema_name=schema_name,
                 price_atom_table=price_atom_table,
+                stage_table=atom_key_map,
             )
-        )
-        stage_metrics_map["normalization_seconds"] = (
-            time.monotonic() - stage_started_at
-        )
-        stage_started_at = time.monotonic()
-        lean_manifest = await _rewrite_ptg2_manifest_price_atom_table_lean_dict(
-            schema_name=schema_name,
-            price_atom_table=price_atom_table,
-            price_atom_dictionary_table=price_attr_dictionary_table,
-        )
-        stage_metrics_map["dictionary_rewrite_seconds"] = (
-            time.monotonic() - stage_started_at
-        )
-        if not isinstance(lean_manifest, dict):
-            raise RuntimeError(
-                "strict V3 price atom rewrite did not produce a dictionary contract"
+            return lean_price_manifest, atom_stats, atom_map_started_at
+
+        async def prepare_price_key_stage() -> dict[str, int | None]:
+            """Build and announce the validated dense price-key stage."""
+
+            stage_started_at = time.monotonic()
+            price_map_stats = await _create_v3_price_key_stage(
+                schema_name=schema_name,
+                price_set_summary_table=price_set_summary_table,
+                price_set_summary_source_count=normalized_summary_source_count,
+                stage_table=price_key_map,
             )
-        stage_started_at = time.monotonic()
+            stage_metrics_map["price_key_build_seconds"] = (
+                time.monotonic() - stage_started_at
+            )
+            price_set_count = int(price_map_stats.get("row_count") or 0)
+            if price_set_count <= 0:
+                raise RuntimeError(
+                    "strict V3 cannot publish an empty price-set dictionary"
+                )
+            if price_key_ready is not None:
+                price_key_ready(
+                    PreparedSharedPriceKeyMap(
+                        schema_name=schema_name,
+                        price_key_map=price_key_map,
+                        price_set_count=price_set_count,
+                    )
+                )
+            return price_map_stats
+
+        price_map_task = asyncio.create_task(prepare_price_key_stage())
+        atom_stages_task = asyncio.create_task(prepare_atom_stages())
         try:
-            async with asyncio.TaskGroup() as task_group:
-                price_map_task = task_group.create_task(
-                    _create_v3_price_key_stage(
-                        schema_name=schema_name,
-                        price_atom_table=price_atom_table,
-                        price_set_atom_table=price_set_atom_table,
-                        stage_table=price_key_map,
-                    )
-                )
-                atom_map_task = task_group.create_task(
-                    _create_v3_atom_key_stage(
-                        schema_name=schema_name,
-                        price_atom_table=price_atom_table,
-                        stage_table=atom_key_map,
-                    )
-                )
-        finally:
-            await db.status(
-                f"ALTER TABLE {_qualified(schema_name, price_atom_table)} "
-                "DROP COLUMN IF EXISTS negotiated_rate_numeric;"
+            price_map_stats, atom_stage_result = await asyncio.gather(
+                price_map_task,
+                atom_stages_task,
             )
-        price_map_stats = price_map_task.result()
-        atom_map_stats = atom_map_task.result()
+        except BaseException:
+            for task in (price_map_task, atom_stages_task):
+                task.cancel()
+            drain_future = asyncio.gather(
+                price_map_task,
+                atom_stages_task,
+                return_exceptions=True,
+            )
+            await _await_cleanup_task(drain_future)
+            raise
+        lean_manifest, atom_map_stats, atom_map_started_at = atom_stage_result
+        parallel_finished_at = time.monotonic()
         stage_metrics_map["dense_key_build_seconds"] = (
-            time.monotonic() - stage_started_at
+            parallel_finished_at - atom_map_started_at
+        )
+        stage_metrics_map["parallel_price_prepare_seconds"] = (
+            parallel_finished_at - parallel_started_at
         )
         price_set_count = int(price_map_stats.get("row_count") or 0)
         atom_count = int(atom_map_stats.get("row_count") or 0)
-        if price_set_count <= 0:
-            raise RuntimeError("strict V3 cannot publish an empty price-set dictionary")
         return PreparedSharedPriceArtifacts(
             schema_name=schema_name,
             price_atom_table=price_atom_table,
@@ -1041,18 +1166,21 @@ async def prepare_shared_price_artifacts(
             stage_metrics=stage_metrics_map,
         )
     except BaseException:
-        await db.status(
-            "DROP TABLE IF EXISTS "
-            f"{_qualified(schema_name, price_key_map)}, "
-            f"{_qualified(schema_name, atom_key_map)}, "
-            f"{_qualified(schema_name, price_attr_dictionary_table)} "
-            "CASCADE;"
+        cleanup_task = asyncio.create_task(
+            db.status(
+                "DROP TABLE IF EXISTS "
+                f"{_qualified(schema_name, price_key_map)}, "
+                f"{_qualified(schema_name, atom_key_map)}, "
+                f"{_qualified(schema_name, price_attr_dictionary_table)} "
+                "CASCADE;"
+            )
         )
+        await _await_cleanup_task(cleanup_task)
         raise
 
 
 async def export_shared_price_key_map(
-    prepared: PreparedSharedPriceArtifacts,
+    prepared: PreparedSharedPriceArtifacts | PreparedSharedPriceKeyMap,
     output_path: str | Path,
 ) -> Path:
     """Export the authoritative ID-to-cost-rank map as PostgreSQL binary COPY."""
@@ -1180,7 +1308,9 @@ async def publish_shared_price_artifacts(
             constant_values=price_atom_constant_value_by_kind,
         )
         return SharedPricePublication(
-            references=block_publication.references,
+            object_kinds=block_publication.object_kinds,
+            mapping_count=block_publication.mapping_count,
+            unique_block_count=block_publication.unique_block_count,
             price_set_count=price_set_count,
             atom_count=atom_count,
             atom_key_bits=atom_key_bits,
@@ -1206,6 +1336,7 @@ async def publish_shared_price_artifacts(
 __all__ = [
     "SharedPricePublication",
     "PreparedSharedPriceArtifacts",
+    "PreparedSharedPriceKeyMap",
     "PTG2_V3_PRICE_KEY_ORDER",
     "cleanup_prepared_shared_price_artifacts",
     "export_shared_price_key_map",

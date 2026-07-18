@@ -18,8 +18,14 @@ from api.ptg2_shared_blocks import (
 from process.ptg_parts.ptg2_shared_blocks import shared_block_hash
 
 
-def _shard_block_key(code_key: int, provider_set_key: int) -> int:
-    return (int(code_key) << 31) | (int(provider_set_key) // 1024)
+def _shard_block_key(
+    code_key: int,
+    provider_set_key: int,
+    provider_shard_span: int = 1024,
+) -> int:
+    return (int(code_key) << 31) | (
+        int(provider_set_key) // int(provider_shard_span)
+    )
 
 
 def _uvarint(value: int) -> bytes:
@@ -262,6 +268,60 @@ async def test_provider_filtered_read_computes_only_exact_sparse_shards(
     discover.assert_not_awaited()
     assert fetch.await_args.kwargs["block_keys"] == (block_zero, block_two)
     assert fetch.await_args.kwargs["require_all"] is False
+
+
+@pytest.mark.asyncio
+async def test_provider_filtered_read_uses_manifest_provider_shard_span(
+    monkeypatch,
+):
+    provider_shard_span = 8192
+    block_zero = _shard_block_key(7, 5, provider_shard_span)
+    block_one = _shard_block_key(7, 8193, provider_shard_span)
+    fetch = AsyncMock(
+        return_value=[
+            _fragment_row(
+                _fragment(
+                    _grouped_payload(2, [(5, [(8, 0)])]),
+                    entry_count=1,
+                    block_key=block_zero,
+                )
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_discover_forward_shard_keys",
+        AsyncMock(
+            side_effect=AssertionError(
+                "sparse provider reads must not discover a code range"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        fetch,
+    )
+    _patch_reference_lookups(monkeypatch)
+
+    filtered_rows = await ptg2_db_sidecars.lookup_serving_binary_by_code_from_db(
+        object(),
+        7,
+        provider_set_keys=(5, 8193),
+        shared_snapshot_key=41,
+        source_count=2,
+        price_dictionary_item_count=128,
+        price_dictionary_block_bytes=2048,
+        provider_shard_span=provider_shard_span,
+    )
+
+    assert [
+        (filtered_row.provider_set_key, filtered_row.price_key)
+        for filtered_row in filtered_rows
+    ] == [
+        (5, 8)
+    ]
+    assert fetch.await_args.kwargs["block_keys"] == (block_zero, block_one)
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,9 @@ import json
 import os
 import struct
 import uuid
+from decimal import Decimal
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -22,10 +24,12 @@ from api.ptg2_db_sidecars import (
 )
 from api.ptg2_shared_blocks import fetch_shared_blocks, fetch_shared_graph_members
 from db.connection import db
+from process.ptg_parts import ptg2_shared_publish
 from process.ptg_parts.ptg2_manifest_artifacts import write_global_membership_sidecar
 from process.ptg_parts.ptg2_manifest_publish import (
     PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     _copy_price_atom_member_file,
+    _copy_price_set_summary_file,
     _copy_ptg2_manifest_price_atom_file,
     _create_ptg2_manifest_serving_stage_table,
     _ptg2_manifest_support_stage_table,
@@ -53,6 +57,12 @@ from process.ptg_parts.ptg2_shared_reuse import (
     SharedPhysicalArtifactIdentity,
     SharedSnapshotSourceAssignment,
     shared_source_set_metadata,
+)
+from process.ptg_parts.ptg2_shared_price import _create_v3_price_key_stage
+from process.ptg_parts.ptg2_shared_publish import (
+    _upsert_shared_block_mappings,
+    create_shared_block_stage,
+    publish_shared_block_stage,
 )
 from process.ptg_parts.ptg2_shared_snapshot_publish import (
     publish_shared_v3_snapshot_sources,
@@ -148,6 +158,475 @@ async def _create_shared_schema(schema_name: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_real_postgres_cross_file_price_set_summary_ranking_and_conflict():
+    """Rank matching cross-file summaries and reject conflicting minima."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip(
+            "set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1 for the isolated PostgreSQL test"
+        )
+
+    schema_name = f"ptg2_price_summary_{uuid.uuid4().hex[:16]}"
+    quoted_schema = '"' + schema_name + '"'
+    summary_table = "price_set_summary"
+    key_table = "price_keys"
+    conflict_key_table = "price_keys_conflict"
+
+    await db.disconnect()
+    await db.connect()
+    try:
+        await db.execute_ddl(f"CREATE SCHEMA {quoted_schema}")
+        await db.execute_ddl(
+            f"""
+            CREATE UNLOGGED TABLE {quoted_schema}.{summary_table} (
+                price_set_global_id_128 bytea NOT NULL,
+                minimum_negotiated_rate numeric NOT NULL
+            )
+            """
+        )
+        await db.status(
+            f"""
+            INSERT INTO {quoted_schema}.{summary_table}
+                (price_set_global_id_128, minimum_negotiated_rate)
+            VALUES
+                (decode(repeat('11', 16), 'hex'), 10.00),
+                (decode(repeat('11', 16), 'hex'), 10.00),
+                (decode(repeat('22', 16), 'hex'), -1.25),
+                (decode(repeat('22', 16), 'hex'), -1.25),
+                (decode(repeat('33', 16), 'hex'), 10.00),
+                (decode(repeat('33', 16), 'hex'), 10.00)
+            """
+        )
+
+        dense_stats = await _create_v3_price_key_stage(
+            schema_name=schema_name,
+            price_set_summary_table=summary_table,
+            price_set_summary_source_count=2,
+            stage_table=key_table,
+        )
+
+        assert dense_stats == {
+            "row_count": 3,
+            "distinct_id_count": 3,
+            "distinct_key_count": 3,
+            "minimum_key": 0,
+            "maximum_key": 2,
+        }
+        ranked_rows = await db.all(
+            f"""
+            SELECT encode(price_set_global_id_128, 'hex'),
+                   price_key,
+                   minimum_negotiated_rate
+              FROM {quoted_schema}.{key_table}
+             ORDER BY price_key
+            """
+        )
+        assert [
+            (
+                str(ranked_price_row[0]),
+                int(ranked_price_row[1]),
+                Decimal(ranked_price_row[2]),
+            )
+            for ranked_price_row in ranked_rows
+        ] == [
+            ("22" * 16, 0, Decimal("-1.25")),
+            ("11" * 16, 1, Decimal("10.00")),
+            ("33" * 16, 2, Decimal("10.00")),
+        ]
+
+        await db.status(f"TRUNCATE TABLE {quoted_schema}.{summary_table}")
+        await db.status(
+            f"""
+            INSERT INTO {quoted_schema}.{summary_table}
+                (price_set_global_id_128, minimum_negotiated_rate)
+            VALUES
+                (decode(repeat('44', 16), 'hex'), 2.50),
+                (decode(repeat('44', 16), 'hex'), 2.51)
+            """
+        )
+
+        with pytest.raises(RuntimeError, match="conflicting minimum rates"):
+            await _create_v3_price_key_stage(
+                schema_name=schema_name,
+                price_set_summary_table=summary_table,
+                price_set_summary_source_count=2,
+                stage_table=conflict_key_table,
+            )
+        assert not bool(
+            await db.scalar(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_catalog.pg_tables
+                     WHERE schemaname = :schema_name
+                       AND tablename = :table_name
+                )
+                """,
+                schema_name=schema_name,
+                table_name=conflict_key_table,
+            )
+        )
+    finally:
+        try:
+            await db.execute_ddl(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
+        finally:
+            await db.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_shared_block_mapping_upsert_is_idempotent_and_fail_closed():
+    """Accept unique retries while rejecting every duplicate mapping key."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip(
+            "set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1 for the isolated PostgreSQL test"
+        )
+
+    schema_name = f"ptg2_mapping_upsert_{uuid.uuid4().hex[:16]}"
+    quoted_schema = '"' + schema_name + '"'
+    stage_table = "block_stage"
+
+    await db.disconnect()
+    await db.connect()
+    try:
+        await db.execute_ddl(f"CREATE SCHEMA {quoted_schema}")
+        await db.execute_ddl(
+            f"""
+            CREATE UNLOGGED TABLE {quoted_schema}.{stage_table} (
+                object_kind varchar(64) NOT NULL,
+                block_key bigint NOT NULL,
+                fragment_no integer NOT NULL,
+                entry_count bigint NOT NULL,
+                block_hash bytea NOT NULL
+            )
+            """
+        )
+        await db.execute_ddl(
+            f"""
+            CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_block (
+                snapshot_key bigint NOT NULL,
+                object_kind varchar(64) NOT NULL,
+                block_key bigint NOT NULL,
+                fragment_no integer NOT NULL,
+                entry_count bigint NOT NULL,
+                block_hash bytea NOT NULL,
+                PRIMARY KEY (snapshot_key, object_kind, block_key, fragment_no)
+            )
+            """
+        )
+        await db.status(
+            f"""
+            INSERT INTO {quoted_schema}.{stage_table}
+                (object_kind, block_key, fragment_no, entry_count, block_hash)
+            VALUES
+                ('serving', 1, 0, 3, decode(repeat('11', 32), 'hex')),
+                ('serving', 2, 0, 4, decode(repeat('22', 32), 'hex'))
+            """
+        )
+        # A unique fresh stage and an identical retry both succeed.
+        for _ in range(2):
+            async with db.transaction() as session:
+                await _upsert_shared_block_mappings(
+                    session,
+                    schema_name=schema_name,
+                    stage_table=stage_table,
+                    snapshot_key=7,
+                )
+        assert int(
+            await db.scalar(
+                f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_snapshot_block"
+            )
+            or 0
+        ) == 2
+
+        # An exact duplicate key is rejected for both retry and fresh snapshots.
+        await db.status(
+            f"""
+            INSERT INTO {quoted_schema}.{stage_table}
+                (object_kind, block_key, fragment_no, entry_count, block_hash)
+            VALUES ('serving', 1, 0, 3, decode(repeat('11', 32), 'hex'))
+            """
+        )
+        for snapshot_key in (7, 8):
+            with pytest.raises(RuntimeError, match="mapping conflicts"):
+                async with db.transaction() as session:
+                    await _upsert_shared_block_mappings(
+                        session,
+                        schema_name=schema_name,
+                        stage_table=stage_table,
+                        snapshot_key=snapshot_key,
+                    )
+        assert int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(*)
+                  FROM {quoted_schema}.ptg2_v3_snapshot_block
+                 WHERE snapshot_key = 8
+                """
+            )
+            or 0
+        ) == 0
+
+        # A duplicate key with conflicting content is likewise rejected fresh.
+        await db.status(f"TRUNCATE TABLE {quoted_schema}.{stage_table}")
+        await db.status(
+            f"""
+            INSERT INTO {quoted_schema}.{stage_table}
+                (object_kind, block_key, fragment_no, entry_count, block_hash)
+            VALUES
+                ('serving', 1, 0, 3, decode(repeat('11', 32), 'hex')),
+                ('serving', 1, 0, 4, decode(repeat('ff', 32), 'hex'))
+            """
+        )
+        with pytest.raises(RuntimeError, match="mapping conflicts"):
+            async with db.transaction() as session:
+                await _upsert_shared_block_mappings(
+                    session,
+                    schema_name=schema_name,
+                    stage_table=stage_table,
+                    snapshot_key=9,
+                )
+        assert int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(*)
+                  FROM {quoted_schema}.ptg2_v3_snapshot_block
+                 WHERE snapshot_key = 9
+                """
+            )
+            or 0
+        ) == 0
+
+        # An existing conflicting mapping rolls back a new mapping in the batch.
+        await db.status(f"TRUNCATE TABLE {quoted_schema}.{stage_table}")
+        await db.status(
+            f"""
+            INSERT INTO {quoted_schema}.{stage_table}
+                (object_kind, block_key, fragment_no, entry_count, block_hash)
+            VALUES
+                ('serving', 1, 0, 3, decode(repeat('11', 32), 'hex')),
+                ('serving', 2, 0, 4, decode(repeat('ff', 32), 'hex')),
+                ('serving', 3, 0, 5, decode(repeat('33', 32), 'hex'))
+            """
+        )
+        with pytest.raises(RuntimeError, match="mapping conflicts"):
+            async with db.transaction() as session:
+                await _upsert_shared_block_mappings(
+                    session,
+                    schema_name=schema_name,
+                    stage_table=stage_table,
+                    snapshot_key=7,
+                )
+        assert int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(*)
+                  FROM {quoted_schema}.ptg2_v3_snapshot_block
+                 WHERE snapshot_key = 7
+                """
+            )
+            or 0
+        ) == 2
+        assert not bool(
+            await db.scalar(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.ptg2_v3_snapshot_block
+                     WHERE snapshot_key = 7 AND block_key = 3
+                )
+                """
+            )
+        )
+        stored_hash = await db.scalar(
+            f"""
+            SELECT encode(block_hash, 'hex')
+              FROM {quoted_schema}.ptg2_v3_snapshot_block
+             WHERE snapshot_key = 7 AND block_key = 2
+            """
+        )
+        assert stored_hash == "22" * 32
+    finally:
+        await db.status(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
+        await db.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_shared_block_publish_preserves_content_conflict_checks(
+    monkeypatch,
+):
+    """Stored-content comparison rejects both fresh and retry hash conflicts."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip(
+            "set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1 for the isolated PostgreSQL test"
+        )
+
+    schema_name = f"ptg2_block_publish_{uuid.uuid4().hex[:16]}"
+    quoted_schema = '"' + schema_name + '"'
+    stage_table = "block_stage"
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_shared_layout_for_dense_write",
+        AsyncMock(),
+    )
+
+    async def load_stage(values_sql: str) -> None:
+        await create_shared_block_stage(
+            schema_name=schema_name,
+            stage_table=stage_table,
+        )
+        await db.status(
+            f"""
+            INSERT INTO {quoted_schema}.{stage_table}
+                (block_hash, format_version, object_kind, block_key, fragment_no,
+                 entry_count, codec, raw_byte_count, stored_byte_count, payload)
+            VALUES {values_sql}
+            """
+        )
+
+    await db.disconnect()
+    await db.connect()
+    try:
+        await db.execute_ddl(f"CREATE SCHEMA {quoted_schema}")
+        await db.execute_ddl(
+            f"""
+            CREATE TABLE {quoted_schema}.ptg2_v3_block (
+                block_hash bytea PRIMARY KEY,
+                format_version smallint NOT NULL,
+                object_kind varchar(64) NOT NULL,
+                codec varchar(16) NOT NULL,
+                entry_count bigint NOT NULL,
+                raw_byte_count bigint NOT NULL,
+                stored_byte_count bigint NOT NULL,
+                payload bytea NOT NULL,
+                created_at timestamp with time zone NOT NULL
+            )
+            """
+        )
+        await db.execute_ddl(
+            f"""
+            CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_block (
+                snapshot_key bigint NOT NULL,
+                object_kind varchar(64) NOT NULL,
+                block_key bigint NOT NULL,
+                fragment_no integer NOT NULL,
+                entry_count bigint NOT NULL,
+                block_hash bytea NOT NULL,
+                PRIMARY KEY (snapshot_key, object_kind, block_key, fragment_no)
+            )
+            """
+        )
+
+        identical_rows = """
+            (decode(repeat('11', 32), 'hex'), 2, 'serving', 1, 0,
+             3, 'none', 3, 3, decode('616263', 'hex')),
+            (decode(repeat('11', 32), 'hex'), 2, 'serving', 2, 0,
+             3, 'none', 3, 3, decode('616263', 'hex'))
+        """
+        for _ in range(2):
+            await load_stage(identical_rows)
+            publication = await publish_shared_block_stage(
+                schema_name=schema_name,
+                stage_table=stage_table,
+                snapshot_key=7,
+                build_token="build-7",
+            )
+            assert publication.object_kinds == ("serving",)
+            assert publication.mapping_count == 2
+            assert publication.unique_block_count == 1
+            assert publication.logical_byte_count == 6
+            assert publication.stored_byte_count == 6
+        assert int(
+            await db.scalar(f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_block")
+            or 0
+        ) == 1
+        assert int(
+            await db.scalar(
+                f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_snapshot_block"
+            )
+            or 0
+        ) == 2
+
+        # A metadata-only retry reuses the immutable durable payload.
+        await load_stage(
+            """
+            (decode(repeat('11', 32), 'hex'), 2, 'serving', 1, 0,
+             3, 'none', 3, 3, NULL)
+            """
+        )
+        reused_publication = await publish_shared_block_stage(
+            schema_name=schema_name,
+            stage_table=stage_table,
+            snapshot_key=7,
+            build_token="build-7",
+        )
+        assert reused_publication.mapping_count == 1
+        assert reused_publication.unique_block_count == 1
+
+        # Metadata-only rows cannot create an absent durable block.
+        await load_stage(
+            """
+            (decode(repeat('33', 32), 'hex'), 2, 'serving', 3, 0,
+             3, 'none', 3, 3, NULL)
+            """
+        )
+        with pytest.raises(RuntimeError, match="conflicts with stored content metadata"):
+            await publish_shared_block_stage(
+                schema_name=schema_name,
+                stage_table=stage_table,
+                snapshot_key=8,
+                build_token="build-8",
+            )
+
+        # A retry cannot reuse a hash for different stored content.
+        await load_stage(
+            """
+            (decode(repeat('11', 32), 'hex'), 2, 'serving', 3, 0,
+             3, 'none', 3, 3, decode('78797a', 'hex'))
+            """
+        )
+        with pytest.raises(RuntimeError, match="conflicts with stored content metadata"):
+            await publish_shared_block_stage(
+                schema_name=schema_name,
+                stage_table=stage_table,
+                snapshot_key=7,
+                build_token="build-7",
+            )
+
+        # Conflicting rows sharing a new hash also fail and roll back the chosen insert.
+        await load_stage(
+            """
+            (decode(repeat('22', 32), 'hex'), 2, 'serving', 1, 0,
+             3, 'none', 3, 3, decode('616263', 'hex')),
+            (decode(repeat('22', 32), 'hex'), 2, 'serving', 2, 0,
+             3, 'none', 3, 3, decode('78797a', 'hex'))
+            """
+        )
+        with pytest.raises(RuntimeError, match="conflicts with stored content metadata"):
+            await publish_shared_block_stage(
+                schema_name=schema_name,
+                stage_table=stage_table,
+                snapshot_key=8,
+                build_token="build-8",
+            )
+
+        assert int(
+            await db.scalar(f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_block")
+            or 0
+        ) == 1
+        assert int(
+            await db.scalar(
+                f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_snapshot_block"
+            )
+            or 0
+        ) == 2
+    finally:
+        await db.status(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
+        await db.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
     tmp_path,
     monkeypatch,
@@ -202,14 +681,12 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
     provider_set_id = next(iter(provider_set_ids))
     provider_set_metadata_path = tmp_path / "provider-set-metadata.copy"
     provider_set_metadata_path.write_text(
-        f"{provider_set_id.hex()}\t{{}}\n",
+        f"{provider_set_id.hex()}\t2\t{{}}\n",
         encoding="ascii",
-    )
-    provider_set_metadata_entries = (
-        {"path": str(provider_set_metadata_path), "row_count": 1},
     )
     assert scan["price_atom_frames"]
     assert scan["price_set_atom_frames"]
+    assert scan["price_set_summary_frames"]
     assert all(
         Path(frame["path"]).stat().st_size > 0 for frame in scan["price_atom_frames"]
     )
@@ -250,6 +727,23 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             "source_run_contract_sha256"
         ],
         scanner_summary=scanner_summary,
+    )
+    provider_set_metadata_payload = provider_set_metadata_path.read_bytes()
+    provider_set_metadata_entries = (
+        {
+            "path": str(provider_set_metadata_path),
+            "row_count": 1,
+            "bytes": len(provider_set_metadata_payload),
+            "sha256": hashlib.sha256(provider_set_metadata_payload).hexdigest(),
+            "format": "ptg2_v3_provider_set_metadata_copy",
+            "version": 1,
+            "source_type": source_identity.source_type,
+            "identity_kind": source_identity.identity_kind,
+            "identity_sha256": source_identity.identity_sha256,
+            "source_run_contract_sha256": serving_run_entries[0][
+                "source_run_contract_sha256"
+            ],
+        },
     )
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
@@ -332,6 +826,14 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
                     "price_set_atom",
                 ),
             )
+        for frame in scan["price_set_summary_frames"]:
+            await _copy_price_set_summary_file(
+                Path(frame["path"]),
+                target_table=_ptg2_manifest_support_stage_table(
+                    stage_table,
+                    "price_set_summary",
+                ),
+            )
 
         provider_group_id = bytes.fromhex("00112233445566778899aabbccddeeff")
         npi = 1234567890
@@ -352,6 +854,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             serving_run_entries=serving_run_entries,
             code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
+            price_set_summary_source_count=1,
             graph_artifact_entries=graph_entries,
             source_audit_witness_entries=(
                 scanner_tests._single_frame(
@@ -368,6 +871,23 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         assert publication.snapshot_key == reservation.snapshot_key
         assert publication.layout_reused_at_seal is False
         assert publication.stored_byte_count > 0
+        assert publication.mapping_count > 0
+        assert 0 < publication.unique_block_count <= publication.mapping_count
+        assert len(publication.mapping_digest) == 32
+        assert set(publication.object_kinds) == {
+            "by_code_provider_shard_v1",
+            "by_code_price_page_v4",
+            "by_code_price_dictionary",
+            "provider_set_count_dictionary",
+            "provider_set_codes_v3",
+            "provider_set_page_v3_s2",
+            "price_set_atom_memberships_v3",
+            "price_atoms_v3",
+            "graph_npi_groups_v1",
+            "graph_group_npis_v1",
+            "graph_group_provider_sets_v1",
+            "graph_provider_set_groups_v1",
+        }
         assert publication.serving_index["storage_generation"] == "shared_blocks_v3"
         assert publication.serving_index["shared_block_layout"] == "dense_shared_blocks_v3"
         assert publication.serving_index["source_count"] == 1
@@ -382,6 +902,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         assert publication.serving_index["serving_binary_table"] is None
         assert {
             "finalizer_seconds",
+            "price_key_ready_finalizer_wall_seconds",
             "serving_block_publish_seconds",
             "dictionary_publish_seconds",
             "provider_set_key_export_seconds",
@@ -397,6 +918,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             publication.serving_index["timings"][name] >= 0
             for name in (
                 "finalizer_seconds",
+                "price_key_ready_finalizer_wall_seconds",
                 "serving_block_publish_seconds",
                 "dictionary_publish_seconds",
                 "provider_set_key_export_seconds",
@@ -409,6 +931,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
                 "shared_publish_total_seconds",
             )
         )
+        assert publication.serving_index["price_stage"]["price_key_build_seconds"] >= 0
         assert publication.serving_index["price_stage"]["duplicate_rows_removed"] > 0
         assert publication.serving_index["audit_sample"]["contract"] == (
             "persisted_served_occurrence_sample_v2"
@@ -787,6 +1310,14 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
                     "price_set_atom",
                 ),
             )
+        for frame in scan["price_set_summary_frames"]:
+            await _copy_price_set_summary_file(
+                Path(frame["path"]),
+                target_table=_ptg2_manifest_support_stage_table(
+                    reused_stage,
+                    "price_set_summary",
+                ),
+            )
         reused_snapshot_id = f"shared-reused-{uuid.uuid4().hex}"
         reused_assignment = SharedSnapshotSourceAssignment(
             source_key=0,
@@ -838,6 +1369,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             serving_run_entries=serving_run_entries,
             code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
+            price_set_summary_source_count=1,
             graph_artifact_entries=graph_entries,
             source_audit_witness_entries=(
                 scanner_tests._single_frame(

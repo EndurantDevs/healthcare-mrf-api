@@ -208,9 +208,9 @@ async def test_plan_get_autocomplete_success():
     )
     response = await get_autocomplete_list(request)
     response_payload = json.loads(response.body)
-    lookup = {item["plan_id"]: item for item in response_payload["plans"]}
-    assert lookup["P123"]["network_checksum"] == {"111": "GOLD"}
-    assert lookup["P456"]["network_checksum"] == {"222": "SILVER"}
+    lookup_by_key = {item["plan_id"]: item for item in response_payload["plans"]}
+    assert lookup_by_key["P123"]["network_checksum"] == {"111": "GOLD"}
+    assert lookup_by_key["P456"]["network_checksum"] == {"222": "SILVER"}
 
 
 @pytest.mark.asyncio
@@ -269,7 +269,7 @@ async def test_plan_get_price_plan_success():
 
 @pytest.mark.asyncio
 async def test_plan_get_plan_success():
-    plan_row = {
+    plan_row_by_field = {
         "plan_id": "P123",
         "year": 2024,
         "issuer_id": 42,
@@ -278,7 +278,7 @@ async def test_plan_get_plan_success():
     }
     request = make_request(
         [
-            FakeResult(rows=[plan_row]),
+            FakeResult(rows=[plan_row_by_field]),
             FakeResult(rows=[(77777, "PREFERRED")]),
             FakeResult(scalar="Sample Issuer"),
             FakeResult(rows=[{"plan_id": "P123", "year": 2024, "drug_tier": "Tier 1", "pharmacy_type": "Retail"}]),
@@ -300,7 +300,7 @@ async def test_plan_get_plan_success():
 @pytest.mark.asyncio
 async def test_plan_find_plan_success():
     """Verify plan find plan success."""
-    plan_entry = {
+    plan_entry_by_field = {
         "plan_id": "P123",
         "year": 2024,
         "issuer_id": 42,
@@ -316,7 +316,7 @@ async def test_plan_find_plan_success():
             FakeResult(
                 rows=[
                     {
-                        **plan_entry,
+                        **plan_entry_by_field,
                         "market_coverage": "On Exchange",
                         "is_on_exchange": True,
                         "is_off_exchange": False,
@@ -411,11 +411,11 @@ def test_parse_float_invalid():
 
 
 def test_append_filter_skips_empty():
-    applied = {"existing": 1}
-    plan_module._append_filter(applied, "empty", "")
-    assert applied == {"existing": 1}
-    plan_module._append_filter(applied, "filled", 2)
-    assert applied["filled"] == 2
+    applied_filters = {"existing": 1}
+    plan_module._append_filter(applied_filters, "empty", "")
+    assert applied_filters == {"existing": 1}
+    plan_module._append_filter(applied_filters, "filled", 2)
+    assert applied_filters["filled"] == 2
 
 
 def test_collect_price_bounds_merges():
@@ -686,7 +686,7 @@ async def test_find_a_plan_no_results():
 
 @pytest.mark.asyncio
 async def test_find_a_plan_with_new_filters():
-    plan_entry = {
+    plan_entry_by_field = {
         "plan_id": "PX",
         "year": 2024,
         "issuer_id": 42,
@@ -716,7 +716,7 @@ async def test_find_a_plan_with_new_filters():
         [
             FakeResult(rows=[(1,)], scalar=1),
             *make_facet_results(),
-            FakeResult(rows=[plan_entry]),
+            FakeResult(rows=[plan_entry_by_field]),
             FakeResult(rows=[{"plan_id": "PX", "year": 2024, "individual_rate": 150.0}]),
             FakeResult(rows=[{"issuer_id": 42, "issuer_name": "Issuer", "plan_count": 1}]),
         ],
@@ -1296,7 +1296,7 @@ async def test_find_a_plan_invalid_age():
     with pytest.raises(sanic.exceptions.BadRequest):
         await find_a_plan(request)
 def test_normalize_attribute_map_converts_scalars():
-    raw = {"PlanMarketingName": "Bronze ABC"}
-    normalized = plan_module._normalize_attribute_map(raw)
+    raw_by_key = {"PlanMarketingName": "Bronze ABC"}
+    normalized = plan_module._normalize_attribute_map(raw_by_key)
     assert normalized["PlanMarketingName"]["attr_value"] == "Bronze ABC"
     assert "human_attr_name" in normalized["PlanMarketingName"]
