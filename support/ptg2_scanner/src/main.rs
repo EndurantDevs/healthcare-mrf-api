@@ -20135,9 +20135,7 @@ fn prepare_v3_partition(
         elapsed_seconds,
         scratch,
     );
-    Ok(V3PreparedPartition {
-        inputs,
-    })
+    Ok(V3PreparedPartition { inputs })
 }
 
 fn build_v3_provider_identity_map(path: &Path, expected_rows: u64) -> io::Result<DenseIdentityMap> {
