@@ -14,7 +14,7 @@ from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
 from api.ptg2_serving_utils import ein_plan_id_variants
 from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
 from process.ptg_parts.ptg2_candidate_attestation import (
-    PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+    PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS,
 )
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts.ptg2_shared_blocks import (
@@ -458,8 +458,8 @@ async def snapshot_serving_tables(
              LIMIT 1
         """
     else:
-        query_params_by_name["attestation_contract"] = (
-            PTG2_CANDIDATE_ATTESTATION_CONTRACT
+        query_params_by_name["attestation_contracts"] = list(
+            PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
         )
         query_sql = f"""
             SELECT layout.layout_manifest->'serving_index'
@@ -511,7 +511,9 @@ async def snapshot_serving_tables(
                AND snapshot.status = 'published'
                AND layout.state = 'sealed'
                AND layout.generation = :storage_generation
-               AND attestation.contract = :attestation_contract
+               AND attestation.contract = ANY(
+                   CAST(:attestation_contracts AS text[])
+               )
                AND attestation.activated_at IS NOT NULL
                AND attestation.plan_id = snapshot_scope.plan_id
                AND attestation.plan_market_type

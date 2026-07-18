@@ -14,10 +14,14 @@ from api.ptg2_candidate_audit import (
 from api.ptg2_serving_utils import ein_plan_id_variants
 from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
 from process.ptg_parts.ptg2_candidate_attestation import (
-    PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+    PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS,
 )
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+_PTG2_ATTESTATION_CONTRACT_SQL = ", ".join(
+    f"'{contract}'"
+    for contract in PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
+)
 
 
 def _serving_relation_available_sql(
@@ -41,7 +45,7 @@ def _serving_relation_available_sql(
         """
         attestation_checks = f"""
                AND shared_attestation.contract
-                   = '{PTG2_CANDIDATE_ATTESTATION_CONTRACT}'
+                   IN ({_PTG2_ATTESTATION_CONTRACT_SQL})
                AND shared_attestation.activated_at IS NOT NULL
         """
     return f"""
@@ -142,7 +146,7 @@ async def current_snapshot_id(
                             WHERE source_attestation.snapshot_id = ptg2_snapshot.snapshot_id
                               AND source_attestation.source_key = :source_key
                               AND source_attestation.contract
-                                  = '{PTG2_CANDIDATE_ATTESTATION_CONTRACT}'
+                                  IN ({_PTG2_ATTESTATION_CONTRACT_SQL})
                               AND source_attestation.activated_at IS NOT NULL
                        )
                 """

@@ -130,6 +130,35 @@ async def test_candidate_snapshot_resolution_requires_matching_request_capabilit
 
 
 @pytest.mark.asyncio
+async def test_published_snapshot_resolution_accepts_supported_attestation_contracts():
+    class Result:
+        def scalar(self):
+            return "published-snapshot"
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, statement, params):
+            self.calls.append((str(statement), dict(params)))
+            return Result()
+
+    session = Session()
+    resolved = await ptg2_snapshot.current_snapshot_id(
+        session,
+        requested_snapshot_id="published-snapshot",
+        requested_source_key="source-a",
+    )
+
+    assert resolved == "published-snapshot"
+    sql, _params = session.calls[0]
+    for supported_contract in (
+        ptg2_snapshot.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
+    ):
+        assert sql.count(f"'{supported_contract}'") == 2
+
+
+@pytest.mark.asyncio
 async def test_candidate_serving_metadata_query_is_validated_and_scope_bound():
     class EmptyResult:
         def one_or_none(self):

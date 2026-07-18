@@ -103,7 +103,7 @@ from api.ptg2_shared_blocks import (
 )
 from process.ptg_parts.ptg2_shared_blocks import PTG2_V3_SHARED_GENERATION
 from process.ptg_parts.ptg2_candidate_attestation import (
-    PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+    PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS,
 )
 from process.ext.contact_canon import canonicalize_one
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -183,7 +183,7 @@ _PTG2_NETWORK_SERVING_TABLES_REVALIDATION_SQL = f"""
        AND snapshot.status = 'published'
        AND layout.state = 'sealed'
        AND layout.generation = :storage_generation
-       AND attestation.contract = :attestation_contract
+       AND attestation.contract = ANY(CAST(:attestation_contracts AS text[]))
        AND attestation.activated_at IS NOT NULL
        AND attestation.plan_id = snapshot_scope.plan_id
        AND attestation.plan_market_type = snapshot_scope.plan_market_type
@@ -9132,7 +9132,9 @@ async def _is_cached_network_serving_tables_current(
         {
             "snapshot_ids": list(snapshot_ids),
             "storage_generation": PTG2_V3_SHARED_GENERATION,
-            "attestation_contract": PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+            "attestation_contracts": list(
+                PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
+            ),
         },
     )
     validated_snapshot_ids: set[str] = set()

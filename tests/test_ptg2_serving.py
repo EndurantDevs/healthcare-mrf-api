@@ -2621,6 +2621,30 @@ async def test_network_serving_tables_cache_is_revalidated_and_reloads_on_mismat
 
 
 @pytest.mark.asyncio
+async def test_network_descriptor_revalidation_accepts_supported_attestations():
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, statement, params):
+            self.calls.append((str(statement), dict(params)))
+            return []
+
+    session = Session()
+    is_current = await ptg2_serving._is_cached_network_serving_tables_current(
+        session,
+        {"snapshot-a": _strict_v3_tables(snapshot_id="snapshot-a")},
+    )
+
+    assert is_current is False
+    sql, params = session.calls[0]
+    assert "attestation.contract = ANY(" in sql
+    assert params["attestation_contracts"] == list(
+        ptg2_serving.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
+    )
+
+
+@pytest.mark.asyncio
 async def test_multi_network_forward_reads_share_request_session_sequentially(
     monkeypatch,
 ):

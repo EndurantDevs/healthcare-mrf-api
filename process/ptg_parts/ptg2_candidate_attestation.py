@@ -34,7 +34,24 @@ from process.ptg_parts.ptg2_source_witness_contract import (
 )
 
 
-PTG2_CANDIDATE_ATTESTATION_CONTRACT = "ptg2_v3_release_audit_attestation_v3"
+PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3 = (
+    "ptg2_v3_release_audit_attestation_v3"
+)
+PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4 = (
+    "ptg2_v3_release_audit_attestation_v4"
+)
+PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT = (
+    PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
+)
+PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS = (
+    PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4,
+    PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
+)
+# Compatibility alias for the V3 writer. The batch-audit rollout changes only
+# CURRENT after every serving replica accepts all SUPPORTED contracts.
+PTG2_CANDIDATE_ATTESTATION_CONTRACT = (
+    PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT
+)
 PTG2_CANDIDATE_AUDIT_TOOL = PTG2_FAST_AUDIT_TOOL
 PTG2_CANDIDATE_AUDIT_TOOL_VERSION = PTG2_FAST_AUDIT_TOOL_VERSION
 PTG2_VERIFIED_HTTPS_TRANSPORT = "verified_https_v1"
@@ -791,7 +808,7 @@ async def verify_candidate_audit_attestation_in_transaction(
                AND source_set_digest = :source_set_digest
                AND audit_sample_digest = :audit_sample_digest
                AND source_witness_digest = :source_witness_digest
-               AND contract = :contract
+               AND contract = ANY(CAST(:supported_contracts AS text[]))
                AND activated_at IS NULL
                AND expires_at > clock_timestamp()
              FOR UPDATE
@@ -807,7 +824,9 @@ async def verify_candidate_audit_attestation_in_transaction(
             "source_set_digest": identity["source_set_digest"],
             "audit_sample_digest": identity["audit_sample_digest"],
             "source_witness_digest": identity["source_witness_digest"],
-            "contract": PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+            "supported_contracts": list(
+                PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
+            ),
         },
     )
     attestation_row = query_result.first()
