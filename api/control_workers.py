@@ -235,12 +235,12 @@ def _worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> di
         return _kubernetes_worker_state(spec, payload)
 
     pid = _read_pid(_pid_path(spec))
-    running = _pid_running(pid) and _pid_matches_spec(pid, spec)
+    running = _is_pid_running(pid) and _is_pid_spec_match(pid, spec)
     if pid and not running:
         _remove_stale_pid(spec)
     if not running:
         pid = _find_running_pid(spec)
-        running = _pid_running(pid)
+        running = _is_pid_running(pid)
         if running and pid:
             _write_pid_file(spec, pid)
     return {
@@ -384,7 +384,7 @@ def _delete_kubernetes_worker_jobs_for_spec(
     deletion_records: list[dict[str, Any]] = []
     deletion_errors: list[dict[str, Any]] = []
     for job_record in _kubernetes_job_records(body):
-        deletion_record, deletion_error = _delete_kubernetes_worker_job(namespace, worker_spec, job_record)
+        deletion_record, deletion_error = _delete_kubernetes_worker_job_record(namespace, worker_spec, job_record)
         if deletion_record:
             deletion_records.append(deletion_record)
         if deletion_error:
@@ -398,7 +398,7 @@ def _kubernetes_job_records(body: dict[str, Any]) -> list[dict[str, Any]]:
     return [record for record in raw_records if isinstance(record, dict)]
 
 
-def _delete_kubernetes_worker_job(
+def _delete_kubernetes_worker_job_record(
     namespace: str,
     worker_spec: WorkerSpec,
     job_record: dict[str, Any],
@@ -970,7 +970,7 @@ def _read_pid(path: Path) -> int | None:
         return None
 
 
-def _pid_running(pid: int | None) -> bool:
+def _is_pid_running(pid: int | None) -> bool:
     if not pid or pid <= 0:
         return False
     try:
@@ -982,7 +982,7 @@ def _pid_running(pid: int | None) -> bool:
     return True
 
 
-def _pid_matches_spec(pid: int | None, spec: WorkerSpec) -> bool:
+def _is_pid_spec_match(pid: int | None, spec: WorkerSpec) -> bool:
     if not pid:
         return False
     try:
@@ -992,10 +992,10 @@ def _pid_matches_spec(pid: int | None, spec: WorkerSpec) -> bool:
             output = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True)
         except Exception:
             return True
-    return _process_matches_worker_spec(output, spec)
+    return _is_process_worker_spec_match(output, spec)
 
 
-def _pid_matches_current_node(pid: int | None) -> bool:
+def _is_pid_on_current_node(pid: int | None) -> bool:
     if not pid:
         return False
     try:
@@ -1005,7 +1005,7 @@ def _pid_matches_current_node(pid: int | None) -> bool:
             output = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True)
         except Exception:
             return True
-    return _matches_current_node(output)
+    return _is_current_node_match(output)
 
 
 def _find_running_pid(spec: WorkerSpec) -> int | None:
@@ -1018,7 +1018,7 @@ def _find_running_pid(spec: WorkerSpec) -> int | None:
             return None
     for line in output.splitlines():
         text = line.strip()
-        if " rg " in text or not _process_matches_worker_spec(text, spec):
+        if " rg " in text or not _is_process_worker_spec_match(text, spec):
             continue
         raw_pid = text.split(None, 1)[0]
         try:
@@ -1030,8 +1030,8 @@ def _find_running_pid(spec: WorkerSpec) -> int | None:
     return None
 
 
-def _process_matches_worker_spec(process_text: str, spec: WorkerSpec) -> bool:
-    if not _matches_current_node(process_text):
+def _is_process_worker_spec_match(process_text: str, spec: WorkerSpec) -> bool:
+    if not _is_current_node_match(process_text):
         return False
     parts = process_text.split()
     for index, part in enumerate(parts[:-2]):
@@ -1040,7 +1040,7 @@ def _process_matches_worker_spec(process_text: str, spec: WorkerSpec) -> bool:
     return False
 
 
-def _matches_current_node(process_text: str) -> bool:
+def _is_current_node_match(process_text: str) -> bool:
     node_id = os.getenv("HLTHPRT_IMPORT_NODE_ID", "").strip()
     if not node_id:
         return True

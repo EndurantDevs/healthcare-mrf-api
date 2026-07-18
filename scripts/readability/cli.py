@@ -16,6 +16,7 @@ DEFAULT_BASELINE = "readability-baseline.json"
 PROTECTED_NEW_ISSUE_CATEGORIES = frozenset(
     {
         "builtin_shadowing",
+        "confusable_function_names",
         "global_state_usage",
         "inline_suppressions",
         "pass_placeholders",
@@ -135,8 +136,7 @@ def _check_readability_ratchet(
         return 2
 
     ratchet_baseline = _load_json(ratchet_baseline_path)
-    ratchet_rules = ratchet_baseline.get("rules", {"thresholds": ratchet_baseline.get("thresholds")})
-    if ratchet_rules != snapshot.get("rules"):
+    if not _has_compatible_ratchet_rules_by_section(ratchet_baseline, snapshot):
         print("Readability ratchet rules differ from the base branch.", file=sys.stderr)
         return 2
 
@@ -207,6 +207,32 @@ def _rules_snapshot(config: dict[str, Any]) -> dict[str, Any]:
         "readability": config.get("readability", {}),
         "thresholds": config.get("thresholds", {}),
     }
+
+
+def _has_compatible_ratchet_rules_by_section(
+    ratchet_baseline: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> bool:
+    """Allow the one-time confusable-name rule migration, then require exact rules."""
+
+    ratchet_rules_by_section = ratchet_baseline.get(
+        "rules",
+        {"thresholds": ratchet_baseline.get("thresholds")},
+    )
+    current_rules_by_section = snapshot.get("rules")
+    if ratchet_rules_by_section == current_rules_by_section:
+        return True
+    if "confusable_function_names" in ratchet_baseline.get("issue_counts", {}):
+        return False
+    if not isinstance(current_rules_by_section, dict):
+        return False
+    current_readability_by_name = dict(current_rules_by_section.get("readability", {}))
+    exceptions = current_readability_by_name.pop("confusable_function_name_exceptions", None)
+    if not isinstance(exceptions, list):
+        return False
+    migrated_rules_by_section = dict(current_rules_by_section)
+    migrated_rules_by_section["readability"] = current_readability_by_name
+    return ratchet_rules_by_section == migrated_rules_by_section
 
 
 def _baseline_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:

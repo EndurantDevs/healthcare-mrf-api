@@ -167,7 +167,7 @@ async def test_group_plan_providers_filters_to_ten_digit_npis(monkeypatch):
     )
     monkeypatch.setattr(
         pricing_module,
-        "current_source_snapshot_ids_for_plan",
+        "current_network_snapshots_for_plan",
         fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
@@ -200,7 +200,7 @@ async def test_group_plan_providers_pages_strict_v3_npi_scope(monkeypatch):
 
     monkeypatch.setattr(
         pricing_module,
-        "current_source_snapshot_ids_for_plan",
+        "current_network_snapshots_for_plan",
         fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
@@ -225,7 +225,7 @@ async def test_group_plan_providers_filters_by_canonical_provider_sex(monkeypatc
 
     monkeypatch.setattr(
         pricing_module,
-        "current_source_snapshot_ids_for_plan",
+        "current_network_snapshots_for_plan",
         fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(
@@ -269,7 +269,7 @@ async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
     )
     monkeypatch.setattr(
         pricing_module,
-        "current_source_snapshot_ids_for_plan",
+        "current_network_snapshots_for_plan",
         fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
@@ -313,7 +313,7 @@ async def test_group_plan_providers_does_not_refresh_legacy_specialty_cache(monk
         fail_if_called,
         raising=False,
     )
-    monkeypatch.setattr(pricing_module, "current_source_snapshot_ids_for_plan", fake_plan_snapshot_pairs)
+    monkeypatch.setattr(pricing_module, "current_network_snapshots_for_plan", fake_plan_snapshot_pairs)
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
         [FakeResult(rows=[types.SimpleNamespace(npi=1234567890)])],
@@ -398,7 +398,7 @@ async def test_group_plan_providers_classification_internal_medicine_uses_base_t
     )
     monkeypatch.setattr(
         pricing_module,
-        "current_source_snapshot_ids_for_plan",
+        "current_network_snapshots_for_plan",
         fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
@@ -440,7 +440,7 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
     )
     monkeypatch.setattr(
         pricing_module,
-        "current_source_snapshot_ids_for_plan",
+        "current_network_snapshots_for_plan",
         fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
@@ -533,7 +533,7 @@ async def test_group_plan_providers_widens_zip_filter_to_radius_by_default(monke
             {"zip5": "60611", "distance_miles": 1.2},
         ]
 
-    monkeypatch.setattr(pricing_module, "current_source_snapshot_ids_for_plan", fake_plan_snapshot_pairs)
+    monkeypatch.setattr(pricing_module, "current_network_snapshots_for_plan", fake_plan_snapshot_pairs)
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     monkeypatch.setattr(pricing_module, "_zip_radius_rows", fake_zip_radius_rows)
     request = make_request(
@@ -572,7 +572,7 @@ async def test_group_plan_providers_drives_from_local_specialty_candidates(monke
     async def fake_zip_radius_rows(_session, *, zip5, radius_miles, state_hint=None, **_kwargs):
         return [{"zip5": "60601"}, {"zip5": "60602"}]
 
-    monkeypatch.setattr(pricing_module, "current_source_snapshot_ids_for_plan", fake_plan_snapshot_pairs)
+    monkeypatch.setattr(pricing_module, "current_network_snapshots_for_plan", fake_plan_snapshot_pairs)
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     monkeypatch.setattr(pricing_module, "_zip_radius_rows", fake_zip_radius_rows)
     request = make_request(
@@ -615,7 +615,7 @@ async def test_group_plan_providers_unions_all_published_network_snapshots(monke
     async def fake_snapshot_serving_tables(_session, snapshot_id):
         return strict_snapshot_tables(snapshot_id)
 
-    monkeypatch.setattr(pricing_module, "current_source_snapshot_ids_for_plan", fake_network_snapshot_pairs)
+    monkeypatch.setattr(pricing_module, "current_network_snapshots_for_plan", fake_network_snapshot_pairs)
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
         [FakeResult(rows=[types.SimpleNamespace(npi=1073913877)])],
@@ -654,7 +654,7 @@ async def test_group_plan_providers_splits_multi_network_postal_scans(monkeypatc
     async def fake_postal_radius_rows(_session, **keyword_args):
         return [{"zip5": keyword_args["zip5"]}, {"zip5": "60602"}]
 
-    monkeypatch.setattr(pricing_module, "current_source_snapshot_ids_for_plan", fake_network_snapshot_pairs)
+    monkeypatch.setattr(pricing_module, "current_network_snapshots_for_plan", fake_network_snapshot_pairs)
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     monkeypatch.setattr(pricing_module, "_zip_radius_rows", fake_postal_radius_rows)
     request = make_request(
@@ -713,7 +713,7 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
     )
     monkeypatch.setattr(
         pricing_module,
-        "current_source_snapshot_ids_for_plan",
+        "current_network_snapshots_for_plan",
         fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
@@ -1473,7 +1473,7 @@ async def test_get_pricing_provider_score_estimated_fallback(monkeypatch):
                     "high_score_threshold_passed": False,
                     "high_confidence_threshold_passed": False,
                 },
-                pricing_module._empty_domains_payload(),
+                pricing_module._empty_domain_payloads_by_name(),
                 cohort_context={
                     "selected_geography": "zip:20850",
                     "selected_cohort_level": None,

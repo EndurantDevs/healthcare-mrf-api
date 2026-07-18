@@ -21,7 +21,7 @@ from api.endpoint.plan import (
     find_a_plan,
     get_autocomplete_list,
     get_network_by_checksum,
-    get_networks_by_checksums,
+    get_network_batch_by_checksums,
     get_plan,
     get_price_plan,
     get_price_plans_bulk,
@@ -102,20 +102,20 @@ async def test_get_network_by_checksum(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_networks_by_checksums(monkeypatch):
+async def test_get_network_batch_by_checksums(monkeypatch):
     async def fake_fetch(_session, checksum):
         return {"checksum": checksum, "plans": []}
 
     monkeypatch.setattr("api.endpoint.plan._fetch_network_entry", fake_fetch)
 
     request = make_request([])
-    response = await get_networks_by_checksums(request, "1,2,1")
+    response = await get_network_batch_by_checksums(request, "1,2,1")
     response_payload = json.loads(response.body)
     assert [entry["checksum"] for entry in response_payload] == [1, 2]
 
 
 @pytest.mark.asyncio
-async def test_get_networks_by_checksums_not_found(monkeypatch):
+async def test_get_network_batch_by_checksums_not_found(monkeypatch):
     async def fake_fetch(_session, _checksum):
         return None
 
@@ -123,7 +123,17 @@ async def test_get_networks_by_checksums_not_found(monkeypatch):
 
     request = make_request([])
     with pytest.raises(sanic.exceptions.NotFound):
-        await get_networks_by_checksums(request, "1,2")
+        await get_network_batch_by_checksums(request, "1,2")
+
+
+def test_network_batch_route_keeps_legacy_reverse_name():
+    route = next(
+        route
+        for route in plan_module.blueprint._future_routes
+        if route.uri == "/network/multiple/<checksums>"
+    )
+
+    assert route.name == "plan.get_networks_by_checksums"
 
 
 @pytest.mark.asyncio
@@ -1126,14 +1136,14 @@ def test_result_scalar_empty():
 
 
 @pytest.mark.asyncio
-async def test_get_networks_by_checksums_skips_invalid(monkeypatch):
+async def test_get_network_batch_by_checksums_skips_invalid(monkeypatch):
     async def fake_fetch(_session, checksum):
         return {"checksum": checksum, "plans": []}
 
     monkeypatch.setattr("api.endpoint.plan._fetch_network_entry", fake_fetch)
     session = FakeSession([])
     request = types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=session))
-    response = await get_networks_by_checksums(request, "bad,1")
+    response = await get_network_batch_by_checksums(request, "bad,1")
     response_payload = json.loads(response.body)
     assert [entry["checksum"] for entry in response_payload] == [1]
 

@@ -275,7 +275,7 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
     return str(snapshot_id_value) if snapshot_id_value else None
 
 
-async def current_source_snapshot_ids_for_plan(
+async def current_network_snapshots_for_plan(
     session, args: dict[str, object]
 ) -> list[tuple[str, str]]:
     """Resolve the newest sealed shared V3 snapshot for each logical plan network.

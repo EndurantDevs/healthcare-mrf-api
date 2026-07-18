@@ -155,7 +155,7 @@ class _FailingSession:
     [
         (ptg2_snapshot.current_source_snapshot_id, ("source-a",)),
         (ptg2_snapshot.current_source_snapshot_id_for_plan, ({"plan_id": "plan-a"},)),
-        (ptg2_snapshot.current_source_snapshot_ids_for_plan, ({"plan_id": "plan-a"},)),
+        (ptg2_snapshot.current_network_snapshots_for_plan, ({"plan_id": "plan-a"},)),
     ],
 )
 async def test_source_pointer_query_exceptions_propagate(resolver, args):
@@ -174,7 +174,7 @@ class _EmptySession:
     [
         (ptg2_snapshot.current_source_snapshot_id, ("source-a",), None),
         (ptg2_snapshot.current_source_snapshot_id_for_plan, ({"plan_id": "plan-a"},), None),
-        (ptg2_snapshot.current_source_snapshot_ids_for_plan, ({"plan_id": "plan-a"},), []),
+        (ptg2_snapshot.current_network_snapshots_for_plan, ({"plan_id": "plan-a"},), []),
     ],
 )
 async def test_successful_empty_source_pointer_queries_preserve_not_found(

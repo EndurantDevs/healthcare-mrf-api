@@ -1457,7 +1457,7 @@ async def test_create_import_run_persists_enqueued_state(monkeypatch):
 
     monkeypatch.setattr(control_imports, "db", FakeDb())
     monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find)
-    monkeypatch.setattr(control_imports, "find_active_run_by_importer", fake_find_importer)
+    monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", fake_find_importer)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fake_enqueue)
 
     source_row, created = await create_import_run(
@@ -1494,7 +1494,7 @@ async def test_create_import_run_returns_active_run_after_integrity_race(monkeyp
 
     monkeypatch.setattr(control_imports, "db", FakeDb())
     monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find)
-    monkeypatch.setattr(control_imports, "find_active_run_by_importer", fake_find_importer)
+    monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", fake_find_importer)
 
     created_run_map, created = await create_import_run(
         {
@@ -1526,7 +1526,7 @@ async def test_create_import_run_returns_active_same_importer_run(monkeypatch):
         raise AssertionError("enqueue should not run when importer already has an active run")
 
     monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find_idem)
-    monkeypatch.setattr(control_imports, "find_active_run_by_importer", fake_find_importer)
+    monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", fake_find_importer)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
 
     created_run_map, created = await create_import_run(
@@ -1565,7 +1565,7 @@ async def test_create_import_run_allows_parallel_source_file_ptg(monkeypatch):
 
     monkeypatch.setattr(control_imports, "db", FakeDb())
     monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find_idem)
-    monkeypatch.setattr(control_imports, "find_active_run_by_importer", fail_find_importer)
+    monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", fail_find_importer)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fake_enqueue)
 
     source_row, created = await create_import_run(
@@ -1603,7 +1603,7 @@ async def test_create_import_run_serializes_unsourced_ptg(monkeypatch):
         raise AssertionError("enqueue should not run for unsourced PTG while PTG is active")
 
     monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find_idem)
-    monkeypatch.setattr(control_imports, "find_active_run_by_importer", fake_find_importer)
+    monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", fake_find_importer)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
 
     created_run_map, created = await create_import_run(

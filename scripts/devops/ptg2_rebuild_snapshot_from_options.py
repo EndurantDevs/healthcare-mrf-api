@@ -126,7 +126,7 @@ async def _resolve_toc_url(url: str, *, refresh_toc_urls: bool) -> str:
     return url
 
 
-async def _resolve_toc_urls(urls: list[str], *, refresh_toc_urls: bool) -> list[str]:
+async def _resolve_toc_url_batch(urls: list[str], *, refresh_toc_urls: bool) -> list[str]:
     return [await _resolve_toc_url(url, refresh_toc_urls=refresh_toc_urls) for url in urls]
 
 
@@ -207,7 +207,7 @@ async def _execute_rebuild(cli_args: argparse.Namespace) -> dict[str, Any]:
         stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
         import_id = f"space_rebuild_{source_key[-10:]}_{stamp}"
     toc_urls = _as_list(options.get("toc_urls"))
-    resolved_toc_urls = await _resolve_toc_urls(toc_urls, refresh_toc_urls=bool(cli_args.refresh_toc_urls))
+    resolved_toc_urls = await _resolve_toc_url_batch(toc_urls, refresh_toc_urls=bool(cli_args.refresh_toc_urls))
     ptg_run_result = await run_ptg(
         test_mode=_is_truthy(options.get("test_mode")),
         toc_urls=resolved_toc_urls,

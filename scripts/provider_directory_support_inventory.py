@@ -236,7 +236,7 @@ def render_current_dataset_audit_section(
     return audit_lines
 
 
-def _credential_row(
+def _format_credential_row(
     source_label: str,
     support_label: str,
     access_label: str,
@@ -264,7 +264,7 @@ def _credential_rows(
         support_record = support_by_entry[entry["entry_id"]]
         if support_record["access_requirement"] == "none" and not support_record["requires_registration"]:
             continue
-        rows.append(_credential_row(
+        rows.append(_format_credential_row(
             f"{entry['display_name']} (`{entry['entry_id']}`)",
             display_value(support_record["support_level"]),
             display_value(support_record["access_requirement"]),
@@ -273,7 +273,7 @@ def _credential_rows(
     for blocker in blockers:
         if blocker["access_requirement"] == "none" and not blocker["requires_registration"]:
             continue
-        rows.append(_credential_row(
+        rows.append(_format_credential_row(
             f"{blocker['display_name']} (`{blocker['id']}`)",
             display_value("not-supported"),
             display_value(blocker["access_requirement"]),

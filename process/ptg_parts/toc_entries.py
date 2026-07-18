@@ -137,7 +137,7 @@ def _flat_toc_plan_info(toc_url: str) -> tuple[dict[str, str], ...]:
     )
 
 
-def _flat_toc_catalog_entry(
+def _build_flat_toc_catalog_entry(
     file_item: dict[str, Any],
     section_type: tuple[str, str],
     toc_url: str,
@@ -180,7 +180,7 @@ def flat_toc_catalog_entries(
         for file_item in section_items:
             if not isinstance(file_item, dict):
                 continue
-            catalog_entry = _flat_toc_catalog_entry(
+            catalog_entry = _build_flat_toc_catalog_entry(
                 file_item,
                 section_type,
                 toc_url,

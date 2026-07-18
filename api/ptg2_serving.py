@@ -47,7 +47,7 @@ from api.ptg2_code_context import (
     _resolve_ptg2_code_search_context,
 )
 from api.ptg2_snapshot import (
-    current_source_snapshot_ids_for_plan,
+    current_network_snapshots_for_plan,
     resolve_current_ptg2_snapshot_id,
 )
 from api.ptg2_response import (
@@ -1473,7 +1473,7 @@ def _ptg2_manifest_id_bytes(value: Any) -> bytes:
         return b""
 
 
-def _ptg2_manifest_ids(values: list[Any] | tuple[Any, ...]) -> tuple[str, ...]:
+def _deduplicate_ptg2_manifest_ids(values: list[Any] | tuple[Any, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(hex_value for value in values if (hex_value := _ptg2_manifest_id(value))))
 
 
@@ -1820,7 +1820,7 @@ async def _provider_set_keys_for_ids(
     serving_tables: PTG2ServingTables,
     provider_set_ids: Iterable[str],
 ) -> dict[str, int]:
-    normalized_ids = list(_ptg2_manifest_ids(tuple(provider_set_ids)))
+    normalized_ids = list(_deduplicate_ptg2_manifest_ids(tuple(provider_set_ids)))
     if not normalized_ids:
         return {}
     _require_strict_shared_v3(serving_tables)
@@ -2829,7 +2829,7 @@ class _VersionThreeReverseSelection:
     total_row_count: int | None = None
 
     @property
-    def total_is_exact(self) -> bool:
+    def is_total_exact(self) -> bool:
         """Return whether the reverse selection has an exact total row count."""
         return self.total_row_count is not None
 
@@ -2903,7 +2903,7 @@ async def _version_three_reverse_scope(
     )
     if not provider_set_key_by_id:
         return None
-    missing_provider_set_ids = set(_ptg2_manifest_ids(tuple(reverse_query.provider_set_ids))).difference(
+    missing_provider_set_ids = set(_deduplicate_ptg2_manifest_ids(tuple(reverse_query.provider_set_ids))).difference(
         provider_set_key_by_id
     )
     if missing_provider_set_ids:
@@ -3073,7 +3073,7 @@ async def _load_version_three_page_projection(
         serving_tables,
         reverse_query.provider_set_ids,
     )
-    normalized_provider_ids = set(_ptg2_manifest_ids(tuple(reverse_query.provider_set_ids)))
+    normalized_provider_ids = set(_deduplicate_ptg2_manifest_ids(tuple(reverse_query.provider_set_ids)))
     if set(provider_set_key_by_id) != normalized_provider_ids:
         raise PTG2ManifestArtifactError(
             "PTG2 v3 provider-set dictionary is missing a referenced provider set"
@@ -3526,7 +3526,7 @@ async def _shared_graph_members_by_id(
     """Resolve dense shared-graph members for normalized 128-bit owner IDs."""
 
     _require_strict_shared_v3(serving_tables)
-    owner_id_list = list(_ptg2_manifest_ids(tuple(owner_ids)))
+    owner_id_list = list(_deduplicate_ptg2_manifest_ids(tuple(owner_ids)))
     if not owner_id_list:
         return {}
     return await _shared_graph_members_many(
@@ -3572,7 +3572,7 @@ async def _shared_provider_group_keys_for_ids(
     serving_tables: PTG2ServingTables,
     provider_group_ids: Iterable[str],
 ) -> dict[str, int]:
-    ids = tuple(_ptg2_manifest_ids(tuple(provider_group_ids)))
+    ids = tuple(_deduplicate_ptg2_manifest_ids(tuple(provider_group_ids)))
     if not ids:
         return {}
     result = await session.execute(
@@ -3702,7 +3702,7 @@ async def _manifest_sets_by_group(
     serving_tables: PTG2ServingTables,
     group_ids: list[str] | tuple[str, ...],
 ) -> dict[str, tuple[str, ...]]:
-    normalized_group_ids = _ptg2_manifest_ids(tuple(group_ids))
+    normalized_group_ids = _deduplicate_ptg2_manifest_ids(tuple(group_ids))
     if not normalized_group_ids:
         return {}
     return await _shared_graph_members_by_id(
@@ -3713,7 +3713,7 @@ async def _manifest_sets_by_group(
     )
 
 def _ptg2_build_rate_scope(group_ids: tuple[str, ...]) -> _ManifestRateScope:
-    normalized_group_ids = tuple(sorted(set(_ptg2_manifest_ids(group_ids))))
+    normalized_group_ids = tuple(sorted(set(_deduplicate_ptg2_manifest_ids(group_ids))))
     sql_group_ids = normalized_group_ids if len(normalized_group_ids) <= _ptg2_sql_scope_limit() else ()
     binary_group_ids = [_ptg2_manifest_id_bytes(group_id) for group_id in normalized_group_ids]
     if any(not group_id for group_id in binary_group_ids):
@@ -3968,7 +3968,7 @@ async def _provider_npis_for_sets(
 ) -> dict[str, tuple[int, ...]]:
     """Load bounded NPI prefixes for sealed provider sets."""
 
-    provider_set_ids = _ptg2_manifest_ids(tuple(provider_set_global_ids))
+    provider_set_ids = _deduplicate_ptg2_manifest_ids(tuple(provider_set_global_ids))
     if limit_per_set is None:
         uncached_provider_set_ids = provider_set_ids
         requested_limit = None
@@ -4419,7 +4419,7 @@ async def _prices_for_price_sets(
 ) -> dict[str, list[dict[str, Any]]]:
     """Return hydrated prices for each requested price set, preserving atom order."""
 
-    price_set_ids = _ptg2_manifest_ids(tuple(price_set_global_ids))
+    price_set_ids = _deduplicate_ptg2_manifest_ids(tuple(price_set_global_ids))
     if not price_set_ids:
         return {}
     _require_strict_shared_v3(serving_tables)
@@ -6438,7 +6438,7 @@ async def _provider_rows_for_sets(
 ) -> dict[str, list[dict[str, Any]]] | None:
     """Resolve enriched provider rows for each requested provider set."""
 
-    provider_set_ids = _ptg2_manifest_ids(tuple(provider_set_global_ids))
+    provider_set_ids = _deduplicate_ptg2_manifest_ids(tuple(provider_set_global_ids))
     if not provider_set_ids:
         return {}
     args = args or {}
@@ -8856,7 +8856,7 @@ async def search_ptg2_provider_procedures(
     explicit_source = str(args.get("source_key") or "").strip()
     plan_scoped = bool(str(args.get("plan_id") or args.get("plan_external_id") or "").strip())
     if plan_scoped and not explicit_snapshot and not explicit_source:
-        network_snapshots = await current_source_snapshot_ids_for_plan(session, args)
+        network_snapshots = await current_network_snapshots_for_plan(session, args)
         if len(network_snapshots) > 1:
             return await _search_multi_ptg2_provider_procedures(
                 session,
@@ -9244,7 +9244,7 @@ async def search_current_ptg2_index(session, args: dict[str, Any], pagination) -
     # its own snapshot) and combine results. A pinned snapshot_id or source_key,
     # or a non-plan query, stays on the original single-snapshot path untouched.
     if plan_scoped and not explicit_snapshot and not explicit_source:
-        network_snapshots = await current_source_snapshot_ids_for_plan(session, args)
+        network_snapshots = await current_network_snapshots_for_plan(session, args)
         if len(network_snapshots) > 1:
             return await _search_multi_ptg2_snapshots(session, network_snapshots, args, pagination)
         if len(network_snapshots) == 1:

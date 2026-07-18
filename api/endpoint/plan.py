@@ -539,8 +539,11 @@ async def get_network_by_checksum(request, checksum):
     return response.json(entry, default=str)
 
 
-@blueprint.get("/network/multiple/<checksums>")
-async def get_networks_by_checksums(request, checksums):
+@blueprint.get(
+    "/network/multiple/<checksums>",
+    name="get_networks_by_checksums",
+)
+async def get_network_batch_by_checksums(request, checksums):
     """Return networks matching a collection of stable checksums."""
     session = _get_session(request)
     values = [value.strip() for value in checksums.split(",") if value.strip()]

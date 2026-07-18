@@ -190,7 +190,7 @@ GEO_SERVICE_LOCATIONS_ENV = "HLTHPRT_GEO_INCLUDE_SERVICE_LOCATIONS"
 GEO_SERVICE_LOCATION_TYPES = ("primary", "secondary", "practice", "site")
 
 
-def _geo_includes_service_locations() -> bool:
+def _should_include_geo_service_locations() -> bool:
     return os.getenv(GEO_SERVICE_LOCATIONS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -838,7 +838,7 @@ def _npi_detail_response_cache_set(cache_key: str, payload: bytes) -> bytes:
     return payload
 
 
-def _npi_detail_response_cacheable(
+def _is_npi_detail_response_cacheable(
     data: dict[str, Any],
     *,
     force_address_update: bool,
@@ -4179,7 +4179,7 @@ async def _fast_primary_npi_count() -> int:
 def _nearby_geo_type_clause(address_table_sql: str) -> str:
     """Return the partial geo-index address-type predicate."""
 
-    if address_table_sql.endswith(".entity_address_unified") and _geo_includes_service_locations():
+    if address_table_sql.endswith(".entity_address_unified") and _should_include_geo_service_locations():
         type_list = ", ".join(
             f"'{address_type}'" for address_type in GEO_SERVICE_LOCATION_TYPES
         )
@@ -4518,7 +4518,7 @@ def _name_like_clause(alias: str = "", param: str = "name_like") -> str:
     return f"({expr} LIKE {param_ref})"
 
 
-def _name_like_clauses(alias: str, names: Sequence[str], base_param: str = "name_like") -> tuple[str, dict]:
+def _names_like_filter_clause(alias: str, names: Sequence[str], base_param: str = "name_like") -> tuple[str, dict]:
     if not names:
         return "", {}
     prefix = alias
@@ -4885,23 +4885,23 @@ async def _fetch_provider_directory_profile_map(
     return profiles_by_npi
 
 
-def _address_serving_unified_requested() -> bool:
+def _is_unified_address_serving_requested() -> bool:
     return os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower() == ADDRESS_SERVING_SOURCE_UNIFIED
 
 
-def _address_table_is_unified(address_table_sql: str) -> bool:
+def _is_unified_address_table(address_table_sql: str) -> bool:
     return address_table_sql.endswith(f".{EntityAddressUnified.__tablename__}")
 
 
 def _address_zip5_filter(alias: str, address_table_sql: str, *, any_array: bool = False) -> str:
-    column = f"{alias}.zip5" if _address_table_is_unified(address_table_sql) else f"LEFT({alias}.postal_code, 5)"
+    column = f"{alias}.zip5" if _is_unified_address_table(address_table_sql) else f"LEFT({alias}.postal_code, 5)"
     operator = "ANY (:zip_codes)" if any_array else ":zip_code"
     return f"{column} = {operator}"
 
 
 def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
     raw_digits = f"regexp_replace(COALESCE({alias}.telephone_number, ''), '[^0-9]', '', 'g')"
-    if _address_table_is_unified(address_table_sql):
+    if _is_unified_address_table(address_table_sql):
         return f"COALESCE(NULLIF({alias}.phone_number, ''), {raw_digits}) = :phone_digits"
     return f"{raw_digits} = :phone_digits"
 
@@ -5030,7 +5030,7 @@ phone_candidates_unranked AS MATERIALIZED (
 
 def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
     """Return indexed phone candidates, including current FHIR evidence."""
-    if not _address_table_is_unified(address_table_sql):
+    if not _is_unified_address_table(address_table_sql):
         return None
     direct_phone = _address_phone_digits_filter("phone_address", address_table_sql)
     service_types = ", ".join(f"'{location_type}'" for location_type in GEO_SERVICE_LOCATION_TYPES)
@@ -5095,13 +5095,13 @@ def _sql_with_ctes(*ctes: str | None) -> str:
 
 
 def _address_npi_filter(alias: str, address_table_sql: str) -> str:
-    if _address_table_is_unified(address_table_sql):
+    if _is_unified_address_table(address_table_sql):
         return f"COALESCE({alias}.npi, {alias}.inferred_npi) = :npi_filter"
     return f"{alias}.npi = :npi_filter"
 
 
 def _address_site_key_filter(alias: str, address_table_sql: str) -> str:
-    if _address_table_is_unified(address_table_sql):
+    if _is_unified_address_table(address_table_sql):
         return f"{alias}.premise_key = CAST(:address_site_key AS uuid)"
     return "1=0"
 
@@ -5112,7 +5112,7 @@ def _provider_list_address_type_clause(
     *,
     include_service_locations: bool,
 ) -> str:
-    if include_service_locations and _address_table_is_unified(address_table_sql):
+    if include_service_locations and _is_unified_address_table(address_table_sql):
         type_list = ", ".join(f"'{value}'" for value in GEO_SERVICE_LOCATION_TYPES)
         return f"{alias}.type IN ({type_list})"
     return f"{alias}.type = 'primary'"
@@ -5124,7 +5124,7 @@ def _primary_address_order_clause(alias: str, address_table_sql: str) -> str:
         f"({alias}.lat IS NULL OR {alias}.long IS NULL), "
         f"(NULLIF(TRIM(COALESCE({alias}.first_line, '')), '') IS NULL), "
     )
-    if _address_table_is_unified(address_table_sql):
+    if _is_unified_address_table(address_table_sql):
         return (
             common
             + f"(COALESCE({alias}.address_precision, '') = 'city_zip'), "
@@ -5144,7 +5144,7 @@ def _public_address_serving_column_keys() -> set[str]:
 
 
 async def _address_serving_model(required_columns: set[str] | None = None, *, session: Any = None):
-    if not _address_serving_unified_requested():
+    if not _is_unified_address_serving_requested():
         return NPIAddress
     required = set(required_columns or ())
     columns = await _table_columns(EntityAddressUnified.__tablename__, session=session)
@@ -5791,7 +5791,7 @@ def _build_npi_where_clause(
     params: dict[str, object] = {}
 
     if names_like:
-        name_clause, name_params = _name_like_clauses(alias, names_like)
+        name_clause, name_params = _names_like_filter_clause(alias, names_like)
         if name_clause:
             clauses.append(name_clause)
             params.update(name_params)
@@ -5938,7 +5938,7 @@ async def pharmacists_in_pharmacies(request):
     if not names:
         return response.json({"count": 0})
 
-    name_clause, name_params = _name_like_clauses("d", names)
+    name_clause, name_params = _names_like_filter_clause("d", names)
     address_table_sql = await _address_serving_table_sql(
         {"npi", "type", "state_name", "telephone_number", "taxonomy_array"},
         session=request_session,
@@ -5997,7 +5997,7 @@ async def pharmacists_per_pharmacy(request):
     name_clause = ""
     name_query_param_map: dict = {}
     if names:
-        name_clause, name_query_param_map = _name_like_clauses("d", names)
+        name_clause, name_query_param_map = _names_like_filter_clause("d", names)
         query_param_map.update(name_query_param_map)
 
     state_filter_addr = "AND a.state_name = :state" if state else ""
@@ -6373,7 +6373,7 @@ def _match_geo_distance_expr(params: dict[str, Any], alias: str = "a") -> str:
 
 
 def _match_candidate_column_sql(address_table_sql: str) -> dict[str, str]:
-    unified = _address_table_is_unified(address_table_sql)
+    unified = _is_unified_address_table(address_table_sql)
     return {
         "provider_npi": "COALESCE(a.npi, a.inferred_npi)" if unified else "a.npi",
         "premise_key": "a.premise_key::text" if unified else "NULL::text",
@@ -6541,7 +6541,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     address_from_sql = f"FROM {address_table_sql} AS a"
     phone_provider_directory_match = "false"
     phone_source_record_ids = "ARRAY[]::varchar[]"
-    if selected_locator_name == "phone" and _address_table_is_unified(address_table_sql):
+    if selected_locator_name == "phone" and _is_unified_address_table(address_table_sql):
         phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
         query_params["candidate_limit"] = min(
             max(int(params["limit"]) * 8, 20),
@@ -6577,7 +6577,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
         )
         geo_precision_clause = (
             "AND COALESCE(a.address_precision, '') <> 'city_zip' "
-            if _address_table_is_unified(address_table_sql)
+            if _is_unified_address_table(address_table_sql)
             else ""
         )
         geo_locator_where.append(
@@ -6625,7 +6625,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
 
     address_site_match = (
         "a.premise_key = CAST(:address_site_key AS uuid)"
-        if _address_table_is_unified(address_table_sql) and params.get("address_site_key")
+        if _is_unified_address_table(address_table_sql) and params.get("address_site_key")
         else "false"
     )
     address_key_match = "a.address_key = CAST(:address_key AS uuid)" if params.get("address_key") else "false"
@@ -7045,7 +7045,7 @@ def _rank_match_candidate_outputs(
     ]
 
 
-def _provider_type_filter_matched(row: Mapping[str, Any], params: Mapping[str, Any]) -> bool:
+def _is_provider_type_filter_matched(row: Mapping[str, Any], params: Mapping[str, Any]) -> bool:
     if not (params.get("taxonomy_exact") or params.get("taxonomy_prefixes") or params.get("provider_type")):
         return False
     taxonomy_list = _json_array_value(row.get("taxonomy_list"))
@@ -7103,7 +7103,7 @@ def _match_candidate_output(
         or enrichment.get("has_ffs_enrollment")
         or enrichment.get("has_medicare_claims")
     ))
-    taxonomy_matched = _provider_type_filter_matched(provider_row, params)
+    taxonomy_matched = _is_provider_type_filter_matched(provider_row, params)
     is_provider_type_matched = _is_provider_type_taxonomy_matched(provider_row, params)
     is_general_acute_care_matched = _should_boost_general_acute_care_candidate(
         provider_row,
@@ -8601,7 +8601,7 @@ async def get_all(request):
                 providers_by_npi[npi_value] = provider_by_field
 
             if (
-                _address_table_is_unified(address_table_sql)
+                _is_unified_address_table(address_table_sql)
                 and (address_key or address_site_key or phone_digits or exact_npi is not None)
                 and len(providers_by_npi) < limit
                 and not npi_where
@@ -10286,7 +10286,7 @@ async def get_npi(request, npi):
             default=str,
             separators=(",", ":"),
         ).encode("utf-8")
-        if _npi_detail_response_cacheable(
+        if _is_npi_detail_response_cacheable(
             data,
             force_address_update=force_address_update,
             sync_geocode=sync_geocode,
@@ -10427,7 +10427,7 @@ async def get_npi(request, npi):
 
     _redact_internal_address_fields(data)
     response_body = json.dumps(data, default=str, separators=(",", ":")).encode("utf-8")
-    if _npi_detail_response_cacheable(
+    if _is_npi_detail_response_cacheable(
         data,
         force_address_update=force_address_update,
         sync_geocode=sync_geocode,

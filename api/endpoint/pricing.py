@@ -42,7 +42,7 @@ from api.ptg2_serving import (
     search_current_ptg2_index,
     search_ptg2_provider_procedures,
 )
-from api.ptg2_snapshot import current_source_snapshot_id_for_plan, current_source_snapshot_ids_for_plan
+from api.ptg2_snapshot import current_source_snapshot_id_for_plan, current_network_snapshots_for_plan
 from api.ptg2_response import _normalize_filter_string_list
 from api.ptg2_address_policy import (
     PTG2_LEGACY_ADDRESS_COLUMNS,
@@ -1782,7 +1782,7 @@ async def _table_columns(session, table_name: str) -> set[str]:
     return set(columns)
 
 
-def _is_address_serving_unified_requested() -> bool:
+def _is_unified_address_serving_requested() -> bool:
     raw = str(os.getenv(ADDRESS_SERVING_SOURCE_ENV, "")).strip().lower()
     if not raw:
         return False
@@ -1791,7 +1791,7 @@ def _is_address_serving_unified_requested() -> bool:
 
 async def _group_plan_provider_address_source(session) -> tuple[str, bool, bool, bool]:
     legacy_table = f"{PRICING_SCHEMA}.npi_address"
-    if not _is_address_serving_unified_requested():
+    if not _is_unified_address_serving_requested():
         return legacy_table, False, False, False
 
     unified_table = f"{PRICING_SCHEMA}.entity_address_unified"
@@ -1867,7 +1867,7 @@ def _terminology_item(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _terminology_available(session) -> bool:
+async def _is_terminology_available(session) -> bool:
     return await _table_exists(session, terminology_synonym_table.name)
 
 
@@ -1883,7 +1883,7 @@ async def _query_terminology(
 ) -> list[dict[str, Any]]:
     term_text = str(term or "").strip()
     term_key = _normalize_term_key(term_text)
-    if not term_key or not await _terminology_available(session):
+    if not term_key or not await _is_terminology_available(session):
         return []
 
     synonym_lower = func.lower(func.coalesce(terminology_synonym_table.c.synonym, ""))
@@ -2153,7 +2153,7 @@ def _empty_domain_payload() -> dict[str, Any]:
     }
 
 
-def _empty_domains_payload() -> dict[str, dict[str, Any]]:
+def _empty_domain_payloads_by_name() -> dict[str, dict[str, Any]]:
     return {
         "appropriateness": _empty_domain_payload(),
         "effectiveness": _empty_domain_payload(),
@@ -2587,7 +2587,7 @@ def _geography_priority_for_benchmark_mode(
     return deduped
 
 
-def _row_matches_geography(
+def _is_row_geography_match(
     row_scope: str | None,
     row_value: str | None,
     target_scope: str,
@@ -2618,7 +2618,7 @@ def _row_matches_geography(
     return row_value_text == target_value_text
 
 
-def _value_matches_or_generic(row_value: Any, requested_value: str | None, *, upper: bool) -> bool:
+def _is_value_match_or_generic(row_value: Any, requested_value: str | None, *, upper: bool) -> bool:
     if requested_value is None:
         return True
     text = str(row_value or "").strip()
@@ -2713,7 +2713,7 @@ def _collect_peer_target_candidates(
         matched_geography_scope = None
         matched_geography_value = None
         for index, (target_scope, target_value) in enumerate(geography_priority):
-            if _row_matches_geography(row_scope, row_value, target_scope, target_value):
+            if _is_row_geography_match(row_scope, row_value, target_scope, target_value):
                 geography_rank = index
                 matched_geography_scope = target_scope
                 matched_geography_value = target_value
@@ -2724,12 +2724,12 @@ def _collect_peer_target_candidates(
         cohort_level = _normalize_cohort_level(
             _pick_first_from_lowered(payload_lower, "cohort_level", "cohort_tier", "cohort", "level")
         ) or "L3"
-        specialty_match = _value_matches_or_generic(
+        specialty_match = _is_value_match_or_generic(
             _pick_first_from_lowered(payload_lower, "specialty_key", "specialty"),
             specialty_key,
             upper=False,
         )
-        taxonomy_match = _value_matches_or_generic(
+        taxonomy_match = _is_value_match_or_generic(
             _pick_first_from_lowered(payload_lower, "taxonomy_code", "taxonomy"),
             taxonomy_code,
             upper=True,
@@ -3400,7 +3400,7 @@ async def _load_estimated_quality_modes(
         if peer_count <= 0:
             continue
 
-        domains_payload = _empty_domains_payload()
+        domains_payload = _empty_domain_payloads_by_name()
         domain_result = await session.execute(
             text(
                 f"""
@@ -3828,7 +3828,7 @@ def _build_live_mode_payload_for_candidate(
         ],
     }
 
-    domains_payload = _empty_domains_payload()
+    domains_payload = _empty_domain_payloads_by_name()
     for domain, measures in measures_by_domain.items():
         domains_payload[domain] = _aggregate_domain(measures)
 
@@ -4034,7 +4034,7 @@ def _build_live_variant_payload(
     }
 
 
-def _live_mode_payload_is_available(payload: dict[str, Any] | None) -> bool:
+def _is_live_mode_payload_available(payload: dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
     context = payload.get("cohort_context")
@@ -4227,7 +4227,7 @@ def _normalized_intent_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
-def _intent_contains_any(intent: str, terms: frozenset[str]) -> bool:
+def _has_any_intent_term(intent: str, terms: frozenset[str]) -> bool:
     if not intent:
         return False
     normalized = f" {intent} "
@@ -4238,9 +4238,9 @@ def _taxonomy_codes_for_intent(clinical_intent: Any) -> tuple[tuple[str, ...], s
     intent = _normalized_intent_text(clinical_intent)
     if not intent:
         return (), None
-    if _intent_contains_any(intent, PROCEDURE_TAXONOMY_PRIMARY_CARE_INTENT_TERMS):
+    if _has_any_intent_term(intent, PROCEDURE_TAXONOMY_PRIMARY_CARE_INTENT_TERMS):
         return PRIMARY_CARE_TAXONOMY_CODES, "primary_care_intent"
-    if _intent_contains_any(intent, PROCEDURE_TAXONOMY_ORTHOPAEDIC_INTENT_TERMS):
+    if _has_any_intent_term(intent, PROCEDURE_TAXONOMY_ORTHOPAEDIC_INTENT_TERMS):
         return ORTHOPAEDIC_SURGERY_TAXONOMY_CODES, "orthopaedic_intent"
     return (), None
 
@@ -4914,7 +4914,7 @@ def _apply_prescription_code_preferences(
 
 async def _current_source_snapshot_pairs_for_plan(session, plan_fields: dict[str, object]) -> list[tuple[str, str]]:
     try:
-        snapshot_pairs = await current_source_snapshot_ids_for_plan(session, plan_fields)
+        snapshot_pairs = await current_network_snapshots_for_plan(session, plan_fields)
     except Exception:
         snapshot_pairs = []
     if snapshot_pairs:
@@ -6743,7 +6743,7 @@ async def group_plan_providers(request):
         "WHERE snapshot_key = ANY(:snapshot_keys))"
     )
 
-    # current_source_snapshot_ids_for_plan resolves the plan's per-SOURCE serving
+    # current_network_snapshots_for_plan resolves the plan's per-SOURCE serving
     # snapshot, which for PTG group-plan imports is snapshot-scoped to a single
     # plan (snapshot_scoped=true; the serving table carries only this plan_id). So
     # the shared layout's NPI scope holds exactly the source's in-network provider
@@ -7510,7 +7510,7 @@ async def get_pricing_provider_score(request, npi: str):
                 "high_confidence_threshold_passed": False,
                 "unavailable_reasons": reasons,
             },
-            _empty_domains_payload(),
+            _empty_domain_payloads_by_name(),
             cohort_context=(
                 {
                     "selected_geography": selected_geography,
@@ -7577,7 +7577,7 @@ async def get_pricing_provider_score(request, npi: str):
                 requested_procedure_codes=requested_procedure_codes,
                 procedure_match_threshold=procedure_match_threshold,
             )
-            if _live_mode_payload_is_available(mode_payload):
+            if _is_live_mode_payload_available(mode_payload):
                 scores_by_benchmark_mode[mode] = mode_payload
             if variants_scope == SCORE_VARIANTS_SCOPE_PROVIDER:
                 provider_specialty_key, provider_taxonomy_code, provider_procedure_codes = _variant_scope_inputs_from_mode_payload(
@@ -7698,7 +7698,7 @@ async def get_pricing_provider_score(request, npi: str):
     }
 
     domains_by_mode: dict[str, dict[str, Any]] = {
-        mode: _empty_domains_payload()
+        mode: _empty_domain_payloads_by_name()
         for mode in QUALITY_BENCHMARK_MODE_ORDER
     }
     domain_query = text(
@@ -7736,7 +7736,7 @@ async def get_pricing_provider_score(request, npi: str):
 
     selected_payload = _build_quality_mode_payload(
         score_data,
-        domains_by_mode.get(selected_mode, _empty_domains_payload()),
+        domains_by_mode.get(selected_mode, _empty_domain_payloads_by_name()),
         cohort_context=selected_cohort_context,
     )
 
@@ -7748,7 +7748,7 @@ async def get_pricing_provider_score(request, npi: str):
             continue
         scores_by_benchmark_mode[mode] = _build_quality_mode_payload(
             mode_score,
-            domains_by_mode.get(mode, _empty_domains_payload()),
+            domains_by_mode.get(mode, _empty_domain_payloads_by_name()),
             cohort_context=cohort_context_by_mode.get(mode),
         )
 

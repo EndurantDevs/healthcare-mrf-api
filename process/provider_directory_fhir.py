@@ -3505,7 +3505,7 @@ async def _flush_partition_checkpoints(state: PartitionFetchState) -> None:
         await _upsert_rows(ProviderDirectoryReverseLookupCheckpoint, checkpoint_batch_rows)
 
 
-def _resource_start_urls(source: dict[str, Any], resource_type: str, *, page_count: int) -> list[str]:
+def _partitioned_resource_start_urls(source: dict[str, Any], resource_type: str, *, page_count: int) -> list[str]:
     start_url = _resource_start_url(source, resource_type, page_count=page_count)
     if not start_url:
         return []
@@ -5521,7 +5521,7 @@ def _plan_net_accepting_patients(resource: dict[str, Any]) -> list[dict[str, str
     ]
 
 
-def _normalized_identifier(identifier: Any) -> dict[str, Any] | None:
+def _normalize_identifier_record(identifier: Any) -> dict[str, Any] | None:
     if not isinstance(identifier, dict):
         return None
     period = identifier.get("period") if isinstance(identifier.get("period"), dict) else {}
@@ -5552,7 +5552,7 @@ def _normalized_identifiers(value: Any) -> list[dict[str, Any]]:
     return [
         normalized
         for identifier in value
-        if (normalized := _normalized_identifier(identifier)) is not None
+        if (normalized := _normalize_identifier_record(identifier)) is not None
     ]
 
 
@@ -9790,7 +9790,7 @@ def _assert_provider_directory_artifact_target_dependencies(
             )
     violations = _artifact_dataset_profile_violations(fence)
     violations.extend(
-        _artifact_target_dependency_violations(fence, enabled_targets)
+        _collect_artifact_target_dependency_violations(fence, enabled_targets)
     )
     if violations:
         raise RuntimeError(
@@ -9855,7 +9855,7 @@ def _provider_directory_artifact_resource_types(
     )
 
 
-def _artifact_target_dependency_violations(
+def _collect_artifact_target_dependency_violations(
     fence: ProviderDirectoryArtifactDatasetFence,
     enabled_targets: tuple[str, ...],
 ) -> list[str]:
@@ -11513,7 +11513,7 @@ async def _publish_selected_provider_directory_artifacts(
     )
 
 
-def _collect_provider_directory_artifact_stages(
+def _normalize_provider_directory_artifact_stages(
     raw_stages: Any,
 ) -> tuple[ProviderDirectoryPreparedArtifactStage, ...] | None:
     stages = (
@@ -11546,7 +11546,7 @@ def _collect_provider_directory_artifact_stage(
         and len(publish_result) == 2
     ):
         metrics, raw_stages = publish_result
-        stages = _collect_provider_directory_artifact_stages(raw_stages)
+        stages = _normalize_provider_directory_artifact_stages(raw_stages)
         if isinstance(metrics, dict) and stages is not None:
             for stage in stages:
                 artifact_bundle.add(stage)
@@ -16622,7 +16622,7 @@ def _probe_flush_every() -> int:
         return 50
 
 
-async def _probe_sources(
+async def _run_source_probe_batch(
     sources: list[dict[str, Any]],
     *,
     timeout: int,
@@ -23357,7 +23357,7 @@ async def _fetch_partition_pass(
     return None
 
 
-async def _fetch_partition_passes(
+async def _fetch_partition_plan_passes(
     source_record: dict[str, Any],
     resource_type: str,
     model: type,
@@ -23587,7 +23587,7 @@ async def _fetch_last_updated_partition_resource_rows(
     )
     if count_failure is not None:
         return count_failure
-    pass_failure = await _fetch_partition_passes(
+    pass_failure = await _fetch_partition_plan_passes(
         source_record,
         resource_type,
         model,
@@ -23979,7 +23979,7 @@ async def _fetch_resource_rows(
             per_resource_limit,
             page_limit,
         )
-        start_urls = _resource_start_urls(
+        start_urls = _partitioned_resource_start_urls(
             source_record,
             resource_type,
             page_count=page_count,
@@ -24054,7 +24054,7 @@ async def _fetch_resource_rows(
             per_resource_limit,
             page_limit,
         )
-        start_urls = _resource_start_urls(
+        start_urls = _partitioned_resource_start_urls(
             source_record,
             resource_type,
             page_count=page_count,
@@ -28803,7 +28803,7 @@ async def _reset_unexpected_empty_pagination_checkpoint(
         or result.error != CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR
     ):
         return
-    start_urls = _resource_start_urls(
+    start_urls = _partitioned_resource_start_urls(
         source,
         resource_type,
         page_count=page_count,
@@ -32285,7 +32285,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         )
         valid_source_ids: set[str] | None = None
         if not seed_only and probe and source_rows:
-            probed, valid, valid_source_ids = await _probe_sources(
+            probed, valid, valid_source_ids = await _run_source_probe_batch(
                 source_rows,
                 timeout=timeout,
                 concurrency=concurrency,

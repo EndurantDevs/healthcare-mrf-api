@@ -1293,7 +1293,7 @@ def test_top_level_latency_gate_uses_verified_client_http_timing(
         negative_cold_query_ms=[2_000.0],
         random_cold_latency_ms=[2_000.0],
     )
-    latency_reports = runner._latency_reports(progress, capacity_report)
+    latency_reports = runner._build_latency_reports(progress, capacity_report)
     top_level_latency = audit.AuditRunner._latency_report(
         progress,
         latency_reports,

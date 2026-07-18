@@ -130,7 +130,7 @@ def is_placeholder_carrier(value: str) -> bool:
 
 def discovery_candidate_matches(candidate: Any, carrier: str) -> bool:
     """Return whether discovery's payer text filter matches the carrier label."""
-    return discovery._candidate_matches_text_filters(
+    return discovery._is_candidate_text_filter_match(
         candidate,
         entity_types=(),
         payer_query=carrier,
@@ -427,7 +427,7 @@ async def load_discovery_candidates(
     importable = [
         candidate
         for candidate in catalog_candidates
-        if discovery._candidate_is_importable_source(candidate)
+        if discovery._is_candidate_importable_source(candidate)
     ]
     return catalog_candidates, importable
 

@@ -1614,7 +1614,7 @@ def _validate_gc_cycle_continuity(
         raise ResourceTelemetryError("gc_discontinuity", f"{item_path}.starting_backlog_layouts")
 
 
-def _parse_gc_cycles(
+def _parse_gc_cycle_series(
     raw_cycles: Any,
     path: str,
     contention_started_at: datetime,
@@ -2053,7 +2053,7 @@ def _parse_resource_telemetry(raw_telemetry: Any) -> ResourceTelemetry:
     storage_evidence = _parse_storage_evidence(context)
     event_evidence = _parse_event_evidence(context, storage_evidence)
     _validate_autovacuum_concurrency(intervals, event_evidence.autovacuum_events)
-    gc_cycles = _parse_gc_cycles(
+    gc_cycles = _parse_gc_cycle_series(
         context.telemetry_object["gc_cycles"],
         "gc_cycles",
         context.contention_started_at,
