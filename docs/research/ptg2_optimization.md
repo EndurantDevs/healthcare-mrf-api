@@ -118,7 +118,7 @@ block store. Both paths retain fail-closed cleanup and metadata validation.
 
 The authoritative by-code writer emits only `by_code_provider_shard_v1`.
 Provider-set keys are partitioned by the versioned `provider_shard_span`
-recorded by the artifact (currently 1,024 keys), where
+recorded by the artifact (currently 8,192 keys), where
 `shard_id = provider_set_key // provider_shard_span` and
 `block_key = (code_key << 31) | shard_id`; every block's fragments are dense
 and contiguous from `0`. The separate `by_code_price_page_v4` projection holds

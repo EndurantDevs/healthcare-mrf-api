@@ -250,7 +250,7 @@ async def test_shared_graph_converter_double_cancel_allows_same_path_retry(
     manifest_path = tmp_path / "shared-graph-output.manifest.json"
 
     conversion_task = asyncio.create_task(
-        rust_scanner.convert_v3_provider_membership_shards_to_shared_graph_rust(
+        rust_scanner.convert_membership_shards_to_shared_graph_rust(
             shards=(_shared_graph_bundle(tmp_path),),
             provider_set_key_map_path=provider_map_path,
             output_directory=output_directory,
@@ -268,7 +268,7 @@ async def test_shared_graph_converter_double_cancel_allows_same_path_retry(
     assert not manifest_path.exists()
     assert not output_directory.exists()
     retry_result = (
-        await rust_scanner.convert_v3_provider_membership_shards_to_shared_graph_rust(
+        await rust_scanner.convert_membership_shards_to_shared_graph_rust(
             shards=(_shared_graph_bundle(tmp_path),),
             provider_set_key_map_path=provider_map_path,
             output_directory=output_directory,

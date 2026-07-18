@@ -290,12 +290,12 @@ async def test_real_postgres_stale_cutoff_is_utc_naive_under_non_utc_session(
     schema = f'"{schema_name}"'
     monkeypatch.setattr(
         snapshot_gc,
-        "require_ptg2_v3_migration_owned_tables",
+        "require_migration_owned_tables",
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
         snapshot_gc,
-        "build_ptg2_shared_layout_release_plan",
+        "build_shared_layout_release_plan",
         AsyncMock(
             return_value=SimpleNamespace(
                 logical_layout_count=0,

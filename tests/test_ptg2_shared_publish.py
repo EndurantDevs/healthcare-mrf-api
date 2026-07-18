@@ -91,7 +91,7 @@ async def test_strict_v3_stage_creates_only_price_inputs(monkeypatch):
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
     monkeypatch.setattr(ptg2_manifest_publish.db, "status", status)
 
-    stage_table = await ptg2_manifest_publish._create_ptg2_manifest_serving_stage_table(
+    stage_table = await ptg2_manifest_publish._create_serving_stage_table(
         "strict-run"
     )
 
@@ -131,7 +131,7 @@ async def test_strict_v3_precopy_loads_only_price_inputs(tmp_path, monkeypatch):
     price_set_atom_copy = AsyncMock()
     price_set_summary_copy = AsyncMock()
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
-    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_price_atom_file", price_atom_copy)
+    monkeypatch.setattr(process_ptg, "_copy_price_atom_file", price_atom_copy)
     monkeypatch.setattr(process_ptg, "_copy_price_atom_member_file", price_set_atom_copy)
     monkeypatch.setattr(
         process_ptg,
@@ -157,7 +157,7 @@ async def test_strict_v3_precopy_loads_only_price_inputs(tmp_path, monkeypatch):
     price_set_atom_copy.assert_awaited_once()
     price_set_summary_copy.assert_awaited_once()
     assert not hasattr(process_ptg, "_copy_lean_manifest_serving_file")
-    assert not hasattr(process_ptg, "_copy_ptg2_manifest_provider_group_member_file")
+    assert not hasattr(process_ptg, "_copy_provider_group_member_file")
     assert not (tmp_path / "price_atom.copy").exists()
     assert not (tmp_path / "price_set_atom.copy").exists()
     assert not (tmp_path / "price_set_summary.copy").exists()

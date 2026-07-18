@@ -3660,7 +3660,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
+    monkeypatch.setattr(process_ptg, "_create_serving_stage_table", AsyncMock(return_value="manifest_stage"))
     monkeypatch.setattr(process_ptg, "_process_table_of_contents", fake_toc)
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
@@ -3762,7 +3762,7 @@ def test_ptg2_main_marks_claim_failed_when_import_run_start_fails(monkeypatch):
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", push)
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_tables_for_manifest", final_table_cleanup)
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", AsyncMock())
-    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", create_stage)
+    monkeypatch.setattr(process_ptg, "_create_serving_stage_table", create_stage)
 
     with pytest.raises(RuntimeError, match="import run write failed"):
         asyncio.run(
@@ -3838,7 +3838,7 @@ def test_ptg2_main_cleans_complete_stage_family_when_stage_creation_fails(monkey
 
     monkeypatch.setattr(
         process_ptg,
-        "_create_ptg2_manifest_serving_stage_table",
+        "_create_serving_stage_table",
         AsyncMock(side_effect=create_partial_stage),
     )
 
@@ -3887,7 +3887,7 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
+    monkeypatch.setattr(process_ptg, "_create_serving_stage_table", AsyncMock(return_value="manifest_stage"))
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
@@ -4369,7 +4369,7 @@ def _install_allowed_only_publish_mocks(
 ) -> None:
     monkeypatch.setattr(
         process_ptg,
-        "_create_ptg2_manifest_serving_stage_table",
+        "_create_serving_stage_table",
         manifest_stage,
     )
     monkeypatch.setattr(
@@ -4546,7 +4546,7 @@ def _install_failed_import_cleanup_mocks(monkeypatch) -> None:
         "_drop_ptg2_snapshot_tables_for_manifest",
         "_drop_ptg2_snapshot_table_names",
         "delete_ptg2_artifacts_for_snapshot",
-        "delete_unpublished_shared_v3_snapshot_sources",
+        "delete_unpublished_snapshot_sources",
     ):
         monkeypatch.setattr(process_ptg, helper_name, AsyncMock())
 
@@ -4649,7 +4649,7 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
+    monkeypatch.setattr(process_ptg, "_create_serving_stage_table", AsyncMock(return_value="manifest_stage"))
     monkeypatch.setattr(process_ptg, "_process_table_of_contents", fake_toc)
     monkeypatch.setattr(
         process_ptg,
@@ -4699,7 +4699,7 @@ def test_ptg2_main_marks_failed_when_toc_download_fails(monkeypatch):
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
+    monkeypatch.setattr(process_ptg, "_create_serving_stage_table", AsyncMock(return_value="manifest_stage"))
     monkeypatch.setattr(process_ptg, "_process_table_of_contents", fake_toc)
     monkeypatch.delenv("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", raising=False)
 
@@ -5301,7 +5301,7 @@ async def test_ptg2_manifest_publish_uploads_sidecars_to_db(monkeypatch, tmp_pat
     monkeypatch.setattr(ptg_manifest_publish, "store_ptg2_artifact_file_in_db", fake_store)
     monkeypatch.setattr(ptg_manifest_publish, "write_live_progress", lambda **payload: progress_events.append(payload))
 
-    artifacts = await ptg_manifest_publish._store_ptg2_manifest_sidecar_artifacts_in_db(
+    artifacts = await ptg_manifest_publish._store_sidecar_artifacts_in_db(
         schema_name="mrf",
         snapshot_id="ptg2:test",
         sidecar_artifacts={
@@ -5341,7 +5341,7 @@ async def test_ptg2_manifest_publish_reuses_bytes_without_collapsing_source_shar
     monkeypatch.setattr(ptg_manifest_publish, "ptg2_artifact_db_store_enabled", lambda: True)
     monkeypatch.setattr(ptg_manifest_publish, "store_ptg2_artifact_file_in_db", fake_store)
 
-    artifacts = await ptg_manifest_publish._store_ptg2_manifest_sidecar_artifacts_in_db(
+    artifacts = await ptg_manifest_publish._store_sidecar_artifacts_in_db(
         schema_name="mrf",
         snapshot_id="ptg2:test",
         sidecar_artifacts={
@@ -5367,7 +5367,7 @@ async def test_ptg2_manifest_publish_omits_db_owned_local_paths(monkeypatch):
     monkeypatch.setattr(ptg_manifest_publish, "ptg2_artifact_db_store_enabled", lambda: True)
     monkeypatch.setattr(ptg_manifest_publish, "ptg2_artifact_db_retain_local_cache", lambda: False)
 
-    artifacts = await ptg_manifest_publish._store_ptg2_manifest_sidecar_artifacts_in_db(
+    artifacts = await ptg_manifest_publish._store_sidecar_artifacts_in_db(
         schema_name="mrf",
         snapshot_id="ptg2:test",
         sidecar_artifacts={
@@ -5424,7 +5424,7 @@ async def test_ptg2_manifest_publish_uploads_base_artifact_sidecars_to_db(monkey
         base_sidecars,
         {"price_forward": {"name": "price_forward", "path": str(price_path), "sha256": "price-sha"}},
     )
-    stored = await ptg_manifest_publish._store_ptg2_manifest_sidecar_artifacts_in_db(
+    stored = await ptg_manifest_publish._store_sidecar_artifacts_in_db(
         schema_name="mrf",
         snapshot_id="ptg2:test",
         sidecar_artifacts=combined,
@@ -5479,10 +5479,10 @@ async def test_ptg2_manifest_serving_sidecars_use_rust_copy_fast_path(monkeypatc
     monkeypatch.setattr(ptg_manifest_publish, "_is_rust_sidecar_enabled", lambda: True)
     monkeypatch.setattr(ptg_manifest_publish, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
     monkeypatch.setattr(ptg_manifest_publish, "_copy_ptg2_query_to_file", fake_copy_query_to_file)
-    monkeypatch.setattr(ptg_manifest_publish, "_run_ptg2_serving_sidecar_from_key_copy", fake_runner)
+    monkeypatch.setattr(ptg_manifest_publish, "_run_serving_sidecar_from_key_copy", fake_runner)
     monkeypatch.setattr(ptg_manifest_publish, "write_live_progress", lambda **payload: progress_events.append(payload))
 
-    sidecars = await ptg_manifest_publish._write_ptg2_manifest_serving_sidecars_rust(
+    sidecars = await ptg_manifest_publish._write_serving_sidecars_rust(
         schema_name="mrf",
         final_table="ptg2_serving_test",
         artifact_dir=tmp_path,
@@ -6738,7 +6738,7 @@ def _install_reused_mixed_support_mocks(monkeypatch):
     )
     monkeypatch.setattr(
         process_ptg,
-        "validate_reused_shared_v3_snapshot_sources",
+        "validate_reused_snapshot_sources",
         AsyncMock(),
     )
     monkeypatch.setattr(
@@ -7094,7 +7094,7 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
+    monkeypatch.setattr(process_ptg, "_create_serving_stage_table", AsyncMock(return_value="manifest_stage"))
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
@@ -7186,7 +7186,7 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
     )
     monkeypatch.setattr(
         process_ptg,
-        "_create_ptg2_manifest_serving_stage_table",
+        "_create_serving_stage_table",
         AsyncMock(return_value="manifest_stage"),
     )
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
@@ -7312,7 +7312,7 @@ def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
     )
     monkeypatch.setattr(
         process_ptg,
-        "_create_ptg2_manifest_serving_stage_table",
+        "_create_serving_stage_table",
         AsyncMock(return_value="manifest_stage"),
     )
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
@@ -7441,7 +7441,7 @@ def _install_ptg2_publish_failure_mocks(monkeypatch):
     )
     monkeypatch.setattr(
         process_ptg,
-        "_create_ptg2_manifest_serving_stage_table",
+        "_create_serving_stage_table",
         AsyncMock(return_value="manifest_stage"),
     )
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
@@ -7457,7 +7457,7 @@ def _install_ptg2_publish_failure_mocks(monkeypatch):
     monkeypatch.setattr(process_ptg, "delete_ptg2_artifacts_for_snapshot", AsyncMock())
     monkeypatch.setattr(
         process_ptg,
-        "delete_unpublished_shared_v3_snapshot_sources",
+        "delete_unpublished_snapshot_sources",
         AsyncMock(),
     )
     return pushed_rows, abandon
@@ -7570,7 +7570,7 @@ def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", create_stage_mock)
+    monkeypatch.setattr(process_ptg, "_create_serving_stage_table", create_stage_mock)
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())

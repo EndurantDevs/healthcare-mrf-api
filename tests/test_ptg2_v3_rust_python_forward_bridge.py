@@ -389,7 +389,7 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
         assert shared_snapshot_key == 73
         assert schema_name == "mrf"
         assert tuple(code_keys) == (code_key,)
-        assert provider_shard_span == 1024
+        assert provider_shard_span == 8192
         return shard_keys_by_code
 
     async def dictionary_values(
@@ -514,7 +514,7 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
     assert sparse_rows == expected_rows[1:]
     discovery_mock.assert_awaited_once()
     sparse_transport_call = transport_mock.await_args_list[-1]
-    assert sparse_transport_call.kwargs["block_keys"] == (0, 2)
+    assert sparse_transport_call.kwargs["block_keys"] == (0,)
     assert sparse_transport_call.kwargs["require_all"] is False
     assert provider_count_mock.await_args_list[-1].kwargs["provider_set_keys"] == {1}
     assert dictionary_mock.await_args_list[-1].kwargs["item_keys"] == {0}

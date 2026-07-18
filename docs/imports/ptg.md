@@ -222,7 +222,7 @@ layout.
 The authoritative by-code writer emits only `by_code_provider_shard_v1`
 objects. It does not emit a monolithic or legacy by-code membership object.
 Each shard covers the versioned `provider_shard_span` recorded by the artifact
-(currently 1,024 provider-set keys), with
+(currently 8,192 provider-set keys), with
 `shard_id = provider_set_key // provider_shard_span` and
 `block_key = (code_key << 31) | shard_id`. Fragments within each block are
 numbered contiguously from `0`; a missing, repeated, or out-of-order fragment

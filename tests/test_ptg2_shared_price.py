@@ -20,7 +20,7 @@ async def test_strict_price_stage_deduplicates_identical_cross_file_atoms(monkey
     monkeypatch.setattr(shared_price.db, "scalar", scalar)
     monkeypatch.setattr(shared_price.db, "status", status)
 
-    metrics = await shared_price._normalize_strict_v3_price_atom_stage(
+    metrics = await shared_price._normalize_strict_price_atom_stage(
         schema_name="mrf",
         price_atom_table="price_atoms",
     )
@@ -47,7 +47,7 @@ async def test_strict_price_stage_rejects_same_id_with_different_payload(monkeyp
     monkeypatch.setattr(shared_price.db, "status", status)
 
     with pytest.raises(RuntimeError, match="conflicting source payloads"):
-        await shared_price._normalize_strict_v3_price_atom_stage(
+        await shared_price._normalize_strict_price_atom_stage(
             schema_name="mrf",
             price_atom_table="price_atoms",
         )
@@ -64,7 +64,7 @@ async def test_strict_price_stage_rejects_empty_dictionary(monkeypatch):
     monkeypatch.setattr(shared_price.db, "status", AsyncMock())
 
     with pytest.raises(RuntimeError, match="empty price atom dictionary"):
-        await shared_price._normalize_strict_v3_price_atom_stage(
+        await shared_price._normalize_strict_price_atom_stage(
             schema_name="mrf",
             price_atom_table="price_atoms",
         )
@@ -194,7 +194,7 @@ async def test_lean_price_atom_does_not_repeat_numeric_rate_conversion(monkeypat
         AsyncMock(return_value=True),
     )
 
-    await manifest_publish._rewrite_ptg2_manifest_price_atom_table_lean_dict(
+    await manifest_publish._rewrite_price_atom_lean_dictionary(
         schema_name="mrf",
         price_atom_table="price_atoms",
         price_atom_dictionary_table="price_attributes",
@@ -226,7 +226,7 @@ async def test_lean_price_atom_respects_logged_stage_override(monkeypatch):
         AsyncMock(return_value=True),
     )
 
-    await manifest_publish._rewrite_ptg2_manifest_price_atom_table_lean_dict(
+    await manifest_publish._rewrite_price_atom_lean_dictionary(
         schema_name="mrf",
         price_atom_table="price_atoms",
         price_atom_dictionary_table="price_attributes",
@@ -244,12 +244,12 @@ async def test_prepared_price_artifacts_rank_summary_in_parallel(monkeypatch):
     monkeypatch.setattr(shared_price.db, "status", status)
     monkeypatch.setattr(
         shared_price,
-        "_normalize_strict_v3_price_atom_stage",
+        "_normalize_strict_price_atom_stage",
         AsyncMock(return_value={"rows_after": 2}),
     )
     monkeypatch.setattr(
         shared_price,
-        "_rewrite_ptg2_manifest_price_atom_table_lean_dict",
+        "_rewrite_price_atom_lean_dictionary",
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
@@ -298,12 +298,12 @@ async def test_price_key_ready_fires_while_atom_preparation_is_still_running(
     monkeypatch.setattr(shared_price.db, "status", AsyncMock())
     monkeypatch.setattr(
         shared_price,
-        "_normalize_strict_v3_price_atom_stage",
+        "_normalize_strict_price_atom_stage",
         normalize_atom_stage,
     )
     monkeypatch.setattr(
         shared_price,
-        "_rewrite_ptg2_manifest_price_atom_table_lean_dict",
+        "_rewrite_price_atom_lean_dictionary",
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
@@ -345,7 +345,7 @@ async def test_price_prepare_failure_removes_partial_key_stages(monkeypatch):
     monkeypatch.setattr(shared_price.db, "status", status)
     monkeypatch.setattr(
         shared_price,
-        "_normalize_strict_v3_price_atom_stage",
+        "_normalize_strict_price_atom_stage",
         AsyncMock(side_effect=RuntimeError("broken stage")),
     )
     monkeypatch.setattr(
@@ -400,7 +400,7 @@ async def test_price_prepare_repeated_cancellation_finishes_drain_and_cleanup(
     monkeypatch.setattr(shared_price.db, "status", status)
     monkeypatch.setattr(
         shared_price,
-        "_normalize_strict_v3_price_atom_stage",
+        "_normalize_strict_price_atom_stage",
         fail_atom_stage,
     )
     monkeypatch.setattr(

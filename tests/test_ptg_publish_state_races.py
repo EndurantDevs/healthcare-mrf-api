@@ -96,7 +96,7 @@ def test_deterministic_rerun_returns_already_published_without_table_work(monkey
     )
     monkeypatch.setattr(
         process_ptg,
-        "_create_ptg2_manifest_serving_stage_table",
+        "_create_serving_stage_table",
         create_stage,
     )
     monkeypatch.setattr(
@@ -144,7 +144,7 @@ def test_building_snapshot_collision_fails_closed(monkeypatch):
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", push)
     monkeypatch.setattr(
         process_ptg,
-        "_create_ptg2_manifest_serving_stage_table",
+        "_create_serving_stage_table",
         create_stage,
     )
     monkeypatch.setattr(

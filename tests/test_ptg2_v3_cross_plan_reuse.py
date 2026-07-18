@@ -429,7 +429,7 @@ async def test_postgres_cross_plan_scope_isolation_and_bound_layout_retention(mo
             assert cross_plan_params["plan_id"] == PLAN_B
 
         async with database.acquire() as connection:
-            planned = await shared_gc.build_ptg2_shared_layout_release_plan(
+            planned = await shared_gc.build_shared_layout_release_plan(
                 schema_name=schema_name,
                 executor=connection,
                 removing_snapshot_ids=(SNAPSHOT_A,),

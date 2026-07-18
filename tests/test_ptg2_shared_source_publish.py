@@ -204,7 +204,7 @@ async def test_failed_snapshot_cleanup_removes_logical_sources_not_layouts(monke
         yield session
 
     monkeypatch.setattr(publication.db, "transaction", transaction)
-    await publication.delete_unpublished_shared_v3_snapshot_sources(
+    await publication.delete_unpublished_snapshot_sources(
         schema_name="mrf",
         snapshot_id="snapshot-failed",
     )
@@ -228,7 +228,7 @@ async def test_failed_snapshot_cleanup_preserves_bound_candidate_sources(monkeyp
         yield session
 
     monkeypatch.setattr(publication.db, "transaction", transaction)
-    await publication.delete_unpublished_shared_v3_snapshot_sources(
+    await publication.delete_unpublished_snapshot_sources(
         schema_name="mrf",
         snapshot_id="snapshot-candidate",
     )

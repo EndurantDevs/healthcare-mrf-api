@@ -14,7 +14,7 @@ from process.ptg_parts.ptg2_shared_graph import (
     PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
     PTG2_V3_GRAPH_NPI_TO_GROUP,
     PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
-    convert_v3_provider_memberships_to_shared_graph,
+    convert_memberships_to_shared_graph,
 )
 from process.ptg_parts.ptg2_shared_publish import publish_shared_graph
 from tests.test_ptg2_shared_graph import _fixtures
@@ -28,7 +28,7 @@ async def test_real_postgres_graph_binary_copy_publish_and_reads(tmp_path):
         pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
 
     artifacts, provider_keys, groups, npis = _fixtures(tmp_path)
-    conversion = convert_v3_provider_memberships_to_shared_graph(
+    conversion = convert_memberships_to_shared_graph(
         group_npi=artifacts[0],
         npi_group=artifacts[1],
         group_provider_set=artifacts[2],

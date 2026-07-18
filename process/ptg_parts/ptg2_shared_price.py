@@ -17,7 +17,7 @@ from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_manifest_publish import (
     _ptg2_manifest_support_stage_table,
-    _rewrite_ptg2_manifest_price_atom_table_lean_dict,
+    _rewrite_price_atom_lean_dictionary,
 )
 from process.ptg_parts.ptg2_serving_binary_v3 import select_atom_key_bits
 from process.ptg_parts.ptg2_shared_blocks import (
@@ -851,7 +851,7 @@ def _validate_v3_atom_summary(
     _validate_atom_width(summary, "price atoms", atom_key_bits)
 
 
-async def _normalize_strict_v3_price_atom_stage(
+async def _normalize_strict_price_atom_stage(
     *,
     schema_name: str,
     price_atom_table: str,
@@ -1066,7 +1066,7 @@ async def prepare_shared_price_artifacts(
 
             stage_started_at = time.monotonic()
             stage_metrics_map.update(
-                await _normalize_strict_v3_price_atom_stage(
+                await _normalize_strict_price_atom_stage(
                     schema_name=schema_name,
                     price_atom_table=price_atom_table,
                 )
@@ -1076,7 +1076,7 @@ async def prepare_shared_price_artifacts(
             )
             stage_started_at = time.monotonic()
             lean_price_manifest = (
-                await _rewrite_ptg2_manifest_price_atom_table_lean_dict(
+                await _rewrite_price_atom_lean_dictionary(
                     schema_name=schema_name,
                     price_atom_table=price_atom_table,
                     price_atom_dictionary_table=price_attr_dictionary_table,

@@ -73,7 +73,7 @@ async def test_real_postgres_price_atom_rewrite_uses_configured_stage_durability
         )
 
         manifest = (
-            await ptg2_manifest_publish._rewrite_ptg2_manifest_price_atom_table_lean_dict(
+            await ptg2_manifest_publish._rewrite_price_atom_lean_dictionary(
                 schema_name=schema_name,
                 price_atom_table="price_atoms",
                 price_atom_dictionary_table="price_attributes",

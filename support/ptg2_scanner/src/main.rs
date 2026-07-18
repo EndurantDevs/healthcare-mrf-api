@@ -11862,7 +11862,7 @@ const PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND: &str = "by_code_assi
 const PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND: &str = "by_code_price_dictionary_v3";
 const PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_BLOCK_SPAN: i64 = 1024;
 // Keep the existing writer span until manifest-driven readers are deployed.
-const PTG2_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN: i64 = 1024;
+const PTG2_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_SPAN: i64 = 8192;
 const PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_BLOCK_SPAN: i64 = 1;
 const PTG2_SERVING_BINARY_PRICE_MEMBERSHIPS_V3_BLOCK_SPAN: i64 = 512;
 const PTG2_SERVING_BINARY_PRICE_ATOMS_V3_BLOCK_SPAN: i64 = 512;
@@ -28715,6 +28715,14 @@ mod tests {
         );
         assert_eq!(
             serving_binary_by_code_provider_shard_block_key(0, 1024).unwrap(),
+            0
+        );
+        assert_eq!(
+            serving_binary_by_code_provider_shard_block_key(0, 8191).unwrap(),
+            0
+        );
+        assert_eq!(
+            serving_binary_by_code_provider_shard_block_key(0, 8192).unwrap(),
             1
         );
         assert_eq!(
@@ -29211,19 +29219,19 @@ mod tests {
         let input = pg_binary_copy_rows(&[
             vec![
                 pg_i32_field(1),
-                pg_i32_field(1023),
+                pg_i32_field(8191),
                 pg_i32_field(2),
                 pg_i64_field(0),
             ],
             vec![
                 pg_i32_field(1),
-                pg_i32_field(1024),
+                pg_i32_field(8192),
                 pg_i32_field(3),
                 pg_i64_field(1),
             ],
             vec![
                 pg_i32_field(2),
-                pg_i32_field(1024),
+                pg_i32_field(8192),
                 pg_i32_field(3),
                 pg_i64_field(2),
             ],
@@ -29259,7 +29267,7 @@ mod tests {
             summary["artifact_kind"],
             PTG2_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND
         );
-        assert_eq!(summary["provider_shard_span"], 1024);
+        assert_eq!(summary["provider_shard_span"], 8192);
         assert_eq!(summary["block_count"], 3);
         assert_eq!(summary["by_code_copy_record_count"], 3);
         assert_eq!(summary["by_code_provider_shard"]["block_count"], 3);
@@ -29405,10 +29413,10 @@ mod tests {
             tagged_codec: TaggedServingRunCodec::new(3, 1).unwrap(),
         };
         let expected_rows = vec![
-            (7, 1023, 2, 0),
-            (7, 1023, 3, 2),
-            (7, 1024, 5, 1),
-            (8, 1024, 6, 2),
+            (7, 8191, 2, 0),
+            (7, 8191, 3, 2),
+            (7, 8192, 5, 1),
+            (8, 8192, 6, 2),
         ];
         let input = pg_binary_copy_rows(
             &expected_rows

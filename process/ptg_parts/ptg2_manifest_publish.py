@@ -349,7 +349,7 @@ def _is_provider_location_enabled() -> bool:
     return False
 
 
-def _ptg2_manifest_provider_group_location_index_profile() -> str:
+def _provider_group_location_index_profile() -> str:
     raw_value = os.getenv(
         PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_ENV,
         _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN,
@@ -406,7 +406,7 @@ def _ptg2_manifest_support_stage_table(serving_stage_table: str, kind: str) -> s
     return f"ptg2_manifest_stage_{kind}_{_ptg2_manifest_stage_suffix(serving_stage_table)}"[:63]
 
 
-async def _create_ptg2_manifest_serving_stage_table(token: str) -> str:
+async def _create_serving_stage_table(token: str) -> str:
     """Create the PostgreSQL stages consumed by strict V3 publish."""
 
     if _ptg2_manifest_snapshot_arch() != PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3:
@@ -414,13 +414,13 @@ async def _create_ptg2_manifest_serving_stage_table(token: str) -> str:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     stage_table = _ptg2_manifest_stage_table_name(token)
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
-    await _create_ptg2_manifest_price_atom_stage_table(stage_table)
+    await _create_price_atom_stage_table(stage_table)
     await _create_price_atom_member_stage_table(stage_table)
     await _create_price_set_summary_stage_table(stage_table)
     return stage_table
 
 
-async def _create_ptg2_manifest_price_atom_stage_table(serving_stage_table: str) -> str:
+async def _create_price_atom_stage_table(serving_stage_table: str) -> str:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "price_atom")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
@@ -483,7 +483,7 @@ async def _create_price_set_summary_stage_table(serving_stage_table: str) -> str
     return stage_table
 
 
-async def _create_ptg2_manifest_provider_group_member_stage_table(serving_stage_table: str) -> str:
+async def _create_provider_group_member_stage(serving_stage_table: str) -> str:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "provider_group_member")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
@@ -514,7 +514,7 @@ async def _create_provider_npi_scope_stage(serving_stage_table: str) -> str:
     return stage_table
 
 
-async def _create_ptg2_manifest_code_count_stage_table(serving_stage_table: str) -> str:
+async def _create_code_count_stage_table(serving_stage_table: str) -> str:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "code_count")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
@@ -532,7 +532,7 @@ async def _create_ptg2_manifest_code_count_stage_table(serving_stage_table: str)
     return stage_table
 
 
-async def _create_ptg2_manifest_provider_set_dictionary_stage_table(serving_stage_table: str) -> str:
+async def _create_provider_set_dictionary_stage(serving_stage_table: str) -> str:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "provider_set_dictionary")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
@@ -598,7 +598,7 @@ async def _copy_lean_manifest_serving_file(copy_path: Path, *, target_table: str
     )
 
 
-async def _copy_ptg2_manifest_price_atom_file(copy_path: Path, *, target_table: str) -> None:
+async def _copy_price_atom_file(copy_path: Path, *, target_table: str) -> None:
     await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PRICE_ATOM_COLUMNS)
 
 
@@ -614,7 +614,7 @@ async def _copy_price_set_summary_file(copy_path: Path, *, target_table: str) ->
     )
 
 
-async def _copy_ptg2_manifest_provider_group_member_file(copy_path: Path, *, target_table: str) -> None:
+async def _copy_provider_group_member_file(copy_path: Path, *, target_table: str) -> None:
     await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COLUMNS)
 
 
@@ -626,11 +626,11 @@ async def _copy_provider_npi_scope_file(copy_path: Path, *, target_table: str) -
     )
 
 
-async def _copy_ptg2_manifest_code_count_file(copy_path: Path, *, target_table: str) -> None:
+async def _copy_code_count_file(copy_path: Path, *, target_table: str) -> None:
     await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_CODE_COUNT_COLUMNS)
 
 
-async def _copy_ptg2_manifest_provider_set_dictionary_file(copy_path: Path, *, target_table: str) -> None:
+async def _copy_provider_set_dictionary_file(copy_path: Path, *, target_table: str) -> None:
     await _copy_ptg2_manifest_file(
         copy_path,
         target_table=target_table,
@@ -815,7 +815,7 @@ async def _copy_ptg2_query_to_file(sql: str, output_path: Path) -> None:
             )
 
 
-def _run_ptg2_serving_sidecar_from_key_copy(kind: str, copy_path: Path, output_path: Path) -> None:
+def _run_serving_sidecar_from_key_copy(kind: str, copy_path: Path, output_path: Path) -> None:
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
         raise RuntimeError("PTG2 Rust serving sidecar encoder is enabled but no scanner binary was found")
@@ -840,7 +840,7 @@ def _run_ptg2_serving_sidecar_from_key_copy(kind: str, copy_path: Path, output_p
         )
 
 
-async def _write_ptg2_manifest_serving_sidecars_rust(
+async def _write_serving_sidecars_rust(
     *,
     schema_name: str,
     final_table: str,
@@ -918,7 +918,7 @@ async def _write_ptg2_manifest_serving_sidecars_rust(
             copy_bytes=_path_byte_count(by_code_copy),
         )
         await asyncio.to_thread(
-            _run_ptg2_serving_sidecar_from_key_copy,
+            _run_serving_sidecar_from_key_copy,
             "by_code",
             by_code_copy,
             by_code_path,
@@ -961,7 +961,7 @@ async def _write_ptg2_manifest_serving_sidecars_rust(
             copy_bytes=_path_byte_count(by_provider_set_copy),
         )
         await asyncio.to_thread(
-            _run_ptg2_serving_sidecar_from_key_copy,
+            _run_serving_sidecar_from_key_copy,
             "by_provider_set",
             by_provider_set_copy,
             by_provider_set_path,
@@ -1023,7 +1023,7 @@ async def _write_ptg2_manifest_serving_sidecars(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     qualified_table = f"{_quote_ident(schema_name)}.{_quote_ident(final_table)}"
     try:
-        rust_sidecars = await _write_ptg2_manifest_serving_sidecars_rust(
+        rust_sidecars = await _write_serving_sidecars_rust(
             schema_name=schema_name,
             final_table=final_table,
             artifact_dir=artifact_dir,
@@ -1105,7 +1105,7 @@ def _postgresql_artifact_manifest_entry(entry: Mapping[str, Any]) -> dict[str, A
     return manifest_entry_map
 
 
-async def _store_ptg2_manifest_sidecar_artifacts_in_db(
+async def _store_sidecar_artifacts_in_db(
     *,
     schema_name: str,
     snapshot_id: str,
@@ -1621,7 +1621,7 @@ async def _index_provider_group_locations(
     schema_name: str,
     provider_group_location_table: str,
 ) -> None:
-    profile = _ptg2_manifest_provider_group_location_index_profile()
+    profile = _provider_group_location_index_profile()
     if profile == _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL:
         location_indexes = [
             ("group_zip_idx", "(provider_group_global_id_128, zip5, npi)"),
@@ -1902,7 +1902,7 @@ def _known_or_deduped_serving_rows(
     return max(int(known_serving_rows), 0) if known_serving_rows is not None else None
 
 
-async def _dedupe_ptg2_manifest_price_atom_table(schema_name: str, price_atom_table: str) -> dict[str, int]:
+async def _dedupe_price_atom_table(schema_name: str, price_atom_table: str) -> dict[str, int]:
     price_atom_rows_before_dedupe = await _exact_table_rows(schema_name, price_atom_table)
     price_atom_dedup_table = _ptg2_snapshot_index_name(price_atom_table, "dedup")
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_dedup_table)};")
@@ -1999,7 +1999,7 @@ async def _ptg2_price_atom_constant_metadata(
     return constant_key_by_column, constant_value_by_kind
 
 
-async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
+async def _rewrite_price_atom_lean_dictionary(
     *,
     schema_name: str,
     price_atom_table: str,
@@ -2236,7 +2236,7 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
     }
 
 
-async def _dedupe_ptg2_manifest_provider_group_member_table(
+async def _dedupe_provider_group_members(
     schema_name: str,
     provider_group_member_table: str,
 ) -> dict[str, int]:
@@ -2366,7 +2366,7 @@ def _manifest_constants_from_artifacts(
     }
 
 
-async def _rewrite_ptg2_manifest_serving_table_lean_provider_key(
+async def _rewrite_serving_lean_provider_key(
     *,
     schema_name: str,
     final_table: str,
