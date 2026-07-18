@@ -208,6 +208,14 @@
         "process/url_security.py"
       ],
       "format": "coverage.py",
+      "growth": {
+        "changed_line_divisor": 10,
+        "debt_reduction_percent": 1,
+        "target_percent_by_metric": {
+          "branches": 90,
+          "lines": 95
+        }
+      },
       "metrics": {
         "branches": {
           "covered": 16984,
@@ -276,6 +284,15 @@
         "support/ptg2_scanner/src/v3_runs.rs"
       ],
       "format": "llvm-cov",
+      "growth": {
+        "changed_line_divisor": 10,
+        "debt_reduction_percent": 1,
+        "target_percent_by_metric": {
+          "functions": 90,
+          "lines": 95,
+          "regions": 90
+        }
+      },
       "metrics": {
         "functions": {
           "covered": 1907,

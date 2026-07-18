@@ -4,6 +4,19 @@ CI keeps Python and Rust coverage separate. A change fails when any coverage
 ratio falls or when any uncovered-code count rises, so growth in one language
 cannot hide a regression in the other.
 
+Production-source changes also pay down existing debt until the configured
+target is reached. For every metric in the affected language report, CI requires
+the smaller of:
+
+- 1% of the base branch's uncovered units, rounded up; or
+- 10% of the PR's changed in-scope source lines, rounded up, with a minimum of one.
+
+Lines and statements target 95%. Branches, functions, and compiler regions
+target 90%. Test-only, documentation, and tooling PRs keep the exact
+no-regression check without an unrelated paydown requirement. The policy and
+targets are versioned in `test-coverage-baseline.json`; CI rejects attempts to
+weaken them.
+
 ## Current baseline
 
 Python is measured with Coverage.py 7.15.2 across `main.py`, `api/`, `db/`,
@@ -43,3 +56,8 @@ Install cargo-llvm-cov 0.8.7 and the Rust `llvm-tools-preview` component before
 the local Rust command. The versioned source of truth is
 `test-coverage-baseline.json`; CI compares it with the pull request base commit
 to prevent lowering or removing a baseline.
+After an in-scope source change, regenerate the affected report and run
+`python scripts/coverage_ratchet.py --report python --write-baseline` or
+`python scripts/coverage_ratchet.py --report rust --write-baseline`. The pinned
+Ubuntu CI measurement is canonical; if local counts differ, use the CI counts
+rather than committing platform-specific totals.
