@@ -497,6 +497,10 @@ jobs:
         env:
           HLTHPRT_PTG2_V3_LIFECYCLE_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
         run: python -m pytest -q tests/test_ptg2_v3_migrated_lifecycle_postgres.py
+      - name: Run candidate attestation rolling-compatibility gate
+        env:
+          HLTHPRT_PTG2_ATTESTATION_COMPAT_POSTGRES_TEST: "1"
+        run: python -m pytest -q tests/test_ptg2_attestation_contract_compat_postgres.py
       - name: Run MRF discovery checkpoint PostgreSQL gate
         env:
           HLTHPRT_MRF_DISCOVERY_CHECKPOINT_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"

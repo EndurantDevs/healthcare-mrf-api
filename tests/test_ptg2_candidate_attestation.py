@@ -557,6 +557,7 @@ def _candidate_plan_pointer_entries():
 
 
 def test_record_candidate_attestation_binds_database_identity(monkeypatch):
+    """Prove the current writer persists V3 with the locked snapshot identity."""
     session = _Session()
     identity_map = {
         "snapshot_key": 17,
@@ -601,6 +602,10 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
     )
 
     assert attestation_result["status"] == "attested"
+    assert (
+        attestation_result["contract"]
+        == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
+    )
     assert len(attestation_result["report_digest"]) == 64
     sql, params = session.calls[0]
     assert "ptg2_v3_candidate_audit_attestation" in sql
@@ -610,6 +615,10 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
     assert params["source_set_digest"] == b"s" * 32
     assert params["audit_sample_digest"] == bytes.fromhex("ab" * 32)
     assert params["source_witness_digest"] == b"w" * 32
+    assert (
+        params["contract"]
+        == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
+    )
     assert params["expires_at"] > params["attested_at"]
 
 
@@ -766,8 +775,27 @@ def test_activation_rechecks_attestation_expiry_against_wall_clock(monkeypatch):
     assert "expires_at > clock_timestamp()" in sql
     assert "expires_at > now()" not in sql
     assert "source_set_digest = :source_set_digest" in sql
+    assert "contract = ANY(CAST(:supported_contracts AS text[]))" in sql
+    assert params["supported_contracts"] == list(
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
+    )
     assert params["audit_sample_digest"] == bytes.fromhex("ab" * 32)
     assert params["source_witness_digest"] == b"w" * 32
+
+
+def test_v3_writer_prepares_dual_v3_v4_attestation_readers():
+    assert (
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT
+        == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
+    )
+    assert (
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT
+        == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
+    )
+    assert ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS == (
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4,
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
+    )
 
 
 def test_activation_rejects_report_quarantine_changed_after_attestation(monkeypatch):

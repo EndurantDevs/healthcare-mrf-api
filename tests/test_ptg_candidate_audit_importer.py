@@ -310,6 +310,23 @@ async def test_candidate_scope_is_derived_and_corroboration_cannot_spoof(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_candidate_target_query_ignores_unsupported_attestations(monkeypatch):
+    database_read = AsyncMock(return_value=[])
+    monkeypatch.setattr(ptg_candidate_audit.db, "all", database_read)
+
+    assert await ptg_candidate_audit._candidate_rows("ptg2:derived-import") == []
+
+    query = database_read.await_args.args[0]
+    query_parameters = database_read.await_args.kwargs
+    assert " attestation.contract = ANY(" in query
+    assert "current_attestation.contract = ANY(" in query
+    assert query.count(":supported_contracts") == 2
+    assert query_parameters["supported_contracts"] == list(
+        ptg_candidate_audit.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
+    )
+
+
+@pytest.mark.asyncio
 async def test_equivalent_current_snapshot_reuses_existing_attestation(monkeypatch):
     candidate_row = _candidate_row_with_equivalent_current()
     raw_sources = AsyncMock(side_effect=[(RAW_DIGEST,), (RAW_DIGEST,)])

@@ -456,6 +456,12 @@ def test_snapshot_availability_branches_v3_to_binding_and_layout():
     assert "shared_layout.generation = 'shared_blocks_v3'" in sql
     assert "ptg2_v3_candidate_audit_attestation" in sql
     assert "shared_attestation.activated_at IS NOT NULL" in sql
+    assert "shared_attestation.contract" in sql
+    assert " IN (" in sql
+    for supported_contract in (
+        ptg2_snapshot.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
+    ):
+        assert f"'{supported_contract}'" in sql
     assert "manifest" not in sql
     assert "<> 'postgres_binary_v3'" not in sql
     assert "to_regclass" not in sql

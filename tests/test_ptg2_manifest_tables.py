@@ -165,6 +165,11 @@ async def test_snapshot_serving_tables_requires_published_and_never_caches_v3_me
     assert "snapshot.manifest" not in sql
     assert "current_setting('server_version_num')" in sql
     assert "txid_current_snapshot()" in sql
+    assert "attestation.contract = ANY(" in sql
+    query_params = session.calls[0][0][1]
+    assert query_params["attestation_contracts"] == list(
+        ptg2_tables.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
+    )
     assert "COUNT(DISTINCT code.coverage_scope_id)" not in sql
     assert "ptg2_v3_code code" not in sql
     assert not hasattr(ptg2_tables, "_PTG2_SNAPSHOT_TABLES_CACHE")

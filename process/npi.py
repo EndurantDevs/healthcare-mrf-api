@@ -276,114 +276,130 @@ async def process_npi_chunk(ctx, task):
 
     npi_csv_map = task['npi_csv_map']
     npi_csv_map_reverse = task['npi_csv_map_reverse']
-    for row in task['row_list']:
-        obj = {}
+    for npi_source_row in task['row_list']:
+        npi_record_by_field = {}
 
         for key in npi_csv_map:
-            t = row[key]
-            if not t or str(t).upper() == '<UNAVAIL>':
-                obj[npi_csv_map[key]] = None
+            normalized_field_value = npi_source_row[key]
+            if not normalized_field_value or str(normalized_field_value).upper() == '<UNAVAIL>':
+                npi_record_by_field[npi_csv_map[key]] = None
                 continue
             if npi_csv_map[key] in ('replacement_npi', 'entity_type_code', 'npi',):
-                t = int(t)
+                normalized_field_value = int(normalized_field_value)
             elif npi_csv_map[key].endswith('_date'):
-                t = pytz.utc.localize(parse_date(t, fuzzy=True))
+                normalized_field_value = pytz.utc.localize(parse_date(normalized_field_value, fuzzy=True))
 
-            obj[npi_csv_map[key]] = t
+            npi_record_by_field[npi_csv_map[key]] = normalized_field_value
 
-        npi_obj_list.append(obj)
-        taxonomy_array = _taxonomy_array_from_npi_row(row, taxonomy_int_code_map)
+        npi_obj_list.append(npi_record_by_field)
+        taxonomy_array = _taxonomy_array_from_npi_row(npi_source_row, taxonomy_int_code_map)
 
-        if row['Provider First Line Business Practice Location Address']:
-            obj = {
-                'first_line': row['Provider First Line Business Practice Location Address'],
-                'second_line': row['Provider Second Line Business Practice Location Address'],
-                'city_name': row.get('Provider Business Practice Location Address City Name', '').upper(),
-                'state_name': row.get('Provider Business Practice Location Address State Name', '').upper(),
-                'postal_code': row['Provider Business Practice Location Address Postal Code'],
-                'country_code': row['Provider Business Practice Location Address Country Code (If outside U.S.)'],
+        if npi_source_row['Provider First Line Business Practice Location Address']:
+            address_record_by_field = {
+                'first_line': npi_source_row['Provider First Line Business Practice Location Address'],
+                'second_line': npi_source_row['Provider Second Line Business Practice Location Address'],
+                'city_name': npi_source_row.get('Provider Business Practice Location Address City Name', '').upper(),
+                'state_name': npi_source_row.get('Provider Business Practice Location Address State Name', '').upper(),
+                'postal_code': npi_source_row['Provider Business Practice Location Address Postal Code'],
+                'country_code': npi_source_row[
+                    'Provider Business Practice Location Address Country Code (If outside U.S.)'
+                ],
             }
 
-            obj.update({
-                'checksum': return_checksum(list(obj.values())),  # addresses have blank symbols
-                'npi': int(row['NPI']),
+            address_record_by_field.update({
+                'checksum': return_checksum(list(address_record_by_field.values())),  # addresses have blank symbols
+                'npi': int(npi_source_row['NPI']),
                 'type': 'primary',
-                'telephone_number': row['Provider Business Practice Location Address Telephone Number'],
-                'fax_number': row['Provider Business Practice Location Address Fax Number'],
+                'telephone_number': npi_source_row['Provider Business Practice Location Address Telephone Number'],
+                'fax_number': npi_source_row['Provider Business Practice Location Address Fax Number'],
                 'taxonomy_array': taxonomy_array,
-                'date_added': pytz.utc.localize(parse_date(row['Last Update Date'], fuzzy=True))
-                if row['Last Update Date']
+                'date_added': pytz.utc.localize(parse_date(npi_source_row['Last Update Date'], fuzzy=True))
+                if npi_source_row['Last Update Date']
                 else None,
             })
-            npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'],])] = obj
+            address_key = '_'.join([
+                str(address_record_by_field['npi']),
+                str(address_record_by_field['checksum']),
+                address_record_by_field['type'],
+            ])
+            npi_address_list_dict[address_key] = address_record_by_field
 
-        if row['Provider First Line Business Mailing Address']:
-            obj = {
-                'first_line': row['Provider First Line Business Mailing Address'],
-                'second_line': row['Provider Second Line Business Mailing Address'],
-                'city_name': row.get('Provider Business Mailing Address City Name', '').upper(),
-                'state_name': row.get('Provider Business Mailing Address State Name', '').upper(),
-                'postal_code': row['Provider Business Mailing Address Postal Code'],
-                'country_code': row['Provider Business Mailing Address Country Code (If outside U.S.)'],
+        if npi_source_row['Provider First Line Business Mailing Address']:
+            address_record_by_field = {
+                'first_line': npi_source_row['Provider First Line Business Mailing Address'],
+                'second_line': npi_source_row['Provider Second Line Business Mailing Address'],
+                'city_name': npi_source_row.get('Provider Business Mailing Address City Name', '').upper(),
+                'state_name': npi_source_row.get('Provider Business Mailing Address State Name', '').upper(),
+                'postal_code': npi_source_row['Provider Business Mailing Address Postal Code'],
+                'country_code': npi_source_row[
+                    'Provider Business Mailing Address Country Code (If outside U.S.)'
+                ],
             }
 
-            obj.update({
-                'checksum': return_checksum(list(obj.values())),  # addresses have blank symbols
-                'npi': int(row['NPI']),
+            address_record_by_field.update({
+                'checksum': return_checksum(list(address_record_by_field.values())),  # addresses have blank symbols
+                'npi': int(npi_source_row['NPI']),
                 'type': 'mail',
-                'telephone_number': row['Provider Business Mailing Address Telephone Number'],
-                'fax_number': row['Provider Business Mailing Address Fax Number'],
+                'telephone_number': npi_source_row['Provider Business Mailing Address Telephone Number'],
+                'fax_number': npi_source_row['Provider Business Mailing Address Fax Number'],
                 'taxonomy_array': taxonomy_array,
-                'date_added': pytz.utc.localize(parse_date(row['Last Update Date'], fuzzy=True))
-                if row['Last Update Date']
+                'date_added': pytz.utc.localize(parse_date(npi_source_row['Last Update Date'], fuzzy=True))
+                if npi_source_row['Last Update Date']
                 else None,
             })
-            npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'],])] = obj
+            address_key = '_'.join([
+                str(address_record_by_field['npi']),
+                str(address_record_by_field['checksum']),
+                address_record_by_field['type'],
+            ])
+            npi_address_list_dict[address_key] = address_record_by_field
 
         for i in range(1, 16):
-            if row[f'Healthcare Provider Taxonomy Code_{i}']:
-                t = {
-                    'npi': int(row[npi_csv_map_reverse['npi']]),
-                    'healthcare_provider_taxonomy_code': row[f'Healthcare Provider Taxonomy Code_{i}'],
-                    'provider_license_number': row[f'Provider License Number_{i}'],
-                    'provider_license_number_state_code': row[f'Provider License Number State Code_{i}'],
-                    'healthcare_provider_primary_taxonomy_switch': row[
+            if npi_source_row[f'Healthcare Provider Taxonomy Code_{i}']:
+                taxonomy_record_by_field = {
+                    'npi': int(npi_source_row[npi_csv_map_reverse['npi']]),
+                    'healthcare_provider_taxonomy_code': npi_source_row[f'Healthcare Provider Taxonomy Code_{i}'],
+                    'provider_license_number': npi_source_row[f'Provider License Number_{i}'],
+                    'provider_license_number_state_code': npi_source_row[f'Provider License Number State Code_{i}'],
+                    'healthcare_provider_primary_taxonomy_switch': npi_source_row[
                         f'Healthcare Provider Primary Taxonomy Switch_{i}']
                 }
-                checksum = return_checksum(list(t.values()))
-                t['checksum'] = checksum
-                npi_taxonomy_list_dict[checksum] = t
+                checksum = return_checksum(list(taxonomy_record_by_field.values()))
+                taxonomy_record_by_field['checksum'] = checksum
+                npi_taxonomy_list_dict[checksum] = taxonomy_record_by_field
             else:
                 break
 
         for i in range(1, 51):
-            if row[f'Other Provider Identifier_{i}']:
-                t = {
-                    'npi': int(row[npi_csv_map_reverse['npi']]),
-                    'other_provider_identifier': row[f'Other Provider Identifier_{i}'],
-                    'other_provider_identifier_type_code': row[f'Other Provider Identifier Type Code_{i}'],
-                    'other_provider_identifier_state': row[f'Other Provider Identifier State_{i}'],
-                    'other_provider_identifier_issuer': row[f'Other Provider Identifier Issuer_{i}']
+            if npi_source_row[f'Other Provider Identifier_{i}']:
+                identifier_record_by_field = {
+                    'npi': int(npi_source_row[npi_csv_map_reverse['npi']]),
+                    'other_provider_identifier': npi_source_row[f'Other Provider Identifier_{i}'],
+                    'other_provider_identifier_type_code': npi_source_row[f'Other Provider Identifier Type Code_{i}'],
+                    'other_provider_identifier_state': npi_source_row[f'Other Provider Identifier State_{i}'],
+                    'other_provider_identifier_issuer': npi_source_row[f'Other Provider Identifier Issuer_{i}']
                 }
-                checksum = return_checksum(list(t.values()))
-                t['checksum'] = checksum
-                npi_other_id_list_dict[checksum] = t
+                checksum = return_checksum(list(identifier_record_by_field.values()))
+                identifier_record_by_field['checksum'] = checksum
+                npi_other_id_list_dict[checksum] = identifier_record_by_field
             else:
                 break
 
         for i in range(1, 16):
-            if row[f'Healthcare Provider Taxonomy Group_{i}']:
-                t = {
-                    'npi': int(row[npi_csv_map_reverse['npi']]),
-                    'healthcare_provider_taxonomy_group': row[f'Healthcare Provider Taxonomy Group_{i}'],
+            if npi_source_row[f'Healthcare Provider Taxonomy Group_{i}']:
+                taxonomy_group_record_by_field = {
+                    'npi': int(npi_source_row[npi_csv_map_reverse['npi']]),
+                    'healthcare_provider_taxonomy_group': npi_source_row[
+                        f'Healthcare Provider Taxonomy Group_{i}'
+                    ],
                 }
-                checksum = return_checksum(list(t.values()))
-                t['checksum'] = checksum
-                npi_taxonomy_group_list_dict[checksum] = t
+                checksum = return_checksum(list(taxonomy_group_record_by_field.values()))
+                taxonomy_group_record_by_field['checksum'] = checksum
+                npi_taxonomy_group_list_dict[checksum] = taxonomy_group_record_by_field
             else:
                 break
 
-    payload = {
+    normalized_rows_by_kind = {
         'npi_obj_list': npi_obj_list,
         'npi_taxonomy_list': list(npi_taxonomy_list_dict.values()),
         'npi_other_id_list': list(npi_other_id_list_dict.values()),
@@ -394,10 +410,10 @@ async def process_npi_chunk(ctx, task):
         ),
     }
     if task.get('direct'):
-        await save_npi_data(ctx, payload)
+        await save_npi_data(ctx, normalized_rows_by_kind)
         print(f'Processing.. {len(npi_obj_list)} rows directly')
     else:
-        await redis.enqueue_job('save_npi_data', payload, _queue_name=NPI_QUEUE_NAME)
+        await redis.enqueue_job('save_npi_data', normalized_rows_by_kind, _queue_name=NPI_QUEUE_NAME)
 
 
 
@@ -458,13 +474,13 @@ async def process_data(ctx, task=None):  # pragma: no cover
             total=len(selected_files),
             message=f"{len(selected_files)} source files discovered",
         )
-    for file_idx, p in enumerate(selected_files):
+    for file_idx, archive_filename in enumerate(selected_files):
         await raise_if_cancelled(ctx, task)
         count_files = count_files + 1
         current_sql_chunk_size = sql_chunk_size
         if test_mode:
             current_sql_chunk_size = min(current_sql_chunk_size, TEST_NPI_ROWS)
-        print(f"Round {count_files} for {p}")
+        print(f"Round {count_files} for {archive_filename}")
         if run_id:
             enqueue_live_progress(
                 run_id=run_id,
@@ -475,16 +491,16 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 done=file_idx,
                 total=len(selected_files),
                 message=f"downloading file {file_idx + 1}/{len(selected_files)}",
-                label=p,
+                label=archive_filename,
             )
         with tempfile.TemporaryDirectory() as tmpdirname:
-            print(f"Found: {p}")
+            print(f"Found: {archive_filename}")
             # await unzip('/users/nick/downloads/NPPES_Data_Dissemination_November_2022.zip', tmpdirname, __debug=True)
 
-            tmp_filename = str(PurePath(str(tmpdirname), p))
-            await download_it_and_save(os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR'] + p, tmp_filename,
+            tmp_filename = str(PurePath(str(tmpdirname), archive_filename))
+            await download_it_and_save(os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR'] + archive_filename, tmp_filename,
                                        chunk_size=10 * 1024 * 1024, cache_dir='/tmp')
-            print(f"Downloaded: {p}")
+            print(f"Downloaded: {archive_filename}")
             if os.environ.get("DEBUG"):
                 print(f"DEBUG: Downloaded file {tmp_filename}, size: {os.path.getsize(tmp_filename)} bytes")
                 if os.path.getsize(tmp_filename) > 100 * 1024 * 1024:
@@ -511,9 +527,9 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 current_sql_chunk_size = sql_chunk_size // 26
                 npi_set: set[int] = set()
                 async with async_open(npi_file, 'r') as afp:
-                    async for row in AsyncDictReader(afp, delimiter=","):
-                        if row.get('NPI'):
-                            npi_set.add(int(row['NPI']))
+                    async for source_csv_row in AsyncDictReader(afp, delimiter=","):
+                        if source_csv_row.get('NPI'):
+                            npi_set.add(int(source_csv_row['NPI']))
 
                 for cls in (NPIData, NPIDataTaxonomyGroup, NPIDataTaxonomy, NPIAddress):
                     table = make_class(cls, import_date)
@@ -532,9 +548,9 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 npi_set.clear()
 
                 async with async_open(pl_file, 'r') as afp:
-                    async for row in AsyncDictReader(afp, delimiter=","):
-                        if row.get('NPI'):
-                            npi_set.add(int(row['NPI']))
+                    async for source_csv_row in AsyncDictReader(afp, delimiter=","):
+                        if source_csv_row.get('NPI'):
+                            npi_set.add(int(source_csv_row['NPI']))
 
                 table = make_class(NPIAddress, import_date)
                 npi_list = list(npi_set)
@@ -550,9 +566,9 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 npi_set.clear()
 
                 async with async_open(other_file, 'r') as afp:
-                    async for row in AsyncDictReader(afp, delimiter=","):
-                        if row.get('NPI'):
-                            npi_set.add(int(row['NPI']))
+                    async for source_csv_row in AsyncDictReader(afp, delimiter=","):
+                        if source_csv_row.get('NPI'):
+                            npi_set.add(int(source_csv_row['NPI']))
 
                 table = make_class(NPIDataOtherIdentifier, import_date)
                 npi_list = list(npi_set)
@@ -568,8 +584,8 @@ async def process_data(ctx, task=None):  # pragma: no cover
 
             endpoint_file = [fn for fn in glob.glob(f"{tmpdirname}/endpoint*.csv")
                 if not os.path.basename(fn).endswith('_fileheader.csv')][0]
-            for t in (endpoint_file, other_file, pl_file, npi_file):
-                print(f"Files: {t}")
+            for source_file_path in (endpoint_file, other_file, pl_file, npi_file):
+                print(f"Files: {source_file_path}")
 
 
             npi_csv_map = {}
@@ -578,13 +594,13 @@ async def process_data(ctx, task=None):  # pragma: no cover
             int_key_re = re.compile(r'.*_\d+$')
 
             async with async_open(npi_file, 'r') as afp:
-                async for row in AsyncDictReader(afp, delimiter=","):
-                    for key in row:
+                async for source_csv_row in AsyncDictReader(afp, delimiter=","):
+                    for key in source_csv_row:
                         if int_key_re.match(key) or ' Address' in key:
                             continue
-                        t = re.sub(r"\(.*\)", r"", key.lower()).strip().replace(' ', '_')
-                        npi_csv_map[key] = t
-                        npi_csv_map_reverse[t] = key
+                        normalized_column_name = re.sub(r"\(.*\)", r"", key.lower()).strip().replace(' ', '_')
+                        npi_csv_map[key] = normalized_column_name
+                        npi_csv_map_reverse[normalized_column_name] = key
                     break
             count = 0
 
@@ -593,12 +609,12 @@ async def process_data(ctx, task=None):  # pragma: no cover
             coros = []
             processed_rows = 0
             async with async_open(npi_file, 'r') as afp:
-                async for row in AsyncDictReader(afp, delimiter=","):
-                    if not row['NPI']:
+                async for source_csv_row in AsyncDictReader(afp, delimiter=","):
+                    if not source_csv_row['NPI']:
                         continue
                     if not count % current_sql_chunk_size:
                         print(f"Processed: {count}")
-                    row_list.append(row)
+                    row_list.append(source_csv_row)
                     processed_rows += 1
                     if run_id and processed_rows and processed_rows % (100 if test_mode else 100_000) == 0:
                         enqueue_live_progress(
@@ -610,19 +626,19 @@ async def process_data(ctx, task=None):  # pragma: no cover
                             done=processed_rows,
                             total=TEST_NPI_ROWS if test_mode else None,
                             message=f"parsed {processed_rows} primary rows",
-                            label=p,
+                            label=archive_filename,
                         )
                     if count > current_sql_chunk_size:
                         print(f"Sending to DB: {count}")
                         await raise_if_cancelled(ctx, task)
-                        payload = {
+                        npi_chunk_by_field = {
                             'row_list': row_list.copy(),
                             'npi_csv_map': npi_csv_map,
                             'npi_csv_map_reverse': npi_csv_map_reverse,
                             'taxonomy_int_code_map': taxonomy_int_code_map,
                             'direct': True,
                         }
-                        await enqueue_or_flush(coros, process_npi_chunk(ctx, payload))
+                        await enqueue_or_flush(coros, process_npi_chunk(ctx, npi_chunk_by_field))
                         row_list.clear()
                         count = 0
                     else:
@@ -630,7 +646,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                     if test_mode and processed_rows >= TEST_NPI_ROWS:
                         break
 
-            payload = {
+            npi_chunk_by_field = {
                 'row_list': row_list.copy(),
                 'npi_csv_map': npi_csv_map,
                 'npi_csv_map_reverse': npi_csv_map_reverse,
@@ -638,36 +654,38 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 'direct': True,
             }
             await raise_if_cancelled(ctx, task)
-            await enqueue_or_flush(coros, process_npi_chunk(ctx, payload))
+            await enqueue_or_flush(coros, process_npi_chunk(ctx, npi_chunk_by_field))
             row_list.clear()
 
             npi_other_org_list_dict = {}
 
             async with async_open(other_file, 'r') as afp:
                 processed_other = 0
-                async for row in AsyncDictReader(afp, delimiter=","):
-                    if not row['NPI']:
+                async for source_csv_row in AsyncDictReader(afp, delimiter=","):
+                    if not source_csv_row['NPI']:
                         continue
                     if not count % current_sql_chunk_size:
                         print(f"Other Names Processed: {count}")
-                    obj = {
-                        'npi': int(row['NPI']),
-                        'other_provider_identifier': row['Provider Other Organization Name'],
-                        'other_provider_identifier_type_code': row['Provider Other Organization Name Type Code'],
+                    other_identifier_by_field = {
+                        'npi': int(source_csv_row['NPI']),
+                        'other_provider_identifier': source_csv_row['Provider Other Organization Name'],
+                        'other_provider_identifier_type_code': source_csv_row[
+                            'Provider Other Organization Name Type Code'
+                        ],
                         'other_provider_identifier_state': None,
                         'other_provider_identifier_issuer': None,
                     }
-                    checksum = return_checksum(list(obj.values()))
-                    obj['checksum'] = checksum
-                    npi_other_org_list_dict[checksum] = obj
+                    checksum = return_checksum(list(other_identifier_by_field.values()))
+                    other_identifier_by_field['checksum'] = checksum
+                    npi_other_org_list_dict[checksum] = other_identifier_by_field
 
                     if count > current_sql_chunk_size:
                         print(f"Sending to DB: {count}")
                         await raise_if_cancelled(ctx, task)
-                        other_payload = {
+                        other_identifier_rows_by_key = {
                             'npi_other_id_list': list(npi_other_org_list_dict.copy().values())
                         }
-                        await enqueue_or_flush(coros, save_npi_data(ctx, other_payload))
+                        await enqueue_or_flush(coros, save_npi_data(ctx, other_identifier_rows_by_key))
                         npi_other_org_list_dict.clear()
                         count = 0
                     else:
@@ -683,42 +701,70 @@ async def process_data(ctx, task=None):  # pragma: no cover
                             done=processed_other,
                             total=TEST_NPI_OTHER_ROWS if test_mode else None,
                             message=f"parsed {processed_other} other identifier rows",
-                            label=p,
+                            label=archive_filename,
                         )
                     if test_mode and processed_other >= TEST_NPI_OTHER_ROWS:
                         break
 
-            other_payload = {'npi_other_id_list': list(npi_other_org_list_dict.copy().values())}
-            await enqueue_or_flush(coros, save_npi_data(ctx, other_payload))
+            other_identifier_rows_by_key = {
+                'npi_other_id_list': list(npi_other_org_list_dict.copy().values())
+            }
+            await enqueue_or_flush(coros, save_npi_data(ctx, other_identifier_rows_by_key))
             npi_other_org_list_dict.clear()
 
 
             npi_address_list_dict = {}
             async with async_open(pl_file, 'r') as afp:
                 processed_secondary = 0
-                async for row in AsyncDictReader(afp, delimiter=","):
-                    if not row['NPI'] and not row['Provider Secondary Practice Location Address- Address Line 1']:
+                async for source_csv_row in AsyncDictReader(afp, delimiter=","):
+                    if (
+                        not source_csv_row['NPI']
+                        and not source_csv_row['Provider Secondary Practice Location Address- Address Line 1']
+                    ):
                         continue
                     if not count % current_sql_chunk_size:
                         print(f"Secondary Addresses Processed: {count}")
-                    obj = {
-                        'first_line': row['Provider Secondary Practice Location Address- Address Line 1'],
-                        'second_line': row['Provider Secondary Practice Location Address-  Address Line 2'],
-                        'city_name': row.get('Provider Secondary Practice Location Address - City Name', '').upper(),
-                        'state_name': row.get('Provider Secondary Practice Location Address - State Name', '').upper(),
-                        'postal_code': row['Provider Secondary Practice Location Address - Postal Code'],
-                        'country_code': row['Provider Secondary Practice Location Address - Country Code (If outside U.S.)'],
+                    secondary_address_by_field = {
+                        'first_line': source_csv_row[
+                            'Provider Secondary Practice Location Address- Address Line 1'
+                        ],
+                        'second_line': source_csv_row[
+                            'Provider Secondary Practice Location Address-  Address Line 2'
+                        ],
+                        'city_name': source_csv_row.get(
+                            'Provider Secondary Practice Location Address - City Name',
+                            '',
+                        ).upper(),
+                        'state_name': source_csv_row.get(
+                            'Provider Secondary Practice Location Address - State Name',
+                            '',
+                        ).upper(),
+                        'postal_code': source_csv_row[
+                            'Provider Secondary Practice Location Address - Postal Code'
+                        ],
+                        'country_code': source_csv_row[
+                            'Provider Secondary Practice Location Address - Country Code (If outside U.S.)'
+                        ],
                     }
 
-                    obj.update({
-                        'checksum': return_checksum(list(obj.values())),  # addresses have blank symbols
-                        'npi': int(row['NPI']),
+                    secondary_address_by_field.update({
+                        'checksum': return_checksum(
+                            list(secondary_address_by_field.values())
+                        ),  # addresses have blank symbols
+                        'npi': int(source_csv_row['NPI']),
                         'type': 'secondary',
-                        'telephone_number': row['Provider Secondary Practice Location Address - Telephone Number'],
-                        'fax_number': row['Provider Practice Location Address - Fax Number'],
+                        'telephone_number': source_csv_row[
+                            'Provider Secondary Practice Location Address - Telephone Number'
+                        ],
+                        'fax_number': source_csv_row['Provider Practice Location Address - Fax Number'],
                         'date_added': pytz.utc.localize(datetime.datetime.now())
                     })
-                    npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'], ])] = obj
+                    address_key = '_'.join([
+                        str(secondary_address_by_field['npi']),
+                        str(secondary_address_by_field['checksum']),
+                        secondary_address_by_field['type'],
+                    ])
+                    npi_address_list_dict[address_key] = secondary_address_by_field
 
                     if count > current_sql_chunk_size:
                         print(f"Sending Secondary to DB: {count}")
@@ -753,7 +799,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                             done=processed_secondary,
                             total=TEST_NPI_SECONDARY_ROWS if test_mode else None,
                             message=f"parsed {processed_secondary} secondary address rows",
-                            label=p,
+                            label=archive_filename,
                         )
                     if test_mode and processed_secondary >= TEST_NPI_SECONDARY_ROWS:
                         print(f"Test mode: stopping secondary address scan at {processed_secondary} rows.")
@@ -788,7 +834,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                     done=file_idx + 1,
                     total=len(selected_files),
                     message=f"processed file {file_idx + 1}/{len(selected_files)}",
-                    label=p,
+                    label=archive_filename,
                 )
 
     # Mark this job as successfully completed; shutdown finalization depends on this.
@@ -811,36 +857,40 @@ async def startup(ctx):  # pragma: no cover
     import_date = ctx['import_date']
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
 
-    tables = {}  # for the future complex usage
+    staged_models_by_table = {}  # for the future complex usage
 
     await _ensure_required_extensions()
 
     try:
-        obj = AddressArchive
+        archive_model = AddressArchive
         await db.create_table(AddressArchive.__table__, checkfirst=True)
         if hasattr(AddressArchive, "__my_index_elements__"):
             await db.status(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS {obj.__tablename__}_idx_primary ON "
-                f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {archive_model.__tablename__}_idx_primary ON "
+                f"{db_schema}.{archive_model.__tablename__} "
+                f"({', '.join(archive_model.__my_index_elements__)});"
+            )
     except DuplicateTableError:
-        print(f"Address archive table {db_schema}.{obj.__tablename__} already exists.")
+        print(f"Address archive table {db_schema}.{archive_model.__tablename__} already exists.")
 
     for cls in (NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIAddress, NPIPhoneStaffing):
-        tables[cls.__main_table__] = make_class(cls, import_date)
-        obj = tables[cls.__main_table__]
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};")
-        await db.create_table(obj.__table__, checkfirst=True)
-        if hasattr(obj, "__my_index_elements__"):
+        staged_models_by_table[cls.__main_table__] = make_class(cls, import_date)
+        staged_model = staged_models_by_table[cls.__main_table__]
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{staged_model.__main_table__}_{import_date};")
+        await db.create_table(staged_model.__table__, checkfirst=True)
+        if hasattr(staged_model, "__my_index_elements__"):
             await db.status(
-                f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
-                f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
+                f"CREATE UNIQUE INDEX {staged_model.__tablename__}_idx_primary ON "
+                f"{db_schema}.{staged_model.__tablename__} "
+                f"({', '.join(staged_model.__my_index_elements__)});"
+            )
 
         if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
             for index in cls.__my_initial_indexes__:
                 index_name = index.get("name", "_".join(index.get("index_elements")))
                 using = ""
-                if t := index.get("using"):
-                    using = f"USING {t} "
+                if index_method := index.get("using"):
+                    using = f"USING {index_method} "
 
                 unique = ' '
                 if index.get('unique'):
@@ -849,8 +899,8 @@ async def startup(ctx):  # pragma: no cover
                 if index.get('where'):
                     where = f' WHERE {index.get("where")} '
                 create_index_sql = (
-                    f"CREATE{unique}INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
-                    f"ON {db_schema}.{obj.__tablename__}  {using}"
+                    f"CREATE{unique}INDEX IF NOT EXISTS {staged_model.__tablename__}_idx_{index_name} "
+                    f"ON {db_schema}.{staged_model.__tablename__}  {using}"
                     f"({', '.join(index.get('index_elements'))}){where};"
                 )
                 print(create_index_sql)
@@ -1133,7 +1183,7 @@ async def shutdown(ctx):  # pragma: no cover
                 message=f"npi shutdown {phase} started",
             )
         try:
-            result = await awaitable
+            phase_result = await awaitable
         except Exception:
             elapsed = round(time.monotonic() - started, 3)
             shutdown_phase_timings.append(
@@ -1182,7 +1232,7 @@ async def shutdown(ctx):  # pragma: no cover
                 pct=100,
                 message=f"npi shutdown {phase} completed",
             )
-        return result
+        return phase_result
 
     if not context.get('run'):
         print("No NPI jobs ran in this worker session; skipping shutdown validation.")
@@ -1194,7 +1244,7 @@ async def shutdown(ctx):  # pragma: no cover
         await _assert_nucc_ready(db_schema)
     if source_enabled("nppes"):
         await _assert_nppes_canonical_ready(db_schema)
-    tables = {}
+    staged_models_by_table = {}
 
     npi_address_stage_table = f"{NPIAddress.__tablename__}_{import_date}"
     npi_address_stage_exists = await db.scalar(
@@ -1244,25 +1294,25 @@ async def shutdown(ctx):  # pragma: no cover
             """
         ))
 
-    stage_counts: dict[str, int] = {}
+    stage_row_counts_by_table: dict[str, int] = {}
     for cls in processing_classes_array:
         stage_obj = make_class(cls, import_date)
         if await table_exists(stage_obj.__tablename__):
-            stage_counts[cls.__main_table__] = int(
+            stage_row_counts_by_table[cls.__main_table__] = int(
                 await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_obj.__tablename__};") or 0
             )
 
-    postgis_cache: dict[str, bool | None] = {"available": None}
+    postgis_availability_by_key: dict[str, bool | None] = {"available": None}
 
     async def has_postgis() -> bool:
         """Cache whether PostGIS types and constructors are available."""
-        if postgis_cache["available"] is None:
+        if postgis_availability_by_key["available"] is None:
             geography_type = await db.scalar("SELECT to_regtype('geography');")
             st_makepoint = await db.scalar("SELECT to_regprocedure('st_makepoint(double precision, double precision)');")
-            postgis_cache["available"] = bool(geography_type and st_makepoint)
-            if not postgis_cache["available"]:
+            postgis_availability_by_key["available"] = bool(geography_type and st_makepoint)
+            if not postgis_availability_by_key["available"]:
                 print("PostGIS is unavailable; geo GIST index creation will be skipped.")
-        return bool(postgis_cache["available"])
+        return bool(postgis_availability_by_key["available"])
 
     async def archive_index(index_name: str) -> str:
         """Move a live index name aside before staged table promotion."""
@@ -1343,7 +1393,7 @@ async def shutdown(ctx):  # pragma: no cover
 
         return await timed_shutdown_phase("geocode_archive_enrichment", _run_geo_update())
 
-    async def create_additional_indexes(cls, obj) -> None:
+    async def create_additional_indexes(cls, staged_model) -> None:
         """Create model-declared secondary indexes on a staged table."""
         if not hasattr(cls, '__my_additional_indexes__') or not cls.__my_additional_indexes__:
             return
@@ -1351,13 +1401,13 @@ async def shutdown(ctx):  # pragma: no cover
             index_name = index.get('name', '_'.join(index.get('index_elements')))
             if _index_requires_postgis(index) and not await has_postgis():
                 print(
-                    f"Skipping index {obj.__tablename__}_idx_{index_name}: "
+                    f"Skipping index {staged_model.__tablename__}_idx_{index_name}: "
                     "requires PostGIS (geography + ST_MakePoint)."
                 )
                 continue
             using = ""
-            if t := index.get('using'):
-                using = f"USING {t} "
+            if index_method := index.get('using'):
+                using = f"USING {index_method} "
             where_clause = ""
             if where := index.get('where'):
                 where_clause = f" WHERE {where}"
@@ -1368,13 +1418,13 @@ async def shutdown(ctx):  # pragma: no cover
                 for element in index.get('index_elements')
             ]
             create_index_sql = (
-                f"CREATE INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
-                f"ON {db_schema}.{obj.__tablename__}  {using}"
+                f"CREATE INDEX IF NOT EXISTS {staged_model.__tablename__}_idx_{index_name} "
+                f"ON {db_schema}.{staged_model.__tablename__}  {using}"
                 f"({', '.join(index_elements)}){where_clause};"
             )
             print(create_index_sql)
             await timed_shutdown_phase(
-                f"index_creation:{obj.__tablename__}:{index_name}",
+                f"index_creation:{staged_model.__tablename__}:{index_name}",
                 db.status(create_index_sql),
             )
 
@@ -1382,15 +1432,15 @@ async def shutdown(ctx):  # pragma: no cover
 
     async with db.transaction():
         for cls in processing_classes_array:
-            tables[cls.__main_table__] = make_class(cls, import_date)
-            obj = tables[cls.__main_table__]
+            staged_models_by_table[cls.__main_table__] = make_class(cls, import_date)
+            staged_model = staged_models_by_table[cls.__main_table__]
             if cls is NPIData:
-                deferred_npi_indexes_obj = obj
+                deferred_npi_indexes_obj = staged_model
             if cls is NPIDataOtherIdentifier:
                 print('Updating NPI do_business_as arrays from other identifiers...')
-                target_npi_cls = tables.get(NPIData.__main_table__)
+                target_npi_cls = staged_models_by_table.get(NPIData.__main_table__)
                 target_table_name = target_npi_cls.__tablename__ if target_npi_cls else NPIData.__tablename__
-                source_table_name = obj.__tablename__
+                source_table_name = staged_model.__tablename__
                 await timed_shutdown_phase(
                     "do_business_as_enrichment",
                     refresh_do_business_as(
@@ -1409,7 +1459,7 @@ async def shutdown(ctx):  # pragma: no cover
                     await timed_shutdown_phase(
                         "taxonomy_array_enrichment",
                         refresh_taxonomy_arrays(
-                            address_table=obj.__tablename__,
+                            address_table=staged_model.__tablename__,
                             taxonomy_table=npi_taxonomy_table,
                             schema=db_schema,
                         ),
@@ -1429,7 +1479,7 @@ async def shutdown(ctx):  # pragma: no cover
                 )
                 if await table_exists(archive_source):
                     print(f"Updating NPI Addresses Geo from Archive {archive_source}...")
-                    await _timed_geo_update(obj, archive_source, use_canonical_archive)
+                    await _timed_geo_update(staged_model, archive_source, use_canonical_archive)
                 else:
                     print(f"Skipping NPI geo update: no address archive table is available in {db_schema}.")
 
@@ -1438,7 +1488,7 @@ async def shutdown(ctx):  # pragma: no cover
                     await timed_shutdown_phase(
                         "plan_network_array_enrichment",
                         db.status(
-                        f"""UPDATE {db_schema}.{obj.__tablename__} as a
+                        f"""UPDATE {db_schema}.{staged_model.__tablename__} as a
 SET
     plans_network_array = n_list
 FROM (
@@ -1460,7 +1510,7 @@ WHERE
                     await timed_shutdown_phase(
                         "procedures_array_enrichment",
                         db.status(
-                        f"""UPDATE {db_schema}.{obj.__tablename__} AS a
+                        f"""UPDATE {db_schema}.{staged_model.__tablename__} AS a
 SET
     procedures_array = b.codes
 FROM (
@@ -1485,7 +1535,7 @@ WHERE
                     await timed_shutdown_phase(
                         "medications_array_enrichment",
                         db.status(
-                        f"""UPDATE {db_schema}.{obj.__tablename__} AS a
+                        f"""UPDATE {db_schema}.{staged_model.__tablename__} AS a
 SET
     medications_array = b.codes
 FROM (
@@ -1509,7 +1559,7 @@ WHERE
                     )
 
             if cls is NPIPhoneStaffing:
-                address_stage = tables.get(NPIAddress.__main_table__)
+                address_stage = staged_models_by_table.get(NPIAddress.__main_table__)
                 if address_stage is None:
                     print(
                         f"Skipping phone staffing materialization: "
@@ -1519,14 +1569,14 @@ WHERE
                     await timed_shutdown_phase(
                         "phone_staffing_rebuild",
                         rebuild_phone_staffing_table(
-                            target_table=obj.__tablename__,
+                            target_table=staged_model.__tablename__,
                             address_table=address_stage.__tablename__,
                             schema=db_schema,
                         ),
                     )
 
             if cls is not NPIData:
-                await create_additional_indexes(cls, obj)
+                await create_additional_indexes(cls, staged_model)
 
         if deferred_npi_indexes_obj is not None:
             await create_additional_indexes(NPIData, deferred_npi_indexes_obj)
@@ -1544,41 +1594,46 @@ WHERE
         )
 
     vacuum_tasks = [
-        vacuum_table(tables[cls.__main_table__])
+        vacuum_table(staged_models_by_table[cls.__main_table__])
         for cls in processing_classes_array
     ]
     await asyncio.gather(*vacuum_tasks)
 
     async with db.transaction():
         for cls in processing_classes_array:
-            obj = tables[cls.__main_table__]
-            table = obj.__main_table__
-            if not await table_exists(obj.__tablename__):
-                print(f"Skipping publish rotation for {db_schema}.{obj.__tablename__}: staging table is missing.")
+            staged_model = staged_models_by_table[cls.__main_table__]
+            table = staged_model.__main_table__
+            if not await table_exists(staged_model.__tablename__):
+                print(
+                    f"Skipping publish rotation for {db_schema}.{staged_model.__tablename__}: "
+                    "staging table is missing."
+                )
                 continue
 
-            async def _publish_table_rotation(cls=cls, obj=obj, table=table):
+            async def _publish_table_rotation(cls=cls, staged_model=staged_model, table=table):
                 await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
                 await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-                await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{obj.__tablename__} RENAME TO {table};")
+                await db.status(
+                    f"ALTER TABLE IF EXISTS {db_schema}.{staged_model.__tablename__} RENAME TO {table};"
+                )
 
                 await archive_index(f"{table}_idx_primary")
 
                 await db.status(f"ALTER INDEX IF EXISTS "
-                                f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
+                                f"{db_schema}.{staged_model.__tablename__}_idx_primary RENAME TO "
                                 f"{table}_idx_primary;")
 
                 move_indexes = []
                 if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
                     move_indexes += cls.__my_initial_indexes__
-                if hasattr(cls, '__my_additional_indexes__') and obj.__my_additional_indexes__:
-                    move_indexes += obj.__my_additional_indexes__
+                if hasattr(cls, '__my_additional_indexes__') and staged_model.__my_additional_indexes__:
+                    move_indexes += staged_model.__my_additional_indexes__
 
                 for index in move_indexes:
                     index_name = index.get('name', '_'.join(index.get('index_elements')))
                     await archive_index(f"{table}_idx_{index_name}")
                     await db.status(f"ALTER INDEX IF EXISTS "
-                                    f"{db_schema}.{obj.__tablename__}_idx_{index_name} RENAME TO "
+                                    f"{db_schema}.{staged_model.__tablename__}_idx_{index_name} RENAME TO "
                                     f"{table}_idx_{index_name};")
 
             await timed_shutdown_phase(
@@ -1600,7 +1655,7 @@ WHERE
             "phase": "npi published",
         },
         metrics={
-            "stage_rows": stage_counts,
+            "stage_rows": stage_row_counts_by_table,
             "npi_address_rows": int(npi_address_count or 0),
             "npi_shutdown_phase_timings": shutdown_phase_timings,
             **({"address_resolve": address_stats.__dict__} if address_stats else {}),
@@ -1615,28 +1670,28 @@ async def save_npi_data(ctx, task):
     import_date = ctx['import_date']
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     await ensure_database(test_mode)
-    x = []
+    write_tasks = []
     for key in task:
         match key:
             case 'npi_obj_list':
                 mynpidata = make_class(NPIData, import_date)
-                x.append(push_objects(task['npi_obj_list'], mynpidata, rewrite=True))
+                write_tasks.append(push_objects(task['npi_obj_list'], mynpidata, rewrite=True))
             case 'npi_taxonomy_list':
                 mynpidatataxonomy = make_class(NPIDataTaxonomy, import_date)
-                x.append(push_objects(task['npi_taxonomy_list'], mynpidatataxonomy, rewrite=True))
+                write_tasks.append(push_objects(task['npi_taxonomy_list'], mynpidatataxonomy, rewrite=True))
             case 'npi_other_id_list':
                 mynpidataotheridentifier = make_class(NPIDataOtherIdentifier, import_date)
-                unique = list({item['checksum']: item for item in task['npi_other_id_list']}.values())
-                x.append(push_objects(unique, mynpidataotheridentifier))
+                unique_rows = list({item['checksum']: item for item in task['npi_other_id_list']}.values())
+                write_tasks.append(push_objects(unique_rows, mynpidataotheridentifier))
             case 'npi_taxonomy_group_list':
                 mynpidatataxonomygroup = make_class(NPIDataTaxonomyGroup, import_date)
-                x.append(push_objects(task['npi_taxonomy_group_list'], mynpidatataxonomygroup, rewrite=True))
+                write_tasks.append(push_objects(task['npi_taxonomy_group_list'], mynpidatataxonomygroup, rewrite=True))
             case 'npi_address_list':
                 mynpiaddress = make_class(NPIAddress, import_date)
-                x.append(push_objects(task['npi_address_list'], mynpiaddress, rewrite=True))
+                write_tasks.append(push_objects(task['npi_address_list'], mynpiaddress, rewrite=True))
             case _:
                 print('Some wrong key passed')
-    for coro in x:
+    for coro in write_tasks:
         await coro
 
 

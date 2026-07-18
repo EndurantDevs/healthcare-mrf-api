@@ -23,6 +23,7 @@ from process.ptg_parts.ptg2_fast_candidate_audit import (
     run_fast_candidate_audit,
 )
 from process.ptg_parts.ptg2_candidate_attestation import (
+    PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS,
     PTG2_TRUSTED_CLUSTER_HTTP_TRANSPORT,
     PTG2_VERIFIED_HTTPS_TRANSPORT,
     record_candidate_audit_attestation,
@@ -97,8 +98,12 @@ _CANDIDATE_TARGET_SQL = """
         ON current_layout.snapshot_key = current_binding.snapshot_key
       LEFT JOIN {schema}.ptg2_v3_candidate_audit_attestation AS attestation
         ON attestation.snapshot_id = snapshot.snapshot_id
+       AND attestation.contract = ANY(CAST(:supported_contracts AS text[]))
       LEFT JOIN {schema}.ptg2_v3_candidate_audit_attestation AS current_attestation
         ON current_attestation.snapshot_id = current_snapshot.snapshot_id
+       AND current_attestation.contract = ANY(
+           CAST(:supported_contracts AS text[])
+       )
      WHERE snapshot.import_run_id = :candidate_run_id
      ORDER BY snapshot.snapshot_id
 """
@@ -192,6 +197,9 @@ async def _candidate_rows(candidate_run_id: str) -> list[dict[str, Any]]:
     candidate_rows = await db.all(
         _CANDIDATE_TARGET_SQL.format(schema=schema),
         candidate_run_id=candidate_run_id,
+        supported_contracts=list(
+            PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
+        ),
     )
     return [_row_mapping(candidate_row) for candidate_row in candidate_rows]
 
