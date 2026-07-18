@@ -102,9 +102,24 @@ Completed worker-run counts provide the exact attempted-row metric; the
 scanner marks legacy uniqueness metrics as unmeasured instead of paying their
 per-row CPU and memory cost.
 
+The parallel scanner's exact per-worker duplicate caches remove shared-lock
+traffic for repeated price-atom, price-set, and provider-set identities. The caches are
+bounded and may be cleared without weakening correctness because every local
+miss is still checked by the authoritative process-wide set; locally rejected
+duplicates are bulk-added to the same attempted/duplicate counters at worker
+completion.
+
+Save-phase work is pipelined at its exact dependency boundary. The validated
+cost-ranked price-key stage can be exported and consumed by the Rust finalizer
+while independent price-atom normalization, dictionary rewriting, and atom-key
+assignment continue. Content-addressed block publication then hashes the full
+COPY source but transfers payload bytes only for hashes absent from the durable
+block store. Both paths retain fail-closed cleanup and metadata validation.
+
 The authoritative by-code writer emits only `by_code_provider_shard_v1`.
-Provider-set keys are partitioned into 1,024-key shards, where
-`shard_id = provider_set_key // 1024` and
+Provider-set keys are partitioned by the versioned `provider_shard_span`
+recorded by the artifact (currently 1,024 keys), where
+`shard_id = provider_set_key // provider_shard_span` and
 `block_key = (code_key << 31) | shard_id`; every block's fragments are dense
 and contiguous from `0`. The separate `by_code_price_page_v4` projection holds
 at most 64 rows and exists only for fast qualifying first-page reads.

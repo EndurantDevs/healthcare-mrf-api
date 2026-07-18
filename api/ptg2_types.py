@@ -47,6 +47,7 @@ class PTG2ServingTables:
     cold_lookup_contract: str | None = None
     price_dictionary_item_count: int | None = None
     price_dictionary_block_bytes: int | None = None
+    provider_shard_span: int | None = None
     atom_key_bits: int | None = None
     price_key_block_span: int | None = None
     atom_key_block_span: int | None = None

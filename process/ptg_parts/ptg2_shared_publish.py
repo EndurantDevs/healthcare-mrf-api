@@ -16,8 +16,11 @@ from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SHARED_FORMAT_VERSION,
     SharedBlock,
-    SharedBlockReference,
     lock_shared_layout_for_dense_write,
+)
+from process.ptg_parts.ptg2_shared_block_copy import (
+    SelectiveSharedBlockCopyReader,
+    scan_shared_block_copy,
 )
 from process.ptg_parts.ptg2_shared_finalize import validate_v3_finalizer_summary
 from process.ptg_parts.ptg2_shared_graph import SharedGraphConversionResult
@@ -40,11 +43,12 @@ _SHARED_BLOCK_STAGE_COLUMNS = (
     "stored_byte_count",
     "payload",
 )
+_SHARED_BLOCK_EXISTENCE_BATCH_ROWS = 8_192
 
 
 @dataclass(frozen=True)
 class SharedBlockStagePublication:
-    references: tuple[SharedBlockReference, ...]
+    object_kinds: tuple[str, ...]
     mapping_count: int
     unique_block_count: int
     logical_byte_count: int
@@ -77,7 +81,9 @@ class _DigestingReader:
 
 @dataclass(frozen=True)
 class SharedGraphPublication:
-    references: tuple[SharedBlockReference, ...]
+    object_kinds: tuple[str, ...]
+    mapping_count: int
+    unique_block_count: int
     block_count: int
     owner_count: int
     provider_group_count: int
@@ -201,10 +207,50 @@ async def create_shared_block_stage(*, schema_name: str, stage_table: str) -> No
             codec varchar(16) NOT NULL CHECK (codec IN ('none', 'zlib')),
             raw_byte_count bigint NOT NULL CHECK (raw_byte_count >= 0),
             stored_byte_count bigint NOT NULL CHECK (stored_byte_count >= 0),
-            payload bytea NOT NULL CHECK (octet_length(payload) = stored_byte_count)
+            payload bytea CHECK (
+                payload IS NULL OR octet_length(payload) = stored_byte_count
+            )
         );
         """
     )
+
+
+async def _existing_shared_block_hashes(
+    *,
+    schema_name: str,
+    requested_hashes: Iterable[bytes],
+) -> set[bytes]:
+    """Return the exact requested hashes already durable, using bounded queries."""
+
+    schema = _quote_ident(_safe_identifier(schema_name))
+    remaining_hashes = {bytes(block_hash) for block_hash in requested_hashes}
+    existing_hashes: set[bytes] = set()
+    while remaining_hashes:
+        batch_block_hashes = [
+            remaining_hashes.pop()
+            for _ in range(
+                min(len(remaining_hashes), _SHARED_BLOCK_EXISTENCE_BATCH_ROWS)
+            )
+        ]
+        block_hash_rows = await db.all(
+            db.text(
+                f"""
+                SELECT block_hash
+                  FROM {schema}.ptg2_v3_block
+                 WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))
+                """
+            ),
+            block_hashes=batch_block_hashes,
+        )
+        batch_hashes = set(batch_block_hashes)
+        for block_hash_row in block_hash_rows:
+            block_hash = bytes(block_hash_row[0])
+            if block_hash not in batch_hashes:
+                raise RuntimeError(
+                    "strict V3 shared-block existence query returned an unexpected hash"
+                )
+            existing_hashes.add(block_hash)
+    return existing_hashes
 
 
 async def copy_shared_block_binary_file(
@@ -214,6 +260,7 @@ async def copy_shared_block_binary_file(
     stage_table: str,
     expected_copy_bytes: int | None = None,
     expected_copy_sha256: str | None = None,
+    reuse_existing: bool = False,
 ) -> None:
     """Validate and binary-COPY a shared-block file into the staging table."""
 
@@ -238,6 +285,18 @@ async def copy_shared_block_binary_file(
             )
         ):
             raise RuntimeError("strict V3 shared-block COPY has invalid expected digest")
+    if reuse_existing and expected_copy_bytes is None:
+        raise RuntimeError(
+            "strict V3 reused shared-block COPY requires byte and digest expectations"
+        )
+    existing_hashes: set[bytes] = set()
+    scanned_copy = None
+    if reuse_existing:
+        scanned_copy = scan_shared_block_copy(path)
+        existing_hashes = await _existing_shared_block_hashes(
+            schema_name=schema_name,
+            requested_hashes=scanned_copy.block_hashes,
+        )
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection
         driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
@@ -245,7 +304,16 @@ async def copy_shared_block_binary_file(
         if copy_to_table is None:
             raise NotImplementedError("active database driver does not expose binary COPY")
         with path.open("rb") as source_file:
-            copy_source = _DigestingReader(source_file)
+            copy_source: Any
+            if existing_hashes:
+                copy_source = SelectiveSharedBlockCopyReader(
+                    source_file,
+                    existing_hashes=existing_hashes,
+                    expected_source_bytes=int(expected_copy_bytes),
+                    expected_source_sha256=str(expected_copy_sha256),
+                )
+            else:
+                copy_source = _DigestingReader(source_file)
             await copy_to_table(
                 _safe_identifier(stage_table),
                 source=copy_source,
@@ -253,12 +321,31 @@ async def copy_shared_block_binary_file(
                 columns=list(_SHARED_BLOCK_STAGE_COLUMNS),
                 format="binary",
             )
+            observed_byte_count = (
+                copy_source.source_byte_count
+                if isinstance(copy_source, SelectiveSharedBlockCopyReader)
+                else copy_source.byte_count
+            )
+            observed_sha256 = (
+                copy_source.source_sha256
+                if isinstance(copy_source, SelectiveSharedBlockCopyReader)
+                else copy_source.sha256
+            )
             if expected_copy_bytes is not None and (
-                copy_source.byte_count != int(expected_copy_bytes)
-                or copy_source.sha256 != expected_copy_sha256
+                observed_byte_count != int(expected_copy_bytes)
+                or observed_sha256 != expected_copy_sha256
             ):
                 raise RuntimeError(
                     "strict V3 shared-block COPY content changed during publication"
+                )
+            if isinstance(copy_source, SelectiveSharedBlockCopyReader) and (
+                scanned_copy is None
+                or copy_source.row_count != scanned_copy.row_count
+                or copy_source.reused_payload_bytes + copy_source.copied_payload_bytes
+                != scanned_copy.stored_payload_bytes
+            ):
+                raise RuntimeError(
+                    "strict V3 shared-block COPY filtering changed source aggregates"
                 )
 
 
@@ -328,6 +415,8 @@ async def _copy_text_file_to_stage(
     schema_name: str,
     stage_table: str,
     columns: Sequence[str],
+    expected_bytes: int,
+    expected_sha256: str,
 ) -> None:
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection
@@ -335,22 +424,50 @@ async def _copy_text_file_to_stage(
         copy_to_table = getattr(driver_conn, "copy_to_table", None)
         if copy_to_table is None:
             raise NotImplementedError("active database driver does not expose text COPY")
-        with path.open("rb") as source:
+        with path.open("rb") as raw_source:
+            digesting_source = _DigestingCopySource(raw_source)
             await copy_to_table(
                 _safe_identifier(stage_table),
-                source=source,
+                source=digesting_source,
                 schema_name=_safe_identifier(schema_name),
                 columns=list(columns),
                 format="text",
             )
+            if (
+                digesting_source.byte_count != expected_bytes
+                or digesting_source.hexdigest() != expected_sha256
+            ):
+                raise RuntimeError(
+                    "strict V3 provider-set metadata changed during publication"
+                )
+
+
+class _DigestingCopySource:
+    def __init__(self, source) -> None:
+        self._source = source
+        self._digest = hashlib.sha256()
+        self.byte_count = 0
+
+    def read(self, size: int = -1) -> bytes:
+        """Read source bytes while updating the exact byte count and digest."""
+
+        chunk = self._source.read(size)
+        self._digest.update(chunk)
+        self.byte_count += len(chunk)
+        return chunk
+
+    def hexdigest(self) -> str:
+        """Return the digest of bytes consumed from the wrapped source."""
+
+        return self._digest.hexdigest()
 
 
 def _provider_set_metadata_files(
     entries: Iterable[Mapping[str, Any]],
     *,
     required: bool,
-) -> tuple[tuple[Path, int], ...]:
-    files: list[tuple[Path, int]] = []
+) -> tuple[tuple[Path, int, int, str], ...]:
+    files: list[tuple[Path, int, int, str]] = []
     seen_paths: set[Path] = set()
     for raw_entry in entries:
         if not isinstance(raw_entry, Mapping):
@@ -369,8 +486,24 @@ def _provider_set_metadata_files(
             ) from exc
         if row_count <= 0:
             raise RuntimeError("strict V3 provider-set metadata file must contain rows")
+        if (
+            raw_entry.get("format") != "ptg2_v3_provider_set_metadata_copy"
+            or raw_entry.get("version") != 1
+        ):
+            raise RuntimeError("strict V3 provider-set metadata format is incompatible")
+        raw_bytes = raw_entry.get("bytes")
+        raw_sha256 = raw_entry.get("sha256")
+        if (
+            type(raw_bytes) is not int
+            or raw_bytes <= 0
+            or raw_bytes != path.stat().st_size
+            or type(raw_sha256) is not str
+            or len(raw_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in raw_sha256)
+        ):
+            raise RuntimeError("strict V3 provider-set metadata digest contract is invalid")
         seen_paths.add(path)
-        files.append((path, row_count))
+        files.append((path, row_count, raw_bytes, raw_sha256))
     if required and not files:
         raise RuntimeError("strict V3 provider-set metadata is required")
     return tuple(files)
@@ -470,6 +603,7 @@ async def publish_shared_finalizer_dictionaries(
             f"""
             CREATE UNLOGGED TABLE {schema}.{quoted_provider_metadata_stage} (
                 provider_set_global_id_128 text NOT NULL,
+                provider_count bigint NOT NULL CHECK (provider_count >= 0),
                 network_names text[] NOT NULL
             );
             """
@@ -501,12 +635,23 @@ async def publish_shared_finalizer_dictionaries(
                 "provider_count",
             ),
         )
-        for metadata_path, _row_count in provider_metadata_files:
+        for (
+            metadata_path,
+            _row_count,
+            metadata_bytes,
+            metadata_sha256,
+        ) in provider_metadata_files:
             await _copy_text_file_to_stage(
                 metadata_path,
                 schema_name=schema_name,
                 stage_table=provider_metadata_stage,
-                columns=("provider_set_global_id_128", "network_names"),
+                columns=(
+                    "provider_set_global_id_128",
+                    "provider_count",
+                    "network_names",
+                ),
+                expected_bytes=metadata_bytes,
+                expected_sha256=metadata_sha256,
             )
         if provider_count > 0:
             await db.status(
@@ -553,7 +698,8 @@ async def publish_shared_finalizer_dictionaries(
                 db.text(f"SELECT COUNT(*) FROM {schema}.{quoted_provider_stage}")
             )
             expected_metadata_rows = sum(
-                row_count for _path, row_count in provider_metadata_files
+                row_count
+                for _path, row_count, _bytes, _sha256 in provider_metadata_files
             )
             observed_metadata_rows = 0
             has_conflicting_metadata = False
@@ -568,9 +714,9 @@ async def publish_shared_finalizer_dictionaries(
                         f"""
                         SELECT EXISTS (
                             SELECT 1
-                              FROM {schema}.{quoted_provider_metadata_stage}
+                             FROM {schema}.{quoted_provider_metadata_stage}
                              GROUP BY provider_set_global_id_128
-                            HAVING COUNT(DISTINCT network_names) <> 1
+                            HAVING COUNT(DISTINCT ROW(provider_count, network_names)) <> 1
                         )
                         """
                     )
@@ -603,11 +749,14 @@ async def publish_shared_finalizer_dictionaries(
                         UPDATE {schema}.{quoted_provider_stage} provider_stage
                            SET network_names = metadata.network_names
                           FROM (
-                                SELECT DISTINCT provider_set_global_id_128, network_names
+                                SELECT DISTINCT provider_set_global_id_128,
+                                                provider_count,
+                                                network_names
                                   FROM {schema}.{quoted_provider_metadata_stage}
                                ) metadata
                          WHERE provider_stage.provider_set_global_id_128 =
                                decode(metadata.provider_set_global_id_128, 'hex')
+                           AND provider_stage.provider_count = metadata.provider_count
                         """
                     )
                 )
@@ -689,23 +838,16 @@ async def _validate_shared_block_stage(
     schema_name: str,
     stage_table: str,
 ) -> None:
+    """Reject incompatible stage rows before publishing shared content.
+
+    Mapping uniqueness is proved by ``_upsert_shared_block_mappings`` against
+    the raw stage row count.  Content consistency is proved after insertion by
+    comparing every staged row with the stored block.  Keeping those checks at
+    their mutation boundaries avoids grouping the complete stage here as well.
+    """
+
     schema = _quote_ident(_safe_identifier(schema_name))
     stage = _quote_ident(_safe_identifier(stage_table))
-    duplicate_mapping = await session.scalar(
-        db.text(
-            f"""
-            SELECT EXISTS (
-                SELECT 1
-                  FROM {schema}.{stage}
-                 GROUP BY object_kind, block_key, fragment_no
-                HAVING COUNT(DISTINCT block_hash) > 1
-                    OR COUNT(DISTINCT entry_count) > 1
-            )
-            """
-        )
-    )
-    if duplicate_mapping:
-        raise RuntimeError("strict V3 shared-block stage contains conflicting mapping rows")
     incompatible_version = await session.scalar(
         db.text(
             f"""
@@ -720,26 +862,111 @@ async def _validate_shared_block_stage(
     )
     if incompatible_version:
         raise RuntimeError("strict V3 shared-block stage uses an incompatible format version")
-    duplicate_hash = await session.scalar(
+
+
+async def _upsert_shared_block_mappings(
+    session: Any,
+    *,
+    schema_name: str,
+    stage_table: str,
+    snapshot_key: int,
+) -> None:
+    """Insert mappings and detect conflicting retries without no-op updates."""
+
+    schema = _quote_ident(_safe_identifier(schema_name))
+    stage = _quote_ident(_safe_identifier(stage_table))
+    has_relevant_mapping = await session.scalar(
         db.text(
             f"""
             SELECT EXISTS (
                 SELECT 1
-                  FROM {schema}.{stage}
-                 GROUP BY block_hash
-                HAVING COUNT(DISTINCT format_version) > 1
-                    OR COUNT(DISTINCT object_kind) > 1
-                    OR COUNT(DISTINCT codec) > 1
-                    OR COUNT(DISTINCT entry_count) > 1
-                    OR COUNT(DISTINCT raw_byte_count) > 1
-                    OR COUNT(DISTINCT stored_byte_count) > 1
-                    OR COUNT(DISTINCT payload) > 1
+                  FROM (
+                        SELECT DISTINCT object_kind
+                          FROM {schema}.{stage}
+                       ) staged_kind
+                  JOIN {schema}.ptg2_v3_snapshot_block mapping
+                    ON mapping.snapshot_key = :snapshot_key
+                   AND mapping.object_kind = staged_kind.object_kind
             )
             """
-        )
+        ),
+        {"snapshot_key": int(snapshot_key)},
     )
-    if duplicate_hash:
-        raise RuntimeError("strict V3 shared-block stage contains conflicting content hashes")
+    if has_relevant_mapping:
+        reconciliation_result = await session.execute(
+            db.text(
+                f"""
+                WITH canonical_mapping AS MATERIALIZED (
+                    SELECT DISTINCT ON (object_kind, block_key, fragment_no)
+                           object_kind, block_key, fragment_no, entry_count, block_hash
+                      FROM {schema}.{stage}
+                     ORDER BY object_kind, block_key, fragment_no, block_hash
+                ),
+                existing_mapping AS MATERIALIZED (
+                    SELECT canonical_mapping.*,
+                           mapping.snapshot_key IS NOT NULL AS mapping_exists,
+                           mapping.entry_count AS existing_entry_count,
+                           mapping.block_hash AS existing_block_hash
+                      FROM canonical_mapping
+                      LEFT JOIN {schema}.ptg2_v3_snapshot_block mapping
+                        ON mapping.snapshot_key = :snapshot_key
+                       AND mapping.object_kind = canonical_mapping.object_kind
+                       AND mapping.block_key = canonical_mapping.block_key
+                       AND mapping.fragment_no = canonical_mapping.fragment_no
+                ),
+                applied_mapping AS (
+                    INSERT INTO {schema}.ptg2_v3_snapshot_block
+                        (snapshot_key, object_kind, block_key, fragment_no,
+                         entry_count, block_hash)
+                    SELECT :snapshot_key, object_kind, block_key, fragment_no,
+                           entry_count, block_hash
+                      FROM existing_mapping
+                     WHERE NOT mapping_exists
+                    ON CONFLICT (snapshot_key, object_kind, block_key, fragment_no)
+                    DO NOTHING
+                    RETURNING 1
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM {schema}.{stage})::bigint AS expected_count,
+                    (
+                        COUNT(*) FILTER (
+                            WHERE mapping_exists
+                              AND existing_entry_count = entry_count
+                              AND existing_block_hash = block_hash
+                        ) + (SELECT COUNT(*) FROM applied_mapping)
+                    )::bigint AS applied_count
+                  FROM existing_mapping
+                """
+            ),
+            {"snapshot_key": int(snapshot_key)},
+        )
+    else:
+        expected_count = int(
+            await session.scalar(
+                db.text(f"SELECT COUNT(*) FROM {schema}.{stage}")
+            )
+            or 0
+        )
+        insert_result = await session.execute(
+            db.text(
+                f"""
+                INSERT INTO {schema}.ptg2_v3_snapshot_block
+                    (snapshot_key, object_kind, block_key, fragment_no,
+                     entry_count, block_hash)
+                SELECT :snapshot_key, object_kind, block_key, fragment_no,
+                       entry_count, block_hash
+                  FROM {schema}.{stage}
+                ON CONFLICT (snapshot_key, object_kind, block_key, fragment_no)
+                DO NOTHING
+                """
+            ),
+            {"snapshot_key": int(snapshot_key)},
+        )
+        applied_count = int(insert_result.rowcount or 0)
+    if has_relevant_mapping:
+        expected_count, applied_count = _integer_counts(reconciliation_result.one())
+    if applied_count != expected_count:
+        raise RuntimeError("strict V3 shared layout mapping conflicts with staged output")
 
 
 async def publish_shared_block_stage(
@@ -772,11 +999,19 @@ async def publish_shared_block_stage(
                     INSERT INTO {schema}.ptg2_v3_block
                         (block_hash, format_version, object_kind, codec, entry_count,
                          raw_byte_count, stored_byte_count, payload, created_at)
-                    SELECT DISTINCT ON (block_hash)
-                           block_hash, format_version, object_kind, codec, entry_count,
-                           raw_byte_count, stored_byte_count, payload, now()
-                      FROM {schema}.{stage}
-                     ORDER BY block_hash
+                    SELECT DISTINCT ON (staged.block_hash)
+                           staged.block_hash, staged.format_version,
+                           staged.object_kind, staged.codec, staged.entry_count,
+                           staged.raw_byte_count, staged.stored_byte_count,
+                           staged.payload, now()
+                      FROM {schema}.{stage} AS staged
+                     WHERE staged.payload IS NOT NULL
+                       AND NOT EXISTS (
+                               SELECT 1
+                                 FROM {schema}.ptg2_v3_block AS stored
+                                WHERE stored.block_hash = staged.block_hash
+                           )
+                     ORDER BY staged.block_hash
                     ON CONFLICT (block_hash) DO NOTHING
                     """
                 )
@@ -787,93 +1022,67 @@ async def publish_shared_block_stage(
                     SELECT EXISTS (
                         SELECT 1
                           FROM {schema}.{stage} staged
-                          JOIN {schema}.ptg2_v3_block stored
+                          LEFT JOIN {schema}.ptg2_v3_block stored
                             ON stored.block_hash = staged.block_hash
-                         WHERE stored.format_version <> staged.format_version
+                         WHERE stored.block_hash IS NULL
+                            OR stored.format_version <> staged.format_version
                             OR stored.object_kind <> staged.object_kind
                             OR stored.codec <> staged.codec
                             OR stored.entry_count <> staged.entry_count
                             OR stored.raw_byte_count <> staged.raw_byte_count
                             OR stored.stored_byte_count <> staged.stored_byte_count
-                            OR stored.payload <> staged.payload
+                            OR (
+                                staged.payload IS NOT NULL
+                                AND stored.payload <> staged.payload
+                            )
                     )
                     """
                 )
             )
             if mismatch:
                 raise RuntimeError("strict V3 shared block conflicts with stored content metadata")
-            await session.execute(
-                db.text(
-                    f"""
-                    INSERT INTO {schema}.ptg2_v3_snapshot_block
-                        (snapshot_key, object_kind, block_key, fragment_no,
-                         entry_count, block_hash)
-                    SELECT DISTINCT ON (object_kind, block_key, fragment_no)
-                           :snapshot_key, object_kind, block_key, fragment_no,
-                           entry_count, block_hash
-                      FROM {schema}.{stage}
-                     ORDER BY object_kind, block_key, fragment_no, block_hash
-                    ON CONFLICT (snapshot_key, object_kind, block_key, fragment_no)
-                    DO NOTHING
-                    """
-                ),
-                {"snapshot_key": int(snapshot_key)},
+            await _upsert_shared_block_mappings(
+                session,
+                schema_name=schema_name,
+                stage_table=stage_table,
+                snapshot_key=int(snapshot_key),
             )
-            mapping_mismatch = await session.scalar(
+            aggregate_result = await session.execute(
                 db.text(
                     f"""
-                    SELECT EXISTS (
-                        SELECT 1
-                          FROM {schema}.{stage} staged
-                          JOIN {schema}.ptg2_v3_snapshot_block mapping
-                            ON mapping.snapshot_key = :snapshot_key
-                           AND mapping.object_kind = staged.object_kind
-                           AND mapping.block_key = staged.block_key
-                           AND mapping.fragment_no = staged.fragment_no
-                         WHERE mapping.entry_count <> staged.entry_count
-                            OR mapping.block_hash <> staged.block_hash
-                    )
-                    """
-                ),
-                {"snapshot_key": int(snapshot_key)},
-            )
-            if mapping_mismatch:
-                raise RuntimeError("strict V3 shared layout mapping conflicts with staged output")
-            query_result = await session.execute(
-                db.text(
-                    f"""
-                    SELECT object_kind, block_key, fragment_no, entry_count,
-                           block_hash, raw_byte_count, stored_byte_count
+                    SELECT COUNT(*)::bigint,
+                           COUNT(DISTINCT block_hash)::bigint,
+                           COALESCE(SUM(raw_byte_count), 0)::bigint,
+                           COALESCE(SUM(stored_byte_count), 0)::bigint,
+                           COALESCE(
+                               ARRAY_AGG(DISTINCT object_kind ORDER BY object_kind),
+                               ARRAY[]::text[]
+                           )
                       FROM {schema}.{stage}
-                     GROUP BY object_kind, block_key, fragment_no, entry_count,
-                              block_hash, raw_byte_count, stored_byte_count
-                     ORDER BY object_kind, block_key, fragment_no
                     """
                 )
             )
-            block_rows = [
-                dict(getattr(query_row, "_mapping", query_row))
-                for query_row in query_result
-            ]
-        references = tuple(
-            SharedBlockReference(
-                object_kind=str(block_row["object_kind"]),
-                block_key=int(block_row["block_key"]),
-                fragment_no=int(block_row["fragment_no"]),
-                entry_count=int(block_row["entry_count"]),
-                block_hash=bytes(block_row["block_hash"]),
-                raw_byte_count=int(block_row["raw_byte_count"]),
-            )
-            for block_row in block_rows
-        )
+            aggregate_row = aggregate_result.one()
+        mapping_count = int(aggregate_row[0])
+        unique_block_count = int(aggregate_row[1])
+        logical_byte_count = int(aggregate_row[2])
+        stored_byte_count = int(aggregate_row[3])
+        if min(
+            mapping_count,
+            unique_block_count,
+            logical_byte_count,
+            stored_byte_count,
+        ) < 0 or unique_block_count > mapping_count:
+            raise RuntimeError("strict V3 shared block stage returned invalid aggregates")
+        object_kinds = tuple(str(object_kind) for object_kind in (aggregate_row[4] or ()))
+        if object_kinds != tuple(sorted(set(object_kinds))):
+            raise RuntimeError("strict V3 shared block stage returned invalid object kinds")
         return SharedBlockStagePublication(
-            references=references,
-            mapping_count=len(references),
-            unique_block_count=len({reference.block_hash for reference in references}),
-            logical_byte_count=sum(reference.raw_byte_count for reference in references),
-            stored_byte_count=sum(
-                int(block_row["stored_byte_count"]) for block_row in block_rows
-            ),
+            object_kinds=object_kinds,
+            mapping_count=mapping_count,
+            unique_block_count=unique_block_count,
+            logical_byte_count=logical_byte_count,
+            stored_byte_count=stored_byte_count,
         )
     finally:
         await db.status(f"DROP TABLE IF EXISTS {schema}.{stage};")
@@ -886,119 +1095,22 @@ async def _publish_graph_block_stage(
     stage_table: str,
     snapshot_key: int,
     build_token: str,
-) -> tuple[SharedBlockReference, ...]:
-    """Publish graph blocks with SQL-side validation and no Python row dictionaries."""
+) -> SharedBlockStagePublication:
+    """Publish graph blocks through the common bounded aggregate stage path."""
 
-    schema = _quote_ident(_safe_identifier(schema_name))
-    stage = _quote_ident(_safe_identifier(stage_table))
-    async with db.transaction() as session:
-        await lock_shared_layout_for_dense_write(
-            session,
-            schema_name=schema_name,
-            snapshot_key=int(snapshot_key),
-            build_token=build_token,
-        )
-        await _validate_shared_block_stage(
-            session,
-            schema_name=schema_name,
-            stage_table=stage_table,
-        )
-        await session.execute(
-            db.text(
-                f"""
-                INSERT INTO {schema}.ptg2_v3_block
-                    (block_hash, format_version, object_kind, codec, entry_count,
-                     raw_byte_count, stored_byte_count, payload, created_at)
-                SELECT DISTINCT ON (block_hash)
-                       block_hash, format_version, object_kind, codec, entry_count,
-                       raw_byte_count, stored_byte_count, payload, now()
-                  FROM {schema}.{stage}
-                 ORDER BY block_hash
-                ON CONFLICT (block_hash) DO NOTHING
-                """
-            )
-        )
-        content_mismatch = await session.scalar(
-            db.text(
-                f"""
-                SELECT EXISTS (
-                    SELECT 1
-                      FROM {schema}.{stage} staged
-                      JOIN {schema}.ptg2_v3_block stored
-                        ON stored.block_hash = staged.block_hash
-                     WHERE stored.format_version <> staged.format_version
-                        OR stored.object_kind <> staged.object_kind
-                        OR stored.codec <> staged.codec
-                        OR stored.entry_count <> staged.entry_count
-                        OR stored.raw_byte_count <> staged.raw_byte_count
-                        OR stored.stored_byte_count <> staged.stored_byte_count
-                        OR stored.payload <> staged.payload
-                )
-                """
-            )
-        )
-        if content_mismatch:
-            raise RuntimeError("strict V3 graph block conflicts with stored content")
-        await session.execute(
-            db.text(
-                f"""
-                INSERT INTO {schema}.ptg2_v3_snapshot_block
-                    (snapshot_key, object_kind, block_key, fragment_no,
-                     entry_count, block_hash)
-                SELECT :snapshot_key, object_kind, block_key, fragment_no,
-                       entry_count, block_hash
-                  FROM {schema}.{stage}
-                 ORDER BY object_kind, block_key, fragment_no
-                ON CONFLICT (snapshot_key, object_kind, block_key, fragment_no)
-                DO NOTHING
-                """
-            ),
-            {"snapshot_key": int(snapshot_key)},
-        )
-        mapping_mismatch = await session.scalar(
-            db.text(
-                f"""
-                SELECT EXISTS (
-                    SELECT 1
-                      FROM {schema}.{stage} staged
-                      JOIN {schema}.ptg2_v3_snapshot_block mapping
-                        ON mapping.snapshot_key = :snapshot_key
-                       AND mapping.object_kind = staged.object_kind
-                       AND mapping.block_key = staged.block_key
-                       AND mapping.fragment_no = staged.fragment_no
-                     WHERE mapping.entry_count <> staged.entry_count
-                        OR mapping.block_hash <> staged.block_hash
-                )
-                """
-            ),
-            {"snapshot_key": int(snapshot_key)},
-        )
-        if mapping_mismatch:
-            raise RuntimeError("strict V3 graph block mapping conflicts with staged output")
-        counts = await session.execute(
-            db.text(
-                f"""
-                SELECT COUNT(*), COALESCE(SUM(raw_byte_count), 0),
-                       COALESCE(SUM(stored_byte_count), 0)
-                  FROM {schema}.{stage}
-                """
-            )
-        )
-        count_row = counts.one()
-        observed_block_count = int(count_row[0])
-        observed_raw_byte_count = int(count_row[1])
-        observed_stored_byte_count = int(count_row[2])
-        if (
-            observed_block_count != int(conversion.block_count)
-            or observed_raw_byte_count != int(conversion.raw_block_byte_count)
-            or observed_stored_byte_count != int(conversion.stored_block_byte_count)
-        ):
-            raise RuntimeError("strict V3 graph block counts changed during binary COPY")
-
-    references = tuple(conversion.iter_references())
-    if len(references) != int(conversion.block_count):
-        raise RuntimeError("strict V3 graph reference count mismatch")
-    return references
+    publication = await publish_shared_block_stage(
+        schema_name=schema_name,
+        stage_table=stage_table,
+        snapshot_key=int(snapshot_key),
+        build_token=build_token,
+    )
+    if (
+        publication.mapping_count != int(conversion.block_count)
+        or publication.logical_byte_count != int(conversion.raw_block_byte_count)
+        or publication.stored_byte_count != int(conversion.stored_block_byte_count)
+    ):
+        raise RuntimeError("strict V3 graph block counts changed during binary COPY")
+    return publication
 
 
 def _expected_graph_row_counts(
@@ -1036,7 +1148,7 @@ async def publish_shared_graph(
             schema_name=schema_name,
             stage_table=block_stage,
         )
-        references = await _publish_graph_block_stage(
+        block_publication = await _publish_graph_block_stage(
             conversion,
             schema_name=schema_name,
             stage_table=block_stage,
@@ -1169,7 +1281,9 @@ async def publish_shared_graph(
             f"{schema}.{_quote_ident(block_stage)};"
         )
     return SharedGraphPublication(
-        references=references,
+        object_kinds=block_publication.object_kinds,
+        mapping_count=block_publication.mapping_count,
+        unique_block_count=block_publication.unique_block_count,
         block_count=int(conversion.block_count),
         owner_count=int(conversion.owner_count),
         provider_group_count=int(conversion.provider_group_count),

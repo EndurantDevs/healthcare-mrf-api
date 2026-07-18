@@ -282,7 +282,7 @@ def test_price_address_assurance_rejects_malformed_provider_directory_network_ma
 
 def test_price_address_assurance_rejects_malformed_provider_directory_network_keys():
     """Verify price address assurance rejects malformed provider directory network keys."""
-    base_match = {
+    base_match_by_field = {
         "ptg_network_name": "C2",
         "provider_directory_network_name": "C2",
         "provider_directory_network_match_key": "c2",
@@ -326,7 +326,7 @@ def test_price_address_assurance_rejects_malformed_provider_directory_network_ke
                             "network_bound_address": True,
                             "provider_directory_plan_context_matched": False,
                             "provider_directory_network_name_matched": True,
-                            "provider_directory_network_matches": [{**base_match, **overrides}],
+                            "provider_directory_network_matches": [{**base_match_by_field, **overrides}],
                             "address_verification_evidence": {
                                 "matched_on": "npi_address_key_role_location_network_name",
                             },
@@ -1000,7 +1000,7 @@ def test_price_address_assurance_combines_raw_artifact_and_api_payload(tmp_path)
             "in_network": [],
         },
     )
-    api_payload = {
+    api_payload_by_field = {
         "data": {
             "items": [
                 {
@@ -1019,7 +1019,7 @@ def test_price_address_assurance_combines_raw_artifact_and_api_payload(tmp_path)
     }
 
     report = build_price_address_assurance_report(
-        api_payload=api_payload,
+        api_payload=api_payload_by_field,
         raw_artifact_paths=[raw_artifact],
     )
 
@@ -1216,7 +1216,7 @@ def test_price_address_assurance_rejects_payer_confirmed_when_traced_raw_lacks_a
             "in_network": [],
         },
     )
-    api_payload = {
+    api_payload_by_field = {
         "data": {
             "items": [
                 {
@@ -1242,7 +1242,7 @@ def test_price_address_assurance_rejects_payer_confirmed_when_traced_raw_lacks_a
     }
 
     report = build_price_address_assurance_report(
-        api_payload=api_payload,
+        api_payload=api_payload_by_field,
         raw_artifact_paths=[raw_artifact],
         raw_artifact_source_file_version_ids_by_path={str(raw_artifact): "version-a"},
     )
@@ -1283,7 +1283,7 @@ def test_price_address_assurance_accepts_payer_confirmed_when_traced_raw_has_add
             "in_network": [],
         },
     )
-    api_payload = {
+    api_payload_by_field = {
         "data": {
             "items": [
                 {
@@ -1309,7 +1309,7 @@ def test_price_address_assurance_accepts_payer_confirmed_when_traced_raw_has_add
     }
 
     report = build_price_address_assurance_report(
-        api_payload=api_payload,
+        api_payload=api_payload_by_field,
         raw_artifact_paths=[raw_artifact],
         raw_artifact_source_file_version_ids_by_path={str(raw_artifact): ["version-a"]},
     )
@@ -1344,7 +1344,7 @@ def test_price_address_assurance_rejects_payer_confirmed_when_source_trace_unres
             "in_network": [],
         },
     )
-    api_payload = {
+    api_payload_by_field = {
         "data": {
             "items": [
                 {
@@ -1370,7 +1370,7 @@ def test_price_address_assurance_rejects_payer_confirmed_when_source_trace_unres
     }
 
     report = build_price_address_assurance_report(
-        api_payload=api_payload,
+        api_payload=api_payload_by_field,
         raw_artifact_paths=[raw_artifact],
         raw_artifact_source_file_version_ids_by_path={str(raw_artifact): ["version-a"]},
     )
@@ -1667,12 +1667,12 @@ def test_price_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch,
     raw_artifact = tmp_path / "raw-rates.json.gz"
     raw_artifact.write_text("{}", encoding="utf-8")
     missing_artifact = tmp_path / "missing-rates.json.gz"
-    captured = {}
+    captured_by_field = {}
 
     class FakeConnection:
         async def fetch(self, sql, source_file_version_ids):
-            captured["sql"] = sql
-            captured["source_file_version_ids"] = source_file_version_ids
+            captured_by_field["sql"] = sql
+            captured_by_field["source_file_version_ids"] = source_file_version_ids
             return [
                 {
                     "source_file_version_id": "version-a",
@@ -1695,10 +1695,10 @@ def test_price_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch,
             ]
 
         async def close(self):
-            captured["closed"] = True
+            captured_by_field["closed"] = True
 
     async def fake_connect(**kwargs):
-        captured["connect_kwargs"] = kwargs
+        captured_by_field["connect_kwargs"] = kwargs
         return FakeConnection()
 
     monkeypatch.setitem(sys.modules, "asyncpg", types.SimpleNamespace(connect=fake_connect))
@@ -1715,16 +1715,16 @@ def test_price_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch,
         )
     )
 
-    assert captured["connect_kwargs"] == {
+    assert captured_by_field["connect_kwargs"] == {
         "host": "db.local",
         "port": 5440,
         "database": "healthporta_test",
         "user": "postgres",
         "password": None,
     }
-    assert '"mrf_custom".ptg2_source_file_version' in captured["sql"]
-    assert captured["source_file_version_ids"] == ["version-a", "version-b", "version-c", "version-d"]
-    assert captured["closed"] is True
+    assert '"mrf_custom".ptg2_source_file_version' in captured_by_field["sql"]
+    assert captured_by_field["source_file_version_ids"] == ["version-a", "version-b", "version-c", "version-d"]
+    assert captured_by_field["closed"] is True
     assert resolutions == [
         {
             "source_file_version_id": "version-a",
@@ -1820,11 +1820,11 @@ def test_price_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypat
             }
         },
     )
-    captured = {}
+    captured_by_field = {}
 
     class FakeConnection:
         async def fetch(self, _sql, source_file_version_ids):
-            captured["source_file_version_ids"] = source_file_version_ids
+            captured_by_field["source_file_version_ids"] = source_file_version_ids
             return [
                 {
                     "source_file_version_id": "version-a",
@@ -1835,7 +1835,7 @@ def test_price_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypat
             ]
 
         async def close(self):
-            captured["closed"] = True
+            captured_by_field["closed"] = True
 
     async def fake_connect(**_kwargs):
         return FakeConnection()
@@ -1858,8 +1858,8 @@ def test_price_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypat
     assert script.main() == 0
     output = json.loads(capsys.readouterr().out)
 
-    assert captured["source_file_version_ids"] == ["version-a"]
-    assert captured["closed"] is True
+    assert captured_by_field["source_file_version_ids"] == ["version-a"]
+    assert captured_by_field["closed"] is True
     assert output["ok"] is True
     assert output["requested_source_file_version_ids"] == ["version-a"]
     assert output["raw_artifact_resolution"][0]["status"] == "resolved"
@@ -1871,7 +1871,7 @@ def test_price_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypat
 
 def test_price_address_assurance_cli_fetches_api_url(monkeypatch):
     script = _load_cli_module()
-    captured = {}
+    captured_by_field = {}
 
     class Headers:
         def get_content_charset(self):
@@ -1890,10 +1890,10 @@ def test_price_address_assurance_cli_fetches_api_url(monkeypatch):
             return b'{"data":{"items":[]}}'
 
     def fake_urlopen(request, timeout):
-        captured["url"] = request.full_url
-        captured["authorization"] = request.get_header("Authorization")
-        captured["accept"] = request.get_header("Accept")
-        captured["timeout"] = timeout
+        captured_by_field["url"] = request.full_url
+        captured_by_field["authorization"] = request.get_header("Authorization")
+        captured_by_field["accept"] = request.get_header("Accept")
+        captured_by_field["timeout"] = timeout
         return Response()
 
     monkeypatch.setattr(script.urllib.request, "urlopen", fake_urlopen)
@@ -1901,7 +1901,7 @@ def test_price_address_assurance_cli_fetches_api_url(monkeypatch):
     assurance_by_field = script._load_api_payload(None, "https://api.example.test/ptg", "secret-token", 2.5)
 
     assert assurance_by_field == {"data": {"items": []}}
-    assert captured == {
+    assert captured_by_field == {
         "url": "https://api.example.test/ptg",
         "authorization": "Bearer secret-token",
         "accept": "application/json",

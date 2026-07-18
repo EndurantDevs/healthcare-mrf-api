@@ -18,6 +18,7 @@ from tests.ptg2_shared_finalize_test_support import (
     _entry,
     _identity,
     _one_source_contracted_inputs,
+    _provider_metadata_entries,
 )
 
 
@@ -144,6 +145,9 @@ def test_finalizer_input_manifest_is_explicit_and_path_validated(tmp_path):
         tmp_path / "input.json",
         serving_run_entries=serving_entries,
         code_dictionary_entries=dictionary_entries,
+        provider_set_metadata_entries=_provider_metadata_entries(
+            tmp_path, (identity, serving_entries[0])
+        ),
         expected_source_identities=[identity],
     )
 
@@ -193,6 +197,9 @@ def test_finalizer_accepts_multiple_dictionary_shards_for_one_source(tmp_path):
         tmp_path / "multi-dictionary.json",
         serving_run_entries=serving_entries,
         code_dictionary_entries=dictionary_entries,
+        provider_set_metadata_entries=_provider_metadata_entries(
+            tmp_path, (identity, serving_entries[0])
+        ),
         expected_source_identities=[identity],
     )
 
@@ -283,6 +290,9 @@ def test_finalizer_rejects_dictionary_shard_omitted_after_attachment(tmp_path):
             tmp_path / "omitted-dictionary.json",
             serving_run_entries=serving_entries,
             code_dictionary_entries=dictionary_entries[:1],
+            provider_set_metadata_entries=_provider_metadata_entries(
+                tmp_path, (identity, serving_entries[0])
+            ),
             expected_source_identities=[identity],
         )
 
@@ -299,6 +309,9 @@ def test_manifest_uses_scanner_dictionary_digest_without_rereading(tmp_path):
         tmp_path / "mutated-dictionary.json",
         serving_run_entries=serving_entries,
         code_dictionary_entries=dictionary_entries,
+        provider_set_metadata_entries=_provider_metadata_entries(
+            tmp_path, (identity, serving_entries[0])
+        ),
         expected_source_identities=[identity],
     )
     payload = json.loads(manifest_path.read_text(encoding="ascii"))
@@ -321,6 +334,9 @@ def test_finalizer_rejects_duplicate_dictionary_contract_identity(tmp_path):
             tmp_path / "duplicate-dictionary-contract.json",
             serving_run_entries=serving_entries,
             code_dictionary_entries=dictionary_entries,
+            provider_set_metadata_entries=_provider_metadata_entries(
+                tmp_path, (identity, serving_entries[0])
+            ),
             expected_source_identities=[identity],
         )
 
@@ -337,6 +353,9 @@ def test_finalizer_requires_one_dictionary_contract_per_dense_source(tmp_path):
             tmp_path / "missing-dictionary-contract.json",
             serving_run_entries=serving_entries,
             code_dictionary_entries=dictionary_entries,
+            provider_set_metadata_entries=_provider_metadata_entries(
+                tmp_path, (identity, serving_entries[0])
+            ),
             expected_source_identities=[identity],
         )
 
@@ -356,6 +375,9 @@ def test_finalizer_rejects_extra_dictionary_contract_fields(tmp_path):
             tmp_path / "extra-dictionary-contract-field.json",
             serving_run_entries=serving_entries,
             code_dictionary_entries=dictionary_entries,
+            provider_set_metadata_entries=_provider_metadata_entries(
+                tmp_path, (identity, serving_entries[0])
+            ),
             expected_source_identities=[identity],
         )
 
@@ -378,6 +400,9 @@ def test_finalizer_rejects_non_integer_source_contract_version(
             tmp_path / "invalid-source-contract-version.json",
             serving_run_entries=serving_entries,
             code_dictionary_entries=dictionary_entries,
+            provider_set_metadata_entries=_provider_metadata_entries(
+                tmp_path, (identity, serving_entries[0])
+            ),
             expected_source_identities=[identity],
         )
 
@@ -396,6 +421,9 @@ def test_finalizer_rejects_extra_source_contract_identity_fields(tmp_path):
             tmp_path / "extra-source-identity-field.json",
             serving_run_entries=serving_entries,
             code_dictionary_entries=dictionary_entries,
+            provider_set_metadata_entries=_provider_metadata_entries(
+                tmp_path, (identity, serving_entries[0])
+            ),
             expected_source_identities=[identity],
         )
 
@@ -463,5 +491,8 @@ def test_finalizer_rejects_unsorted_dictionary_contract_descriptors(tmp_path):
             tmp_path / "unsorted-dictionary-contract.json",
             serving_run_entries=serving_entries,
             code_dictionary_entries=dictionary_entries,
+            provider_set_metadata_entries=_provider_metadata_entries(
+                tmp_path, (identity, serving_entries[0])
+            ),
             expected_source_identities=[identity],
         )

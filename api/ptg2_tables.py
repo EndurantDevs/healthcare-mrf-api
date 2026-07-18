@@ -710,6 +710,11 @@ async def snapshot_serving_tables(
             "price_dictionary",
             "block_bytes",
         ),
+        provider_shard_span=_serving_binary_section_integer(
+            serving_index,
+            "assigned_encoder",
+            "provider_shard_span",
+        ),
         atom_key_bits=_serving_index_atom_key_bits(serving_index),
         price_key_block_span=_serving_binary_section_integer(
             serving_index,

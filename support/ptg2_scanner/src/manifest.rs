@@ -121,9 +121,19 @@ pub fn price_set_global_id_from_atom_ids(price_atom_ids: &[GlobalId128]) -> Glob
     let mut sorted_atom_ids = price_atom_ids.to_vec();
     sorted_atom_ids.sort_unstable();
 
+    price_set_global_id_from_sorted_atom_ids(&sorted_atom_ids)
+}
+
+pub fn price_set_global_id_from_sorted_atom_ids(
+    sorted_price_atom_ids: &[GlobalId128],
+) -> GlobalId128 {
+    debug_assert!(sorted_price_atom_ids
+        .windows(2)
+        .all(|pair| pair[0] <= pair[1]));
+
     let mut hasher = Xxh3::new();
     hasher.update(b"price_set_manifest");
-    for price_atom_id in sorted_atom_ids {
+    for price_atom_id in sorted_price_atom_ids {
         hasher.update(b"\x1f");
         hasher.update(&price_atom_id.0);
     }
@@ -347,6 +357,28 @@ mod tests {
         assert_eq!(first, reordered);
         assert_ne!(first, deduplicated);
         assert_ne!(first, different);
+    }
+
+    #[test]
+    fn sorted_price_set_global_id_matches_canonicalizing_wrapper() {
+        let low = GlobalId128([1; GLOBAL_ID_BYTES]);
+        let middle = GlobalId128([2; GLOBAL_ID_BYTES]);
+        let high = GlobalId128([3; GLOBAL_ID_BYTES]);
+        for sorted in [
+            Vec::new(),
+            vec![low],
+            vec![low, middle, high],
+            vec![low, middle, middle, high],
+        ] {
+            assert_eq!(
+                price_set_global_id_from_sorted_atom_ids(&sorted),
+                price_set_global_id_from_atom_ids(&sorted),
+            );
+        }
+        assert_eq!(
+            price_set_global_id_from_sorted_atom_ids(&[low, middle, middle, high]),
+            price_set_global_id_from_atom_ids(&[high, middle, low, middle]),
+        );
     }
 
     #[test]

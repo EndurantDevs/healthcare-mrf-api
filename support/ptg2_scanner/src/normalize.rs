@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::fmt::Display;
 use std::io::{self, Read};
 use struson::reader::{JsonReader, JsonStreamReader, ValueType};
@@ -406,12 +407,46 @@ pub fn strict_money_number(value: &Value) -> io::Result<String> {
             "negotiated_rate must be a JSON number",
         ));
     };
-    canonical_decimal_text(&number.to_string()).ok_or_else(|| {
+    canonical_decimal_text(number.as_str()).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "negotiated_rate cannot be represented by the canonical decimal contract",
         )
     })
+}
+
+/// Compare two values produced by the canonical decimal contract without
+/// converting them to a bounded numeric type.
+pub fn compare_canonical_decimal_text(left: &str, right: &str) -> Ordering {
+    let (left_negative, left_magnitude) = match left.strip_prefix('-') {
+        Some(magnitude) => (true, magnitude),
+        None => (false, left),
+    };
+    let (right_negative, right_magnitude) = match right.strip_prefix('-') {
+        Some(magnitude) => (true, magnitude),
+        None => (false, right),
+    };
+    match (left_negative, right_negative) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => {
+            let compare_magnitude = |left: &str, right: &str| {
+                let (left_integer, left_fraction) = left.split_once('.').unwrap_or((left, ""));
+                let (right_integer, right_fraction) = right.split_once('.').unwrap_or((right, ""));
+                left_integer
+                    .len()
+                    .cmp(&right_integer.len())
+                    .then_with(|| left_integer.as_bytes().cmp(right_integer.as_bytes()))
+                    .then_with(|| left_fraction.as_bytes().cmp(right_fraction.as_bytes()))
+            };
+            let magnitude_ordering = compare_magnitude(left_magnitude, right_magnitude);
+            if left_negative {
+                magnitude_ordering.reverse()
+            } else {
+                magnitude_ordering
+            }
+        }
+    }
 }
 
 pub fn strict_string_array_from_reader<R: Read>(
@@ -474,8 +509,10 @@ pub fn canonical_text_list(values: Vec<String>, uppercase: bool) -> Vec<String> 
                 None
             } else if uppercase {
                 Some(trimmed.to_uppercase())
+            } else if trimmed.len() == value.len() {
+                Some(value)
             } else {
-                Some(trimmed.to_string())
+                Some(trimmed.to_owned())
             }
         })
         .collect();
@@ -502,14 +539,14 @@ pub fn canonical_modifier_list(values: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_modifier_list, canonical_text_list, int_list, normalize_catalog_code,
-        normalize_code, normalize_code_system, normalize_money_text, normalize_string,
-        normalize_tin_type, normalize_tin_value, normalized_money_from_reader,
+        canonical_modifier_list, canonical_text_list, compare_canonical_decimal_text, int_list,
+        normalize_catalog_code, normalize_code, normalize_code_system, normalize_money_text,
+        normalize_string, normalize_tin_type, normalize_tin_value, normalized_money_from_reader,
         normalized_scalar_from_reader, normalized_string_list_from_reader, npi_list,
-        strict_integer, strict_integer_text, strict_money_number_from_reader, strict_npi_list,
-        strict_npi_partition, strict_string_array_from_reader, StrictNpiList,
+        strict_integer, strict_integer_text, strict_money_number, strict_money_number_from_reader,
+        strict_npi_list, strict_npi_partition, strict_string_array_from_reader, StrictNpiList,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
     use struson::reader::JsonStreamReader;
 
     #[test]
@@ -650,6 +687,69 @@ mod tests {
     }
 
     #[test]
+    fn strict_money_value_preserves_arbitrary_precision_canonicalization() {
+        for (raw, expected) in [
+            ("12.3400", "12.34"),
+            ("1.2e2", "120"),
+            ("-0.000", "0"),
+            (
+                "123456789012345678901234567890.0001000",
+                "123456789012345678901234567890.0001",
+            ),
+        ] {
+            let value: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(strict_money_number(&value).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn canonical_decimal_comparison_matches_exact_numeric_order() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
+        for (left, right, expected) in [
+            ("0", "0", Equal),
+            ("-1", "0", Less),
+            ("0", "0.0001", Less),
+            ("9.9", "10", Less),
+            ("-10", "-9.9", Less),
+            ("0.009999", "0.01", Less),
+            ("1", "1.0000000000000000001", Less),
+            ("-1", "-1.0000000000000000001", Greater),
+            ("123.455999", "123.456", Less),
+            ("100000000000000000000", "99999999999999999999", Greater),
+        ] {
+            assert_eq!(compare_canonical_decimal_text(left, right), expected);
+            assert_eq!(
+                compare_canonical_decimal_text(right, left),
+                expected.reverse()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_decimal_comparison_handles_huge_values_without_conversion() {
+        let smaller_integer = format!("1{}", "0".repeat(131_070));
+        let larger_integer = format!("1{}", "0".repeat(131_071));
+        assert_eq!(
+            compare_canonical_decimal_text(&smaller_integer, &larger_integer),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_canonical_decimal_text(
+                &format!("-{smaller_integer}"),
+                &format!("-{larger_integer}")
+            ),
+            std::cmp::Ordering::Greater
+        );
+        let smaller_fraction = format!("0.{}1", "0".repeat(16_000));
+        let larger_fraction = format!("0.{}1", "0".repeat(15_999));
+        assert_eq!(
+            compare_canonical_decimal_text(&smaller_fraction, &larger_fraction),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
     fn strict_string_array_reader_rejects_scalars_and_non_string_elements() {
         let mut reader = JsonStreamReader::new(br#"["11", " 22 "]"#.as_slice());
         assert_eq!(
@@ -745,6 +845,15 @@ mod tests {
             ),
             vec!["a".to_string(), "b".to_string()]
         );
+    }
+
+    #[test]
+    fn canonical_text_list_reuses_already_trimmed_owned_values() {
+        let value = String::from("already-trimmed");
+        let allocation = value.as_ptr();
+        let canonical = canonical_text_list(vec![value], false);
+        assert_eq!(canonical, ["already-trimmed"]);
+        assert_eq!(canonical[0].as_ptr(), allocation);
     }
 
     #[test]

@@ -22,7 +22,7 @@ def test_strict_ptg_docs_define_sharded_writer_and_bounded_cost_pages():
         assert re.search(
             r"emits only `by_code_provider_shard_v1`", text, re.IGNORECASE
         )
-        assert "`shard_id = provider_set_key // 1024`" in text
+        assert "`shard_id = provider_set_key // provider_shard_span`" in text
         assert "`block_key = (code_key << 31) | shard_id`" in text
         assert re.search(r"contigu\w* from `0`", text)
         assert "`by_code_price_page_v4`" in text

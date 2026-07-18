@@ -247,6 +247,9 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
 
     async def fake_ptg_main(**_kwargs):
         observed_env_map["workers"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORKERS")
+        observed_env_map["rapidgzip_threads"] = ptg_control.os.environ.get(
+            "HLTHPRT_PTG2_RUST_RAPIDGZIP_THREADS"
+        )
         observed_env_map["parse"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS")
         observed_env_map["top_level_byte_scan"] = ptg_control.os.environ.get(
             "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN"
@@ -296,6 +299,7 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
                 "_expected_queue": "arq:PTGSmall",
                 "_expected_worker_class": "process.PTGSmall",
                 "_scanner_rust_workers": 4,
+                "_scanner_rapidgzip_threads": 8,
                 "_scanner_parse_in_workers": True,
                 "_scanner_top_level_byte_scan": True,
                 "_scanner_work_queue": 5,
@@ -316,6 +320,7 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
 
     assert observed_env_map == {
         "workers": "4",
+        "rapidgzip_threads": "8",
         "parse": "true",
         "top_level_byte_scan": "true",
         "work_queue": "5",

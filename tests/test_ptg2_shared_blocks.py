@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import os
+import struct
+import uuid
 import zlib
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import text
 
 from api.ptg2_shared_blocks import (
     PTG2SharedBlockError,
@@ -12,8 +19,13 @@ from api.ptg2_shared_blocks import (
     fetch_shared_graph_members,
     fetch_snapshot_source_set_metadata,
 )
+from db.connection import db
+from process.ptg_parts import ptg2_shared_blocks as shared_blocks_module
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_DENSE_LAYOUT_TABLES,
+    SharedBlockReference,
+    SharedMappingDigestSummary,
+    _SharedMappingBinaryCopyDigest,
     is_shared_layout_build_abandoned,
     lock_shared_layout_for_dense_write,
     SharedBlock,
@@ -25,8 +37,12 @@ from process.ptg_parts.ptg2_shared_blocks import (
     shared_mapping_digest,
     shared_semantic_fingerprint,
     shared_support_digest,
+    summarize_shared_snapshot_mappings,
     touch_shared_layout_build,
 )
+
+
+_PG_BINARY_COPY_HEADER = b"PGCOPY\n\xff\r\n\0" + struct.pack(">II", 0, 0)
 
 
 class _Rows:
@@ -68,6 +84,119 @@ class _ScriptedSession:
         self.calls.append((str(statement), dict(params or {})))
         assert self.results, f"unexpected SQL: {statement}"
         return self.results.pop(0)
+
+
+class _MappingCopyDriver:
+    def __init__(self, streams_by_kind, *, chunk_sizes=(1, 7, 2, 31, 3, 64)):
+        self.streams_by_kind = dict(streams_by_kind)
+        self.chunk_sizes = tuple(chunk_sizes)
+        self.calls = []
+
+    async def copy_from_query(self, query, *args, output, **copy_options):
+        copy_format = copy_options.pop("format")
+        assert not copy_options
+        self.calls.append((query, args, copy_format))
+        stream = self.streams_by_kind[args[1]]
+        offset = 0
+        chunk_index = 0
+        while offset < len(stream):
+            chunk_size = self.chunk_sizes[chunk_index % len(self.chunk_sizes)]
+            await output(stream[offset : offset + chunk_size])
+            offset += chunk_size
+            chunk_index += 1
+        return f"COPY {len(stream)}"
+
+
+class _MappingCopyConnection:
+    def __init__(self, driver):
+        self.driver = driver
+        self.raw_connection_calls = 0
+
+    async def get_raw_connection(self):
+        self.raw_connection_calls += 1
+        return SimpleNamespace(driver_connection=self.driver)
+
+
+class _MappingCopySession:
+    def __init__(self, aggregate_rows, driver):
+        self.aggregate_rows = list(aggregate_rows)
+        self.connection_object = _MappingCopyConnection(driver)
+        self.calls = []
+        self.connection_calls = 0
+
+    async def connection(self):
+        self.connection_calls += 1
+        return self.connection_object
+
+    async def execute(self, statement, params=None):
+        self.calls.append((str(statement), dict(params or {})))
+        return _Rows(self.aggregate_rows)
+
+
+def _mapping_record(reference: SharedBlockReference) -> bytes:
+    object_kind = reference.object_kind.encode("utf-8")
+    return b"".join(
+        (
+            struct.pack(">I", len(object_kind)),
+            object_kind,
+            struct.pack(">q", reference.block_key),
+            struct.pack(">I", reference.fragment_no),
+            struct.pack(">Q", reference.entry_count),
+            reference.block_hash,
+        )
+    )
+
+
+def _binary_copy_stream(
+    records: list[bytes],
+    *,
+    flags: int = 0,
+    extension: bytes = b"",
+) -> bytes:
+    stream = bytearray(b"PGCOPY\n\xff\r\n\0")
+    stream.extend(struct.pack(">II", flags, len(extension)))
+    stream.extend(extension)
+    for record in records:
+        stream.extend(struct.pack(">hi", 1, len(record)))
+        stream.extend(record)
+    stream.extend(struct.pack(">h", -1))
+    return bytes(stream)
+
+
+def _mapping_streams_by_kind(
+    references: list[SharedBlockReference],
+) -> dict[str, bytes]:
+    streams_by_kind = {}
+    object_kinds = sorted({reference.object_kind for reference in references})
+    for object_kind in object_kinds:
+        kind_references = sorted(
+            (
+                reference
+                for reference in references
+                if reference.object_kind == object_kind
+            ),
+            key=lambda reference: (reference.block_key, reference.fragment_no),
+        )
+        streams_by_kind[object_kind] = _binary_copy_stream(
+            [_mapping_record(reference) for reference in kind_references]
+        )
+    return streams_by_kind
+
+
+def _mapping_summary(
+    references: list[SharedBlockReference],
+) -> SharedMappingDigestSummary:
+    return SharedMappingDigestSummary(
+        mapping_digest=shared_mapping_digest(references),
+        mapping_count=len(references),
+        unique_block_count=len({reference.block_hash for reference in references}),
+        entry_count=sum(reference.entry_count for reference in references),
+        logical_byte_count=sum(reference.raw_byte_count for reference in references),
+        canonical_byte_count=sum(
+            len(_mapping_record(reference)) for reference in references
+        ),
+        object_kinds=tuple(sorted({reference.object_kind for reference in references})),
+    )
 
 
 def _stored_row(
@@ -135,6 +264,290 @@ def test_mapping_digest_is_order_stable_and_rejects_duplicate_keys():
     assert shared_mapping_digest([first, second]) == shared_mapping_digest([second, first])
     with pytest.raises(ValueError, match="duplicate"):
         shared_mapping_digest([first, first])
+
+
+def test_binary_copy_mapping_digest_is_exact_for_unicode_and_arbitrary_chunks():
+    references = [
+        SharedBlockReference("🧪_kind", 9, 1, 5, b"e" * 32, 17),
+        SharedBlockReference("a_kind", 2, 0, 3, b"a" * 32, 7),
+        SharedBlockReference("ž_kind", 4, 2, 7, b"d" * 32, 13),
+        SharedBlockReference("a_kind", 1, 3, 2, b"a" * 32, 7),
+        SharedBlockReference("ž_kind", 4, 1, 6, b"c" * 32, 12),
+    ]
+    accumulator = _SharedMappingBinaryCopyDigest()
+    streams_by_kind = _mapping_streams_by_kind(references)
+
+    for object_kind in sorted(streams_by_kind):
+        accumulator.begin_copy(object_kind)
+        stream = streams_by_kind[object_kind]
+        offset = 0
+        chunk_sizes = (1, 13, 2, 29, 3, 5, 47)
+        chunk_index = 0
+        while offset < len(stream):
+            chunk_size = chunk_sizes[chunk_index % len(chunk_sizes)]
+            accumulator.feed(stream[offset : offset + chunk_size])
+            offset += chunk_size
+            chunk_index += 1
+        assert accumulator.finish_copy() == sum(
+            reference.object_kind == object_kind for reference in references
+        )
+
+    parsed = accumulator.finish()
+
+    assert parsed.mapping_digest == shared_mapping_digest(references)
+    assert parsed.mapping_count == len(references)
+    assert parsed.entry_count == sum(reference.entry_count for reference in references)
+    assert parsed.canonical_byte_count == sum(
+        len(_mapping_record(reference)) for reference in references
+    )
+
+
+@pytest.mark.parametrize(
+    ("stream", "error"),
+    [
+        (
+            b"X" + _binary_copy_stream([])[1:],
+            "header signature",
+        ),
+        (
+            _binary_copy_stream([], flags=1),
+            "header flags",
+        ),
+        (
+            _binary_copy_stream([], extension=b"x"),
+            "header extension",
+        ),
+        (
+            _PG_BINARY_COPY_HEADER + struct.pack(">h", 2),
+            "exactly one field",
+        ),
+        (
+            _PG_BINARY_COPY_HEADER
+            + struct.pack(">hi", 1, -1)
+            + struct.pack(">h", -1),
+            "must not be NULL",
+        ),
+        (
+            _PG_BINARY_COPY_HEADER + struct.pack(">hi", 1, 10_000),
+            "invalid length",
+        ),
+        (
+            _binary_copy_stream(
+                [
+                    _mapping_record(
+                        SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)
+                    )
+                    + b"x"
+                ]
+            ),
+            "does not match object_kind",
+        ),
+        (
+            _binary_copy_stream(
+                [_mapping_record(SharedBlockReference("a", -1, 0, 1, b"a" * 32, 1))]
+            ),
+            "negative mapping value",
+        ),
+        (
+            _binary_copy_stream(
+                [
+                    _mapping_record(
+                        SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)
+                    ),
+                    _mapping_record(
+                        SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)
+                    ),
+                ]
+            ),
+            "duplicate mapping key",
+        ),
+        (
+            _binary_copy_stream(
+                [
+                    _mapping_record(
+                        SharedBlockReference("a", 2, 0, 1, b"b" * 32, 1)
+                    ),
+                    _mapping_record(
+                        SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)
+                    ),
+                ]
+            ),
+            "out-of-order mapping key",
+        ),
+        (
+            _binary_copy_stream(
+                [_mapping_record(SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1))]
+            )
+            + b"x",
+            "after its trailer",
+        ),
+    ],
+)
+def test_binary_copy_mapping_digest_rejects_malformed_streams(stream, error):
+    accumulator = _SharedMappingBinaryCopyDigest()
+    accumulator.begin_copy("a")
+
+    with pytest.raises(RuntimeError, match=error):
+        accumulator.feed(stream)
+
+
+@pytest.mark.parametrize("removed_bytes", [1, 2, 3, 20])
+def test_binary_copy_mapping_digest_rejects_truncated_streams(removed_bytes):
+    stream = _binary_copy_stream(
+        [_mapping_record(SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1))]
+    )
+    accumulator = _SharedMappingBinaryCopyDigest()
+    accumulator.begin_copy("a")
+    accumulator.feed(stream[:-removed_bytes])
+
+    with pytest.raises(RuntimeError, match="truncated"):
+        accumulator.finish_copy()
+
+
+@pytest.mark.asyncio
+async def test_mapping_summary_uses_supplied_session_and_matches_python_digest():
+    """Match the streaming SQL digest to Python using the supplied session."""
+
+    references = [
+        SharedBlockReference("🧪_kind", 9, 1, 5, b"e" * 32, 17),
+        SharedBlockReference("a_kind", 2, 0, 3, b"b" * 32, 11),
+        SharedBlockReference("ž_kind", 4, 2, 7, b"d" * 32, 13),
+        SharedBlockReference("a_kind", 1, 3, 2, b"a" * 32, 7),
+    ]
+    aggregate_rows = []
+    for object_kind in {reference.object_kind for reference in references}:
+        kind_references = [
+            reference
+            for reference in references
+            if reference.object_kind == object_kind
+        ]
+        aggregate_rows.append(
+            {
+                "object_kind": object_kind,
+                "mapping_count": len(kind_references),
+                "unique_block_count": len(
+                    {reference.block_hash for reference in kind_references}
+                ),
+                "resolved_mapping_count": len(kind_references),
+                "entry_count": sum(
+                    reference.entry_count for reference in kind_references
+                ),
+                "logical_byte_count": sum(
+                    reference.raw_byte_count for reference in kind_references
+                ),
+            }
+        )
+    driver = _MappingCopyDriver(_mapping_streams_by_kind(references))
+    session = _MappingCopySession(aggregate_rows, driver)
+
+    summary = await summarize_shared_snapshot_mappings(
+        session,
+        schema_name="mrf",
+        snapshot_key=41,
+    )
+
+    assert summary.mapping_digest == shared_mapping_digest(references)
+    assert summary.mapping_count == len(references)
+    assert summary.unique_block_count == len(
+        {reference.block_hash for reference in references}
+    )
+    assert summary.entry_count == sum(reference.entry_count for reference in references)
+    assert summary.logical_byte_count == sum(
+        reference.raw_byte_count for reference in references
+    )
+    assert summary.canonical_byte_count == sum(
+        len(_mapping_record(reference)) for reference in references
+    )
+    assert summary.object_kinds == tuple(
+        sorted({reference.object_kind for reference in references})
+    )
+    assert summary.object_kind_count == 3
+    assert session.connection_calls == 1
+    assert session.connection_object.raw_connection_calls == 1
+    assert session.calls[0][1] == {"snapshot_key": 41}
+    assert "LEFT JOIN \"mrf\".ptg2_v3_block" in session.calls[0][0]
+    assert [call[1][1] for call in driver.calls] == list(summary.object_kinds)
+    assert all(call[1][0] == 41 and call[2] == "binary" for call in driver.calls)
+
+
+@pytest.mark.asyncio
+async def test_mapping_summary_rejects_missing_raw_asyncpg_copy_support():
+    session = _MappingCopySession([], SimpleNamespace())
+
+    with pytest.raises(NotImplementedError, match="asyncpg copy_from_query"):
+        await summarize_shared_snapshot_mappings(
+            session,
+            schema_name="mrf",
+            snapshot_key=41,
+        )
+
+
+@pytest.mark.asyncio
+async def test_mapping_summary_rejects_join_and_copy_count_anomalies():
+    """Reject inconsistent aggregate, join, and COPY mapping counts."""
+
+    invalid_unique_session = _MappingCopySession(
+        [
+            {
+                "object_kind": "a",
+                "mapping_count": 1,
+                "unique_block_count": 2,
+                "resolved_mapping_count": 1,
+                "entry_count": 1,
+                "logical_byte_count": 1,
+            }
+        ],
+        _MappingCopyDriver({}),
+    )
+    with pytest.raises(RuntimeError, match="unique_block_count exceeds"):
+        await summarize_shared_snapshot_mappings(
+            invalid_unique_session,
+            schema_name="mrf",
+            snapshot_key=41,
+        )
+
+    unresolved_driver = _MappingCopyDriver({})
+    unresolved_session = _MappingCopySession(
+        [
+            {
+                "object_kind": "a",
+                "mapping_count": 2,
+                "unique_block_count": 1,
+                "resolved_mapping_count": 1,
+                "entry_count": 2,
+                "logical_byte_count": 1,
+            }
+        ],
+        unresolved_driver,
+    )
+    with pytest.raises(RuntimeError, match="resolve every block_hash"):
+        await summarize_shared_snapshot_mappings(
+            unresolved_session,
+            schema_name="mrf",
+            snapshot_key=41,
+        )
+
+    reference = SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)
+    changed_driver = _MappingCopyDriver({"a": _binary_copy_stream([_mapping_record(reference)])})
+    changed_session = _MappingCopySession(
+        [
+            {
+                "object_kind": "a",
+                "mapping_count": 2,
+                "unique_block_count": 1,
+                "resolved_mapping_count": 2,
+                "entry_count": 2,
+                "logical_byte_count": 2,
+            }
+        ],
+        changed_driver,
+    )
+    with pytest.raises(RuntimeError, match="count changed during binary COPY"):
+        await summarize_shared_snapshot_mappings(
+            changed_session,
+            schema_name="mrf",
+            snapshot_key=41,
+        )
 
 
 def test_support_digest_is_order_stable_and_context_sensitive():
@@ -279,7 +692,7 @@ async def test_dense_write_lock_requires_current_build_token():
 
 
 @pytest.mark.asyncio
-async def test_seal_validates_mapping_without_rejoining_immutable_blocks():
+async def test_seal_locks_ownership_then_rechecks_authoritative_summary(monkeypatch):
     expected = SharedBlock(
         "page_v4",
         7,
@@ -289,20 +702,16 @@ async def test_seal_validates_mapping_without_rejoining_immutable_blocks():
         9,
         b"123456789",
     ).reference()
+    expected_summary = _mapping_summary([expected])
+    summarize = AsyncMock(return_value=expected_summary)
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "summarize_shared_snapshot_mappings",
+        summarize,
+    )
     session = _ScriptedSession(
         [
             _Result(scalar_value=41),
-            _Result(
-                rows=[
-                    {
-                        "object_kind": expected.object_kind,
-                        "block_key": expected.block_key,
-                        "fragment_no": expected.fragment_no,
-                        "entry_count": expected.entry_count,
-                        "block_hash": expected.block_hash,
-                    }
-                ]
-            ),
             _Result(),
             _Result(scalar_value=None),
             _Result(scalar_value=41),
@@ -314,69 +723,82 @@ async def test_seal_validates_mapping_without_rejoining_immutable_blocks():
         schema_name="mrf",
         snapshot_key=41,
         build_token="attempt-41",
-        expected_blocks=(expected,),
+        expected_summary=expected_summary,
         support_digest=b"s" * 32,
         layout_manifest={"contract": "strict-v3"},
     )
 
     assert sealed.snapshot_key == 41
-    mapping_sql = session.calls[1][0]
-    assert "ptg2_v3_snapshot_block" in mapping_sql
-    assert "ptg2_v3_block block" not in mapping_sql
-    assert "JOIN" not in mapping_sql
+    ownership_sql = session.calls[0][0]
+    assert "ptg2_v3_snapshot_layout" in ownership_sql
+    assert "FOR UPDATE" in ownership_sql
+    summarize.assert_awaited_once_with(
+        session,
+        schema_name="mrf",
+        snapshot_key=41,
+    )
     update_params = session.calls[-1][1]
     assert update_params["logical_byte_count"] == expected.raw_byte_count
 
 
 @pytest.mark.asyncio
-async def test_seal_still_rejects_mapping_hash_mismatch_without_block_join():
+@pytest.mark.parametrize(
+    ("field_name", "observed_value"),
+    [
+        ("mapping_digest", b"x" * 32),
+        ("mapping_count", 2),
+        ("unique_block_count", 0),
+        ("entry_count", 2),
+        ("logical_byte_count", 2),
+        ("canonical_byte_count", 99),
+        ("object_kinds", ("other_kind",)),
+    ],
+)
+async def test_seal_rejects_every_authoritative_summary_mismatch(
+    monkeypatch,
+    field_name,
+    observed_value,
+):
     expected = SharedBlock("page_v4", 7, 0, 1, "none", 1, b"a").reference()
-    session = _ScriptedSession(
-        [
-            _Result(scalar_value=41),
-            _Result(
-                rows=[
-                    {
-                        "object_kind": expected.object_kind,
-                        "block_key": expected.block_key,
-                        "fragment_no": expected.fragment_no,
-                        "entry_count": expected.entry_count,
-                        "block_hash": b"x" * 32,
-                    }
-                ]
-            ),
-        ]
+    expected_summary = _mapping_summary([expected])
+    observed_summary = replace(
+        expected_summary,
+        **{field_name: observed_value},
     )
+    summarize = AsyncMock(return_value=observed_summary)
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "summarize_shared_snapshot_mappings",
+        summarize,
+    )
+    session = _ScriptedSession([_Result(scalar_value=41)])
 
-    with pytest.raises(RuntimeError, match="mapping mismatch"):
+    with pytest.raises(RuntimeError, match=f"summary mismatch for {field_name}"):
         await seal_shared_layout(
             session,
             schema_name="mrf",
             snapshot_key=41,
             build_token="attempt-41",
-            expected_blocks=(expected,),
+            expected_summary=expected_summary,
             support_digest=b"s" * 32,
             layout_manifest={},
         )
 
 
 @pytest.mark.asyncio
-async def test_seal_exact_reuse_does_not_queue_still_referenced_blocks_for_gc():
+async def test_seal_exact_reuse_does_not_queue_still_referenced_blocks_for_gc(
+    monkeypatch,
+):
     expected = SharedBlock("page_v4", 7, 0, 1, "none", 1, b"a").reference()
+    expected_summary = _mapping_summary([expected])
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "summarize_shared_snapshot_mappings",
+        AsyncMock(return_value=expected_summary),
+    )
     session = _ScriptedSession(
         [
             _Result(scalar_value=41),
-            _Result(
-                rows=[
-                    {
-                        "object_kind": expected.object_kind,
-                        "block_key": expected.block_key,
-                        "fragment_no": expected.fragment_no,
-                        "entry_count": expected.entry_count,
-                        "block_hash": expected.block_hash,
-                    }
-                ]
-            ),
             _Result(),
             _Result(scalar_value=17),
             _Result(),
@@ -391,7 +813,7 @@ async def test_seal_exact_reuse_does_not_queue_still_referenced_blocks_for_gc():
         schema_name="mrf",
         snapshot_key=41,
         build_token="attempt-41",
-        expected_blocks=(expected,),
+        expected_summary=expected_summary,
         support_digest=b"s" * 32,
         layout_manifest={"contract": "strict-v3"},
     )
@@ -682,3 +1104,116 @@ async def test_build_heartbeat_is_owned_and_extends_the_gc_lease():
     assert params["snapshot_key"] == 41
     assert params["build_token"] == "run-41"
     assert params["lease_until"] > params["heartbeat_at"]
+
+
+@pytest.mark.asyncio
+async def test_mapping_summary_real_postgres_uses_same_uncommitted_transaction():
+    """Read uncommitted mappings through the caller's PostgreSQL transaction."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip(
+            "set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1 for the isolated PostgreSQL test"
+        )
+
+    schema_name = f"ptg2_mapping_digest_{uuid.uuid4().hex[:16]}"
+    quoted_schema = f'"{schema_name}"'
+    references = [
+        SharedBlockReference("🧪_kind", 9, 1, 5, b"e" * 32, 17),
+        SharedBlockReference("a_kind", 2, 0, 3, b"a" * 32, 7),
+        SharedBlockReference("ž_kind", 4, 2, 7, b"d" * 32, 13),
+        SharedBlockReference("a_kind", 1, 3, 2, b"a" * 32, 7),
+    ]
+
+    await db.disconnect()
+    await db.connect()
+    try:
+        await db.execute_ddl(f"CREATE SCHEMA {quoted_schema}")
+        await db.execute_ddl(
+            f"""
+            CREATE TABLE {quoted_schema}.ptg2_v3_block (
+                block_hash bytea PRIMARY KEY,
+                raw_byte_count bigint NOT NULL CHECK (raw_byte_count >= 0)
+            )
+            """
+        )
+        await db.execute_ddl(
+            f"""
+            CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_block (
+                snapshot_key bigint NOT NULL,
+                object_kind varchar(64) NOT NULL,
+                block_key bigint NOT NULL CHECK (block_key >= 0),
+                fragment_no integer NOT NULL CHECK (fragment_no >= 0),
+                entry_count bigint NOT NULL CHECK (entry_count >= 0),
+                block_hash bytea NOT NULL
+                    REFERENCES {quoted_schema}.ptg2_v3_block (block_hash),
+                PRIMARY KEY (snapshot_key, object_kind, block_key, fragment_no)
+            )
+            """
+        )
+        async with db.transaction() as session:
+            await session.execute(
+                text(
+                    f"""
+                    INSERT INTO {quoted_schema}.ptg2_v3_block
+                        (block_hash, raw_byte_count)
+                    VALUES (:block_hash, :raw_byte_count)
+                    """
+                ),
+                [
+                    {
+                        "block_hash": block_hash,
+                        "raw_byte_count": raw_byte_count,
+                    }
+                    for block_hash, raw_byte_count in {
+                        reference.block_hash: reference.raw_byte_count
+                        for reference in references
+                    }.items()
+                ],
+            )
+            await session.execute(
+                text(
+                    f"""
+                    INSERT INTO {quoted_schema}.ptg2_v3_snapshot_block
+                        (snapshot_key, object_kind, block_key, fragment_no,
+                         entry_count, block_hash)
+                    VALUES
+                        (:snapshot_key, :object_kind, :block_key, :fragment_no,
+                         :entry_count, :block_hash)
+                    """
+                ),
+                [
+                    {
+                        "snapshot_key": 41,
+                        "object_kind": reference.object_kind,
+                        "block_key": reference.block_key,
+                        "fragment_no": reference.fragment_no,
+                        "entry_count": reference.entry_count,
+                        "block_hash": reference.block_hash,
+                    }
+                    for reference in references
+                ],
+            )
+
+            summary = await summarize_shared_snapshot_mappings(
+                session,
+                schema_name=schema_name,
+                snapshot_key=41,
+            )
+
+        assert summary.mapping_digest == shared_mapping_digest(references)
+        assert summary.mapping_count == len(references)
+        assert summary.unique_block_count == len(
+            {reference.block_hash for reference in references}
+        )
+        assert summary.entry_count == sum(
+            reference.entry_count for reference in references
+        )
+        assert summary.logical_byte_count == sum(
+            reference.raw_byte_count for reference in references
+        )
+        assert summary.object_kinds == tuple(
+            sorted({reference.object_kind for reference in references})
+        )
+    finally:
+        await db.execute_ddl(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
+        await db.disconnect()

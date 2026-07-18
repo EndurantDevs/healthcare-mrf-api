@@ -1909,7 +1909,7 @@ async def _lookup_shared_forward_rows(
         if provider_counts_by_key is not None
         else {}
     )
-    dictionary_hints = _version_three_page_price_lookup_hints(serving_tables)
+    dictionary_hints = _version_three_forward_lookup_hints(serving_tables)
     return await lookup_serving_binary_by_code_from_db(
         session,
         int(code_key),
@@ -1957,16 +1957,32 @@ def _shared_forward_row_window(
     return ordered_rows[start : start + max(int(limit), 0)]
 
 
-def _version_three_page_price_lookup_hints(serving_tables: PTG2ServingTables) -> dict[str, Any]:
+def _version_three_page_price_lookup_hints(
+    serving_tables: PTG2ServingTables,
+) -> dict[str, Any]:
     item_count = serving_tables.price_dictionary_item_count
     block_bytes = serving_tables.price_dictionary_block_bytes
     if item_count is None or block_bytes is None:
         raise PTG2ManifestArtifactError(
-            "PTG2 strict V3 price dictionary metadata is missing; reimport the snapshot"
+            "PTG2 strict V3 price metadata is missing; reimport the snapshot"
         )
     return {
         "price_dictionary_item_count": int(item_count),
         "price_dictionary_block_bytes": int(block_bytes),
+    }
+
+
+def _version_three_forward_lookup_hints(
+    serving_tables: PTG2ServingTables,
+) -> dict[str, Any]:
+    provider_shard_span = serving_tables.provider_shard_span
+    if provider_shard_span is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 strict V3 provider-shard metadata is missing; reimport the snapshot"
+        )
+    return {
+        **_version_three_page_price_lookup_hints(serving_tables),
+        "provider_shard_span": int(provider_shard_span),
     }
 
 
@@ -2217,7 +2233,7 @@ async def _shared_rows_for_code(
                 descending=descending,
                 shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
                 source_count=_required_source_count(serving_tables),
-                **_version_three_page_price_lookup_hints(serving_tables),
+                **_version_three_forward_lookup_hints(serving_tables),
                 schema_name=PTG2_SCHEMA,
             )
             if not prefix_rows:
@@ -2961,7 +2977,7 @@ async def _version_three_forward_entries_for_batch(
         code_metadata_by_key,
         provider_set_keys=provider_set_id_by_key,
         provider_counts_by_key=provider_counts_by_key,
-        **_version_three_page_price_lookup_hints(serving_tables),
+        **_version_three_forward_lookup_hints(serving_tables),
         shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
         source_count=_required_source_count(serving_tables),
         schema_name=PTG2_SCHEMA,

@@ -2967,15 +2967,39 @@ def run_scanner_fixture(
     artifact = write_fixture(case, run_dir)
     serving_copy = run_dir / "manifest_serving.copy"
     price_atom_copy = run_dir / "price_atom.copy"
+    price_set_atom_copy = run_dir / "price_set_atom.copy"
+    price_set_summary_copy = run_dir / "price_set_summary.copy"
     member_copy = run_dir / "provider_group_member.copy"
+    serving_run_directory = run_dir / "serving-runs"
+    provider_forward_sidecar = run_dir / "provider-forward.sidecar"
+    provider_inverted_sidecar = run_dir / "provider-inverted.sidecar"
     scanner_environment_by_name = {
+        "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v3",
+        "HLTHPRT_PTG2_RAW_SOURCE_SHA256": hashlib.sha256(
+            artifact.read_bytes()
+        ).hexdigest(),
+        "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID": (b"\xcc" * 32).hex(),
         "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "research-snapshot",
         "HLTHPRT_PTG2_COMPACT_PLAN_ID": "research-plan",
         "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "research-plan-month",
         "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "research-source-trace",
         "HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH": str(serving_copy),
         "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH": str(price_atom_copy),
+        "HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH": str(
+            price_set_atom_copy
+        ),
+        "HLTHPRT_PTG2_MANIFEST_PRICE_SET_SUMMARY_COPY_PATH": str(
+            price_set_summary_copy
+        ),
         "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH": str(member_copy),
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH": str(
+            provider_forward_sidecar
+        ),
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH": str(
+            provider_inverted_sidecar
+        ),
+        "HLTHPRT_PTG2_V3_SERVING_RUN_DIR": str(serving_run_directory),
+        "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS": "false",
         "HLTHPRT_PTG2_MANIFEST_ONLY": "true",
         **env_overrides,
     }
@@ -3036,14 +3060,37 @@ def run_with_sampling(command: list[str], env_overrides: dict[str, str], *, cwd:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    while proc.poll() is None:
-        sampler.sample(proc.pid)
-        time.sleep(float(os.getenv("HLTHPRT_PTG2_RESEARCH_SAMPLE_SECONDS", "0.1")))
-    stdout, stderr = proc.communicate()
+    output_by_stream: dict[str, bytes] = {}
+    communication_errors: list[BaseException] = []
+
+    def drain_output() -> None:
+        """Drain both child pipes so large benchmark output cannot deadlock."""
+
+        try:
+            output_by_stream["stdout"], output_by_stream["stderr"] = proc.communicate()
+        except BaseException as exc:  # pragma: no cover - defensive thread boundary
+            communication_errors.append(exc)
+
+    drain_thread = Thread(target=drain_output, daemon=True)
+    drain_thread.start()
+    sample_seconds = float(
+        os.getenv("HLTHPRT_PTG2_RESEARCH_SAMPLE_SECONDS", "0.1")
+    )
+    while drain_thread.is_alive():
+        if proc.poll() is None:
+            sampler.sample(proc.pid)
+        drain_thread.join(timeout=sample_seconds)
+    if communication_errors:
+        raise communication_errors[0]
     elapsed = time.monotonic() - started
     sampler.sample(proc.pid)
     return (
-        subprocess.CompletedProcess(command, proc.returncode, stdout=stdout, stderr=stderr),
+        subprocess.CompletedProcess(
+            command,
+            proc.returncode,
+            stdout=output_by_stream.get("stdout", b""),
+            stderr=output_by_stream.get("stderr", b""),
+        ),
         elapsed,
         sampler.to_json(),
     )
@@ -3055,6 +3102,8 @@ def collect_copy_outputs(run_dir: Path) -> dict[str, Any]:
     for label, pattern in {
         "serving": "manifest_serving.copy*",
         "price_atom": "price_atom.copy*",
+        "price_set_atom": "price_set_atom.copy*",
+        "price_set_summary": "price_set_summary.copy*",
         "provider_group_member": "provider_group_member.copy*",
     }.items():
         lines = []
@@ -3814,6 +3863,12 @@ def compare_dedupe(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[
         "price_atom_attempted",
         "price_atom_unique",
         "price_atom_duplicate",
+        "price_set_attempted",
+        "price_set_unique",
+        "price_set_duplicate",
+        "provider_set_attempted",
+        "provider_set_unique",
+        "provider_set_duplicate",
     ]
     mismatches = [key for key in keys if baseline.get(key) != candidate.get(key)]
     return {"status": "failed" if mismatches else "passed", "mismatches": mismatches}

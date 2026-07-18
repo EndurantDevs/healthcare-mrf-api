@@ -1306,9 +1306,9 @@ def test_ffs_parent_source_is_not_a_unified_address_source():
             "geo_zip_lookup": False,
         },
     )
-    child_source = next(s for s in selects if "'provider_enrollment_ffs_address'::varchar AS address_source" in s)
+    child_source = next(sql_text for sql_text in selects if "'provider_enrollment_ffs_address'::varchar AS address_source" in sql_text)
 
-    assert not any("'provider_enrollment_ffs'::varchar AS address_source" in s for s in selects)
+    assert not any("'provider_enrollment_ffs'::varchar AS address_source" in sql_text for sql_text in selects)
     assert "NULL::varchar AS first_line" in child_source
     assert "NULL::varchar AS second_line" in child_source
 
@@ -1325,7 +1325,7 @@ def test_ffs_address_source_filters_unkeyable_practice_locations():
         },
     )
 
-    child_source = next(s for s in selects if "'provider_enrollment_ffs_address'::varchar AS address_source" in s)
+    child_source = next(sql_text for sql_text in selects if "'provider_enrollment_ffs_address'::varchar AS address_source" in sql_text)
     assert "WHERE f.npi IS NOT NULL" in child_source
     assert "NULLIF(BTRIM(COALESCE(fa.state, '')), '') IS NOT NULL" in child_source
     assert "NOT IN ('NULL', 'NONE', 'NA', 'NAN', 'UN', 'UNKNOWN', 'UNSPECIFIED', 'XX', 'ZZ')" in child_source
@@ -1346,7 +1346,7 @@ def test_entity_address_unified_registers_mrf_address_source():
         },
     )
 
-    mrf_source = next(s for s in selects if "'mrf'::varchar AS address_source" in s)
+    mrf_source = next(sql_text for sql_text in selects if "'mrf'::varchar AS address_source" in sql_text)
     assert "FROM mrf.mrf_address AS a" in mrf_source
     assert "a.first_line::varchar AS first_line" in mrf_source
     assert "a.postal_code::varchar AS postal_code" in mrf_source
@@ -1365,7 +1365,7 @@ def test_entity_address_unified_mrf_source_filters_placeholder_addresses():
         },
     )
 
-    mrf_source = next(s for s in selects if "'mrf'::varchar AS address_source" in s)
+    mrf_source = next(sql_text for sql_text in selects if "'mrf'::varchar AS address_source" in sql_text)
     assert "WHERE a.npi IS NOT NULL" in mrf_source
     assert "NULLIF(BTRIM(COALESCE(a.state_name, '')), '') IS NOT NULL" in mrf_source
     assert "NOT IN ('NULL', 'NONE', 'NA', 'NAN', 'UN', 'UNKNOWN', 'UNSPECIFIED', 'XX', 'ZZ')" in mrf_source
@@ -1388,7 +1388,7 @@ def test_entity_address_unified_mrf_source_borrows_arrays_from_primary_npi_addre
         },
     )
 
-    mrf_source = next(s for s in selects if "'mrf'::varchar AS address_source" in s)
+    mrf_source = next(sql_text for sql_text in selects if "'mrf'::varchar AS address_source" in sql_text)
     assert "FROM mrf.mrf_address AS a" in mrf_source
     assert "FROM mrf.npi_address AS pa WHERE pa.npi = a.npi AND pa.type = 'primary'" in mrf_source
     assert "COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[] AS taxonomy_array" in mrf_source
@@ -3245,9 +3245,9 @@ async def test_entity_address_unified_post_publish_serving_indexes_use_live_tabl
     assert "entity_address_unified.zip5" in index_context_map["post_publish_skipped_indexes"]
     assert index_context_map["post_publish_index_concurrency"] in {1}
     index_statements = [
-        s
-        for s in statements
-        if "CREATE EXTENSION" not in s and not s.startswith("ANALYZE ")
+        sql_text
+        for sql_text in statements
+        if "CREATE EXTENSION" not in sql_text and not sql_text.startswith("ANALYZE ")
     ]
     assert "CREATE EXTENSION IF NOT EXISTS btree_gin" in statements
     assert "ANALYZE mrf.entity_address_unified;" in statements
@@ -3315,9 +3315,9 @@ async def test_entity_address_unified_post_publish_non_concurrent_indexes_can_fa
     assert "entity_address_unified_idx_service_premise_key_npi" in joined
     assert "CREATE INDEX CONCURRENTLY" not in joined
     index_statements = [
-        s
-        for s in statements
-        if "CREATE EXTENSION" not in s and not s.startswith("ANALYZE ")
+        sql_text
+        for sql_text in statements
+        if "CREATE EXTENSION" not in sql_text and not sql_text.startswith("ANALYZE ")
     ]
     assert "CREATE EXTENSION IF NOT EXISTS btree_gin" in statements
     assert "ANALYZE mrf.entity_address_unified;" in statements

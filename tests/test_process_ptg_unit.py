@@ -3687,7 +3687,25 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
         "_publish_shared_v3_source_dictionary",
         AsyncMock(),
     )
-    monkeypatch.setattr(process_ptg, "publish_strict_shared_v3_layout", fake_publish)
+    monkeypatch.setattr(
+        process_ptg,
+        "_merge_and_copy_ptg2_manifest_files",
+        AsyncMock(
+            return_value={
+                "enabled": True,
+                "source_files_by_kind": {
+                    "price_atom": 2,
+                    "price_set_atom": 2,
+                    "price_set_summary": 2,
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "publish_strict_shared_v3_layout",
+        fake_publish,
+    )
     _install_candidate_stage_mock(monkeypatch)
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", AsyncMock())
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
@@ -3836,7 +3854,7 @@ def test_ptg2_main_cleans_complete_stage_family_when_stage_creation_fails(monkey
 
     stage_table_names = stage_cleanup.await_args.args[0]
     assert partially_created_tables == [stage_table_names[0]]
-    assert len(stage_table_names) == 3
+    assert len(stage_table_names) == 4
     assert stage_table_names[1:] == process_ptg._ptg2_manifest_stage_table_names(
         stage_table_names[0]
     )[1:]
@@ -5693,6 +5711,174 @@ def _write_manifest_copy_files(tmp_path):
     return source_files_by_kind
 
 
+def test_strict_v3_precopy_rejects_partial_price_artifacts_per_source(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
+    successful_files = []
+    all_paths = []
+    for source_index, kinds in enumerate(
+        (
+            ("price_atom", "price_set_atom", "price_set_summary"),
+            ("price_atom", "price_set_atom"),
+        )
+    ):
+        copy_entries_by_kind = {}
+        for kind in kinds:
+            path = tmp_path / f"source-{source_index}-{kind}.copy"
+            path.write_text("row\n", encoding="utf-8")
+            all_paths.append(path)
+            copy_entries_by_kind[kind] = [{"path": str(path), "row_count": 1}]
+        successful_files.append(
+            {
+                "url": f"https://example.test/source-{source_index}.json.gz",
+                "summary": {
+                    "manifest": {
+                        "serving_rows": 1,
+                        "copy_files": copy_entries_by_kind,
+                    }
+                },
+            }
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"source-1\.json\.gz.*price_set_summary",
+    ):
+        asyncio.run(
+            process_ptg._merge_and_copy_ptg2_manifest_files(
+                successful_files=successful_files,
+                manifest_stage_table="ptg2_manifest_stage_serving_partial",
+            )
+        )
+
+    assert not any(path.exists() for path in all_paths)
+
+
+def test_completed_strict_v3_file_registers_scratch_before_batch_end(
+    tmp_path,
+    monkeypatch,
+):
+    """Register completed V3 scratch artifacts before their batch exits."""
+
+    artifact_root = tmp_path / "artifacts"
+    sidecar_path = artifact_root / "serving" / "attempt" / "provider.ptg2sc"
+    sidecar_path.parent.mkdir(parents=True)
+    sidecar_path.write_bytes(b"sidecar")
+    copy_entries_by_kind = {}
+    copy_paths = []
+    for kind in (
+        "serving_run",
+        "serving_code_dictionary",
+        "source_audit_witness",
+        "provider_set_metadata",
+        "price_atom",
+        "price_set_atom",
+        "price_set_summary",
+    ):
+        path = tmp_path / f"{kind}.copy"
+        path.write_bytes(b"scratch")
+        copy_paths.append(path)
+        copy_entries_by_kind[kind] = [{"path": str(path), "row_count": 1}]
+    pending = process_ptg._PendingStrictV3State({}, {})
+    monkeypatch.setattr(
+        process_ptg,
+        "resolve_ptg2_artifact_dir",
+        lambda: artifact_root,
+    )
+
+    file_result = process_ptg.PTG2FileProcessResult(
+        "in_network",
+        "https://example.test/in-network.json.gz",
+        True,
+        summary={
+            "manifest": {
+                "copy_files": copy_entries_by_kind,
+                "sidecars": [{"path": str(sidecar_path)}],
+            }
+        },
+    )
+
+    async def exercise_done_but_undrained_cancellation_window():
+        async def finish_file():
+            process_ptg._claim_strict_v3_file_scratch(pending, file_result)
+            return file_result
+
+        task = asyncio.create_task(finish_file())
+        await asyncio.sleep(0)
+        assert task.done()
+        tasks = {task}
+        await process_ptg._cancel_and_wait_tasks(tasks)
+        assert tasks == set()
+
+    asyncio.run(exercise_done_but_undrained_cancellation_window())
+
+    assert set(pending.copy_entries_by_kind) == set(copy_entries_by_kind)
+    assert pending.graph_artifacts_map["sidecars"] == [
+        {"path": str(sidecar_path)}
+    ]
+    process_ptg._cleanup_manifest_copy_entries(pending.copy_entries_by_kind)
+    process_ptg._cleanup_strict_v3_graph_artifacts(pending.graph_artifacts_map)
+    assert not any(path.exists() for path in copy_paths)
+    assert not sidecar_path.exists()
+
+
+def test_strict_v3_annotation_failure_still_claims_completed_scratch(
+    tmp_path,
+    monkeypatch,
+):
+    copy_path = tmp_path / "provider_set_metadata.copy"
+    copy_path.write_bytes(b"scratch")
+    pending = process_ptg._PendingStrictV3State({}, {})
+    file_result = process_ptg.PTG2FileProcessResult(
+        "in_network",
+        "https://example.test/in-network.json.gz",
+        True,
+        summary={
+            "manifest": {
+                "copy_files": {
+                    "provider_set_metadata": [
+                        {"path": str(copy_path), "row_count": 1}
+                    ]
+                }
+            }
+        },
+    )
+
+    def fail_annotation(*_args, **_kwargs):
+        raise RuntimeError("source contract attachment failed")
+
+    monkeypatch.setattr(
+        process_ptg,
+        "_annotate_v3_file_result_source_identity",
+        fail_annotation,
+    )
+
+    with pytest.raises(RuntimeError, match="source contract attachment failed"):
+        process_ptg._claim_strict_v3_file_result(
+            pending,
+            file_result,
+            process_ptg.SharedPhysicalArtifactIdentity(
+                "in_network",
+                "logical_json_sha256_v1",
+                "a" * 64,
+            ),
+            {},
+        )
+
+    assert pending.copy_entries_by_kind["provider_set_metadata"] == [
+        {"path": str(copy_path), "row_count": 1}
+    ]
+    assert all(
+        not entries
+        for kind, entries in pending.copy_entries_by_kind.items()
+        if kind != "provider_set_metadata"
+    )
+    process_ptg._cleanup_manifest_copy_entries(pending.copy_entries_by_kind)
+    assert not copy_path.exists()
+
+
 def _fake_manifest_merge_recorder(merge_calls):
     async def fake_merge(kind, output_path, input_paths):
         merge_calls.append((kind, output_path, tuple(input_paths)))
@@ -6246,6 +6432,8 @@ def _install_candidate_stage_mock(monkeypatch):
 
 
 def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
+    """Install a successful strict V3 publisher and return its async mock."""
+
     monkeypatch.setattr(process_ptg, "_ptg2_auto_activate_candidates", lambda: True)
     publication = SimpleNamespace(
         snapshot_key=7,
@@ -6281,6 +6469,20 @@ def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
         process_ptg,
         "_shared_v3_scanner_identity",
         lambda: {"contract_version": 1, "scanner_binary_sha256": "a" * 64},
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_merge_and_copy_ptg2_manifest_files",
+        AsyncMock(
+            return_value={
+                "enabled": True,
+                "source_files_by_kind": {
+                    "price_atom": 1,
+                    "price_set_atom": 1,
+                    "price_set_summary": 1,
+                },
+            }
+        ),
     )
     monkeypatch.setattr(process_ptg, "publish_strict_shared_v3_layout", publish)
     _install_candidate_stage_mock(monkeypatch)
@@ -7580,11 +7782,16 @@ def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, mon
 
     async def fake_scanner(*_args, **kwargs):
         price_worker = Path(f"{kwargs['manifest_price_atom_copy_path']}.worker0003")
+        summary_worker = Path(
+            f"{kwargs['manifest_price_set_summary_copy_path']}.worker0003"
+        )
         member_worker = Path(f"{kwargs['manifest_provider_group_member_copy_path']}.provider_refs.worker0003")
         price_worker.write_text("price-1\n")
+        summary_worker.write_text("price-set-1\t1.25\n")
         member_worker.write_text("member-1\n")
         recovered_paths_by_kind.update(
             price=str(price_worker),
+            summary=str(summary_worker),
             member=str(member_worker),
         )
         yield "scanner_config", {"worker_count": 2}
@@ -7642,6 +7849,9 @@ def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, mon
     assert summary["manifest"]["serving_rows"] == 2
     assert summary["manifest"]["copy_files"]["price_atom"] == [
         {"path": recovered_paths_by_kind["price"], "row_count": 1}
+    ]
+    assert summary["manifest"]["copy_files"]["price_set_summary"] == [
+        {"path": recovered_paths_by_kind["summary"], "row_count": 1}
     ]
     assert summary["manifest"]["copy_files"]["provider_group_member"] == []
     assert graph_input_paths == [Path(recovered_paths_by_kind["member"])]

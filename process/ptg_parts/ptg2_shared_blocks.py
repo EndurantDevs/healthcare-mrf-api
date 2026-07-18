@@ -47,6 +47,13 @@ _BLOCK_HASH_DOMAIN = b"PTG2V3BLOCK\x01"
 _MAPPING_HASH_DOMAIN = b"PTG2V3MAP\x02"
 _SEMANTIC_HASH_DOMAIN = b"PTG2V3SEMANTIC\x02"
 _SUPPORT_HASH_DOMAIN = b"PTG2V3SUPPORT\x02"
+_PG_BINARY_COPY_SIGNATURE = b"PGCOPY\n\xff\r\n\0"
+_PG_BINARY_COPY_HEADER_SIZE = len(_PG_BINARY_COPY_SIGNATURE) + 8
+_MAPPING_COPY_FIXED_RECORD_BYTES = 4 + 8 + 4 + 8 + 32
+_MAPPING_COPY_MAX_KIND_BYTES = 64 * 4
+_MAPPING_COPY_MAX_RECORD_BYTES = (
+    _MAPPING_COPY_FIXED_RECORD_BYTES + _MAPPING_COPY_MAX_KIND_BYTES
+)
 
 
 def _utcnow() -> datetime:
@@ -217,6 +224,23 @@ class SharedBlockReference:
 
 
 @dataclass(frozen=True)
+class SharedMappingDigestSummary:
+    mapping_digest: bytes
+    mapping_count: int
+    unique_block_count: int
+    entry_count: int
+    logical_byte_count: int
+    canonical_byte_count: int
+    object_kinds: tuple[str, ...]
+
+    @property
+    def object_kind_count(self) -> int:
+        """Return the number of distinct object kinds in the mapping set."""
+
+        return len(self.object_kinds)
+
+
+@dataclass(frozen=True)
 class SharedBlockBatchResult:
     references: tuple[SharedBlockReference, ...]
     unique_block_count: int
@@ -282,6 +306,402 @@ def _row_mapping(row: Any) -> dict[str, Any]:
     if isinstance(row, Mapping):
         return dict(row)
     return dict(row or {})
+
+
+@dataclass(frozen=True)
+class _ParsedSharedMappingDigest:
+    mapping_digest: bytes
+    mapping_count: int
+    entry_count: int
+    canonical_byte_count: int
+
+
+class _SharedMappingBinaryCopyDigest:
+    """Incrementally validate and hash one-field PostgreSQL binary COPY streams."""
+
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256()
+        self._digest.update(_MAPPING_HASH_DOMAIN)
+        self._mapping_count = 0
+        self._entry_count = 0
+        self._canonical_byte_count = 0
+        self._previous_key: tuple[str, int, int] | None = None
+        self._buffer = bytearray()
+        self._offset = 0
+        self._state = "idle"
+        self._expected_kind: str | None = None
+        self._field_length: int | None = None
+        self._copy_mapping_count = 0
+
+    def begin_copy(self, object_kind: str) -> None:
+        """Begin one authenticated mapping COPY stream for an object kind."""
+
+        if self._state != "idle":
+            raise RuntimeError("shared PTG mapping binary COPY is already active")
+        normalized_kind = str(object_kind)
+        if len(normalized_kind.encode("utf-8")) > _MAPPING_COPY_MAX_KIND_BYTES:
+            raise RuntimeError("shared PTG mapping object_kind exceeds the durable schema")
+        self._buffer.clear()
+        self._offset = 0
+        self._state = "header"
+        self._expected_kind = normalized_kind
+        self._field_length = None
+        self._copy_mapping_count = 0
+
+    def feed(self, chunk: bytes | bytearray | memoryview) -> None:
+        """Consume and validate the next mapping COPY byte chunk."""
+
+        if not chunk:
+            return
+        if self._state == "idle":
+            raise RuntimeError("shared PTG mapping binary COPY received bytes while idle")
+        if self._state == "complete":
+            raise RuntimeError("shared PTG mapping binary COPY has bytes after its trailer")
+        self._buffer.extend(chunk)
+        while True:
+            available = len(self._buffer) - self._offset
+            if self._state == "header":
+                if available < _PG_BINARY_COPY_HEADER_SIZE:
+                    break
+                signature = bytes(
+                    self._buffer[
+                        self._offset : self._offset + len(_PG_BINARY_COPY_SIGNATURE)
+                    ]
+                )
+                if signature != _PG_BINARY_COPY_SIGNATURE:
+                    raise RuntimeError(
+                        "shared PTG mapping binary COPY has an invalid header signature"
+                    )
+                flags, extension_length = struct.unpack_from(
+                    ">Ii",
+                    self._buffer,
+                    self._offset + len(_PG_BINARY_COPY_SIGNATURE),
+                )
+                if flags != 0:
+                    raise RuntimeError(
+                        "shared PTG mapping binary COPY uses unsupported header flags"
+                    )
+                if extension_length != 0:
+                    raise RuntimeError(
+                        "shared PTG mapping binary COPY uses an unsupported header extension"
+                    )
+                self._offset += _PG_BINARY_COPY_HEADER_SIZE
+                self._state = "row"
+                continue
+            if self._state == "row":
+                if available < 2:
+                    break
+                field_count = struct.unpack_from(">h", self._buffer, self._offset)[0]
+                self._offset += 2
+                if field_count == -1:
+                    self._state = "complete"
+                    if len(self._buffer) != self._offset:
+                        raise RuntimeError(
+                            "shared PTG mapping binary COPY has bytes after its trailer"
+                        )
+                    break
+                if field_count != 1:
+                    raise RuntimeError(
+                        "shared PTG mapping binary COPY rows must contain exactly one field"
+                    )
+                self._state = "field_length"
+                continue
+            if self._state == "field_length":
+                if available < 4:
+                    break
+                field_length = struct.unpack_from(">i", self._buffer, self._offset)[0]
+                self._offset += 4
+                if field_length == -1:
+                    raise RuntimeError(
+                        "shared PTG mapping binary COPY field must not be NULL"
+                    )
+                if not (
+                    _MAPPING_COPY_FIXED_RECORD_BYTES
+                    <= field_length
+                    <= _MAPPING_COPY_MAX_RECORD_BYTES
+                ):
+                    raise RuntimeError(
+                        "shared PTG mapping binary COPY field has an invalid length"
+                    )
+                self._field_length = field_length
+                self._state = "field"
+                continue
+            if self._state == "field":
+                assert self._field_length is not None
+                if available < self._field_length:
+                    break
+                field_end = self._offset + self._field_length
+                record_bytes = bytes(self._buffer[self._offset : field_end])
+                self._offset = field_end
+                self._consume_mapping_record(record_bytes)
+                self._field_length = None
+                self._state = "row"
+                continue
+            raise AssertionError(f"unexpected shared mapping COPY state: {self._state}")
+        self._compact_buffer()
+
+    def finish_copy(self) -> int:
+        """Finish the active COPY stream and return its mapping count."""
+
+        if self._state == "idle":
+            raise RuntimeError("shared PTG mapping binary COPY is not active")
+        if self._state != "complete":
+            detail = "header" if self._state == "header" else "stream before trailer"
+            raise RuntimeError(f"shared PTG mapping binary COPY has a truncated {detail}")
+        if self._copy_mapping_count <= 0:
+            raise RuntimeError("shared PTG mapping binary COPY contains no mappings")
+        copy_mapping_count = self._copy_mapping_count
+        self._buffer.clear()
+        self._offset = 0
+        self._state = "idle"
+        self._expected_kind = None
+        self._field_length = None
+        self._copy_mapping_count = 0
+        return copy_mapping_count
+
+    def finish(self) -> _ParsedSharedMappingDigest:
+        """Return the digest summary after every COPY stream is closed."""
+
+        if self._state != "idle":
+            raise RuntimeError("shared PTG mapping binary COPY is still active")
+        return _ParsedSharedMappingDigest(
+            mapping_digest=self._digest.copy().digest(),
+            mapping_count=self._mapping_count,
+            entry_count=self._entry_count,
+            canonical_byte_count=self._canonical_byte_count,
+        )
+
+    def _consume_mapping_record(self, record_bytes: bytes) -> None:
+        object_kind_length = struct.unpack_from(">I", record_bytes, 0)[0]
+        if object_kind_length > _MAPPING_COPY_MAX_KIND_BYTES:
+            raise RuntimeError(
+                "shared PTG mapping binary COPY object_kind length is invalid"
+            )
+        expected_length = _MAPPING_COPY_FIXED_RECORD_BYTES + object_kind_length
+        if len(record_bytes) != expected_length:
+            raise RuntimeError(
+                "shared PTG mapping binary COPY record length does not match object_kind"
+            )
+        kind_end = 4 + object_kind_length
+        try:
+            object_kind = record_bytes[4:kind_end].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                "shared PTG mapping binary COPY object_kind is not valid UTF-8"
+            ) from exc
+        if object_kind != self._expected_kind:
+            raise RuntimeError(
+                "shared PTG mapping binary COPY returned an unexpected object_kind"
+            )
+        block_key = struct.unpack_from(">q", record_bytes, kind_end)[0]
+        fragment_no = struct.unpack_from(">i", record_bytes, kind_end + 8)[0]
+        entry_count = struct.unpack_from(">q", record_bytes, kind_end + 12)[0]
+        if block_key < 0 or fragment_no < 0 or entry_count < 0:
+            raise RuntimeError(
+                "shared PTG mapping binary COPY contains a negative mapping value"
+            )
+        mapping_key = (object_kind, block_key, fragment_no)
+        if self._previous_key is not None and mapping_key <= self._previous_key:
+            qualifier = "duplicate" if mapping_key == self._previous_key else "out-of-order"
+            raise RuntimeError(
+                f"shared PTG mapping binary COPY contains a {qualifier} mapping key: "
+                f"{mapping_key!r}"
+            )
+        self._previous_key = mapping_key
+        self._digest.update(record_bytes)
+        self._mapping_count += 1
+        self._entry_count += entry_count
+        self._canonical_byte_count += len(record_bytes)
+        self._copy_mapping_count += 1
+
+    def _compact_buffer(self) -> None:
+        if self._offset == 0:
+            return
+        if self._offset == len(self._buffer) or self._offset >= 65_536:
+            del self._buffer[: self._offset]
+            self._offset = 0
+
+
+def _non_negative_mapping_aggregate(value: Any, *, name: str) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"shared PTG mapping summary has invalid {name}") from exc
+    if normalized < 0:
+        raise RuntimeError(f"shared PTG mapping summary has negative {name}")
+    return normalized
+
+
+async def summarize_shared_snapshot_mappings(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+) -> SharedMappingDigestSummary:
+    """Stream an exact mapping digest and bounded aggregates on the caller's session."""
+
+    connection_method = getattr(session, "connection", None)
+    if not callable(connection_method):
+        raise NotImplementedError(
+            "shared PTG mapping summary requires a SQLAlchemy session with raw asyncpg COPY support"
+        )
+    connection = await connection_method()
+    raw_connection_method = getattr(connection, "get_raw_connection", None)
+    if not callable(raw_connection_method):
+        raise NotImplementedError(
+            "shared PTG mapping summary requires raw asyncpg COPY support"
+        )
+    raw_connection = await raw_connection_method()
+    driver_connection = getattr(raw_connection, "driver_connection", raw_connection)
+    copy_from_query = getattr(driver_connection, "copy_from_query", None)
+    if not callable(copy_from_query):
+        raise NotImplementedError(
+            "shared PTG mapping summary requires raw asyncpg copy_from_query support"
+        )
+
+    schema = _quote_ident(schema_name)
+    aggregate_result = await session.execute(
+        text(
+            f"""
+            SELECT mapping.object_kind,
+                   COUNT(*) AS mapping_count,
+                   COUNT(DISTINCT mapping.block_hash) AS unique_block_count,
+                   COUNT(block.block_hash) AS resolved_mapping_count,
+                   COALESCE(SUM(mapping.entry_count), 0) AS entry_count,
+                   COALESCE(SUM(block.raw_byte_count), 0) AS logical_byte_count
+              FROM {schema}.ptg2_v3_snapshot_block AS mapping
+              LEFT JOIN {schema}.ptg2_v3_block AS block
+                ON block.block_hash = mapping.block_hash
+             WHERE mapping.snapshot_key = :snapshot_key
+             GROUP BY mapping.object_kind
+            """
+        ),
+        {"snapshot_key": int(snapshot_key)},
+    )
+    aggregate_by_kind: dict[str, tuple[int, int, int, int]] = {}
+    for aggregate_row in aggregate_result:
+        row_map = _row_mapping(aggregate_row)
+        raw_kind = row_map.get("object_kind")
+        if not isinstance(raw_kind, str):
+            raise RuntimeError("shared PTG mapping summary has invalid object_kind")
+        if raw_kind in aggregate_by_kind:
+            raise RuntimeError(
+                f"shared PTG mapping summary contains duplicate object_kind: {raw_kind!r}"
+            )
+        mapping_count = _non_negative_mapping_aggregate(
+            row_map.get("mapping_count"),
+            name="mapping_count",
+        )
+        unique_block_count = _non_negative_mapping_aggregate(
+            row_map.get("unique_block_count"),
+            name="unique_block_count",
+        )
+        resolved_mapping_count = _non_negative_mapping_aggregate(
+            row_map.get("resolved_mapping_count"),
+            name="resolved_mapping_count",
+        )
+        entry_count = _non_negative_mapping_aggregate(
+            row_map.get("entry_count"),
+            name="entry_count",
+        )
+        logical_byte_count = _non_negative_mapping_aggregate(
+            row_map.get("logical_byte_count"),
+            name="logical_byte_count",
+        )
+        if mapping_count <= 0:
+            raise RuntimeError(
+                f"shared PTG mapping summary has an empty object_kind group: {raw_kind!r}"
+            )
+        if unique_block_count > mapping_count:
+            raise RuntimeError(
+                "shared PTG mapping summary unique_block_count exceeds mapping_count "
+                f"for object_kind {raw_kind!r}"
+            )
+        if resolved_mapping_count != mapping_count:
+            raise RuntimeError(
+                "shared PTG mapping summary could not resolve every block_hash for "
+                f"object_kind {raw_kind!r}: expected {mapping_count}, "
+                f"resolved {resolved_mapping_count}"
+            )
+        aggregate_by_kind[raw_kind] = (
+            mapping_count,
+            unique_block_count,
+            entry_count,
+            logical_byte_count,
+        )
+
+    object_kinds = tuple(sorted(aggregate_by_kind))
+    copy_query = f"""
+        SELECT pg_catalog.int4send(
+                   pg_catalog.octet_length(
+                       pg_catalog.convert_to(mapping.object_kind, 'UTF8')
+                   )
+               )
+               || pg_catalog.convert_to(mapping.object_kind, 'UTF8')
+               || pg_catalog.int8send(mapping.block_key)
+               || pg_catalog.int4send(mapping.fragment_no)
+               || pg_catalog.int8send(mapping.entry_count)
+               || mapping.block_hash AS mapping_record
+          FROM {schema}.ptg2_v3_snapshot_block AS mapping
+         WHERE mapping.snapshot_key = $1::bigint
+           AND mapping.object_kind = $2::text
+         ORDER BY mapping.block_key, mapping.fragment_no
+    """
+    accumulator = _SharedMappingBinaryCopyDigest()
+
+    async def _feed_copy(chunk: bytes) -> None:
+        accumulator.feed(chunk)
+
+    for object_kind in object_kinds:
+        accumulator.begin_copy(object_kind)
+        await copy_from_query(
+            copy_query,
+            int(snapshot_key),
+            object_kind,
+            output=_feed_copy,
+            format="binary",
+        )
+        observed_count = accumulator.finish_copy()
+        expected_count = aggregate_by_kind[object_kind][0]
+        if observed_count != expected_count:
+            raise RuntimeError(
+                "shared PTG mapping count changed during binary COPY for "
+                f"object_kind {object_kind!r}: expected {expected_count}, "
+                f"observed {observed_count}"
+            )
+
+    parsed = accumulator.finish()
+    expected_mapping_count = sum(
+        aggregate_values[0] for aggregate_values in aggregate_by_kind.values()
+    )
+    unique_block_count = sum(
+        aggregate_values[1] for aggregate_values in aggregate_by_kind.values()
+    )
+    expected_entry_count = sum(
+        aggregate_values[2] for aggregate_values in aggregate_by_kind.values()
+    )
+    logical_byte_count = sum(
+        aggregate_values[3] for aggregate_values in aggregate_by_kind.values()
+    )
+    if parsed.mapping_count != expected_mapping_count:
+        raise RuntimeError(
+            "shared PTG mapping count changed during binary COPY: "
+            f"expected {expected_mapping_count}, observed {parsed.mapping_count}"
+        )
+    if parsed.entry_count != expected_entry_count:
+        raise RuntimeError(
+            "shared PTG mapping entry_count changed during binary COPY: "
+            f"expected {expected_entry_count}, observed {parsed.entry_count}"
+        )
+    return SharedMappingDigestSummary(
+        mapping_digest=parsed.mapping_digest,
+        mapping_count=parsed.mapping_count,
+        unique_block_count=unique_block_count,
+        entry_count=parsed.entry_count,
+        logical_byte_count=logical_byte_count,
+        canonical_byte_count=parsed.canonical_byte_count,
+        object_kinds=object_kinds,
+    )
 
 
 def _advisory_lock_key(digest: bytes) -> int:
@@ -734,13 +1154,12 @@ async def seal_shared_layout(
     schema_name: str,
     snapshot_key: int,
     build_token: str,
-    expected_blocks: Sequence[SharedBlockReference],
+    expected_summary: SharedMappingDigestSummary,
     support_digest: bytes,
     layout_manifest: Mapping[str, Any],
 ) -> SealedSharedLayout:
-    """Validate every mapping and atomically seal the immutable layout."""
+    """Recheck the bounded authoritative summary and atomically seal the layout."""
 
-    expected_digest = shared_mapping_digest(expected_blocks)
     normalized_support_digest = bytes(support_digest)
     if len(normalized_support_digest) != 32:
         raise ValueError("shared PTG support digest must contain 32 bytes")
@@ -773,46 +1192,30 @@ async def seal_shared_layout(
     )
     if owner_result.scalar() is None:
         raise RuntimeError("shared PTG seal lost ownership of its building layout")
-    # The mapping FK and block format CHECK already guarantee block existence and
-    # version; publication validated full block metadata before inserting mappings.
-    mapping_result = await session.execute(
-        text(
-            f"""
-            SELECT object_kind, block_key, fragment_no, entry_count, block_hash
-              FROM {schema}.ptg2_v3_snapshot_block
-             WHERE snapshot_key = :snapshot_key
-             ORDER BY object_kind, block_key, fragment_no
-            """
-        ),
-        {"snapshot_key": int(snapshot_key)},
+    observed_summary = await summarize_shared_snapshot_mappings(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
     )
-    observed_rows = [_row_mapping(mapping_row) for mapping_row in mapping_result]
-    expected_by_key = {
-        (block.object_kind, int(block.block_key), int(block.fragment_no)): block
-        for block in expected_blocks
-    }
-    if len(observed_rows) != len(expected_by_key):
-        raise RuntimeError(
-            f"shared PTG mapping count mismatch: expected {len(expected_by_key)}, "
-            f"observed {len(observed_rows)}"
-        )
-    logical_byte_count = 0
-    for observed_row in observed_rows:
-        key = (
-            str(observed_row["object_kind"]),
-            int(observed_row["block_key"]),
-            int(observed_row["fragment_no"]),
-        )
-        expected = expected_by_key.get(key)
-        if expected is None:
-            raise RuntimeError(f"unexpected shared PTG mapping: {key!r}")
-        if bytes(observed_row["block_hash"]) != expected.block_hash or int(
-            observed_row["entry_count"]
-        ) != int(expected.entry_count):
-            raise RuntimeError(f"shared PTG mapping mismatch: {key!r}")
-        if int(expected.raw_byte_count) < 0:
-            raise RuntimeError(f"shared PTG mapping has a negative logical size: {key!r}")
-        logical_byte_count += int(expected.raw_byte_count)
+    for field_name in (
+        "mapping_digest",
+        "mapping_count",
+        "unique_block_count",
+        "entry_count",
+        "logical_byte_count",
+        "canonical_byte_count",
+        "object_kinds",
+    ):
+        expected_value = getattr(expected_summary, field_name)
+        observed_value = getattr(observed_summary, field_name)
+        if observed_value != expected_value:
+            raise RuntimeError(
+                "shared PTG mapping summary mismatch for "
+                f"{field_name}: expected {expected_value!r}, observed {observed_value!r}"
+            )
+    expected_digest = bytes(expected_summary.mapping_digest)
+    if len(expected_digest) != 32:
+        raise RuntimeError("shared PTG mapping summary digest must contain 32 bytes")
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:lock_key)"),
         {"lock_key": _advisory_lock_key(expected_digest)},
@@ -918,7 +1321,7 @@ async def seal_shared_layout(
                 sort_keys=True,
                 separators=(",", ":"),
             ),
-            "logical_byte_count": logical_byte_count,
+            "logical_byte_count": int(expected_summary.logical_byte_count),
             "heartbeat_at": _utcnow(),
             "lease_until": _lease_deadline(sealed=True),
             "published_at": _utcnow(),

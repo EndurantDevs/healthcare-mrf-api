@@ -46,9 +46,11 @@ _STRICT_SCANNER_FRAME_KINDS = {
     "dedupe_summary",
     "manifest_price_atom_copy_file",
     "manifest_price_set_atom_copy_file",
+    "manifest_price_set_summary_copy_file",
     "manifest_provider_forward_sidecar_file",
     "manifest_provider_group_member_copy_file",
     "manifest_provider_inverted_sidecar_file",
+    "manifest_provider_set_dictionary_copy_file",
     "scanner_config",
     "scanner_summary",
     "source_audit_witness_file",
@@ -398,7 +400,9 @@ def _run_scanner(
     compact_copy_path = run_directory / "compact.copy"
     price_atom_copy_path = run_directory / "manifest-price-atom.copy"
     price_set_atom_copy_path = run_directory / "manifest-price-set-atom.copy"
+    price_set_summary_copy_path = run_directory / "manifest-price-set-summary.copy"
     provider_group_member_copy_path = run_directory / "provider-group-member.copy"
+    provider_set_metadata_copy_path = run_directory / "provider-set-metadata.copy"
     provider_forward_path = run_directory / "provider-forward.sidecar"
     provider_inverted_path = run_directory / "provider-inverted.sidecar"
     serving_run_directory = run_directory / "serving-runs"
@@ -427,8 +431,14 @@ def _run_scanner(
             "HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH": str(
                 price_set_atom_copy_path
             ),
+            "HLTHPRT_PTG2_MANIFEST_PRICE_SET_SUMMARY_COPY_PATH": str(
+                price_set_summary_copy_path
+            ),
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH": str(
                 provider_group_member_copy_path
+            ),
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COPY_PATH": str(
+                provider_set_metadata_copy_path
             ),
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH": str(
                 provider_forward_path
@@ -481,10 +491,20 @@ def _run_scanner(
         for kind, frame_payload in frames
         if kind == "manifest_price_set_atom_copy_file"
     ]
+    price_set_summary_frames = [
+        frame_payload
+        for kind, frame_payload in frames
+        if kind == "manifest_price_set_summary_copy_file"
+    ]
     provider_group_member_frames = [
         frame_payload
         for kind, frame_payload in frames
         if kind == "manifest_provider_group_member_copy_file"
+    ]
+    provider_set_metadata_frames = [
+        frame_payload
+        for kind, frame_payload in frames
+        if kind == "manifest_provider_set_dictionary_copy_file"
     ]
     partition_bytes = b"".join(
         Path(frame["path"]).read_bytes()
@@ -497,14 +517,18 @@ def _run_scanner(
         "lean_copy_path": lean_copy_path,
         "price_atom_copy_path": price_atom_copy_path,
         "price_set_atom_copy_path": price_set_atom_copy_path,
+        "price_set_summary_copy_path": price_set_summary_copy_path,
         "provider_group_member_copy_path": provider_group_member_copy_path,
+        "provider_set_metadata_copy_path": provider_set_metadata_copy_path,
         "provider_forward_path": provider_forward_path,
         "provider_inverted_path": provider_inverted_path,
         "partition_frames": partition_frames,
         "code_dictionary_frames": code_dictionary_frames,
         "price_atom_frames": price_atom_frames,
         "price_set_atom_frames": price_set_atom_frames,
+        "price_set_summary_frames": price_set_summary_frames,
         "provider_group_member_frames": provider_group_member_frames,
+        "provider_set_metadata_frames": provider_set_metadata_frames,
         "partition_bytes": partition_bytes,
     }
 
@@ -677,6 +701,16 @@ def test_v3_all_scanner_paths_emit_identical_fixed_width_records(tmp_path):
             Path(frame["path"]).exists()
             for frame in run["provider_group_member_frames"]
         )
+        assert run["price_set_summary_frames"]
+        assert sum(
+            frame["row_count"] for frame in run["price_set_summary_frames"]
+        ) == 1
+        summary_rows = b"".join(
+            Path(frame["path"]).read_bytes()
+            for frame in run["price_set_summary_frames"]
+        ).splitlines()
+        assert len(summary_rows) == 1
+        assert summary_rows[0].rsplit(b"\t", 1)[1] == b"125.5"
         assert run["provider_forward_path"].exists()
         assert run["provider_inverted_path"].exists()
         partition_frame = run["partition_frames"][0]
@@ -982,6 +1016,21 @@ def test_direct_v3_finalizer_cli_emits_shared_block_staging_copy(tmp_path):
         manifest_path,
         serving_run_entries=serving_run_entries,
         code_dictionary_entries=code_dictionary_entries,
+        provider_set_metadata_entries=[
+            {
+                **entry,
+                **source_identity_dict,
+                "sha256": hashlib.sha256(
+                    Path(entry["path"]).read_bytes()
+                ).hexdigest(),
+                "format": "ptg2_v3_provider_set_metadata_copy",
+                "version": 1,
+                "source_run_contract_sha256": serving_run_entries[0][
+                    "source_run_contract_sha256"
+                ],
+            }
+            for entry in scan["provider_set_metadata_frames"]
+        ],
         expected_source_identities=[source_identity_dict],
     )
     membership_input = tmp_path / "future-memberships.copy"
@@ -1208,4 +1257,7 @@ def test_direct_v3_finalizer_cli_emits_shared_block_staging_copy(tmp_path):
         timeout=120,
     )
     assert tampered.returncode != 0
-    assert b"content digest mismatch" in tampered.stderr
+    assert (
+        b"content digest mismatch" in tampered.stderr
+        or b"immutable dense map" in tampered.stderr
+    )

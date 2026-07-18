@@ -89,8 +89,10 @@ def test_graph_conversion_failure_removes_scanner_outputs(tmp_path, monkeypatch)
 
     async def scanner(*_args, **kwargs):
         membership_path = Path(kwargs["manifest_provider_group_member_copy_path"])
+        summary_path = Path(kwargs["manifest_price_set_summary_copy_path"])
         membership_path.parent.mkdir(parents=True, exist_ok=True)
         membership_path.write_bytes(b"synthetic")
+        summary_path.write_bytes(b"synthetic-summary")
         yield "scanner_summary", {
             "serving_run_rows": 1,
             "serving_run_partition_files": [],

@@ -69,6 +69,29 @@ def _contracted_dictionary_entries(entries, identity, serving_entries, **summary
     )
 
 
+def _provider_metadata_entries(tmp_path, *sources):
+    entries = []
+    for index, (identity, serving_entry) in enumerate(sources):
+        payload = f"{index + 1:032x}\t1\t{{}}\n".encode("ascii")
+        path = tmp_path / f"provider-metadata-{index}.copy"
+        path.write_bytes(payload)
+        entries.append(
+            {
+                "path": str(path),
+                "row_count": 1,
+                "bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "format": "ptg2_v3_provider_set_metadata_copy",
+                "version": 1,
+                **identity,
+                "source_run_contract_sha256": serving_entry[
+                    "source_run_contract_sha256"
+                ],
+            }
+        )
+    return entries
+
+
 def _one_source_contracted_inputs(tmp_path, *, dictionary_file_count=2):
     identity = _identity("a")
     serving_entries = _contracted_entries(

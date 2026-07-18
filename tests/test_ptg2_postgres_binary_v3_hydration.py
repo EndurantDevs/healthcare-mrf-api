@@ -39,6 +39,7 @@ def _version_three_tables(**table_overrides_by_key):
         "atom_key_block_span": 512,
         "price_dictionary_item_count": 1024,
         "price_dictionary_block_bytes": 65536,
+        "provider_shard_span": 8192,
     }
     table_kwargs_by_key.update(table_overrides_by_key)
     return ptg2_serving.PTG2ServingTables(**table_kwargs_by_key)

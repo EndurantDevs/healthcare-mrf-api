@@ -110,6 +110,8 @@ def _build_nppes_zip(tmp_path):
 
 @pytest.mark.asyncio
 async def test_process_data_test_mode_imports_nppes_zip(monkeypatch, tmp_path, npi_module):
+    """Import a representative NPPES archive in bounded test mode."""
+
     zip_path = _build_nppes_zip(tmp_path)
     captured_payloads = []
 

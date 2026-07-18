@@ -91,7 +91,7 @@ class _QueryParamCollector(ast.NodeVisitor):
 
 
 def _collect_code_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
-    routes: dict[tuple[str, str], dict[str, set[str]]] = {}
+    routes_by_key: dict[tuple[str, str], dict[str, set[str]]] = {}
     for path in ENDPOINT_DIR.glob("*.py"):
         tree = ast.parse(path.read_text())
         prefix = _extract_blueprint_prefix(tree)
@@ -99,12 +99,12 @@ def _collect_code_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
         collector.visit(tree)
         for route in collector.routes:
             key = (route["method"], route["spec_path"])
-            routes[key] = {
+            routes_by_key[key] = {
                 "query_params": route["query_params"],
                 "path_params": route["path_params"],
                 "source": {"file": path.name, "function": route["function"]},
             }
-    return routes
+    return routes_by_key
 
 
 def _extract_blueprint_prefix(tree: ast.AST) -> str:
@@ -175,13 +175,13 @@ def _collect_query_params(node: ast.AST) -> set[str]:
 
 def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
     """Support the collect spec routes test fixture."""
-    spec_routes: dict[tuple[str, str], dict[str, set[str]]] = {}
+    routes_by_path: dict[tuple[str, str], dict[str, set[str]]] = {}
     lines = OPENAPI_PATH.read_text().splitlines()
     in_paths = False
     current_path: str | None = None
     current_method: str | None = None
     in_parameters = False
-    current_param: dict[str, str] | None = None
+    current_parameter_by_field: dict[str, str] | None = None
 
     for raw_line in lines:
         if not in_paths:
@@ -197,42 +197,42 @@ def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
         if indent == 2 and stripped.endswith(":") and stripped.startswith("/"):
             current_path = stripped[:-1]
             current_method = None
-            spec_routes.setdefault(("", current_path), {})
+            routes_by_path.setdefault(("", current_path), {})
             continue
         if indent == 4 and stripped.endswith(":") and current_path:
             token = stripped[:-1].lower()
             if token in HTTP_METHODS:
                 current_method = token
-                spec_routes[("", current_path)][current_method] = []
+                routes_by_path[("", current_path)][current_method] = []
                 in_parameters = False
                 continue
             current_method = None
         if indent == 6 and current_method:
             if stripped == "parameters:":
                 in_parameters = True
-                spec_routes[("", current_path)][current_method] = []
+                routes_by_path[("", current_path)][current_method] = []
                 continue
             else:
                 in_parameters = False
         if indent == 8 and in_parameters and current_method:
             if stripped.startswith("- name:"):
                 name = stripped.split(":", 1)[1].strip().strip("'\"")
-                current_param = {"name": name}
-                spec_routes[("", current_path)][current_method].append(current_param)
+                current_parameter_by_field = {"name": name}
+                routes_by_path[("", current_path)][current_method].append(current_parameter_by_field)
                 continue
-        if indent >= 10 and in_parameters and current_method and current_param is not None:
+        if indent >= 10 and in_parameters and current_method and current_parameter_by_field is not None:
             if stripped.startswith("in:"):
-                current_param["in"] = stripped.split(":", 1)[1].strip()
+                current_parameter_by_field["in"] = stripped.split(":", 1)[1].strip()
             continue
         if indent <= 6:
-            current_param = None
+            current_parameter_by_field = None
             in_parameters = in_parameters and stripped == "parameters:"
 
     spec_routes_by_operation: dict[tuple[str, str], dict[str, set[str]]] = {}
-    for (_, path), methods in spec_routes.items():
+    for (_, path), methods in routes_by_path.items():
         for method, params in methods.items():
-            query_params = {p["name"] for p in params if p.get("in") == "query"}
-            path_params = {p["name"] for p in params if p.get("in") == "path"}
+            query_params = {parameter_by_field["name"] for parameter_by_field in params if parameter_by_field.get("in") == "query"}
+            path_params = {parameter_by_field["name"] for parameter_by_field in params if parameter_by_field.get("in") == "path"}
             spec_routes_by_operation[(method, path)] = {
                 "query_params": query_params,
                 "path_params": path_params,
@@ -243,10 +243,10 @@ def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
 def test_openapi_routes_match_code():
     code_routes = _collect_code_routes()
     spec_routes_raw = _collect_spec_routes()
-    spec_routes = {(method, path): info for (method, path), info in spec_routes_raw.items() if method}
+    spec_routes_by_key = {(method, path): info for (method, path), info in spec_routes_raw.items() if method}
 
     # Normalise spec keys to align with code keys
-    spec_keys = set(spec_routes.keys())
+    spec_keys = set(spec_routes_by_key.keys())
     code_keys = set(code_routes.keys()) - HIDDEN_RUNTIME_ALIASES
 
     missing_in_spec = sorted(code_keys - spec_keys)
@@ -257,7 +257,7 @@ def test_openapi_routes_match_code():
 
     for key in sorted(code_keys):
         code_info = code_routes[key]
-        spec_info = spec_routes[key]
+        spec_info = spec_routes_by_key[key]
         assert code_info["path_params"] == spec_info["path_params"], (
             f"Path parameters mismatch for {key}: code={sorted(code_info['path_params'])}, "
             f"spec={sorted(spec_info['path_params'])}"
@@ -301,9 +301,9 @@ def test_openapi_strict_ptg_pagination_exposes_exact_page_continuation():
     assert strict_pagination[0] == {
         "$ref": "#/components/schemas/PaginationMeta"
     }
-    required = set(strict_pagination[1]["required"])
-    assert required == {"total", "limit", "offset", "has_more"}
-    assert {"total_is_exact", "total_lower_bound"}.isdisjoint(required)
+    required_parameters = set(strict_pagination[1]["required"])
+    assert required_parameters == {"total", "limit", "offset", "has_more"}
+    assert {"total_is_exact", "total_lower_bound"}.isdisjoint(required_parameters)
     assert (
         schemas["PricingProcedureProviderListResponse"]["properties"][
             "pagination"

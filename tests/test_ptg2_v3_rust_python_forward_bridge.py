@@ -211,6 +211,21 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
         manifest_path,
         serving_run_entries=serving_run_entries,
         code_dictionary_entries=code_dictionary_entries,
+        provider_set_metadata_entries=[
+            {
+                **entry,
+                **source_identity_map,
+                "sha256": hashlib.sha256(
+                    Path(entry["path"]).read_bytes()
+                ).hexdigest(),
+                "format": "ptg2_v3_provider_set_metadata_copy",
+                "version": 1,
+                "source_run_contract_sha256": serving_run_entries[0][
+                    "source_run_contract_sha256"
+                ],
+            }
+            for entry in scan["provider_set_metadata_frames"]
+        ],
         expected_source_identities=[source_identity_map],
     )
 
@@ -369,10 +384,12 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
         shared_snapshot_key,
         schema_name,
         code_keys,
+        provider_shard_span,
     ):
         assert shared_snapshot_key == 73
         assert schema_name == "mrf"
         assert tuple(code_keys) == (code_key,)
+        assert provider_shard_span == 1024
         return shard_keys_by_code
 
     async def dictionary_values(
@@ -464,6 +481,9 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
         source_count=1,
         price_dictionary_item_count=2,
         price_dictionary_block_bytes=65536,
+        provider_shard_span=finalizer_summary["blocks"]["assigned_encoder"][
+            "provider_shard_span"
+        ],
     )
     assert decoded_rows == expected_rows
     assert Counter(
@@ -487,6 +507,9 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
         source_count=1,
         price_dictionary_item_count=2,
         price_dictionary_block_bytes=65536,
+        provider_shard_span=finalizer_summary["blocks"]["assigned_encoder"][
+            "provider_shard_span"
+        ],
     )
     assert sparse_rows == expected_rows[1:]
     discovery_mock.assert_awaited_once()

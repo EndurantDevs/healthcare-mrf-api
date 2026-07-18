@@ -1525,6 +1525,7 @@ def _iter_compact_serving_records_rust(
     manifest_price_forward_sidecar_path: str | Path | None = None,
     manifest_price_atom_copy_path: str | Path | None = None,
     manifest_price_set_atom_copy_path: str | Path | None = None,
+    manifest_price_set_summary_copy_path: str | Path | None = None,
     manifest_provider_group_member_copy_path: str | Path | None = None,
     manifest_code_count_copy_path: str | Path | None = None,
     manifest_provider_set_dictionary_copy_path: str | Path | None = None,
@@ -1635,6 +1636,10 @@ def _iter_compact_serving_records_rust(
         scanner_environment_map[
             "HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH"
         ] = str(manifest_price_set_atom_copy_path)
+    if manifest_price_set_summary_copy_path is not None:
+        scanner_environment_map[
+            "HLTHPRT_PTG2_MANIFEST_PRICE_SET_SUMMARY_COPY_PATH"
+        ] = str(manifest_price_set_summary_copy_path)
     if manifest_provider_group_member_copy_path is not None:
         scanner_environment_map[
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH"
@@ -1869,6 +1874,7 @@ async def _aiter_compact_serving_records_rust(
     manifest_price_forward_sidecar_path: str | Path | None = None,
     manifest_price_atom_copy_path: str | Path | None = None,
     manifest_price_set_atom_copy_path: str | Path | None = None,
+    manifest_price_set_summary_copy_path: str | Path | None = None,
     manifest_provider_group_member_copy_path: str | Path | None = None,
     manifest_code_count_copy_path: str | Path | None = None,
     manifest_provider_set_dictionary_copy_path: str | Path | None = None,
@@ -1906,6 +1912,7 @@ async def _aiter_compact_serving_records_rust(
         manifest_price_forward_sidecar_path=manifest_price_forward_sidecar_path,
         manifest_price_atom_copy_path=manifest_price_atom_copy_path,
         manifest_price_set_atom_copy_path=manifest_price_set_atom_copy_path,
+        manifest_price_set_summary_copy_path=manifest_price_set_summary_copy_path,
         manifest_provider_group_member_copy_path=manifest_provider_group_member_copy_path,
         manifest_code_count_copy_path=manifest_code_count_copy_path,
         manifest_provider_set_dictionary_copy_path=manifest_provider_set_dictionary_copy_path,

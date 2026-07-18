@@ -228,11 +228,11 @@ def test_source_sample_keeps_portal_url():
 
 @pytest.mark.asyncio
 async def test_provider_directory_coverage_audit_credential_backlog_uses_seed_validation_fallback(monkeypatch):
-    captured_sql = {}
+    captured_sql_by_key = {}
 
     class FakeConn:
         async def fetch(self, sql):
-            captured_sql["sql"] = sql
+            captured_sql_by_key["sql"] = sql
             return [
                 {
                     "source_id": "pdfhir_auth_seed",
@@ -260,7 +260,7 @@ async def test_provider_directory_coverage_audit_credential_backlog_uses_seed_va
         sample_limit=5,
     )
 
-    assert "COALESCE(NULLIF(last_probe_status, ''), NULLIF(last_validated_status, ''))" in captured_sql["sql"]
+    assert "COALESCE(NULLIF(last_probe_status, ''), NULLIF(last_validated_status, ''))" in captured_sql_by_key["sql"]
     assert backlog["blocked_source_count"] == 1
     assert backlog["credential_config_missing_source_count"] == 1
     assert backlog["credential_rule_candidate_source_count"] == 1
@@ -571,7 +571,7 @@ def test_provider_directory_coverage_audit_renders_probe_timeout_backlog():
 
 
 def test_provider_directory_coverage_audit_credential_spec_matches_importer_keys():
-    config = {
+    credential_config_by_scope = {
         "defaults": {"headers": {"X-Default": "env:DEFAULT_TOKEN"}},
         "hosts": {"payer.example": {"headers": {"X-Host": "env:HOST_TOKEN"}}},
         "api_bases": {"https://payer.example/fhir": {"query_params": {"client_id": "env:CLIENT_ID"}}},
@@ -585,7 +585,7 @@ def test_provider_directory_coverage_audit_credential_spec_matches_importer_keys
             "org_name": "Example Payer",
             "api_base": "https://payer.example/fhir/",
         },
-        config,
+        credential_config_by_scope,
     )
 
     assert spec["_matched_by"] == [
@@ -1605,11 +1605,11 @@ def test_provider_directory_coverage_audit_serving_readiness_flags_required_gaps
         }
     )
 
-    failed = {check["name"] for check in summary["checks"] if check["status"] == "fail"}
+    failed_checks = {check["name"] for check in summary["checks"] if check["status"] == "fail"}
 
     assert summary["status"] == "not_ready"
     assert summary["required_fail_count"] == 6
-    assert failed == {
+    assert failed_checks == {
         "resource_rows_imported",
         "searchable_phone_overlay",
         "source_detail_attribution",
@@ -1651,15 +1651,15 @@ def test_provider_directory_coverage_audit_serving_readiness_respects_pod_safe_s
         }
     )
 
-    checks = {check["name"]: check for check in summary["checks"]}
+    checks_by_name = {check["name"]: check for check in summary["checks"]}
 
     assert summary["status"] == "ready"
     assert summary["required_fail_count"] == 0
-    assert checks["searchable_address_overlay"]["status"] == "skip"
-    assert checks["searchable_phone_overlay"]["status"] == "skip"
-    assert checks["source_detail_attribution"]["status"] == "skip"
-    assert checks["searchable_address_overlay"]["required"] is False
-    assert checks["searchable_phone_overlay"]["required"] is False
+    assert checks_by_name["searchable_address_overlay"]["status"] == "skip"
+    assert checks_by_name["searchable_phone_overlay"]["status"] == "skip"
+    assert checks_by_name["source_detail_attribution"]["status"] == "skip"
+    assert checks_by_name["searchable_address_overlay"]["required"] is False
+    assert checks_by_name["searchable_phone_overlay"]["required"] is False
 
 
 def test_readiness_uses_resource_summary():
@@ -1704,12 +1704,12 @@ def test_readiness_uses_resource_summary():
         }
     )
 
-    checks = {check["name"]: check for check in summary["checks"]}
+    checks_by_name = {check["name"]: check for check in summary["checks"]}
 
     assert summary["status"] == "ready"
-    assert checks["resource_rows_imported"]["status"] == "pass"
-    assert checks["resource_rows_imported"]["metrics"]["resource_table_rows"] == 49
-    assert checks["resource_rows_imported"]["metrics"]["source_resource_coverage_skipped"] is True
+    assert checks_by_name["resource_rows_imported"]["status"] == "pass"
+    assert checks_by_name["resource_rows_imported"]["metrics"]["resource_table_rows"] == 49
+    assert checks_by_name["resource_rows_imported"]["metrics"]["source_resource_coverage_skipped"] is True
 
 
 def test_provider_directory_coverage_audit_gap_wording_for_fast_probe_lower_bounds():
@@ -1794,12 +1794,12 @@ def test_provider_directory_coverage_audit_markdown_renders_serving_readiness():
 
 
 def test_provider_directory_coverage_audit_serving_readiness_exit_code():
-    ready_report = {"serving_readiness": {"status": "ready", "required_fail_count": 0}}
-    not_ready_report = {"serving_readiness": {"status": "not_ready", "required_fail_count": 2}}
+    ready_report_by_field = {"serving_readiness": {"status": "ready", "required_fail_count": 0}}
+    not_ready_report_by_field = {"serving_readiness": {"status": "not_ready", "required_fail_count": 2}}
 
-    assert audit._serving_readiness_exit_code(ready_report, require_serving_ready=True) == 0
-    assert audit._serving_readiness_exit_code(not_ready_report, require_serving_ready=True) == 1
-    assert audit._serving_readiness_exit_code(not_ready_report, require_serving_ready=False) == 0
+    assert audit._serving_readiness_exit_code(ready_report_by_field, require_serving_ready=True) == 0
+    assert audit._serving_readiness_exit_code(not_ready_report_by_field, require_serving_ready=True) == 1
+    assert audit._serving_readiness_exit_code(not_ready_report_by_field, require_serving_ready=False) == 0
 
 
 def test_provider_directory_coverage_audit_main_can_gate_serving_readiness(monkeypatch, capsys):

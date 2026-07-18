@@ -30,6 +30,7 @@ from process.ptg_parts.config import (
     PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES_ENV,
     PTG2_RUST_PROVIDER_REF_WORKERS_ENV,
     PTG2_RUST_PROVIDER_REFS_IN_WORKERS_ENV,
+    PTG2_RUST_RAPIDGZIP_THREADS_ENV,
     PTG2_RUST_SPLIT_NEGOTIATED_RATES_ENV,
     PTG2_RUST_TOP_LEVEL_BYTE_SCAN_ENV,
     PTG2_RUST_RAW_CHUNK_BYTES_ENV,
@@ -208,6 +209,9 @@ def _assert_expected_lane(params: dict[str, Any]) -> None:
 def _ptg_lane_environment(params: dict[str, Any]):
     lane_environment_by_name = {
         PTG2_RUST_WORKERS_ENV: _optional_env_value(params.get("_scanner_rust_workers")),
+        PTG2_RUST_RAPIDGZIP_THREADS_ENV: _optional_env_value(
+            params.get("_scanner_rapidgzip_threads")
+        ),
         PTG2_RUST_PARSE_IN_WORKERS_ENV: _bool_env_value(params.get("_scanner_parse_in_workers")),
         PTG2_RUST_TOP_LEVEL_BYTE_SCAN_ENV: _bool_env_value(params.get("_scanner_top_level_byte_scan")),
         PTG2_RUST_WORK_QUEUE_ENV: _optional_env_value(params.get("_scanner_work_queue")),
