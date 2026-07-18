@@ -1975,15 +1975,11 @@ def _version_three_page_price_lookup_hints(
 def _version_three_forward_lookup_hints(
     serving_tables: PTG2ServingTables,
 ) -> dict[str, Any]:
+    lookup_hints_by_key = _version_three_page_price_lookup_hints(serving_tables)
     provider_shard_span = serving_tables.provider_shard_span
-    if provider_shard_span is None:
-        raise PTG2ManifestArtifactError(
-            "PTG2 strict V3 provider-shard metadata is missing; reimport the snapshot"
-        )
-    return {
-        **_version_three_page_price_lookup_hints(serving_tables),
-        "provider_shard_span": int(provider_shard_span),
-    }
+    if provider_shard_span is not None:
+        lookup_hints_by_key["provider_shard_span"] = int(provider_shard_span)
+    return lookup_hints_by_key
 
 
 def _version_three_forward_page_payloads(

@@ -19835,15 +19835,7 @@ fn try_zeroed_u64_vec(len: usize, label: &str) -> io::Result<Vec<u64>> {
 #[cfg(test)]
 #[derive(Debug)]
 struct V3PreparedPartition {
-    partition: usize,
     inputs: Vec<V3FinalizerPartitionInput>,
-    provider_spool_path: PathBuf,
-    provider_sort_stats: MultiFileSortStats,
-    row_count: u64,
-    code_key_start: u32,
-    code_rate_counts: Vec<u64>,
-    elapsed_seconds: f64,
-    scratch: V3ScratchBytes,
 }
 
 #[derive(Debug)]
@@ -20144,15 +20136,7 @@ fn prepare_v3_partition(
         scratch,
     );
     Ok(V3PreparedPartition {
-        partition,
         inputs,
-        provider_spool_path,
-        provider_sort_stats,
-        row_count,
-        code_key_start,
-        code_rate_counts,
-        elapsed_seconds,
-        scratch,
     })
 }
 

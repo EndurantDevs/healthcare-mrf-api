@@ -197,6 +197,23 @@ def _version_three_tables(**table_overrides_by_key):
     return ptg2_serving.PTG2ServingTables(**table_kwargs_by_key)
 
 
+@pytest.mark.parametrize(
+    ("provider_shard_span", "expected_hint"),
+    ((None, None), (8192, 8192)),
+)
+def test_v3_forward_lookup_hints_preserve_legacy_and_manifest_spans(
+    provider_shard_span,
+    expected_hint,
+):
+    """Use the legacy lower-layer default unless the manifest declares a span."""
+
+    lookup_hints_by_key = ptg2_serving._version_three_forward_lookup_hints(
+        _version_three_tables(provider_shard_span=provider_shard_span)
+    )
+
+    assert lookup_hints_by_key.get("provider_shard_span") == expected_hint
+
+
 @pytest.mark.asyncio
 async def test_v3_forward_uses_existing_forward_rows_and_keeps_price_key(monkeypatch):
     async def forward_rows(_session, code_key, *, provider_set_keys=None, **dictionary_hints):
