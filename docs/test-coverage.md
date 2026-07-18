@@ -12,8 +12,8 @@ cargo-llvm-cov 0.8.7 across all targets with its Python bridge enabled.
 
 | Scope | Metric | Covered / total | Coverage |
 | --- | --- | ---: | ---: |
-| Python | Lines | 61,663 / 83,945 | 73.46% |
-| Python | Branches | 17,050 / 29,250 | 58.29% |
+| Python | Lines | 61,507 / 83,945 | 73.27% |
+| Python | Branches | 16,984 / 29,250 | 58.07% |
 | PTG2 scanner | Lines | 28,883 / 37,775 | 76.46% |
 | PTG2 scanner | Functions | 1,907 / 2,602 | 73.29% |
 | PTG2 scanner | Regions | 43,828 / 56,533 | 77.53% |

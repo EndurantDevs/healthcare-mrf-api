@@ -210,11 +210,11 @@
       "format": "coverage.py",
       "metrics": {
         "branches": {
-          "covered": 17050,
+          "covered": 16984,
           "total": 29250
         },
         "lines": {
-          "covered": 61663,
+          "covered": 61507,
           "total": 83945
         }
       },
