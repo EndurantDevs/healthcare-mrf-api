@@ -327,7 +327,7 @@ async def _ensure_provider_quality_rx_agg_table(classes: dict[str, type], schema
 async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str, type], str]:
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
-    dynamic: dict[str, type] = {}
+    staging_model_by_name: dict[str, type] = {}
     staging_models = (
         PricingQppProvider,
         PricingSviZcta,
@@ -339,7 +339,7 @@ async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str,
 
     for cls in staging_models:
         obj = make_class(cls, stage_suffix, schema_override=db_schema)
-        dynamic[cls.__name__] = obj
+        staging_model_by_name[cls.__name__] = obj
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__tablename__};")
         await db.status(f"DROP TYPE IF EXISTS {db_schema}.{obj.__tablename__} CASCADE;")
         await db.create_table(obj.__table__, checkfirst=True)
@@ -349,7 +349,7 @@ async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str,
     for cls in (*staging_models, PricingQualityRun):
         await db.create_table(cls.__table__, checkfirst=True)
 
-    return dynamic, db_schema
+    return staging_model_by_name, db_schema
 
 
 async def _download_csv_head(url: str, path: str, max_bytes: int) -> None:
@@ -398,11 +398,11 @@ def _resolve_sources(test_mode: bool = False) -> dict[str, list[dict[str, Any]]]
     if test_mode and years:
         years = [max(years)]
 
-    resolved: dict[str, list[dict[str, Any]]] = {"qpp_provider": [], "svi_zcta": []}
+    source_specs_by_dataset: dict[str, list[dict[str, Any]]] = {"qpp_provider": [], "svi_zcta": []}
     for year in years:
         qpp_url = _qpp_url_for_year(year)
         if qpp_url:
-            resolved["qpp_provider"].append(
+            source_specs_by_dataset["qpp_provider"].append(
                 {
                     "url": qpp_url,
                     "reporting_year": year,
@@ -411,14 +411,14 @@ def _resolve_sources(test_mode: bool = False) -> dict[str, list[dict[str, Any]]]
             )
         svi_url = _svi_url_for_year(year)
         if svi_url:
-            resolved["svi_zcta"].append(
+            source_specs_by_dataset["svi_zcta"].append(
                 {
                     "url": svi_url,
                     "reporting_year": year,
                     "dataset_title": "CDC SVI ZCTA",
                 }
             )
-    return resolved
+    return source_specs_by_dataset
 
 
 async def _create_empty_source_file(dataset_key: str, temp_dir: str, reporting_year: int) -> str:
@@ -434,16 +434,16 @@ async def _create_empty_source_file(dataset_key: str, temp_dir: str, reporting_y
 
 async def _download_source_file(
     dataset_key: str,
-    source: dict[str, Any],
+    source_spec: dict[str, Any],
     temp_dir: str,
     test_mode: bool,
 ) -> tuple[str, bool]:
-    reporting_year = max(_safe_int(source.get("reporting_year"), PROVIDER_QUALITY_MIN_YEAR), 2013)
+    reporting_year = max(_safe_int(source_spec.get("reporting_year"), PROVIDER_QUALITY_MIN_YEAR), 2013)
     Path(temp_dir).mkdir(parents=True, exist_ok=True)
     filename = f"{dataset_key}_{reporting_year}.csv"
     path = str(Path(temp_dir) / filename)
 
-    url = str(source.get("url") or "").strip()
+    url = str(source_spec.get("url") or "").strip()
     if not url:
         msg = (
             "provider-quality source URL is missing: "
@@ -563,7 +563,7 @@ def _extract_qpp_score(row: dict[str, Any], *keys: str) -> float | None:
 
 async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mode: bool) -> None:
     """Load normalized QPP provider rows from one source artifact."""
-    rows: list[dict[str, Any]] = []
+    qpp_entries: list[dict[str, Any]] = []
     accepted = 0
     progress_start = time.monotonic()
     progress_last = progress_start
@@ -571,7 +571,7 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
     async with async_open(path, "r", encoding="utf-8-sig") as handle:
         reader = AsyncDictReader(handle)
         row_number = 0
-        async for row in reader:
+        async for qpp_csv_fields in reader:
             row_number += 1
             now = time.monotonic()
             if now - progress_last >= ROW_PROGRESS_INTERVAL_SECONDS:
@@ -580,7 +580,7 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
 
             npi = _to_npi(
                 _pick_first_ci(
-                    row,
+                    qpp_csv_fields,
                     "npi",
                     "clinician_npi",
                     "clinician npi",
@@ -592,7 +592,7 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
                 continue
             year = _to_int(
                 _pick_first_ci(
-                    row,
+                    qpp_csv_fields,
                     "year",
                     "performance_year",
                     "performance year",
@@ -603,7 +603,7 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
             year = max(year or reporting_year, 2013)
 
             quality_score = _extract_qpp_score(
-                row,
+                qpp_csv_fields,
                 "quality_score",
                 "quality score",
                 "quality",
@@ -614,7 +614,7 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
                 "quality performance category score",
             )
             cost_score = _extract_qpp_score(
-                row,
+                qpp_csv_fields,
                 "cost_score",
                 "cost score",
                 "cost",
@@ -625,7 +625,7 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
                 "cost performance category score",
             )
             final_score = _extract_qpp_score(
-                row,
+                qpp_csv_fields,
                 "final_score",
                 "final score",
                 "final",
@@ -636,38 +636,41 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
                 "final score performance year",
             )
 
-            rows.append(
+            qpp_entries.append(
                 {
                     "npi": npi,
                     "year": year,
                     "quality_score": quality_score,
                     "cost_score": cost_score,
                     "final_score": final_score,
-                    "raw_json_text": json.dumps(row, ensure_ascii=True),
+                    "raw_json_text": json.dumps(qpp_csv_fields, ensure_ascii=True),
                     "updated_at": datetime.datetime.utcnow(),
                 }
             )
             accepted += 1
-            if len(rows) >= IMPORT_BATCH_SIZE:
-                deduped = {(
-                    item.get("npi"),
-                    item.get("year"),
-                ): item for item in rows}
-                await _push_objects_with_retry(list(deduped.values()), qpp_cls)
-                rows.clear()
+            if len(qpp_entries) >= IMPORT_BATCH_SIZE:
+                qpp_entry_by_identity = {(
+                    qpp_entry.get("npi"),
+                    qpp_entry.get("year"),
+                ): qpp_entry for qpp_entry in qpp_entries}
+                await _push_objects_with_retry(list(qpp_entry_by_identity.values()), qpp_cls)
+                qpp_entries.clear()
 
             if test_mode and accepted >= PROVIDER_QUALITY_TEST_QPP_ROWS:
                 break
 
-    if rows:
-        deduped = {(item.get("npi"), item.get("year")): item for item in rows}
-        await _push_objects_with_retry(list(deduped.values()), qpp_cls)
+    if qpp_entries:
+        qpp_entry_by_identity = {
+            (qpp_entry.get("npi"), qpp_entry.get("year")): qpp_entry
+            for qpp_entry in qpp_entries
+        }
+        await _push_objects_with_retry(list(qpp_entry_by_identity.values()), qpp_cls)
     _print_row_progress("qpp_provider", row_number, accepted, progress_start, final=True)
 
 
 async def _load_svi_rows(path: str, svi_cls: type, reporting_year: int, test_mode: bool) -> None:
     """Load normalized social-vulnerability rows from one source artifact."""
-    rows: list[dict[str, Any]] = []
+    svi_entries: list[dict[str, Any]] = []
     accepted = 0
     skipped_missing_zcta = 0
     header_keys: tuple[str, ...] = ()
@@ -678,10 +681,10 @@ async def _load_svi_rows(path: str, svi_cls: type, reporting_year: int, test_mod
     async with async_open(path, "r", encoding="utf-8-sig") as handle:
         reader = AsyncDictReader(handle)
         row_number = 0
-        async for row in reader:
+        async for svi_csv_fields in reader:
             row_number += 1
             if row_number == 1:
-                header_keys = tuple(str(key) for key in row.keys())
+                header_keys = tuple(str(key) for key in svi_csv_fields.keys())
             now = time.monotonic()
             if now - progress_last >= ROW_PROGRESS_INTERVAL_SECONDS:
                 _print_row_progress("svi_zcta", row_number, accepted, progress_start)
@@ -689,7 +692,7 @@ async def _load_svi_rows(path: str, svi_cls: type, reporting_year: int, test_mod
 
             zcta = _normalize_zcta(
                 _pick_first(
-                    row,
+                    svi_csv_fields,
                     "zcta",
                     "ZCTA",
                     "ZCTA5",
@@ -704,45 +707,55 @@ async def _load_svi_rows(path: str, svi_cls: type, reporting_year: int, test_mod
             if not zcta:
                 skipped_missing_zcta += 1
                 if len(missing_zcta_examples) < 3:
-                    sample = {
-                        "FIPS": row.get("FIPS"),
-                        "LOCATION": row.get("LOCATION"),
-                        "ZCTA": row.get("ZCTA"),
-                        "ZCTA5": row.get("ZCTA5"),
-                        "ZIP": row.get("ZIP"),
+                    missing_zcta_field_by_name = {
+                        "FIPS": svi_csv_fields.get("FIPS"),
+                        "LOCATION": svi_csv_fields.get("LOCATION"),
+                        "ZCTA": svi_csv_fields.get("ZCTA"),
+                        "ZCTA5": svi_csv_fields.get("ZCTA5"),
+                        "ZIP": svi_csv_fields.get("ZIP"),
                     }
-                    compact_sample = {key: value for key, value in sample.items() if value not in (None, "")}
-                    if not compact_sample:
-                        compact_sample = {"keys": list(row.keys())[:6]}
-                    missing_zcta_examples.append(json.dumps(compact_sample, ensure_ascii=True)[:220])
+                    present_zcta_field_by_name = {
+                        key: field_value
+                        for key, field_value in missing_zcta_field_by_name.items()
+                        if field_value not in (None, "")
+                    }
+                    if not present_zcta_field_by_name:
+                        present_zcta_field_by_name = {"keys": list(svi_csv_fields.keys())[:6]}
+                    missing_zcta_examples.append(json.dumps(present_zcta_field_by_name, ensure_ascii=True)[:220])
                 continue
-            year = _to_int(_pick_first(row, "year", "Year"))
+            year = _to_int(_pick_first(svi_csv_fields, "year", "Year"))
             year = max(year or reporting_year, 2013)
 
-            rows.append(
+            svi_entries.append(
                 {
                     "zcta": zcta,
                     "year": year,
-                    "svi_overall": _to_float(_pick_first(row, "svi_overall", "RPL_THEMES", "SVI Overall")),
-                    "svi_socioeconomic": _to_float(_pick_first(row, "svi_socioeconomic", "RPL_THEME1", "SVI Theme 1")),
-                    "svi_household": _to_float(_pick_first(row, "svi_household", "RPL_THEME2", "SVI Theme 2")),
-                    "svi_minority": _to_float(_pick_first(row, "svi_minority", "RPL_THEME3", "SVI Theme 3")),
-                    "svi_housing": _to_float(_pick_first(row, "svi_housing", "RPL_THEME4", "SVI Theme 4")),
+                    "svi_overall": _to_float(_pick_first(svi_csv_fields, "svi_overall", "RPL_THEMES", "SVI Overall")),
+                    "svi_socioeconomic": _to_float(_pick_first(svi_csv_fields, "svi_socioeconomic", "RPL_THEME1", "SVI Theme 1")),
+                    "svi_household": _to_float(_pick_first(svi_csv_fields, "svi_household", "RPL_THEME2", "SVI Theme 2")),
+                    "svi_minority": _to_float(_pick_first(svi_csv_fields, "svi_minority", "RPL_THEME3", "SVI Theme 3")),
+                    "svi_housing": _to_float(_pick_first(svi_csv_fields, "svi_housing", "RPL_THEME4", "SVI Theme 4")),
                     "updated_at": datetime.datetime.utcnow(),
                 }
             )
             accepted += 1
-            if len(rows) >= IMPORT_BATCH_SIZE:
-                deduped = {(item.get("zcta"), item.get("year")): item for item in rows}
-                await _push_objects_with_retry(list(deduped.values()), svi_cls)
-                rows.clear()
+            if len(svi_entries) >= IMPORT_BATCH_SIZE:
+                svi_entry_by_identity = {
+                    (svi_entry.get("zcta"), svi_entry.get("year")): svi_entry
+                    for svi_entry in svi_entries
+                }
+                await _push_objects_with_retry(list(svi_entry_by_identity.values()), svi_cls)
+                svi_entries.clear()
 
             if test_mode and accepted >= PROVIDER_QUALITY_TEST_SVI_ROWS:
                 break
 
-    if rows:
-        deduped = {(item.get("zcta"), item.get("year")): item for item in rows}
-        await _push_objects_with_retry(list(deduped.values()), svi_cls)
+    if svi_entries:
+        svi_entry_by_identity = {
+            (svi_entry.get("zcta"), svi_entry.get("year")): svi_entry
+            for svi_entry in svi_entries
+        }
+        await _push_objects_with_retry(list(svi_entry_by_identity.values()), svi_cls)
     _print_row_progress("svi_zcta", row_number, accepted, progress_start, final=True)
     logger.info(
         "SVI ingest summary: path=%s year=%s parsed=%s accepted=%s skipped_missing_zcta=%s",
@@ -798,13 +811,13 @@ async def _materialize_quality_rows_cohort(classes: dict[str, type], schema: str
     await db.status(_cohort_sql_phase_4_build_peer_targets(ctx))
 
     for year in PROVIDER_QUALITY_YEAR_WINDOW:
-        shard_params = {"year": year, "shard_id": 0, "shard_count": 1}
-        await db.status(_cohort_sql_phase_5_build_measure_shard(ctx), **shard_params)
-        await db.status(_cohort_sql_phase_6_build_domain_shard(ctx), **shard_params)
+        shard_parameter_map = {"year": year, "shard_id": 0, "shard_count": 1}
+        await db.status(_cohort_sql_phase_5_build_measure_shard(ctx), **shard_parameter_map)
+        await db.status(_cohort_sql_phase_6_build_domain_shard(ctx), **shard_parameter_map)
         await db.status(
             _cohort_sql_phase_7_build_score_shard(ctx),
             run_id=run_id,
-            **shard_params,
+            **shard_parameter_map,
         )
 async def _materialize_quality_rows(classes: dict[str, type], schema: str, run_id: str) -> None:
     """Materialize provider-quality rows using the configured cohort mode."""
@@ -1540,12 +1553,12 @@ async def _enqueue_materialize_phase_shards(
         ",".join(str(y) for y in years),
         job_name,
     )
-    for payload in payloads:
-        year = _safe_int(payload.get("year"), PROVIDER_QUALITY_MIN_YEAR)
-        shard_id = _safe_int(payload.get("shard_id"), 0)
+    for shard_task_payload_map in payloads:
+        year = _safe_int(shard_task_payload_map.get("year"), PROVIDER_QUALITY_MIN_YEAR)
+        shard_id = _safe_int(shard_task_payload_map.get("shard_id"), 0)
         await redis.enqueue_job(
             job_name,
-            payload,
+            shard_task_payload_map,
             _queue_name=PROVIDER_QUALITY_MATERIALIZE_SHARD_QUEUE_NAME,
             _job_id=_materialize_shard_job_id(run_id, phase, year, shard_id),
         )
@@ -1738,13 +1751,13 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
 
     await ensure_database(test_mode)
 
-    t = _step_start("prepare staging tables")
+    step_started_at = _step_start("prepare staging tables")
     _classes, schema = await _prepare_tables(stage_suffix, test_mode)
-    _step_end("prepare staging tables", t)
+    _step_end("prepare staging tables", step_started_at)
 
-    t = _step_start("resolve provider quality sources")
-    sources = _resolve_sources(test_mode=test_mode)
-    _step_end("resolve provider quality sources", t)
+    step_started_at = _step_start("resolve provider quality sources")
+    source_specs_by_dataset = _resolve_sources(test_mode=test_mode)
+    _step_end("resolve provider quality sources", step_started_at)
 
     work_dir = _run_dir(import_id_val, run_id)
     downloads_dir = work_dir / "downloads"
@@ -1752,19 +1765,24 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
     chunks_root.mkdir(parents=True, exist_ok=True)
 
     chunks: list[dict[str, Any]] = []
-    local_paths: dict[str, list[str]] = {}
+    local_paths_by_dataset: dict[str, list[str]] = {}
     degraded_sources: list[dict[str, Any]] = []
 
     await _init_run_state(redis, run_id, 0)
 
     semaphore = asyncio.Semaphore(PROVIDER_QUALITY_DOWNLOAD_CONCURRENCY)
 
-    async def _download_split_source(dataset_key: str, source: dict[str, Any], source_index: int):
+    async def _download_split_source(dataset_key: str, source_spec: dict[str, Any], source_index: int):
         async with semaphore:
-            reporting_year = max(_safe_int(source.get("reporting_year"), PROVIDER_QUALITY_MIN_YEAR), 2013)
+            reporting_year = max(_safe_int(source_spec.get("reporting_year"), PROVIDER_QUALITY_MIN_YEAR), 2013)
             step = _step_start(f"download+split {dataset_key} year={reporting_year}")
             try:
-                local_path, degraded = await _download_source_file(dataset_key, source, str(downloads_dir), test_mode)
+                local_path, degraded = await _download_source_file(
+                    dataset_key,
+                    source_spec,
+                    str(downloads_dir),
+                    test_mode,
+                )
                 split_chunks = await _split_source_into_chunks(
                     dataset_key=dataset_key,
                     source_path=local_path,
@@ -1779,17 +1797,17 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
                 _step_end(f"download+split {dataset_key} year={reporting_year}", step)
 
     dataset_tasks = [
-        asyncio.create_task(_download_split_source(dataset.key, source, idx))
+        asyncio.create_task(_download_split_source(dataset.key, source_spec, idx))
         for dataset in DATASETS
-        for idx, source in enumerate(sources.get(dataset.key, []))
+        for idx, source_spec in enumerate(source_specs_by_dataset.get(dataset.key, []))
     ]
 
-    t = _step_start("download+split+enqueue chunks (streaming)")
+    step_started_at = _step_start("download+split+enqueue chunks (streaming)")
     try:
         try:
             for completed in asyncio.as_completed(dataset_tasks):
                 dataset_key, local_path, split_chunks, degraded, reporting_year = await completed
-                local_paths.setdefault(dataset_key, []).append(local_path)
+                local_paths_by_dataset.setdefault(dataset_key, []).append(local_path)
                 if degraded:
                     degraded_sources.append({"dataset_key": dataset_key, "reporting_year": reporting_year})
                 for chunk in split_chunks:
@@ -1797,7 +1815,7 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
                     source_index = max(_safe_int(chunk.get("source_index"), 0), 0)
                     chunk_index = max(_safe_int(chunk.get("chunk_index"), 0), 0)
                     unique_chunk_id = f"{chunk['dataset_key']}:{reporting_year}:{source_index}:{chunk_index}"
-                    payload = {
+                    chunk_task_payload_map = {
                         "import_id": import_id_val,
                         "run_id": run_id,
                         "stage_suffix": stage_suffix,
@@ -1810,7 +1828,7 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
                     }
                     await redis.enqueue_job(
                         "provider_quality_process_chunk",
-                        payload,
+                        chunk_task_payload_map,
                         _queue_name=PROVIDER_QUALITY_QUEUE_NAME,
                         _job_id=_chunk_job_id(run_id, chunk["dataset_key"], source_index, reporting_year, chunk_index),
                     )
@@ -1818,16 +1836,16 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
                     await _increment_total_chunks(redis, run_id, len(split_chunks))
                     chunks.extend(split_chunks)
         except Exception:
-            failure_manifest = {
+            failure_manifest_map = {
                 "year": max(PROVIDER_QUALITY_YEAR_WINDOW) if PROVIDER_QUALITY_YEAR_WINDOW else PROVIDER_QUALITY_MIN_YEAR,
-                "sources": sources,
+                "sources": source_specs_by_dataset,
             }
             try:
                 await _insert_run_metadata(
                     schema,
                     run_id,
                     import_id_val,
-                    failure_manifest,
+                    failure_manifest_map,
                     status="failed_source",
                 )
             except Exception as metadata_exc:
@@ -1837,16 +1855,16 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
         for task_ref in dataset_tasks:
             if not task_ref.done():
                 task_ref.cancel()
-    _step_end("download+split+enqueue chunks (streaming)", t)
+    _step_end("download+split+enqueue chunks (streaming)", step_started_at)
 
-    manifest = {
+    run_manifest_map = {
         "import_id": import_id_val,
         "run_id": run_id,
         "stage_suffix": stage_suffix,
         "schema": schema,
         "test_mode": test_mode,
-        "sources": sources,
-        "local_paths": local_paths,
+        "sources": source_specs_by_dataset,
+        "local_paths": local_paths_by_dataset,
         "degraded_sources": degraded_sources,
         "chunks": chunks,
         "total_chunks": len(chunks),
@@ -1857,7 +1875,7 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
     }
 
     manifest_path = _manifest_path(work_dir)
-    _write_manifest(manifest_path, manifest)
+    _write_manifest(manifest_path, run_manifest_map)
 
     await redis.enqueue_job(
         "provider_quality_finalize",
@@ -1976,7 +1994,7 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
     if not stage_suffix:
         stage_suffix = str(manifest.get("stage_suffix") or _build_stage_suffix(import_id_val, run_id))
 
-    global_lock_acquired = False
+    has_global_lock = False
     if redis is not None and run_id:
         finalized_key = _state_key(run_id, "finalized")
         if await redis.get(finalized_key):
@@ -2009,7 +2027,7 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
             raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
         if not await _claim_global_finalize_lock(redis, run_id):
             raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
-        global_lock_acquired = True
+        has_global_lock = True
         await mark_control_run(
             run_id,
             status="finalizing",
@@ -2028,7 +2046,7 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
     try:
         classes = _staging_classes(stage_suffix, schema)
 
-        t = _step_start("materialize provider quality rows")
+        step_started_at = _step_start("materialize provider quality rows")
         use_sharded_materialization = (
             PROVIDER_QUALITY_COHORT_ENABLED
             and PROVIDER_QUALITY_MATERIALIZE_SHARDED_ENABLED
@@ -2048,21 +2066,21 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
             )
         else:
             await _materialize_quality_rows(classes, schema, run_id)
-        _step_end("materialize provider quality rows", t)
+        _step_end("materialize provider quality rows", step_started_at)
 
         if PROVIDER_QUALITY_DEFER_STAGE_INDEXES:
-            t = _step_start("build provider quality staging indexes")
+            step_started_at = _step_start("build provider quality staging indexes")
             await _build_staging_indexes(classes, schema)
-            _step_end("build provider quality staging indexes", t)
+            _step_end("build provider quality staging indexes", step_started_at)
 
-        t = _step_start("publish provider quality staging -> final")
+        step_started_at = _step_start("publish provider quality staging -> final")
         await _publish_by_table_rename(classes, schema)
-        _step_end("publish provider quality staging -> final", t)
+        _step_end("publish provider quality staging -> final", step_started_at)
 
-        t = _step_start("write provider quality run metadata")
+        step_started_at = _step_start("write provider quality run metadata")
         run_status = "degraded_test" if bool(manifest.get("degraded_sources")) else "published"
         await _insert_run_metadata(schema, run_id, import_id_val, manifest, status=run_status)
-        _step_end("write provider quality run metadata", t)
+        _step_end("write provider quality run metadata", step_started_at)
 
         if redis is not None and run_id:
             await redis.set(_state_key(run_id, "finalized"), "1", ex=PROVIDER_QUALITY_REDIS_TTL_SECONDS)
@@ -2074,7 +2092,7 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
         await _mark_provider_quality_finalize_failed(run_id, exc)
         raise
     finally:
-        if redis is not None and run_id and global_lock_acquired:
+        if redis is not None and run_id and has_global_lock:
             await _release_global_finalize_lock(redis, run_id)
 
     if manifest:
@@ -2109,14 +2127,14 @@ async def main(test_mode: bool = False, import_id: str | None = None) -> dict[st
     """Queue a provider-quality import and return its run identity."""
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
     run_id = _normalize_run_id(None)
-    payload = {
+    start_task_payload_map = {
         "test_mode": bool(test_mode),
         "import_id": import_id,
         "run_id": run_id,
     }
     await redis.enqueue_job(
         "provider_quality_start",
-        payload,
+        start_task_payload_map,
         _queue_name=PROVIDER_QUALITY_QUEUE_NAME,
         _job_id=f"provider_quality_start_{run_id}",
     )
@@ -2145,17 +2163,17 @@ async def finish_main(
     """Queue finalization for an existing provider-quality run."""
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
     stage_suffix = _build_stage_suffix(_normalize_import_id(import_id), run_id)
-    payload = {
+    finalize_task_payload_map = {
         "import_id": import_id,
         "run_id": run_id,
         "stage_suffix": stage_suffix,
         "test_mode": bool(test_mode),
     }
     if manifest_path:
-        payload["manifest_path"] = manifest_path
+        finalize_task_payload_map["manifest_path"] = manifest_path
     await redis.enqueue_job(
         "provider_quality_finalize",
-        payload,
+        finalize_task_payload_map,
         _queue_name=PROVIDER_QUALITY_FINISH_QUEUE_NAME,
         _job_id=f"provider_quality_finalize_{run_id}_{secrets.token_hex(4)}",
     )

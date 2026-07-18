@@ -832,139 +832,69 @@ async def publish_shared_finalizer_dictionaries(
         )
 
 
-async def _validate_shared_block_stage(
-    session: Any,
-    *,
-    schema_name: str,
-    stage_table: str,
-) -> None:
-    """Reject incompatible stage rows before publishing shared content.
-
-    Mapping uniqueness is proved by ``_upsert_shared_block_mappings`` against
-    the raw stage row count.  Content consistency is proved after insertion by
-    comparing every staged row with the stored block.  Keeping those checks at
-    their mutation boundaries avoids grouping the complete stage here as well.
-    """
-
-    schema = _quote_ident(_safe_identifier(schema_name))
-    stage = _quote_ident(_safe_identifier(stage_table))
-    incompatible_version = await session.scalar(
-        db.text(
-            f"""
-            SELECT EXISTS (
-                SELECT 1
-                  FROM {schema}.{stage}
-                 WHERE format_version <> :format_version
-            )
-            """
-        ),
-        {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
-    )
-    if incompatible_version:
-        raise RuntimeError("strict V3 shared-block stage uses an incompatible format version")
-
-
 async def _upsert_shared_block_mappings(
     session: Any,
     *,
     schema_name: str,
     stage_table: str,
     snapshot_key: int,
+    expected_count: int | None = None,
 ) -> None:
-    """Insert mappings and detect conflicting retries without no-op updates."""
+    """Insert mappings once, reconciling only when the fast path conflicts."""
 
     schema = _quote_ident(_safe_identifier(schema_name))
     stage = _quote_ident(_safe_identifier(stage_table))
-    has_relevant_mapping = await session.scalar(
+    if expected_count is None:
+        expected_count = int(
+            await session.scalar(db.text(f"SELECT COUNT(*) FROM {schema}.{stage}"))
+            or 0
+        )
+    if expected_count < 0:
+        raise RuntimeError("strict V3 shared layout mapping count is invalid")
+    insert_result = await session.execute(
         db.text(
             f"""
-            SELECT EXISTS (
-                SELECT 1
-                  FROM (
-                        SELECT DISTINCT object_kind
-                          FROM {schema}.{stage}
-                       ) staged_kind
-                  JOIN {schema}.ptg2_v3_snapshot_block mapping
-                    ON mapping.snapshot_key = :snapshot_key
-                   AND mapping.object_kind = staged_kind.object_kind
-            )
+            INSERT INTO {schema}.ptg2_v3_snapshot_block
+                (snapshot_key, object_kind, block_key, fragment_no,
+                 entry_count, block_hash)
+            SELECT :snapshot_key, object_kind, block_key, fragment_no,
+                   entry_count, block_hash
+              FROM {schema}.{stage}
+            ON CONFLICT (snapshot_key, object_kind, block_key, fragment_no)
+            DO NOTHING
             """
         ),
         {"snapshot_key": int(snapshot_key)},
     )
-    if has_relevant_mapping:
-        reconciliation_result = await session.execute(
-            db.text(
-                f"""
-                WITH canonical_mapping AS MATERIALIZED (
-                    SELECT DISTINCT ON (object_kind, block_key, fragment_no)
-                           object_kind, block_key, fragment_no, entry_count, block_hash
-                      FROM {schema}.{stage}
-                     ORDER BY object_kind, block_key, fragment_no, block_hash
-                ),
-                existing_mapping AS MATERIALIZED (
-                    SELECT canonical_mapping.*,
-                           mapping.snapshot_key IS NOT NULL AS mapping_exists,
-                           mapping.entry_count AS existing_entry_count,
-                           mapping.block_hash AS existing_block_hash
-                      FROM canonical_mapping
-                      LEFT JOIN {schema}.ptg2_v3_snapshot_block mapping
-                        ON mapping.snapshot_key = :snapshot_key
-                       AND mapping.object_kind = canonical_mapping.object_kind
-                       AND mapping.block_key = canonical_mapping.block_key
-                       AND mapping.fragment_no = canonical_mapping.fragment_no
-                ),
-                applied_mapping AS (
-                    INSERT INTO {schema}.ptg2_v3_snapshot_block
-                        (snapshot_key, object_kind, block_key, fragment_no,
-                         entry_count, block_hash)
-                    SELECT :snapshot_key, object_kind, block_key, fragment_no,
-                           entry_count, block_hash
-                      FROM existing_mapping
-                     WHERE NOT mapping_exists
-                    ON CONFLICT (snapshot_key, object_kind, block_key, fragment_no)
-                    DO NOTHING
-                    RETURNING 1
-                )
-                SELECT
-                    (SELECT COUNT(*) FROM {schema}.{stage})::bigint AS expected_count,
-                    (
-                        COUNT(*) FILTER (
-                            WHERE mapping_exists
-                              AND existing_entry_count = entry_count
-                              AND existing_block_hash = block_hash
-                        ) + (SELECT COUNT(*) FROM applied_mapping)
-                    )::bigint AS applied_count
-                  FROM existing_mapping
-                """
-            ),
-            {"snapshot_key": int(snapshot_key)},
-        )
-    else:
-        expected_count = int(
-            await session.scalar(
-                db.text(f"SELECT COUNT(*) FROM {schema}.{stage}")
-            )
-            or 0
-        )
-        insert_result = await session.execute(
-            db.text(
-                f"""
-                INSERT INTO {schema}.ptg2_v3_snapshot_block
-                    (snapshot_key, object_kind, block_key, fragment_no,
-                     entry_count, block_hash)
-                SELECT :snapshot_key, object_kind, block_key, fragment_no,
-                       entry_count, block_hash
+    inserted_count = int(insert_result.rowcount or 0)
+    if inserted_count == expected_count:
+        return
+
+    reconciliation_result = await session.execute(
+        db.text(
+            f"""
+            WITH canonical_mapping AS MATERIALIZED (
+                SELECT DISTINCT ON (object_kind, block_key, fragment_no)
+                       object_kind, block_key, fragment_no, entry_count, block_hash
                   FROM {schema}.{stage}
-                ON CONFLICT (snapshot_key, object_kind, block_key, fragment_no)
-                DO NOTHING
-                """
-            ),
-            {"snapshot_key": int(snapshot_key)},
-        )
-        applied_count = int(insert_result.rowcount or 0)
-    if has_relevant_mapping:
-        expected_count, applied_count = _integer_counts(reconciliation_result.one())
+                 ORDER BY object_kind, block_key, fragment_no, block_hash
+            )
+            SELECT COUNT(*) FILTER (
+                       WHERE mapping.snapshot_key IS NOT NULL
+                         AND mapping.entry_count = canonical_mapping.entry_count
+                         AND mapping.block_hash = canonical_mapping.block_hash
+                   )::bigint
+              FROM canonical_mapping
+              LEFT JOIN {schema}.ptg2_v3_snapshot_block mapping
+                ON mapping.snapshot_key = :snapshot_key
+               AND mapping.object_kind = canonical_mapping.object_kind
+               AND mapping.block_key = canonical_mapping.block_key
+               AND mapping.fragment_no = canonical_mapping.fragment_no
+            """
+        ),
+        {"snapshot_key": int(snapshot_key)},
+    )
+    applied_count = int(reconciliation_result.scalar() or 0)
     if applied_count != expected_count:
         raise RuntimeError("strict V3 shared layout mapping conflicts with staged output")
 
@@ -988,11 +918,6 @@ async def publish_shared_block_stage(
                 snapshot_key=int(snapshot_key),
                 build_token=build_token,
             )
-            await _validate_shared_block_stage(
-                session,
-                schema_name=schema_name,
-                stage_table=stage_table,
-            )
             await session.execute(
                 db.text(
                     f"""
@@ -1005,7 +930,8 @@ async def publish_shared_block_stage(
                            staged.raw_byte_count, staged.stored_byte_count,
                            staged.payload, now()
                       FROM {schema}.{stage} AS staged
-                     WHERE staged.payload IS NOT NULL
+                     WHERE staged.format_version = :format_version
+                       AND staged.payload IS NOT NULL
                        AND NOT EXISTS (
                                SELECT 1
                                  FROM {schema}.ptg2_v3_block AS stored
@@ -1014,56 +940,68 @@ async def publish_shared_block_stage(
                      ORDER BY staged.block_hash
                     ON CONFLICT (block_hash) DO NOTHING
                     """
-                )
-            )
-            mismatch = await session.scalar(
-                db.text(
-                    f"""
-                    SELECT EXISTS (
-                        SELECT 1
-                          FROM {schema}.{stage} staged
-                          LEFT JOIN {schema}.ptg2_v3_block stored
-                            ON stored.block_hash = staged.block_hash
-                         WHERE stored.block_hash IS NULL
-                            OR stored.format_version <> staged.format_version
-                            OR stored.object_kind <> staged.object_kind
-                            OR stored.codec <> staged.codec
-                            OR stored.entry_count <> staged.entry_count
-                            OR stored.raw_byte_count <> staged.raw_byte_count
-                            OR stored.stored_byte_count <> staged.stored_byte_count
-                            OR (
-                                staged.payload IS NOT NULL
-                                AND stored.payload <> staged.payload
-                            )
-                    )
-                    """
-                )
-            )
-            if mismatch:
-                raise RuntimeError("strict V3 shared block conflicts with stored content metadata")
-            await _upsert_shared_block_mappings(
-                session,
-                schema_name=schema_name,
-                stage_table=stage_table,
-                snapshot_key=int(snapshot_key),
+                ),
+                {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
             )
             aggregate_result = await session.execute(
                 db.text(
                     f"""
                     SELECT COUNT(*)::bigint,
-                           COUNT(DISTINCT block_hash)::bigint,
-                           COALESCE(SUM(raw_byte_count), 0)::bigint,
-                           COALESCE(SUM(stored_byte_count), 0)::bigint,
+                           COUNT(DISTINCT staged.block_hash)::bigint,
+                           COALESCE(SUM(staged.raw_byte_count), 0)::bigint,
+                           COALESCE(SUM(staged.stored_byte_count), 0)::bigint,
                            COALESCE(
-                               ARRAY_AGG(DISTINCT object_kind ORDER BY object_kind),
+                               ARRAY_AGG(
+                                   DISTINCT staged.object_kind
+                                   ORDER BY staged.object_kind
+                               ),
                                ARRAY[]::text[]
+                           ),
+                           COALESCE(
+                               BOOL_OR(staged.format_version <> :format_version),
+                               FALSE
+                           ),
+                           COALESCE(
+                               BOOL_OR(
+                                   stored.block_hash IS NULL
+                                   OR stored.format_version <> staged.format_version
+                                   OR stored.object_kind <> staged.object_kind
+                                   OR stored.codec <> staged.codec
+                                   OR stored.entry_count <> staged.entry_count
+                                   OR stored.raw_byte_count <> staged.raw_byte_count
+                                   OR stored.stored_byte_count <> staged.stored_byte_count
+                                   OR (
+                                       staged.payload IS NOT NULL
+                                       AND stored.payload <> staged.payload
+                                   )
+                               ),
+                               FALSE
                            )
-                      FROM {schema}.{stage}
+                      FROM {schema}.{stage} staged
+                      LEFT JOIN {schema}.ptg2_v3_block stored
+                        ON stored.block_hash = staged.block_hash
                     """
-                )
+                ),
+                {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
             )
             aggregate_row = aggregate_result.one()
-        mapping_count = int(aggregate_row[0])
+            incompatible_version = bool(aggregate_row[5])
+            if incompatible_version:
+                raise RuntimeError(
+                    "strict V3 shared-block stage uses an incompatible format version"
+                )
+            mismatch = bool(aggregate_row[6])
+            if mismatch:
+                raise RuntimeError("strict V3 shared block conflicts with stored content metadata")
+            mapping_count = int(aggregate_row[0])
+            await _upsert_shared_block_mappings(
+                session,
+                schema_name=schema_name,
+                stage_table=stage_table,
+                snapshot_key=int(snapshot_key),
+                expected_count=mapping_count,
+            )
+
         unique_block_count = int(aggregate_row[1])
         logical_byte_count = int(aggregate_row[2])
         stored_byte_count = int(aggregate_row[3])

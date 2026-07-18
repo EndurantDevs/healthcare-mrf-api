@@ -13,7 +13,6 @@ from process.ptg_parts.domain import PTG2FileProcessResult
 from process.ptg_parts.ptg2_shared_publish import (
     _SHARED_BLOCK_STAGE_COLUMNS,
     _upsert_shared_block_mappings,
-    _validate_shared_block_stage,
     create_shared_block_stage,
     publish_shared_block_stage,
     publish_shared_finalizer_dictionaries,
@@ -262,42 +261,10 @@ async def test_shared_block_stage_allows_metadata_only_reused_rows(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_shared_block_validation_defers_uniqueness_to_mutation_checks():
-    session = SimpleNamespace(scalar=AsyncMock(return_value=False))
-
-    await _validate_shared_block_stage(
-        session,
-        schema_name="mrf",
-        stage_table="ptg2_v3_block_stage_proof",
-    )
-
-    statement = str(session.scalar.await_args.args[0])
-    assert "format_version <> :format_version" in statement
-    assert "GROUP BY" not in statement
-    assert "block_hash" not in statement
-    assert session.scalar.await_args.args[1] == {
-        "format_version": ptg2_shared_publish.PTG2_V3_SHARED_FORMAT_VERSION
-    }
-    session.scalar.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_shared_block_validation_still_rejects_incompatible_format_version():
-    session = SimpleNamespace(scalar=AsyncMock(return_value=True))
-
-    with pytest.raises(RuntimeError, match="incompatible format version"):
-        await _validate_shared_block_stage(
-            session,
-            schema_name="mrf",
-            stage_table="ptg2_v3_block_stage_proof",
-        )
-
-
-@pytest.mark.asyncio
 async def test_shared_block_mapping_upsert_combines_insert_and_conflict_check():
     session = SimpleNamespace(
-        scalar=AsyncMock(side_effect=(False, 11)),
-        execute=AsyncMock(return_value=_OneRowResult((11, 11), rowcount=11)),
+        scalar=AsyncMock(),
+        execute=AsyncMock(return_value=_OneRowResult((11,), rowcount=11)),
     )
 
     await _upsert_shared_block_mappings(
@@ -305,6 +272,7 @@ async def test_shared_block_mapping_upsert_combines_insert_and_conflict_check():
         schema_name="mrf",
         stage_table="ptg2_v3_block_stage_proof",
         snapshot_key=42,
+        expected_count=11,
     )
 
     statement = str(session.execute.await_args.args[0])
@@ -315,14 +283,20 @@ async def test_shared_block_mapping_upsert_combines_insert_and_conflict_check():
     assert "DO UPDATE" not in statement
     assert 'FROM "mrf"."ptg2_v3_block_stage_proof"' in statement
     assert session.execute.await_args.args[1] == {"snapshot_key": 42}
-    assert session.scalar.await_count == 2
+    session.scalar.assert_not_awaited()
+    session.execute.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_shared_block_mapping_upsert_rejects_conflicting_existing_mapping():
     session = SimpleNamespace(
-        scalar=AsyncMock(side_effect=(False, 11)),
-        execute=AsyncMock(return_value=_OneRowResult((11, 10), rowcount=10)),
+        scalar=AsyncMock(),
+        execute=AsyncMock(
+            side_effect=[
+                _OneRowResult((10,), rowcount=10),
+                _OneRowResult((10,)),
+            ]
+        ),
     )
 
     with pytest.raises(RuntimeError, match="mapping conflicts"):
@@ -331,14 +305,25 @@ async def test_shared_block_mapping_upsert_rejects_conflicting_existing_mapping(
             schema_name="mrf",
             stage_table="ptg2_v3_block_stage_proof",
             snapshot_key=42,
+            expected_count=11,
         )
+    reconciliation_sql = str(session.execute.await_args_list[-1].args[0])
+    assert "canonical_mapping AS MATERIALIZED" in reconciliation_sql
+    assert "mapping.entry_count = canonical_mapping.entry_count" in reconciliation_sql
+    assert "mapping.block_hash = canonical_mapping.block_hash" in reconciliation_sql
+    session.scalar.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_shared_block_mapping_upsert_uses_read_only_identical_retry_path():
     session = SimpleNamespace(
-        scalar=AsyncMock(return_value=True),
-        execute=AsyncMock(return_value=_OneRowResult((11, 11))),
+        scalar=AsyncMock(),
+        execute=AsyncMock(
+            side_effect=[
+                _OneRowResult((0,), rowcount=0),
+                _OneRowResult((11,)),
+            ]
+        ),
     )
 
     await _upsert_shared_block_mappings(
@@ -346,16 +331,17 @@ async def test_shared_block_mapping_upsert_uses_read_only_identical_retry_path()
         schema_name="mrf",
         stage_table="ptg2_v3_block_stage_proof",
         snapshot_key=42,
+        expected_count=11,
     )
 
-    statement = str(session.execute.await_args.args[0])
-    assert "existing_mapping AS MATERIALIZED" in statement
-    assert "WHERE NOT mapping_exists" in statement
-    assert "DO NOTHING" in statement
-    assert "DO UPDATE" not in statement
-    assert "existing_entry_count = entry_count" in statement
-    assert "existing_block_hash = block_hash" in statement
-    assert 'SELECT COUNT(*) FROM "mrf"."ptg2_v3_block_stage_proof"' in statement
+    insert_sql = str(session.execute.await_args_list[0].args[0])
+    assert "ON CONFLICT" in insert_sql
+    assert "DO NOTHING" in insert_sql
+    reconciliation_sql = str(session.execute.await_args_list[1].args[0])
+    assert "canonical_mapping AS MATERIALIZED" in reconciliation_sql
+    assert "LEFT JOIN" in reconciliation_sql
+    assert "DO UPDATE" not in reconciliation_sql
+    session.scalar.assert_not_awaited()
 
 
 def _serving_run_entries(tmp_path):
@@ -533,13 +519,44 @@ class _OneRowResult:
         return self.row[0]
 
 
+def _assert_shared_stage_sql(session):
+    block_insert_sql = str(session.execute.await_args_list[0].args[0])
+    assert "NOT EXISTS" in block_insert_sql
+    assert "staged.format_version = :format_version" in block_insert_sql
+    assert "staged.payload IS NOT NULL" in block_insert_sql
+    assert "stored.block_hash = staged.block_hash" in block_insert_sql
+    assert "ON CONFLICT (block_hash) DO NOTHING" in block_insert_sql
+    aggregate_sql = str(session.execute.await_args_list[-1].args[0])
+    assert "LEFT JOIN" in aggregate_sql
+    assert "stored.block_hash IS NULL" in aggregate_sql
+    assert "staged.payload IS NOT NULL" in aggregate_sql
+    assert "BOOL_OR" in aggregate_sql
+    assert "staged.format_version <> :format_version" in aggregate_sql
+    assert "COUNT(DISTINCT staged.block_hash)" in aggregate_sql
+    assert "ARRAY_AGG(" in aggregate_sql
+    assert "DISTINCT staged.object_kind" in aggregate_sql
+    assert "ORDER BY staged.object_kind" in aggregate_sql
+    assert "canonical_mapping" not in aggregate_sql
+    assert 'FROM "mrf"."ptg2_v3_block_stage_proof"' in aggregate_sql
+    format_by_field = {
+        "format_version": ptg2_shared_publish.PTG2_V3_SHARED_FORMAT_VERSION
+    }
+    assert session.execute.await_args_list[0].args[1] == format_by_field
+    assert session.execute.await_args_list[1].args[1] == format_by_field
+
+
 @pytest.mark.asyncio
 async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatch):
     session = SimpleNamespace(
         execute=AsyncMock(
-            side_effect=[None, _OneRowResult((3, 2, 30, 20, ["a_kind", "z_kind"]))]
+            side_effect=[
+                None,
+                _OneRowResult(
+                    (3, 2, 30, 20, ["a_kind", "z_kind"], False, False)
+                ),
+            ]
         ),
-        scalar=AsyncMock(return_value=False),
+        scalar=AsyncMock(),
     )
 
     @asynccontextmanager
@@ -553,15 +570,11 @@ async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatc
         "lock_shared_layout_for_dense_write",
         AsyncMock(),
     )
-    monkeypatch.setattr(
-        ptg2_shared_publish,
-        "_validate_shared_block_stage",
-        AsyncMock(),
-    )
+    mapping_upsert = AsyncMock()
     monkeypatch.setattr(
         ptg2_shared_publish,
         "_upsert_shared_block_mappings",
-        AsyncMock(),
+        mapping_upsert,
     )
 
     publication = await publish_shared_block_stage(
@@ -576,20 +589,58 @@ async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatc
     assert publication.unique_block_count == 2
     assert publication.logical_byte_count == 30
     assert publication.stored_byte_count == 20
-    block_insert_sql = str(session.execute.await_args_list[0].args[0])
-    assert "NOT EXISTS" in block_insert_sql
-    assert "staged.payload IS NOT NULL" in block_insert_sql
-    assert "stored.block_hash = staged.block_hash" in block_insert_sql
-    assert "ON CONFLICT (block_hash) DO NOTHING" in block_insert_sql
-    mismatch_sql = str(session.scalar.await_args_list[-1].args[0])
-    assert "LEFT JOIN" in mismatch_sql
-    assert "stored.block_hash IS NULL" in mismatch_sql
-    assert "staged.payload IS NOT NULL" in mismatch_sql
-    aggregate_sql = str(session.execute.await_args_list[-1].args[0])
-    assert "COUNT(DISTINCT block_hash)" in aggregate_sql
-    assert "ARRAY_AGG(DISTINCT object_kind ORDER BY object_kind)" in aggregate_sql
-    assert "canonical_mapping" not in aggregate_sql
-    assert 'FROM "mrf"."ptg2_v3_block_stage_proof"' in aggregate_sql
+    _assert_shared_stage_sql(session)
+    session.scalar.assert_not_awaited()
+    mapping_upsert.assert_awaited_once_with(
+        session,
+        schema_name="mrf",
+        stage_table="ptg2_v3_block_stage_proof",
+        snapshot_key=42,
+        expected_count=3,
+    )
+
+
+@pytest.mark.asyncio
+async def test_shared_block_stage_rejects_incompatible_version_in_combined_scan(
+    monkeypatch,
+):
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                None,
+                _OneRowResult((1, 1, 3, 3, ["serving"], True, True)),
+            ]
+        ),
+        scalar=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_shared_layout_for_dense_write",
+        AsyncMock(),
+    )
+    mapping_upsert = AsyncMock()
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_upsert_shared_block_mappings",
+        mapping_upsert,
+    )
+
+    with pytest.raises(RuntimeError, match="incompatible format version"):
+        await publish_shared_block_stage(
+            schema_name="mrf",
+            stage_table="ptg2_v3_block_stage_proof",
+            snapshot_key=42,
+            build_token="build-42",
+        )
+
+    mapping_upsert.assert_not_awaited()
 
 
 def _dictionary_summary(tmp_path, *, row_count: int) -> dict[str, object]:
