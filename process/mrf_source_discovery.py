@@ -2506,21 +2506,21 @@ def _repair_missing_array_object_commas(text: str) -> str:
     # Some payer TOCs are published with adjacent objects in an array but no comma.
     # Keep this intentionally narrow and only apply it to TiC TOC-looking payloads.
     repaired: list[str] = []
-    in_string = False
-    escaped = False
+    is_in_string = False
+    is_escaped = False
     length = len(text)
     for idx, char in enumerate(text):
         repaired.append(char)
-        if in_string:
-            if escaped:
-                escaped = False
+        if is_in_string:
+            if is_escaped:
+                is_escaped = False
             elif char == "\\":
-                escaped = True
+                is_escaped = True
             elif char == '"':
-                in_string = False
+                is_in_string = False
             continue
         if char == '"':
-            in_string = True
+            is_in_string = True
             continue
         if char != "}":
             continue
@@ -5171,7 +5171,7 @@ def _merge_crawl_target_plan_info(
     if not target_by_key:
         return metadata
     merged_plans: list[Any] = []
-    changed = False
+    has_changed = False
     for plan in plan_info:
         if not isinstance(plan, dict):
             merged_plans.append(plan)
@@ -5186,9 +5186,9 @@ def _merge_crawl_target_plan_info(
         ):
             if not next_plan.get(key) and target_plan.get(key):
                 next_plan[key] = target_plan[key]
-                changed = True
+                has_changed = True
         merged_plans.append(next_plan)
-    if not changed:
+    if not has_changed:
         return metadata
     return {**metadata, "plan_info": merged_plans}
 

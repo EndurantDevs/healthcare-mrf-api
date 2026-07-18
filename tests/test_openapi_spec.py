@@ -177,16 +177,16 @@ def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
     """Support the collect spec routes test fixture."""
     routes_by_path: dict[tuple[str, str], dict[str, set[str]]] = {}
     lines = OPENAPI_PATH.read_text().splitlines()
-    in_paths = False
+    is_in_paths = False
     current_path: str | None = None
     current_method: str | None = None
-    in_parameters = False
+    is_in_parameters = False
     current_parameter_by_field: dict[str, str] | None = None
 
     for raw_line in lines:
-        if not in_paths:
+        if not is_in_paths:
             if raw_line.strip() == "paths:":
-                in_paths = True
+                is_in_paths = True
             continue
         if raw_line.strip().startswith("components:"):
             break
@@ -204,29 +204,29 @@ def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
             if token in HTTP_METHODS:
                 current_method = token
                 routes_by_path[("", current_path)][current_method] = []
-                in_parameters = False
+                is_in_parameters = False
                 continue
             current_method = None
         if indent == 6 and current_method:
             if stripped == "parameters:":
-                in_parameters = True
+                is_in_parameters = True
                 routes_by_path[("", current_path)][current_method] = []
                 continue
             else:
-                in_parameters = False
-        if indent == 8 and in_parameters and current_method:
+                is_in_parameters = False
+        if indent == 8 and is_in_parameters and current_method:
             if stripped.startswith("- name:"):
                 name = stripped.split(":", 1)[1].strip().strip("'\"")
                 current_parameter_by_field = {"name": name}
                 routes_by_path[("", current_path)][current_method].append(current_parameter_by_field)
                 continue
-        if indent >= 10 and in_parameters and current_method and current_parameter_by_field is not None:
+        if indent >= 10 and is_in_parameters and current_method and current_parameter_by_field is not None:
             if stripped.startswith("in:"):
                 current_parameter_by_field["in"] = stripped.split(":", 1)[1].strip()
             continue
         if indent <= 6:
             current_parameter_by_field = None
-            in_parameters = in_parameters and stripped == "parameters:"
+            is_in_parameters = is_in_parameters and stripped == "parameters:"
 
     spec_routes_by_operation: dict[tuple[str, str], dict[str, set[str]]] = {}
     for (_, path), methods in routes_by_path.items():

@@ -808,16 +808,15 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         stage_table = await _create_serving_stage_table(
             f"shared_{reservation.snapshot_key}"
         )
-        # Duplicate dictionary rows to exercise atom dedupe. Membership rows are
-        # copied once because duplicate physical source files never reach scanning.
-        for _duplicate_source in range(2):
-            for frame in scan["price_atom_frames"]:
-                await _copy_price_atom_file(
-                    Path(frame["path"]),
-                    target_table=_ptg2_manifest_support_stage_table(
-                        stage_table, "price_atom"
-                    ),
-                )
+        # A single scanner source emits every atom ID once. Cross-source
+        # canonicalization has separate PostgreSQL coverage.
+        for frame in scan["price_atom_frames"]:
+            await _copy_price_atom_file(
+                Path(frame["path"]),
+                target_table=_ptg2_manifest_support_stage_table(
+                    stage_table, "price_atom"
+                ),
+            )
         for frame in scan["price_set_atom_frames"]:
             await _copy_price_atom_member_file(
                 Path(frame["path"]),
@@ -932,7 +931,11 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             )
         )
         assert publication.serving_index["price_stage"]["price_key_build_seconds"] >= 0
-        assert publication.serving_index["price_stage"]["duplicate_rows_removed"] > 0
+        assert publication.serving_index["price_stage"]["price_atom_source_mode"] == (
+            "single_scanner_unique_provenance"
+        )
+        assert publication.serving_index["price_stage"]["normalization_seconds"] == 0
+        assert publication.serving_index["price_stage"]["duplicate_rows_removed"] == 0
         assert publication.serving_index["audit_sample"]["contract"] == (
             "persisted_served_occurrence_sample_v2"
         )
@@ -1293,15 +1296,14 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         reused_stage = await _create_serving_stage_table(
             f"shared_{discarded_snapshot_key}"
         )
-        for _duplicate_source in range(2):
-            for frame in scan["price_atom_frames"]:
-                await _copy_price_atom_file(
-                    Path(frame["path"]),
-                    target_table=_ptg2_manifest_support_stage_table(
-                        reused_stage,
-                        "price_atom",
-                    ),
-                )
+        for frame in scan["price_atom_frames"]:
+            await _copy_price_atom_file(
+                Path(frame["path"]),
+                target_table=_ptg2_manifest_support_stage_table(
+                    reused_stage,
+                    "price_atom",
+                ),
+            )
         for frame in scan["price_set_atom_frames"]:
             await _copy_price_atom_member_file(
                 Path(frame["path"]),

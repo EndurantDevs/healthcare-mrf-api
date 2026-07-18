@@ -1371,7 +1371,7 @@ async def _create_post_publish_indexes(
     async def _build_index(index_name: str, stmt: str) -> None:
         started_at = time.time()
         live_index_name = f"{table_name}_idx_{index_name}"
-        completed = False
+        is_completed = False
         try:
             await _drop_invalid_index(live_index_name)
             if build_concurrently and hasattr(db, "execute_ddl"):
@@ -1388,7 +1388,7 @@ async def _create_post_publish_indexes(
                     context=phase_context,
                     phase="entity-address-unified post-publish indexing",
                 )
-            completed = True
+            is_completed = True
         except Exception as exc:
             msg = str(exc).lower()
             if "st_makepoint" in msg or "geography" in msg or "postgis" in msg:
@@ -1397,7 +1397,7 @@ async def _create_post_publish_indexes(
                     index_name,
                     exc,
                 )
-                completed = True
+                is_completed = True
                 return
             raise
         finally:
@@ -1411,7 +1411,7 @@ async def _create_post_publish_indexes(
                     "finished_at": round(finished_at, 6),
                 }
             )
-            if completed:
+            if is_completed:
                 phase_context["post_publish_index_completed"] = int(
                     phase_context.get("post_publish_index_completed") or 0
                 ) + 1
@@ -8357,15 +8357,15 @@ async def _populate_support_stage_tables(
             if isinstance(result, BaseException):
                 raise result
 
-    parallel_batch: list[tuple[int, _SupportStageStatement]] = []
+    parallel_batches: list[tuple[int, _SupportStageStatement]] = []
     for index, item in enumerate(statements, start=1):
         if item.parallel:
-            parallel_batch.append((index, item))
+            parallel_batches.append((index, item))
             continue
-        await _run_parallel_batch(parallel_batch)
-        parallel_batch = []
+        await _run_parallel_batch(parallel_batches)
+        parallel_batches = []
         await _finish_item(index, item)
-    await _run_parallel_batch(parallel_batch)
+    await _run_parallel_batch(parallel_batches)
     counts: dict[str, int] = {}
     for model, stage_cls in stage_classes.items():
         counts[model.__tablename__] = int(
@@ -11133,16 +11133,16 @@ async def process_data(ctx, task=None):
                 message="sources materialized",
             )
 
-    enable_inference = str(
+    should_enable_inference = str(
         os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_INFERENCE", "false")
     ).strip().lower() in {"1", "true", "yes", "on"}
     if test_mode:
-        enable_inference = str(
+        should_enable_inference = str(
             os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_TEST_ENABLE_INFERENCE", "false")
         ).strip().lower() in {"1", "true", "yes", "on"}
 
     if (
-        enable_inference
+        should_enable_inference
         and available.get("npi", False)
         and available.get("npi_address", False)
         and available.get("npi_taxonomy", False)
@@ -11437,17 +11437,19 @@ async def process_data(ctx, task=None):
     node_id = str(os.getenv("HLTHPRT_IMPORT_NODE_ID") or "").strip() or None
     cached_support_counts = context.get("support_counts")
     if serving_only_refresh:
-        support_counts = {}
+        support_counts_by_kind = {}
         context["support_stage_populated"] = False
         context["support_stage_skipped"] = True
-        context["support_counts"] = support_counts
+        context["support_counts"] = support_counts_by_kind
     elif context.get("support_stage_populated") and isinstance(cached_support_counts, dict):
-        support_counts = {str(key): int(value) for key, value in cached_support_counts.items()}
+        support_counts_by_kind = {
+            str(key): int(value) for key, value in cached_support_counts.items()
+        }
     else:
         support_raw_table = None if partial_source_refresh else raw_table
         support_affected_group_table = None
         copy_unaffected_support_bridges = True
-        support_counts = await _populate_support_stage_tables(
+        support_counts_by_kind = await _populate_support_stage_tables(
             db_schema,
             stage_table,
             support_stage_classes,
@@ -11462,7 +11464,7 @@ async def process_data(ctx, task=None):
             copy_unaffected_bridges=copy_unaffected_support_bridges,
         )
         context["support_stage_populated"] = True
-        context["support_counts"] = support_counts
+        context["support_counts"] = support_counts_by_kind
     if raw_table and _keep_raw_stage():
         context["raw_stage_kept"] = True
         context["raw_stage_table"] = raw_table
@@ -11753,7 +11755,7 @@ async def process_data(ctx, task=None):
     context["npi_rows"] = npi_rows
     context["inferred_rows"] = inferred_rows
     context["multi_source_rows"] = multi_source_rows
-    context["support_counts"] = support_counts
+    context["support_counts"] = support_counts_by_kind
     if run_id:
         enqueue_live_progress(
             run_id=run_id,

@@ -299,12 +299,21 @@ async def test_prepared_price_artifacts_rank_summary_in_parallel(monkeypatch):
         AsyncMock(return_value={"row_count": 2}),
     )
 
-    await shared_price.prepare_shared_price_artifacts(
+    prepared = await shared_price.prepare_shared_price_artifacts(
         schema_name="mrf",
         manifest_stage_table="manifest_stage",
         price_set_summary_source_count=1,
     )
 
+    shared_price._normalize_strict_price_atom_stage.assert_not_awaited()
+    assert prepared.stage_metrics["price_atom_source_mode"] == (
+        "single_scanner_unique_provenance"
+    )
+    assert prepared.stage_metrics["normalization_seconds"] == 0.0
+    assert prepared.stage_metrics["rows_before"] == 2
+    assert prepared.stage_metrics["rows_after"] == 2
+    assert prepared.stage_metrics["duplicate_rows_removed"] == 0
+    assert prepared.stage_metrics["conflicting_ids"] == 0
     assert not any(
         "negotiated_rate_numeric" in call.args[0] for call in status.await_args_list
     )
@@ -316,6 +325,53 @@ async def test_prepared_price_artifacts_rank_summary_in_parallel(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_prepared_price_artifacts_normalize_cross_source_atoms(monkeypatch):
+    normalizer = AsyncMock(
+        return_value={
+            "rows_before": 3,
+            "rows_after": 2,
+            "duplicate_rows_removed": 1,
+            "conflicting_ids": 0,
+        }
+    )
+    monkeypatch.setattr(shared_price.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        shared_price,
+        "_normalize_strict_price_atom_stage",
+        normalizer,
+    )
+    monkeypatch.setattr(
+        shared_price,
+        "_rewrite_price_atom_lean_dictionary",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        shared_price,
+        "_create_v3_price_key_stage",
+        AsyncMock(return_value={"row_count": 2}),
+    )
+    monkeypatch.setattr(
+        shared_price,
+        "_create_v3_atom_key_stage",
+        AsyncMock(return_value={"row_count": 2}),
+    )
+
+    prepared = await shared_price.prepare_shared_price_artifacts(
+        schema_name="mrf",
+        manifest_stage_table="manifest_stage",
+        price_set_summary_source_count=2,
+    )
+
+    normalizer.assert_awaited_once()
+    assert prepared.stage_metrics["price_atom_source_mode"] == (
+        "cross_file_canonicalize"
+    )
+    assert prepared.stage_metrics["rows_before"] == 3
+    assert prepared.stage_metrics["rows_after"] == 2
+    assert prepared.stage_metrics["duplicate_rows_removed"] == 1
+
+
+@pytest.mark.asyncio
 async def test_price_key_ready_fires_while_atom_preparation_is_still_running(
     monkeypatch,
 ):
@@ -323,9 +379,9 @@ async def test_price_key_ready_fires_while_atom_preparation_is_still_running(
     ready = asyncio.Event()
     observed_keys = []
 
-    async def normalize_atom_stage(**_kwargs):
+    async def rewrite_atom_stage(**_kwargs):
         await atom_release.wait()
-        return {"rows_after": 2}
+        return {}
 
     def price_key_ready(prepared_key):
         observed_keys.append(prepared_key)
@@ -335,12 +391,12 @@ async def test_price_key_ready_fires_while_atom_preparation_is_still_running(
     monkeypatch.setattr(
         shared_price,
         "_normalize_strict_price_atom_stage",
-        normalize_atom_stage,
+        AsyncMock(),
     )
     monkeypatch.setattr(
         shared_price,
         "_rewrite_price_atom_lean_dictionary",
-        AsyncMock(return_value={}),
+        rewrite_atom_stage,
     )
     monkeypatch.setattr(
         shared_price,
@@ -371,6 +427,7 @@ async def test_price_key_ready_fires_while_atom_preparation_is_still_running(
 
     atom_release.set()
     prepared = await prepare_task
+    shared_price._normalize_strict_price_atom_stage.assert_not_awaited()
     assert prepared.price_key_map == observed_key.price_key_map
     assert prepared.stage_metrics["price_key_build_seconds"] >= 0
 
@@ -394,7 +451,7 @@ async def test_price_prepare_failure_removes_partial_key_stages(monkeypatch):
         await shared_price.prepare_shared_price_artifacts(
             schema_name="mrf",
             manifest_stage_table="manifest_stage",
-            price_set_summary_source_count=1,
+            price_set_summary_source_count=2,
         )
 
     cleanup_sql = status.await_args_list[-1].args[0]
@@ -449,7 +506,7 @@ async def test_price_prepare_repeated_cancellation_finishes_drain_and_cleanup(
         shared_price.prepare_shared_price_artifacts(
             schema_name="mrf",
             manifest_stage_table="manifest_stage",
-            price_set_summary_source_count=1,
+            price_set_summary_source_count=2,
         )
     )
     await child_cleanup_started.wait()
