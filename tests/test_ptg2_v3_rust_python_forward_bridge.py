@@ -229,18 +229,14 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
         expected_source_identities=[source_identity_map],
     )
 
-    price_key_by_id = {
-        low_price_set_id: 0,
-        high_price_set_id: 1,
-    }
     price_map_rows = [
-        [price_set_id, struct.pack(">q", price_key_by_id[price_set_id])]
-        for price_set_id in sorted(price_key_by_id)
+        [low_price_set_id, struct.pack(">q", 0)],
+        [high_price_set_id, struct.pack(">q", 1)],
     ]
     assert [
         struct.unpack(">q", price_map_row[1])[0]
         for price_map_row in price_map_rows
-    ] == [1, 0]
+    ] == [0, 1]
     price_key_map_path = tmp_path / "price-key-map.copy"
     price_key_map_path.write_bytes(scanner_support._pg_binary_copy_rows(price_map_rows))
     assert scanner_support._read_pg_binary_rows(
@@ -260,6 +256,8 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
             *scanner_support._v3_finalizer_test_resource_args(),
             "--price-key-map-input",
             str(price_key_map_path),
+            "--price-key-map-row-count",
+            str(len(price_map_rows)),
             "--price-membership-input",
             str(deferred_membership_path),
             "--price-atom-input",
@@ -342,8 +340,8 @@ async def test_real_rust_v3_forward_writer_bridges_to_strict_python_reader(
     assert forward_fragments[0]["payload"][0] == 2
 
     price_id_by_key = {
-        price_key: price_set_id.hex()
-        for price_set_id, price_key in price_key_by_id.items()
+        0: low_price_set_id.hex(),
+        1: high_price_set_id.hex(),
     }
     shard_keys_by_code = {
         code_key: tuple(

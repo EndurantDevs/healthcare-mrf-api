@@ -403,6 +403,7 @@ async def test_finalizer_invocation_passes_and_reports_resource_contract(
         provider_set_metadata_entries=provider_metadata_entries,
         expected_source_identities=[_physical_identity()],
         price_key_map_input=price_key_map_path,
+        price_key_map_row_count=1,
     )
 
     command_arguments = invocation_by_key["command_arguments"]
@@ -413,6 +414,9 @@ async def test_finalizer_invocation_passes_and_reports_resource_contract(
     assert command_arguments[
         command_arguments.index("--total-sort-memory-bytes") + 1
     ] == str(4 * _GIB)
+    assert command_arguments[
+        command_arguments.index("--price-key-map-row-count") + 1
+    ] == "1"
     assert "--memory-records" not in command_arguments
     manifest_metadata = json.loads(
         (tmp_path / "work" / "scanner-summary.json").read_text()
