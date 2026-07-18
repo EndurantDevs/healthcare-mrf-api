@@ -16,6 +16,15 @@ from coverage_reports import (
     _metric,
     _read_json,
 )
+from coverage_growth import (
+    build_growth_policy_test_baseline,
+    collect_growth_evidence,
+    compare_growth_metric,
+    compare_growth_policy,
+    load_growth_policy,
+    run_exclusion_guard_self_test,
+    run_growth_helper_self_test,
+)
 
 SCHEMA_VERSION = 1
 
@@ -105,14 +114,21 @@ def _compare_policy(
     for field in ("manifest", "source"):
         if reference_policy.get(field) != candidate_policy.get(field):
             errors.append(f"{report_name}: measurement policy changed {field}")
+    for field in ("c8", "cargo_llvm_cov", "coverage", "pytest", "rust"):
+        if field in reference_policy and (
+            reference_policy.get(field) != candidate_policy.get(field)
+        ):
+            errors.append(f"{report_name}: measurement policy changed {field}")
     return errors
 
 
 def _compare_baselines(
     candidate: dict[str, Any],
     reference: dict[str, Any],
+    changed_line_by_report: dict[str, int] | None = None,
 ) -> list[str]:
     errors: list[str] = []
+    changed_line_by_report = changed_line_by_report or {}
     candidate_reports = candidate["reports"]
     for report_name, old_config in reference["reports"].items():
         new_config = candidate_reports.get(report_name)
@@ -123,6 +139,7 @@ def _compare_baselines(
             if new_config.get(field) != old_config.get(field):
                 errors.append(f"{report_name}: baseline {field} changed")
         errors.extend(_compare_scope(report_name, new_config, old_config))
+        errors.extend(compare_growth_policy(report_name, new_config, old_config))
         if not set(old_config.get("files", [])).issubset(
             set(new_config.get("files", []))
         ):
@@ -146,11 +163,30 @@ def _compare_baselines(
                     old_metric,
                 )
             )
+            changed_line_count = changed_line_by_report.get(report_name, 0)
+            if changed_line_count:
+                growth_policy_by_field = load_growth_policy(report_name, new_config)
+                errors.extend(
+                    compare_growth_metric(
+                        f"{report_name}.{metric_name} baseline",
+                        new_metric,
+                        old_metric,
+                        growth_policy_by_field["target_percent_by_metric"][metric_name],
+                        growth_policy_by_field,
+                        changed_line_count,
+                    )
+                )
     return errors
 
 
-def _write_baseline(path: Path, baseline: dict[str, Any], root: Path) -> None:
-    for report_name, config in baseline["reports"].items():
+def _write_baseline(
+    path: Path,
+    baseline: dict[str, Any],
+    root: Path,
+    selected_names: list[str],
+) -> None:
+    for report_name in selected_names:
+        config = baseline["reports"][report_name]
         snapshot = _collect_report(
             root, report_name, config, enforce_baseline_files=False
         )
@@ -241,6 +277,11 @@ def _assert_reference_behavior() -> None:
                 "scope": {"include": ["*.py"], "exclude": [], "policy": {}},
                 "files": ["sample.py"],
                 "metrics": {"lines": exact_metric_map},
+                "growth": {
+                    "changed_line_divisor": 10,
+                    "debt_reduction_percent": 1,
+                    "target_percent_by_metric": {"lines": 95},
+                },
             }
         }
     }
@@ -265,10 +306,67 @@ def _assert_reference_behavior() -> None:
     )
 
 
+def _assert_growth_behavior() -> None:
+    reference_baseline_by_field = build_growth_policy_test_baseline()
+    unchanged_baseline_by_field = json.loads(json.dumps(reference_baseline_by_field))
+    _require_self_test(
+        bool(
+            _compare_baselines(
+                unchanged_baseline_by_field,
+                reference_baseline_by_field,
+                {"python": 5},
+            )
+        ),
+        "changed source requires debt reduction",
+    )
+    improved_baseline_by_field = json.loads(json.dumps(reference_baseline_by_field))
+    improved_baseline_by_field["reports"]["python"]["metrics"]["lines"] = {
+        "covered": 81,
+        "total": 100,
+    }
+    _require_self_test(
+        not _compare_baselines(
+            improved_baseline_by_field,
+            reference_baseline_by_field,
+            {"python": 5},
+        ),
+        "one-unit debt reduction for a small change",
+    )
+    target_baseline_by_field = json.loads(json.dumps(reference_baseline_by_field))
+    target_baseline_by_field["reports"]["python"]["metrics"]["lines"] = {
+        "covered": 95,
+        "total": 100,
+    }
+    _require_self_test(
+        not _compare_baselines(
+            target_baseline_by_field,
+            target_baseline_by_field,
+            {"python": 100},
+        ),
+        "growth stops at the configured target",
+    )
+    weakened_baseline_by_field = json.loads(json.dumps(reference_baseline_by_field))
+    weakened_baseline_by_field["reports"]["python"]["growth"][
+        "target_percent_by_metric"
+    ]["lines"] = 90
+    _require_self_test(
+        bool(
+            _compare_baselines(
+                weakened_baseline_by_field,
+                reference_baseline_by_field,
+            )
+        ),
+        "growth target weakening",
+    )
+
+
 def _run_self_test() -> None:
     _assert_metric_behavior()
     _assert_parser_behavior()
     _assert_reference_behavior()
+    _assert_growth_behavior()
+    run_growth_helper_self_test()
+    run_exclusion_guard_self_test()
     print("coverage ratchet self-test passed")
 
 
@@ -276,6 +374,10 @@ def _parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", default="test-coverage-baseline.json")
     parser.add_argument("--reference-baseline")
+    parser.add_argument(
+        "--changed-since",
+        help="Git revision used to measure changed production-source lines",
+    )
     parser.add_argument(
         "--report",
         action="append",
@@ -319,19 +421,48 @@ def _execute_gate(args: argparse.Namespace) -> int:
     root = Path.cwd()
     baseline_path = root / args.baseline
     baseline = _load_baseline(baseline_path)
-    if args.write_baseline:
-        _write_baseline(baseline_path, baseline, root)
-        baseline = _load_baseline(baseline_path)
-    errors: list[str] = []
-    if args.reference_baseline:
-        reference = _load_baseline(Path(args.reference_baseline))
-        errors.extend(_compare_baselines(baseline, reference))
     selected_names = args.report_names or list(baseline["reports"])
     unknown_names = sorted(set(selected_names) - set(baseline["reports"]))
     if unknown_names:
         raise CoverageRatchetError(
             f"unknown baseline reports: {', '.join(unknown_names)}"
         )
+    if args.write_baseline:
+        _write_baseline(baseline_path, baseline, root, selected_names)
+        baseline = _load_baseline(baseline_path)
+    for report_name in selected_names:
+        load_growth_policy(report_name, baseline["reports"][report_name])
+    errors: list[str] = []
+    changed_line_by_report: dict[str, int] = {}
+    if args.reference_baseline:
+        if not args.changed_since:
+            raise CoverageRatchetError(
+                "--reference-baseline requires --changed-since"
+            )
+        reference = _load_baseline(Path(args.reference_baseline))
+        changed_line_by_report, exclusion_errors = collect_growth_evidence(
+            root,
+            args.changed_since,
+            baseline,
+            selected_names,
+        )
+        errors.extend(exclusion_errors)
+        errors.extend(
+            _compare_baselines(baseline, reference, changed_line_by_report)
+        )
+    elif args.changed_since:
+        raise CoverageRatchetError(
+            "--changed-since requires --reference-baseline"
+        )
+    for report_name in selected_names:
+        changed_line_count = changed_line_by_report.get(report_name, 0)
+        if changed_line_count:
+            print(
+                f"{report_name}: {changed_line_count} changed production-source "
+                "lines require coverage debt reduction"
+            )
+        elif args.changed_since:
+            print(f"{report_name}: no production-source changes; no debt paydown required")
     for report_name in selected_names:
         errors.extend(
             _check_current_report(root, report_name, baseline["reports"][report_name])
@@ -340,7 +471,7 @@ def _execute_gate(args: argparse.Namespace) -> int:
         for error in errors:
             print(f"ERROR: {error}")
         return 1
-    print("Test coverage is at or above the versioned baseline.")
+    print("Test coverage satisfies the versioned no-regression and growth policy.")
     return 0
 
 

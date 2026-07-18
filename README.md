@@ -61,8 +61,8 @@ CI and test tooling must not add debt. Commit message rules live in
 `python3 scripts/check_commit_messages.py --last 1` before pushing hand-written
 commits.
 
-Current Python and PTG2 scanner coverage, their measured scopes, and the
-no-regression CI rule are documented in `docs/test-coverage.md`.
+Current Python and PTG2 scanner coverage, their measured scopes, and the soft
+coverage-growth CI rule are documented in `docs/test-coverage.md`.
 
 ## Importers
 
