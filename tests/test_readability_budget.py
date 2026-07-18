@@ -22,7 +22,9 @@ def test_ci_readability_ratchet_requires_python_debt_reduction():
         Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
     ).read_text(encoding="utf-8")
 
-    assert 'git diff --quiet "$BASE_SHA" HEAD -- \'*.py\' \'*.pyi\'' in workflow_text
+    assert 'git diff --quiet "$BASE_SHA" HEAD -- \\' in workflow_text
+    for source_root in ("api", "db", "process", "service"):
+        assert f"':(glob){source_root}/**/*.py'" in workflow_text
     assert "--required-reduction-percent 0" in workflow_text
     assert "--required-reduction-percent 1" in workflow_text
 
