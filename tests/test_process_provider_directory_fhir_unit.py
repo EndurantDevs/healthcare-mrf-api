@@ -2336,7 +2336,7 @@ async def test_process_data_acquires_only_neutral_0900_without_alias_fanout(
     monkeypatch.setattr(importer, "_resolve_seed_db", lambda *_args, **_kwargs: ("fixture.db", None))
     monkeypatch.setattr(importer, "_seed_rows_from_sqlite", lambda *_args, **_kwargs: seed_rows)
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=6))
-    monkeypatch.setattr(importer, "_probe_sources", probe_sources)
+    monkeypatch.setattr(importer, "_run_source_probe_batch", probe_sources)
     monkeypatch.setattr(importer, "_import_resources", import_resources)
 
     audit_metrics = await importer.process_data(
@@ -5470,7 +5470,7 @@ async def test_probe_sources_records_credential_descriptor_without_secret(monkey
         "canonical_api_base": "https://payer.example/fhir",
         "metadata_json": {},
     }
-    await importer._probe_sources(
+    await importer._run_source_probe_batch(
         [tested_source_map],
         timeout=3,
         concurrency=1,
@@ -5617,7 +5617,7 @@ async def test_probe_sources_marks_source_timeout_when_probe_exceeds_hard_deadli
     monkeypatch.setattr(importer, "_source_probe_hard_timeout_seconds", lambda _source, *, timeout: 0.01)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    probed, valid, valid_source_ids = await importer._probe_sources(
+    probed, valid, valid_source_ids = await importer._run_source_probe_batch(
         [
             {
                 "source_id": "source_timeout",
@@ -5788,7 +5788,7 @@ async def test_probe_sources_does_not_count_credentialed_metadata_without_creden
         "auth_type": "OAuth2/SMART",
         "requires_registration": True,
     }
-    probed, valid, valid_source_ids = await importer._probe_sources(
+    probed, valid, valid_source_ids = await importer._run_source_probe_batch(
         [tested_source_map],
         timeout=3,
         concurrency=1,
@@ -5860,7 +5860,7 @@ async def test_probe_sources_uses_alohr_graphql_when_fhir_metadata_is_gone(monke
         "requires_registration": True,
         "metadata_json": {"provider_directory_graphql_tenant_id": importer.ALOHR_TENANT_ID},
     }
-    probed, valid, valid_source_ids = await importer._probe_sources(
+    probed, valid, valid_source_ids = await importer._run_source_probe_batch(
         [source_by_name],
         timeout=3,
         concurrency=1,
@@ -5994,7 +5994,7 @@ async def test_probe_sources_persists_resolved_api_base_for_repaired_catalog_url
         }
     )
 
-    probed, valid, valid_source_ids = await importer._probe_sources(
+    probed, valid, valid_source_ids = await importer._run_source_probe_batch(
         [tested_source_map],
         timeout=3,
         concurrency=1,
@@ -11160,7 +11160,7 @@ async def test_probe_only_refresh_skips_artifact_publish(monkeypatch):
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=1))
-    monkeypatch.setattr(importer, "_probe_sources", AsyncMock(return_value=(1, 1, {"source_a"})))
+    monkeypatch.setattr(importer, "_run_source_probe_batch", AsyncMock(return_value=(1, 1, {"source_a"})))
     publish_artifacts = AsyncMock(return_value={})
     monkeypatch.setattr(importer, "_publish_provider_directory_artifacts", publish_artifacts)
 
@@ -11312,7 +11312,7 @@ async def test_process_data_source_id_scopes_seed_probe_and_resource_import(monk
     )
     monkeypatch.setattr(importer, "_source_row_from_seed", fake_source_row)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
-    monkeypatch.setattr(importer, "_probe_sources", probe_sources)
+    monkeypatch.setattr(importer, "_run_source_probe_batch", probe_sources)
     monkeypatch.setattr(importer, "_import_resources", import_resources)
 
     metrics = await importer.process_data(
@@ -11357,7 +11357,7 @@ async def test_process_data_source_id_missing_from_catalog_fails_fast(monkeypatc
         },
     )
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock())
-    monkeypatch.setattr(importer, "_probe_sources", AsyncMock())
+    monkeypatch.setattr(importer, "_run_source_probe_batch", AsyncMock())
     monkeypatch.setattr(importer, "_import_resources", AsyncMock())
 
     with pytest.raises(ValueError, match="source_id not found"):
@@ -11372,7 +11372,7 @@ async def test_process_data_source_id_missing_from_catalog_fails_fast(monkeypatc
         )
 
     importer._upsert_rows.assert_not_awaited()
-    importer._probe_sources.assert_not_awaited()
+    importer._run_source_probe_batch.assert_not_awaited()
     importer._import_resources.assert_not_awaited()
 
 
@@ -11466,7 +11466,7 @@ def _stub_checkpoint_retry_process(monkeypatch, requested_source_id):
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=1))
     monkeypatch.setattr(
         importer,
-        "_probe_sources",
+        "_run_source_probe_batch",
         AsyncMock(return_value=(1, 0, set())),
     )
     monkeypatch.setattr(importer, "_import_resources", import_resources)
@@ -11580,7 +11580,7 @@ async def test_process_data_uses_live_probe_success_over_seed_auth_required_stat
         },
     )
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=1))
-    monkeypatch.setattr(importer, "_probe_sources", AsyncMock(return_value=(1, 1, {"source_a"})))
+    monkeypatch.setattr(importer, "_run_source_probe_batch", AsyncMock(return_value=(1, 1, {"source_a"})))
     import_resources = AsyncMock(return_value={"Practitioner": 1})
     monkeypatch.setattr(importer, "_import_resources", import_resources)
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=0))
@@ -12109,23 +12109,23 @@ def test_resource_start_url_ignores_unreachable_catalog_endpoint():
     assert url == "https://fp.medicaid.utah.gov/ProviderDirectoryServices/Location?_count=100"
 
 
-def test_resource_start_urls_partitions_scan_too_costly_resources():
-    practitioner_urls = importer._resource_start_urls(
+def test_partitioned_resource_start_urls_partitions_scan_too_costly_resources():
+    practitioner_urls = importer._partitioned_resource_start_urls(
         {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
         "Practitioner",
         page_count=25,
     )
-    location_urls = importer._resource_start_urls(
+    location_urls = importer._partitioned_resource_start_urls(
         {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
         "Location",
         page_count=25,
     )
-    organization_urls = importer._resource_start_urls(
+    organization_urls = importer._partitioned_resource_start_urls(
         {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
         "Organization",
         page_count=25,
     )
-    plan_urls = importer._resource_start_urls(
+    plan_urls = importer._partitioned_resource_start_urls(
         {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
         "InsurancePlan",
         page_count=25,
@@ -12168,7 +12168,7 @@ def test_aetna_commercial_resources_use_one_unfiltered_count_30_stream():
     )
 
     for resource_type in importer.AETNA_COMMERCIAL_SUPPORTED_RESOURCES:
-        assert importer._resource_start_urls(
+        assert importer._partitioned_resource_start_urls(
             source_lookup,
             resource_type,
             page_count=100,
@@ -12176,7 +12176,7 @@ def test_aetna_commercial_resources_use_one_unfiltered_count_30_stream():
             f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}/{resource_type}?_count=30"
         ]
 
-    assert importer._resource_start_urls(
+    assert importer._partitioned_resource_start_urls(
         source_lookup,
         "Endpoint",
         page_count=100,
@@ -12293,23 +12293,23 @@ async def test_aetna_medicaid_targeted_import_can_write_evidence(monkeypatch):
     assert [written_row["resource_id"] for written_row in written_rows] == ["prac-1"]
 
 
-def test_resource_start_urls_partitions_uhc_provider_directory_searches():
-    practitioner_urls = importer._resource_start_urls(
+def test_partitioned_resource_start_urls_partitions_uhc_provider_directory_searches():
+    practitioner_urls = importer._partitioned_resource_start_urls(
         {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
         "Practitioner",
         page_count=100,
     )
-    organization_urls = importer._resource_start_urls(
+    organization_urls = importer._partitioned_resource_start_urls(
         {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
         "Organization",
         page_count=100,
     )
-    location_urls = importer._resource_start_urls(
+    location_urls = importer._partitioned_resource_start_urls(
         {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
         "Location",
         page_count=100,
     )
-    role_urls = importer._resource_start_urls(
+    role_urls = importer._partitioned_resource_start_urls(
         {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
         "PractitionerRole",
         page_count=100,
@@ -12807,7 +12807,7 @@ def test_uhc_location_max_city_prefix_reports_unsplittable_cap():
 
 def test_uhc_organization_affiliation_has_no_false_partition_strategy():
     source_lookup = {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE}
-    start_urls = importer._resource_start_urls(
+    start_urls = importer._partitioned_resource_start_urls(
         source_lookup,
         "OrganizationAffiliation",
         page_count=100,
@@ -13781,7 +13781,7 @@ async def test_fetch_resource_rows_uses_concurrent_partition_workers(monkeypatch
         "https://example.test/fhir/Practitioner?part=2",
         "https://example.test/fhir/Practitioner?part=3",
     ]
-    monkeypatch.setattr(importer, "_resource_start_urls", lambda *_args, **_kwargs: start_urls)
+    monkeypatch.setattr(importer, "_partitioned_resource_start_urls", lambda *_args, **_kwargs: start_urls)
     monkeypatch.setattr(importer, "_partition_fetch_concurrency", lambda: 2)
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
 
@@ -13821,7 +13821,7 @@ async def test_single_partition_worker_checks_cancellation_before_fetch(monkeypa
     async def cancel_partition(_cancel_ctx, _cancel_task):
         raise RuntimeError("partition canceled")
 
-    monkeypatch.setattr(importer, "_resource_start_urls", lambda *_args, **_kwargs: start_urls)
+    monkeypatch.setattr(importer, "_partitioned_resource_start_urls", lambda *_args, **_kwargs: start_urls)
     monkeypatch.setattr(importer, "_partition_fetch_concurrency", lambda: 1)
     monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
     monkeypatch.setattr(importer, "raise_if_cancelled", cancel_partition)
@@ -21973,7 +21973,7 @@ async def test_unconfigured_resource_keeps_normal_paged_acquisition(monkeypatch)
     )
     monkeypatch.setattr(
         importer,
-        "_resource_start_urls",
+        "_partitioned_resource_start_urls",
         lambda *_args, **_kwargs: ["https://example.test/fhir/Location"],
     )
     monkeypatch.setattr(

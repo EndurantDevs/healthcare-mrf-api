@@ -140,6 +140,9 @@
       "metadata",
       "payload"
     ],
+    "confusable_function_name_exceptions": [
+      "confusable_function_name:tests/test_nucc_api:FakeResult:scalar:scalar|scalars"
+    ],
     "comment_noise_patterns": [
       "^(?:increment|decrement|return|returns|loop|iterate|assign|set|get|create|call|print)\\b",
       "^(?:initialize|initialise) (?:variable|counter|list|dict|dictionary|set)\\b"

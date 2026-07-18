@@ -10,6 +10,13 @@ and prevent new debt from entering unnoticed.
 - Use names that tell the human what role a value plays. Avoid generic
   function names, vague long-scope locals, one-letter names outside tiny scopes,
   and names that shadow Python builtins.
+- Do not distinguish one-item and multi-item functions only with a trailing
+  plural. Keep the singular entity name for one item and add explicit
+  cardinality or a collection verb for many items, such as `refresh_node_health`
+  and `refresh_all_node_health` rather than `refresh_nodes_health`.
+- Reserve `readability.confusable_function_name_exceptions` for externally
+  defined protocols that require both spellings. Entries are exact stable
+  finding IDs, not broad name-pattern exemptions.
 - Boolean names should read as predicates: `is_*`, `has_*`, `should_*`,
   `can_*`, `needs_*`, `supports_*`, or equivalent.
 - Collection names should reveal their shape: plural names for lists/sets and
@@ -31,7 +38,8 @@ and prevent new debt from entering unnoticed.
 - Inline suppressions are reported and blocked when new.
 - Naming and decomposition debt is reported for generic function/class names,
   vague local variable names in long scopes, boolean-name mismatches, builtin
-  shadowing, collection-name mismatches, one-letter names, too many parameters,
+  shadowing, confusable singular/plural function names, collection-name
+  mismatches, one-letter names, too many parameters,
   too many locals, global/nonlocal state, missing contract docstrings, placeholder
   bodies, and noisy comments.
 

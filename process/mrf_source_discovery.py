@@ -751,7 +751,7 @@ def _private_context_candidate_matches(
         candidate
         for candidate in eligible_candidates
         if _supports_candidate_benefit_line(candidate, context.benefit_line)
-        and _candidate_matches_text_filters(
+        and _is_candidate_text_filter_match(
             candidate, entity_types=(), payer_query=context.carrier_query
         )
     ]
@@ -763,8 +763,8 @@ def _private_query_expanded_candidates(
     eligible_candidates = [
         candidate
         for candidate in candidates
-        if _candidate_is_importable_source(candidate)
-        and _candidate_supports_source_query_expansion(candidate)
+        if _is_candidate_importable_source(candidate)
+        and _is_candidate_query_expansion_supported(candidate)
     ]
     matches_by_context: dict[tuple[str, str], list[SourceCandidate]] = {}
     expanded_candidates: list[SourceCandidate] = []
@@ -993,7 +993,7 @@ _MONTH_NAME_TO_NUMBER = {
 }
 
 
-def _looks_non_tic_mrf_reference(url: str | None, label: str | None = None) -> bool:
+def _is_non_tic_mrf_reference(url: str | None, label: str | None = None) -> bool:
     """Identify references that are clearly unrelated to TiC MRF data."""
     parsed = urlsplit(str(url or ""))
     host = parsed.netloc.lower()
@@ -1093,12 +1093,12 @@ def _looks_non_tic_mrf_reference(url: str | None, label: str | None = None) -> b
 def _mrf_body_file_type_from_text(
     url: str | None, label: str | None = None
 ) -> str | None:
-    if _looks_non_tic_mrf_reference(url, label):
+    if _is_non_tic_mrf_reference(url, label):
         return None
     inferred = _mrf_file_type_from_text(url, label)
     if inferred:
         return inferred
-    if not _looks_direct_mrf_body_url(url):
+    if not _is_direct_mrf_body_url(url):
         return None
     parsed = urlsplit(str(url or ""))
     path = parsed.path.lower().replace("_", "-")
@@ -1177,9 +1177,9 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "sapphire"
     if host == "mrf.healthsparq.com" and path.endswith("/latest_metadata.json"):
         return "healthsparq_direct_metadata"
-    if _looks_direct_toc_url(raw):
+    if _is_direct_toc_url(raw):
         return "direct_toc"
-    if _looks_direct_mrf_body_url(raw) and _mrf_body_file_type_from_text(raw):
+    if _is_direct_mrf_body_url(raw) and _mrf_body_file_type_from_text(raw):
         return "direct_mrf_body"
     if host == "mrf.healthgram.com":
         return "healthgram"
@@ -1693,7 +1693,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
         "amerihealthnj.com",
     } and path.startswith(("/cmstic", "/cmsticsvc/", "/developer-resources")):
         return "cmstic_file_info"
-    if _looks_cmstic_keyed_toc_url(raw):
+    if _is_cmstic_keyed_toc_url(raw):
         return "cmstic_keyed_toc_redirect"
     if host in {"www.reliancematrix.com", "reliancematrix.com"} and (
         "transparency-in-coverage" in path
@@ -1790,7 +1790,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "highmark_hmhs"
     if "asomrf" in raw:
         return "bcbs_asomrf"
-    if _looks_direct_toc_url(raw):
+    if _is_direct_toc_url(raw):
         return "direct_toc"
     if "changehealthcare.com" in host:
         return "change_healthcare"
@@ -2396,7 +2396,7 @@ async def _fetch_query_filtered_toc(
     session: aiohttp.ClientSession | None = None,
 ) -> dict[str, Any]:
     """Stream a carrier-wide TOC and retain only target-query structures."""
-    target_queries = _source_target_payer_queries(crawl_target.source)
+    target_queries = _source_payer_query_candidates(crawl_target.source)
     if not target_queries:
         raise ValueError("target payer query is required for filtered TOC streaming")
     await _assert_fetch_url_allowed(crawl_target.url)
@@ -2489,7 +2489,7 @@ async def _fetch_json_value(
     return _loads_mrf_json_value(text)
 
 
-def _looks_tic_toc_json_text(text: str) -> bool:
+def _is_tic_toc_json_text(text: str) -> bool:
     normalized = str(text or "").lower()
     return (
         '"reporting_structure"' in normalized
@@ -2536,7 +2536,7 @@ def _loads_mrf_json_value(text: str) -> Any:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        if not _looks_tic_toc_json_text(text):
+        if not _is_tic_toc_json_text(text):
             raise
         repaired = _repair_missing_array_object_commas(text)
         if repaired == text:
@@ -3317,7 +3317,7 @@ def _healthsparq_rows_from_metadata(
                     if plan.get("plan_market_type")
                 }
             ),
-            "is_signed_url": _looks_signed(file_url),
+            "is_signed_url": _is_signed(file_url),
             "size_bytes": None,
             "schema_version": None,
             "metadata_json": {
@@ -3355,7 +3355,7 @@ def _toc_rows_from_content(
     plan_rows_by_id: dict[str, dict[str, Any]] = {}
     file_rows: list[dict[str, Any]] = []
     target_query = _source_target_payer_query(source)
-    target_queries = _source_target_payer_queries(source)
+    target_queries = _source_payer_query_candidates(source)
     plan_predicate = None
     if filter_to_target_query and target_queries:
         plan_predicate = lambda plan: _is_plan_info_query_match(
@@ -3442,7 +3442,7 @@ def _toc_rows_from_content(
                         if plan.get("plan_market_type")
                     }
                 ),
-                "is_signed_url": _looks_signed(entry.original_url),
+                "is_signed_url": _is_signed(entry.original_url),
                 "size_bytes": None,
                 "schema_version": schema_version,
                 "metadata_json": {
@@ -3477,7 +3477,7 @@ def _metadata_text_file_type(value: Any) -> str:
     return text or "unknown"
 
 
-def _looks_direct_mrf_body_url(url: str | None) -> bool:
+def _is_direct_mrf_body_url(url: str | None) -> bool:
     path = urlsplit(str(url or "")).path.lower()
     if not path.endswith((".json", ".json.gz", ".gz", ".zip", ".7z", ".csv")):
         return False
@@ -3507,7 +3507,7 @@ def _metadata_text_rows_from_content(
     file_rows_by_id: dict[str, dict[str, Any]] = {}
     for line in (text or "").splitlines():
         file_url = _first_http_url(line)
-        if not file_url or not _looks_direct_mrf_body_url(file_url):
+        if not file_url or not _is_direct_mrf_body_url(file_url):
             continue
         fields = _metadata_text_fields(line)
         file_type = _metadata_text_file_type(
@@ -3561,7 +3561,7 @@ def _metadata_text_rows_from_content(
             "plan_ids": [sponsor_ein] if sponsor_ein else [],
             "plan_names": [plan_name] if plan_name else [],
             "market_types": [],
-            "is_signed_url": _looks_signed(file_url),
+            "is_signed_url": _is_signed(file_url),
             "size_bytes": None,
             "schema_version": None,
                 "metadata_json": {
@@ -3646,7 +3646,7 @@ def _parse_uhc_blob_listing(
         lower_name = name.lower()
         direct_embedded_vision = (
             "uhc---embedded-vision_uhc-vision" in lower_name
-            and _looks_direct_mrf_body_url(url)
+            and _is_direct_mrf_body_url(url)
             and _mrf_file_type_from_text(url, name) == "in-network"
         )
         if "_index.json" not in lower_name and not direct_embedded_vision:
@@ -3683,7 +3683,7 @@ def _uhc_blob_targets_matching_query(
     return [
         target
         for target in targets
-        if _search_values_match_query(
+        if _is_search_value_query_match(
             (
                 target.get("label"),
                 target.get("name"),
@@ -4184,7 +4184,7 @@ def _mymedicalshopper_employer_search_values(employer: dict[str, Any]) -> list[A
 def _has_mymedicalshopper_employer_query_match(
     employer: dict[str, Any], query: str | None
 ) -> bool:
-    return _search_values_match_query(
+    return _is_search_value_query_match(
         _mymedicalshopper_employer_search_values(employer), query
     )
 
@@ -4668,7 +4668,7 @@ def _viva_health_commercial_target(
     )
 
 
-def _viva_health_commercial_targets(
+def _collect_viva_health_commercial_targets(
     source: dict[str, Any], url: str
 ) -> list[CrawlTarget]:
     canonical_url = _canonical_or_none(url) or url
@@ -4731,7 +4731,7 @@ def _viva_health_employer_landing_target(
     )
 
 
-async def _viva_health_employer_landing_targets(
+async def _collect_viva_health_employer_landing_targets(
     source: dict[str, Any],
     *,
     employer_page_url: str,
@@ -4763,18 +4763,18 @@ async def _resolve_viva_health_mrf(
     path = urlsplit(url).path.rstrip("/").lower()
     crawl_targets: list[CrawlTarget] = []
     if path.startswith("/files/mrf/"):
-        crawl_targets.extend(_viva_health_commercial_targets(source_record, url))
+        crawl_targets.extend(_collect_viva_health_commercial_targets(source_record, url))
         if not crawl_targets:
             raise ValueError(f"no VIVA Health commercial MRF target found for {url}")
         return crawl_targets
     if resolver.get("include_commercial_static", True):
-        crawl_targets.extend(_viva_health_commercial_targets(source_record, url))
+        crawl_targets.extend(_collect_viva_health_commercial_targets(source_record, url))
     if resolver.get("include_employer_mrf_links", True):
         employer_url = urljoin(
             url, str(resolver.get("employer_path") or "/mrf/employers/")
         )
         try:
-            employer_targets = await _viva_health_employer_landing_targets(
+            employer_targets = await _collect_viva_health_employer_landing_targets(
                 source_record,
                 employer_page_url=employer_url,
                 resolver=resolver,
@@ -5459,7 +5459,7 @@ def _auxiant_container_format(url: str | None, label: str | None = None) -> str 
     return None
 
 
-def _auxiant_is_download_link(url: str | None, label: str | None = None) -> bool:
+def _is_auxiant_download_link(url: str | None, label: str | None = None) -> bool:
     if not _auxiant_download_extension(url, label):
         return False
     parsed = urlsplit(str(url or ""))
@@ -5516,7 +5516,7 @@ def _parse_auxiant_page_links(html_text: str, *, base_url: str) -> list[dict[str
         if "return to list" in label.lower():
             continue
         parsed = urlsplit(url)
-        if _auxiant_is_download_link(url, label):
+        if _is_auxiant_download_link(url, label):
             key = ("file_reference", _canonical_or_none(url) or url)
             links[key] = {
                 "url": url,
@@ -5789,7 +5789,7 @@ def _sapphire_toc_target(
         or inferred_payer_name
         or _label_from_index_name(inferred_file_name or Path(path).name)
     )
-    if not _looks_html_mrf_toc_url(url, inferred_file_name or inferred_label):
+    if not _is_html_mrf_toc_url(url, inferred_file_name or inferred_label):
         return None
     target_by_field: dict[str, Any] = {
         "url": url,
@@ -6442,7 +6442,7 @@ async def _resolve_html_delegated_mrf_links(
     return crawl_targets
 
 
-def _target_url_matches_any_pattern(target: CrawlTarget, patterns: Iterable[Any]) -> bool:
+def _is_target_url_pattern_match(target: CrawlTarget, patterns: Iterable[Any]) -> bool:
     url = str(target.url or "")
     return any(
         str(pattern or "").strip()
@@ -6460,13 +6460,13 @@ def _filter_crawl_targets_by_resolver_patterns(
         targets = [
             target
             for target in targets
-            if _target_url_matches_any_pattern(target, include_patterns)
+            if _is_target_url_pattern_match(target, include_patterns)
         ]
     if exclude_patterns:
         targets = [
             target
             for target in targets
-            if not _target_url_matches_any_pattern(target, exclude_patterns)
+            if not _is_target_url_pattern_match(target, exclude_patterns)
         ]
     return targets
 
@@ -7202,10 +7202,10 @@ def _json_mrf_directory_targets_from_payload(
             label = Path(urlsplit(file_url).path).name
             target_kind: str | None = None
             target_file_type: str | None = None
-            if _looks_html_mrf_toc_url(file_url, label):
+            if _is_html_mrf_toc_url(file_url, label):
                 target_kind = "toc_json"
                 target_file_type = "table-of-contents"
-            elif _looks_html_mrf_body_reference(file_url, label):
+            elif _is_html_mrf_body_reference(file_url, label):
                 target_kind = "file_reference"
                 target_file_type = _mrf_file_type_from_text(file_url, label)
             if not target_kind or not target_file_type:
@@ -7465,7 +7465,7 @@ async def _resolve_humana_pct_file_list(
     return crawl_targets[:max_targets]
 
 
-def _html_looks_cloudflare_challenge(html_text: str) -> bool:
+def _is_html_cloudflare_challenge(html_text: str) -> bool:
     lowered = str(html_text or "").lower()
     return (
         "cf-mitigated" in lowered
@@ -7544,7 +7544,7 @@ async def _resolve_fchn_payor_search(
         max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
         session=session,
     )
-    if _html_looks_cloudflare_challenge(html_text):
+    if _is_html_cloudflare_challenge(html_text):
         raise ValueError(f"cloudflare_challenge blocks FCHN MRF discovery for {url}")
     crawl_targets = _fchn_targets_from_detail_html(
         source, html_text, detail_url=url, resolver_type=resolver_type
@@ -7568,7 +7568,7 @@ async def _resolve_fchn_payor_search(
             )
         except Exception:
             continue
-        if _html_looks_cloudflare_challenge(detail_html):
+        if _is_html_cloudflare_challenge(detail_html):
             continue
         crawl_targets.extend(
             _fchn_targets_from_detail_html(
@@ -7856,7 +7856,7 @@ def _payercompass_plan_info_by_file_key(
     return plan_info_by_key, toc_metadata
 
 
-def _payercompass_is_index_target(target: CrawlTarget) -> bool:
+def _is_payercompass_index_target(target: CrawlTarget) -> bool:
     metadata = target.metadata or {}
     file_name = str(metadata.get("payercompass_file_name") or target.label or "")
     normalized = file_name.lower()
@@ -7893,7 +7893,7 @@ async def _enrich_payercompass_target_plan_info(
     plan_info_by_key: dict[str, list[dict[str, Any]]] = {}
     toc_metadata_by_field: dict[str, str | None] = {}
     for crawl_target in crawl_targets:
-        if not _payercompass_is_index_target(crawl_target):
+        if not _is_payercompass_index_target(crawl_target):
             continue
         size_bytes = _parse_size_bytes((crawl_target.metadata or {}).get("size_bytes"))
         if size_bytes and size_bytes > index_fetch_max_bytes:
@@ -8236,7 +8236,7 @@ def _cmstic_brand_from_url(url: str) -> str | None:
     return None
 
 
-def _cmstic_brands_from_url(url: str, resolver: dict[str, Any]) -> list[str]:
+def _cmstic_brand_candidates_from_url(url: str, resolver: dict[str, Any]) -> list[str]:
     parsed = urlsplit(str(url or ""))
     host = parsed.netloc.lower()
     brand = _cmstic_brand_from_url(url)
@@ -8283,7 +8283,7 @@ def _cmstic_api_url(url: str, brand: str | None = None) -> str:
     return f"{base}?{urlencode({'brand': brand})}"
 
 
-def _looks_cmstic_keyed_toc_url(url: str | None) -> bool:
+def _is_cmstic_keyed_toc_url(url: str | None) -> bool:
     parsed = urlsplit(str(url or "").strip())
     host = parsed.netloc.lower()
     if host not in {"www.ibx.com", "ibx.com"}:
@@ -8301,9 +8301,9 @@ def _cmstic_keyed_toc_crawl_target(
     resolver: dict[str, Any],
     resolver_type: str,
 ) -> CrawlTarget | None:
-    if not _looks_cmstic_keyed_toc_url(url):
+    if not _is_cmstic_keyed_toc_url(url):
         return None
-    if not _looks_direct_toc_url(final_url):
+    if not _is_direct_toc_url(final_url):
         return None
     source_id = Path(urlsplit(str(url or "")).path.rstrip("/")).name
     toc_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
@@ -8332,7 +8332,7 @@ async def _resolve_cmstic_keyed_toc_redirect(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
-    if not _looks_cmstic_keyed_toc_url(url):
+    if not _is_cmstic_keyed_toc_url(url):
         raise ValueError(f"unsupported CMSTIC keyed TOC URL: {url}")
     await _assert_fetch_url_allowed(url)
     async with session.head(
@@ -8382,7 +8382,7 @@ def _cmstic_target_from_payload(
     if not file_url.startswith(("http://", "https://")):
         return None
     label = _clean_text(payload.get("name")) or Path(urlsplit(file_url).path).name
-    if not _looks_html_mrf_toc_url(file_url, label):
+    if not _is_html_mrf_toc_url(file_url, label):
         return None
     return CrawlTarget(
         source=source,
@@ -8407,7 +8407,7 @@ async def _resolve_cmstic_file_info(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     targets: list[CrawlTarget] = []
-    for brand in _cmstic_brands_from_url(url, resolver):
+    for brand in _cmstic_brand_candidates_from_url(url, resolver):
         api_url = _cmstic_api_url(url, brand)
         payload = await _fetch_json(
             api_url,
@@ -8491,10 +8491,10 @@ def _github_tree_mrf_target(
     label = _github_mrf_plan_label(path) or Path(path).name
     file_type: str | None = None
     target_kind: str | None = None
-    if _looks_html_mrf_toc_url(raw_url, label):
+    if _is_html_mrf_toc_url(raw_url, label):
         file_type = "table-of-contents"
         target_kind = "toc_json"
-    elif _looks_direct_mrf_body_url(raw_url):
+    elif _is_direct_mrf_body_url(raw_url):
         file_type = _mrf_file_type_from_text(raw_url, label)
         target_kind = "file_reference"
     if not file_type or not target_kind:
@@ -8722,8 +8722,8 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
         for url in _embedded_mrf_urls(html_text or "", base_url=base_url):
             label = Path(urlsplit(url).path).name
             if not (
-                _looks_html_mrf_toc_url(url, label)
-                or _looks_html_mrf_body_reference(url, label)
+                _is_html_mrf_toc_url(url, label)
+                or _is_html_mrf_body_reference(url, label)
             ):
                 continue
             candidates.append({"attr": "text", "value": url, "label": label})
@@ -8945,14 +8945,14 @@ def _decode_embedded_url_text(value: str | None) -> str:
     return text
 
 
-def _looks_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
+def _is_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
     """Classify whether a URL or label refers to an MRF table of contents."""
     parsed = urlsplit(str(url or ""))
     host = parsed.netloc.lower()
     path = parsed.path.lower()
     query = parsed.query.lower()
     text = f"{path} {query} {label or ''}".lower().replace("_", "-")
-    if _looks_non_tic_mrf_reference(url, label):
+    if _is_non_tic_mrf_reference(url, label):
         return False
     if any(
         token in text for token in ("formulary", "provider-data", "provider ")
@@ -9030,16 +9030,16 @@ def _looks_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
     )
 
 
-def _looks_html_mrf_body_reference(url: str | None, label: str | None = None) -> bool:
+def _is_html_mrf_body_reference(url: str | None, label: str | None = None) -> bool:
     """Classify whether a URL or label refers to an MRF body file."""
     query_file_name = _query_mrf_file_name(url)
-    direct_body = _looks_direct_mrf_body_url(url) or bool(query_file_name)
+    direct_body = _is_direct_mrf_body_url(url) or bool(query_file_name)
     parsed = urlsplit(str(url or ""))
     host = parsed.netloc.lower()
     path = parsed.path.lower()
     if host == "github.com" and path.startswith("/cmsgov/price-transparency-guide"):
         return False
-    if _looks_non_tic_mrf_reference(url, label):
+    if _is_non_tic_mrf_reference(url, label):
         return False
     if path.endswith("/") and not query_file_name:
         return False
@@ -9145,7 +9145,7 @@ def _html_mrf_frame_urls(html_text: str, *, base_url: str) -> list[str]:
     return urls
 
 
-def _html_label_looks_fileish(label: str | None, path: str) -> bool:
+def _is_html_label_fileish(label: str | None, path: str) -> bool:
     text = _clean_text(label)
     if not text:
         return True
@@ -9158,7 +9158,7 @@ def _html_label_looks_fileish(label: str | None, path: str) -> bool:
     return bool(re.match(r"^\d{4}-\d{2}-\d{2}[_-]", text))
 
 
-def _html_label_looks_planish(label: str | None) -> bool:
+def _is_html_label_planish(label: str | None) -> bool:
     text = _clean_text(label)
     if not text:
         return False
@@ -9224,7 +9224,7 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
         target_file_type: str | None = None
         resolver = "html_mrf_link"
         query_file_name = _query_mrf_file_name(url)
-        direct_body = _looks_direct_mrf_body_url(url) or bool(query_file_name)
+        direct_body = _is_direct_mrf_body_url(url) or bool(query_file_name)
         link_file_type = _mrf_file_type_from_html_link_context(
             html_text,
             html_start if isinstance(html_start, int) else None,
@@ -9239,13 +9239,13 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
             target_kind = "metadata_text"
             target_file_type = "metadata-index"
             resolver = "html_metadata_text"
-        elif _looks_html_mrf_toc_url(url, label):
+        elif _is_html_mrf_toc_url(url, label):
             target_kind = "toc_json"
             target_file_type = "table-of-contents"
-        elif _looks_html_mrf_body_reference(url, label) or (
+        elif _is_html_mrf_body_reference(url, label) or (
             direct_body
             and (link_file_type or section_file_type)
-            and not _looks_non_tic_mrf_reference(url, label)
+            and not _is_non_tic_mrf_reference(url, label)
         ):
             target_kind = "file_reference"
             target_file_type = _mrf_body_file_type_from_text(url, label) or (
@@ -9256,17 +9256,17 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
             resolver = "html_file_reference"
             inferred_label = _mrf_file_plan_label(path)
             if (
-                _looks_direct_mrf_body_url(url)
+                _is_direct_mrf_body_url(url)
                 and inferred_label
-                and _html_label_looks_fileish(label, path)
+                and _is_html_label_fileish(label, path)
             ):
                 label = inferred_label
         if not target_kind or not target_file_type:
             continue
         plan_info_rows = []
         if target_kind == "file_reference":
-            if _html_label_looks_fileish(candidate.get("label"), path) or (
-                target_file_type == "in-network" and _html_label_looks_planish(label)
+            if _is_html_label_fileish(candidate.get("label"), path) or (
+                target_file_type == "in-network" and _is_html_label_planish(label)
             ):
                 plan_info_rows = _plan_info_from_label(label)
         key = (target_kind, _canonical_or_none(url) or url)
@@ -10517,8 +10517,8 @@ def _healthcarebluebook_link_items_from_context(
         if not link_url:
             continue
         if not (
-            _healthcarebluebook_relative_file_url(link_url)
-            or _looks_direct_mrf_body_url(link_url)
+            _is_healthcarebluebook_relative_file_url(link_url)
+            or _is_direct_mrf_body_url(link_url)
             or classify_hosting_platform(link_url)
         ):
             continue
@@ -10572,18 +10572,18 @@ def _healthcarebluebook_grid_items(
     return items
 
 
-def _healthcarebluebook_relative_file_url(url: str) -> bool:
+def _is_healthcarebluebook_relative_file_url(url: str) -> bool:
     parsed = urlsplit(url)
     return parsed.netloc.lower() == "mrf.healthcarebluebook.com" and bool(
         re.match(r"^/[^/]+/\d+/?$", parsed.path)
     )
 
 
-async def _healthcarebluebook_numeric_file_url_is_downloadable(
+async def _is_healthcarebluebook_numeric_url_downloadable(
     url: str,
     session: aiohttp.ClientSession | None,
 ) -> bool:
-    if not _healthcarebluebook_relative_file_url(url):
+    if not _is_healthcarebluebook_relative_file_url(url):
         return True
     probe = await _head_url(url, session=session)
     status = str(probe.get("status") or "")
@@ -10591,7 +10591,7 @@ async def _healthcarebluebook_numeric_file_url_is_downloadable(
         return True
     final_url = str(probe.get("final_url") or url)
     if final_url != url and (
-        _container_format(final_url) or _looks_direct_mrf_body_url(final_url)
+        _container_format(final_url) or _is_direct_mrf_body_url(final_url)
     ):
         return True
     http_status = _as_int(probe.get("http_status"))
@@ -10606,7 +10606,7 @@ async def _healthcarebluebook_numeric_file_url_is_downloadable(
     return True
 
 
-def _healthcarebluebook_item_matches_query(
+def _is_healthcarebluebook_item_query_match(
     item: dict[str, Any],
     *,
     link_url: str,
@@ -10616,7 +10616,7 @@ def _healthcarebluebook_item_matches_query(
 ) -> bool:
     if not query:
         return True
-    return _search_values_match_query(
+    return _is_search_value_query_match(
         [
             label,
             link_url,
@@ -10695,7 +10695,7 @@ async def _resolve_healthcarebluebook_mrf(
         file_type = _healthcarebluebook_file_type(type_text, label, link_url)
         if not file_type:
             continue
-        if not _healthcarebluebook_item_matches_query(
+        if not _is_healthcarebluebook_item_query_match(
             listing_item,
             link_url=link_url,
             label=label,
@@ -10703,11 +10703,11 @@ async def _resolve_healthcarebluebook_mrf(
             query=target_query,
         ):
             continue
-        is_hbb_numeric_file = _healthcarebluebook_relative_file_url(link_url)
-        if is_hbb_numeric_file or _looks_direct_mrf_body_url(link_url):
+        is_hbb_numeric_file = _is_healthcarebluebook_relative_file_url(link_url)
+        if is_hbb_numeric_file or _is_direct_mrf_body_url(link_url):
             is_downloadable = (
                 not is_hbb_numeric_file
-                or await _healthcarebluebook_numeric_file_url_is_downloadable(
+                or await _is_healthcarebluebook_numeric_url_downloadable(
                     link_url, session
                 )
             )
@@ -10880,7 +10880,7 @@ async def _resolve_html_mrf_with_healthcarebluebook(
     return crawl_targets
 
 
-def _regex_matches_config(value: Any, pattern: Any) -> bool:
+def _is_regex_config_match(value: Any, pattern: Any) -> bool:
     pattern_text = str(pattern or "").strip()
     if not pattern_text:
         return True
@@ -10987,7 +10987,7 @@ def _socrata_dataset_contact_text(dataset: dict[str, Any]) -> str:
     return " ".join(str(value or "") for value in values)
 
 
-def _socrata_dataset_matches(dataset: dict[str, Any], resolver: dict[str, Any]) -> bool:
+def _is_socrata_dataset_match(dataset: dict[str, Any], resolver: dict[str, Any]) -> bool:
     title = _clean_text(dataset.get("title"))
     description = _clean_text(dataset.get("description"))
     if not title:
@@ -10996,9 +10996,9 @@ def _socrata_dataset_matches(dataset: dict[str, Any], resolver: dict[str, Any]) 
         return False
     if not _socrata_file_type(title, description):
         return False
-    if not _regex_matches_config(title, resolver.get("title_regex")):
+    if not _is_regex_config_match(title, resolver.get("title_regex")):
         return False
-    if not _regex_matches_config(
+    if not _is_regex_config_match(
         _socrata_dataset_contact_text(dataset), resolver.get("contact_regex")
     ):
         return False
@@ -11088,7 +11088,7 @@ async def _resolve_socrata_data_json_mrf_catalog(
     datasets = [
         dataset_entry
         for dataset_entry in (catalog_payload.get("dataset") or [])
-        if isinstance(dataset_entry, dict) and _socrata_dataset_matches(dataset_entry, resolver)
+        if isinstance(dataset_entry, dict) and _is_socrata_dataset_match(dataset_entry, resolver)
     ]
     if resolver.get("latest_coverage_month_only"):
         coverage_months = [
@@ -11203,7 +11203,7 @@ def _parse_cigna_lookup_targets(
                 or Path(urlsplit(file_url).path).name
             )
             if not (
-                _looks_direct_toc_url(file_url)
+                _is_direct_toc_url(file_url)
                 or _mrf_file_type_from_text(file_url, file_name) == "table-of-contents"
             ):
                 continue
@@ -11415,7 +11415,7 @@ def _bcbs_global_solutions_landing_links_from_html(
     return urls
 
 
-def _bcbs_global_solutions_toc_has_in_network(payload: Any) -> bool:
+def _is_bcbs_toc_in_network(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
     reporting_structure = payload.get("reporting_structure")
@@ -11498,7 +11498,7 @@ async def _resolve_bcbs_global_solutions_mrf(
             )
         except Exception:
             continue
-        if not _bcbs_global_solutions_toc_has_in_network(toc_payload):
+        if not _is_bcbs_toc_in_network(toc_payload):
             continue
         plan_type = _clean_text(link.get("plan_type"))
         plan_name = _bcbs_global_solutions_first_plan_name(toc_payload)
@@ -11896,10 +11896,10 @@ def _azure_mrf_listing_targets_from_xml(
         label = Path(urlsplit(file_url).path).name or name
         target_kind: str | None = None
         target_file_type: str | None = None
-        if _looks_html_mrf_toc_url(file_url, label):
+        if _is_html_mrf_toc_url(file_url, label):
             target_kind = "toc_json"
             target_file_type = "table-of-contents"
-        elif _looks_html_mrf_body_reference(file_url, label):
+        elif _is_html_mrf_body_reference(file_url, label):
             target_kind = "file_reference"
             target_file_type = _mrf_file_type_from_text(file_url, label)
         if not file_url or not target_kind or not target_file_type:
@@ -12217,7 +12217,7 @@ def _healthspace_mrf_targets_from_soap(
         if not url:
             continue
         file_type = _mrf_file_type_from_text(url, file_name)
-        if not file_type and _looks_non_tic_mrf_reference(url, file_name):
+        if not file_type and _is_non_tic_mrf_reference(url, file_name):
             continue
         if not file_type:
             continue
@@ -12737,7 +12737,7 @@ def _healthsparq_query_plan_label(
     query = _clean_text(target_query)
     if not raw_name:
         return None, None
-    if not query or not _search_values_match_query([raw_name], query):
+    if not query or not _is_search_value_query_match([raw_name], query):
         return raw_name, None
     tokens = _query_match_tokens(query)
     if not tokens:
@@ -12826,7 +12826,7 @@ def _matching_plan_info_query(
         (
             query_value
             for query_value in _plan_info_query_values(query)
-            if _search_values_match_query(search_values, query_value)
+            if _is_search_value_query_match(search_values, query_value)
         ),
         None,
     )
@@ -12866,12 +12866,12 @@ def _healthsparq_plan_info(
     return items
 
 
-def _healthsparq_file_matches_query(
+def _is_healthsparq_file_query_match(
     file_item: dict[str, Any], query: str | None
 ) -> bool:
     if not query:
         return True
-    return _search_values_match_query(
+    return _is_search_value_query_match(
         [
             _healthsparq_file_name(file_item),
             _healthsparq_file_path(file_item),
@@ -12908,7 +12908,7 @@ def _healthsparq_targets_from_metadata(
     target_query = _source_target_payer_query(source_row_dict)
     targets_by_key: dict[tuple[str, str], CrawlTarget] = {}
     for file_item in files:
-        if not _healthsparq_file_matches_query(file_item, target_query):
+        if not _is_healthsparq_file_query_match(file_item, target_query):
             continue
         file_url = _healthsparq_file_url(metadata_url, _healthsparq_file_path(file_item))
         if not file_url:
@@ -13108,7 +13108,7 @@ def _providence_toc_targets_from_payload(
             if not isinstance(toc_entry, dict):
                 continue
             toc_url = _clean_text(toc_entry.get("TOC_URL"))
-            if not _looks_html_mrf_toc_url(toc_url, Path(urlsplit(toc_url).path).name):
+            if not _is_html_mrf_toc_url(toc_url, Path(urlsplit(toc_url).path).name):
                 continue
             metadata = {
                 "resolver": resolver_type,
@@ -13206,8 +13206,8 @@ async def _resolve_providence_mrf_api(
     return crawl_targets
 
 
-def _looks_direct_toc_url(url: str | None) -> bool:
-    if _looks_non_tic_mrf_reference(url):
+def _is_direct_toc_url(url: str | None) -> bool:
+    if _is_non_tic_mrf_reference(url):
         return False
     parsed = urlsplit(str(url or ""))
     host = parsed.netloc.lower()
@@ -13463,7 +13463,7 @@ async def _crawl_targets_for_source(
             raise ValueError(f"no UHC blob index links found for {url}{suffix}")
         return crawl_targets
     if resolver_type == "sapphire_html_tocs":
-        if _looks_direct_toc_url(url):
+        if _is_direct_toc_url(url):
             return [
                 CrawlTarget(
                     source=source_row,
@@ -13564,7 +13564,7 @@ async def _crawl_targets_for_source(
     direct_body_target = _direct_mrf_body_crawl_target(source_row, url)
     if direct_body_target:
         return [direct_body_target]
-    if not _looks_direct_toc_url(url):
+    if not _is_direct_toc_url(url):
         html_text = await _fetch_text(url, max_bytes=5 * 1024 * 1024, session=session)
         html_targets = _parse_html_mrf_links(html_text, base_url=url)
         if html_targets:
@@ -13717,7 +13717,7 @@ def _source_target_payer_query(source: dict[str, Any]) -> str | None:
     ) or None
 
 
-def _source_target_payer_queries(source_row: dict[str, Any]) -> tuple[str, ...]:
+def _source_payer_query_candidates(source_row: dict[str, Any]) -> tuple[str, ...]:
     """Return scoped employer names and stable identifiers used to scan TOCs."""
     query_values: list[str] = []
     canonical_query = _source_target_payer_query(source_row)
@@ -13825,7 +13825,7 @@ def _matched_query_expansion_target(
         return crawl_target
     metadata = dict(crawl_target.metadata or {})
     is_resolver_context_match = metadata.get("query_context_match") is True
-    if not is_resolver_context_match and not _search_values_match_query(
+    if not is_resolver_context_match and not _is_search_value_query_match(
         _crawl_target_search_values(crawl_target), query
     ):
         return None
@@ -14042,7 +14042,7 @@ def _direct_mrf_body_crawl_target(
     *,
     resolver: str = "direct_mrf_body",
 ) -> CrawlTarget | None:
-    if not _looks_direct_mrf_body_url(url):
+    if not _is_direct_mrf_body_url(url):
         return None
     file_type = _mrf_body_file_type_from_text(
         url, str(source_record.get("display_name") or "")
@@ -14078,7 +14078,7 @@ def _direct_toc_crawl_target(
     resolver: str = "direct_toc",
     target_max_bytes: int | None = None,
 ) -> CrawlTarget | None:
-    if not _looks_direct_toc_url(url):
+    if not _is_direct_toc_url(url):
         return None
     metadata = {
         "resolver": resolver,
@@ -14151,7 +14151,7 @@ def _toc_target_file_row(crawl_target: CrawlTarget) -> dict[str, Any]:
                 if plan.get("plan_market_type")
             }
         ),
-        "is_signed_url": _looks_signed(crawl_target.url),
+        "is_signed_url": _is_signed(crawl_target.url),
         "size_bytes": size_bytes,
         "etag": target_metadata.get("etag"),
         "last_modified": target_metadata.get("last_modified"),
@@ -14363,7 +14363,7 @@ def _normalize_text_query(value: Any) -> str | None:
     return text or None
 
 
-def _candidate_matches_text_filters(
+def _is_candidate_text_filter_match(
     candidate: SourceCandidate,
     *,
     entity_types: tuple[str, ...],
@@ -14382,14 +14382,14 @@ def _candidate_matches_text_filters(
             target_payer_query or "",
         )
         if not any(
-            _candidate_search_name_matches_query(name, query)
+            _is_candidate_search_name_match(name, query)
             for name in searchable_names
         ):
             return False
     return True
 
 
-def _candidate_search_name_matches_query(name: str, query: str) -> bool:
+def _is_candidate_search_name_match(name: str, query: str) -> bool:
     text = _clean_text(name).lower()
     if not text:
         return False
@@ -14431,7 +14431,7 @@ def _query_token_variants(token: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(variant for variant in variants if variant))
 
 
-def _search_values_match_query(values: Iterable[Any], query: str | None) -> bool:
+def _is_search_value_query_match(values: Iterable[Any], query: str | None) -> bool:
     clean_query = _clean_text(query).lower()
     if not clean_query:
         return True
@@ -14471,7 +14471,7 @@ def _search_match_text(value: Any) -> str:
     return text
 
 
-def _candidate_supports_source_query_expansion(candidate: SourceCandidate) -> bool:
+def _is_candidate_query_expansion_supported(candidate: SourceCandidate) -> bool:
     source_url = candidate.index_url or candidate.human_url
     platform = candidate.hosting_platform or classify_hosting_platform(source_url)
     if platform not in _source_query_expansion_platforms():
@@ -14519,7 +14519,7 @@ def _candidate_with_target_payer_query(
     )
 
 
-def _candidate_is_importable_source(candidate: SourceCandidate) -> bool:
+def _is_candidate_importable_source(candidate: SourceCandidate) -> bool:
     if not (candidate.index_url or candidate.human_url):
         return False
     if _normalize_source_tier(candidate.source_tier) != "mrf_importable":
@@ -14534,7 +14534,7 @@ def _source_row_source_tier(row: dict[str, Any]) -> str:
     return _normalize_source_tier(row.get("source_tier") or metadata.get("source_tier"))
 
 
-def _source_row_is_importable(row: dict[str, Any]) -> bool:
+def _is_source_row_importable(row: dict[str, Any]) -> bool:
     status = str(row.get("status") or "active").strip().lower()
     return (
         _source_row_source_tier(row) == "mrf_importable"
@@ -14542,8 +14542,8 @@ def _source_row_is_importable(row: dict[str, Any]) -> bool:
     )
 
 
-def _candidate_has_catalog_source(candidate: SourceCandidate) -> bool:
-    if _candidate_is_importable_source(candidate):
+def _has_candidate_catalog_source(candidate: SourceCandidate) -> bool:
+    if _is_candidate_importable_source(candidate):
         return True
     if not (candidate.index_url or candidate.human_url):
         return False
@@ -15151,7 +15151,7 @@ async def _crawl_toc_metadata(
     )
 
 
-def _looks_signed(url: str | None) -> bool:
+def _is_signed(url: str | None) -> bool:
     raw = str(url or "").lower()
     return any(
         token in raw
@@ -15470,7 +15470,7 @@ async def _process_discovery_source_record(
             )
         plans_discovered = 0
         files_discovered = 0
-        if processing_options.crawl and _source_row_is_importable(source_record):
+        if processing_options.crawl and _is_source_row_importable(source_record):
             (
                 plans_discovered,
                 files_discovered,
@@ -15867,14 +15867,14 @@ async def main(
             and sum(len(token) for token in _query_tokens(parsed_source_payer_query)) >= 3
         )
         for candidate in candidates:
-            if _candidate_matches_text_filters(
+            if _is_candidate_text_filter_match(
                 candidate,
                 entity_types=parsed_source_entity_types,
                 payer_query=parsed_source_payer_query,
             ):
                 filtered_candidates.append(candidate)
                 continue
-            if query_can_expand and _candidate_supports_source_query_expansion(candidate):
+            if query_can_expand and _is_candidate_query_expansion_supported(candidate):
                 query_expansion_candidates.append(
                     _candidate_with_target_payer_query(
                         candidate, parsed_source_payer_query or ""
@@ -15887,7 +15887,7 @@ async def main(
     candidates = [
         candidate
         for candidate in candidates
-        if _candidate_has_catalog_source(candidate)
+        if _has_candidate_catalog_source(candidate)
     ]
     if bounded_limit:
         candidates = candidates[:bounded_limit]

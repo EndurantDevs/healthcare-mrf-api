@@ -13,6 +13,7 @@ DEFAULT_ISSUE_CATEGORIES = (
     "class_name_shape",
     "collection_name_mismatch",
     "comment_noise",
+    "confusable_function_names",
     "deep_nesting",
     "function_name_shape",
     "global_state_usage",

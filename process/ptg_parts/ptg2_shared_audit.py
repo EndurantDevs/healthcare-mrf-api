@@ -713,7 +713,7 @@ async def _graph_targeted_members(
         member_width,
     )
     block_payload_by_key = await reader.logical_blocks(object_kind, block_keys)
-    return _decode_graph_members(
+    return _decode_requested_graph_members(
         requested_ordinals_by_owner,
         locator_by_owner_key,
         block_payload_by_key,
@@ -753,7 +753,7 @@ def _required_graph_block_keys(
     return block_keys
 
 
-def _decode_graph_members(
+def _decode_requested_graph_members(
     requested_ordinals_by_owner: Mapping[int, Sequence[int]],
     locator_by_owner_key: Mapping[int, _GraphOwnerLocator],
     block_payload_by_key: Mapping[int, tuple[bytes, int]],

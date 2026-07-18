@@ -1179,17 +1179,17 @@ async def test_get_all_falls_back_to_exists_when_arrays_unavailable(monkeypatch)
     assert "c.medications_array @> ARRAY[:medication_code_0]::INTEGER[]" not in conn.last_sql
 
 
-def test_name_like_clauses_default_like_only(monkeypatch):
+def test_names_like_filter_clause_default_like_only(monkeypatch):
     monkeypatch.setattr(npi_module, "ENABLE_TRGM_FUZZY_NAME_SEARCH", False)
-    clause, params = npi_module._name_like_clauses("d", ["cvs"])
+    clause, params = npi_module._names_like_filter_clause("d", ["cvs"])
     assert " % :" not in clause
     assert "name_like_0" in params
     assert "name_like_0_fuzzy" not in params
 
 
-def test_name_like_clauses_can_enable_trgm_fuzzy(monkeypatch):
+def test_names_like_filter_clause_can_enable_trgm_fuzzy(monkeypatch):
     monkeypatch.setattr(npi_module, "ENABLE_TRGM_FUZZY_NAME_SEARCH", True)
-    clause, params = npi_module._name_like_clauses("d", ["cvs"])
+    clause, params = npi_module._names_like_filter_clause("d", ["cvs"])
     assert " % :name_like_0_fuzzy" in clause
     assert params["name_like_0"] == "%cvs%"
     assert params["name_like_0_fuzzy"] == "cvs"

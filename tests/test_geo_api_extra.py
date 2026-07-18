@@ -604,7 +604,7 @@ async def test_geo_places_by_zip_not_found():
 
 
 @pytest.mark.asyncio
-async def test_geo_states_invalid_limit():
+async def test_geo_state_list_rejects_invalid_limit():
     request = types.SimpleNamespace(
         args={"limit": "bad"},
         ctx=types.SimpleNamespace(sa_session=FakeSession([])),
@@ -668,7 +668,7 @@ async def test_geo_state_invalid_length():
 
 
 @pytest.mark.asyncio
-async def test_geo_state_invalid_limit():
+async def test_geo_state_lookup_rejects_invalid_limit():
     request = types.SimpleNamespace(args={"limit": "bad"}, ctx=types.SimpleNamespace(sa_session=FakeSession([])))
     with pytest.raises(InvalidUsage):
         await geo_module.get_top_cities_by_state(request, "CA")

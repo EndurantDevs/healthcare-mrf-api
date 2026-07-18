@@ -26,8 +26,8 @@ def test_process_worker_runs_targeted_mrf_discovery_job_once(monkeypatch, tmp_pa
         return FakeProcess()
 
     monkeypatch.setattr(control_workers.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(control_workers, "_pid_running", lambda pid: pid == FakeProcess.pid)
-    monkeypatch.setattr(control_workers, "_pid_matches_spec", lambda pid, spec: True)
+    monkeypatch.setattr(control_workers, "_is_pid_running", lambda pid: pid == FakeProcess.pid)
+    monkeypatch.setattr(control_workers, "_is_pid_spec_match", lambda pid, spec: True)
 
     result = control_workers.ensure_worker(_discovery_launch_payload())
 

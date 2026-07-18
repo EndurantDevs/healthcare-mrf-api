@@ -116,7 +116,7 @@ async def _load_synonym_entries(session, key_variants: SpecialtyKeyVariants) -> 
     return entries_by_variant
 
 
-async def load_dynamic_specialty_entries(session, key_variants: SpecialtyKeyVariants) -> SpecialtyEntries:
+async def load_dynamic_specialty_entries_by_variant(session, key_variants: SpecialtyKeyVariants) -> SpecialtyEntries:
     """Load DB-backed NUCC and synonym specialty aliases."""
 
     entries_by_variant = await _load_nucc_entries(session, key_variants)

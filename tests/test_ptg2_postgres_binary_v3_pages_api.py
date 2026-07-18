@@ -368,7 +368,7 @@ async def test_reverse_page_reports_exact_projected_total(monkeypatch):
     assert selection is not None
     assert len(selection.rows) == 1
     assert selection.total_row_count == 100
-    assert selection.total_is_exact
+    assert selection.is_total_exact
     assert not selection.exhausted
 
 

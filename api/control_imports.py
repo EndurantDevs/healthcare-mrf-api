@@ -959,7 +959,7 @@ async def find_active_run_by_idempotency_key(idempotency_key: str) -> dict[str, 
     return normalize_run(row) if row else None
 
 
-async def find_active_run_by_importer(importer: str) -> dict[str, Any] | None:
+async def find_earliest_active_run_by_importer(importer: str) -> dict[str, Any] | None:
     """Return the earliest active run for an importer."""
 
     result = await db.execute(
@@ -1200,7 +1200,7 @@ def _provider_directory_max_active() -> int:
     return configured_limit if configured_limit is not None and configured_limit > 0 else 2
 
 
-def _allows_parallel_active_importer_runs(
+def _is_parallel_active_importer_run_allowed(
     importer: str,
     payload: dict[str, Any],
     idempotency_key: str | None,
@@ -1256,12 +1256,12 @@ async def create_import_run(
         active = await find_active_run_by_idempotency_key(idempotency_key)
         if active:
             return active, False
-    if importer != "provider-directory-fhir" and not _allows_parallel_active_importer_runs(
+    if importer != "provider-directory-fhir" and not _is_parallel_active_importer_run_allowed(
         importer,
         request_payload_map,
         idempotency_key,
     ):
-        active_importer = await find_active_run_by_importer(importer)
+        active_importer = await find_earliest_active_run_by_importer(importer)
         if active_importer:
             return active_importer, False
 

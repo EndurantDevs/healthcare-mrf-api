@@ -1332,21 +1332,21 @@ def test_candidate_text_filter_matches_public_aliases():
         aliases=("The Health Plan of the Upper Ohio Valley", "THP"),
     )
 
-    assert discovery._candidate_matches_text_filters(
+    assert discovery._is_candidate_text_filter_match(
         candidate, entity_types=(), payer_query="Upper Ohio Valley"
     )
-    assert discovery._candidate_matches_text_filters(
+    assert discovery._is_candidate_text_filter_match(
         candidate, entity_types=(), payer_query="THP"
     )
-    assert discovery._candidate_matches_text_filters(
+    assert discovery._is_candidate_text_filter_match(
         candidate,
         entity_types=(),
         payer_query="Example Group - The Health Plan of the Upper Ohio Valley",
     )
-    assert not discovery._candidate_matches_text_filters(
+    assert not discovery._is_candidate_text_filter_match(
         candidate, entity_types=(), payer_query="Example Group using THP"
     )
-    assert not discovery._candidate_matches_text_filters(
+    assert not discovery._is_candidate_text_filter_match(
         candidate, entity_types=(), payer_query="Unrelated"
     )
 
@@ -1442,24 +1442,24 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
         hosting_platform="direct_toc",
     )
 
-    assert discovery._candidate_supports_source_query_expansion(sapphire)
-    assert discovery._candidate_supports_source_query_expansion(aetna)
-    assert discovery._candidate_supports_source_query_expansion(healthcarebluebook)
-    assert discovery._candidate_supports_source_query_expansion(payercompass)
-    assert discovery._candidate_supports_source_query_expansion(mymedicalshopper)
-    assert discovery._candidate_supports_source_query_expansion(
+    assert discovery._is_candidate_query_expansion_supported(sapphire)
+    assert discovery._is_candidate_query_expansion_supported(aetna)
+    assert discovery._is_candidate_query_expansion_supported(healthcarebluebook)
+    assert discovery._is_candidate_query_expansion_supported(payercompass)
+    assert discovery._is_candidate_query_expansion_supported(mymedicalshopper)
+    assert discovery._is_candidate_query_expansion_supported(
         bounded_mymedicalshopper
     )
-    assert discovery._candidate_supports_source_query_expansion(
+    assert discovery._is_candidate_query_expansion_supported(
         delegated_healthcarebluebook
     )
-    assert discovery._candidate_supports_source_query_expansion(hcsc)
-    assert discovery._candidate_supports_source_query_expansion(html_mrf)
-    assert discovery._candidate_supports_source_query_expansion(bcbsal)
-    assert discovery._candidate_supports_source_query_expansion(blueadvantage)
-    assert discovery._candidate_supports_source_query_expansion(anthem)
-    assert discovery._candidate_supports_source_query_expansion(auxiant_directory)
-    assert not discovery._candidate_supports_source_query_expansion(direct_group)
+    assert discovery._is_candidate_query_expansion_supported(hcsc)
+    assert discovery._is_candidate_query_expansion_supported(html_mrf)
+    assert discovery._is_candidate_query_expansion_supported(bcbsal)
+    assert discovery._is_candidate_query_expansion_supported(blueadvantage)
+    assert discovery._is_candidate_query_expansion_supported(anthem)
+    assert discovery._is_candidate_query_expansion_supported(auxiant_directory)
+    assert not discovery._is_candidate_query_expansion_supported(direct_group)
     expanded = discovery._candidate_with_target_payer_query(
         sapphire, "Example Packaging"
     )
@@ -1882,7 +1882,7 @@ def _synthetic_scoped_query_source():
 
 def test_scoped_query_identities_include_alias_and_identifier_variants():
     """Scoped identity extraction preserves names and normalized identifiers."""
-    assert discovery._source_target_payer_queries(
+    assert discovery._source_payer_query_candidates(
         _synthetic_scoped_query_source()
     ) == (
         "Sample Holdings, LLC",
@@ -1915,7 +1915,7 @@ def test_scoped_query_identities_preserve_legacy_context_rows():
         }
     }
 
-    assert discovery._source_target_payer_queries(legacy_source_dict) == (
+    assert discovery._source_payer_query_candidates(legacy_source_dict) == (
         "Legacy Example LLC",
         "Legacy Example",
         "98-7654321",
@@ -2541,15 +2541,15 @@ def test_query_expanded_generic_toc_rows_normalize_plan_labels_before_merge():
 
 
 def test_query_expansion_match_tolerates_legal_suffix_and_concatenated_plan_text():
-    assert discovery._search_values_match_query(
+    assert discovery._is_search_value_query_match(
         ["Example Water Co., et. al DBA Example PackagingHSA Aetna Choice POS II"],
         "Example Packaging Inc",
     )
-    assert discovery._search_values_match_query(
+    assert discovery._is_search_value_query_match(
         ["Example Hospitality Group DBA Example Clubs"],
         "Example Clubs",
     )
-    assert not discovery._search_values_match_query(
+    assert not discovery._is_search_value_query_match(
         ["Unrelated PackagingHSA Aetna Choice POS II"],
         "Example Packaging Inc",
     )
@@ -3272,14 +3272,14 @@ async def test_master_list_uses_current_public_source_urls_for_selected_payers()
         candidate.index_url
         == "https://www.molinamarketplace.com/marketplace/oh/en-us/About/compinfo/PricingTransparency"
         and candidate.status == "active"
-        and discovery._candidate_is_importable_source(candidate)
+        and discovery._is_candidate_importable_source(candidate)
         for candidate in molina
     )
     assert any(
         candidate.index_url
         == "https://www.molinahealthcare.com/members/common/mrf.aspx"
         and candidate.status == "unsupported"
-        and not discovery._candidate_is_importable_source(candidate)
+        and not discovery._is_candidate_importable_source(candidate)
         for candidate in molina
     )
     assert by_name["Paramount Health Care"][0].index_url == (
@@ -3306,7 +3306,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     active_humana = active_humana_candidates[0]
     assert active_humana.source_tier == "coverage_evidence"
     assert active_humana.benefit_lines == ("medical", "dental", "vision")
-    assert not discovery._candidate_is_importable_source(active_humana)
+    assert not discovery._is_candidate_importable_source(active_humana)
     aliases_by_name = {}
     for candidate in candidates:
         aliases_by_name.setdefault(candidate.payer_name, set()).update(
@@ -3839,7 +3839,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Community Eye Care" in by_name["VSP Vision"].aliases
     assert "CEC Community Eye Care" in by_name["VSP Vision"].aliases
     assert "CEC Vision" in by_name["VSP Vision"].aliases
-    assert discovery._candidate_matches_text_filters(
+    assert discovery._is_candidate_text_filter_match(
         by_name["VSP Vision"], entity_types=(), payer_query="Community Eye Care"
     )
     assert "Guardian VSP Network" in by_name["VSP Vision"].aliases
@@ -4400,7 +4400,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "Comprehensive Benefits Administrators" in by_name["CBA Blue"].aliases
     assert "Cobalt Benefits Group CBA Blue" in by_name["CBA Blue"].aliases
-    assert discovery._candidate_matches_text_filters(
+    assert discovery._is_candidate_text_filter_match(
         by_name["CBA Blue"], entity_types=(), payer_query="Cobalt Benefits Group"
     )
     assert "EBPA Employee Benefits" in by_name["EBPA"].aliases
@@ -4448,7 +4448,7 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
         return {
             candidate.payer_name
             for candidate in candidates
-            if discovery._candidate_matches_text_filters(
+            if discovery._is_candidate_text_filter_match(
                 candidate,
                 entity_types=(),
                 payer_query=query,
@@ -4459,8 +4459,8 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
         return {
             candidate.payer_name
             for candidate in candidates
-            if discovery._candidate_is_importable_source(candidate)
-            and discovery._candidate_matches_text_filters(
+            if discovery._is_candidate_importable_source(candidate)
+            and discovery._is_candidate_text_filter_match(
                 candidate,
                 entity_types=(),
                 payer_query=query,
@@ -5084,7 +5084,7 @@ def test_parse_master_list_skips_placeholder_source_urls():
 
 
 def test_master_list_importable_source_filter_keeps_only_working_url_rows():
-    assert discovery._candidate_is_importable_source(
+    assert discovery._is_candidate_importable_source(
         discovery.SourceCandidate(
             payer_name="Active",
             provider="master-list",
@@ -5092,7 +5092,7 @@ def test_master_list_importable_source_filter_keeps_only_working_url_rows():
             status="active",
         )
     )
-    assert not discovery._candidate_is_importable_source(
+    assert not discovery._is_candidate_importable_source(
         discovery.SourceCandidate(
             payer_name="Stale",
             provider="master-list",
@@ -5100,15 +5100,15 @@ def test_master_list_importable_source_filter_keeps_only_working_url_rows():
             status="stale",
         )
     )
-    assert not discovery._source_row_is_importable(
+    assert not discovery._is_source_row_importable(
         {"source_tier": "mrf_importable", "status": "stale"}
     )
-    assert not discovery._candidate_is_importable_source(
+    assert not discovery._is_candidate_importable_source(
         discovery.SourceCandidate(
             payer_name="Needs Review", provider="master-list", status="needs_review"
         )
     )
-    assert not discovery._candidate_is_importable_source(
+    assert not discovery._is_candidate_importable_source(
         discovery.SourceCandidate(
             payer_name="Needs Review With Url",
             provider="master-list",
@@ -5116,7 +5116,7 @@ def test_master_list_importable_source_filter_keeps_only_working_url_rows():
             status="needs_review",
         )
     )
-    assert not discovery._candidate_is_importable_source(
+    assert not discovery._is_candidate_importable_source(
         discovery.SourceCandidate(
             payer_name="Unsupported",
             provider="master-list",
@@ -5124,7 +5124,7 @@ def test_master_list_importable_source_filter_keeps_only_working_url_rows():
             status="unsupported",
         )
     )
-    assert not discovery._candidate_is_importable_source(
+    assert not discovery._is_candidate_importable_source(
         discovery.SourceCandidate(
             payer_name="Archived",
             provider="master-list",
@@ -5146,7 +5146,7 @@ def test_master_list_marks_replaced_viva_transparency_url_archived():
     assert candidate.payer_name == "VIVA Health"
     assert candidate.status == "archived"
     assert candidate.hosting_platform == "custom"
-    assert not discovery._candidate_is_importable_source(candidate)
+    assert not discovery._is_candidate_importable_source(candidate)
 
 
 def test_master_list_demotes_replaced_transparency_legal_page():
@@ -5167,9 +5167,9 @@ def test_master_list_demotes_replaced_transparency_legal_page():
 
     assert current.status == "active"
     assert current.hosting_platform == "custom"
-    assert discovery._candidate_is_importable_source(current)
+    assert discovery._is_candidate_importable_source(current)
     assert replaced.status == "stale"
-    assert not discovery._candidate_is_importable_source(replaced)
+    assert not discovery._is_candidate_importable_source(replaced)
 
 
 def test_dedupe_candidates_prefers_more_specific_url_for_same_canonical_key():
@@ -6260,7 +6260,7 @@ async def test_healthcarebluebook_resolver_catalogs_stable_file_links(monkeypatc
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
     monkeypatch.setattr(
         discovery,
-        "_healthcarebluebook_numeric_file_url_is_downloadable",
+        "_is_healthcarebluebook_numeric_url_downloadable",
         AsyncMock(return_value=True),
     )
 
@@ -6311,7 +6311,7 @@ async def test_healthcarebluebook_resolver_skips_html_error_numeric_links(
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
     monkeypatch.setattr(
         discovery,
-        "_healthcarebluebook_numeric_file_url_is_downloadable",
+        "_is_healthcarebluebook_numeric_url_downloadable",
         is_numeric_file_downloadable,
     )
 
@@ -6350,7 +6350,7 @@ async def test_healthcarebluebook_resolver_extracts_table_row_data_href(monkeypa
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
     monkeypatch.setattr(
         discovery,
-        "_healthcarebluebook_numeric_file_url_is_downloadable",
+        "_is_healthcarebluebook_numeric_url_downloadable",
         AsyncMock(return_value=True),
     )
 
@@ -6390,7 +6390,7 @@ async def test_healthcarebluebook_resolver_applies_max_targets_early(monkeypatch
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
     monkeypatch.setattr(
         discovery,
-        "_healthcarebluebook_numeric_file_url_is_downloadable",
+        "_is_healthcarebluebook_numeric_url_downloadable",
         AsyncMock(return_value=True),
     )
 
@@ -7751,7 +7751,7 @@ async def test_viva_health_resolver_adds_commercial_and_employer_landing_targets
         ]
 
     monkeypatch.setattr(
-        discovery, "_viva_health_employer_landing_targets", fake_employer_targets
+        discovery, "_collect_viva_health_employer_landing_targets", fake_employer_targets
     )
 
     catalog_source_dict = {"source_id": "source_viva", "payer_id": "payer_viva"}
@@ -7791,7 +7791,7 @@ async def test_viva_health_resolver_adds_commercial_and_employer_landing_targets
 def test_viva_health_direct_commercial_target_handles_extensionless_downloads():
     source_dict = {"source_id": "source_viva", "payer_id": "payer_viva"}
 
-    targets = discovery._viva_health_commercial_targets(
+    targets = discovery._collect_viva_health_commercial_targets(
         source_dict,
         "https://www.vivahealth.com/files/mrf/viva-health-commercial-out-of-network-rates",
     )
@@ -11058,7 +11058,7 @@ def test_cmstic_keyed_toc_target_preserves_redirect_provenance():
         "2026-06-01_821410_index.json"
     )
 
-    assert discovery._looks_cmstic_keyed_toc_url(keyed_url) is True
+    assert discovery._is_cmstic_keyed_toc_url(keyed_url) is True
     target = discovery._cmstic_keyed_toc_crawl_target(
         source_dict,
         keyed_url,
@@ -11083,7 +11083,7 @@ def test_cmstic_brand_defaults_cover_amerihealth_developer_page():
         }
     }
 
-    brands = discovery._cmstic_brands_from_url(
+    brands = discovery._cmstic_brand_candidates_from_url(
         "https://www.amerihealth.com/developer-resources/index.html", resolver_dict
     )
 
@@ -11641,38 +11641,38 @@ def test_fetch_text_decode_response_body_handles_raw_gzip_json():
 
 
 def test_direct_toc_url_accepts_no_extension_mrf_index():
-    assert discovery._looks_direct_toc_url(
+    assert discovery._is_direct_toc_url(
         "https://mrf.example.com/mrf/hmo_ha_hii_example_index"
     )
-    assert discovery._looks_direct_toc_url(
+    assert discovery._is_direct_toc_url(
         "https://bcbsm.sapphiremrfhub.com/tocs/current/blue_cross_blue_shield_of_michigan"
     )
-    assert discovery._looks_direct_toc_url(
+    assert discovery._is_direct_toc_url(
         "https://www.bluecrossvt.org/documents/toc-json"
     )
-    assert discovery._looks_direct_toc_url(
+    assert discovery._is_direct_toc_url(
         "https://mrf.secure.bcbsks.com/api/filedownloadhttptrigger?name=table-of-contents&ext=json"
     )
-    assert discovery._looks_direct_toc_url(
+    assert discovery._is_direct_toc_url(
         "https://www.hmaa.com/wp-content/uploads/2022/06/MRF_HMAA.zip"
     )
 
 
 def test_direct_toc_url_rejects_provider_directory_indexes():
     assert (
-        discovery._looks_direct_toc_url(
+        discovery._is_direct_toc_url(
             "https://example.test/acadirectory/97176/97176Index.json"
         )
         is False
     )
     assert (
-        discovery._looks_direct_toc_url(
+        discovery._is_direct_toc_url(
             "https://example.test/provider-directory/index.json"
         )
         is False
     )
     assert (
-        discovery._looks_direct_toc_url(
+        discovery._is_direct_toc_url(
             "https://example.test/cms-data-index/index.json"
         )
         is False
@@ -12891,14 +12891,14 @@ def test_crawl_target_limit_prefers_resolved_json_before_landing_pages():
 
 
 def test_direct_toc_url_gate_skips_html_landing_pages():
-    assert discovery._looks_direct_toc_url("https://example.com/index.json") is True
+    assert discovery._is_direct_toc_url("https://example.com/index.json") is True
     assert (
-        discovery._looks_direct_toc_url(
+        discovery._is_direct_toc_url(
             "https://example.com/app/public/#/one/machine-readable-transparency-in-coverage"
         )
         is False
     )
-    assert discovery._looks_direct_toc_url("https://example.com/transparency") is False
+    assert discovery._is_direct_toc_url("https://example.com/transparency") is False
 
 
 def test_direct_table_of_contents_json_is_not_body_file():
@@ -13632,31 +13632,31 @@ def test_parse_text_filter_values_defaults_and_dedupes():
     )
 
 
-def test_candidate_matches_text_filters_by_entity_type_and_payer_name():
+def test_is_candidate_text_filter_match_by_entity_type_and_payer_name():
     candidate = discovery.SourceCandidate(
         payer_name="Collective Health", provider="master-list", entity_type="tpa"
     )
 
     assert (
-        discovery._candidate_matches_text_filters(
+        discovery._is_candidate_text_filter_match(
             candidate, entity_types=("tpa",), payer_query=None
         )
         is True
     )
     assert (
-        discovery._candidate_matches_text_filters(
+        discovery._is_candidate_text_filter_match(
             candidate, entity_types=("network/tpa",), payer_query=None
         )
         is False
     )
     assert (
-        discovery._candidate_matches_text_filters(
+        discovery._is_candidate_text_filter_match(
             candidate, entity_types=(), payer_query="collective"
         )
         is True
     )
     assert (
-        discovery._candidate_matches_text_filters(
+        discovery._is_candidate_text_filter_match(
             candidate, entity_types=(), payer_query="meritain"
         )
         is False

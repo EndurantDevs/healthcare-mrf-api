@@ -423,6 +423,33 @@ def test_readability_ratchet_zero_percent_prevents_net_growth(tmp_path):
     assert readability_budget.main(ratchet_args) == 1
 
 
+def test_readability_ratchet_allows_one_time_confusable_name_rule_migration():
+    base_rules_by_section = {
+        "readability": {"ambiguous_function_names": ["process_data"]},
+        "thresholds": {"max_function_lines": 60},
+    }
+    current_rules_by_section = {
+        "readability": {
+            "ambiguous_function_names": ["process_data"],
+            "confusable_function_name_exceptions": [
+                "confusable_function_name:pkg/module:<module>:entry:entry|entries"
+            ],
+        },
+        "thresholds": {"max_function_lines": 60},
+    }
+    base_snapshot_by_field = {"rules": base_rules_by_section, "issue_counts": {"long_functions": 1}}
+    current_snapshot_by_field = {"rules": current_rules_by_section, "issue_counts": {"long_functions": 1}}
+
+    assert readability_cli._has_compatible_ratchet_rules_by_section(base_snapshot_by_field, current_snapshot_by_field)
+
+    migrated_base_by_field = dict(base_snapshot_by_field)
+    migrated_base_by_field["issue_counts"] = {
+        "confusable_function_names": 0,
+        "long_functions": 1,
+    }
+    assert not readability_cli._has_compatible_ratchet_rules_by_section(migrated_base_by_field, current_snapshot_by_field)
+
+
 def test_protected_issue_comparison_ignores_line_only_relocations():
     baseline_by_field = {
         "issue_ids": {

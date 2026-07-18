@@ -11,6 +11,7 @@ from typing import Any
 from .config import (DEFAULT_COMMENT_NOISE_PATTERNS, compile_suppression_patterns, is_matching_path_pattern,
                      readability_options, threshold)
 from .function_visitor import FunctionVisitor
+from .function_names import confusable_function_name_issues
 from .model import DEFAULT_ISSUE_CATEGORIES, Issue
 
 
@@ -18,12 +19,18 @@ def collect_issues(repo_root: Path, config: dict[str, Any]) -> dict[str, list[Is
     """Collect readability findings grouped by rule category."""
     patterns = compile_suppression_patterns(config)
     issues_by_category: dict[str, list[Issue]] = {category: [] for category in DEFAULT_ISSUE_CATEGORIES}
-    for path in _iter_source_files(repo_root, config):
+    source_files = _iter_source_files(repo_root, config)
+    for path in source_files:
         for issue in _analyze_file(repo_root, path, config):
             issues_by_category[issue.category].append(issue)
         issues_by_category["inline_suppressions"].extend(_find_inline_suppressions(repo_root, path, patterns))
         if path.suffix == ".py":
             issues_by_category["comment_noise"].extend(_find_comment_noise(repo_root, path, config))
+    python_paths = [path for path in source_files if path.suffix == ".py"]
+    name_exceptions = set(readability_options(config).get("confusable_function_name_exceptions", []))
+    issues_by_category["confusable_function_names"].extend(
+        confusable_function_name_issues(repo_root, python_paths, name_exceptions)
+    )
     return {category: sorted(values, key=lambda issue: issue.identifier) for category, values in issues_by_category.items()}
 
 

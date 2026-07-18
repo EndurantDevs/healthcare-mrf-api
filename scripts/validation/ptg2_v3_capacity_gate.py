@@ -2696,7 +2696,7 @@ def _validate_import_sample(value: Any, path: str) -> ImportLifecycleSample:
     )
 
 
-def _validate_import_samples(
+def _validate_import_sample_collection(
     values: Any, contention_run_id: str
 ) -> tuple[ImportLifecycleSample, ...]:
     samples = tuple(
@@ -2775,7 +2775,7 @@ def _require_audit_import_join(
         _require_equal(actual, expected, f"{path}.{field_name}")
 
 
-def _validate_audit_samples(
+def _validate_audit_sample_collection(
     values: Any,
     imports: tuple[ImportLifecycleSample, ...],
     contention_run_id: str,
@@ -2819,7 +2819,7 @@ def _validate_peak_import_event(value: Any, path: str) -> PeakImportEvent:
     )
 
 
-def _validate_peak_import_events(values: Any) -> tuple[PeakImportEvent, ...]:
+def _validate_peak_import_event_collection(values: Any) -> tuple[PeakImportEvent, ...]:
     path = "raw_samples.peak_import_events"
     events = tuple(
         _validate_peak_import_event(value, f"{path}.{index}")
@@ -2845,7 +2845,7 @@ def _validate_peak_audit_event(value: Any, path: str) -> PeakAuditEvent:
     )
 
 
-def _validate_peak_audit_events(values: Any) -> tuple[PeakAuditEvent, ...]:
+def _validate_peak_audit_event_collection(values: Any) -> tuple[PeakAuditEvent, ...]:
     path = "raw_samples.peak_audit_events"
     events = tuple(
         _validate_peak_audit_event(value, f"{path}.{index}")
@@ -3413,16 +3413,16 @@ def _validate_raw_sample_groups(
     trust: ReceiptTrust,
     receipt: VerifiedReceipt,
 ) -> _ValidatedRawSampleGroups:
-    imports = _validate_import_samples(
+    imports = _validate_import_sample_collection(
         raw_object["import_lifecycle"], api.contention_run_id
     )
-    audits = _validate_audit_samples(
+    audits = _validate_audit_sample_collection(
         raw_object["audit_results"], imports, api.contention_run_id
     )
-    peak_import_events = _validate_peak_import_events(
+    peak_import_events = _validate_peak_import_event_collection(
         raw_object["peak_import_events"]
     )
-    peak_audit_events = _validate_peak_audit_events(raw_object["peak_audit_events"])
+    peak_audit_events = _validate_peak_audit_event_collection(raw_object["peak_audit_events"])
     matched, negative, random_samples = _validate_raw_http_samples(
         raw_object, api, trust, receipt
     )

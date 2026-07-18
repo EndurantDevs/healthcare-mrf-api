@@ -243,9 +243,9 @@ class SpecialtyResolutionCache:
     async def _load_dynamic_entries(self, session) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
         """Load DB-backed NUCC and synonym specialty aliases."""
 
-        from api.provider_specialty_cache_entries import load_dynamic_specialty_entries
+        from api.provider_specialty_cache_entries import load_dynamic_specialty_entries_by_variant
 
-        return await load_dynamic_specialty_entries(session, _specialty_key_variants)
+        return await load_dynamic_specialty_entries_by_variant(session, _specialty_key_variants)
 
 _SPECIALTY_RESOLUTION_CACHE = SpecialtyResolutionCache()
 

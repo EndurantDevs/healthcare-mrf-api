@@ -69,8 +69,8 @@ def test_ensure_worker_starts_registered_burst_worker(monkeypatch, tmp_path):
     monkeypatch.setenv("HLTHPRT_WORKER_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("HLTHPRT_WORKER_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setattr(control_workers.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(control_workers, "_pid_running", lambda pid: pid == FakeProcess.pid)
-    monkeypatch.setattr(control_workers, "_pid_matches_spec", lambda pid, spec: True)
+    monkeypatch.setattr(control_workers, "_is_pid_running", lambda pid: pid == FakeProcess.pid)
+    monkeypatch.setattr(control_workers, "_is_pid_spec_match", lambda pid, spec: True)
 
     worker_response = control_workers.ensure_worker(
         {"importer": "claims-pricing", "run_id": "run_1"}
@@ -96,8 +96,8 @@ def test_ensure_worker_uses_finish_role_for_finalizing_run(monkeypatch, tmp_path
         return FakeProcess()
 
     monkeypatch.setattr(control_workers.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(control_workers, "_pid_running", lambda pid: pid == FakeProcess.pid)
-    monkeypatch.setattr(control_workers, "_pid_matches_spec", lambda pid, spec: True)
+    monkeypatch.setattr(control_workers, "_is_pid_running", lambda pid: pid == FakeProcess.pid)
+    monkeypatch.setattr(control_workers, "_is_pid_spec_match", lambda pid, spec: True)
 
     result = control_workers.ensure_worker({"importer": "partd-formulary-network", "status": "finalizing"})
 
@@ -121,8 +121,8 @@ def test_ensure_worker_uses_explicit_ptg_lane(monkeypatch, tmp_path):
         return FakeProcess()
 
     monkeypatch.setattr(control_workers.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(control_workers, "_pid_running", lambda pid: pid == FakeProcess.pid)
-    monkeypatch.setattr(control_workers, "_pid_matches_spec", lambda pid, spec: True)
+    monkeypatch.setattr(control_workers, "_is_pid_running", lambda pid: pid == FakeProcess.pid)
+    monkeypatch.setattr(control_workers, "_is_pid_spec_match", lambda pid, spec: True)
 
     result = control_workers.ensure_worker(
         {"importer": "ptg", "queue": "arq:PTGSmall", "worker_class": "process.PTGSmall", "run_id": "run_ptg"}
@@ -151,8 +151,8 @@ def test_ensure_worker_starts_entity_address_unified_shared_worker(monkeypatch, 
         return FakeProcess()
 
     monkeypatch.setattr(control_workers.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(control_workers, "_pid_running", lambda pid: pid == FakeProcess.pid)
-    monkeypatch.setattr(control_workers, "_pid_matches_spec", lambda pid, spec: True)
+    monkeypatch.setattr(control_workers, "_is_pid_running", lambda pid: pid == FakeProcess.pid)
+    monkeypatch.setattr(control_workers, "_is_pid_spec_match", lambda pid, spec: True)
 
     result = control_workers.ensure_worker({"importer": "entity-address-unified", "run_id": "run_refresh"})
 

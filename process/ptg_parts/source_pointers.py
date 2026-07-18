@@ -183,7 +183,7 @@ def _ptg2_plan_source_key(
     # network sources (e.g. a medical network plus a pharmacy carve-out) needs
     # one current-pointer row per source. Without it, whichever source
     # publishes last overwrites the others' rows via ON CONFLICT, and
-    # current_source_snapshot_ids_for_plan only ever sees one network.
+    # current_network_snapshots_for_plan only ever sees one network.
     payload = {
         "plan_id": plan_id,
         "plan_market_type": plan_market_type or "",

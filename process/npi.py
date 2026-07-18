@@ -177,7 +177,7 @@ def is_test_mode(ctx: dict) -> bool:
 
 
 def _attach_npi_address_key(address: dict, *, canonical_enabled: bool) -> dict:
-    return _attach_npi_address_keys([address], canonical_enabled=canonical_enabled)[0]
+    return _attach_all_npi_address_keys([address], canonical_enabled=canonical_enabled)[0]
 
 
 def _npi_address_canon_row(address: dict) -> tuple[object, object, object, object, object, object]:
@@ -212,7 +212,7 @@ def _attach_npi_contact_fields(addresses) -> list[dict]:
     return address_list
 
 
-def _attach_npi_address_keys(addresses, *, canonical_enabled: bool) -> list[dict]:
+def _attach_all_npi_address_keys(addresses, *, canonical_enabled: bool) -> list[dict]:
     address_list = list(addresses)
     if not canonical_enabled:
         return address_list
@@ -224,7 +224,7 @@ def _attach_npi_address_keys(addresses, *, canonical_enabled: bool) -> list[dict
 
 
 def _prepare_npi_address_rows(addresses, *, canonical_enabled: bool) -> list[dict]:
-    return _attach_npi_address_keys(
+    return _attach_all_npi_address_keys(
         _attach_npi_contact_fields(addresses),
         canonical_enabled=canonical_enabled,
     )

@@ -7450,7 +7450,7 @@ class AuditRunner:
             ],
         )
 
-    def _latency_reports(
+    def _build_latency_reports(
         self,
         progress: _AuditProgress,
         capacity_report: Mapping[str, Any] | None = None,
@@ -7971,7 +7971,7 @@ class AuditRunner:
             standard_http_requests=standard_http_requests,
             capacity_report=capacity_report,
         )
-        latency_reports = self._latency_reports(progress, capacity_report)
+        latency_reports = self._build_latency_reports(progress, capacity_report)
         context = _AuditReportContext(
             started_at=started_at,
             completed_at=dt.datetime.now(dt.timezone.utc),
