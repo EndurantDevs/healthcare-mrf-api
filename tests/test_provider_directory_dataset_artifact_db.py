@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-import getpass
 import importlib
 import json
 import uuid
@@ -181,12 +180,6 @@ async def _insert_fixture_rows(database: Database, schema: str) -> None:
 
 @asynccontextmanager
 async def _dataset_database(monkeypatch):
-    monkeypatch.setenv("HLTHPRT_DB_DRIVER", "asyncpg")
-    monkeypatch.setenv("HLTHPRT_DB_HOST", "127.0.0.1")
-    monkeypatch.setenv("HLTHPRT_DB_PORT", "5440")
-    monkeypatch.setenv("HLTHPRT_DB_USER", getpass.getuser())
-    monkeypatch.setenv("HLTHPRT_DB_PASSWORD", "")
-    monkeypatch.setenv("HLTHPRT_DB_DATABASE", "healthporta_test")
     schema = f"provider_directory_dataset_artifact_{uuid.uuid4().hex[:12]}"
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     database = Database()

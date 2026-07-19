@@ -144,7 +144,7 @@ jobs:
       - name: Run capacity evidence tests with coverage
         run: |
           mapfile -t capacity_tests <<< "$CAPACITY_TEST_PATHS"
-          python -m pytest -q -n 2 --dist load --durations=20 \
+          python -m pytest -q -n 4 --dist load --durations=20 \
             --cov-config=test-coverage.ini \
             --cov=api --cov=db --cov=process --cov=service --cov=main \
             --cov-branch --cov-report= \
@@ -375,9 +375,9 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd "pg_isready -U postgres -d ptg2_v3_lifecycle_test_ci_runner"
-          --health-interval 10s
+          --health-interval 2s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 25
     env:
       HLTHPRT_DB_DRIVER: asyncpg
       HLTHPRT_DB_HOST: 127.0.0.1
@@ -394,10 +394,15 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - name: Install dependencies
+      - name: Install dependencies and build Rust scanner
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          python -m pip install -r requirements-dev.txt &
+          pip_pid=$!
+          cargo build --manifest-path support/ptg2_scanner/Cargo.toml &
+          cargo_pid=$!
+          wait "$pip_pid"
+          wait "$cargo_pid"
       - name: Prepare PostGIS and address canonical schema
         run: |
           python - <<'PY'
@@ -442,8 +447,6 @@ jobs:
         env:
           HLTHPRT_MRF_DISCOVERY_CHECKPOINT_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
         run: python -m pytest -q tests/test_mrf_discovery_checkpoints_postgres.py
-      - name: Build Rust scanner for parity tests
-        run: cargo build --manifest-path support/ptg2_scanner/Cargo.toml
       - name: Run strict shared PTG PostgreSQL publish, graph, and cold-read smoke
         env:
           HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST: "1"
@@ -465,20 +468,24 @@ jobs:
         env:
           HLTHPRT_PTG2_CROSS_PLAN_POSTGRES_TEST: "1"
         run: python -m pytest -q tests/test_ptg2_v3_cross_plan_reuse.py
-      - name: Run address canonical DB tests
-        run: |
-          python -m pytest -q tests/test_address_canonical_db.py
-          python -m pytest -q tests/test_npi_geo_evidence_search_db.py
-          python -m pytest -q tests/test_entity_address_unified_archive_coordinates_db.py
-          python -m pytest -q tests/test_npi_phone_evidence_search_db.py
-          python -m pytest -q tests/test_npi_provider_directory_role_evidence_db.py
-          python -m pytest -q tests/test_provider_directory_profile_affiliations_db.py
-          python -m pytest -q tests/test_provider_directory_dataset_serving_relations_db.py
-          python -m pytest -q tests/test_provider_directory_contra_affiliation.py
-          python -m pytest -q tests/test_provider_directory_dataset_artifact_db.py
-          python -m pytest -q tests/test_provider_directory_artifact_scope_bulk_load_db.py
-          python -m pytest -q tests/test_provider_directory_dataset_rehydrate_db.py
-          python -m pytest -q tests/test_provider_directory_two_phase_publication.py
-          python -m pytest -q tests/test_provider_directory_contract_identity_cutover.py
-          python -m pytest -q tests/test_provider_directory_retry_cleanup.py
-          python -m pytest -q tests/test_provider_directory_artifact_cutover_reconciliation.py
+      - name: Run address and Provider Directory DB tests
+        run: >
+          python -m pytest -q
+          -o asyncio_default_test_loop_scope=session
+          -o asyncio_default_fixture_loop_scope=session
+          --durations=20
+          tests/test_address_canonical_db.py
+          tests/test_npi_geo_evidence_search_db.py
+          tests/test_entity_address_unified_archive_coordinates_db.py
+          tests/test_npi_phone_evidence_search_db.py
+          tests/test_npi_provider_directory_role_evidence_db.py
+          tests/test_provider_directory_profile_affiliations_db.py
+          tests/test_provider_directory_dataset_serving_relations_db.py
+          tests/test_provider_directory_contra_affiliation.py
+          tests/test_provider_directory_dataset_artifact_db.py
+          tests/test_provider_directory_artifact_scope_bulk_load_db.py
+          tests/test_provider_directory_dataset_rehydrate_db.py
+          tests/test_provider_directory_two_phase_publication.py
+          tests/test_provider_directory_contract_identity_cutover.py
+          tests/test_provider_directory_retry_cleanup.py
+          tests/test_provider_directory_artifact_cutover_reconciliation.py

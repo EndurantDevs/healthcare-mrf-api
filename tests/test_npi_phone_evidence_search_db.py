@@ -167,7 +167,7 @@ async def _delete_phone_membership_fixture(session, schema: str, fixture: dict) 
         )
 
 
-@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.asyncio(loop_scope="session")
 async def test_phone_candidates_require_exact_current_dataset_membership():
     """A matching current run cannot admit a nonmember resource overlay."""
     _requires_test_database()
