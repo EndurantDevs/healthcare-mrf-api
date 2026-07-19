@@ -117,6 +117,36 @@ def test_forward_physical_parse_requires_block_identity():
         )
 
 
+def test_forward_physical_parse_requires_first_occurrence(monkeypatch):
+    fragment_view = _forward_fragment_view(b"f" * 32, fragment_no=0)
+    monkeypatch.setattr(
+        sidecars,
+        "_visit_serving_binary_by_code_record",
+        Mock(
+            return_value=(
+                sidecars._ForwardFragmentCursor(
+                    provider_set_key=5,
+                    occurrence=(8, 0),
+                ),
+                2,
+            )
+        ),
+    )
+
+    with pytest.raises(sidecars.PTG2ManifestArtifactError, match="no occurrences"):
+        sidecars._parse_physical_forward_fragment_once(
+            (fragment_view,),
+            sidecars._ForwardBatchOptions(
+                shared_snapshot_key=1,
+                source_count=2,
+                price_dictionary_item_count=128,
+                price_dictionary_block_bytes=32,
+            ),
+            128,
+            {(fragment_view.code_key, fragment_view.block_key, 0): []},
+        )
+
+
 @pytest.mark.parametrize(
     ("second_fragment", "expected_message"),
     (
