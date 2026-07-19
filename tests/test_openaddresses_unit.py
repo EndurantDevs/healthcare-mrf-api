@@ -379,10 +379,10 @@ async def test_openaddresses_sharded_backfill_uses_bounded_concurrency_and_aggre
         openaddresses.OpenAddressesBackfillShard(state_code="NY", zip_prefix="10", candidate_count=30),
     ]
 
-    async def fake_table_exists(_schema, _table):
+    async def is_table_present(_schema, _table):
         return True
 
-    async def fake_table_has_column(_schema, _table, _column):
+    async def has_table_column(_schema, _table, _column):
         return True
 
     async def fake_plan(**_kwargs):
@@ -400,8 +400,8 @@ async def test_openaddresses_sharded_backfill_uses_bounded_concurrency_and_aggre
             relaxed_updates=2,
         )
 
-    monkeypatch.setattr(openaddresses, "_is_table_present", fake_table_exists)
-    monkeypatch.setattr(openaddresses, "_has_table_column", fake_table_has_column)
+    monkeypatch.setattr(openaddresses, "_is_table_present", is_table_present)
+    monkeypatch.setattr(openaddresses, "_has_table_column", has_table_column)
     monkeypatch.setattr(openaddresses, "_plan_openaddresses_backfill_shards", fake_plan)
     monkeypatch.setattr(openaddresses, "refresh_archive_geocodes_from_openaddresses", fake_refresh)
     monkeypatch.setattr(openaddresses, "enqueue_live_progress", lambda **payload: progress.append(payload))
@@ -426,10 +426,10 @@ async def test_openaddresses_sharded_backfill_uses_bounded_concurrency_and_aggre
 async def test_openaddresses_backfill_exact_match_mode_skips_fuzzy_relaxed(monkeypatch):
     statements = []
 
-    async def fake_table_exists(_schema, _table):
+    async def is_table_present(_schema, _table):
         return True
 
-    async def fake_table_has_column(_schema, _table, _column):
+    async def has_table_column(_schema, _table, _column):
         return True
 
     class FakeDb:
@@ -437,8 +437,8 @@ async def test_openaddresses_backfill_exact_match_mode_skips_fuzzy_relaxed(monke
             statements.append(stmt)
             return "UPDATE 1" if "UPDATE" in stmt else "CREATE EXTENSION"
 
-    monkeypatch.setattr(openaddresses, "_is_table_present", fake_table_exists)
-    monkeypatch.setattr(openaddresses, "_has_table_column", fake_table_has_column)
+    monkeypatch.setattr(openaddresses, "_is_table_present", is_table_present)
+    monkeypatch.setattr(openaddresses, "_has_table_column", has_table_column)
     monkeypatch.setattr(openaddresses, "db", FakeDb())
 
     stats = await openaddresses.refresh_archive_geocodes_from_openaddresses(
@@ -825,7 +825,7 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
     async def fake_ensure_database(_test_mode):
         return None
 
-    async def fake_table_exists(schema, table_name):
+    async def is_table_present(schema, table_name):
         seen_by_field["table_exists"] = (schema, table_name)
         return True
 
@@ -861,7 +861,7 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
             return FakeTransaction()
 
     monkeypatch.setattr(openaddresses, "ensure_database", fake_ensure_database)
-    monkeypatch.setattr(openaddresses, "_is_table_present", fake_table_exists)
+    monkeypatch.setattr(openaddresses, "_is_table_present", is_table_present)
     monkeypatch.setattr(openaddresses, "_create_indexes", fake_create_indexes)
     monkeypatch.setattr(
         openaddresses,
@@ -898,11 +898,11 @@ async def test_openaddresses_shutdown_is_idempotent_after_stage_publish(monkeypa
     async def fake_ensure_database(_test_mode):
         calls.append("ensure_database")
 
-    async def fake_table_exists(_schema, table_name):
+    async def is_table_present(_schema, table_name):
         return table_name == openaddresses.OpenAddressesGeocode.__main_table__
 
     monkeypatch.setattr(openaddresses, "ensure_database", fake_ensure_database)
-    monkeypatch.setattr(openaddresses, "_is_table_present", fake_table_exists)
+    monkeypatch.setattr(openaddresses, "_is_table_present", is_table_present)
 
     await openaddresses.shutdown(
         {
