@@ -51,14 +51,21 @@ def test_parse_serving_only_summary_extracts_scanner_config():
     text = (
         "PTG2 serving-only import summary: "
         "{'serving_rates': 1, 'scanner': {'config': {'parse_in_workers': True}, "
-        "'summary': {'elapsed_seconds': 0.12}}}"
+        "'summary': {'elapsed_seconds': 0.12}}, 'manifest': "
+        "{'copy_file_accounting': {'scanner_reported_files': 5, "
+        "'recovered_unreported_files': 0}}}"
     )
 
     summary = harness.parse_serving_only_summary(text)
+    copy_file_accounting = harness.copy_file_accounting_from_summary(summary)
 
     assert summary["serving_rates"] == 1
     assert summary["scanner"]["config"]["parse_in_workers"] is True
     assert summary["scanner"]["summary"]["elapsed_seconds"] == 0.12
+    assert copy_file_accounting == {
+        "scanner_reported_files": 5,
+        "recovered_unreported_files": 0,
+    }
 
 
 def test_read_proc_status_parses_memory_values(tmp_path):
@@ -1282,6 +1289,33 @@ def test_markdown_report_includes_scanner_and_import_summary():
     assert "npi_reverse:p95=14.5ms,max=18.0ms,total=25" in markdown
     assert "passed<br>prices=7/7<br>npis=1/1" in markdown
     assert "passed<br>pg=4.00 KiB<br>artifact=1.00 KiB<br>gzip=512 B<br>ratio=4.0x" in markdown
+
+
+def test_markdown_report_includes_copy_file_accounting():
+    """Keep single-pass COPY-file counters visible in harness evidence."""
+    report_dict = {
+        "results": [
+            {
+                "case_id": "local",
+                "variant_id": "single-pass",
+                "kind": "local_ptg_cli",
+                "status": "succeeded",
+                "import_run": {
+                    "import_done": {"status": "validated"},
+                    "copy_file_accounting": {
+                        "scanner_reported_files": 5,
+                        "recovered_unreported_files": 0,
+                        "fallback_row_count_files": 0,
+                        "scanner_duplicate_files": 0,
+                    },
+                },
+            }
+        ]
+    }
+
+    markdown = harness.render_markdown_report(report_dict)
+
+    assert "copy_files=reported:5,recovered:0,fallback:0,duplicates:0" in markdown
 
 
 def test_markdown_report_includes_serving_arch_summary():

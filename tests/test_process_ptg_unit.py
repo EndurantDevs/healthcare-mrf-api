@@ -598,6 +598,170 @@ def test_copy_load_split_keeps_facade_helpers_stable():
     assert process_ptg._copy_ignore_ptg2_objects is ptg_copy_load._copy_ignore_ptg2_objects
 
 
+def test_push_ptg2_objects_routes_snapshot_state_writes(monkeypatch):
+    snapshot_by_field = {"snapshot_id": "ptg2:test"}
+    stored_snapshot_by_field = {**snapshot_by_field, "status": "building"}
+    preserve_snapshot = AsyncMock(return_value=stored_snapshot_by_field)
+    monkeypatch.setattr(
+        process_ptg,
+        "_push_ptg2_snapshot_preserving_publication",
+        preserve_snapshot,
+    )
+
+    result = asyncio.run(
+        process_ptg._push_ptg2_objects(
+            [snapshot_by_field],
+            process_ptg.PTG2Snapshot,
+        )
+    )
+
+    assert result == stored_snapshot_by_field
+    preserve_snapshot.assert_awaited_once_with(snapshot_by_field)
+    with pytest.raises(ValueError, match="exactly one row"):
+        asyncio.run(
+            process_ptg._push_ptg2_objects(
+                [snapshot_by_field, snapshot_by_field],
+                process_ptg.PTG2Snapshot,
+            )
+        )
+
+
+def test_push_ptg2_objects_uses_each_specialized_copy_path(monkeypatch):
+    copy_calls = []
+
+    async def record_copy(copy_kind, object_entries, table_class):
+        copy_calls.append((copy_kind, object_entries, table_class))
+
+    async def copy_ignore(object_entries, table_class):
+        await record_copy("ignore", object_entries, table_class)
+
+    async def copy_insert(object_entries, table_class):
+        await record_copy("insert", object_entries, table_class)
+
+    async def copy_upsert(object_entries, table_class):
+        await record_copy("upsert", object_entries, table_class)
+
+    async def reject_generic_push(*_args, **_kwargs):
+        raise AssertionError("specialized COPY should finish the write")
+
+    class BulkTable:
+        __tablename__ = "bulk_table"
+
+    monkeypatch.setattr(process_ptg, "_env_bool", lambda *_args: True)
+    monkeypatch.setattr(process_ptg, "_env_int", lambda *_args: 1)
+    monkeypatch.setattr(process_ptg, "_copy_ignore_ptg2_objects", copy_ignore)
+    monkeypatch.setattr(process_ptg, "_copy_insert_ptg2_objects", copy_insert)
+    monkeypatch.setattr(process_ptg, "_copy_upsert_ptg2_objects", copy_upsert)
+    monkeypatch.setattr(process_ptg, "push_objects", reject_generic_push)
+
+    async def run_writes():
+        await process_ptg._push_ptg2_objects(
+            [{"price_set_hash": "price-set"}],
+            process_ptg.PTG2PriceSet,
+        )
+        await process_ptg._push_ptg2_objects(
+            [{"serving_rate_hash": "serving-rate"}],
+            process_ptg.PTG2ServingRate,
+        )
+        await process_ptg._push_ptg2_objects([{"id": 1}], BulkTable)
+
+    asyncio.run(run_writes())
+
+    assert [copy_kind for copy_kind, _rows, _table in copy_calls] == [
+        "ignore",
+        "insert",
+        "upsert",
+    ]
+
+
+def test_push_ptg2_objects_falls_back_to_legacy_push_signature(monkeypatch):
+    push_calls = []
+
+    async def fail_copy(*_args, **_kwargs):
+        raise RuntimeError("COPY unavailable")
+
+    async def legacy_push(object_entries, table_class, **kwargs):
+        push_calls.append((object_entries, table_class, kwargs))
+        if "use_copy" in kwargs:
+            raise TypeError("unexpected keyword argument 'use_copy'")
+
+    monkeypatch.setattr(process_ptg, "_env_bool", lambda *_args: True)
+    monkeypatch.setattr(process_ptg, "_env_int", lambda *_args: 1)
+    monkeypatch.setattr(process_ptg, "_copy_ignore_ptg2_objects", fail_copy)
+    monkeypatch.setattr(process_ptg, "_copy_upsert_ptg2_objects", fail_copy)
+    monkeypatch.setattr(process_ptg, "push_objects", legacy_push)
+
+    object_entries = [{"price_set_hash": "price-set"}]
+    asyncio.run(
+        process_ptg._push_ptg2_objects(
+            object_entries,
+            process_ptg.PTG2PriceSet,
+        )
+    )
+
+    assert push_calls == [
+        (
+            object_entries,
+            process_ptg.PTG2PriceSet,
+            {"rewrite": True, "use_copy": False},
+        ),
+        (object_entries, process_ptg.PTG2PriceSet, {"rewrite": True}),
+    ]
+
+
+def test_push_ptg2_objects_falls_back_after_direct_copy_failure(monkeypatch):
+    push_objects = AsyncMock()
+    monkeypatch.setattr(process_ptg, "_env_bool", lambda *_args: True)
+    monkeypatch.setattr(process_ptg, "_env_int", lambda *_args: 250)
+    monkeypatch.setattr(
+        process_ptg,
+        "_copy_insert_ptg2_objects",
+        AsyncMock(side_effect=RuntimeError("COPY unavailable")),
+    )
+    monkeypatch.setattr(process_ptg, "push_objects", push_objects)
+
+    object_entries = [{"serving_rate_hash": "serving-rate"}]
+    asyncio.run(
+        process_ptg._push_ptg2_objects(
+            object_entries,
+            process_ptg.PTG2ServingRate,
+            rewrite=False,
+        )
+    )
+
+    push_objects.assert_awaited_once_with(
+        object_entries,
+        process_ptg.PTG2ServingRate,
+        rewrite=False,
+        use_copy=False,
+    )
+
+
+def test_push_ptg2_objects_reraises_unrelated_type_errors(monkeypatch):
+    async def fail_push(*_args, **_kwargs):
+        raise TypeError("database adapter failed")
+
+    class SmallTable:
+        __tablename__ = "small_table"
+
+    monkeypatch.setattr(process_ptg, "_env_bool", lambda *_args: False)
+    monkeypatch.setattr(process_ptg, "_env_int", lambda *_args: 250)
+    monkeypatch.setattr(process_ptg, "push_objects", fail_push)
+
+    with pytest.raises(TypeError, match="database adapter failed"):
+        asyncio.run(process_ptg._push_ptg2_objects([{"id": 1}], SmallTable))
+
+
+def test_ptg2_copy_file_row_count_returns_zero_for_missing_file(tmp_path):
+    assert process_ptg._ptg2_copy_file_row_count(tmp_path / "missing.copy") == 0
+
+
+def test_row_mapping_prefers_sqlalchemy_mapping_attribute():
+    row_object = SimpleNamespace(_mapping={"snapshot_id": "ptg2:test"})
+
+    assert process_ptg._row_mapping(row_object) == {"snapshot_id": "ptg2:test"}
+
+
 def test_copy_load_strips_postgres_nuls_from_text_values():
     row_map = {
         "plain": "ab\0cd",
@@ -7768,10 +7932,11 @@ def test_materialize_zip_when_deferred(tmp_path, monkeypatch):
 
 
 def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, monkeypatch):
-    """Recover worker copy files that the scanner did not report directly."""
+    """Count only genuinely unreported worker files during recovery."""
     artifact_dir = tmp_path / "artifacts"
     recovered_paths_by_kind = {}
     graph_input_paths = []
+    row_counted_paths = []
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
 
     async def fake_push_ptg2_objects(*_args, **_kwargs):
@@ -7794,8 +7959,20 @@ def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, mon
             summary=str(summary_worker),
             member=str(member_worker),
         )
+        yield "manifest_price_atom_copy_file", {
+            "path": str(price_worker),
+            "bytes": price_worker.stat().st_size,
+            "row_count": 1,
+            "final": True,
+        }
         yield "scanner_config", {"worker_count": 2}
         yield "scanner_summary", {"serving_run_rows": 2}
+
+    original_copy_file_row_count = process_ptg._ptg2_copy_file_row_count
+
+    def tracked_copy_file_row_count(copy_path):
+        row_counted_paths.append(str(copy_path))
+        return original_copy_file_row_count(copy_path)
 
     async def fake_build_membership_sidecars(
         *,
@@ -7816,6 +7993,11 @@ def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, mon
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push_ptg2_objects)
     monkeypatch.setattr(process_ptg, "flush_error_log", fake_flush_error_log)
     monkeypatch.setattr(process_ptg, "_aiter_compact_serving_records_rust", fake_scanner)
+    monkeypatch.setattr(
+        process_ptg,
+        "_ptg2_copy_file_row_count",
+        tracked_copy_file_row_count,
+    )
     monkeypatch.setattr(
         process_ptg,
         "_build_ptg2_provider_membership_sidecars",
@@ -7856,6 +8038,19 @@ def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, mon
     assert summary["manifest"]["copy_files"]["provider_group_member"] == []
     assert graph_input_paths == [Path(recovered_paths_by_kind["member"])]
     assert not Path(recovered_paths_by_kind["member"]).exists()
+    assert set(row_counted_paths) == {
+        recovered_paths_by_kind["summary"],
+        recovered_paths_by_kind["member"],
+    }
+    assert summary["manifest"]["copy_file_accounting"] == {
+        "scanner_reported_files": 1,
+        "scanner_duplicate_files": 0,
+        "recovery_candidates": 8,
+        "recovery_already_reported_files": 1,
+        "recovered_unreported_files": 2,
+        "fallback_row_count_files": 2,
+        "fallback_row_count_bytes": len("price-set-1\t1.25\nmember-1\n"),
+    }
     assert set(summary["manifest"]["sidecars"]) == {
         "provider_group_npi",
         "provider_npi_group",

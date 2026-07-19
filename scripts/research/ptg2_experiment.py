@@ -347,6 +347,18 @@ def parse_serving_only_summary(text: bytes | str) -> dict[str, Any] | None:
     return None
 
 
+def copy_file_accounting_from_summary(
+    serving_summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Extract single-pass COPY-file counters from an importer summary."""
+
+    manifest = serving_summary.get("manifest")
+    if not isinstance(manifest, dict):
+        return {}
+    accounting = manifest.get("copy_file_accounting")
+    return dict(accounting) if isinstance(accounting, dict) else {}
+
+
 def coerce_scalar(value: str) -> Any:
     """Convert a scalar value into a stable report representation."""
     if value in {"true", "false"}:
@@ -3235,6 +3247,7 @@ def run_local_ptg_cli(
     combined = completed.stdout + b"\n" + completed.stderr
     import_done = parse_import_done(combined)
     serving_summary = parse_serving_only_summary(combined) or {}
+    copy_file_accounting = copy_file_accounting_from_summary(serving_summary)
     scanner_summary = serving_summary.get("scanner") if isinstance(serving_summary.get("scanner"), dict) else {}
     status = "succeeded" if completed.returncode == 0 and (import_done or {}).get("status") == "validated" else "failed"
     verification = None
@@ -3323,6 +3336,7 @@ def run_local_ptg_cli(
             "storage": storage_summary_dict or {},
             "serving_index_checks": serving_index_checks or {},
             "api_latency": api_latency or {},
+            "copy_file_accounting": copy_file_accounting,
         },
         error=completed.stderr.decode("utf-8", errors="replace") if status != "succeeded" else None,
     )
@@ -4034,6 +4048,20 @@ def format_import_done(report_result: dict[str, Any]) -> str:
         parts.append(f"files={import_done_payload.get('files_processed')}")
     if import_done_payload.get("serving_rates") is not None:
         parts.append(f"rates={import_done_payload.get('serving_rates')}")
+    copy_file_accounting = import_run.get("copy_file_accounting")
+    if isinstance(copy_file_accounting, dict) and copy_file_accounting:
+        parts.append(
+            "copy_files=reported:{reported},recovered:{recovered},"
+            "fallback:{fallback},duplicates:{duplicates}".format(
+                reported=copy_file_accounting.get("scanner_reported_files", 0),
+                recovered=copy_file_accounting.get(
+                    "recovered_unreported_files",
+                    0,
+                ),
+                fallback=copy_file_accounting.get("fallback_row_count_files", 0),
+                duplicates=copy_file_accounting.get("scanner_duplicate_files", 0),
+            )
+        )
     api_latency = import_run.get("api_latency") if isinstance(import_run, dict) else None
     if isinstance(api_latency, dict) and api_latency:
         latency_summary = _format_api_latency(api_latency)

@@ -1171,6 +1171,15 @@ async def _parse_strict_v3_file(
     deferred_copy_file_paths_by_kind: dict[str, set[str]] = {
         kind: set() for kind in deferred_copy_entries_by_kind
     }
+    manifest_copy_file_accounting_by_name = {
+        "scanner_reported_files": 0,
+        "scanner_duplicate_files": 0,
+        "recovery_candidates": 0,
+        "recovery_already_reported_files": 0,
+        "recovered_unreported_files": 0,
+        "fallback_row_count_files": 0,
+        "fallback_row_count_bytes": 0,
+    }
     is_scan_complete = False
 
     def _new_copy_path(prefix: str) -> Path:
@@ -1288,7 +1297,12 @@ async def _parse_strict_v3_file(
         shutil.rmtree(v3_serving_run_directory, ignore_errors=True)
         shutil.rmtree(manifest_artifact_dir, ignore_errors=True)
 
-    def record_ready_manifest_file(kind: str, copy_row: dict[str, Any]) -> None:
+    def record_ready_manifest_file(
+        kind: str,
+        copy_row: dict[str, Any],
+        *,
+        from_recovery: bool = False,
+    ) -> None:
         """Record one nonempty deferred COPY file exactly once for publication."""
 
         if kind not in {
@@ -1303,8 +1317,29 @@ async def _parse_strict_v3_file(
         if not raw_copy_path:
             return
         copy_file = Path(raw_copy_path)
+        path_key = _copy_file_key(copy_file)
+        seen_paths = deferred_copy_file_paths_by_kind.setdefault(kind, set())
+        if from_recovery:
+            manifest_copy_file_accounting_by_name["recovery_candidates"] += 1
+        if path_key in seen_paths:
+            duplicate_counter = (
+                "recovery_already_reported_files"
+                if from_recovery
+                else "scanner_duplicate_files"
+            )
+            manifest_copy_file_accounting_by_name[duplicate_counter] += 1
+            return
+        if from_recovery and (
+            not copy_file.exists() or copy_file.stat().st_size <= 0
+        ):
+            return
         copied_rows = int(copy_row.get("row_count") or 0)
         if copied_rows <= 0:
+            file_size = copy_file.stat().st_size if copy_file.exists() else 0
+            manifest_copy_file_accounting_by_name["fallback_row_count_files"] += 1
+            manifest_copy_file_accounting_by_name[
+                "fallback_row_count_bytes"
+            ] += file_size
             copied_rows = _ptg2_copy_file_row_count(copy_file)
         _record_deferred_copy_file_once(
             kind,
@@ -1312,6 +1347,12 @@ async def _parse_strict_v3_file(
             copied_rows,
             metadata=copy_row,
         )
+        recorded_counter = (
+            "recovered_unreported_files"
+            if from_recovery
+            else "scanner_reported_files"
+        )
+        manifest_copy_file_accounting_by_name[recorded_counter] += 1
 
     try:
         raw_source_sha256 = str(
@@ -1400,11 +1441,11 @@ async def _parse_strict_v3_file(
             (manifest_provider_set_metadata_copy_path, "provider_set_metadata"),
         ):
             for candidate_copy_path in _manifest_copy_candidates(copy_path):
-                if candidate_copy_path.exists() and candidate_copy_path.stat().st_size > 0:
-                    record_ready_manifest_file(
-                        kind,
-                        {"path": str(candidate_copy_path), "row_count": 0},
-                    )
+                record_ready_manifest_file(
+                    kind,
+                    {"path": str(candidate_copy_path), "row_count": 0},
+                    from_recovery=True,
+                )
         is_scan_complete = True
     finally:
         manifest_copy_paths = (
@@ -1487,6 +1528,7 @@ async def _parse_strict_v3_file(
                 if path is not None
             },
             "copy_files": deferred_copy_entries_by_kind,
+            "copy_file_accounting": manifest_copy_file_accounting_by_name,
             "precopy_merge_deferred": True,
             "membership_graph": membership_graph_metrics_map,
         },
