@@ -272,11 +272,20 @@ async def test_lean_price_atom_does_not_repeat_numeric_rate_conversion(monkeypat
         for call in status.await_args_list
         if "WITH dictionary_source AS" in call.args[0]
     )
-    assert dictionary_sql.count('FROM "mrf"."price_atoms"') == 4
+    assert dictionary_sql.count('FROM "mrf"."price_atoms"') == 1
+    assert "UNION ALL" not in dictionary_sql
     assert "GROUP BY GROUPING SETS" in dictionary_sql
-    assert "GROUPING(negotiated_type) = 0" in dictionary_sql
-    assert "GROUPING(expiration_date) = 0" in dictionary_sql
-    assert "GROUPING(billing_class) = 0" in dictionary_sql
+    for attribute in (
+        "negotiated_type",
+        "expiration_date",
+        "service_code",
+        "billing_class",
+        "setting",
+        "billing_code_modifier",
+        "additional_information",
+    ):
+        assert f"GROUPING({attribute}) = 0" in dictionary_sql
+        assert f"({attribute})" in dictionary_sql
 
 
 @pytest.mark.asyncio

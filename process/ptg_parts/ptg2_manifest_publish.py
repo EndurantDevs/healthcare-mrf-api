@@ -2029,7 +2029,15 @@ async def _rewrite_price_atom_lean_dictionary(
                            THEN 'expiration_date'::varchar(64)
                        WHEN GROUPING(billing_class) = 0
                            THEN 'billing_class'::varchar(64)
-                       ELSE 'setting'::varchar(64)
+                       WHEN GROUPING(setting) = 0
+                           THEN 'setting'::varchar(64)
+                       WHEN GROUPING(service_code) = 0
+                           THEN 'service_code'::varchar(64)
+                       WHEN GROUPING(billing_code_modifier) = 0
+                           THEN 'billing_code_modifier'::varchar(64)
+                       WHEN GROUPING(additional_information) = 0
+                           THEN 'additional_information'::varchar(64)
+                       ELSE NULL::varchar(64)
                    END AS attr_kind,
                    CASE
                        WHEN GROUPING(negotiated_type) = 0
@@ -2038,28 +2046,29 @@ async def _rewrite_price_atom_lean_dictionary(
                            THEN expiration_date::text
                        WHEN GROUPING(billing_class) = 0
                            THEN billing_class::text
-                       ELSE setting::text
+                       WHEN GROUPING(setting) = 0
+                           THEN setting::text
+                       WHEN GROUPING(additional_information) = 0
+                           THEN additional_information::text
+                       ELSE NULL::text
                    END AS text_value,
-                   NULL::text[] AS text_array
+                   CASE
+                       WHEN GROUPING(service_code) = 0
+                           THEN service_code::text[]
+                       WHEN GROUPING(billing_code_modifier) = 0
+                           THEN billing_code_modifier::text[]
+                       ELSE NULL::text[]
+                   END AS text_array
               FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
              GROUP BY GROUPING SETS (
                  (negotiated_type),
                  (expiration_date),
                  (billing_class),
-                 (setting)
+                 (setting),
+                 (service_code),
+                 (billing_code_modifier),
+                 (additional_information)
              )
-            UNION ALL
-            SELECT 'service_code'::varchar(64), NULL::text, service_code::text[]
-              FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-             GROUP BY service_code
-            UNION ALL
-            SELECT 'billing_code_modifier'::varchar(64), NULL::text, billing_code_modifier::text[]
-              FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-             GROUP BY billing_code_modifier
-            UNION ALL
-            SELECT 'additional_information'::varchar(64), additional_information::text, NULL::text[]
-              FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-             GROUP BY additional_information
         )
         SELECT
             attr_kind,
