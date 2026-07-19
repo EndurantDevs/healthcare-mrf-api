@@ -214,10 +214,10 @@ async def test_fetch_pharmacy_context_uses_legacy_address_table_by_default(monke
 async def test_fetch_pharmacy_context_uses_unified_address_table_by_default_when_available(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
 
-    async def table_exists(_session, table):
+    async def is_table_present(_session, table):
         return table is reports.EntityAddressUnified.__table__
 
-    monkeypatch.setattr(reports, "_table_exists", table_exists)
+    monkeypatch.setattr(reports, "_table_exists", is_table_present)
 
     class Session:
         def __init__(self):
@@ -261,7 +261,7 @@ async def test_query_market_summaries_avoids_count_query_when_data_present(monke
     monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
     monkeypatch.setattr(reports, "_build_market_sql", lambda **_: ("SELECT count", "SELECT data", {}))
 
-    market_summary = {
+    market_summary_by_field = {
         "market_id": "city:TX:austin",
         "market_scope": "city",
         "market_name": "Austin",
@@ -292,7 +292,7 @@ async def test_query_market_summaries_avoids_count_query_when_data_present(monke
     class Session:
         async def execute(self, stmt, _params):
             if stmt.text == "SELECT data":
-                return _FakeMappingsResult([market_summary])
+                return _FakeMappingsResult([market_summary_by_field])
             raise AssertionError("count query should not run when data rows are present")
 
     total, market_summaries = await reports._query_market_summaries(
@@ -459,12 +459,12 @@ async def test_query_pharmacy_state_stats_normalizes_and_zero_fills_states(monke
 async def test_query_chain_summary_uses_helper_table_when_available(monkeypatch):
     monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=True))
 
-    captured = {}
+    query_by_field = {}
 
     class Session:
         async def execute(self, stmt, params):
-            captured["sql"] = stmt.text
-            captured["params"] = params
+            query_by_field["sql"] = stmt.text
+            query_by_field["params"] = params
             return _FakeMappingRowResult(
                 {
                     "summary": {"pharmacy_npi_count": 2},
@@ -480,25 +480,25 @@ async def test_query_chain_summary_uses_helper_table_when_available(monkeypatch)
     )
 
     assert has_helper is True
-    assert "FROM mrf.npi_phone_staffing" in captured["sql"]
-    assert "FROM mrf.entity_address_unified AS a" in captured["sql"]
-    assert "FROM mrf.npi_address AS a" not in captured["sql"]
+    assert "FROM mrf.npi_phone_staffing" in query_by_field["sql"]
+    assert "FROM mrf.entity_address_unified AS a" in query_by_field["sql"]
+    assert "FROM mrf.npi_address AS a" not in query_by_field["sql"]
     assert summary["pharmacy_npi_count"] == 2
     assert histogram[0]["label"] == "1"
     assert states[0]["state"] == "CA"
-    assert captured["params"]["name_like_0"] == "%cvs%"
+    assert query_by_field["params"]["name_like_0"] == "%cvs%"
 
 
 @pytest.mark.asyncio
 async def test_query_chain_summary_falls_back_when_helper_missing(monkeypatch):
     monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
 
-    captured = {}
+    query_by_field = {}
 
     class Session:
         async def execute(self, stmt, params):
-            captured["sql"] = stmt.text
-            captured["params"] = params
+            query_by_field["sql"] = stmt.text
+            query_by_field["params"] = params
             return _FakeMappingRowResult(
                 {
                     "summary": {"pharmacy_npi_count": 0},
@@ -514,11 +514,11 @@ async def test_query_chain_summary_falls_back_when_helper_missing(monkeypatch):
     )
 
     assert has_helper is False
-    assert "FROM mrf.npi_phone_staffing" not in captured["sql"]
-    assert "FROM mrf.npi_address AS a" in captured["sql"]
-    assert "FROM mrf.entity_address_unified AS a" not in captured["sql"]
-    assert "GROUP BY a.state_name, REGEXP_REPLACE(a.telephone_number, '[^0-9]', '', 'g')" in captured["sql"]
-    assert captured["params"]["include_states"] is False
+    assert "FROM mrf.npi_phone_staffing" not in query_by_field["sql"]
+    assert "FROM mrf.npi_address AS a" in query_by_field["sql"]
+    assert "FROM mrf.entity_address_unified AS a" not in query_by_field["sql"]
+    assert "GROUP BY a.state_name, REGEXP_REPLACE(a.telephone_number, '[^0-9]', '', 'g')" in query_by_field["sql"]
+    assert query_by_field["params"]["include_states"] is False
     assert summary["pharmacy_npi_count"] == 0
     assert histogram == []
     assert states == []
@@ -593,12 +593,12 @@ def test_build_market_sql_can_force_legacy_address_table(monkeypatch):
 async def test_query_chain_summary_optimizes_match_all_wildcard(monkeypatch):
     monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=True))
 
-    captured = {}
+    query_by_field = {}
 
     class Session:
         async def execute(self, stmt, params):
-            captured["sql"] = stmt.text
-            captured["params"] = params
+            query_by_field["sql"] = stmt.text
+            query_by_field["params"] = params
             return _FakeMappingRowResult(
                 {
                     "summary": {"pharmacy_npi_count": 5},
@@ -614,9 +614,9 @@ async def test_query_chain_summary_optimizes_match_all_wildcard(monkeypatch):
     )
 
     assert has_helper is True
-    assert "JOIN mrf.npi AS d ON d.npi = a.npi" not in captured["sql"]
-    assert "WHERE a.type = 'primary'" in captured["sql"]
-    assert "name_like_0" not in captured["params"]
+    assert "JOIN mrf.npi AS d ON d.npi = a.npi" not in query_by_field["sql"]
+    assert "WHERE a.type = 'primary'" in query_by_field["sql"]
+    assert "name_like_0" not in query_by_field["params"]
     assert summary["pharmacy_npi_count"] == 5
     assert histogram[0]["count"] == 5
     assert states == []
@@ -626,11 +626,11 @@ async def test_query_chain_summary_optimizes_match_all_wildcard(monkeypatch):
 async def test_query_pharmacy_state_stats_uses_helper_table(monkeypatch):
     monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=True))
 
-    captured = {}
+    query_by_field = {}
 
     class Session:
         async def execute(self, stmt, _params=None):
-            captured["sql"] = stmt.text
+            query_by_field["sql"] = stmt.text
             return _FakeMappingsResult(
                 [
                     {
@@ -647,9 +647,9 @@ async def test_query_pharmacy_state_stats_uses_helper_table(monkeypatch):
     rows, has_helper = await reports._query_pharmacy_state_stats(Session())
 
     assert has_helper is True
-    assert "FROM mrf.npi_phone_staffing" in captured["sql"]
-    assert "FROM mrf.entity_address_unified AS a" in captured["sql"]
-    assert "FROM mrf.npi_address AS a" not in captured["sql"]
+    assert "FROM mrf.npi_phone_staffing" in query_by_field["sql"]
+    assert "FROM mrf.entity_address_unified AS a" in query_by_field["sql"]
+    assert "FROM mrf.npi_address AS a" not in query_by_field["sql"]
     by_state = {row["state"]: row for row in rows}
     assert by_state["CA"]["state"] == "CA"
 

@@ -8,7 +8,7 @@ import re
 import zlib
 from array import array
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Mapping
+from typing import AbstractSet, Any, Callable, Iterable, Mapping
 
 from sqlalchemy import text
 
@@ -139,6 +139,7 @@ class _ForwardFanoutCapture:
         tuple[_ForwardBatchFragmentView, ...],
     ]
     fallback_views: tuple[_ForwardBatchFragmentView, ...]
+    provider_filter_set: frozenset[int] | None
     retained_by_coordinate: dict[
         tuple[int, int, int],
         list[tuple[int, int, int]],
@@ -153,8 +154,7 @@ class _ForwardFanoutCapture:
         source_key: int,
     ) -> None:
         if self.first_provider_set_key is None:
-            self.first_provider_set_key = provider_set_key
-            self.first_occurrence = (price_key, source_key)
+            self.capture_first(provider_set_key, price_key, source_key)
         exact_views = self.exact_views_by_occurrence.get(
             (provider_set_key, source_key),
             (),
@@ -171,6 +171,18 @@ class _ForwardFanoutCapture:
             )
             if is_provider_match and is_source_match:
                 self._retain(view, provider_set_key, price_key, source_key)
+
+    def capture_first(
+        self,
+        provider_set_key: int,
+        price_key: int,
+        source_key: int,
+    ) -> None:
+        """Record physical ordering state without retaining an unmatched row."""
+
+        if self.first_provider_set_key is None:
+            self.first_provider_set_key = provider_set_key
+            self.first_occurrence = (price_key, source_key)
 
     def _retain(
         self,
@@ -873,13 +885,78 @@ def _dense_source_key_at(
     return source_key
 
 
+def _visit_single_source_forward_occurrences(
+    fragment_bytes: bytes,
+    cursor: int,
+    *,
+    price_key_count: int,
+    occurrence_consumer: Callable[[int, int], None] | None,
+    first_occurrence_consumer: Callable[[int, int], None] | None,
+    price_item_count: int | None,
+    previous_occurrence: tuple[int, int] | None,
+) -> tuple[int, tuple[int, int]]:
+    """Validate and deliver zero-bit source occurrences in one pass."""
+
+    for price_index in range(price_key_count):
+        price_key, cursor = read_strict_uvarint(fragment_bytes, cursor)
+        if price_key > 2**32 - 1 or (
+            price_item_count is not None
+            and price_key >= int(price_item_count)
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 grouped by-code price key is out of range"
+            )
+        occurrence = (price_key, 0)
+        if previous_occurrence is not None and occurrence < previous_occurrence:
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 grouped by-code occurrences are not ordered"
+            )
+        previous_occurrence = occurrence
+        if price_index == 0 and first_occurrence_consumer is not None:
+            first_occurrence_consumer(price_key, 0)
+        if occurrence_consumer is not None:
+            occurrence_consumer(price_key, 0)
+    _encoded_sources, source_vector_end = _dense_source_vector_view(
+        fragment_bytes,
+        cursor,
+        entry_count=price_key_count,
+        source_count=1,
+        source_bits=0,
+    )
+    return source_vector_end, previous_occurrence
+
+
+def _validated_forward_price_key_array(
+    fragment_bytes: bytes,
+    cursor: int,
+    *,
+    price_key_count: int,
+    price_item_count: int | None,
+) -> tuple[array, int]:
+    """Decode bounded price keys needed by a packed multi-source vector."""
+
+    price_key_array = array("I")
+    for _price_index in range(price_key_count):
+        price_key, cursor = read_strict_uvarint(fragment_bytes, cursor)
+        if price_key > 2**32 - 1 or (
+            price_item_count is not None
+            and price_key >= int(price_item_count)
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 grouped by-code price key is out of range"
+            )
+        price_key_array.append(price_key)
+    return price_key_array, cursor
+
+
 def _visit_forward_occurrences(
     fragment_bytes: bytes,
     cursor: int,
     *,
     source_count: int,
     source_bits: int,
-    occurrence_consumer: Callable[[int, int], None],
+    occurrence_consumer: Callable[[int, int], None] | None,
+    first_occurrence_consumer: Callable[[int, int], None] | None = None,
     price_item_count: int | None = None,
     previous_occurrence: tuple[int, int] | None = None,
 ) -> tuple[int, tuple[int, int]]:
@@ -890,16 +967,22 @@ def _visit_forward_occurrences(
         raise PTG2ManifestArtifactError(
             "PTG2 v3 grouped by-code occurrence count is invalid"
         )
-    price_keys = array("I")
-    for _price_index in range(price_key_count):
-        price_key, cursor = read_strict_uvarint(fragment_bytes, cursor)
-        if price_key > 2**32 - 1 or (
-            price_item_count is not None and price_key >= int(price_item_count)
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 grouped by-code price key is out of range"
-            )
-        price_keys.append(price_key)
+    if source_count == 1 and source_bits == 0:
+        return _visit_single_source_forward_occurrences(
+            fragment_bytes,
+            cursor,
+            price_key_count=price_key_count,
+            occurrence_consumer=occurrence_consumer,
+            first_occurrence_consumer=first_occurrence_consumer,
+            price_item_count=price_item_count,
+            previous_occurrence=previous_occurrence,
+        )
+    price_key_array, cursor = _validated_forward_price_key_array(
+        fragment_bytes,
+        cursor,
+        price_key_count=price_key_count,
+        price_item_count=price_item_count,
+    )
     encoded_sources, source_vector_end = _dense_source_vector_view(
         fragment_bytes,
         cursor,
@@ -907,7 +990,7 @@ def _visit_forward_occurrences(
         source_count=source_count,
         source_bits=source_bits,
     )
-    for occurrence_index, price_key in enumerate(price_keys):
+    for occurrence_index, price_key in enumerate(price_key_array):
         source_key = _dense_source_key_at(
             encoded_sources,
             occurrence_index,
@@ -920,21 +1003,21 @@ def _visit_forward_occurrences(
                 "PTG2 v3 grouped by-code occurrences are not ordered"
             )
         previous_occurrence = occurrence
-        occurrence_consumer(price_key, source_key)
-    if previous_occurrence is None:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 grouped by-code occurrence vector is empty"
-        )
+        if occurrence_index == 0 and first_occurrence_consumer is not None:
+            first_occurrence_consumer(price_key, source_key)
+        if occurrence_consumer is not None:
+            occurrence_consumer(price_key, source_key)
     return source_vector_end, previous_occurrence
 
 
 def _visit_forward_fragment_unchecked(
     fragment_row: Mapping[str, Any],
     *,
-    provider_filter: set[int] | None,
+    provider_filter: AbstractSet[int] | None,
     fragment_cursor: _ForwardFragmentCursor,
     validation: _ForwardFragmentValidation,
     occurrence_consumer: Callable[[int, int, int], None],
+    first_occurrence_consumer: Callable[[int, int, int], None] | None = None,
 ) -> tuple[_ForwardFragmentCursor, int]:
     """Validate one grouped fragment and visit selected occurrences."""
 
@@ -953,7 +1036,7 @@ def _visit_forward_fragment_unchecked(
         raise PTG2ManifestArtifactError(
             "PTG2 v3 grouped by-code fragment has an invalid entry count"
         )
-    for _ in range(entry_count):
+    for provider_index in range(entry_count):
         provider_delta, cursor = read_strict_uvarint(fragment_bytes, cursor)
         provider_set_key += provider_delta
         if (
@@ -974,16 +1057,25 @@ def _visit_forward_fragment_unchecked(
                 "PTG2 v3 provider set is outside its forward shard"
             )
 
+        is_provider_match = (
+            provider_filter is None or provider_set_key in provider_filter
+        )
+
         def _consume(price_key: int, source_key: int) -> None:
-            is_provider_match = (
-                provider_filter is None or provider_set_key in provider_filter
-            )
             is_source_match = (
                 validation.source_filter is None
                 or source_key in validation.source_filter
             )
-            if is_provider_match and is_source_match:
+            if is_source_match:
                 occurrence_consumer(provider_set_key, price_key, source_key)
+
+        def _capture_first(price_key: int, source_key: int) -> None:
+            if first_occurrence_consumer is not None:
+                first_occurrence_consumer(
+                    provider_set_key,
+                    price_key,
+                    source_key,
+                )
 
         is_provider_continuation = (
             previous_provider_set_key == provider_set_key
@@ -993,7 +1085,13 @@ def _visit_forward_fragment_unchecked(
             cursor,
             source_count=source_count,
             source_bits=source_bits,
-            occurrence_consumer=_consume,
+            occurrence_consumer=(_consume if is_provider_match else None),
+            first_occurrence_consumer=(
+                _capture_first
+                if first_occurrence_consumer is not None
+                and provider_index == 0
+                else None
+            ),
             price_item_count=validation.price_item_count,
             previous_occurrence=(
                 previous_occurrence if is_provider_continuation else None
@@ -1020,7 +1118,7 @@ def _visit_forward_fragment_unchecked(
 def _decode_forward_fragment_unchecked(
     fragment_row: Mapping[str, Any],
     *,
-    provider_filter: set[int] | None,
+    provider_filter: AbstractSet[int] | None,
     expected_source_count: int | None,
     previous_provider_set_key: int | None,
     previous_occurrence: tuple[int, int] | None,
@@ -1066,7 +1164,7 @@ _decode_serving_binary_by_code_record_unchecked = _decode_forward_fragment_unche
 def _decode_serving_binary_by_code_record(
     fragment_row: Mapping[str, Any],
     *,
-    provider_filter: set[int] | None,
+    provider_filter: AbstractSet[int] | None,
     expected_source_count: int | None,
     previous_provider_set_key: int | None,
     previous_occurrence: tuple[int, int] | None,
@@ -1096,10 +1194,11 @@ def _decode_serving_binary_by_code_record(
 def _visit_serving_binary_by_code_record(
     fragment_row: Mapping[str, Any],
     *,
-    provider_filter: set[int] | None,
+    provider_filter: AbstractSet[int] | None,
     fragment_cursor: _ForwardFragmentCursor,
     validation: _ForwardFragmentValidation,
     occurrence_consumer: Callable[[int, int, int], None],
+    first_occurrence_consumer: Callable[[int, int, int], None] | None = None,
 ) -> tuple[_ForwardFragmentCursor, int]:
     try:
         return _visit_forward_fragment_unchecked(
@@ -1108,6 +1207,7 @@ def _visit_serving_binary_by_code_record(
             fragment_cursor=fragment_cursor,
             validation=validation,
             occurrence_consumer=occurrence_consumer,
+            first_occurrence_consumer=first_occurrence_consumer,
         )
     except PTG2ManifestArtifactError:
         raise
@@ -2289,11 +2389,18 @@ def _forward_fanout_capture(
         list[_ForwardBatchFragmentView],
     ] = {}
     fallback_views: list[_ForwardBatchFragmentView] = []
+    provider_filter_set: set[int] = set()
+    is_provider_scope_unrestricted = False
     for view in physical_views:
         if view.occurrence_filter is None:
             fallback_views.append(view)
+            if view.provider_filter is None:
+                is_provider_scope_unrestricted = True
+            else:
+                provider_filter_set.update(view.provider_filter)
             continue
         for occurrence_key in view.occurrence_filter:
+            provider_filter_set.add(occurrence_key[0])
             exact_views_by_occurrence.setdefault(occurrence_key, []).append(view)
     return _ForwardFanoutCapture(
         exact_views_by_occurrence={
@@ -2301,6 +2408,11 @@ def _forward_fanout_capture(
             for occurrence_key, views in exact_views_by_occurrence.items()
         },
         fallback_views=tuple(fallback_views),
+        provider_filter_set=(
+            None
+            if is_provider_scope_unrestricted
+            else frozenset(provider_filter_set)
+        ),
         retained_by_coordinate=retained_by_coordinate,
     )
 
@@ -2340,13 +2452,14 @@ def _parse_physical_forward_fragment_once(
     )
     last_cursor, source_count = _visit_serving_binary_by_code_record(
         representative.fragment_row,
-        provider_filter=None,
+        provider_filter=fanout_capture.provider_filter_set,
         fragment_cursor=_ForwardFragmentCursor(),
         validation=_ForwardFragmentValidation(
             expected_source_count=options.source_count,
             price_item_count=price_item_count,
         ),
         occurrence_consumer=fanout_capture,
+        first_occurrence_consumer=fanout_capture.capture_first,
     )
     if (
         fanout_capture.first_provider_set_key is None

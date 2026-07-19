@@ -1444,6 +1444,41 @@ async def test_bounded_prefix_validates_source_metadata_in_every_shard(
 
 
 @pytest.mark.asyncio
+async def test_bounded_prefix_rejects_materialized_row_without_dense_rank(
+    monkeypatch,
+):
+    fragment = _fragment(
+        _grouped_payload(2, [(5, [(1, 0)])]),
+        entry_count=1,
+        block_key=_shard_block_key(7, 5),
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_materialize_forward_rows",
+        Mock(
+            return_value=(
+                ptg2_db_sidecars.PTG2ServingBinaryRow(
+                    code_key=7,
+                    provider_set_key=5,
+                    provider_count=None,
+                    price_set_global_id_128="0" * 32,
+                    source_key=0,
+                    price_key=1,
+                ),
+            )
+        ),
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="dense rank field"):
+        await _prefix_rows(
+            monkeypatch,
+            fragments=(fragment,),
+            limit=1,
+            descending=False,
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("descending", "expected"),
     [

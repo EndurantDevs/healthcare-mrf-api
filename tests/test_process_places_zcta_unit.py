@@ -36,7 +36,7 @@ def test_normalize_zcta(value, expected, places_module):
 
 
 def test_build_places_record_filters_latest_year(places_module):
-    row = {
+    place_by_field = {
         "Year": "2025",
         "LocationID": "USZCTA5 60654",
         "MeasureId": "CSMOKING",
@@ -47,13 +47,13 @@ def test_build_places_record_filters_latest_year(places_module):
         "Data_Value_Type": "Crude prevalence",
         "DataSource": "CDC PLACES",
     }
-    record = places_module._build_places_record(row, latest_year=2025)
+    record = places_module._build_places_record(place_by_field, latest_year=2025)
     assert record is not None
     assert record["zcta"] == "60654"
     assert record["year"] == 2025
     assert record["measure_id"] == "CSMOKING"
     assert record["data_value"] == 11.2
-    assert places_module._build_places_record(row, latest_year=2024) is None
+    assert places_module._build_places_record(place_by_field, latest_year=2024) is None
 
 
 @pytest.mark.asyncio
@@ -71,29 +71,29 @@ async def test_process_data_dedupes_rows_latest_year(monkeypatch, places_module,
     async def _fake_download(_url, target_path, **_kwargs):
         Path(target_path).write_text(csv_path.read_text(encoding="utf-8"), encoding="utf-8")
 
-    captured = {}
+    push_by_field = {}
 
     async def _fake_push(rows, cls, **kwargs):
-        captured["rows"] = list(rows)
-        captured["cls"] = cls
-        captured["kwargs"] = kwargs
+        push_by_field["rows"] = list(rows)
+        push_by_field["cls"] = cls
+        push_by_field["kwargs"] = kwargs
 
     monkeypatch.setattr(places_module, "download_it_and_save", _fake_download)
     monkeypatch.setattr(places_module, "ensure_database", AsyncMock())
     monkeypatch.setattr(places_module, "make_class", lambda _cls, suffix: SimpleNamespace(__tablename__=f"pricing_places_zcta_{suffix}"))
     monkeypatch.setattr(places_module, "push_objects", _fake_push)
 
-    ctx = {"import_date": "20260319", "context": {}}
-    await places_module.process_data(ctx, {"test_mode": False})
+    job_context_by_field = {"import_date": "20260319", "context": {}}
+    await places_module.process_data(job_context_by_field, {"test_mode": False})
 
-    assert captured["cls"].__tablename__ == "pricing_places_zcta_20260319"
-    assert captured["kwargs"] == {"rewrite": True, "use_copy": False}
-    assert len(captured["rows"]) == 2
-    by_measure = {measure_row["measure_id"]: measure_row for measure_row in captured["rows"]}
+    assert push_by_field["cls"].__tablename__ == "pricing_places_zcta_20260319"
+    assert push_by_field["kwargs"] == {"rewrite": True, "use_copy": False}
+    assert len(push_by_field["rows"]) == 2
+    by_measure = {measure_row["measure_id"]: measure_row for measure_row in push_by_field["rows"]}
     assert by_measure["CSMOKING"]["measure_name"] == "Smoking B"
     assert by_measure["CSMOKING"]["data_value"] == 11.0
     assert by_measure["BPHIGH"]["data_value"] == 20.0
-    assert ctx["context"]["audit"]["latest_year"] == 2025
+    assert job_context_by_field["context"]["audit"]["latest_year"] == 2025
 
 
 @pytest.mark.asyncio
@@ -121,8 +121,8 @@ async def test_process_data_honors_test_row_limit(monkeypatch, places_module, tm
     monkeypatch.setattr(places_module, "push_objects", _fake_push)
     monkeypatch.setenv("HLTHPRT_PLACES_ZCTA_TEST_ROWS", "2")
 
-    ctx = {"import_date": "20260319", "context": {}}
-    await places_module.process_data(ctx, {"test_mode": True})
+    job_context_by_field = {"import_date": "20260319", "context": {}}
+    await places_module.process_data(job_context_by_field, {"test_mode": True})
 
     assert len(pushed_rows) == 2
     assert {row["measure_id"] for row in pushed_rows} == {"M1", "M2"}
@@ -157,10 +157,10 @@ async def test_startup_creates_stage_table(monkeypatch, places_module):
     )
     monkeypatch.setenv("HLTHPRT_IMPORT_ID_OVERRIDE", "2026-03-19")
 
-    ctx = {}
-    await places_module.startup(ctx)
+    startup_context_by_field = {}
+    await places_module.startup(startup_context_by_field)
 
-    assert ctx["import_date"] == "20260319"
+    assert startup_context_by_field["import_date"] == "20260319"
     assert create_calls == ["pricing_places_zcta_20260319"]
     assert any("CREATE UNIQUE INDEX" in stmt for stmt in status_calls)
 
@@ -180,7 +180,7 @@ async def test_shutdown_aborts_when_stage_rows_below_min(monkeypatch, places_mod
     monkeypatch.setattr(places_module.db, "scalar", AsyncMock(return_value=12))
     monkeypatch.setenv("HLTHPRT_PLACES_ZCTA_MIN_ROWS", "500")
 
-    ctx = {
+    shutdown_context_by_field = {
         "import_date": "20260319",
         "context": {
             "run": 1,
@@ -190,7 +190,7 @@ async def test_shutdown_aborts_when_stage_rows_below_min(monkeypatch, places_mod
     }
 
     with pytest.raises(RuntimeError, match="below minimum"):
-        await places_module.shutdown(ctx)
+        await places_module.shutdown(shutdown_context_by_field)
 
 
 @pytest.mark.asyncio
