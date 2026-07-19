@@ -95,20 +95,20 @@ def _command_text(args: list[str]) -> str:
 
 def _provider_directory_cli_report() -> dict[str, Any]:
     help_text = _command_text(["main.py", "start", PROVIDER_DIRECTORY_IMPORTER, "--help"])
-    missing = [option for option in REQUIRED_PROVIDER_DIRECTORY_CLI_OPTIONS if option not in help_text]
+    missing_options = [option for option in REQUIRED_PROVIDER_DIRECTORY_CLI_OPTIONS if option not in help_text]
     return {
-        "ok": not missing,
-        "missing": missing,
+        "ok": not missing_options,
+        "missing": missing_options,
         "required": list(REQUIRED_PROVIDER_DIRECTORY_CLI_OPTIONS),
     }
 
 
 def _coverage_audit_cli_report() -> dict[str, Any]:
     help_text = _command_text(["scripts/research/provider_directory_coverage_audit.py", "--help"])
-    missing = [option for option in REQUIRED_COVERAGE_AUDIT_OPTIONS if option not in help_text]
+    missing_options = [option for option in REQUIRED_COVERAGE_AUDIT_OPTIONS if option not in help_text]
     return {
-        "ok": not missing,
-        "missing": missing,
+        "ok": not missing_options,
+        "missing": missing_options,
         "required": list(REQUIRED_COVERAGE_AUDIT_OPTIONS),
     }
 
@@ -126,28 +126,28 @@ def _harness_cli_report() -> dict[str, Any]:
 def _importer_schema_report() -> dict[str, Any]:
     from api.control_imports import importer_registry
 
-    items = {
+    importer_by_name = {
         str(item.get("name") or ""): item
         for item in importer_registry()
         if isinstance(item, dict)
     }
-    provider_directory = items.get(PROVIDER_DIRECTORY_IMPORTER) or {}
-    params_schema = list(provider_directory.get("params_schema") or [])
+    provider_directory = importer_by_name.get(PROVIDER_DIRECTORY_IMPORTER) or {}
+    parameter_schemas = list(provider_directory.get("params_schema") or [])
     by_name = {
         str(param.get("name") or ""): param
-        for param in params_schema
+        for param in parameter_schemas
         if isinstance(param, dict)
     }
-    missing = [name for name in REQUIRED_PROVIDER_DIRECTORY_SCHEMA_PARAMS if name not in by_name]
+    missing_schema_fields = [name for name in REQUIRED_PROVIDER_DIRECTORY_SCHEMA_PARAMS if name not in by_name]
     refresh_preset = by_name.get("refresh_preset") or {}
     refresh_choices = list(refresh_preset.get("choices") or [])
     if "monthly-full" not in refresh_choices:
-        missing.append("refresh_preset.choice.monthly-full")
+        missing_schema_fields.append("refresh_preset.choice.monthly-full")
     if (by_name.get("include_supplemental_catalogs") or {}).get("type") != "boolean":
-        missing.append("include_supplemental_catalogs.type.boolean")
+        missing_schema_fields.append("include_supplemental_catalogs.type.boolean")
     return {
-        "ok": not missing,
-        "missing": missing,
+        "ok": not missing_schema_fields,
+        "missing": missing_schema_fields,
         "required": list(REQUIRED_PROVIDER_DIRECTORY_SCHEMA_PARAMS),
         "refresh_preset_choices": refresh_choices,
     }
@@ -156,10 +156,10 @@ def _importer_schema_report() -> dict[str, Any]:
 def _monthly_preset_report() -> dict[str, Any]:
     provider_directory_fhir = importlib.import_module("process.provider_directory_fhir")
 
-    task = provider_directory_fhir._apply_provider_directory_refresh_preset(  # pylint: disable=protected-access
+    task = provider_directory_fhir._apply_provider_directory_refresh_preset(
         {"refresh_preset": "monthly_full"}
     )
-    expected = {
+    expected_values_by_name = {
         "refresh_preset": "monthly-full",
         "import_resources": True,
         "full_refresh": True,
@@ -169,15 +169,15 @@ def _monthly_preset_report() -> dict[str, Any]:
         "bulk_export": True,
         "include_supplemental_catalogs": True,
     }
-    mismatched = {
+    mismatch_by_name = {
         key: {"expected": expected_value, "observed": task.get(key)}
-        for key, expected_value in expected.items()
+        for key, expected_value in expected_values_by_name.items()
         if task.get(key) != expected_value
     }
     return {
-        "ok": not mismatched,
-        "mismatched": mismatched,
-        "expected": expected,
+        "ok": not mismatch_by_name,
+        "mismatched": mismatch_by_name,
+        "expected": expected_values_by_name,
     }
 
 
@@ -235,7 +235,7 @@ def _serving_readiness_contract_report() -> dict[str, Any]:
 
 def build_report() -> dict[str, Any]:
     """Evaluate the database-free Provider Directory runtime contract."""
-    checks = {
+    checks_by_name = {
         "provider_directory_cli": _provider_directory_cli_report(),
         "coverage_audit_cli": _coverage_audit_cli_report(),
         "provider_directory_harness_cli": _harness_cli_report(),
@@ -243,15 +243,15 @@ def build_report() -> dict[str, Any]:
         "monthly_preset": _monthly_preset_report(),
         "serving_readiness_contract": _serving_readiness_contract_report(),
     }
-    failures = {
+    failures_by_name = {
         name: check
-        for name, check in checks.items()
+        for name, check in checks_by_name.items()
         if not check.get("ok")
     }
     return {
-        "ok": not failures,
-        "failures": failures,
-        "checks": checks,
+        "ok": not failures_by_name,
+        "failures": failures_by_name,
+        "checks": checks_by_name,
     }
 
 

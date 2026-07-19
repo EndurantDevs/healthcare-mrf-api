@@ -195,16 +195,19 @@ def _positive_resource_row_count(metrics: dict[str, Any]) -> int:
 
 
 def external_result_errors(
-    entry: dict[str, Any], result: dict[str, Any], *, expected_importer: str
+    entry: dict[str, Any],
+    operator_result_by_field: dict[str, Any],
+    *,
+    expected_importer: str,
 ) -> list[str]:
     """Validate a local result supplied for an externally acquired dataset."""
 
     errors: list[str] = []
-    params_by_name = result.get("params")
+    params_by_name = operator_result_by_field.get("params")
     params_by_name = params_by_name if isinstance(params_by_name, dict) else {}
-    metrics_by_name = result.get("metrics")
+    metrics_by_name = operator_result_by_field.get("metrics")
     metrics_by_name = metrics_by_name if isinstance(metrics_by_name, dict) else {}
-    if result.get("importer") != expected_importer:
+    if operator_result_by_field.get("importer") != expected_importer:
         errors.append("result importer does not match the manifest")
     expected_source_ids = list(entry["source_ids"])
     if params_by_name.get("source_ids") != expected_source_ids:

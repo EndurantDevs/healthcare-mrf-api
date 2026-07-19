@@ -30,6 +30,7 @@ from db.models import (
 from process.control_lifecycle import mark_control_run
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
 from process.live_progress import enqueue_live_progress
+from process import provider_directory_profile as profile_artifact
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -2659,14 +2660,7 @@ async def _latest_provider_directory_partial_scope(db_schema: str) -> tuple[str 
 
 
 def _provider_directory_reference_resource_id_sql(reference: str, resource_type: str) -> str:
-    return (
-        "NULLIF(BTRIM(CASE "
-        f"WHEN {reference} LIKE '%/{resource_type}/%' "
-        f"THEN regexp_replace({reference}, '^.*/{resource_type}/', '') "
-        f"WHEN {reference} LIKE '{resource_type}/%' "
-        f"THEN regexp_replace({reference}, '^{resource_type}/', '') "
-        f"ELSE {reference} END), '')"
-    )
+    return profile_artifact.fhir_reference_resource_id_sql(reference, resource_type)
 
 
 def _provider_directory_referenced_plans_sql(

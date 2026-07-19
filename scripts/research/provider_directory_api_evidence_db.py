@@ -44,6 +44,7 @@ def overlay_sample_sql(schema: str, *, phone_required: bool = True) -> str:
               FROM unnest($1::varchar[]) AS requested(source_id)
         ), current_sources AS MATERIALIZED (
             SELECT requested.source_id,
+                   dataset.dataset_id,
                    COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id
               FROM requested_sources AS requested
               JOIN {quoted_schema}.provider_directory_source AS source

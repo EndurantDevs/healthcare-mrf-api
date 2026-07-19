@@ -371,18 +371,19 @@ def _result_param_errors(
 def terminal_metric_errors(
     manifest: dict[str, Any],
     entry: dict[str, Any],
-    result: dict[str, Any],
+    operator_result_by_field: dict[str, Any],
 ) -> list[str]:
     """Return completeness failures for one local operator result."""
 
     classification = str(entry["classification"])
     if classification == "external":
         errors = external_result_errors(
-            entry, result, expected_importer=str(manifest["importer"])
+            entry, operator_result_by_field,
+            expected_importer=str(manifest["importer"]),
         )
     else:
-        errors = _result_param_errors(manifest, entry, result)
-    metrics = result.get("metrics")
+        errors = _result_param_errors(manifest, entry, operator_result_by_field)
+    metrics = operator_result_by_field.get("metrics")
     metrics = metrics if isinstance(metrics, dict) else {}
     for flag_name in PUBLICATION_FLAGS:
         if metrics.get(flag_name) is not False:
@@ -432,33 +433,33 @@ def evaluate_operator_input(
 
     selected_entries = _selected_entries(manifest, selected_entry_ids)
     entries_by_id = {str(entry["entry_id"]): entry for entry in manifest["entries"]}
-    results = operator_input.get("results")
-    if not isinstance(results, dict):
+    operator_results_by_entry_id = operator_input.get("results")
+    if not isinstance(operator_results_by_entry_id, dict):
         raise ManifestError("operator input results must be an object")
-    unknown_result_ids = set(results) - entries_by_id.keys()
+    unknown_result_ids = set(operator_results_by_entry_id) - entries_by_id.keys()
     if unknown_result_ids:
         raise ManifestError(
             "operator input contains unknown entries: "
             + ",".join(sorted(unknown_result_ids))
         )
 
-    report_entries: dict[str, dict[str, Any]] = {}
+    report_entry_by_id: dict[str, dict[str, Any]] = {}
     for entry in selected_entries:
         entry_id = str(entry["entry_id"])
-        result = results.get(entry_id)
-        if not isinstance(result, dict):
-            report_entries[entry_id] = {
+        operator_result_by_field = operator_results_by_entry_id.get(entry_id)
+        if not isinstance(operator_result_by_field, dict):
+            report_entry_by_id[entry_id] = {
                 "status": "missing",
                 "errors": ["operator result is missing"],
             }
             continue
         errors = []
-        if result.get("status") != "succeeded":
+        if operator_result_by_field.get("status") != "succeeded":
             errors.append("operator result status must be succeeded")
-        errors.extend(terminal_metric_errors(manifest, entry, result))
-        report_entries[entry_id] = {
+        errors.extend(terminal_metric_errors(manifest, entry, operator_result_by_field))
+        report_entry_by_id[entry_id] = {
             "status": "failed" if errors else "passed",
-            "result_status": result.get("status"),
+            "result_status": operator_result_by_field.get("status"),
             "errors": errors,
         }
 
@@ -469,9 +470,9 @@ def evaluate_operator_input(
         "manifest_sha256": _json_hash(manifest),
         "ok": all(
             report_entry["status"] == "passed"
-            for report_entry in report_entries.values()
+            for report_entry in report_entry_by_id.values()
         ),
-        "entries": report_entries,
+        "entries": report_entry_by_id,
     }
 
 

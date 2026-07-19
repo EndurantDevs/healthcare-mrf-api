@@ -38,7 +38,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                 ON source_context.source_id = role.source_id
               LEFT JOIN {{PRACTITIONER_REF}} AS practitioner
                 ON practitioner.source_id = role.source_id
-               AND practitioner.resource_id = NULLIF(BTRIM(CASE WHEN role.practitioner_ref LIKE '%/Practitioner/%' THEN regexp_replace(role.practitioner_ref, '^.*/Practitioner/', '') WHEN role.practitioner_ref LIKE 'Practitioner/%' THEN regexp_replace(role.practitioner_ref, '^Practitioner/', '') ELSE role.practitioner_ref END), '')
+               AND practitioner.resource_id = {{ROLE_PRACTITIONER_RESOURCE_ID_SQL}}
              WHERE COALESCE(role.npi, practitioner.npi) IS NOT NULL
         ), qualification_values AS MATERIALIZED (
             SELECT practitioner_rows.*,
@@ -121,7 +121,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               ) AS service_reference(value)
               JOIN {{SERVICE_REF}} AS service
                 ON service.source_id = role_rows.source_id
-               AND service.resource_id = NULLIF(BTRIM(CASE WHEN service_reference.value LIKE '%/HealthcareService/%' THEN regexp_replace(service_reference.value, '^.*/HealthcareService/', '') WHEN service_reference.value LIKE 'HealthcareService/%' THEN regexp_replace(service_reference.value, '^HealthcareService/', '') ELSE service_reference.value END), '')
+               AND service.resource_id = {{ROLE_SERVICE_RESOURCE_ID_SQL}}
         ), direct_service_rows AS MATERIALIZED (
             SELECT service.npi,
                    service.source_id,
@@ -176,7 +176,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               ) AS endpoint_reference(value)
               JOIN {{ENDPOINT_REF}} AS endpoint
                 ON endpoint.source_id = role_rows.source_id
-               AND endpoint.resource_id = NULLIF(BTRIM(CASE WHEN endpoint_reference.value LIKE '%/Endpoint/%' THEN regexp_replace(endpoint_reference.value, '^.*/Endpoint/', '') WHEN endpoint_reference.value LIKE 'Endpoint/%' THEN regexp_replace(endpoint_reference.value, '^Endpoint/', '') ELSE endpoint_reference.value END), '')
+               AND endpoint.resource_id = {{ROLE_ENDPOINT_RESOURCE_ID_SQL}}
         ), affiliation_rows AS MATERIALIZED (
             SELECT role_rows.resolved_npi AS npi,
                    role_rows.source_id,
@@ -603,7 +603,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               FROM role_rows AS role
               LEFT JOIN {{ORGANIZATION_REF}} AS organization
                 ON organization.source_id = role.source_id
-               AND organization.resource_id = NULLIF(BTRIM(CASE WHEN role.organization_ref LIKE '%/Organization/%' THEN regexp_replace(role.organization_ref, '^.*/Organization/', '') WHEN role.organization_ref LIKE 'Organization/%' THEN regexp_replace(role.organization_ref, '^Organization/', '') ELSE role.organization_ref END), '')
+               AND organization.resource_id = {{ROLE_ORGANIZATION_RESOURCE_ID_SQL}}
              WHERE NULLIF(COALESCE(organization.name, role.organization_ref, ''), '') IS NOT NULL
 
             UNION ALL
@@ -744,9 +744,10 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    source_org_name, source_plan_name, resource_type,
                    resource_id, role_resource_id, active, effective_start,
                    effective_end, observed_at
-              FROM facts
+             FROM facts
              WHERE npi IS NOT NULL
                AND {{VALID_NPI_SQL}}
+               AND {{CURRENT_EVIDENCE_SQL}}
                AND value_json IS NOT NULL
                AND value_json <> '{}'::jsonb
              ORDER BY npi, fact_type, fact_key, source_id,

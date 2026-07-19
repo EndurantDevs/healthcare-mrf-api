@@ -2109,24 +2109,11 @@ def _sql_string_literal(value: str) -> str:
 
 
 def _sql_ref_matches_resource(ref_expr: str, resource_type: str, resource_id_expr: str) -> str:
-    resource_type_literal = str(resource_type).replace("'", "''")
-    return (
-        f"({ref_expr} IN ({resource_id_expr}, '{resource_type_literal}/' || {resource_id_expr}) "
-        f"OR {ref_expr} LIKE '%/{resource_type_literal}/' || {resource_id_expr})"
-    )
+    return f"({_sql_reference_resource_id(ref_expr, resource_type)} = {resource_id_expr})"
 
 
 def _sql_reference_resource_id(ref_expr: str, resource_type: str) -> str:
-    resource_type_literal = str(resource_type).replace("'", "''")
-    return (
-        "NULLIF(BTRIM(CASE "
-        f"WHEN {ref_expr} LIKE '%/{resource_type_literal}/%' "
-        f"THEN regexp_replace({ref_expr}, '^.*/{resource_type_literal}/', '') "
-        f"WHEN {ref_expr} LIKE '{resource_type_literal}/%' "
-        f"THEN regexp_replace({ref_expr}, '^{resource_type_literal}/', '') "
-        f"ELSE {ref_expr} "
-        "END), '')"
-    )
+    return profile_artifact.fhir_reference_resource_id_sql(ref_expr, resource_type)
 
 
 def _now() -> datetime.datetime:
@@ -11687,7 +11674,7 @@ async def _is_provider_directory_corroboration_artifact_published(
 async def _provider_directory_profile_scope_source_ids(
     schema: str,
     allowed_source_ids: set[str],
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     configured_source_ids = list(
         profile_artifact.configured_profile_source_ids()
     )
@@ -11697,7 +11684,7 @@ async def _provider_directory_profile_scope_source_ids(
         ),
         configured_source_ids=configured_source_ids,
     )
-    return sorted(
+    retained_source_ids = sorted(
         {
             source_id
             for source_row in source_rows
@@ -11708,9 +11695,14 @@ async def _provider_directory_profile_scope_source_ids(
                     )
                 )
             )
-            and source_id in allowed_source_ids
         }
     )
+    selected_source_ids = [
+        source_id
+        for source_id in retained_source_ids
+        if source_id in allowed_source_ids
+    ]
+    return selected_source_ids, retained_source_ids
 
 
 async def _create_provider_directory_profile_indexes(
@@ -11828,7 +11820,9 @@ class _ProviderDirectoryProfileBuild:
     schema: str
     generation_id: str
     source_ids: tuple[str, ...]
+    retained_source_ids: tuple[str, ...]
     dataset_ids: tuple[str, ...]
+    profile_as_of: str
     evidence_stage: str
     profile_stage: str
 
@@ -11844,29 +11838,34 @@ async def _resolve_provider_directory_profile_build(
     schema: str,
     run_id: str | None,
     dataset_fence: ProviderDirectoryArtifactDatasetFence,
-) -> _ProviderDirectoryProfileBuild | None:
-    selected_source_ids = await _provider_directory_profile_scope_source_ids(
-        schema,
-        {dataset.source_id for dataset in dataset_fence.datasets},
+) -> _ProviderDirectoryProfileBuild:
+    selected_source_ids, retained_source_ids = (
+        await _provider_directory_profile_scope_source_ids(
+            schema,
+            {dataset.source_id for dataset in dataset_fence.datasets},
+        )
     )
-    if not selected_source_ids:
-        return None
     source_ids, dataset_ids = profile_artifact.profile_source_dataset_pairs(
         dataset_fence.datasets,
         selected_source_ids,
     )
+    profile_as_of = _now().date().isoformat()
     generation_id = (
         _clean_text(run_id)
         or "pdprofile_"
         + hashlib.sha1(
-            "|".join(dataset_ids).encode("utf-8")
+            "|".join(
+                [profile_as_of, *retained_source_ids, *dataset_ids]
+            ).encode("utf-8")
         ).hexdigest()[:32]
     )[:64]
     return _ProviderDirectoryProfileBuild(
         schema=schema,
         generation_id=generation_id,
         source_ids=tuple(source_ids),
+        retained_source_ids=tuple(retained_source_ids),
         dataset_ids=tuple(dataset_ids),
+        profile_as_of=profile_as_of,
         evidence_stage=profile_artifact.profile_evidence_stage_table_name(
             generation_id
         ),
@@ -11881,8 +11880,7 @@ async def _create_provider_directory_profile_evidence_stage(
 ) -> None:
     """Build the logged evidence replacement table and its serving indexes."""
     evidence_stage_ref = _provider_directory_profile_build_ref(
-        build,
-        build.evidence_stage,
+        build, build.evidence_stage
     )
     await db.status(
         profile_artifact.profile_evidence_table_sql(
@@ -11901,6 +11899,8 @@ async def _create_provider_directory_profile_evidence_stage(
                 target_ref=evidence_stage_ref,
             ),
             source_ids=list(build.source_ids),
+            retained_source_ids=list(build.retained_source_ids),
+            profile_as_of=build.profile_as_of,
         )
     await db.status(
         profile_artifact.profile_evidence_insert_sql(
@@ -11932,6 +11932,7 @@ async def _create_provider_directory_profile_evidence_stage(
         ),
         source_ids=list(build.source_ids),
         dataset_ids=list(build.dataset_ids),
+        profile_as_of=build.profile_as_of,
     )
     await _create_provider_directory_profile_indexes(
         build.schema,
@@ -11946,9 +11947,9 @@ async def _create_provider_directory_profile_compact_stage(
     *,
     has_existing_artifacts: bool,
 ) -> None:
+    """Build the compact profile stage while preserving unaffected NPIs."""
     evidence_stage_ref = _provider_directory_profile_build_ref(
-        build,
-        build.evidence_stage,
+        build, build.evidence_stage
     )
     profile_stage_ref = _provider_directory_profile_build_ref(
         build,
@@ -11978,6 +11979,8 @@ async def _create_provider_directory_profile_compact_stage(
                 profile_stage_ref=profile_stage_ref,
             ),
             source_ids=list(build.source_ids),
+            retained_source_ids=list(build.retained_source_ids),
+            profile_as_of=build.profile_as_of,
         )
     await db.status(
         profile_artifact.profile_insert_sql(
@@ -11989,6 +11992,8 @@ async def _create_provider_directory_profile_compact_stage(
             rebuild_all=should_rebuild_all_profiles,
         ),
         source_ids=list(build.source_ids),
+        retained_source_ids=list(build.retained_source_ids),
+        profile_as_of=build.profile_as_of,
         generation_id=build.generation_id,
     )
     await _create_provider_directory_profile_indexes(
@@ -12165,11 +12170,6 @@ async def publish_provider_directory_profile(
         run_id,
         dataset_fence,
     )
-    if build is None:
-        return {
-            "skipped": True,
-            "reason": "no_profile_enabled_sources_in_scope",
-        }
     async with contextlib.AsyncExitStack() as build_guards:
         evidence_build_fence = await build_guards.enter_async_context(
             _provider_directory_artifact_build_guard(
@@ -32446,6 +32446,12 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 metrics.get("resource_fetch_stats") or {},
                 "collection_complete_sources",
             )
+            metrics["resource_fetch_completed_source_ids"] = {
+                resource_type: sorted(source_ids)
+                for resource_type, source_ids in sorted(
+                    completed_source_ids_by_resource.items()
+                )
+            }
             if pagination_resume_required_entries:
                 required_entries = sorted(pagination_resume_required_entries)
                 metrics["pagination_resume_required"] = required_entries
@@ -32454,10 +32460,6 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     f"{PAGINATION_RESUME_REQUIRED_ERROR}:"
                     + ",".join(required_entries)
                 )
-            metrics["resource_fetch_completed_source_ids"] = {
-                resource_type: sorted(source_ids)
-                for resource_type, source_ids in sorted(completed_source_ids_by_resource.items())
-            }
             metrics["sources_import_attempted"] = len(importable)
             if publish_artifacts or publish_after_acquisition:
                 artifact_source_ids = requested_source_ids
