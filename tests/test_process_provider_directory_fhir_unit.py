@@ -1560,7 +1560,7 @@ def test_new_abacus_state_candidates_use_throttled_synthetic_skip(api_base):
 
 @pytest.mark.parametrize(
     "api_base",
-    tuple(importer.NETSMART_PROVIDER_DIRECTORY_BASES),
+    tuple(sorted(importer.NETSMART_PROVIDER_DIRECTORY_BASES)),
 )
 def test_netsmart_candidates_advance_synthetic_offset_by_bundle_size(api_base):
     source_lookup = {"source_id": "county-candidate", "api_base": api_base}
