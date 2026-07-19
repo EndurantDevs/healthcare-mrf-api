@@ -36,14 +36,18 @@ def build_provider_set(
     tin_value: str | None = None,
 ) -> dict[str, Any]:
     """Build a canonical, hashed provider-set record from NPIs and optional TIN."""
-    normalized_npi = tuple(sorted({int(value) for value in npi if value is not None}))
-    payload = PTG2ProviderSetValue(npi=normalized_npi, tin_type=tin_type, tin_value=tin_value)
+    normalized_npis = tuple(sorted({int(value) for value in npi if value is not None}))
+    payload = PTG2ProviderSetValue(
+        npi=normalized_npis,
+        tin_type=tin_type,
+        tin_value=tin_value,
+    )
     provider_set_hash = semantic_hash(payload, domain="provider_set")
     return {
         "provider_set_hash": provider_set_hash,
         "hash_prefix": hash_prefix(provider_set_hash),
-        "provider_count": len(normalized_npi),
-        "npi": list(normalized_npi),
+        "provider_count": len(normalized_npis),
+        "npi": list(normalized_npis),
         "tin_type": tin_type,
         "tin_value": tin_value,
         "canonical_payload": _canonicalize_for_json(payload),
@@ -166,7 +170,7 @@ def build_rate_pack_group(
 ) -> dict[str, Any]:
     """Build a rate pack that groups provider sets for one procedure context."""
     provider_collection = build_provider_set_collection(provider_set_hashes)
-    payload = {
+    rate_pack_field_map = {
         "context_hash": context_hash,
         "domain": domain,
         "procedure_hash": procedure_hash,
@@ -175,7 +179,7 @@ def build_rate_pack_group(
         "price_set_hash": price_set_hash,
         "source_trace_set_hash": source_trace_set_hash,
     }
-    rate_pack_hash = semantic_hash(payload, domain="rate_pack")
+    rate_pack_hash = semantic_hash(rate_pack_field_map, domain="rate_pack")
     return {
         "rate_pack_hash": rate_pack_hash,
         "hash_prefix": hash_prefix(rate_pack_hash),
@@ -185,7 +189,7 @@ def build_rate_pack_group(
         "provider_set_hash": provider_collection["provider_set_collection_hash"],
         "price_set_hash": price_set_hash,
         "source_trace_set_hash": source_trace_set_hash,
-        "canonical_payload": _canonicalize_for_json(payload),
+        "canonical_payload": _canonicalize_for_json(rate_pack_field_map),
     }
 
 
@@ -200,7 +204,7 @@ def build_rate_pack_procedure_group(
     """Build a rate pack that groups procedures and provider sets by context."""
     provider_collection = build_provider_set_collection(provider_set_hashes)
     procedure_collection = build_procedure_collection(procedure_hashes)
-    payload = {
+    rate_pack_field_map = {
         "context_hash": context_hash,
         "domain": domain,
         "procedure_hash": procedure_collection["procedure_collection_hash"],
@@ -210,7 +214,7 @@ def build_rate_pack_procedure_group(
         "price_set_hash": price_set_hash,
         "source_trace_set_hash": source_trace_set_hash,
     }
-    rate_pack_hash = semantic_hash(payload, domain="rate_pack")
+    rate_pack_hash = semantic_hash(rate_pack_field_map, domain="rate_pack")
     return {
         "rate_pack_hash": rate_pack_hash,
         "hash_prefix": hash_prefix(rate_pack_hash),
@@ -220,7 +224,7 @@ def build_rate_pack_procedure_group(
         "provider_set_hash": provider_collection["provider_set_collection_hash"],
         "price_set_hash": price_set_hash,
         "source_trace_set_hash": source_trace_set_hash,
-        "canonical_payload": _canonicalize_for_json(payload),
+        "canonical_payload": _canonicalize_for_json(rate_pack_field_map),
     }
 
 

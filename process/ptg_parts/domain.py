@@ -102,7 +102,7 @@ def normalize_ptg2_search_mode(value: str | None) -> str:
 
 def ptg2_confidence_statement(confidence_code: str) -> str:
     """Return the user-facing evidence caveat for a PTG2 confidence code."""
-    statements = {
+    statement_by_code = {
         PTG2_CONFIDENCE_NPPES_PRACTICE_LOCATION: (
             "Provider location is based on the NPPES practice address; TiC rate files do not prove the service is offered there."
         ),
@@ -116,7 +116,10 @@ def ptg2_confidence_statement(confidence_code: str) -> str:
             "Provider-network confidence can be strengthened with payer directory evidence when available."
         ),
     }
-    return statements.get(str(confidence_code), "Confidence is based on the available source evidence for this PTG2 snapshot.")
+    return statement_by_code.get(
+        str(confidence_code),
+        "Confidence is based on the available source evidence for this PTG2 snapshot.",
+    )
 
 
 @dataclass(frozen=True)

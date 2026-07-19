@@ -19,10 +19,10 @@ from process.ptg_parts.ptg2_source_snapshot_gc import (
 def _print_plan(plan: PTG2SourceSnapshotGCPlan) -> None:
     print(f"current_snapshot_refs={len(plan.current_snapshot_ids)}")
     print(f"candidate_snapshots={len(plan.candidate_snapshot_ids)}")
-    reason_counts: dict[str, int] = {}
+    snapshot_count_by_reason: dict[str, int] = {}
     for _snapshot_id, reason in plan.candidate_reasons:
-        reason_counts[reason] = reason_counts.get(reason, 0) + 1
-    for reason, count in sorted(reason_counts.items()):
+        snapshot_count_by_reason[reason] = snapshot_count_by_reason.get(reason, 0) + 1
+    for reason, count in sorted(snapshot_count_by_reason.items()):
         print(f"candidate_reason={reason} snapshots={count}")
     print(f"candidate_tables={plan.table_count}")
     print(f"candidate_bytes={plan.total_bytes}")

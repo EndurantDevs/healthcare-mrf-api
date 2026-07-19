@@ -29,7 +29,7 @@ async def _table_exists(schema_name: str, table_name: str) -> bool:
     return bool(row.get("table_exists") if isinstance(row, dict) else getattr(row, "table_exists", False))
 
 
-async def _table_has_rows(schema_name: str, table_name: str) -> bool:
+async def _has_rows_in_table(schema_name: str, table_name: str) -> bool:
     rows = await db.all(
         f"""
         SELECT EXISTS (

@@ -42,7 +42,7 @@ async def _record_source_version(
         if logical_hash_deferred
         else "logical_json_sha256_v1"
     )
-    version_payload = {
+    source_version_field_map = {
         "source_identity_hash": source_identity_hash,
         "raw_sha256": raw_artifact.raw_sha256,
         "logical_sha256": logical_artifact.logical_sha256,
@@ -51,7 +51,10 @@ async def _record_source_version(
         "content_length": raw_artifact.head.content_length if raw_artifact.head else raw_artifact.byte_count,
         "last_modified": raw_artifact.head.last_modified if raw_artifact.head else None,
     }
-    source_file_version_id = semantic_hash(version_payload, domain="source_file_version")[:32]
+    source_file_version_id = semantic_hash(
+        source_version_field_map,
+        domain="source_file_version",
+    )[:32]
     content_hash = semantic_hash(
         {
             "domain": domain,

@@ -27,7 +27,7 @@ from process.ptg_parts.ptg2_artifact_blobs import (
     store_ptg2_artifact_file_in_db,
 )
 from process.ptg_parts.db_tables import (_exact_table_rows, _quote_ident,
-                                         _table_exists, _table_has_rows)
+                                         _has_rows_in_table, _table_exists)
 from process.ptg_parts.live_progress import write_live_progress
 from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2ManifestArtifactError,
@@ -1823,7 +1823,7 @@ async def _materialize_manifest_provider_group_rate_scope(
             """
         )
 
-    if not await _table_has_rows(schema_name, table_name):
+    if not await _has_rows_in_table(schema_name, table_name):
         await db.status(f"DROP TABLE IF EXISTS {qualified_table} CASCADE;")
         return None
 

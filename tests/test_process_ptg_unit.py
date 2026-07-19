@@ -583,7 +583,7 @@ def test_artifact_stream_split_keeps_facade_helpers_stable():
 def test_db_table_split_keeps_facade_helpers_stable():
     assert process_ptg._quote_ident is ptg_db_tables._quote_ident
     assert process_ptg._table_exists is ptg_db_tables._table_exists
-    assert process_ptg._table_has_rows is ptg_db_tables._table_has_rows
+    assert process_ptg._has_rows_in_table is ptg_db_tables._has_rows_in_table
     assert process_ptg._estimated_table_rows is ptg_db_tables._estimated_table_rows
     assert process_ptg._exact_table_rows is ptg_db_tables._exact_table_rows
 
@@ -3877,7 +3877,11 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
     monkeypatch.setattr(process_ptg, "_enqueue_ptg2_auto_address_refresh_after_import", refresh_mock)
     monkeypatch.setenv(process_ptg.PTG2_FILE_PROCESS_CONCURRENCY_ENV, "2")
-    monkeypatch.setattr(process_ptg, "_ptg2_auto_activate_candidates", lambda: True)
+    monkeypatch.setattr(
+        process_ptg,
+        "_should_auto_activate_ptg2_candidates",
+        lambda: True,
+    )
 
     import_result = asyncio.run(
         process_ptg.main(
@@ -5724,7 +5728,7 @@ def test_ptg2_automatic_candidate_activation_is_rejected(monkeypatch):
     monkeypatch.setenv("HLTHPRT_PTG2_AUTO_ACTIVATE_CANDIDATES", "true")
 
     with pytest.raises(ValueError, match="audited control-plane activation"):
-        ptg_config._ptg2_auto_activate_candidates()
+        ptg_config._should_auto_activate_ptg2_candidates()
 
 
 def test_manifest_publish_materializes_components(tmp_path, monkeypatch):
@@ -5796,7 +5800,11 @@ def test_manifest_publish_materializes_lean_provider_group_rate_scope(monkeypatc
 
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
     monkeypatch.setattr(ptg_manifest_publish, "_table_exists", is_fake_table_present)
-    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", fake_table_has_rows)
+    monkeypatch.setattr(
+        ptg_manifest_publish,
+        "_has_rows_in_table",
+        fake_table_has_rows,
+    )
 
     materialized_table_name = asyncio.run(
         ptg_manifest_publish._materialize_manifest_provider_group_rate_scope(
@@ -6598,7 +6606,11 @@ def _install_candidate_stage_mock(monkeypatch):
 def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
     """Install a successful strict V3 publisher and return its async mock."""
 
-    monkeypatch.setattr(process_ptg, "_ptg2_auto_activate_candidates", lambda: True)
+    monkeypatch.setattr(
+        process_ptg,
+        "_should_auto_activate_ptg2_candidates",
+        lambda: True,
+    )
     publication = SimpleNamespace(
         snapshot_key=7,
         serving_index={
@@ -7362,7 +7374,11 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
         AsyncMock(),
     )
     _install_strict_v3_publish_mocks(monkeypatch, serving_rates=987)
-    monkeypatch.setattr(process_ptg, "_ptg2_auto_activate_candidates", lambda: False)
+    monkeypatch.setattr(
+        process_ptg,
+        "_should_auto_activate_ptg2_candidates",
+        lambda: False,
+    )
     candidate_stage = process_ptg._stage_ptg2_source_candidate
     monkeypatch.setattr(
         process_ptg,

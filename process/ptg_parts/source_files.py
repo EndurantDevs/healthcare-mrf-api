@@ -36,14 +36,14 @@ async def _extract_metadata_fields(file_path: str) -> dict[str, Any]:
         "plan_sponsor_name",
         "issuer_name",
     }
-    meta: dict[str, Any] = {}
+    metadata_by_field: dict[str, Any] = {}
     with open_json_artifact_stream(file_path) as afp:
         for prefix, event, value in ijson.parse(afp):
             if event in ("string", "number") and prefix in fields:
-                meta[prefix] = value
-                if len(meta) == len(fields):
+                metadata_by_field[prefix] = value
+                if len(metadata_by_field) == len(fields):
                     break
-    return meta
+    return metadata_by_field
 
 
 _PLAN_FIELD_NAMES = (

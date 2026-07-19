@@ -173,7 +173,7 @@ def _materialize_stream_with_hash(src, target: Path) -> tuple[str, int]:
         raise
 
 
-def _raw_file_is_gzip(path: str | Path) -> bool:
+def _is_raw_file_gzip(path: str | Path) -> bool:
     path_obj = Path(path)
     if path_obj.name.endswith(".gz"):
         return True
@@ -331,7 +331,7 @@ def _open_zip_member_stream(path: Path, info: zipfile.ZipInfo, zip_ref: zipfile.
 def open_json_artifact_stream(path: str | Path):
     """Yield decompressed JSON bytes from plain, gzip, or zip artifacts."""
     path_obj = Path(path)
-    if _raw_file_is_gzip(path_obj):
+    if _is_raw_file_gzip(path_obj):
         with open(path_obj, "rb") as raw_fp:
             gzip_cls = igzip.IGzipFile if igzip is not None and _env_bool(PTG2_ISAL_GZIP_ENV, False) else gzip.GzipFile
             with gzip_cls(fileobj=raw_fp, mode="rb") as gzip_fp:
@@ -364,7 +364,7 @@ def _zip_member_name(path: str | Path) -> str | None:
 
 def _compression_for_path(raw_path: str | Path) -> tuple[str | None, str | None]:
     raw_path_obj = Path(raw_path)
-    compression = "gzip" if _raw_file_is_gzip(raw_path_obj) else None
+    compression = "gzip" if _is_raw_file_gzip(raw_path_obj) else None
     member_name = None
     if compression is None and zipfile.is_zipfile(raw_path_obj):
         compression = "zip"
@@ -415,7 +415,7 @@ def stream_logical_artifact(raw_path: str | Path, output_dir: str | Path | None 
     raw_path_obj = Path(raw_path)
     output_root = Path(output_dir) if output_dir else raw_path_obj.parent
     output_root.mkdir(parents=True, exist_ok=True)
-    if _raw_file_is_gzip(raw_path_obj):
+    if _is_raw_file_gzip(raw_path_obj):
         logical_path = output_root / f"{raw_path_obj.stem}_logical.json"
         try:
             with open_json_artifact_stream(raw_path_obj) as src:

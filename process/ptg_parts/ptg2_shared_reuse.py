@@ -530,7 +530,7 @@ def shared_physical_input_identity(
     )
 
 
-def same_downloaded_physical_input(
+def is_same_downloaded_physical_input(
     left: PTG2DownloadedJob,
     right: PTG2DownloadedJob,
 ) -> bool:
@@ -548,7 +548,7 @@ __all__ = [
     "deterministic_source_key_assignments",
     "normalized_physical_artifact_identity",
     "logical_plan_fields_for_job",
-    "same_downloaded_physical_input",
+    "is_same_downloaded_physical_input",
     "shared_physical_artifact_identity",
     "shared_logical_artifact_metadata",
     "shared_physical_input_identity",

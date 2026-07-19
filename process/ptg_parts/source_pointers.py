@@ -819,7 +819,7 @@ async def _locked_snapshot_publication_row(
     return _row_mapping(row)
 
 
-def _requires_audited_candidate_activation(snapshot: dict[str, Any]) -> bool:
+def _needs_audited_candidate_activation(snapshot: dict[str, Any]) -> bool:
     activation = _manifest_mapping(
         _manifest_mapping(snapshot.get("manifest")).get("activation")
     )
@@ -1322,7 +1322,7 @@ async def _publish_ptg2_source_pointers(
             schema_name=schema_name,
             snapshot_id=normalized_snapshot_id,
         )
-        if require_audit_attestation or _requires_audited_candidate_activation(
+        if require_audit_attestation or _needs_audited_candidate_activation(
             authoritative_snapshot
         ):
             return await _activate_ptg2_source_candidate_in_transaction(
