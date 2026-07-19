@@ -100,16 +100,6 @@ def test_provider_filters_union_witness_and_persisted_coordinates():
     ) == {7: (5,), 8: (5,), 9: (6,)}
 
 
-def test_allowed_sources_skip_code_keys_outside_provider_scope():
-    challenge = _challenge()
-
-    assert batch._allowed_source_keys_by_code_key(
-        (challenge,),
-        {("CPT", "99213"): ({"code_key": 7}, {"code_key": 99})},
-        {7: (5,)},
-    ) == {7: {0}}
-
-
 def test_required_occurrence_keys_preserve_provider_source_correlation():
     first = _challenge()
     second = replace(
@@ -141,11 +131,11 @@ def test_required_occurrence_keys_preserve_provider_source_correlation():
 
 
 @pytest.mark.asyncio
-async def test_price_load_prunes_cross_product_before_hydration(monkeypatch):
-    """Hydrate only exact diagonal coordinates from one broad forward read."""
+async def test_price_load_filters_exact_coordinates_before_hydration(monkeypatch):
+    """Pass exact diagonal coordinates into the reader before hydration."""
 
-    first, second, persisted, broad_index = _cross_product_price_load_case()
-    forward_lookup = AsyncMock(return_value=broad_index)
+    first, second, persisted, exact_index = _exact_price_load_case()
+    forward_lookup = AsyncMock(return_value=exact_index)
 
     async def hydrate(_session, _tables, price_keys, *, copy_payloads):
         retained_keys = set(price_keys)
@@ -175,18 +165,44 @@ async def test_price_load_prunes_cross_product_before_hydration(monkeypatch):
         (8, 7, 1): (14,),
     }
     assert hydration.await_args.args[2] == {10, 13, 14}
+    assert forward_lookup.await_args.args[3] == frozenset(
+        {(7, 5, 0), (7, 6, 1), (8, 7, 1)}
+    )
     assert price_load.selection_io == {
         "exact_candidate_occurrence_coordinates": 3,
-        "forward_occurrence_coordinates_before_exact_filter": 5,
-        "forward_occurrence_coordinates_after_exact_filter": 3,
-        "forward_price_key_deliveries_before_exact_filter": 5,
-        "forward_price_key_deliveries_after_exact_filter": 3,
-        "discarded_forward_price_key_deliveries": 2,
+        "exact_forward_occurrence_coordinates_returned": 3,
+        "exact_forward_price_key_deliveries_returned": 3,
     }
 
 
-def _cross_product_price_load_case():
-    """Return two diagonal challenges and their deliberately broad index."""
+@pytest.mark.asyncio
+async def test_price_load_rejects_forward_rows_outside_exact_scope(monkeypatch):
+    first, second, persisted, exact_index = _exact_price_load_case()
+    escaped_index = {**exact_index, (7, 5, 1): (11,)}
+    monkeypatch.setattr(
+        batch,
+        "_candidate_forward_price_keys",
+        AsyncMock(return_value=escaped_index),
+    )
+    hydration = AsyncMock()
+    monkeypatch.setattr(batch, "_version_three_price_hydration", hydration)
+
+    with pytest.raises(PTG2ManifestArtifactError, match="exact occurrence scope"):
+        await batch._load_candidate_price_data(
+            object(),
+            _serving_tables(),
+            (first, second),
+            {("CPT", "99213"): ({"code_key": 7},)},
+            {first.npi: (5,), second.npi: (6,)},
+            {7: (5, 6), 8: (7,)},
+            (persisted,),
+        )
+
+    hydration.assert_not_awaited()
+
+
+def _exact_price_load_case():
+    """Return two diagonal challenges and their exact forward index."""
 
     first = _challenge()
     second = replace(
@@ -204,14 +220,12 @@ def _cross_product_price_load_case():
         0,
         15,
     )
-    broad_index = {
+    exact_index = {
         (7, 5, 0): (10,),
-        (7, 5, 1): (11,),
-        (7, 6, 0): (12,),
         (7, 6, 1): (13,),
         (8, 7, 1): (14,),
     }
-    return first, second, persisted, broad_index
+    return first, second, persisted, exact_index
 
 
 class _NetworkSession:
@@ -258,11 +272,28 @@ async def test_forward_lookup_skips_empty_provider_scope(monkeypatch):
     assert await batch._candidate_forward_price_keys(
         object(),
         _serving_tables(),
-        (),
         {},
-        {},
+        frozenset(),
     ) == {}
     lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_forward_lookup_receives_exact_occurrence_filter(monkeypatch):
+    lookup = AsyncMock(return_value={(7, 5, 0): (8,)})
+    monkeypatch.setattr(batch, "lookup_forward_price_index_from_db", lookup)
+    required_occurrences = frozenset({(7, 5, 0)})
+
+    observed = await batch._candidate_forward_price_keys(
+        object(),
+        _serving_tables(),
+        {7: (5,)},
+        required_occurrences,
+    )
+
+    assert observed == {(7, 5, 0): (8,)}
+    assert lookup.await_args.kwargs["occurrence_keys"] is required_occurrences
+    assert "source_keys_by_code" not in lookup.await_args.kwargs
 
 
 def test_candidate_projection_reuses_one_tuple_and_deduplicates_availability():

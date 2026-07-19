@@ -1439,8 +1439,10 @@ class _StaticApiOccurrenceSource:
         self.occurrences = tuple(occurrences)
         self.calls = []
 
-    def validate_source_set(self):
+    def is_source_set_valid(self):
         return True
+
+    validate_source_set = is_source_set_valid
 
     def sample_occurrences(self, *, sample_target, seed):
         self.calls.append((sample_target, seed))

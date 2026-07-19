@@ -155,7 +155,7 @@ def test_taxonomy_scope_tokens_accept_exact_and_prefix():
 
 
 def test_match_candidate_query_uses_site_key_and_taxonomy_filter():
-    params = {
+    params_by_name = {
         "address_site_key": "22222222-2222-2222-2222-222222222222",
         "address_key": None,
         "lat": None,
@@ -170,7 +170,7 @@ def test_match_candidate_query_uses_site_key_and_taxonomy_filter():
         "limit": 5,
     }
 
-    query, query_params = npi_module._match_candidate_query(params, "mrf.entity_address_unified")
+    query, query_params = npi_module._match_candidate_query(params_by_name, "mrf.entity_address_unified")
     sql = str(query)
 
     assert "a.premise_key = CAST(:address_site_key AS uuid)" in sql
@@ -213,7 +213,7 @@ def test_match_candidate_query_keeps_explicit_taxonomy_scope_restrictive():
 
 
 def test_geo_only_locator_uses_bbox():
-    params = {
+    params_by_name = {
         "address_site_key": None,
         "address_key": None,
         "lat": 40.0,
@@ -228,17 +228,17 @@ def test_geo_only_locator_uses_bbox():
         "limit": 5,
     }
 
-    query, query_params = npi_module._match_candidate_query(params, "mrf.entity_address_unified")
+    query, query_params = npi_module._match_candidate_query(params_by_name, "mrf.entity_address_unified")
     sql = str(query)
 
     assert "a.lat BETWEEN CAST(:lat_min AS numeric) AND CAST(:lat_max AS numeric)" in sql
     assert "a.long BETWEEN CAST(:long_min AS numeric) AND CAST(:long_max AS numeric)" in sql
-    assert query_params["lat_min"] < params["lat"] < query_params["lat_max"]
-    assert query_params["long_min"] < params["long"] < query_params["long_max"]
+    assert query_params["lat_min"] < params_by_name["lat"] < query_params["lat_max"]
+    assert query_params["long_min"] < params_by_name["long"] < query_params["long_max"]
 
 
 def test_match_candidate_query_keeps_geo_as_scoring_signal_with_exact_locator():
-    params = {
+    params_by_name = {
         "address_site_key": "22222222-2222-2222-2222-222222222222",
         "address_key": "11111111-1111-1111-1111-111111111111",
         "lat": 40.0,
@@ -253,15 +253,15 @@ def test_match_candidate_query_keeps_geo_as_scoring_signal_with_exact_locator():
         "limit": 5,
     }
 
-    query, query_params = npi_module._match_candidate_query(params, "mrf.entity_address_unified")
+    query, query_params = npi_module._match_candidate_query(params_by_name, "mrf.entity_address_unified")
     sql = str(query)
 
     assert "a.premise_key = CAST(:address_site_key AS uuid)" in sql
     assert "geo_distance_miles" in sql
     assert "a.lat BETWEEN CAST(:lat_min AS numeric) AND CAST(:lat_max AS numeric)" not in sql
-    assert query_params["lat"] == params["lat"]
-    assert query_params["address_key"] == params["address_key"]
-    assert query_params["phone_digits"] == params["phone_digits"]
+    assert query_params["lat"] == params_by_name["lat"]
+    assert query_params["address_key"] == params_by_name["address_key"]
+    assert query_params["phone_digits"] == params_by_name["phone_digits"]
 
 
 def test_match_candidate_output_scores_and_hides_internal_fields():
@@ -290,7 +290,7 @@ def test_match_candidate_output_scores_and_hides_internal_fields():
             }
         ],
     }
-    match_query_params = {
+    match_query_params_by_name = {
         "radius_miles": 1.0,
         "taxonomy_exact": ("282N00000X",),
         "taxonomy_prefixes": (),
@@ -307,7 +307,7 @@ def test_match_candidate_output_scores_and_hides_internal_fields():
         "primary_provider_type_code": "12",
     }
 
-    candidate = npi_module._match_candidate_output(candidate_row_map, match_query_params, enrichment_summary_map)
+    candidate = npi_module._match_candidate_output(candidate_row_map, match_query_params_by_name, enrichment_summary_map)
 
     assert candidate["npi"] == 1234567890
     assert candidate["address_site_key"] == "22222222-2222-2222-2222-222222222222"

@@ -11,9 +11,9 @@ from api.utils import square_poly
 
 
 def test_init_api_registers_group(monkeypatch):
-    called = {}
+    calls_by_name = {}
 
-    fake_db = types.SimpleNamespace(init_app=lambda app: called.setdefault("init", True))
+    fake_db = types.SimpleNamespace(init_app=lambda app: calls_by_name.setdefault("init", True))
     api_module = importlib.import_module("api.__init__")
     monkeypatch.setattr(api_module, "db", fake_db)
     monkeypatch.setitem(init_api.__globals__, "db", fake_db)
@@ -45,7 +45,7 @@ def test_init_api_registers_group(monkeypatch):
     app = FakeApp()
     init_api(app)
 
-    assert called["init"] is True
+    assert calls_by_name["init"] is True
     assert app.registered is not None
     assert app.registered_middleware == [
         (init_api.__globals__["_capacity_process_request_guard"], "request")

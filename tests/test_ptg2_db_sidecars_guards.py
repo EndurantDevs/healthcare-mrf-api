@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import zlib
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -262,3 +262,218 @@ def test_shared_dictionary_rejects_malformed_shape():
             entries_per_fragment=1,
             schema_name="mrf",
         )
+
+
+def test_shared_dictionary_rejects_duplicate_physical_fragment_aliases():
+    fragment_rows = (
+        _dictionary_fragment(_block_hash=b"a" * 32),
+        _dictionary_fragment(_block_hash=b"b" * 32),
+    )
+    with pytest.raises(sidecars.PTG2ManifestArtifactError, match="unexpected"):
+        sidecars._shared_dictionary_values_for_keys(
+            fragment_rows,
+            (0,),
+            item_count=1,
+            entries_per_fragment=1,
+            schema_name="mrf",
+        )
+
+
+def test_shared_dictionary_requires_every_requested_fragment():
+    with pytest.raises(
+        sidecars.PTG2ManifestArtifactError,
+        match="missing a requested fragment",
+    ):
+        sidecars._shared_dictionary_values_for_keys(
+            (_dictionary_fragment(),),
+            (0, 1),
+            item_count=2,
+            entries_per_fragment=1,
+            schema_name="mrf",
+        )
+
+
+def test_shared_dictionary_rebases_valid_physical_aliases():
+    fragment_rows = (
+        _dictionary_fragment(block_no=0),
+        _dictionary_fragment(block_no=1),
+    )
+    values_by_key = sidecars._shared_dictionary_values_for_keys(
+        fragment_rows,
+        (0, 1),
+        item_count=2,
+        entries_per_fragment=1,
+        schema_name="mrf",
+    )
+
+    assert set(values_by_key) == {0, 1}
+    assert values_by_key[0] == values_by_key[1]
+
+
+def test_shared_dictionary_checks_alias_decoder_contract(monkeypatch):
+    monkeypatch.setattr(
+        sidecars,
+        "_dictionary_alias_values",
+        Mock(return_value=({}, {0})),
+    )
+    with pytest.raises(sidecars.PTG2ManifestArtifactError, match="out of range"):
+        sidecars._shared_dictionary_values_for_keys(
+            (_dictionary_fragment(),),
+            (0,),
+            item_count=1,
+            entries_per_fragment=1,
+            schema_name="mrf",
+        )
+
+
+def test_forward_fragments_must_be_contiguous():
+    with pytest.raises(sidecars.PTG2ManifestArtifactError, match="contiguous"):
+        sidecars._ordered_forward_fragments(
+            ({"block_no": 0}, {"block_no": 2})
+        )
+
+
+def test_forward_source_filter_is_checked_against_observed_header(monkeypatch):
+    fragment_cursor = sidecars._ForwardFragmentCursor(
+        provider_set_key=5,
+        occurrence=(8, 0),
+    )
+    monkeypatch.setattr(
+        sidecars,
+        "_visit_serving_binary_by_code_record",
+        Mock(return_value=(fragment_cursor, 2)),
+    )
+    with pytest.raises(sidecars.PTG2ManifestArtifactError, match="source key"):
+        sidecars._visit_code_records_with_source_count(
+            ({"block_no": 0},),
+            provider_set_keys=None,
+            occurrence_consumer=lambda *_occurrence: None,
+            source_keys=(2,),
+        )
+
+
+def test_forward_fragments_must_agree_on_source_count(monkeypatch):
+    fragment_cursor = sidecars._ForwardFragmentCursor(
+        provider_set_key=5,
+        occurrence=(8, 0),
+    )
+    monkeypatch.setattr(
+        sidecars,
+        "_visit_serving_binary_by_code_record",
+        Mock(
+            side_effect=(
+                (fragment_cursor, 2),
+                (fragment_cursor, 3),
+            )
+        ),
+    )
+    with pytest.raises(sidecars.PTG2ManifestArtifactError, match="source_count"):
+        sidecars._visit_code_records_with_source_count(
+            ({"block_no": 0}, {"block_no": 1}),
+            provider_set_keys=None,
+            occurrence_consumer=lambda *_occurrence: None,
+        )
+
+
+def test_forward_shards_reject_unexpected_blocks_and_source_drift(monkeypatch):
+    first_block_key = sidecars._forward_provider_shard_block_key(7, 0)
+    second_block_key = sidecars._forward_provider_shard_block_key(7, 1024)
+    visit_options = sidecars._ForwardShardVisitOptions(
+        code_key=7,
+        expected_block_keys=(first_block_key,),
+        provider_set_keys=None,
+        expected_source_count=None,
+        price_item_count=128,
+    )
+    with pytest.raises(sidecars.PTG2ManifestArtifactError, match="unexpected"):
+        sidecars._visit_forward_shards_for_code(
+            ({"block_key": second_block_key},),
+            options=visit_options,
+            occurrence_consumer=lambda *_occurrence: None,
+        )
+
+    monkeypatch.setattr(
+        sidecars,
+        "_visit_code_records_with_source_count",
+        Mock(side_effect=(2, 3)),
+    )
+    with pytest.raises(sidecars.PTG2ManifestArtifactError, match="source_count"):
+        sidecars._visit_forward_shards_for_code(
+            (
+                {"block_key": first_block_key},
+                {"block_key": second_block_key},
+            ),
+            options=sidecars._ForwardShardVisitOptions(
+                code_key=7,
+                expected_block_keys=(first_block_key, second_block_key),
+                provider_set_keys=None,
+                expected_source_count=None,
+                price_item_count=128,
+            ),
+            occurrence_consumer=lambda *_occurrence: None,
+        )
+
+
+def test_forward_fragment_grouping_rejects_unrequested_block():
+    requested_block_key = sidecars._forward_provider_shard_block_key(7, 0)
+    unrequested_block_key = sidecars._forward_provider_shard_block_key(7, 1024)
+    with pytest.raises(sidecars.PTG2ManifestArtifactError, match="unexpected"):
+        sidecars._group_forward_fragments_by_code(
+            ({"block_key": unrequested_block_key},),
+            {7: (requested_block_key,)},
+        )
+
+
+@pytest.mark.asyncio
+async def test_single_forward_read_empty_paths_do_not_hydrate(monkeypatch):
+    required_options_by_name = {
+        "shared_snapshot_key": 1,
+        "source_count": 2,
+        "price_dictionary_item_count": 128,
+        "price_dictionary_block_bytes": 32,
+    }
+    assert await sidecars.lookup_code_rows_from_db(
+        object(),
+        7,
+        provider_set_keys=(),
+        **required_options_by_name,
+    ) == ()
+    assert await sidecars.lookup_code_prefix_rows_from_db(
+        object(),
+        7,
+        limit=1,
+        provider_set_keys=(),
+        **required_options_by_name,
+    ) == ()
+
+    fragment_reader = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        fragment_reader,
+    )
+    assert await sidecars.lookup_code_rows_from_db(
+        object(),
+        7,
+        provider_set_keys=(5,),
+        **required_options_by_name,
+    ) == ()
+    fragment_reader.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_nonempty_price_id_lookup_delegates_to_dictionary(monkeypatch):
+    dictionary_reader = AsyncMock(return_value={8: "0" * 32})
+    monkeypatch.setattr(
+        sidecars,
+        "_serving_binary_dictionary_values_for_keys",
+        dictionary_reader,
+    )
+    assert await sidecars.lookup_price_ids_from_db(
+        object(),
+        (8,),
+        shared_snapshot_key=1,
+        price_dictionary_item_count=128,
+        price_dictionary_block_bytes=32,
+    ) == {8: "0" * 32}
+    dictionary_reader.assert_awaited_once()

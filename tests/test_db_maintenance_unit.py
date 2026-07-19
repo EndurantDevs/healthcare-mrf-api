@@ -107,6 +107,6 @@ def test_managed_schemas_defaults_to_db_schema(monkeypatch) -> None:
 
 
 def test_should_manage_table_schema_skips_tiger_when_only_mrf_managed() -> None:
-    managed = {"mrf"}
-    assert _should_manage_table_schema("mrf", managed) is True
-    assert _should_manage_table_schema("tiger", managed) is False
+    managed_schemas = {"mrf"}
+    assert _should_manage_table_schema("mrf", managed_schemas) is True
+    assert _should_manage_table_schema("tiger", managed_schemas) is False

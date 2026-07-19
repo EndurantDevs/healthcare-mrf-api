@@ -90,9 +90,9 @@ async def test_last_import_stats(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_issuer_import_data_success(monkeypatch):
-    issuer_payload = {"issuer_id": 101, "issuer_name": "ACME"}
+    issuer_by_field = {"issuer_id": 101, "issuer_name": "ACME"}
     fake_db = FakeDB(
-        scalar_responses=[lambda: FakeIssuer(issuer_payload)],
+        scalar_responses=[lambda: FakeIssuer(issuer_by_field)],
         execute_rows=[
             types.SimpleNamespace(
                 to_json_dict=lambda: {"checksum": 1, "message": "duplicate"}

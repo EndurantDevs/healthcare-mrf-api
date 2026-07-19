@@ -42,7 +42,7 @@ entity_address_unified = importlib.import_module("process.entity_address_unified
 
 
 def test_address_checksum_models_use_bigint():
-    expected_columns = {
+    expected_columns_by_model = {
         AddressArchive: ("checksum",),
         NPIAddress: ("checksum",),
         MRFAddress: ("checksum",),
@@ -51,30 +51,30 @@ def test_address_checksum_models_use_bigint():
         EntityAddressUnified: ("checksum",),
     }
 
-    for model, columns in expected_columns.items():
+    for model, columns in expected_columns_by_model.items():
         for column_name in columns:
             assert isinstance(model.__table__.c[column_name].type, BigInteger)
 
 
 def test_mrf_provider_staging_uses_bigint_for_npi_and_network_checksums():
-    expected_columns = {
+    expected_columns_by_model = {
         PlanNPIRaw: ("npi", "checksum_network"),
         PlanNetworkTierRaw: ("checksum_network",),
         MRFAddressEvidence: ("npi", "checksum_network"),
     }
 
-    for model, columns in expected_columns.items():
+    for model, columns in expected_columns_by_model.items():
         for column_name in columns:
             assert isinstance(model.__table__.c[column_name].type, BigInteger)
 
 
 def test_address_source_models_use_bigint_for_npi_identifiers():
-    expected_columns = {
+    expected_columns_by_model = {
         NPIAddress: ("npi",),
         MRFAddress: ("npi",),
     }
 
-    for model, columns in expected_columns.items():
+    for model, columns in expected_columns_by_model.items():
         for column_name in columns:
             assert isinstance(model.__table__.c[column_name].type, BigInteger)
 
@@ -126,14 +126,14 @@ def test_mrf_address_npi_bigint_migration_targets_address_summaries_only():
 
 
 def test_npi_source_models_use_bigint_for_npi_identifiers():
-    expected_columns = {
+    expected_columns_by_model = {
         NPIData: ("npi", "replacement_npi"),
         NPIDataTaxonomy: ("npi",),
         NPIDataOtherIdentifier: ("npi",),
         NPIDataTaxonomyGroup: ("npi",),
     }
 
-    for model, columns in expected_columns.items():
+    for model, columns in expected_columns_by_model.items():
         for column_name in columns:
             assert isinstance(model.__table__.c[column_name].type, BigInteger)
 

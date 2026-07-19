@@ -4,7 +4,7 @@ from process import live_progress
 
 
 def test_heartbeat_preserves_old_importer_progress():
-    merged = {
+    merged_by_field = {
         "source": "engine-heartbeat",
         "unit": "run",
         "done": 0,
@@ -14,7 +14,7 @@ def test_heartbeat_preserves_old_importer_progress():
         "phase": "process_data running",
         "confidence": "heartbeat",
     }
-    previous = {
+    previous_by_field = {
         "source": "entity-address-unified-sql-progress",
         "confidence": "live",
         "updated_at": (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=10)).isoformat(),
@@ -27,16 +27,16 @@ def test_heartbeat_preserves_old_importer_progress():
     }
 
     live_progress._preserve_progress_for_heartbeat(
-        merged,
-        previous,
+        merged_by_field,
+        previous_by_field,
         now=dt.datetime.now(dt.UTC),
     )
 
-    assert merged["source"] == "entity-address-unified-sql-progress"
-    assert merged["confidence"] == "live"
-    assert merged["unit"] == "shards"
-    assert merged["done"] == 16
-    assert merged["total"] == 64
-    assert merged["pct"] == 25.0
-    assert merged["message"] == "enriched 16/64 raw shards"
-    assert merged["phase"] == "entity-address-unified enriching raw"
+    assert merged_by_field["source"] == "entity-address-unified-sql-progress"
+    assert merged_by_field["confidence"] == "live"
+    assert merged_by_field["unit"] == "shards"
+    assert merged_by_field["done"] == 16
+    assert merged_by_field["total"] == 64
+    assert merged_by_field["pct"] == 25.0
+    assert merged_by_field["message"] == "enriched 16/64 raw shards"
+    assert merged_by_field["phase"] == "entity-address-unified enriching raw"
