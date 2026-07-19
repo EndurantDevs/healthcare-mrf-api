@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from api.ptg2_candidate_audit_integrity import PersistedAuditOccurrence
@@ -13,14 +12,6 @@ from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
 
 
 OccurrenceKey = tuple[int, int, int]
-
-
-@dataclass(frozen=True)
-class CandidateForwardSelection:
-    """Exact forward rows and cardinality proof from one broad in-memory index."""
-
-    price_keys_by_occurrence: Mapping[OccurrenceKey, tuple[int, ...]]
-    selection_io: Mapping[str, int]
 
 
 def required_candidate_occurrence_keys(
@@ -63,52 +54,7 @@ def required_candidate_occurrence_keys(
     return frozenset(required_keys)
 
 
-def select_candidate_forward_prices(
-    broad_price_keys_by_occurrence: Mapping[
-        OccurrenceKey, tuple[int, ...]
-    ],
-    required_occurrence_keys: frozenset[OccurrenceKey],
-) -> CandidateForwardSelection:
-    """Prune broad forward rows and report cardinalities without another read."""
-
-    selected_price_keys_by_occurrence = {}
-    broad_price_key_deliveries = 0
-    selected_price_key_deliveries = 0
-    for occurrence_key, price_keys in broad_price_keys_by_occurrence.items():
-        price_key_count = len(price_keys)
-        broad_price_key_deliveries += price_key_count
-        if occurrence_key not in required_occurrence_keys:
-            continue
-        selected_price_keys_by_occurrence[occurrence_key] = price_keys
-        selected_price_key_deliveries += price_key_count
-    return CandidateForwardSelection(
-        price_keys_by_occurrence=selected_price_keys_by_occurrence,
-        selection_io={
-            "exact_candidate_occurrence_coordinates": len(
-                required_occurrence_keys
-            ),
-            "forward_occurrence_coordinates_before_exact_filter": len(
-                broad_price_keys_by_occurrence
-            ),
-            "forward_occurrence_coordinates_after_exact_filter": len(
-                selected_price_keys_by_occurrence
-            ),
-            "forward_price_key_deliveries_before_exact_filter": (
-                broad_price_key_deliveries
-            ),
-            "forward_price_key_deliveries_after_exact_filter": (
-                selected_price_key_deliveries
-            ),
-            "discarded_forward_price_key_deliveries": (
-                broad_price_key_deliveries - selected_price_key_deliveries
-            ),
-        },
-    )
-
-
 __all__ = [
-    "CandidateForwardSelection",
     "OccurrenceKey",
     "required_candidate_occurrence_keys",
-    "select_candidate_forward_prices",
 ]

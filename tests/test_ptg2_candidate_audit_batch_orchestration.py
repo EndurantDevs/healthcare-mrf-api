@@ -212,9 +212,11 @@ async def test_candidate_price_data_hydrates_retained_prices_once(monkeypatch):
 
     assert price_load.data.price_keys_by_occurrence == forward_index
     assert price_load.data.atom_keys_by_price_key == {8: (9,)}
-    assert price_load.selection_io[
-        "discarded_forward_price_key_deliveries"
-    ] == 0
+    assert price_load.selection_io == {
+        "exact_candidate_occurrence_coordinates": 1,
+        "exact_forward_occurrence_coordinates_returned": 1,
+        "exact_forward_price_key_deliveries_returned": 1,
+    }
     hydrate_prices.assert_awaited_once_with(
         ANY,
         ANY,

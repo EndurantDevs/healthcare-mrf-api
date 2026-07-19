@@ -116,6 +116,88 @@ def _fragment_row(
     return fragment_fields_by_name
 
 
+def _dense_forward_fragment(
+    provider_set_keys: tuple[int, ...],
+    source_keys: tuple[int, ...],
+) -> dict:
+    forward_block_bytes = _grouped_payload(
+        len(source_keys),
+        [
+            (
+                provider_set_key,
+                [(source_key + 1, source_key) for source_key in source_keys],
+            )
+            for provider_set_key in provider_set_keys
+        ],
+    )
+    return _fragment_row(
+        _fragment(
+            forward_block_bytes,
+            entry_count=len(provider_set_keys),
+            block_key=_shard_block_key(7, provider_set_keys[0]),
+        )
+    )
+
+
+def _install_forward_fragment_reader(monkeypatch, returned_fragments):
+    visit_spy = Mock(
+        wraps=ptg2_db_sidecars._visit_serving_binary_by_code_record
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        AsyncMock(return_value=returned_fragments),
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_visit_serving_binary_by_code_record",
+        visit_spy,
+    )
+    return visit_spy
+
+
+def _capture_forward_fanout(monkeypatch):
+    captures = []
+    original_capture = ptg2_db_sidecars._forward_fanout_capture
+
+    def capture_spy(*args):
+        capture = original_capture(*args)
+        captures.append(capture)
+        return capture
+
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_forward_fanout_capture",
+        capture_spy,
+    )
+    return captures
+
+
+def _aliased_forward_fragments(code_keys: tuple[int, ...]):
+    source_count = len(code_keys)
+    forward_block_bytes = _grouped_payload(
+        source_count,
+        [(5, [(source_key + 1, source_key) for source_key in range(source_count)])],
+    )
+    block_hash = b"x" * 32
+    returned_fragments = [
+        _fragment_row(
+            _fragment(
+                forward_block_bytes,
+                entry_count=1,
+                block_key=_shard_block_key(code_key, 5),
+            ),
+            block_hash=block_hash,
+        )
+        for code_key in code_keys
+    ]
+    required_occurrences = {
+        (code_key, 5, source_key)
+        for source_key, code_key in enumerate(code_keys)
+    }
+    return source_count, returned_fragments, required_occurrences
+
+
 def _patch_reference_lookups(monkeypatch):
     provider_counts = AsyncMock(
         side_effect=lambda _session, **kwargs: {
@@ -520,6 +602,254 @@ async def test_audit_forward_index_filters_sources_during_one_union_visit(
     }
     fetch.assert_awaited_once()
     assert fetch.await_args.kwargs["block_keys"] == (block_7, block_8)
+
+
+@pytest.mark.asyncio
+async def test_audit_forward_index_filters_exact_provider_source_pairs(
+    monkeypatch,
+):
+    block_key = _shard_block_key(7, 5)
+    fetch = AsyncMock(
+        return_value=[
+            _fragment_row(
+                _fragment(
+                    _grouped_payload(
+                        2,
+                        [
+                            (5, [(8, 0), (9, 1)]),
+                            (6, [(10, 0), (11, 1)]),
+                        ],
+                    ),
+                    entry_count=2,
+                    block_key=block_key,
+                )
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        fetch,
+    )
+
+    price_keys_by_occurrence = await (
+        ptg2_db_sidecars.lookup_forward_price_index_from_db(
+            object(),
+            (7,),
+            provider_set_keys_by_code={7: (5, 6)},
+            occurrence_keys={(7, 5, 0), (7, 6, 1)},
+            shared_snapshot_key=41,
+            source_count=2,
+            price_dictionary_item_count=128,
+            price_dictionary_block_bytes=2048,
+        )
+    )
+
+    assert price_keys_by_occurrence == {
+        (7, 5, 0): (8,),
+        (7, 6, 1): (11,),
+    }
+    assert (7, 5, 1) not in price_keys_by_occurrence
+    assert (7, 6, 0) not in price_keys_by_occurrence
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_filters_by_code",
+    [None, {7: (5, 6)}],
+)
+async def test_audit_forward_exact_scope_fails_before_shard_io(
+    monkeypatch,
+    provider_filters_by_code,
+):
+    discover = AsyncMock(return_value={7: (_shard_block_key(7, 5),)})
+    fetch = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_discover_forward_shard_keys",
+        discover,
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        fetch,
+    )
+    read_options_by_name = {
+        "occurrence_keys": {(7, 5, 0)},
+        "shared_snapshot_key": 41,
+        "source_count": 2,
+        "price_dictionary_item_count": 128,
+        "price_dictionary_block_bytes": 2048,
+    }
+    if provider_filters_by_code is not None:
+        read_options_by_name["provider_set_keys_by_code"] = (
+            provider_filters_by_code
+        )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="provider scope"):
+        await ptg2_db_sidecars.lookup_forward_price_index_from_db(
+            object(),
+            (7,),
+            **read_options_by_name,
+        )
+
+    discover.assert_not_awaited()
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_audit_forward_exact_filter_spans_provider_shards(monkeypatch):
+    provider_set_keys = (5, 1025)
+    block_keys = tuple(_shard_block_key(7, key) for key in provider_set_keys)
+    returned_fragments = [
+        _fragment_row(
+            _fragment(
+                _grouped_payload(2, [(provider_key, [(provider_key, source_key)])]),
+                entry_count=1,
+                block_key=block_key,
+            )
+        )
+        for source_key, (provider_key, block_key) in enumerate(
+            zip(provider_set_keys, block_keys)
+        )
+    ]
+    fetch = AsyncMock(return_value=returned_fragments)
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        fetch,
+    )
+    required_occurrences = {(7, 5, 0), (7, 1025, 1)}
+
+    observed = await ptg2_db_sidecars.lookup_forward_price_index_from_db(
+        object(),
+        (7,),
+        provider_set_keys_by_code={7: provider_set_keys},
+        occurrence_keys=required_occurrences,
+        shared_snapshot_key=41,
+        source_count=2,
+        price_dictionary_item_count=2048,
+        price_dictionary_block_bytes=2048,
+    )
+
+    assert observed == {(7, 5, 0): (5,), (7, 1025, 1): (1025,)}
+    assert fetch.await_args.kwargs["block_keys"] == block_keys
+
+
+@pytest.mark.asyncio
+async def test_audit_forward_exact_filter_validates_unretained_rows(monkeypatch):
+    block_key = _shard_block_key(7, 5)
+    fetch = AsyncMock(
+        return_value=[
+            _fragment_row(
+                _fragment(
+                    _grouped_payload(2, [(5, [(8, 0), (999, 1)])]),
+                    entry_count=1,
+                    block_key=block_key,
+                )
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        fetch,
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="price key"):
+        await ptg2_db_sidecars.lookup_forward_price_index_from_db(
+            object(),
+            (7,),
+            provider_set_keys_by_code={7: (5,)},
+            occurrence_keys={(7, 5, 0)},
+            shared_snapshot_key=41,
+            source_count=2,
+            price_dictionary_item_count=128,
+            price_dictionary_block_bytes=2048,
+        )
+
+
+@pytest.mark.asyncio
+async def test_audit_forward_exact_filter_prunes_dense_cross_product_during_visit(
+    monkeypatch,
+):
+    """Retain 100 exact coordinates while validating all 10,000 rows once."""
+
+    provider_set_keys = tuple(range(5, 105))
+    source_keys = tuple(range(100))
+    visit_spy = _install_forward_fragment_reader(
+        monkeypatch,
+        [_dense_forward_fragment(provider_set_keys, source_keys)],
+    )
+
+    broad_index = await ptg2_db_sidecars.lookup_forward_price_index_from_db(
+        object(),
+        (7,),
+        provider_set_keys_by_code={7: provider_set_keys},
+        source_keys_by_code={7: source_keys},
+        shared_snapshot_key=41,
+        source_count=len(source_keys),
+        price_dictionary_item_count=128,
+        price_dictionary_block_bytes=2048,
+    )
+    required_occurrences = {
+        (7, provider_set_key, source_key)
+        for provider_set_key, source_key in zip(provider_set_keys, source_keys)
+    }
+    exact_index = await ptg2_db_sidecars.lookup_forward_price_index_from_db(
+        object(),
+        (7,),
+        provider_set_keys_by_code={7: provider_set_keys},
+        occurrence_keys=required_occurrences,
+        shared_snapshot_key=41,
+        source_count=len(source_keys),
+        price_dictionary_item_count=128,
+        price_dictionary_block_bytes=2048,
+    )
+
+    assert len(broad_index) == 10_000
+    assert exact_index == {
+        occurrence_key: (occurrence_key[2] + 1,)
+        for occurrence_key in required_occurrences
+    }
+    assert len(exact_index) == 100
+    assert visit_spy.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_audit_forward_exact_alias_indexes_logical_views_once(monkeypatch):
+    """Index aliased logical views before the single physical block parse."""
+
+    code_keys = tuple(range(7, 71))
+    source_count, returned_fragments, required_occurrences = (
+        _aliased_forward_fragments(code_keys)
+    )
+    visit_spy = _install_forward_fragment_reader(monkeypatch, returned_fragments)
+    captures = _capture_forward_fanout(monkeypatch)
+    price_keys_by_occurrence = await (
+        ptg2_db_sidecars.lookup_forward_price_index_from_db(
+            object(),
+            code_keys,
+            provider_set_keys_by_code={code_key: (5,) for code_key in code_keys},
+            occurrence_keys=required_occurrences,
+            shared_snapshot_key=41,
+            source_count=source_count,
+            price_dictionary_item_count=128,
+            price_dictionary_block_bytes=2048,
+        )
+    )
+
+    assert price_keys_by_occurrence == {
+        occurrence_key: (source_key + 1,)
+        for source_key, occurrence_key in enumerate(sorted(required_occurrences))
+    }
+    assert visit_spy.call_count == 1
+    assert len(captures) == 1
+    assert captures[0].fallback_views == ()
+    assert len(captures[0].exact_views_by_occurrence) == source_count
+    assert sum(
+        len(views) for views in captures[0].exact_views_by_occurrence.values()
+    ) == source_count
 
 
 @pytest.mark.asyncio

@@ -70,6 +70,7 @@ class _ForwardBatchOptions:
     provider_set_keys: Iterable[int] | None = None
     provider_set_keys_by_code: Mapping[int, Iterable[int]] | None = None
     source_keys_by_code: Mapping[int, Iterable[int]] | None = None
+    occurrence_keys: Iterable[tuple[int, int, int]] | None = None
     provider_counts_by_key: Mapping[int, int] | None = None
     schema_name: str = "mrf"
 
@@ -115,6 +116,7 @@ class _ForwardBatchFragmentView:
     provider_key_max: int
     provider_filter: frozenset[int] | None
     source_filter: frozenset[int] | None
+    occurrence_filter: frozenset[tuple[int, int]] | None
     fragment_row: Mapping[str, Any]
 
 
@@ -132,7 +134,11 @@ class _ParsedForwardFragment:
 class _ForwardFanoutCapture:
     """Retain one physical fragment's first row and logical deliveries."""
 
-    views: tuple[_ForwardBatchFragmentView, ...]
+    exact_views_by_occurrence: Mapping[
+        tuple[int, int],
+        tuple[_ForwardBatchFragmentView, ...],
+    ]
+    fallback_views: tuple[_ForwardBatchFragmentView, ...]
     retained_by_coordinate: dict[
         tuple[int, int, int],
         list[tuple[int, int, int]],
@@ -149,7 +155,13 @@ class _ForwardFanoutCapture:
         if self.first_provider_set_key is None:
             self.first_provider_set_key = provider_set_key
             self.first_occurrence = (price_key, source_key)
-        for view in self.views:
+        exact_views = self.exact_views_by_occurrence.get(
+            (provider_set_key, source_key),
+            (),
+        )
+        for view in exact_views:
+            self._retain(view, provider_set_key, price_key, source_key)
+        for view in self.fallback_views:
             is_provider_match = (
                 view.provider_filter is None
                 or provider_set_key in view.provider_filter
@@ -158,10 +170,19 @@ class _ForwardFanoutCapture:
                 view.source_filter is None or source_key in view.source_filter
             )
             if is_provider_match and is_source_match:
-                coordinate = (view.code_key, view.block_key, view.fragment_no)
-                self.retained_by_coordinate[coordinate].append(
-                    (provider_set_key, price_key, source_key)
-                )
+                self._retain(view, provider_set_key, price_key, source_key)
+
+    def _retain(
+        self,
+        view: _ForwardBatchFragmentView,
+        provider_set_key: int,
+        price_key: int,
+        source_key: int,
+    ) -> None:
+        coordinate = (view.code_key, view.block_key, view.fragment_no)
+        self.retained_by_coordinate[coordinate].append(
+            (provider_set_key, price_key, source_key)
+        )
 
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
@@ -791,7 +812,7 @@ def _decode_forward_occurrences(
     """Decode and validate one provider set's ordered price/source pairs."""
 
     occurrences: list[tuple[int, int]] = []
-    cursor = _visit_forward_occurrences(
+    cursor, _last_occurrence = _visit_forward_occurrences(
         fragment_bytes,
         cursor,
         source_count=source_count,
@@ -1906,16 +1927,69 @@ def _normalized_batch_source_filters(
     return normalized_filters_by_code
 
 
+def _normalized_batch_occurrence_filters(
+    options: _ForwardBatchOptions,
+    code_keys: tuple[int, ...],
+) -> dict[int, frozenset[tuple[int, int]]] | None:
+    """Normalize exact code/provider/source triples for one batch visit."""
+
+    if options.occurrence_keys is None:
+        return None
+    if isinstance(options.source_count, bool):
+        raise PTG2ManifestArtifactError(
+            "PTG2 batch occurrence filter requires a valid source count"
+        )
+    try:
+        source_count = int(options.source_count)
+        dense_source_key_bits(source_count)
+    except (TypeError, ValueError, PTG2SharedBlockError) as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 batch occurrence filter requires a valid source count"
+        ) from exc
+    normalized_filters_by_code: dict[int, set[tuple[int, int]]] = {
+        code_key: set() for code_key in code_keys
+    }
+    for raw_occurrence_key in options.occurrence_keys:
+        try:
+            raw_code_key, raw_provider_set_key, raw_source_key = raw_occurrence_key
+        except (TypeError, ValueError) as exc:
+            raise PTG2ManifestArtifactError(
+                "PTG2 batch occurrence filter has an invalid coordinate"
+            ) from exc
+        code_key = _normalized_code_key(raw_code_key)
+        if code_key not in normalized_filters_by_code:
+            raise PTG2ManifestArtifactError(
+                "PTG2 batch occurrence filter contains an unexpected code key"
+            )
+        provider_filter = _normalized_provider_set_filter((raw_provider_set_key,))
+        source_filter = _normalized_source_filter((raw_source_key,), source_count)
+        if not provider_filter or not source_filter:
+            raise PTG2ManifestArtifactError(
+                "PTG2 batch occurrence filter must not be empty"
+            )
+        normalized_filters_by_code[code_key].add(
+            (provider_filter[0], next(iter(source_filter)))
+        )
+    if any(not occurrence_filter for occurrence_filter in normalized_filters_by_code.values()):
+        raise PTG2ManifestArtifactError(
+            "PTG2 batch occurrence filters must cover exactly the requested codes"
+        )
+    return {
+        code_key: frozenset(occurrence_filter)
+        for code_key, occurrence_filter in normalized_filters_by_code.items()
+    }
+
+
 async def _forward_batch_shards_and_filters(
     session: Any,
     options: _ForwardBatchOptions,
     code_keys: tuple[int, ...],
+    filters_by_code: dict[int, tuple[int, ...]] | None,
 ) -> tuple[
     dict[int, tuple[int, ...]],
     dict[int, tuple[int, ...] | None],
     bool,
 ]:
-    filters_by_code = _normalized_batch_provider_filters(options, code_keys)
     if filters_by_code is None:
         shard_keys_by_code = await _discover_forward_shard_keys(
             session,
@@ -1973,18 +2047,17 @@ def _forward_batch_fragment_views(
     shard_keys_by_code: Mapping[int, Iterable[int]],
     filters_by_code: Mapping[int, Iterable[int] | None],
     source_filters_by_code: Mapping[int, frozenset[int]] | None,
+    occurrence_filters_by_code: Mapping[
+        int,
+        frozenset[tuple[int, int]],
+    ]
+    | None,
     provider_shard_span: int | None,
 ) -> tuple[_ForwardBatchFragmentView, ...]:
     """Validate logical shard coordinates before any physical payload parse."""
 
     views: list[_ForwardBatchFragmentView] = []
     for code_key in code_keys:
-        rows_by_block = _validated_forward_rows_by_block(
-            code_key,
-            fragments_by_code[code_key],
-            shard_keys_by_code[code_key],
-            provider_shard_span,
-        )
         provider_filter = (
             None
             if filters_by_code[code_key] is None
@@ -1995,28 +2068,147 @@ def _forward_batch_fragment_views(
             if source_filters_by_code is None
             else source_filters_by_code[code_key]
         )
-        for block_key in sorted(rows_by_block):
-            provider_key_min, provider_key_max = _forward_provider_range_for_block(
+        occurrence_filter = (
+            None
+            if occurrence_filters_by_code is None
+            else occurrence_filters_by_code[code_key]
+        )
+        views.extend(
+            _forward_code_fragment_views(
                 code_key,
-                block_key,
+                fragments_by_code[code_key],
+                shard_keys_by_code[code_key],
+                provider_filter,
+                source_filter,
+                occurrence_filter,
                 provider_shard_span,
             )
-            for fragment_row in _ordered_forward_fragments(
-                rows_by_block[block_key]
-            ):
-                views.append(
-                    _ForwardBatchFragmentView(
-                        code_key=code_key,
-                        block_key=block_key,
-                        fragment_no=int(fragment_row.get("block_no") or 0),
-                        provider_key_min=provider_key_min,
-                        provider_key_max=provider_key_max,
-                        provider_filter=provider_filter,
-                        source_filter=source_filter,
-                        fragment_row=fragment_row,
-                    )
-                )
+        )
     return tuple(views)
+
+
+def _forward_code_fragment_views(
+    code_key: int,
+    fragment_rows: Iterable[Mapping[str, Any]],
+    shard_keys: Iterable[int],
+    provider_filter: frozenset[int] | None,
+    source_filter: frozenset[int] | None,
+    occurrence_filter: frozenset[tuple[int, int]] | None,
+    provider_shard_span: int | None,
+) -> tuple[_ForwardBatchFragmentView, ...]:
+    """Build the logical views for one code after validating exact scope."""
+
+    rows_by_block = _validated_forward_rows_by_block(
+        code_key,
+        fragment_rows,
+        shard_keys,
+        provider_shard_span,
+    )
+    views: list[_ForwardBatchFragmentView] = []
+    for block_key in sorted(rows_by_block):
+        provider_key_min, provider_key_max = _forward_provider_range_for_block(
+            code_key,
+            block_key,
+            provider_shard_span,
+        )
+        block_occurrence_filter = _forward_block_occurrence_filter(
+            occurrence_filter,
+            provider_key_min,
+            provider_key_max,
+        )
+        for fragment_row in _ordered_forward_fragments(rows_by_block[block_key]):
+            views.append(
+                _ForwardBatchFragmentView(
+                    code_key=code_key,
+                    block_key=block_key,
+                    fragment_no=int(fragment_row.get("block_no") or 0),
+                    provider_key_min=provider_key_min,
+                    provider_key_max=provider_key_max,
+                    provider_filter=provider_filter,
+                    source_filter=source_filter,
+                    occurrence_filter=block_occurrence_filter,
+                    fragment_row=fragment_row,
+                )
+            )
+    return tuple(views)
+
+
+def _validate_forward_occurrence_scope(
+    provider_filter: frozenset[int] | None,
+    source_filter: frozenset[int] | None,
+    occurrence_filter: frozenset[tuple[int, int]] | None,
+) -> None:
+    """Require exact occurrence coordinates to agree with broad read scope."""
+
+    if occurrence_filter is None:
+        return
+    exact_provider_filter = frozenset(
+        provider_set_key for provider_set_key, _source_key in occurrence_filter
+    )
+    if provider_filter is None or exact_provider_filter != provider_filter:
+        raise PTG2ManifestArtifactError(
+            "PTG2 batch occurrence filter must equal its provider scope"
+        )
+    if source_filter is not None and any(
+        source_key not in source_filter
+        for _provider_set_key, source_key in occurrence_filter
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 batch occurrence filter exceeds its source scope"
+        )
+
+
+def _validate_forward_batch_occurrence_scopes(
+    code_keys: tuple[int, ...],
+    filters_by_code: Mapping[int, Iterable[int]] | None,
+    source_filters_by_code: Mapping[int, frozenset[int]] | None,
+    occurrence_filters_by_code: Mapping[
+        int,
+        frozenset[tuple[int, int]],
+    ]
+    | None,
+) -> None:
+    """Reject inconsistent exact scope before shard discovery or payload I/O."""
+
+    if occurrence_filters_by_code is None:
+        return
+    for code_key in code_keys:
+        provider_filter = (
+            None
+            if filters_by_code is None
+            else frozenset(filters_by_code[code_key])
+        )
+        source_filter = (
+            None
+            if source_filters_by_code is None
+            else source_filters_by_code[code_key]
+        )
+        _validate_forward_occurrence_scope(
+            provider_filter,
+            source_filter,
+            occurrence_filters_by_code[code_key],
+        )
+
+
+def _forward_block_occurrence_filter(
+    occurrence_filter: frozenset[tuple[int, int]] | None,
+    provider_key_min: int,
+    provider_key_max: int,
+) -> frozenset[tuple[int, int]] | None:
+    """Restrict exact coordinates to one already-selected provider shard."""
+
+    if occurrence_filter is None:
+        return None
+    block_filter = frozenset(
+        (provider_set_key, source_key)
+        for provider_set_key, source_key in occurrence_filter
+        if provider_key_min <= provider_set_key < provider_key_max
+    )
+    if not block_filter:
+        raise PTG2ManifestArtifactError(
+            "PTG2 batch occurrence filter is empty for a requested shard"
+        )
+    return block_filter
 
 
 def _validated_forward_rows_by_block(
@@ -2083,6 +2275,36 @@ def _parse_forward_batch_physical_fragments_once(
     return parsed_by_identity, retained_by_coordinate
 
 
+def _forward_fanout_capture(
+    physical_views: tuple[_ForwardBatchFragmentView, ...],
+    retained_by_coordinate: dict[
+        tuple[int, int, int],
+        list[tuple[int, int, int]],
+    ],
+) -> _ForwardFanoutCapture:
+    """Index exact logical views once before visiting physical occurrences."""
+
+    exact_views_by_occurrence: dict[
+        tuple[int, int],
+        list[_ForwardBatchFragmentView],
+    ] = {}
+    fallback_views: list[_ForwardBatchFragmentView] = []
+    for view in physical_views:
+        if view.occurrence_filter is None:
+            fallback_views.append(view)
+            continue
+        for occurrence_key in view.occurrence_filter:
+            exact_views_by_occurrence.setdefault(occurrence_key, []).append(view)
+    return _ForwardFanoutCapture(
+        exact_views_by_occurrence={
+            occurrence_key: tuple(views)
+            for occurrence_key, views in exact_views_by_occurrence.items()
+        },
+        fallback_views=tuple(fallback_views),
+        retained_by_coordinate=retained_by_coordinate,
+    )
+
+
 def _forward_views_by_physical_identity(
     views: tuple[_ForwardBatchFragmentView, ...],
 ) -> dict[tuple[Any, ...], list[_ForwardBatchFragmentView]]:
@@ -2112,7 +2334,10 @@ def _parse_physical_forward_fragment_once(
         schema_name=options.schema_name,
         block_hash=bytes(raw_block_hash),
     )
-    fanout_capture = _ForwardFanoutCapture(physical_views, retained_by_coordinate)
+    fanout_capture = _forward_fanout_capture(
+        physical_views,
+        retained_by_coordinate,
+    )
     last_cursor, source_count = _visit_serving_binary_by_code_record(
         representative.fragment_row,
         provider_filter=None,
@@ -2207,36 +2432,16 @@ async def _visit_forward_batch_keys(
         options,
         code_keys,
     )
-    shard_keys_by_code, filters_by_code, requires_all = (
-        await _forward_batch_shards_and_filters(session, options, code_keys)
-    )
-    if requires_all and any(not shard_keys_by_code[code_key] for code_key in code_keys):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 forward artifact is missing referenced code shards"
-        )
-    block_keys = _flatten_forward_shard_keys(shard_keys_by_code)
-    if not block_keys:
-        return
-    fragment_rows = await _shared_serving_binary_payload_rows_for_keys(
-        session,
-        shared_snapshot_key=options.shared_snapshot_key,
-        schema_name=options.schema_name,
-        artifact_kind=_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND,
-        block_keys=block_keys,
-        require_all=requires_all,
-    )
-    fragments_by_code = _group_forward_fragments_by_code(
-        fragment_rows,
-        shard_keys_by_code,
-        options.provider_shard_span,
-    )
-    views = _forward_batch_fragment_views(
+    occurrence_filters_by_code = _normalized_batch_occurrence_filters(
+        options,
         code_keys,
-        fragments_by_code,
-        shard_keys_by_code,
-        filters_by_code,
+    )
+    views = await _fetch_forward_batch_fragment_views(
+        session,
+        code_keys,
+        options,
         source_filters_by_code,
-        options.provider_shard_span,
+        occurrence_filters_by_code,
     )
     parsed_by_identity, retained_by_coordinate = (
         _parse_forward_batch_physical_fragments_once(
@@ -2250,6 +2455,65 @@ async def _visit_forward_batch_keys(
         parsed_by_identity,
         retained_by_coordinate,
         occurrence_consumer,
+    )
+
+
+async def _fetch_forward_batch_fragment_views(
+    session: Any,
+    code_keys: tuple[int, ...],
+    options: _ForwardBatchOptions,
+    source_filters_by_code: Mapping[int, frozenset[int]] | None,
+    occurrence_filters_by_code: Mapping[
+        int,
+        frozenset[tuple[int, int]],
+    ]
+    | None,
+) -> tuple[_ForwardBatchFragmentView, ...]:
+    """Fetch selected shards and bind them to validated logical views."""
+
+    filters_by_code = _normalized_batch_provider_filters(options, code_keys)
+    _validate_forward_batch_occurrence_scopes(
+        code_keys,
+        filters_by_code,
+        source_filters_by_code,
+        occurrence_filters_by_code,
+    )
+    shard_keys_by_code, filters_by_code, requires_all = (
+        await _forward_batch_shards_and_filters(
+            session,
+            options,
+            code_keys,
+            filters_by_code,
+        )
+    )
+    if requires_all and any(not shard_keys_by_code[code_key] for code_key in code_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 forward artifact is missing referenced code shards"
+        )
+    block_keys = _flatten_forward_shard_keys(shard_keys_by_code)
+    if not block_keys:
+        return ()
+    fragment_rows = await _shared_serving_binary_payload_rows_for_keys(
+        session,
+        shared_snapshot_key=options.shared_snapshot_key,
+        schema_name=options.schema_name,
+        artifact_kind=_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND,
+        block_keys=block_keys,
+        require_all=requires_all,
+    )
+    fragments_by_code = _group_forward_fragments_by_code(
+        fragment_rows,
+        shard_keys_by_code,
+        options.provider_shard_span,
+    )
+    return _forward_batch_fragment_views(
+        code_keys,
+        fragments_by_code,
+        shard_keys_by_code,
+        filters_by_code,
+        source_filters_by_code,
+        occurrence_filters_by_code,
+        options.provider_shard_span,
     )
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -64,9 +63,9 @@ def _code_record(
 
 
 @pytest.mark.asyncio
-async def test_forward_batch_unions_witness_and_persisted_sources(monkeypatch):
-    first = _challenge()
-    second = replace(first, code="99214", source_artifact_key=1)
+async def test_forward_batch_preserves_exact_witness_and_persisted_sources(
+    monkeypatch,
+):
     lookup = AsyncMock(
         return_value={
             (7, 5, 0): (8,),
@@ -86,22 +85,14 @@ async def test_forward_batch_unions_witness_and_persisted_sources(monkeypatch):
         price_dictionary_block_bytes=2048,
     )
 
+    required_occurrences = frozenset(
+        {(7, 5, 0), (8, 6, 1), (9, 7, 1)}
+    )
     observed = await batch._candidate_forward_price_keys(
         object(),
         serving_tables,
-        (first, second),
-        {
-            ("CPT", "99213"): ({"code_key": 7},),
-            ("CPT", "99214"): ({"code_key": 8},),
-        },
         {7: (5,), 8: (6,), 9: (7,)},
-        (
-            _persisted_occurrence(
-                code_key=9,
-                provider_set_key=7,
-                source_artifact_key=1,
-            ),
-        ),
+        required_occurrences,
     )
 
     assert observed == lookup.return_value
@@ -110,11 +101,8 @@ async def test_forward_batch_unions_witness_and_persisted_sources(monkeypatch):
         8: (6,),
         9: (7,),
     }
-    assert lookup.await_args.kwargs["source_keys_by_code"] == {
-        7: {0},
-        8: {1},
-        9: {1},
-    }
+    assert lookup.await_args.kwargs["occurrence_keys"] is required_occurrences
+    assert "source_keys_by_code" not in lookup.await_args.kwargs
 
 
 def test_persisted_audit_requires_exact_code_and_provider_graph_scope():

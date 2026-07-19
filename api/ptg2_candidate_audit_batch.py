@@ -32,7 +32,6 @@ from api.ptg2_candidate_audit_projection import (
 )
 from api.ptg2_candidate_audit_selection import (
     required_candidate_occurrence_keys as _required_candidate_occurrence_keys,
-    select_candidate_forward_prices,
 )
 from api.ptg2_serving import (
     PTG2_SCHEMA,
@@ -73,7 +72,7 @@ class _CandidateAuditData:
 
 @dataclass(frozen=True)
 class _CandidatePriceLoad:
-    """Candidate prices plus proof that broad forward rows were pruned once."""
+    """Candidate prices plus proof that only exact forward rows were retained."""
 
     data: CandidatePriceData
     selection_io: Mapping[str, int]
@@ -225,53 +224,21 @@ async def _provider_network_names_by_key(
 async def _candidate_forward_price_keys(
     session: Any,
     serving_tables: PTG2ServingTables,
-    challenges: Sequence[AuditBatchChallenge],
-    code_records_by_pair: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]],
     provider_filters_by_code_key: Mapping[int, tuple[int, ...]],
-    persisted_audit_occurrences: Sequence[PersistedAuditOccurrence] = (),
+    required_occurrence_keys: frozenset[tuple[int, int, int]],
 ) -> dict[tuple[int, int, int], tuple[int, ...]]:
     if not provider_filters_by_code_key:
         return {}
-    allowed_sources_by_code_key = _allowed_source_keys_by_code_key(
-        challenges,
-        code_records_by_pair,
-        provider_filters_by_code_key,
-        persisted_audit_occurrences,
-    )
     return await lookup_forward_price_index_from_db(
         session,
         provider_filters_by_code_key,
         provider_set_keys_by_code=provider_filters_by_code_key,
-        source_keys_by_code=allowed_sources_by_code_key,
+        occurrence_keys=required_occurrence_keys,
         shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
         source_count=_required_source_count(serving_tables),
         schema_name=PTG2_SCHEMA,
         **_version_three_forward_lookup_hints(serving_tables),
     )
-
-
-def _allowed_source_keys_by_code_key(
-    challenges: Sequence[AuditBatchChallenge],
-    code_records_by_pair: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]],
-    provider_filters_by_code_key: Mapping[int, tuple[int, ...]],
-    persisted_audit_occurrences: Sequence[PersistedAuditOccurrence] = (),
-) -> dict[int, set[int]]:
-    source_keys_by_code_key = {
-        code_key: set() for code_key in provider_filters_by_code_key
-    }
-    for challenge in challenges:
-        code_pair = (challenge.code_system, challenge.code)
-        for code_record in code_records_by_pair[code_pair]:
-            code_key = int(code_record["code_key"])
-            if code_key in source_keys_by_code_key:
-                source_keys_by_code_key[code_key].add(
-                    challenge.source_artifact_key
-                )
-    for occurrence in persisted_audit_occurrences:
-        source_keys_by_code_key[occurrence.code_key].add(
-            occurrence.source_artifact_key
-        )
-    return source_keys_by_code_key
 
 
 async def _candidate_audit_data(
@@ -408,7 +375,7 @@ async def _load_candidate_price_data(
     provider_filters_by_code_key: Mapping[int, tuple[int, ...]],
     persisted_audit_occurrences: Sequence[PersistedAuditOccurrence] = (),
 ) -> _CandidatePriceLoad:
-    """Prune broad forward rows, then hydrate each exact retained price once."""
+    """Retain exact forward rows, then hydrate each retained price once."""
 
     required_occurrence_keys = _required_candidate_occurrence_keys(
         challenges,
@@ -416,18 +383,16 @@ async def _load_candidate_price_data(
         provider_set_keys_by_npi,
         persisted_audit_occurrences,
     )
-    forward_selection = select_candidate_forward_prices(
-        await _candidate_forward_price_keys(
-            session,
-            serving_tables,
-            challenges,
-            code_records_by_pair,
-            provider_filters_by_code_key,
-            persisted_audit_occurrences,
-        ),
+    price_keys_by_occurrence = await _candidate_forward_price_keys(
+        session,
+        serving_tables,
+        provider_filters_by_code_key,
         required_occurrence_keys,
     )
-    price_keys_by_occurrence = forward_selection.price_keys_by_occurrence
+    if set(price_keys_by_occurrence).difference(required_occurrence_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 candidate forward read escaped its exact occurrence scope"
+        )
     retained_price_keys = {
         price_key
         for occurrence_price_keys in price_keys_by_occurrence.values()
@@ -445,7 +410,18 @@ async def _load_candidate_price_data(
             hydration.atom_keys_by_price_key,
             hydration.prices_by_key,
         ),
-        selection_io=forward_selection.selection_io,
+        selection_io={
+            "exact_candidate_occurrence_coordinates": len(
+                required_occurrence_keys
+            ),
+            "exact_forward_occurrence_coordinates_returned": len(
+                price_keys_by_occurrence
+            ),
+            "exact_forward_price_key_deliveries_returned": sum(
+                len(price_keys)
+                for price_keys in price_keys_by_occurrence.values()
+            ),
+        },
     )
 
 

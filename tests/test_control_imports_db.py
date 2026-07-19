@@ -220,11 +220,11 @@ async def test_duplicate_idempotency_key_uses_real_partial_unique_index(monkeypa
         assert first["run_id"] == "run_first"
 
         real_find = control_imports.find_active_run_by_idempotency_key
-        calls = {"count": 0}
+        calls_by_name = {"count": 0}
 
         async def race_miss_then_real(idempotency_key: str):
-            calls["count"] += 1
-            if calls["count"] == 1:
+            calls_by_name["count"] += 1
+            if calls_by_name["count"] == 1:
                 return None
             return await real_find(idempotency_key)
 
@@ -239,7 +239,7 @@ async def test_duplicate_idempotency_key_uses_real_partial_unique_index(monkeypa
 
         assert second_created is False
         assert second["run_id"] == "run_first"
-        assert calls["count"] == 2
+        assert calls_by_name["count"] == 2
 
         await db.execute(
             update(ImportRun)

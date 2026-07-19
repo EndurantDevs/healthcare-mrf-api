@@ -20,15 +20,15 @@ from db.connection import (
 
 @pytest.mark.asyncio
 async def test_database_connect_initializes_engine(monkeypatch):
-    created = {}
+    created_by_field = {}
 
     def fake_create_engine(url, **kwargs):  # pragma: no cover - executed in test
-        created["url"] = url
-        created["kwargs"] = kwargs
+        created_by_field["url"] = url
+        created_by_field["kwargs"] = kwargs
         return SimpleNamespace(connect=AsyncMock())
 
     def fake_sessionmaker(engine, **kwargs):
-        created["session_kwargs"] = kwargs
+        created_by_field["session_kwargs"] = kwargs
         return lambda: "session"
 
     monkeypatch.setenv("HLTHPRT_DB_DRIVER", "psycopg")
@@ -46,9 +46,9 @@ async def test_database_connect_initializes_engine(monkeypatch):
     db = Database()
     await db.connect()
 
-    assert created["url"].drivername == "postgresql+psycopg"
-    assert created["kwargs"]["pool_size"] == 2
-    assert created["kwargs"]["max_overflow"] == 2
+    assert created_by_field["url"].drivername == "postgresql+psycopg"
+    assert created_by_field["kwargs"]["pool_size"] == 2
+    assert created_by_field["kwargs"]["max_overflow"] == 2
     assert db.engine is not None
     assert db.session_factory is not None
 
@@ -335,11 +335,11 @@ async def test_statement_adapter_methods(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_connection_proxy_helpers(monkeypatch):
-    executed = []
+    executed_calls = []
 
     class FakeConnection:
         async def execute(self, stmt, params=None):
-            executed.append((stmt, params))
+            executed_calls.append((stmt, params))
             return _FakeResult(value=99, rowcount=3)
 
     proxy = ConnectionProxy(SimpleNamespace(), FakeConnection(), SimpleNamespace())
@@ -347,7 +347,7 @@ async def test_connection_proxy_helpers(monkeypatch):
     assert await proxy.first("SELECT 1") == 99
     assert await proxy.scalar("SELECT 1") == 99
     assert await proxy.status("DELETE") == 3
-    assert executed
+    assert executed_calls
 
 
 @pytest.mark.asyncio
@@ -388,13 +388,13 @@ async def test_acquire_driver_avoids_managed_transaction_and_invalidates_on_erro
 async def test_create_table_and_execute_ddl(monkeypatch):
     table = Table("things", MetaData(), Column("id", Integer))
 
-    run_calls = {}
+    run_calls_by_name = {}
 
     class FakeBeginCtx:
         async def __aenter__(self):
             class Runner:
                 async def run_sync(self_inner, fn, **kw):
-                    run_calls["run"] = run_calls.get("run", 0) + 1
+                    run_calls_by_name["run"] = run_calls_by_name.get("run", 0) + 1
 
                 
             return Runner()
@@ -419,13 +419,13 @@ async def test_create_table_and_execute_ddl(monkeypatch):
                     return self_inner
 
                 async def exec_driver_sql(self_inner, statement):
-                    run_calls["ddl"] = statement
+                    run_calls_by_name["ddl"] = statement
 
             return _Conn()
 
     db = Database(engine=FakeEngine())
     await db.create_table(table)
-    assert run_calls.get("run") == 1
+    assert run_calls_by_name.get("run") == 1
 
     await db.execute_ddl("VACUUM")
-    assert run_calls["ddl"] == "VACUUM"
+    assert run_calls_by_name["ddl"] == "VACUUM"

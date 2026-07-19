@@ -48,13 +48,13 @@ def test_resolve_specs_prefers_finalizing_status_over_stale_start_queue():
 
 
 def test_ensure_worker_starts_registered_burst_worker(monkeypatch, tmp_path):
-    captured: dict[str, object] = {}
+    captured_by_field: dict[str, object] = {}
 
     class FakeProcess:
         pid = 12345
 
     def fake_popen(cmd, *, cwd, env, stdout, stderr, start_new_session):
-        captured.update(
+        captured_by_field.update(
             {
                 "cmd": cmd,
                 "cwd": cwd,
@@ -78,21 +78,21 @@ def test_ensure_worker_starts_registered_burst_worker(monkeypatch, tmp_path):
 
     assert worker_response["status"] == "started"
     assert worker_response["items"][0]["worker_class"] == "process.ClaimsPricing"
-    assert captured["env"]["HLTHPRT_CONTROL_RUN_ID"] == "run_1"
-    assert captured["start_new_session"] is True
+    assert captured_by_field["env"]["HLTHPRT_CONTROL_RUN_ID"] == "run_1"
+    assert captured_by_field["start_new_session"] is True
 
 
 def test_ensure_worker_uses_finish_role_for_finalizing_run(monkeypatch, tmp_path):
     class FakeProcess:
         pid = 456
 
-    captured: dict[str, object] = {}
+    captured_by_field: dict[str, object] = {}
 
     monkeypatch.setenv("HLTHPRT_WORKER_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("HLTHPRT_WORKER_LOG_DIR", str(tmp_path / "logs"))
 
     def fake_popen(cmd, **_kwargs):
-        captured["cmd"] = cmd
+        captured_by_field["cmd"] = cmd
         return FakeProcess()
 
     monkeypatch.setattr(control_workers.subprocess, "Popen", fake_popen)
@@ -103,21 +103,21 @@ def test_ensure_worker_uses_finish_role_for_finalizing_run(monkeypatch, tmp_path
 
     assert result["status"] == "started"
     assert result["items"][0]["role"] == "finish"
-    assert captured["cmd"][-2:] == ["process.PartDFormularyNetwork_finish", "--burst"]
+    assert captured_by_field["cmd"][-2:] == ["process.PartDFormularyNetwork_finish", "--burst"]
 
 
 def test_ensure_worker_uses_explicit_ptg_lane(monkeypatch, tmp_path):
     class FakeProcess:
         pid = 789
 
-    captured: dict[str, object] = {}
+    captured_by_field: dict[str, object] = {}
 
     monkeypatch.setenv("HLTHPRT_WORKER_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("HLTHPRT_WORKER_LOG_DIR", str(tmp_path / "logs"))
 
     def fake_popen(cmd, *, env, **_kwargs):
-        captured["cmd"] = cmd
-        captured["env"] = env
+        captured_by_field["cmd"] = cmd
+        captured_by_field["env"] = env
         return FakeProcess()
 
     monkeypatch.setattr(control_workers.subprocess, "Popen", fake_popen)
@@ -130,24 +130,24 @@ def test_ensure_worker_uses_explicit_ptg_lane(monkeypatch, tmp_path):
 
     assert result["status"] == "started"
     assert result["items"][0]["worker_class"] == "process.PTGSmall"
-    assert captured["cmd"][-2:] == ["worker-once", "process.PTGSmall"]
-    assert captured["env"]["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:PTGSmall"
-    assert captured["env"]["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
-    assert captured["env"]["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "ptg_start_run_ptg"
+    assert captured_by_field["cmd"][-2:] == ["worker-once", "process.PTGSmall"]
+    assert captured_by_field["env"]["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:PTGSmall"
+    assert captured_by_field["env"]["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
+    assert captured_by_field["env"]["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "ptg_start_run_ptg"
 
 
 def test_ensure_worker_starts_entity_address_unified_shared_worker(monkeypatch, tmp_path):
     class FakeProcess:
         pid = 2468
 
-    captured: dict[str, object] = {}
+    captured_by_field: dict[str, object] = {}
 
     monkeypatch.setenv("HLTHPRT_WORKER_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("HLTHPRT_WORKER_LOG_DIR", str(tmp_path / "logs"))
 
     def fake_popen(cmd, *, env, **_kwargs):
-        captured["cmd"] = cmd
-        captured["env"] = env
+        captured_by_field["cmd"] = cmd
+        captured_by_field["env"] = env
         return FakeProcess()
 
     monkeypatch.setattr(control_workers.subprocess, "Popen", fake_popen)
@@ -158,8 +158,8 @@ def test_ensure_worker_starts_entity_address_unified_shared_worker(monkeypatch, 
 
     assert result["status"] == "started"
     assert result["items"][0]["worker_class"] == "process.EntityAddressUnified"
-    assert captured["cmd"][-2:] == ["process.EntityAddressUnified", "--burst"]
-    assert captured["env"]["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:EntityAddressUnified"
+    assert captured_by_field["cmd"][-2:] == ["process.EntityAddressUnified", "--burst"]
+    assert captured_by_field["env"]["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:EntityAddressUnified"
 
 
 def test_ensure_worker_rejects_mismatched_explicit_ptg_lane():
@@ -268,13 +268,13 @@ def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
         "limits": {"cpu": "4", "memory": "8Gi"},
     }
     assert container["command"][-2:] == ["worker-once", "process.PTGSmall"]
-    env = {
+    env_by_name = {
         environment_entry["name"]: environment_entry["value"]
         for environment_entry in container["env"]
     }
-    assert env["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:PTGSmall"
-    assert env["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
-    assert env["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "ptg_start_run_ptg"
+    assert env_by_name["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:PTGSmall"
+    assert env_by_name["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
+    assert env_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "ptg_start_run_ptg"
 
 
 def test_kubernetes_start_worker_replicas_use_parallel_job(monkeypatch):

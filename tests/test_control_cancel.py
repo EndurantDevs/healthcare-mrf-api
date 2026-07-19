@@ -411,7 +411,7 @@ def test_control_run_heartbeat_update_values_prefers_live_progress():
 
 def test_control_run_heartbeat_update_values_preserves_live_progress_detail():
     now = dt.datetime(2026, 6, 29, 14, 0, 0)
-    detail = {
+    detail_by_field = {
         "active_source_groups": [
             {
                 "sample_source_id": "source_a",
@@ -430,13 +430,13 @@ def test_control_run_heartbeat_update_values_preserves_live_progress_detail():
             "total": 25,
             "pct": 32,
             "message": "imported resources for 8/25 source group(s)",
-            "detail": detail,
+            "detail": detail_by_field,
             "updated_at": "2026-06-29T14:00:00Z",
         },
         now,
     )
 
-    assert values["progress"]["detail"] == detail
+    assert values["progress"]["detail"] == detail_by_field
 
 
 @pytest.mark.asyncio
@@ -486,7 +486,10 @@ async def test_mark_control_run_can_preserve_existing_finished_at(monkeypatch):
         preserve_finished_at=True,
     )
 
-    values = {getattr(key, "key", str(key)): value for key, value in db_updates[0]._values.items()}
-    assert "finished_at" not in values
+    values_by_field = {
+        getattr(key, "key", str(key)): value
+        for key, value in db_updates[0]._values.items()
+    }
+    assert "finished_at" not in values_by_field
     assert live_events[-1]["finished_at"] is None
     assert status_events[-1]["finished_at"] is None
