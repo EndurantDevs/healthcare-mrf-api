@@ -64,11 +64,13 @@ This script reads source files and issues many standard pricing requests for
 manual diagnosis and capacity qualification. It is not the automated
 activation verifier and cannot create or substitute for a V4 attestation.
 Automatic activation is solely the bounded PostgreSQL-witness gate. During the
-reader-first release it keeps writing V3 attestations while all replicas learn
-to read V4. The following writer release switches each executed audit to one
-authenticated V4 POST.
+completed reader-first release it kept writing V3 attestations while all
+replicas learned to read V4. The current writer release switches each executed
+audit to one authenticated V4 POST while retaining V3 reader compatibility for
+existing history.
 The attestation persistence path, including its authenticated control endpoint,
-rejects every non-current writer contract during either rollout phase.
+rejects every non-current writer contract, so new V3 writes fail closed after
+the cutover.
 
 Pass every release floor and require zero exactness, multiplicity, source
 attribution, unresolved-reference, invalid-value, and negative-query failures.

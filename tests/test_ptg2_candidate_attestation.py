@@ -448,6 +448,11 @@ def test_record_candidate_attestation_rechecks_freshness_after_lock(monkeypatch)
         "30",
     )
     monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT",
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
+    )
+    monkeypatch.setattr(
         ptg2_candidate_attestation.db,
         "transaction",
         lambda: _Transaction(session),
@@ -724,7 +729,7 @@ def _candidate_plan_pointer_entries():
 
 
 def test_record_candidate_attestation_binds_database_identity(monkeypatch):
-    """Prove a legacy V3 report remains persistable with locked identity."""
+    """Keep the rollback writer path covered without making it the default."""
     session = _Session()
     identity_map = {
         "snapshot_key": 17,
@@ -741,6 +746,11 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
         ptg2_candidate_attestation,
         "_locked_candidate_identity",
         AsyncMock(return_value=identity_map),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT",
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
     )
     monkeypatch.setattr(
         ptg2_candidate_attestation.db,
@@ -818,6 +828,11 @@ def test_record_candidate_attestation_rejects_report_quarantine_mismatch(monkeyp
         AsyncMock(return_value=identity_map),
     )
     monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT",
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
+    )
+    monkeypatch.setattr(
         ptg2_candidate_attestation.db,
         "transaction",
         lambda: _Transaction(session),
@@ -872,6 +887,11 @@ def test_attestation_expiry_is_capped_by_report_freshness(monkeypatch):
     monkeypatch.setenv(
         ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_ENV,
         "24",
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT",
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
     )
     monkeypatch.setattr(
         ptg2_candidate_attestation,
@@ -960,14 +980,14 @@ def test_activation_rechecks_attestation_expiry_against_wall_clock(monkeypatch):
     assert params["source_witness_digest"] == b"w" * 32
 
 
-def test_reader_first_phase_accepts_v4_without_switching_current_writer():
+def test_writer_cutover_writes_v4_and_keeps_v3_reader_compatibility():
     assert (
         ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT
-        == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
+        == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
     )
     assert (
         ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT
-        == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
+        == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
     )
     assert ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS == (
         ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4,
@@ -975,13 +995,13 @@ def test_reader_first_phase_accepts_v4_without_switching_current_writer():
     )
 
 
-def test_reader_first_phase_rejects_v4_attestation_writes(monkeypatch):
+def test_writer_cutover_rejects_new_v3_attestation_writes(monkeypatch):
     monkeypatch.setattr(
         ptg2_candidate_attestation,
         "validate_candidate_release_audit_report",
         lambda *_args, **_kwargs: {
             "contract": (
-                ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
+                ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
             )
         },
     )
@@ -995,18 +1015,18 @@ def test_reader_first_phase_rejects_v4_attestation_writes(monkeypatch):
                 source_key="source_a",
                 plan_id="12-3456789",
                 plan_market_type="group",
-                report={"schema_version": 4},
+                report={"schema_version": 3},
             )
         )
     assert exc_info.value.retryable is False
 
 
-def test_reader_first_phase_rechecks_writer_contract_under_lock(monkeypatch):
+def test_writer_cutover_rechecks_contract_under_lock(monkeypatch):
     session = _Session()
     evidence_contracts = iter(
         (
-            ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
             ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4,
+            ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
         )
     )
     monkeypatch.setattr(
@@ -1046,7 +1066,7 @@ def test_reader_first_phase_rechecks_writer_contract_under_lock(monkeypatch):
                 source_key="source_a",
                 plan_id="12-3456789",
                 plan_market_type="group",
-                report={"schema_version": 3},
+                report={"schema_version": 4},
             )
         )
 

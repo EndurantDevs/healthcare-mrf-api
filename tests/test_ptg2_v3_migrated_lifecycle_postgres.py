@@ -30,9 +30,18 @@ from process.ptg import (
     _reused_shared_v3_serving_index,
 )
 from process.ptg_parts.import_rows import _ptg2_source_trace_rows
+from process.ptg_parts.ptg2_batch_candidate_audit_report import (
+    BatchAuditReportInput,
+    BatchAuditReportTarget,
+    build_batch_audit_report,
+)
+from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
+    AuditBatchWitnessBinding,
+    build_audit_batch_request,
+    parse_audit_batch_response,
+)
 from process.ptg_parts.ptg2_candidate_audit_contract import (
-    PTG2_FAST_AUDIT_CONTRACT,
-    PTG2_FAST_AUDIT_TOOL_VERSION,
+    FastAuditHttpConfig,
 )
 from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 from process.ptg_parts.ptg2_manifest_artifacts import write_global_membership_sidecar
@@ -154,10 +163,6 @@ FINAL_EMPTY_TABLES = (
     "ptg2_v3_snapshot_source",
     "ptg2_v3_source_audit_witness",
 )
-
-
-def _sha256(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _quoted(identifier: str) -> str:
@@ -421,134 +426,75 @@ def _graph_artifacts(
     return entries
 
 
-def _release_report(
+async def _release_report(
     *,
+    client,
     snapshot_id: str,
     source_key: str,
     plan_id: str,
-    sample_digest: str,
-    source_set: Mapping[str, Any],
+    raw_container_sha256: str,
+    audit_sample: Mapping[str, Any],
     source_witness: Mapping[str, Any],
     provider_identifier_quarantine: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Build a passing release-audit report for one logical snapshot."""
+    """Execute the real one-request batch gate and build its V4 report."""
 
-    completed_at = datetime.datetime.now(datetime.timezone.utc).replace(
-        microsecond=0
+    audit_target = BatchAuditReportTarget(
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+        plan_id=plan_id,
+        plan_market_type="group",
+        raw_container_sha256=(raw_container_sha256,),
+        source_witness=dict(source_witness),
+        audit_sample=dict(audit_sample),
+        provider_identifier_quarantine=dict(provider_identifier_quarantine),
     )
-    started_at = completed_at - datetime.timedelta(seconds=30)
-    source_witness_map = dict(source_witness)
-    occurrence_count = int(source_witness_map["occurrence_witness_count"])
-    provider_count = int(source_witness_map["provider_witness_count"])
-    total_count = int(source_witness_map["record_count"])
-    return {
-        "schema_version": 3,
-        "harness": {
-            "name": "ptg2_v3_fast_source_witness_audit",
-            "version": PTG2_FAST_AUDIT_TOOL_VERSION,
-            "contract": PTG2_FAST_AUDIT_CONTRACT,
-        },
-        "runtime": {"http_client": "aiohttp", "event_loop": "uvloop"},
-        "status": "pass",
-        "profile": "release",
-        "release_profile_enforced": True,
-        "release_gate_eligible": True,
-        "started_at": started_at.isoformat(),
-        "completed_at": completed_at.isoformat(),
-        "duration_seconds": 30.0,
-        "target": {
-            "expected_architecture": "postgres_binary_v3",
-            "expected_storage_generation": "shared_blocks_v3",
-            "expected_database_backend": "postgresql",
-            "expected_snapshot_lifecycle": "validated",
-            "architecture_assertion": "required_postgresql_session_evidence",
-            "api_path_sha256": _sha256(
-                "/api/v1/pricing/providers/audit-search-by-procedure"
+    audit_request = build_audit_batch_request(
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+        plan_id=plan_id,
+        plan_market_type="group",
+        witness_binding=AuditBatchWitnessBinding(
+            audit_sample_digest=str(audit_sample["sample_digest"]),
+            source_witness_sample_digest=str(source_witness["sample_digest"]),
+            source_witness_payload_sha256=str(source_witness["payload_sha256"]),
+            raw_container_sha256=(raw_container_sha256,),
+            source_witness_occurrence_count=int(
+                source_witness["occurrence_witness_count"]
             ),
-            "api_audit_path_sha256": _sha256(
-                "/api/v1/pricing/providers/audit-occurrences"
+        ),
+    )
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    response = await _asgi_request(
+        client,
+        "post",
+        "/api/v1/pricing/providers/audit-source-witness-batch",
+        json=audit_request.payload,
+        headers=_candidate_headers(snapshot_id),
+    )
+    completed_at = datetime.datetime.now(datetime.timezone.utc)
+    audit_response = parse_audit_batch_response(
+        _response_json(response),
+        request=audit_request,
+        expected_source_witness=source_witness,
+        expected_audit_sample=audit_sample,
+    )
+    return build_batch_audit_report(
+        BatchAuditReportInput(
+            target=audit_target,
+            request=audit_request,
+            response=audit_response,
+            http_config=FastAuditHttpConfig(
+                api_base_url="https://candidate-api.internal.example",
+                headers={},
+                verify_tls=True,
+                transport_contract="verified_https_v1",
             ),
-            "endpoint_contract": "pricing.providers.search_by_procedure",
-            "audit_endpoint_contract": "persisted_served_occurrence_sample_v2",
-            "snapshot_id_sha256": _sha256(snapshot_id),
-            "source_key_sha256": _sha256(source_key),
-            "plan_id_sha256": _sha256(plan_id),
-            "market_type_sha256": _sha256("group"),
-            "tls_verified": True,
-            "transport_contract": "verified_https_v1",
-        },
-        "reproducibility": {},
-        "source": {
-            "source_count": int(source_set["source_count"]),
-            "source_set_digest": source_set["raw_container_sha256_digest"],
-            "witness": source_witness_map,
-            "provider_identifier_quarantine": dict(
-                provider_identifier_quarantine
-            )
-        },
-        "coverage": {
-            "failures": [],
-            "selection_method": source_witness_map["selection_method"],
-            "queryable_occurrence_population_count": source_witness_map[
-                "queryable_occurrence_population_count"
-            ],
-            "emitted_rate_row_count": source_witness_map[
-                "emitted_rate_row_count"
-            ],
-            "unqueryable_rate_row_count": source_witness_map[
-                "unqueryable_rate_row_count"
-            ],
-            "unqueryable_rate_policy": source_witness_map[
-                "unqueryable_rate_policy"
-            ],
-            "occurrence_sample_count": occurrence_count,
-            "provider_sample_count": provider_count,
-        },
-        "checks": {
-            "source_witnesses": total_count,
-            "api_witnesses_matched": occurrence_count,
-            "api_challenges_executed": occurrence_count,
-            "provider_witnesses_validated": provider_count,
-            "api_audit_occurrences_validated": 1,
-        },
-        "http": {
-            "standard_api_actual_http_requests": occurrence_count + 1,
-            "retry_count": 0,
-            "max_concurrency": 32,
-        },
-        "random_api_requests": {
-            "requested": occurrence_count,
-            "executed": occurrence_count,
-        },
-        "latency": {
-            "request_p50_ms": 100.0,
-            "request_p95_ms": 250.0,
-            "request_max_ms": 300.0,
-            "request_p95_ceiling_ms": 250.0,
-            "request_p95_within_ceiling": True,
-        },
-        "api_audit_sample": {
-            "sample_digest": sample_digest,
-            "sample_digest_validated": True,
-            "source_set_validated": True,
-        },
-        "failures": {"counts": {}, "examples": []},
-        "limitations": [],
-        "redaction": {
-            "policy": "sensitive_identifiers_excluded",
-            "excluded": [
-                "source_paths",
-                "source_file_names",
-                "raw_source_hashes",
-                "source_trace_URLs",
-                "plan_and_snapshot_values",
-                "auth_values",
-                "HTTP_bodies",
-                "network_names",
-                "arbitrary_source_and_API_strings",
-            ],
-        },
-    }
+            event_loop_contract="uvloop",
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+    )
 
 
 def _build_asgi_app() -> Sanic:
@@ -1084,12 +1030,13 @@ async def test_v3_lifecycle_fails_closed(
             "activated_at": None,
         }
 
-        report = _release_report(
+        report = await _release_report(
+            client=client,
             snapshot_id=snapshot_a,
             source_key=SOURCE_A,
             plan_id=PLAN_A,
-            sample_digest=candidate_audit["audit_sample"]["sample_digest"],
-            source_set=source_set,
+            raw_container_sha256=artifact_digest,
+            audit_sample=candidate_audit["audit_sample"],
             source_witness=publication.serving_index["source_witness"],
             provider_identifier_quarantine=publication.serving_index[
                 "provider_identifier_quarantine"

@@ -343,6 +343,16 @@ def _summary_benefits_to_dict(payload):
     return mapping
 
 
+def _distinct_state_codes(query_result) -> list[str]:
+    """Return sorted nonempty state codes from a one-column query."""
+
+    return sorted(
+        state_record[0]
+        for state_record in _result_rows(query_result)
+        if state_record[0]
+    )
+
+
 async def _states_for_zip(session, zip_code: str) -> list[str]:
     digits = "".join(ch for ch in zip_code if ch.isdigit())
     if len(digits) < 3:
@@ -359,9 +369,7 @@ async def _states_for_zip(session, zip_code: str) -> list[str]:
             raise
         geo_states = []
     else:
-        geo_states = sorted(
-            value for value in (row[0] for row in _result_rows(geo_result)) if value
-        )
+        geo_states = _distinct_state_codes(geo_result)
         if geo_states:
             return geo_states
 
@@ -370,10 +378,8 @@ async def _states_for_zip(session, zip_code: str) -> list[str]:
         select(func.distinct(plan_rating_areas_table.c.state))
         .where(plan_rating_areas_table.c.zip3 == zip3)
     )
-    result = await session.execute(stmt)
-    states = sorted(
-        value for value in (row[0] for row in _result_rows(result)) if value
-    )
+    rating_area_result = await session.execute(stmt)
+    states = _distinct_state_codes(rating_area_result)
     if states:
         return states
 
@@ -388,9 +394,7 @@ async def _states_for_zip(session, zip_code: str) -> list[str]:
         fallback_result = await session.execute(fallback_stmt)
     except ProgrammingError:
         return []
-    return sorted(
-        value for value in (row[0] for row in _result_rows(fallback_result)) if value
-    )
+    return _distinct_state_codes(fallback_result)
 
 
 
@@ -462,11 +466,11 @@ async def all_plans_variants(request):
         if offset:
             stmt = stmt.offset(int(offset))
 
-    result = await session.execute(stmt)
-    data = []
-    for row in _result_rows(result):
-        row_dict = _row_to_dict(row)
-        data.append(
+    variant_result = await session.execute(stmt)
+    plan_variants = []
+    for variant_row in _result_rows(variant_result):
+        row_dict = _row_to_dict(variant_row)
+        plan_variants.append(
             {
                 "marketing_name": row_dict.get("marketing_name"),
                 "plan_id": row_dict.get("plan_id"),
@@ -474,7 +478,7 @@ async def all_plans_variants(request):
                 "year": row_dict.get("year"),
             }
         )
-    return response.json(data, default=str)
+    return response.json(plan_variants, default=str)
 
 
 async def _fetch_network_entry(session, checksum):
@@ -498,20 +502,20 @@ async def _fetch_network_entry(session, checksum):
         .where(plan_network_tier_table.c.checksum_network == checksum)
     )
 
-    result = await session.execute(stmt)
-    rows = _result_rows(result)
-    if not rows:
+    network_result = await session.execute(stmt)
+    network_rows = _result_rows(network_result)
+    if not network_rows:
         return None
 
     plans = []
-    seen = set()
-    first_row = _row_to_dict(rows[0])
-    for row in rows:
-        row_dict = _row_to_dict(row)
+    seen_plan_keys = set()
+    first_row = _row_to_dict(network_rows[0])
+    for network_row in network_rows:
+        row_dict = _row_to_dict(network_row)
         key = (row_dict.get("plan_id"), row_dict.get("year"))
-        if key not in seen:
+        if key not in seen_plan_keys:
             plans.append({"plan_id": row_dict.get("plan_id"), "year": row_dict.get("year")})
-            seen.add(key)
+            seen_plan_keys.add(key)
 
     issuer_marketing_name = first_row.get("issuer_marketing_name") or ""
     network_tier = first_row.get("network_tier") or "N/A"
@@ -596,20 +600,20 @@ async def get_autocomplete_list(request):
 
     stmt = stmt.limit(100)
 
-    result = await session.execute(stmt)
-    rows = _result_rows(result)
-    if not rows:
+    plan_result = await session.execute(stmt)
+    plan_rows = _result_rows(plan_result)
+    if not plan_rows:
         return response.json({"plans": []}, default=str)
 
-    plans = {}
+    plans_by_id = {}
     plan_ids = []
-    for row in rows:
-        row_dict = _row_to_dict(row)
+    for plan_row in plan_rows:
+        row_dict = _row_to_dict(plan_row)
         plan_id = row_dict.get("plan_id")
-        if plan_id not in plans:
-            row_copy = dict(row_dict)
-            row_copy["network_checksum"] = {}
-            plans[plan_id] = row_copy
+        if plan_id not in plans_by_id:
+            plan_row_dict = dict(row_dict)
+            plan_row_dict["network_checksum"] = {}
+            plans_by_id[plan_id] = plan_row_dict
             plan_ids.append(plan_id)
 
     network_stmt = select(
@@ -620,11 +624,13 @@ async def get_autocomplete_list(request):
 
     network_result = await session.execute(network_stmt)
     for plan_id, checksum, tier in _result_rows(network_result):
-        if plan_id in plans:
-            plans[plan_id]["network_checksum"][str(checksum)] = tier
+        if plan_id in plans_by_id:
+            plans_by_id[plan_id]["network_checksum"][str(checksum)] = tier
 
-    filtered = [plan for plan in plans.values() if plan["network_checksum"]]
-    return response.json({"plans": filtered}, default=str)
+    network_plans = [
+        plan for plan in plans_by_id.values() if plan["network_checksum"]
+    ]
+    return response.json({"plans": network_plans}, default=str)
 
 
 @blueprint.get("/search", name="find_a_plan")
@@ -1073,49 +1079,53 @@ async def get_price_plan(request, plan_id, year=None, variant=None):
     stmt = select(plan_prices_table).where(plan_prices_table.c.plan_id == plan_id)
     if year is not None:
         stmt = stmt.where(plan_prices_table.c.year == year)
-    result = await session.execute(stmt)
-    data = [_row_to_dict(row) for row in _result_rows(result)]
+    price_result = await session.execute(stmt)
+    plan_prices = [
+        _row_to_dict(price_row) for price_row in _result_rows(price_result)
+    ]
     if year is not None:
-        data = [row for row in data if row.get("year") == year]
-    return response.json(data, default=str)
+        plan_prices = [
+            price_entry for price_entry in plan_prices if price_entry.get("year") == year
+        ]
+    return response.json(plan_prices, default=str)
 
 
 @blueprint.post("/price/bulk", name="get_price_plans_bulk")
 async def get_price_plans_bulk(request):
     """Return price data for a bounded collection of plans."""
     session = _get_session(request)
-    payload = request.json or {}
-    if not isinstance(payload, dict):
+    request_body = request.json or {}
+    if not isinstance(request_body, dict):
         raise sanic.exceptions.BadRequest("Request body must be a JSON object")
 
-    raw_plan_ids = payload.get("plan_ids")
+    raw_plan_ids = request_body.get("plan_ids")
     if not isinstance(raw_plan_ids, (list, tuple, set)):
         raise sanic.exceptions.BadRequest("plan_ids must be an array of plan IDs")
 
     plan_ids = []
-    for value in raw_plan_ids:
-        if value is None:
+    for raw_plan_id in raw_plan_ids:
+        if raw_plan_id is None:
             continue
-        plan_ids.append(str(value).strip())
+        plan_ids.append(str(raw_plan_id).strip())
     plan_ids = [pid for pid in plan_ids if pid]
     if not plan_ids:
         raise sanic.exceptions.BadRequest("plan_ids cannot be empty")
 
-    year = payload.get("year")
+    year = request_body.get("year")
     if year is not None:
         try:
             year = int(year)
         except (TypeError, ValueError) as exc:
             raise sanic.exceptions.BadRequest("year must be numeric") from exc
 
-    age = payload.get("age")
+    age = request_body.get("age")
     if age is not None:
         try:
             age = int(age)
         except (TypeError, ValueError) as exc:
             raise sanic.exceptions.BadRequest("age must be numeric") from exc
 
-    rating_area = payload.get("rating_area")
+    rating_area = request_body.get("rating_area")
     if rating_area is not None:
         rating_area = str(rating_area).strip()
         if not rating_area:
@@ -1131,18 +1141,25 @@ async def get_price_plans_bulk(request):
             and_(plan_prices_table.c.min_age <= age, plan_prices_table.c.max_age >= age)
         )
 
-    result = await session.execute(stmt)
-    rows = [_row_to_dict(row) for row in _result_rows(result)]
+    price_result = await session.execute(stmt)
+    price_rows = [
+        _row_to_dict(price_row) for price_row in _result_rows(price_result)
+    ]
 
-    data = {pid: [] for pid in plan_ids}
-    for row in rows:
-        pid = row.get("plan_id")
-        if pid in data:
-            data[pid].append(row)
+    prices_by_plan = {pid: [] for pid in plan_ids}
+    for price_row in price_rows:
+        pid = price_row.get("plan_id")
+        if pid in prices_by_plan:
+            prices_by_plan[pid].append(price_row)
 
-    missing = [pid for pid, entries in data.items() if not entries]
+    missing_plan_ids = [
+        pid for pid, entries in prices_by_plan.items() if not entries
+    ]
 
-    return response.json({"results": data, "missing": missing}, default=str)
+    return response.json(
+        {"results": prices_by_plan, "missing": missing_plan_ids},
+        default=str,
+    )
 
 
 @blueprint.get("/id/<plan_id>", name="get_plan_by_plan_id")
@@ -1191,7 +1208,10 @@ async def get_plan(request, plan_id, year=None, variant=None):
         )
     )
     formulary_result = await session.execute(formulary_stmt)
-    plan_data["formulary"] = [_row_to_dict(row) for row in _result_rows(formulary_result)]
+    plan_data["formulary"] = [
+        _row_to_dict(formulary_row)
+        for formulary_row in _result_rows(formulary_result)
+    ]
 
     drug_count_stmt = (
         select(func.coalesce(plan_drug_stats_table.c.total_drugs, 0))
@@ -1215,7 +1235,7 @@ async def get_plan(request, plan_id, year=None, variant=None):
     variant_result = await session.execute(variant_stmt)
 
     def _unique(values):
-        seen = set()
+        seen_values = set()
         ordered = []
         for value in values:
             if value is None:
@@ -1238,12 +1258,19 @@ async def get_plan(request, plan_id, year=None, variant=None):
                 else:
                     value = trimmed
             normalized = str(value).strip()
-            if normalized and normalized not in seen:
-                seen.add(normalized)
+            if normalized and normalized not in seen_values:
+                seen_values.add(normalized)
                 ordered.append(normalized)
         return ordered
 
-    variants = _unique([row[0] if isinstance(row, (list, tuple)) else row for row in _result_rows(variant_result)])
+    variants = _unique(
+        [
+            variant_row[0]
+            if isinstance(variant_row, (list, tuple))
+            else variant_row
+            for variant_row in _result_rows(variant_result)
+        ]
+    )
 
     plan_data["attributes"] = {}
     plan_data["plan_benefits"] = {}
@@ -1262,8 +1289,8 @@ async def get_plan(request, plan_id, year=None, variant=None):
         )
     )
     plan_attr_result = await session.execute(plan_attr_stmt)
-    for row in _result_rows(plan_attr_result):
-        row_dict = _row_to_dict(row)
+    for attribute_row in _result_rows(plan_attr_result):
+        row_dict = _row_to_dict(attribute_row)
         full_id = _normalize_single(row_dict.get("full_plan_id"))
         if full_id and full_id not in variants:
             variants.append(full_id)
@@ -1293,8 +1320,8 @@ async def get_plan(request, plan_id, year=None, variant=None):
             values.append(coins)
         return ", ".join(values) if values else None
 
-    for row in _result_rows(plan_benefit_result):
-        row_dict = _row_to_dict(row)
+    for benefit_row in _result_rows(plan_benefit_result):
+        row_dict = _row_to_dict(benefit_row)
         full_id = _normalize_single(row_dict.get("full_plan_id"))
         if full_id and full_id not in variants:
             variants.append(full_id)

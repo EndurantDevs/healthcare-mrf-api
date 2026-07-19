@@ -726,12 +726,11 @@ accounting; it does not issue another candidate-audit HTTP request. Any differen
 missing attestation, or non-activated current snapshot fails closed.
 
 The bounded PostgreSQL witness audit is the sole automated release verifier.
-Deployment is reader-first and uses two releases. The first release deploys
-readers that accept V3 and V4 while the automatic worker continues writing V3.
-Only a follow-up release may switch the worker to one V4 report per candidate.
-Persistence is centrally limited to the current writer contract, so the control
-attestation endpoint rejects V4 during the reader-first release even though all
-new readers accept stored V4 evidence.
+The reader-first release has deployed readers that accept V3 and V4. The
+current writer release switches the automatic worker to one V4 report per
+candidate. Persistence is centrally limited to that current writer contract,
+so the control attestation endpoint rejects new V3 writes while readers retain
+V3 compatibility for existing history.
 An unactivated identity-equal V3 row may upgrade to V4, while V4-to-V3
 downgrade and every activated-row rewrite fail closed. Activation never
 rereads or decompresses complete source files. The witness
