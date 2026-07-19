@@ -4,7 +4,7 @@ import json
 import types
 
 import pytest
-from sanic.exceptions import NotFound
+from sanic.exceptions import InvalidUsage, NotFound
 
 from api.endpoint import formulary
 
@@ -60,6 +60,83 @@ def make_request(results, args=None):
     session = FakeSession(results)
     ctx = types.SimpleNamespace(sa_session=session)
     return types.SimpleNamespace(args=args or {}, ctx=ctx)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    ((None, None), ("", None), ("null", None), ("0", 0), ("42", 42)),
+)
+def test_parse_positive_int_accepts_empty_and_nonnegative_values(value, expected):
+    assert formulary._parse_positive_int(value, "limit") == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    (("invalid", "must be an integer"), ("-1", "must be non-negative")),
+)
+def test_parse_positive_int_rejects_invalid_values(value, message):
+    with pytest.raises(InvalidUsage, match=message):
+        formulary._parse_positive_int(value, "limit")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    ((None, None), (True, True), (" YES ", True), ("0", False)),
+)
+def test_parse_bool_accepts_empty_native_and_text_values(value, expected):
+    assert formulary._parse_bool(value, "covered") is expected
+
+
+def test_parse_bool_rejects_unknown_text():
+    with pytest.raises(InvalidUsage, match="must be boolean-like"):
+        formulary._parse_bool("sometimes", "covered")
+
+
+@pytest.mark.parametrize(
+    ("formulary_id", "message"),
+    (
+        ("PLAN123", "must include a year"),
+        (":2025", "missing plan id"),
+        ("PLAN123:year", "year must be numeric"),
+    ),
+)
+def test_decode_formulary_id_rejects_invalid_shapes(formulary_id, message):
+    with pytest.raises(InvalidUsage, match=message):
+        formulary._decode_formulary_id(formulary_id)
+
+
+def test_sort_and_order_normalization_cover_valid_and_invalid_values():
+    assert formulary._normalise_sort("NAME", {"name"}, "tier") == "name"
+    assert formulary._normalise_order("DESC") == "desc"
+
+    with pytest.raises(InvalidUsage, match="Unsupported sort field"):
+        formulary._normalise_sort("cost", {"name"}, "name")
+    with pytest.raises(InvalidUsage, match="Order must"):
+        formulary._normalise_order("sideways")
+
+
+def test_get_session_and_tier_options_cover_failure_and_duplicate_paths():
+    request = types.SimpleNamespace(ctx=types.SimpleNamespace())
+    with pytest.raises(RuntimeError, match="session not available"):
+        formulary._get_session(request)
+
+    tier_options = formulary._build_tier_options(("Tier 1", "Tier 1", None))
+    assert tier_options == [
+        {"tier_slug": "tier_1", "tier_label": "Tier 1"},
+        {"tier_slug": "unknown", "tier_label": "UNKNOWN"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_collect_distinct_strings_ignores_nulls_and_deduplicates():
+    session = FakeSession(
+        [FakeResult(rows=[("Retail",), (None,), ("Mail",), ("Retail",)])]
+    )
+
+    assert await formulary._collect_distinct_strings(session, object()) == [
+        "Mail",
+        "Retail",
+    ]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -106,6 +108,110 @@ def test_allowed_sources_skip_code_keys_outside_provider_scope():
         {("CPT", "99213"): ({"code_key": 7}, {"code_key": 99})},
         {7: (5,)},
     ) == {7: {0}}
+
+
+def test_required_occurrence_keys_preserve_provider_source_correlation():
+    first = _challenge()
+    second = replace(
+        first,
+        npi=1234567891,
+        source_artifact_key=1,
+    )
+    persisted = batch.PersistedAuditOccurrence(
+        b"p" * 32,
+        8,
+        7,
+        14,
+        1,
+        1234567892,
+        0,
+        15,
+    )
+
+    required = batch._required_candidate_occurrence_keys(
+        (first, second),
+        {("CPT", "99213"): ({"code_key": 7},)},
+        {first.npi: (5,), second.npi: (6,)},
+        (persisted,),
+    )
+
+    assert required == frozenset({(7, 5, 0), (7, 6, 1), (8, 7, 1)})
+    assert (7, 5, 1) not in required
+    assert (7, 6, 0) not in required
+
+
+@pytest.mark.asyncio
+async def test_price_load_prunes_cross_product_before_hydration(monkeypatch):
+    """Hydrate only exact diagonal coordinates from one broad forward read."""
+
+    first, second, persisted, broad_index = _cross_product_price_load_case()
+    forward_lookup = AsyncMock(return_value=broad_index)
+
+    async def hydrate(_session, _tables, price_keys, *, copy_payloads):
+        retained_keys = set(price_keys)
+        assert copy_payloads is False
+        return SimpleNamespace(
+            atom_keys_by_price_key={key: (key + 100,) for key in retained_keys},
+            prices_by_key={key: [{"key": key}] for key in retained_keys},
+        )
+
+    hydration = AsyncMock(side_effect=hydrate)
+    monkeypatch.setattr(batch, "_candidate_forward_price_keys", forward_lookup)
+    monkeypatch.setattr(batch, "_version_three_price_hydration", hydration)
+
+    price_load = await batch._load_candidate_price_data(
+        object(),
+        _serving_tables(),
+        (first, second),
+        {("CPT", "99213"): ({"code_key": 7},)},
+        {first.npi: (5,), second.npi: (6,)},
+        {7: (5, 6), 8: (7,)},
+        (persisted,),
+    )
+
+    assert price_load.data.price_keys_by_occurrence == {
+        (7, 5, 0): (10,),
+        (7, 6, 1): (13,),
+        (8, 7, 1): (14,),
+    }
+    assert hydration.await_args.args[2] == {10, 13, 14}
+    assert price_load.selection_io == {
+        "exact_candidate_occurrence_coordinates": 3,
+        "forward_occurrence_coordinates_before_exact_filter": 5,
+        "forward_occurrence_coordinates_after_exact_filter": 3,
+        "forward_price_key_deliveries_before_exact_filter": 5,
+        "forward_price_key_deliveries_after_exact_filter": 3,
+        "discarded_forward_price_key_deliveries": 2,
+    }
+
+
+def _cross_product_price_load_case():
+    """Return two diagonal challenges and their deliberately broad index."""
+
+    first = _challenge()
+    second = replace(
+        first,
+        npi=1234567891,
+        source_artifact_key=1,
+    )
+    persisted = batch.PersistedAuditOccurrence(
+        b"p" * 32,
+        8,
+        7,
+        14,
+        1,
+        1234567892,
+        0,
+        15,
+    )
+    broad_index = {
+        (7, 5, 0): (10,),
+        (7, 5, 1): (11,),
+        (7, 6, 0): (12,),
+        (7, 6, 1): (13,),
+        (8, 7, 1): (14,),
+    }
+    return first, second, persisted, broad_index
 
 
 class _NetworkSession:

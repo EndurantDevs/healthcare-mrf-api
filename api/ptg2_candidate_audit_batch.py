@@ -30,6 +30,10 @@ from api.ptg2_candidate_audit_projection import (
     _build_canonical_candidate_tuple,
     candidate_availability_index,
 )
+from api.ptg2_candidate_audit_selection import (
+    required_candidate_occurrence_keys as _required_candidate_occurrence_keys,
+    select_candidate_forward_prices,
+)
 from api.ptg2_serving import (
     PTG2_SCHEMA,
     _required_shared_snapshot_key,
@@ -65,6 +69,14 @@ class _CandidateAuditData:
     ]
     candidate_processing_io: Mapping[str, int]
     persisted_audit_occurrence_count: int = 0
+
+
+@dataclass(frozen=True)
+class _CandidatePriceLoad:
+    """Candidate prices plus proof that broad forward rows were pruned once."""
+
+    data: CandidatePriceData
+    selection_io: Mapping[str, int]
 
 
 @dataclass(frozen=True)
@@ -288,24 +300,25 @@ async def _candidate_audit_data(
         challenges,
         persisted_audit_occurrences,
     )
-    price_data = await _load_candidate_price_data(
+    price_load = await _load_candidate_price_data(
         session,
         serving_tables,
         challenges,
         scope_indexes.code_index.by_pair,
+        scope_indexes.provider_set_keys_by_npi,
         scope_indexes.provider_filters_by_code_key,
         persisted_audit_occurrences,
     )
     validate_persisted_audit_price_scope(
         persisted_audit_occurrences,
-        price_data,
+        price_load.data,
     )
     availability_index, processing_ledger = candidate_availability_index(
         challenges,
         scope_indexes.code_index.by_pair,
         scope_indexes.provider_set_keys_by_npi,
         scope_indexes.network_digests_by_key,
-        price_data,
+        price_load.data,
     )
     return _CandidateAuditData(
         challenges=challenges,
@@ -391,19 +404,30 @@ async def _load_candidate_price_data(
     serving_tables: PTG2ServingTables,
     challenges: Sequence[AuditBatchChallenge],
     code_records_by_pair: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]],
+    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
     provider_filters_by_code_key: Mapping[int, tuple[int, ...]],
     persisted_audit_occurrences: Sequence[PersistedAuditOccurrence] = (),
-) -> CandidatePriceData:
-    """Build the final forward index and hydrate each retained price once."""
+) -> _CandidatePriceLoad:
+    """Prune broad forward rows, then hydrate each exact retained price once."""
 
-    price_keys_by_occurrence = await _candidate_forward_price_keys(
-        session,
-        serving_tables,
+    required_occurrence_keys = _required_candidate_occurrence_keys(
         challenges,
         code_records_by_pair,
-        provider_filters_by_code_key,
+        provider_set_keys_by_npi,
         persisted_audit_occurrences,
     )
+    forward_selection = select_candidate_forward_prices(
+        await _candidate_forward_price_keys(
+            session,
+            serving_tables,
+            challenges,
+            code_records_by_pair,
+            provider_filters_by_code_key,
+            persisted_audit_occurrences,
+        ),
+        required_occurrence_keys,
+    )
+    price_keys_by_occurrence = forward_selection.price_keys_by_occurrence
     retained_price_keys = {
         price_key
         for occurrence_price_keys in price_keys_by_occurrence.values()
@@ -415,10 +439,13 @@ async def _load_candidate_price_data(
         retained_price_keys,
         copy_payloads=False,
     )
-    return CandidatePriceData(
-        price_keys_by_occurrence,
-        hydration.atom_keys_by_price_key,
-        hydration.prices_by_key,
+    return _CandidatePriceLoad(
+        data=CandidatePriceData(
+            price_keys_by_occurrence,
+            hydration.atom_keys_by_price_key,
+            hydration.prices_by_key,
+        ),
+        selection_io=forward_selection.selection_io,
     )
 
 

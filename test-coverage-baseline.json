@@ -43,6 +43,7 @@
         "api/ptg2_candidate_audit_coordinates.py",
         "api/ptg2_candidate_audit_integrity.py",
         "api/ptg2_candidate_audit_projection.py",
+        "api/ptg2_candidate_audit_selection.py",
         "api/ptg2_capacity_evidence.py",
         "api/ptg2_code_context.py",
         "api/ptg2_code_details.py",
@@ -230,12 +231,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 17900,
-          "total": 29814
+          "covered": 17936,
+          "total": 29818
         },
         "lines": {
-          "covered": 64182,
-          "total": 86046
+          "covered": 64269,
+          "total": 86081
         }
       },
       "path": "test-coverage-python.json",
