@@ -233,12 +233,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 18128,
-          "total": 29872
+          "covered": 18138,
+          "total": 29880
         },
         "lines": {
-          "covered": 64640,
-          "total": 86219
+          "covered": 64655,
+          "total": 86229
         }
       },
       "path": "test-coverage-python.json",
