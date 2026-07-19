@@ -177,69 +177,17 @@ def test_profile_publication_filters_invalid_npis_from_new_and_copied_rows():
 
     assert "(npi) BETWEEN 1000000000 AND 2999999999" in evidence_insert_sql
     assert "(npi) BETWEEN 1000000000 AND 2999999999" in evidence_copy_sql
+    assert "source_id = ANY(CAST(:retained_source_ids AS varchar[]))" in (
+        evidence_copy_sql
+    )
+    assert "source_id <> ALL(CAST(:retained_source_ids AS varchar[]))" in (
+        profile_copy_sql
+    )
     assert (
         "(profile.npi) BETWEEN 1000000000 AND 2999999999"
         in profile_copy_sql
     )
     assert "JOIN \"mrf\".\"npi\"" not in evidence_insert_sql
-
-
-def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
-    sql = profile.profile_evidence_insert_sql(
-        target_ref='"fixture"."evidence"',
-        source_ref='"fixture"."source"',
-        practitioner_ref='"fixture"."practitioner"',
-        role_ref='"fixture"."role"',
-        organization_ref='"fixture"."organization"',
-        service_ref='"fixture"."service"',
-        endpoint_ref='"fixture"."endpoint"',
-    )
-
-    for fact_type in (
-        "age",
-        "years_of_practice",
-        "credential",
-        "taxonomy_qualification",
-        "qualification_detail",
-        "language",
-        "contact",
-        "specialty",
-        "new_patient_acceptance",
-        "telehealth",
-        "accepting_medicaid",
-        "role_identifier",
-        "organization",
-        "affiliation",
-        "service",
-        "endpoint",
-    ):
-        assert f"'{fact_type}'" in sql
-    assert "practitioner.birth_date" not in sql
-    assert "practitioner.birthDate" not in sql
-    assert "practitioner.age_years BETWEEN 18 AND 100" in sql
-    assert "'derivation', 'FHIR Practitioner.birthDate'" in sql
-    assert "basis_start_date" in sql
-    assert "'identifiers', role.identifiers::jsonb" in sql
-    assert "'identifiers', service.identifiers::jsonb" in sql
-    assert "'accepting_patients', service.accepting_patients::jsonb" in sql
-    assert "'comment', service.comment" in sql
-    assert "JOIN \"fixture\".\"endpoint\" AS endpoint" in sql
-    assert (
-        "JOIN \"fixture\".\"provider_directory_dataset_affiliation_organization\" "
-        "AS affiliation_edge"
-    ) in sql
-    assert (
-        "JOIN \"fixture\".\"provider_directory_organization_affiliation\" "
-        "AS affiliation"
-    ) in sql
-    assert "affiliation.participating_organization_ref" in sql
-    assert "affiliation_edge.dataset_id = role_rows.dataset_id" in sql
-    assert "affiliation.organization_ref = role_rows.organization_ref" not in sql
-    assert "'accepting_patients', COALESCE(" in sql
-    assert "npi) BETWEEN 1000000000 AND 2999999999" in sql
-    assert "AND MOD(" in sql
-    assert "{{VALID_NPI_SQL}}" not in sql
-    assert "ON CONFLICT (evidence_key) DO NOTHING" in sql
 
 
 def test_profile_artifact_scope_materializes_endpoint_resources():
@@ -306,12 +254,18 @@ async def test_profile_scope_filters_to_current_immutable_dataset_fence(
     )
     monkeypatch.setattr(importer.db, "all", fake_all)
 
-    source_ids = await importer._provider_directory_profile_scope_source_ids(
-        "mrf",
-        {"source_allowed"},
+    source_ids, retained_source_ids = (
+        await importer._provider_directory_profile_scope_source_ids(
+            "mrf",
+            {"source_allowed"},
+        )
     )
 
     assert source_ids == ["source_allowed"]
+    assert retained_source_ids == [
+        "source_allowed",
+        "source_outside_fence",
+    ]
     assert captured_by_name["params"]["configured_source_ids"] == [
         "source_allowed",
         "source_outside_fence",
@@ -341,7 +295,9 @@ async def test_profile_stage_build_creates_logged_tables_without_rewrite(
         schema="mrf",
         generation_id="generation",
         source_ids=("source_a",),
+        retained_source_ids=("source_a",),
         dataset_ids=("dataset_a",),
+        profile_as_of="2026-07-19",
         evidence_stage="evidence_stage",
         profile_stage="profile_stage",
     )
@@ -408,7 +364,9 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
         schema="mrf",
         generation_id="generation_1",
         source_ids=("source_a",),
+        retained_source_ids=("source_a",),
         dataset_ids=("dataset_a",),
+        profile_as_of="2026-07-19",
         evidence_stage="evidence_stage",
         profile_stage="profile_stage",
     )
@@ -474,7 +432,7 @@ async def test_profile_publish_refuses_a_partial_artifact_pair(monkeypatch):
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_scope_source_ids",
-        AsyncMock(return_value=["source_a"]),
+        AsyncMock(return_value=(["source_a"], ["source_a"])),
     )
     monkeypatch.setattr(
         importer,

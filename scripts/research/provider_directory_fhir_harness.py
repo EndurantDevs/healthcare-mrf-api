@@ -215,9 +215,9 @@ def _run_fixture_case() -> CaseResult:
     try:
         importer = importlib.import_module("process.provider_directory_fhir")
 
-        source = {"source_id": "fixture_source", "api_base": "https://fixture.example/fhir"}
+        fixture_source_by_field = {"source_id": "fixture_source", "api_base": "https://fixture.example/fhir"}
         capability = importer.parse_capability(
-            source,
+            fixture_source_by_field,
             {
                 "resourceType": "CapabilityStatement",
                 "fhirVersion": "4.0.1",
@@ -234,9 +234,9 @@ def _run_fixture_case() -> CaseResult:
             {"status": "valid", "http_status": 200, "response_time_ms": 12, "url": "https://fixture.example/fhir/metadata"},
         )
         parsed = _parse_fixture_resources(importer)
-        resource_counts: dict[str, int] = {}
-        for model, _row in (item for item in parsed if item):
-            resource_counts[model.__tablename__] = resource_counts.get(model.__tablename__, 0) + 1
+        resource_count_by_table: dict[str, int] = {}
+        for model, _row in (parsed_resource for parsed_resource in parsed if parsed_resource):
+            resource_count_by_table[model.__tablename__] = resource_count_by_table.get(model.__tablename__, 0) + 1
         completeness_checks = _fixture_completeness_checks(parsed)
         is_complete = (
             capability["fhir_version"] == "4.0.1"
@@ -251,7 +251,7 @@ def _run_fixture_case() -> CaseResult:
             elapsed_seconds=time.monotonic() - started,
             metrics={
                 "supported_resources": capability["supported_resources"],
-                "resource_counts": resource_counts,
+                "resource_counts": resource_count_by_table,
                 "completeness_checks": completeness_checks,
             },
         )
@@ -339,7 +339,7 @@ async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
     sqlalchemy_url = f"postgresql+asyncpg://{auth}@{args.db_host}:{args.db_port}/{args.db_database}"
     engine = None
     raw_execute = None
-    schema_created = False
+    is_schema_created = False
     status = "succeeded"
     error: str | None = None
     try:
@@ -359,10 +359,10 @@ async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
 
         raw_execute = raw
         await raw(_sql_typing_ddl(schema))
-        schema_created = True
+        is_schema_created = True
         engine = create_async_engine(sqlalchemy_url)
         async with engine.begin() as conn:
-            params = {
+            query_params_by_name = {
                 "run_id": "run_sql_typing",
                 "after_source_id": None,
                 "after_resource_id": None,
@@ -372,15 +372,20 @@ async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
                 schema,
                 run_id="run_sql_typing",
             )
-            row = (await conn.execute(text(sql), params)).fetchone()
-            assert row is not None and row.candidate_rows == 0
+            batch_result_row = (
+                await conn.execute(text(sql), query_params_by_name)
+            ).fetchone()
+            assert batch_result_row is not None
+            assert batch_result_row.candidate_rows == 0
 
             seen_sql = importer.provider_directory_location_address_key_batch_sql(
                 schema,
                 run_id="run_sql_typing",
                 seen_table="provider_directory_import_seen_stage_test",
             )
-            seen_row = (await conn.execute(text(seen_sql), params)).fetchone()
+            seen_row = (
+                await conn.execute(text(seen_sql), query_params_by_name)
+            ).fetchone()
             assert seen_row is not None and seen_row.candidate_rows == 0
     except Exception as exc:
         status = "failed"
@@ -388,7 +393,11 @@ async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
     finally:
         if engine is not None:
             await engine.dispose()
-        if schema_created and raw_execute is not None and not args.keep_sql_schema:
+        if (
+            is_schema_created
+            and raw_execute is not None
+            and not args.keep_sql_schema
+        ):
             try:
                 await raw_execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
             except Exception as exc:
@@ -422,16 +431,16 @@ def _parse_import_metrics(output: str) -> dict[str, Any]:
     for line in reversed(output.splitlines()):
         if not line.startswith(prefix):
             continue
-        metrics: dict[str, Any] = {}
+        metrics_by_name: dict[str, Any] = {}
         for token in line[len(prefix) :].strip().split():
             if "=" not in token:
                 continue
             key, value = token.split("=", 1)
             try:
-                metrics[key] = int(value)
+                metrics_by_name[key] = int(value)
             except ValueError:
-                metrics[key] = value
-        return metrics
+                metrics_by_name[key] = value
+        return metrics_by_name
     return {}
 
 
@@ -508,7 +517,12 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
     if args.no_probe:
         command.append("--no-probe")
     env = os.environ.copy()
-    env.update({key: str(value) for key, value in (args.env or {}).items()})
+    env.update(
+        {
+            key: str(environment_value)
+            for key, environment_value in (args.env or {}).items()
+        }
+    )
     try:
         proc = subprocess.run(
             command,
@@ -541,7 +555,7 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
     token = args.control_token or os.getenv("HLTHPRT_CONTROL_API_TOKEN")
     if not control_url or not token:
         return CaseResult(case_id=case_id, kind="control", status="skipped", elapsed_seconds=0, error="control URL/token not supplied")
-    payload = {
+    request_payload_by_field = {
         "importer": "provider-directory-fhir",
         "idempotency_key": f"provider-directory-fhir-harness-{dt.datetime.now(dt.UTC).strftime('%Y%m%d%H%M%S')}",
         "params": {
@@ -552,13 +566,13 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         },
     }
     if args.refresh_preset:
-        payload["params"]["refresh_preset"] = args.refresh_preset
+        request_payload_by_field["params"]["refresh_preset"] = args.refresh_preset
     if args.include_supplemental_catalogs is not None:
-        payload["params"]["include_supplemental_catalogs"] = args.include_supplemental_catalogs
+        request_payload_by_field["params"]["include_supplemental_catalogs"] = args.include_supplemental_catalogs
     if args.stale_cleanup is not None:
-        payload["params"]["stale_cleanup"] = args.stale_cleanup
+        request_payload_by_field["params"]["stale_cleanup"] = args.stale_cleanup
     if args.publish_artifacts is not None:
-        payload["params"]["publish_artifacts"] = args.publish_artifacts
+        request_payload_by_field["params"]["publish_artifacts"] = args.publish_artifacts
     for key in (
         "resource_limit",
         "resource_deadline_seconds",
@@ -569,20 +583,20 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         "stream_batch_size",
         "source_concurrency",
     ):
-        value = getattr(args, key)
-        if value is not None:
-            payload["params"][key] = value
+        param_value = getattr(args, key)
+        if param_value is not None:
+            request_payload_by_field["params"][key] = param_value
     if args.limit:
-        payload["params"]["limit"] = args.limit
+        request_payload_by_field["params"]["limit"] = args.limit
     if args.source_query:
-        payload["params"]["source_query"] = args.source_query
+        request_payload_by_field["params"]["source_query"] = args.source_query
     if args.retest_results_path:
-        payload["params"]["retest_results_path"] = args.retest_results_path
+        request_payload_by_field["params"]["retest_results_path"] = args.retest_results_path
     if args.retest_results_url:
-        payload["params"]["retest_results_url"] = args.retest_results_url
+        request_payload_by_field["params"]["retest_results_url"] = args.retest_results_url
     request = urllib.request.Request(
         f"{control_url}/imports",
-        data=json.dumps(payload).encode("utf-8"),
+        data=json.dumps(request_payload_by_field).encode("utf-8"),
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         method="POST",
     )
@@ -823,21 +837,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         results.append(_run_coverage_audit_case(args))
     if args.control_url:
         results.append(_run_control_case("control-api", args))
-    serialized = [result.to_json() for result in results]
-    overall_status = "failed" if any(item["status"] == "failed" for item in serialized) else "succeeded"
-    report = {
+    serialized_results = [result.to_json() for result in results]
+    overall_status = "failed" if any(item["status"] == "failed" for item in serialized_results) else "succeeded"
+    report_by_field = {
         "generated_at": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "overall_status": overall_status,
-        "results": serialized,
+        "results": serialized_results,
     }
     output_root = (
         Path(args.output_dir)
         if args.output_dir
         else DEFAULT_REPORT_DIR / f"run-{dt.datetime.now(dt.UTC).strftime('%Y%m%d%H%M%S')}"
     )
-    write_report(report, output_root)
-    report["output_dir"] = str(output_root)
-    return report
+    write_report(report_by_field, output_root)
+    report_by_field["output_dir"] = str(output_root)
+    return report_by_field
 
 
 def _add_harness_case_args(parser: argparse.ArgumentParser) -> None:
@@ -923,13 +937,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     _add_source_catalog_args(parser)
     _add_import_behavior_args(parser)
     args = parser.parse_args(argv)
-    env: dict[str, str] = {}
+    environment_by_name: dict[str, str] = {}
     for item in args.env:
         key, sep, value = item.partition("=")
         if not sep or not key:
             raise SystemExit(f"invalid --env value: {item}")
-        env[key] = value
-    args.env = env
+        environment_by_name[key] = value
+    args.env = environment_by_name
     return args
 
 

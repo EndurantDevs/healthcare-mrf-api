@@ -20,6 +20,7 @@ from api import control
 from api import metrics as api_metrics
 from api.control import _require_control_auth
 from api import control_imports
+from api.provider_directory_sources import provider_directory_source_catalog
 from api.control_imports import (
     _enqueue_import_start,
     _remove_queued_job,
@@ -2546,6 +2547,44 @@ async def test_control_importers_endpoint(monkeypatch):
     payload = json.loads(response.body)
 
     assert payload == {"items": [{"name": "ptg", "engine": "healthcare-mrf-api"}], "next_cursor": None}
+
+
+def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
+    payload = provider_directory_source_catalog()
+    runnable_items = [item for item in payload["items"] if item["runnable"]]
+    probe_items = [item for item in payload["items"] if not item["runnable"]]
+
+    assert payload["entry_count"] == 29
+    assert payload["runnable_count"] == 17
+    assert payload["profile_source_count"] == 17
+    assert len(payload["catalog_digest"]) == 64
+    assert len(runnable_items) == 17
+    assert all(item["profile_enabled"] for item in runnable_items)
+    assert len(probe_items) == 12
+    assert all(item["classification"] == "probe_only" for item in probe_items)
+    assert {item["entry_id"] for item in runnable_items} >= {
+        "aetna-commercial-medicare",
+        "alohr",
+        "caresource",
+        "molina",
+    }
+
+
+@pytest.mark.asyncio
+async def test_control_provider_directory_sources_endpoint(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    monkeypatch.setattr(
+        control,
+        "provider_directory_source_catalog",
+        lambda: {"catalog_digest": "a" * 64, "items": []},
+    )
+
+    response = await control.control_provider_directory_sources(authed_request())
+
+    assert json.loads(response.body) == {
+        "catalog_digest": "a" * 64,
+        "items": [],
+    }
 
 
 @pytest.mark.asyncio

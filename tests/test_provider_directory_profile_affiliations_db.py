@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime
@@ -51,7 +52,11 @@ async def _require_profile_database(database: Database) -> None:
         )
     except (OSError, OperationalError):
         pytest.skip("profile affiliation tests need disposable PostgreSQL")
-    if "test" not in database_name.lower():
+    is_schema_test_opted_in = os.getenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_ALLOW_SCHEMA_TESTS",
+        "",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if "test" not in database_name.lower() and not is_schema_test_opted_in:
         pytest.skip("profile affiliation tests need a test database")
 
 
@@ -210,6 +215,7 @@ async def _build_profile_artifacts(
         ),
         source_ids=["profile-source-a", "profile-source-b"],
         dataset_ids=["profile-dataset-a", "profile-dataset-b"],
+        profile_as_of="2026-07-19",
     )
     await database.status(
         profile.profile_insert_sql(
@@ -219,6 +225,7 @@ async def _build_profile_artifacts(
             rebuild_all=True,
         ),
         generation_id="profile-affiliation-test",
+        profile_as_of="2026-07-19",
     )
 
 

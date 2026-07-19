@@ -32,6 +32,12 @@ from typing import Any
 
 import asyncpg
 
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from process import provider_directory_profile as profile_artifact
+
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 PROVIDER_DIRECTORY_RESOURCE_TABLES = (
@@ -111,24 +117,11 @@ def _sql_string_array(values: list[str] | tuple[str, ...] | frozenset[str]) -> s
 
 
 def _sql_ref_matches_resource(ref_expr: str, resource_type: str, resource_id_expr: str) -> str:
-    resource_type_literal = str(resource_type).replace("'", "''")
-    return (
-        f"({ref_expr} IN ({resource_id_expr}, '{resource_type_literal}/' || {resource_id_expr}) "
-        f"OR {ref_expr} LIKE '%/{resource_type_literal}/' || {resource_id_expr})"
-    )
+    return f"({_sql_fhir_reference_resource_id(ref_expr, resource_type)} = {resource_id_expr})"
 
 
 def _sql_fhir_reference_resource_id(ref_expr: str, resource_type: str) -> str:
-    resource_type_literal = str(resource_type).replace("'", "''")
-    return (
-        "NULLIF(BTRIM(CASE "
-        f"WHEN {ref_expr} LIKE '%/{resource_type_literal}/%' "
-        f"THEN regexp_replace({ref_expr}, '^.*/{resource_type_literal}/', '') "
-        f"WHEN {ref_expr} LIKE '{resource_type_literal}/%' "
-        f"THEN regexp_replace({ref_expr}, '^{resource_type_literal}/', '') "
-        f"ELSE {ref_expr} "
-        "END), '')"
-    )
+    return profile_artifact.fhir_reference_resource_id_sql(ref_expr, resource_type)
 
 
 def _pct(numerator: int, denominator: int) -> float:

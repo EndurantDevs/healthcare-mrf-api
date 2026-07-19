@@ -6659,19 +6659,17 @@ def test_address_corroboration_sql_links_overlay_roles():
     assert "loc.resource_id = e.location_resource_id" in sql
     assert "COALESCE(role.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs" in sql
     assert "COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs" in sql
-    assert (
-        "insurance_plan.resource_id = NULLIF(BTRIM(CASE WHEN plan_ref.value LIKE '%/InsurancePlan/%'"
-        in sql
-    )
+    assert "insurance_plan.resource_id = CASE WHEN BTRIM(plan_ref.value)" in sql
+    assert "(?:^|/)InsurancePlan/" in sql
     assert "|| insurance_plan.resource_id" not in sql
     assert "JOIN LATERAL (\n              SELECT DISTINCT normalized_ref AS resource_id" in sql
     assert "organization.resource_id = organization_ref.resource_id" in sql
     assert "organization_address_matches AS" not in sql
     assert "'organization_address'::varchar AS provider_directory_match_type" not in sql
     assert 'LEFT JOIN "mrf"."provider_directory_network_catalog" network_catalog' in sql
-    assert "network_catalog.network_resource_id = NULLIF(BTRIM(CASE" in sql
-    assert "regexp_replace(network_ref.value, '^.*/Organization/', '')" in sql
-    assert "regexp_replace(network_ref.value, '^Organization/', '')" in sql
+    assert "network_catalog.network_resource_id = CASE WHEN BTRIM(network_ref.value)" in sql
+    assert "(?:^|/)Organization/" in sql
+    assert "(?:/_history/" in sql
     assert "overlay.address_key::uuid AS address_key" in sql
     assert "jsonb_build_object(" in sql
     assert "'matched_on'," in sql
@@ -6956,11 +6954,14 @@ def test_reference_resource_key_handles_relative_and_absolute_fhir_refs():
     assert importer._reference_resource_key("Organization/org-1", "Location") is None
 
 
-def test_sql_ref_matches_resource_accepts_absolute_url_suffixes():
+def test_sql_ref_matches_resource_accepts_absolute_and_versioned_references():
     sql = importer._sql_ref_matches_resource("refs.ref", "Organization", "org.resource_id")
 
-    assert "refs.ref IN (org.resource_id, 'Organization/' || org.resource_id)" in sql
-    assert "refs.ref LIKE '%/Organization/' || org.resource_id" in sql
+    assert "substring(BTRIM(refs.ref) FROM" in sql
+    assert "(?:^|/)Organization/" in sql
+    assert "(?:/_history/" in sql
+    assert "(?:[?#].*)?$" in sql
+    assert "= org.resource_id" in sql
 
 
 def test_linked_resource_candidate_urls_use_network_endpoint_for_network_refs():
@@ -11473,6 +11474,26 @@ def _stub_checkpoint_retry_process(monkeypatch, requested_source_id):
     return import_resources
 
 
+def _checkpoint_retry_task(requested_source_id):
+    """Return the unbounded retry task shared by checkpoint regressions."""
+    return {
+        "run_id": "run_retry",
+        "retry_of_run_id": "run_parent",
+        "provider_directory_pagination_root_run_id": "run_root",
+        "seed_db_path": "fixture.db",
+        "source_ids": [requested_source_id],
+        "probe": True,
+        "import_resources": True,
+        "resources": "Location",
+        "full_refresh": True,
+        "resource_limit": 0,
+        "page_limit": 0,
+        "stream_batch_size": 5000,
+        "stale_cleanup": False,
+        "publish_artifacts": False,
+    }
+
+
 @pytest.mark.asyncio
 async def test_checkpoint_retry_keeps_exact_source_after_transient_probe_rejection(
     monkeypatch,
@@ -11485,22 +11506,7 @@ async def test_checkpoint_retry_keeps_exact_source_after_transient_probe_rejecti
 
     metrics = await importer.process_data(
         {"context": {}},
-        {
-            "run_id": "run_retry",
-            "retry_of_run_id": "run_parent",
-            "provider_directory_pagination_root_run_id": "run_root",
-            "seed_db_path": "fixture.db",
-            "source_ids": [requested_source_id],
-            "probe": True,
-            "import_resources": True,
-            "resources": "Location",
-            "full_refresh": True,
-            "resource_limit": 0,
-            "page_limit": 0,
-            "stream_batch_size": 5000,
-            "stale_cleanup": False,
-            "publish_artifacts": False,
-        },
+        _checkpoint_retry_task(requested_source_id),
     )
 
     assert metrics["source_import_sources_selected_checkpoint_retry"] == 1
@@ -11535,22 +11541,7 @@ async def test_checkpoint_retry_surfaces_quota_deadline_before_resume_failure(
     with pytest.raises(RuntimeError, match=importer.PAGINATION_RESUME_REQUIRED_ERROR):
         await importer.process_data(
             process_context_map,
-            {
-                "run_id": "run_retry",
-                "retry_of_run_id": "run_parent",
-                "provider_directory_pagination_root_run_id": "run_root",
-                "seed_db_path": "fixture.db",
-                "source_ids": [requested_source_id],
-                "probe": True,
-                "import_resources": True,
-                "resources": "Location",
-                "full_refresh": True,
-                "resource_limit": 0,
-                "page_limit": 0,
-                "stream_batch_size": 5000,
-                "stale_cleanup": False,
-                "publish_artifacts": False,
-            },
+            _checkpoint_retry_task(requested_source_id),
         )
 
     audit_dict = process_context_map["context"]["audit"]
@@ -11558,6 +11549,42 @@ async def test_checkpoint_retry_surfaces_quota_deadline_before_resume_failure(
     assert audit_dict["provider_directory_retry_not_before_by_resource"] == {
         "Location": retry_not_before
     }
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_retry_persists_completion_before_resume_failure(
+    monkeypatch,
+):
+    requested_source_id = "pdfhir_checkpointed"
+    _stub_checkpoint_retry_process(monkeypatch, requested_source_id)
+
+    async def fake_import_resources(
+        _sources,
+        *,
+        pagination_resume_required,
+        resource_completion,
+        **_kwargs,
+    ):
+        resource_completion["Organization"] = {requested_source_id}
+        pagination_resume_required.add(f"{requested_source_id}:Location")
+        return {"Organization": 1, "Location": 0}
+
+    monkeypatch.setattr(importer, "_import_resources", fake_import_resources)
+    process_context_map = {"context": {}}
+
+    with pytest.raises(RuntimeError, match=importer.PAGINATION_RESUME_REQUIRED_ERROR):
+        await importer.process_data(
+            process_context_map,
+            _checkpoint_retry_task(requested_source_id),
+        )
+
+    audit_dict = process_context_map["context"]["audit"]
+    assert audit_dict["resource_fetch_completed_source_ids"] == {
+        "Organization": [requested_source_id]
+    }
+    assert audit_dict["pagination_resume_required"] == [
+        f"{requested_source_id}:Location"
+    ]
 
 
 @pytest.mark.asyncio
@@ -20197,8 +20224,9 @@ def test_network_catalog_insert_sql_resolves_network_refs():
     assert 'FROM "mrf"."provider_directory_practitioner_role" AS role' in sql
     assert 'FROM "mrf"."provider_directory_organization_affiliation" AS affiliation' in sql
     assert 'JOIN "mrf"."provider_directory_organization" AS network_org' in sql
-    assert "regexp_replace(refs_raw.network_ref, '^.*/Organization/', '')" in sql
-    assert "regexp_replace(refs_raw.network_ref, '^Organization/', '')" in sql
+    assert "substring(BTRIM(refs_raw.network_ref) FROM" in sql
+    assert "(?:^|/)Organization/" in sql
+    assert "(?:/_history/" in sql
     assert "provider_directory_issuer_network_match_key" in sql
     assert "insurance_plan.last_seen_run_id = CAST(:run_id AS varchar)" in sql
     assert "insurance_plan.source_id = ANY(CAST(:source_ids AS varchar[]))" in sql

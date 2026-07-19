@@ -231,6 +231,7 @@ def test_overlay_query_is_current_deterministic_and_has_no_role_scan():
 
     assert '"mrf".provider_directory_address_overlay' in sql
     assert '"mrf".provider_directory_profile_evidence' in sql
+    assert "dataset.dataset_id" in sql
     assert "overlay.source_id = current_source.source_id" in sql
     assert "overlay.last_seen_run_id = current_source.run_id" in sql
     assert "profile_evidence.source_id = current_source.source_id" in sql

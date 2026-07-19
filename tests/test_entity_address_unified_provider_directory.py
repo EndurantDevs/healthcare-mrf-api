@@ -82,7 +82,9 @@ def test_practitioner_role_resolves_plan_identifiers_and_network_organizations()
     assert "COALESCE(role.insurance_plan_refs::jsonb, '[]'::jsonb)" in sql
     assert "JOIN mrf.provider_directory_insurance_plan AS insurance_plan" in sql
     assert "insurance_plan.source_id = role.source_id" in sql
-    assert "insurance_plan.resource_id = NULLIF(BTRIM(CASE" in sql
+    assert "insurance_plan.resource_id = CASE WHEN BTRIM(plan_ref.value)" in sql
+    assert "(?:^|/)InsurancePlan/" in sql
+    assert "(?:/_history/" in sql
     assert "COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)" in sql
     assert "LEFT JOIN mrf.provider_directory_network_catalog AS network_catalog" in sql
     assert "network_catalog.network_resource_id = network_ref.network_resource_id" in sql

@@ -52,7 +52,7 @@ def run_acquisition_cli(argv: list[str] | None = None) -> int:
     selected_entry_ids = frozenset(args.entry)
     plan = harness.build_operator_plan(manifest, selected_entry_ids)
     if args.validate_only:
-        payload = {
+        output_by_field = {
             "valid": True,
             "entries": len(plan["entries"]),
             "manifest_sha256": plan["manifest_sha256"],
@@ -60,17 +60,17 @@ def run_acquisition_cli(argv: list[str] | None = None) -> int:
         exit_code = 0
     elif args.operator_input:
         operator_input = harness.load_operator_input(args.operator_input)
-        payload = harness.evaluate_operator_input(
+        output_by_field = harness.evaluate_operator_input(
             manifest, operator_input, selected_entry_ids
         )
-        exit_code = 0 if payload["ok"] else 2
+        exit_code = 0 if output_by_field["ok"] else 2
     else:
-        payload = plan
+        output_by_field = plan
         exit_code = 0
 
     if args.output:
-        harness.write_json(args.output, payload)
-    print(json.dumps(payload, sort_keys=True))
+        harness.write_json(args.output, output_by_field)
+    print(json.dumps(output_by_field, sort_keys=True))
     return exit_code
 
 

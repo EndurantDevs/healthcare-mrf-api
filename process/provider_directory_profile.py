@@ -13,6 +13,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
+from process.provider_directory_profile_reference_sql import (
+    current_profile_evidence_sql,
+    fhir_reference_resource_id_sql,
+)
+
 
 PROFILE_TABLE = "provider_directory_profile"
 PROFILE_EVIDENCE_TABLE = "provider_directory_profile_evidence"
@@ -330,13 +335,15 @@ def copy_existing_evidence_sql(
     source_ref: str,
     target_ref: str,
 ) -> str:
-    """Copy evidence for sources outside an incremental refresh."""
+    """Copy retained evidence for sources outside an incremental refresh."""
     columns = ", ".join(quote_identifier(column) for column in profile_evidence_columns())
     return f"""
         INSERT INTO {target_ref} ({columns})
         SELECT {columns}
-          FROM {source_ref}
+         FROM {source_ref}
          WHERE source_id <> ALL(CAST(:source_ids AS varchar[]))
+           AND source_id = ANY(CAST(:retained_source_ids AS varchar[]))
+           AND {current_profile_evidence_sql()}
            AND {valid_npi_sql("npi")};
     """
 
@@ -354,8 +361,10 @@ def copy_unaffected_profiles_sql(
         INSERT INTO {profile_stage_ref} ({columns})
         WITH affected_npis AS MATERIALIZED (
             SELECT npi
-              FROM {evidence_source_ref}
+             FROM {evidence_source_ref}
              WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
+                OR source_id <> ALL(CAST(:retained_source_ids AS varchar[]))
+                OR NOT {current_profile_evidence_sql()}
             UNION
             SELECT npi
               FROM {evidence_stage_ref}
@@ -407,6 +416,27 @@ def profile_evidence_insert_sql(
             "AFFILIATION_ORGANIZATION_REF": affiliation_organization_ref,
             "SERVICE_REF": service_ref,
             "ENDPOINT_REF": endpoint_ref,
+            "ROLE_PRACTITIONER_RESOURCE_ID_SQL": (
+                fhir_reference_resource_id_sql(
+                    "role.practitioner_ref",
+                    "Practitioner",
+                )
+            ),
+            "ROLE_SERVICE_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
+                "service_reference.value",
+                "HealthcareService",
+            ),
+            "ROLE_ENDPOINT_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
+                "endpoint_reference.value",
+                "Endpoint",
+            ),
+            "ROLE_ORGANIZATION_RESOURCE_ID_SQL": (
+                fhir_reference_resource_id_sql(
+                    "role.organization_ref",
+                    "Organization",
+                )
+            ),
+            "CURRENT_EVIDENCE_SQL": current_profile_evidence_sql(),
             "VALID_NPI_SQL": valid_npi_sql("npi"),
         },
     )
@@ -427,6 +457,8 @@ def profile_insert_sql(
             SELECT npi
               FROM {old_evidence_ref}
              WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
+                OR source_id <> ALL(CAST(:retained_source_ids AS varchar[]))
+                OR NOT {current_profile_evidence_sql()}
             UNION
             SELECT npi
               FROM {evidence_ref}

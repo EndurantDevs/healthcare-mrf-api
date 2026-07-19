@@ -1124,14 +1124,7 @@ def _provider_directory_affiliation_keys_from_addresses(
 
 
 def _provider_directory_reference_resource_id_sql(reference: str, resource_type: str) -> str:
-    return (
-        "NULLIF(BTRIM(CASE "
-        f"WHEN {reference} LIKE '%/{resource_type}/%' "
-        f"THEN regexp_replace({reference}, '^.*/{resource_type}/', '') "
-        f"WHEN {reference} LIKE '{resource_type}/%' "
-        f"THEN regexp_replace({reference}, '^{resource_type}/', '') "
-        f"ELSE {reference} END), '')"
-    )
+    return profile_artifact.fhir_reference_resource_id_sql(reference, resource_type)
 
 
 def _provider_directory_plan_network_match_sql(

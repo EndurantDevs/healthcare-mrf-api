@@ -21,6 +21,7 @@ from api.control_imports import (
 )
 from api.control_workers import ensure_worker, worker_registry
 from api.control_auth import require_control_auth as _require_control_auth
+from api.provider_directory_sources import provider_directory_source_catalog
 from api.mrf_discovery_catalog import (
     DEFAULT_FILE_PAGE_SIZE,
     DEFAULT_SOURCE_PAGE_SIZE,
@@ -67,6 +68,13 @@ async def control_importers(request):
 
     _require_control_auth(request)
     return response.json({"items": importer_registry(), "next_cursor": None})
+
+
+@blueprint.get("/provider-directory/sources")
+async def control_provider_directory_sources(request):
+    """List reviewed FHIR sources from the deployed acquisition contract."""
+    _require_control_auth(request)
+    return response.json(provider_directory_source_catalog())
 
 
 @blueprint.get("/health/node")

@@ -1408,19 +1408,22 @@ def test_overlap_uses_serving_network_names():
     assert "AND plan_ids.plan_id = $1" in sql
 
 
-def test_provider_directory_coverage_audit_ref_match_accepts_absolute_url_suffixes():
+def test_provider_directory_coverage_audit_ref_match_accepts_versioned_url_suffixes():
     sql = audit._sql_ref_matches_resource("refs.ref", "Organization", "org.resource_id")
 
-    assert "refs.ref IN (org.resource_id, 'Organization/' || org.resource_id)" in sql
-    assert "refs.ref LIKE '%/Organization/' || org.resource_id" in sql
+    assert "substring(BTRIM(refs.ref) FROM" in sql
+    assert "(?:^|/)Organization/" in sql
+    assert "(?:/_history/" in sql
+    assert "= org.resource_id" in sql
 
 
 def test_provider_directory_coverage_audit_reference_id_expr_accepts_absolute_url_suffixes():
     sql = audit._sql_fhir_reference_resource_id("refs.ref", "Organization")
 
-    assert "regexp_replace(refs.ref, '^.*/Organization/', '')" in sql
-    assert "regexp_replace(refs.ref, '^Organization/', '')" in sql
-    assert "ELSE refs.ref" in sql
+    assert "substring(BTRIM(refs.ref) FROM" in sql
+    assert "(?:^|/)Organization/" in sql
+    assert "(?:/_history/" in sql
+    assert "(?:[?#].*)?$" in sql
 
 
 @pytest.mark.asyncio
