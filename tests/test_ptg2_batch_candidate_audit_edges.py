@@ -95,6 +95,17 @@ def test_event_loop_contract_requires_uvloop_when_configured(monkeypatch):
         require_uvloop=False
     )
 
+    class RecognizedUvloop:
+        pass
+
+    monkeypatch.setattr(batch_audit.uvloop, "Loop", RecognizedUvloop)
+    monkeypatch.setattr(
+        batch_audit.asyncio,
+        "get_running_loop",
+        RecognizedUvloop,
+    )
+    assert batch_audit._event_loop_contract(require_uvloop=True) == "uvloop"
+
 
 def _connector_failure() -> batch_audit.aiohttp.ClientConnectorError:
     connection_key = SimpleNamespace(
@@ -185,6 +196,50 @@ async def test_batch_client_classifies_transport_without_retry_or_details(
     assert str(exc_info.value) == expected_reason
     assert "sensitive-transport-detail" not in str(exc_info.value)
     assert "private.example" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_batch_client_rejects_nonretryable_response(monkeypatch):
+    observed_posts = []
+
+    class RejectedResponse:
+        status = 400
+        content = ChunkContent([b"{}"])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc_info):
+            return False
+
+    class RejectedResponseSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc_info):
+            return False
+
+        def post(self, request_url, **request_options):
+            observed_posts.append((request_url, request_options))
+            return RejectedResponse()
+
+    monkeypatch.setattr(
+        batch_audit.aiohttp,
+        "ClientSession",
+        lambda **_session_options: RejectedResponseSession(),
+    )
+
+    with pytest.raises(
+        batch_audit.BatchCandidateAuditContractError,
+        match="batch_endpoint_rejected",
+    ):
+        await batch_audit._post_batch_request(
+            request_payload_by_field={},
+            http_config=_http_config("https://private.example"),
+            deadline_seconds=55.0,
+        )
+
+    assert len(observed_posts) == 1
 
 
 @pytest.mark.asyncio
