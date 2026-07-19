@@ -74,7 +74,7 @@ def test_interrupted_private_replacement_is_rebuilt(monkeypatch):
     def is_index_shape_matching(*_args, **_options):
         raise RuntimeError(
             "existing_schema_index_invalid:fixture."
-            "entity_address_unified_idx_geo_bbox_hjhp3"
+            "entity_address_unified_idx_geo_bbox_replacement"
         )
 
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "fixture")
