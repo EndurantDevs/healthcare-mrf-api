@@ -25,6 +25,7 @@ from api.ptg2_shared_blocks import (
     shared_block_read_once_scope,
 )
 from db.connection import db
+from process.ptg_parts import ptg2_shared_audit as shared_audit
 from process.ptg_parts import ptg2_shared_blocks as shared_blocks_module
 from process.ptg_parts import ptg2_serving_binary_v3
 from process.ptg_parts.ptg2_shared_blocks import (
@@ -1885,9 +1886,9 @@ async def test_read_once_scope_poisoned_corruption_is_never_retried():
 
 
 @pytest.mark.asyncio
-async def test_fetch_shared_blocks_fails_on_corrupt_content_hash():
+async def test_fetch_shared_blocks_fails_when_payload_no_longer_matches_content_hash():
     row = _stored_row(object_kind="page_v4", block_key=7, fragment_no=0, raw_payload=b"first")
-    row["block_hash"] = b"x" * 32
+    row["payload"] = b"other"
 
     with pytest.raises(PTG2SharedBlockError, match="identity"):
         await fetch_shared_blocks(
@@ -1896,6 +1897,37 @@ async def test_fetch_shared_blocks_fails_on_corrupt_content_hash():
             snapshot_key=12,
             object_kind="page_v4",
             block_keys=[7],
+        )
+
+
+def test_candidate_audit_rejects_corrupt_content_hash():
+    with pytest.raises(RuntimeError, match="block hash validation failed"):
+        shared_audit._BuildingBlockReader(
+            object(),
+            schema_name="mrf",
+            snapshot_key=1,
+            budget=shared_audit._ReadBudget(),
+        )._decode_fragment(
+            "serving",
+            {
+                "object_kind": "serving",
+                "block_object_kind": "serving",
+                "block_key": 1,
+                "fragment_no": 0,
+                "mapping_entry_count": 1,
+                "block_entry_count": 1,
+                "format_version": 2,
+                "codec": "none",
+                "raw_byte_count": 3,
+                "stored_byte_count": 3,
+                "payload": b"abd",
+                "block_hash": shared_block_hash(
+                    format_version=2,
+                    object_kind="serving",
+                    codec="none",
+                    payload=b"abc",
+                ),
+            },
         )
 
 

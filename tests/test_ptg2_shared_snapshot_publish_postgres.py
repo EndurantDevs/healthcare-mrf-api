@@ -40,6 +40,7 @@ from process.ptg_parts.ptg2_candidate_attestation import (
 from process.ptg_parts.ptg2_shared_blocks import (
     bind_snapshot_to_shared_layout,
     reserve_shared_layout,
+    shared_block_hash,
     shared_semantic_fingerprint,
 )
 from process.ptg_parts.ptg2_shared_finalize import (
@@ -455,7 +456,7 @@ async def test_real_postgres_shared_block_mapping_upsert_is_idempotent_and_fail_
 async def test_real_postgres_shared_block_publish_preserves_content_conflict_checks(
     monkeypatch,
 ):
-    """Stored-content comparison rejects both fresh and retry hash conflicts."""
+    """Content-addressed reuse retains metadata and durable-existence checks."""
 
     if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
         pytest.skip(
@@ -518,11 +519,24 @@ async def test_real_postgres_shared_block_publish_preserves_content_conflict_che
             """
         )
 
-        identical_rows = """
-            (decode(repeat('11', 32), 'hex'), 2, 'serving', 1, 0,
-             3, 'none', 3, 3, decode('616263', 'hex')),
-            (decode(repeat('11', 32), 'hex'), 2, 'serving', 2, 0,
-             3, 'none', 3, 3, decode('616263', 'hex'))
+        canonical_payload_bytes = b"abc"
+        canonical_block_hash_hex = shared_block_hash(
+            format_version=2,
+            object_kind="serving",
+            codec="none",
+            payload=canonical_payload_bytes,
+        ).hex()
+        missing_block_hash_hex = shared_block_hash(
+            format_version=2,
+            object_kind="serving",
+            codec="none",
+            payload=b"missing",
+        ).hex()
+        identical_rows = f"""
+            (decode('{canonical_block_hash_hex}', 'hex'), 2, 'serving', 1, 0,
+             3, 'none', 3, 3, decode('{canonical_payload_bytes.hex()}', 'hex')),
+            (decode('{canonical_block_hash_hex}', 'hex'), 2, 'serving', 2, 0,
+             3, 'none', 3, 3, decode('{canonical_payload_bytes.hex()}', 'hex'))
         """
         for _ in range(2):
             await load_stage(identical_rows)
@@ -550,8 +564,8 @@ async def test_real_postgres_shared_block_publish_preserves_content_conflict_che
 
         # A metadata-only retry reuses the immutable durable payload.
         await load_stage(
-            """
-            (decode(repeat('11', 32), 'hex'), 2, 'serving', 1, 0,
+            f"""
+            (decode('{canonical_block_hash_hex}', 'hex'), 2, 'serving', 1, 0,
              3, 'none', 3, 3, NULL)
             """
         )
@@ -566,9 +580,9 @@ async def test_real_postgres_shared_block_publish_preserves_content_conflict_che
 
         # Metadata-only rows cannot create an absent durable block.
         await load_stage(
-            """
-            (decode(repeat('33', 32), 'hex'), 2, 'serving', 3, 0,
-             3, 'none', 3, 3, NULL)
+            f"""
+            (decode('{missing_block_hash_hex}', 'hex'), 2, 'serving', 3, 0,
+             1, 'none', 7, 7, NULL)
             """
         )
         with pytest.raises(RuntimeError, match="conflicts with stored content metadata"):
@@ -579,11 +593,11 @@ async def test_real_postgres_shared_block_publish_preserves_content_conflict_che
                 build_token="build-8",
             )
 
-        # A retry cannot reuse a hash for different stored content.
+        # Reuse still rejects lightweight metadata drift without reading payloads.
         await load_stage(
-            """
-            (decode(repeat('11', 32), 'hex'), 2, 'serving', 3, 0,
-             3, 'none', 3, 3, decode('78797a', 'hex'))
+            f"""
+            (decode('{canonical_block_hash_hex}', 'hex'), 2, 'serving', 3, 0,
+             4, 'none', 3, 3, NULL)
             """
         )
         with pytest.raises(RuntimeError, match="conflicts with stored content metadata"):
@@ -592,23 +606,6 @@ async def test_real_postgres_shared_block_publish_preserves_content_conflict_che
                 stage_table=stage_table,
                 snapshot_key=7,
                 build_token="build-7",
-            )
-
-        # Conflicting rows sharing a new hash also fail and roll back the chosen insert.
-        await load_stage(
-            """
-            (decode(repeat('22', 32), 'hex'), 2, 'serving', 1, 0,
-             3, 'none', 3, 3, decode('616263', 'hex')),
-            (decode(repeat('22', 32), 'hex'), 2, 'serving', 2, 0,
-             3, 'none', 3, 3, decode('78797a', 'hex'))
-            """
-        )
-        with pytest.raises(RuntimeError, match="conflicts with stored content metadata"):
-            await publish_shared_block_stage(
-                schema_name=schema_name,
-                stage_table=stage_table,
-                snapshot_key=8,
-                build_token="build-8",
             )
 
         assert int(
