@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import hashlib
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -274,6 +274,153 @@ def test_release_report_validation_fails_closed(mutation, message):
             plan_id="12-3456789",
             plan_market_type="group",
         )
+
+
+@pytest.mark.parametrize(
+    ("mapping_value", "expected_mapping"),
+    (
+        ({"value": 1}, {"value": 1}),
+        ('{"value": 2}', {"value": 2}),
+        ("[]", {}),
+        ("{", {}),
+        (None, {}),
+    ),
+)
+def test_attestation_mapping_edges(mapping_value, expected_mapping):
+    assert ptg2_candidate_attestation._mapping(mapping_value) == expected_mapping
+
+
+def test_attestation_row_mapping_edges():
+    driver_row = Mock()
+    driver_row._mapping = {"value": 3}
+
+    assert ptg2_candidate_attestation._row_mapping(None) == {}
+    assert ptg2_candidate_attestation._row_mapping({"value": 1}) == {"value": 1}
+    assert ptg2_candidate_attestation._row_mapping(driver_row) == {"value": 3}
+    assert ptg2_candidate_attestation._row_mapping((("value", 4),)) == {
+        "value": 4
+    }
+
+
+@pytest.mark.parametrize(
+    ("timestamp_value", "message"),
+    (
+        (None, "is invalid"),
+        ("not-a-timestamp", "is invalid"),
+        ("2026-07-19T12:00:00", "must include a timezone"),
+    ),
+)
+def test_attestation_timestamp_edges(timestamp_value, message):
+    with pytest.raises(ValueError, match=message):
+        ptg2_candidate_attestation._report_timestamp(
+            timestamp_value,
+            field="time",
+        )
+
+
+def test_v3_report_time_normalizes_clock():
+    report_by_field = _release_report()
+    completed_at = datetime.datetime.fromisoformat(report_by_field["completed_at"])
+
+    assert ptg2_candidate_attestation._validated_v3_report_time(
+        report_by_field,
+        completed_at.replace(tzinfo=None),
+    ) == completed_at
+
+
+@pytest.mark.parametrize(
+    ("report_mutator", "evaluation_delta", "message"),
+    (
+        (
+            lambda report_by_field: report_by_field.update(duration_seconds=True),
+            datetime.timedelta(),
+            "timing is invalid",
+        ),
+        (
+            lambda _report_by_field: None,
+            datetime.timedelta(
+                seconds=(
+                    ptg2_candidate_attestation
+                    .PTG2_CANDIDATE_AUDIT_REPORT_FUTURE_SKEW_SECONDS
+                    + 1
+                )
+            ),
+            "future",
+        ),
+    ),
+)
+def test_v3_report_time_edges(report_mutator, evaluation_delta, message):
+    report_by_field = _release_report()
+    report_mutator(report_by_field)
+    completed_at = datetime.datetime.fromisoformat(report_by_field["completed_at"])
+
+    with pytest.raises(ValueError, match=message):
+        ptg2_candidate_attestation._validated_v3_report_time(
+            report_by_field,
+            completed_at - evaluation_delta,
+        )
+
+
+@pytest.mark.parametrize(
+    ("section_name", "field_name", "invalid_value"),
+    (
+        (None, "schema_version", 4),
+        ("harness", "name", "wrong"),
+        ("harness", "contract", "wrong"),
+        ("harness", "version", "wrong"),
+    ),
+)
+def test_v3_tool_identity_edges(section_name, field_name, invalid_value):
+    report_by_field = _release_report()
+    mutation_mapping = (
+        report_by_field
+        if section_name is None
+        else report_by_field[section_name]
+    )
+    mutation_mapping[field_name] = invalid_value
+
+    with pytest.raises(ValueError):
+        ptg2_candidate_attestation._validated_v3_tool_version(
+            ptg2_candidate_attestation._v3_report_sections(report_by_field)
+        )
+
+
+@pytest.mark.asyncio
+async def test_database_timestamp_type_edge():
+    timestamp_result = Mock()
+    timestamp_result.scalar_one.return_value = "not-a-timestamp"
+    session = Mock()
+    session.execute = AsyncMock(return_value=timestamp_result)
+
+    with pytest.raises(RuntimeError, match="did not return"):
+        await ptg2_candidate_attestation._database_timestamp(session)
+
+
+@pytest.mark.parametrize(
+    "database_timestamp",
+    (
+        datetime.datetime(2026, 7, 19, 12),
+        datetime.datetime(
+            2026,
+            7,
+            19,
+            12,
+            tzinfo=datetime.timezone.utc,
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_database_timestamp_timezone_edges(database_timestamp):
+    timestamp_result = Mock()
+    timestamp_result.scalar_one.return_value = database_timestamp
+    session = Mock()
+    session.execute = AsyncMock(return_value=timestamp_result)
+    expected_timestamp = database_timestamp.replace(tzinfo=datetime.timezone.utc)
+
+    assert (
+        await ptg2_candidate_attestation._database_timestamp(session)
+        == expected_timestamp
+    )
 
 
 def test_release_report_cannot_refresh_attestation_after_freshness_window():

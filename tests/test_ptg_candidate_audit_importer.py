@@ -444,6 +444,208 @@ async def test_candidate_scope_rejects_snapshot_layout_quarantine_mismatch(monke
         )
 
 
+@pytest.mark.parametrize(
+    ("mapping_value", "expected_mapping"),
+    (
+        ({"value": 1}, {"value": 1}),
+        ('{"value": 2}', {"value": 2}),
+        ("[]", {}),
+        ("{", {}),
+        (None, {}),
+    ),
+)
+def test_candidate_mapping_edges(mapping_value, expected_mapping):
+    assert ptg_candidate_audit._mapping(mapping_value) == expected_mapping
+
+
+def test_candidate_row_mapping_edges():
+    driver_row = Mock()
+    driver_row._mapping = {"value": 2}
+
+    assert ptg_candidate_audit._row_mapping({"value": 1}) == {"value": 1}
+    assert ptg_candidate_audit._row_mapping(driver_row) == {"value": 2}
+
+
+@pytest.mark.parametrize(
+    ("database_rows", "message"),
+    (
+        (
+            [{"source_key": "bad", "raw_container_sha256": RAW_DIGEST}],
+            "invalid ordinal",
+        ),
+        (
+            [{"source_key": 1, "raw_container_sha256": RAW_DIGEST}],
+            "not dense",
+        ),
+        ([], "no public raw source"),
+        (
+            [
+                {"source_key": 0, "raw_container_sha256": RAW_DIGEST},
+                {"source_key": 1, "raw_container_sha256": RAW_DIGEST},
+            ],
+            "ambiguous",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_candidate_raw_source_edges(monkeypatch, database_rows, message):
+    monkeypatch.setattr(
+        ptg_candidate_audit.db,
+        "all",
+        AsyncMock(return_value=database_rows),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        await ptg_candidate_audit._candidate_raw_sources("candidate-snapshot")
+
+
+@pytest.mark.parametrize(
+    ("activated", "candidate_mutator", "message"),
+    (
+        (
+            False,
+            lambda candidate_row: candidate_row.update(import_run_id="wrong"),
+            "run binding",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row["manifest"]["serving_index"].update(
+                provider_identifier_quarantine={}
+            ),
+            "quarantine is invalid",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row["layout_manifest"].update(
+                serving_index={
+                    **candidate_row["layout_manifest"]["serving_index"],
+                    "source_witness": {},
+                }
+            ),
+            "source witness changed",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row.update(snapshot_id=""),
+            "exact strict",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row["manifest"]["activation"].update(
+                source_key=""
+            ),
+            "source scope is incomplete",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row.update(
+                previous_snapshot_id="other"
+            ),
+            "predecessor binding",
+        ),
+        (
+            True,
+            lambda candidate_row: candidate_row["manifest"]["activation"].update(
+                mode="wrong"
+            ),
+            "cannot be corroborated",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row.update(status="draft"),
+            "not validated",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row.update(
+                current_snapshot_id="candidate-snapshot"
+            ),
+            "not validated",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row.update(
+                current_snapshot_id="new-current"
+            ),
+            "not validated",
+        ),
+        (
+            True,
+            lambda candidate_row: candidate_row.update(audit_report=None),
+            "no corroborating audit report",
+        ),
+    ),
+)
+def test_candidate_target_binding_edges(
+    activated,
+    candidate_mutator,
+    message,
+):
+    candidate_row_by_field = _candidate_row(activated=activated)
+    candidate_mutator(candidate_row_by_field)
+
+    with pytest.raises(ValueError, match=message):
+        ptg_candidate_audit._candidate_target_from_row(
+            candidate_row_by_field,
+            candidate_run_id="ptg2:derived-import",
+            raw_container_sha256=(RAW_DIGEST,),
+        )
+
+
+@pytest.mark.parametrize(
+    "configuration_case",
+    ("url", "token", "header", "trusted"),
+)
+def test_audit_configuration_security_edges(monkeypatch, configuration_case):
+    message_by_case = {
+        "url": ptg_candidate_audit.API_BASE_URL_ENV,
+        "token": "HLTHPRT_CONTROL_API_TOKEN",
+        "header": "auth header",
+        "trusted": ptg_candidate_audit.TRUSTED_CLUSTER_HTTP_ENV,
+    }
+    monkeypatch.delenv("PTG_AUDIT_API_BASE_URL", raising=False)
+    monkeypatch.delenv(ptg_candidate_audit.AUTH_SCHEME_ENV, raising=False)
+    monkeypatch.setenv(
+        ptg_candidate_audit.API_BASE_URL_ENV,
+        "https://candidate.example",
+    )
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "token")
+    monkeypatch.setenv(ptg_candidate_audit.AUTH_HEADER_ENV, "Authorization")
+    monkeypatch.setenv(ptg_candidate_audit.TRUSTED_CLUSTER_HTTP_ENV, "false")
+
+    if configuration_case == "url":
+        monkeypatch.delenv(ptg_candidate_audit.API_BASE_URL_ENV)
+    elif configuration_case == "token":
+        monkeypatch.delenv("HLTHPRT_CONTROL_API_TOKEN")
+    elif configuration_case == "header":
+        monkeypatch.setenv(ptg_candidate_audit.AUTH_HEADER_ENV, "bad\nheader")
+    else:
+        monkeypatch.setenv(
+            ptg_candidate_audit.TRUSTED_CLUSTER_HTTP_ENV,
+            "maybe",
+        )
+
+    with pytest.raises(ValueError, match=message_by_case[configuration_case]):
+        ptg_candidate_audit._audit_configuration("candidate-snapshot")
+
+
+def test_audit_summary_timing_edges():
+    empty_summary_by_field = ptg_candidate_audit._audit_summary({}, "d" * 64)
+    assert empty_summary_by_field["audit_timings"] == {}
+
+    batch_summary_by_field = ptg_candidate_audit._audit_summary(
+        {
+            "duration_seconds": True,
+            "latency": {"request_p50_ms": True},
+            "batch": {"endpoint_duration_ms": 1.0},
+        },
+        "d" * 64,
+    )
+    assert batch_summary_by_field["audit_timings"] == {
+        "endpoint_duration_ms": 1.0
+    }
+
+
 def test_candidate_audit_has_no_retained_source_file_dependency():
     assert not hasattr(ptg_candidate_audit, "resolve_retained_raw_files")
     assert ptg_candidate_audit.PTG2_BATCH_AUDIT_WRITER_ENABLED is False
