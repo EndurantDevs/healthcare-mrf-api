@@ -809,6 +809,22 @@ def test_release_audit_rejects_untrusted_plain_http_configuration(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_progress_without_control_run_is_a_no_op(monkeypatch):
+    mark_control_run = AsyncMock()
+    monkeypatch.setattr(ptg_candidate_audit, "mark_control_run", mark_control_run)
+
+    await ptg_candidate_audit._progress(
+        None,
+        snapshot_id="candidate-snapshot",
+        phase="candidate release audit",
+        message="ignored",
+        pct=20,
+    )
+
+    mark_control_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_default_v4_audit_attests_then_activates(
     monkeypatch,
 ):
