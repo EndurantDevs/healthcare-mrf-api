@@ -65,6 +65,21 @@ def _source_witness(source_set):
     }
 
 
+def _audit_sample(sample_digest: str) -> dict[str, object]:
+    return {
+        "contract": "persisted_served_occurrence_sample_v2",
+        "format_version": 2,
+        "method": "publish_time_stratified_v1",
+        "sample_count": 1,
+        "maximum_rows": 2_560,
+        "sample_digest": sample_digest,
+        "source_count": 1,
+        "occurrence_identity": "sha256_candidate_ordinal_source_key_v2",
+        "complete_population": False,
+        "serving_multiplicity_semantics": "source_multiset_v1",
+    }
+
+
 def _release_report(**target_overrides):
     """Support the release report test fixture."""
     completed_at = datetime.datetime.now(datetime.timezone.utc).replace(
@@ -331,14 +346,14 @@ def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
     serving_index = {
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
-        "audit_sample": {"sample_digest": audit_sample_digest},
+        "audit_sample": _audit_sample(audit_sample_digest),
         "source_witness": _source_witness(source_set),
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
     layout_serving_index = {
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_count": 1,
-        "audit_sample": {"sample_digest": audit_sample_digest},
+        "audit_sample": _audit_sample(audit_sample_digest),
         "source_witness": _source_witness(source_set),
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
@@ -367,6 +382,11 @@ def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
         source_set["raw_container_sha256_digest"]
     )
     assert identity["audit_sample_digest"] == bytes.fromhex(audit_sample_digest)
+    assert identity["ordered_source_ordinal_digest"] == (
+        ptg2_candidate_attestation.ordered_source_ordinal_digest(
+            [raw_container_digest.hex()]
+        )
+    )
 
 
 def test_candidate_identity_rejects_snapshot_layout_sample_mismatch():
@@ -378,7 +398,7 @@ def test_candidate_identity_rejects_snapshot_layout_sample_mismatch():
     serving_index = {
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
-        "audit_sample": {"sample_digest": "ab" * 32},
+        "audit_sample": _audit_sample("ab" * 32),
         "source_witness": _source_witness(source_set),
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
@@ -399,7 +419,7 @@ def test_candidate_identity_rejects_snapshot_layout_sample_mismatch():
                     "serving_index": {
                         "coverage_scope_id": coverage_scope_id.hex(),
                         "source_count": 1,
-                        "audit_sample": {"sample_digest": "cd" * 32},
+                        "audit_sample": _audit_sample("cd" * 32),
                         "source_witness": _source_witness(source_set),
                         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
                     }
@@ -422,7 +442,7 @@ def test_candidate_identity_rejects_snapshot_layout_quarantine_mismatch():
     serving_index = {
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
-        "audit_sample": {"sample_digest": "ab" * 32},
+        "audit_sample": _audit_sample("ab" * 32),
         "source_witness": _source_witness(source_set),
         "provider_identifier_quarantine": MALFORMED_PROVIDER_IDENTIFIER_QUARANTINE,
     }
@@ -443,7 +463,7 @@ def test_candidate_identity_rejects_snapshot_layout_quarantine_mismatch():
                     "serving_index": {
                         "coverage_scope_id": coverage_scope_id.hex(),
                         "source_count": 1,
-                        "audit_sample": {"sample_digest": "ab" * 32},
+                        "audit_sample": _audit_sample("ab" * 32),
                         "source_witness": _source_witness(source_set),
                         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
                     }
@@ -466,7 +486,7 @@ def test_candidate_identity_rejects_snapshot_layout_physical_scope_mismatch():
     serving_index = {
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
-        "audit_sample": {"sample_digest": "ab" * 32},
+        "audit_sample": _audit_sample("ab" * 32),
         "source_witness": _source_witness(source_set),
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
@@ -487,7 +507,7 @@ def test_candidate_identity_rejects_snapshot_layout_physical_scope_mismatch():
                     "serving_index": {
                         "coverage_scope_id": (b"d" * 32).hex(),
                         "source_count": 1,
-                        "audit_sample": {"sample_digest": "ab" * 32},
+                        "audit_sample": _audit_sample("ab" * 32),
                         "source_witness": _source_witness(source_set),
                         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
                     }
@@ -557,7 +577,7 @@ def _candidate_plan_pointer_entries():
 
 
 def test_record_candidate_attestation_binds_database_identity(monkeypatch):
-    """Prove the current writer persists V3 with the locked snapshot identity."""
+    """Prove a legacy V3 report remains persistable with locked identity."""
     session = _Session()
     identity_map = {
         "snapshot_key": 17,
@@ -620,6 +640,16 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
         == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
     )
     assert params["expires_at"] > params["attested_at"]
+    assert "contract = EXCLUDED.contract" in sql
+    assert "tool_name = EXCLUDED.tool_name" in sql
+    assert "attestation.contract = :v3_contract" in sql
+    assert "EXCLUDED.contract = :v4_contract" in sql
+    assert params["v3_contract"] == (
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
+    )
+    assert params["v4_contract"] == (
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
+    )
 
 
 def test_record_candidate_attestation_rejects_report_quarantine_mismatch(monkeypatch):
@@ -783,7 +813,7 @@ def test_activation_rechecks_attestation_expiry_against_wall_clock(monkeypatch):
     assert params["source_witness_digest"] == b"w" * 32
 
 
-def test_v3_writer_prepares_dual_v3_v4_attestation_readers():
+def test_reader_first_phase_accepts_v4_without_switching_current_writer():
     assert (
         ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT
         == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
@@ -796,6 +826,85 @@ def test_v3_writer_prepares_dual_v3_v4_attestation_readers():
         ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4,
         ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
     )
+
+
+def test_reader_first_phase_rejects_v4_attestation_writes(monkeypatch):
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "validate_candidate_release_audit_report",
+        lambda *_args, **_kwargs: {
+            "contract": (
+                ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
+            )
+        },
+    )
+    with pytest.raises(
+        ptg2_candidate_attestation.CandidateAttestationWriterContractError,
+        match="not enabled for writes",
+    ) as exc_info:
+        asyncio.run(
+            ptg2_candidate_attestation.record_candidate_audit_attestation(
+                snapshot_id="snap_new",
+                source_key="source_a",
+                plan_id="12-3456789",
+                plan_market_type="group",
+                report={"schema_version": 4},
+            )
+        )
+    assert exc_info.value.retryable is False
+
+
+def test_reader_first_phase_rechecks_writer_contract_under_lock(monkeypatch):
+    session = _Session()
+    evidence_contracts = iter(
+        (
+            ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
+            ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4,
+        )
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "validate_candidate_release_audit_report",
+        lambda *_args, **_kwargs: {"contract": next(evidence_contracts)},
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation.db,
+        "transaction",
+        lambda: _Transaction(session),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "acquire_ptg2_lifecycle_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "_database_timestamp",
+        AsyncMock(return_value=datetime.datetime.now(datetime.timezone.utc)),
+    )
+    locked_identity = AsyncMock()
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "_locked_candidate_identity",
+        locked_identity,
+    )
+
+    with pytest.raises(
+        ptg2_candidate_attestation.CandidateAttestationWriterContractError,
+        match="not enabled for writes",
+    ):
+        asyncio.run(
+            ptg2_candidate_attestation.record_candidate_audit_attestation(
+                snapshot_id="snap_new",
+                source_key="source_a",
+                plan_id="12-3456789",
+                plan_market_type="group",
+                report={"schema_version": 3},
+            )
+        )
+
+    locked_identity.assert_not_awaited()
+    assert session.calls == []
 
 
 def test_activation_rejects_report_quarantine_changed_after_attestation(monkeypatch):

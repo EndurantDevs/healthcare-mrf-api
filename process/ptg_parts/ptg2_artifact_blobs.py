@@ -35,21 +35,30 @@ def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
 
 
-def _env_bool(name: str, default: bool) -> bool:
+def _is_env_flag_enabled(name: str, default: bool) -> bool:
     raw_value = os.getenv(name)
     if raw_value is None:
         return default
     return str(raw_value).strip().lower() not in {"0", "false", "no", "off"}
 
 
-def ptg2_artifact_db_store_enabled() -> bool:
+def is_artifact_db_store_enabled() -> bool:
     """Return whether PTG2 artifacts should be persisted as PostgreSQL blobs."""
-    return _env_bool(PTG2_ARTIFACT_DB_STORE_ENV, True)
+    return _is_env_flag_enabled(PTG2_ARTIFACT_DB_STORE_ENV, True)
 
 
-def ptg2_artifact_db_retain_local_cache() -> bool:
+ptg2_artifact_db_store_enabled = is_artifact_db_store_enabled
+
+
+def should_retain_artifact_cache() -> bool:
     """Return whether PostgreSQL-backed artifacts retain a local file cache."""
-    return _env_bool(PTG2_ARTIFACT_DB_RETAIN_LOCAL_CACHE_ENV, False)
+    return _is_env_flag_enabled(
+        PTG2_ARTIFACT_DB_RETAIN_LOCAL_CACHE_ENV,
+        False,
+    )
+
+
+ptg2_artifact_db_retain_local_cache = should_retain_artifact_cache
 
 
 def _artifact_db_chunk_bytes() -> int:
@@ -71,7 +80,7 @@ def ptg2_db_artifact_uri(artifact_id: str) -> str:
     return f"{PTG2_ARTIFACT_DB_URI_PREFIX}{artifact_id}"
 
 
-def ptg2_artifact_id_from_db_uri(uri: str) -> str | None:
+def ptg2_artifact_id_from_uri(uri: str) -> str | None:
     """Extract a valid artifact identifier from a PTG2 database URI."""
     text_value = str(uri or "").strip()
     if not text_value.startswith(PTG2_ARTIFACT_DB_URI_PREFIX):
@@ -80,6 +89,9 @@ def ptg2_artifact_id_from_db_uri(uri: str) -> str | None:
     if not artifact_id or "/" in artifact_id or ".." in artifact_id:
         return None
     return artifact_id
+
+
+ptg2_artifact_id_from_db_uri = ptg2_artifact_id_from_uri
 
 
 def _row_mapping(row: Any) -> dict[str, Any]:
@@ -175,7 +187,7 @@ def _json_param(value: Mapping[str, Any]) -> str:
     return json.dumps(dict(value), sort_keys=True, default=str, separators=(",", ":"))
 
 
-async def store_ptg2_artifact_file_in_db(
+async def store_ptg2_artifact_file(
     path: str | Path,
     *,
     snapshot_id: str | None,
@@ -320,6 +332,9 @@ async def store_ptg2_artifact_file_in_db(
     return artifact_entry_map
 
 
+store_ptg2_artifact_file_in_db = store_ptg2_artifact_file
+
+
 def _artifact_cache_root() -> Path:
     configured = os.getenv(PTG2_ARTIFACT_DB_CACHE_DIR_ENV)
     root = Path(configured) if configured else resolve_ptg2_artifact_dir() / "db-cache"
@@ -340,7 +355,10 @@ def _artifact_cache_path(artifact_id: str, metadata: Mapping[str, Any] | None) -
     return _artifact_cache_root() / artifact_id[:2] / artifact_id[2:4] / file_name
 
 
-def _cached_file_valid(path: Path, metadata: Mapping[str, Any] | None) -> bool:
+def _is_cached_file_valid(
+    path: Path,
+    metadata: Mapping[str, Any] | None,
+) -> bool:
     if not path.exists() or not path.is_file():
         return False
     expected_byte_count = (metadata or {}).get("byte_count")
@@ -369,7 +387,7 @@ async def materialize_ptg2_artifact_from_db(
     if not artifact_id:
         raise ValueError(f"unsupported PTG2 artifact storage uri: {storage_uri!r}")
     cache_path = _artifact_cache_path(artifact_id, metadata)
-    if _cached_file_valid(cache_path, metadata):
+    if _is_cached_file_valid(cache_path, metadata):
         return cache_path
 
     schema = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
@@ -426,7 +444,7 @@ async def materialize_ptg2_artifact_from_db(
     return cache_path
 
 
-async def hydrate_ptg2_artifact_entry_from_db(
+async def hydrate_ptg2_artifact_entry(
     session,
     entry: Mapping[str, Any],
     *,
@@ -446,3 +464,6 @@ async def hydrate_ptg2_artifact_entry_from_db(
     hydrated_entry_map["path"] = str(cache_path)
     hydrated_entry_map["cache_path"] = str(cache_path)
     return hydrated_entry_map
+
+
+hydrate_ptg2_artifact_entry_from_db = hydrate_ptg2_artifact_entry

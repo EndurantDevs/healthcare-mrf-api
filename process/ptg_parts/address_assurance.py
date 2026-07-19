@@ -137,12 +137,15 @@ def _source_file_version_ids_from_value(value: Any, found: set[str]) -> None:
             _source_file_version_ids_from_value(child, found)
 
 
-def source_file_version_ids_from_ptg_payload(payload: Any) -> list[str]:
+def ptg_source_file_version_ids(payload: Any) -> list[str]:
     """Extract retained source-file IDs from PTG API source_trace payloads."""
 
     source_file_version_ids: set[str] = set()
     _source_file_version_ids_from_value(payload, source_file_version_ids)
     return sorted(source_file_version_ids)
+
+
+source_file_version_ids_from_ptg_payload = ptg_source_file_version_ids
 
 
 def _source_file_version_ids_from_item(item: dict[str, Any]) -> list[str]:
@@ -162,14 +165,24 @@ def _canonical_network_name(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
-def _nonempty(source: dict[str, Any], *keys: str) -> bool:
+def _has_nonempty_field(source: dict[str, Any], *keys: str) -> bool:
     return any(source.get(key) not in (None, "", [], {}) for key in keys)
 
 
-def _usable_address_source(source: dict[str, Any]) -> bool:
-    if _nonempty(source, "first_line", "address_line_1", "street", "street_address"):
+def _has_usable_address_source(source: dict[str, Any]) -> bool:
+    if _has_nonempty_field(
+        source,
+        "first_line",
+        "address_line_1",
+        "street",
+        "street_address",
+    ):
         return True
-    return _nonempty(source, "city", "city_name") and _nonempty(
+    return _has_nonempty_field(
+        source,
+        "city",
+        "city_name",
+    ) and _has_nonempty_field(
         source,
         "state",
         "state_name",
@@ -178,9 +191,12 @@ def _usable_address_source(source: dict[str, Any]) -> bool:
     )
 
 
-def _usable_address(item: dict[str, Any]) -> bool:
-    address = item.get("address")
-    return (isinstance(address, dict) and _usable_address_source(address)) or _usable_address_source(item)
+def _has_usable_address(price_item_by_field: dict[str, Any]) -> bool:
+    address_by_field = price_item_by_field.get("address")
+    return (
+        isinstance(address_by_field, dict)
+        and _has_usable_address_source(address_by_field)
+    ) or _has_usable_address_source(price_item_by_field)
 
 
 def _issue(message: str, *, index: int | None, severity: str = "error") -> dict[str, Any]:
@@ -261,7 +277,7 @@ def _network_match_ptg_name_keys(value: Any) -> set[str]:
     }
 
 
-def _network_matches_align_with_served_network_names(
+def _has_only_served_network_matches(
     item: dict[str, Any],
     *match_lists: Any,
 ) -> bool:
@@ -348,7 +364,7 @@ def _has_provider_directory_network_context_evidence(verification: dict[str, Any
 
 
 def validate_ptg_price_address_item(
-    item: dict[str, Any],
+    price_item_by_field: dict[str, Any],
     *,
     index: int = 0,
     require_displayed_address: bool = True,
@@ -356,8 +372,8 @@ def validate_ptg_price_address_item(
 ) -> list[dict[str, Any]]:
     """Validate address evidence attached to one pricing item."""
     issues: list[dict[str, Any]] = []
-    verification = item.get("address_verification")
-    has_address = _usable_address(item)
+    verification = price_item_by_field.get("address_verification")
+    has_address = _has_usable_address(price_item_by_field)
     if not isinstance(verification, dict) or not verification:
         issues.append(_issue("PTG price row is missing address_verification", index=index))
         return issues
@@ -403,7 +419,7 @@ def validate_ptg_price_address_item(
     elif displayed_address_present is False and has_address:
         issues.append(_issue("displayed_address_present=false but usable address fields are present", index=index))
     if displayed_address_present is False:
-        leaked_fields = _nonempty_no_display_fields(item)
+        leaked_fields = _nonempty_no_display_fields(price_item_by_field)
         if leaked_fields:
             issues.append(
                 _issue(
@@ -421,7 +437,7 @@ def validate_ptg_price_address_item(
                     index=index,
                 )
             )
-    expected_network_bound = (
+    is_expected_network_bound = (
         displayed_address_present is True
         and address_binding in {"payer_confirmed_location", "payer_directory_corroborated_location"}
     )
@@ -429,7 +445,10 @@ def validate_ptg_price_address_item(
         issues.append(_issue("network_bound_address is required", index=index))
     elif not isinstance(network_bound_address, bool):
         issues.append(_issue("network_bound_address must be boolean", index=index))
-    elif isinstance(network_bound_address, bool) and network_bound_address is not expected_network_bound:
+    elif (
+        isinstance(network_bound_address, bool)
+        and network_bound_address is not is_expected_network_bound
+    ):
         issues.append(
             _issue(
                 "network_bound_address must match address_network_binding and displayed_address_present",
@@ -471,7 +490,7 @@ def validate_ptg_price_address_item(
     if (
         require_network_bound_address
         and displayed_address_present is True
-        and not expected_network_bound
+        and not is_expected_network_bound
     ):
         issues.append(
             _issue(
@@ -498,7 +517,7 @@ def validate_ptg_price_address_item(
             issues.append(_issue("payer-confirmed address must include direct PTG/TiC payer-location evidence", index=index))
         if not _has_materialized_payer_location_record_evidence(verification):
             issues.append(_issue("payer-confirmed address must include materialized PTG/TiC source record evidence", index=index))
-        if not _source_file_version_ids_from_item(item):
+        if not _source_file_version_ids_from_item(price_item_by_field):
             issues.append(
                 _issue(
                     "payer-confirmed address must include source_trace.source_file_version_id for raw TiC verification",
@@ -512,8 +531,8 @@ def validate_ptg_price_address_item(
             issues.append(_issue("payer-directory context match must not require location confirmation", index=index))
         if plan_context is not True and not _has_provider_directory_network_context_evidence(verification):
             issues.append(_issue("payer-directory context match must expose plan context or network-name proof", index=index))
-        elif plan_context is not True and not _network_matches_align_with_served_network_names(
-            item,
+        elif plan_context is not True and not _has_only_served_network_matches(
+            price_item_by_field,
             provider_directory_network_matches,
             evidence_network_name_matches,
         ):
@@ -532,7 +551,7 @@ def validate_ptg_price_address_item(
 
 
 def summarize_ptg_price_address_payload(
-    payload: Any,
+    price_payload: Any,
     *,
     require_displayed_address: bool = True,
     require_network_names: bool = False,
@@ -542,7 +561,7 @@ def summarize_ptg_price_address_payload(
     """Summarize address assurance across a pricing payload."""
     require_network_names = require_network_names or require_network_bound_address
     require_source_file_version_id = require_source_file_version_id or require_network_bound_address
-    price_items = _items_from_payload(payload)
+    price_items = _items_from_payload(price_payload)
     issues: list[dict[str, Any]] = []
     binding_count_by_name: dict[str, int] = {}
     evidence_count_by_level: dict[str, int] = {}
@@ -556,7 +575,7 @@ def summarize_ptg_price_address_payload(
     if not price_items:
         issues.append(_issue("no PTG price rows found", index=None))
     for index, price_item in enumerate(price_items):
-        if _usable_address(price_item):
+        if _has_usable_address(price_item):
             displayed_address_rows += 1
         network_names = _network_names_from_item(price_item)
         if network_names:
@@ -690,13 +709,17 @@ def build_price_address_assurance_report(
                 raw_report.get("direct_displayable_location_fields_present")
             )
     if api_payload is not None and raw_reports:
-        for index, item in enumerate(_items_from_payload(api_payload)):
-            verification = item.get("address_verification")
+        for index, price_item_by_field in enumerate(
+            _items_from_payload(api_payload)
+        ):
+            verification = price_item_by_field.get("address_verification")
             if not isinstance(verification, dict):
                 continue
             if verification.get("address_network_binding") != "payer_confirmed_location":
                 continue
-            item_source_ids = _source_file_version_ids_from_item(item)
+            item_source_ids = _source_file_version_ids_from_item(
+                price_item_by_field
+            )
             if not item_source_ids:
                 issues.append(
                     _issue(

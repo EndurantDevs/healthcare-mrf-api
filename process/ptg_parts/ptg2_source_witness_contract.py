@@ -32,6 +32,32 @@ PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES = 64 * 1024 * 1024
 SOURCE_BUNDLE_MAGIC = b"PTG2SW02"
 SOURCE_RECORD_MAGIC = b"PTG2SWR2"
 PERSISTED_PAYLOAD_MAGIC = b"PTG2SWP5"
+PTG2_SOURCE_WITNESS_MANIFEST_FIELDS = (
+    "contract",
+    "format_version",
+    "selection_method",
+    "population_semantics",
+    "unqueryable_rate_policy",
+    "source_count",
+    "source_set_digest",
+    "occurrence_target",
+    "total_target",
+    "provider_quota",
+    "queryable_occurrence_population_count",
+    "provider_population_count",
+    "emitted_rate_row_count",
+    "unqueryable_rate_row_count",
+    "occurrence_witness_count",
+    "provider_witness_count",
+    "record_count",
+    "evidence_dictionary_count",
+    "evidence_dictionary_raw_bytes",
+    "evidence_dictionary_stored_bytes",
+    "sample_digest",
+    "payload_sha256",
+    "payload_bytes",
+    "compression",
+)
 
 
 @dataclass(frozen=True)
@@ -276,6 +302,23 @@ def validate_source_witness_manifest(
     return manifest_by_field
 
 
+def source_witness_manifest_projection(
+    raw_manifest: Any,
+    *,
+    expected_source_count: int | None = None,
+) -> dict[str, Any]:
+    """Return only canonical report-safe source-witness manifest fields."""
+
+    validated_manifest = validate_source_witness_manifest(
+        raw_manifest,
+        expected_source_count=expected_source_count,
+    )
+    return {
+        field_name: validated_manifest[field_name]
+        for field_name in PTG2_SOURCE_WITNESS_MANIFEST_FIELDS
+    }
+
+
 __all__ = [
     "CompressedSourceWitnessRecord",
     "LoadedSourceWitness",
@@ -293,10 +336,12 @@ __all__ = [
     "PTG2_V3_SOURCE_WITNESS_SELECTION",
     "PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET",
     "PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY",
+    "PTG2_SOURCE_WITNESS_MANIFEST_FIELDS",
     "SOURCE_BUNDLE_MAGIC",
     "SOURCE_RECORD_MAGIC",
     "SourceWitnessPublication",
     "SourceWitnessRecord",
     "source_witness_targets",
+    "source_witness_manifest_projection",
     "validate_source_witness_manifest",
 ]

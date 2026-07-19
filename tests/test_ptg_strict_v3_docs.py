@@ -10,6 +10,10 @@ PTG_DOCS = (
     REPO_ROOT / "docs" / "imports" / "ptg.md",
     REPO_ROOT / "docs" / "research" / "ptg2_optimization.md",
 )
+DIAGNOSTIC_AUDIT_DOCS = (
+    REPO_ROOT / "docs" / "devops" / "ptg2-space-rebuild.md",
+    REPO_ROOT / "scripts" / "validation" / "README.md",
+)
 
 
 def _normalized_text(path: Path) -> str:
@@ -42,7 +46,22 @@ def test_strict_ptg_docs_define_bounded_candidate_audit_contract():
         text = _normalized_text(path)
         assert "10,000" in text
         assert "1,000" in text
-        assert "10,001" in text
+        assert "10,001" not in text
+        assert re.search(r"one (?:authenticated )?V4 POST", text)
+        assert re.search(r"(?:zero redirects|redirects[^.]*exactly 0)", text, re.I)
+        assert re.search(
+            r"(?:zero in-attempt retries|in-attempt retries[^.]*exactly 0)",
+            text,
+            re.I,
+        )
+        assert re.search(
+            r"(?:zero repeated-work|repeated-work (?:counter|ledger)[^.]*zero)",
+            text,
+            re.I,
+        )
+        assert "application cache" in text
+        assert "reader-first" in text.lower()
+        assert re.search(r"accept(?:s|ing)? V3 and V4", text)
         assert "independent" in text.lower()
         assert re.search(r"55[- ]second", text, re.IGNORECASE)
         assert "`aiohttp`" in text
@@ -66,3 +85,15 @@ def test_strict_ptg_docs_pass_public_repository_hygiene():
     spec.loader.exec_module(checker)
 
     assert checker.check_content(list(PTG_DOCS)) == []
+
+
+def test_source_file_audit_is_documented_as_standalone_diagnostic_only():
+    for path in DIAGNOSTIC_AUDIT_DOCS:
+        text = _normalized_text(path)
+        assert "ptg2_v3_source_api_audit.py" in text
+        assert re.search(
+            r"not (?:the )?(?:synchronous |automated )?activation",
+            text,
+            re.IGNORECASE,
+        )
+        assert "one authenticated V4 POST" in text

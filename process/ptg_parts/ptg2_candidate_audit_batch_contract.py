@@ -21,6 +21,7 @@ from process.ptg_parts.ptg2_shared_source_set import (
 
 PTG2_AUDIT_BATCH_REQUEST_CONTRACT = "ptg2_v3_source_witness_batch_request_v1"
 PTG2_AUDIT_BATCH_RESPONSE_CONTRACT = "ptg2_v3_source_witness_batch_response_v1"
+PTG2_AUDIT_BATCH_API_PATH = "/api/v1/pricing/providers/audit-source-witness-batch"
 PTG2_AUDIT_BATCH_MAX_CHALLENGES = 10_000
 _REQUEST_FIELDS = frozenset(
     {
@@ -37,8 +38,6 @@ _REQUEST_FIELDS = frozenset(
         "request_digest",
     }
 )
-
-
 @dataclass(frozen=True, order=True)
 class AuditBatchChallenge:
     """One grouped matching condition without source text or raw identities."""
@@ -364,10 +363,19 @@ def build_audit_batch_request(
     )
 
 
+from process.ptg_parts.ptg2_candidate_audit_batch_response import (
+    AuditBatchResponse,
+    parse_audit_batch_response,
+    validate_audit_batch_once_ledgers,
+)
+
+
 __all__ = [
     "AuditBatchChallenge",
     "AuditBatchRequest",
+    "AuditBatchResponse",
     "AuditBatchWitnessBinding",
+    "PTG2_AUDIT_BATCH_API_PATH",
     "PTG2_AUDIT_BATCH_MAX_CHALLENGES",
     "PTG2_AUDIT_BATCH_REQUEST_CONTRACT",
     "PTG2_AUDIT_BATCH_RESPONSE_CONTRACT",
@@ -375,4 +383,6 @@ __all__ = [
     "group_audit_batch_challenges",
     "matched_audit_batch_digest",
     "parse_audit_batch_request",
+    "parse_audit_batch_response",
+    "validate_audit_batch_once_ledgers",
 ]

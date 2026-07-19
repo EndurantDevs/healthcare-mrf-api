@@ -15,6 +15,9 @@ _HASH_DOMAIN = b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V1\0"
 _MAX_DISTINCT_VALUES = 1024
 _MIN_I64 = -(2**63)
 _MAX_I64 = 2**63 - 1
+_EVIDENCE_FIELDS = frozenset(
+    {"contract", "occurrence_count", "distinct_value_count", "sha256"}
+)
 
 
 def _digest(counts: Mapping[int, int]) -> str:
@@ -110,6 +113,48 @@ def validate_provider_identifier_quarantine(
     return canonical
 
 
+def provider_identifier_quarantine_evidence(
+    quarantine_payload: Any,
+) -> dict[str, Any]:
+    """Return bounded report evidence without raw malformed identifiers."""
+
+    canonical = validate_provider_identifier_quarantine(quarantine_payload)
+    return {
+        field_name: canonical[field_name]
+        for field_name in sorted(_EVIDENCE_FIELDS)
+    }
+
+
+def validate_provider_identifier_quarantine_evidence(
+    raw_evidence: Any,
+) -> dict[str, Any]:
+    """Validate redacted quarantine counts and digest for candidate binding."""
+
+    if not isinstance(raw_evidence, Mapping) or set(raw_evidence) != _EVIDENCE_FIELDS:
+        raise ValueError("provider identifier quarantine evidence is incompatible")
+    evidence_by_field = dict(raw_evidence)
+    occurrence_count = evidence_by_field.get("occurrence_count")
+    distinct_count = evidence_by_field.get("distinct_value_count")
+    digest = evidence_by_field.get("sha256")
+    if (
+        evidence_by_field.get("contract")
+        != PTG2_PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT
+        or type(occurrence_count) is not int
+        or occurrence_count < 0
+        or occurrence_count >= 2**64
+        or type(distinct_count) is not int
+        or distinct_count < 0
+        or distinct_count > _MAX_DISTINCT_VALUES
+        or distinct_count > occurrence_count
+        or (distinct_count == 0) != (occurrence_count == 0)
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError("provider identifier quarantine evidence is invalid")
+    return evidence_by_field
+
+
 def combine_provider_identifier_quarantines(
     payloads: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
@@ -126,6 +171,8 @@ def combine_provider_identifier_quarantines(
 __all__ = [
     "PTG2_PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT",
     "combine_provider_identifier_quarantines",
+    "provider_identifier_quarantine_evidence",
     "provider_identifier_quarantine_payload",
     "validate_provider_identifier_quarantine",
+    "validate_provider_identifier_quarantine_evidence",
 ]
