@@ -1842,3 +1842,152 @@ def test_attestation_consumption_failure_rolls_back_all_activation_state(monkeyp
 
     assert transaction.exit_type is RuntimeError
     assert state_map == original_state_map
+
+
+def test_candidate_attestation_low_level_validation_edges(monkeypatch):
+    """Cover canonical serialization and configuration fallbacks."""
+    with pytest.raises(ValueError, match="canonical JSON"):
+        ptg2_candidate_attestation._canonical_report_bytes({"bad": object()})
+    assert (
+        ptg2_candidate_attestation._sha256_hex("ab" * 32, field="digest")
+        == "ab" * 32
+    )
+
+    monkeypatch.setenv(
+        ptg2_candidate_attestation.PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_ENV,
+        "invalid",
+    )
+    assert ptg2_candidate_attestation._audit_report_max_age() == datetime.timedelta(
+        minutes=(
+            ptg2_candidate_attestation.PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_DEFAULT
+        )
+    )
+    monkeypatch.setenv(
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_ENV,
+        "invalid",
+    )
+    assert ptg2_candidate_attestation._attestation_ttl_hours() == (
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_DEFAULT
+    )
+
+
+def test_candidate_attestation_report_shape_validation_edges():
+    """Reject missing mappings and incomplete batch reports."""
+    with pytest.raises(ValueError, match="field missing"):
+        ptg2_candidate_attestation._required_report_mapping({}, "missing")
+    with pytest.raises(ValueError):
+        ptg2_candidate_attestation.validate_candidate_release_audit_report(
+            {
+                "schema_version": (
+                    ptg2_candidate_attestation.PTG2_BATCH_AUDIT_REPORT_SCHEMA_VERSION
+                )
+            },
+            snapshot_id="s",
+            source_key="k",
+            plan_id="p",
+            plan_market_type="group",
+        )
+
+
+def test_candidate_attestation_physical_identity_validation_edges():
+    """Reject incomplete or inconsistent immutable physical identity."""
+    with pytest.raises(ValueError, match="immutable audit identity"):
+        ptg2_candidate_attestation._validated_candidate_physical_identity(
+            {
+                "raw_container_sha256_values": ["aa" * 32],
+                "coverage_scope_id": b"",
+            },
+            {"source_set": {}, "coverage_scope_id": ""},
+            {},
+        )
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata(
+        ("aa" * 32,)
+    )
+    with pytest.raises(ValueError, match="PostgreSQL bindings"):
+        ptg2_candidate_attestation._validated_candidate_physical_identity(
+            {
+                "raw_container_sha256_values": ["aa" * 32],
+                "coverage_scope_id": b"d" * 32,
+            },
+            {
+                "source_set": source_set,
+                "coverage_scope_id": (b"c" * 32).hex(),
+            },
+            {
+                "coverage_scope_id": (b"c" * 32).hex(),
+                "source_count": 1,
+            },
+        )
+
+
+def test_candidate_attestation_source_witness_validation_edges():
+    """Reject changed, incompatible, and mismatched source witnesses."""
+    with pytest.raises(ValueError, match="changed after layout sealing"):
+        ptg2_candidate_attestation._validated_candidate_source_witness(
+            {},
+            {"changed": True},
+            source_count=1,
+            source_set_digest_hex="00" * 32,
+        )
+    with pytest.raises(ValueError, match="incompatible"):
+        ptg2_candidate_attestation._validated_candidate_source_witness(
+            {}, {}, source_count=1, source_set_digest_hex="00" * 32
+        )
+    witness = _source_witness(
+        {
+            "source_count": 1,
+            "raw_container_sha256_digest": "11" * 32,
+        }
+    )
+    with pytest.raises(ValueError, match="changed after layout sealing"):
+        ptg2_candidate_attestation._validated_candidate_source_witness(
+            witness,
+            witness,
+            source_count=1,
+            source_set_digest_hex="22" * 32,
+        )
+
+
+def test_candidate_attestation_v3_check_validation_edges():
+    """Reject invalid V3 status, check counts, and witness sections."""
+    with pytest.raises(ValueError, match="strict V3 validated candidate"):
+        ptg2_candidate_attestation._candidate_identity({"status": "invalid"})
+    check_counts_by_name = {
+        "source_witnesses": 3,
+        "api_witnesses_matched": 1,
+        "api_challenges_executed": 1,
+        "provider_witnesses_validated": 1,
+        "api_audit_occurrences_validated": 2,
+    }
+    with pytest.raises(ValueError, match="coverage is invalid"):
+        ptg2_candidate_attestation._validated_v3_checks(
+            check_counts_by_name,
+            {
+                "record_count": 3,
+                "occurrence_witness_count": 1,
+                "provider_witness_count": 1,
+            },
+        )
+
+    invalid_sections = Mock(
+        source_by_field={"source_count": 1, "witness": {}},
+        checks_by_name={},
+    )
+    with pytest.raises(ValueError, match="coverage is invalid"):
+        ptg2_candidate_attestation._validated_v3_witness(invalid_sections)
+    witness = _source_witness(
+        {
+            "source_count": 1,
+            "raw_container_sha256_digest": "11" * 32,
+        }
+    )
+    mismatched_sections = Mock(
+        source_by_field={
+            "source_count": 1,
+            "witness": witness,
+            "source_set_digest": "22" * 32,
+        },
+        checks_by_name={},
+    )
+    with pytest.raises(ValueError, match="source set is invalid"):
+        ptg2_candidate_attestation._validated_v3_witness(mismatched_sections)

@@ -1071,3 +1071,353 @@ def test_ptg_main_releases_input_lease_for_every_terminal_outcome(
     assert len(observed_lease_ids) == 1
     assert not list(store.leases_dir.glob("*.json"))
     assert len(list((root / ".retention" / "unleased").glob("*.json"))) == 1
+
+
+def test_retention_parsing_and_unleased_marker_edges(tmp_path):
+    assert retention._parse_timestamp(None) is None
+    assert retention._parse_timestamp("not-a-timestamp") is None
+    assert retention._parse_timestamp("2026-07-19T10:00:00") == datetime.datetime(
+        2026, 7, 19, 10, tzinfo=datetime.UTC
+    )
+    with pytest.raises(ValueError):
+        retention._normalized_managed_relative_path(None)
+    with pytest.raises(ValueError):
+        retention._normalized_managed_relative_path("raw/../escape")
+
+    store = PTG2ArtifactStore(tmp_path / "markers")
+    relative_path = "raw/aa/artifact"
+    marker_path = retention._unleased_marker_path(store, relative_path)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 999,
+                "relative_path": relative_path,
+                "unleased_since": "2026-07-19T10:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="retention marker"):
+        retention._read_unleased_since_locked(store, relative_path)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "schema_version": retention.UNLEASED_SCHEMA_VERSION,
+                "relative_path": relative_path,
+                "unleased_since": "bad",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="retention timestamp"):
+        retention._read_unleased_since_locked(store, relative_path)
+    marker_path.write_text(
+        json.dumps(
+            retention._unleased_payload(
+                relative_path,
+                datetime.datetime(2026, 7, 19, tzinfo=datetime.UTC),
+            )
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        retention._is_newly_marked_unleased_locked(
+            store,
+            relative_path,
+            now=datetime.datetime(2026, 7, 20, tzinfo=datetime.UTC),
+        )
+        is False
+    )
+
+
+def test_retention_prefix_reference_edges(tmp_path):
+    """Resolve only regular files beneath a protected prefix."""
+    store = PTG2ArtifactStore(tmp_path / "refs")
+    assert retention._lease_referenced_paths_locked(
+        store, {"paths": [], "prefixes": ["raw/missing"]}
+    ) == set()
+    prefix = store.root / "raw" / "prefix"
+    prefix.mkdir(parents=True)
+    target_path = prefix / "target"
+    target_path.write_text("x", encoding="utf-8")
+    (prefix / "link").symlink_to(target_path)
+    assert retention._lease_referenced_paths_locked(
+        store, {"paths": [], "prefixes": ["raw/prefix"]}
+    ) == {"raw/prefix/target"}
+
+
+def test_retention_lease_lifecycle_edges(tmp_path):
+    """Exercise idempotent starts, duplicate markers, and lease binding."""
+    store = PTG2ArtifactStore(tmp_path / "lease")
+    lease = PTG2ArtifactLease(
+        store=store, owner="first", heartbeat_seconds=0
+    ).start()
+    assert lease.start() is lease
+    lease.release()
+    duplicate = PTG2ArtifactLease(
+        store=store,
+        owner="duplicate",
+        heartbeat_seconds=0,
+        lease_id="fixed",
+    )
+    duplicate.marker_path.parent.mkdir(parents=True, exist_ok=True)
+    duplicate.marker_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="already exists"):
+        duplicate.start()
+    duplicate.marker_path.unlink()
+
+    assert retention.has_released_current_artifact_lease() is False
+    with bind_artifact_lease("not-registered"):
+        assert retention.has_released_current_artifact_lease() is False
+    assert (
+        retention.has_protected_existing_artifact(
+            store, store.root / "raw" / "missing"
+        )
+        is False
+    )
+    protect_artifact_prefix(store, store.root / "raw" / "unused")
+    assert not list(store.leases_dir.glob("*.json"))
+    prefix_lease = PTG2ArtifactLease(
+        store=store, owner="prefix", heartbeat_seconds=0
+    ).start()
+    try:
+        with bind_artifact_lease(prefix_lease.lease_id):
+            protect_artifact_prefix(store, store.root / "raw" / "not-created")
+        lease_payload_by_field = json.loads(
+            prefix_lease.marker_path.read_text(encoding="utf-8")
+        )
+        assert lease_payload_by_field["prefixes"] == ["raw/not-created"]
+    finally:
+        prefix_lease.release()
+
+
+def test_retention_gc_result_reports_remaining_capacity(tmp_path):
+    """Report bytes remaining above the configured retained-input target."""
+    store = PTG2ArtifactStore(tmp_path / "result")
+    gc_result = retention.PTG2InputArtifactGCResult(
+        executed=False,
+        root=store.root,
+        active_lease_ids=(),
+        stale_lease_files=(),
+        protected_files=(),
+        newly_unleased_files=(),
+        eligible_files=(),
+        selected_files=(),
+        deleted_files=(),
+        total_bytes_before=20,
+        total_bytes_after=15,
+        selected_bytes=0,
+        deleted_bytes=0,
+        target_bytes=10,
+        manifest_entries_before=0,
+        manifest_entries_after=0,
+        manifest_invalid_lines=0,
+    )
+    assert gc_result.over_target_bytes == 5
+
+
+def test_retention_publish_conflict_edges(tmp_path):
+    """Exercise directory, reuse, discard, and checksum publish conflicts."""
+    store = PTG2ArtifactStore(tmp_path / "publish")
+    staged = tmp_path / "staged"
+    staged.write_text("new", encoding="utf-8")
+    directory_target = store.root / "raw" / "directory"
+    directory_target.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        publish_artifact_file(store, staged, directory_target)
+
+    same = store.root / "raw" / "same"
+    same.parent.mkdir(parents=True, exist_ok=True)
+    same.write_text("same", encoding="utf-8")
+    assert publish_artifact_file(store, same, same) == same
+
+    existing = store.root / "raw" / "existing"
+    existing.write_text("old", encoding="utf-8")
+    discarded = tmp_path / "discarded"
+    discarded.write_text("discard", encoding="utf-8")
+    assert publish_artifact_file(store, discarded, existing) == existing
+    assert not discarded.exists()
+
+    checksum_target = store.root / "raw" / "checksum"
+    checksum_target.write_text("old", encoding="utf-8")
+    mismatched = tmp_path / "mismatched"
+    mismatched.write_text("new", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="staging checksum"):
+        publish_artifact_file(
+            store,
+            mismatched,
+            checksum_target,
+            expected_sha256="0" * 64,
+        )
+
+
+def test_retention_stale_lease_candidate_edges(tmp_path):
+    """Reject invalid expirations and retain the latest stale timestamp."""
+    store = PTG2ArtifactStore(tmp_path / "stale")
+    artifact = store.root / "raw" / "item"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("x", encoding="utf-8")
+    bad = retention._StaleLease(
+        tmp_path / "bad.json",
+        {"expires_at": "bad", "paths": [], "prefixes": []},
+    )
+    with pytest.raises(RuntimeError, match="expiration"):
+        retention._stale_unleased_candidates_locked(
+            store,
+            (bad,),
+            active_exact_paths=set(),
+            active_prefixes=set(),
+        )
+
+    def stale(name, expires_at, path):
+        return retention._StaleLease(
+            tmp_path / name,
+            {"expires_at": expires_at, "paths": [path], "prefixes": []},
+        )
+
+    late = "2026-07-19T10:00:00Z"
+    early = "2026-07-19T09:00:00Z"
+    assert (
+        retention._stale_unleased_candidates_locked(
+            store,
+            (
+                stale("protected", late, "raw/item"),
+                stale("missing", late, "raw/missing"),
+            ),
+            active_exact_paths={"raw/item"},
+            active_prefixes=set(),
+        )
+        == {}
+    )
+    candidates = retention._stale_unleased_candidates_locked(
+        store,
+        (
+            stale("late", late, "raw/item"),
+            stale("early", early, "raw/item"),
+        ),
+        active_exact_paths=set(),
+        active_prefixes=set(),
+    )
+    assert candidates["raw/item"] == datetime.datetime(
+        2026, 7, 19, 10, tzinfo=datetime.UTC
+    )
+
+
+def test_retention_selection_honors_byte_cap(tmp_path):
+    """Stop selection before the next artifact exceeds the byte cap."""
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.UTC)
+    stored_artifacts = [
+        retention._StoredArtifact(
+            tmp_path / "a",
+            "raw/a",
+            6,
+            now.timestamp() - 7200,
+            False,
+            now - datetime.timedelta(hours=2),
+        ),
+        retention._StoredArtifact(
+            tmp_path / "b",
+            "raw/b",
+            6,
+            now.timestamp() - 7200,
+            False,
+            now - datetime.timedelta(hours=2),
+        ),
+    ]
+    _eligible, selected = retention._select_artifacts(
+        stored_artifacts,
+        now_timestamp=now.timestamp(),
+        retention_seconds=0,
+        min_age_seconds=0,
+        target_bytes=None,
+        max_delete_bytes=10,
+        max_delete_files=None,
+    )
+    assert [selected_artifact.relative_path for selected_artifact in selected] == [
+        "raw/a"
+    ]
+
+
+def test_retention_manifest_and_metadata_cleanup_edges(tmp_path):
+    store = PTG2ArtifactStore(tmp_path / "manifest")
+    assert (
+        retention._is_record_pointing_to_missing_file(
+            store, {"storage_uri": None}
+        )
+        is False
+    )
+    assert (
+        retention._is_record_pointing_to_missing_file(
+            store, {"storage_uri": str(tmp_path.parent / "outside")}
+        )
+        is False
+    )
+    store.manifest_path.write_text("[]\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="manifest record"):
+        retention._validate_manifest_locked(store)
+    store.manifest_path.write_text("not-json\n[]\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="before compaction"):
+        retention._compact_manifest_locked(store)
+
+    invalid_store = PTG2ArtifactStore(tmp_path / "meta-bad")
+    invalid_dir = retention._unleased_dir(invalid_store)
+    invalid_dir.mkdir(parents=True)
+    (invalid_dir / "bad.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "relative_path": None,
+                "unleased_since": "2026-07-19T10:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="fails closed"):
+        retention._prune_unleased_metadata_locked(invalid_store)
+
+    missing_store = PTG2ArtifactStore(tmp_path / "meta-missing")
+    relative_path = "raw/missing"
+    marker_path = retention._unleased_marker_path(missing_store, relative_path)
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_text(
+        json.dumps(
+            retention._unleased_payload(
+                relative_path,
+                datetime.datetime(2026, 7, 19, tzinfo=datetime.UTC),
+            )
+        ),
+        encoding="utf-8",
+    )
+    retention._prune_unleased_metadata_locked(missing_store)
+    assert not marker_path.exists()
+
+    atomic_store = PTG2ArtifactStore(tmp_path / "atomic")
+    directory_candidate = atomic_store.root / ".manifest.jsonl.directory.tmp"
+    directory_candidate.mkdir()
+    retention._prune_atomic_metadata_temps_locked(atomic_store)
+    assert directory_candidate.is_dir()
+
+
+def test_retention_collector_honors_all_environment_caps(tmp_path, monkeypatch):
+    monkeypatch.setenv(retention.PTG2_INPUT_ARTIFACT_TARGET_BYTES_ENV, "123")
+    monkeypatch.setenv(retention.PTG2_INPUT_ARTIFACT_MAX_DELETE_BYTES_ENV, "456")
+    monkeypatch.setenv(retention.PTG2_INPUT_ARTIFACT_MAX_DELETE_FILES_ENV, "7")
+    captured_caps_by_name = {}
+
+    def capture_selection(_stored_artifacts, **selection_options):
+        captured_caps_by_name.update(selection_options)
+        return [], []
+
+    monkeypatch.setattr(retention, "_select_artifacts", capture_selection)
+    result = collect_ptg2_input_artifacts(
+        root=tmp_path / "collect",
+        target_bytes=retention.DEFAULT_TARGET_BYTES,
+        max_delete_bytes=retention.DEFAULT_MAX_DELETE_BYTES,
+        max_delete_files=retention.DEFAULT_MAX_DELETE_FILES,
+    )
+    assert result.target_bytes == 123
+    assert result.executed is False
+    assert captured_caps_by_name["target_bytes"] == 123
+    assert captured_caps_by_name["max_delete_bytes"] == 456
+    assert captured_caps_by_name["max_delete_files"] == 7

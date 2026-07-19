@@ -1044,3 +1044,75 @@ def test_scheduler_result_is_redacted():
         "audit_timings",
         "metrics",
     }
+
+
+class _AuditAutocommit:
+    def __init__(self, acquired):
+        self.acquired = acquired
+        self.calls = []
+
+    async def scalar(self, query, params):
+        self.calls.append((query, params))
+        return self.acquired if len(self.calls) == 1 else None
+
+
+class _AuditConnection:
+    def __init__(self, autocommit, awaitable):
+        self.autocommit = autocommit
+        self.awaitable = awaitable
+
+    def execution_options(self, **_kwargs):
+        if not self.awaitable:
+            return self.autocommit
+
+        async def resolved():
+            return self.autocommit
+
+        return resolved()
+
+
+class _AuditConnectionContext:
+    def __init__(self, connection):
+        self.connection = connection
+
+    async def __aenter__(self):
+        return self.connection
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _AuditEngine:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def connect(self):
+        return _AuditConnectionContext(self.connection)
+
+
+@pytest.mark.asyncio
+async def test_candidate_audit_guard_covers_connection_protocols_and_rejection(
+    monkeypatch,
+):
+    """Cover sync and async connection setup plus lock rejection."""
+
+    good_autocommit = _AuditAutocommit(True)
+    good_engine = _AuditEngine(_AuditConnection(good_autocommit, awaitable=True))
+    monkeypatch.setattr(ptg_candidate_audit.db, "engine", None)
+
+    async def connect():
+        ptg_candidate_audit.db.engine = good_engine
+
+    monkeypatch.setattr(ptg_candidate_audit.db, "connect", connect)
+    async with ptg_candidate_audit.candidate_audit_guard("run-good"):
+        assert ptg_candidate_audit.db.engine is good_engine
+    assert len(good_autocommit.calls) == 2
+
+    bad_autocommit = _AuditAutocommit(False)
+    ptg_candidate_audit.db.engine = _AuditEngine(
+        _AuditConnection(bad_autocommit, awaitable=False)
+    )
+    with pytest.raises(RuntimeError, match="was not acquired"):
+        async with ptg_candidate_audit.candidate_audit_guard("run-bad"):
+            pytest.fail("guard accepted a connection without an advisory lock")
+    assert len(bad_autocommit.calls) == 1
