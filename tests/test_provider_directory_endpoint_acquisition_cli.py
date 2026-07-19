@@ -33,7 +33,7 @@ def test_acquisition_cli_emits_selected_operator_plan(capsys):
 
 def test_acquisition_cli_verifies_local_operator_input(tmp_path, capsys):
     manifest = acquisition_cli.harness.load_manifest()
-    entry = manifest["entries"][0]
+    entry = next(manifest_entry for manifest_entry in manifest["entries"] if manifest_entry["resources"])
     source_ids = list(entry["source_ids"])
     metrics = {
         "source_ids": source_ids,
