@@ -813,6 +813,39 @@ NEBRASKA_DHHS_PAGINATION_HOST = "dhhs-uat-api.ne.gov"
 ARKANSAS_PROVIDER_DIRECTORY_BASE = (
     "https://fite.ar-prd.gw02.abacusinsights.ai/provider-directory"
 )
+IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE = (
+    "https://fite.ia-prd.gw03.abacusinsights.ai/provider-directory"
+)
+PENNSYLVANIA_MEDICAID_PROVIDER_DIRECTORY_BASE = (
+    "https://fite.pa-prd.gw03.abacusinsights.ai/provider-directory"
+)
+SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE = (
+    "https://fhir.netsmartcloud.com/payer/provider-directory/v2/"
+    "eb7b73e0-836a-4041-9c0c-753079b3518f"
+)
+SAN_MATEO_COUNTY_PROVIDER_DIRECTORY_BASE = (
+    "https://fhir.netsmartcloud.com/payer/provider-directory/v2/"
+    "1639ac79-9144-4699-a38b-eb956f258677"
+)
+EL_DORADO_COUNTY_PROVIDER_DIRECTORY_BASE = (
+    "https://fhir.netsmartcloud.com/payer/provider-directory/v2/"
+    "e8c254e2-72ed-4654-8258-02a395017a2a"
+)
+NETSMART_PROVIDER_DIRECTORY_BASES = frozenset(
+    {
+        SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE,
+        SAN_MATEO_COUNTY_PROVIDER_DIRECTORY_BASE,
+        EL_DORADO_COUNTY_PROVIDER_DIRECTORY_BASE,
+    }
+)
+DEVOTED_PROVIDER_DIRECTORY_BASE = "https://fhir.devoted.com/fhir"
+SIMPRA_PROVIDER_DIRECTORY_BASE = "https://data.healthlx.com:8004/SIMPRA"
+CAPITAL_BLUE_CROSS_PROVIDER_DIRECTORY_BASE = (
+    "https://providerdirectory-api.capbluecross.com/r4"
+)
+REVIEWED_PROVIDER_DIRECTORY_CANDIDATE_SOURCE = (
+    "healthporta-reviewed-provider-directory-candidate"
+)
 IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE = (
     "https://api-idmedicaid.safhir.io/v1/api/provider-directory"
 )
@@ -836,7 +869,14 @@ IDAHO_MEDICAID_RESOURCE_PROFILES = {
 FHIR_OFFSET_PAGINATION_BASES = frozenset(
     {TMHP_PROVIDER_DIRECTORY_BASE, NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE}
 )
-FHIR_SYNTHETIC_SKIP_PAGINATION_BASES = frozenset({ARKANSAS_PROVIDER_DIRECTORY_BASE})
+FHIR_SYNTHETIC_SKIP_PAGINATION_BASES = frozenset(
+    {
+        ARKANSAS_PROVIDER_DIRECTORY_BASE,
+        IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE,
+        PENNSYLVANIA_MEDICAID_PROVIDER_DIRECTORY_BASE,
+    }
+)
+FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES = NETSMART_PROVIDER_DIRECTORY_BASES
 INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE = "https://api.interopstation.com/mdhhs/fhir"
 MICHIGAN_PROVIDER_DIRECTORY_BASE = "https://mi.fhir.mhbapp.com/pd/api/v1"
 MICHIGAN_SUPPORTED_RESOURCES = frozenset(
@@ -877,6 +917,25 @@ SCAN_PROVIDER_DIRECTORY_BASE = "https://providerdirectory.scanhealthplan.com"
 SCAN_PROVIDER_DIRECTORY_DOC_URL = (
     "https://developer.scanhealthplan.com/default/documentation/providerdirectory"
 )
+SCAN_LAST_UPDATED_PARTITION_RESOURCES = {
+    resource_type: {
+        "start": "1900-01-01T00:00:00Z",
+        "end": "resolved_now",
+        "ceiling": 1000,
+        "minimum_width_seconds": 1,
+        "page_count": 100,
+        "volatile_metadata_paths": [],
+    }
+    for resource_type in DEFAULT_RESOURCES
+}
+SCAN_EXPECTED_NONEMPTY_RESOURCES = (
+    "InsurancePlan",
+    "PractitionerRole",
+    "Practitioner",
+    "Organization",
+    "Location",
+    "OrganizationAffiliation",
+)
 SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR = "scan_practitioner_role_requires_reverse_lookup"
 SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES = ("Practitioner", "Organization", "Location")
 SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS = {
@@ -911,6 +970,8 @@ PREFERRED_FULL_REFRESH_PAGE_COUNT_BY_BASE = {
 }
 SOURCE_REQUEST_INTERVAL_SECONDS_BY_BASE = {
     HAP_PROVIDER_DIRECTORY_BASE: 20.0,
+    IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE: 1.0,
+    PENNSYLVANIA_MEDICAID_PROVIDER_DIRECTORY_BASE: 1.0,
 }
 SOURCE_RETRY_AFTER_FIELD = "_healthporta_retry_after"
 SOURCE_FETCH_DIAGNOSTIC_FIELD = "_healthporta_source_fetch_diagnostic"
@@ -952,10 +1013,18 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE,
         IEHP_PROVIDER_DIRECTORY_BASE,
+        IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE,
         MAINE_PROVIDER_DIRECTORY_BASE,
+        MICHIGAN_PROVIDER_DIRECTORY_BASE,
         MISSOURI_PROVIDER_DIRECTORY_BASE,
         MOLINA_PROVIDER_DIRECTORY_BASE,
         NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
+        PENNSYLVANIA_MEDICAID_PROVIDER_DIRECTORY_BASE,
+        SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE,
+        SAN_MATEO_COUNTY_PROVIDER_DIRECTORY_BASE,
+        EL_DORADO_COUNTY_PROVIDER_DIRECTORY_BASE,
+        DEVOTED_PROVIDER_DIRECTORY_BASE,
+        SIMPRA_PROVIDER_DIRECTORY_BASE,
         CONTRA_COSTA_PROVIDER_DIRECTORY_BASE,
         TMHP_PROVIDER_DIRECTORY_BASE,
         UHC_PROVIDER_DIRECTORY_BASE,
@@ -967,6 +1036,12 @@ PAGINATION_CHECKPOINT_ACTIVE = "active"
 PAGINATION_CHECKPOINT_COMPLETE = "complete"
 PAGINATION_CHECKPOINT_RECENT_URL_LIMIT = 64
 PAGINATION_CHECKPOINT_STRATEGY_VERSION = "provider-directory-fhir-search-v2"
+SYNTHETIC_POSITION_PAGE_GUARD_VERSION = "synthetic-position-page-v1"
+SYNTHETIC_POSITION_PAGE_GUARD_KEY = "synthetic_position_page_guard"
+SYNTHETIC_POSITION_PAGINATION_STRATEGY_VERSION = (
+    f"{PAGINATION_CHECKPOINT_STRATEGY_VERSION}+"
+    f"{SYNTHETIC_POSITION_PAGE_GUARD_VERSION}"
+)
 LAST_UPDATED_PARTITION_STRATEGY_VERSION = (
     "provider-directory-fhir-last-updated-v3"
 )
@@ -2499,7 +2574,7 @@ def _append_unique(values: list[str], value: str | None) -> None:
         values.append(value)
 
 
-def _candidate_base_urls(source: dict[str, Any]) -> list[str]:
+def _candidate_base_urls(source_record: dict[str, Any]) -> list[str]:
     candidates: list[str] = []
 
     def add(raw_url: str | None) -> None:
@@ -2523,7 +2598,7 @@ def _candidate_base_urls(source: dict[str, Any]) -> list[str]:
         ):
             _append_unique(candidates, _parent_base_url(api_base))
 
-    add(source.get("api_base"))
+    add(source_record.get("api_base"))
     for field in (
         "endpoint_insurance_plan",
         "endpoint_practitioner",
@@ -2535,7 +2610,7 @@ def _candidate_base_urls(source: dict[str, Any]) -> list[str]:
         "endpoint_network",
         "endpoint_endpoint",
     ):
-        add(source.get(field))
+        add(source_record.get(field))
     return candidates
 
 
@@ -2928,7 +3003,12 @@ def _url_with_count(url: str, page_count: int) -> str:
 
 def _source_pagination_start_url(source: dict[str, Any], url: str) -> str:
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
-    if api_base not in FHIR_OFFSET_PAGINATION_BASES | FHIR_SYNTHETIC_SKIP_PAGINATION_BASES:
+    position_pagination_bases = (
+        FHIR_OFFSET_PAGINATION_BASES
+        | FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
+        | FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES
+    )
+    if api_base not in position_pagination_bases:
         return url
     sorted_url = _url_with_replaced_query_item(url, "_sort", "_id")
     offset_parameter = (
@@ -3511,8 +3591,13 @@ def _partitioned_resource_start_urls(source: dict[str, Any], resource_type: str,
 
 
 def _scan_practitioner_role_requires_reverse_lookup(source: dict[str, Any], resource_type: str) -> bool:
+    last_updated_config, _config_error = _last_updated_partition_config(
+        source,
+        resource_type,
+    )
     return (
         resource_type == "PractitionerRole"
+        and last_updated_config is None
         and not _is_uhc_role_postal_partition_enabled(source)
         and bool(_practitioner_role_reverse_lookup_resources(source))
     )
@@ -4833,7 +4918,8 @@ def _michigan_provider_directory_override(
             "provider_directory_override_reason": (
                 "InteropStation relays Michigan's directory, but the public MHB FHIR "
                 "upstream is the canonical endpoint for metadata and resource probes. "
-                "Resource acquisition remains disabled pending an enumerable contract."
+                "Candidate acquisition follows its advertised opaque cursor with durable "
+                "checkpoints; publication still requires two matching exhaustive roots."
             ),
             "provider_directory_previous_api_base": _clean_text(
                 source_row.get("api_base")
@@ -4843,19 +4929,16 @@ def _michigan_provider_directory_override(
                 f"{MICHIGAN_PROVIDER_DIRECTORY_BASE}/metadata"
             ),
             "provider_directory_supported_resources": supported_resources,
+            "provider_directory_expected_nonempty_resources": supported_resources,
             "provider_directory_resource_page_count_caps": {
                 resource_type: 25 if resource_type == "PractitionerRole" else 100
                 for resource_type in supported_resources
             },
-            "provider_directory_fully_enumerable_resources": [],
-            "provider_directory_coverage_mode": "probe_only",
-            "provider_directory_acquisition_enabled": False,
-            "provider_directory_blocked_reason": (
-                PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
-            ),
-            "provider_directory_acquisition_blocked_reason": (
-                "The public upstream's advertised HAPI continuation is reachable, but "
-                "checkpoint resume and two matching exhaustive passes are not verified."
+            "provider_directory_fully_enumerable_resources": supported_resources,
+            "provider_directory_coverage_mode": "full",
+            "provider_directory_acquisition_enabled": True,
+            "provider_directory_candidate_status": (
+                "pending_two_matching_exhaustive_acquisitions"
             ),
         },
     }
@@ -5167,6 +5250,17 @@ def _scan_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | N
             "provider_directory_confirmed_doc_url": SCAN_PROVIDER_DIRECTORY_DOC_URL,
             "provider_directory_coverage_mode": "probe_only",
             "provider_directory_fully_enumerable_resources": [],
+            "provider_directory_acquisition_enabled": True,
+            "provider_directory_candidate_status": (
+                "pending_two_matching_exhaustive_acquisitions"
+            ),
+            "provider_directory_expected_nonempty_resources": list(
+                SCAN_EXPECTED_NONEMPTY_RESOURCES
+            ),
+            LAST_UPDATED_PARTITION_METADATA_KEY: {
+                "enabled": True,
+                "resources": SCAN_LAST_UPDATED_PARTITION_RESOURCES,
+            },
             "provider_directory_blocked_reason": (
                 PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
             ),
@@ -6352,11 +6446,15 @@ def _address(resource: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def parse_capability(source: dict[str, Any], payload: dict[str, Any], probe: dict[str, Any]) -> dict[str, Any]:
+def parse_capability(
+    source_record: dict[str, Any],
+    capability_payload: dict[str, Any],
+    probe: dict[str, Any],
+) -> dict[str, Any]:
     """Parse capability into normalized provider-directory records."""
     rest_resources: list[str] = []
-    search_params: dict[str, list[str]] = {}
-    for rest in payload.get("rest") or []:
+    search_params_by_resource: dict[str, list[str]] = {}
+    for rest in capability_payload.get("rest") or []:
         if not isinstance(rest, dict):
             continue
         for resource in rest.get("resource") or []:
@@ -6367,38 +6465,49 @@ def parse_capability(source: dict[str, Any], payload: dict[str, Any], probe: dic
                 continue
             rest_resources.append(resource_type)
             names = [
-                str(item.get("name"))
-                for item in resource.get("searchParam") or []
-                if isinstance(item, dict) and _clean_text(item.get("name"))
+                str(search_parameter.get("name"))
+                for search_parameter in resource.get("searchParam") or []
+                if isinstance(search_parameter, dict)
+                and _clean_text(search_parameter.get("name"))
             ]
-            search_params[resource_type] = names
-    software = payload.get("software") if isinstance(payload.get("software"), dict) else {}
-    implementation = payload.get("implementation") if isinstance(payload.get("implementation"), dict) else {}
-    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+            search_params_by_resource[resource_type] = names
+    software = (
+        capability_payload.get("software")
+        if isinstance(capability_payload.get("software"), dict)
+        else {}
+    )
+    implementation = (
+        capability_payload.get("implementation")
+        if isinstance(capability_payload.get("implementation"), dict)
+        else {}
+    )
+    digest = hashlib.sha256(
+        json.dumps(capability_payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
     return {
-        "source_id": source["source_id"],
-        "api_base": source.get("api_base"),
+        "source_id": source_record["source_id"],
+        "api_base": source_record.get("api_base"),
         "metadata_url": probe.get("url"),
         "probe_status": probe["status"],
         "http_status": probe.get("http_status"),
         "response_time_ms": probe.get("response_time_ms"),
-        "resource_type": _clean_text(payload.get("resourceType")),
-        "fhir_version": _clean_text(payload.get("fhirVersion")),
+        "resource_type": _clean_text(capability_payload.get("resourceType")),
+        "fhir_version": _clean_text(capability_payload.get("fhirVersion")),
         "software_name": _clean_text(software.get("name")),
         "software_version": _clean_text(software.get("version")),
         "implementation_url": _clean_text(implementation.get("url")),
-        "formats": payload.get("format") or [],
+        "formats": capability_payload.get("format") or [],
         "supported_resources": sorted(set(rest_resources)),
-        "search_params": search_params,
+        "search_params": search_params_by_resource,
         "auth_required": probe["status"] == "auth_required",
         "error": probe.get("error"),
         "capability_hash": digest,
         "probed_at": _now(),
         "run_id": probe.get("run_id"),
         "metadata_json": {
-            "publisher": _clean_text(payload.get("publisher")),
-            "date": _clean_text(payload.get("date")),
-            "kind": _clean_text(payload.get("kind")),
+            "publisher": _clean_text(capability_payload.get("publisher")),
+            "date": _clean_text(capability_payload.get("date")),
+            "kind": _clean_text(capability_payload.get("kind")),
         },
     }
 
@@ -12902,7 +13011,7 @@ async def _network_catalog_scope_sources(
     cleaned = _clean_source_id_list(source_ids)
     if cleaned or not run_id:
         return cleaned
-    rows = await db.all(
+    source_rows = await db.all(
         f"""
         SELECT DISTINCT source_id
           FROM (
@@ -12926,7 +13035,9 @@ async def _network_catalog_scope_sources(
         """,
         run_id=run_id,
     )
-    return _clean_source_id_list([row[0] for row in rows])
+    return _clean_source_id_list(
+        [source_row[0] for source_row in source_rows]
+    )
 
 
 def _provider_directory_network_catalog_scope_filter(
@@ -13761,26 +13872,32 @@ def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_pr
 
 async def _mark_resource_rows_seen(
     model,
-    rows: list[dict[str, Any]],
+    resource_rows: list[dict[str, Any]],
     run_id: str | None,
     *,
     seen_table: str | None = None,
 ) -> int:
+    """Record the unique source/resource identities observed in this run."""
     resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
-    if not run_id or not resource_type or not rows:
+    if not run_id or not resource_type or not resource_rows:
         return 0
-    seen: dict[tuple[str, str], tuple[str, str]] = {}
-    for row in rows:
-        source_id = _clean_text(row.get("source_id"))
-        resource_id = _clean_text(row.get("resource_id"))
+    seen_pairs_by_key: dict[tuple[str, str], tuple[str, str]] = {}
+    for resource_row in resource_rows:
+        source_id = _clean_text(resource_row.get("source_id"))
+        resource_id = _clean_text(resource_row.get("resource_id"))
         if source_id and resource_id:
-            seen[(source_id, resource_id)] = (source_id, resource_id)
-    if not seen:
+            seen_pairs_by_key[(source_id, resource_id)] = (source_id, resource_id)
+    if not seen_pairs_by_key:
         return 0
-    items = list(seen.values())
-    if _copy_upsert_enabled() and len(items) >= _copy_upsert_min_rows():
+    seen_pairs = list(seen_pairs_by_key.values())
+    if _copy_upsert_enabled() and len(seen_pairs) >= _copy_upsert_min_rows():
         try:
-            return await _copy_mark_resource_rows_seen(resource_type, items, run_id, seen_table=seen_table)
+            return await _copy_mark_resource_rows_seen(
+                resource_type,
+                seen_pairs,
+                run_id,
+                seen_table=seen_table,
+            )
         except Exception as exc:  # pragma: no cover - exercised on driver-specific fallback paths
             print(f"Provider Directory COPY seen fallback for {resource_type}: {_short_error(exc)}")
     max_rows = _max_rows_per_statement(4)
@@ -13791,26 +13908,26 @@ async def _mark_resource_rows_seen(
         if seen_table
         else "ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING"
     )
-    for offset in range(0, len(items), max_rows):
-        batch = items[offset : offset + max_rows]
-        params: dict[str, Any] = {
+    for offset in range(0, len(seen_pairs), max_rows):
+        batch = seen_pairs[offset : offset + max_rows]
+        query_params_by_name: dict[str, Any] = {
             "run_id": run_id,
             "resource_type": resource_type,
         }
-        values_sql: list[str] = []
+        value_rows_sql: list[str] = []
         for idx, (source_id, resource_id) in enumerate(batch):
-            params[f"source_id_{idx}"] = source_id
-            params[f"resource_id_{idx}"] = resource_id
-            values_sql.append(
+            query_params_by_name[f"source_id_{idx}"] = source_id
+            query_params_by_name[f"resource_id_{idx}"] = resource_id
+            value_rows_sql.append(
                 f"(:run_id, :resource_type, :source_id_{idx}, :resource_id_{idx})"
             )
         await db.status(
             f"""
             INSERT INTO {seen_ref} (run_id, resource_type, source_id, resource_id)
-            VALUES {", ".join(values_sql)}
+            VALUES {", ".join(value_rows_sql)}
             {conflict_sql};
             """,
-            **params,
+            **query_params_by_name,
         )
         total += len(batch)
     return total
@@ -13818,7 +13935,7 @@ async def _mark_resource_rows_seen(
 
 async def _copy_mark_resource_rows_seen(
     resource_type: str,
-    items: list[tuple[str, str]],
+    source_resource_pairs: list[tuple[str, str]],
     run_id: str,
     *,
     seen_table: str | None = None,
@@ -13826,20 +13943,31 @@ async def _copy_mark_resource_rows_seen(
     schema = _schema()
     if seen_table:
         columns = ["run_id", "resource_type", "source_id", "resource_id"]
-        records = [(run_id, resource_type, source_id, resource_id) for source_id, resource_id in items]
+        copy_records = [
+            (run_id, resource_type, source_id, resource_id)
+            for source_id, resource_id in source_resource_pairs
+        ]
         async with db.acquire() as conn:
             raw_conn = conn.raw_connection
             driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
             copy_method = getattr(driver_conn, "copy_records_to_table", None)
             if copy_method is None:
                 raise NotImplementedError("active database driver lacks copy_records_to_table")
-            await copy_method(seen_table, schema_name=schema, columns=columns, records=records)
-        return len(items)
+            await copy_method(
+                seen_table,
+                schema_name=schema,
+                columns=columns,
+                records=copy_records,
+            )
+        return len(source_resource_pairs)
 
     seen_ref = _qt(schema, PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
     stage_table = _stage_table_name()
     columns = ["run_id", "resource_type", "source_id", "resource_id"]
-    records = [(run_id, resource_type, source_id, resource_id) for source_id, resource_id in items]
+    copy_records = [
+        (run_id, resource_type, source_id, resource_id)
+        for source_id, resource_id in source_resource_pairs
+    ]
     async with db.acquire() as conn:
         await conn.status(
             f"""
@@ -13852,7 +13980,7 @@ async def _copy_mark_resource_rows_seen(
         copy_method = getattr(driver_conn, "copy_records_to_table", None)
         if copy_method is None:
             raise NotImplementedError("active database driver lacks copy_records_to_table")
-        await copy_method(stage_table, columns=columns, records=records)
+        await copy_method(stage_table, columns=columns, records=copy_records)
         quoted_columns = ", ".join(_q(column) for column in columns)
         await conn.status(
             f"""
@@ -13862,7 +13990,7 @@ async def _copy_mark_resource_rows_seen(
             ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING;
             """
         )
-    return len(items)
+    return len(source_resource_pairs)
 
 
 async def _clear_resource_rows_seen(run_id: str | None) -> int:
@@ -13968,7 +14096,7 @@ def _endpoint_dataset_resource_rows(
 
 def _source_resource_edge_rows(
     model,
-    rows: list[dict[str, Any]],
+    resource_rows: list[dict[str, Any]],
     *,
     canonical_api_base: str | None,
     source_ids: list[str],
@@ -13980,8 +14108,8 @@ def _source_resource_edge_rows(
         return []
     resource_ids = {
         resource_id
-        for row in rows
-        if (resource_id := _clean_text(row.get("resource_id")))
+        for resource_row in resource_rows
+        if (resource_id := _clean_text(resource_row.get("resource_id")))
     }
     observed_at = _now()
     return [
@@ -14151,7 +14279,7 @@ async def _copy_upsert_connection(transaction_session: Any | None):
 
 async def _copy_upsert_rows(
     model,
-    normalized: list[dict[str, Any]],
+    normalized_rows: list[dict[str, Any]],
     columns: list[str],
     primary_keys: list[str],
     *,
@@ -14184,7 +14312,10 @@ async def _copy_upsert_rows(
         conflict_sql = "DO NOTHING"
 
     json_columns = _json_columns(table)
-    records = [_copy_record(row, columns, json_columns) for row in normalized]
+    copy_records = [
+        _copy_record(normalized_row, columns, json_columns)
+        for normalized_row in normalized_rows
+    ]
     select_sql = f"SELECT {quoted_columns}\n            FROM {quoted_stage}"
     if skip_unchanged:
         stage_alias = "stage_row"
@@ -14221,7 +14352,7 @@ async def _copy_upsert_rows(
         copy_method = getattr(driver_conn, "copy_records_to_table", None)
         if copy_method is None:
             raise NotImplementedError("active database driver lacks copy_records_to_table")
-        await copy_method(stage_table, columns=columns, records=records)
+        await copy_method(stage_table, columns=columns, records=copy_records)
         if skip_unchanged:
             await conn.status(f"ANALYZE {quoted_stage};")
         await conn.status(
@@ -14231,32 +14362,37 @@ async def _copy_upsert_rows(
             ON CONFLICT ({quoted_conflict}) {conflict_sql};
             """
         )
-    return len(normalized)
+    return len(normalized_rows)
 
 
 async def _upsert_rows(
     model,
-    rows: list[dict[str, Any]],
+    resource_rows: list[dict[str, Any]],
     *,
     skip_unchanged: bool = False,
 ) -> int:
-    if not rows:
+    if not resource_rows:
         return 0
-    if model is ProviderDirectoryLocation and _location_contact_fields_missing(rows):
-        rows = _attach_location_contact_fields(rows)
+    if model is ProviderDirectoryLocation and _location_contact_fields_missing(
+        resource_rows
+    ):
+        resource_rows = _attach_location_contact_fields(resource_rows)
     table = model.__table__
     columns = [column.name for column in table.columns]
     primary_keys = [column.name for column in table.primary_key.columns]
-    rows = _dedupe_rows_by_primary_key(primary_keys, rows)
-    if not rows:
+    resource_rows = _dedupe_rows_by_primary_key(primary_keys, resource_rows)
+    if not resource_rows:
         return 0
-    normalized = [{key: row.get(key) for key in columns} for row in rows]
+    normalized_rows = [
+        {key: resource_row.get(key) for key in columns}
+        for resource_row in resource_rows
+    ]
     transaction_options = _transaction_session_options(_bound_upsert_session())
-    if _copy_upsert_enabled() and len(normalized) >= _copy_upsert_min_rows():
+    if _copy_upsert_enabled() and len(normalized_rows) >= _copy_upsert_min_rows():
         try:
             return await _copy_upsert_rows(
                 model,
-                normalized,
+                normalized_rows,
                 columns,
                 primary_keys,
                 skip_unchanged=skip_unchanged,
@@ -14266,7 +14402,7 @@ async def _upsert_rows(
             print(f"Provider Directory COPY upsert fallback for {model.__tablename__}: {_short_error(exc)}")
     return await _upsert_rows_values(
         model,
-        normalized,
+        normalized_rows,
         columns,
         primary_keys,
         skip_unchanged=skip_unchanged,
@@ -15129,7 +15265,11 @@ def _provider_directory_blocker_seed_rows(*, source_query: str | None = None) ->
                 },
             }
         )
-    return [row for row in blocker_rows if _seed_row_matches_query(row, source_query)]
+    return [
+        blocker_record
+        for blocker_record in blocker_rows
+        if _seed_row_matches_query(blocker_record, source_query)
+    ]
 
 
 def _health_partners_plans_seed_rows(*, source_query: str | None = None) -> list[dict[str, Any]]:
@@ -15149,6 +15289,210 @@ def _health_partners_plans_seed_rows(*, source_query: str | None = None) -> list
     return [row] if _seed_row_matches_query(row, source_query) else []
 
 
+def _reviewed_provider_directory_candidate_seed_rows(
+    *,
+    source_query: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return reviewed seeds that remain unpublished Provider Directory candidates."""
+
+    def candidate_row(
+        *,
+        row_id: str,
+        org_name: str,
+        plan_name: str,
+        api_base: str,
+        source_url: str,
+        resources: tuple[str, ...],
+        expected_nonempty_resources: tuple[str, ...],
+        seed_source: str = REVIEWED_PROVIDER_DIRECTORY_CANDIDATE_SOURCE,
+        requires_registration: bool = False,
+        acquisition_enabled: bool = True,
+        acquisition_blocked_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Build one fail-closed reviewed candidate seed record."""
+        metadata = {
+            "provider_directory_override": "reviewed_candidate_acquisition",
+            "provider_directory_confirmed_base": api_base,
+            "provider_directory_confirmed_metadata_url": f"{api_base}/metadata",
+            "provider_directory_confirmed_catalog_url": source_url,
+            "provider_directory_supported_resources": list(resources),
+            "provider_directory_resource_page_count_caps": {
+                resource_type: 100 for resource_type in resources
+            },
+            "provider_directory_expected_nonempty_resources": list(
+                expected_nonempty_resources
+            ),
+        }
+        if acquisition_enabled:
+            metadata.update(
+                {
+                    "provider_directory_fully_enumerable_resources": list(resources),
+                    "provider_directory_coverage_mode": "full",
+                    "provider_directory_acquisition_enabled": True,
+                    "provider_directory_candidate_status": (
+                        "pending_two_matching_exhaustive_acquisitions"
+                    ),
+                }
+            )
+        else:
+            metadata.update(
+                {
+                    "provider_directory_fully_enumerable_resources": [],
+                    "provider_directory_coverage_mode": "probe_only",
+                    "provider_directory_acquisition_enabled": False,
+                    "provider_directory_blocked_reason": (
+                        PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
+                    ),
+                    "provider_directory_acquisition_blocked_reason": (
+                        acquisition_blocked_reason
+                        or (
+                            "Exact broad census requests return OperationOutcome, so the "
+                            "strict ranged-only completeness contract is not implemented."
+                        )
+                    ),
+                }
+            )
+        return {
+            "id": row_id,
+            "org_name": org_name,
+            "plan_name": plan_name,
+            "api_base": api_base,
+            "auth_type": "none",
+            "last_validated_status": "valid",
+            "requires_registration": requires_registration,
+            "source": seed_source,
+            "source_detail": (
+                "HealthPorta-reviewed public Provider Directory candidate "
+                + (
+                    "pending two matching exhaustive acquisitions"
+                    if acquisition_enabled
+                    else "with acquisition blocked by an incomplete census contract"
+                )
+            ),
+            "source_url": source_url,
+            "note": (
+                (
+                    "Acquisition controls are configured for candidate verification only; "
+                    if acquisition_enabled
+                    else "Acquisition remains disabled and fail-closed; "
+                )
+                + "the source is not runnable in the public manifest or published to Profile."
+            ),
+            "metadata_json": metadata,
+        }
+
+    state_resources = tuple(DEFAULT_RESOURCES)
+    county_expected_resources = (
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+    )
+    reviewed_rows = [
+        candidate_row(
+            row_id="cms-sma-iowa-reviewed-candidate",
+            org_name="State of Iowa",
+            plan_name="Iowa Medicaid Provider Directory",
+            api_base=IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE,
+            source_url=CMS_SMA_ENDPOINT_DIRECTORY_URL,
+            seed_source=CMS_SMA_ENDPOINT_DIRECTORY_SOURCE,
+            resources=state_resources,
+            expected_nonempty_resources=tuple(
+                sorted(STATE_EXPECTED_NONEMPTY_RESOURCES)
+            ),
+        ),
+        candidate_row(
+            row_id="cms-sma-pennsylvania-reviewed-candidate",
+            org_name="State of Pennsylvania",
+            plan_name="Pennsylvania Medicaid Provider Directory",
+            api_base=PENNSYLVANIA_MEDICAID_PROVIDER_DIRECTORY_BASE,
+            source_url=CMS_SMA_ENDPOINT_DIRECTORY_URL,
+            seed_source=CMS_SMA_ENDPOINT_DIRECTORY_SOURCE,
+            resources=state_resources,
+            expected_nonempty_resources=tuple(
+                sorted(STATE_EXPECTED_NONEMPTY_RESOURCES)
+            ),
+        ),
+        candidate_row(
+            row_id="san-bernardino-county-dbh-reviewed-candidate",
+            org_name="San Bernardino County Department of Behavioral Health",
+            plan_name="San Bernardino County Behavioral Health Provider Directory",
+            api_base=SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE,
+            source_url="https://wp.sbcounty.gov/dbh/developersapis/",
+            resources=state_resources,
+            expected_nonempty_resources=county_expected_resources,
+        ),
+        candidate_row(
+            row_id="san-mateo-county-bhrs-reviewed-candidate",
+            org_name=(
+                "San Mateo County Behavioral Health and Recovery Services"
+            ),
+            plan_name="San Mateo County Behavioral Health Provider Directory",
+            api_base=SAN_MATEO_COUNTY_PROVIDER_DIRECTORY_BASE,
+            source_url="https://www.smchealth.org/node/6722",
+            resources=state_resources,
+            expected_nonempty_resources=county_expected_resources,
+        ),
+        candidate_row(
+            row_id="el-dorado-county-behavioral-health-reviewed-candidate",
+            org_name="El Dorado County Behavioral Health",
+            plan_name="El Dorado County Behavioral Health Provider Directory",
+            api_base=EL_DORADO_COUNTY_PROVIDER_DIRECTORY_BASE,
+            source_url=(
+                "https://www.eldoradocounty.ca.gov/files/assets/county/v/2/"
+                "documents/health-amp-wellbeing/mental-health/"
+                "patient-access_provider_directory-api-documentation_30dec2025.pdf"
+            ),
+            resources=state_resources,
+            expected_nonempty_resources=county_expected_resources,
+            requires_registration=True,
+            acquisition_enabled=False,
+            acquisition_blocked_reason=(
+                "County documentation requires organization registration and approval; "
+                "anonymous exhaustive acquisition is disabled until access permission "
+                "is confirmed."
+            ),
+        ),
+        candidate_row(
+            row_id="devoted-health-reviewed-candidate",
+            org_name="Devoted Health",
+            plan_name="Devoted Health Provider Directory",
+            api_base=DEVOTED_PROVIDER_DIRECTORY_BASE,
+            source_url="https://www.devoted.com/developers/",
+            resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
+            expected_nonempty_resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
+        ),
+        candidate_row(
+            row_id="simpra-advantage-reviewed-candidate",
+            org_name="Simpra Advantage",
+            plan_name="Simpra Advantage Provider Directory",
+            api_base=SIMPRA_PROVIDER_DIRECTORY_BASE,
+            source_url="https://simpra.healthlx.com/developers",
+            resources=AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES,
+            expected_nonempty_resources=AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES,
+        ),
+        candidate_row(
+            row_id="capital-blue-cross-reviewed-candidate",
+            org_name="Capital Blue Cross",
+            plan_name="Capital Blue Cross Provider Directory",
+            api_base=CAPITAL_BLUE_CROSS_PROVIDER_DIRECTORY_BASE,
+            source_url=(
+                "https://www.capbluecross.com/wps/portal/cap/about/developer/"
+                "provider-directory-api-access-guide"
+            ),
+            resources=tuple(DEFAULT_RESOURCES),
+            expected_nonempty_resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
+            acquisition_enabled=False,
+        ),
+    ]
+    return [
+        candidate_record
+        for candidate_record in reviewed_rows
+        if _seed_row_matches_query(candidate_record, source_query)
+    ]
+
+
 def _seed_rows_from_supplemental_catalogs(
     *,
     source_query: str | None = None,
@@ -15163,6 +15507,14 @@ def _seed_rows_from_supplemental_catalogs(
     """Build rows from supplemental catalogs used to seed provider-directory discovery."""
     rows: list[dict[str, Any]] = []
     metrics: dict[str, Any] = {"catalogs": {}}
+    candidate_rows = _reviewed_provider_directory_candidate_seed_rows(
+        source_query=source_query
+    )
+    rows.extend(candidate_rows)
+    metrics["catalogs"]["reviewed_provider_directory_candidates"] = {
+        "source": REVIEWED_PROVIDER_DIRECTORY_CANDIDATE_SOURCE,
+        "rows": len(candidate_rows),
+    }
     try:
         catalog_rows, catalog_metrics = _seed_rows_from_amerihealth_caritas_catalog(
             source_query=source_query,
@@ -15228,49 +15580,67 @@ def _seed_rows_from_supplemental_catalogs(
 
 
 def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = None) -> list[dict[str, Any]]:
+    """Load normalized Provider Directory seed rows from a retest report."""
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        retest_document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Provider Directory retest results could not be read from {path}: {exc}") from exc
-    results = payload.get("results") if isinstance(payload, dict) else payload
-    if not isinstance(results, list):
+    retest_results = (
+        retest_document.get("results")
+        if isinstance(retest_document, dict)
+        else retest_document
+    )
+    if not isinstance(retest_results, list):
         raise RuntimeError(f"Provider Directory retest results at {path} must be a JSON object/list with results.")
     seed_rows: list[dict[str, Any]] = []
     allowed_classifications = {"valid", "valid_non_fhir", "auth_required"}
-    for index, item in enumerate(results):
-        if not isinstance(item, dict):
+    for index, result_record in enumerate(retest_results):
+        if not isinstance(result_record, dict):
             continue
-        classification = (_clean_text(item.get("classification")) or "").lower()
-        api_base = _clean_text(item.get("api_base"))
-        org_name = _clean_text(item.get("org_name"))
+        classification = (
+            _clean_text(result_record.get("classification")) or ""
+        ).lower()
+        api_base = _clean_text(result_record.get("api_base"))
+        org_name = _clean_text(result_record.get("org_name"))
         if not api_base or not org_name:
             continue
         is_auth_required = classification == "auth_required"
-        row = {
-            "id": _clean_text(item.get("payer_id")) or f"retest-{index}",
+        seed_record = {
+            "id": _clean_text(result_record.get("payer_id")) or f"retest-{index}",
             "org_name": org_name,
-            "plan_name": _clean_text(item.get("plan_name")) or "Provider Directory Retest",
+            "plan_name": _clean_text(result_record.get("plan_name"))
+            or "Provider Directory Retest",
             "api_base": api_base,
             "auth_type": (
                 "open"
                 if classification == "valid"
-                else _clean_text(item.get("auth_type")) or (
+                else _clean_text(result_record.get("auth_type")) or (
                     "OAuth2 Client Credentials" if is_auth_required else "none"
                 )
             ),
             "last_validated_status": classification,
             "requires_registration": is_auth_required,
-            "fhir_version": _clean_text(item.get("fhir_version")),
+            "fhir_version": _clean_text(result_record.get("fhir_version")),
             "source": "provider-directory-db-retest",
             "note": "Supplemental source from provider-directory-db retest_results.json",
-            "source_detail": f"retest classification={classification}; status_code={item.get('status_code')}",
-            "source_url": _clean_text(item.get("url")),
-            "source_date": _clean_text(payload.get("tested_at")) if isinstance(payload, dict) else None,
+            "source_detail": (
+                f"retest classification={classification}; "
+                f"status_code={result_record.get('status_code')}"
+            ),
+            "source_url": _clean_text(result_record.get("url")),
+            "source_date": (
+                _clean_text(retest_document.get("tested_at"))
+                if isinstance(retest_document, dict)
+                else None
+            ),
         }
-        if classification not in allowed_classifications and not _seed_row_has_recoverable_provider_directory_base(row):
+        if (
+            classification not in allowed_classifications
+            and not _seed_row_has_recoverable_provider_directory_base(seed_record)
+        ):
             continue
-        if _seed_row_matches_query(row, source_query):
-            seed_rows.append(row)
+        if _seed_row_matches_query(seed_record, source_query):
+            seed_rows.append(seed_record)
     return seed_rows
 
 
@@ -15541,23 +15911,23 @@ def _fetch_json_sync(
 
 def _post_json_sync(
     url: str,
-    payload: dict[str, Any],
+    request_payload: dict[str, Any],
     *,
     timeout: int,
     extra_headers: dict[str, str] | None = None,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
-    headers = {
+    request_headers_by_name = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
     }
     if extra_headers:
-        headers.update(extra_headers)
+        request_headers_by_name.update(extra_headers)
     started = time.monotonic()
     request = urllib.request.Request(
         url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
+        data=json.dumps(request_payload).encode("utf-8"),
+        headers=request_headers_by_name,
         method="POST",
     )
     try:
@@ -16845,6 +17215,179 @@ def _synthetic_skip_pagination_next_url(
         return None
     next_skip = int(skip_values[0]) + bundle_entry_count
     return _url_with_replaced_query_item(current_url, "_skip", str(next_skip))
+
+
+def _synthetic_offset_pagination_next_url(
+    source_record: dict[str, Any],
+    current_url: str,
+    bundle_entry_count: int,
+) -> str | None:
+    """Advance Netsmart's stable offset by rows, ignoring its overlapping next link."""
+
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    if api_base not in FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES:
+        raise ValueError("synthetic offset pagination is not configured for source")
+    parsed_current = urllib.parse.urlsplit(current_url)
+    parsed_base = urllib.parse.urlsplit(api_base)
+    query_items = urllib.parse.parse_qsl(parsed_current.query, keep_blank_values=True)
+    count_values = [parameter_value for key, parameter_value in query_items if key == "_count"]
+    offset_values = [parameter_value for key, parameter_value in query_items if key == "_offset"]
+    sort_values = [parameter_value for key, parameter_value in query_items if key == "_sort"]
+    is_valid = (
+        parsed_current.scheme.lower() == parsed_base.scheme.lower()
+        and parsed_current.netloc.lower() == parsed_base.netloc.lower()
+        and parsed_current.path.startswith(parsed_base.path.rstrip("/") + "/")
+        and not parsed_current.fragment
+        and len(count_values) == 1
+        and count_values[0].isdigit()
+        and int(count_values[0]) > 0
+        and len(offset_values) == 1
+        and offset_values[0].isdigit()
+        and sort_values == ["_id"]
+    )
+    if not is_valid:
+        raise ValueError("invalid synthetic offset pagination URL")
+    if bundle_entry_count < int(count_values[0]):
+        return None
+    next_offset = int(offset_values[0]) + bundle_entry_count
+    return _url_with_replaced_query_item(current_url, "_offset", str(next_offset))
+
+
+def _synthetic_position_page_identity(
+    source_record: dict[str, Any],
+    bundle_entries: list[dict[str, Any]],
+) -> tuple[tuple[str, ...], str] | None:
+    """Return a stable page identity for synthetic skip/offset pagination."""
+
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    if api_base not in (
+        FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
+        | FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES
+    ):
+        return None
+    resource_identities: list[str] = []
+    for entry in bundle_entries:
+        resource = entry.get("resource") if isinstance(entry, dict) else None
+        if not isinstance(resource, dict):
+            continue
+        resource_type = _clean_text(resource.get("resourceType")) or "Resource"
+        resource_id = _clean_text(resource.get("id"))
+        if resource_id:
+            resource_identities.append(f"{resource_type}/{resource_id}")
+            continue
+        full_url = _clean_text(entry.get("fullUrl"))
+        if full_url:
+            resource_identities.append(f"url:{full_url}")
+            continue
+        payload_hash = hashlib.sha256(
+            json.dumps(
+                resource,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        resource_identities.append(f"payload:{payload_hash}")
+    ordered_identities = tuple(resource_identities)
+    page_fingerprint = hashlib.sha256(
+        json.dumps(
+            ordered_identities,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return ordered_identities, page_fingerprint
+
+
+def _synthetic_position_resume_guard(
+    resume_state: PaginationResumeState | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if resume_state is None:
+        return (), ()
+    guard = resume_state.completeness.get(SYNTHETIC_POSITION_PAGE_GUARD_KEY)
+    if not isinstance(guard, dict) or guard.get("strategy_version") != (
+        SYNTHETIC_POSITION_PAGE_GUARD_VERSION
+    ):
+        return (), ()
+    resource_identities = guard.get("resource_identities")
+    recent_page_fingerprints = guard.get("recent_page_fingerprints")
+    if not isinstance(resource_identities, list) or not all(
+        isinstance(resource_identity, str)
+        for resource_identity in resource_identities
+    ):
+        return (), ()
+    if not isinstance(recent_page_fingerprints, list) or not all(
+        isinstance(page_fingerprint, str) and page_fingerprint
+        for page_fingerprint in recent_page_fingerprints
+    ):
+        return (), ()
+    return tuple(resource_identities), tuple(recent_page_fingerprints)
+
+
+def _synthetic_position_resume_guard_error(
+    source_record: dict[str, Any],
+    resume_state: PaginationResumeState | None,
+) -> str | None:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    if api_base not in (
+        FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
+        | FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES
+    ):
+        return None
+    if (
+        resume_state is None
+        or not resume_state.resumed
+        or (
+            resume_state.pages_processed <= 0
+            and resume_state.rows_processed <= 0
+        )
+    ):
+        return None
+    _resource_identities, recent_page_fingerprints = (
+        _synthetic_position_resume_guard(resume_state)
+    )
+    if not recent_page_fingerprints:
+        return "pagination_page_guard_missing"
+    return None
+
+
+def _synthetic_position_page_guard_error(
+    page_identity: tuple[tuple[str, ...], str] | None,
+    previous_resource_identities: tuple[str, ...],
+    recent_page_fingerprints: tuple[str, ...],
+) -> str | None:
+    if page_identity is None:
+        return None
+    resource_identities, page_fingerprint = page_identity
+    identity_set = set(resource_identities)
+    if len(identity_set) != len(resource_identities):
+        return "pagination_page_repeated"
+    if page_fingerprint in recent_page_fingerprints:
+        return "pagination_page_repeated"
+    if identity_set.intersection(previous_resource_identities):
+        return "pagination_page_repeated"
+    return None
+
+
+def _synthetic_position_page_guard_completeness(
+    page_identity: tuple[tuple[str, ...], str] | None,
+    recent_page_fingerprints: tuple[str, ...],
+) -> dict[str, Any] | None:
+    if page_identity is None:
+        return None
+    resource_identities, page_fingerprint = page_identity
+    return {
+        SYNTHETIC_POSITION_PAGE_GUARD_KEY: {
+            "strategy_version": SYNTHETIC_POSITION_PAGE_GUARD_VERSION,
+            "resource_identities": list(resource_identities),
+            "page_fingerprint": page_fingerprint,
+            "recent_page_fingerprints": list(recent_page_fingerprints),
+        }
+    }
 
 
 def _pagination_host_key(url_or_host: str | None) -> str | None:
@@ -18169,7 +18712,7 @@ def _bulk_export_poll_settings() -> tuple[int, int]:
 
 async def _bulk_export_poll_outputs(
     session: aiohttp.ClientSession,
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     status_url: str,
     *,
     resource_type: str,
@@ -18178,18 +18721,24 @@ async def _bulk_export_poll_outputs(
     """Poll a Bulk Data status URL until output URLs, an error, or timeout."""
     max_polls, poll_seconds = _bulk_export_poll_settings()
     for poll in range(1, max(1, max_polls) + 1):
-        status_code, headers, payload, error = await _bulk_http_get_json(
+        status_code, headers, status_payload, error = await _bulk_http_get_json(
             session,
-            source,
+            source_record,
             status_url,
             timeout=timeout,
         )
         if error:
-            _bulk_export_log_poll_error(source, resource_type, poll, max_polls, error)
+            _bulk_export_log_poll_error(
+                source_record,
+                resource_type,
+                poll,
+                max_polls,
+                error,
+            )
             return None, error, poll
         if status_code == 202:
             await _bulk_export_sleep_after_poll_wait(
-                source,
+                source_record,
                 resource_type,
                 poll,
                 max_polls,
@@ -18200,17 +18749,22 @@ async def _bulk_export_poll_outputs(
             continue
         if status_code == 200:
             output_urls, payload_error = _bulk_export_poll_ready_result(
-                source,
+                source_record,
                 resource_type,
                 poll,
-                payload,
+                status_payload,
             )
             return output_urls, payload_error, poll
-        _bulk_export_log_poll_http_error(source, resource_type, poll, status_code)
+        _bulk_export_log_poll_http_error(
+            source_record,
+            resource_type,
+            poll,
+            status_code,
+        )
         return None, f"bulk_export_status_http_{status_code}", poll
     _bulk_export_log(
         "poll_timeout",
-        source_id=source.get("source_id"),
+        source_id=source_record.get("source_id"),
         resource=resource_type,
         polls=max(1, max_polls),
         max_polls=max_polls,
@@ -24103,6 +24657,25 @@ async def _fetch_resource_rows(
         if isinstance(prepared_census, ResourceFetchResult):
             return prepared_census
         caresource_proof_by_field = prepared_census
+    synthetic_resume_guard_error = _synthetic_position_resume_guard_error(
+        source_record,
+        resume_state,
+    )
+    if synthetic_resume_guard_error and resume_state is not None:
+        return ResourceFetchResult(
+            model=model,
+            rows=[],
+            rows_fetched=resume_state.rows_processed,
+            rows_written=0,
+            pages_fetched=resume_state.pages_processed,
+            complete=False,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=True,
+            error=synthetic_resume_guard_error,
+            fetch_mode="checkpointed_paged",
+        )
     if resume_state and resume_state.complete:
         if is_caresource_census_enabled and (
             not caresource_proof_by_field
@@ -24160,6 +24733,10 @@ async def _fetch_resource_rows(
     source_api_base = _canonical_base(
         source_record.get("canonical_api_base") or source_record.get("api_base")
     )
+    (
+        previous_synthetic_resource_identities,
+        recent_synthetic_page_fingerprints,
+    ) = _synthetic_position_resume_guard(resume_state)
     is_uhc_partition_scan = (
         source_api_base == UHC_PROVIDER_DIRECTORY_BASE and len(start_urls) > 1
     )
@@ -24333,6 +24910,8 @@ async def _fetch_resource_rows(
                     seen_urls.clear()
                     recent_url_hashes.clear()
                     persisted_url_hashes.clear()
+                    previous_synthetic_resource_identities = ()
+                    recent_synthetic_page_fingerprints = ()
                     has_restart_attempted = True
                     url = checkpoint_start_url
                     continue
@@ -24374,6 +24953,27 @@ async def _fetch_resource_rows(
             if _is_uhc_partition_cap_exhausted(source_record, url, response_payload):
                 error_message = f"uhc_{resource_type.lower()}_partition_cap_exhausted"
             entries = _bundle_entries(response_payload)
+            synthetic_page_identity = _synthetic_position_page_identity(
+                source_record,
+                entries,
+            )
+            synthetic_page_guard_error = _synthetic_position_page_guard_error(
+                synthetic_page_identity,
+                previous_synthetic_resource_identities,
+                recent_synthetic_page_fingerprints,
+            )
+            if synthetic_page_guard_error:
+                error_message = synthetic_page_guard_error
+                has_next_url = True
+                break
+            if synthetic_page_identity is not None:
+                previous_synthetic_resource_identities = (
+                    synthetic_page_identity[0]
+                )
+                recent_synthetic_page_fingerprints = (
+                    *recent_synthetic_page_fingerprints,
+                    synthetic_page_identity[1],
+                )[-PAGINATION_CHECKPOINT_RECENT_URL_LIMIT:]
             for entry_index, entry in enumerate(entries):
                 parsed = parse_fhir_resource(
                     source_record["source_id"],
@@ -24411,11 +25011,24 @@ async def _fetch_resource_rows(
                 source_record.get("canonical_api_base") or source_record.get("api_base")
             )
             try:
-                resolved_next_url = (
-                    _synthetic_skip_pagination_next_url(source_record, url, len(entries))
-                    if source_api_base in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
-                    else _resolved_fhir_next_url(source_record, url, next_url)
-                )
+                if source_api_base in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES:
+                    resolved_next_url = _synthetic_skip_pagination_next_url(
+                        source_record,
+                        url,
+                        len(entries),
+                    )
+                elif source_api_base in FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES:
+                    resolved_next_url = _synthetic_offset_pagination_next_url(
+                        source_record,
+                        url,
+                        len(entries),
+                    )
+                else:
+                    resolved_next_url = _resolved_fhir_next_url(
+                        source_record,
+                        url,
+                        next_url,
+                    )
             except ValueError as exc:
                 error_message = str(exc)
                 has_next_url = True
@@ -24447,6 +25060,10 @@ async def _fetch_resource_rows(
                     pages_processed=pages,
                     rows_processed=rows_fetched,
                     recent_url_hashes=recent_url_hashes,
+                    completeness=_synthetic_position_page_guard_completeness(
+                        synthetic_page_identity,
+                        recent_synthetic_page_fingerprints,
+                    ),
                 )
             url = resolved_next_url
             if not _limit_allows_more(rows_fetched, per_resource_limit) and url:
@@ -25050,7 +25667,7 @@ def _linked_resource_refs(rows_by_resource: dict[str, list[dict[str, Any]]]) -> 
 
 
 async def _fetch_linked_resource_row(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     resource_type: str,
     resource_id: str,
     *,
@@ -25060,29 +25677,33 @@ async def _fetch_linked_resource_row(
     run_id: str | None,
 ) -> tuple[type, dict[str, Any]] | None:
     for url in _linked_resource_candidate_urls(
-        source,
+        source_record,
         resource_type,
         resource_id,
         reference=reference,
         reference_field=reference_field,
     ):
-        status_code, payload, error, _elapsed = await _fetch_source_json(source, url, timeout=timeout)
-        if status_code != 200 or error or not payload:
+        status_code, response_payload, error, _elapsed = await _fetch_source_json(
+            source_record,
+            url,
+            timeout=timeout,
+        )
+        if status_code != 200 or error or not response_payload:
             continue
-        resource_payload = payload
+        resource_payload = response_payload
         acquisition = FHIRAcquisitionContext(
             self_url=url,
             fetch_url=url,
             fetch_mode="rest_read",
         )
-        if payload.get("resourceType") == "Bundle":
-            entries = _bundle_entries(payload)
+        if response_payload.get("resourceType") == "Bundle":
+            entries = _bundle_entries(response_payload)
             bundle_entry = entries[0] if entries else None
             resource_payload = bundle_entry["resource"] if bundle_entry else {}
             if bundle_entry:
                 acquisition = _rest_bundle_acquisition(bundle_entry, url)
         parsed = parse_fhir_resource(
-            source["source_id"],
+            source_record["source_id"],
             resource_payload,
             resource_url=url,
             acquisition=acquisition,
@@ -25094,7 +25715,7 @@ async def _fetch_linked_resource_row(
 
 
 async def _import_linked_resource_rows(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     rows_by_resource: dict[str, list[dict[str, Any]]],
     *,
     per_source_limit: int,
@@ -25112,27 +25733,29 @@ async def _import_linked_resource_rows(
     """Import linked resource rows into the provider-directory snapshot."""
     if per_source_limit <= 0:
         return {}
-    existing = {
-        (resource_type, row.get("resource_id"))
-        for resource_type, rows in rows_by_resource.items()
-        for row in rows
-        if row.get("resource_id")
+    existing_resource_keys = {
+        (resource_type, resource_row.get("resource_id"))
+        for resource_type, resource_rows in rows_by_resource.items()
+        for resource_row in resource_rows
+        if resource_row.get("resource_id")
     }
-    refs_to_fetch: list[tuple[str, str, str, str]] = []
+    linked_references: list[tuple[str, str, str, str]] = []
     for resource_type, resource_id, reference, reference_field in _linked_resource_refs(rows_by_resource):
-        if len(refs_to_fetch) >= per_source_limit:
+        if len(linked_references) >= per_source_limit:
             break
-        if (resource_type, resource_id) in existing:
+        if (resource_type, resource_id) in existing_resource_keys:
             continue
-        refs_to_fetch.append((resource_type, resource_id, reference, reference_field))
+        linked_references.append(
+            (resource_type, resource_id, reference, reference_field)
+        )
 
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async def _fetch_one(ref: tuple[str, str, str, str]) -> tuple[str, type, dict[str, Any]] | None:
         resource_type, resource_id, reference, reference_field = ref
         async with semaphore:
-            result = await _fetch_linked_resource_row(
-                source,
+            fetch_result = await _fetch_linked_resource_row(
+                source_record,
                 resource_type,
                 resource_id,
                 reference=reference,
@@ -25140,16 +25763,18 @@ async def _import_linked_resource_rows(
                 timeout=timeout,
                 run_id=run_id,
             )
-            if not result:
+            if not fetch_result:
                 return None
-            model, row = result
-            return resource_type, model, row
+            model, resource_row = fetch_result
+            return resource_type, model, resource_row
 
-    counts: dict[str, int] = {}
-    logical_source_ids = source_ids or [source["source_id"]]
+    counts_by_resource: dict[str, int] = {}
+    logical_source_ids = source_ids or [source_record["source_id"]]
     compatibility_source_id = _compatibility_storage_source_id(logical_source_ids)
     edge_source_ids = [compatibility_source_id]
-    canonical_api_base = source.get("canonical_api_base") or source.get("api_base")
+    canonical_api_base = (
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
     by_model: dict[type, list[dict[str, Any]]] = {}
     linked_counts_by_name = {"pending_rows": 0}
     flush_threshold = max(int(flush_rows or _linked_resource_flush_rows()), 1)
@@ -25161,13 +25786,16 @@ async def _import_linked_resource_rows(
         pending = by_model.copy()
         by_model.clear()
         linked_counts_by_name["pending_rows"] = 0
-        for model, rows in pending.items():
-            if not rows:
+        for model, resource_rows in pending.items():
+            if not resource_rows:
                 continue
-            rows = _rows_for_compatibility_source(rows, compatibility_source_id)
+            resource_rows = _rows_for_compatibility_source(
+                resource_rows,
+                compatibility_source_id,
+            )
             imported = await _upsert_resource_rows(
                 model,
-                rows,
+                resource_rows,
                 run_id=run_id,
                 track_seen=track_seen,
                 seen_table=seen_table,
@@ -25177,32 +25805,42 @@ async def _import_linked_resource_rows(
             )
             if imported:
                 resource_name = model.__name__.removeprefix("ProviderDirectory")
-                counts[resource_name] = counts.get(resource_name, 0) + imported
+                counts_by_resource[resource_name] = (
+                    counts_by_resource.get(resource_name, 0) + imported
+                )
                 if progress_callback is not None:
                     await progress_callback(resource_name, imported)
 
-    tasks = [asyncio.create_task(_fetch_one(ref)) for ref in refs_to_fetch]
+    tasks = [
+        asyncio.create_task(_fetch_one(linked_reference))
+        for linked_reference in linked_references
+    ]
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
     try:
         for future in asyncio.as_completed(tasks):
             try:
                 if deadline_at is None:
-                    result = await future
+                    fetch_result = await future
                 else:
                     remaining = deadline_at - time.monotonic()
                     if remaining <= 0:
                         break
-                    result = await asyncio.wait_for(future, timeout=remaining)
+                    fetch_result = await asyncio.wait_for(
+                        future,
+                        timeout=remaining,
+                    )
             except TimeoutError:
                 break
             except Exception:  # pragma: no cover - defensive per-reference isolation
                 continue
-            if not result:
+            if not fetch_result:
                 continue
-            fetched_resource_type, model, row = result
-            by_model.setdefault(model, []).append(row)
+            fetched_resource_type, model, resource_row = fetch_result
+            by_model.setdefault(model, []).append(resource_row)
             linked_counts_by_name["pending_rows"] += 1
-            existing.add((fetched_resource_type, row.get("resource_id")))
+            existing_resource_keys.add(
+                (fetched_resource_type, resource_row.get("resource_id"))
+            )
             if linked_counts_by_name["pending_rows"] >= flush_threshold:
                 await flush_pending_rows()
     finally:
@@ -25212,7 +25850,7 @@ async def _import_linked_resource_rows(
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
     await flush_pending_rows()
-    return counts
+    return counts_by_resource
 
 
 def _uhc_plan_graph_network_predicate_error(
@@ -27096,6 +27734,11 @@ def _pagination_checkpoint_strategy_version(
         return LAST_UPDATED_PARTITION_STRATEGY_VERSION
     if canonical_api_base == UHC_PROVIDER_DIRECTORY_BASE:
         return UHC_PLAN_GRAPH_STRATEGY_VERSION
+    if canonical_api_base in (
+        FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
+        | FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES
+    ):
+        return SYNTHETIC_POSITION_PAGINATION_STRATEGY_VERSION
     return PAGINATION_CHECKPOINT_STRATEGY_VERSION
 
 
@@ -28551,6 +29194,7 @@ async def _save_pagination_checkpoint(
     pages_processed: int,
     rows_processed: int,
     recent_url_hashes: list[str],
+    completeness: dict[str, Any] | None = None,
 ) -> None:
     bounded_hashes = recent_url_hashes[-PAGINATION_CHECKPOINT_RECENT_URL_LIMIT:]
     is_complete = next_url is None
@@ -28562,6 +29206,11 @@ async def _save_pagination_checkpoint(
                pages_processed = :pages_processed,
                rows_processed = :rows_processed,
                recent_cursor_hashes = CAST(:recent_cursor_hashes AS jsonb),
+               completeness_json = CASE
+                   WHEN :has_completeness
+                   THEN CAST(:completeness AS jsonb)
+                   ELSE completeness_json
+               END,
                updated_at = now(),
                completed_at = CASE WHEN :is_complete THEN now() ELSE NULL END
          WHERE canonical_api_base = :canonical_api_base
@@ -28579,6 +29228,8 @@ async def _save_pagination_checkpoint(
         pages_processed=pages_processed,
         rows_processed=rows_processed,
         recent_cursor_hashes=json.dumps(bounded_hashes),
+        has_completeness=completeness is not None,
+        completeness=json.dumps(completeness or {}, sort_keys=True),
         is_complete=is_complete,
         canonical_api_base=context.canonical_api_base,
         resource_type=resource_type,
@@ -28847,14 +29498,14 @@ async def _fetch_alohr_graphql_page(
     next_token: str | None,
     timeout: int,
 ) -> tuple[list[dict[str, Any]], str | None, str | None]:
-    payload = {
+    request_payload = {
         "query": query,
         "variables": {"criteria": {}, "nextToken": next_token},
     }
-    status_code, data, error, _elapsed = await asyncio.to_thread(
+    status_code, response_payload, error, _elapsed = await asyncio.to_thread(
         _post_json_sync,
         ALOHR_GRAPHQL_URL,
-        payload,
+        request_payload,
         timeout=timeout,
         extra_headers={"tenantId": ALOHR_TENANT_ID},
     )
@@ -28862,16 +29513,24 @@ async def _fetch_alohr_graphql_page(
         return [], None, error
     if status_code != 200:
         return [], None, f"http_{status_code}"
-    if not isinstance(data, dict):
+    if not isinstance(response_payload, dict):
         return [], None, "invalid_json"
-    errors = data.get("errors")
+    errors = response_payload.get("errors")
     if errors:
         return [], None, f"graphql_errors:{json.dumps(errors, default=str)[:500]}"
-    result = data.get("data", {}).get(root_key) if isinstance(data.get("data"), dict) else None
-    if not isinstance(result, dict):
+    result_by_field = (
+        response_payload.get("data", {}).get(root_key)
+        if isinstance(response_payload.get("data"), dict)
+        else None
+    )
+    if not isinstance(result_by_field, dict):
         return [], None, f"missing_graphql_result:{root_key}"
-    items = [item for item in result.get(item_key) or [] if isinstance(item, dict)]
-    return items, _clean_text(result.get("nextToken")), None
+    source_items = [
+        source_item
+        for source_item in result_by_field.get(item_key) or []
+        if isinstance(source_item, dict)
+    ]
+    return source_items, _clean_text(result_by_field.get("nextToken")), None
 
 
 def _alohr_graphql_checkpoint_locator(root_key: str, next_token: str | None) -> str:
@@ -32347,6 +33006,12 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             ) -> None:
                 """Publish progress for the active provider-directory resource."""
                 metrics["resource_rows"] = counts
+                metrics["resource_fetch_completed_source_ids"] = {
+                    resource_type: sorted(source_ids)
+                    for resource_type, source_ids in sorted(
+                        completed_source_ids_by_resource.items()
+                    )
+                }
                 active_source_groups = (
                     details.get("active_source_groups", [])
                     if isinstance(details, dict)

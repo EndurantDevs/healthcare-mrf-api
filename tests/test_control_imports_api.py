@@ -2550,19 +2550,56 @@ async def test_control_importers_endpoint(monkeypatch):
 
 
 def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
-    payload = provider_directory_source_catalog()
-    runnable_items = [item for item in payload["items"] if item["runnable"]]
-    probe_items = [item for item in payload["items"] if not item["runnable"]]
+    catalog = provider_directory_source_catalog()
+    runnable_items = [entry for entry in catalog["items"] if entry["runnable"]]
+    probe_items = [entry for entry in catalog["items"] if not entry["runnable"]]
 
-    assert payload["entry_count"] == 29
-    assert payload["runnable_count"] == 17
-    assert payload["profile_source_count"] == 17
-    assert len(payload["catalog_digest"]) == 64
+    assert catalog["entry_count"] == 37
+    assert catalog["runnable_count"] == 17
+    assert catalog["profile_source_count"] == 17
+    assert len(catalog["catalog_digest"]) == 64
     assert len(runnable_items) == 17
-    assert all(item["profile_enabled"] for item in runnable_items)
-    assert len(probe_items) == 12
-    assert all(item["classification"] == "probe_only" for item in probe_items)
-    assert {item["entry_id"] for item in runnable_items} >= {
+    assert all(entry["profile_enabled"] for entry in runnable_items)
+    assert all(
+        entry["supported_resources"] == entry["resources"]
+        for entry in runnable_items
+    )
+    assert len(probe_items) == 20
+    assert all(entry["classification"] == "probe_only" for entry in probe_items)
+    probe_by_id = {entry["entry_id"]: entry for entry in probe_items}
+    assert probe_by_id["capital-blue-cross"]["resources"] == []
+    assert probe_by_id["capital-blue-cross"]["supported_resources"] == [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint",
+    ]
+    assert len(probe_by_id["devoted-health"]["supported_resources"]) == 7
+    assert len(probe_by_id["simpra-advantage"]["supported_resources"]) == 6
+    assert probe_by_id["michigan"]["resources"] == []
+    assert probe_by_id["michigan"]["supported_resources"] == [
+        "Location",
+        "Organization",
+        "OrganizationAffiliation",
+        "Practitioner",
+        "PractitionerRole",
+    ]
+    assert probe_by_id["scan"]["resources"] == []
+    assert probe_by_id["scan"]["supported_resources"] == [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint",
+    ]
+    assert {entry["entry_id"] for entry in runnable_items} >= {
         "aetna-commercial-medicare",
         "alohr",
         "caresource",

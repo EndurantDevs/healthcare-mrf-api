@@ -37,9 +37,17 @@
     "verification_snapshot": "specs/provider_directory_endpoint_verification.json",
     "blocker_registry": "specs/provider_directory_blocker_registry.json",
     "entry_support": {
+      "iowa-medicaid": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The public CMS-listed R4 endpoint exposes all eight Plan-Net collections. Candidate acquisition uses stable _id sorting, synthetic _skip pagination, one-request-per-second pacing, and durable checkpoints. It remains probe-only until two distinct exhaustive roots produce matching per-resource and dataset hashes; no Profile source is published."},
+      "pennsylvania-medicaid": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The public CMS-listed R4 endpoint exposes all eight Plan-Net collections. Candidate acquisition uses stable _id sorting, synthetic _skip pagination, one-request-per-second pacing, and durable checkpoints. It remains probe-only until two distinct exhaustive roots produce matching per-resource and dataset hashes; no Profile source is published."},
+      "san-bernardino-county-dbh": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The public Netsmart R4 endpoint exposes all eight resource families, with five currently populated. Its advertised next offset overlaps the preceding page, so candidate acquisition ignores that link and advances a stable _id-sorted _offset by the exact Bundle entry count. It remains probe-only pending two matching exhaustive roots and Profile publication review."},
+      "san-mateo-county-bhrs": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The public Netsmart R4 endpoint exposes all eight resource families, with five currently populated. Its advertised next offset overlaps the preceding page, so candidate acquisition ignores that link and advances a stable _id-sorted _offset by the exact Bundle entry count. It remains probe-only pending two matching exhaustive roots and Profile publication review."},
+      "el-dorado-county-behavioral-health": {"support_level": "probe-only", "access_requirement": "unknown", "requires_registration": true, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The live Netsmart R4 endpoint is anonymously readable and exposes all eight resource families, but the county documentation describes organization registration and approval. Bounded probes use stable synthetic _offset pagination; exhaustive acquisition and publication remain disabled until permission semantics are confirmed, after which two matching exhaustive roots would still be required."},
+      "devoted-health": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"], "limitation": "The public R4 endpoint exposes seven populated Plan-Net collections and same-origin opaque HAPI continuations. Durable checkpoint support is configured for candidate acquisition, but the source remains probe-only until two distinct exhaustive roots match and downstream Profile publication is reviewed."},
+      "simpra-advantage": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "OrganizationAffiliation"], "limitation": "The public R4 endpoint exposes six populated Plan-Net collections and same-origin opaque HAPI continuations. Durable checkpoint support is configured for candidate acquisition, but the source remains probe-only until two distinct exhaustive roots match and downstream Profile publication is reviewed."},
+      "capital-blue-cross": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The public R4 endpoint exposes seven populated Plan-Net collections and an empty Endpoint collection, but each broad exact census request returns an HTTP-200 OperationOutcome requiring a search predicate. ge1900 ranged counts work, but the strict lastUpdated engine requires broad and ranged census equivalence. Acquisition remains disabled and probe-only until a reviewed ranged-only completeness contract is implemented."},
       "idaho": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-10", "method": "rest", "limitation": "Accepts api-ida-prd.safhir.io cursor continuations with checkpoints."},
       "molina": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "The first unbounded dev run checkpointed 497,700 Location rows before Molina returned a quota-specific HTTP 403 with an advertised reset delay. The importer records retry_not_before, and the external scheduler defers the exact-source checkpoint retry until that boundary; terminal endpoint-wide proof remains pending."},
-      "michigan": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-13", "method": "probe", "limitation": "The public MHB upstream returned a CapabilityStatement and two advertised opaque-cursor pages from dev for Location, Organization, OrganizationAffiliation, Practitioner, and PractitionerRole. Synthetic _getpagesoffset continuation is not equivalent and remains prohibited. The importer preserves the existing relay-derived source identity but uses the direct upstream for probes. Acquisition remains blocked until checkpoint resume and two matching exhaustive passes prove completeness."},
+      "michigan": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"], "limitation": "The public MHB upstream returned a CapabilityStatement and pageable opaque-cursor results from dev for Location, Organization, OrganizationAffiliation, Practitioner, and PractitionerRole. Synthetic _getpagesoffset continuation is not equivalent and remains prohibited. Candidate acquisition uses the advertised opaque cursor with durable checkpoints, while the public manifest and Profile remain non-runnable until two distinct exhaustive roots match."},
       "cigna": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-10", "method": "rest", "limitation": "Sequential REST pagination at _count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets for role, organization, location, service, and affiliation collections. No Bulk. Expected nonempty initial searches retry transient HTTP-200 empty search sets with cooldowns."},
       "caresource": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-14", "method": "rest", "limitation": "Dev verification on 2026-07-14 returned public metadata with HTTP 200 and accepted _count=1000. Populated collections return same-origin opaque _page/_searchId continuations, and PractitionerRole advertised about 1.83 million rows. Full-refresh acquisition durably records a pre-scan _summary=count census, checkpoints every opaque next link without the generic page ceiling, and permits terminal completion only when processed and unique candidate resource IDs equal unchanged post-scan census. Any cursor loss, duplicate/count mismatch, or census drift fails closed. A new exhaustive acquisition and downstream proof remain pending. No product membership is inferred from the catalog row."},
       "aetna-commercial-medicare": {"support_level": "acquisition-configured", "access_requirement": "oauth2-client-credentials", "requires_registration": true, "reviewed_at": "2026-07-11", "method": "bulk", "limitation": "OAuth2 client credentials and Bulk; Endpoint collection is unavailable. The separate /providerdirectory Medicaid base has 19 credentialed catalog aliases and only targeted search semantics, so it is not treated as another fully enumerable carrier directory."},
@@ -62,7 +70,7 @@
       "uhc": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-13", "method": "probe", "limitation": "Optum Flex caps five core collections at 10,000, pagination cannot pass that cap, available filters do not form disjoint exhaustive shards, and Bulk Data export is unavailable. Generic resource acquisition is now blocked in the importer, and plan_graph_complete never satisfies endpoint publication. Flex remains a semantic probe for network-scoped enrichment only; product-scoped UHC provider files require a separate complete-file importer and an explicit product-to-FHIR plan/network crosswalk before evidence can be published."},
       "missouri": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-12", "method": "probe", "limitation": "Metadata declares eight directory resources, but Location returns false-empty Bundles above _count=100, Bundle.total reflects only the page size, a Practitioner response exceeds the 20 MiB cap, and HealthcareService and PractitionerRole requests time out. Other resource searches also return contradictory empty Bundles; no stable exhaustive REST or Bulk Data acquisition contract is verified."},
       "maine": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-13", "method": "rest", "limitation": "Five collections are anonymously readable with ct cursor pagination. InsurancePlan, HealthcareService, and Endpoint return HTTP 403 and remain excluded. Terminal acquisition succeeded for all five configured collections, and current artifact plus unified/API readiness is recorded in the tracked verification snapshot."},
-      "scan": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-13", "method": "probe", "limitation": "The server enforces a 1,000-result search ceiling: family=MA has 2,679 Practitioner matches and returns HTTP 413 SearchTooCostly when rows are requested. Fixed name-prefix shards therefore cannot prove completeness. Generic acquisition remains blocked. The importer now implements adaptive half-open _lastUpdated partitions, pre/post unfiltered and ranged census reconciliation, durable retry checkpoints, and twin-pass staged-row proof, but SCAN remains probe-only until a live all-resource campaign produces matching terminal completeness metrics."},
+      "scan": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "Fresh dev verification found exact broad and ge1900 ranged counts equal for all eight collections (76 InsurancePlan, 631,329 PractitionerRole, 88,045 Practitioner, 60,514 Organization, 215,369 Location, 0 HealthcareService, 967 OrganizationAffiliation, and 0 Endpoint). The 1,000-result search ceiling is handled with pageable <=1,000-row _lastUpdated leaves. Candidate acquisition now uses adaptive half-open _lastUpdated partitions with a one-second minimum leaf width, stable _lastUpdated,_id sorting, pre/post unfiltered and ranged census reconciliation, durable retry checkpoints, full-payload twin fingerprints, and twin-pass staged-row proof. SCAN remains probe-only and non-runnable until a full all-resource campaign produces matching terminal completeness metrics."},
       "centene": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-13", "method": "probe", "limitation": "The production base now returns public FHIR metadata from dev egress. Location requires at least one resource search parameter: an _count-only request returns HTTP 400, while address-state=OK with _count=1 returns 200 rows plus a next link. Generic resource acquisition is blocked in the importer because stable exhaustive pagination and equivalent behavior across all directory collections remain unverified."},
       "contra-costa": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-13", "method": "rest", "limitation": "Seven public collections follow opaque next-link pagination; Endpoint is unsupported and excluded. The official catalog can return HTTP 403, so the confirmed fallback base is retained. Terminal acquisition succeeded, and current artifact plus unified/API readiness is recorded in the tracked verification snapshot."},
       "alohr": {"support_level": "acquisition-configured", "access_requirement": "private-connector", "requires_registration": true, "reviewed_at": "2026-07-14", "method": "graphql", "limitation": "FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr. The prior five-resource run is not proof for the corrected contract because the source does not expose organization-affiliation relationships. A fresh four-resource GraphQL acquisition, validation, artifact publication, and unified/API proof are pending."}
@@ -131,6 +139,94 @@
     }
   },
   "entries": [
+    {
+      "entry_id": "iowa-medicaid",
+      "display_name": "Iowa Medicaid",
+      "owner_id": "state-of-iowa-medicaid",
+      "source_ids": ["pdfhir_fa3c581c79ffdfa5b73b43b9"],
+      "canonical_base": "https://fite.ia-prd.gw03.abacusinsights.ai/provider-directory",
+      "classification": "probe_only",
+      "launch_mode": "create",
+      "resource_profile": "NONE",
+      "resources": []
+    },
+    {
+      "entry_id": "pennsylvania-medicaid",
+      "display_name": "Pennsylvania Medicaid",
+      "owner_id": "state-of-pennsylvania-medicaid",
+      "source_ids": ["pdfhir_5fd73a1218a9b5b73066d000"],
+      "canonical_base": "https://fite.pa-prd.gw03.abacusinsights.ai/provider-directory",
+      "classification": "probe_only",
+      "launch_mode": "create",
+      "resource_profile": "NONE",
+      "resources": []
+    },
+    {
+      "entry_id": "san-bernardino-county-dbh",
+      "display_name": "San Bernardino County DBH",
+      "owner_id": "san-bernardino-county-dbh",
+      "source_ids": ["pdfhir_29c125ae13aeffa0afe0e121"],
+      "canonical_base": "https://fhir.netsmartcloud.com/payer/provider-directory/v2/eb7b73e0-836a-4041-9c0c-753079b3518f",
+      "classification": "probe_only",
+      "launch_mode": "create",
+      "resource_profile": "NONE",
+      "resources": []
+    },
+    {
+      "entry_id": "san-mateo-county-bhrs",
+      "display_name": "San Mateo County BHRS",
+      "owner_id": "san-mateo-county-bhrs",
+      "source_ids": ["pdfhir_0c52480afd14b4c89386df94"],
+      "canonical_base": "https://fhir.netsmartcloud.com/payer/provider-directory/v2/1639ac79-9144-4699-a38b-eb956f258677",
+      "classification": "probe_only",
+      "launch_mode": "create",
+      "resource_profile": "NONE",
+      "resources": []
+    },
+    {
+      "entry_id": "el-dorado-county-behavioral-health",
+      "display_name": "El Dorado County Behavioral Health",
+      "owner_id": "el-dorado-county-behavioral-health",
+      "source_ids": ["pdfhir_0d7938920b8933d55c1777ae"],
+      "canonical_base": "https://fhir.netsmartcloud.com/payer/provider-directory/v2/e8c254e2-72ed-4654-8258-02a395017a2a",
+      "classification": "probe_only",
+      "launch_mode": "create",
+      "resource_profile": "NONE",
+      "resources": []
+    },
+    {
+      "entry_id": "devoted-health",
+      "display_name": "Devoted Health",
+      "owner_id": "devoted-health",
+      "source_ids": ["pdfhir_46d7d27acc677651b0d3516e"],
+      "canonical_base": "https://fhir.devoted.com/fhir",
+      "classification": "probe_only",
+      "launch_mode": "create",
+      "resource_profile": "NONE",
+      "resources": []
+    },
+    {
+      "entry_id": "simpra-advantage",
+      "display_name": "Simpra Advantage",
+      "owner_id": "simpra-advantage",
+      "source_ids": ["pdfhir_e3d82f2cd0a10ab4463dbdda"],
+      "canonical_base": "https://data.healthlx.com:8004/SIMPRA",
+      "classification": "probe_only",
+      "launch_mode": "create",
+      "resource_profile": "NONE",
+      "resources": []
+    },
+    {
+      "entry_id": "capital-blue-cross",
+      "display_name": "Capital Blue Cross",
+      "owner_id": "capital-blue-cross",
+      "source_ids": ["pdfhir_95d5ad93c689d016351dd088"],
+      "canonical_base": "https://providerdirectory-api.capbluecross.com/r4",
+      "classification": "probe_only",
+      "launch_mode": "create",
+      "resource_profile": "NONE",
+      "resources": []
+    },
     {
       "entry_id": "idaho",
       "display_name": "Idaho",

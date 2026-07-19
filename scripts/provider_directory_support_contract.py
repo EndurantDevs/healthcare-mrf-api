@@ -178,9 +178,9 @@ def _validate_endpoint_classification(
         raise SupportDocumentationError(
             f"{entry_id}: external support requires documented_resources"
         )
-    if classification != "external" and documented_resources is not None:
+    if classification not in {"external", "probe_only"} and documented_resources is not None:
         raise SupportDocumentationError(
-            f"{entry_id}: documented_resources is reserved for external support"
+            f"{entry_id}: documented_resources is reserved for external or probe-only support"
         )
 
 
