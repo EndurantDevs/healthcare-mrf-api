@@ -214,11 +214,13 @@ async def test_candidate_snapshot_keeps_pre_activation_manifest_validation():
 
     assert tables.source_key == "source-a"
     assert tables.source_set == strict_serving_index()["source_set"]
+    assert tables.source_witness is None
     sql = str(session.calls[0][0][0])
     assert "snapshot.status = 'validated'" in sql
     assert "snapshot.manifest->'serving_index' AS candidate_serving_index" in sql
     assert "SELECT snapshot.manifest," not in sql
     assert "ptg2_v3_candidate_audit_attestation" not in sql
+    assert "LEFT JOIN mrf.ptg2_v3_source_audit_witness" in sql
 
 
 @pytest.mark.asyncio

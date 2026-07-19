@@ -146,6 +146,13 @@ jobs:
           tests/test_process_ptg_unit.py
           tests/test_ptg_publish_state_races.py
           tests/test_ptg2_artifact_blobs.py
+          tests/test_ptg2_candidate_audit_batch.py
+          tests/test_ptg2_candidate_audit_batch_indexes.py
+          tests/test_ptg2_candidate_audit_batch_orchestration.py
+          tests/test_ptg2_candidate_audit_batch_contract.py
+          tests/test_ptg2_candidate_audit_batch_integrity.py
+          tests/test_ptg2_candidate_audit_witness_integrity.py
+          tests/test_ptg2_candidate_audit_coordinates.py
           tests/test_ptg2_db_serving_v3_sparse.py
           tests/test_ptg2_exact_numeric_response.py
           tests/test_ptg2_manifest_artifacts.py
@@ -168,9 +175,13 @@ jobs:
           tests/test_ptg_devops_scripts.py
           tests/test_ptg2_shared_audit.py
           tests/test_ptg2_source_witness.py
+          tests/test_ptg2_source_witness_persisted_decode_guards.py
           tests/test_ptg2_source_witness_dedup.py
           tests/test_ptg2_fast_candidate_audit.py
           tests/test_ptg2_shared_blocks.py
+          tests/test_ptg2_shared_blocks_guards.py
+          tests/test_ptg2_db_sidecars_guards.py
+          tests/test_ptg2_shared_alias_readers.py
           tests/test_ptg2_shared_block_copy_integrity.py
           tests/test_ptg2_shared_finalize.py
           tests/test_ptg2_shared_finalize_source_contracts.py
@@ -515,9 +526,11 @@ jobs:
         run: cargo build --manifest-path support/ptg2_scanner/Cargo.toml
       - name: Run strict shared PTG PostgreSQL publish, graph, and cold-read smoke
         env:
+          HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST: "1"
           HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST: "1"
         run: >
           python -m pytest -q
+          tests/test_ptg2_candidate_audit_batch_postgres.py
           tests/test_ptg2_shared_graph_postgres.py
           tests/test_ptg2_shared_price_postgres.py
           tests/test_ptg2_shared_snapshot_publish_postgres.py

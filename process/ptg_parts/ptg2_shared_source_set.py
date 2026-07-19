@@ -10,6 +10,9 @@ from typing import Any, Iterable
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 PTG2_V3_SOURCE_SET_CONTRACT = "sorted_raw_container_sha256_bytes_v1"
+_ORDERED_SOURCE_ORDINAL_DIGEST_DOMAIN = (
+    b"ptg2_v3_ordered_source_ordinal_digest_v1\0"
+)
 
 
 def _normalized_sha256(value: Any, *, field_name: str) -> str:
@@ -42,4 +45,27 @@ def shared_source_set_metadata(
     }
 
 
-__all__ = ["PTG2_V3_SOURCE_SET_CONTRACT", "shared_source_set_metadata"]
+def ordered_source_ordinal_digest(
+    raw_container_sha256_values: Iterable[Any],
+) -> str:
+    """Bind every dense source ordinal to its exact raw container identity."""
+
+    raw_hashes = tuple(
+        _normalized_sha256(value, field_name="raw_container_sha256")
+        for value in raw_container_sha256_values
+    )
+    if not raw_hashes or len(raw_hashes) != len(set(raw_hashes)):
+        raise ValueError("strict shared V3 ordered source scope is invalid")
+    digest = hashlib.sha256()
+    digest.update(_ORDERED_SOURCE_ORDINAL_DIGEST_DOMAIN)
+    for source_ordinal, raw_hash in enumerate(raw_hashes):
+        digest.update(source_ordinal.to_bytes(4, "big", signed=False))
+        digest.update(bytes.fromhex(raw_hash))
+    return digest.hexdigest()
+
+
+__all__ = [
+    "PTG2_V3_SOURCE_SET_CONTRACT",
+    "ordered_source_ordinal_digest",
+    "shared_source_set_metadata",
+]

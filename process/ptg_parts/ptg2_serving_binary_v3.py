@@ -17,8 +17,12 @@ from process.ptg_parts.ptg2_serving_binary_v3_primitives import (
     PTG2_V3_INDEXED_FORMAT_VERSION,
     PTG2_V3_MAX_24_BIT_KEY_COUNT,
     PTG2_V3_MAX_32_BIT_KEY_COUNT,
+    _checkpoint_offset_bytes,
     _dense_key_bytes,
     _key_bits_from_bytes,
+    _read_checkpoint_offset,
+    _skip_optional_text,
+    _validate_checkpoint_shape,
     append_uvarint,
     decode_dense_keys,
     encode_dense_keys,
@@ -31,20 +35,6 @@ from process.ptg_parts.ptg2_serving_binary_v3_types import (
     PTG2V3CodeSetStats,
     PTG2V3PriceAtomRecord,
 )
-
-
-def _checkpoint_offset_bytes(record_offset: int) -> bytes:
-    normalized_offset = int(record_offset)
-    if normalized_offset < 0 or normalized_offset > 0xFFFFFFFF:
-        raise ValueError("PTG2 v3 checkpoint offset must fit in uint32")
-    return normalized_offset.to_bytes(4, "little")
-
-
-def _read_checkpoint_offset(payload: bytes | bytearray | memoryview, cursor: int) -> tuple[int, int]:
-    checkpoint_end = cursor + 4
-    if checkpoint_end > len(payload):
-        raise ValueError("PTG2 v3 checkpoint directory is truncated")
-    return int.from_bytes(payload[cursor:checkpoint_end], "little"), checkpoint_end
 
 
 def encode_price_memberships(
@@ -85,6 +75,15 @@ def decode_price_memberships(encoded_payload: bytes | bytearray | memoryview) ->
     """Decode and validate shared-price-key to dense-atom-key memberships."""
 
     header = _price_membership_header(encoded_payload)
+    return _decode_price_memberships_with_header(encoded_payload, header)
+
+
+def _decode_price_memberships_with_header(
+    encoded_payload: bytes | bytearray | memoryview,
+    header: _MembershipPayloadHeader,
+) -> dict[int, tuple[int, ...]]:
+    """Decode all membership records after one validated header parse."""
+
     key_bytes = _dense_key_bytes(header.atom_key_bits)
     cursor = header.records_offset
     memberships_by_price_key: dict[int, tuple[int, ...]] = {}
@@ -120,6 +119,9 @@ def price_membership_entry_count(encoded_payload: bytes | bytearray | memoryview
 def decode_price_memberships_for_keys(
     encoded_payload: bytes | bytearray | memoryview,
     requested_price_keys: Iterable[int],
+    *,
+    expected_entry_count: int | None = None,
+    expected_atom_key_bits: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Decode only requested memberships using v2 checkpoint directories."""
 
@@ -127,8 +129,19 @@ def decode_price_memberships_for_keys(
     if not requested_keys:
         return {}
     header = _price_membership_header(encoded_payload)
+    if expected_entry_count is not None and header.entry_count != int(
+        expected_entry_count
+    ):
+        raise ValueError("price-membership entry count does not match payload")
+    if expected_atom_key_bits is not None and header.atom_key_bits != int(
+        expected_atom_key_bits
+    ):
+        raise ValueError("membership payload atom-key width disagrees with manifest")
     if header.version == PTG2_V3_FORMAT_VERSION:
-        all_memberships = decode_price_memberships(encoded_payload)
+        all_memberships = _decode_price_memberships_with_header(
+            encoded_payload,
+            header,
+        )
         return {price_key: all_memberships[price_key] for price_key in requested_keys if price_key in all_memberships}
     requested_by_checkpoint: dict[int, set[int]] = {}
     for price_key in requested_keys:
@@ -174,14 +187,6 @@ def _price_membership_header(
         checkpoint_interval,
         tuple(raw_checkpoints),
     )
-
-
-def _validate_checkpoint_shape(entry_count: int, interval: int, checkpoint_count: int) -> None:
-    if interval <= 0 or interval > 4096:
-        raise ValueError("PTG2 v3 checkpoint interval is invalid")
-    expected_count = (entry_count + interval - 1) // interval
-    if checkpoint_count != expected_count:
-        raise ValueError("PTG2 v3 checkpoint count is invalid")
 
 
 def _validate_membership_checkpoints(
@@ -309,6 +314,15 @@ def decode_price_atoms(payload: bytes | bytearray | memoryview) -> tuple[PTG2V3P
     """Decode dense-order negotiated rates and lean dictionary keys."""
 
     header = _price_atom_header(payload)
+    return _decode_price_atoms_with_header(payload, header)
+
+
+def _decode_price_atoms_with_header(
+    payload: bytes | bytearray | memoryview,
+    header: _AtomPayloadHeader,
+) -> tuple[PTG2V3PriceAtomRecord, ...]:
+    """Decode all atom records after one validated header parse."""
+
     cursor = header.records_offset
     price_atoms: list[PTG2V3PriceAtomRecord] = []
     for _atom_index in range(header.entry_count):
@@ -330,20 +344,31 @@ def price_atom_entry_count(payload: bytes | bytearray | memoryview) -> int:
 
 
 def decode_price_atoms_for_offsets(
-    payload: bytes | bytearray | memoryview,
+    encoded_payload: bytes | bytearray | memoryview,
     requested_atom_offsets: Iterable[int],
+    *,
+    expected_entry_count: int | None = None,
+    maximum_entry_count: int | None = None,
 ) -> dict[int, PTG2V3PriceAtomRecord]:
     """Decode only requested dense offsets using v2 checkpoint directories."""
 
     requested_offsets = tuple(sorted({int(atom_offset) for atom_offset in requested_atom_offsets}))
     if not requested_offsets:
         return {}
-    header = _price_atom_header(payload)
+    header = _price_atom_header(encoded_payload)
+    if expected_entry_count is not None and header.entry_count != int(
+        expected_entry_count
+    ):
+        raise ValueError("price-atom count does not match block metadata")
+    if maximum_entry_count is not None and header.entry_count > int(
+        maximum_entry_count
+    ):
+        raise ValueError("price-atom count exceeds block span")
     valid_offsets = tuple(
         atom_offset for atom_offset in requested_offsets if 0 <= atom_offset < header.entry_count
     )
     if header.version == PTG2_V3_FORMAT_VERSION:
-        all_atoms = decode_price_atoms(payload)
+        all_atoms = _decode_price_atoms_with_header(encoded_payload, header)
         return {atom_offset: all_atoms[atom_offset] for atom_offset in valid_offsets}
     offsets_by_checkpoint: dict[int, set[int]] = {}
     for atom_offset in valid_offsets:
@@ -352,7 +377,12 @@ def decode_price_atoms_for_offsets(
     atoms_by_offset: dict[int, PTG2V3PriceAtomRecord] = {}
     for checkpoint_index, checkpoint_offsets in offsets_by_checkpoint.items():
         atoms_by_offset.update(
-            _price_atoms_for_checkpoint(payload, header, checkpoint_index, checkpoint_offsets)
+            _price_atoms_for_checkpoint(
+                encoded_payload,
+                header,
+                checkpoint_index,
+                checkpoint_offsets,
+            )
         )
     return atoms_by_offset
 
@@ -466,13 +496,3 @@ def _read_optional_text(
         return bytes(payload[cursor:text_end]).decode("utf-8"), text_end
     except UnicodeDecodeError as exc:
         raise ValueError("PTG2 v3 price-atom text is not valid UTF-8") from exc
-
-
-def _skip_optional_text(payload: bytes | bytearray | memoryview, offset: int) -> int:
-    encoded_length, cursor = read_uvarint(payload, offset)
-    if encoded_length == 0:
-        return cursor
-    text_end = cursor + encoded_length - 1
-    if text_end > len(payload):
-        raise ValueError("PTG2 v3 price-atom text is truncated")
-    return text_end

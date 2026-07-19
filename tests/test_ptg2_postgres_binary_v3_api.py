@@ -90,6 +90,7 @@ def test_v3_provider_shard_preserves_cross_source_duplicates_and_multiplicity():
 @pytest.mark.asyncio
 async def test_forward_batch_decoder_receives_and_enforces_source_count(monkeypatch):
     block_key = 7 << 31
+    block_hash = b"h" * 32
     monkeypatch.setattr(
         ptg2_db_sidecars,
         "_discover_forward_shard_keys",
@@ -105,6 +106,7 @@ async def test_forward_batch_decoder_receives_and_enforces_source_count(monkeypa
                     "block_no": 0,
                     "entry_count": 1,
                     "_decoded_payload": _provider_shard_payload(2, [0], [1]),
+                    "_block_hash": block_hash,
                 }
             ]
         ),

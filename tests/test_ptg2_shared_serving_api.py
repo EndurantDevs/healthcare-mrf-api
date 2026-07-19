@@ -15,6 +15,7 @@ from api import (
     ptg2_tables,
 )
 from api.ptg2_shared_blocks import SharedBlockPayload
+from process.ptg_parts.ptg2_shared_blocks import shared_block_hash
 
 
 def test_shared_v3_object_kinds_and_block_format_are_fail_closed():
@@ -43,6 +44,37 @@ def test_shared_v3_object_kinds_and_block_format_are_fail_closed():
             },
             expected_kind="by_code_provider_shard_v1",
         )
+
+
+def _strict_source_witness():
+    return {
+        "contract": "ptg2_v3_source_witness_payload_v5",
+        "format_version": 5,
+        "selection_method": "bottom_k_independent_occurrence_provider_cohorts_v3",
+        "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
+        "unqueryable_rate_policy": (
+            "count_but_exclude_from_npi_api_challenges_v1"
+        ),
+        "source_count": 1,
+        "source_set_digest": "b" * 64,
+        "occurrence_target": 10_000,
+        "total_target": 11_000,
+        "provider_quota": 1_000,
+        "queryable_occurrence_population_count": 1,
+        "provider_population_count": 0,
+        "emitted_rate_row_count": 1,
+        "unqueryable_rate_row_count": 0,
+        "occurrence_witness_count": 1,
+        "provider_witness_count": 0,
+        "record_count": 1,
+        "evidence_dictionary_count": 0,
+        "evidence_dictionary_raw_bytes": 0,
+        "evidence_dictionary_stored_bytes": 0,
+        "sample_digest": "d" * 64,
+        "payload_sha256": "e" * 64,
+        "payload_bytes": 1,
+        "compression": "per_record_zlib_shared_evidence_dictionary_v1",
+    }
 
 
 def _strict_serving_index(snapshot_key=41):
@@ -74,6 +106,7 @@ def _strict_serving_index(snapshot_key=41):
             "source_count": 1,
             "raw_container_sha256_digest": "b" * 64,
         },
+        "source_witness": _strict_source_witness(),
         "code_count": 1,
         "coverage_scope_id": "c" * 64,
         "provider_scope_strategy": "postgres_shared_graph",
@@ -181,11 +214,39 @@ def _candidate_descriptor_row(manifest_source_key: str):
     return {
         "candidate_serving_index": serving_index,
         "layout_audit_sample": serving_index["audit_sample"],
+        "layout_source_witness": serving_index["source_witness"],
         "layout_coverage_scope_id": serving_index["coverage_scope_id"],
         "layout_code_count": serving_index["code_count"],
         "snapshot_plan_id": "plan-a",
         "snapshot_plan_market_type": "group",
         "snapshot_coverage_scope_id": serving_index["coverage_scope_id"],
+        "persisted_witness_contract": serving_index["source_witness"][
+            "contract"
+        ],
+        "persisted_witness_selection_method": serving_index["source_witness"][
+            "selection_method"
+        ],
+        "persisted_witness_source_set_digest": serving_index["source_witness"][
+            "source_set_digest"
+        ],
+        "persisted_witness_sample_digest": serving_index["source_witness"][
+            "sample_digest"
+        ],
+        "persisted_witness_occurrence_population_count": serving_index[
+            "source_witness"
+        ]["queryable_occurrence_population_count"],
+        "persisted_witness_provider_population_count": serving_index[
+            "source_witness"
+        ]["provider_population_count"],
+        "persisted_witness_occurrence_count": serving_index["source_witness"][
+            "occurrence_witness_count"
+        ],
+        "persisted_witness_provider_count": serving_index["source_witness"][
+            "provider_witness_count"
+        ],
+        "persisted_witness_payload_sha256": serving_index["source_witness"][
+            "payload_sha256"
+        ],
         "postgres_server_version_num": 160004,
         "database_selected": True,
         "backend_session_active": True,
@@ -318,6 +379,24 @@ async def test_candidate_snapshot_descriptor_rejects_mismatched_manifest_source(
     with pytest.raises(
         ptg2_tables.PTG2ManifestArtifactError,
         match="candidate source does not match",
+    ):
+        await ptg2_tables.snapshot_serving_tables(
+            session,
+            access.snapshot_id,
+            candidate_audit_access=access,
+        )
+
+
+@pytest.mark.asyncio
+async def test_candidate_snapshot_descriptor_rejects_missing_source_set():
+    access = _candidate_audit_access()
+    descriptor_row = _candidate_descriptor_row(access.source_key)
+    descriptor_row["candidate_serving_index"].pop("source_set")
+    session = _RecordingOneRowSession(descriptor_row)
+
+    with pytest.raises(
+        ptg2_tables.PTG2ManifestArtifactError,
+        match="candidate source set is missing",
     ):
         await ptg2_tables.snapshot_serving_tables(
             session,
@@ -599,6 +678,12 @@ async def test_shared_dictionary_read_passes_snapshot_key_and_never_caches(monke
                     fragment_no=0,
                     entry_count=2,
                     payload=dictionary_bytes,
+                    block_hash=shared_block_hash(
+                        format_version=2,
+                        object_kind="by_code_price_dictionary",
+                        codec="none",
+                        payload=dictionary_bytes,
+                    ),
                 ),
             )
         }
@@ -653,6 +738,12 @@ async def test_large_shared_dictionary_reads_only_the_requested_tail_fragment(
                     fragment_no=fragment_no,
                     entry_count=fragment_entries,
                     payload=bytes(dictionary_fragment),
+                    block_hash=shared_block_hash(
+                        format_version=2,
+                        object_kind="by_code_price_dictionary",
+                        codec="none",
+                        payload=bytes(dictionary_fragment),
+                    ),
                 ),
             )
         }

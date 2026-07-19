@@ -4885,6 +4885,30 @@ def _canonical_api_price_tuple(
     )
 
 
+def canonical_api_price_tuple(
+    api_item: Mapping[str, Any],
+    raw_price: Mapping[str, Any],
+    query: QueryKey,
+) -> CanonicalTuple:
+    """Apply the public exact-source response schema and tuple projection."""
+
+    observed_query = _strict_api_identity(
+        api_item,
+        code_system_field="reported_code_system",
+        code_field="reported_code",
+        field_prefix="item_0",
+    )
+    if observed_query != query:
+        raise ApiSchemaError("item_0_identity_disagrees_with_query")
+    return _canonical_api_price_tuple(
+        api_item,
+        raw_price,
+        query,
+        item_index=0,
+        price_index=0,
+    )
+
+
 def _api_item_prices(
     api_item: Mapping[str, Any],
     *,

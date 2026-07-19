@@ -7,7 +7,11 @@ import uuid
 
 import pytest
 
-from api.ptg2_shared_blocks import fetch_shared_graph_members
+from api.ptg2_shared_blocks import (
+    PTG2_V3_GRAPH_CHUNK_BYTES,
+    fetch_shared_graph_members,
+    shared_block_read_once_scope,
+)
 from db.connection import db
 from process.ptg_parts.ptg2_shared_graph import (
     PTG2_V3_GRAPH_GROUP_TO_NPI,
@@ -159,6 +163,30 @@ async def test_real_postgres_graph_binary_copy_publish_and_reads(tmp_path):
                     group_key_by_global_id[groups[1]],
                 )
             }
+            npi_owner_keys = tuple(int.from_bytes(npi[8:], "big") for npi in npis)
+            with shared_block_read_once_scope(
+                max_retained_raw_bytes=PTG2_V3_GRAPH_CHUNK_BYTES,
+            ) as read_once:
+                assert await fetch_shared_graph_members(
+                    session,
+                    schema_name=schema_name,
+                    snapshot_key=snapshot_key,
+                    direction=PTG2_V3_GRAPH_NPI_TO_GROUP,
+                    owner_keys=npi_owner_keys,
+                ) == {
+                    npi_owner_keys[0]: (
+                        group_key_by_global_id[groups[0]],
+                        group_key_by_global_id[groups[1]],
+                    ),
+                    npi_owner_keys[1]: (group_key_by_global_id[groups[0]],),
+                    npi_owner_keys[2]: (group_key_by_global_id[groups[0]],),
+                }
+                read_once.assert_read_once()
+                read_once_ledger = read_once.ledger
+            assert read_once_ledger["logical_block_deliveries"] == 1
+            assert read_once_ledger["unique_physical_blocks"] == 1
+            assert read_once_ledger["physical_block_reads"] == 1
+            assert read_once_ledger["physical_block_decodes"] == 1
             assert await fetch_shared_graph_members(
                 session,
                 schema_name=schema_name,

@@ -13,7 +13,6 @@ from process.ptg_parts.ptg2_serving_binary_v3 import (
     PTG2_V3_ATOM_KEY_32_BITS,
     decode_price_memberships_for_keys,
     decode_provider_code_set,
-    price_membership_entry_count,
     read_uvarint,
 )
 
@@ -135,17 +134,6 @@ def _decode_provider_code_block(
         raise PTG2ManifestArtifactError(f"PTG2 v3 provider-set code block {block_key} is corrupt") from exc
 
 
-def _membership_atom_key_bits(block_bytes: bytes) -> int:
-    if len(block_bytes) < 2:
-        raise ValueError("price-membership payload is truncated")
-    key_bytes = int(block_bytes[1])
-    if key_bytes == 3:
-        return PTG2_V3_ATOM_KEY_24_BITS
-    if key_bytes == 4:
-        return PTG2_V3_ATOM_KEY_32_BITS
-    raise ValueError("price-membership payload uses an invalid atom-key width")
-
-
 def _decode_price_membership_block(
     block_bytes: bytes,
     *,
@@ -156,14 +144,11 @@ def _decode_price_membership_block(
     requested_price_keys: set[int],
 ) -> dict[int, tuple[int, ...]]:
     try:
-        payload_key_bits = _membership_atom_key_bits(block_bytes)
-        if atom_key_bits is not None and payload_key_bits != atom_key_bits:
-            raise ValueError("membership payload atom-key width disagrees with manifest")
-        if price_membership_entry_count(block_bytes) != entry_count:
-            raise ValueError("price-membership entry count does not match payload")
         memberships_by_price_key = decode_price_memberships_for_keys(
             block_bytes,
             requested_price_keys,
+            expected_entry_count=entry_count,
+            expected_atom_key_bits=atom_key_bits,
         )
         if any(
             not _is_key_in_block(

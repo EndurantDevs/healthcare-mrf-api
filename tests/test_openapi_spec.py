@@ -13,6 +13,7 @@ HIDDEN_RUNTIME_ALIASES = {
     # Control-authenticated candidate validation is intentionally excluded
     # from the public OpenAPI contract.
     ("get", "/pricing/providers/audit-search-by-procedure"),
+    ("post", "/pricing/providers/audit-source-witness-batch"),
     ("get", "/pricing/physicians"),
     ("get", "/pricing/physicians/{npi}"),
     ("get", "/pricing/physicians/{npi}/score"),

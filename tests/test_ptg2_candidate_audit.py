@@ -14,6 +14,7 @@ from api.ptg2_candidate_audit import (
     PTG2CandidateAuditAccess,
     candidate_audit_access_from_args,
     candidate_audit_access_from_request,
+    candidate_audit_access_from_verified_request,
 )
 from api.ptg2_tables import snapshot_serving_tables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -58,6 +59,10 @@ def test_candidate_audit_access_requires_explicit_header_and_control_token(monke
         query_arg_map,
     )
     assert access == _candidate_access()
+
+
+def test_verified_candidate_audit_access_still_requires_explicit_header():
+    assert candidate_audit_access_from_verified_request(_request(), {}) is None
 
 
 def test_candidate_audit_access_is_exact_and_user_scalars_are_ignored(monkeypatch):

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 
@@ -68,6 +68,7 @@ class LoadedSourceWitness:
 
     metadata: Mapping[str, Any]
     records: tuple[SourceWitnessRecord, ...]
+    evidence_by_sha256: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     @property
     def occurrence_records(self) -> tuple[SourceWitnessRecord, ...]:

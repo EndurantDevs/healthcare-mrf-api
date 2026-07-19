@@ -65,6 +65,7 @@ class PTG2ServingTables:
     network_names: list[str] | None = None
     source_key: str | None = None
     audit_sample: dict[str, Any] | None = None
+    source_witness: dict[str, Any] | None = None
     source_set: dict[str, Any] | None = None
     database_evidence: dict[str, Any] | None = None
 

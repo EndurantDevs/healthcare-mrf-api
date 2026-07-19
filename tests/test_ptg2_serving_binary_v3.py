@@ -2,6 +2,7 @@
 
 import pytest
 
+from process.ptg_parts import ptg2_serving_binary_v3_primitives as primitives
 from process.ptg_parts.ptg2_serving_binary_v3 import (
     PTG2_V3_ATOM_KEY_24_BITS,
     PTG2_V3_ATOM_KEY_32_BITS,
@@ -161,3 +162,29 @@ def test_v3_provider_code_set_rejects_noncanonical_order_and_truncation():
         decode_provider_code_set(encoded[:-1])
     with pytest.raises(ValueError, match="version"):
         decode_provider_code_set(b"\x02")
+
+
+@pytest.mark.parametrize(
+    ("operation", "message"),
+    [
+        (lambda: primitives.append_uvarint(bytearray(), -1), "fit in uint64"),
+        (lambda: primitives.read_uvarint(b"", -1), "outside its payload"),
+        (lambda: primitives.read_uvarint(b"\x80" * 9 + b"\x02", 0), "too large"),
+        (lambda: primitives._checkpoint_offset_bytes(-1), "fit in uint32"),
+        (lambda: primitives._read_checkpoint_offset(b"\0\0\0", 0), "truncated"),
+        (lambda: primitives._validate_checkpoint_shape(1, 0, 1), "interval"),
+        (lambda: primitives._validate_checkpoint_shape(33, 32, 1), "count"),
+        (lambda: primitives._skip_optional_text(b"\x02", 0), "text is truncated"),
+        (lambda: primitives.select_atom_key_bits(-1), "cannot be negative"),
+        (lambda: primitives.select_atom_key_bits((1 << 32) + 1), "at most"),
+        (lambda: primitives.decode_dense_keys(b"\0", 24), "not aligned"),
+        (lambda: primitives.encode_dense_keys((), 16), "24 or 32"),
+    ],
+)
+def test_v3_primitive_guards_reject_invalid_boundaries(operation, message):
+    with pytest.raises(ValueError, match=message):
+        operation()
+
+
+def test_v3_optional_text_skip_accepts_absent_text():
+    assert primitives._skip_optional_text(b"\0", 0) == 1

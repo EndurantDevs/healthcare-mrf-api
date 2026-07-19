@@ -147,6 +147,16 @@ def _fragment_exact_numbers(value: Any) -> Any:
     return value
 
 
+def _response_wire_value(value: Any) -> Any:
+    """Round-trip one response value through its exact JSON wire form."""
+
+    return json.loads(
+        orjson.dumps(_fragment_exact_numbers(value)),
+        parse_float=Decimal,
+        parse_int=int,
+    )
+
+
 def _normalize_catalog_code_system(raw_system: Any) -> str:
     return normalize_code_system(raw_system)
 
