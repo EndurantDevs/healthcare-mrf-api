@@ -2022,27 +2022,36 @@ async def _rewrite_price_atom_lean_dictionary(
         f"""
         CREATE {temporary_storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} AS
         WITH dictionary_source AS (
-            SELECT 'negotiated_type'::varchar(64) AS attr_kind,
-                   negotiated_type::text AS text_value,
+            SELECT CASE
+                       WHEN GROUPING(negotiated_type) = 0
+                           THEN 'negotiated_type'::varchar(64)
+                       WHEN GROUPING(expiration_date) = 0
+                           THEN 'expiration_date'::varchar(64)
+                       WHEN GROUPING(billing_class) = 0
+                           THEN 'billing_class'::varchar(64)
+                       ELSE 'setting'::varchar(64)
+                   END AS attr_kind,
+                   CASE
+                       WHEN GROUPING(negotiated_type) = 0
+                           THEN negotiated_type::text
+                       WHEN GROUPING(expiration_date) = 0
+                           THEN expiration_date::text
+                       WHEN GROUPING(billing_class) = 0
+                           THEN billing_class::text
+                       ELSE setting::text
+                   END AS text_value,
                    NULL::text[] AS text_array
               FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-             GROUP BY negotiated_type
-            UNION ALL
-            SELECT 'expiration_date'::varchar(64), expiration_date::text, NULL::text[]
-              FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-             GROUP BY expiration_date
+             GROUP BY GROUPING SETS (
+                 (negotiated_type),
+                 (expiration_date),
+                 (billing_class),
+                 (setting)
+             )
             UNION ALL
             SELECT 'service_code'::varchar(64), NULL::text, service_code::text[]
               FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
              GROUP BY service_code
-            UNION ALL
-            SELECT 'billing_class'::varchar(64), billing_class::text, NULL::text[]
-              FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-             GROUP BY billing_class
-            UNION ALL
-            SELECT 'setting'::varchar(64), setting::text, NULL::text[]
-              FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-             GROUP BY setting
             UNION ALL
             SELECT 'billing_code_modifier'::varchar(64), NULL::text, billing_code_modifier::text[]
               FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}

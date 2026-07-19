@@ -218,6 +218,26 @@ async def test_dense_map_uses_exact_ctas_count_and_index_bounds(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_lean_price_atom_skips_missing_stage(monkeypatch):
+    status = AsyncMock()
+    monkeypatch.setattr(manifest_publish.db, "status", status)
+    monkeypatch.setattr(
+        manifest_publish,
+        "_table_exists",
+        AsyncMock(return_value=False),
+    )
+
+    manifest = await manifest_publish._rewrite_price_atom_lean_dictionary(
+        schema_name="mrf",
+        price_atom_table="missing_price_atoms",
+        price_atom_dictionary_table="price_attributes",
+    )
+
+    assert manifest is None
+    status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_lean_price_atom_does_not_repeat_numeric_rate_conversion(monkeypatch):
     monkeypatch.delenv(manifest_publish.PTG2_UNLOGGED_STAGE_ENV, raising=False)
     status = AsyncMock()
@@ -247,6 +267,16 @@ async def test_lean_price_atom_does_not_repeat_numeric_rate_conversion(monkeypat
     assert "hashtextextended" in sql
     assert "hash_array_extended" in sql
     assert "IS NOT DISTINCT FROM" in sql
+    dictionary_sql = next(
+        call.args[0]
+        for call in status.await_args_list
+        if "WITH dictionary_source AS" in call.args[0]
+    )
+    assert dictionary_sql.count('FROM "mrf"."price_atoms"') == 4
+    assert "GROUP BY GROUPING SETS" in dictionary_sql
+    assert "GROUPING(negotiated_type) = 0" in dictionary_sql
+    assert "GROUPING(expiration_date) = 0" in dictionary_sql
+    assert "GROUPING(billing_class) = 0" in dictionary_sql
 
 
 @pytest.mark.asyncio
