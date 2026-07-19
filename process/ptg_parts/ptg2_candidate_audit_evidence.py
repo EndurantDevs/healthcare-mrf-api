@@ -27,20 +27,81 @@ _TUPLE_FIELDS_EXCEPT_NETWORK = tuple(
 
 
 @dataclass(frozen=True)
-class SourceChallenge:
-    """One exact source occurrence to locate through the public pricing API."""
+class SourceAuditCondition:
+    """Canonical source fields needed by either audit execution path."""
 
     query: source_audit.QueryKey
     expected_tuple: source_audit.CanonicalTuple
     required_network_names: tuple[str, ...]
     raw_source_sha256: str
+
+
+@dataclass(frozen=True)
+class SourceChallenge(SourceAuditCondition):
+    """One exact source occurrence to locate through the public pricing API."""
+
     negotiated_rate: str
     service_codes: tuple[str, ...]
     modifiers: tuple[str, ...]
     fingerprint: str
 
 
-def _json_object(raw_json: bytes, *, field_name: str) -> dict[str, Any]:
+def canonical_tuple_digest_without_networks(
+    canonical_tuple: source_audit.CanonicalTuple,
+) -> str:
+    """Bind every canonical source field except the subset-matched networks."""
+
+    canonical_field_map = {
+        field_name: getattr(canonical_tuple, field_name)
+        for field_name in _TUPLE_FIELDS_EXCEPT_NETWORK
+    }
+    return hashlib.sha256(
+        source_audit.canonical_json(canonical_field_map).encode("utf-8")
+    ).hexdigest()
+
+
+def canonical_network_name_digests(network_names: Any) -> tuple[str, ...]:
+    """Return sorted hashes of canonical network names without exposing names."""
+
+    return tuple(
+        hashlib.sha256(network_name.encode("utf-8")).hexdigest()
+        for network_name in source_audit.canonical_list(network_names)
+    )
+
+
+def is_canonical_tuple_digest_match(
+    candidate_tuple: source_audit.CanonicalTuple,
+    expected_tuple_digest: str,
+) -> bool:
+    """Compare every canonical tuple field except subset-matched networks."""
+
+    return (
+        canonical_tuple_digest_without_networks(candidate_tuple)
+        == expected_tuple_digest
+    )
+
+
+def is_network_digest_subset_match(
+    required_network_digests: Any,
+    candidate_network_digests: Any,
+) -> bool:
+    """Match network subset semantics using precomputed canonical digests."""
+
+    return set(required_network_digests).issubset(candidate_network_digests)
+
+
+def _json_object(
+    raw_json: bytes,
+    *,
+    field_name: str,
+    evidence_sha256: str | None = None,
+    parsed_evidence_by_sha256: Mapping[str, Mapping[str, Any]] | None = None,
+) -> Mapping[str, Any]:
+    if parsed_evidence_by_sha256 is not None:
+        decoded = parsed_evidence_by_sha256.get(str(evidence_sha256 or ""))
+        if not isinstance(decoded, Mapping):
+            raise FastCandidateAuditError(f"{field_name}_parsed_evidence_missing")
+        return decoded
     try:
         decoded = json.loads(raw_json, parse_float=Decimal, parse_int=int)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -120,6 +181,7 @@ def _referenced_provider_evidence(
     witness_record: SourceWitnessRecord,
     raw_rate: Mapping[str, Any],
     evidence: Mapping[str, Any],
+    parsed_evidence_by_sha256: Mapping[str, Mapping[str, Any]] | None,
 ) -> tuple[int, list[str]]:
     if set(evidence) != {
         "source_kind",
@@ -133,6 +195,8 @@ def _referenced_provider_evidence(
     linked_provider = _json_object(
         witness_record.linked_provider_json,
         field_name="source_linked_provider",
+        evidence_sha256=witness_record.linked_provider_sha256,
+        parsed_evidence_by_sha256=parsed_evidence_by_sha256,
     )
     evidence_reference = str(evidence.get("provider_reference_id") or "")
     linked_reference = _strict_provider_reference_id(
@@ -164,6 +228,7 @@ def _referenced_provider_evidence(
 def _source_npi_and_networks(
     witness_record: SourceWitnessRecord,
     raw_rate: Mapping[str, Any],
+    parsed_evidence_by_sha256: Mapping[str, Mapping[str, Any]] | None,
 ) -> tuple[int, tuple[str, ...]]:
     evidence = _mapping(
         witness_record.provider_evidence,
@@ -180,6 +245,7 @@ def _source_npi_and_networks(
             witness_record,
             raw_rate,
             evidence,
+            parsed_evidence_by_sha256,
         )
     else:
         raise FastCandidateAuditError("source_provider_evidence_kind_invalid")
@@ -192,34 +258,36 @@ def _source_npi_and_networks(
     return selected_npi, tuple(required_network_names)
 
 
-def source_challenge(witness_record: SourceWitnessRecord) -> SourceChallenge:
-    """Derive one API challenge without trusting scanner-authored field values."""
+def _source_audit_condition_and_price(
+    witness_record: SourceWitnessRecord,
+    *,
+    parsed_evidence_by_sha256: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[SourceAuditCondition, dict[str, Any]]:
+    """Canonicalize one occurrence price exactly once from authenticated evidence."""
 
     if witness_record.kind != "rate_occurrence" or witness_record.procedure is None:
         raise FastCandidateAuditError("source_occurrence_witness_invalid")
     if dict(witness_record.expected) != {"contract": RATE_EXPECTED_CONTRACT}:
         raise FastCandidateAuditError("source_occurrence_expected_contract_invalid")
-    raw_rate = _json_object(witness_record.raw_json, field_name="source_rate")
-    prices = raw_rate.get("negotiated_prices")
-    price_ordinal = witness_record.coordinate[2]
-    if (
-        not isinstance(prices, list)
-        or price_ordinal >= len(prices)
-        or not isinstance(prices[price_ordinal], Mapping)
-    ):
-        raise FastCandidateAuditError("source_rate_price_coordinate_invalid")
-    raw_price_by_field = dict(prices[price_ordinal])
-    procedure_by_field = dict(witness_record.procedure)
-    code_system = source_audit.canonical_code_system(
-        procedure_by_field.get("billing_code_type")
+    raw_rate = _json_object(
+        witness_record.raw_json,
+        field_name="source_rate",
+        evidence_sha256=witness_record.raw_sha256,
+        parsed_evidence_by_sha256=parsed_evidence_by_sha256,
     )
-    code = source_audit.canonical_catalog_code(
+    (
+        raw_price_by_field,
+        procedure_by_field,
         code_system,
-        procedure_by_field.get("billing_code"),
+        code,
+    ) = _source_price_and_code_fields(
+        witness_record,
+        raw_rate,
     )
     npi, required_network_names = _source_npi_and_networks(
         witness_record,
         raw_rate,
+        parsed_evidence_by_sha256,
     )
     if not code_system or not code:
         raise FastCandidateAuditError("source_rate_query_invalid")
@@ -236,6 +304,66 @@ def source_challenge(witness_record: SourceWitnessRecord) -> SourceChallenge:
         )
     except (source_audit.SourceCoverageError, ValueError) as exc:
         raise FastCandidateAuditError("source_rate_tuple_invalid") from exc
+    return (
+        SourceAuditCondition(
+            query=query,
+            expected_tuple=canonical_tuple,
+            required_network_names=required_network_names,
+            raw_source_sha256=witness_record.raw_source_sha256,
+        ),
+        raw_price_by_field,
+    )
+
+
+def _source_price_and_code_fields(
+    witness_record: SourceWitnessRecord,
+    raw_rate: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], str, str]:
+    prices = raw_rate.get("negotiated_prices")
+    price_ordinal = witness_record.coordinate[2]
+    if (
+        not isinstance(prices, list)
+        or price_ordinal >= len(prices)
+        or not isinstance(prices[price_ordinal], Mapping)
+    ):
+        raise FastCandidateAuditError("source_rate_price_coordinate_invalid")
+    raw_price_by_field = dict(prices[price_ordinal])
+    procedure_by_field = dict(witness_record.procedure or {})
+    code_system = source_audit.canonical_code_system(
+        procedure_by_field.get("billing_code_type")
+    )
+    code = source_audit.canonical_catalog_code(
+        code_system,
+        procedure_by_field.get("billing_code"),
+    )
+    return raw_price_by_field, procedure_by_field, code_system, code
+
+
+def source_audit_condition(
+    witness_record: SourceWitnessRecord,
+    *,
+    parsed_evidence_by_sha256: Mapping[str, Mapping[str, Any]] | None = None,
+) -> SourceAuditCondition:
+    """Derive the minimal condition used by the server-side batch audit."""
+
+    condition, _raw_price = _source_audit_condition_and_price(
+        witness_record,
+        parsed_evidence_by_sha256=parsed_evidence_by_sha256,
+    )
+    return condition
+
+
+def source_challenge(
+    witness_record: SourceWitnessRecord,
+    *,
+    parsed_evidence_by_sha256: Mapping[str, Mapping[str, Any]] | None = None,
+) -> SourceChallenge:
+    """Derive one legacy public-HTTP challenge from authenticated evidence."""
+
+    condition, raw_price_by_field = _source_audit_condition_and_price(
+        witness_record,
+        parsed_evidence_by_sha256=parsed_evidence_by_sha256,
+    )
     canonical_price = source_audit.canonical_price_payload(raw_price_by_field)
     fingerprint_payload = (
         f"{witness_record.raw_source_sha256}:{witness_record.raw_sha256}:"
@@ -243,10 +371,10 @@ def source_challenge(witness_record: SourceWitnessRecord) -> SourceChallenge:
         f"{witness_record.coordinate}"
     )
     return SourceChallenge(
-        query=query,
-        expected_tuple=canonical_tuple,
-        required_network_names=required_network_names,
-        raw_source_sha256=witness_record.raw_source_sha256,
+        query=condition.query,
+        expected_tuple=condition.expected_tuple,
+        required_network_names=condition.required_network_names,
+        raw_source_sha256=condition.raw_source_sha256,
         negotiated_rate=canonical_price["negotiated_rate"],
         service_codes=tuple(canonical_price["service_code"]),
         modifiers=tuple(canonical_price["billing_code_modifier"]),
@@ -254,17 +382,26 @@ def source_challenge(witness_record: SourceWitnessRecord) -> SourceChallenge:
     )
 
 
-def validate_provider_witness(record: SourceWitnessRecord) -> None:
+def validate_provider_witness(
+    witness_record: SourceWitnessRecord,
+    *,
+    parsed_evidence_by_sha256: Mapping[str, Mapping[str, Any]] | None = None,
+) -> None:
     """Validate the only provider claims retained by the V2 witness contract."""
 
-    if record.kind != "provider_reference":
+    if witness_record.kind != "provider_reference":
         raise FastCandidateAuditError("source_provider_witness_invalid")
-    raw_provider = _json_object(record.raw_json, field_name="source_provider")
+    raw_provider = _json_object(
+        witness_record.raw_json,
+        field_name="source_provider",
+        evidence_sha256=witness_record.raw_sha256,
+        parsed_evidence_by_sha256=parsed_evidence_by_sha256,
+    )
     raw_group_id = _strict_provider_reference_id(
         raw_provider.get("provider_group_id"),
         field_name="source_provider_id",
     )
-    expected_by_field = dict(record.expected)
+    expected_by_field = dict(witness_record.expected)
     if set(expected_by_field) != {"contract", "provider_group_id"} or (
         expected_by_field.get("contract") != PROVIDER_EXPECTED_CONTRACT
         or str(expected_by_field.get("provider_group_id") or "") != raw_group_id
@@ -303,13 +440,17 @@ def is_tuple_matching_challenge(
         for field_name in _TUPLE_FIELDS_EXCEPT_NETWORK
     ):
         return False
-    return set(challenge.required_network_names).issubset(
-        candidate_tuple.network_names
-    )
+    return set(challenge.required_network_names).issubset(candidate_tuple.network_names)
 
 
 __all__ = [
+    "SourceAuditCondition",
     "SourceChallenge",
+    "canonical_network_name_digests",
+    "canonical_tuple_digest_without_networks",
+    "is_canonical_tuple_digest_match",
+    "is_network_digest_subset_match",
+    "source_audit_condition",
     "source_challenge",
     "is_tuple_matching_challenge",
     "validate_provider_witness",

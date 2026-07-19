@@ -6,12 +6,14 @@ import asyncio
 import hashlib
 import json
 from dataclasses import replace
+from unittest.mock import patch
 
 import aiohttp
 import pytest
 import uvloop
 from aiohttp import web
 
+from process.ptg_parts import ptg2_candidate_audit_evidence as evidence
 from process.ptg_parts import ptg2_fast_candidate_audit as audit
 from process.ptg_parts.ptg2_candidate_audit_evidence import source_challenge
 from process.ptg_parts.ptg2_provider_quarantine import (
@@ -133,6 +135,255 @@ def _provider_record(index: int = 0) -> SourceWitnessRecord:
         },
         raw_json=raw_json,
         linked_provider_json=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("invoke", "reason"),
+    [
+        (
+            lambda: evidence._json_object(
+                b"{}",
+                field_name="field",
+                evidence_sha256="missing",
+                parsed_evidence_by_sha256={},
+            ),
+            "field_parsed_evidence_missing",
+        ),
+        (
+            lambda: evidence._json_object(b"{", field_name="field"),
+            "field_json_invalid",
+        ),
+        (
+            lambda: evidence._json_object(b"[]", field_name="field"),
+            "field_not_object",
+        ),
+        (lambda: evidence._mapping([], field_name="field"), "field_invalid"),
+        (lambda: evidence._strict_index(-1, field_name="field"), "field_invalid"),
+        (
+            lambda: evidence._strict_provider_reference_id(
+                "1",
+                field_name="field",
+            ),
+            "field_invalid",
+        ),
+        (lambda: evidence._provider_groups({}, field_name="field"), "field_invalid"),
+    ],
+)
+def test_candidate_evidence_rejects_invalid_primitive_shapes(invoke, reason):
+    with pytest.raises(evidence.FastCandidateAuditError, match=reason):
+        invoke()
+
+
+@pytest.mark.parametrize(
+    ("groups", "reason"),
+    [
+        ([], "source_provider_group_coordinate_invalid"),
+        ([{}], "source_provider_npi_coordinate_invalid"),
+        ([{"npi": [1]}], "source_provider_npi_invalid"),
+    ],
+)
+def test_candidate_evidence_rejects_invalid_provider_coordinates(groups, reason):
+    with pytest.raises(evidence.FastCandidateAuditError, match=reason):
+        evidence._npi_at_source_coordinate(
+            groups,
+            {"provider_group_ordinal": 0, "npi_ordinal": 0},
+        )
+
+
+def test_candidate_evidence_covers_inline_provider_guards():
+    occurrence_witness = _occurrence_record()
+    coordinate_by_field = {"provider_group_ordinal": 0, "npi_ordinal": 0}
+    inline_evidence_by_field = {
+        "source_kind": "inline_provider_group",
+        **coordinate_by_field,
+    }
+    raw_inline_by_field = {
+        "provider_groups": [{"npi": [1_234_567_890]}],
+        "network_names": ["Inline Network"],
+    }
+
+    assert evidence._inline_provider_evidence(
+        raw_inline_by_field,
+        inline_evidence_by_field,
+    ) == (1_234_567_890, [])
+    with pytest.raises(
+        evidence.FastCandidateAuditError,
+        match="source_inline_provider_evidence_invalid",
+    ):
+        evidence._inline_provider_evidence(
+            raw_inline_by_field,
+            {**inline_evidence_by_field, "extra": True},
+        )
+
+    inline_record = replace(
+        occurrence_witness,
+        provider_evidence=inline_evidence_by_field,
+        linked_provider_sha256=None,
+        linked_provider_json=None,
+    )
+    assert evidence._source_npi_and_networks(
+        inline_record,
+        raw_inline_by_field,
+        None,
+    )[0] == 1_234_567_890
+
+
+def test_candidate_evidence_covers_referenced_provider_guards():
+    occurrence_witness = _occurrence_record()
+    raw_rate = json.loads(occurrence_witness.raw_json)
+
+    with pytest.raises(
+        evidence.FastCandidateAuditError,
+        match="source_referenced_provider_evidence_invalid",
+    ):
+        evidence._referenced_provider_evidence(
+            occurrence_witness,
+            raw_rate,
+            {"source_kind": "provider_reference"},
+            None,
+        )
+    with pytest.raises(
+        evidence.FastCandidateAuditError,
+        match="source_linked_provider_missing",
+    ):
+        evidence._referenced_provider_evidence(
+            replace(occurrence_witness, linked_provider_json=None),
+            raw_rate,
+            occurrence_witness.provider_evidence,
+            None,
+        )
+    with pytest.raises(
+        evidence.FastCandidateAuditError,
+        match="source_provider_references_invalid",
+    ):
+        evidence._referenced_provider_evidence(
+            occurrence_witness,
+            {**raw_rate, "provider_references": []},
+            occurrence_witness.provider_evidence,
+            None,
+        )
+    with pytest.raises(
+        evidence.FastCandidateAuditError,
+        match="source_provider_evidence_kind_invalid",
+    ):
+        evidence._source_npi_and_networks(
+            replace(
+                occurrence_witness,
+                provider_evidence={"source_kind": "unknown"},
+            ),
+            raw_rate,
+            None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("record", "reason"),
+    [
+        (
+            replace(_occurrence_record(), kind="unknown"),
+            "source_occurrence_witness_invalid",
+        ),
+        (
+            replace(_occurrence_record(), expected={"contract": "unknown"}),
+            "source_occurrence_expected_contract_invalid",
+        ),
+        (
+            replace(
+                _occurrence_record(),
+                procedure={
+                    **_occurrence_record().procedure,
+                    "billing_code": "",
+                },
+            ),
+            "source_rate_query_invalid",
+        ),
+        (
+            replace(_occurrence_record(), coordinate=(7, 0, 99, 0)),
+            "source_rate_price_coordinate_invalid",
+        ),
+    ],
+)
+def test_candidate_evidence_rejects_invalid_rate_occurrences(record, reason):
+    with pytest.raises(evidence.FastCandidateAuditError, match=reason):
+        evidence.source_challenge(record)
+
+
+def test_candidate_evidence_wraps_canonical_tuple_failures():
+    with patch.object(
+        evidence.source_audit.CanonicalTuple,
+        "from_parts",
+        side_effect=ValueError("bad tuple"),
+    ):
+        with pytest.raises(
+            evidence.FastCandidateAuditError,
+            match="source_rate_tuple_invalid",
+        ):
+            evidence.source_challenge(_occurrence_record())
+
+
+def test_candidate_evidence_rejects_invalid_provider_witness_shapes():
+    with pytest.raises(
+        evidence.FastCandidateAuditError,
+        match="source_provider_witness_invalid",
+    ):
+        evidence.validate_provider_witness(
+            replace(_provider_record(), kind="rate_occurrence")
+        )
+
+    malformed_providers = (
+        (
+            {"provider_group_id": 1, "provider_groups": [1]},
+            "source_provider_group_invalid",
+        ),
+        (
+            {"provider_group_id": 1, "provider_groups": [{"npi": "bad"}]},
+            "source_provider_npi_invalid",
+        ),
+        (
+            {"provider_group_id": 1, "provider_groups": [{"npi": [True]}]},
+            "source_provider_npi_invalid",
+        ),
+    )
+    for raw_provider, reason in malformed_providers:
+        raw_json = json.dumps(raw_provider, separators=(",", ":")).encode()
+        with pytest.raises(evidence.FastCandidateAuditError, match=reason):
+            evidence.validate_provider_witness(
+                replace(_provider_record(), raw_json=raw_json)
+            )
+
+
+def test_candidate_evidence_tuple_matching_fail_closed_paths():
+    challenge = evidence.source_challenge(_occurrence_record())
+    tuple_digest = evidence.canonical_tuple_digest_without_networks(
+        challenge.expected_tuple
+    )
+    assert evidence.is_canonical_tuple_digest_match(
+        challenge.expected_tuple,
+        tuple_digest,
+    )
+    assert not evidence.is_tuple_matching_challenge(
+        "{",
+        challenge.expected_tuple,
+        challenge,
+    )
+    assert not evidence.is_tuple_matching_challenge(
+        "{}",
+        challenge.expected_tuple,
+        challenge,
+    )
+    occurrence_key = json.dumps(
+        {"raw_container_sha256": challenge.raw_source_sha256}
+    )
+    assert not evidence.is_tuple_matching_challenge(
+        occurrence_key,
+        replace(challenge.expected_tuple, code="other"),
+        challenge,
+    )
+    assert evidence.is_tuple_matching_challenge(
+        occurrence_key,
+        challenge.expected_tuple,
+        challenge,
     )
 
 

@@ -2584,6 +2584,38 @@ def _shared_forward_response_row(
     }
 
 
+def _exact_source_rate_fields(
+    *,
+    reported_code_system: Any,
+    reported_code: Any,
+    negotiation_arrangement: Any,
+    billing_code_type_version: Any,
+    source_name: Any,
+    source_description: Any,
+    network_names: Any,
+    price_response_fields: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project source-exact fields shared by public serving and audit."""
+
+    projected_network_names = (
+        list(network_names) if isinstance(network_names, tuple) else network_names
+    )
+    return {
+        "reported_code_system": reported_code_system,
+        "reported_code": reported_code,
+        "negotiation_arrangement": negotiation_arrangement,
+        "billing_code_type_version": billing_code_type_version,
+        "procedure_name": source_name,
+        "procedure_description": source_description,
+        "source_procedure_name": source_name,
+        "source_procedure_description": source_description,
+        "network_names": _coerce_str_list_payload(projected_network_names),
+        "prices": price_response_fields.get("prices", []),
+        "tic_prices": price_response_fields.get("tic_prices", []),
+        "price_summary": price_response_fields.get("price_summary", []),
+    }
+
+
 async def _raise_missing_v3_block(
     session: Any,
     serving_tables: PTG2ServingTables,
@@ -4260,11 +4292,7 @@ async def _version_three_dictionary_values(
     """Read only dictionary values referenced by the requested dense atoms."""
 
     attribute_specs = _ptg2_price_atom_attr_specs()
-    constant_values = (
-        serving_tables.price_atom_constant_values
-        if isinstance(serving_tables.price_atom_constant_values, dict)
-        else {}
-    )
+    constant_values = _version_three_price_atom_constants(serving_tables)
     required_keys: set[tuple[str, int]] = set()
     for price_atom in price_atoms_by_key.values():
         if len(price_atom.attribute_keys) != len(attribute_specs):
@@ -4330,17 +4358,27 @@ def _version_three_price_payload(
     return payload
 
 
-async def _version_three_prices_by_key(
+@dataclass(frozen=True)
+class _VersionThreePriceHydration:
+    """Memberships and projected rows produced by one shared-block hydration."""
+
+    atom_keys_by_price_key: dict[int, tuple[int, ...]]
+    prices_by_key: dict[int, list[dict[str, Any]]]
+
+
+async def _version_three_price_hydration(
     session,
     serving_tables: PTG2ServingTables,
     price_keys: Iterable[int],
-) -> dict[int, list[dict[str, Any]]]:
-    """Hydrate v3 price keys from compact memberships and dense atoms only."""
+    *,
+    copy_payloads: bool = True,
+) -> _VersionThreePriceHydration:
+    """Hydrate memberships and prices through one union of shared blocks."""
 
     _require_strict_shared_v3(serving_tables)
     normalized_price_keys = tuple(sorted({int(price_key) for price_key in price_keys}))
     if not normalized_price_keys:
-        return {}
+        return _VersionThreePriceHydration({}, {})
     atom_key_bits = _version_three_atom_key_bits(serving_tables)
     atom_keys_by_price_key = await lookup_shared_price_atom_memberships_from_db(
         session,
@@ -4376,18 +4414,43 @@ async def _version_three_prices_by_key(
         serving_tables,
         price_atoms_by_key,
     )
-    constant_values = (
-        serving_tables.price_atom_constant_values
-        if isinstance(serving_tables.price_atom_constant_values, dict)
-        else {}
+    constant_values = _version_three_price_atom_constants(serving_tables)
+    return _VersionThreePriceHydration(
+        atom_keys_by_price_key=atom_keys_by_price_key,
+        prices_by_key=_version_three_price_rows(
+            normalized_price_keys,
+            atom_keys_by_price_key,
+            price_atoms_by_key,
+            dictionary_values,
+            constant_values,
+            copy_payloads=copy_payloads,
+        ),
     )
-    return _version_three_price_rows(
-        normalized_price_keys,
-        atom_keys_by_price_key,
-        price_atoms_by_key,
-        dictionary_values,
-        constant_values,
+
+
+async def _version_three_prices_by_key(
+    session,
+    serving_tables: PTG2ServingTables,
+    price_keys: Iterable[int],
+    *,
+    copy_payloads: bool = True,
+) -> dict[int, list[dict[str, Any]]]:
+    """Hydrate v3 price keys from compact memberships and dense atoms only."""
+
+    hydration = await _version_three_price_hydration(
+        session,
+        serving_tables,
+        price_keys,
+        copy_payloads=copy_payloads,
     )
+    return hydration.prices_by_key
+
+
+def _version_three_price_atom_constants(
+    serving_tables: PTG2ServingTables,
+) -> Mapping[str, Any]:
+    constant_values = serving_tables.price_atom_constant_values
+    return constant_values if isinstance(constant_values, dict) else {}
 
 
 def _validate_version_three_price_memberships(
@@ -4412,14 +4475,28 @@ def _version_three_price_rows(
     price_atoms_by_key: Mapping[int, Any],
     dictionary_values: Mapping[tuple[str, int], str],
     constant_values: Mapping[str, Any],
+    *,
+    copy_payloads: bool = True,
 ) -> dict[int, list[dict[str, Any]]]:
-    """Build response price payloads in requested dense-key order."""
+    """Project each unique atom once, then assemble requested price rows."""
 
+    payload_by_atom_key = {
+        atom_key: _version_three_price_payload(
+            price_atom,
+            dictionary_values,
+            constant_values,
+        )
+        for atom_key, price_atom in price_atoms_by_key.items()
+    }
     return {
         price_key: [
-            _version_three_price_payload(price_atoms_by_key[atom_key], dictionary_values, constant_values)
+            (
+                dict(payload_by_atom_key[atom_key])
+                if copy_payloads
+                else payload_by_atom_key[atom_key]
+            )
             for atom_key in atom_keys_by_price_key.get(price_key, ())
-            if atom_key in price_atoms_by_key
+            if atom_key in payload_by_atom_key
         ]
         for price_key in price_keys
     }
@@ -4907,6 +4984,18 @@ def _ptg2_manifest_provider_procedure_item(
     source_procedure_description = serving_data.get(
         "source_procedure_description"
     )
+    exact_source_fields = _exact_source_rate_fields(
+        reported_code_system=reported_system,
+        reported_code=reported_code,
+        negotiation_arrangement=serving_data.get("negotiation_arrangement"),
+        billing_code_type_version=serving_data.get(
+            "billing_code_type_version"
+        ),
+        source_name=source_procedure_name,
+        source_description=source_procedure_description,
+        network_names=serving_data.get("network_names"),
+        price_response_fields=_price_response_fields(prices),
+    )
     provider_item_by_field = dict(provider_context or {})
     provider_item_by_field.update(
         {
@@ -4916,13 +5005,8 @@ def _ptg2_manifest_provider_procedure_item(
             "provider_set_hash": provider_set_hash,
             "provider_count": serving_data.get("provider_count") or 0,
             "provider_set_count": 1 if provider_set_hash else 0,
-            "network_names": _coerce_str_list_payload(
-                serving_data.get("network_names")
-            ),
             "procedure_code": reported_code,
-            "billing_code_type_version": serving_data.get(
-                "billing_code_type_version"
-            ),
+            **exact_source_fields,
             "procedure_name": (
                 source_procedure_name
                 if is_exact_source_mode
@@ -4934,18 +5018,10 @@ def _ptg2_manifest_provider_procedure_item(
                 else source_procedure_description
                 or procedure_detail.get("procedure_description")
             ),
-            "source_procedure_name": source_procedure_name,
-            "source_procedure_description": source_procedure_description,
             "catalog_procedure_name": procedure_detail.get("procedure_name"),
             "catalog_procedure_description": procedure_detail.get("procedure_description"),
-            "reported_code": reported_code,
-            "reported_code_system": reported_system,
-            "negotiation_arrangement": serving_data.get(
-                "negotiation_arrangement"
-            ),
             "billing_code": reported_code,
             "billing_code_type": reported_system,
-            "prices": prices,
             "price_set_hash": price_set_hash,
             "rate_pack_hash": rate_pack_hash,
             "source_key": serving_data.get("logical_source_key")
@@ -7812,6 +7888,20 @@ async def _search_manifest_serving_table(
         source_procedure_description = serving_row.get(
             "source_procedure_description"
         )
+        exact_source_fields = _exact_source_rate_fields(
+            reported_code_system=reported_system,
+            reported_code=reported_code,
+            negotiation_arrangement=serving_row.get(
+                "negotiation_arrangement"
+            ),
+            billing_code_type_version=serving_row.get(
+                "billing_code_type_version"
+            ),
+            source_name=source_procedure_name,
+            source_description=source_procedure_description,
+            network_names=serving_row.get("network_names"),
+            price_response_fields=price_response_by_field,
+        )
         is_exact_source_mode = mode_value == PTG2_MODE_EXACT_SOURCE
         base_response_by_field = {
             "plan_id": serving_row.get("plan_id"),
@@ -7823,16 +7913,11 @@ async def _search_manifest_serving_table(
             "source_key": _logical_source_key(serving_tables, args),
             "source_artifact_key": int(serving_row["source_key"]),
             "snapshot_id": snapshot_id,
-            "network_names": _coerce_str_list_payload(
-                serving_row.get("network_names")
-            ),
             "provider_count": serving_row.get("provider_count") or 0,
             "provider_set_count": 1 if provider_set_hash else 0,
             "procedure_code": reported_code,
             "hp_procedure_code": reported_code,
-            "billing_code_type_version": serving_row.get(
-                "billing_code_type_version"
-            ),
+            **exact_source_fields,
             "procedure_name": (
                 source_procedure_name
                 if is_exact_source_mode
@@ -7844,20 +7929,12 @@ async def _search_manifest_serving_table(
                 else source_procedure_description
                 or procedure_detail.get("procedure_description")
             ),
-            "source_procedure_name": source_procedure_name,
-            "source_procedure_description": source_procedure_description,
             "catalog_procedure_name": procedure_detail.get("procedure_name"),
             "catalog_procedure_description": procedure_detail.get("procedure_description"),
             "service_code": reported_code,
             "service_code_system": reported_system or requested_system or "CPT",
-            "reported_code": reported_code,
-            "reported_code_system": reported_system,
-            "negotiation_arrangement": serving_row.get(
-                "negotiation_arrangement"
-            ),
             "billing_code": reported_code,
             "billing_code_type": reported_system,
-            **price_response_by_field,
             "price_set_hash": price_set_hash,
             "rate_pack_hash": rate_pack_hash,
             "_ptg_price_key": (
@@ -8180,13 +8257,25 @@ def _provider_taxonomy_summary_lateral_sql(npi_sql: str, alias: str = "tax") -> 
     """
 
 
+def _row_price_response_fields(
+    serving_row_by_field: Mapping[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    response_field_names = ("prices", "tic_prices", "price_summary")
+    if all(field_name in serving_row_by_field for field_name in response_field_names):
+        return {
+            field_name: list(serving_row_by_field.get(field_name) or [])
+            for field_name in response_field_names
+        }
+    return _price_response_fields(serving_row_by_field.get("prices") or [])
+
+
 def _compact_item_from_row(
     serving_row_by_field: dict[str, Any],
     args: dict[str, Any],
 ) -> dict[str, Any]:
     """Shape one compact database row into the public provider payload."""
 
-    prices = _normalize_price_payload(serving_row_by_field.get("prices") or [])
+    price_response_by_field = _row_price_response_fields(serving_row_by_field)
     provider_set_hashes = _coerce_json_payload(
         serving_row_by_field.get("provider_set_hashes"),
         [],
@@ -8315,7 +8404,7 @@ def _compact_item_from_row(
         "network_names": _coerce_str_list_payload(
             serving_row_by_field.get("network_names")
         ),
-        **_price_response_fields(prices),
+        **price_response_by_field,
         "source_trace": _coerce_json_payload(
             _first_payload_value(
                 serving_row_by_field.get("hydrated_source_trace"),

@@ -23,8 +23,19 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
                         func, or_, select, text)
 
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
+from api.control_auth import require_control_auth
 from api.endpoint.pagination import parse_pagination
-from api.ptg2_candidate_audit import attach_candidate_audit_access
+from api.ptg2_candidate_audit import (
+    PTG2_CANDIDATE_AUDIT_HEADER,
+    attach_candidate_audit_access,
+    candidate_audit_access_from_args,
+    candidate_audit_access_from_verified_request,
+)
+from api.ptg2_candidate_audit_batch import audit_candidate_source_witness_batch
+from api.ptg2_shared_blocks import (
+    PTG2SharedBlockError,
+    shared_block_read_once_scope,
+)
 from api.ptg2_audit_occurrences import audit_occurrences_payload
 from api.ptg2_capacity_evidence import (
     begin_capacity_evidence,
@@ -76,6 +87,12 @@ from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProviderProcedureLocation,
                        PricingProcedurePeerStats, TerminologySynonym)
 from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
+    PTG2_AUDIT_BATCH_RESPONSE_CONTRACT,
+    matched_audit_batch_digest,
+    parse_audit_batch_request,
+)
 
 blueprint = Blueprint("pricing", url_prefix="/pricing", version=1)
 logger = logging.getLogger(__name__)
@@ -224,7 +241,7 @@ def _reported_procedure_code_system(code: Any) -> str | None:
     return "HCPCS"
 
 
-def _env_flag(*names: str, default: bool = False) -> bool:
+def _is_env_flag_enabled(*names: str, default: bool = False) -> bool:
     for name in names:
         raw = os.getenv(name)
         if raw is None:
@@ -315,7 +332,7 @@ def _state_code_sql(expr: str) -> str:
     """
 
 
-ENABLE_PRICING_SCHEMA_CACHE = _env_flag(
+ENABLE_PRICING_SCHEMA_CACHE = _is_env_flag_enabled(
     "HLTHPRT_ENABLE_PRICING_SCHEMA_CACHE",
     "HLTHPRT_ENABLE_SCHEMA_CACHE",
 )
@@ -627,33 +644,29 @@ def _normalize_provider_payload(
     return provider_payload_by_field
 
 
-def _normalize_provider_service_aggregate(payload: dict[str, Any], include_legacy: bool) -> dict[str, Any]:
+def _normalize_provider_service_aggregate(service_summary_map: dict[str, Any], include_legacy: bool) -> dict[str, Any]:
     """Normalize provider service totals and derive comparable averages."""
 
-    payload["total_services"] = _coalesce_value(payload.get("total_services"), payload.get("total_claims"))
-    payload["total_beneficiaries"] = _coalesce_value(payload.get("total_beneficiaries"), payload.get("total_benes"))
-    payload["total_submitted_charges"] = _coalesce_value(payload.get("total_submitted_charges"), payload.get("total_day_supply"))
-    payload["total_allowed_amount"] = _coalesce_value(payload.get("total_allowed_amount"), payload.get("total_drug_cost"))
-    total_services = _as_float(payload.get("total_services"))
-    total_submitted_charges = _as_float(payload.get("total_submitted_charges"))
-    total_allowed_amount = _as_float(payload.get("total_allowed_amount"))
-
-    cost_index = _as_float(payload.get("cost_index"))
+    service_summary_map["total_services"] = _coalesce_value(service_summary_map.get("total_services"), service_summary_map.get("total_claims"))
+    service_summary_map["total_beneficiaries"] = _coalesce_value(service_summary_map.get("total_beneficiaries"), service_summary_map.get("total_benes"))
+    service_summary_map["total_submitted_charges"] = _coalesce_value(service_summary_map.get("total_submitted_charges"), service_summary_map.get("total_day_supply"))
+    service_summary_map["total_allowed_amount"] = _coalesce_value(service_summary_map.get("total_allowed_amount"), service_summary_map.get("total_drug_cost"))
+    total_services = _as_float(service_summary_map.get("total_services"))
+    total_submitted_charges = _as_float(service_summary_map.get("total_submitted_charges"))
+    total_allowed_amount = _as_float(service_summary_map.get("total_allowed_amount"))
+    cost_index = _as_float(service_summary_map.get("cost_index"))
     if cost_index is None and total_services and total_services > 0 and total_allowed_amount is not None:
         cost_index = total_allowed_amount / total_services
-    payload["cost_index"] = cost_index
-
-    avg_submitted_charge = _as_float(payload.get("avg_submitted_charge"))
+    service_summary_map["cost_index"] = cost_index
+    avg_submitted_charge = _as_float(service_summary_map.get("avg_submitted_charge"))
     if avg_submitted_charge is None and total_services and total_services > 0 and total_submitted_charges is not None:
         avg_submitted_charge = total_submitted_charges / total_services
-    payload["avg_submitted_charge"] = avg_submitted_charge
-
-    avg_allowed_amount = _as_float(payload.get("avg_allowed_amount"))
+    service_summary_map["avg_submitted_charge"] = avg_submitted_charge
+    avg_allowed_amount = _as_float(service_summary_map.get("avg_allowed_amount"))
     if avg_allowed_amount is None:
         avg_allowed_amount = cost_index
-    payload["avg_allowed_amount"] = avg_allowed_amount
-
-    payload["legacy_field_aliases"] = {
+    service_summary_map["avg_allowed_amount"] = avg_allowed_amount
+    service_summary_map["legacy_field_aliases"] = {
         "total_claims": "total_services",
         "total_day_supply": "total_submitted_charges",
         "total_benes": "total_beneficiaries",
@@ -665,15 +678,15 @@ def _normalize_provider_service_aggregate(payload: dict[str, Any], include_legac
         "average_price": "avg_allowed_amount",
     }
     if include_legacy:
-        payload["total_claims"] = payload.get("total_services")
-        payload["total_day_supply"] = payload.get("total_submitted_charges")
-        payload["total_benes"] = payload.get("total_beneficiaries")
-        payload["total_drug_cost"] = payload.get("total_allowed_amount")
-        payload["charge_per_service_avg"] = payload.get("avg_submitted_charge")
-        payload["medicare_avg_submitted_charge_per_service"] = payload.get("avg_submitted_charge")
-        payload["medicare_avg_allowed_amount_per_service"] = payload.get("avg_allowed_amount")
-        payload["medicare_average_price_per_service"] = payload.get("avg_allowed_amount")
-        payload["average_price"] = payload.get("avg_allowed_amount")
+        service_summary_map["total_claims"] = service_summary_map.get("total_services")
+        service_summary_map["total_day_supply"] = service_summary_map.get("total_submitted_charges")
+        service_summary_map["total_benes"] = service_summary_map.get("total_beneficiaries")
+        service_summary_map["total_drug_cost"] = service_summary_map.get("total_allowed_amount")
+        service_summary_map["charge_per_service_avg"] = service_summary_map.get("avg_submitted_charge")
+        service_summary_map["medicare_avg_submitted_charge_per_service"] = service_summary_map.get("avg_submitted_charge")
+        service_summary_map["medicare_avg_allowed_amount_per_service"] = service_summary_map.get("avg_allowed_amount")
+        service_summary_map["medicare_average_price_per_service"] = service_summary_map.get("avg_allowed_amount")
+        service_summary_map["average_price"] = service_summary_map.get("avg_allowed_amount")
     if not include_legacy:
         for key in (
             "total_claims",
@@ -687,8 +700,8 @@ def _normalize_provider_service_aggregate(payload: dict[str, Any], include_legac
             "average_price",
             "legacy_field_aliases",
         ):
-            payload.pop(key, None)
-    return payload
+            service_summary_map.pop(key, None)
+    return service_summary_map
 
 
 def _normalize_prescription_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2243,9 +2256,9 @@ def _cohort_context_from_score_row(
     procedure_match_threshold: float | None = None,
 ) -> dict[str, Any] | None:
     context_raw = score_data.get("cohort_context")
-    context: dict[str, Any]
+    context_map: dict[str, Any]
     if isinstance(context_raw, dict):
-        context = dict(context_raw)
+        context_map = dict(context_raw)
     else:
         selected_scope = _normalize_peer_geography_scope(
             score_data.get("cohort_geography_scope")
@@ -2255,7 +2268,7 @@ def _cohort_context_from_score_row(
             score_data.get("cohort_geography_value")
             or score_data.get("cohort_geo_value")
         )
-        context = {
+        context_map = {
             "selected_geography": score_data.get("selected_geography")
             or _selected_geography_label(selected_scope, selected_value),
             "selected_cohort_level": score_data.get("selected_cohort_level")
@@ -2273,25 +2286,25 @@ def _cohort_context_from_score_row(
             or score_data.get("cohort_procedure_bucket"),
             "procedure_match_threshold": score_data.get("procedure_match_threshold"),
         }
-        if not any(context_entry is not None for context_entry in context.values()):
+        if not any(context_entry is not None for context_entry in context_map.values()):
             return None
 
-    threshold_value = _as_float(context.get("procedure_match_threshold"))
+    threshold_value = _as_float(context_map.get("procedure_match_threshold"))
     if threshold_value is None and procedure_match_threshold is not None:
         threshold_value = procedure_match_threshold
     if threshold_value is not None:
-        context["procedure_match_threshold"] = min(1.0, max(0.0, float(threshold_value)))
+        context_map["procedure_match_threshold"] = min(1.0, max(0.0, float(threshold_value)))
 
-    context["selected_geography"] = context.get("selected_geography")
-    context["selected_cohort_level"] = _normalize_cohort_level(context.get("selected_cohort_level"))
-    context["peer_count"] = _as_int(context.get("peer_count"))
-    context["specialty_key"] = _parse_specialty_key(context.get("specialty_key"))
-    taxonomy_code = context.get("taxonomy_code")
-    context["taxonomy_code"] = str(taxonomy_code).strip().upper() if taxonomy_code not in (None, "") else None
-    procedure_bucket = context.get("procedure_bucket")
-    context["procedure_bucket"] = str(procedure_bucket).strip() if procedure_bucket not in (None, "") else None
-    context["computed_live"] = bool(computed_live)
-    return context
+    context_map["selected_geography"] = context_map.get("selected_geography")
+    context_map["selected_cohort_level"] = _normalize_cohort_level(context_map.get("selected_cohort_level"))
+    context_map["peer_count"] = _as_int(context_map.get("peer_count"))
+    context_map["specialty_key"] = _parse_specialty_key(context_map.get("specialty_key"))
+    taxonomy_code = context_map.get("taxonomy_code")
+    context_map["taxonomy_code"] = str(taxonomy_code).strip().upper() if taxonomy_code not in (None, "") else None
+    procedure_bucket = context_map.get("procedure_bucket")
+    context_map["procedure_bucket"] = str(procedure_bucket).strip() if procedure_bucket not in (None, "") else None
+    context_map["computed_live"] = bool(computed_live)
+    return context_map
 
 
 def _normalize_provider_class(raw: Any) -> str | None:
@@ -2422,7 +2435,7 @@ def _build_provider_quality_response_payload(
         for mode in QUALITY_BENCHMARK_MODE_ORDER
         if scores_by_benchmark_mode.get(mode) is not None
     ]
-    response_payload = {
+    response_payload_map = {
         "npi": provider_npi,
         "year_used": year_used,
         "year_source": year_source,
@@ -2455,14 +2468,14 @@ def _build_provider_quality_response_payload(
         "scores_by_benchmark_mode": scores_by_benchmark_mode,
     }
     if selected_payload.get("cohort_context") is not None:
-        response_payload["cohort_context"] = selected_payload.get("cohort_context")
+        response_payload_map["cohort_context"] = selected_payload.get("cohort_context")
     if variants_scope == SCORE_VARIANTS_SCOPE_PROVIDER:
-        response_payload["variants_scope"] = variants_scope
-        response_payload["variants_by_benchmark_mode"] = variants_by_benchmark_mode or {
+        response_payload_map["variants_scope"] = variants_scope
+        response_payload_map["variants_by_benchmark_mode"] = variants_by_benchmark_mode or {
             mode: []
             for mode in QUALITY_BENCHMARK_MODE_ORDER
         }
-    return response_payload
+    return response_payload_map
 
 
 def _parse_token_list(raw_tokens: Any) -> list[str]:
@@ -2580,15 +2593,15 @@ def _geography_priority_for_benchmark_mode(
         candidates.append(("state", state_key))
     candidates.append(("national", "US"))
 
-    deduped: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    deduped_geographies: list[tuple[str, str]] = []
+    seen_geographies: set[tuple[str, str]] = set()
     for scope, value in candidates:
         item = (scope, str(value).strip())
-        if item in seen:
+        if item in seen_geographies:
             continue
-        seen.add(item)
-        deduped.append(item)
-    return deduped
+        seen_geographies.add(item)
+        deduped_geographies.append(item)
+    return deduped_geographies
 
 
 def _is_row_geography_match(
@@ -2728,12 +2741,12 @@ def _collect_peer_target_candidates(
         cohort_level = _normalize_cohort_level(
             _pick_first_from_lowered(payload_lower, "cohort_level", "cohort_tier", "cohort", "level")
         ) or "L3"
-        specialty_match = _is_value_match_or_generic(
+        is_specialty_match = _is_value_match_or_generic(
             _pick_first_from_lowered(payload_lower, "specialty_key", "specialty"),
             specialty_key,
             upper=False,
         )
-        taxonomy_match = _is_value_match_or_generic(
+        is_taxonomy_match = _is_value_match_or_generic(
             _pick_first_from_lowered(payload_lower, "taxonomy_code", "taxonomy"),
             taxonomy_code,
             upper=True,
@@ -2747,10 +2760,10 @@ def _collect_peer_target_candidates(
                 "geography_rank": geography_rank,
                 "cohort_level": cohort_level,
                 "cohort_rank": _cohort_level_rank(cohort_level),
-                "specialty_match": specialty_match,
-                "taxonomy_match": taxonomy_match,
+                "specialty_match": is_specialty_match,
+                "taxonomy_match": is_taxonomy_match,
                 "procedure_match_ratio": procedure_match_ratio,
-                "strict_match": bool(specialty_match and taxonomy_match),
+                "strict_match": bool(is_specialty_match and is_taxonomy_match),
                 "procedure_bucket": procedure_bucket,
                 "peer_count": _peer_count_from_row(payload_lower),
                 "selected_geography": row_geography_label
@@ -2799,7 +2812,7 @@ def _collect_provider_scope_variant_candidates(
     provider_taxonomy_code: str | None,
     provider_procedure_codes: set[str],
 ) -> list[dict[str, Any]]:
-    filtered: list[dict[str, Any]] = []
+    filtered_candidates: list[dict[str, Any]] = []
     for candidate in candidates:
         payload_lower = candidate.get("payload_lower")
         if not isinstance(payload_lower, dict):
@@ -2817,10 +2830,10 @@ def _collect_provider_scope_variant_candidates(
             continue
         if provider_procedure_codes and (_as_float(candidate.get("procedure_match_ratio")) or 0.0) <= 0.0:
             continue
-        filtered.append(candidate)
+        filtered_candidates.append(candidate)
 
-    if filtered:
-        return filtered
+    if filtered_candidates:
+        return filtered_candidates
     if candidates:
         return [candidates[0]]
     return []
@@ -2939,12 +2952,12 @@ def _estimated_cost_level_from_risk_ratio(rr_cost: float | None) -> str:
 def _compute_live_measure(
     *,
     observed: float | None,
-    target: float | None,
+    peer_target: float | None,
     evidence_n: float,
     reverse_ratio: bool,
 ) -> dict[str, float]:
     observed_value = _as_float(observed)
-    target_value = _as_float(target)
+    target_value = _as_float(peer_target)
     evidence = max(_as_float(evidence_n) or 0.0, 1.0)
     if reverse_ratio:
         if observed_value is None or observed_value <= 0 or target_value is None or target_value <= 0:
@@ -3356,24 +3369,24 @@ async def _load_estimated_quality_modes(
             "COALESCE(LOWER(BTRIM(COALESCE(s.score_method, 'direct'))), 'direct') <> 'unavailable'",
         ]
         feature_filters: list[str] = []
-        params: dict[str, Any] = {"year": year, "benchmark_mode": mode}
+        parameter_map: dict[str, Any] = {"year": year, "benchmark_mode": mode}
         if provider_class not in {None, "unknown"}:
             feature_filters.append("COALESCE(LOWER(BTRIM(COALESCE(f.provider_class, ''))), 'unknown') = :provider_class")
-            params["provider_class"] = provider_class
+            parameter_map["provider_class"] = provider_class
         if taxonomy_code:
             feature_filters.append("UPPER(BTRIM(COALESCE(f.taxonomy_code, ''))) = :taxonomy_code")
-            params["taxonomy_code"] = taxonomy_code
+            parameter_map["taxonomy_code"] = taxonomy_code
         elif specialty_key:
             feature_filters.append("LOWER(BTRIM(COALESCE(f.specialty_key, ''))) = :specialty_key")
-            params["specialty_key"] = specialty_key
+            parameter_map["specialty_key"] = specialty_key
         else:
             continue
         if mode == "zip":
             feature_filters.append("f.zip5 = :zip5")
-            params["zip5"] = profile.get("zip5")
+            parameter_map["zip5"] = profile.get("zip5")
         elif mode == "state":
             feature_filters.append("UPPER(BTRIM(COALESCE(f.state, ''))) = :state_key")
-            params["state_key"] = profile.get("state_key")
+            parameter_map["state_key"] = profile.get("state_key")
 
         where_sql = " AND ".join(score_filters + feature_filters)
         score_result = await session.execute(
@@ -3394,7 +3407,7 @@ async def _load_estimated_quality_modes(
                 WHERE {where_sql}
                 """
             ),
-            params,
+            parameter_map,
         )
         score_row = score_result.first()
         if score_row is None:
@@ -3427,7 +3440,7 @@ async def _load_estimated_quality_modes(
                 GROUP BY d.domain
                 """
             ),
-            params,
+            parameter_map,
         )
         for domain_row in domain_result:
             domain_data = _row_to_dict(domain_row)
@@ -3444,7 +3457,7 @@ async def _load_estimated_quality_modes(
 
         rr_cost = _as_float(domains_payload["cost"].get("risk_ratio_point"))
         confidence_0_100 = _estimated_confidence_score(profile, peer_count)
-        score_row_payload = {
+        score_row_map = {
             "model_version": PROVIDER_QUALITY_MODEL_VERSION,
             "benchmark_mode": mode,
             "tier": _tier_from_quality_summary(
@@ -3482,7 +3495,7 @@ async def _load_estimated_quality_modes(
                 and (_as_float(score_data_raw.get("ci75_high")) or 0.0) < 1.0
             ),
         }
-        cohort_context = {
+        cohort_context_map = {
             "selected_geography": _selected_geography_label(
                 "national" if mode == "national" else mode,
                 "US" if mode == "national" else (profile.get("zip5") if mode == "zip" else profile.get("state_key")),
@@ -3496,9 +3509,9 @@ async def _load_estimated_quality_modes(
             "procedure_match_threshold": None,
         }
         scores_by_benchmark_mode[mode] = _build_quality_mode_payload(
-            score_row_payload,
+            score_row_map,
             domains_payload,
-            cohort_context=cohort_context,
+            cohort_context=cohort_context_map,
         )
 
     return scores_by_benchmark_mode
@@ -3667,11 +3680,11 @@ async def _load_quality_peer_targets(
     zip_enabled = zip_value is not None and any(mode == "zip" for mode in normalized_modes)
 
     mode_placeholders = ", ".join(f":mode_{idx}" for idx, _ in enumerate(normalized_modes))
-    params: dict[str, Any] = {"year": year}
+    parameter_map: dict[str, Any] = {"year": year}
     for idx, mode in enumerate(normalized_modes):
-        params[f"mode_{idx}"] = mode
+        parameter_map[f"mode_{idx}"] = mode
 
-    params.update(
+    parameter_map.update(
         {
             "state_key": state_value,
             "zip5": zip_value,
@@ -3731,7 +3744,7 @@ async def _load_quality_peer_targets(
     """
 
     try:
-        peer_target_query_result = await session.execute(text(fast_query), params)
+        peer_target_query_result = await session.execute(text(fast_query), parameter_map)
         peer_target_rows = [
             _row_to_dict(peer_target_row)
             for peer_target_row in peer_target_query_result
@@ -3739,14 +3752,14 @@ async def _load_quality_peer_targets(
         if peer_target_rows:
             return peer_target_rows
         # Safety fallback for unexpected geography-key formats.
-        fallback_result = await session.execute(text(select_sql + geography_clause), params)
+        fallback_result = await session.execute(text(select_sql + geography_clause), parameter_map)
         fallback_rows = [
             _row_to_dict(peer_target_row)
             for peer_target_row in fallback_result
         ]
         if fallback_rows:
             return fallback_rows
-        fallback_result = await session.execute(text(select_sql), params)
+        fallback_result = await session.execute(text(select_sql), parameter_map)
         return [
             _row_to_dict(peer_target_row)
             for peer_target_row in fallback_result
@@ -3806,13 +3819,13 @@ def _build_live_mode_payload_for_candidate(
         "appropriateness": [
             _compute_live_measure(
                 observed=_as_float(observed_data.get("utilization_adjusted")),
-                target=target_values_by_name.get("target_appropriateness"),
+                peer_target=target_values_by_name.get("target_appropriateness"),
                 evidence_n=evidence_n_claims,
                 reverse_ratio=False,
             ),
             _compute_live_measure(
                 observed=_as_float(observed_data.get("rx_claim_rate")),
-                target=target_values_by_name.get("target_rx_appropriateness"),
+                peer_target=target_values_by_name.get("target_rx_appropriateness"),
                 evidence_n=evidence_n_rx,
                 reverse_ratio=False,
             ),
@@ -3820,7 +3833,7 @@ def _build_live_mode_payload_for_candidate(
         "effectiveness": [
             _compute_live_measure(
                 observed=_as_float(observed_data.get("qpp_quality_score")),
-                target=target_values_by_name.get("target_effectiveness"),
+                peer_target=target_values_by_name.get("target_effectiveness"),
                 evidence_n=evidence_n_claims,
                 reverse_ratio=True,
             ),
@@ -3828,13 +3841,13 @@ def _build_live_mode_payload_for_candidate(
         "cost": [
             _compute_live_measure(
                 observed=_as_float(observed_data.get("qpp_cost_score")),
-                target=target_values_by_name.get("target_qpp_cost"),
+                peer_target=target_values_by_name.get("target_qpp_cost"),
                 evidence_n=evidence_n_claims,
                 reverse_ratio=True,
             ),
             _compute_live_measure(
                 observed=_as_float(observed_data.get("cost_adjusted")),
-                target=target_values_by_name.get("target_cost"),
+                peer_target=target_values_by_name.get("target_cost"),
                 evidence_n=evidence_n_claims,
                 reverse_ratio=False,
             ),
@@ -4406,15 +4419,15 @@ def _classify_procedure_taxonomy_resolution(
 
     top_item = evidence_items[0] if evidence_items else None
     top_npi_share = _as_float(top_item.get("distinct_npi_share")) if top_item else 0.0
-    representative = (
+    is_representative = (
         evidence_totals_by_metric["distinct_npis"] >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_NPIS
         and evidence_totals_by_metric["total_beneficiaries"]
         >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_BENEFICIARIES
         and not is_known_young_skew
     )
-    if top_npi_share is not None and top_npi_share >= PROCEDURE_TAXONOMY_HIGH_NPI_SHARE and representative:
+    if top_npi_share is not None and top_npi_share >= PROCEDURE_TAXONOMY_HIGH_NPI_SHARE and is_representative:
         confidence = "high"
-    elif top_npi_share is not None and top_npi_share >= PROCEDURE_TAXONOMY_MEDIUM_NPI_SHARE and representative:
+    elif top_npi_share is not None and top_npi_share >= PROCEDURE_TAXONOMY_MEDIUM_NPI_SHARE and is_representative:
         confidence = "medium"
     elif evidence_items:
         confidence = "low"
@@ -4445,7 +4458,7 @@ def _classify_procedure_taxonomy_resolution(
     ]
     if is_known_young_skew:
         bias_notes.append("procedure_is_known_to_skew_younger_than_medicare_ffs")
-    if not representative:
+    if not is_representative:
         bias_notes.append("representativeness_gate_failed")
 
     safe_for_hard_filter = (
@@ -4453,7 +4466,7 @@ def _classify_procedure_taxonomy_resolution(
         and not needs_intent
         and not needs_review
         and confidence == "high"
-        and representative
+        and is_representative
     )
     hard_filter_allowed_by_request = allow_hard_filter or not PROCEDURE_TAXONOMY_HARD_FILTER_REQUIRES_ALLOW
     if needs_intent:
@@ -4472,15 +4485,15 @@ def _classify_procedure_taxonomy_resolution(
     filter_payload = None
     boost_payload = None
     if recommended_codes:
-        taxonomy_filter_parameters = {
+        taxonomy_filter_parameter_map = {
             "taxonomy_codes": recommended_codes,
             "include_subspecialties": False,
             "primary_only": False,
         }
         if recommended_mode == "hard_filter":
-            filter_payload = taxonomy_filter_parameters
+            filter_payload = taxonomy_filter_parameter_map
         else:
-            boost_payload = taxonomy_filter_parameters
+            boost_payload = taxonomy_filter_parameter_map
 
     return {
         "status": status,
@@ -4495,7 +4508,7 @@ def _classify_procedure_taxonomy_resolution(
         "provider_boost": boost_payload,
         "conflict_reasons": conflict_reasons,
         "representativeness": {
-            "passed": representative,
+            "passed": is_representative,
             "distinct_npis": evidence_totals_by_metric["distinct_npis"],
             "total_services": evidence_totals_by_metric["total_services"],
             "total_beneficiaries": evidence_totals_by_metric["total_beneficiaries"],
@@ -8839,7 +8852,7 @@ async def get_procedure_benchmarks(request, code_system: str, code: str):
     threshold_result = await session.execute(threshold_query)
     thresholds = _row_to_dict(threshold_result.first() or {})
 
-    benchmark_payload: dict[str, Any] = {
+    benchmark_payload_map: dict[str, Any] = {
         "matched_rows": int(aggregate.get("matched_rows") or 0),
         "provider_count": int(aggregate.get("provider_count") or 0),
         "total_services": float(aggregate.get("total_services") or 0.0),
@@ -8857,14 +8870,14 @@ async def get_procedure_benchmarks(request, code_system: str, code: str):
         },
     }
     if include_legacy_fields:
-        benchmark_payload.update(
+        benchmark_payload_map.update(
             {
-                "total_claims": benchmark_payload["total_services"],
-                "total_day_supply": benchmark_payload["total_submitted_charges"],
-                "total_drug_cost": benchmark_payload["total_allowed_amount"],
-                "avg_total_drug_cost": benchmark_payload["avg_total_allowed_amount"],
-                "min_total_drug_cost": benchmark_payload["min_total_allowed_amount"],
-                "max_total_drug_cost": benchmark_payload["max_total_allowed_amount"],
+                "total_claims": benchmark_payload_map["total_services"],
+                "total_day_supply": benchmark_payload_map["total_submitted_charges"],
+                "total_drug_cost": benchmark_payload_map["total_allowed_amount"],
+                "avg_total_drug_cost": benchmark_payload_map["avg_total_allowed_amount"],
+                "min_total_drug_cost": benchmark_payload_map["min_total_allowed_amount"],
+                "max_total_drug_cost": benchmark_payload_map["max_total_allowed_amount"],
             }
         )
     return response.json(
@@ -8880,7 +8893,7 @@ async def get_procedure_benchmarks(request, code_system: str, code: str):
                 "resolved_codes": code_context["resolved_codes"],
                 "matched_via": code_context["matched_via"],
             },
-            "benchmark": benchmark_payload,
+            "benchmark": benchmark_payload_map,
         }
     )
 
@@ -9493,28 +9506,28 @@ async def resolve_procedure_taxonomy(request):
     args.get("expand_codes")
     args.get("include_evidence")
 
-    resolver_args = dict(args)
+    resolver_arg_map = dict(args)
     default_system = _reported_procedure_code_system(code) or INTERNAL_CODE_SYSTEM
-    if not resolver_args.get("code_system"):
-        resolver_args["code_system"] = default_system
+    if not resolver_arg_map.get("code_system"):
+        resolver_arg_map["code_system"] = default_system
 
     internal_codes: list[int] = []
-    code_context: dict[str, Any]
+    code_context_map: dict[str, Any]
     try:
-        internal_codes, code_context = await _resolve_internal_codes_for_request(
+        internal_codes, code_context_map = await _resolve_internal_codes_for_request(
             session,
             code,
-            resolver_args,
+            resolver_arg_map,
             default_system=default_system,
         )
     except sanic.exceptions.NotFound:
-        code_system = _normalize_code_system(resolver_args.get("code_system") or default_system)
-        code_context = {
+        code_system = _normalize_code_system(resolver_arg_map.get("code_system") or default_system)
+        code_context_map = {
             "input_code": {"code_system": code_system, "code": code},
             "resolved_codes": [],
             "internal_codes": [],
             "matched_via": [],
-            "expanded": _parse_bool(resolver_args.get("expand_codes"), "expand_codes", default=False),
+            "expanded": _parse_bool(resolver_arg_map.get("expand_codes"), "expand_codes", default=False),
             "resolution_status": "unmapped",
         }
 
@@ -9530,7 +9543,7 @@ async def resolve_procedure_taxonomy(request):
         evidence_items=evidence_items,
         allow_hard_filter=allow_hard_filter,
     )
-    evidence_payload = {
+    evidence_payload_map = {
         "source": "cms_physician_other_practitioners_medicare_ffs",
         "ranking": "distinct_npi_share_then_service_share",
         "coverage": resolution["representativeness"],
@@ -9543,7 +9556,7 @@ async def resolve_procedure_taxonomy(request):
             "ok": True,
             "query": {
                 "code": code,
-                "code_system": code_context.get("input_code", {}).get("code_system"),
+                "code_system": code_context_map.get("input_code", {}).get("code_system"),
                 "year": year,
                 "year_source": year_source,
                 "clinical_intent": clinical_intent or None,
@@ -9555,8 +9568,8 @@ async def resolve_procedure_taxonomy(request):
                 for key, value in resolution.items()
                 if key not in {"representativeness", "bias_notes"}
             },
-            "evidence": evidence_payload,
-            "code_context": code_context,
+            "evidence": evidence_payload_map,
+            "code_context": code_context_map,
         }
     )
 
@@ -9702,7 +9715,7 @@ async def list_provider_specialties(request):
         for specialty_row in specialty_rows
     ]
 
-    query_payload: dict[str, Any] = {
+    query_payload_map: dict[str, Any] = {
         "q": q or None,
         "code": code or None,
         "year": year,
@@ -9716,7 +9729,7 @@ async def list_provider_specialties(request):
         "provider_type_resolution": provider_type_resolution,
     }
     if code_context is not None:
-        query_payload.update(
+        query_payload_map.update(
             {
                 "input_code": code_context["input_code"],
                 "resolved_codes": code_context["resolved_codes"],
@@ -9733,7 +9746,7 @@ async def list_provider_specialties(request):
                 "offset": pagination.offset,
                 "page": pagination.page,
             },
-            "query": query_payload,
+            "query": query_payload_map,
         }
     )
 
@@ -9936,7 +9949,7 @@ async def list_ptg2_audit_occurrences(request):
     """Page a persisted, deterministic exact-source audit sample."""
 
     args = request.args
-    audit_args = {
+    audit_arg_map = {
         "plan_id": args.get("plan_id"),
         "snapshot_id": args.get("snapshot_id"),
         "mode": args.get("mode"),
@@ -9947,9 +9960,147 @@ async def list_ptg2_audit_occurrences(request):
         "plan_market_type": args.get("plan_market_type"),
         "source_key": args.get("source_key"),
     }
-    attach_candidate_audit_access(request, audit_args)
-    payload = await audit_occurrences_payload(_get_session(request), audit_args)
+    attach_candidate_audit_access(request, audit_arg_map)
+    payload = await audit_occurrences_payload(_get_session(request), audit_arg_map)
     return _json_response(payload)
+
+
+def _candidate_audit_batch_raw_limit() -> int:
+    try:
+        configured_limit = int(
+            os.getenv(
+                "HLTHPRT_PTG2_AUDIT_BATCH_MAX_RAW_BYTES",
+                str(512 * 1024 * 1024),
+            )
+        )
+    except ValueError as exc:
+        raise PTG2SharedBlockError(
+            "candidate audit batch raw-byte limit is invalid"
+        ) from exc
+    if configured_limit < 1:
+        raise PTG2SharedBlockError(
+            "candidate audit batch raw-byte limit must be positive"
+        )
+    return min(configured_limit, 2 * 1024 * 1024 * 1024)
+
+
+def _read_once_block_io_map(read_once_scope) -> dict[str, int]:
+    read_once_scope.assert_processed_once()
+    return read_once_scope.ledger
+
+
+def _candidate_audit_batch_access(request, raw_request: Any):
+    if not isinstance(raw_request, Mapping):
+        raise InvalidUsage("audit_batch_request_fields_invalid")
+    audit_arg_map = {
+        "snapshot_id": raw_request.get("snapshot_id"),
+        "source_key": raw_request.get("source_key"),
+        "plan_id": raw_request.get("plan_id"),
+        "plan_market_type": raw_request.get("plan_market_type"),
+    }
+    candidate_access = candidate_audit_access_from_verified_request(
+        request,
+        audit_arg_map,
+    )
+    if candidate_access is None:
+        raise sanic.exceptions.Forbidden("candidate audit access is required")
+    return candidate_access
+
+
+def _require_candidate_audit_batch_auth(request) -> None:
+    headers = getattr(request, "headers", {}) or {}
+    if not str(headers.get(PTG2_CANDIDATE_AUDIT_HEADER) or "").strip():
+        raise sanic.exceptions.Forbidden("candidate audit access is required")
+    require_control_auth(request)
+
+
+def _validate_candidate_audit_batch_counts(batch_result, audit_request) -> None:
+    """Require complete witness and persisted-coordinate validation counts."""
+
+    if batch_result.matched_challenge_count != audit_request.challenge_count:
+        raise PTG2ManifestArtifactError(
+            "PTG2 candidate audit returned an incomplete match count"
+        )
+    if (
+        batch_result.validated_persisted_audit_occurrence_count
+        != batch_result.persisted_audit_occurrence_count
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 candidate audit returned an incomplete persisted occurrence count"
+        )
+
+
+def _candidate_audit_batch_response_map(
+    audit_request,
+    batch_result,
+    block_io_map,
+    duration_ms: float,
+) -> dict[str, Any]:
+    """Build the redacted aggregate response for one completed candidate audit."""
+
+    return {
+        "contract": PTG2_AUDIT_BATCH_RESPONSE_CONTRACT,
+        "request_digest": audit_request.request_digest,
+        "challenge_count": audit_request.challenge_count,
+        "unique_challenge_count": batch_result.unique_challenge_count,
+        "matched_challenge_count": batch_result.matched_challenge_count,
+        "persisted_audit_occurrence_count": (
+            batch_result.persisted_audit_occurrence_count
+        ),
+        "validated_persisted_audit_occurrence_count": (
+            batch_result.validated_persisted_audit_occurrence_count
+        ),
+        "matched_challenge_digest": matched_audit_batch_digest(
+            audit_request.request_digest,
+            batch_result.matched_challenge_count,
+        ),
+        "duration_ms": duration_ms,
+        "block_io": block_io_map,
+        "witness_io": dict(batch_result.witness_io),
+        "candidate_processing_io": dict(batch_result.candidate_processing_io),
+    }
+
+
+@blueprint.post(
+    "/providers/audit-source-witness-batch",
+    name="pricing.providers.audit_source_witness_batch",
+)
+async def audit_ptg2_source_witness_batch(request):
+    """Verify one exhaustive candidate witness through one read-only request."""
+
+    maximum_body_bytes = 64 * 1024
+    if len(request.body or b"") > maximum_body_bytes:
+        raise InvalidUsage("candidate audit batch request is too large")
+    _require_candidate_audit_batch_auth(request)
+    raw_request = request.json
+    candidate_access = _candidate_audit_batch_access(request, raw_request)
+    try:
+        audit_request = parse_audit_batch_request(raw_request)
+    except ValueError as exc:
+        raise InvalidUsage(str(exc)) from exc
+    started_at = time.perf_counter()
+    try:
+        with shared_block_read_once_scope(
+            max_retained_raw_bytes=_candidate_audit_batch_raw_limit(),
+        ) as read_once_scope:
+            batch_result = await audit_candidate_source_witness_batch(
+                _get_session(request),
+                audit_request,
+                candidate_access,
+            )
+            _validate_candidate_audit_batch_counts(batch_result, audit_request)
+            block_io_map = _read_once_block_io_map(read_once_scope)
+    except (PTG2ManifestArtifactError, PTG2SharedBlockError) as exc:
+        raise InvalidUsage(str(exc)) from exc
+    duration_ms = round((time.perf_counter() - started_at) * 1_000, 3)
+    return _json_response(
+        _candidate_audit_batch_response_map(
+            audit_request,
+            batch_result,
+            block_io_map,
+            duration_ms,
+        )
+    )
 
 
 # Back-compat alias retained by the public OpenAPI contract for

@@ -24,6 +24,9 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SHARED_GENERATION,
 )
 from process.ptg_parts.ptg2_shared_reuse import PTG2_V3_SOURCE_SET_CONTRACT
+from process.ptg_parts.ptg2_source_witness_contract import (
+    validate_source_witness_manifest,
+)
 
 from api.ptg2_types import PTG2ServingTables
 
@@ -142,6 +145,57 @@ def _strict_v3_audit_sample(
             "PTG2 postgres_binary_v3 audit sample digest is invalid; reimport the snapshot"
         )
     return dict(audit_sample)
+
+
+def _strict_v3_source_witness(
+    serving_index: dict[str, Any],
+    *,
+    source_count: int,
+) -> dict[str, Any]:
+    """Validate the source-witness descriptor sealed into one V3 layout."""
+
+    try:
+        return validate_source_witness_manifest(
+            serving_index.get("source_witness"),
+            expected_source_count=source_count,
+        )
+    except ValueError as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 postgres_binary_v3 snapshot has an invalid source witness; "
+            "reimport the snapshot"
+        ) from exc
+
+
+def _persisted_source_witness_identity(row_fields: Any) -> dict[str, Any]:
+    """Project the immutable witness columns selected with a candidate."""
+
+    return {
+        "contract": str(row_fields.get("persisted_witness_contract") or ""),
+        "selection_method": str(
+            row_fields.get("persisted_witness_selection_method") or ""
+        ),
+        "source_set_digest": str(
+            row_fields.get("persisted_witness_source_set_digest") or ""
+        ),
+        "sample_digest": str(
+            row_fields.get("persisted_witness_sample_digest") or ""
+        ),
+        "queryable_occurrence_population_count": _optional_integer(
+            row_fields.get("persisted_witness_occurrence_population_count")
+        ),
+        "provider_population_count": _optional_integer(
+            row_fields.get("persisted_witness_provider_population_count")
+        ),
+        "occurrence_witness_count": _optional_integer(
+            row_fields.get("persisted_witness_occurrence_count")
+        ),
+        "provider_witness_count": _optional_integer(
+            row_fields.get("persisted_witness_provider_count")
+        ),
+        "payload_sha256": str(
+            row_fields.get("persisted_witness_payload_sha256") or ""
+        ),
+    }
 
 
 def _strict_v3_source_set(
@@ -403,6 +457,8 @@ async def snapshot_serving_tables(
             SELECT snapshot.manifest->'serving_index' AS candidate_serving_index,
                    layout.layout_manifest->'serving_index'->'audit_sample'
                        AS layout_audit_sample,
+                   layout.layout_manifest->'serving_index'->'source_witness'
+                       AS layout_source_witness,
                    layout.layout_manifest->'serving_index'->>'coverage_scope_id'
                        AS layout_coverage_scope_id,
                    layout.layout_manifest->'serving_index'->>'code_count'
@@ -411,6 +467,23 @@ async def snapshot_serving_tables(
                    snapshot_scope.plan_market_type AS snapshot_plan_market_type,
                    encode(snapshot_scope.coverage_scope_id, 'hex')
                        AS snapshot_coverage_scope_id,
+                   source_witness.contract AS persisted_witness_contract,
+                   source_witness.selection_method
+                       AS persisted_witness_selection_method,
+                   encode(source_witness.source_set_digest, 'hex')
+                       AS persisted_witness_source_set_digest,
+                   encode(source_witness.sample_digest, 'hex')
+                       AS persisted_witness_sample_digest,
+                   source_witness.queryable_occurrence_population_count
+                       AS persisted_witness_occurrence_population_count,
+                   source_witness.provider_population_count
+                       AS persisted_witness_provider_population_count,
+                   source_witness.occurrence_witness_count
+                       AS persisted_witness_occurrence_count,
+                   source_witness.provider_witness_count
+                       AS persisted_witness_provider_count,
+                   encode(source_witness.payload_sha256, 'hex')
+                       AS persisted_witness_payload_sha256,
                    current_setting('server_version_num')::integer
                        AS postgres_server_version_num,
                    current_database() IS NOT NULL AS database_selected,
@@ -424,6 +497,8 @@ async def snapshot_serving_tables(
                 ON layout.snapshot_key = binding.snapshot_key
               JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_scope snapshot_scope
                 ON snapshot_scope.snapshot_id = snapshot.snapshot_id
+              LEFT JOIN {PTG2_SCHEMA}.ptg2_v3_source_audit_witness source_witness
+                ON source_witness.snapshot_key = binding.snapshot_key
              WHERE snapshot.snapshot_id = :snapshot_id
                AND snapshot.status = 'validated'
                AND snapshot.manifest->'activation'->>'contract'
@@ -566,6 +641,7 @@ async def snapshot_serving_tables(
     coverage_scope_id = _strict_coverage_scope_id(serving_index)
     code_count = _optional_integer(serving_index.get("code_count"))
     source_count = _optional_integer(serving_index.get("source_count"))
+    source_witness_by_field = None
     if candidate_audit_access is not None:
         layout_audit_sample = row_fields.get("layout_audit_sample")
         if isinstance(layout_audit_sample, str):
@@ -599,6 +675,37 @@ async def snapshot_serving_tables(
             serving_index,
             source_count=int(source_count or 0),
         )
+        if source_set_by_field is None:
+            raise PTG2ManifestArtifactError(
+                "PTG2 candidate source set is missing from its snapshot manifest"
+            )
+        if serving_index.get("source_witness") is not None:
+            source_witness_by_field = _strict_v3_source_witness(
+                serving_index,
+                source_count=int(source_count or 0),
+            )
+            layout_source_witness = row_fields.get("layout_source_witness")
+            if isinstance(layout_source_witness, str):
+                try:
+                    layout_source_witness = json.loads(layout_source_witness)
+                except json.JSONDecodeError as exc:
+                    raise PTG2ManifestArtifactError(
+                        "PTG2 sealed layout source witness is malformed"
+                    ) from exc
+            persisted_witness_identity = _persisted_source_witness_identity(row_fields)
+            sealed_witness_identity_by_field = {
+                field_name: source_witness_by_field.get(field_name)
+                for field_name in persisted_witness_identity
+            }
+            if (
+                layout_source_witness != source_witness_by_field
+                or persisted_witness_identity != sealed_witness_identity_by_field
+                or source_witness_by_field.get("source_set_digest")
+                != source_set_by_field.get("raw_container_sha256_digest")
+            ):
+                raise PTG2ManifestArtifactError(
+                    "PTG2 sealed source witness does not match its persisted identity"
+                )
         source_key = (
             str(serving_index.get("source_key") or "").strip().lower() or None
         )
@@ -695,6 +802,7 @@ async def snapshot_serving_tables(
         ),
         source_key=source_key,
         audit_sample=audit_sample,
+        source_witness=source_witness_by_field,
         source_set=source_set_by_field,
         database_evidence=_database_execution_evidence(row_fields),
         source_trace_set_hash=str(

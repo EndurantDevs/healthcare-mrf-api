@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from api import ptg2_db_sidecars
+from api import ptg2_db_serving_v3, ptg2_db_sidecars, ptg2_serving
 from api.ptg2_db_sidecars import (
     PTG2ManifestArtifactError,
     lookup_code_prefix_rows_from_db,
@@ -16,6 +16,10 @@ from api.ptg2_shared_blocks import (
     stream_shared_blocks,
 )
 from process.ptg_parts.ptg2_shared_blocks import shared_block_hash
+from process.ptg_parts import ptg2_serving_binary_v3
+from process.ptg_parts.ptg2_serving_binary_v3_types import (
+    PTG2V3PriceAtomRecord,
+)
 
 
 def _shard_block_key(
@@ -91,13 +95,25 @@ def _fragment(
     )
 
 
-def _fragment_row(fragment: SharedBlockPayload) -> dict:
-    return {
+def _fragment_row(
+    fragment: SharedBlockPayload,
+    *,
+    block_hash: bytes | None = None,
+) -> dict:
+    physical_block_hash = block_hash or shared_block_hash(
+        format_version=2,
+        object_kind="by_code_provider_shard_v1",
+        codec="none",
+        payload=fragment.payload,
+    )
+    fragment_fields_by_name = {
         "block_key": fragment.block_key,
         "block_no": fragment.fragment_no,
         "entry_count": fragment.entry_count,
         "_decoded_payload": fragment.payload,
+        "_block_hash": physical_block_hash,
     }
+    return fragment_fields_by_name
 
 
 def _patch_reference_lookups(monkeypatch):
@@ -396,6 +412,489 @@ async def test_sparse_batch_reads_multiple_codes_from_exact_provider_shards(
     assert fetch.await_args.kwargs["block_keys"] == expected_block_keys
     assert fetch.await_args.kwargs["require_all"] is False
     discover.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sparse_batch_uses_each_codes_own_provider_shards(monkeypatch):
+    block_7 = _shard_block_key(7, 5)
+    block_8 = _shard_block_key(8, 1025)
+    returned_fragments = [
+        _fragment_row(
+            _fragment(
+                _grouped_payload(2, [(5, [(8, 0)])]),
+                entry_count=1,
+                block_key=block_7,
+            )
+        ),
+        _fragment_row(
+            _fragment(
+                _grouped_payload(2, [(1025, [(2, 1)])]),
+                entry_count=1,
+                block_key=block_8,
+            )
+        ),
+    ]
+    fetch = AsyncMock(return_value=returned_fragments)
+    discover = AsyncMock(
+        side_effect=AssertionError("per-code filters must not discover code ranges")
+    )
+    hydrate = AsyncMock(
+        side_effect=AssertionError("occurrence reads must not hydrate labels")
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        fetch,
+    )
+    monkeypatch.setattr(ptg2_db_sidecars, "_discover_forward_shard_keys", discover)
+    monkeypatch.setattr(ptg2_db_sidecars, "_lookup_forward_references", hydrate)
+
+    occurrences_by_code = (
+        await ptg2_db_sidecars.lookup_forward_occurrences_batch_from_db(
+            object(),
+            (8, 7),
+            provider_set_keys_by_code={7: (5,), 8: (1025,)},
+            shared_snapshot_key=41,
+            source_count=2,
+            price_dictionary_item_count=128,
+            price_dictionary_block_bytes=2048,
+        )
+    )
+
+    assert occurrences_by_code == {7: ((5, 8, 0),), 8: ((1025, 2, 1),)}
+    assert fetch.await_args.kwargs["block_keys"] == (block_7, block_8)
+    assert fetch.await_args.kwargs["require_all"] is False
+    discover.assert_not_awaited()
+    hydrate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_audit_forward_index_filters_sources_during_one_union_visit(
+    monkeypatch,
+):
+    block_7 = _shard_block_key(7, 5)
+    block_8 = _shard_block_key(8, 1025)
+    fetch = AsyncMock(
+        return_value=[
+            _fragment_row(
+                _fragment(
+                    _grouped_payload(
+                        2,
+                        [(5, [(8, 0), (9, 1), (10, 0)])],
+                    ),
+                    entry_count=1,
+                    block_key=block_7,
+                )
+            ),
+            _fragment_row(
+                _fragment(
+                    _grouped_payload(2, [(1025, [(2, 0), (3, 1)])]),
+                    entry_count=1,
+                    block_key=block_8,
+                )
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        fetch,
+    )
+
+    price_keys_by_occurrence = await (
+        ptg2_db_sidecars.lookup_forward_price_index_from_db(
+            object(),
+            (8, 7),
+            provider_set_keys_by_code={7: (5,), 8: (1025,)},
+            source_keys_by_code={7: (1,), 8: (0,)},
+            shared_snapshot_key=41,
+            source_count=2,
+            price_dictionary_item_count=128,
+            price_dictionary_block_bytes=2048,
+        )
+    )
+
+    assert price_keys_by_occurrence == {
+        (7, 5, 1): (9,),
+        (8, 1025, 0): (2,),
+    }
+    fetch.assert_awaited_once()
+    assert fetch.await_args.kwargs["block_keys"] == (block_7, block_8)
+
+
+@pytest.mark.asyncio
+async def test_audit_forward_alias_parses_and_claims_physical_payload_once(
+    monkeypatch,
+):
+    block_7 = _shard_block_key(7, 5)
+    block_8 = _shard_block_key(8, 5)
+    block_hash = b"h" * 32
+    forward_block_bytes = _grouped_payload(2, [(5, [(8, 0), (9, 1)])])
+    fetch = AsyncMock(
+        return_value=[
+            _fragment_row(
+                _fragment(forward_block_bytes, entry_count=1, block_key=block_7),
+                block_hash=block_hash,
+            ),
+            _fragment_row(
+                _fragment(forward_block_bytes, entry_count=1, block_key=block_8),
+                block_hash=block_hash,
+            ),
+        ]
+    )
+    original_visit = ptg2_db_sidecars._visit_serving_binary_by_code_record
+    visit_spy = Mock(wraps=original_visit)
+    claim = Mock()
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        fetch,
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_visit_serving_binary_by_code_record",
+        visit_spy,
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "claim_shared_block_processing",
+        claim,
+    )
+
+    price_keys_by_occurrence = await (
+        ptg2_db_sidecars.lookup_forward_price_index_from_db(
+            object(),
+            (8, 7),
+            provider_set_keys_by_code={7: (5,), 8: (5,)},
+            source_keys_by_code={7: (0,), 8: (1,)},
+            shared_snapshot_key=41,
+            source_count=2,
+            price_dictionary_item_count=128,
+            price_dictionary_block_bytes=2048,
+        )
+    )
+
+    assert price_keys_by_occurrence == {
+        (7, 5, 0): (8,),
+        (8, 5, 1): (9,),
+    }
+    visit_spy.assert_called_once()
+    claim.assert_called_once_with(schema_name="mrf", block_hash=block_hash)
+
+
+@pytest.mark.asyncio
+async def test_audit_forward_alias_revalidates_each_logical_shard_bounds(
+    monkeypatch,
+):
+    block_7 = _shard_block_key(7, 5)
+    block_8 = _shard_block_key(8, 1025)
+    block_hash = b"h" * 32
+    forward_block_bytes = _grouped_payload(2, [(5, [(8, 0)])])
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        AsyncMock(
+            return_value=[
+                _fragment_row(
+                    _fragment(forward_block_bytes, entry_count=1, block_key=block_7),
+                    block_hash=block_hash,
+                ),
+                _fragment_row(
+                    _fragment(forward_block_bytes, entry_count=1, block_key=block_8),
+                    block_hash=block_hash,
+                ),
+            ]
+        ),
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="outside its forward shard"):
+        await ptg2_db_sidecars.lookup_forward_price_index_from_db(
+            object(),
+            (7, 8),
+            provider_set_keys_by_code={7: (5,), 8: (1025,)},
+            source_keys_by_code={7: (0,), 8: (0,)},
+            shared_snapshot_key=41,
+            source_count=2,
+            price_dictionary_item_count=128,
+            price_dictionary_block_bytes=2048,
+        )
+
+
+@pytest.mark.asyncio
+async def test_audit_forward_rejects_missing_physical_block_identity(monkeypatch):
+    block_key = _shard_block_key(7, 5)
+    fragment_fields_by_name = _fragment_row(
+        _fragment(
+            _grouped_payload(1, [(5, [(8, 0)])]),
+            entry_count=1,
+            block_key=block_key,
+        )
+    )
+    fragment_fields_by_name.pop("_block_hash")
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        AsyncMock(return_value=[fragment_fields_by_name]),
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="physical block identity"):
+        await ptg2_db_sidecars.lookup_forward_price_index_from_db(
+            object(),
+            (7,),
+            provider_set_keys_by_code={7: (5,)},
+            source_keys_by_code={7: (0,)},
+            shared_snapshot_key=41,
+            source_count=1,
+            price_dictionary_item_count=128,
+            price_dictionary_block_bytes=2048,
+        )
+
+
+@pytest.mark.asyncio
+async def test_audit_forward_index_deduplicates_continuation_prices(monkeypatch):
+    block_key = _shard_block_key(7, 5)
+    fetch = AsyncMock(
+        return_value=[
+            _fragment_row(
+                _fragment(
+                    _grouped_payload(2, [(5, [(8, 1)])]),
+                    fragment_no=0,
+                    entry_count=1,
+                    block_key=block_key,
+                )
+            ),
+            _fragment_row(
+                _fragment(
+                    _grouped_payload(2, [(5, [(8, 1), (9, 1)])]),
+                    fragment_no=1,
+                    entry_count=1,
+                    block_key=block_key,
+                )
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        fetch,
+    )
+
+    price_keys_by_occurrence = await (
+        ptg2_db_sidecars.lookup_forward_price_index_from_db(
+            object(),
+            (7,),
+            provider_set_keys_by_code={7: (5,)},
+            source_keys_by_code={7: (1,)},
+            shared_snapshot_key=41,
+            source_count=2,
+            price_dictionary_item_count=128,
+            price_dictionary_block_bytes=2048,
+        )
+    )
+
+    assert price_keys_by_occurrence == {(7, 5, 1): (8, 9)}
+
+
+@pytest.mark.asyncio
+async def test_audit_forward_index_validates_filtered_out_occurrences(monkeypatch):
+    block_key = _shard_block_key(7, 5)
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        AsyncMock(
+            return_value=[
+                _fragment_row(
+                    _fragment(
+                        _grouped_payload(2, [(5, [(9, 0), (8, 1)])]),
+                        entry_count=1,
+                        block_key=block_key,
+                    )
+                )
+            ]
+        ),
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="not ordered"):
+        await (
+            ptg2_db_sidecars.lookup_forward_price_index_from_db(
+                object(),
+                (7,),
+                provider_set_keys_by_code={7: (5,)},
+                source_keys_by_code={7: (0,)},
+                shared_snapshot_key=41,
+                source_count=2,
+                price_dictionary_item_count=128,
+                price_dictionary_block_bytes=2048,
+            )
+        )
+
+
+def test_forward_occurrence_price_vector_is_parsed_once(monkeypatch):
+    original_reader = ptg2_db_sidecars.read_strict_uvarint
+    read_offsets = []
+
+    def _counted_reader(payload, offset):
+        read_offsets.append(offset)
+        return original_reader(payload, offset)
+
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "read_strict_uvarint",
+        _counted_reader,
+    )
+    fragment = _fragment_row(
+        _fragment(
+            _grouped_payload(2, [(5, [(8, 0), (9, 1), (10, 0)])]),
+            entry_count=1,
+        )
+    )
+
+    decoded = ptg2_db_sidecars._decode_serving_binary_code_records(
+        (fragment,),
+        provider_set_keys=(5,),
+        expected_source_count=2,
+        price_item_count=128,
+    )
+
+    assert decoded == [(5, 8, 0), (5, 9, 1), (5, 10, 0)]
+    assert len(read_offsets) == 5
+
+
+def test_price_membership_header_is_parsed_once(monkeypatch):
+    encoded_memberships = ptg2_serving_binary_v3.encode_price_memberships(
+        ((0, (7,)),),
+        24,
+    )
+    original_header = ptg2_serving_binary_v3._price_membership_header
+    header_spy = Mock(wraps=original_header)
+
+    monkeypatch.setattr(
+        ptg2_serving_binary_v3,
+        "_price_membership_header",
+        header_spy,
+    )
+
+    memberships = ptg2_db_serving_v3._decode_price_membership_block(
+        encoded_memberships,
+        block_key=0,
+        entry_count=1,
+        atom_key_bits=24,
+        block_span=512,
+        requested_price_keys={0},
+    )
+
+    assert memberships == {0: (7,)}
+    header_spy.assert_called_once_with(encoded_memberships)
+
+
+def test_price_atom_header_is_parsed_once(monkeypatch):
+    price_atom = PTG2V3PriceAtomRecord("12.34", (None,))
+    encoded_atoms = ptg2_serving_binary_v3.encode_price_atoms((price_atom,))
+    original_header = ptg2_serving_binary_v3._price_atom_header
+    header_spy = Mock(wraps=original_header)
+
+    monkeypatch.setattr(
+        ptg2_serving_binary_v3,
+        "_price_atom_header",
+        header_spy,
+    )
+
+    atoms = ptg2_db_sidecars._decode_price_atom_block(
+        encoded_atoms,
+        block_key=0,
+        entry_count=1,
+        block_span=512,
+        requested_keys={0},
+    )
+
+    assert atoms == {0: price_atom}
+    header_spy.assert_called_once_with(encoded_atoms)
+
+
+def test_shared_price_atom_is_projected_once_per_hydration(monkeypatch):
+    projection_calls = []
+
+    def _project(price_atom, _dictionary_values, _constant_values):
+        projection_calls.append(price_atom)
+        return {"negotiated_rate": "12.34", "service_code": []}
+
+    atom = object()
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_version_three_price_payload",
+        _project,
+    )
+
+    copied_rows = ptg2_serving._version_three_price_rows(
+        (1, 2),
+        {1: (7,), 2: (7,)},
+        {7: atom},
+        {},
+        {},
+    )
+
+    assert projection_calls == [atom]
+    assert copied_rows[1][0] == copied_rows[2][0]
+    assert copied_rows[1][0] is not copied_rows[2][0]
+    copied_rows[1][0]["negotiated_rate"] = "changed"
+    assert copied_rows[2][0]["negotiated_rate"] == "12.34"
+
+    projection_calls.clear()
+    shared_rows = ptg2_serving._version_three_price_rows(
+        (1, 2),
+        {1: (7,), 2: (7,)},
+        {7: atom},
+        {},
+        {},
+        copy_payloads=False,
+    )
+
+    assert projection_calls == [atom]
+    assert shared_rows[1][0] is shared_rows[2][0]
+
+
+@pytest.mark.parametrize(
+    "source_filters_by_code",
+    [
+        {7: ()},
+        {8: (0,)},
+        {7: (False,)},
+        {7: (-1,)},
+        {7: (2,)},
+    ],
+)
+@pytest.mark.asyncio
+async def test_audit_forward_index_rejects_invalid_source_filters(
+    source_filters_by_code,
+):
+    with pytest.raises(PTG2ManifestArtifactError, match="source filter"):
+        await (
+            ptg2_db_sidecars.lookup_forward_price_index_from_db(
+                object(),
+                (7,),
+                provider_set_keys_by_code={7: (5,)},
+                source_keys_by_code=source_filters_by_code,
+                shared_snapshot_key=41,
+                source_count=2,
+                price_dictionary_item_count=128,
+                price_dictionary_block_bytes=2048,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_sparse_batch_rejects_two_provider_filter_modes():
+    with pytest.raises(PTG2ManifestArtifactError, match="one filter mode"):
+        await ptg2_db_sidecars.lookup_forward_occurrences_batch_from_db(
+            object(),
+            (7,),
+            provider_set_keys=(5,),
+            provider_set_keys_by_code={7: (5,)},
+            shared_snapshot_key=41,
+            source_count=2,
+            price_dictionary_item_count=128,
+            price_dictionary_block_bytes=2048,
+        )
 
 
 @pytest.mark.asyncio

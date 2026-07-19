@@ -65,6 +65,19 @@ def candidate_audit_access_from_request(
     if not requested_candidate:
         return None
     require_control_auth(request)
+    return candidate_audit_access_from_verified_request(request, args)
+
+
+def candidate_audit_access_from_verified_request(
+    request,
+    args: Mapping[str, Any],
+) -> PTG2CandidateAuditAccess | None:
+    """Create a capability after the caller verified control authentication."""
+
+    headers = getattr(request, "headers", {}) or {}
+    requested_candidate = _normalized(headers.get(PTG2_CANDIDATE_AUDIT_HEADER))
+    if not requested_candidate:
+        return None
     snapshot_id = _normalized(args.get("snapshot_id"))
     source_key = _normalized(args.get("source_key"), lower=True)
     plan_id = _normalized(args.get("plan_id") or args.get("plan_external_id"))

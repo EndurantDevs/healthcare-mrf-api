@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import zlib
+from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 from process.ptg_parts.ptg2_source_witness_codec import decode_persisted_record
@@ -164,7 +165,7 @@ def _read_evidence_entry(
     witness_payload: bytes,
     dictionary_offset: int,
     previous_sha256: str,
-) -> tuple[str, bytes, int, int]:
+) -> tuple[str, bytes, dict[str, Any], int, int]:
     digest_end = dictionary_offset + 32
     if digest_end > len(witness_payload):
         raise RuntimeError(
@@ -191,14 +192,20 @@ def _read_evidence_entry(
     if hashlib.sha256(raw_json).hexdigest() != evidence_sha256:
         raise RuntimeError("strict V3 evidence dictionary digest is invalid")
     try:
-        evidence_object = json.loads(raw_json)
+        evidence_object = json.loads(raw_json, parse_float=Decimal, parse_int=int)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(
             "strict V3 evidence dictionary JSON is invalid"
         ) from exc
     if not isinstance(evidence_object, dict):
         raise RuntimeError("strict V3 evidence dictionary JSON must be an object")
-    return evidence_sha256, raw_json, compressed_end, evidence_length
+    return (
+        evidence_sha256,
+        raw_json,
+        evidence_object,
+        compressed_end,
+        evidence_length,
+    )
 
 
 def _validate_evidence_dictionary_metrics(
@@ -228,8 +235,8 @@ def _decode_evidence_dictionary(
     *,
     dictionary_offset: int,
     header: Mapping[str, Any],
-) -> tuple[dict[str, bytes], int]:
-    """Decode and authenticate the shared exact source-evidence dictionary."""
+) -> tuple[dict[str, bytes], dict[str, dict[str, Any]], int]:
+    """Decode, parse once, and authenticate the shared evidence dictionary."""
 
     dictionary_count, dictionary_offset = read_u32(
         witness_payload,
@@ -247,10 +254,17 @@ def _decode_evidence_dictionary(
     ):
         raise RuntimeError("strict V3 evidence dictionary count does not match")
     evidence_by_sha256: dict[str, bytes] = {}
+    evidence_object_by_sha256: dict[str, dict[str, Any]] = {}
     raw_byte_count = stored_byte_count = 0
     previous_sha256 = ""
     for _dictionary_index in range(dictionary_count):
-        evidence_sha256, raw_json, dictionary_offset, stored_bytes = (
+        (
+            evidence_sha256,
+            raw_json,
+            evidence_object,
+            dictionary_offset,
+            stored_bytes,
+        ) = (
             _read_evidence_entry(
                 witness_payload,
                 dictionary_offset,
@@ -258,6 +272,7 @@ def _decode_evidence_dictionary(
             )
         )
         evidence_by_sha256[evidence_sha256] = raw_json
+        evidence_object_by_sha256[evidence_sha256] = evidence_object
         raw_byte_count += len(raw_json)
         stored_byte_count += stored_bytes
         previous_sha256 = evidence_sha256
@@ -266,7 +281,7 @@ def _decode_evidence_dictionary(
         raw_byte_count=raw_byte_count,
         stored_byte_count=stored_byte_count,
     )
-    return evidence_by_sha256, dictionary_offset
+    return evidence_by_sha256, evidence_object_by_sha256, dictionary_offset
 
 
 def _read_persisted_record(
@@ -418,7 +433,7 @@ def decode_persisted_source_witness(
         payload_bytes,
         expected_sources=expected_sources,
     )
-    evidence_map, record_offset = _decode_evidence_dictionary(
+    evidence_map, evidence_object_map, record_offset = _decode_evidence_dictionary(
         payload_bytes,
         dictionary_offset=dictionary_offset,
         header=header,
@@ -443,6 +458,7 @@ def decode_persisted_source_witness(
     return LoadedSourceWitness(
         metadata=metadata_by_field,
         records=tuple(witness_records),
+        evidence_by_sha256=evidence_object_map,
     )
 
 

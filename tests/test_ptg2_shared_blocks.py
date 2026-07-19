@@ -6,21 +6,27 @@ import uuid
 import zlib
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import text
 
+from api import ptg2_db_serving_v3, ptg2_db_sidecars
+from api import ptg2_shared_blocks as shared_readers
 from api.ptg2_shared_blocks import (
     PTG2SharedBlockError,
+    PTG2_V3_GRAPH_CHUNK_BYTES,
     PTG2_V3_GRAPH_NPI_TO_GROUP,
     decode_shared_block_payload,
     fetch_shared_blocks,
     fetch_shared_graph_members,
     fetch_snapshot_source_set_metadata,
+    fetch_snapshot_source_set_identity,
+    shared_block_read_once_scope,
 )
 from db.connection import db
 from process.ptg_parts import ptg2_shared_blocks as shared_blocks_module
+from process.ptg_parts import ptg2_serving_binary_v3
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_DENSE_LAYOUT_TABLES,
     SharedBlockReference,
@@ -39,6 +45,9 @@ from process.ptg_parts.ptg2_shared_blocks import (
     shared_support_digest,
     summarize_shared_snapshot_mappings,
     touch_shared_layout_build,
+)
+from process.ptg_parts.ptg2_serving_binary_v3_types import (
+    PTG2V3PriceAtomRecord,
 )
 
 
@@ -84,6 +93,36 @@ class _ScriptedSession:
         self.calls.append((str(statement), dict(params or {})))
         assert self.results, f"unexpected SQL: {statement}"
         return self.results.pop(0)
+
+
+class _ReadOnceSession:
+    def __init__(self, *, mapping_rows, physical_rows, owner_rows=()):
+        self.mapping_rows = list(mapping_rows)
+        self.physical_rows = list(physical_rows)
+        self.owner_rows = list(owner_rows)
+        self.calls = []
+
+    async def execute(self, statement, params=None):
+        sql = str(statement)
+        params_by_name = dict(params or {})
+        self.calls.append((sql, params_by_name))
+        if "ptg2_v3_graph_owner" in sql:
+            return _Rows(self.owner_rows)
+        if "ptg2_v3_snapshot_block" in sql:
+            requested_keys = set(params_by_name["block_keys"])
+            return _Rows(
+                row
+                for row in self.mapping_rows
+                if int(row["block_key"]) in requested_keys
+            )
+        if "ptg2_v3_block" in sql:
+            requested_hashes = set(params_by_name["block_hashes"])
+            return _Rows(
+                row
+                for row in self.physical_rows
+                if bytes(row["block_hash"]) in requested_hashes
+            )
+        raise AssertionError(f"unexpected SQL: {sql}")
 
 
 class _MappingCopyDriver:
@@ -227,6 +266,105 @@ def _stored_row(
     }
     stored_row_map.update(extra or {})
     return stored_row_map
+
+
+def _read_once_rows(
+    *,
+    object_kind: str,
+    raw_payload: bytes,
+    coordinates: tuple[tuple[int, int], ...],
+    codec: str = "none",
+    entry_count: int = 1,
+):
+    stored = _stored_row(
+        object_kind=object_kind,
+        block_key=coordinates[0][0],
+        fragment_no=coordinates[0][1],
+        raw_payload=raw_payload,
+        codec=codec,
+    )
+    mapping_rows = [
+        {
+            "object_kind": object_kind,
+            "block_key": block_key,
+            "fragment_no": fragment_no,
+            "mapping_entry_count": entry_count,
+            "block_hash": stored["block_hash"],
+        }
+        for block_key, fragment_no in coordinates
+    ]
+    physical_record_by_name = {
+        "block_hash": stored["block_hash"],
+        "object_kind": object_kind,
+        "format_version": stored["format_version"],
+        "codec": codec,
+        "block_entry_count": entry_count,
+        "raw_byte_count": len(raw_payload),
+        "payload": stored["payload"],
+    }
+    return mapping_rows, [physical_record_by_name]
+
+
+def _provider_code_payload(code_key):
+    encoded_codes, _stats = ptg2_serving_binary_v3.encode_provider_code_set(
+        (code_key,)
+    )
+    payload = bytearray()
+    ptg2_serving_binary_v3.append_uvarint(payload, 1)
+    ptg2_serving_binary_v3.append_uvarint(payload, 0)
+    ptg2_serving_binary_v3.append_uvarint(payload, len(encoded_codes))
+    payload.extend(encoded_codes)
+    return bytes(payload)
+
+
+def _partially_aliased_provider_rows():
+    object_kind = "provider_set_codes_v3"
+    first_payload = _provider_code_payload(1)
+    second_payload = _provider_code_payload(2)
+    shared_prefix_size = next(
+        index
+        for index, pair in enumerate(zip(first_payload, second_payload))
+        if pair[0] != pair[1]
+    )
+    raw_parts = (
+        first_payload[:shared_prefix_size],
+        first_payload[shared_prefix_size:],
+        second_payload[shared_prefix_size:],
+    )
+    stored_parts = [
+        _stored_row(
+            object_kind=object_kind,
+            block_key=0,
+            fragment_no=fragment_no,
+            raw_payload=raw_payload,
+        )
+        for fragment_no, raw_payload in enumerate(raw_parts)
+    ]
+    entry_counts = (1, 0, 0)
+    physical_rows = [
+        {
+            "block_hash": stored_part["block_hash"],
+            "object_kind": object_kind,
+            "format_version": stored_part["format_version"],
+            "codec": stored_part["codec"],
+            "block_entry_count": entry_count,
+            "raw_byte_count": stored_part["raw_byte_count"],
+            "payload": stored_part["payload"],
+        }
+        for stored_part, entry_count in zip(stored_parts, entry_counts)
+    ]
+    mapping_rows = [
+        {
+            "object_kind": object_kind,
+            "block_key": block_key,
+            "fragment_no": fragment_no,
+            "mapping_entry_count": entry_counts[part_index],
+            "block_hash": stored_parts[part_index]["block_hash"],
+        }
+        for block_key, part_indexes in ((0, (0, 1)), (1, (0, 2)))
+        for fragment_no, part_index in enumerate(part_indexes)
+    ]
+    return mapping_rows, physical_rows, raw_parts
 
 
 def test_semantic_fingerprint_is_order_stable_and_context_sensitive():
@@ -582,6 +720,44 @@ async def test_snapshot_source_set_is_recomputed_from_complete_dense_rows():
 
 
 @pytest.mark.asyncio
+async def test_snapshot_source_identity_preserves_dense_ordinal_order():
+    first_session = _Session(
+        [
+            {"source_key": 0, "raw_container_sha256": "1" * 64},
+            {"source_key": 1, "raw_container_sha256": "2" * 64},
+        ]
+    )
+    reversed_session = _Session(
+        [
+            {"source_key": 0, "raw_container_sha256": "2" * 64},
+            {"source_key": 1, "raw_container_sha256": "1" * 64},
+        ]
+    )
+
+    first_set, first_ordered, first_raw_hashes = (
+        await fetch_snapshot_source_set_identity(
+            first_session,
+            schema_name="mrf",
+            logical_snapshot_id="snapshot-1",
+            expected_source_count=2,
+        )
+    )
+    reversed_set, reversed_ordered, reversed_raw_hashes = (
+        await fetch_snapshot_source_set_identity(
+            reversed_session,
+            schema_name="mrf",
+            logical_snapshot_id="snapshot-1",
+            expected_source_count=2,
+        )
+    )
+
+    assert first_set == reversed_set
+    assert first_ordered != reversed_ordered
+    assert first_raw_hashes == ("1" * 64, "2" * 64)
+    assert reversed_raw_hashes == ("2" * 64, "1" * 64)
+
+
+@pytest.mark.asyncio
 async def test_snapshot_source_set_rejects_omitted_or_extra_rows():
     session = _Session(
         [{"source_key": 0, "raw_container_sha256": "1" * 64}]
@@ -837,7 +1013,7 @@ def test_decode_shared_block_payload_is_strict():
     assert (
         decode_shared_block_payload(
             codec="zlib",
-            payload=compressed,
+            encoded_payload=compressed,
             raw_byte_count=len(raw),
         )
         == raw
@@ -845,14 +1021,389 @@ def test_decode_shared_block_payload_is_strict():
     with pytest.raises(PTG2SharedBlockError, match="length mismatch"):
         decode_shared_block_payload(
             codec="none",
-            payload=b"x",
+            encoded_payload=b"x",
             raw_byte_count=2,
         )
     with pytest.raises(PTG2SharedBlockError, match="unsupported"):
         decode_shared_block_payload(
             codec="gzip",
-            payload=b"x",
+            encoded_payload=b"x",
             raw_byte_count=1,
+        )
+    with pytest.raises(PTG2SharedBlockError, match="byte limit"):
+        decode_shared_block_payload(
+            codec="zlib",
+            encoded_payload=compressed,
+            raw_byte_count=len(raw),
+            maximum_raw_bytes=len(raw) - 1,
+        )
+    with pytest.raises(PTG2SharedBlockError, match="framing"):
+        decode_shared_block_payload(
+            codec="zlib",
+            encoded_payload=compressed,
+            raw_byte_count=8,
+            maximum_raw_bytes=8,
+        )
+
+
+def test_decode_shared_block_payload_rejects_limit_before_zlib_allocation(monkeypatch):
+    def unexpected_decompressor():
+        raise AssertionError("decompression must not start beyond the raw-byte limit")
+
+    monkeypatch.setattr(zlib, "decompressobj", unexpected_decompressor)
+
+    with pytest.raises(PTG2SharedBlockError, match="byte limit"):
+        decode_shared_block_payload(
+            codec="zlib",
+            encoded_payload=b"not inspected",
+            raw_byte_count=1024,
+            maximum_raw_bytes=16,
+        )
+
+
+@pytest.mark.parametrize(
+    ("operation", "message"),
+    [
+        (lambda: shared_readers.read_strict_uvarint(b"", 0), "ended inside"),
+        (
+            lambda: shared_readers.read_strict_uvarint(b"\x80" * 9 + b"\x02", 0),
+            "exceeds uint64",
+        ),
+        (
+            lambda: shared_readers.read_strict_uvarint(b"\x80\0", 0),
+            "non-canonical",
+        ),
+        (lambda: shared_readers.dense_source_key_bits(0), "source_count"),
+        (
+            lambda: shared_readers.decode_dense_source_header(
+                b"",
+                0,
+                format_version=1,
+            ),
+            "format version",
+        ),
+        (
+            lambda: shared_readers.decode_dense_source_header(
+                b"\x01\x01",
+                0,
+                format_version=1,
+            ),
+            "missing source_bits",
+        ),
+        (
+            lambda: shared_readers.decode_dense_source_vector(
+                b"",
+                0,
+                entry_count=-1,
+                source_count=2,
+                source_bits=1,
+            ),
+            "count is negative",
+        ),
+        (
+            lambda: shared_readers.decode_dense_source_vector(
+                b"",
+                0,
+                entry_count=0,
+                source_count=2,
+                source_bits=2,
+            ),
+            "width is invalid",
+        ),
+        (
+            lambda: shared_readers.decode_dense_source_vector(
+                b"",
+                0,
+                entry_count=1,
+                source_count=2,
+                source_bits=1,
+            ),
+            "truncated",
+        ),
+        (
+            lambda: shared_readers.decode_dense_source_vector(
+                b"\x02",
+                0,
+                entry_count=1,
+                source_count=2,
+                source_bits=1,
+            ),
+            "padding bits",
+        ),
+        (
+            lambda: shared_readers.decode_dense_source_vector(
+                b"\x03",
+                0,
+                entry_count=1,
+                source_count=3,
+                source_bits=2,
+            ),
+            "out-of-range key",
+        ),
+    ],
+)
+def test_shared_dense_codec_guards_reject_invalid_payloads(operation, message):
+    with pytest.raises(PTG2SharedBlockError, match=message):
+        operation()
+
+
+def test_shared_row_mapping_supports_mapping_rows_and_pairs():
+    mapped_row = type("MappedRow", (), {"_mapping": {"value": 1}})()
+
+    assert shared_readers._row_mapping(mapped_row) == {"value": 1}
+    assert shared_readers._row_mapping((("value", 2),)) == {"value": 2}
+
+
+def test_shared_block_validators_reject_entry_count_disagreement():
+    stored_row = _stored_row(
+        object_kind="page_v4",
+        block_key=7,
+        fragment_no=0,
+        raw_payload=b"payload",
+    )
+    with pytest.raises(PTG2SharedBlockError, match="entry count"):
+        shared_readers._validated_physical_block(
+            {**stored_row, "block_entry_count": -1},
+            expected_kind="page_v4",
+        )
+    with pytest.raises(PTG2SharedBlockError, match="entry count"):
+        shared_readers._validated_payload(
+            {
+                **stored_row,
+                "block_entry_count": 1,
+                "mapping_entry_count": 2,
+            },
+            expected_kind="page_v4",
+        )
+
+
+def test_read_once_scope_rejects_invalid_state_transitions():
+    unread_hash = b"x" * 32
+    with pytest.raises(ValueError, match="limit must be positive"):
+        shared_readers.SharedBlockReadOnceScope(max_retained_raw_bytes=0)
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        with pytest.raises(PTG2SharedBlockError, match="no physical read"):
+            scope.prepare_payload("mrf", unread_hash)
+        with pytest.raises(PTG2SharedBlockError, match="logical payload is empty"):
+            scope.register_logical_payload("mrf", ())
+        with pytest.raises(PTG2SharedBlockError, match="unread fragment"):
+            scope.register_logical_payload("mrf", (unread_hash,))
+        with pytest.raises(PTG2SharedBlockError, match="logical payload is empty"):
+            scope.claim_logical_payload_processing("mrf", ())
+        with pytest.raises(PTG2SharedBlockError, match="unprepared fragment"):
+            scope.claim_logical_payload_processing("mrf", (unread_hash,))
+        with pytest.raises(PTG2SharedBlockError, match="cannot be nested"):
+            with shared_block_read_once_scope(
+                max_retained_raw_bytes=1024
+            ) as nested_scope:
+                assert nested_scope is not scope
+
+
+async def _read_once_fetch(
+    session,
+    *,
+    block_keys=(7,),
+    fragment_nos=None,
+    require_all=True,
+):
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024):
+        return await fetch_shared_blocks(
+            session,
+            schema_name="mrf",
+            snapshot_key=12,
+            object_kind="page_v4",
+            block_keys=block_keys,
+            fragment_nos=fragment_nos,
+            require_all=require_all,
+        )
+
+
+@pytest.mark.asyncio
+async def test_shared_fetch_rejects_bad_coordinates_and_incomplete_mappings():
+    empty_session = _ReadOnceSession(mapping_rows=(), physical_rows=())
+    with pytest.raises(ValueError, match="non-negative"):
+        await _read_once_fetch(empty_session, fragment_nos=(-1,))
+
+    assert await _read_once_fetch(
+        _ReadOnceSession(mapping_rows=(), physical_rows=()),
+        block_keys=(),
+    ) == {}
+    assert await fetch_shared_blocks(
+        _Session([]),
+        schema_name="mrf",
+        snapshot_key=12,
+        object_kind="page_v4",
+        block_keys=(),
+    ) == {}
+    assert await _read_once_fetch(
+        _ReadOnceSession(mapping_rows=(), physical_rows=()),
+        require_all=False,
+    ) == {}
+
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="page_v4",
+        raw_payload=b"payload",
+        coordinates=((7, 0),),
+    )
+    mapping_rows[0]["fragment_no"] = -1
+    with pytest.raises(PTG2SharedBlockError, match="unexpected or unordered"):
+        await _read_once_fetch(
+            _ReadOnceSession(
+                mapping_rows=mapping_rows,
+                physical_rows=physical_rows,
+            )
+        )
+
+    with pytest.raises(PTG2SharedBlockError, match="missing block keys"):
+        await _read_once_fetch(
+            _ReadOnceSession(mapping_rows=(), physical_rows=())
+        )
+
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="page_v4",
+        raw_payload=b"payload",
+        coordinates=((7, 0),),
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+    assert 7 in await _read_once_fetch(session, fragment_nos=(0,))
+    with pytest.raises(PTG2SharedBlockError, match="missing fragments"):
+        await _read_once_fetch(
+            _ReadOnceSession(
+                mapping_rows=mapping_rows,
+                physical_rows=physical_rows,
+            ),
+            fragment_nos=(0, 1),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("duplicate", "unexpected row"),
+        ("missing", "missing physical block"),
+        ("entry_count", "entry count"),
+    ],
+)
+async def test_read_once_fetch_rejects_invalid_physical_results(failure, message):
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="page_v4",
+        raw_payload=b"payload",
+        coordinates=((7, 0),),
+    )
+    if failure == "duplicate":
+        physical_rows.append(dict(physical_rows[0]))
+    elif failure == "missing":
+        physical_rows.clear()
+    else:
+        mapping_rows[0]["mapping_entry_count"] = 2
+
+    with pytest.raises(PTG2SharedBlockError, match=message):
+        await _read_once_fetch(
+            _ReadOnceSession(
+                mapping_rows=mapping_rows,
+                physical_rows=physical_rows,
+            )
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows", "fragment_nos", "message"),
+    [
+        (
+            [
+                _stored_row(
+                    object_kind="page_v4",
+                    block_key=8,
+                    fragment_no=0,
+                    raw_payload=b"payload",
+                )
+            ],
+            None,
+            "unexpected or unordered",
+        ),
+        ([], None, "missing block keys"),
+        (
+            [
+                _stored_row(
+                    object_kind="page_v4",
+                    block_key=7,
+                    fragment_no=0,
+                    raw_payload=b"payload",
+                )
+            ],
+            (0, 1),
+            "missing fragments",
+        ),
+    ],
+)
+async def test_direct_fetch_rejects_invalid_or_incomplete_results(
+    rows,
+    fragment_nos,
+    message,
+):
+    with pytest.raises(PTG2SharedBlockError, match=message):
+        await fetch_shared_blocks(
+            _Session(rows),
+            schema_name="mrf",
+            snapshot_key=12,
+            object_kind="page_v4",
+            block_keys=(7,),
+            fragment_nos=fragment_nos,
+            require_all=True,
+        )
+
+
+def test_shared_read_once_ledger_guards_and_inactive_helpers():
+    block_hash = b"x" * 32
+    shared_readers.prepare_shared_block_payload(
+        schema_name="mrf",
+        block_hash=block_hash,
+    )
+    shared_readers.register_shared_logical_payload(
+        schema_name="mrf",
+        physical_hashes=(block_hash,),
+    )
+    shared_readers.claim_shared_logical_payload_processing(
+        schema_name="mrf",
+        physical_hashes=(block_hash,),
+    )
+
+    poisoned = shared_readers.SharedBlockReadOnceScope(max_retained_raw_bytes=1)
+    poisoned._poison(RuntimeError("first"))
+    poisoned._poison(RuntimeError("second"))
+    with pytest.raises(PTG2SharedBlockError, match="poisoned: first"):
+        poisoned.assert_read_once()
+
+    inconsistent = shared_readers.SharedBlockReadOnceScope(
+        max_retained_raw_bytes=1,
+    )
+    inconsistent._physical_rows_read = 1
+    with pytest.raises(PTG2SharedBlockError, match="does not prove"):
+        inconsistent.assert_read_once()
+
+
+@pytest.mark.asyncio
+async def test_source_identity_rejects_unbounded_source_count_before_query():
+    with pytest.raises(PTG2SharedBlockError, match="bounded verification limit"):
+        await fetch_snapshot_source_set_identity(
+            object(),
+            schema_name="mrf",
+            logical_snapshot_id="snapshot",
+            expected_source_count=(
+                shared_readers.PTG2_V3_MAX_AUDIT_SOURCE_FILES + 1
+            ),
+        )
+    with pytest.raises(PTG2SharedBlockError, match="snapshot id is missing"):
+        await fetch_snapshot_source_set_identity(
+            object(),
+            schema_name="mrf",
+            logical_snapshot_id="",
+            expected_source_count=1,
         )
 
 
@@ -891,6 +1442,446 @@ async def test_fetch_shared_blocks_uses_one_stable_query_without_process_cache()
     assert second == first
     assert len(session.calls) == 2
     assert all("ptg2_v3_snapshot_block" in sql and "ptg2_v3_block" in sql for sql, _ in session.calls)
+
+
+@pytest.mark.asyncio
+async def test_read_once_scope_fetches_and_decodes_one_shared_physical_block_once():
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="page_v4",
+        raw_payload=b"same immutable payload",
+        coordinates=((7, 0), (8, 0)),
+        codec="zlib",
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        blocks_by_key = await fetch_shared_blocks(
+            session,
+            schema_name="mrf",
+            snapshot_key=12,
+            object_kind="page_v4",
+            block_keys=(7, 8),
+            require_all=True,
+        )
+        scope.assert_read_once()
+        ledger = scope.ledger
+
+    assert blocks_by_key[7][0].payload == blocks_by_key[8][0].payload
+    assert ledger == {
+        "logical_block_deliveries": 2,
+        "physical_mapping_references": 2,
+        "physical_mapping_aliases": 1,
+        "unique_physical_blocks": 1,
+        "physical_block_reads": 1,
+        "physical_block_decodes": 1,
+        "physical_payload_preparations": 0,
+        "expected_logical_payload_processes": 0,
+        "logical_payload_processes": 0,
+        "logical_payload_fragment_references": 0,
+        "logical_payload_fragment_aliases": 0,
+        "repeated_physical_reads": 0,
+        "repeated_physical_decodes": 0,
+        "repeated_physical_preparations": 0,
+        "repeated_logical_payload_processes": 0,
+        "peak_raw_bytes": len(b"same immutable payload"),
+    }
+    assert len(session.calls) == 2
+    assert sum("ptg2_v3_block" in sql for sql, _params in session.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_alias_is_read_decoded_and_parsed_once_then_fanned_out():
+    block_7 = 7 << 31
+    block_8 = 8 << 31
+    forward_block_bytes = b"\x02\x01\x00\x05\x01\x08"
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="by_code_provider_shard_v1",
+        raw_payload=forward_block_bytes,
+        coordinates=((block_7, 0), (block_8, 0)),
+        codec="zlib",
+        entry_count=1,
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        price_keys_by_occurrence = await (
+            ptg2_db_sidecars.lookup_forward_price_index_from_db(
+                session,
+                (7, 8),
+                provider_set_keys_by_code={7: (5,), 8: (5,)},
+                source_keys_by_code={7: (0,), 8: (0,)},
+                shared_snapshot_key=12,
+                source_count=1,
+                price_dictionary_item_count=128,
+                price_dictionary_block_bytes=2048,
+            )
+        )
+        scope.assert_processed_once()
+        ledger = scope.ledger
+
+    assert price_keys_by_occurrence == {
+        (7, 5, 0): (8,),
+        (8, 5, 0): (8,),
+    }
+    assert ledger == {
+        "logical_block_deliveries": 2,
+        "physical_mapping_references": 2,
+        "physical_mapping_aliases": 1,
+        "unique_physical_blocks": 1,
+        "physical_block_reads": 1,
+        "physical_block_decodes": 1,
+        "physical_payload_preparations": 1,
+        "expected_logical_payload_processes": 1,
+        "logical_payload_processes": 1,
+        "logical_payload_fragment_references": 1,
+        "logical_payload_fragment_aliases": 0,
+        "repeated_physical_reads": 0,
+        "repeated_physical_decodes": 0,
+        "repeated_physical_preparations": 0,
+        "repeated_logical_payload_processes": 0,
+        "peak_raw_bytes": len(forward_block_bytes),
+    }
+
+
+@pytest.mark.asyncio
+async def test_price_atom_alias_is_parsed_once_then_rebased_and_fanned_out(
+    monkeypatch,
+):
+    price_atom = PTG2V3PriceAtomRecord("12.34", (None,))
+    atom_block_bytes = ptg2_serving_binary_v3.encode_price_atoms((price_atom,))
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="price_atoms_v3",
+        raw_payload=atom_block_bytes,
+        coordinates=((0, 0), (1, 0)),
+        entry_count=1,
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+    header_spy = Mock(wraps=ptg2_serving_binary_v3._price_atom_header)
+    monkeypatch.setattr(
+        ptg2_serving_binary_v3,
+        "_price_atom_header",
+        header_spy,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        atoms_by_key = await ptg2_db_sidecars.lookup_shared_price_atoms_from_db(
+            session,
+            12,
+            atom_keys=(0, 512),
+            block_span=512,
+            schema_name="mrf",
+        )
+        scope.assert_processed_once()
+        ledger = scope.ledger
+
+    assert atoms_by_key == {0: price_atom, 512: price_atom}
+    assert atoms_by_key[0] is atoms_by_key[512]
+    header_spy.assert_called_once_with(atom_block_bytes)
+    assert ledger == {
+        "logical_block_deliveries": 2,
+        "physical_mapping_references": 2,
+        "physical_mapping_aliases": 1,
+        "unique_physical_blocks": 1,
+        "physical_block_reads": 1,
+        "physical_block_decodes": 1,
+        "physical_payload_preparations": 1,
+        "expected_logical_payload_processes": 1,
+        "logical_payload_processes": 1,
+        "logical_payload_fragment_references": 1,
+        "logical_payload_fragment_aliases": 0,
+        "repeated_physical_reads": 0,
+        "repeated_physical_decodes": 0,
+        "repeated_physical_preparations": 0,
+        "repeated_logical_payload_processes": 0,
+        "peak_raw_bytes": len(atom_block_bytes),
+    }
+
+
+@pytest.mark.asyncio
+async def test_partially_aliased_fragments_prepare_once_and_parse_each_logical_payload(
+    monkeypatch,
+):
+    """Distinguish physical preparation from necessary logical tuple parses."""
+
+    mapping_rows, physical_rows, raw_parts = _partially_aliased_provider_rows()
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+    decoder_spy = Mock(wraps=ptg2_db_serving_v3._decode_provider_code_block)
+    monkeypatch.setattr(
+        ptg2_db_serving_v3,
+        "_decode_provider_code_block",
+        decoder_spy,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        code_keys_by_provider = await (
+            ptg2_db_sidecars.lookup_provider_code_keys_from_db(
+                session,
+                12,
+                provider_set_keys=(0, 1024),
+                schema_name="mrf",
+            )
+        )
+        scope.assert_processed_once()
+        ledger = scope.ledger
+
+    assert code_keys_by_provider == {0: (1,), 1024: (2,)}
+    assert decoder_spy.call_count == 2
+    assert ledger == {
+        "logical_block_deliveries": 4,
+        "physical_mapping_references": 4,
+        "physical_mapping_aliases": 1,
+        "unique_physical_blocks": 3,
+        "physical_block_reads": 3,
+        "physical_block_decodes": 3,
+        "physical_payload_preparations": 3,
+        "expected_logical_payload_processes": 2,
+        "logical_payload_processes": 2,
+        "logical_payload_fragment_references": 4,
+        "logical_payload_fragment_aliases": 1,
+        "repeated_physical_reads": 0,
+        "repeated_physical_decodes": 0,
+        "repeated_physical_preparations": 0,
+        "repeated_logical_payload_processes": 0,
+        "peak_raw_bytes": sum(len(raw_part) for raw_part in raw_parts),
+    }
+
+
+@pytest.mark.asyncio
+async def test_read_once_scope_requires_every_registered_logical_payload():
+    """Reject missing expected tuples and fabricated replacement claims."""
+
+    mapping_rows, physical_rows, _raw_parts = _partially_aliased_provider_rows()
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        logical_blocks = await ptg2_db_sidecars._shared_logical_blocks_by_key(
+            session,
+            shared_snapshot_key=12,
+            schema_name="mrf",
+            artifact_kind="provider_set_codes_v3",
+            block_keys=(0, 1),
+        )
+        scope.claim_logical_payload_processing(
+            "mrf",
+            logical_blocks[0].physical_hashes,
+        )
+        with pytest.raises(PTG2SharedBlockError, match="was not registered"):
+            scope.claim_logical_payload_processing(
+                "mrf",
+                (logical_blocks[1].physical_hashes[-1],),
+            )
+        with pytest.raises(PTG2SharedBlockError, match="ledger is incomplete"):
+            scope.assert_processed_once()
+
+
+@pytest.mark.asyncio
+async def test_read_once_scope_rejects_duplicate_physical_processing_claim():
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="page_v4",
+        raw_payload=b"process once",
+        coordinates=((7, 0),),
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        blocks_by_key = await fetch_shared_blocks(
+            session,
+            schema_name="mrf",
+            snapshot_key=12,
+            object_kind="page_v4",
+            block_keys=(7,),
+            require_all=True,
+        )
+        block_hash = blocks_by_key[7][0].block_hash
+        scope.claim_payload_processing("mrf", block_hash)
+        with pytest.raises(PTG2SharedBlockError, match="prepared more than once"):
+            scope.claim_payload_processing("mrf", block_hash)
+
+
+@pytest.mark.asyncio
+async def test_read_once_scope_rejects_duplicate_logical_payload_processing():
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="page_v4",
+        raw_payload=b"process logical payload once",
+        coordinates=((7, 0),),
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        blocks_by_key = await fetch_shared_blocks(
+            session,
+            schema_name="mrf",
+            snapshot_key=12,
+            object_kind="page_v4",
+            block_keys=(7,),
+            require_all=True,
+        )
+        block_hash = blocks_by_key[7][0].block_hash
+        scope.prepare_payload("mrf", block_hash)
+        scope.register_logical_payload("mrf", (block_hash,))
+        scope.claim_logical_payload_processing("mrf", (block_hash,))
+        with pytest.raises(PTG2SharedBlockError, match="processed more than once"):
+            scope.claim_logical_payload_processing("mrf", (block_hash,))
+        scope.assert_processed_once()
+
+
+@pytest.mark.asyncio
+async def test_read_once_scope_rejects_same_hash_under_later_coordinate():
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="page_v4",
+        raw_payload=b"one physical payload",
+        coordinates=((7, 0), (8, 0)),
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024):
+        await fetch_shared_blocks(
+            session,
+            schema_name="mrf",
+            snapshot_key=12,
+            object_kind="page_v4",
+            block_keys=(7,),
+            require_all=True,
+        )
+        with pytest.raises(PTG2SharedBlockError, match="requested more than once"):
+            await fetch_shared_blocks(
+                session,
+                schema_name="mrf",
+                snapshot_key=12,
+                object_kind="page_v4",
+                block_keys=(8,),
+                require_all=True,
+            )
+
+    assert sum("ptg2_v3_block" in sql for sql, _params in session.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_once_scope_rejects_incomplete_processing_ledger():
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="page_v4",
+        raw_payload=b"missing processing claim",
+        coordinates=((7, 0),),
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        await fetch_shared_blocks(
+            session,
+            schema_name="mrf",
+            snapshot_key=12,
+            object_kind="page_v4",
+            block_keys=(7,),
+            require_all=True,
+        )
+        with pytest.raises(PTG2SharedBlockError, match="ledger is incomplete"):
+            scope.assert_processed_once()
+
+
+@pytest.mark.asyncio
+async def test_read_once_scope_rejects_a_second_logical_block_delivery():
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="page_v4",
+        raw_payload=b"one delivery",
+        coordinates=((7, 0),),
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024):
+        await fetch_shared_blocks(
+            session,
+            schema_name="mrf",
+            snapshot_key=12,
+            object_kind="page_v4",
+            block_keys=(7,),
+            require_all=True,
+        )
+        with pytest.raises(PTG2SharedBlockError, match="more than once"):
+            await fetch_shared_blocks(
+                session,
+                schema_name="mrf",
+                snapshot_key=12,
+                object_kind="page_v4",
+                block_keys=(7,),
+                require_all=True,
+            )
+
+    assert len(session.calls) == 3
+    assert sum("ptg2_v3_block" in sql for sql, _params in session.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_once_scope_poisoned_corruption_is_never_retried():
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="page_v4",
+        raw_payload=b"valid bytes",
+        coordinates=((7, 0),),
+    )
+    physical_rows[0]["payload"] = b"corrupt bytes"
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024):
+        with pytest.raises(PTG2SharedBlockError, match="identity"):
+            await fetch_shared_blocks(
+                session,
+                schema_name="mrf",
+                snapshot_key=12,
+                object_kind="page_v4",
+                block_keys=(7,),
+                require_all=True,
+            )
+        with pytest.raises(PTG2SharedBlockError, match="poisoned"):
+            await fetch_shared_blocks(
+                session,
+                schema_name="mrf",
+                snapshot_key=12,
+                object_kind="page_v4",
+                block_keys=(7,),
+                require_all=True,
+            )
+        with pytest.raises(PTG2SharedBlockError, match="poisoned"):
+            await fetch_shared_blocks(
+                session,
+                schema_name="mrf",
+                snapshot_key=12,
+                object_kind="page_v4",
+                block_keys=(),
+            )
+
+    assert len(session.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -967,6 +1958,150 @@ async def test_graph_members_are_resolved_in_one_query_and_integer_space():
     assert "ptg2_v3_graph_owner" in sql
     assert "generate_series" in sql
     assert params["member_width"] == 4
+
+
+@pytest.mark.asyncio
+async def test_graph_read_once_scope_loads_one_chunk_shared_by_multiple_owners():
+    encoded = (3).to_bytes(4, "little") + (9).to_bytes(4, "little")
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="graph_npi_groups_v1",
+        raw_payload=encoded,
+        coordinates=((4, 0),),
+        codec="zlib",
+        entry_count=2,
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+        owner_rows=(
+            {
+                "owner_key": 1111111111,
+                "first_chunk": 4,
+                "member_offset": 0,
+                "member_count": 1,
+                "selected_member_count": 1,
+            },
+            {
+                "owner_key": 2222222222,
+                "first_chunk": 4,
+                "member_offset": 4,
+                "member_count": 1,
+                "selected_member_count": 1,
+            },
+        ),
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        member_map = await fetch_shared_graph_members(
+            session,
+            schema_name="mrf",
+            snapshot_key=12,
+            direction=PTG2_V3_GRAPH_NPI_TO_GROUP,
+            owner_keys=(1111111111, 2222222222),
+        )
+        scope.assert_read_once()
+        ledger = scope.ledger
+
+    assert member_map == {1111111111: (3,), 2222222222: (9,)}
+    assert ledger["unique_physical_blocks"] == 1
+    assert ledger["physical_block_reads"] == 1
+    assert ledger["physical_block_decodes"] == 1
+    assert len(session.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_graph_read_once_scope_rejects_overlapping_owner_ranges():
+    session = _ReadOnceSession(
+        mapping_rows=(),
+        physical_rows=(),
+        owner_rows=(
+            {
+                "owner_key": 1111111111,
+                "first_chunk": 4,
+                "member_offset": 0,
+                "member_count": 2,
+                "selected_member_count": 2,
+            },
+            {
+                "owner_key": 2222222222,
+                "first_chunk": 4,
+                "member_offset": 4,
+                "member_count": 2,
+                "selected_member_count": 2,
+            },
+        ),
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024):
+        with pytest.raises(PTG2SharedBlockError, match="ranges overlap"):
+            await fetch_shared_graph_members(
+                session,
+                schema_name="mrf",
+                snapshot_key=12,
+                direction=PTG2_V3_GRAPH_NPI_TO_GROUP,
+                owner_keys=(1111111111, 2222222222),
+            )
+
+
+@pytest.mark.asyncio
+async def test_graph_read_once_scope_rejects_a_short_nonfinal_chunk():
+    raw_chunks_by_key = {
+        0: b"a\x00\x00\x00" * ((PTG2_V3_GRAPH_CHUNK_BYTES - 4) // 4),
+        1: b"b\x00\x00\x00",
+    }
+    mapping_rows = []
+    physical_rows = []
+    for block_key, raw_chunk in raw_chunks_by_key.items():
+        stored_row = _stored_row(
+            object_kind="graph_npi_groups_v1",
+            block_key=block_key,
+            fragment_no=0,
+            raw_payload=raw_chunk,
+        )
+        entry_count = len(raw_chunk) // 4
+        mapping_rows.append(
+            {
+                "object_kind": "graph_npi_groups_v1",
+                "block_key": block_key,
+                "fragment_no": 0,
+                "mapping_entry_count": entry_count,
+                "block_hash": stored_row["block_hash"],
+            }
+        )
+        physical_rows.append(
+            {
+                "block_hash": stored_row["block_hash"],
+                "object_kind": "graph_npi_groups_v1",
+                "format_version": stored_row["format_version"],
+                "codec": stored_row["codec"],
+                "block_entry_count": entry_count,
+                "raw_byte_count": len(raw_chunk),
+                "payload": stored_row["payload"],
+            }
+        )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+        owner_rows=(
+            {
+                "owner_key": 1111111111,
+                "first_chunk": 0,
+                "member_offset": PTG2_V3_GRAPH_CHUNK_BYTES - 8,
+                "member_count": 3,
+                "selected_member_count": 3,
+            },
+        ),
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=128 * 1024):
+        with pytest.raises(PTG2SharedBlockError, match="member framing"):
+            await fetch_shared_graph_members(
+                session,
+                schema_name="mrf",
+                snapshot_key=12,
+                direction=PTG2_V3_GRAPH_NPI_TO_GROUP,
+                owner_keys=(1111111111,),
+            )
 
 
 @pytest.mark.asyncio

@@ -47,6 +47,51 @@ def read_uvarint(encoded_payload: bytes | bytearray | memoryview, offset: int) -
     raise ValueError("uvarint is too large")
 
 
+def _checkpoint_offset_bytes(record_offset: int) -> bytes:
+    normalized_offset = int(record_offset)
+    if normalized_offset < 0 or normalized_offset > 0xFFFFFFFF:
+        raise ValueError("PTG2 v3 checkpoint offset must fit in uint32")
+    return normalized_offset.to_bytes(4, "little")
+
+
+def _read_checkpoint_offset(
+    encoded_payload: bytes | bytearray | memoryview,
+    cursor: int,
+) -> tuple[int, int]:
+    checkpoint_end = cursor + 4
+    if checkpoint_end > len(encoded_payload):
+        raise ValueError("PTG2 v3 checkpoint directory is truncated")
+    return (
+        int.from_bytes(encoded_payload[cursor:checkpoint_end], "little"),
+        checkpoint_end,
+    )
+
+
+def _validate_checkpoint_shape(
+    entry_count: int,
+    interval: int,
+    checkpoint_count: int,
+) -> None:
+    if interval <= 0 or interval > 4096:
+        raise ValueError("PTG2 v3 checkpoint interval is invalid")
+    expected_count = (entry_count + interval - 1) // interval
+    if checkpoint_count != expected_count:
+        raise ValueError("PTG2 v3 checkpoint count is invalid")
+
+
+def _skip_optional_text(
+    encoded_payload: bytes | bytearray | memoryview,
+    offset: int,
+) -> int:
+    encoded_length, cursor = read_uvarint(encoded_payload, offset)
+    if encoded_length == 0:
+        return cursor
+    text_end = cursor + encoded_length - 1
+    if text_end > len(encoded_payload):
+        raise ValueError("PTG2 v3 price-atom text is truncated")
+    return text_end
+
+
 def select_atom_key_bits(atom_count: int) -> int:
     """Select the snapshot-wide key width able to address every dense atom key."""
 

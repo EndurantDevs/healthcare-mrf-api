@@ -173,9 +173,15 @@ def _verified_raw_evidence(
         record_metadata.get("raw_sha256"),
         field_name="raw record digest",
     )
-    if not raw_json and evidence_by_sha256 is not None:
+    if evidence_by_sha256 is not None:
+        if raw_json:
+            raise RuntimeError(
+                "strict V3 persisted witness unexpectedly embeds raw evidence"
+            )
         raw_json = evidence_by_sha256.get(raw_sha256, b"")
-    if hashlib.sha256(raw_json).hexdigest() != raw_sha256:
+        if not raw_json:
+            raise RuntimeError("strict V3 persisted raw evidence is missing")
+    elif hashlib.sha256(raw_json).hexdigest() != raw_sha256:
         raise RuntimeError("strict V3 source witness raw token digest is invalid")
     linked_provider_sha256 = record_metadata.get("linked_provider_sha256")
     if linked_provider_sha256 is not None:
@@ -183,17 +189,19 @@ def _verified_raw_evidence(
             linked_provider_sha256,
             field_name="linked provider digest",
         )
-    if (
-        linked_provider_json is None
-        and linked_provider_sha256 is not None
-        and evidence_by_sha256 is not None
-    ):
+    if evidence_by_sha256 is not None and linked_provider_json is not None:
+        raise RuntimeError(
+            "strict V3 persisted witness unexpectedly embeds provider evidence"
+        )
+    if linked_provider_sha256 is not None and evidence_by_sha256 is not None:
         linked_provider_json = evidence_by_sha256.get(
             linked_provider_sha256
         )
+        if linked_provider_json is None:
+            raise RuntimeError("strict V3 persisted provider evidence is missing")
     if (linked_provider_json is None) != (linked_provider_sha256 is None):
         raise RuntimeError("strict V3 linked provider evidence is incomplete")
-    if linked_provider_json is not None and (
+    if evidence_by_sha256 is None and linked_provider_json is not None and (
         hashlib.sha256(linked_provider_json).hexdigest() != linked_provider_sha256
     ):
         raise RuntimeError("strict V3 linked provider digest is invalid")

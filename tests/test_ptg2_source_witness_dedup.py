@@ -7,7 +7,11 @@ import json
 import random
 import struct
 import zlib
+from decimal import Decimal
 
+from process.ptg_parts.ptg2_candidate_audit_evidence import (
+    source_audit_condition,
+)
 from process.ptg_parts import ptg2_source_witness_persisted_encode as witness_encoder
 from process.ptg_parts.ptg2_source_witness import (
     decode_persisted_source_witness,
@@ -180,6 +184,52 @@ def test_persisted_witness_shares_evidence_across_raw_and_linked_roles():
     assert witness_metadata["evidence_dictionary_count"] == 1
     assert loaded_witness.records[0].raw_json == shared_evidence
     assert loaded_witness.records[0].linked_provider_json == shared_evidence
+
+
+def test_persisted_witness_reuses_exact_decimal_evidence_for_audit_condition():
+    raw_json = (
+        b'{"negotiated_prices":[{"negotiated_type":"negotiated",'
+        b'"negotiated_rate":0.0000000000000000000125,'
+        b'"expiration_date":"2027-01-01","service_code":["11"],'
+        b'"billing_class":"professional","setting":"outpatient",'
+        b'"billing_code_modifier":[],"additional_information":null}],'
+        b'"provider_references":[1]}'
+    )
+    linked_provider_json = (
+        b'{"provider_group_id":1,"provider_groups":'
+        b'[{"npi":[1234567890]}]}'
+    )
+    witness_payload, witness_metadata = encode_persisted_source_witness(
+        [
+            _compressed_occurrence(
+                0,
+                linked_provider_json,
+                raw_json=raw_json,
+            )
+        ],
+        _payload_counts(1),
+    )
+
+    loaded_witness = decode_persisted_source_witness(
+        witness_payload,
+        expected_raw_source_sha256=[SOURCE_DIGEST],
+        expected_metadata=witness_metadata,
+    )
+    occurrence = loaded_witness.occurrence_records[0]
+    parsed_rate = loaded_witness.evidence_by_sha256[occurrence.raw_sha256][
+        "negotiated_prices"
+    ][0]["negotiated_rate"]
+    retained_condition = source_audit_condition(
+        occurrence,
+        parsed_evidence_by_sha256=loaded_witness.evidence_by_sha256,
+    )
+    direct_condition = source_audit_condition(occurrence)
+
+    assert parsed_rate == Decimal("0.0000000000000000000125")
+    assert retained_condition == direct_condition
+    assert retained_condition.expected_tuple.payload["negotiated_rate"] == (
+        "0.0000000000000000000125"
+    )
 
 
 def test_persisted_witness_fits_repeated_large_source_evidence_within_budget(

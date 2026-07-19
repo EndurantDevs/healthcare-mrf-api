@@ -4,7 +4,11 @@ import orjson
 import pytest
 
 from api.endpoint.pricing import _json_response
-from api.ptg2_response import _canonical_price_row, _shape_ptg2_response
+from api.ptg2_response import (
+    _canonical_price_row,
+    _response_wire_value,
+    _shape_ptg2_response,
+)
 
 
 def _serialized_rate(value):
@@ -53,6 +57,16 @@ def test_pricing_http_serializer_preserves_exact_numeric_fragment():
     response = _json_response(payload)
 
     assert b'"negotiated_rate":123.4567890123456789' in response.body
+
+
+def test_response_wire_value_restores_exact_rate_as_decimal():
+    row = _canonical_price_row(
+        {"negotiated_rate": "123.4567890123456789"}
+    )
+
+    assert _response_wire_value(row) == {
+        "negotiated_rate": Decimal("123.4567890123456789")
+    }
 
 
 def test_source_identity_fields_are_opt_in():
