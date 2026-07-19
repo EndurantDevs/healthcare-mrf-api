@@ -3343,7 +3343,7 @@ def _healthsparq_rows_from_metadata(
 
 
 def _toc_rows_from_content(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     toc: dict[str, Any],
     *,
@@ -3351,11 +3351,11 @@ def _toc_rows_from_content(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Convert TOC content into plan and file rows."""
     if isinstance(toc.get("files"), list):
-        return _healthsparq_rows_from_metadata(source, url, toc)
+        return _healthsparq_rows_from_metadata(source_row_dict, url, toc)
     plan_rows_by_id: dict[str, dict[str, Any]] = {}
     file_rows: list[dict[str, Any]] = []
-    target_query = _source_target_payer_query(source)
-    target_queries = _source_payer_query_candidates(source)
+    target_query = _source_target_payer_query(source_row_dict)
+    target_queries = _source_payer_query_candidates(source_row_dict)
     plan_predicate = None
     if filter_to_target_query and target_queries:
         plan_predicate = lambda plan: _is_plan_info_query_match(
@@ -3386,7 +3386,7 @@ def _toc_rows_from_content(
             plan_row_id = _id(
                 "mrfplan",
                 {
-                    "source": source["source_id"],
+                    "source": source_row_dict["source_id"],
                     "plan_id": plan_id,
                     "plan_name": plan_name,
                     "market_type": market_type,
@@ -3394,8 +3394,8 @@ def _toc_rows_from_content(
             )
             plan_rows_by_id[plan_row_id] = {
                 "mrf_plan_id": plan_row_id,
-                "payer_id": source.get("payer_id"),
-                "source_id": source["source_id"],
+                "payer_id": source_row_dict.get("payer_id"),
+                "source_id": source_row_dict["source_id"],
                 "plan_id": plan_id or None,
                 "plan_id_type": plan.get("plan_id_type"),
                 "plan_name": plan_name,
@@ -3413,7 +3413,7 @@ def _toc_rows_from_content(
         file_row_id = _id(
             "mrffile",
             {
-                "source": source["source_id"],
+                "source": source_row_dict["source_id"],
                 "type": entry.source_type,
                 "url": entry.canonical_url,
             },
@@ -3421,8 +3421,8 @@ def _toc_rows_from_content(
         file_rows.append(
             {
                 "mrf_file_id": file_row_id,
-                "payer_id": source.get("payer_id"),
-                "source_id": source["source_id"],
+                "payer_id": source_row_dict.get("payer_id"),
+                "source_id": source_row_dict["source_id"],
                 "file_type": entry.source_type,
                 "url": entry.original_url,
                 "canonical_url": entry.canonical_url,
@@ -3448,7 +3448,7 @@ def _toc_rows_from_content(
                 "metadata_json": {
                     "container_format": _container_format(entry.original_url),
                     **_file_benefit_metadata(
-                        source,
+                        source_row_dict,
                         entry.original_url,
                         entry.description,
                         entry.reporting_entity_name,
@@ -5950,7 +5950,7 @@ def _parse_sapphire_static_query_toc_links(
 ) -> list[dict[str, Any]]:
     """Parse Sapphire query JSON and collect TOC links."""
     try:
-        payload = json.loads(query_text or "{}")
+        query_payload_dict = json.loads(query_text or "{}")
     except json.JSONDecodeError:
         return []
     urls: dict[str, dict[str, Any]] = {}
@@ -6009,7 +6009,7 @@ def _parse_sapphire_static_query_toc_links(
                     toc_target_by_field,
                 )
 
-    visit(payload)
+    visit(query_payload_dict)
     return list(urls.values())
 
 
@@ -6809,7 +6809,7 @@ def _wordpress_elfinder_target_sort_key(target: CrawlTarget) -> tuple[int, int, 
 
 
 async def _resolve_wordpress_elfinder_mrf_links(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -6869,7 +6869,7 @@ async def _resolve_wordpress_elfinder_mrf_links(
             root_url = _wordpress_elfinder_root_url(root_payload)
             crawl_targets.extend(
                 _wordpress_elfinder_targets_from_payload(
-                    source,
+                    source_row_dict,
                     root_payload,
                     root_url=root_url,
                     resolved_from_url=manager_config["url"],
@@ -6900,7 +6900,7 @@ async def _resolve_wordpress_elfinder_mrf_links(
                     continue
                 crawl_targets.extend(
                     _wordpress_elfinder_targets_from_payload(
-                        source,
+                        source_row_dict,
                         directory_payload,
                         root_url=root_url,
                         resolved_from_url=manager_config["url"],
@@ -7244,7 +7244,7 @@ def _json_mrf_directory_targets_from_payload(
 
 
 async def _resolve_json_mrf_directory_links(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -7268,7 +7268,7 @@ async def _resolve_json_mrf_directory_links(
         )
         crawl_targets.extend(
             _json_mrf_directory_targets_from_payload(
-                source,
+                source_row_dict,
                 directory_payload,
                 directory_url=directory_url,
                 resolver_type="json_mrf_directory_links",
@@ -7398,7 +7398,7 @@ def _humana_pct_targets_from_payload(
 
 
 async def _resolve_humana_pct_file_list(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -7443,7 +7443,7 @@ async def _resolve_humana_pct_file_list(
                 break
             crawl_targets.extend(
                 _humana_pct_targets_from_payload(
-                    source,
+                    source_row_dict,
                     page_payload,
                     api_url=page_url,
                     resolver=resolver,
@@ -7533,7 +7533,7 @@ def _fchn_targets_from_detail_html(
 
 
 async def _resolve_fchn_payor_search(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -7547,7 +7547,7 @@ async def _resolve_fchn_payor_search(
     if _is_html_cloudflare_challenge(html_text):
         raise ValueError(f"cloudflare_challenge blocks FCHN MRF discovery for {url}")
     crawl_targets = _fchn_targets_from_detail_html(
-        source, html_text, detail_url=url, resolver_type=resolver_type
+        source_row_dict, html_text, detail_url=url, resolver_type=resolver_type
     )
     max_details = _as_int(resolver.get("max_details")) or 100
     max_targets = _as_int(resolver.get("max_targets")) or 1000
@@ -7572,7 +7572,7 @@ async def _resolve_fchn_payor_search(
             continue
         crawl_targets.extend(
             _fchn_targets_from_detail_html(
-                source,
+                source_row_dict,
                 detail_html,
                 detail_url=detail_url,
                 resolver_type=resolver_type,
@@ -7644,7 +7644,7 @@ def _payercompass_value(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
 
 
 def _payercompass_target_for_file(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     *,
     base_url: str,
     resolver: dict[str, Any],
@@ -7679,7 +7679,7 @@ def _payercompass_target_for_file(
         "size_bytes": size_bytes,
     }
     return CrawlTarget(
-        source=source,
+        source=source_row_dict,
         url=_payercompass_download_url(base_url, resolver, file_id),
         label=_mrf_file_plan_label(file_name) or file_name,
         resolved_from_url=base_url,
@@ -7946,7 +7946,7 @@ async def _enrich_payercompass_target_plan_info(
 
 
 def _payercompass_targets_from_structure(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     *,
     base_url: str,
     resolver: dict[str, Any],
@@ -7976,7 +7976,7 @@ def _payercompass_targets_from_structure(
             if not isinstance(file_item, dict):
                 continue
             crawl_target = _payercompass_target_for_file(
-                source,
+                source_row_dict,
                 base_url=base_url,
                 resolver=resolver,
                 frame=frame,
@@ -7992,7 +7992,7 @@ def _payercompass_targets_from_structure(
 
 
 async def _resolve_payercompass_mrf(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -8027,7 +8027,7 @@ async def _resolve_payercompass_mrf(
         )
         files_by_timeframe[timeframe_id] = _payercompass_file_list_items(file_list_payload)
     crawl_targets = _payercompass_targets_from_structure(
-        source,
+        source_row_dict,
         base_url=url,
         resolver=resolver,
         structure=structure,
@@ -8130,7 +8130,7 @@ def _webtpa_record_target(
 
 
 async def _resolve_webtpa_mrf_api(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -8203,7 +8203,7 @@ async def _resolve_webtpa_mrf_api(
                 if not file_url:
                     continue
                 crawl_target = _webtpa_record_target(
-                    source,
+                    source_row_dict,
                     plan=plan,
                     file_record=file_record,
                     file_type=file_type,
@@ -8327,7 +8327,7 @@ def _cmstic_keyed_toc_crawl_target(
 
 
 async def _resolve_cmstic_keyed_toc_redirect(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -8349,7 +8349,7 @@ async def _resolve_cmstic_keyed_toc_redirect(
             "content_type": resp.headers.get("Content-Type"),
         }
     crawl_target = _cmstic_keyed_toc_crawl_target(
-        source,
+        source_row_dict,
         url,
         final_url=final_url,
         resolver=resolver,
@@ -8522,7 +8522,7 @@ def _github_tree_mrf_target(
 
 
 async def _resolve_github_repo_mrf(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -8557,7 +8557,7 @@ async def _resolve_github_repo_mrf(
         if prefix and path != prefix and not path.startswith(f"{prefix}/"):
             continue
         crawl_target = _github_tree_mrf_target(
-            source,
+            source_row_dict,
             owner=owner,
             repo=repo,
             branch=branch,
@@ -8846,7 +8846,7 @@ def _parse_midlandschoice_mrf_rows(
 
 
 async def _resolve_midlandschoice_mrf(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -8862,7 +8862,7 @@ async def _resolve_midlandschoice_mrf(
         label = file_row.get("network_name") or file_row.get("file_name") or file_row["network_code"]
         crawl_targets.append(
             CrawlTarget(
-                source=source,
+                source=source_row_dict,
                 url=file_row["url"],
                 label=label,
                 resolved_from_url=url,
@@ -8875,7 +8875,7 @@ async def _resolve_midlandschoice_mrf(
                     "network_name": file_row.get("network_name"),
                     "file_name": file_row.get("file_name"),
                     "midlandschoice_file_type": file_row.get("file_type"),
-                    "reporting_entity_name": source.get("display_name")
+                    "reporting_entity_name": source_row_dict.get("display_name")
                     or "Midlands Choice",
                     "reporting_entity_type": "third_party_administrator",
                     "plan_info": _plan_info_from_label(
@@ -8900,7 +8900,7 @@ def _embedded_http_urls(value: str | None) -> list[str]:
 
     text = _decode_embedded_url_text(value)
     urls: list[str] = []
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
     for match in re.finditer(r"https?://[^\s\"'<>]+", text, flags=re.I):
         url = match.group(0).rstrip("\\,.;)")
         while url.endswith(("]", "}")) and (
@@ -8910,16 +8910,16 @@ def _embedded_http_urls(value: str | None) -> list[str]:
         if not url:
             continue
         key = _canonical_or_none(url) or url
-        if key in seen:
+        if key in seen_urls:
             continue
-        seen.add(key)
+        seen_urls.add(key)
         urls.append(url)
     return urls
 
 
 def _decode_embedded_url_text(value: str | None) -> str:
     text = html.unescape(str(value or ""))
-    replacements = {
+    url_replacement_by_escape = {
         "\\/": "/",
         "\\u002f": "/",
         "\\u002F": "/",
@@ -8940,7 +8940,7 @@ def _decode_embedded_url_text(value: str | None) -> str:
         "\\x3e": ">",
         "\\x3E": ">",
     }
-    for old, new in replacements.items():
+    for old, new in url_replacement_by_escape.items():
         text = text.replace(old, new)
     return text
 
@@ -9360,16 +9360,16 @@ def _embedded_mrf_host_urls(raw_html_text: str | None) -> list[str]:
         r"(?P<host>price-transparency\.webtpa\.com)(?P<path>/[A-Za-z0-9_.~%/?=&:#-]*)?",
     )
     urls: list[str] = []
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
     for pattern in host_patterns:
         for match in re.finditer(pattern, text, flags=re.I):
             host = str(match.group("host") or "").rstrip(".").lower()
             path = str(match.groupdict().get("path") or "/").rstrip(".,;")
             url = f"https://{host}{path or '/'}"
             canonical_url_key = _canonical_or_none(url) or url
-            if canonical_url_key in seen:
+            if canonical_url_key in seen_urls:
                 continue
-            seen.add(canonical_url_key)
+            seen_urls.add(canonical_url_key)
             urls.append(url)
     return urls
 
@@ -11018,7 +11018,7 @@ def _is_socrata_dataset_match(dataset: dict[str, Any], resolver: dict[str, Any])
 
 
 def _socrata_target_from_dataset(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     dataset: dict[str, Any],
     *,
     catalog_url: str,
@@ -11057,13 +11057,13 @@ def _socrata_target_from_dataset(
             if coverage_month
             else None
         ),
-        "reporting_entity_name": source.get("display_name"),
+        "reporting_entity_name": source_row_dict.get("display_name"),
         "reporting_entity_type": "health_insurance_issuer",
         "plan_info": plan_info,
         **benefit_metadata,
     }
     return CrawlTarget(
-        source=source,
+        source=source_row_dict,
         url=download_url,
         label=title,
         resolved_from_url=catalog_url,
@@ -11074,7 +11074,7 @@ def _socrata_target_from_dataset(
 
 
 async def _resolve_socrata_data_json_mrf_catalog(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -11110,7 +11110,7 @@ async def _resolve_socrata_data_json_mrf_catalog(
     crawl_targets: list[CrawlTarget] = []
     for dataset in sorted(datasets, key=lambda dataset_entry: _clean_text(dataset_entry.get("title"))):
         crawl_target = _socrata_target_from_dataset(
-            source,
+            source_row_dict,
             dataset,
             catalog_url=url,
             resolver_type=resolver_type,
@@ -11445,7 +11445,7 @@ def _bcbs_global_solutions_first_plan_name(payload: Any) -> str | None:
 
 
 async def _resolve_bcbs_global_solutions_mrf(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -11505,9 +11505,10 @@ async def _resolve_bcbs_global_solutions_mrf(
         label = _clean_text(link.get("label")) or plan_name or plan_type
         crawl_targets.append(
             CrawlTarget(
-                source=source,
+                source=source_row_dict,
                 url=toc_url,
-                label=label or str(source.get("display_name") or "BCBS Global TOC"),
+                label=label
+                or str(source_row_dict.get("display_name") or "BCBS Global TOC"),
                 resolved_from_url=url,
                 metadata={
                     "resolver": resolver_type,
@@ -11732,9 +11733,9 @@ def _kaiser_inventory_targets_from_text(
         raise ValueError(f"unsupported Kaiser inventory category: {category}")
     include_external_data = resolver.get("include_external_data") is True
     configured_regions = {
-        str(value or "").strip().lower()
-        for value in (resolver.get("region_codes") or ())
-        if str(value or "").strip()
+        str(region_value or "").strip().lower()
+        for region_value in (resolver.get("region_codes") or ())
+        if str(region_value or "").strip()
     }
     toc_max_bytes = (
         _parse_size_bytes(resolver.get("toc_max_bytes")) or 5 * 1024 * 1024
@@ -11952,7 +11953,7 @@ def _crawl_target_priority_key(target: CrawlTarget) -> tuple[int, str]:
 
 
 async def _resolve_azure_mrf_listing(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -11971,7 +11972,10 @@ async def _resolve_azure_mrf_listing(
         )
         crawl_targets.extend(
             _azure_mrf_listing_targets_from_xml(
-                source, xml_text, listing_url=listing_url, resolver=resolver
+                source_row_dict,
+                xml_text,
+                listing_url=listing_url,
+                resolver=resolver,
             )
         )
     crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
@@ -12112,7 +12116,7 @@ def _triples_mtt_targets_from_payload(
 
 
 async def _resolve_triples_mtt_api(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -12150,7 +12154,10 @@ async def _resolve_triples_mtt_api(
             )
             resolved_from_url = latest_url
     crawl_targets = _triples_mtt_targets_from_payload(
-        source, api_payload, resolved_from_url=resolved_from_url, resolver=resolver
+        source_row_dict,
+        api_payload,
+        resolved_from_url=resolved_from_url,
+        resolver=resolver,
     )
     if not crawl_targets:
         raise ValueError(f"no Triple-S MTT targets found for {url}")
@@ -12265,7 +12272,7 @@ def _healthspace_mrf_targets_from_soap(
 
 
 async def _resolve_healthspace_machine_readable_files(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -12299,7 +12306,10 @@ async def _resolve_healthspace_machine_readable_files(
         session=session,
     )
     crawl_targets = _healthspace_mrf_targets_from_soap(
-        source, soap_text, resolved_from_url=service_url, resolver=resolver
+        source_row_dict,
+        soap_text,
+        resolved_from_url=service_url,
+        resolver=resolver,
     )
     crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
@@ -12419,7 +12429,7 @@ async def _resolve_healthez_benefits_mrf(
 
 
 def _s3_xml_listing_targets_from_xml(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     xml_text: str,
     *,
     listing_url: str,
@@ -12463,7 +12473,7 @@ def _s3_xml_listing_targets_from_xml(
         seen_urls.add(key)
         crawl_targets.append(
             CrawlTarget(
-                source=source,
+                source=source_row_dict,
                 url=file_url,
                 label=_mrf_file_plan_label(label) or label,
                 resolved_from_url=listing_url,
@@ -12483,7 +12493,7 @@ def _s3_xml_listing_targets_from_xml(
 
 
 async def _resolve_s3_xml_listing(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -12502,7 +12512,10 @@ async def _resolve_s3_xml_listing(
         )
         crawl_targets.extend(
             _s3_xml_listing_targets_from_xml(
-                source, xml_text, listing_url=listing_url, resolver=resolver
+                source_row_dict,
+                xml_text,
+                listing_url=listing_url,
+                resolver=resolver,
             )
         )
     crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
@@ -12519,7 +12532,7 @@ async def _resolve_s3_xml_listing(
 
 
 async def _resolve_cigna_static_mrf_lookup(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -12544,7 +12557,7 @@ async def _resolve_cigna_static_mrf_lookup(
             _parse_cigna_lookup_targets(
                 lookup_payload,
                 lookup_url=lookup_url,
-                source_row_dict=source,
+                source_row_dict=source_row_dict,
                 resolver=resolver,
             )
         )
@@ -12984,7 +12997,7 @@ async def _resolve_healthsparq_direct_metadata(
 
 
 async def _resolve_healthsparq_public_mrf(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -13001,9 +13014,9 @@ async def _resolve_healthsparq_public_mrf(
                 session=session,
             )
         except Exception:
-            return [_healthsparq_target(source, metadata_url, url, params)]
+            return [_healthsparq_target(source_row_dict, metadata_url, url, params)]
         crawl_targets = _healthsparq_targets_from_metadata(
-            source,
+            source_row_dict,
             metadata_url,
             api_payload_by_field,
             resolved_from_url=url,
@@ -13012,7 +13025,7 @@ async def _resolve_healthsparq_public_mrf(
         if crawl_targets:
             max_targets = _as_int(resolver.get("max_targets"))
             return crawl_targets[:max_targets] if max_targets else crawl_targets
-        return [_healthsparq_target(source, metadata_url, url, params)]
+        return [_healthsparq_target(source_row_dict, metadata_url, url, params)]
     login_url = _healthsparq_service_url(url, resolver, "login_path")
     login_query_by_key = {"_": str(int(_utc_now().timestamp() * 1000)), **params}
     await _fetch_json(
@@ -13050,9 +13063,11 @@ async def _resolve_healthsparq_public_mrf(
             session=session,
         )
     except Exception:
-        return [_healthsparq_target(source, metadata_url, mrf_all_url, params)]
+        return [
+            _healthsparq_target(source_row_dict, metadata_url, mrf_all_url, params)
+        ]
     crawl_targets = _healthsparq_targets_from_metadata(
-        source,
+        source_row_dict,
         metadata_url,
         metadata_payload,
         resolved_from_url=mrf_all_url,
@@ -13061,7 +13076,7 @@ async def _resolve_healthsparq_public_mrf(
     if crawl_targets:
         max_targets = _as_int(resolver.get("max_targets"))
         return crawl_targets[:max_targets] if max_targets else crawl_targets
-    return [_healthsparq_target(source, metadata_url, mrf_all_url, params)]
+    return [_healthsparq_target(source_row_dict, metadata_url, mrf_all_url, params)]
 
 
 async def _fetch_json_with_headers(
@@ -13143,7 +13158,7 @@ def _providence_toc_targets_from_payload(
 
 
 async def _resolve_providence_mrf_api(
-    source: dict[str, Any],
+    source_row_dict: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
@@ -13191,7 +13206,7 @@ async def _resolve_providence_mrf_api(
         )
         crawl_targets.extend(
             _providence_toc_targets_from_payload(
-                source,
+                source_row_dict,
                 toc_payload,
                 api_url=toc_url,
                 resolver_type=resolver_type,
