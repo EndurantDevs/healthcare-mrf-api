@@ -395,7 +395,7 @@ async def _delete_relation_fixture(session, schema: str, fixture: dict[str, list
     )
 
 
-@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.asyncio(loop_scope="session")
 async def test_provider_directory_role_evidence_sql_explains_with_array_binds():
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
@@ -416,7 +416,7 @@ async def test_provider_directory_role_evidence_sql_explains_with_array_binds():
     assert plan
 
 
-@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.asyncio(loop_scope="session")
 async def test_provider_directory_affiliation_evidence_sql_explains_with_dataset_relation():
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
@@ -436,7 +436,7 @@ async def test_provider_directory_affiliation_evidence_sql_explains_with_dataset
     assert plan
 
 
-@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.asyncio(loop_scope="session")
 async def test_role_evidence_executes_relation_fallback_and_zero_edge_contracts():
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")

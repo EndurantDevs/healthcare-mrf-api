@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import getpass
 import hashlib
 import importlib
 import json
-import os
 import uuid
 from unittest.mock import AsyncMock
 
@@ -188,20 +186,7 @@ async def _insert_retained_payload(
 
 @asynccontextmanager
 async def _fixture_database(monkeypatch):
-    """Yield an isolated schema in local disposable PostgreSQL."""
-    database_defaults_by_variable = {
-        "HLTHPRT_DB_DRIVER": "asyncpg",
-        "HLTHPRT_DB_HOST": "127.0.0.1",
-        "HLTHPRT_DB_PORT": "5440",
-        "HLTHPRT_DB_USER": getpass.getuser(),
-        "HLTHPRT_DB_PASSWORD": "",
-        "HLTHPRT_DB_DATABASE": "healthporta_test",
-    }
-    for variable_name, default_value in database_defaults_by_variable.items():
-        monkeypatch.setenv(
-            variable_name,
-            os.getenv(variable_name, default_value),
-        )
+    """Yield an isolated schema in the configured disposable PostgreSQL."""
     monkeypatch.setenv("HLTHPRT_DB_POOL_MIN_SIZE", "1")
     monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "4")
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS", "1")

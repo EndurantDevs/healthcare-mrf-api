@@ -135,7 +135,7 @@ async def _delete_geo_membership_fixture(session, schema: str, fixture: dict) ->
         )
 
 
-@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.asyncio(loop_scope="session")
 async def test_geo_evidence_excludes_resource_absent_from_current_dataset():
     """Current-run overlays still require exact current dataset membership."""
     _requires_test_database()
