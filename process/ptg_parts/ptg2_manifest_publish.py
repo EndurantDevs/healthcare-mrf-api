@@ -27,7 +27,7 @@ from process.ptg_parts.ptg2_artifact_blobs import (
     store_ptg2_artifact_file_in_db,
 )
 from process.ptg_parts.db_tables import (_exact_table_rows, _quote_ident,
-                                         _table_exists, _table_has_rows)
+                                         _has_rows_in_table, _table_exists)
 from process.ptg_parts.live_progress import write_live_progress
 from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2ManifestArtifactError,
@@ -1823,7 +1823,7 @@ async def _materialize_manifest_provider_group_rate_scope(
             """
         )
 
-    if not await _table_has_rows(schema_name, table_name):
+    if not await _has_rows_in_table(schema_name, table_name):
         await db.status(f"DROP TABLE IF EXISTS {qualified_table} CASCADE;")
         return None
 
@@ -2022,27 +2022,36 @@ async def _rewrite_price_atom_lean_dictionary(
         f"""
         CREATE {temporary_storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} AS
         WITH dictionary_source AS (
-            SELECT 'negotiated_type'::varchar(64) AS attr_kind,
-                   negotiated_type::text AS text_value,
+            SELECT CASE
+                       WHEN GROUPING(negotiated_type) = 0
+                           THEN 'negotiated_type'::varchar(64)
+                       WHEN GROUPING(expiration_date) = 0
+                           THEN 'expiration_date'::varchar(64)
+                       WHEN GROUPING(billing_class) = 0
+                           THEN 'billing_class'::varchar(64)
+                       ELSE 'setting'::varchar(64)
+                   END AS attr_kind,
+                   CASE
+                       WHEN GROUPING(negotiated_type) = 0
+                           THEN negotiated_type::text
+                       WHEN GROUPING(expiration_date) = 0
+                           THEN expiration_date::text
+                       WHEN GROUPING(billing_class) = 0
+                           THEN billing_class::text
+                       ELSE setting::text
+                   END AS text_value,
                    NULL::text[] AS text_array
               FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-             GROUP BY negotiated_type
-            UNION ALL
-            SELECT 'expiration_date'::varchar(64), expiration_date::text, NULL::text[]
-              FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-             GROUP BY expiration_date
+             GROUP BY GROUPING SETS (
+                 (negotiated_type),
+                 (expiration_date),
+                 (billing_class),
+                 (setting)
+             )
             UNION ALL
             SELECT 'service_code'::varchar(64), NULL::text, service_code::text[]
               FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
              GROUP BY service_code
-            UNION ALL
-            SELECT 'billing_class'::varchar(64), billing_class::text, NULL::text[]
-              FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-             GROUP BY billing_class
-            UNION ALL
-            SELECT 'setting'::varchar(64), setting::text, NULL::text[]
-              FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-             GROUP BY setting
             UNION ALL
             SELECT 'billing_code_modifier'::varchar(64), NULL::text, billing_code_modifier::text[]
               FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}

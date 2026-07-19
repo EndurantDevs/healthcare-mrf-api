@@ -157,23 +157,23 @@ async def _is_ptg_table_present(obj, db_schema: str) -> bool:
         return True
 
 
-async def _ensure_indexes(obj, db_schema: str) -> None:
-    if not await _is_ptg_table_present(obj, db_schema):
-        logger.warning("Skipping PTG index ensure for missing table %s.%s", db_schema, obj.__tablename__)
+async def _ensure_indexes(model_class, db_schema: str) -> None:
+    if not await _is_ptg_table_present(model_class, db_schema):
+        logger.warning("Skipping PTG index ensure for missing table %s.%s", db_schema, model_class.__tablename__)
         return
     if _env_bool(
         PTG2_SKIP_BULK_INDEX_ENSURE_ENV,
         _env_bool(PTG2_COMPACT_BULK_DROP_INDEXES_ENV, False),
-    ) and obj in {
+    ) and model_class in {
         PTG2PriceSet,
         PTG2ProviderSet,
         PTG2Procedure,
         PTG2ServingRateCompact,
     }:
-        logger.info("Skipping PTG2 bulk index ensure for %s before bulk load", obj.__tablename__)
+        logger.info("Skipping PTG2 bulk index ensure for %s before bulk load", model_class.__tablename__)
         return
     if (
-        obj is PTG2ServingRateCompact
+        model_class is PTG2ServingRateCompact
         and _env_bool(
             PTG2_SKIP_COMPACT_SERVING_INDEX_ENSURE_ENV,
             _env_bool(PTG2_COMPACT_BULK_DROP_INDEXES_ENV, True),
@@ -181,28 +181,28 @@ async def _ensure_indexes(obj, db_schema: str) -> None:
     ):
         logger.info("Skipping PTG2 compact serving index ensure before bulk load")
         return
-    if hasattr(obj, "__my_index_elements__") and obj.__my_index_elements__:
-        index_elements = [str(element) for element in obj.__my_index_elements__]
-        if index_elements == _primary_key_column_names(obj):
-            logger.debug("Skipping duplicate primary unique index ensure for %s", obj.__tablename__)
+    if hasattr(model_class, "__my_index_elements__") and model_class.__my_index_elements__:
+        index_elements = [str(element) for element in model_class.__my_index_elements__]
+        if index_elements == _primary_key_column_names(model_class):
+            logger.debug("Skipping duplicate primary unique index ensure for %s", model_class.__tablename__)
         else:
             cols = ", ".join(index_elements)
             await _create_index_if_not_exists(
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
-                + f"{obj.__tablename__}_idx_primary ON {db_schema}.{obj.__tablename__} ({cols});",
-                index_name=f"{obj.__tablename__}_idx_primary",
+                + f"{model_class.__tablename__}_idx_primary ON {db_schema}.{model_class.__tablename__} ({cols});",
+                index_name=f"{model_class.__tablename__}_idx_primary",
             )
-    if hasattr(obj, "__my_additional_indexes__") and obj.__my_additional_indexes__:
-        for idx in obj.__my_additional_indexes__:
+    if hasattr(model_class, "__my_additional_indexes__") and model_class.__my_additional_indexes__:
+        for idx in model_class.__my_additional_indexes__:
             elements = idx.get("index_elements")
             if not elements:
                 continue
-            name = idx.get("name") or f"{obj.__tablename__}_{'_'.join(elements)}_idx"
+            name = idx.get("name") or f"{model_class.__tablename__}_{'_'.join(elements)}_idx"
             using = idx.get("using")
             where = idx.get("where")
             include_elements = idx.get("include") or ()
             cols = ", ".join(elements)
-            statement = f"CREATE INDEX IF NOT EXISTS {name} ON {db_schema}.{obj.__tablename__}"
+            statement = f"CREATE INDEX IF NOT EXISTS {name} ON {db_schema}.{model_class.__tablename__}"
             if using:
                 statement += f" USING {using}"
             statement += f" ({cols})"

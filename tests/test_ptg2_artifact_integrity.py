@@ -57,6 +57,54 @@ def _configure_single_get_downloads(monkeypatch, *, retries: int = 1) -> None:
     monkeypatch.setenv(config.PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV, "0")
 
 
+def test_completed_range_sidecar_ignores_invalid_state(tmp_path):
+    sidecar_path = tmp_path / "artifact.ranges.json"
+
+    assert artifacts._load_completed_ranges(
+        sidecar_path,
+        total_bytes=10,
+        etag="v1",
+    ) == set()
+
+    sidecar_path.write_text("{", encoding="utf-8")
+    assert artifacts._load_completed_ranges(
+        sidecar_path,
+        total_bytes=10,
+        etag="v1",
+    ) == set()
+
+    sidecar_path.write_text(
+        '{"total_bytes": 11, "etag": "v1", "completed": []}',
+        encoding="utf-8",
+    )
+    assert artifacts._load_completed_ranges(
+        sidecar_path,
+        total_bytes=10,
+        etag="v1",
+    ) == set()
+
+    sidecar_path.write_text(
+        '{"total_bytes": 10, "etag": "v2", "completed": []}',
+        encoding="utf-8",
+    )
+    assert artifacts._load_completed_ranges(
+        sidecar_path,
+        total_bytes=10,
+        etag="v1",
+    ) == set()
+
+    sidecar_path.write_text(
+        '{"total_bytes": 10, "etag": "v1", '
+        '"completed": [[0, 4], ["bad", 6], [-1, 2], [5, 9]]}',
+        encoding="utf-8",
+    )
+    assert artifacts._load_completed_ranges(
+        sidecar_path,
+        total_bytes=10,
+        etag="v1",
+    ) == {(0, 4), (5, 9)}
+
+
 @pytest.mark.parametrize(
     ("filename", "artifact_bytes"),
     [

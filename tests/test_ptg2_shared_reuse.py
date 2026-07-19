@@ -13,7 +13,7 @@ from process.ptg_parts.import_rows import _ptg2_source_trace_rows
 from process.ptg_parts.ptg2_shared_reuse import (
     deterministic_source_key_assignments,
     normalized_physical_artifact_identity,
-    same_downloaded_physical_input,
+    is_same_downloaded_physical_input,
     shared_logical_artifact_metadata,
     shared_physical_artifact_identity,
     shared_physical_input_identity,
@@ -92,7 +92,7 @@ def test_same_files_and_semantics_reuse_across_logical_owners_and_urls():
     assert _identity([first]).coverage_scope_id == _identity([second]).coverage_scope_id
     assert _identity([first]).logical_plan.plan_id == "plan-1"
     assert _identity([second]).logical_plan.plan_id == "plan-2"
-    assert same_downloaded_physical_input(first, second)
+    assert is_same_downloaded_physical_input(first, second)
 
 
 def test_plan_scope_is_logical_but_content_changes_physical_identity():
@@ -125,7 +125,7 @@ def test_duplicate_bytes_with_different_plan_scope_are_physically_equal():
     first = _downloaded(plan_id="plan-1")
     second = _downloaded(plan_id="plan-2")
 
-    assert same_downloaded_physical_input(first, second)
+    assert is_same_downloaded_physical_input(first, second)
 
 
 def test_deferred_logical_hash_reuses_only_byte_identical_containers():
@@ -153,9 +153,9 @@ def test_deferred_logical_hash_reuses_only_byte_identical_containers():
         url="https://mirror.invalid/repacked.gz",
     )
 
-    assert same_downloaded_physical_input(first, same_container)
+    assert is_same_downloaded_physical_input(first, same_container)
     assert _identity([first]).semantic_fingerprint == _identity([same_container]).semantic_fingerprint
-    assert not same_downloaded_physical_input(first, repacked_container)
+    assert not is_same_downloaded_physical_input(first, repacked_container)
     assert _identity([first]).semantic_fingerprint != _identity([repacked_container]).semantic_fingerprint
     assert _identity([first]).payload["artifacts"][0]["identity_kind"] == "raw_container_sha256_v1"
 

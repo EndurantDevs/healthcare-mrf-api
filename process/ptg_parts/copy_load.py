@@ -14,7 +14,7 @@ from typing import Any
 from db.connection import db
 from process.ext.utils import push_objects
 from process.ptg_parts.canonical import normalize_money
-from process.ptg_parts.config import _ptg2_stage_copy_dedupe_enabled
+from process.ptg_parts.config import _uses_ptg2_stage_copy_dedupe
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.rust_stage import _ptg2_dictionary_select_columns
 
@@ -487,14 +487,14 @@ async def _copy_ptg2_dictionary_file(copy_path: Path, kind: str, *, target_table
     table_name, columns, conflict_targets = copy_spec_by_kind[kind]
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     if target_table is not None:
-        dedupe_stage_copy = _ptg2_stage_copy_dedupe_enabled(kind)
+        should_dedupe_stage_copy = _uses_ptg2_stage_copy_dedupe(kind)
         async with db.acquire() as conn:
             raw_conn = conn.raw_connection
             driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
             copy_to_table = getattr(driver_conn, "copy_to_table", None)
             if copy_to_table is None:
                 raise NotImplementedError("Active database driver does not expose copy_to_table")
-            if not dedupe_stage_copy:
+            if not should_dedupe_stage_copy:
                 with copy_path.open("rb") as copy_source:
                     await copy_to_table(
                         target_table,

@@ -87,13 +87,13 @@ from process.ptg_parts.config import (
     PTG2_SOURCE_IMPORT_LOCK_ENABLED_ENV, PTG2_STREAMING_DEDUPE_ENV,
     TEST_TOC_FILES, TEST_TOC_JOBS, _env_bool, _env_int,
     _is_postgres_binary_v3_arch, _ptg2_snapshot_arch_from_env)
-from process.ptg_parts.config import _ptg2_auto_activate_candidates
+from process.ptg_parts.config import _should_auto_activate_ptg2_candidates
 from process.ptg_parts.copy_load import (_copy_ignore_ptg2_objects,
                                          _copy_insert_ptg2_objects,
                                          _copy_upsert_ptg2_objects)
 from process.ptg_parts.db_tables import (_estimated_table_rows,
                                          _exact_table_rows, _quote_ident,
-                                         _table_exists, _table_has_rows)
+                                         _has_rows_in_table, _table_exists)
 from process.ptg_parts.domain import (PTG2_ARTIFACT_RAW,
                                       PTG2_CANDIDATE_ACTIVATION_CONTRACT,
                                       PTG2_CONFIDENCE_NPPES_MAILING_LOCATION,
@@ -184,7 +184,7 @@ from process.ptg_parts.ptg2_shared_reuse import (
     SharedPhysicalArtifactIdentity,
     logical_plan_fields_for_job,
     normalized_physical_artifact_identity,
-    same_downloaded_physical_input,
+    is_same_downloaded_physical_input,
     shared_logical_artifact_metadata,
     shared_physical_artifact_identity,
     shared_physical_input_identity,
@@ -4398,7 +4398,7 @@ async def _main_with_artifact_lease(
         _normalize_source_network_names(source_network_names),
         key=str.casefold,
     )
-    auto_activate_candidates = _ptg2_auto_activate_candidates()
+    should_auto_activate_candidates = _should_auto_activate_ptg2_candidates()
     options_by_name = {
         "toc_urls": toc_urls or [],
         "toc_list": toc_list,
@@ -4436,7 +4436,7 @@ async def _main_with_artifact_lease(
             ),
             1,
         ),
-        "auto_activate_candidates": auto_activate_candidates,
+        "auto_activate_candidates": should_auto_activate_candidates,
     }
     snapshot_id = _ptg2_deterministic_snapshot_id(
         import_month=import_month_value,
@@ -4542,9 +4542,9 @@ async def _main_with_artifact_lease(
                 snapshot_id=snapshot_id,
                 source_key=source_key_val,
                 import_month=import_month_value,
-                auto_activate=auto_activate_candidates,
+                auto_activate=should_auto_activate_candidates,
             )
-            if auto_activate_candidates:
+            if should_auto_activate_candidates:
                 try:
                     await _cleanup_old_ptg2_source_tables(
                         source_key_val,
@@ -4573,7 +4573,7 @@ async def _main_with_artifact_lease(
                 eta_seconds=0,
                 message=(
                     "PTG candidate activated"
-                    if auto_activate_candidates
+                    if should_auto_activate_candidates
                     else "PTG candidate already validated; live pointers unchanged"
                 ),
             )
@@ -5208,7 +5208,7 @@ async def _main_with_artifact_lease(
                         error="download did not produce an artifact",
                     )
                 elif any(
-                    same_downloaded_physical_input(previous, downloaded)
+                    is_same_downloaded_physical_input(previous, downloaded)
                     for previous in downloads_by_logical_hash.get(
                         downloaded.logical_artifact.logical_sha256,
                         (),
@@ -5585,7 +5585,7 @@ async def _main_with_artifact_lease(
         )
         candidate_stage_flags_by_name["staged"] = True
         candidate_attributes_by_field = dict(candidate_result["candidate_attributes"])
-        if auto_activate_candidates:
+        if should_auto_activate_candidates:
             activated_at = _utcnow()
             await _publish_ptg2_source_pointers(
                 source_key=source_key_val,
@@ -5626,7 +5626,7 @@ async def _main_with_artifact_lease(
             total_steps=publish_progress_total,
             message_text="cleaning old PTG source tables",
         )
-        if auto_activate_candidates:
+        if should_auto_activate_candidates:
             await _cleanup_old_ptg2_source_tables(
                 source_key_val,
                 {snapshot_id},
@@ -5648,7 +5648,7 @@ async def _main_with_artifact_lease(
                 source_scoped_compact=True,
                 test_mode=test_mode,
             )
-            if auto_activate_candidates
+            if should_auto_activate_candidates
             else {"status": "skipped", "reason": "candidate-activation-deferred"}
         )
         post_publish_stage_timer.mark("address_refresh")
@@ -5713,7 +5713,7 @@ async def _main_with_artifact_lease(
             eta_seconds=0,
             message=(
                 "PTG import succeeded"
-                if auto_activate_candidates
+                if should_auto_activate_candidates
                 else "PTG candidate validated; live pointers unchanged"
             ),
         )

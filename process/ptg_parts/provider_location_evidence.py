@@ -138,7 +138,7 @@ def _sample_value(value: Any, *, max_items: int = 6) -> Any:
     return _compact_scalar(value)
 
 
-def _nonempty_scalar(value: Any) -> bool:
+def _is_nonempty_scalar(value: Any) -> bool:
     if isinstance(value, str):
         return bool(value.strip())
     return value not in (None, "", [], {})
@@ -157,11 +157,11 @@ def _has_displayable_address_value(value: Any) -> bool:
         has_region = False
         for key, child in value.items():
             normalized_key = _normalized_field_name(key)
-            if normalized_key in STREET_FIELD_NAMES and _nonempty_scalar(child):
+            if normalized_key in STREET_FIELD_NAMES and _is_nonempty_scalar(child):
                 return True
-            if normalized_key in CITY_FIELD_NAMES and _nonempty_scalar(child):
+            if normalized_key in CITY_FIELD_NAMES and _is_nonempty_scalar(child):
                 has_city = True
-            if normalized_key in REGION_FIELD_NAMES and _nonempty_scalar(child):
+            if normalized_key in REGION_FIELD_NAMES and _is_nonempty_scalar(child):
                 has_region = True
             if _has_displayable_address_value(child):
                 return True
@@ -177,7 +177,12 @@ def _has_phone_telecom_value(value: Any) -> bool:
     if isinstance(value, dict):
         system = _normalized_field_name(value.get("system"))
         if system:
-            return system in {"fax", "phone", "tel", "telephone"} and _nonempty_scalar(value.get("value"))
+            return system in {
+                "fax",
+                "phone",
+                "tel",
+                "telephone",
+            } and _is_nonempty_scalar(value.get("value"))
         return any(
             _has_phone_telecom_value(child)
             for child in value.values()
@@ -302,8 +307,8 @@ def _audit_provider_reference(
     )
     if ref_addresses or ref_phones:
         summary["provider_references_with_direct_location_fields"] += 1
-        displayable_address = _has_displayable_address_value(reference_fields_map)
-        if displayable_address:
+        has_displayable_address = _has_displayable_address_value(reference_fields_map)
+        if has_displayable_address:
             summary["provider_references_with_displayable_location_fields"] += 1
         _add_field_counts(address_paths, ref_addresses)
         _add_field_counts(phone_paths, ref_phones)
@@ -312,7 +317,7 @@ def _audit_provider_reference(
             {
                 "scope": "provider_reference",
                 "provider_group_id": ref_id,
-                "displayable_address_present": displayable_address,
+                "displayable_address_present": has_displayable_address,
                 "address_fields": ref_addresses,
                 "phone_fields": ref_phones,
             },
@@ -329,8 +334,8 @@ def _audit_provider_reference(
         group_addresses, group_phones, group_network_names = _collect_matching_fields(group)
         if group_addresses or group_phones:
             summary["provider_groups_with_direct_location_fields"] += 1
-            displayable_address = _has_displayable_address_value(group)
-            if displayable_address:
+            has_displayable_address = _has_displayable_address_value(group)
+            if has_displayable_address:
                 summary["provider_groups_with_displayable_location_fields"] += 1
             _add_field_counts(address_paths, group_addresses)
             _add_field_counts(phone_paths, group_phones)
@@ -341,7 +346,7 @@ def _audit_provider_reference(
                     "provider_group_id": ref_id,
                     "tin": _sample_value(group.get("tin")),
                     "npi_count": len(group.get("npi") or []) if isinstance(group.get("npi"), list) else None,
-                    "displayable_address_present": displayable_address,
+                    "displayable_address_present": has_displayable_address,
                     "address_fields": group_addresses,
                     "phone_fields": group_phones,
                 },
@@ -365,8 +370,8 @@ def _audit_inline_provider_group(
     address_fields, phone_fields, network_name_fields = _collect_matching_fields(group)
     if address_fields or phone_fields:
         summary["inline_provider_groups_with_direct_location_fields"] += 1
-        displayable_address = _has_displayable_address_value(group)
-        if displayable_address:
+        has_displayable_address = _has_displayable_address_value(group)
+        if has_displayable_address:
             summary["inline_provider_groups_with_displayable_location_fields"] += 1
         _add_field_counts(address_paths, address_fields)
         _add_field_counts(phone_paths, phone_fields)
@@ -376,7 +381,7 @@ def _audit_inline_provider_group(
                 "scope": "in_network.negotiated_rates.provider_groups",
                 "tin": _sample_value(group.get("tin")),
                 "npi_count": len(group.get("npi") or []) if isinstance(group.get("npi"), list) else None,
-                "displayable_address_present": displayable_address,
+                "displayable_address_present": has_displayable_address,
                 "address_fields": address_fields,
                 "phone_fields": phone_fields,
             },

@@ -14,7 +14,7 @@ from process.ptg_parts.config import (
     PTG2_FAST_FINAL_REBUILD_ENV,
     PTG2_UNLOGGED_STAGE_ENV,
     _env_bool,
-    _ptg2_stage_copy_dedupe_enabled,
+    _uses_ptg2_stage_copy_dedupe,
 )
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.snapshot_tables import _ptg2_snapshot_index_name
@@ -110,18 +110,18 @@ _PTG2_PROVIDER_SET_COMPACT_NULL_COLUMNS = {
 
 
 def _ptg2_dictionary_select_columns(kind: str, columns: list[str]) -> str:
-    selected: list[str] = []
+    select_expressions: list[str] = []
     for column in columns:
         quoted = _quote_ident(column)
         if kind == "price_atom" and column in _PTG2_PRICE_ATOM_COMPACT_NULL_COLUMNS:
-            selected.append(f"NULL AS {quoted}")
+            select_expressions.append(f"NULL AS {quoted}")
         elif kind == "price_set" and column in _PTG2_PRICE_SET_COMPACT_NULL_COLUMNS:
-            selected.append(f"NULL AS {quoted}")
+            select_expressions.append(f"NULL AS {quoted}")
         elif kind == "provider_set" and column in _PTG2_PROVIDER_SET_COMPACT_NULL_COLUMNS:
-            selected.append(f"NULL AS {quoted}")
+            select_expressions.append(f"NULL AS {quoted}")
         else:
-            selected.append(quoted)
-    return ", ".join(selected)
+            select_expressions.append(quoted)
+    return ", ".join(select_expressions)
 
 
 PTG2_SERVING_STAGE_LANE_PREFIX = "serving_rate_compact_lane_"
@@ -186,8 +186,10 @@ async def _create_one_rust_copy_stage_table(
         schema_name=schema_name,
         stage_table=stage_table,
     )
-    serving_stage = kind == "serving_rate_compact" or kind.startswith(PTG2_SERVING_STAGE_LANE_PREFIX)
-    keep_columns = None if serving_stage else set(columns) | {"created_at"}
+    is_serving_stage = kind == "serving_rate_compact" or kind.startswith(
+        PTG2_SERVING_STAGE_LANE_PREFIX
+    )
+    keep_columns = None if is_serving_stage else set(columns) | {"created_at"}
     for column_row in existing_columns:
         column_name = column_row.get("column_name") if isinstance(column_row, dict) else getattr(column_row, "column_name", None)
         if keep_columns is not None and column_name and column_name not in keep_columns:
@@ -207,7 +209,7 @@ async def _create_one_rust_copy_stage_table(
         )
     except Exception as exc:
         logger.debug("Skipping PTG2 Rust stage autovacuum disable for %s: %s", stage_table, exc)
-    if conflict_targets and _ptg2_stage_copy_dedupe_enabled(kind):
+    if conflict_targets and _uses_ptg2_stage_copy_dedupe(kind):
         dedupe_index_name = _ptg2_snapshot_index_name(stage_table, "copy_dedupe_idx")
         await db.status(
             f"""
@@ -221,10 +223,10 @@ async def _create_one_rust_copy_stage_table(
 async def _create_rust_copy_stage_tables(token: str, *, serving_lanes: int = 1) -> dict[str, str]:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
-    stage_tables: dict[str, str] = {}
+    stage_table_by_kind: dict[str, str] = {}
     for kind, (target_table, columns, conflict_targets) in _RUST_COPY_TABLE_SPECS.items():
         stage_table = _rust_copy_stage_table_name(kind, token)
-        stage_tables[kind] = stage_table
+        stage_table_by_kind[kind] = stage_table
         await _create_one_rust_copy_stage_table(
             kind=kind,
             schema_name=schema_name,
@@ -238,7 +240,7 @@ async def _create_rust_copy_stage_tables(token: str, *, serving_lanes: int = 1) 
             for lane in range(1, max(serving_lanes, 1)):
                 lane_key = _serving_stage_lane_key(lane)
                 lane_table = _rust_copy_stage_table_name(f"serving_rate_compact_w{lane:04d}", token)
-                stage_tables[lane_key] = lane_table
+                stage_table_by_kind[lane_key] = lane_table
                 await _create_one_rust_copy_stage_table(
                     kind=lane_key,
                     schema_name=schema_name,
@@ -248,7 +250,7 @@ async def _create_rust_copy_stage_tables(token: str, *, serving_lanes: int = 1) 
                     columns=columns,
                     conflict_targets=None,
                 )
-    return stage_tables
+    return stage_table_by_kind
 
 
 async def _merge_rust_copy_stage_tables(stage_tables: dict[str, str], *, drop: bool = True) -> None:

@@ -188,7 +188,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _ptg2_auto_activate_candidates() -> bool:
+def _should_auto_activate_ptg2_candidates() -> bool:
     """Return whether a validated strict-V3 candidate should become live."""
 
     if _env_bool(PTG2_AUTO_ACTIVATE_CANDIDATES_ENV, False):
@@ -228,7 +228,7 @@ def _uses_postgres_binary_provider_membership_graph(arch_version: str | None) ->
     return arch_version in PTG2_POSTGRES_BINARY_PROVIDER_MEMBERSHIP_ARCHES
 
 
-def _ptg2_stage_copy_dedupe_enabled(kind: str) -> bool:
+def _uses_ptg2_stage_copy_dedupe(kind: str) -> bool:
     if kind in PTG2_STAGE_COPY_DEDUPE_DEFAULT_KINDS:
         return True
     return _env_bool(PTG2_STAGE_COPY_DEDUPE_ENV, False)

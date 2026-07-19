@@ -123,10 +123,17 @@ async def _process_provider_reference_file(
             import_run_id=import_run_id,
         )
 
-    meta = {
+    file_metadata_by_field = {
         "version": provider_content.get("version"),
     }
-    file_row = _build_file_row(url, "provider-reference", meta, None, None, None)
+    file_row = _build_file_row(
+        url,
+        "provider-reference",
+        file_metadata_by_field,
+        None,
+        None,
+        None,
+    )
     await _push_ptg2_objects_from_facade([file_row], file_cls, rewrite=True)
 
     provider_groups = provider_content.get("provider_groups") or []

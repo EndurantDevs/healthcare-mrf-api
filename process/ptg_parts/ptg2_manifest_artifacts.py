@@ -115,7 +115,7 @@ def _is_dense_membership_magic(magic: bytes) -> bool:
     return magic in _DENSE_MEMBERSHIP_MAGICS
 
 
-def _sidecar_mmap_cache_enabled() -> bool:
+def _is_sidecar_mmap_cache_enabled() -> bool:
     raw = os.getenv("HLTHPRT_PTG2_MANIFEST_SIDECAR_MMAP_CACHE", "true").strip().lower()
     return raw not in {"0", "false", "no", "off"}
 
@@ -1295,7 +1295,7 @@ def lookup_global_sidecar_members_many(
     sidecar_path = Path(path)
     if metadata is not None:
         _validate_membership_record_format(metadata)
-    if _sidecar_mmap_cache_enabled():
+    if _is_sidecar_mmap_cache_enabled():
         mapped_bytes = _cached_sidecar_mmap(sidecar_path, metadata=metadata)
         if len(mapped_bytes) < _MEMBERSHIP_HEADER.size:
             raise PTG2ManifestArtifactError("global membership sidecar is missing its header")

@@ -3,6 +3,8 @@
 import gzip
 import json
 
+import pytest
+
 from process.ptg_parts import provider_location_evidence
 from process.ptg_parts.provider_location_evidence import audit_tic_provider_location_evidence
 
@@ -358,3 +360,82 @@ def test_audit_tic_provider_location_evidence_ignores_email_only_telecom_as_phon
     assert summary["direct_location_fields_present"] is False
     assert summary["direct_phone_fields_present"] is False
     assert summary["phone_field_paths"] == {}
+
+
+def test_evidence_helpers_cover_bounded_and_recursive_shapes(tmp_path):
+    class DescribedValue:
+        def __str__(self):
+            return "described"
+
+    assert provider_location_evidence._compact_scalar(7) == 7
+    assert provider_location_evidence._compact_scalar(DescribedValue()) == "described"
+    assert provider_location_evidence._sample_value(
+        {"first": 1, "second": 2},
+        max_items=1,
+    ) == {"first": 1, "...": "1 more field(s)"}
+    assert provider_location_evidence._sample_value(
+        [1, 2],
+        max_items=1,
+    ) == [1, "... 1 more item(s)"]
+    assert provider_location_evidence._has_displayable_address_value(
+        {"city": "Springfield", "state": "IL"}
+    )
+    assert not provider_location_evidence._has_displayable_address_value(
+        {"city": "Springfield", "state": ""}
+    )
+    assert provider_location_evidence._has_phone_telecom_value(
+        {"nested": {"system": "phone", "value": "555-0100"}}
+    )
+    assert provider_location_evidence._has_phone_telecom_value(["555-0100"])
+    assert not provider_location_evidence._has_phone_telecom_value(42)
+
+    oversized_path = tmp_path / "oversized.json"
+    oversized_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ijson is required"):
+        provider_location_evidence._load_small_artifact_without_ijson(
+            oversized_path,
+            max_json_fallback_bytes=1,
+        )
+
+
+def test_fallback_iterators_skip_non_mapping_groups(monkeypatch, tmp_path):
+    artifact = tmp_path / "rates.json"
+    _write_json(
+        artifact,
+        {
+            "provider_references": [
+                {
+                    "provider_groups": [
+                        None,
+                        {"network_name": ["example network"]},
+                    ]
+                }
+            ],
+            "in_network": [
+                None,
+                {},
+                {
+                    "negotiated_rates": [
+                        None,
+                        {},
+                        {
+                            "provider_groups": [
+                                None,
+                                "ignored",
+                                {"network_name": ["inline network"]},
+                            ]
+                        },
+                    ]
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(provider_location_evidence, "ijson", None)
+
+    summary = audit_tic_provider_location_evidence(artifact)
+
+    assert summary["provider_groups"] == 1
+    assert summary["inline_provider_groups"] == 1
+    assert summary["network_name_field_paths"] == {
+        "network_name": 2,
+    }

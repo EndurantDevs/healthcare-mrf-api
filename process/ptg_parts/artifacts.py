@@ -140,7 +140,7 @@ def _load_completed_ranges(sidecar_path: Path, *, total_bytes: int, etag: str | 
         return set()
     if (payload.get("etag") or None) != (etag or None):
         return set()
-    completed = set()
+    completed_ranges = set()
     for item in payload.get("completed") or []:
         try:
             start = int(item[0])
@@ -148,8 +148,8 @@ def _load_completed_ranges(sidecar_path: Path, *, total_bytes: int, etag: str | 
         except Exception:
             continue
         if 0 <= start <= end < total_bytes:
-            completed.add((start, end))
-    return completed
+            completed_ranges.add((start, end))
+    return completed_ranges
 
 
 def _write_completed_ranges(
@@ -320,7 +320,7 @@ def choose_reusable_raw_artifact(
     if not candidates:
         return None, None
 
-    def raw_exists(candidate: dict[str, Any]) -> bool:
+    def has_raw_file(candidate: dict[str, Any]) -> bool:
         """Return whether a candidate's retained raw file exists."""
         if store is None:
             return True
@@ -331,27 +331,27 @@ def choose_reusable_raw_artifact(
 
     if head is not None:
         for candidate in reversed(candidates):
-            same_length = (
+            has_same_length = (
                 head.content_length is not None
                 and candidate.get("content_length") is not None
                 and int(candidate["content_length"]) == int(head.content_length)
             )
             if (
-                same_length
+                has_same_length
                 and _is_strong_etag(head.etag)
                 and candidate.get("etag") == head.etag
-                and raw_exists(candidate)
+                and has_raw_file(candidate)
             ):
                 return candidate, "strong_etag_length"
         if reuse_policy in {"metadata", "metadata_or_hash"}:
             for candidate in reversed(candidates):
-                same_length = (
+                has_same_length = (
                     head.content_length is not None
                     and candidate.get("content_length") is not None
                     and int(candidate["content_length"]) == int(head.content_length)
                 )
                 same_modified = bool(head.last_modified and candidate.get("last_modified") == head.last_modified)
-                if same_length and same_modified and raw_exists(candidate):
+                if has_same_length and same_modified and has_raw_file(candidate):
                     return candidate, "length_last_modified"
     if store is not None and reuse_policy in {"hash", "metadata_or_hash"}:
         for candidate in reversed(candidates):

@@ -22,7 +22,7 @@ depends_on = None
 
 TABLE_NAME = "entity_address_unified"
 INDEX_NAME = "entity_address_unified_idx_geo_bbox"
-REPLACEMENT_INDEX_NAME = "entity_address_unified_idx_geo_bbox_hjhp3"
+REPLACEMENT_INDEX_NAME = "entity_address_unified_idx_geo_bbox_replacement"
 INDEX_COLUMNS = ("lat", "long")
 INCLUDE_COLUMNS = ("npi", "address_key")
 INDEX_PREDICATE = (
