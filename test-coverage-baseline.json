@@ -233,11 +233,11 @@
       },
       "metrics": {
         "branches": {
-          "covered": 18117,
+          "covered": 18128,
           "total": 29872
         },
         "lines": {
-          "covered": 64620,
+          "covered": 64640,
           "total": 86219
         }
       },

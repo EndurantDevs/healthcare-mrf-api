@@ -13,6 +13,16 @@ from process.ptg_parts.ptg2_serving_binary_v3 import (
     encode_price_memberships,
 )
 
+_CONSTANT_PRICE_ATOM_ROWS = (
+    ("negotiated_type", 0, "negotiated", None),
+    ("expiration_date", 0, "2028-12-31", None),
+    ("service_code", 0, None, ["11"]),
+    ("billing_class", 0, "professional", None),
+    ("setting", 0, "inpatient", None),
+    ("billing_code_modifier", 0, None, ["AA"]),
+    ("additional_information", 0, "constant note", None),
+)
+
 
 @pytest.mark.asyncio
 async def test_price_key_map_export_is_dense_key_ordered(monkeypatch, tmp_path):
@@ -272,11 +282,20 @@ async def test_lean_price_atom_does_not_repeat_numeric_rate_conversion(monkeypat
         for call in status.await_args_list
         if "WITH dictionary_source AS" in call.args[0]
     )
-    assert dictionary_sql.count('FROM "mrf"."price_atoms"') == 4
+    assert dictionary_sql.count('FROM "mrf"."price_atoms"') == 1
+    assert "UNION ALL" not in dictionary_sql
     assert "GROUP BY GROUPING SETS" in dictionary_sql
-    assert "GROUPING(negotiated_type) = 0" in dictionary_sql
-    assert "GROUPING(expiration_date) = 0" in dictionary_sql
-    assert "GROUPING(billing_class) = 0" in dictionary_sql
+    for attribute in (
+        "negotiated_type",
+        "expiration_date",
+        "service_code",
+        "billing_class",
+        "setting",
+        "billing_code_modifier",
+        "additional_information",
+    ):
+        assert f"GROUPING({attribute}) = 0" in dictionary_sql
+        assert f"({attribute})" in dictionary_sql
 
 
 @pytest.mark.asyncio
@@ -302,6 +321,113 @@ async def test_lean_price_atom_respects_logged_stage_override(monkeypatch):
     assert 'CREATE TABLE "mrf"."price_attributes" AS' in sql
     assert 'CREATE TABLE "mrf"."price_atoms_lean_' in sql
     assert "CREATE UNLOGGED TABLE" not in sql
+
+
+@pytest.mark.asyncio
+async def test_lean_price_atom_rejects_dictionary_hash_collisions(monkeypatch):
+    status = AsyncMock()
+    all_rows = AsyncMock()
+    monkeypatch.setattr(manifest_publish.db, "status", status)
+    monkeypatch.setattr(manifest_publish.db, "scalar", AsyncMock(return_value=1))
+    monkeypatch.setattr(manifest_publish.db, "all", all_rows)
+    monkeypatch.setattr(
+        manifest_publish,
+        "_table_exists",
+        AsyncMock(return_value=True),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"dictionary lookup key collision in mrf\.price_attributes",
+    ):
+        await manifest_publish._rewrite_price_atom_lean_dictionary(
+            schema_name="mrf",
+            price_atom_table="price_atoms",
+            price_atom_dictionary_table="price_attributes",
+        )
+
+    all_rows.assert_not_awaited()
+    sql = "\n".join(call.args[0] for call in status.await_args_list)
+    assert 'CREATE UNLOGGED TABLE "mrf"."price_attributes" AS' in sql
+    assert "CREATE UNIQUE INDEX" not in sql
+    assert 'DROP TABLE "mrf"."price_atoms"' not in sql
+
+
+@pytest.mark.asyncio
+async def test_lean_price_atom_v1_keeps_and_indexes_dictionary(monkeypatch):
+    status = AsyncMock()
+    all_rows = AsyncMock()
+    monkeypatch.setattr(manifest_publish.db, "status", status)
+    monkeypatch.setattr(manifest_publish.db, "scalar", AsyncMock(return_value=0))
+    monkeypatch.setattr(manifest_publish.db, "all", all_rows)
+    monkeypatch.setattr(
+        manifest_publish,
+        "_table_exists",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        manifest_publish,
+        "_ptg2_manifest_price_atom_layout",
+        lambda: "lean_dict_v1",
+    )
+
+    manifest = await manifest_publish._rewrite_price_atom_lean_dictionary(
+        schema_name="mrf",
+        price_atom_table="price_atoms",
+        price_atom_dictionary_table="price_attributes",
+    )
+
+    all_rows.assert_not_awaited()
+    assert manifest["price_atom_table_layout"] == "lean_dict_v1"
+    assert manifest["price_atom_dictionary_table"] == "mrf.price_attributes"
+    sql = "\n".join(call.args[0] for call in status.await_args_list)
+    assert 'CREATE UNIQUE INDEX "price_attributes_key_idx_' in sql
+    assert '(attr_kind, attr_key)' in sql
+    assert status.await_args_list[-1].args[0] == 'ANALYZE "mrf"."price_attributes";'
+
+
+@pytest.mark.asyncio
+async def test_lean_price_atom_v2_drops_all_constant_dictionary(monkeypatch):
+    status = AsyncMock()
+    monkeypatch.setattr(manifest_publish.db, "status", status)
+    monkeypatch.setattr(manifest_publish.db, "scalar", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        manifest_publish.db,
+        "all",
+        AsyncMock(return_value=_CONSTANT_PRICE_ATOM_ROWS),
+    )
+    monkeypatch.setattr(
+        manifest_publish,
+        "_table_exists",
+        AsyncMock(return_value=True),
+    )
+
+    manifest = await manifest_publish._rewrite_price_atom_lean_dictionary(
+        schema_name="mrf",
+        price_atom_table="price_atoms",
+        price_atom_dictionary_table="price_attributes",
+    )
+
+    assert manifest["price_atom_dictionary_table"] is None
+    assert manifest["price_atom_constant_keys"] == {
+        "negotiated_type_key": 0,
+        "expiration_date_key": 0,
+        "service_code_key": 0,
+        "billing_class_key": 0,
+        "setting_key": 0,
+        "billing_code_modifier_key": 0,
+        "additional_information_key": 0,
+    }
+    assert manifest["price_atom_constant_values"]["service_code"] == ["11"]
+    lean_sql = next(
+        call.args[0]
+        for call in status.await_args_list
+        if "price_atom.negotiated_rate::text AS negotiated_rate" in call.args[0]
+    )
+    assert " JOIN " not in lean_sql
+    assert status.await_args_list[-1].args[0] == (
+        'DROP TABLE IF EXISTS "mrf"."price_attributes" CASCADE;'
+    )
 
 
 @pytest.mark.asyncio
