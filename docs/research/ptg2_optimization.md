@@ -153,7 +153,7 @@ total is not yet known; a false `total_is_exact` marks `total` and
 | Persisted audit sample | Implemented in repository | Publish-time sample metadata, digest, row bound, and API readback tests. |
 | Bounded candidate release audit | Implemented in repository | Import-time exact source witnesses are sealed in PostgreSQL; one authenticated V4 POST derives and reparses independent cohorts of up to 10,000 pricing occurrences and 1,000 provider records plus the served sample within a 55-second deadline. The response proves zero repeated block, witness, and candidate work. |
 | Candidate attestation and atomic activation | Implemented in repository | Fresh report and sealed-sample binding, immutable validated row, exact predecessor CAS, wall-clock expiry, single-use receipt, V3-reader/V4-writer rolling compatibility, downgrade rejection, and transaction rollback tests. |
-| Automatic candidate audit orchestration | Reader-first deployment in progress | V3 remains the current automatic `ptg-candidate-audit` writer while readers that accept V3 and V4 deploy. The follow-up writer release will submit exactly one non-auto-retrying `aiohttp` V4 request on `uvloop`, validate the redacted report, record the attestation, and atomically promote the exact predecessor. Request-local preparation is discarded and no application cache is warmed. |
+| Automatic candidate audit orchestration | V4 writer cutover implemented | The automatic `ptg-candidate-audit` worker submits exactly one non-auto-retrying `aiohttp` V4 request on `uvloop`, validates the redacted report, records the attestation, and atomically promotes the exact predecessor. Readers retain V3 compatibility for existing history, while new V3 writes fail closed. Request-local preparation is discarded and no application cache is warmed. |
 | Class-specific cold first-page p95 <= 40 ms | Pending release measurement | Fresh API processes, distinct keys, and complete first-page observations measured separately for matched-positive, negative, and deterministic-random requests. |
 | Unique large import in 10-15 minutes | Pending dev measurement | Complete fresh build, logged PostgreSQL publication, audit, seal, and resource report. |
 | 2,000 imports/month | Authenticated schema-v7 gate implemented; measurement pending | `ptg2_v3_capacity_gate.py` requires a fresh Ed25519 collector receipt, committed per-import end-to-end timings, 30 qualifying large builds and reuse samples, reconciled retry and audit HTTP cost, signed raw import and audit arrivals behind gap-free seven-day peaks, independently server-signed fully contended cold API samples, zero errors, and raw contention-bound resource telemetry. |
@@ -190,10 +190,10 @@ test database before release. A skipped database case is not evidence that the
 database behavior passed.
 
 The bounded PostgreSQL witness audit is the sole automated release verifier.
-Deployment is reader-first: deploy readers that accept V3 and V4 attestations
-before switching the audit worker to the V4 writer. An identity-equal,
-unactivated V3 attestation may upgrade to V4; a V4-to-V3 downgrade or any
-activated-row rewrite fails closed. Activation never rereads or decompresses
+The reader-first deployment is complete: readers accept V3 and V4 attestations,
+and the current audit worker writes V4. An identity-equal, unactivated V3
+attestation may upgrade to V4; new V3 writes, a V4-to-V3 downgrade, and any
+activated-row rewrite fail closed. Activation never rereads or decompresses
 complete source files. Stored witnesses preserve authenticated raw source
 fragments captured at V3 emission, which keeps the comparison independent of
 serving storage without adding a second scan.

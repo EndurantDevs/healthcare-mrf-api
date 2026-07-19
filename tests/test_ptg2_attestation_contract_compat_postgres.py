@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -93,25 +93,13 @@ async def _writer_attestation_row(quoted_schema: str):
 
 
 async def _record_writer_report(schema_version: int) -> dict[str, object]:
-    writer_contract = (
-        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
-        if schema_version == 4
-        else ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
+    return await ptg2_candidate_attestation.record_candidate_audit_attestation(
+        snapshot_id="writer-snapshot",
+        source_key="source-a",
+        plan_id="12-3456789",
+        plan_market_type="group",
+        report=_writer_report(schema_version),
     )
-    with patch.object(
-        ptg2_candidate_attestation,
-        "PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT",
-        writer_contract,
-    ):
-        return await (
-            ptg2_candidate_attestation.record_candidate_audit_attestation(
-                snapshot_id="writer-snapshot",
-                source_key="source-a",
-                plan_id="12-3456789",
-                plan_market_type="group",
-                report=_writer_report(schema_version),
-            )
-        )
 
 
 async def _assert_writer_upgrade_and_guards(
@@ -129,7 +117,10 @@ async def _assert_writer_upgrade_and_guards(
     assert upgraded_row[3]["schema_version"] == 4
     assert upgraded_row[4] is None
 
-    with pytest.raises(ValueError, match="conflicts with existing evidence"):
+    with pytest.raises(
+        ptg2_candidate_attestation.CandidateAttestationWriterContractError,
+        match="not enabled for writes",
+    ):
         await _record_writer_report(3)
     assert await _writer_attestation_row(quoted_schema) == upgraded_row
 
@@ -155,17 +146,22 @@ async def _assert_writer_upgrade_and_guards(
         )
     activated_row = await _writer_attestation_row(quoted_schema)
     assert activated_row[4] is not None
-    for schema_version in (4, 3):
-        with pytest.raises(ValueError, match="conflicts with existing evidence"):
-            await _record_writer_report(schema_version)
-        assert await _writer_attestation_row(quoted_schema) == activated_row
+    with pytest.raises(ValueError, match="conflicts with existing evidence"):
+        await _record_writer_report(4)
+    assert await _writer_attestation_row(quoted_schema) == activated_row
+    with pytest.raises(
+        ptg2_candidate_attestation.CandidateAttestationWriterContractError,
+        match="not enabled for writes",
+    ):
+        await _record_writer_report(3)
+    assert await _writer_attestation_row(quoted_schema) == activated_row
 
 
 @pytest.mark.asyncio
 async def test_real_postgres_writer_upgrade_is_monotonic_and_activation_safe(
     monkeypatch,
 ):
-    """Prove the real PostgreSQL upsert permits only unactivated V3 to V4."""
+    """Prove the default V4 writer upgrades V3 and rejects downgrade writes."""
 
     if os.getenv("HLTHPRT_PTG2_ATTESTATION_COMPAT_POSTGRES_TEST") != "1":
         pytest.skip(

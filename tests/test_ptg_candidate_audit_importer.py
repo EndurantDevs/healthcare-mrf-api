@@ -646,13 +646,17 @@ def test_audit_summary_timing_edges():
     }
 
 
-def test_candidate_audit_has_no_retained_source_file_dependency():
+def test_candidate_audit_defaults_follow_current_attestation_writer():
     assert not hasattr(ptg_candidate_audit, "resolve_retained_raw_files")
-    assert ptg_candidate_audit.PTG2_BATCH_AUDIT_WRITER_ENABLED is False
+    assert ptg_candidate_audit.PTG2_BATCH_AUDIT_WRITER_ENABLED is True
+    assert (
+        ptg_candidate_audit.PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT
+        == ptg_candidate_audit.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
+    )
 
 
 @pytest.mark.asyncio
-async def test_reader_phase_keeps_v3_writer(
+async def test_legacy_v3_release_audit_remains_explicitly_callable(
     monkeypatch,
 ):
     expected_report = _passing_report()
@@ -805,29 +809,28 @@ def test_release_audit_rejects_untrusted_plain_http_configuration(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reader_first_v3_audit_attests_then_activates(
+async def test_default_v4_audit_attests_then_activates(
     monkeypatch,
 ):
     events: list[str] = []
-    report = _passing_report(
+    report = _passing_batch_report(
         provider_identifier_quarantine=NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
     )
-    witness = Mock(occurrence_records=())
+    witness_loader = AsyncMock()
     monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
     monkeypatch.setattr(
         ptg_candidate_audit,
         "load_shared_source_witness",
-        AsyncMock(return_value=witness),
+        witness_loader,
     )
 
-    async def audit(target, observed_witness, *, http_config):
+    async def audit(target, *, http_config):
         events.append("audit")
         assert target.snapshot_key == 17
-        assert observed_witness is witness
         assert http_config is None
         return report
 
-    monkeypatch.setattr(ptg_candidate_audit, "run_release_audit", audit)
+    monkeypatch.setattr(ptg_candidate_audit, "run_batch_release_audit", audit)
 
     async def attest(**kwargs):
         events.append("attest")
@@ -859,21 +862,17 @@ async def test_reader_first_v3_audit_attests_then_activates(
     assert activation_response["activation_status"] == "activated"
     assert activation_response["audit_report_digest"] == "ef" * 32
     assert activation_response["audit_counts"][
-        "standard_api_actual_http_requests"
-    ] == 10_001
+        "batch_api_actual_http_requests"
+    ] == 1
     assert activation_response["metrics"]["candidate_run_id"] == "ptg2:derived-import"
+    witness_loader.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_followup_v4_writer_path_avoids_local_witness_load(monkeypatch):
+async def test_default_v4_writer_path_avoids_local_witness_load(monkeypatch):
     expected_report = _passing_batch_report()
     batch_audit = AsyncMock(return_value=expected_report)
     witness_loader = AsyncMock()
-    monkeypatch.setattr(
-        ptg_candidate_audit,
-        "PTG2_BATCH_AUDIT_WRITER_ENABLED",
-        True,
-    )
     monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
     monkeypatch.setattr(
         ptg_candidate_audit,
@@ -900,14 +899,11 @@ async def test_followup_v4_writer_path_avoids_local_witness_load(monkeypatch):
 @pytest.mark.asyncio
 async def test_failing_audit_never_attests_or_activates(monkeypatch):
     monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
+    witness_loader = AsyncMock()
+    monkeypatch.setattr(ptg_candidate_audit, "load_shared_source_witness", witness_loader)
     monkeypatch.setattr(
         ptg_candidate_audit,
-        "load_shared_source_witness",
-        AsyncMock(return_value=Mock(occurrence_records=())),
-    )
-    monkeypatch.setattr(
-        ptg_candidate_audit,
-        "run_release_audit",
+        "run_batch_release_audit",
         AsyncMock(
             side_effect=RuntimeError(
                 "candidate release audit did not pass the release gate"
@@ -927,6 +923,7 @@ async def test_failing_audit_never_attests_or_activates(monkeypatch):
 
     attest.assert_not_awaited()
     promote.assert_not_awaited()
+    witness_loader.assert_not_awaited()
 
 
 @pytest.mark.asyncio
