@@ -102,30 +102,34 @@ async def _collect_distinct_strings(session, stmt):
 
 
 def _build_tier_options(values: Iterable[Any]) -> List[Dict[str, str]]:
-    seen = set()
+    seen_tier_slugs = set()
     options: List[Dict[str, str]] = []
     for raw in values:
         label = (raw or "UNKNOWN") if raw is not None else "UNKNOWN"
         label_str = str(label)
         slug = normalize_drug_tier_slug(label_str)
-        if slug in seen:
+        if slug in seen_tier_slugs:
             continue
         options.append({"tier_slug": slug, "tier_label": label_str})
-        seen.add(slug)
+        seen_tier_slugs.add(slug)
     return options
 
 
 def _build_tier_breakdown(rows: Iterable[Tuple[Any, Any]]) -> List[Dict[str, Any]]:
-    totals: Dict[str, int] = {}
-    labels: Dict[str, str] = {}
+    counts_by_tier_slug: Dict[str, int] = {}
+    labels_by_tier_slug: Dict[str, str] = {}
     for label, count in rows:
         label_str = str(label or "UNKNOWN")
         slug = normalize_drug_tier_slug(label_str)
-        totals[slug] = totals.get(slug, 0) + int(count or 0)
-        labels.setdefault(slug, label_str)
-    ordered = sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+        counts_by_tier_slug[slug] = counts_by_tier_slug.get(slug, 0) + int(count or 0)
+        labels_by_tier_slug.setdefault(slug, label_str)
+    ordered = sorted(counts_by_tier_slug.items(), key=lambda item: (-item[1], item[0]))
     return [
-        {"tier_slug": slug, "tier_label": labels[slug], "drug_count": count}
+        {
+            "tier_slug": slug,
+            "tier_label": labels_by_tier_slug[slug],
+            "drug_count": count,
+        }
         for slug, count in ordered
     ]
 
@@ -142,7 +146,7 @@ def _build_pharmacy_breakdown(rows: Iterable[Tuple[Any, Any]]) -> List[Dict[str,
     return items
 
 
-async def _formulary_exists(session, plan_id: str, year: int) -> bool:
+async def _has_formulary(session, plan_id: str, year: int) -> bool:
     plan_table = Plan.__table__
     stmt = (
         select(func.count())
@@ -253,7 +257,7 @@ async def list_formularies(request):
     year_arg = args.get("year")
     drug_arg = args.get("drug")
 
-    filter_input = {
+    filters_by_name = {
         "issuer_id": issuer_arg,
         "plan_id": plan_arg,
         "state": state_arg,
@@ -261,7 +265,7 @@ async def list_formularies(request):
         "drug": drug_arg,
     }
 
-    filters = _plan_filters(plan_table, plan_drug_table, filter_input)
+    filters = _plan_filters(plan_table, plan_drug_table, filters_by_name)
     filter_condition = and_(*filters) if filters else None
 
     distinct_stmt = (
@@ -311,12 +315,15 @@ async def list_formularies(request):
         .limit(page_size)
     )
 
-    result = await session.execute(data_stmt)
-    items = [_hydrate_formulary_row(row) for row in result.all()]
+    formulary_result = await session.execute(data_stmt)
+    formulary_items = [
+        _hydrate_formulary_row(formulary_row)
+        for formulary_row in formulary_result.all()
+    ]
 
     return response.json(
         {
-            "items": items,
+            "items": formulary_items,
             "page": page,
             "page_size": page_size,
             "limit": page_size,
@@ -386,7 +393,7 @@ async def get_formulary(request, formulary_id):
         .order_by(plan_drug_tier_stats_table.c.drug_tier)
     )
     tiers_result = await session.execute(tiers_stmt)
-    tiers = _build_tier_options(row[0] for row in tiers_result.all())
+    tiers = _build_tier_options(tier_row[0] for tier_row in tiers_result.all())
 
     pharmacy_stmt = (
         select(func.distinct(plan_formulary_table.c.pharmacy_type))
@@ -404,7 +411,7 @@ async def get_formulary(request, formulary_id):
     if last_updated is not None:
         last_updated = last_updated.isoformat()
 
-    payload = {
+    formulary_payload_by_field = {
         "formulary_id": formulary_id,
         "formulary_uri": _encode_formulary_path(plan_id, year),
         "plan": {
@@ -426,7 +433,7 @@ async def get_formulary(request, formulary_id):
         "last_updated": last_updated,
     }
 
-    return response.json(payload)
+    return response.json(formulary_payload_by_field)
 
 
 @blueprint.get("/id/<formulary_id>/drugs")
@@ -435,7 +442,7 @@ async def list_formulary_drugs(request, formulary_id):
 
     session = _get_session(request)
     plan_id, year = _decode_formulary_id(formulary_id)
-    if not await _formulary_exists(session, plan_id, year):
+    if not await _has_formulary(session, plan_id, year):
         raise NotFound("Unknown formulary identifier")
 
     args = request.args
@@ -516,8 +523,8 @@ async def list_formulary_drugs(request, formulary_id):
         .limit(page_size)
     )
 
-    result = await session.execute(data_stmt)
-    rows = result.all()
+    drug_result = await session.execute(data_stmt)
+    drug_rows = drug_result.all()
 
     pharmacy_stmt = (
         select(func.distinct(plan_formulary_table.c.pharmacy_type))
@@ -531,13 +538,13 @@ async def list_formulary_drugs(request, formulary_id):
     )
     pharmacy_types = await _collect_distinct_strings(session, pharmacy_stmt)
 
-    items = []
-    for row in rows:
-        mapping = row._mapping
+    drug_items = []
+    for drug_row in drug_rows:
+        mapping = drug_row._mapping
         last_updated_on = mapping["last_updated_on"]
         if last_updated_on is not None:
             last_updated_on = last_updated_on.isoformat()
-        items.append(
+        drug_items.append(
             {
                 "rxnorm_id": mapping["rxnorm_id"],
                 "drug_name": mapping["drug_name"],
@@ -560,7 +567,7 @@ async def list_formulary_drugs(request, formulary_id):
             "offset": offset,
             "total": total,
             "available_pharmacy_types": pharmacy_types,
-            "items": items,
+            "items": drug_items,
         }
     )
 
@@ -571,7 +578,7 @@ async def get_formulary_drug(request, formulary_id, rxnorm_id):
 
     session = _get_session(request)
     plan_id, year = _decode_formulary_id(formulary_id)
-    if not await _formulary_exists(session, plan_id, year):
+    if not await _has_formulary(session, plan_id, year):
         raise NotFound("Unknown formulary identifier")
 
     plan_drug_table = PlanDrugRaw.__table__
@@ -594,12 +601,12 @@ async def get_formulary_drug(request, formulary_id, rxnorm_id):
         )
     )
 
-    result = await session.execute(stmt)
-    row = result.first()
-    if row is None:
+    drug_result = await session.execute(stmt)
+    drug_row = drug_result.first()
+    if drug_row is None:
         raise NotFound("Drug not found within formulary")
 
-    mapping = row._mapping
+    mapping = drug_row._mapping
     last_updated = mapping["last_updated_on"]
     if last_updated is not None:
         last_updated = last_updated.isoformat()
@@ -617,7 +624,7 @@ async def get_formulary_drug(request, formulary_id, rxnorm_id):
     )
     pharmacy_types = await _collect_distinct_strings(session, pharmacy_stmt)
 
-    payload = {
+    drug_payload_by_field = {
         "formulary_id": formulary_id,
         "formulary_uri": _encode_formulary_path(plan_id, year),
         "rxnorm_id": mapping["rxnorm_id"],
@@ -637,7 +644,7 @@ async def get_formulary_drug(request, formulary_id, rxnorm_id):
         ],
     }
 
-    return response.json(payload)
+    return response.json(drug_payload_by_field)
 
 
 @blueprint.get("/id/<formulary_id>/summary")
@@ -646,7 +653,7 @@ async def get_formulary_summary(request, formulary_id):
 
     session = _get_session(request)
     plan_id, year = _decode_formulary_id(formulary_id)
-    if not await _formulary_exists(session, plan_id, year):
+    if not await _has_formulary(session, plan_id, year):
         raise NotFound("Unknown formulary identifier")
 
     plan_drug_stats_table = PlanDrugStats.__table__
@@ -670,15 +677,15 @@ async def get_formulary_summary(request, formulary_id):
     stats_mapping = getattr(stats_row, "_mapping", {}) if stats_row else {}
     total = int(stats_mapping.get("total_drugs") or 0)
 
-    auth_counts = {
+    authorization_counts_by_requirement = {
         "required": int(stats_mapping.get("auth_required") or 0),
         "not_required": int(stats_mapping.get("auth_not_required") or 0),
     }
-    step_counts = {
+    step_counts_by_requirement = {
         "required": int(stats_mapping.get("step_required") or 0),
         "not_required": int(stats_mapping.get("step_not_required") or 0),
     }
-    quantity_counts = {
+    quantity_counts_by_limit = {
         "has_limit": int(stats_mapping.get("quantity_limit") or 0),
         "no_limit": int(stats_mapping.get("quantity_no_limit") or 0),
     }
@@ -691,7 +698,9 @@ async def get_formulary_summary(request, formulary_id):
         .where(plan_drug_tier_stats_table.c.plan_id == plan_id)
     )
     tier_rows = (await session.execute(tier_stmt)).all()
-    tier_breakdown = _build_tier_breakdown([(row[0], row[1]) for row in tier_rows])
+    tier_breakdown = _build_tier_breakdown(
+        [(tier_row[0], tier_row[1]) for tier_row in tier_rows]
+    )
 
     pharmacy_stmt = (
         select(plan_formulary_table.c.pharmacy_type, func.count())
@@ -704,7 +713,9 @@ async def get_formulary_summary(request, formulary_id):
         .group_by(plan_formulary_table.c.pharmacy_type)
     )
     pharmacy_rows = (await session.execute(pharmacy_stmt)).all()
-    pharmacy_counts = _build_pharmacy_breakdown([(row[0], row[1]) for row in pharmacy_rows])
+    pharmacy_counts = _build_pharmacy_breakdown(
+        [(pharmacy_row[0], pharmacy_row[1]) for pharmacy_row in pharmacy_rows]
+    )
 
     return response.json(
         {
@@ -712,9 +723,9 @@ async def get_formulary_summary(request, formulary_id):
             "formulary_uri": _encode_formulary_path(plan_id, year),
             "total_drugs": int(total),
             "tiers": tier_breakdown,
-            "authorization_requirements": auth_counts,
-            "step_therapy": step_counts,
-            "quantity_limits": quantity_counts,
+            "authorization_requirements": authorization_counts_by_requirement,
+            "step_therapy": step_counts_by_requirement,
+            "quantity_limits": quantity_counts_by_limit,
             "pharmacy_types": pharmacy_counts,
         }
     )
@@ -768,15 +779,15 @@ async def cross_formulary_drug(request, rxnorm_id):
         .order_by(plan_table.c.plan_id.asc(), plan_table.c.year.asc())
     )
 
-    result = await session.execute(stmt)
-    rows = result.all()
-    if not rows:
+    formulary_result = await session.execute(stmt)
+    formulary_rows = formulary_result.all()
+    if not formulary_rows:
         raise NotFound("Drug not present in any known formulary")
 
-    items = []
-    for row in rows:
-        mapping = row._mapping
-        items.append(
+    formulary_items = []
+    for formulary_row in formulary_rows:
+        mapping = formulary_row._mapping
+        formulary_items.append(
             {
                 "formulary_id": _encode_formulary_id(mapping["plan_id"], mapping["year"]),
                 "formulary_uri": _encode_formulary_path(mapping["plan_id"], mapping["year"]),
@@ -796,7 +807,7 @@ async def cross_formulary_drug(request, rxnorm_id):
             }
         )
 
-    return response.json({"rxnorm_id": rxnorm_id, "formularies": items})
+    return response.json({"rxnorm_id": rxnorm_id, "formularies": formulary_items})
 
 
 @blueprint.get("/statistics")
@@ -882,23 +893,25 @@ async def formulary_statistics(request):
     total_formulary_stmt = select(func.count()).select_from(distinct_formulary_stmt.subquery())
 
     top_issuers = []
-    for row in (await session.execute(top_issuers_stmt)).all():
+    for issuer_row in (await session.execute(top_issuers_stmt)).all():
         top_issuers.append(
             {
-                "issuer_id": row[0],
-                "issuer_name": row[1],
-                "drug_count": int(row[2] or 0),
+                "issuer_id": issuer_row[0],
+                "issuer_name": issuer_row[1],
+                "drug_count": int(issuer_row[2] or 0),
             }
         )
 
     tier_rows = (await session.execute(tier_stmt)).all()
-    tier_distribution = _build_tier_breakdown([(row[0], row[1]) for row in tier_rows])
+    tier_distribution = _build_tier_breakdown(
+        [(tier_row[0], tier_row[1]) for tier_row in tier_rows]
+    )
 
     total_drugs_result = await session.execute(total_drugs_stmt)
     totals_row = total_drugs_result.first()
     totals_map = getattr(totals_row, "_mapping", {}) if totals_row else {}
     total_drugs = int(totals_map.get("total_drugs") or 0)
-    authorization_distribution = {
+    authorization_counts_by_requirement = {
         "required": int(totals_map.get("auth_required") or 0),
         "not_required": int(totals_map.get("auth_not_required") or 0),
     }
@@ -912,7 +925,7 @@ async def formulary_statistics(request):
             "total_drugs": int(total_drugs),
             "top_issuers": top_issuers,
             "tier_distribution": tier_distribution,
-            "authorization_distribution": authorization_distribution,
+            "authorization_distribution": authorization_counts_by_requirement,
         }
     )
 
@@ -970,14 +983,14 @@ async def check_plan_drug(request, plan_id, rxnorm_id):
     drug_result = await session.execute(drug_stmt)
     drug_row = drug_result.first()
 
-    covered = drug_row is not None
-    details = None
-    if covered:
+    is_covered = drug_row is not None
+    coverage_details_by_field = None
+    if is_covered:
         mapping = drug_row._mapping
         last_updated = mapping["last_updated_on"]
         if last_updated is not None:
             last_updated = last_updated.isoformat()
-        details = {
+        coverage_details_by_field = {
             "drug_name": mapping["drug_name"],
             "drug_tier": mapping["drug_tier"],
             "drug_tier_slug": normalize_drug_tier_slug(mapping["drug_tier"]),
@@ -994,7 +1007,7 @@ async def check_plan_drug(request, plan_id, rxnorm_id):
             "plan_id": plan_id,
             "year": year,
             "rxnorm_id": rxnorm_id,
-            "covered": covered,
-            "details": details,
+            "covered": is_covered,
+            "details": coverage_details_by_field,
         }
     )

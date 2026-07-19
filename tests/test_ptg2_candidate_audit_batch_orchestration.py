@@ -201,16 +201,20 @@ async def test_candidate_price_data_hydrates_retained_prices_once(monkeypatch):
     monkeypatch.setattr(batch, "_candidate_forward_price_keys", forward_lookup)
     monkeypatch.setattr(batch, "_version_three_price_hydration", hydrate_prices)
 
-    price_data = await batch._load_candidate_price_data(
+    price_load = await batch._load_candidate_price_data(
         object(),
         _serving_tables(),
         (_challenge(),),
         {("CPT", "99213"): ({"code_key": 7},)},
+        {1234567890: (5,)},
         {7: (5,)},
     )
 
-    assert price_data.price_keys_by_occurrence == forward_index
-    assert price_data.atom_keys_by_price_key == {8: (9,)}
+    assert price_load.data.price_keys_by_occurrence == forward_index
+    assert price_load.data.atom_keys_by_price_key == {8: (9,)}
+    assert price_load.selection_io[
+        "discarded_forward_price_key_deliveries"
+    ] == 0
     hydrate_prices.assert_awaited_once_with(
         ANY,
         ANY,
@@ -248,7 +252,15 @@ async def test_candidate_audit_data_runs_each_bounded_index_once(monkeypatch):
     monkeypatch.setattr(batch, "snapshot_serving_tables", AsyncMock(return_value=_serving_tables()))
     monkeypatch.setattr(batch, "validate_candidate_source_scope", AsyncMock(return_value=witness_scope))
     monkeypatch.setattr(batch, "_candidate_scope_indexes", AsyncMock(return_value=scope_indexes))
-    monkeypatch.setattr(batch, "_load_candidate_price_data", AsyncMock(return_value=price_data))
+    price_load = batch._CandidatePriceLoad(
+        data=price_data,
+        selection_io={"exact_candidate_occurrence_coordinates": 1},
+    )
+    monkeypatch.setattr(
+        batch,
+        "_load_candidate_price_data",
+        AsyncMock(return_value=price_load),
+    )
     price_validator = Mock()
     monkeypatch.setattr(batch, "validate_persisted_audit_price_scope", price_validator)
     monkeypatch.setattr(
