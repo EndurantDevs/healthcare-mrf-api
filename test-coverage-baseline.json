@@ -156,8 +156,14 @@
         "process/ptg_parts/provider_location_evidence.py",
         "process/ptg_parts/provider_references.py",
         "process/ptg_parts/ptg2_artifact_blobs.py",
+        "process/ptg_parts/ptg2_batch_candidate_audit.py",
+        "process/ptg_parts/ptg2_batch_candidate_audit_report.py",
+        "process/ptg_parts/ptg2_batch_candidate_audit_report_schema.py",
+        "process/ptg_parts/ptg2_batch_candidate_audit_report_sections.py",
+        "process/ptg_parts/ptg2_batch_candidate_audit_report_validation.py",
         "process/ptg_parts/ptg2_candidate_attestation.py",
         "process/ptg_parts/ptg2_candidate_audit_batch_contract.py",
+        "process/ptg_parts/ptg2_candidate_audit_batch_response.py",
         "process/ptg_parts/ptg2_candidate_audit_contract.py",
         "process/ptg_parts/ptg2_candidate_audit_evidence.py",
         "process/ptg_parts/ptg2_fast_candidate_audit.py",
@@ -224,12 +230,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 17593,
-          "total": 29688
+          "covered": 17840,
+          "total": 29814
         },
         "lines": {
-          "covered": 63227,
-          "total": 85387
+          "covered": 64106,
+          "total": 86044
         }
       },
       "path": "test-coverage-python.json",
