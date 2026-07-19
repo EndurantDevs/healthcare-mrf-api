@@ -582,44 +582,54 @@ records the sample count, maximum, digest, method, format, and
 `source_multiset_v1` marker. Reused logical snapshots expose the same physical
 sample through their independent binding.
 
-This served sample is publication evidence and a one-row preflight for the
-release gate. A completed import is first stored as a `validated` candidate;
+This served sample is publication evidence. The V4 batch endpoint validates
+every persisted sample coordinate as part of the aggregate release gate. A
+completed import is first stored as a `validated` candidate;
 public pricing resolution remains `published`-only. The auditor may read
 exactly one candidate through the control-authenticated audit aliases only when
 snapshot, source, plan, and market selectors all match.
 
-The activation audit loads the sealed source-witness payload from PostgreSQL,
-checks all framing and manifest digests, reparses every selected raw token,
-validates up to 1,000 independently selected provider records, and then runs
-one exact standard pricing challenge for every selected occurrence witness. A
-dense import runs 10,000 pricing challenges plus one served-sample preflight:
-10,001 no-retry HTTP requests. Exact filters normally resolve in one page;
-pagination is bounded to eight pages and all retries and extra requests are
-counted rather than hidden.
+The activation audit sends one authenticated V4 POST containing only the
+candidate coordinates and sealed digests. The server derives the witness and
+persisted sample from PostgreSQL, checks all framing and manifest digests,
+reparses every selected raw token, validates up to 1,000 independently selected
+provider records, and evaluates every selected occurrence witness. A dense
+import still covers 10,000 pricing occurrences and the served sample. The
+worker performs exactly one authenticated V4 POST per executed audit attempt,
+with zero redirects and zero in-attempt retries.
 
-One `aiohttp.ClientSession` and connection pool serves 32 concurrent requests
-(hard maximum 64). Each request has a four-second timeout and one transient
-retry. The complete audit has a fail-closed 55-second deadline that cancels all
-unfinished requests. The candidate-audit ARQ worker and audit core both require
-`uvloop`; the canonical attestation accepts only runtime evidence declaring
-`aiohttp` on `uvloop`. A timeout, cancellation, source mismatch, API mismatch,
-or unsupported runtime leaves the prior snapshot active.
+The server returns once-only block, witness, and candidate-processing ledgers.
+They require each physical block read, decode, and preparation once; each
+logical payload process once; the witness payload read and decode once; and
+each unique evidence entry and candidate projection prepared once. Every
+repeated-work counter must be zero. Prepared values are request-local and are
+discarded after the response; the release path does not warm or depend on an
+application cache.
 
-Run the exact audit once for every pinned physical snapshot participating in a
-multi-network plan. Then run an additional unpinned plan-level probe that checks
-the merged response against the union of those audited snapshots and measures
-cold first-page p95. Multi-network reads use separate PostgreSQL sessions with
-bounded concurrency (`HLTHPRT_PTG2_MULTI_NETWORK_CONCURRENCY`, default 8); a
-failed network read fails the whole request rather than returning a partial
+One `aiohttp.ClientSession` performs the single POST with no redirect or retry.
+The complete audit has a fail-closed 55-second deadline. The candidate-audit
+ARQ worker requires `uvloop`; the canonical attestation accepts only runtime
+evidence declaring `aiohttp` on `uvloop`. A timeout, cancellation, source
+mismatch, API mismatch, or unsupported runtime leaves the prior snapshot
+active. Deterministic gate failures are not retried inside the audit attempt;
+transport failures fail the automatic job as non-retryable and require an
+explicit operator retry.
+
+After the V4 writer is enabled, the automatic release audit executes once for
+the candidate being activated.
+Merged-plan behavior and standard pricing latency remain separate diagnostic
+and capacity checks; they do not add hidden per-network or per-witness requests
+to the automated audit. Multi-network reads use separate PostgreSQL sessions
+with bounded concurrency (`HLTHPRT_PTG2_MULTI_NETWORK_CONCURRENCY`, default 8);
+a failed network read fails the whole request rather than returning a partial
 union.
 
 The exact tuple includes the source artifact's raw container SHA, so a correct
-price attributed to the wrong input file still fails. The bounded activation
-audit records request p50, p95, maximum, retries, and actual HTTP count, but it
-does not claim the separate cold-process 40 ms capacity gate. Audit-only
-requests have a 250 ms p95 operational budget because they are bounded release
-proofs, not public serving traffic. Run the 40 ms standard-API gate from fresh
-API processes with distinct keys under representative concurrent import and API
+price attributed to the wrong input file still fails. The V4 report records one
+endpoint duration, complete worker wall time, one actual HTTP request, zero
+redirects, and zero in-attempt retries. It does not claim the separate
+cold-process 40 ms capacity gate. Run the 40 ms standard-API gate from fresh API
+processes with distinct keys under representative concurrent import and API
 load; it does not imply database or operating-system cache eviction.
 
 Published strict-V3 requests do not inflate the full snapshot manifest on the
@@ -636,12 +646,12 @@ at or before that code falls back to the complete filtered code shard; larger
 provider scopes and descending requests also use that fallback. Provider
 expansion enriches only the requested NPI. Exact-NPI requests that also carry
 geographic or taxonomy filters retain the full address or taxonomy validation
-path. The internal candidate-audit route materializes only the challenged NPI
-and does not require provider-directory or address enrichment.
+path. The internal candidate-audit route materializes the set-based union of
+the sealed witness and sample coordinates and does not require
+provider-directory or address enrichment.
 
-Per-request audit latency starts after the request obtains its bounded
-concurrency slot, so p50/p95 describe HTTP and API execution rather than local
-semaphore wait. Complete audit wall time still includes queueing and is enforced
+The report separates server endpoint duration from complete worker wall time.
+Both belong to the same single request, and the complete audit remains bounded
 by the fail-closed deadline.
 
 An out-of-range nonzero integral value in an NPI array is never padded, coerced, or
@@ -662,7 +672,8 @@ marker. Zero mixed with another value or repeated zero values are rejected so
 an ambiguous provider identifier cannot silently become a TIN-only group.
 
 The audit endpoint recomputes the complete bounded sample digest from
-PostgreSQL before returning a page. A supplied logical `source_key` must match
+PostgreSQL before returning the aggregate response. A supplied logical
+`source_key` must match
 the pinned snapshot, so the audit cannot silently validate another logical
 owner that happens to share physical bytes.
 
@@ -711,11 +722,19 @@ layout key, logical source and plan scope, ordered raw-container digest set,
 provider-identifier quarantine, source-witness identity, and served-audit-sample
 identity. The result names the already-active snapshot and its existing
 attestation, while retaining the redundant candidate identity for lifecycle
-accounting; it does not issue another 2,000 HTTP challenges. Any difference,
+accounting; it does not issue another candidate-audit HTTP request. Any difference,
 missing attestation, or non-activated current snapshot fails closed.
 
 The bounded PostgreSQL witness audit is the sole automated release verifier.
-Activation never rereads or decompresses complete source files. The witness
+Deployment is reader-first and uses two releases. The first release deploys
+readers that accept V3 and V4 while the automatic worker continues writing V3.
+Only a follow-up release may switch the worker to one V4 report per candidate.
+Persistence is centrally limited to the current writer contract, so the control
+attestation endpoint rejects V4 during the reader-first release even though all
+new readers accept stored V4 evidence.
+An unactivated identity-equal V3 row may upgrade to V4, while V4-to-V3
+downgrade and every activated-row rewrite fail closed. Activation never
+rereads or decompresses complete source files. The witness
 contains authenticated raw source fragments captured at the actual V3 emission
 point, so source-to-API comparison remains independent of serving storage while
 its work stays fixed.
@@ -760,11 +779,12 @@ For 2,000 logical imports per 30-day month:
 - One build lane therefore has little burst, retry, and maintenance headroom
   near that bound even though its theoretical steady-state capacity is 2,880
   builds per 30-day month. Candidate audits use separately measured lanes and
-  availability. A full activation has 10,000 occurrence challenges plus one
-  preflight, or 20,002,000 calls at the monthly objective. That averages about
-  7.7 requests per second over a 30-day month, but the capacity gate must prove
-  burst concurrency rather than relying on the average. Measured retries and
-  bounded pagination must be added rather than projected away.
+  availability. A full activation evaluates up to 10,000 occurrence challenges
+  plus the served sample inside one V4 request, or 2,000 candidate-audit HTTP
+  requests at the monthly objective. Capacity evidence must still measure the
+  server-side block, witness, candidate, PostgreSQL, CPU, and memory work rather
+  than treating the lower HTTP count as free work. Transport failures and
+  explicit operator retries must be reported rather than projected away.
 - Physical reuse reduces build work only when the complete-set fingerprint
   matches. Capacity models must measure the reuse hit rate and keep an
   unreused scenario.
@@ -782,9 +802,10 @@ capacity.
 
 The contention run lasts at least 30 minutes with every configured build and
 audit lane active. It includes at least 3,000 requests and 1 request/second of
-normal API traffic plus observed candidate-audit request totals whose duration
-and derived rate reconcile with each audit's occurrence-witness count plus one
-preflight (normally 2,001 requests) and actual retry/page counts. It must use
+normal API traffic plus exactly one V4 POST for each executed candidate audit.
+Audit evidence separately reconciles the server-side occurrence, persisted
+sample, unique block, witness-entry, logical-payload, and candidate-projection
+counts, with zero repeated-work counters. It must use
 fresh API processes and separate error-free cold p95 measurements at or below
 40 ms for at least 100 distinct matched-positive, 250 distinct negative, and
 2,500 distinct deterministic-random requests. Every cold sample must fall
@@ -850,13 +871,13 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
 - The persisted audit sample exists, validates, and contains no more than 2,560
   rows.
 - The bounded candidate audit reparsed every sealed source witness, passed all
-  selected API challenges and its served-sample preflight, ran on
-  `aiohttp`/`uvloop`, completed within 55 seconds, and recorded its actual HTTP
-  and retry counts.
+  selected occurrence challenges and its served-sample validation, ran one V4
+  POST on `aiohttp`/`uvloop`, completed within 55 seconds, and recorded one
+  actual HTTP request, zero retries, and zero repeated-work ledger counters.
 - Cold first-page p95 is at or below 40 ms separately for matched-positive,
   negative, and deterministic-random requests.
-- Audit-only source-witness endpoints may use the separate 250 ms p95 ceiling.
-  That allowance does not relax the 40 ms cold ceiling for standard pricing
+- The one-request candidate audit completes within its 55-second deadline.
+  That deadline does not relax the 40 ms cold ceiling for standard pricing
   endpoints.
 - Price-key publication casts negotiated rates once into a temporary numeric
   work column during the lean atom rewrite, analyzes that physical table, and

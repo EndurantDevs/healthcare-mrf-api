@@ -22,6 +22,14 @@ from process.ptg_parts.ptg2_fast_candidate_audit import (
     FastCandidateAuditError,
     run_fast_candidate_audit,
 )
+from process.ptg_parts.ptg2_batch_candidate_audit import (
+    BatchCandidateAuditContractError,
+    BatchCandidateAuditTransportError,
+    run_batch_candidate_audit,
+)
+from process.ptg_parts.ptg2_batch_candidate_audit_report import (
+    BatchAuditReportTarget,
+)
 from process.ptg_parts.ptg2_candidate_attestation import (
     PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS,
     PTG2_TRUSTED_CLUSTER_HTTP_TRANSPORT,
@@ -29,6 +37,8 @@ from process.ptg_parts.ptg2_candidate_attestation import (
     record_candidate_audit_attestation,
 )
 from process.ptg_parts.ptg2_provider_quarantine import (
+    provider_identifier_quarantine_evidence,
+    validate_provider_identifier_quarantine_evidence,
     validate_provider_identifier_quarantine,
 )
 from process.ptg_parts.ptg2_source_witness import (
@@ -43,6 +53,7 @@ from scripts.validation import ptg2_v3_source_api_audit
 IMPORTER_NAME = "ptg-candidate-audit"
 ARCH_VERSION = "postgres_binary_v3"
 STORAGE_GENERATION = "shared_blocks_v3"
+PTG2_BATCH_AUDIT_WRITER_ENABLED = False
 API_BASE_URL_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL"
 AUTH_HEADER_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_AUTH_HEADER"
 AUTH_SCHEME_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_AUTH_SCHEME"
@@ -137,6 +148,13 @@ class CandidateAuditReleaseGateError(RuntimeError):
     """A deterministic release-audit mismatch that must not be retried."""
 
     control_error_code = "ptg_candidate_audit_release_gate_failed"
+    retryable = False
+
+
+class CandidateAuditTransportError(RuntimeError):
+    """A one-request transport failure that requires an explicit retry."""
+
+    control_error_code = "ptg_candidate_audit_transport_failed"
     retryable = False
 
 
@@ -489,7 +507,11 @@ async def load_candidate_audit_target(
     return candidate_target
 
 
-def _audit_configuration(snapshot_id: str) -> FastAuditHttpConfig:
+def _audit_configuration(
+    snapshot_id: str,
+    *,
+    batch_writer: bool = PTG2_BATCH_AUDIT_WRITER_ENABLED,
+) -> FastAuditHttpConfig:
     api_base_url = str(
         os.getenv(API_BASE_URL_ENV) or os.getenv("PTG_AUDIT_API_BASE_URL") or ""
     ).strip().rstrip("/")
@@ -530,42 +552,57 @@ def _audit_configuration(snapshot_id: str) -> FastAuditHttpConfig:
             auth_header: token_value,
             ptg2_v3_source_api_audit.CANDIDATE_AUDIT_HEADER: snapshot_id,
             "Accept": "application/json",
-            "User-Agent": "ptg2-v3-fast-candidate-audit/1.0",
+            "User-Agent": (
+                "ptg2-v3-batch-candidate-audit/4.0"
+                if batch_writer
+                else "ptg2-v3-fast-candidate-audit/1.0"
+            ),
         },
         verify_tls=should_verify_tls,
         transport_contract=transport_contract,
+        concurrency=1 if batch_writer else 32,
     )
 
 
-async def run_release_audit(
+def _fast_audit_target(
     candidate_target: CandidateAuditTarget,
-    witness: Any,
-) -> dict[str, Any]:
-    """Run the bounded PostgreSQL witness audit without opening source files."""
+) -> FastAuditTarget:
+    """Build the legacy writer target used during the reader-first phase."""
 
-    try:
-        audit_report = await run_fast_candidate_audit(
-            witness=witness,
-            audit_target=FastAuditTarget(
-                snapshot_id=candidate_target.snapshot_id,
-                source_key=candidate_target.source_key,
-                plan_id=candidate_target.plan_id,
-                plan_market_type=candidate_target.plan_market_type,
-                source_count=len(candidate_target.raw_container_sha256),
-                source_set_digest=source_set_digest(
-                    candidate_target.raw_container_sha256
-                ),
-                audit_sample=candidate_target.audit_sample,
-                provider_identifier_quarantine=(
-                    candidate_target.provider_identifier_quarantine
-                ),
-            ),
-            http=_audit_configuration(candidate_target.snapshot_id),
-        )
-    except FastCandidateAuditError as exc:
+    return FastAuditTarget(
+        snapshot_id=candidate_target.snapshot_id,
+        source_key=candidate_target.source_key,
+        plan_id=candidate_target.plan_id,
+        plan_market_type=candidate_target.plan_market_type,
+        source_count=len(candidate_target.raw_container_sha256),
+        source_set_digest=source_set_digest(
+            candidate_target.raw_container_sha256
+        ),
+        audit_sample=candidate_target.audit_sample,
+        provider_identifier_quarantine=(
+            candidate_target.provider_identifier_quarantine
+        ),
+    )
+
+
+def _require_passing_audit_report(audit_report: Mapping[str, Any]) -> None:
+    """Reject a report that did not pass its strict release profile."""
+
+    if (
+        audit_report.get("status") != "pass"
+        or audit_report.get("release_gate_eligible") is not True
+    ):
         raise CandidateAuditReleaseGateError(
-            f"candidate release audit failed: {exc.reason}"
-        ) from exc
+            "candidate release audit did not pass the release gate"
+        )
+
+
+def _require_v3_quarantine_match(
+    audit_report: Mapping[str, Any],
+    candidate_target: CandidateAuditTarget,
+) -> None:
+    """Bind a legacy full quarantine payload to the candidate."""
+
     report_source = _mapping(audit_report.get("source"))
     try:
         observed_quarantine = validate_provider_identifier_quarantine(
@@ -581,13 +618,102 @@ async def run_release_audit(
         raise CandidateAuditReleaseGateError(
             "candidate release audit provider identifier quarantine does not match publication"
         )
-    if (
-        audit_report.get("status") != "pass"
-        or audit_report.get("release_gate_eligible") is not True
-    ):
-        raise CandidateAuditReleaseGateError(
-            "candidate release audit did not pass the release gate"
+
+
+def _require_v4_quarantine_match(
+    audit_report: Mapping[str, Any],
+    candidate_target: CandidateAuditTarget,
+) -> None:
+    """Bind redacted quarantine evidence to the candidate."""
+
+    report_source = _mapping(audit_report.get("source"))
+    try:
+        observed_quarantine = validate_provider_identifier_quarantine_evidence(
+            report_source.get("provider_identifier_quarantine")
         )
+    except ValueError as exc:
+        raise CandidateAuditReleaseGateError(
+            "candidate release audit has invalid provider identifier quarantine evidence"
+        ) from exc
+    expected_quarantine = provider_identifier_quarantine_evidence(
+        candidate_target.provider_identifier_quarantine
+    )
+    if observed_quarantine != expected_quarantine:
+        raise CandidateAuditReleaseGateError(
+            "candidate release audit provider identifier quarantine does not match publication"
+        )
+
+
+async def run_release_audit(
+    candidate_target: CandidateAuditTarget,
+    witness: Any,
+    *,
+    http_config: FastAuditHttpConfig | None = None,
+) -> dict[str, Any]:
+    """Run the deployed V3 writer while V4-capable readers roll out."""
+
+    try:
+        audit_report = await run_fast_candidate_audit(
+            witness=witness,
+            audit_target=_fast_audit_target(candidate_target),
+            http=(
+                http_config
+                if http_config is not None
+                else _audit_configuration(
+                    candidate_target.snapshot_id,
+                    batch_writer=False,
+                )
+            ),
+        )
+    except FastCandidateAuditError as exc:
+        raise CandidateAuditReleaseGateError(
+            f"candidate release audit failed: {exc.reason}"
+        ) from exc
+    _require_v3_quarantine_match(audit_report, candidate_target)
+    _require_passing_audit_report(audit_report)
+    return audit_report
+
+
+async def run_batch_release_audit(
+    candidate_target: CandidateAuditTarget,
+    *,
+    http_config: FastAuditHttpConfig | None = None,
+) -> dict[str, Any]:
+    """Run one server-derived batch audit without decoding witnesses locally."""
+
+    try:
+        audit_report = await run_batch_candidate_audit(
+            audit_target=BatchAuditReportTarget(
+                snapshot_id=candidate_target.snapshot_id,
+                source_key=candidate_target.source_key,
+                plan_id=candidate_target.plan_id,
+                plan_market_type=candidate_target.plan_market_type,
+                raw_container_sha256=candidate_target.raw_container_sha256,
+                source_witness=candidate_target.source_witness,
+                audit_sample=candidate_target.audit_sample,
+                provider_identifier_quarantine=(
+                    candidate_target.provider_identifier_quarantine
+                ),
+            ),
+            http_config=(
+                http_config
+                if http_config is not None
+                else _audit_configuration(
+                    candidate_target.snapshot_id,
+                    batch_writer=True,
+                )
+            ),
+        )
+    except BatchCandidateAuditContractError as exc:
+        raise CandidateAuditReleaseGateError(
+            f"candidate release audit failed: {exc.reason}"
+        ) from exc
+    except BatchCandidateAuditTransportError as exc:
+        raise CandidateAuditTransportError(
+            f"candidate release audit transport failed: {exc.reason}"
+        ) from exc
+    _require_v4_quarantine_match(audit_report, candidate_target)
+    _require_passing_audit_report(audit_report)
     return audit_report
 
 
@@ -610,9 +736,21 @@ def _audit_summary(report: Mapping[str, Any], report_digest: str) -> dict[str, A
             "api_challenges_executed",
             "provider_witnesses_validated",
             "api_audit_occurrences_validated",
+            "source_occurrence_witnesses_matched",
+            "unique_source_conditions_executed",
+            "persisted_audit_occurrences_validated",
+            "batch_requests_executed",
         ),
     )
-    counts.update(_integer_metrics(http, ("standard_api_actual_http_requests",)))
+    counts.update(
+        _integer_metrics(
+            http,
+            (
+                "standard_api_actual_http_requests",
+                "batch_api_actual_http_requests",
+            ),
+        )
+    )
     audit_timings_by_metric: dict[str, Any] = {}
     duration = report.get("duration_seconds")
     if isinstance(duration, (int, float)) and not isinstance(duration, bool):
@@ -628,6 +766,14 @@ def _audit_summary(report: Mapping[str, Any], report_digest: str) -> dict[str, A
             p95_milliseconds, bool
         ):
             audit_timings_by_metric[output_key] = float(p95_milliseconds)
+    batch = _mapping(report.get("batch"))
+    endpoint_duration_ms = batch.get("endpoint_duration_ms")
+    if isinstance(endpoint_duration_ms, (int, float)) and not isinstance(
+        endpoint_duration_ms, bool
+    ):
+        audit_timings_by_metric["endpoint_duration_ms"] = float(
+            endpoint_duration_ms
+        )
     return {
         "audit_report_digest": report_digest,
         "audit_counts": counts,
@@ -733,12 +879,30 @@ async def candidate_audit_guard(candidate_run_id: str) -> AsyncIterator[None]:
                 )
 
 
-async def _audit_and_activate(
+async def _execute_release_audit(
     candidate_target: CandidateAuditTarget,
     *,
     control_run_id: str | None,
+    http_config: FastAuditHttpConfig | None,
 ) -> dict[str, Any]:
-    """Audit sealed source witnesses, attest the report, and promote."""
+    """Run the configured writer after its compatible readers are deployed."""
+
+    if PTG2_BATCH_AUDIT_WRITER_ENABLED:
+        await _progress(
+            control_run_id,
+            snapshot_id=candidate_target.snapshot_id,
+            phase="candidate release audit",
+            message=(
+                "submitting one authenticated server-derived batch request for "
+                f"{int(candidate_target.source_witness['occurrence_witness_count']):,} "
+                "sealed source occurrences"
+            ),
+            pct=20,
+        )
+        return await run_batch_release_audit(
+            candidate_target,
+            http_config=http_config,
+        )
 
     await _progress(
         control_run_id,
@@ -763,7 +927,26 @@ async def _audit_and_activate(
         ),
         pct=35,
     )
-    report = await run_release_audit(candidate_target, witness)
+    return await run_release_audit(
+        candidate_target,
+        witness,
+        http_config=http_config,
+    )
+
+
+async def _audit_and_activate(
+    candidate_target: CandidateAuditTarget,
+    *,
+    control_run_id: str | None,
+    http_config: FastAuditHttpConfig | None = None,
+) -> dict[str, Any]:
+    """Audit sealed source witnesses, attest the report, and promote."""
+
+    report = await _execute_release_audit(
+        candidate_target,
+        control_run_id=control_run_id,
+        http_config=http_config,
+    )
     await _progress(
         control_run_id,
         snapshot_id=candidate_target.snapshot_id,
@@ -850,10 +1033,14 @@ async def main(
                 idempotent=True,
             )
 
-        _audit_configuration(candidate_target.snapshot_id)
+        http_config = _audit_configuration(
+            candidate_target.snapshot_id,
+            batch_writer=PTG2_BATCH_AUDIT_WRITER_ENABLED,
+        )
         return await _audit_and_activate(
             candidate_target,
             control_run_id=run_id,
+            http_config=http_config,
         )
 
 
@@ -861,8 +1048,10 @@ __all__ = [
     "ARCH_VERSION",
     "CandidateAuditTarget",
     "IMPORTER_NAME",
+    "PTG2_BATCH_AUDIT_WRITER_ENABLED",
     "candidate_audit_guard",
     "load_candidate_audit_target",
     "main",
+    "run_batch_release_audit",
     "run_release_audit",
 ]

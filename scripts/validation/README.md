@@ -48,11 +48,12 @@ headers are never emitted to the report.
 
 This full-source harness is a qualification and forensic gate after scanner,
 publisher, or serving changes. It is deliberately slower and is not the
-synchronous activation gate for every import. Automatic activation uses the
-bounded PostgreSQL source-witness audit documented in
-`docs/imports/ptg.md`; that path performs up to 10,000 exact pricing
-challenges, independently validates up to 1,000 provider records, adds one
-served-sample preflight, and completes or fails within 55 seconds.
+synchronous activation gate for every import. After V4-capable readers are
+fully deployed, automatic activation uses the bounded PostgreSQL source-witness
+audit documented in `docs/imports/ptg.md`; that path submits one authenticated
+V4 POST, derives up
+to 10,000 exact pricing challenges and 1,000 provider records server-side,
+validates the complete served sample, and completes or fails within 55 seconds.
 
 To exercise this deep audit against a still-`validated` candidate, provide its
 exact logical source and market selectors and use `--validated-candidate`:
@@ -77,10 +78,11 @@ Candidate mode forces the control-authenticated
 `/api/v1/pricing/providers/audit-search-by-procedure` path. Supplying the same
 header to a public pricing route does not grant candidate access. The deep
 audit report is evidence but is not accepted by the automatic activation
-attestation. The generic `ptg-candidate-audit` worker loads the import-time
-source witness from PostgreSQL, runs the bounded `aiohttp` client on enforced
-`uvloop`, stores its canonical redacted report, and atomically promotes the
-exact predecessor. No report path, retained source path, or local cache file is
+attestation. In V4 mode, the generic `ptg-candidate-audit` worker submits sealed
+candidate coordinates and digests; the authenticated API endpoint loads and
+derives the import-time PostgreSQL witness, returns the bounded aggregate
+result, and the worker stores its canonical redacted report before atomically
+promoting the exact predecessor. No report path, retained source path, or local cache file is
 accepted by promotion. The contract does not depend on a particular
 orchestration product.
 
@@ -331,12 +333,12 @@ The release profile requires all of the following:
 - Candidate audits have at least 30 successful samples and zero errors. Their
   lane count and availability are independent from build lanes, monthly and
   peak utilization must stay at or below 70 percent, maximum queue age is 30
-  minutes, and every full activation is charged its observed
-  occurrence-witness count plus one preflight. The normal dense baseline is
-  10,001 requests. Observed request totals, duration, and derived request rate
-  must reconcile with each
-  activation and the contention interval. At the release objective the
-  normal no-retry baseline is 20,002,000 audit HTTP requests per month.
+  minutes, and every executed audit attempt is charged exactly one
+  authenticated V4 POST. Observed request totals, duration, and derived request
+  rate must reconcile with each activation and the contention interval. At the
+  release objective the no-retry baseline is 2,000 audit HTTP requests per
+  month; server-side occurrence, sample, block, witness, and projection work is
+  measured separately and is not projected away.
 - Peak evidence is a gap-free, fully covered sequence of individually
   timestamped windows spanning at least seven days; every window is at least 30
   minutes. Each window's logical, unique-build, reuse, audit, and queue counts
@@ -349,10 +351,10 @@ The release profile requires all of the following:
   candidate-audit work must fit their queue SLOs.
 - Simultaneous import, candidate-audit, and normal API contention lasts at
   least 30 minutes. It covers every configured import and audit lane, at least
-  3,000 API requests, at least 1 request/second, and enough audit request rate
-  to deliver each audit's occurrence-witness count plus one preflight within
-  its measured duration (normally 10,001 calls), plus observed retries and
-  bounded pagination.
+  3,000 API requests, at least 1 request/second, and one candidate-audit V4 POST
+  per executed audit attempt within its measured duration. The evidence also
+  reconciles server-side challenge and once-only processing ledgers, plus any
+  explicit operator retries.
   Redacted timestamps must cover at least 99 percent of the contention interval
   with no import, audit, or HTTP observation gap greater than five seconds.
 - Fresh processes produce separate cold first-page p95 values at or below 40

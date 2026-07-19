@@ -35,7 +35,7 @@ from process.ptg_parts.ptg2_manifest_publish import (
     _ptg2_manifest_support_stage_table,
 )
 from process.ptg_parts.ptg2_candidate_attestation import (
-    PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+    PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
 )
 from process.ptg_parts.ptg2_shared_blocks import (
     bind_snapshot_to_shared_layout,
@@ -1020,7 +1020,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             audit_sample_digest=bytes.fromhex(
                 publication.serving_index["audit_sample"]["sample_digest"]
             ),
-            contract=PTG2_CANDIDATE_ATTESTATION_CONTRACT,
+            contract=PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
             report_digest=b"\x11" * 32,
         )
 

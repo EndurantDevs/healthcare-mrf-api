@@ -196,7 +196,7 @@ def _read_unleased_since_locked(
     return parsed
 
 
-def _mark_unleased_locked(
+def _is_newly_marked_unleased_locked(
     store: PTG2ArtifactStore,
     relative_path: str,
     *,
@@ -210,6 +210,9 @@ def _mark_unleased_locked(
         return False
     _atomic_write_json(marker_path, _unleased_payload(relative_path, now))
     return True
+
+
+_mark_unleased_locked = _is_newly_marked_unleased_locked
 
 
 def _clear_unleased_locked(store: PTG2ArtifactStore, relative_path: str) -> None:
@@ -375,10 +378,12 @@ class PTG2ArtifactLease:
             _atomic_write_json(self.marker_path, payload)
 
     @property
-    def released(self) -> bool:
+    def is_released(self) -> bool:
         """Return whether this lease has been released locally."""
 
         return self._released
+
+    released = is_released
 
     def release(self) -> None:
         """Stop renewal, remove the marker, and mark unprotected artifacts unleased."""
@@ -441,7 +446,7 @@ def artifact_lease_context(
         lease.release()
 
 
-def release_current_artifact_lease() -> bool:
+def has_released_current_artifact_lease() -> bool:
     """Release the registered current lease and report whether one was found."""
 
     lease_id = current_artifact_lease_id()
@@ -453,6 +458,9 @@ def release_current_artifact_lease() -> bool:
         return False
     lease.release()
     return True
+
+
+release_current_artifact_lease = has_released_current_artifact_lease
 
 
 async def guard_artifact_lease(
@@ -539,7 +547,10 @@ def _updated_lease_payload_locked(
     return marker_path, payload
 
 
-def protect_existing_artifact(store: PTG2ArtifactStore, path: str | Path) -> bool:
+def has_protected_existing_artifact(
+    store: PTG2ArtifactStore,
+    path: str | Path,
+) -> bool:
     """Atomically add an existing file to the current import reference set."""
 
     artifact_path = Path(path)
@@ -558,6 +569,9 @@ def protect_existing_artifact(store: PTG2ArtifactStore, path: str | Path) -> boo
             _atomic_write_json(marker_path, payload)
             _clear_unleased_locked(store, relative_path)
     return True
+
+
+protect_existing_artifact = has_protected_existing_artifact
 
 
 def protect_artifact_path(store: PTG2ArtifactStore, path: str | Path) -> None:
@@ -946,7 +960,7 @@ def _manifest_record_key(payload: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
-def _record_points_to_missing_managed_file(
+def _is_record_pointing_to_missing_file(
     store: PTG2ArtifactStore,
     payload: dict[str, Any],
 ) -> bool:
@@ -963,6 +977,9 @@ def _record_points_to_missing_managed_file(
     except (OSError, ValueError):
         return False
     return not path.exists()
+
+
+_record_points_to_missing_managed_file = _is_record_pointing_to_missing_file
 
 
 def _validate_manifest_locked(store: PTG2ArtifactStore) -> int:
@@ -1252,7 +1269,33 @@ def _optional_nonnegative(value: int) -> int | None:
     return None if value < 0 else value
 
 
-def main() -> None:
+def _print_retention_summary(
+    retention_summary: PTG2InputArtifactGCResult,
+) -> None:
+    """Print stable key-value metrics for one garbage-collection cycle."""
+
+    print(f"artifact_root={retention_summary.root}")
+    print(f"cleanup_executed={str(retention_summary.executed).lower()}")
+    print(f"active_leases={len(retention_summary.active_lease_ids)}")
+    print(f"stale_leases={len(retention_summary.stale_lease_files)}")
+    print(f"protected_files={len(retention_summary.protected_files)}")
+    print(f"newly_unleased_files={len(retention_summary.newly_unleased_files)}")
+    print(f"eligible_files={len(retention_summary.eligible_files)}")
+    print(f"selected_files={len(retention_summary.selected_files)}")
+    print(f"selected_bytes={retention_summary.selected_bytes}")
+    print(f"deleted_files={len(retention_summary.deleted_files)}")
+    print(f"deleted_bytes={retention_summary.deleted_bytes}")
+    print(f"total_bytes_before={retention_summary.total_bytes_before}")
+    print(f"total_bytes_after={retention_summary.total_bytes_after}")
+    print(f"over_target_bytes={retention_summary.over_target_bytes}")
+    print(
+        f"manifest_entries_before={retention_summary.manifest_entries_before}"
+    )
+    print(f"manifest_entries_after={retention_summary.manifest_entries_after}")
+    print(f"manifest_invalid_lines={retention_summary.manifest_invalid_lines}")
+
+
+def _run_cli() -> None:
     """Run retained-input garbage collection and print cycle statistics."""
 
     parser = argparse.ArgumentParser(
@@ -1292,7 +1335,7 @@ def main() -> None:
         help="Per-cycle deletion bound; use -1 for no file bound.",
     )
     args = parser.parse_args()
-    result = collect_ptg2_input_artifacts(
+    retention_summary = collect_ptg2_input_artifacts(
         root=args.root,
         execute=args.execute,
         retention_hours=args.retention_hours,
@@ -1301,24 +1344,11 @@ def main() -> None:
         max_delete_bytes=_optional_nonnegative(args.max_delete_bytes),
         max_delete_files=_optional_nonnegative(args.max_delete_files),
     )
-    print(f"artifact_root={result.root}")
-    print(f"cleanup_executed={str(result.executed).lower()}")
-    print(f"active_leases={len(result.active_lease_ids)}")
-    print(f"stale_leases={len(result.stale_lease_files)}")
-    print(f"protected_files={len(result.protected_files)}")
-    print(f"newly_unleased_files={len(result.newly_unleased_files)}")
-    print(f"eligible_files={len(result.eligible_files)}")
-    print(f"selected_files={len(result.selected_files)}")
-    print(f"selected_bytes={result.selected_bytes}")
-    print(f"deleted_files={len(result.deleted_files)}")
-    print(f"deleted_bytes={result.deleted_bytes}")
-    print(f"total_bytes_before={result.total_bytes_before}")
-    print(f"total_bytes_after={result.total_bytes_after}")
-    print(f"over_target_bytes={result.over_target_bytes}")
-    print(f"manifest_entries_before={result.manifest_entries_before}")
-    print(f"manifest_entries_after={result.manifest_entries_after}")
-    print(f"manifest_invalid_lines={result.manifest_invalid_lines}")
+    _print_retention_summary(retention_summary)
+
+
+main = _run_cli
 
 
 if __name__ == "__main__":
-    main()
+    _run_cli()

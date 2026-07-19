@@ -6,6 +6,7 @@ import sys
 import types
 from pathlib import Path
 
+import process.ptg_parts.address_assurance as address_assurance
 from process.ptg_parts.address_assurance import (
     build_price_address_assurance_report,
     source_file_version_ids_from_ptg_payload,
@@ -1907,3 +1908,187 @@ def test_price_address_assurance_cli_fetches_api_url(monkeypatch):
         "accept": "application/json",
         "timeout": 2.5,
     }
+
+
+def test_price_address_assurance_handles_all_supported_payload_shapes():
+    assert summarize_ptg_price_address_payload(
+        {"items": [{}, "ignored"]}
+    )["item_count"] == 1
+    assert summarize_ptg_price_address_payload([{}, "ignored"])["item_count"] == 1
+    assert summarize_ptg_price_address_payload("invalid")["item_count"] == 0
+    assert summarize_ptg_price_address_payload({})["item_count"] == 0
+
+
+def test_price_address_assurance_rejects_remaining_contract_edges():
+    invalid_contract_by_field = {
+        "address": {"first_line": "1 Main St"},
+        "address_verification": {
+            "rate_network_binding": "invalid-rate",
+            "address_network_binding": "invalid-address",
+            "address_evidence_level": "invalid-evidence",
+            "requires_location_confirmation": "yes",
+            "displayed_address_present": True,
+            "network_bound_address": "false",
+        },
+    }
+    invalid_no_address_by_field = {
+        "address_verification": {
+            "rate_network_binding": "tic_provider_group_npi_tin",
+            "address_network_binding": "payer_confirmed_location",
+            "address_evidence_level": "nppes_provider_address",
+            "requires_location_confirmation": None,
+            "displayed_address_present": False,
+            "network_bound_address": False,
+        },
+    }
+    invalid_directory_confirmation_by_field = {
+        "address": {"first_line": "1 Main St"},
+        "address_verification": {
+            "rate_network_binding": "tic_provider_group_npi_tin",
+            "address_network_binding": "payer_directory_corroborated_location",
+            "address_evidence_level": "payer_directory_network_location",
+            "requires_location_confirmation": True,
+            "displayed_address_present": True,
+            "network_bound_address": True,
+            "provider_directory_plan_context_matched": True,
+        },
+    }
+    summary = summarize_ptg_price_address_payload(
+        [
+            invalid_contract_by_field,
+            invalid_no_address_by_field,
+            invalid_directory_confirmation_by_field,
+        ],
+        require_displayed_address=False,
+    )
+    messages = {issue["message"] for issue in summary["issues"]}
+    assert {
+        "invalid rate_network_binding='invalid-rate'",
+        "invalid address_network_binding='invalid-address'",
+        "invalid address_evidence_level='invalid-evidence'",
+        "requires_location_confirmation must be boolean",
+        "network_bound_address must be boolean",
+        (
+            "no-address pricing rows must keep "
+            "address_network_binding='inferred_from_provider_identity'"
+        ),
+        "no-address pricing rows must use address_evidence_level='unknown'",
+        "no-address pricing rows must require location confirmation",
+        "payer-confirmed address must use payer_confirmed_location evidence",
+        "payer-confirmed address must not require location confirmation",
+        "payer-directory context match must not require location confirmation",
+    }.issubset(messages)
+
+
+def test_price_address_assurance_rejects_non_mapping_network_match_evidence():
+    price_payload_by_field = {
+        "network_names": ["C2"],
+        "address": {"first_line": "1 Main St"},
+        "address_verification": {
+            "rate_network_binding": "tic_provider_group_npi_tin",
+            "address_network_binding": "payer_directory_corroborated_location",
+            "address_evidence_level": "payer_directory_network_location",
+            "requires_location_confirmation": False,
+            "displayed_address_present": True,
+            "network_bound_address": True,
+            "provider_directory_plan_context_matched": False,
+            "provider_directory_network_name_matched": True,
+            "provider_directory_network_matches": "invalid",
+            "address_verification_evidence": {
+                "matched_on": "npi_address_network_name",
+                "network_name_matches": [None],
+            },
+        },
+    }
+    summary = summarize_ptg_price_address_payload([price_payload_by_field])
+    messages = {issue["message"] for issue in summary["issues"]}
+    assert "provider_directory_network_matches must be a list when present" in messages
+    assert (
+        "address_verification_evidence.network_name_matches entries must "
+        "include ptg_network_name and provider_directory_network_name"
+    ) in messages
+    assert (
+        "payer-directory context match must expose plan context or "
+        "network-name proof"
+    ) in messages
+
+
+def test_price_address_assurance_accepts_multiple_fully_keyed_network_matches():
+    network_match_by_field = {
+        "ptg_network_name": "C2",
+        "provider_directory_network_name": "C2",
+        "provider_directory_network_match_key": "c2",
+        "provider_directory_network_key": "c2",
+        "provider_directory_issuer_key": "aetna",
+        "provider_directory_issuer_network_match_key": "aetna:c2",
+    }
+    price_payload_by_field = {
+        "network_names": ["C2"],
+        "address": {"first_line": "1 Main St"},
+        "address_verification": {
+            "rate_network_binding": "tic_provider_group_npi_tin",
+            "address_network_binding": "payer_directory_corroborated_location",
+            "address_evidence_level": "payer_directory_network_location",
+            "requires_location_confirmation": False,
+            "displayed_address_present": True,
+            "network_bound_address": True,
+            "provider_directory_plan_context_matched": False,
+            "provider_directory_network_name_matched": True,
+            "provider_directory_network_matches": [
+                network_match_by_field,
+                dict(network_match_by_field),
+            ],
+            "address_verification_evidence": {
+                "matched_on": "npi_address_network_name",
+            },
+        },
+    }
+    summary = summarize_ptg_price_address_payload([price_payload_by_field])
+    assert summary["ok"] is True
+    assert summary["issues"] == []
+
+
+def test_price_address_assurance_raw_linkage_handles_unverifiable_items(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        address_assurance,
+        "audit_tic_provider_location_evidence",
+        lambda *_args, **_kwargs: {
+            "direct_location_fields_present": False,
+            "direct_displayable_location_fields_present": False,
+        },
+    )
+    payer_confirmed_without_trace_by_field = {
+        "address": {"first_line": "1 Main St"},
+        "address_verification": {
+            "rate_network_binding": "tic_provider_group_npi_tin",
+            "address_network_binding": "payer_confirmed_location",
+            "address_evidence_level": "payer_confirmed_location",
+            "requires_location_confirmation": False,
+            "displayed_address_present": True,
+            "network_bound_address": True,
+            "location_source": "payer_provider_group_location",
+            "address_verification_evidence": {
+                "source": "payer_provider_group_location",
+                "provider_group_id": 42,
+            },
+        },
+    }
+    report = build_price_address_assurance_report(
+        api_payload={
+            "items": [
+                {"address_verification": None},
+                payer_confirmed_without_trace_by_field,
+            ]
+        },
+        raw_artifact_paths=[Path("rates.json")],
+    )
+    assert {
+        "severity": "error",
+        "item_index": 1,
+        "message": (
+            "payer-confirmed address must include source_file_version_id "
+            "in source_trace for raw TiC verification"
+        ),
+    } in report["issues"]

@@ -151,9 +151,9 @@ total is not yet known; a false `total_is_exact` marks `total` and
 | Source and dictionary completeness | Implemented in repository | Per-source run and dictionary contracts bind exact file descriptors to canonical physical identities; Python/Rust parity and coherent-omission tests fail closed. |
 | Exact multiplicity | Implemented in repository | Duplicate source candidates and duplicate atom ordinals survive publication and audit. |
 | Persisted audit sample | Implemented in repository | Publish-time sample metadata, digest, row bound, and API readback tests. |
-| Bounded candidate release audit | Implemented in repository | Import-time exact source witnesses are sealed in PostgreSQL; activation reparses independent cohorts of up to 10,000 pricing occurrences and 1,000 provider records, then runs 10,001 normal no-retry HTTP requests including one served-sample preflight within a 55-second deadline. |
-| Candidate attestation and atomic activation | Implemented in repository | Fresh report and sealed-sample binding, immutable validated row, exact predecessor CAS, wall-clock expiry, single-use receipt, and transaction rollback tests. |
-| Automatic candidate audit orchestration | Implemented in repository | The generic `ptg-candidate-audit` job resolves one validated candidate, loads and verifies its sealed PostgreSQL witness, runs the bounded `aiohttp`/`uvloop` audit, records the attestation, and atomically promotes the exact predecessor. |
+| Bounded candidate release audit | Implemented in repository | Import-time exact source witnesses are sealed in PostgreSQL; one authenticated V4 POST derives and reparses independent cohorts of up to 10,000 pricing occurrences and 1,000 provider records plus the served sample within a 55-second deadline. The response proves zero repeated block, witness, and candidate work. |
+| Candidate attestation and atomic activation | Implemented in repository | Fresh report and sealed-sample binding, immutable validated row, exact predecessor CAS, wall-clock expiry, single-use receipt, V3-reader/V4-writer rolling compatibility, downgrade rejection, and transaction rollback tests. |
+| Automatic candidate audit orchestration | Reader-first deployment in progress | V3 remains the current automatic `ptg-candidate-audit` writer while readers that accept V3 and V4 deploy. The follow-up writer release will submit exactly one non-auto-retrying `aiohttp` V4 request on `uvloop`, validate the redacted report, record the attestation, and atomically promote the exact predecessor. Request-local preparation is discarded and no application cache is warmed. |
 | Class-specific cold first-page p95 <= 40 ms | Pending release measurement | Fresh API processes, distinct keys, and complete first-page observations measured separately for matched-positive, negative, and deterministic-random requests. |
 | Unique large import in 10-15 minutes | Pending dev measurement | Complete fresh build, logged PostgreSQL publication, audit, seal, and resource report. |
 | 2,000 imports/month | Authenticated schema-v7 gate implemented; measurement pending | `ptg2_v3_capacity_gate.py` requires a fresh Ed25519 collector receipt, committed per-import end-to-end timings, 30 qualifying large builds and reuse samples, reconciled retry and audit HTTP cost, signed raw import and audit arrivals behind gap-free seven-day peaks, independently server-signed fully contended cold API samples, zero errors, and raw contention-bound resource telemetry. |
@@ -173,9 +173,11 @@ python -m pytest -q \
   tests/test_ptg2_shared_audit.py \
   tests/test_ptg2_source_witness.py \
   tests/test_ptg2_fast_candidate_audit.py \
+  tests/test_ptg2_batch_candidate_audit.py \
   tests/test_ptg_candidate_audit_importer.py \
   tests/test_ptg2_shared_gc.py \
   tests/test_ptg2_candidate_attestation.py \
+  tests/test_ptg2_attestation_contract_compat_postgres.py \
   tests/test_ptg2_strict_v3_snapshot_validation.py \
   tests/test_ptg2_v3_source_api_audit.py \
   tests/test_ptg2_v3_source_api_audit_capacity.py \
@@ -188,9 +190,13 @@ test database before release. A skipped database case is not evidence that the
 database behavior passed.
 
 The bounded PostgreSQL witness audit is the sole automated release verifier.
-Activation never rereads or decompresses complete source files. Stored witnesses preserve
-authenticated raw source fragments captured at V3 emission, which keeps the
-comparison independent of serving storage without adding a second scan.
+Deployment is reader-first: deploy readers that accept V3 and V4 attestations
+before switching the audit worker to the V4 writer. An identity-equal,
+unactivated V3 attestation may upgrade to V4; a V4-to-V3 downgrade or any
+activated-row rewrite fails closed. Activation never rereads or decompresses
+complete source files. Stored witnesses preserve authenticated raw source
+fragments captured at V3 emission, which keeps the comparison independent of
+serving storage without adding a second scan.
 
 ## Candidate Activation Correctness
 
@@ -206,11 +212,11 @@ The bounded activation gate requires all of these floors:
 | Deterministic source witnesses | 10,000 occurrences plus 1,000 providers for a large combined population |
 | Queryable occurrence witnesses | independently selected; at most 10,000 |
 | Provider-reference witnesses | independently selected; at most 1,000 |
-| Persisted served-sample preflight | exactly 1 |
-| Standard-API challenges | one per selected rate witness |
-| No-retry HTTP baseline | selected rate witnesses plus 1 preflight |
+| Persisted served-sample validation | every sealed sample coordinate, inside the batch |
+| Source occurrence challenges | every selected witness, evaluated server-side |
+| Automated audit HTTP requests | exactly 1 authenticated V4 POST |
 | Complete audit wall time | at most 55 seconds |
-| Per-request timeout | at most 4 seconds, one transient retry |
+| Redirects and in-attempt retries | exactly 0 |
 | Async runtime | `aiohttp` on `uvloop` |
 | Resolved-rate fraction | exactly 1.0 |
 | Unresolved provider references | 0 |
@@ -229,16 +235,17 @@ repeated linked-provider JSON into one compressed, SHA-256-keyed dictionary.
 Records retain the linked digest, and decoding rejects missing, corrupt,
 duplicate, out-of-order, or unused dictionary entries. This removes repeated
 audit evidence without weakening exact source-token verification. Activation
-never rereads or decompresses a source file. It verifies one persisted served
-occurrence as a source-set and sample-digest preflight, then challenges the
-standard pricing API with each source witness.
+never rereads or decompresses a source file. The V4 endpoint validates the
+complete persisted sample and grouped source conditions in one repeatable-read
+request. It reads, decodes, and prepares each unique physical block once;
+processes each logical payload once; and prepares each evidence entry and
+candidate projection once. Alias reuse is request-local, every repeated-work
+counter must be zero, and the request-local state is discarded with the
+response rather than warming an application cache.
 
-Audit-only endpoints have a 250 ms p95 ceiling because they perform bounded
-evidence decoding and integrity checks. Standard cold pricing endpoints retain
-their independent 40 ms p95 ceiling. Candidate requests project only the
-strict `serving_index` from the snapshot manifest; activation compares the
-unrounded nearest-rank audit p95 to the 250 ms ceiling and rejects an
-over-budget or internally inconsistent report.
+The candidate audit retains its independent 55-second whole-request deadline.
+Standard cold pricing endpoints retain their independent 40 ms p95 ceiling;
+the batch-audit deadline does not relax that serving gate.
 
 TIN-only provider groups use only the schema-defined singleton `[0]` marker and
 never create a fake NPI. Zero mixed with another value or repeated zero values
@@ -258,8 +265,9 @@ is also present.
 The physical layout itself stores a deterministic, stratified publication
 sample of at most 2,560 occurrences. It is generated before sealing and includes
 source-candidate and atom ordinals, so `source_multiset_v1` and `multiset_v1`
-multiplicity can be checked. This sample supports the one-row served preflight
-but does not replace the exact source-witness challenges.
+multiplicity can be checked. V4 validates the complete persisted sample inside
+the same aggregate request; it does not replace the exact source-witness
+challenges.
 
 ## Latency Measurement
 
@@ -294,10 +302,9 @@ Convert to stable 128-bit IDs only where the response contract requires them;
 retain the broader traversal only when geographic or taxonomy validation is
 also requested.
 
-Bounded candidate-audit request latency is measured after semaphore admission;
-the complete audit wall clock separately includes concurrency wait and remains
-subject to the hard deadline. This prevents local queue delay from being
-misreported as database/API execution while preserving an end-to-end timeout.
+The batch report records the server endpoint duration and complete worker wall
+time separately. Both measurements belong to the same single POST, while queue
+age remains an orchestration metric outside that audit attempt.
 
 For plans backed by multiple published network snapshots, measure both every
 pinned snapshot and the unpinned merged-plan API. The merged path reads
@@ -328,8 +335,9 @@ A qualifying dev measurement must:
 6. Persist and validate the publish-time audit sample.
 7. Run the bounded candidate audit over independently selected source cohorts
    of 10,000 occurrences and 1,000 provider witnesses for a large population,
-   plus one served-sample preflight. Require `aiohttp` on `uvloop`, a 55-second
-   hard deadline, and a reconciled 10,001-request normal no-retry baseline.
+   plus the served sample. Require exactly one authenticated no-retry V4 POST
+   using `aiohttp` on `uvloop`, a 55-second hard deadline, and zero repeated
+   block, witness, and candidate-processing ledger counters.
 8. Collect at least 30 successful candidate audits with zero errors. Record
    audit lane count and availability, duration, queue age, actual HTTP and retry
    counts per activation, attestation, and exact-predecessor activation.
@@ -450,9 +458,10 @@ Schema-v7 release evidence uses these fixed representativeness policies:
   least 30 minutes with at least 3,000 normal requests and 1 request/second.
   Candidate-audit request totals, duration, and derived rate reconcile both in
   the sample population and contention interval, covering the observed
-  occurrence-witness count plus one preflight per audit. The normal dense
-  baseline is 10,001 calls per audit and 20,002,000 per 2,000 activations. Add
-  measured retries and bounded pagination.
+  occurrence-witness and served-sample work. The normal dense baseline is one
+  V4 HTTP request per audit and 2,000 requests per 2,000 activations, with up to
+  10,000 occurrence challenges evaluated server-side per audit. Record all
+  transport failures and explicit operator retries.
   The signed raw timestamps cover at least 99 percent of the contention interval
   with no import, audit, or HTTP observation gap above five seconds.
 - Fresh-process cold first-page p95 is at most 40 ms independently for at

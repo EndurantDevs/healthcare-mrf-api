@@ -13,6 +13,7 @@ import pytest
 from api import control_imports, control_workers
 from process import PTGCandidateAudit
 from process.ptg_parts.ptg2_provider_quarantine import (
+    provider_identifier_quarantine_evidence,
     provider_identifier_quarantine_payload,
 )
 from process.ptg_parts.ptg2_source_witness import source_set_digest
@@ -64,7 +65,15 @@ def _source_witness_by_field() -> dict[str, object]:
 def _audit_sample_by_field() -> dict[str, object]:
     return {
         "contract": "persisted_served_occurrence_sample_v2",
+        "format_version": 2,
+        "method": "publish_time_stratified_v1",
+        "sample_count": 2_560,
+        "maximum_rows": 2_560,
         "sample_digest": AUDIT_SAMPLE_DIGEST,
+        "source_count": 1,
+        "occurrence_identity": "sha256_candidate_ordinal_source_key_v2",
+        "complete_population": False,
+        "serving_multiplicity_semantics": "source_multiset_v1",
     }
 
 
@@ -176,6 +185,37 @@ def _passing_report(
             "provider_identifier_quarantine": provider_identifier_quarantine,
         },
         "failures": {"examples": [{"body": "must-not-leak"}]},
+    }
+
+
+def _passing_batch_report(
+    *,
+    provider_identifier_quarantine=EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+) -> dict[str, object]:
+    return {
+        "status": "pass",
+        "release_gate_eligible": True,
+        "duration_seconds": 12.5,
+        "checks": {
+            "source_witnesses": 11_000,
+            "source_occurrence_witnesses_matched": 10_000,
+            "unique_source_conditions_executed": 9_000,
+            "provider_witnesses_validated": 1_000,
+            "persisted_audit_occurrences_validated": 2_560,
+            "batch_requests_executed": 1,
+        },
+        "http": {
+            "batch_api_actual_http_requests": 1,
+            "retry_count": 0,
+        },
+        "batch": {"endpoint_duration_ms": 12_000.0},
+        "source": {
+            "provider_identifier_quarantine": (
+                provider_identifier_quarantine_evidence(
+                    provider_identifier_quarantine
+                )
+            ),
+        },
     }
 
 
@@ -404,12 +444,215 @@ async def test_candidate_scope_rejects_snapshot_layout_quarantine_mismatch(monke
         )
 
 
+@pytest.mark.parametrize(
+    ("mapping_value", "expected_mapping"),
+    (
+        ({"value": 1}, {"value": 1}),
+        ('{"value": 2}', {"value": 2}),
+        ("[]", {}),
+        ("{", {}),
+        (None, {}),
+    ),
+)
+def test_candidate_mapping_edges(mapping_value, expected_mapping):
+    assert ptg_candidate_audit._mapping(mapping_value) == expected_mapping
+
+
+def test_candidate_row_mapping_edges():
+    driver_row = Mock()
+    driver_row._mapping = {"value": 2}
+
+    assert ptg_candidate_audit._row_mapping({"value": 1}) == {"value": 1}
+    assert ptg_candidate_audit._row_mapping(driver_row) == {"value": 2}
+
+
+@pytest.mark.parametrize(
+    ("database_rows", "message"),
+    (
+        (
+            [{"source_key": "bad", "raw_container_sha256": RAW_DIGEST}],
+            "invalid ordinal",
+        ),
+        (
+            [{"source_key": 1, "raw_container_sha256": RAW_DIGEST}],
+            "not dense",
+        ),
+        ([], "no public raw source"),
+        (
+            [
+                {"source_key": 0, "raw_container_sha256": RAW_DIGEST},
+                {"source_key": 1, "raw_container_sha256": RAW_DIGEST},
+            ],
+            "ambiguous",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_candidate_raw_source_edges(monkeypatch, database_rows, message):
+    monkeypatch.setattr(
+        ptg_candidate_audit.db,
+        "all",
+        AsyncMock(return_value=database_rows),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        await ptg_candidate_audit._candidate_raw_sources("candidate-snapshot")
+
+
+@pytest.mark.parametrize(
+    ("activated", "candidate_mutator", "message"),
+    (
+        (
+            False,
+            lambda candidate_row: candidate_row.update(import_run_id="wrong"),
+            "run binding",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row["manifest"]["serving_index"].update(
+                provider_identifier_quarantine={}
+            ),
+            "quarantine is invalid",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row["layout_manifest"].update(
+                serving_index={
+                    **candidate_row["layout_manifest"]["serving_index"],
+                    "source_witness": {},
+                }
+            ),
+            "source witness changed",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row.update(snapshot_id=""),
+            "exact strict",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row["manifest"]["activation"].update(
+                source_key=""
+            ),
+            "source scope is incomplete",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row.update(
+                previous_snapshot_id="other"
+            ),
+            "predecessor binding",
+        ),
+        (
+            True,
+            lambda candidate_row: candidate_row["manifest"]["activation"].update(
+                mode="wrong"
+            ),
+            "cannot be corroborated",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row.update(status="draft"),
+            "not validated",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row.update(
+                current_snapshot_id="candidate-snapshot"
+            ),
+            "not validated",
+        ),
+        (
+            False,
+            lambda candidate_row: candidate_row.update(
+                current_snapshot_id="new-current"
+            ),
+            "not validated",
+        ),
+        (
+            True,
+            lambda candidate_row: candidate_row.update(audit_report=None),
+            "no corroborating audit report",
+        ),
+    ),
+)
+def test_candidate_target_binding_edges(
+    activated,
+    candidate_mutator,
+    message,
+):
+    candidate_row_by_field = _candidate_row(activated=activated)
+    candidate_mutator(candidate_row_by_field)
+
+    with pytest.raises(ValueError, match=message):
+        ptg_candidate_audit._candidate_target_from_row(
+            candidate_row_by_field,
+            candidate_run_id="ptg2:derived-import",
+            raw_container_sha256=(RAW_DIGEST,),
+        )
+
+
+@pytest.mark.parametrize(
+    "configuration_case",
+    ("url", "token", "header", "trusted"),
+)
+def test_audit_configuration_security_edges(monkeypatch, configuration_case):
+    message_by_case = {
+        "url": ptg_candidate_audit.API_BASE_URL_ENV,
+        "token": "HLTHPRT_CONTROL_API_TOKEN",
+        "header": "auth header",
+        "trusted": ptg_candidate_audit.TRUSTED_CLUSTER_HTTP_ENV,
+    }
+    monkeypatch.delenv("PTG_AUDIT_API_BASE_URL", raising=False)
+    monkeypatch.delenv(ptg_candidate_audit.AUTH_SCHEME_ENV, raising=False)
+    monkeypatch.setenv(
+        ptg_candidate_audit.API_BASE_URL_ENV,
+        "https://candidate.example",
+    )
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "token")
+    monkeypatch.setenv(ptg_candidate_audit.AUTH_HEADER_ENV, "Authorization")
+    monkeypatch.setenv(ptg_candidate_audit.TRUSTED_CLUSTER_HTTP_ENV, "false")
+
+    if configuration_case == "url":
+        monkeypatch.delenv(ptg_candidate_audit.API_BASE_URL_ENV)
+    elif configuration_case == "token":
+        monkeypatch.delenv("HLTHPRT_CONTROL_API_TOKEN")
+    elif configuration_case == "header":
+        monkeypatch.setenv(ptg_candidate_audit.AUTH_HEADER_ENV, "bad\nheader")
+    else:
+        monkeypatch.setenv(
+            ptg_candidate_audit.TRUSTED_CLUSTER_HTTP_ENV,
+            "maybe",
+        )
+
+    with pytest.raises(ValueError, match=message_by_case[configuration_case]):
+        ptg_candidate_audit._audit_configuration("candidate-snapshot")
+
+
+def test_audit_summary_timing_edges():
+    empty_summary_by_field = ptg_candidate_audit._audit_summary({}, "d" * 64)
+    assert empty_summary_by_field["audit_timings"] == {}
+
+    batch_summary_by_field = ptg_candidate_audit._audit_summary(
+        {
+            "duration_seconds": True,
+            "latency": {"request_p50_ms": True},
+            "batch": {"endpoint_duration_ms": 1.0},
+        },
+        "d" * 64,
+    )
+    assert batch_summary_by_field["audit_timings"] == {
+        "endpoint_duration_ms": 1.0
+    }
+
+
 def test_candidate_audit_has_no_retained_source_file_dependency():
     assert not hasattr(ptg_candidate_audit, "resolve_retained_raw_files")
+    assert ptg_candidate_audit.PTG2_BATCH_AUDIT_WRITER_ENABLED is False
 
 
 @pytest.mark.asyncio
-async def test_release_audit_uses_postgres_witness_and_bounded_http_configuration(
+async def test_reader_phase_keeps_v3_writer(
     monkeypatch,
 ):
     expected_report = _passing_report()
@@ -431,18 +674,51 @@ async def test_release_audit_uses_postgres_witness_and_bounded_http_configuratio
     assert report is expected_report
     kwargs = runner.await_args.kwargs
     assert kwargs["witness"] is witness
-    assert kwargs["audit_target"].snapshot_id == "candidate-snapshot"
     assert kwargs["audit_target"].source_set_digest == SOURCE_SET_DIGEST
     assert kwargs["http"].concurrency == 32
-    assert kwargs["http"].deadline_seconds == 55.0
-    assert kwargs["http"].verify_tls is False
-    assert kwargs["http"].require_uvloop is True
-    assert kwargs["http"].headers["Authorization"] == "Bearer public-control-token"
+    assert kwargs["http"].headers["User-Agent"] == (
+        "ptg2-v3-fast-candidate-audit/1.0"
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_audit_uses_one_batch_and_bounded_http_configuration(
+    monkeypatch,
+):
+    expected_report = _passing_batch_report()
+    runner = AsyncMock(return_value=expected_report)
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
+        "http://candidate-api.default.svc.cluster.local:8080",
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_TRUSTED_CLUSTER_HTTP",
+        "true",
+    )
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
+    monkeypatch.setattr(ptg_candidate_audit, "run_batch_candidate_audit", runner)
+
+    report = await ptg_candidate_audit.run_batch_release_audit(_target())
+
+    assert report is expected_report
+    kwargs = runner.await_args.kwargs
+    assert kwargs["audit_target"].snapshot_id == "candidate-snapshot"
+    assert kwargs["audit_target"].raw_container_sha256 == (RAW_DIGEST,)
+    assert kwargs["audit_target"].source_witness["payload_sha256"] == (
+        SOURCE_WITNESS_DIGEST
+    )
+    assert kwargs["http_config"].concurrency == 1
+    assert kwargs["http_config"].deadline_seconds == 55.0
+    assert kwargs["http_config"].verify_tls is False
+    assert kwargs["http_config"].require_uvloop is True
+    assert kwargs["http_config"].headers["Authorization"] == (
+        "Bearer public-control-token"
+    )
 
 
 @pytest.mark.asyncio
 async def test_release_audit_accepts_exact_nonempty_provider_quarantine(monkeypatch):
-    expected_report = _passing_report(
+    expected_report = _passing_batch_report(
         provider_identifier_quarantine=NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
     )
     runner = AsyncMock(return_value=expected_report)
@@ -451,15 +727,14 @@ async def test_release_audit_accepts_exact_nonempty_provider_quarantine(monkeypa
         "https://public-api.internal.example",
     )
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
-    monkeypatch.setattr(ptg_candidate_audit, "run_fast_candidate_audit", runner)
+    monkeypatch.setattr(ptg_candidate_audit, "run_batch_candidate_audit", runner)
 
-    report = await ptg_candidate_audit.run_release_audit(
+    report = await ptg_candidate_audit.run_batch_release_audit(
         _target(
             provider_identifier_quarantine=(
                 NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
             )
-        ),
-        object(),
+        )
     )
 
     assert report is expected_report
@@ -478,19 +753,43 @@ async def test_release_audit_failure_is_deterministic_and_not_retryable(monkeypa
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
     monkeypatch.setattr(
         ptg_candidate_audit,
-        "run_fast_candidate_audit",
+        "run_batch_candidate_audit",
         AsyncMock(
-            side_effect=ptg_candidate_audit.FastCandidateAuditError(
+            side_effect=ptg_candidate_audit.BatchCandidateAuditContractError(
                 "source_witness_missing_from_api"
             )
         ),
     )
 
     with pytest.raises(ptg_candidate_audit.CandidateAuditReleaseGateError) as exc_info:
-        await ptg_candidate_audit.run_release_audit(_target(), object())
+        await ptg_candidate_audit.run_batch_release_audit(_target())
 
     assert str(exc_info.value).endswith("source_witness_missing_from_api")
     assert exc_info.value.control_error_code == "ptg_candidate_audit_release_gate_failed"
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_release_audit_transport_failure_requires_explicit_retry(monkeypatch):
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
+        "https://public-api.internal.example",
+    )
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "run_batch_candidate_audit",
+        AsyncMock(
+            side_effect=ptg_candidate_audit.BatchCandidateAuditTransportError(
+                "batch_endpoint_transport_failed"
+            )
+        ),
+    )
+
+    with pytest.raises(ptg_candidate_audit.CandidateAuditTransportError) as exc_info:
+        await ptg_candidate_audit.run_batch_release_audit(_target())
+
+    assert exc_info.value.control_error_code == "ptg_candidate_audit_transport_failed"
     assert exc_info.value.retryable is False
 
 
@@ -506,7 +805,9 @@ def test_release_audit_rejects_untrusted_plain_http_configuration(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_passing_audit_loads_postgres_witness_attests_then_activates(monkeypatch):
+async def test_reader_first_v3_audit_attests_then_activates(
+    monkeypatch,
+):
     events: list[str] = []
     report = _passing_report(
         provider_identifier_quarantine=NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
@@ -519,10 +820,11 @@ async def test_passing_audit_loads_postgres_witness_attests_then_activates(monke
         AsyncMock(return_value=witness),
     )
 
-    async def audit(target, observed_witness):
+    async def audit(target, observed_witness, *, http_config):
         events.append("audit")
         assert target.snapshot_key == 17
         assert observed_witness is witness
+        assert http_config is None
         return report
 
     monkeypatch.setattr(ptg_candidate_audit, "run_release_audit", audit)
@@ -556,8 +858,43 @@ async def test_passing_audit_loads_postgres_witness_attests_then_activates(monke
     assert activation_response["snapshot_status"] == "published"
     assert activation_response["activation_status"] == "activated"
     assert activation_response["audit_report_digest"] == "ef" * 32
-    assert activation_response["audit_counts"]["standard_api_actual_http_requests"] == 10_001
+    assert activation_response["audit_counts"][
+        "standard_api_actual_http_requests"
+    ] == 10_001
     assert activation_response["metrics"]["candidate_run_id"] == "ptg2:derived-import"
+
+
+@pytest.mark.asyncio
+async def test_followup_v4_writer_path_avoids_local_witness_load(monkeypatch):
+    expected_report = _passing_batch_report()
+    batch_audit = AsyncMock(return_value=expected_report)
+    witness_loader = AsyncMock()
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "PTG2_BATCH_AUDIT_WRITER_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "run_batch_release_audit",
+        batch_audit,
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_shared_source_witness",
+        witness_loader,
+    )
+
+    report = await ptg_candidate_audit._execute_release_audit(
+        _target(),
+        control_run_id="control-run",
+        http_config=None,
+    )
+
+    assert report is expected_report
+    batch_audit.assert_awaited_once()
+    witness_loader.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -707,3 +1044,75 @@ def test_scheduler_result_is_redacted():
         "audit_timings",
         "metrics",
     }
+
+
+class _AuditAutocommit:
+    def __init__(self, acquired):
+        self.acquired = acquired
+        self.calls = []
+
+    async def scalar(self, query, params):
+        self.calls.append((query, params))
+        return self.acquired if len(self.calls) == 1 else None
+
+
+class _AuditConnection:
+    def __init__(self, autocommit, awaitable):
+        self.autocommit = autocommit
+        self.awaitable = awaitable
+
+    def execution_options(self, **_kwargs):
+        if not self.awaitable:
+            return self.autocommit
+
+        async def resolved():
+            return self.autocommit
+
+        return resolved()
+
+
+class _AuditConnectionContext:
+    def __init__(self, connection):
+        self.connection = connection
+
+    async def __aenter__(self):
+        return self.connection
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _AuditEngine:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def connect(self):
+        return _AuditConnectionContext(self.connection)
+
+
+@pytest.mark.asyncio
+async def test_candidate_audit_guard_covers_connection_protocols_and_rejection(
+    monkeypatch,
+):
+    """Cover sync and async connection setup plus lock rejection."""
+
+    good_autocommit = _AuditAutocommit(True)
+    good_engine = _AuditEngine(_AuditConnection(good_autocommit, awaitable=True))
+    monkeypatch.setattr(ptg_candidate_audit.db, "engine", None)
+
+    async def connect():
+        ptg_candidate_audit.db.engine = good_engine
+
+    monkeypatch.setattr(ptg_candidate_audit.db, "connect", connect)
+    async with ptg_candidate_audit.candidate_audit_guard("run-good"):
+        assert ptg_candidate_audit.db.engine is good_engine
+    assert len(good_autocommit.calls) == 2
+
+    bad_autocommit = _AuditAutocommit(False)
+    ptg_candidate_audit.db.engine = _AuditEngine(
+        _AuditConnection(bad_autocommit, awaitable=False)
+    )
+    with pytest.raises(RuntimeError, match="was not acquired"):
+        async with ptg_candidate_audit.candidate_audit_guard("run-bad"):
+            pytest.fail("guard accepted a connection without an advisory lock")
+    assert len(bad_autocommit.calls) == 1
