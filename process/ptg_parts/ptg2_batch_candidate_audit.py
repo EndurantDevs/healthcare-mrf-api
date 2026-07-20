@@ -30,6 +30,26 @@ from process.ptg_parts.ptg2_candidate_audit_contract import (
 
 PTG2_BATCH_AUDIT_MAX_RESPONSE_BYTES = 256 * 1024
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+_ALLOWLISTED_REJECTION_DETAIL_BY_MESSAGE = {
+    "PTG2 candidate exact provider-code matches exceed their bounded limit": (
+        "provider_code_matches_limit_exceeded"
+    ),
+    "PTG2 candidate provider-code scope exceeds its bounded limit": (
+        "provider_code_scope_limit_exceeded"
+    ),
+    "PTG2 candidate requested code scope exceeds its bounded limit": (
+        "requested_code_scope_limit_exceeded"
+    ),
+    "PTG2 candidate provider-code scope has no requested codes": (
+        "provider_code_scope_empty"
+    ),
+    "PTG2 candidate provider-code artifact is missing a referenced provider set": (
+        "provider_code_artifact_missing_provider_set"
+    ),
+    "PTG2 provider-code intersections exceed their retention limit": (
+        "provider_code_intersections_limit_exceeded"
+    ),
+}
 
 
 class BatchCandidateAuditContractError(RuntimeError):
@@ -76,6 +96,29 @@ def _response_payload(response_body: bytes) -> Any:
         raise BatchCandidateAuditContractError(
             "batch_response_json_invalid"
         ) from exc
+
+
+def _allowlisted_batch_rejection_detail(response_body: bytes) -> str | None:
+    """Classify only exact, non-sensitive endpoint errors."""
+
+    try:
+        response_payload = json.loads(response_body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(response_payload, Mapping):
+        return None
+    response_message = response_payload.get("message")
+    if not isinstance(response_message, str):
+        return None
+    return _ALLOWLISTED_REJECTION_DETAIL_BY_MESSAGE.get(response_message)
+
+
+def _batch_rejection_reason(response_status: int, response_body: bytes) -> str:
+    """Preserve the status and append only an allowlisted endpoint detail."""
+
+    reason = f"batch_endpoint_rejected_{response_status}"
+    safe_detail = _allowlisted_batch_rejection_detail(response_body)
+    return f"{reason}_{safe_detail}" if safe_detail else reason
 
 
 def _witness_binding(target: BatchAuditReportTarget) -> AuditBatchWitnessBinding:
@@ -142,7 +185,7 @@ async def _post_batch_request(
                     )
                 if response.status != 200:
                     raise BatchCandidateAuditContractError(
-                        "batch_endpoint_rejected"
+                        _batch_rejection_reason(response.status, response_body)
                     )
                 return _response_payload(response_body)
     except BatchCandidateAuditContractError:

@@ -11,6 +11,9 @@ import pytest
 from process.ptg_parts import ptg2_batch_candidate_audit as batch_audit
 from process.ptg_parts import ptg2_batch_candidate_audit_report_schema as report_schema
 from process.ptg_parts import ptg2_candidate_audit_batch_response as batch_response
+from process.ptg_parts import ptg2_candidate_audit_contract as audit_contract
+from process.ptg_parts import ptg2_fast_candidate_audit as fast_audit
+from process.ptg_parts import ptg2_fast_candidate_audit_report as fast_report
 from process.ptg_parts.ptg2_batch_candidate_audit_report import (
     validate_batch_candidate_release_audit_report,
 )
@@ -231,7 +234,7 @@ async def test_batch_client_rejects_nonretryable_response(monkeypatch):
 
     with pytest.raises(
         batch_audit.BatchCandidateAuditContractError,
-        match="batch_endpoint_rejected",
+        match="batch_endpoint_rejected_400",
     ):
         await batch_audit._post_batch_request(
             request_payload_by_field={},
@@ -424,3 +427,44 @@ def test_v4_report_field_set_and_naive_timestamp_contracts():
     assert evidence_by_field["contract"] == (
         report_schema.PTG2_BATCH_AUDIT_ATTESTATION_CONTRACT
     )
+
+
+def test_public_audit_sample_projection_rejects_missing_fields():
+    audit_sample = _audit_sample()
+    audit_sample.pop("sample_digest")
+
+    with pytest.raises(ValueError, match="sample_digest"):
+        audit_contract.public_audit_sample_projection(audit_sample)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("contract", "wrong-contract"),
+        ("sample_digest", "g" * 64),
+        ("sample_digest", "AB" * 32),
+    ),
+)
+def test_validated_public_audit_sample_projection_rejects_invalid_contracts(
+    field_name,
+    invalid_value,
+):
+    audit_sample = _audit_sample()
+    audit_sample[field_name] = invalid_value
+
+    with pytest.raises(ValueError, match="public contract is invalid"):
+        audit_contract.validated_public_audit_sample_projection(
+            audit_sample,
+            expected_source_count=1,
+        )
+
+
+def test_fast_audit_scalar_helpers_reject_invalid_values():
+    with pytest.raises(fast_audit.FastCandidateAuditError, match="mapping_invalid"):
+        fast_audit._mapping([], field_name="mapping")
+    with pytest.raises(fast_audit.FastCandidateAuditError, match="count_invalid"):
+        fast_audit._strict_int(True, field_name="count")
+
+
+def test_fast_audit_empty_percentile_is_zero():
+    assert fast_report._raw_percentile([], 0.95) == 0.0
