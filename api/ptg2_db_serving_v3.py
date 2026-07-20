@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from api.ptg2_db_sidecars import _decode_serving_binary_payload
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from process.ptg_parts.ptg2_serving_binary_v3_code_intersection import (
+    ProviderCodeSelection,
+    intersect_provider_code_set,
+)
 from process.ptg_parts.ptg2_serving_binary_v3 import (
     PTG2_V3_ATOM_KEY_24_BITS,
     PTG2_V3_ATOM_KEY_32_BITS,
@@ -100,11 +104,14 @@ def _decode_provider_code_block(
     block_key: int,
     entry_count: int,
     requested_provider_set_keys: set[int],
+    requested_code_selection: ProviderCodeSelection | None = None,
+    claim_retained_code_keys: Callable[[int, tuple[int, ...]], None] | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Decode requested provider sets without expanding neighboring containers."""
 
     try:
         provider_count, cursor = read_uvarint(block_bytes, 0)
+        block_view = memoryview(block_bytes)
         block_start = block_key * PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN
         code_keys_by_provider_set: dict[int, tuple[int, ...]] = {}
         previous_provider_set_key: int | None = None
@@ -122,14 +129,25 @@ def _decode_provider_code_block(
             if previous_provider_set_key is not None and provider_set_key <= previous_provider_set_key:
                 raise ValueError("provider-set entries are not strictly ordered")
             if provider_set_key in requested_provider_set_keys:
-                code_keys_by_provider_set[provider_set_key] = decode_provider_code_set(
-                    block_bytes[cursor:code_bytes_end]
+                encoded_code_set = block_view[cursor:code_bytes_end]
+                retained_code_keys = (
+                    decode_provider_code_set(encoded_code_set)
+                    if requested_code_selection is None
+                    else intersect_provider_code_set(
+                        encoded_code_set,
+                        requested_code_selection,
+                    )
                 )
+                if claim_retained_code_keys is not None:
+                    claim_retained_code_keys(provider_set_key, retained_code_keys)
+                code_keys_by_provider_set[provider_set_key] = retained_code_keys
             previous_provider_set_key = provider_set_key
             cursor = code_bytes_end
         if cursor != len(block_bytes) or provider_count != entry_count:
             raise ValueError("provider-set block length or count is invalid")
         return code_keys_by_provider_set
+    except PTG2ManifestArtifactError:
+        raise
     except Exception as exc:
         raise PTG2ManifestArtifactError(f"PTG2 v3 provider-set code block {block_key} is corrupt") from exc
 
