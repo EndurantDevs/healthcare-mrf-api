@@ -7685,6 +7685,28 @@ async def test_ensure_provider_directory_network_catalog_populated_skips_existin
     publish_catalog.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_network_catalog_scope_sources_resolves_run_owned_evidence(
+    monkeypatch,
+):
+    all_rows = AsyncMock(
+        return_value=[("source-a",), ("source-a",), ("source-b",)]
+    )
+    monkeypatch.setattr(importer.db, "all", all_rows)
+
+    assert await importer._network_catalog_scope_sources(
+        "mrf",
+        run_id="run-a",
+        source_ids=None,
+    ) == ["source-a", "source-b"]
+
+    sql = all_rows.await_args.args[0]
+    assert 'FROM "mrf"."provider_directory_insurance_plan"' in sql
+    assert 'FROM "mrf"."provider_directory_practitioner_role"' in sql
+    assert 'FROM "mrf"."provider_directory_organization_affiliation"' in sql
+    assert all_rows.await_args.kwargs == {"run_id": "run-a"}
+
+
 def test_provider_directory_location_address_key_sql_uses_shared_canonical_functions():
     sql = importer.provider_directory_location_address_key_sql("mrf")
 

@@ -182,6 +182,30 @@ def test_resume_lineage_changes_for_emitted_source_context_drift(
     )
 
 
+def test_resume_lineage_rejects_source_context_scope_drift():
+    dataset = _dataset()
+
+    with pytest.raises(RuntimeError, match="source_context_scope_changed"):
+        importer._provider_directory_profile_resume_lineage_hash(
+            importer.ProviderDirectoryArtifactDatasetFence((dataset,)),
+            ["source-a"],
+            ["source-a"],
+            ["dataset-a"],
+            (),
+        )
+
+
+@pytest.mark.parametrize("raw_value", [True, False, None, "31", 0, -1])
+def test_profile_checkpoint_oid_rejects_nonpositive_or_untyped_values(
+    raw_value,
+):
+    assert importer._provider_directory_profile_checkpoint_oid(raw_value) is None
+
+
+def test_profile_checkpoint_oid_accepts_positive_integer():
+    assert importer._provider_directory_profile_checkpoint_oid(31) == 31
+
+
 def test_profile_checkpoint_migration_is_strict_and_chained_after_catalog():
     migration_source = MIGRATION_PATH.read_text(encoding="utf-8")
 

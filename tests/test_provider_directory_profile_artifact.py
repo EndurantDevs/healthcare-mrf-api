@@ -356,6 +356,21 @@ def test_profile_aggregation_supports_bounded_npi_ranges():
             npi_start=1_000_000_000,
         )
 
+    for npi_start, npi_end in (
+        (999_999_999, 1_000_000_001),
+        (1_000_000_000, 1_000_000_000),
+        (1_000_000_000, 3_000_000_001),
+    ):
+        with pytest.raises(ValueError, match="outside the assignable bounds"):
+            profile.profile_insert_sql(
+                evidence_ref='"fixture"."evidence"',
+                target_ref='"fixture"."profile"',
+                old_evidence_ref=None,
+                rebuild_all=True,
+                npi_start=npi_start,
+                npi_end=npi_end,
+            )
+
 
 def test_profile_source_dataset_pairs_preserve_sorted_alignment():
     datasets = [
