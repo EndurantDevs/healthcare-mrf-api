@@ -188,6 +188,7 @@ async def test_finalizer_cancellation_reaps_group_and_allows_same_directory_retr
         expected_source_identities=[identity],
         price_key_map_input=price_key_map,
         price_key_map_row_count=1,
+        scratch_durability=finalizer.PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY,
     )
 
     first_attempt = asyncio.create_task(

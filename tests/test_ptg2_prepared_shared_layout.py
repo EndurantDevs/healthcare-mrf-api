@@ -333,6 +333,9 @@ async def test_prepared_layout_publishes_and_seals(monkeypatch, tmp_path):
     assert exported_path.parent.parent == tmp_path
     assert not exported_path.parent.exists()
     assert mocks.run_finalizer.await_args.kwargs["price_key_map_row_count"] == 2
+    assert mocks.run_finalizer.await_args.kwargs["scratch_durability"] == (
+        snapshot_publish.PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY
+    )
     assert mocks.copy_block.await_count == 2
     assert all(
         call.kwargs["reuse_existing"] is True
@@ -365,6 +368,9 @@ async def test_prepared_layout_requires_selective_copy_proof(monkeypatch, tmp_pa
 
     assert len(exc_info.value.exceptions) == 1
     assert "did not return selective proof" in str(exc_info.value.exceptions[0])
+    assert mocks.run_finalizer.await_args.kwargs["scratch_durability"] == (
+        snapshot_publish.PTG2_V3_DURABLE_SCRATCH_DURABILITY
+    )
     mocks.publish_blocks.assert_not_awaited()
     mocks.graph_conversion.cleanup.assert_called_once_with()
 

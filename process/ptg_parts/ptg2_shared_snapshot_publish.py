@@ -31,7 +31,11 @@ from process.ptg_parts.ptg2_shared_audit import (
     publish_shared_audit_sample,
     sealed_audit_sample_metadata,
 )
-from process.ptg_parts.ptg2_shared_finalize import run_v3_direct_finalizer
+from process.ptg_parts.ptg2_shared_finalize import (
+    PTG2_V3_DURABLE_SCRATCH_DURABILITY,
+    PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY,
+    run_v3_direct_finalizer,
+)
 from process.ptg_parts.ptg2_shared_graph import SharedGraphConversionResult
 from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 from process.ptg_parts.ptg2_provider_quarantine import (
@@ -249,6 +253,7 @@ async def _export_price_map_and_run_finalizer(
         expected_source_identities=expected_source_identities,
         price_key_map_input=price_key_map_path,
         price_key_map_row_count=prepared_price_key.price_set_count,
+        scratch_durability=PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY,
     )
     return _PreparedFinalizer(
         summary=dict(finalizer_summary),
@@ -982,6 +987,11 @@ async def _publish_prepared_shared_layout(
                 expected_source_identities=expected_source_identities,
                 price_key_map_input=price_key_map_path,
                 price_key_map_row_count=prepared_price.price_set_count,
+                scratch_durability=(
+                    PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY
+                    if prepared_work_directory is None
+                    else PTG2_V3_DURABLE_SCRATCH_DURABILITY
+                ),
             )
             record_stage("finalizer", stage_started_at)
         else:

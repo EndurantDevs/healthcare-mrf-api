@@ -60,15 +60,17 @@ use ptg2_scanner::v3_runs::{
     partition_for_record, read_code_dictionary_exact, source_key_bits, source_key_bytes,
     write_audit_candidate_file, AssignedServingRunBuilder, AssignedServingRunMerger,
     AuditCandidateSelector, MultiFileSortStats, NaturalLeanCode, NaturalLeanCodeFields,
-    PreparedNaturalLeanCode, ServingRunPartitionWriter, ServingRunRecord, TaggedServingRunCodec,
-    AUDIT_CANDIDATE_FORMAT, AUDIT_CANDIDATE_FORMAT_VERSION, AUDIT_CANDIDATE_MAX_RECORDS,
-    AUDIT_CANDIDATE_RECORD_BYTES, AUDIT_CANDIDATE_SELECTION, CODE_DICTIONARY_FORMAT,
-    CODE_DICTIONARY_FORMAT_VERSION, COVERAGE_SCOPE_ID_BYTES, PROVIDER_CODE_PAIR_RECORD_BYTES,
-    PROVIDER_IDENTITY_RECORD_BYTES, SERVING_RUN_FORMAT, SERVING_RUN_FORMAT_VERSION,
-    SERVING_RUN_RECORD_BYTES,
+    PreparedNaturalLeanCode, ScratchDurability, ScratchSyncStats, ServingRunPartitionWriter,
+    ServingRunRecord, TaggedServingRunCodec, AUDIT_CANDIDATE_FORMAT,
+    AUDIT_CANDIDATE_FORMAT_VERSION, AUDIT_CANDIDATE_MAX_RECORDS, AUDIT_CANDIDATE_RECORD_BYTES,
+    AUDIT_CANDIDATE_SELECTION, CODE_DICTIONARY_FORMAT, CODE_DICTIONARY_FORMAT_VERSION,
+    COVERAGE_SCOPE_ID_BYTES, PROVIDER_CODE_PAIR_RECORD_BYTES, PROVIDER_IDENTITY_RECORD_BYTES,
+    SERVING_RUN_FORMAT, SERVING_RUN_FORMAT_VERSION, SERVING_RUN_RECORD_BYTES,
 };
 #[cfg(test)]
-use ptg2_scanner::v3_runs::{natural_lean_code_identity, read_code_dictionary};
+use ptg2_scanner::v3_runs::{
+    natural_lean_code_identity, read_code_dictionary, tagged_serving_run_record_bytes,
+};
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -105,6 +107,7 @@ const REQUIRED_SNAPSHOT_ARCH: &str = "postgres_binary_v3";
 const REQUIRED_STORAGE_GENERATION: &str = "shared_blocks_v3";
 const REQUIRED_COLD_LOOKUP_CONTRACT: &str = "ptg_v3_cold_v2";
 const REQUIRED_SHARED_BLOCK_LAYOUT: &str = "dense_shared_blocks_v3";
+const V3_SCRATCH_DURABILITY_CONTRACT: &str = "ptg2_v3_scratch_durability_v1";
 const V3_COVERAGE_SCOPE_ID_ENV: &str = "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID";
 const V3_RAW_SOURCE_SHA256_ENV: &str = "HLTHPRT_PTG2_RAW_SOURCE_SHA256";
 const GROUP_NEGOTIATED_RATE_CHUNKS_ENV: &str = "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS";
@@ -17685,6 +17688,7 @@ struct V3FinalizerInputs {
 struct V3FinalizerOptions {
     output_directory: PathBuf,
     manifest_paths: Vec<PathBuf>,
+    scratch_durability: ScratchDurability,
     total_sort_memory_bytes: usize,
     workers: usize,
     identity_map_max_bytes: usize,
@@ -17695,7 +17699,7 @@ struct V3FinalizerOptions {
 }
 
 fn v3_finalizer_usage() -> &'static str {
-    "usage: ptg2_scanner --finalize-v3-runs <output_directory> --price-key-map-input PATH --price-key-map-row-count N --workers N --identity-map-max-bytes N --total-sort-memory-bytes N [--price-membership-input PATH]... [--price-atom-input PATH]... <scanner_summary.json>..."
+    "usage: ptg2_scanner --finalize-v3-runs <output_directory> --price-key-map-input PATH --price-key-map-row-count N --workers N --identity-map-max-bytes N --total-sort-memory-bytes N [--scratch-durability durable|ephemeral] [--price-membership-input PATH]... [--price-atom-input PATH]... <scanner_summary.json>..."
 }
 
 fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOptions> {
@@ -17716,6 +17720,7 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
     let mut identity_map_max_bytes = None;
     let mut price_key_map_input = None;
     let mut price_key_map_row_count = None;
+    let mut scratch_durability = None;
     let mut price_membership_inputs = Vec::new();
     let mut price_atom_inputs = Vec::new();
     let mut manifest_paths = Vec::new();
@@ -17836,6 +17841,19 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
                     ));
                 }
             }
+            "--scratch-durability" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, v3_finalizer_usage())
+                })?;
+                let parsed = ScratchDurability::parse(value)?;
+                if scratch_durability.replace(parsed).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--scratch-durability may be specified only once",
+                    ));
+                }
+            }
             "--price-membership-input" => {
                 index += 1;
                 price_membership_inputs.push(PathBuf::from(arguments.get(index).ok_or_else(
@@ -17914,6 +17932,7 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
     Ok(V3FinalizerOptions {
         output_directory: PathBuf::from(output_directory),
         manifest_paths,
+        scratch_durability: scratch_durability.unwrap_or_default(),
         total_sort_memory_bytes,
         workers,
         identity_map_max_bytes,
@@ -19860,6 +19879,7 @@ struct V3AssignedPartition {
     sort_stats: MultiFileSortStats,
     elapsed_seconds: f64,
     scratch: V3ScratchBytes,
+    sync_stats: ScratchSyncStats,
 }
 
 struct V3AssignmentContext<'a> {
@@ -19874,6 +19894,7 @@ struct V3AssignmentContext<'a> {
     combined_provider_seen_words: &'a Mutex<Vec<u64>>,
     combined_price_seen_words: &'a Mutex<Vec<u64>>,
     assigned_record_limit: usize,
+    scratch_durability: ScratchDurability,
 }
 
 #[cfg(test)]
@@ -20497,8 +20518,11 @@ fn assign_v3_partition(
     let started_at = Instant::now();
     let partition_directory = context.work_root.join(format!("partition-{partition:03}"));
     std::fs::create_dir_all(&partition_directory)?;
-    let mut assigned_runs =
-        AssignedServingRunBuilder::new(&partition_directory, context.assigned_record_limit)?;
+    let mut assigned_runs = AssignedServingRunBuilder::with_scratch_durability(
+        &partition_directory,
+        context.assigned_record_limit,
+        context.scratch_durability,
+    )?;
     let &(code_key_start, partition_code_count) = context
         .code_partition_ranges
         .get(partition)
@@ -20670,6 +20694,7 @@ fn assign_v3_partition(
         }
     }
     let assigned_run_set = assigned_runs.finish()?;
+    let sync_stats = assigned_run_set.sync_stats;
     let mut sort_stats = assigned_run_set.stats;
     sort_stats.input_file_count = inputs.len() as u64;
     if sort_stats.input_records != row_count
@@ -20703,6 +20728,7 @@ fn assign_v3_partition(
         sort_stats,
         elapsed_seconds,
         scratch,
+        sync_stats,
     })
 }
 
@@ -20878,9 +20904,30 @@ fn sort_stats_payload(stats: MultiFileSortStats) -> Value {
     })
 }
 
-fn sync_counting_writer(writer: &mut CountingWriter<BufWriter<File>>) -> io::Result<()> {
+fn sync_counting_writer(
+    writer: &mut CountingWriter<BufWriter<File>>,
+    durability: ScratchDurability,
+) -> io::Result<ScratchSyncStats> {
     writer.flush()?;
-    writer.inner.get_ref().sync_all()
+    let byte_count = writer.inner.get_ref().metadata()?.len();
+    if byte_count != writer.byte_count() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shared-block COPY byte count differs from flushed file length",
+        ));
+    }
+    durability.sync_file(writer.inner.get_ref(), byte_count)
+}
+
+fn scratch_sync_stats_payload(stats: ScratchSyncStats) -> Value {
+    json!({
+        "sync_calls": stats.sync_calls,
+        "sync_bytes": stats.sync_bytes,
+        "sync_seconds": stats.sync_seconds,
+        "sync_max_seconds": stats.sync_max_seconds,
+        "skipped_sync_calls": stats.skipped_sync_calls,
+        "skipped_sync_bytes": stats.skipped_sync_bytes,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21096,7 +21143,8 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             &mut price_blocks_writer,
         )
     })?;
-    sync_counting_writer(&mut price_blocks_writer)?;
+    let price_copy_sync =
+        sync_counting_writer(&mut price_blocks_writer, options.scratch_durability)?;
     let price_block_summary = price_blocks_writer.shared_block_summary(&price_blocks_path);
     drop(price_blocks_writer);
     let price_key_map_and_dictionary_seconds =
@@ -21532,6 +21580,7 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             combined_provider_seen_words: combined_provider_seen_words.as_ref(),
             combined_price_seen_words: combined_price_seen_words.as_ref(),
             assigned_record_limit: sort_memory.assigned_records_per_worker,
+            scratch_durability: options.scratch_durability,
         };
         worker_pool.install(|| {
             partition_jobs
@@ -21545,9 +21594,11 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
     assigned_partitions.sort_by_key(|partition| partition.partition);
     let mut assigned_sort_stats = MultiFileSortStats::default();
     let mut assignment_scratch = V3ScratchBytes::default();
+    let mut assigned_final_run_sync = ScratchSyncStats::default();
     for assigned in &assigned_partitions {
         accumulate_sort_stats(&mut assigned_sort_stats, assigned.sort_stats);
         assignment_scratch.add(assigned.scratch);
+        assigned_final_run_sync.add(assigned.sync_stats);
     }
     if assigned_sort_stats.unique_records != source_record_count
         || assigned_sort_stats.input_records != source_record_count
@@ -21651,8 +21702,10 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             },
         )
     })?;
-    sync_counting_writer(&mut serving_blocks_writer)?;
+    let serving_copy_sync =
+        sync_counting_writer(&mut serving_blocks_writer, options.scratch_durability)?;
     let serving_block_summary = serving_blocks_writer.shared_block_summary(&serving_blocks_path);
+    drop(serving_blocks_writer);
     let serving_encode_seconds = serving_encode_started_at.elapsed().as_secs_f64();
 
     let audit_candidate_path = output.path("audit_candidates.bin");
@@ -21767,6 +21820,10 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         encoding_scratch,
     ] {
         total_scratch.add(stage);
+    }
+    let mut total_sync_stats = ScratchSyncStats::default();
+    for category in [assigned_final_run_sync, price_copy_sync, serving_copy_sync] {
+        total_sync_stats.add(category);
     }
 
     let summary = json!({
@@ -21957,6 +22014,26 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "identity_map_max_bytes": options.identity_map_max_bytes,
             "total_sort_memory_bytes": options.total_sort_memory_bytes,
             "sort_memory_scope": V3_FINALIZER_SORT_MEMORY_SCOPE,
+        },
+        "scratch_durability": {
+            "contract": V3_SCRATCH_DURABILITY_CONTRACT,
+            "policy": options.scratch_durability.as_str(),
+            "scope": "selected_rebuildable_categories_v1",
+            "atomic_directory_publish": true,
+            "sync_bytes_definition": "logical_file_bytes_presented_to_sync_all_v1",
+            "sync_seconds_definition": "cumulative_elapsed_around_sync_all_calls_v1",
+            "sync_max_seconds_definition": "maximum_single_sync_all_call_elapsed_v1",
+            "crash_recovery": if options.scratch_durability == ScratchDurability::Durable {
+                "synced_files_before_atomic_directory_publish_v1"
+            } else {
+                "caller_discards_and_rebuilds_uncommitted_attempt_v1"
+            },
+            "categories": {
+                "assigned_final_runs": scratch_sync_stats_payload(assigned_final_run_sync),
+                "price_copy_output": scratch_sync_stats_payload(price_copy_sync),
+                "serving_copy_output": scratch_sync_stats_payload(serving_copy_sync),
+            },
+            "selected_total": scratch_sync_stats_payload(total_sync_stats),
         },
         "workers": active_workers,
         "configured_workers": options.workers,
@@ -23542,6 +23619,10 @@ mod tests {
         ];
         for (source_count, keys, expected) in cases {
             let bits = source_key_bits(source_count).unwrap();
+            assert_eq!(
+                tagged_serving_run_record_bytes(source_count).unwrap(),
+                SERVING_RUN_RECORD_BYTES + usize::from(source_key_bytes(source_count).unwrap()),
+            );
             assert_eq!(
                 encode_source_key_vector(&keys, source_count, bits).unwrap(),
                 expected
@@ -26669,7 +26750,7 @@ mod tests {
         .unwrap();
         write_serving_binary_copy_trailer(&mut writer, ServingBinaryTargetCopyFormat::SharedBinary)
             .unwrap();
-        sync_counting_writer(&mut writer).unwrap();
+        sync_counting_writer(&mut writer, ScratchDurability::Durable).unwrap();
 
         assert_eq!(
             writer.shared_block_summary(&path),
@@ -26777,7 +26858,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_v3_finalizer_is_deterministic_and_encoder_compatible() {
+    fn direct_v3_finalizer_is_deterministic_across_scratch_durability() {
         let _env_lock = scanner_env_lock().lock().unwrap();
         let _compression = TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV, "none");
         let _block_bytes = TestEnvVar::set(PTG2_SERVING_BINARY_BLOCK_BYTES_ENV, "65536");
@@ -26853,6 +26934,7 @@ mod tests {
         let summary_a = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: output_a.clone(),
             manifest_paths: vec![manifest_a.clone(), manifest_b.clone()],
+            scratch_durability: ScratchDurability::Durable,
             total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(2, 1),
             workers: 2,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -26866,6 +26948,7 @@ mod tests {
         let summary_b = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: output_b.clone(),
             manifest_paths: vec![manifest_b, manifest_a],
+            scratch_durability: ScratchDurability::Ephemeral,
             total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(2, 1),
             workers: 2,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -26886,7 +26969,40 @@ mod tests {
             assert_eq!(
                 std::fs::read(output_a.join(file_name)).unwrap(),
                 std::fs::read(output_b.join(file_name)).unwrap(),
-                "{file_name} changed with input order"
+                "{file_name} changed with input order or scratch durability"
+            );
+        }
+        let durable_sync = &summary_a["scratch_durability"];
+        let ephemeral_sync = &summary_b["scratch_durability"];
+        assert_eq!(durable_sync["policy"], "durable");
+        assert_eq!(
+            durable_sync["crash_recovery"],
+            "synced_files_before_atomic_directory_publish_v1"
+        );
+        assert_eq!(ephemeral_sync["policy"], "ephemeral");
+        assert_eq!(
+            ephemeral_sync["crash_recovery"],
+            "caller_discards_and_rebuilds_uncommitted_attempt_v1"
+        );
+        for category in [
+            "assigned_final_runs",
+            "price_copy_output",
+            "serving_copy_output",
+        ] {
+            let durable = &durable_sync["categories"][category];
+            let ephemeral = &ephemeral_sync["categories"][category];
+            assert!(durable["sync_calls"].as_u64().unwrap() > 0);
+            assert!(durable["sync_bytes"].as_u64().unwrap() > 0);
+            assert_eq!(durable["skipped_sync_calls"], 0);
+            assert_eq!(durable["skipped_sync_bytes"], 0);
+            assert_eq!(ephemeral["sync_calls"], 0);
+            assert_eq!(ephemeral["sync_bytes"], 0);
+            assert_eq!(ephemeral["sync_seconds"], 0.0);
+            assert_eq!(ephemeral["sync_max_seconds"], 0.0);
+            assert!(ephemeral["skipped_sync_calls"].as_u64().unwrap() > 0);
+            assert_eq!(
+                durable["sync_bytes"], ephemeral["skipped_sync_bytes"],
+                "{category} measured different logical bytes by policy"
             );
         }
         assert_eq!(
@@ -27145,6 +27261,7 @@ mod tests {
             let summary = finalize_v3_runs(&V3FinalizerOptions {
                 output_directory: output.clone(),
                 manifest_paths: vec![manifest.clone()],
+                scratch_durability: ScratchDurability::Durable,
                 total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(workers, 4),
                 workers,
                 identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -27235,6 +27352,7 @@ mod tests {
         let summary = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: output.clone(),
             manifest_paths: vec![manifest],
+            scratch_durability: ScratchDurability::Durable,
             total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(4, 13),
             workers: 4,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -27348,6 +27466,7 @@ mod tests {
         let summary = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: output,
             manifest_paths: vec![manifest],
+            scratch_durability: ScratchDurability::Durable,
             total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(8, 50_000),
             workers: 8,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -27403,6 +27522,7 @@ mod tests {
         let summary = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: output,
             manifest_paths: vec![manifest],
+            scratch_durability: ScratchDurability::Durable,
             total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(16, 100_000),
             workers: 16,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -27495,6 +27615,7 @@ mod tests {
         let summary = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: output.clone(),
             manifest_paths: vec![source_one, source_zero],
+            scratch_durability: ScratchDurability::Durable,
             total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(2, 1),
             workers: 2,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -27912,6 +28033,7 @@ mod tests {
                 combined_provider_seen_words: &combined_provider_seen_words,
                 combined_price_seen_words: &combined_assignment_price_seen_words,
                 assigned_record_limit: 2,
+                scratch_durability: ScratchDurability::Durable,
             },
         )
         .unwrap_err();
@@ -28294,6 +28416,7 @@ mod tests {
         let error = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: base.join("output"),
             manifest_paths: vec![manifest],
+            scratch_durability: ScratchDurability::Durable,
             total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(1, 1),
             workers: 1,
             identity_map_max_bytes: required - 1,
@@ -28339,6 +28462,7 @@ mod tests {
         let summary = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: base.join("output"),
             manifest_paths: vec![manifest],
+            scratch_durability: ScratchDurability::Durable,
             total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(1, 2),
             workers: 16,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -28443,6 +28567,68 @@ mod tests {
         assert_eq!(options.workers, 2);
         assert_eq!(options.identity_map_max_bytes, 64 * 1024 * 1024);
         assert_eq!(options.total_sort_memory_bytes, 32 * 1024 * 1024);
+        assert_eq!(options.scratch_durability, ScratchDurability::Durable);
+
+        let explicit_ephemeral = parse_v3_finalizer_options(&[
+            base.join("ephemeral-output").display().to_string(),
+            "--price-key-map-input".to_owned(),
+            map_path.display().to_string(),
+            "--price-key-map-row-count".to_owned(),
+            "1".to_owned(),
+            "--workers".to_owned(),
+            "2".to_owned(),
+            "--identity-map-max-bytes".to_owned(),
+            (64 * 1024 * 1024usize).to_string(),
+            "--total-sort-memory-bytes".to_owned(),
+            (32 * 1024 * 1024usize).to_string(),
+            "--scratch-durability".to_owned(),
+            "ephemeral".to_owned(),
+            manifest.clone(),
+        ])
+        .unwrap();
+        assert_eq!(
+            explicit_ephemeral.scratch_durability,
+            ScratchDurability::Ephemeral
+        );
+
+        let missing_durability = parse_v3_finalizer_options(&[
+            base.join("missing-durability-output").display().to_string(),
+            "--scratch-durability".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(missing_durability
+            .to_string()
+            .contains(v3_finalizer_usage()));
+
+        for durability_arguments in [
+            vec!["--scratch-durability", "unsafe"],
+            vec![
+                "--scratch-durability",
+                "ephemeral",
+                "--scratch-durability",
+                "durable",
+            ],
+        ] {
+            let mut arguments = vec![
+                base.join("invalid-durability-output").display().to_string(),
+                "--price-key-map-input".to_owned(),
+                map_path.display().to_string(),
+                "--price-key-map-row-count".to_owned(),
+                "1".to_owned(),
+                "--workers".to_owned(),
+                "2".to_owned(),
+                "--identity-map-max-bytes".to_owned(),
+                (64 * 1024 * 1024usize).to_string(),
+                "--total-sort-memory-bytes".to_owned(),
+                (32 * 1024 * 1024usize).to_string(),
+            ];
+            arguments.extend(durability_arguments.into_iter().map(str::to_owned));
+            arguments.push(manifest.clone());
+            let error = parse_v3_finalizer_options(&arguments).unwrap_err();
+            assert!(
+                error.to_string().contains("durability") || error.to_string().contains("only once")
+            );
+        }
 
         let legacy = parse_v3_finalizer_options(&[
             base.join("legacy-output").display().to_string(),
@@ -28691,6 +28877,7 @@ mod tests {
                 finalize_v3_runs(&V3FinalizerOptions {
                     output_directory: base.join(format!("{label}-output")),
                     manifest_paths: vec![manifest.clone()],
+                    scratch_durability: ScratchDurability::Durable,
                     total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(1, 2),
                     workers: 1,
                     identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -28768,6 +28955,7 @@ mod tests {
         let error = finalize_v3_runs(&V3FinalizerOptions {
             output_directory: output.clone(),
             manifest_paths: vec![manifest_a, manifest_b],
+            scratch_durability: ScratchDurability::Durable,
             total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(2, 1),
             workers: 2,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
