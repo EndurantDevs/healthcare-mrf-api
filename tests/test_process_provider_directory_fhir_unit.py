@@ -1051,6 +1051,41 @@ def test_reviewed_candidate_statuses_match_completed_twin_campaigns():
     )
 
 
+@pytest.mark.asyncio
+async def test_reverse_lookup_seed_producer_closes_every_idle_worker(monkeypatch):
+    """Close every worker queue even when a source yields no lookup seeds."""
+
+    async def no_seed_rows(*_args, **_kwargs):
+        if False:
+            yield None
+
+    monkeypatch.setattr(
+        importer,
+        "_iter_scan_practitioner_role_seed_rows",
+        no_seed_rows,
+    )
+    options = importer.ScanPractitionerRoleFetchOptions(0, 0, 0, 1, "run-1")
+    request = importer._PractitionerRoleReverseLookupRequest(
+        source={},
+        rows_by_resource={},
+        options=options,
+        resource_timeout=1,
+        deadline_at=None,
+    )
+    state = importer._PractitionerRoleReverseLookupState(
+        result_model=object,
+        retained_resource_rows=[],
+        streamed_rows=importer._StreamedResourceRowBuffer(object, None, 1, []),
+        retain_rows=True,
+        page_limit=0,
+    )
+    seed_queue = asyncio.Queue()
+
+    await state.produce_seed_rows(request, seed_queue, worker_count=2)
+
+    assert [await seed_queue.get(), await seed_queue.get()] == [None, None]
+
+
 def test_reverse_lookup_checkpoint_row_requires_canonical_base():
     """Exercise the fail-closed checkpoint identity guard."""
     with pytest.raises(
