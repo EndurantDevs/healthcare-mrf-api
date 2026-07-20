@@ -5978,6 +5978,14 @@ def test_iowa_current_empty_location_census_remains_complete():
     assert practitioner_result.error == importer.EXPECTED_NONEMPTY_RESOURCE_ERROR
 
 
+def test_amerihealth_provider_api_uses_state_nonempty_core():
+    expected_resources = importer._expected_nonempty_resource_types(
+        {"api_base": importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE}
+    )
+
+    assert expected_resources == set(importer.STATE_EXPECTED_NONEMPTY_RESOURCES)
+
+
 @pytest.mark.parametrize(
     ("api_base", "org_name", "expected_resources"),
     [
