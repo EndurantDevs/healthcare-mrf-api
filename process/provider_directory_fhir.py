@@ -1056,6 +1056,10 @@ SYNTHETIC_POSITION_PAGINATION_STRATEGY_VERSION = (
     f"{PAGINATION_CHECKPOINT_STRATEGY_VERSION}+"
     f"{SYNTHETIC_POSITION_PAGE_GUARD_VERSION}"
 )
+NETSMART_PAGE_INDEX_PAGINATION_STRATEGY_VERSION = (
+    f"{SYNTHETIC_POSITION_PAGINATION_STRATEGY_VERSION}+"
+    "netsmart-page-index-v1"
+)
 LAST_UPDATED_PARTITION_STRATEGY_VERSION = (
     "provider-directory-fhir-last-updated-v3"
 )
@@ -18367,7 +18371,7 @@ def _synthetic_offset_pagination_next_url(
     current_url: str,
     bundle_entry_count: int,
 ) -> str | None:
-    """Advance Netsmart's stable offset by rows, ignoring its overlapping next link."""
+    """Advance Netsmart's stable page index without trusting its next link."""
 
     api_base = _canonical_base(
         source_record.get("canonical_api_base") or source_record.get("api_base")
@@ -18396,7 +18400,7 @@ def _synthetic_offset_pagination_next_url(
         raise ValueError("invalid synthetic offset pagination URL")
     if bundle_entry_count < int(count_values[0]):
         return None
-    next_offset = int(offset_values[0]) + bundle_entry_count
+    next_offset = int(offset_values[0]) + 1
     return _url_with_replaced_query_item(current_url, "_offset", str(next_offset))
 
 
@@ -28885,11 +28889,10 @@ def _pagination_checkpoint_strategy_version(
         return LAST_UPDATED_PARTITION_STRATEGY_VERSION
     if canonical_api_base == UHC_PROVIDER_DIRECTORY_BASE:
         return UHC_PLAN_GRAPH_STRATEGY_VERSION
-    if canonical_api_base in (
-        FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
-        | FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES
-    ):
+    if canonical_api_base in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES:
         return SYNTHETIC_POSITION_PAGINATION_STRATEGY_VERSION
+    if canonical_api_base in FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES:
+        return NETSMART_PAGE_INDEX_PAGINATION_STRATEGY_VERSION
     return PAGINATION_CHECKPOINT_STRATEGY_VERSION
 
 
@@ -33516,7 +33519,7 @@ async def _store_validated_endpoint_dataset(
                is_current = false,
                resource_count = :resource_count,
                validated_at = CASE
-                   WHEN :status = :validated_status THEN now()
+                   WHEN :marks_validated THEN now()
                    ELSE NULL
                END,
                published_at = NULL,
@@ -33540,7 +33543,7 @@ async def _store_validated_endpoint_dataset(
         dataset_id=candidate.dataset_id,
         endpoint_id=candidate.endpoint_id,
         acquisition_root_run_id=candidate.acquisition_root_run_id,
-        validated_status=ENDPOINT_DATASET_VALIDATED,
+        marks_validated=status == ENDPOINT_DATASET_VALIDATED,
         immutable_statuses=list(IMMUTABLE_ENDPOINT_DATASET_STATUSES),
     )
     if _coerce_rowcount(validated_count) <= 0:
