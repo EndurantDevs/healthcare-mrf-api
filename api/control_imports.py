@@ -1145,6 +1145,7 @@ def _provider_directory_seed_scope(params: dict[str, Any]) -> frozenset[str] | N
         "full_refresh",
         "stale_cleanup",
         "refresh_preset",
+        "preset",
     )
     if any(params.get(flag_name) for flag_name in incompatible_flags):
         return None

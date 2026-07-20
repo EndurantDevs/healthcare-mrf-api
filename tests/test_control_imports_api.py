@@ -1875,6 +1875,7 @@ def test_fhir_scoped_seed_classifier():
         {"full_refresh": True},
         {"stale_cleanup": True},
         {"refresh_preset": "monthly-full"},
+        {"preset": "monthly-full"},
     ],
 )
 def test_fhir_exclusive_seed_classifier(unsafe_override):
@@ -1892,6 +1893,8 @@ def test_fhir_scoped_seed_conflicts_only_with_overlapping_or_exclusive_work():
         "https://v2-api.aetna.com/fhir/providerdirectory",
     )
     seed_run = _provider_directory_seed_run("run_seed", "pdfhir_devoted", "pdfhir_simpra")
+    artifact_run = _provider_directory_artifact_run("run_artifact", "pdfhir_artifact")
+    second_seed_run = _provider_directory_seed_run("run_second_seed", "pdfhir_other")
     verified_seed = _provider_directory_seed_params(
         "pdfhir_devoted",
         "pdfhir_simpra",
@@ -1899,6 +1902,8 @@ def test_fhir_scoped_seed_conflicts_only_with_overlapping_or_exclusive_work():
         "pdfhir_san_mateo",
     )
     overlapping_seed = _provider_directory_seed_params("pdfhir_aetna")
+    artifact_seed = _provider_directory_seed_params("pdfhir_artifact")
+    other_seed = _provider_directory_seed_params("pdfhir_second_other")
     disjoint_acquisition = _provider_directory_acquisition_params(
         "pdfhir_aetna",
         "https://v2-api.aetna.com/fhir/providerdirectory",
@@ -1912,6 +1917,13 @@ def test_fhir_scoped_seed_conflicts_only_with_overlapping_or_exclusive_work():
 
     assert control_imports._provider_directory_blocking_run(verified_seed, [acquisition_run]) is None
     assert control_imports._provider_directory_blocking_run(overlapping_seed, [acquisition_run]) == acquisition_run
+    assert control_imports._provider_directory_blocking_run(other_seed, [artifact_run]) is None
+    assert control_imports._provider_directory_blocking_run(artifact_seed, [artifact_run]) == artifact_run
+    assert control_imports._provider_directory_blocking_run(other_seed, [second_seed_run]) is None
+    assert control_imports._provider_directory_blocking_run(
+        _provider_directory_seed_params("pdfhir_other"),
+        [second_seed_run],
+    ) == second_seed_run
     assert control_imports._provider_directory_blocking_run(disjoint_acquisition, [seed_run]) is None
     assert control_imports._provider_directory_blocking_run(overlapping_acquisition, [seed_run]) == seed_run
     assert control_imports._provider_directory_blocking_run(verified_seed, [exclusive_run]) == exclusive_run
