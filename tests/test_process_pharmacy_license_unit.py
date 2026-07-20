@@ -216,6 +216,7 @@ def test_extract_candidate_file_links_filters_noise():
 
 def test_parse_datagrid_rows_handles_nested_aspnet_cells():
     html = """
+    <table id="unrelated"><tr><td>Ignore this table</td></tr></table>
     <table id="datagrid_results">
       <tr>
         <th>Name</th><th>License #</th><th>License Type</th><th>Status</th><th>Address</th>
