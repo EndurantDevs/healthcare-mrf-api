@@ -986,9 +986,10 @@ def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
             assert metadata["provider_directory_coverage_mode"] == "full"
             assert metadata["provider_directory_acquisition_enabled"] is True
             assert metadata["provider_directory_fully_enumerable_resources"]
-            assert metadata["provider_directory_candidate_status"] == (
-                "pending_two_matching_exhaustive_acquisitions"
-            )
+            assert metadata["provider_directory_candidate_status"] in {
+                importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
+                importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
+            }
             assert importer._resource_acquisition_blocked_reason(source_row) is None
 
     el_dorado_source = source_by_base[
@@ -1001,6 +1002,53 @@ def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
     assert importer._reviewed_provider_directory_candidate_seed_rows(
         source_query="Devoted"
     )[0]["api_base"] == importer.DEVOTED_PROVIDER_DIRECTORY_BASE
+
+
+def test_reviewed_candidate_statuses_match_completed_twin_campaigns():
+    """Admit only sources whose two exhaustive roots matched exactly."""
+    source_rows = [
+        importer._source_row_from_seed(seed_row)
+        for seed_row in importer._reviewed_provider_directory_candidate_seed_rows()
+    ]
+    status_by_base = {
+        source_row["canonical_api_base"]: source_row["metadata_json"].get(
+            "provider_directory_candidate_status"
+        )
+        for source_row in source_rows
+    }
+
+    verified_status = importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
+    assert status_by_base[importer.DEVOTED_PROVIDER_DIRECTORY_BASE] == verified_status
+    assert status_by_base[importer.SIMPRA_PROVIDER_DIRECTORY_BASE] == verified_status
+    assert (
+        status_by_base[importer.SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE]
+        == verified_status
+    )
+    assert (
+        status_by_base[importer.SAN_MATEO_COUNTY_PROVIDER_DIRECTORY_BASE]
+        == verified_status
+    )
+    pending_status = importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
+    assert status_by_base[importer.IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE] == pending_status
+    assert (
+        status_by_base[importer.PENNSYLVANIA_MEDICAID_PROVIDER_DIRECTORY_BASE]
+        == pending_status
+    )
+
+
+def test_reviewed_candidate_rejects_missing_verification_campaign(monkeypatch):
+    """Keep acquisition disabled when a reviewed source has no campaign."""
+    monkeypatch.setattr(
+        importer,
+        "REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID",
+        {},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_reviewed_candidate_campaign_missing",
+    ):
+        importer._reviewed_provider_directory_candidate_seed_rows()
 
 
 def test_iowa_reviewed_candidate_current_expected_nonempty_contract():
