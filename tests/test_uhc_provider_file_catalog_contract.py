@@ -433,3 +433,38 @@ def test_catalog_parser_rejects_non_list_collection_and_file_id_collision(monkey
     monkeypatch.setattr(catalog_contract, "sha256_text", lambda _value: "f" * 64)
     with pytest.raises(catalog_types.UHCFileCatalogError, match="identity collision"):
         catalog_types.observed_catalog_from_payloads(live_catalog_payloads())
+
+
+def test_catalog_url_canonicalizes_the_explicit_tls_port_and_host_case():
+    explicit_tls_url = "https://providermrf.uhc.com:443/api/files/ui/cs/"
+
+    assert catalog_types.trusted_public_https_url(explicit_tls_url) == explicit_tls_url
+    with pytest.raises(catalog_types.UHCFileCatalogError, match="not canonical"):
+        catalog_types.trusted_public_https_url(
+            "https://ProviderMRF.uhc.com/api/files/ui/cs/"
+        )
+
+
+def test_collection_parser_rechecks_shape_and_expansion_limits(monkeypatch):
+    with pytest.raises(catalog_types.UHCFileCatalogError, match="collection is invalid"):
+        catalog_types._catalog_collection(
+            "ifp",
+            "plans",
+            catalog_types.PLAN_REFERENCE,
+            {"plans": {}},
+            set(),
+        )
+    with pytest.raises(catalog_types.UHCFileCatalogError, match="entry bound"):
+        catalog_types._catalog_collection(
+            "ifp",
+            "plans",
+            catalog_types.PLAN_REFERENCE,
+            {"plans": [None] * (catalog_types.MAX_RAW_ENTRIES_PER_COLLECTION + 1)},
+            set(),
+        )
+
+    monkeypatch.setattr(catalog_types, "_validate_raw_entry_limits", lambda _payloads: None)
+    malformed_payloads_by_family = live_catalog_payloads()
+    malformed_payloads_by_family["cs"] = None
+    with pytest.raises(catalog_types.UHCFileCatalogError, match="catalog is invalid"):
+        catalog_types.observed_catalog_from_payloads(malformed_payloads_by_family)

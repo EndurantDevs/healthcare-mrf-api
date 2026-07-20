@@ -416,3 +416,70 @@ def test_worker_resolution_rejects_unknown_or_conflicting_identity():
     assert control_workers._resolve_specs(
         {"importer": "unknown", "role": "finish"}
     ) == []
+    assert control_workers._resolve_specs({"importer": "unknown"}) == []
+
+
+def test_worker_state_replaces_a_stale_pid_with_the_discovered_process(monkeypatch):
+    worker_spec = control_workers.WorkerSpec("arq:PTG", "process.PTG", ("ptg",))
+    removed_specs = []
+    written_pids = []
+    monkeypatch.setattr(control_workers, "_launcher_mode", lambda: "process")
+    monkeypatch.setattr(control_workers, "_read_pid", lambda _path: 101)
+    monkeypatch.setattr(control_workers, "_is_pid_running", lambda pid: pid == 202)
+    monkeypatch.setattr(control_workers, "_remove_stale_pid", removed_specs.append)
+    monkeypatch.setattr(control_workers, "_find_running_pid", lambda _spec: 202)
+    monkeypatch.setattr(
+        control_workers,
+        "_write_pid_file",
+        lambda spec, pid: written_pids.append((spec, pid)),
+    )
+
+    state = control_workers._worker_state(worker_spec)
+
+    assert state["running"] is True
+    assert state["pid"] == 202
+    assert removed_specs == [worker_spec]
+    assert written_pids == [(worker_spec, 202)]
+
+
+def test_ensure_spec_returns_an_existing_running_worker(monkeypatch):
+    worker_spec = control_workers.WorkerSpec("arq:PTG", "process.PTG", ("ptg",))
+    monkeypatch.setattr(
+        control_workers,
+        "_worker_state",
+        lambda *_args: {"running": True, "pid": 101},
+    )
+
+    assert control_workers._ensure_spec(worker_spec, {}) == {
+        "running": True,
+        "pid": 101,
+        "status": "already_running",
+    }
+
+
+def test_delete_worker_record_distinguishes_missing_and_failed_deletes(monkeypatch):
+    worker_spec = control_workers.WorkerSpec("arq:PTG", "process.PTG", ("ptg",))
+    assert control_workers._delete_kubernetes_worker_job_record(
+        "healthporta-dev", worker_spec, {}
+    ) == (None, None)
+
+    active_job_record_by_field = {
+        "metadata": {"name": "active-job"},
+        "status": {"active": 1},
+    }
+    for status_code, expected_reason in ((404, "not_found"), (403, None)):
+        def reject_delete(*_args, **_kwargs):
+            raise control_workers._KubernetesApiError(status_code, "rejected")
+
+        monkeypatch.setattr(control_workers, "_delete_kubernetes_job", reject_delete)
+        deletion_record, deletion_error = (
+            control_workers._delete_kubernetes_worker_job_record(
+                "healthporta-dev", worker_spec, active_job_record_by_field
+            )
+        )
+        if expected_reason:
+            assert deletion_record["reason"] == expected_reason
+            assert deletion_error is None
+        else:
+            assert deletion_record is None
+            assert deletion_error["status"] == status_code
