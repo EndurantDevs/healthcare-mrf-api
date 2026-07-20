@@ -320,6 +320,7 @@ async def test_prepare_bulk_validators_persists_observed_identity(monkeypatch):
         manifest,
         [output_checkpoint_map],
         timeout=3,
+        ownership_probe=AsyncMock(),
     )
 
     assert checkpoints == refreshed_checkpoints
@@ -352,6 +353,7 @@ async def test_prepare_bulk_validators_records_probe_failure(monkeypatch):
         manifest,
         [output_checkpoint_map],
         timeout=3,
+        ownership_probe=AsyncMock(),
     )
 
     assert checkpoints == [output_checkpoint_map]

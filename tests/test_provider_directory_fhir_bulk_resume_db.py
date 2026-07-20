@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib
 import uuid
@@ -56,7 +57,9 @@ async def _create_checkpoint_tables(database: Database, schema: str) -> None:
             manifest_ciphertext text,
             error text,
             lease_expires_at timestamp,
+            last_polled_at timestamp,
             completed_at timestamp,
+            failed_at timestamp,
             updated_at timestamp NOT NULL DEFAULT now()
         );
         """
@@ -290,6 +293,175 @@ async def test_real_postgres_adopts_legacy_progress_and_guards_completion(
         await _assert_legacy_bulk_adoption(database, schema, validator)
         await _complete_legacy_bulk_outputs(database, schema, identity)
         await _assert_bulk_capabilities_cleared(database, schema)
+    except Exception:
+        if not is_schema_created:
+            pytest.skip("disposable PostgreSQL is unavailable")
+        raise
+    finally:
+        if is_schema_created:
+            await database.status(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
+        await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_repairs_split_failure_and_prior_owner_terminal(
+    monkeypatch,
+):
+    """Prove failure aggregates and terminal capability repair in PostgreSQL."""
+    schema = f"bulk_failure_{uuid.uuid4().hex[:12]}"
+    database = Database()
+    is_schema_created = False
+    try:
+        await database.connect()
+        await _require_disposable_postgres(database)
+        await _create_checkpoint_tables(database, schema)
+        is_schema_created = True
+        monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+        monkeypatch.setattr(importer, "db", database)
+        identity = _identity()
+        await database.status(
+            f"""
+            INSERT INTO "{schema}".provider_directory_bulk_acquisition_checkpoint (
+                checkpoint_id, owner_run_id, state, rows_written,
+                status_url_ciphertext, manifest_ciphertext
+            ) VALUES (
+                :checkpoint_id, :owner_run_id, :state, 999,
+                'encrypted-status', 'encrypted-manifest'
+            );
+            """,
+            checkpoint_id=identity.checkpoint_id,
+            owner_run_id=identity.owner_run_id,
+            state=importer.BULK_EXPORT_CHECKPOINT_STREAMING,
+        )
+        for output_id, state, rows_written in (
+            ("failed-output", importer.BULK_EXPORT_OUTPUT_STREAMING, 5),
+            ("complete-output", importer.BULK_EXPORT_OUTPUT_COMPLETE, 7),
+        ):
+            await database.status(
+                f"""
+                INSERT INTO "{schema}".provider_directory_bulk_output_checkpoint (
+                    checkpoint_id, output_id, state, rows_written,
+                    committed_bytes, output_url_ciphertext, etag_ciphertext
+                ) VALUES (
+                    :checkpoint_id, :output_id, :state, :rows_written,
+                    10, 'encrypted-output', 'encrypted-etag'
+                );
+                """,
+                checkpoint_id=identity.checkpoint_id,
+                output_id=output_id,
+                state=state,
+                rows_written=rows_written,
+            )
+
+        await importer._record_bulk_export_output_error(
+            identity,
+            "failed-output",
+            11,
+            22,
+            "bulk_export_manifest_mismatch",
+            record_checkpoint=False,
+        )
+        split_checkpoint = await database.first(
+            f"""
+            SELECT state, rows_written, status_url_ciphertext
+              FROM "{schema}".provider_directory_bulk_acquisition_checkpoint
+             WHERE checkpoint_id = :checkpoint_id;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+        )
+        failed_output = await database.first(
+            f"""
+            SELECT state, rows_written, output_url_ciphertext, etag_ciphertext
+              FROM "{schema}".provider_directory_bulk_output_checkpoint
+             WHERE output_id = 'failed-output';
+            """
+        )
+        assert tuple(split_checkpoint) == (
+            importer.BULK_EXPORT_CHECKPOINT_STREAMING,
+            18,
+            "encrypted-status",
+        )
+        assert tuple(failed_output) == (
+            importer.BULK_EXPORT_OUTPUT_FAILED,
+            11,
+            None,
+            None,
+        )
+
+        await importer._record_bulk_export_checkpoint_error(
+            identity,
+            "bulk_export_manifest_mismatch",
+            terminal=True,
+        )
+        terminal_checkpoint = await database.first(
+            f"""
+            SELECT owner_run_id, state, error, rows_written,
+                   status_url_ciphertext, manifest_ciphertext
+              FROM "{schema}".provider_directory_bulk_acquisition_checkpoint
+             WHERE checkpoint_id = :checkpoint_id;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+        )
+        assert tuple(terminal_checkpoint) == (
+            identity.owner_run_id,
+            importer.BULK_EXPORT_CHECKPOINT_FAILED,
+            "bulk_export_manifest_mismatch",
+            18,
+            None,
+            None,
+        )
+
+        await database.status(
+            f"""
+            UPDATE "{schema}".provider_directory_bulk_acquisition_checkpoint
+               SET rows_written = 999,
+                   status_url_ciphertext = 'legacy-status',
+                   manifest_ciphertext = 'legacy-manifest'
+             WHERE checkpoint_id = :checkpoint_id;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+        )
+        await database.status(
+            f"""
+            UPDATE "{schema}".provider_directory_bulk_output_checkpoint
+               SET output_url_ciphertext = 'legacy-output',
+                   etag_ciphertext = 'legacy-etag'
+             WHERE checkpoint_id = :checkpoint_id;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+        )
+        retry_identity = dataclasses.replace(
+            identity,
+            owner_run_id="run-db-resume-retry",
+            retry_of_run_id=identity.owner_run_id,
+        )
+        await importer._repair_terminal_bulk_export_checkpoint(
+            retry_identity,
+            importer.BULK_EXPORT_CHECKPOINT_FAILED,
+        )
+        repaired_checkpoint = await database.first(
+            f"""
+            SELECT owner_run_id, state, error, rows_written,
+                   status_url_ciphertext, manifest_ciphertext
+              FROM "{schema}".provider_directory_bulk_acquisition_checkpoint
+             WHERE checkpoint_id = :checkpoint_id;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+        )
+        repaired_outputs = await database.all(
+            f"""
+            SELECT output_url_ciphertext, etag_ciphertext
+              FROM "{schema}".provider_directory_bulk_output_checkpoint
+             WHERE checkpoint_id = :checkpoint_id
+             ORDER BY output_id;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+        )
+        assert tuple(repaired_checkpoint) == tuple(terminal_checkpoint)
+        assert [tuple(output_record) for output_record in repaired_outputs] == [
+            (None, None),
+            (None, None),
+        ]
     except Exception:
         if not is_schema_created:
             pytest.skip("disposable PostgreSQL is unavailable")

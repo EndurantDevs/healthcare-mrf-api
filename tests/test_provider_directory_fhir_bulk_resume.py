@@ -434,8 +434,121 @@ async def test_bulk_output_failure_cancels_and_drains_siblings(monkeypatch):
         _output_checkpoints(identity, manifest),
     )
 
-    assert error == "bulk_export_transport_timeout"
-    assert checkpoint_errors == [("bulk_export_transport_timeout", False)]
+    assert error == "bulk_export_transport_runtimeerror"
+    assert checkpoint_errors == [("bulk_export_transport_runtimeerror", False)]
+
+
+@pytest.mark.asyncio
+async def test_bulk_output_import_cancellation_drains_siblings_and_propagates(
+    monkeypatch,
+):
+    """A child control-plane cancellation cannot become checkpoint failure."""
+    identity = _checkpoint_identity()
+    manifest = _manifest(3)
+    sibling_started = asyncio.Event()
+    sibling_drained = asyncio.Event()
+
+    async def stream_one(
+        _session,
+        _source,
+        _identity,
+        _manifest,
+        manifest_output,
+        *_args,
+    ):
+        if manifest_output.output_index == 0:
+            await sibling_started.wait()
+            raise importer.ImportCancelledError("cancelled")
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_drained.set()
+
+    record_checkpoint_error = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_stream_one_checkpointed_bulk_output",
+        stream_one,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_record_bulk_export_checkpoint_error",
+        record_checkpoint_error,
+    )
+
+    with pytest.raises(importer.ImportCancelledError, match="cancelled"):
+        await importer._resume_checkpointed_bulk_outputs(
+            object(),
+            _aetna_source(),
+            identity,
+            manifest,
+            _resume_stream_options(2),
+            _output_checkpoints(identity, manifest),
+        )
+
+    assert sibling_drained.is_set()
+    record_checkpoint_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bulk_output_fencing_loss_drains_without_failure_writes(monkeypatch):
+    identity = _checkpoint_identity()
+    manifest = _manifest(3)
+    sibling_started = asyncio.Event()
+    sibling_drained = asyncio.Event()
+
+    async def stream_one(
+        _session,
+        _source,
+        _identity,
+        _manifest,
+        manifest_output,
+        *_args,
+    ):
+        if manifest_output.output_index == 0:
+            await sibling_started.wait()
+            raise RuntimeError("bulk_export_checkpoint_worker_guard_lost")
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_drained.set()
+
+    record_output_error = AsyncMock()
+    record_checkpoint_error = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_stream_one_checkpointed_bulk_output",
+        stream_one,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_record_bulk_export_output_error",
+        record_output_error,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_record_bulk_export_checkpoint_error",
+        record_checkpoint_error,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="bulk_export_checkpoint_worker_guard_lost",
+    ):
+        await importer._resume_checkpointed_bulk_outputs(
+            object(),
+            _aetna_source(),
+            identity,
+            manifest,
+            _resume_stream_options(2),
+            _output_checkpoints(identity, manifest),
+        )
+
+    assert sibling_drained.is_set()
+    record_output_error.assert_not_awaited()
+    record_checkpoint_error.assert_not_awaited()
 
 
 @pytest.mark.asyncio

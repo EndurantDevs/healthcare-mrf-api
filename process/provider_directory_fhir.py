@@ -1091,6 +1091,13 @@ BULK_EXPORT_CHECKPOINT_FAILED = "failed"
 BULK_EXPORT_STATUS_DEADLINE_EXCEEDED = (
     "bulk_export_status_deadline_exceeded"
 )
+BULK_EXPORT_FENCING_ERRORS = frozenset(
+    {
+        "bulk_export_checkpoint_worker_guard_lost",
+        "bulk_export_checkpoint_ownership_lost",
+        "bulk_export_output_ownership_lost",
+    }
+)
 BULK_EXPORT_CAPABILITY_CIPHER_PREFIX = "fernet:v1:"
 BULK_EXPORT_DEFAULT_LEASE_SECONDS = 900
 BULK_EXPORT_MIN_LEASE_SECONDS = 60
@@ -4985,11 +4992,13 @@ def _amerihealth_caritas_provider_directory_override(seed_row_by_field: dict[str
     }
 
 
-def _molina_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
-    api_base = _canonical_base(row.get("api_base"))
-    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
-    source_url = (_clean_text(row.get("source_url")) or "").lower()
-    org_name = (_clean_text(row.get("org_name")) or "").lower()
+def _molina_provider_directory_override(
+    seed_row_by_field: dict[str, Any],
+) -> dict[str, Any] | None:
+    api_base = _canonical_base(seed_row_by_field.get("api_base"))
+    portal_url = (_clean_text(seed_row_by_field.get("portal_url")) or "").lower()
+    source_url = (_clean_text(seed_row_by_field.get("source_url")) or "").lower()
+    org_name = (_clean_text(seed_row_by_field.get("org_name")) or "").lower()
     parsed_api_base = urllib.parse.urlsplit(api_base or "")
     api_host = parsed_api_base.netloc.lower()
     api_path = parsed_api_base.path.lower()
@@ -5019,7 +5028,9 @@ def _molina_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] |
                 "working FHIR metadata base is api.interop.molinahealthcare.com/providerdirectory; "
                 "seed and retest rows can point at the portal or stale fhir.molinahealthcare.com host."
             ),
-            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_previous_api_base": _clean_text(
+                seed_row_by_field.get("api_base")
+            ),
             "provider_directory_confirmed_base": MOLINA_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_catalog_url": MOLINA_DEVELOPER_PORTAL_URL,
             "provider_directory_confirmed_metadata_url": MOLINA_PROVIDER_DIRECTORY_METADATA_URL,
@@ -5277,8 +5288,10 @@ def _washington_provider_directory_override(
     }
 
 
-def _state_public_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
-    api_base = _canonical_base(row.get("api_base"))
+def _state_public_provider_directory_override(
+    seed_row_by_field: dict[str, Any],
+) -> dict[str, Any] | None:
+    api_base = _canonical_base(seed_row_by_field.get("api_base"))
     if api_base == TMHP_PROVIDER_DIRECTORY_BASE:
         return {
             "api_base": TMHP_PROVIDER_DIRECTORY_BASE,
@@ -5292,7 +5305,9 @@ def _state_public_provider_directory_override(row: dict[str, Any]) -> dict[str, 
                     "Texas TMHP publishes public Provider Directory FHIR metadata and resource bundles; "
                     "seed rows can retain stale OAuth/SMART labels."
                 ),
-                "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+                "provider_directory_previous_api_base": _clean_text(
+                    seed_row_by_field.get("api_base")
+                ),
                 "provider_directory_confirmed_base": TMHP_PROVIDER_DIRECTORY_BASE,
                 "provider_directory_confirmed_metadata_url": TMHP_PROVIDER_DIRECTORY_METADATA_URL,
                 "provider_directory_supported_resources": list(
@@ -5316,7 +5331,9 @@ def _state_public_provider_directory_override(row: dict[str, Any]) -> dict[str, 
                     "Nebraska DHHS publishes public Provider Directory FHIR metadata and resource bundles; "
                     "seed rows can retain stale OAuth/SMART labels."
                 ),
-                "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+                "provider_directory_previous_api_base": _clean_text(
+                    seed_row_by_field.get("api_base")
+                ),
                 "provider_directory_confirmed_base": NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
                 "provider_directory_confirmed_metadata_url": NEBRASKA_DHHS_PROVIDER_DIRECTORY_METADATA_URL,
                 "provider_directory_supported_resources": list(
@@ -5364,11 +5381,13 @@ def _maine_provider_directory_override(seed_row: dict[str, Any]) -> dict[str, An
     }
 
 
-def _hap_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
-    api_base = _canonical_base(row.get("api_base"))
-    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
-    source_url = (_clean_text(row.get("source_url")) or "").lower()
-    org_key = _payer_alias_key(row.get("org_name"))
+def _hap_provider_directory_override(
+    seed_row_by_field: dict[str, Any],
+) -> dict[str, Any] | None:
+    api_base = _canonical_base(seed_row_by_field.get("api_base"))
+    portal_url = (_clean_text(seed_row_by_field.get("portal_url")) or "").lower()
+    source_url = (_clean_text(seed_row_by_field.get("source_url")) or "").lower()
+    org_key = _payer_alias_key(seed_row_by_field.get("org_name"))
     parsed_api_base = urllib.parse.urlsplit(api_base or "")
     api_host = parsed_api_base.netloc.lower()
     api_path = parsed_api_base.path.lower()
@@ -5398,7 +5417,9 @@ def _hap_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | No
                 "base at provider-directory-r4.api.hap.org; seed rows can point at the docs page, "
                 "a stale api.hap.org/fhir/provider-directory path, or contain only the HAP payer name."
             ),
-            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_previous_api_base": _clean_text(
+                seed_row_by_field.get("api_base")
+            ),
             "provider_directory_confirmed_base": HAP_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_catalog_url": HAP_PROVIDER_DIRECTORY_DOC_URL,
             "provider_directory_confirmed_metadata_url": HAP_PROVIDER_DIRECTORY_METADATA_URL,
@@ -5414,11 +5435,13 @@ def _hap_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
-def _humana_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
-    api_base = _canonical_base(row.get("api_base"))
-    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
-    source_url = (_clean_text(row.get("source_url")) or "").lower()
-    source_detail = (_clean_text(row.get("source_detail")) or "").lower()
+def _humana_provider_directory_override(
+    seed_row_by_field: dict[str, Any],
+) -> dict[str, Any] | None:
+    api_base = _canonical_base(seed_row_by_field.get("api_base"))
+    portal_url = (_clean_text(seed_row_by_field.get("portal_url")) or "").lower()
+    source_url = (_clean_text(seed_row_by_field.get("source_url")) or "").lower()
+    source_detail = (_clean_text(seed_row_by_field.get("source_detail")) or "").lower()
     should_override = (
         api_base == HUMANA_PROVIDER_DIRECTORY_BASE
         or bool(api_base and api_base.startswith(f"{HUMANA_PROVIDER_DIRECTORY_BASE}/"))
@@ -5450,7 +5473,9 @@ def _humana_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] |
                 "fhir.humana.com/api; seed rows can retain stale OAuth labels or a single "
                 "state/product label that must not be assigned to the shared graph."
             ),
-            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_previous_api_base": _clean_text(
+                seed_row_by_field.get("api_base")
+            ),
             "provider_directory_confirmed_base": HUMANA_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_metadata_url": HUMANA_PROVIDER_DIRECTORY_METADATA_URL,
             "provider_directory_supported_resources": supported_resources,
@@ -5460,9 +5485,9 @@ def _humana_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] |
             "provider_directory_plan_provenance_neutralized": True,
             "provider_directory_acquisition_enabled": True,
             "provider_directory_original_alias": {
-                "org_name": _clean_text(row.get("org_name")),
-                "plan_name": _clean_text(row.get("plan_name")),
-                "api_base": _canonical_base(row.get("api_base")),
+                "org_name": _clean_text(seed_row_by_field.get("org_name")),
+                "plan_name": _clean_text(seed_row_by_field.get("plan_name")),
+                "api_base": _canonical_base(seed_row_by_field.get("api_base")),
             },
         },
     }
@@ -5509,11 +5534,13 @@ def _iehp_provider_directory_override(seed_row: dict[str, Any]) -> dict[str, Any
     }
 
 
-def _scan_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
-    api_base = _canonical_base(row.get("api_base"))
-    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
-    source_url = (_clean_text(row.get("source_url")) or "").lower()
-    org_name = (_clean_text(row.get("org_name")) or "").lower()
+def _scan_provider_directory_override(
+    seed_row_by_field: dict[str, Any],
+) -> dict[str, Any] | None:
+    api_base = _canonical_base(seed_row_by_field.get("api_base"))
+    portal_url = (_clean_text(seed_row_by_field.get("portal_url")) or "").lower()
+    source_url = (_clean_text(seed_row_by_field.get("source_url")) or "").lower()
+    org_name = (_clean_text(seed_row_by_field.get("org_name")) or "").lower()
     should_override = (
         api_base in {SCAN_DEVELOPER_PORTAL_URL, SCAN_PROVIDER_DIRECTORY_BASE}
         or "developer.scanhealthplan.com" in portal_url
@@ -5535,7 +5562,9 @@ def _scan_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | N
                 "SCAN's developer portal embeds the Provider Directory OpenAPI spec with "
                 "providerdirectory.scanhealthplan.com as the FHIR server."
             ),
-            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_previous_api_base": _clean_text(
+                seed_row_by_field.get("api_base")
+            ),
             "provider_directory_confirmed_base": SCAN_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_catalog_url": SCAN_DEVELOPER_PORTAL_URL,
             "provider_directory_confirmed_doc_url": SCAN_PROVIDER_DIRECTORY_DOC_URL,
@@ -16378,24 +16407,38 @@ def _seed_rows_from_contra_costa_catalog(
         or CONTRA_COSTA_PROVIDER_DIRECTORY_DOC_URL
     )
     try:
-        text, source = _read_text_from_path_or_url(catalog_path, url, timeout=timeout)
+        text, catalog_source = _read_text_from_path_or_url(
+            catalog_path,
+            url,
+            timeout=timeout,
+        )
     except Exception as exc:
-        rows = _contra_costa_fallback_seed_rows(source_query=source_query, source_url=url)
-        return rows, {
+        seed_rows = _contra_costa_fallback_seed_rows(
+            source_query=source_query,
+            source_url=url,
+        )
+        return seed_rows, {
             "source": url,
-            "rows": len(rows),
+            "rows": len(seed_rows),
             "fallback": True,
             "error": _short_error(exc),
         }
-    rows = _contra_costa_seed_rows_from_developer_html(
+    seed_rows = _contra_costa_seed_rows_from_developer_html(
         text,
         source_query=source_query,
-        source_url=source,
+        source_url=catalog_source,
     )
-    if rows:
-        return rows, {"source": source, "rows": len(rows)}
-    rows = _contra_costa_fallback_seed_rows(source_query=source_query, source_url=source)
-    return rows, {"source": source, "rows": len(rows), "fallback": True}
+    if seed_rows:
+        return seed_rows, {"source": catalog_source, "rows": len(seed_rows)}
+    seed_rows = _contra_costa_fallback_seed_rows(
+        source_query=source_query,
+        source_url=catalog_source,
+    )
+    return seed_rows, {
+        "source": catalog_source,
+        "rows": len(seed_rows),
+        "fallback": True,
+    }
 
 
 def _seed_rows_from_cms_sma_endpoint_directory(
@@ -19085,21 +19128,27 @@ async def _bulk_checkpoint_worker_guard(
         )
         if lock_acquired is not True:
             raise RuntimeError("bulk_export_checkpoint_worker_active")
-        ownership_probe = partial(
-            _assert_bulk_checkpoint_guard_owner,
-            autocommit_connection,
-            identity,
-        )
+        connection_lock = asyncio.Lock()
+
+        async def ownership_probe() -> None:
+            """Serialize probes that share the advisory-lock connection."""
+            async with connection_lock:
+                await _assert_bulk_checkpoint_guard_owner(
+                    autocommit_connection,
+                    identity,
+                )
+
         try:
             yield ownership_probe
         finally:
             with contextlib.suppress(Exception):
-                await autocommit_connection.scalar(
-                    db.text(
-                        "SELECT pg_advisory_unlock(hashtextextended(:checkpoint_id, 0));"
-                    ),
-                    {"checkpoint_id": identity.checkpoint_id},
-                )
+                async with connection_lock:
+                    await autocommit_connection.scalar(
+                        db.text(
+                            "SELECT pg_advisory_unlock(hashtextextended(:checkpoint_id, 0));"
+                        ),
+                        {"checkpoint_id": identity.checkpoint_id},
+                    )
 
 
 def _bulk_checkpoint_primary_secret() -> str:
@@ -20880,6 +20929,11 @@ def _bulk_checkpoint_error_update_sql() -> str:
                     ELSE :retryable_state
                END,
                error = :error,
+               rows_written = (
+                    SELECT COALESCE(sum(output.rows_written), 0)
+                      FROM {_bulk_output_checkpoint_table_ref()} AS output
+                     WHERE output.checkpoint_id = :checkpoint_id
+               ),
                status_url_ciphertext = CASE
                     WHEN :terminal THEN NULL
                     ELSE status_url_ciphertext
@@ -20945,16 +20999,24 @@ async def _persist_bulk_export_next_poll_at(
         raise RuntimeError("bulk_export_checkpoint_ownership_lost")
 
 
-async def _clear_bulk_export_capabilities(
+async def _repair_terminal_bulk_export_checkpoint(
     identity: BulkExportCheckpointIdentity,
+    terminal_state: str,
 ) -> None:
-    await db.status(
+    """Repair terminal aggregates and capabilities while its guard is held."""
+    if terminal_state not in {
+        BULK_EXPORT_CHECKPOINT_COMPLETE,
+        BULK_EXPORT_CHECKPOINT_FAILED,
+    }:
+        raise ValueError("bulk_export_terminal_checkpoint_state_invalid")
+    updated_count = await db.status(
         f"""
         WITH eligible AS (
             SELECT checkpoint_id
               FROM {_bulk_acquisition_checkpoint_table_ref()}
              WHERE checkpoint_id = :checkpoint_id
-               AND owner_run_id = :owner_run_id
+               AND state = :terminal_state
+             FOR UPDATE
         ), cleared_outputs AS (
             UPDATE {_bulk_output_checkpoint_table_ref()}
                SET output_url_ciphertext = NULL,
@@ -20964,14 +21026,21 @@ async def _clear_bulk_export_capabilities(
          RETURNING checkpoint_id
         )
         UPDATE {_bulk_acquisition_checkpoint_table_ref()}
-           SET status_url_ciphertext = NULL,
+           SET rows_written = (
+                    SELECT COALESCE(sum(output.rows_written), 0)
+                      FROM {_bulk_output_checkpoint_table_ref()} AS output
+                     WHERE output.checkpoint_id = :checkpoint_id
+               ),
+               status_url_ciphertext = NULL,
                manifest_ciphertext = NULL,
                updated_at = now()
          WHERE checkpoint_id IN (SELECT checkpoint_id FROM eligible);
         """,
         checkpoint_id=identity.checkpoint_id,
-        owner_run_id=identity.owner_run_id,
+        terminal_state=terminal_state,
     )
+    if _coerce_rowcount(updated_count) <= 0:
+        raise RuntimeError("bulk_export_terminal_checkpoint_repair_lost")
 
 
 def _bulk_manifest_payload_from_checkpoint(
@@ -21418,6 +21487,7 @@ async def _prepare_bulk_output_validators(
     output_checkpoints: list[dict[str, Any]],
     *,
     timeout: int,
+    ownership_probe: Callable[[], Awaitable[None]],
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Persist immutable validators before any incomplete output is streamed."""
     checkpoints_by_id = {
@@ -21446,6 +21516,7 @@ async def _prepare_bulk_output_validators(
             timeout=timeout,
         )
         if validation_error is not None:
+            await ownership_probe()
             await _record_bulk_export_output_error(
                 identity,
                 output_id,
@@ -21687,24 +21758,65 @@ async def _record_bulk_export_output_error(
     *,
     record_checkpoint: bool = True,
 ) -> None:
+    """Persist output failure and its parent aggregate as one transaction."""
     is_terminal = _is_bulk_export_error_terminal(error)
     updated_count = await db.status(
         f"""
-        UPDATE {_bulk_output_checkpoint_table_ref()} AS output
-           SET state = :state,
-               rows_written = :rows_written,
-               committed_bytes = :committed_bytes,
-               error = :error,
-               last_error = :error,
-               last_error_at = now(),
-               updated_at = now()
-         WHERE output.checkpoint_id = :checkpoint_id
-           AND output.output_id = :output_id
-           AND EXISTS (
+        WITH failed_output AS (
+            UPDATE {_bulk_output_checkpoint_table_ref()} AS output
+               SET state = :state,
+                   rows_written = :rows_written,
+                   committed_bytes = :committed_bytes,
+                   error = :error,
+                   last_error = :error,
+                   last_error_at = now(),
+                   output_url_ciphertext = CASE
+                        WHEN :terminal THEN NULL
+                        ELSE output_url_ciphertext
+                   END,
+                   etag_ciphertext = CASE
+                        WHEN :terminal THEN NULL
+                        ELSE etag_ciphertext
+                   END,
+                   updated_at = now()
+             WHERE output.checkpoint_id = :checkpoint_id
+               AND output.output_id = :output_id
+               AND EXISTS (
                 SELECT 1
                   FROM {_bulk_acquisition_checkpoint_table_ref()} AS acquisition
                  WHERE acquisition.checkpoint_id = output.checkpoint_id
                    AND acquisition.owner_run_id = :owner_run_id
+                   AND acquisition.state NOT IN (
+                        :checkpoint_complete_state,
+                        :checkpoint_failed_state
+                   )
+               )
+         RETURNING output.checkpoint_id
+        )
+        UPDATE {_bulk_acquisition_checkpoint_table_ref()} AS acquisition
+           SET rows_written = (
+                    SELECT COALESCE(
+                        sum(
+                            CASE
+                                WHEN output.output_id = :output_id
+                                THEN :rows_written
+                                ELSE output.rows_written
+                            END
+                        ),
+                        0
+                    )
+                      FROM {_bulk_output_checkpoint_table_ref()} AS output
+                     WHERE output.checkpoint_id = acquisition.checkpoint_id
+               ),
+               lease_expires_at = now() + make_interval(secs => :lease_seconds),
+               updated_at = now()
+         WHERE acquisition.checkpoint_id IN (
+                SELECT checkpoint_id FROM failed_output
+               )
+           AND acquisition.owner_run_id = :owner_run_id
+           AND acquisition.state NOT IN (
+                :checkpoint_complete_state,
+                :checkpoint_failed_state
            );
         """,
         checkpoint_id=identity.checkpoint_id,
@@ -21715,13 +21827,16 @@ async def _record_bulk_export_output_error(
             if is_terminal
             else BULK_EXPORT_OUTPUT_PENDING
         ),
+        terminal=is_terminal,
         rows_written=rows_written,
         committed_bytes=committed_bytes,
         error=error,
+        lease_seconds=_bulk_checkpoint_lease_seconds(),
+        checkpoint_complete_state=BULK_EXPORT_CHECKPOINT_COMPLETE,
+        checkpoint_failed_state=BULK_EXPORT_CHECKPOINT_FAILED,
     )
     if _coerce_rowcount(updated_count) <= 0:
         raise RuntimeError("bulk_export_output_ownership_lost")
-    await _refresh_bulk_export_rows_written(identity)
     if record_checkpoint:
         await _record_bulk_export_checkpoint_error(
             identity,
@@ -22074,16 +22189,15 @@ async def _stream_bulk_export_output_rows(
             str(exc),
         )
     except RuntimeError as exc:
-        if str(exc) in {
-            "bulk_export_checkpoint_ownership_lost",
-            "bulk_export_checkpoint_worker_guard_lost",
-            BULK_EXPORT_STATUS_DEADLINE_EXCEEDED,
-        }:
+        error = str(exc)
+        if error in BULK_EXPORT_FENCING_ERRORS:
+            raise
+        if error == BULK_EXPORT_STATUS_DEADLINE_EXCEEDED:
             return _bulk_stream_result(
                 rows,
                 stream_counts_by_name,
                 row_limit_by_name,
-                str(exc),
+                error,
             )
         return _bulk_stream_result(
             rows,
@@ -22202,6 +22316,7 @@ async def _start_checkpointed_bulk_export(
     identity: BulkExportCheckpointIdentity,
     *,
     timeout: int,
+    ownership_probe: Callable[[], Awaitable[None]],
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
     status_code, headers, status_payload, start_error = await _bulk_http_get_json(
         session,
@@ -22222,6 +22337,7 @@ async def _start_checkpointed_bulk_export(
         start_url=_bulk_export_log_url(identity.start_url),
         status_url=_bulk_capability_log_identity(raw_status_location),
     )
+    await ownership_probe()
     if start_error or status_code is None:
         return await _fail_unknown_bulk_export_acceptance(identity)
     if status_code not in {200, 202}:
@@ -22564,6 +22680,7 @@ async def _finish_checkpointed_bulk_output(
         output_error=output_error,
     )
     if output_error:
+        await options.ownership_probe()
         await _record_bulk_export_output_error(
             identity,
             output_id,
@@ -22662,6 +22779,7 @@ async def _finalize_checkpointed_bulk_outputs(
     )
     if output_checkpoint_error or not is_every_output_complete:
         final_error = output_checkpoint_error or "bulk_export_outputs_incomplete"
+        await options.ownership_probe()
         await _record_bulk_export_checkpoint_error(
             identity,
             final_error,
@@ -22697,6 +22815,7 @@ async def _finalize_checkpointed_bulk_outputs(
 async def _validated_bulk_output_checkpoints(
     identity: BulkExportCheckpointIdentity,
     manifest: BulkExportManifest,
+    ownership_probe: Callable[[], Awaitable[None]],
 ) -> tuple[list[dict[str, Any]], str | None]:
     output_checkpoints = await _load_bulk_output_checkpoints(identity.checkpoint_id)
     checkpoint_error = _bulk_output_checkpoint_error(
@@ -22705,6 +22824,7 @@ async def _validated_bulk_output_checkpoints(
         output_checkpoints,
     )
     if checkpoint_error:
+        await ownership_probe()
         await _record_bulk_export_checkpoint_error(
             identity,
             checkpoint_error,
@@ -22752,8 +22872,14 @@ def _completed_bulk_output_error(
         active_item_by_task.pop(completed_task)
         try:
             task_error = completed_task.result()
+        except (ImportCancelledError, asyncio.CancelledError):
+            raise
+        except RuntimeError as exc:
+            if str(exc) in BULK_EXPORT_FENCING_ERRORS:
+                raise
+            task_error = _bulk_transport_error(exc)
         except Exception as exc:
-            task_error = str(exc) or _bulk_transport_error(exc)
+            task_error = _bulk_transport_error(exc)
         output_error = output_error or task_error
     return output_error
 
@@ -22817,6 +22943,7 @@ async def _run_pending_bulk_output_tasks(
             )
             if output_error:
                 await _cancel_bulk_output_tasks(active_item_by_task)
+                await options.ownership_probe()
                 await _record_bulk_export_checkpoint_error(
                     identity,
                     output_error,
@@ -22846,6 +22973,7 @@ async def _resume_checkpointed_bulk_outputs(
         output_checkpoints,
     )
     if pending_error:
+        await options.ownership_probe()
         await _record_bulk_export_checkpoint_error(
             identity,
             pending_error,
@@ -22887,7 +23015,11 @@ async def _stream_checkpointed_bulk_outputs(
 ) -> ResourceFetchResult:
     """Validate, stream, and atomically finalize manifest outputs."""
     output_checkpoints, checkpoint_error = (
-        await _validated_bulk_output_checkpoints(identity, manifest)
+        await _validated_bulk_output_checkpoints(
+            identity,
+            manifest,
+            options.ownership_probe,
+        )
     )
     if checkpoint_error:
         return _checkpointed_bulk_stream_result(
@@ -22904,6 +23036,7 @@ async def _stream_checkpointed_bulk_outputs(
             manifest,
             output_checkpoints,
             timeout=options.timeout,
+            ownership_probe=options.ownership_probe,
         )
         if validator_error:
             return _checkpointed_bulk_stream_result(
@@ -22946,10 +23079,17 @@ async def _load_or_start_checkpointed_bulk_export(
     identity: BulkExportCheckpointIdentity,
     *,
     timeout: int,
+    ownership_probe: Callable[[], Awaitable[None]],
+    cancel_probe: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
     checkpoint = await _load_bulk_export_checkpoint(identity)
     if checkpoint:
-        return await _claim_existing_bulk_export_checkpoint(identity, checkpoint)
+        return await _claim_existing_bulk_export_checkpoint(
+            identity,
+            checkpoint,
+            ownership_probe=ownership_probe,
+            cancel_probe=cancel_probe,
+        )
     try:
         _bulk_checkpoint_primary_secret()
     except RuntimeError as exc:
@@ -22958,36 +23098,50 @@ async def _load_or_start_checkpointed_bulk_export(
         identity
     )
     if not is_reservation_owner:
-        return await _claim_existing_bulk_export_checkpoint(identity, checkpoint)
+        return await _claim_existing_bulk_export_checkpoint(
+            identity,
+            checkpoint,
+            ownership_probe=ownership_probe,
+            cancel_probe=cancel_probe,
+        )
+    await ownership_probe()
     return await _start_checkpointed_bulk_export(
         session,
         source_record,
         identity,
         timeout=timeout,
+        ownership_probe=ownership_probe,
     )
 
 
 async def _claim_existing_bulk_export_checkpoint(
     identity: BulkExportCheckpointIdentity,
     checkpoint: dict[str, Any],
+    *,
+    ownership_probe: Callable[[], Awaitable[None]],
+    cancel_probe: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[dict[str, Any], None, str | None]:
     claim_deadline = time.monotonic() + _bulk_checkpoint_lease_seconds()
     while True:
+        if cancel_probe is not None:
+            await cancel_probe()
         checkpoint_owner = _clean_text(checkpoint.get("owner_run_id"))
         checkpoint_state = _clean_text(checkpoint.get("state"))
-        if checkpoint_owner == identity.owner_run_id:
-            if checkpoint_state == BULK_EXPORT_CHECKPOINT_STARTING:
-                return await _fail_unknown_bulk_export_acceptance(identity)
-            return checkpoint, None, None
         if checkpoint_state in {
             BULK_EXPORT_CHECKPOINT_COMPLETE,
             BULK_EXPORT_CHECKPOINT_FAILED,
         }:
             return checkpoint, None, None
+        if checkpoint_owner == identity.owner_run_id:
+            await ownership_probe()
+            if checkpoint_state == BULK_EXPORT_CHECKPOINT_STARTING:
+                return await _fail_unknown_bulk_export_acceptance(identity)
+            return checkpoint, None, None
         if identity.retry_of_run_id != checkpoint_owner:
             return checkpoint, None, "bulk_export_checkpoint_lineage_mismatch"
         try:
             adopted_checkpoint = await _adopt_bulk_export_checkpoint(identity)
+            await ownership_probe()
             return adopted_checkpoint, None, None
         except RuntimeError as exc:
             if str(exc) != "bulk_export_checkpoint_ownership_conflict":
@@ -23112,6 +23266,8 @@ async def _load_active_bulk_checkpoint(
     identity: BulkExportCheckpointIdentity,
     model: type,
     fetch_options: BulkExportFetchOptions,
+    ownership_probe: Callable[[], Awaitable[None]],
+    cancel_probe: Callable[[], Awaitable[None]],
 ) -> tuple[
     dict[str, Any] | None,
     dict[str, Any] | None,
@@ -23123,6 +23279,8 @@ async def _load_active_bulk_checkpoint(
             source_record,
             identity,
             timeout=fetch_options.timeout,
+            ownership_probe=ownership_probe,
+            cancel_probe=cancel_probe,
         )
     )
     if checkpoint is None:
@@ -23134,8 +23292,21 @@ async def _load_active_bulk_checkpoint(
         )
     terminal_result = _terminal_bulk_checkpoint_result(model, checkpoint)
     if terminal_result is not None:
-        await _clear_bulk_export_capabilities(identity)
-        return None, None, terminal_result
+        terminal_state = _clean_text(checkpoint.get("state"))
+        if terminal_state is None:
+            raise RuntimeError("bulk_export_terminal_checkpoint_state_missing")
+        await _repair_terminal_bulk_export_checkpoint(
+            identity,
+            terminal_state,
+        )
+        repaired_checkpoint = await _load_bulk_export_checkpoint(identity)
+        repaired_result = _terminal_bulk_checkpoint_result(
+            model,
+            repaired_checkpoint,
+        )
+        if repaired_result is None:
+            raise RuntimeError("bulk_export_terminal_checkpoint_repair_lost")
+        return None, None, repaired_result
     return checkpoint, initial_status_payload, None
 
 
@@ -23145,8 +23316,11 @@ async def _fetch_owned_checkpointed_bulk_resource_rows(
     ownership_probe: Callable[[], Awaitable[None]],
 ) -> ResourceFetchResult | None:
     """Continue one checkpoint while its worker guard is held."""
-    runtime_probe = _bulk_fetch_runtime_probe(ownership_probe, fetch_options)
-    await runtime_probe()
+    cancel_probe, runtime_probe = _bulk_fetch_runtime_probes(
+        ownership_probe,
+        fetch_options,
+    )
+    await cancel_probe()
     async with _bulk_client_session() as session:
         checkpoint, initial_status_payload, early_result = (
             await _load_active_bulk_checkpoint(
@@ -23155,12 +23329,15 @@ async def _fetch_owned_checkpointed_bulk_resource_rows(
                 identity,
                 model,
                 fetch_options,
+                ownership_probe,
+                cancel_probe,
             )
         )
         if early_result is not None:
             return early_result
         if checkpoint is None:
             return None
+        await runtime_probe()
         manifest, manifest_error, polls = await _checkpointed_bulk_export_manifest(
             session,
             source_record,
@@ -23200,17 +23377,28 @@ async def _fetch_owned_checkpointed_bulk_resource_rows(
         )
 
 
-def _bulk_fetch_runtime_probe(
+def _bulk_fetch_runtime_probes(
     ownership_probe: Callable[[], Awaitable[None]],
     fetch_options: BulkExportFetchOptions,
-) -> Callable[[], Awaitable[None]]:
-    return partial(
+) -> tuple[
+    Callable[[], Awaitable[None]],
+    Callable[[], Awaitable[None]],
+]:
+    deadline_at = _bulk_deadline_at(fetch_options.deadline_seconds)
+    cancel_probe = partial(
+        _bulk_cancel_probe,
+        fetch_options.cancel_ctx,
+        fetch_options.cancel_task,
+        deadline_at,
+    )
+    runtime_probe = partial(
         _bulk_checkpoint_runtime_probe,
         ownership_probe,
         fetch_options.cancel_ctx,
         fetch_options.cancel_task,
-        _bulk_deadline_at(fetch_options.deadline_seconds),
+        deadline_at,
     )
+    return cancel_probe, runtime_probe
 
 
 async def _fetch_bulk_export_resource_rows(
@@ -27963,7 +28151,7 @@ def _reference_resource_key(reference: str | None, expected_type: str) -> tuple[
 
 
 def _linked_resource_candidate_urls(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     resource_type: str,
     resource_id: str,
     *,
@@ -27977,13 +28165,17 @@ def _linked_resource_candidate_urls(
         parsed_ref = urllib.parse.urlsplit(reference)
         if parsed_ref.scheme and parsed_ref.netloc:
             urls.append(urllib.parse.urlunsplit((parsed_ref.scheme, parsed_ref.netloc, parsed_ref.path, "", "")))
-    api_base = _canonical_base(source.get("api_base"))
+    api_base = _canonical_base(source_record.get("api_base"))
     endpoint = None
     if resource_type == "Organization" and reference_field == "network_refs":
-        endpoint = _clean_text(source.get("endpoint_network"))
+        endpoint = _clean_text(source_record.get("endpoint_network"))
     if not endpoint:
         endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type)
-        endpoint = _clean_text(source.get(endpoint_field)) if endpoint_field else None
+        endpoint = (
+            _clean_text(source_record.get(endpoint_field))
+            if endpoint_field
+            else None
+        )
     if endpoint and not _is_placeholder_url(endpoint):
         encoded_id = urllib.parse.quote(resource_id, safe="")
         parsed_endpoint = urllib.parse.urlsplit(endpoint)

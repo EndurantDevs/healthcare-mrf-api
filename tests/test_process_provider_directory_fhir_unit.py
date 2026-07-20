@@ -2814,7 +2814,7 @@ def test_resource_import_source_selection_reports_credentialed_policy_counts():
 
 
 def test_resource_import_source_selection_allows_live_probe_success_over_open_only():
-    source_row = {
+    source_record_by_field = {
         "source_id": "credentialed_valid",
         "api_base": "https://auth.example/fhir",
         "auth_type": "OAuth2 Client Credentials",
@@ -2823,13 +2823,13 @@ def test_resource_import_source_selection_allows_live_probe_success_over_open_on
     }
 
     selected, metrics = importer._select_resource_import_sources(
-        [source_row],
+        [source_record_by_field],
         valid_source_ids={"credentialed_valid"},
         open_only=True,
         include_auth_required=False,
     )
 
-    assert selected == [source_row]
+    assert selected == [source_record_by_field]
     assert metrics["source_import_sources_selected"] == 1
     assert metrics["source_import_sources_selected_live_probe_valid"] == 1
     assert metrics["source_import_sources_selected_declared_credentialed"] == 1
@@ -16021,8 +16021,8 @@ class _BulkCheckpointMemory:
         monkeypatch.setattr(importer, "_record_bulk_export_checkpoint_error", self.record_checkpoint_error)
         monkeypatch.setattr(
             importer,
-            "_clear_bulk_export_capabilities",
-            self.clear_capabilities,
+            "_repair_terminal_bulk_export_checkpoint",
+            self.repair_terminal_checkpoint,
         )
 
     def _checkpoint_map(
@@ -16342,10 +16342,15 @@ class _BulkCheckpointMemory:
                     output_checkpoint["output_url_ciphertext"] = None
                     output_checkpoint["etag_ciphertext"] = None
 
-    async def clear_capabilities(self, identity):
+    async def repair_terminal_checkpoint(self, identity, terminal_state):
         checkpoint_id = identity.checkpoint_id
         checkpoint = self.checkpoint_by_id[checkpoint_id]
-        assert checkpoint["owner_run_id"] == identity.owner_run_id
+        assert checkpoint["state"] == terminal_state
+        checkpoint["rows_written"] = sum(
+            output_checkpoint["rows_written"]
+            for output_checkpoint in self.output_by_id.values()
+            if output_checkpoint["checkpoint_id"] == checkpoint_id
+        )
         checkpoint["status_url_ciphertext"] = None
         checkpoint["manifest_ciphertext"] = None
         for output_checkpoint in self.output_by_id.values():
