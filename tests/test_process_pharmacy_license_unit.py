@@ -598,3 +598,165 @@ def test_parse_zip_records_handles_nested_archives_and_skips_metadata_files():
     assert len(rows) == 1
     assert rows[0]["License Number"] == "MA123"
     assert rows[0]["Organization Name"] == "Sample Pharmacy"
+
+
+def test_identifier_and_source_normalizers_cover_supported_edge_cases():
+    generated_run_id = pharmacy_license._normalize_run_id(None)
+    punctuation_only_run_id = pharmacy_license._normalize_run_id("***")
+
+    assert pharmacy_license._normalize_run_id(" run/id ") == "run_id"
+    assert len(generated_run_id) == 23
+    assert generated_run_id[14] == "_"
+    assert len(punctuation_only_run_id) == 23
+    assert pharmacy_license._normalize_import_id(None).isdigit()
+    assert pharmacy_license._normalize_import_id("monthly/2026-07") == "monthly_2026_07"
+    assert pharmacy_license._normalize_import_id("***") == "___"
+    assert pharmacy_license._normalize_key(" License Number ") == "licensenumber"
+    assert pharmacy_license._safe_text(None) is None
+    assert pharmacy_license._safe_text("   ") is None
+    assert pharmacy_license._safe_text(" value ") == "value"
+    assert pharmacy_license._strip_html_tags("<b>A &amp; B</b>") == "A & B"
+    assert pharmacy_license._normalize_license_for_match(None) is None
+    assert pharmacy_license._normalize_license_for_match(" ma-ph 12 ") == "MAPH12"
+    assert pharmacy_license._normalize_zip_for_match("12") is None
+    assert pharmacy_license._normalize_zip_for_match("02108-1234") == "02108"
+    assert pharmacy_license._normalize_digits_for_match(None) is None
+    assert pharmacy_license._normalize_digits_for_match("MA-12-03") == "1203"
+    assert pharmacy_license._normalize_city_for_match(None) is None
+    assert pharmacy_license._normalize_city_for_match("  New-York  ") == "new york"
+    assert pharmacy_license._normalize_name_for_match(None) is None
+    assert pharmacy_license._normalize_name_for_match("Acme Pharmacy, Inc.") == "acmepharmacyinc"
+    assert (
+        pharmacy_license._normalize_name_for_match("Acme Pharmacy, Inc.", loose=True)
+        == "acmepharmacy"
+    )
+    assert pharmacy_license._iter_name_variants_for_match(None) == []
+    assert pharmacy_license._unique_mapping({"A": {1}, "B": {2, 3}}) == {"A": 1}
+    assert pharmacy_license._state_code_for_name("  New   York ") == "NY"
+    assert pharmacy_license._state_code_for_name("Atlantis") is None
+
+    snapshot_id = pharmacy_license._hash_snapshot_id("run", "MA", "https://example.com")
+    assert snapshot_id.startswith("run:MA:")
+    assert len(snapshot_id) == len("run:MA:") + 12
+    assert pharmacy_license._entry_extensions(None) == ""
+    assert pharmacy_license._entry_extensions("https://example.com/a.CSV?x=1") == "csv"
+    assert pharmacy_license._entry_extensions("https://example.com/a.json") == "json"
+    assert pharmacy_license._entry_extensions("https://example.com/a.zip") == "zip"
+    assert pharmacy_license._entry_extensions("https://example.com/a.xml") == "xml"
+    assert pharmacy_license._entry_extensions("https://example.com/a.txt") == ""
+    assert pharmacy_license._is_noise_link("https://example.com/sitemap.xml") is True
+    assert pharmacy_license._is_noise_link("https://example.com/licenses.csv") is False
+
+
+def test_date_boolean_and_npi_normalizers_cover_invalid_and_wrapped_values():
+    assert pharmacy_license._to_date(None) is None
+    assert pharmacy_license._to_date("not-a-date") is None
+    assert pharmacy_license._to_date("recorded 2026-02-28") == datetime.date(2026, 2, 28)
+    assert pharmacy_license._to_date("recorded 2026-02-30") is None
+    assert pharmacy_license._to_date("08/31/26") == datetime.date(2026, 8, 31)
+    assert pharmacy_license._to_date("08-31-26") == datetime.date(2026, 8, 31)
+
+    assert pharmacy_license._to_bool(None) is None
+    assert pharmacy_license._to_bool(True) is True
+    assert pharmacy_license._to_bool(" ") is None
+    assert pharmacy_license._to_bool("YES") is True
+    assert pharmacy_license._to_bool("closed") is False
+    assert pharmacy_license._to_bool("maybe") is None
+
+    assert pharmacy_license._to_npi("1-1234567890-0") == 1234567890
+    assert pharmacy_license._to_npi("1-2345678901") == 2345678901
+    assert pharmacy_license._to_npi("123") is None
+    assert pharmacy_license._to_npi("0000000000") is None
+
+
+def test_state_npi_resolver_uses_each_partd_name_fallback_level():
+    resolver = pharmacy_license.StateNpiResolver(
+        state_code="MA",
+        by_license={"MAPH1": 1111111111},
+        by_name_city={("cityrx", "boston"): 2222222222},
+        by_name={"namerx": 3333333333},
+        partd_name_fallback_enabled=True,
+    )
+
+    assert resolver.resolve(
+        license_number="MA-PH-1",
+        entity_name=None,
+        dba_name=None,
+        city=None,
+        zip_code=None,
+    ) == 1111111111
+    assert resolver.resolve(
+        license_number=None,
+        entity_name="City RX",
+        dba_name=None,
+        city="Boston",
+        zip_code=None,
+    ) == 2222222222
+    assert resolver.resolve(
+        license_number=None,
+        entity_name="Name RX",
+        dba_name=None,
+        city=None,
+        zip_code=None,
+    ) == 3333333333
+    assert resolver.resolve(
+        license_number=None,
+        entity_name="Missing RX",
+        dba_name=None,
+        city=None,
+        zip_code=None,
+    ) is None
+    assert resolver.stats == {"license": 1, "name_city": 1, "name": 1}
+
+
+def test_aspnet_form_helpers_cover_empty_and_fallback_paths():
+    page_html = """
+    <form action="results.aspx">
+      <input type="hidden" name="ignored" value="x">
+      <input type="hidden" name="__VIEWSTATE" value="a&amp;b">
+      <input name="t_web_lookup__full_name">
+      <select name="t_web_lookup__profession_name">
+        <option value="">Select</option>
+        <option value="PH">Pharmacy</option>
+      </select>
+    </form>
+    """
+
+    assert pharmacy_license._extract_hidden_fields(page_html) == {"__VIEWSTATE": "a&b"}
+    assert pharmacy_license._extract_lookup_field_names(page_html) == {
+        "t_web_lookup__full_name",
+        "t_web_lookup__profession_name",
+    }
+    options = pharmacy_license._extract_select_options(
+        page_html,
+        "t_web_lookup__profession_name",
+    )
+    assert options == [("", "Select"), ("PH", "Pharmacy")]
+    assert pharmacy_license._extract_select_options(page_html, "missing") == []
+    assert pharmacy_license._pick_pharmacy_option([]) is None
+    assert pharmacy_license._pick_pharmacy_option(options) == "PH"
+    assert pharmacy_license._pick_pharmacy_option(
+        [("TECH", "Pharmacy Technician"), ("RX", "Retail Pharmacy")],
+        prefer_facility=True,
+    ) == "RX"
+    assert pharmacy_license._pick_pharmacy_option([("GRAD", "Graduate Pharmacist")]) == "GRAD"
+    assert pharmacy_license._pick_pharmacy_option([("MD", "Physician")]) is None
+    assert pharmacy_license._pick_exact_option(options, "") is None
+    assert pharmacy_license._pick_exact_option(options, "pharmacy") == "PH"
+    assert pharmacy_license._pick_exact_option(options, "pharmacist") is None
+    assert pharmacy_license._extract_form_action("<div />", "https://example.com/search") == (
+        "https://example.com/search"
+    )
+    assert pharmacy_license._extract_form_action(
+        "<form action='results.aspx'>",
+        "https://example.com/search",
+    ) == "https://example.com/results.aspx"
+    assert pharmacy_license._hydrate_row_with_address_parts({"Name": "A"}) == {"Name": "A"}
+    assert pharmacy_license._hydrate_row_with_address_parts(
+        {"Address": "not a city-state-zip"}
+    ) == {"Address": "not a city-state-zip"}
+    assert pharmacy_license._hydrate_row_with_address_parts(
+        {"Address": "Boston MA 02108", "City": "Boston", "State": "MA"}
+    ) == {"Address": "Boston MA 02108", "City": "Boston", "State": "MA"}
+    assert pharmacy_license._is_captcha_page("Please solve the CAPTCHA") is True
+    assert pharmacy_license._is_captcha_page("license results") is False

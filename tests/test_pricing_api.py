@@ -2843,7 +2843,7 @@ def test_allowed_amount_provider_predicate_preserves_provider_sex():
 
 
 @pytest.mark.asyncio
-async def test_plan_scoped_ptg_miss_queries_allowed_amounts_by_default(
+async def test_missing_plan_snapshots_return_empty_200_after_default_allowed_fallback(
     monkeypatch,
 ):
     strict_search = AsyncMock(return_value=None)
@@ -2865,13 +2865,18 @@ async def test_plan_scoped_ptg_miss_queries_allowed_amounts_by_default(
             "plan_id": "TESTPLAN001",
             "market_type": "group",
             "code": "99203",
-            "snapshot_id": "strict-v3-snapshot",
         },
     )
     response = await list_providers_by_procedure(request)
     response_by_field = json.loads(response.body)
 
+    assert response.status == 200
+    assert response_by_field["result_state"] == "no_snapshot_for_plan"
     assert response_by_field["pricing_scope"] == "plan_scoped_ptg"
+    assert response_by_field["resolved"] is False
+    assert response_by_field["reason"] == (
+        "no published serving snapshot for this plan_id + market_type"
+    )
     assert response_by_field["items"] == []
     strict_search.assert_awaited_once()
     allowed_search.assert_awaited_once()
@@ -2971,6 +2976,8 @@ async def test_allowed_amount_snapshot_lookup_uses_allowed_only_current_pointers
     assert "ptg2_allowed_amount_plan plan_coverage" in lookup_sql
     assert "ptg2_current_plan_source" not in lookup_sql
     assert "serving_index" not in lookup_sql
+    assert "json_typeof(allowed_index) = 'object'" in lookup_sql
+    assert "jsonb_typeof(allowed_index)" not in lookup_sql
     assert "allowed_index->>'current_source_key'" in lookup_sql
     assert "allowed_index->>'arch_version' = 'postgres_binary_v3'" in lookup_sql
     assert "allowed_index->>'storage' = 'postgresql'" in lookup_sql
