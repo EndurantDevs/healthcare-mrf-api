@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import resource
 import shutil
@@ -48,6 +49,9 @@ from process.ptg_parts.rust_scanner import (
 
 PTG2_V3_FINALIZER_FORMAT = "ptg2_v3_direct_finalizer_v3"
 PTG2_V3_FINALIZER_RESOURCE_CONTRACT = "ptg2_v3_finalizer_resources_v1"
+PTG2_V3_SCRATCH_DURABILITY_CONTRACT = "ptg2_v3_scratch_durability_v1"
+PTG2_V3_DURABLE_SCRATCH_DURABILITY = "durable"
+PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY = "ephemeral"
 PTG2_V3_SERVING_RUN_FORMAT = "ptg2_v3_serving_run"
 PTG2_V3_SERVING_RUN_VERSION = 1
 PTG2_V3_SERVING_RUN_RECORD_BYTES = 52
@@ -111,6 +115,20 @@ _FINALIZER_RESOURCE_CONFIGURATION_FIELDS = frozenset(
     }
 )
 _FINALIZER_SORT_MEMORY_SCOPE = "process_total_across_workers_v1"
+_FINALIZER_SCRATCH_DURABILITY_SCOPE = "selected_rebuildable_categories_v1"
+_FINALIZER_SCRATCH_CATEGORIES = frozenset(
+    {"assigned_final_runs", "price_copy_output", "serving_copy_output"}
+)
+_FINALIZER_SCRATCH_SYNC_FIELDS = frozenset(
+    {
+        "sync_calls",
+        "sync_bytes",
+        "sync_seconds",
+        "sync_max_seconds",
+        "skipped_sync_calls",
+        "skipped_sync_bytes",
+    }
+)
 _MIB = 1024 * 1024
 _CGROUP_MEMORY_LIMIT_PATHS = (
     Path("/sys/fs/cgroup/memory.max"),
@@ -1539,11 +1557,198 @@ def _validated_finalizer_resource_contract(
     return contract_map
 
 
+def _validated_scratch_sync_metrics(
+    sync_metrics_by_field: Any,
+    *,
+    label: str,
+) -> dict[str, int | float]:
+    """Validate exact counters and timings for one scratch category."""
+
+    if not isinstance(sync_metrics_by_field, Mapping) or set(
+        sync_metrics_by_field
+    ) != set(
+        _FINALIZER_SCRATCH_SYNC_FIELDS
+    ):
+        raise RuntimeError(f"strict V3 finalizer {label} sync metrics are incomplete")
+    normalized_metrics_by_field: dict[str, int | float] = {}
+    for field_name in _FINALIZER_SCRATCH_SYNC_FIELDS - {
+        "sync_seconds",
+        "sync_max_seconds",
+    }:
+        normalized_metrics_by_field[field_name] = _required_non_negative_integer(
+            sync_metrics_by_field.get(field_name),
+            field_name=f"{label} {field_name}",
+        )
+    for field_name in ("sync_seconds", "sync_max_seconds"):
+        metric_value = sync_metrics_by_field.get(field_name)
+        if (
+            type(metric_value) not in (int, float)
+            or not math.isfinite(metric_value)
+            or metric_value < 0
+        ):
+            raise RuntimeError(
+                f"strict V3 finalizer {label} has invalid {field_name}"
+            )
+        normalized_metrics_by_field[field_name] = float(metric_value)
+    if (
+        normalized_metrics_by_field["sync_max_seconds"]
+        > normalized_metrics_by_field["sync_seconds"]
+    ):
+        raise RuntimeError(
+            f"strict V3 finalizer {label} sync maxima are inconsistent"
+        )
+    return normalized_metrics_by_field
+
+
+def _expected_scratch_crash_recovery(expected_policy: str) -> str:
+    """Return the fail-closed crash contract for one durability policy."""
+
+    if expected_policy == PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY:
+        return "caller_discards_and_rebuilds_uncommitted_attempt_v1"
+    return "synced_files_before_atomic_directory_publish_v1"
+
+
+def _validated_scratch_contract(
+    scratch_metadata: Any,
+    *,
+    expected_policy: str,
+) -> tuple[dict[str, Any], Mapping[str, Any]]:
+    """Validate policy identity and return its exact category mapping."""
+
+    if expected_policy not in {
+        PTG2_V3_DURABLE_SCRATCH_DURABILITY,
+        PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY,
+    }:
+        raise RuntimeError(
+            "strict V3 finalizer expected scratch durability is incompatible"
+        )
+    if not isinstance(scratch_metadata, Mapping):
+        raise RuntimeError("strict V3 finalizer scratch durability is missing")
+    scratch_map = dict(scratch_metadata)
+    expected_by_field = {
+        "contract": PTG2_V3_SCRATCH_DURABILITY_CONTRACT,
+        "policy": expected_policy,
+        "scope": _FINALIZER_SCRATCH_DURABILITY_SCOPE,
+        "atomic_directory_publish": True,
+        "sync_bytes_definition": "logical_file_bytes_presented_to_sync_all_v1",
+        "sync_seconds_definition": "cumulative_elapsed_around_sync_all_calls_v1",
+        "sync_max_seconds_definition": "maximum_single_sync_all_call_elapsed_v1",
+        "crash_recovery": _expected_scratch_crash_recovery(expected_policy),
+    }
+    if any(
+        scratch_map.get(field_name) != expected_value
+        for field_name, expected_value in expected_by_field.items()
+    ):
+        raise RuntimeError("strict V3 finalizer scratch durability is incompatible")
+    sync_metrics_by_category = scratch_map.get("categories")
+    if not isinstance(sync_metrics_by_category, Mapping) or set(
+        sync_metrics_by_category
+    ) != set(_FINALIZER_SCRATCH_CATEGORIES):
+        raise RuntimeError(
+            "strict V3 finalizer scratch durability categories are incomplete"
+        )
+    return scratch_map, sync_metrics_by_category
+
+
+def _validate_scratch_metric_totals(
+    sync_metrics_by_category: Mapping[str, Mapping[str, int | float]],
+    total_metrics_by_field: Mapping[str, int | float],
+) -> None:
+    """Require totals to exactly describe all bounded sync categories."""
+
+    for field_name in _FINALIZER_SCRATCH_SYNC_FIELDS:
+        category_values = [
+            metrics_by_field[field_name]
+            for metrics_by_field in sync_metrics_by_category.values()
+        ]
+        category_total = (
+            max(category_values)
+            if field_name == "sync_max_seconds"
+            else sum(category_values)
+        )
+        totals_match = (
+            math.isclose(
+                float(total_metrics_by_field[field_name]),
+                float(category_total),
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            if field_name in {"sync_seconds", "sync_max_seconds"}
+            else total_metrics_by_field[field_name] == category_total
+        )
+        if not totals_match:
+            raise RuntimeError(
+                f"strict V3 finalizer scratch total {field_name} is inconsistent"
+            )
+
+
+def _validate_scratch_policy_metrics(
+    sync_metrics_by_category: Mapping[str, Mapping[str, int | float]],
+    *,
+    expected_policy: str,
+) -> None:
+    """Require every category to prove it honored the selected policy."""
+
+    for metrics_by_field in sync_metrics_by_category.values():
+        if expected_policy == PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY:
+            is_policy_honored = (
+                metrics_by_field["sync_calls"] == 0
+                and metrics_by_field["sync_bytes"] == 0
+                and metrics_by_field["sync_seconds"] == 0
+                and metrics_by_field["sync_max_seconds"] == 0
+                and metrics_by_field["skipped_sync_calls"] > 0
+                and metrics_by_field["skipped_sync_bytes"] > 0
+            )
+        else:
+            is_policy_honored = (
+                metrics_by_field["skipped_sync_calls"] == 0
+                and metrics_by_field["skipped_sync_bytes"] == 0
+                and metrics_by_field["sync_calls"] > 0
+                and metrics_by_field["sync_bytes"] > 0
+            )
+        if not is_policy_honored:
+            raise RuntimeError(
+                f"strict V3 finalizer did not honor {expected_policy} scratch durability"
+            )
+
+
+def _validated_scratch_durability(
+    scratch_metadata: Any,
+    *,
+    expected_policy: str,
+) -> dict[str, Any]:
+    """Validate a complete durability report and its selected policy."""
+
+    scratch_map, raw_metrics_by_category = _validated_scratch_contract(
+        scratch_metadata,
+        expected_policy=expected_policy,
+    )
+    sync_metrics_by_category = {
+        category: _validated_scratch_sync_metrics(
+            raw_metrics_by_category[category], label=f"scratch {category}"
+        )
+        for category in sorted(_FINALIZER_SCRATCH_CATEGORIES)
+    }
+    total_metrics_by_field = _validated_scratch_sync_metrics(
+        scratch_map.get("selected_total"), label="scratch selected total"
+    )
+    _validate_scratch_metric_totals(
+        sync_metrics_by_category,
+        total_metrics_by_field,
+    )
+    _validate_scratch_policy_metrics(
+        sync_metrics_by_category,
+        expected_policy=expected_policy,
+    )
+    return scratch_map
+
+
 def validate_v3_finalizer_summary(
     summary_payload: Mapping[str, Any],
     *,
     expected_source_count: int | None = None,
     expected_resource_configuration: Mapping[str, Any] | None = None,
+    expected_scratch_durability: str | None = None,
 ) -> dict[str, Any]:
     """Validate the strict finalizer contract and return a shallow summary copy."""
 
@@ -1574,6 +1779,26 @@ def validate_v3_finalizer_summary(
             raise RuntimeError(
                 "strict V3 finalizer did not confirm the invoked resource configuration"
             )
+    observed_scratch_durability = finalizer_summary_map.get("scratch_durability")
+    if expected_scratch_durability is not None:
+        _validated_scratch_durability(
+            observed_scratch_durability,
+            expected_policy=expected_scratch_durability,
+        )
+    elif observed_scratch_durability is not None:
+        observed_policy = (
+            observed_scratch_durability.get("policy")
+            if isinstance(observed_scratch_durability, Mapping)
+            else None
+        )
+        if observed_policy not in {"durable", "ephemeral"}:
+            raise RuntimeError(
+                "strict V3 finalizer scratch durability is incompatible"
+            )
+        _validated_scratch_durability(
+            observed_scratch_durability,
+            expected_policy=observed_policy,
+        )
     source_count = _required_non_negative_integer(
         finalizer_summary_map.get("source_count"), field_name="source_count"
     )
@@ -1729,9 +1954,17 @@ async def run_v3_direct_finalizer(
     ],
     price_key_map_input: str | Path,
     price_key_map_row_count: int,
+    scratch_durability: str = PTG2_V3_DURABLE_SCRATCH_DURABILITY,
 ) -> dict[str, Any]:
     """Run the bounded Rust external-sort/finalize path without Python row materialization."""
 
+    if scratch_durability not in {
+        PTG2_V3_DURABLE_SCRATCH_DURABILITY,
+        PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY,
+    }:
+        raise RuntimeError(
+            "strict V3 finalizer scratch durability must be durable or ephemeral"
+        )
     resource_configuration = _load_v3_finalizer_resource_configuration()
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
@@ -1766,6 +1999,8 @@ async def run_v3_direct_finalizer(
         str(price_key_map_path),
         "--price-key-map-row-count",
         str(int(price_key_map_row_count)),
+        "--scratch-durability",
+        scratch_durability,
         *resource_configuration.command_arguments(),
     ]
     command_args.append(str(manifest_path))
@@ -1793,6 +2028,9 @@ async def run_v3_direct_finalizer(
             expected_source_count=expected_source_count,
             expected_resource_configuration=(
                 resource_configuration.contract_metadata()
+            ),
+            expected_scratch_durability=(
+                scratch_durability
             ),
         )
         if (

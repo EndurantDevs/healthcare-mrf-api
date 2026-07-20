@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::Instant;
 
 pub const SERVING_RUN_RECORD_BYTES: usize = 52;
 pub const SERVING_RUN_FORMAT: &str = "ptg2_v3_serving_run";
@@ -26,6 +27,90 @@ const DEFAULT_SORT_BUFFER_BYTES: usize = 1024 * 1024;
 const DEFAULT_SORT_MERGE_FAN_IN: usize = 64;
 const MAX_TAGGED_SERVING_RUN_RECORD_BYTES: usize = SERVING_RUN_RECORD_BYTES + 4;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Controls whether rebuildable, per-attempt files are synced before use.
+///
+/// Durable is deliberately the default so standalone scanner invocations keep
+/// their existing crash-durability contract. Ephemeral is reserved for callers
+/// that own cleanup and can rebuild an uncommitted attempt after a host crash.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ScratchDurability {
+    #[default]
+    Durable,
+    Ephemeral,
+}
+
+impl ScratchDurability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+
+    pub fn parse(value: &str) -> io::Result<Self> {
+        match value {
+            "durable" => Ok(Self::Durable),
+            "ephemeral" => Ok(Self::Ephemeral),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scratch durability must be durable or ephemeral",
+            )),
+        }
+    }
+
+    pub fn sync_file(self, file: &File, byte_count: u64) -> io::Result<ScratchSyncStats> {
+        if self == Self::Ephemeral {
+            return Ok(ScratchSyncStats {
+                skipped_sync_calls: 1,
+                skipped_sync_bytes: byte_count,
+                ..ScratchSyncStats::default()
+            });
+        }
+        let started_at = Instant::now();
+        file.sync_all()?;
+        let sync_seconds = started_at.elapsed().as_secs_f64();
+        Ok(ScratchSyncStats {
+            sync_calls: 1,
+            sync_bytes: byte_count,
+            sync_seconds,
+            sync_max_seconds: sync_seconds,
+            ..ScratchSyncStats::default()
+        })
+    }
+
+    pub fn sync_path(self, path: &Path) -> io::Result<ScratchSyncStats> {
+        let file = File::open(path)?;
+        let byte_count = file.metadata()?.len();
+        self.sync_file(&file, byte_count)
+    }
+}
+
+/// Observable sync work for one rebuildable file category.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScratchSyncStats {
+    pub sync_calls: u64,
+    pub sync_bytes: u64,
+    pub sync_seconds: f64,
+    pub sync_max_seconds: f64,
+    pub skipped_sync_calls: u64,
+    pub skipped_sync_bytes: u64,
+}
+
+impl ScratchSyncStats {
+    pub fn add(&mut self, value: Self) {
+        self.sync_calls = self.sync_calls.saturating_add(value.sync_calls);
+        self.sync_bytes = self.sync_bytes.saturating_add(value.sync_bytes);
+        self.sync_seconds += value.sync_seconds;
+        self.sync_max_seconds = self.sync_max_seconds.max(value.sync_max_seconds);
+        self.skipped_sync_calls = self
+            .skipped_sync_calls
+            .saturating_add(value.skipped_sync_calls);
+        self.skipped_sync_bytes = self
+            .skipped_sync_bytes
+            .saturating_add(value.skipped_sync_bytes);
+    }
+}
 
 /// One bounded audit seed selected from the final source-multiset serving stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2056,6 +2141,7 @@ pub fn external_sort_assigned_serving_records(
 pub struct AssignedServingRunBuilder {
     temporary_directory: PathBuf,
     record_limit: usize,
+    scratch_durability: ScratchDurability,
     records: Vec<AssignedServingRecord>,
     runs: BoundedRunAccumulator,
     temporary_files: TemporaryFiles,
@@ -2066,6 +2152,18 @@ pub struct AssignedServingRunBuilder {
 
 impl AssignedServingRunBuilder {
     pub fn new(temporary_directory: impl AsRef<Path>, record_limit: usize) -> io::Result<Self> {
+        Self::with_scratch_durability(
+            temporary_directory,
+            record_limit,
+            ScratchDurability::Durable,
+        )
+    }
+
+    pub fn with_scratch_durability(
+        temporary_directory: impl AsRef<Path>,
+        record_limit: usize,
+        scratch_durability: ScratchDurability,
+    ) -> io::Result<Self> {
         if record_limit == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2094,6 +2192,7 @@ impl AssignedServingRunBuilder {
         Ok(Self {
             temporary_directory,
             record_limit,
+            scratch_durability,
             records,
             runs: BoundedRunAccumulator::new(DEFAULT_SORT_MERGE_FAN_IN),
             temporary_files: TemporaryFiles::default(),
@@ -2159,6 +2258,7 @@ impl AssignedServingRunBuilder {
             input_records,
             input_bytes,
             mut merge_bytes,
+            scratch_durability,
             ..
         } = self;
         let mut merger = FixedRunMerger::<AssignedServingRecord> {
@@ -2181,12 +2281,14 @@ impl AssignedServingRunBuilder {
                 "assigned serving run builder changed the input population",
             ));
         }
+        let mut sync_stats = ScratchSyncStats::default();
         for path in &paths {
-            File::open(path)?.sync_all()?;
+            sync_stats.add(scratch_durability.sync_path(path)?);
             temporary_files.release(path);
         }
         Ok(AssignedServingRunSet {
             paths,
+            sync_stats,
             stats: MultiFileSortStats {
                 input_file_count: 0,
                 input_records,
@@ -2205,6 +2307,7 @@ impl AssignedServingRunBuilder {
 pub struct AssignedServingRunSet {
     pub paths: Vec<PathBuf>,
     pub stats: MultiFileSortStats,
+    pub sync_stats: ScratchSyncStats,
 }
 
 /// K-way reader for one partition's bounded assigned-row runs.
@@ -4055,6 +4158,13 @@ mod tests {
         assert_eq!(run_set.stats.output_bytes, run_set.stats.input_bytes);
         assert_eq!(run_set.stats.final_copy_bytes, 0);
         assert_eq!(run_set.paths.len(), 3);
+        assert_eq!(run_set.sync_stats.sync_calls, 3);
+        assert_eq!(
+            run_set.sync_stats.sync_bytes,
+            5 * ASSIGNED_SERVING_RECORD_BYTES as u64
+        );
+        assert_eq!(run_set.sync_stats.skipped_sync_calls, 0);
+        assert_eq!(run_set.sync_stats.skipped_sync_bytes, 0);
         assert!(!temporary.join("assigned.unsorted").exists());
         assert!(!temporary.join("assigned.sorted").exists());
 
@@ -4064,6 +4174,105 @@ mod tests {
             actual.push(record);
         }
         assert_eq!(actual, vec![first, first, first, second, second]);
+    }
+
+    #[test]
+    fn assigned_run_builder_ephemeral_output_is_flushed_and_rejects_truncation() {
+        let base = TestDirectory::new("assigned-ephemeral-truncation");
+        let temporary = base.join("temporary");
+        let mut record = [0u8; ASSIGNED_SERVING_RECORD_BYTES];
+        record[3] = 1;
+        let mut builder = AssignedServingRunBuilder::with_scratch_durability(
+            &temporary,
+            1,
+            ScratchDurability::Ephemeral,
+        )
+        .unwrap();
+        builder.push(record).unwrap();
+
+        let run_set = builder.finish().unwrap();
+
+        assert_eq!(run_set.paths.len(), 1);
+        assert_eq!(fs::read(&run_set.paths[0]).unwrap(), record);
+        assert_eq!(run_set.sync_stats.sync_calls, 0);
+        assert_eq!(run_set.sync_stats.sync_bytes, 0);
+        assert_eq!(run_set.sync_stats.sync_seconds, 0.0);
+        assert_eq!(run_set.sync_stats.sync_max_seconds, 0.0);
+        assert_eq!(run_set.sync_stats.skipped_sync_calls, 1);
+        assert_eq!(
+            run_set.sync_stats.skipped_sync_bytes,
+            ASSIGNED_SERVING_RECORD_BYTES as u64
+        );
+
+        OpenOptions::new()
+            .write(true)
+            .open(&run_set.paths[0])
+            .unwrap()
+            .set_len((ASSIGNED_SERVING_RECORD_BYTES - 1) as u64)
+            .unwrap();
+        let error = match AssignedServingRunMerger::new(&run_set.paths) {
+            Ok(_) => panic!("truncated assigned scratch was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not aligned"));
+    }
+
+    #[test]
+    fn scratch_durability_and_assigned_builder_bounds_fail_closed() {
+        assert_eq!(
+            ScratchDurability::parse("durable").unwrap().as_str(),
+            "durable"
+        );
+        assert_eq!(
+            ScratchDurability::parse("ephemeral").unwrap().as_str(),
+            "ephemeral"
+        );
+        assert_eq!(
+            ScratchDurability::parse("volatile").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let base = TestDirectory::new("assigned-builder-bounds");
+        let allocation_overflow = match AssignedServingRunBuilder::with_scratch_durability(
+            base.join("allocation-overflow"),
+            usize::MAX,
+            ScratchDurability::Ephemeral,
+        ) {
+            Ok(_) => panic!("overflowing assigned-run allocation was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(allocation_overflow.kind(), io::ErrorKind::InvalidInput);
+
+        let capacity_overflow = match AssignedServingRunBuilder::with_scratch_durability(
+            base.join("capacity-overflow"),
+            usize::MAX / std::mem::size_of::<AssignedServingRecord>(),
+            ScratchDurability::Ephemeral,
+        ) {
+            Ok(_) => panic!("oversized assigned-run capacity was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(capacity_overflow.kind(), io::ErrorKind::OutOfMemory);
+
+        let mut record_overflow = AssignedServingRunBuilder::new(base.join("records"), 2).unwrap();
+        record_overflow.input_records = u64::MAX;
+        assert_eq!(
+            record_overflow
+                .push([0; ASSIGNED_SERVING_RECORD_BYTES])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut byte_overflow = AssignedServingRunBuilder::new(base.join("bytes"), 2).unwrap();
+        byte_overflow.input_bytes = u64::MAX;
+        assert_eq!(
+            byte_overflow
+                .push([0; ASSIGNED_SERVING_RECORD_BYTES])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

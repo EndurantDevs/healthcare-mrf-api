@@ -65,6 +65,39 @@ def _resource_contract_metadata():
     }
 
 
+def _scratch_sync_metrics(*, skipped_calls=1, skipped_bytes=1):
+    """Build one synthetic ephemeral sync metric set."""
+
+    return {
+        "sync_calls": 0,
+        "sync_bytes": 0,
+        "sync_seconds": 0.0,
+        "sync_max_seconds": 0.0,
+        "skipped_sync_calls": skipped_calls,
+        "skipped_sync_bytes": skipped_bytes,
+    }
+
+
+def _ephemeral_scratch_metadata():
+    """Build the exact scratch contract returned by a synthetic subprocess."""
+
+    category_names = ("assigned_final_runs", "price_copy_output", "serving_copy_output")
+    return {
+        "contract": finalizer_module.PTG2_V3_SCRATCH_DURABILITY_CONTRACT,
+        "policy": "ephemeral",
+        "scope": "selected_rebuildable_categories_v1",
+        "atomic_directory_publish": True,
+        "sync_bytes_definition": "logical_file_bytes_presented_to_sync_all_v1",
+        "sync_seconds_definition": "cumulative_elapsed_around_sync_all_calls_v1",
+        "sync_max_seconds_definition": "maximum_single_sync_all_call_elapsed_v1",
+        "crash_recovery": "caller_discards_and_rebuilds_uncommitted_attempt_v1",
+        "categories": {
+            category: _scratch_sync_metrics() for category in category_names
+        },
+        "selected_total": _scratch_sync_metrics(skipped_calls=3, skipped_bytes=3),
+    }
+
+
 def _summary_metadata(output_directory):
     """Build the minimum valid Rust summary used by invocation tests."""
 
@@ -76,6 +109,7 @@ def _summary_metadata(output_directory):
         "source_count": 1,
         "output_directory": str(output_directory.resolve()),
         "resource_configuration": _resource_contract_metadata(),
+        "scratch_durability": _ephemeral_scratch_metadata(),
         "price_key_map": {
             "copy_format": "postgresql_binary_copy",
             "row_count": 1,
@@ -353,7 +387,10 @@ def test_finalizer_summary_must_echo_invoked_resource_configuration(tmp_path):
             expected_resource_configuration=expected_resources,
         )
 
-    summary_metadata["resource_configuration"] = {**expected_resources, "workers": 3}
+    summary_metadata["resource_configuration"] = {
+        **expected_resources,
+        "workers": 3,
+    }
     with pytest.raises(RuntimeError, match="did not confirm"):
         validate_v3_finalizer_summary(
             summary_metadata,
@@ -404,6 +441,7 @@ async def test_finalizer_invocation_passes_and_reports_resource_contract(
         expected_source_identities=[_physical_identity()],
         price_key_map_input=price_key_map_path,
         price_key_map_row_count=1,
+        scratch_durability="ephemeral",
     )
 
     command_arguments = invocation_by_key["command_arguments"]
@@ -417,6 +455,9 @@ async def test_finalizer_invocation_passes_and_reports_resource_contract(
     assert command_arguments[
         command_arguments.index("--price-key-map-row-count") + 1
     ] == "1"
+    assert command_arguments[
+        command_arguments.index("--scratch-durability") + 1
+    ] == "ephemeral"
     assert "--memory-records" not in command_arguments
     manifest_metadata = json.loads(
         (tmp_path / "work" / "scanner-summary.json").read_text()

@@ -252,12 +252,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 20932,
-          "total": 31294
+          "covered": 21000,
+          "total": 31332
         },
         "lines": {
-          "covered": 71413,
-          "total": 90633
+          "covered": 71545,
+          "total": 90702
         }
       },
       "path": "test-coverage-python.json",
@@ -329,16 +329,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 1907,
-          "total": 2602
+          "covered": 1917,
+          "total": 2604
         },
         "lines": {
-          "covered": 28883,
-          "total": 37775
+          "covered": 29329,
+          "total": 38154
         },
         "regions": {
-          "covered": 43828,
-          "total": 56533
+          "covered": 44360,
+          "total": 56999
         }
       },
       "path": "test-coverage-rust.json",

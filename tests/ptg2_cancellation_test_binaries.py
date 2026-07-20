@@ -158,6 +158,14 @@ resources = {{
     "total_sort_memory_bytes": argument_value("--total-sort-memory-bytes"),
     "sort_memory_scope": "process_total_across_workers_v1",
 }}
+sync_metrics = {{
+    "sync_calls": 0,
+    "sync_bytes": 0,
+    "sync_seconds": 0.0,
+    "sync_max_seconds": 0.0,
+    "skipped_sync_calls": 1,
+    "skipped_sync_bytes": 1,
+}}
 summary = {{
     "format": "ptg2_v3_direct_finalizer_v3",
     "storage_generation": "shared_blocks_v3",
@@ -166,6 +174,26 @@ summary = {{
     "source_count": 1,
     "output_directory": str(output.resolve()),
     "resource_configuration": resources,
+    "scratch_durability": {{
+        "contract": "ptg2_v3_scratch_durability_v1",
+        "policy": arguments[arguments.index("--scratch-durability") + 1],
+        "scope": "selected_rebuildable_categories_v1",
+        "atomic_directory_publish": True,
+        "sync_bytes_definition": "logical_file_bytes_presented_to_sync_all_v1",
+        "sync_seconds_definition": "cumulative_elapsed_around_sync_all_calls_v1",
+        "sync_max_seconds_definition": "maximum_single_sync_all_call_elapsed_v1",
+        "crash_recovery": "caller_discards_and_rebuilds_uncommitted_attempt_v1",
+        "categories": {{
+            "assigned_final_runs": sync_metrics,
+            "price_copy_output": sync_metrics,
+            "serving_copy_output": sync_metrics,
+        }},
+        "selected_total": {{
+            **sync_metrics,
+            "skipped_sync_calls": 3,
+            "skipped_sync_bytes": 3,
+        }},
+    }},
     "price_key_map": {{
         "copy_format": "postgresql_binary_copy",
         "row_count": 1,

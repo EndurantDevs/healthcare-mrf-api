@@ -139,6 +139,9 @@ async def test_finalizer_starts_before_independent_atom_preparation_finishes(
     assert prepared_finalizer.price_key_map_export_seconds >= 0
     assert prepared_finalizer.finalizer_seconds >= 0
     assert finalizer_calls[0]["price_key_map_row_count"] == 3
+    assert finalizer_calls[0]["scratch_durability"] == (
+        shared_snapshot_publish.PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY
+    )
     assert prepared_price_publication.publication == "published-price"
     assert prepared_price_publication.publish_seconds >= 0
 
