@@ -759,7 +759,47 @@ def _integer_metrics(mapping: Mapping[str, Any], keys: Sequence[str]) -> dict[st
     }
 
 
+def _audit_timing_summary(
+    report: Mapping[str, Any],
+    http: Mapping[str, Any],
+) -> dict[str, float]:
+    """Return only bounded numeric timing and request-rate observations."""
+
+    audit_timings_by_metric: dict[str, float] = {}
+    duration = report.get("duration_seconds")
+    if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+        audit_timings_by_metric["duration_seconds"] = float(duration)
+    latency = _mapping(report.get("latency"))
+    for timing_key in ("request_p50_ms", "request_p95_ms", "request_max_ms"):
+        timing_value = latency.get(timing_key)
+        if isinstance(timing_value, (int, float)) and not isinstance(
+            timing_value, bool
+        ):
+            audit_timings_by_metric[timing_key] = float(timing_value)
+    batch = _mapping(report.get("batch"))
+    endpoint_duration_ms = batch.get("endpoint_duration_ms")
+    if isinstance(endpoint_duration_ms, (int, float)) and not isinstance(
+        endpoint_duration_ms, bool
+    ):
+        audit_timings_by_metric["endpoint_duration_ms"] = float(
+            endpoint_duration_ms
+        )
+    for timing_key in (
+        "request_start_rate_limit_per_second",
+        "request_start_rate_actual_per_second",
+        "request_start_span_seconds",
+    ):
+        timing_value = http.get(timing_key)
+        if isinstance(timing_value, (int, float)) and not isinstance(
+            timing_value, bool
+        ):
+            audit_timings_by_metric[timing_key] = float(timing_value)
+    return audit_timings_by_metric
+
+
 def _audit_summary(report: Mapping[str, Any], report_digest: str) -> dict[str, Any]:
+    """Project safe request accounting and timing evidence for control-plane runs."""
+
     checks = _mapping(report.get("checks"))
     http = _mapping(report.get("http"))
     counts = _integer_metrics(
@@ -781,37 +821,19 @@ def _audit_summary(report: Mapping[str, Any], report_digest: str) -> dict[str, A
             http,
             (
                 "standard_api_actual_http_requests",
+                "batch_api_planned_http_requests",
                 "batch_api_actual_http_requests",
+                "batch_api_completed_http_requests",
+                "batch_api_failed_http_requests",
+                "retry_count",
+                "max_concurrency",
             ),
         )
     )
-    audit_timings_by_metric: dict[str, Any] = {}
-    duration = report.get("duration_seconds")
-    if isinstance(duration, (int, float)) and not isinstance(duration, bool):
-        audit_timings_by_metric["duration_seconds"] = float(duration)
-    latency = _mapping(report.get("latency"))
-    for output_key, source_key in (
-        ("request_p50_ms", "request_p50_ms"),
-        ("request_p95_ms", "request_p95_ms"),
-        ("request_max_ms", "request_max_ms"),
-    ):
-        p95_milliseconds = latency.get(source_key)
-        if isinstance(p95_milliseconds, (int, float)) and not isinstance(
-            p95_milliseconds, bool
-        ):
-            audit_timings_by_metric[output_key] = float(p95_milliseconds)
-    batch = _mapping(report.get("batch"))
-    endpoint_duration_ms = batch.get("endpoint_duration_ms")
-    if isinstance(endpoint_duration_ms, (int, float)) and not isinstance(
-        endpoint_duration_ms, bool
-    ):
-        audit_timings_by_metric["endpoint_duration_ms"] = float(
-            endpoint_duration_ms
-        )
     return {
         "audit_report_digest": report_digest,
         "audit_counts": counts,
-        "audit_timings": audit_timings_by_metric,
+        "audit_timings": _audit_timing_summary(report, http),
     }
 
 
