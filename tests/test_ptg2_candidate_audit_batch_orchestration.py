@@ -166,7 +166,7 @@ async def test_candidate_scope_indexes_resolve_each_coordinate_family_once(
     monkeypatch.setattr(batch, "validate_persisted_audit_graph_scope", graph_validator)
     monkeypatch.setattr(
         selection,
-        "load_candidate_provider_code_sets",
+        "_load_candidate_provider_code_sets_prepared",
         provider_code_lookup,
     )
     monkeypatch.setattr(batch, "_provider_network_digests_by_key", network_lookup)
@@ -187,8 +187,13 @@ async def test_candidate_scope_indexes_resolve_each_coordinate_family_once(
     assert indexes.provider_filters_by_code_key == {7: (5,), 8: (7,)}
     graph_validator.assert_called_once()
     provider_code_lookup.assert_awaited_once()
-    assert set(provider_code_lookup.await_args.args[2]) == {5, 6, 7}
-    assert set(provider_code_lookup.await_args.args[3]) == {7, 8}
+    requests = provider_code_lookup.await_args.args[2]
+    assert requests.code_keys_by_provider_set == {
+        5: (7,),
+        6: (7,),
+        7: (8,),
+    }
+    assert requests.membership_count == 3
     network_lookup.assert_awaited_once()
     assert network_lookup.await_args.args[2] == {7: (5,), 8: (7,)}
 

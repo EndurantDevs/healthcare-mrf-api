@@ -92,13 +92,20 @@ def test_provider_filters_prune_and_union_exact_coordinates():
         0,
         10,
     )
+    duplicate_match = replace(
+        persisted,
+        occurrence_id=b"d" * 32,
+        code_key=7,
+        provider_set_key=5,
+        npi=challenge.npi,
+    )
 
     provider_scope = selection.candidate_provider_scope_by_npi_code(
         (challenge, challenge),
         code_index,
         {challenge.npi: (5, 6)},
         {5: frozenset((7, 9)), 6: frozenset((8, 9))},
-        (persisted,),
+        (persisted, duplicate_match),
     )
 
     assert provider_scope == {
@@ -140,10 +147,10 @@ def test_provider_code_scope_rejects_persisted_membership_mismatch():
 
 
 @pytest.mark.asyncio
-async def test_provider_code_lookup_requires_complete_filtered_memberships(
+async def test_provider_code_lookup_rejects_empty_code_scope(
     monkeypatch,
 ):
-    lookup = AsyncMock(return_value={5: (7,), 6: (8,)})
+    lookup = AsyncMock()
     monkeypatch.setattr(
         selection,
         "lookup_shared_provider_code_intersections_from_db",
@@ -155,17 +162,39 @@ async def test_provider_code_lookup_requires_complete_filtered_memberships(
             object(),
             41,
             (),
-            (7, 8),
+            (),
             schema_name="mrf",
         )
         == {}
     )
     lookup.assert_not_awaited()
 
+    with pytest.raises(PTG2ManifestArtifactError, match="no requested codes"):
+        await selection.load_candidate_provider_code_sets(
+            object(),
+            41,
+            (5,),
+            (),
+            schema_name="mrf",
+        )
+    lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_code_lookup_requires_complete_filtered_memberships(
+    monkeypatch,
+):
+    lookup = AsyncMock(return_value={5: (7,), 6: (8,)})
+    monkeypatch.setattr(
+        selection,
+        "lookup_shared_provider_code_intersections_from_db",
+        lookup,
+    )
+
     assert await selection.load_candidate_provider_code_sets(
         object(),
         41,
-        (5, 5, 6),
+        (5, 6),
         (8, 7, 8),
         schema_name="mrf",
     ) == {5: frozenset((7,)), 6: frozenset((8,))}

@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
-from itertools import chain
 from typing import Any, Iterable, Mapping, Sequence
 
 from api.ptg2_candidate_audit_codes import CandidateCodeIndex
 from api.ptg2_candidate_audit_integrity import PersistedAuditOccurrence
 from api.ptg2_db_sidecars import (
+    _ValidatedProviderCodeRequests,
+    _freeze_provider_code_requests,
+    _lookup_prepared_code_map_from_db,
     lookup_shared_provider_code_intersections_from_db,
 )
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import AuditBatchChallenge
@@ -52,6 +54,41 @@ def _add_provider_match(
         )
     provider_set_keys.add(provider_set_key)
     return retained_membership_count + 1
+
+
+def _add_provider_code_request(
+    code_keys_by_provider_set: dict[int, set[int]],
+    requested_code_keys: set[int],
+    provider_set_key: int,
+    code_key: int,
+    requested_membership_count: int,
+) -> int:
+    """Add one exact request pair while preserving both hard bounds."""
+
+    provider_code_keys = code_keys_by_provider_set.setdefault(
+        int(provider_set_key), set()
+    )
+    normalized_code_key = int(code_key)
+    if normalized_code_key in provider_code_keys:
+        return requested_membership_count
+    if (
+        normalized_code_key not in requested_code_keys
+        and len(requested_code_keys)
+        >= PTG2_AUDIT_BATCH_MAX_REQUESTED_CODE_KEYS
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 candidate requested code scope exceeds its bounded limit"
+        )
+    if (
+        requested_membership_count
+        >= PTG2_AUDIT_BATCH_MAX_PROVIDER_CODE_SCOPE
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 candidate provider-code scope exceeds its bounded limit"
+        )
+    provider_code_keys.add(normalized_code_key)
+    requested_code_keys.add(normalized_code_key)
+    return requested_membership_count + 1
 
 
 def candidate_provider_scope_by_npi_code(
@@ -149,7 +186,9 @@ async def load_candidate_provider_code_sets(
             shared_snapshot_key,
             requested_keys,
             normalized_code_keys,
-            max_retained_memberships=PTG2_AUDIT_BATCH_MAX_PROVIDER_CODE_SCOPE,
+            max_retained_memberships=(
+                PTG2_AUDIT_BATCH_MAX_PROVIDER_CODE_SCOPE
+            ),
             schema_name=schema_name,
         )
     )
@@ -161,6 +200,85 @@ async def load_candidate_provider_code_sets(
         provider_set_key: frozenset(code_keys)
         for provider_set_key, code_keys in code_keys_by_provider_set.items()
     }
+
+
+async def _load_candidate_provider_code_sets_prepared(
+    session: Any,
+    shared_snapshot_key: int,
+    requests: _ValidatedProviderCodeRequests,
+    *,
+    schema_name: str,
+) -> dict[int, frozenset[int]]:
+    """Retain exact memberships without rebuilding the validated request map."""
+
+    if not requests.provider_set_keys:
+        return {}
+    if not requests.membership_count:
+        raise PTG2ManifestArtifactError(
+            "PTG2 candidate provider-code scope has no requested codes"
+        )
+    code_keys_by_provider_set = (
+        await _lookup_prepared_code_map_from_db(
+            session,
+            shared_snapshot_key,
+            requests,
+            max_retained_memberships=PTG2_AUDIT_BATCH_MAX_PROVIDER_CODE_SCOPE,
+            schema_name=schema_name,
+        )
+    )
+    if set(code_keys_by_provider_set) != set(requests.provider_set_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 candidate provider-code artifact is missing a referenced provider set"
+        )
+    return {
+        provider_set_key: frozenset(code_keys)
+        for provider_set_key, code_keys in code_keys_by_provider_set.items()
+    }
+
+
+def _requested_code_keys_by_provider_set(
+    challenges: Sequence[AuditBatchChallenge],
+    code_index: CandidateCodeIndex,
+    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
+    persisted_audit_occurrences: Sequence[PersistedAuditOccurrence],
+) -> _ValidatedProviderCodeRequests:
+    """Bind requested codes only to providers reachable from their exact NPI."""
+
+    code_keys_by_provider_set: dict[int, set[int]] = {}
+    requested_code_keys: set[int] = set()
+    seen_npi_code_keys: set[tuple[int, int]] = set()
+    requested_membership_count = 0
+
+    for challenge in challenges:
+        provider_set_keys = provider_set_keys_by_npi.get(challenge.npi, ())
+        for code_record in code_index.by_pair[
+            (challenge.code_system, challenge.code)
+        ]:
+            code_key = int(code_record["code_key"])
+            npi_code_key = (challenge.npi, code_key)
+            if npi_code_key in seen_npi_code_keys:
+                continue
+            seen_npi_code_keys.add(npi_code_key)
+            for provider_set_key in provider_set_keys:
+                requested_membership_count = _add_provider_code_request(
+                    code_keys_by_provider_set,
+                    requested_code_keys,
+                    provider_set_key,
+                    code_key,
+                    requested_membership_count,
+                )
+    for occurrence in persisted_audit_occurrences:
+        requested_membership_count = _add_provider_code_request(
+            code_keys_by_provider_set,
+            requested_code_keys,
+            occurrence.provider_set_key,
+            occurrence.code_key,
+            requested_membership_count,
+        )
+    return _freeze_provider_code_requests(
+        code_keys_by_provider_set,
+        membership_count=requested_membership_count,
+    )
 
 
 async def load_candidate_provider_indexes(
@@ -178,31 +296,16 @@ async def load_candidate_provider_indexes(
 ]:
     """Load and build the exact provider scope once for downstream readers."""
 
-    challenge_npis = {challenge.npi for challenge in challenges}
-    provider_code_keys = chain(
-        (
-            provider_set_key
-            for npi in challenge_npis
-            for provider_set_key in provider_set_keys_by_npi.get(npi, ())
-        ),
-        (
-            occurrence.provider_set_key
-            for occurrence in persisted_audit_occurrences
-        ),
+    provider_code_requests = _requested_code_keys_by_provider_set(
+        challenges,
+        code_index,
+        provider_set_keys_by_npi,
+        persisted_audit_occurrences,
     )
-    requested_code_keys = chain(
-        (
-            int(code_record["code_key"])
-            for code_records in code_index.by_pair.values()
-            for code_record in code_records
-        ),
-        (occurrence.code_key for occurrence in persisted_audit_occurrences),
-    )
-    provider_code_sets = await load_candidate_provider_code_sets(
+    provider_code_sets = await _load_candidate_provider_code_sets_prepared(
         session,
         shared_snapshot_key,
-        provider_code_keys,
-        requested_code_keys,
+        provider_code_requests,
         schema_name=schema_name,
     )
     provider_sets_by_npi_code = candidate_provider_scope_by_npi_code(

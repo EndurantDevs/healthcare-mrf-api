@@ -85,6 +85,48 @@ def test_provider_code_block_retains_only_requested_code_memberships(monkeypatch
     )
 
 
+def test_provider_code_block_applies_exact_selection_per_provider():
+    block_key, provider_payload = _provider_block(
+        ((3, (7, 8)), (4, (7, 8)))
+    )
+
+    assert db_serving_v3._decode_provider_code_block(
+        provider_payload,
+        block_key=block_key,
+        entry_count=2,
+        requested_provider_set_keys={3, 4},
+        requested_code_selections_by_provider_set={
+            3: provider_code_selection((7,)),
+            4: provider_code_selection((8,)),
+        },
+    ) == {3: (7,), 4: (8,)}
+
+
+def test_provider_code_block_rejects_ambiguous_or_missing_exact_selection():
+    block_key, provider_payload = _provider_block(((3, (7, 8)),))
+
+    with pytest.raises(PTG2ManifestArtifactError, match="block 0 is corrupt"):
+        db_serving_v3._decode_provider_code_block(
+            provider_payload,
+            block_key=block_key,
+            entry_count=1,
+            requested_provider_set_keys={3},
+            requested_code_selection=provider_code_selection((7,)),
+            requested_code_selections_by_provider_set={
+                3: provider_code_selection((8,))
+            },
+        )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="block 0 is corrupt"):
+        db_serving_v3._decode_provider_code_block(
+            provider_payload,
+            block_key=block_key,
+            entry_count=1,
+            requested_provider_set_keys={3},
+            requested_code_selections_by_provider_set={},
+        )
+
+
 def test_provider_code_block_claims_budget_before_retaining_next_provider():
     block_key, provider_payload = _provider_block(
         ((3, tuple(range(100_000))), (4, (7, 8)), (5, (9, 10)))
