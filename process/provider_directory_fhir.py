@@ -29,7 +29,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from html.parser import HTMLParser
 from pathlib import Path
@@ -67,6 +67,7 @@ from db.models import (
     ProviderDirectoryPaginationCheckpoint,
     ProviderDirectoryPractitioner,
     ProviderDirectoryPractitionerRole,
+    ProviderDirectoryProfileBuildCheckpoint,
     ProviderDirectoryReverseLookupCheckpoint,
     ProviderDirectorySource,
     ProviderDirectorySourceResource,
@@ -479,6 +480,7 @@ CANONICAL_RESOURCE_MODELS = (
     ProviderDirectoryBulkAcquisitionCheckpoint,
     ProviderDirectoryBulkOutputCheckpoint,
     ProviderDirectoryPaginationCheckpoint,
+    ProviderDirectoryProfileBuildCheckpoint,
     ProviderDirectoryReverseLookupCheckpoint,
 )
 USER_AGENT = os.getenv(
@@ -3770,7 +3772,7 @@ def _partitioned_resource_start_urls(source: dict[str, Any], resource_type: str,
     return [_url_with_query_item(start_url, key, value) for key, value in partitions]
 
 
-def _scan_practitioner_role_requires_reverse_lookup(source: dict[str, Any], resource_type: str) -> bool:
+def _needs_practitioner_role_reverse_lookup(source: dict[str, Any], resource_type: str) -> bool:
     last_updated_config, _config_error = _last_updated_partition_config(
         source,
         resource_type,
@@ -3783,10 +3785,10 @@ def _scan_practitioner_role_requires_reverse_lookup(source: dict[str, Any], reso
     )
 
 
-def _scan_practitioner_role_reverse_lookup_planned(source: dict[str, Any], resources: list[str]) -> bool:
+def _is_practitioner_role_reverse_lookup_planned(source: dict[str, Any], resources: list[str]) -> bool:
     reverse_lookup_resources = _practitioner_role_reverse_lookup_resources(source)
     return (
-        _scan_practitioner_role_requires_reverse_lookup(source, "PractitionerRole")
+        _needs_practitioner_role_reverse_lookup(source, "PractitionerRole")
         and "PractitionerRole" in resources
         and any(resource in resources for resource in reverse_lookup_resources)
     )
@@ -3816,7 +3818,7 @@ def _scan_practitioner_role_seed_rows(
     source: dict[str, Any] | None,
     rows_by_resource: dict[str, list[dict[str, Any]]]
 ) -> Iterator[tuple[str, str, str]]:
-    seen: set[tuple[str, str]] = set()
+    seen_resource_keys: set[tuple[str, str]] = set()
     search_params = _practitioner_role_reverse_lookup_params(source)
     for resource_type in _practitioner_role_reverse_lookup_resources(source):
         search_param = search_params.get(resource_type)
@@ -3827,9 +3829,9 @@ def _scan_practitioner_role_seed_rows(
             if not resource_id:
                 continue
             key = (resource_type, resource_id)
-            if key in seen:
+            if key in seen_resource_keys:
                 continue
-            seen.add(key)
+            seen_resource_keys.add(key)
             yield (search_param, resource_type, resource_id)
 
 
@@ -4017,7 +4019,7 @@ def _compact_linked_reference_rows(resource_type: str, rows: list[dict[str, Any]
 
 
 def _load_credentials_config() -> dict[str, Any]:
-    config: dict[str, Any] = {}
+    config_by_name: dict[str, Any] = {}
     path = _clean_text(_PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.get()) or _clean_text(
         os.getenv(PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV)
     )
@@ -4025,7 +4027,7 @@ def _load_credentials_config() -> dict[str, Any]:
         try:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
             if isinstance(payload, dict):
-                config.update(payload)
+                config_by_name.update(payload)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             payload = None
     raw = _clean_text(os.getenv(PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV))
@@ -4033,10 +4035,10 @@ def _load_credentials_config() -> dict[str, Any]:
         try:
             payload = json.loads(raw)
             if isinstance(payload, dict):
-                config.update(payload)
+                config_by_name.update(payload)
         except json.JSONDecodeError:
             payload = None
-    return config
+    return config_by_name
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -4168,25 +4170,25 @@ def _resolve_secret_text(value: Any) -> str | None:
 
 
 def _merge_credential_spec(base: dict[str, Any], overlay: dict[str, Any], *, matched_by: str) -> dict[str, Any]:
-    merged = dict(base)
-    merged_headers = {**_mapping(base.get("headers")), **_mapping(overlay.get("headers"))}
-    merged_query = {
+    merged_by_name = dict(base)
+    headers_by_name = {**_mapping(base.get("headers")), **_mapping(overlay.get("headers"))}
+    query_by_name = {
         **_mapping(base.get("query")),
         **_mapping(base.get("query_params")),
         **_mapping(overlay.get("query")),
         **_mapping(overlay.get("query_params")),
     }
-    if merged_headers:
-        merged["headers"] = merged_headers
-    if merged_query:
-        merged["query_params"] = merged_query
+    if headers_by_name:
+        merged_by_name["headers"] = headers_by_name
+    if query_by_name:
+        merged_by_name["query_params"] = query_by_name
     for key in ("bearer_token", "api_key", "oauth2", "oauth", "enabled"):
         if key in overlay:
-            merged[key] = overlay[key]
-    matched = list(merged.get("_matched_by") or [])
-    matched.append(matched_by)
-    merged["_matched_by"] = matched
-    return merged
+            merged_by_name[key] = overlay[key]
+    matched_rules = list(merged_by_name.get("_matched_by") or [])
+    matched_rules.append(matched_by)
+    merged_by_name["_matched_by"] = matched_rules
+    return merged_by_name
 
 
 def _source_hosts(source: dict[str, Any]) -> set[str]:
@@ -4300,7 +4302,7 @@ def _is_url_within_api_base(url: str, api_base: str) -> bool:
     return request_path == base_path or request_path.startswith(f"{base_path}/")
 
 
-def _credential_allowed_for_url(source: dict[str, Any], url: str) -> bool:
+def _is_credential_allowed_for_url(source: dict[str, Any], url: str) -> bool:
     parsed = urllib.parse.urlsplit(url)
     if not parsed.netloc:
         return True
@@ -4409,7 +4411,7 @@ def _fetch_oauth2_client_credentials_token_sync(oauth2: dict[str, Any], *, timeo
 
 def _credential_request_options_for_source(source_record: dict[str, Any], url: str) -> dict[str, Any]:
     spec = _credential_spec_for_source(source_record)
-    if not spec or not _credential_allowed_for_url(source_record, url):
+    if not spec or not _is_credential_allowed_for_url(source_record, url):
         return {"headers": {}, "query_params": {}, "descriptor": None}
     headers_by_name: dict[str, str] = {}
     bearer = _resolve_secret_text(spec.get("bearer_token"))
@@ -4441,7 +4443,7 @@ def _credential_request_options_for_source(source_record: dict[str, Any], url: s
     return {"headers": headers_by_name, "query_params": query_params_by_name, "descriptor": descriptor_by_field}
 
 
-def _source_declares_credentialed_access(source: dict[str, Any]) -> bool:
+def _has_source_declared_credentialed_access(source: dict[str, Any]) -> bool:
     if _bool_from_seed(source.get("requires_registration")) or _bool_from_seed(source.get("requires_api_key")):
         return True
     metadata = _source_metadata(source)
@@ -4454,7 +4456,7 @@ def _source_declares_credentialed_access(source: dict[str, Any]) -> bool:
     return any(marker in auth_type for marker in ("oauth", "api key", "bearer", "token", "client credential"))
 
 
-def _source_uses_known_onboarding_gateway(source: dict[str, Any]) -> bool:
+def _uses_source_known_onboarding_gateway(source: dict[str, Any]) -> bool:
     return urllib.parse.urlsplit(_canonical_base(source.get("canonical_api_base") or source.get("api_base")) or "").netloc.lower() in FHIR_ONBOARDING_GATEWAY_HOSTS
 
 
@@ -4487,32 +4489,44 @@ def _select_resource_import_sources(
     checkpoint_retry_source_ids: set[str] | None = None,
     requested_resource_types: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    selected: list[dict[str, Any]] = []
+    """Select runnable sources under probe, auth, and checkpoint policy."""
+    selected_sources: list[dict[str, Any]] = []
     metrics = _resource_import_selection_metrics(len(source_rows))
     checkpoint_retry_ids = checkpoint_retry_source_ids or set()
-    for source in source_rows:
-        if not _canonical_base(source.get("api_base")):
+    for source_record in source_rows:
+        if not _canonical_base(source_record.get("api_base")):
             metrics["source_import_skipped_missing_api_base"] += 1
             continue
         blocked_reason = _resource_acquisition_blocked_reason(
-            source,
+            source_record,
             requested_resource_types,
         )
         if blocked_reason:
             metrics["source_import_skipped_blocked_source"] += 1
             metrics[f"source_import_skipped_blocked_source_{blocked_reason}"] += 1
             continue
-        auth_type = (_clean_text(source.get("auth_type")) or "").lower()
-        validation = (_clean_text(source.get("last_validated_status")) or "").lower()
-        live_probe_valid = valid_source_ids is not None and source["source_id"] in valid_source_ids
-        is_checkpoint_retry = source["source_id"] in checkpoint_retry_ids
-        if valid_source_ids is not None and not (live_probe_valid or is_checkpoint_retry):
+        auth_type = (
+            _clean_text(source_record.get("auth_type")) or ""
+        ).lower()
+        validation = (
+            _clean_text(source_record.get("last_validated_status")) or ""
+        ).lower()
+        is_live_probe_valid = (
+            valid_source_ids is not None
+            and source_record["source_id"] in valid_source_ids
+        )
+        is_checkpoint_retry = (
+            source_record["source_id"] in checkpoint_retry_ids
+        )
+        if valid_source_ids is not None and not (
+            is_live_probe_valid or is_checkpoint_retry
+        ):
             metrics["source_import_skipped_probe_not_valid"] += 1
             continue
         if (
             open_only
             and auth_type not in {"open", "none", ""}
-            and not (live_probe_valid or is_checkpoint_retry)
+            and not (is_live_probe_valid or is_checkpoint_retry)
         ):
             metrics["source_import_skipped_open_only"] += 1
             continue
@@ -4526,17 +4540,17 @@ def _select_resource_import_sources(
             if validation not in allowed_statuses:
                 metrics["source_import_skipped_validation_status"] += 1
                 continue
-        selected.append(source)
+        selected_sources.append(source_record)
         metrics["source_import_sources_selected"] += 1
-        if live_probe_valid:
+        if is_live_probe_valid:
             metrics["source_import_sources_selected_live_probe_valid"] += 1
         if is_checkpoint_retry:
             metrics["source_import_sources_selected_checkpoint_retry"] += 1
-        if _source_declares_credentialed_access(source):
+        if _has_source_declared_credentialed_access(source_record):
             metrics["source_import_sources_selected_declared_credentialed"] += 1
         if validation == "auth_required":
             metrics["source_import_sources_selected_auth_required_seed"] += 1
-    return selected, metrics
+    return selected_sources, metrics
 
 
 def _requested_source_import_empty_error(
@@ -4693,7 +4707,7 @@ def _aetna_provider_directory_data_seed_rows(*, source_query: str | None = None)
     }
     return (
         [commercial_seed_map]
-        if _seed_row_matches_query(commercial_seed_map, source_query)
+        if _is_seed_row_query_match(commercial_seed_map, source_query)
         else []
     )
 
@@ -6148,7 +6162,7 @@ def _identifier_value(
     *tokens: str,
     allow_systemless: bool = False,
 ) -> str | None:
-    lowered = tuple(token.lower() for token in tokens)
+    lowered_tokens = tuple(token.lower() for token in tokens)
     systemless_value = None
     for identifier in resource.get("identifier") or []:
         if not isinstance(identifier, dict):
@@ -6157,7 +6171,7 @@ def _identifier_value(
         if not value:
             continue
         descriptor = _identifier_descriptor(identifier)
-        if any(token in descriptor for token in lowered):
+        if any(token in descriptor for token in lowered_tokens):
             return value
         if allow_systemless and not identifier.get("system") and not identifier.get("type"):
             systemless_value = systemless_value or value
@@ -6211,14 +6225,14 @@ def _telecom(resource: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in telecom if isinstance(item, dict)]
 
 
-def _string_list(value: Any) -> list[str]:
-    if value is None:
+def _string_list(raw_values: Any) -> list[str]:
+    if raw_values is None:
         return []
-    if isinstance(value, str):
-        value = [value]
-    if not isinstance(value, list):
+    if isinstance(raw_values, str):
+        raw_values = [raw_values]
+    if not isinstance(raw_values, list):
         return []
-    return [text for item in value if (text := _clean_text(item))]
+    return [text for item in raw_values if (text := _clean_text(item))]
 
 
 def _phone(telecom: list[dict[str, Any]], *, system: str = "phone") -> str | None:
@@ -6273,7 +6287,7 @@ def _attach_location_contact_fields(rows: list[dict[str, Any]]) -> list[dict[str
     return rows
 
 
-def _location_contact_fields_missing(rows: list[dict[str, Any]]) -> bool:
+def _has_missing_location_contact_fields(rows: list[dict[str, Any]]) -> bool:
     contact_keys = ("phone_number", "phone_extension", "fax_number_digits", "fax_extension")
     return any(
         (row.get("telephone_number") or row.get("fax_number"))
@@ -6360,12 +6374,14 @@ def _name(resource: dict[str, Any]) -> tuple[str | None, list[str], str | None]:
     if not first:
         return None, [], None
     family = _clean_text(first.get("family"))
-    given = [str(value) for value in first.get("given") or [] if _clean_text(value)]
+    given_names = [
+        str(value) for value in first.get("given") or [] if _clean_text(value)
+    ]
     text = _clean_text(first.get("text"))
     if not text:
-        parts = given + ([family] if family else [])
+        parts = given_names + ([family] if family else [])
         text = " ".join(parts) if parts else None
-    return family, given, text
+    return family, given_names, text
 
 
 def _profile_text(value: Any, *, max_length: int = 2048) -> str | None:
@@ -7105,7 +7121,7 @@ def parse_fhir_resource(
     return None
 
 
-def _alohr_source_uses_graphql_connector(source: dict[str, Any]) -> bool:
+def _uses_alohr_graphql_connector(source: dict[str, Any]) -> bool:
     api_base = _canonical_base(source.get("api_base") or source.get("canonical_api_base"))
     if api_base in {ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE, ALOHR_FHIR_PROVIDER_DIRECTORY_BASE}:
         return True
@@ -7114,8 +7130,8 @@ def _alohr_source_uses_graphql_connector(source: dict[str, Any]) -> bool:
 
 
 def _alohr_resource_id(prefix: str, *parts: Any) -> str:
-    cleaned = [_clean_text(part) or "" for part in parts]
-    raw = "|".join(cleaned)
+    cleaned_parts = [_clean_text(part) or "" for part in parts]
+    raw = "|".join(cleaned_parts)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     candidate = _clean_text(parts[0]) if parts else None
     if candidate and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", candidate):
@@ -7174,12 +7190,14 @@ def _alohr_specialty_codings(code: Any, display: Any) -> list[dict[str, Any]]:
     clean_display = _clean_text(display)
     if not clean_code and not clean_display:
         return []
-    coding: dict[str, Any] = {}
+    coding_by_field: dict[str, Any] = {}
     if clean_code:
-        coding.update({"system": "http://nucc.org/provider-taxonomy", "code": clean_code})
+        coding_by_field.update(
+            {"system": "http://nucc.org/provider-taxonomy", "code": clean_code}
+        )
     if clean_display:
-        coding["display"] = clean_display
-    return [coding]
+        coding_by_field["display"] = clean_display
+    return [coding_by_field]
 
 
 def _alohr_address_items(address_item_by_field: dict[str, Any]) -> list[dict[str, Any]]:
@@ -7880,6 +7898,8 @@ class ProviderDirectoryPreparedArtifactStage:
     target_relation: str
     rename_stage_indexes: Callable[[str, str], Awaitable[None]]
     build_fence: ProviderDirectoryArtifactBuildFence | None = None
+    retain_on_failed_bundle: bool = False
+    resume_checkpoint: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -7897,6 +7917,7 @@ class ProviderDirectoryArtifactBundle:
     stages: list[ProviderDirectoryPreparedArtifactStage] = field(
         default_factory=list
     )
+    promoted: bool = False
 
     def add(
         self,
@@ -7920,11 +7941,25 @@ class ProviderDirectoryArtifactBundle:
             await _retry_provider_directory_artifact_bundle_promotion(
                 tuple(self.stages)
             )
+        self.promoted = True
+        for schema, build_id in sorted(
+            {
+                stage.resume_checkpoint
+                for stage in self.stages
+                if getattr(stage, "resume_checkpoint", None) is not None
+            }
+        ):
+            await _delete_provider_directory_profile_build_checkpoint(
+                schema,
+                build_id,
+            )
         return len(self.stages)
 
     async def cleanup(self) -> None:
         """Remove every stage name that was not consumed by promotion."""
         for stage in reversed(self.stages):
+            if stage.retain_on_failed_bundle and not self.promoted:
+                continue
             await _remove_provider_directory_artifact_stage(stage)
 
 
@@ -9453,7 +9488,7 @@ def provider_directory_location_address_key_batch_sql(
     """
 
 
-async def _address_canon_functions_available(db_schema: str) -> bool:
+async def _has_address_canon_functions(db_schema: str) -> bool:
     value = await db.scalar(
         "SELECT to_regprocedure(:signature);",
         signature=f"{db_schema}.addr_key_v1(text,text,text,text,text,text)",
@@ -12059,14 +12094,14 @@ async def publish_provider_directory_location_address_keys(
 ) -> int:
     """Publish provider directory location address keys for provider-directory serving."""
     schema = db_schema or _schema()
-    if not await _address_canon_functions_available(schema):
+    if not await _has_address_canon_functions(schema):
         return 0
     restore_state_from_zip = await _table_exists(schema, "geo_zip_lookup")
-    params: dict[str, Any] = {}
+    params_by_name: dict[str, Any] = {}
     if run_id is not None:
-        params["run_id"] = run_id
+        params_by_name["run_id"] = run_id
     if source_ids:
-        params["source_ids"] = list(source_ids)
+        params_by_name["source_ids"] = list(source_ids)
     total_updated = 0
     after_source_id: str | None = None
     after_resource_id: str | None = None
@@ -12079,19 +12114,25 @@ async def publish_provider_directory_location_address_keys(
         seen_table=seen_table,
     )
     while True:
-        row = await db.first(
+        result_row = await db.first(
             sql,
-            **params,
+            **params_by_name,
             after_source_id=after_source_id,
             after_resource_id=after_resource_id,
             batch_size=bounded_batch_size,
         )
-        payload = row._mapping if hasattr(row, "_mapping") else dict(row or {})
-        candidate_rows = int(payload.get("candidate_rows") or 0)
-        updated_rows = int(payload.get("updated_rows") or 0)
+        result_by_field = (
+            result_row._mapping
+            if hasattr(result_row, "_mapping")
+            else dict(result_row or {})
+        )
+        candidate_rows = int(result_by_field.get("candidate_rows") or 0)
+        updated_rows = int(result_by_field.get("updated_rows") or 0)
         total_updated += updated_rows
-        next_source_id = _clean_text(payload.get("last_source_id"))
-        next_resource_id = _clean_text(payload.get("last_resource_id"))
+        next_source_id = _clean_text(result_by_field.get("last_source_id"))
+        next_resource_id = _clean_text(
+            result_by_field.get("last_resource_id")
+        )
         if candidate_rows <= 0 or not next_source_id or not next_resource_id:
             break
         if next_source_id == after_source_id and next_resource_id == after_resource_id:
@@ -13015,10 +13056,55 @@ async def _is_provider_directory_corroboration_artifact_published(
     return True
 
 
+def _profile_source_context_from_row(
+    source_row: Any,
+) -> _ProviderDirectoryProfileSourceContext | None:
+    """Decode the exact source columns emitted into Profile evidence."""
+    source_row_map = _pagination_checkpoint_row_mapping(source_row)
+    source_id = _clean_text(source_row_map.get("source_id"))
+    if not source_id:
+        return None
+    context_value_by_field: dict[str, str | None] = {}
+    for field_name in ("canonical_api_base", "org_name", "plan_name"):
+        if field_name not in source_row_map:
+            raise RuntimeError(
+                "provider_directory_profile_source_context_missing:"
+                + source_id
+                + ":"
+                + field_name
+            )
+        raw_value = source_row_map.get(field_name)
+        if (
+            (field_name == "org_name" and raw_value is None)
+            or (
+                raw_value is not None
+                and not isinstance(raw_value, str)
+            )
+        ):
+            raise RuntimeError(
+                "provider_directory_profile_source_context_invalid:"
+                + source_id
+                + ":"
+                + field_name
+            )
+        context_value_by_field[field_name] = raw_value
+    return _ProviderDirectoryProfileSourceContext(
+        source_id=source_id,
+        canonical_api_base=context_value_by_field["canonical_api_base"],
+        org_name=context_value_by_field["org_name"],
+        plan_name=context_value_by_field["plan_name"],
+    )
+
+
 async def _provider_directory_profile_scope_source_ids(
     schema: str,
     allowed_source_ids: set[str],
-) -> tuple[list[str], list[str]]:
+) -> tuple[
+    list[str],
+    list[str],
+    tuple[_ProviderDirectoryProfileSourceContext, ...],
+]:
+    """Resolve retained aliases and exact emitted context for selected ones."""
     configured_source_ids = list(
         profile_artifact.configured_profile_source_ids()
     )
@@ -13028,25 +13114,34 @@ async def _provider_directory_profile_scope_source_ids(
         ),
         configured_source_ids=configured_source_ids,
     )
-    retained_source_ids = sorted(
-        {
-            source_id
-            for source_row in source_rows
-            if (
-                source_id := _clean_text(
-                    _pagination_checkpoint_row_mapping(source_row).get(
-                        "source_id"
-                    )
-                )
+    source_context_by_id: dict[
+        str,
+        _ProviderDirectoryProfileSourceContext,
+    ] = {}
+    for source_row in source_rows:
+        source_context = _profile_source_context_from_row(source_row)
+        if source_context is None:
+            continue
+        if source_context.source_id in source_context_by_id:
+            raise RuntimeError(
+                "provider_directory_profile_source_context_ambiguous:"
+                + source_context.source_id
             )
-        }
-    )
+        source_context_by_id[source_context.source_id] = source_context
+    retained_source_ids = sorted(source_context_by_id)
     selected_source_ids = [
         source_id
         for source_id in retained_source_ids
         if source_id in allowed_source_ids
     ]
-    return selected_source_ids, retained_source_ids
+    return (
+        selected_source_ids,
+        retained_source_ids,
+        tuple(
+            source_context_by_id[source_id]
+            for source_id in selected_source_ids
+        ),
+    )
 
 
 async def _create_provider_directory_profile_indexes(
@@ -13160,6 +13255,14 @@ async def _remove_provider_directory_profile_stage_table(
 
 
 @dataclass(frozen=True)
+class _ProviderDirectoryProfileSourceContext:
+    source_id: str
+    canonical_api_base: str | None
+    org_name: str | None
+    plan_name: str | None
+
+
+@dataclass(frozen=True)
 class _ProviderDirectoryProfileBuild:
     schema: str
     generation_id: str
@@ -13169,6 +13272,102 @@ class _ProviderDirectoryProfileBuild:
     profile_as_of: str
     evidence_stage: str
     profile_stage: str
+    resume_lineage_hash: str = "0" * 64
+    build_id: str | None = None
+    owner_run_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileEvidenceBatch:
+    kind: str
+    source_id: str | None = None
+    dataset_id: str | None = None
+    fact_type: str | None = None
+    role_bucket_count: int = 1
+    role_bucket: int = 0
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileCompactBatch:
+    kind: str
+    npi_start: int | None = None
+    npi_end: int | None = None
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileBuildCheckpointState:
+    evidence_next_batch: int
+    evidence_total_batches: int
+    profile_next_batch: int
+    profile_total_batches: int
+    state: str
+
+
+def _provider_directory_profile_build_id(
+    build: _ProviderDirectoryProfileBuild,
+) -> str:
+    return build.build_id or build.generation_id
+
+
+def _provider_directory_profile_evidence_batches(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    has_existing_artifacts: bool,
+) -> tuple[_ProviderDirectoryProfileEvidenceBatch, ...]:
+    batches: list[_ProviderDirectoryProfileEvidenceBatch] = []
+    if has_existing_artifacts:
+        batches.append(_ProviderDirectoryProfileEvidenceBatch(kind="copy"))
+    for source_id, dataset_id in zip(
+        build.source_ids,
+        build.dataset_ids,
+        strict=True,
+    ):
+        for fact_type in profile_artifact.PROFILE_EVIDENCE_FACT_TYPES:
+            role_bucket_count = (
+                profile_artifact.PROFILE_AFFILIATION_ROLE_BUCKETS
+                if fact_type == "affiliation"
+                else 1
+            )
+            batches.extend(
+                _ProviderDirectoryProfileEvidenceBatch(
+                    kind="fact",
+                    source_id=source_id,
+                    dataset_id=dataset_id,
+                    fact_type=fact_type,
+                    role_bucket_count=role_bucket_count,
+                    role_bucket=role_bucket,
+                )
+                for role_bucket in range(role_bucket_count)
+            )
+    return tuple(batches)
+
+
+def _provider_directory_profile_compact_batches(
+    *,
+    has_existing_artifacts: bool,
+    npi_batch_size: int,
+) -> tuple[_ProviderDirectoryProfileCompactBatch, ...]:
+    if npi_batch_size < 1:
+        raise ValueError("profile NPI batch size must be positive")
+    batches: list[_ProviderDirectoryProfileCompactBatch] = []
+    if has_existing_artifacts:
+        batches.append(_ProviderDirectoryProfileCompactBatch(kind="copy"))
+    batches.extend(
+        _ProviderDirectoryProfileCompactBatch(
+            kind="npi",
+            npi_start=npi_start,
+            npi_end=min(
+                npi_start + npi_batch_size,
+                profile_artifact.NPI_MAX + 1,
+            ),
+        )
+        for npi_start in range(
+            profile_artifact.NPI_MIN,
+            profile_artifact.NPI_MAX + 1,
+            npi_batch_size,
+        )
+    )
+    return tuple(batches)
 
 
 def _provider_directory_profile_build_ref(
@@ -13178,12 +13377,107 @@ def _provider_directory_profile_build_ref(
     return _unscoped_qt(build.schema, table_name)
 
 
+def _provider_directory_profile_resume_lineage_hash(
+    dataset_fence: ProviderDirectoryArtifactDatasetFence,
+    source_ids: list[str],
+    retained_source_ids: list[str],
+    dataset_ids: list[str],
+    source_contexts: tuple[_ProviderDirectoryProfileSourceContext, ...],
+) -> str:
+    """Hash every immutable input that can affect a resumed Profile build."""
+    if tuple(context.source_id for context in source_contexts) != tuple(
+        source_ids
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_source_context_scope_changed"
+        )
+
+    def canonical_datasets(
+        datasets: Iterable[ProviderDirectoryArtifactDataset],
+    ) -> list[dict[str, Any]]:
+        """Return full dataset records in deterministic identity order."""
+        dataset_contracts = [asdict(dataset) for dataset in datasets]
+        return sorted(dataset_contracts, key=_stable_identity_json)
+
+    return _identity_hash(
+        {
+            "contract": "provider-directory-profile-resume-lineage-v1",
+            "dataset_fence": {
+                "datasets": canonical_datasets(dataset_fence.datasets),
+                "promotion_aliases": canonical_datasets(
+                    dataset_fence.promotion_aliases
+                ),
+                "should_select_validated_candidates": (
+                    dataset_fence.should_select_validated_candidates
+                ),
+            },
+            "dataset_ids": dataset_ids,
+            "emitted_source_contexts": [
+                asdict(source_context) for source_context in source_contexts
+            ],
+            "profile_schema_version": profile_artifact.PROFILE_SCHEMA_VERSION,
+            "retained_source_ids": retained_source_ids,
+            "source_ids": source_ids,
+            "strategy_version": (
+                profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+            ),
+        }
+    )
+
+
+def _provider_directory_profile_checkpoint_oid(raw_value: Any) -> int | None:
+    if isinstance(raw_value, bool) or not isinstance(raw_value, int):
+        return None
+    return raw_value if raw_value > 0 else None
+
+
+def _is_profile_target_oid_matching(
+    raw_value: Any,
+    expected_oid: int | None,
+) -> bool:
+    if expected_oid is None:
+        return raw_value is None
+    return (
+        _provider_directory_profile_checkpoint_oid(raw_value)
+        == expected_oid
+    )
+
+
+async def _is_profile_stage_pair_matching(
+    schema: str,
+    checkpoint_map: dict[str, Any],
+    evidence_stage: str,
+    profile_stage: str,
+) -> bool:
+    for stage_table, oid_field in (
+        (evidence_stage, "evidence_stage_oid"),
+        (profile_stage, "profile_stage_oid"),
+    ):
+        expected_oid = _provider_directory_profile_checkpoint_oid(
+            checkpoint_map.get(oid_field)
+        )
+        if expected_oid is None:
+            return False
+        if (
+            await _provider_directory_profile_stage_relation_identity(
+                schema,
+                stage_table,
+            )
+            != (expected_oid, "r", "p")
+        ):
+            return False
+    return True
+
+
 async def _resolve_provider_directory_profile_build(
     schema: str,
     run_id: str | None,
     dataset_fence: ProviderDirectoryArtifactDatasetFence,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
 ) -> _ProviderDirectoryProfileBuild:
-    selected_source_ids, retained_source_ids = (
+    """Resolve a deterministic build and preserve a valid retry as-of date."""
+    selected_source_ids, retained_source_ids, source_contexts = (
         await _provider_directory_profile_scope_source_ids(
             schema,
             {dataset.source_id for dataset in dataset_fence.datasets},
@@ -13193,16 +13487,81 @@ async def _resolve_provider_directory_profile_build(
         dataset_fence.datasets,
         selected_source_ids,
     )
+    resume_lineage_hash = _provider_directory_profile_resume_lineage_hash(
+        dataset_fence,
+        source_ids,
+        retained_source_ids,
+        dataset_ids,
+        source_contexts,
+    )
+    build_id = "pdpb_" + resume_lineage_hash[:32]
+    evidence_stage = profile_artifact.profile_evidence_stage_table_name(
+        build_id
+    )
+    profile_stage = profile_artifact.profile_stage_table_name(build_id)
     profile_as_of = _now().date().isoformat()
-    generation_id = (
-        _clean_text(run_id)
-        or "pdprofile_"
-        + hashlib.sha1(
-            "|".join(
-                [profile_as_of, *retained_source_ids, *dataset_ids]
-            ).encode("utf-8")
-        ).hexdigest()[:32]
-    )[:64]
+    checkpoint_row = await db.first(
+        f"SELECT * FROM {_provider_directory_profile_checkpoint_ref(schema)} "
+        "WHERE build_id = :build_id;",
+        build_id=build_id,
+    )
+    checkpoint_map = (
+        _pagination_checkpoint_row_mapping(checkpoint_row)
+        if checkpoint_row is not None
+        else {}
+    )
+    checkpoint_as_of = _clean_text(checkpoint_map.get("profile_as_of"))
+    is_checkpoint_lineage_matching = bool(checkpoint_map) and (
+        _clean_text(checkpoint_map.get("strategy_version"))
+        == profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+        and int(checkpoint_map.get("schema_version") or -1)
+        == profile_artifact.PROFILE_SCHEMA_VERSION
+        and _clean_text(checkpoint_map.get("resume_lineage_hash"))
+        == resume_lineage_hash
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("source_ids")
+        )
+        == tuple(source_ids)
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("retained_source_ids")
+        )
+        == tuple(retained_source_ids)
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("dataset_ids")
+        )
+        == tuple(dataset_ids)
+        and _clean_text(checkpoint_map.get("evidence_stage"))
+        == evidence_stage
+        and _clean_text(checkpoint_map.get("profile_stage"))
+        == profile_stage
+        and _is_profile_target_oid_matching(
+            checkpoint_map.get("evidence_target_oid"),
+            evidence_build_fence.target_oid,
+        )
+        and _is_profile_target_oid_matching(
+            checkpoint_map.get("profile_target_oid"),
+            profile_build_fence.target_oid,
+        )
+    )
+    if is_checkpoint_lineage_matching and checkpoint_as_of:
+        try:
+            checkpoint_date = datetime.date.fromisoformat(checkpoint_as_of)
+        except ValueError:
+            checkpoint_date = None
+        is_stage_pair_logged = checkpoint_date is not None and (
+            await _is_profile_stage_pair_matching(
+                schema,
+                checkpoint_map,
+                evidence_stage,
+                profile_stage,
+            )
+        )
+        if is_stage_pair_logged and checkpoint_date is not None:
+            profile_as_of = checkpoint_date.isoformat()
+    generation_identity = f"{build_id}:{profile_as_of}"
+    generation_id = "pdprofile_" + hashlib.sha256(
+        generation_identity.encode("utf-8")
+    ).hexdigest()[:32]
     return _ProviderDirectoryProfileBuild(
         schema=schema,
         generation_id=generation_id,
@@ -13210,73 +13569,919 @@ async def _resolve_provider_directory_profile_build(
         retained_source_ids=tuple(retained_source_ids),
         dataset_ids=tuple(dataset_ids),
         profile_as_of=profile_as_of,
-        evidence_stage=profile_artifact.profile_evidence_stage_table_name(
-            generation_id
-        ),
-        profile_stage=profile_artifact.profile_stage_table_name(generation_id),
+        evidence_stage=evidence_stage,
+        profile_stage=profile_stage,
+        resume_lineage_hash=resume_lineage_hash,
+        build_id=build_id,
+        owner_run_id=_clean_text(run_id),
     )
 
 
-async def _create_provider_directory_profile_evidence_stage(
+def _provider_directory_profile_checkpoint_ref(schema: str) -> str:
+    return _unscoped_qt(
+        schema,
+        ProviderDirectoryProfileBuildCheckpoint.__tablename__,
+    )
+
+
+def _provider_directory_profile_checkpoint_array(
+    raw_value: Any,
+) -> tuple[str, ...]:
+    if isinstance(raw_value, str):
+        raw_value = json.loads(raw_value)
+    if not isinstance(raw_value, list):
+        return ()
+    return tuple(str(value) for value in raw_value)
+
+
+def _provider_directory_profile_checkpoint_state(
+    checkpoint_map: dict[str, Any],
+) -> _ProviderDirectoryProfileBuildCheckpointState:
+    return _ProviderDirectoryProfileBuildCheckpointState(
+        evidence_next_batch=int(
+            checkpoint_map.get("evidence_next_batch") or 0
+        ),
+        evidence_total_batches=int(
+            checkpoint_map.get("evidence_total_batches") or 0
+        ),
+        profile_next_batch=int(
+            checkpoint_map.get("profile_next_batch") or 0
+        ),
+        profile_total_batches=int(
+            checkpoint_map.get("profile_total_batches") or 0
+        ),
+        state=_clean_text(checkpoint_map.get("state")) or "",
+    )
+
+
+async def _assert_provider_directory_profile_checkpoint_ready(
+    build: _ProviderDirectoryProfileBuild,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> None:
+    checkpoint_row = await db.first(
+        f"SELECT * FROM "
+        f"{_provider_directory_profile_checkpoint_ref(build.schema)} "
+        "WHERE build_id = :build_id;",
+        build_id=_provider_directory_profile_build_id(build),
+    )
+    if checkpoint_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_ready_checkpoint_missing"
+        )
+    checkpoint_map = _pagination_checkpoint_row_mapping(checkpoint_row)
+    checkpoint_state = _provider_directory_profile_checkpoint_state(
+        checkpoint_map
+    )
+    is_ready = (
+        _clean_text(checkpoint_map.get("resume_lineage_hash"))
+        == build.resume_lineage_hash
+        and _clean_text(checkpoint_map.get("evidence_stage"))
+        == build.evidence_stage
+        and _clean_text(checkpoint_map.get("profile_stage"))
+        == build.profile_stage
+        and _is_profile_target_oid_matching(
+            checkpoint_map.get("evidence_target_oid"),
+            evidence_build_fence.target_oid,
+        )
+        and _is_profile_target_oid_matching(
+            checkpoint_map.get("profile_target_oid"),
+            profile_build_fence.target_oid,
+        )
+        and checkpoint_state.state == "ready"
+        and checkpoint_state.evidence_next_batch
+        == checkpoint_state.evidence_total_batches
+        and checkpoint_state.profile_next_batch
+        == checkpoint_state.profile_total_batches
+    )
+    if not is_ready or not (
+        await _is_profile_stage_pair_matching(
+            build.schema,
+            checkpoint_map,
+            build.evidence_stage,
+            build.profile_stage,
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_ready_checkpoint_stale"
+        )
+
+
+async def _is_profile_build_checkpoint_reusable(
+    build: _ProviderDirectoryProfileBuild,
+    checkpoint_map: dict[str, Any],
+    *,
+    has_existing_artifacts: bool,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+    evidence_total_batches: int,
+    profile_total_batches: int,
+) -> bool:
+    """Accept only a lineage-fenced, phase-consistent logged build."""
+    checkpoint_state = _provider_directory_profile_checkpoint_state(
+        checkpoint_map
+    )
+    is_phase_order_valid = (
+        checkpoint_state.profile_next_batch == 0
+        or checkpoint_state.evidence_next_batch
+        == checkpoint_state.evidence_total_batches
+    )
+    is_state_progress_valid = (
+        checkpoint_state.state
+        in {
+            "building_evidence",
+            "evidence_complete",
+            "building_profile",
+            "ready",
+            "failed",
+        }
+        and (
+            checkpoint_state.state != "building_evidence"
+            or checkpoint_state.profile_next_batch == 0
+        )
+        and (
+            checkpoint_state.state != "evidence_complete"
+            or (
+                checkpoint_state.evidence_next_batch
+                == checkpoint_state.evidence_total_batches
+                and checkpoint_state.profile_next_batch == 0
+            )
+        )
+        and (
+            checkpoint_state.state != "building_profile"
+            or checkpoint_state.evidence_next_batch
+            == checkpoint_state.evidence_total_batches
+        )
+        and (
+            checkpoint_state.state != "ready"
+            or (
+                checkpoint_state.evidence_next_batch
+                == checkpoint_state.evidence_total_batches
+                and checkpoint_state.profile_next_batch
+                == checkpoint_state.profile_total_batches
+            )
+        )
+    )
+    is_identity_matching = (
+        _clean_text(checkpoint_map.get("build_id"))
+        == _provider_directory_profile_build_id(build)
+        and _clean_text(checkpoint_map.get("strategy_version"))
+        == profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+        and int(checkpoint_map.get("schema_version") or -1)
+        == profile_artifact.PROFILE_SCHEMA_VERSION
+        and _clean_text(checkpoint_map.get("resume_lineage_hash"))
+        == build.resume_lineage_hash
+        and _clean_text(checkpoint_map.get("profile_as_of"))
+        == build.profile_as_of
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("source_ids")
+        )
+        == build.source_ids
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("retained_source_ids")
+        )
+        == build.retained_source_ids
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("dataset_ids")
+        )
+        == build.dataset_ids
+        and _clean_text(checkpoint_map.get("evidence_stage"))
+        == build.evidence_stage
+        and _clean_text(checkpoint_map.get("profile_stage"))
+        == build.profile_stage
+        and _is_profile_target_oid_matching(
+            checkpoint_map.get("evidence_target_oid"),
+            evidence_build_fence.target_oid,
+        )
+        and _is_profile_target_oid_matching(
+            checkpoint_map.get("profile_target_oid"),
+            profile_build_fence.target_oid,
+        )
+        and bool(checkpoint_map.get("has_existing_artifacts"))
+        is has_existing_artifacts
+        and checkpoint_state.evidence_total_batches
+        == evidence_total_batches
+        and checkpoint_state.profile_total_batches
+        == profile_total_batches
+        and 0
+        <= checkpoint_state.evidence_next_batch
+        <= evidence_total_batches
+        and 0
+        <= checkpoint_state.profile_next_batch
+        <= profile_total_batches
+        and is_phase_order_valid
+        and is_state_progress_valid
+    )
+    if not is_identity_matching:
+        return False
+    return await _is_profile_stage_pair_matching(
+        build.schema,
+        checkpoint_map,
+        build.evidence_stage,
+        build.profile_stage,
+    )
+
+
+async def _claim_provider_directory_profile_build_checkpoint(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    has_existing_artifacts: bool,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> _ProviderDirectoryProfileBuildCheckpointState:
+    """Claim a valid resumable build or atomically initialize logged stages."""
+    evidence_batches = _provider_directory_profile_evidence_batches(
+        build,
+        has_existing_artifacts=has_existing_artifacts,
+    )
+    profile_batches = _provider_directory_profile_compact_batches(
+        has_existing_artifacts=has_existing_artifacts,
+        npi_batch_size=profile_artifact.PROFILE_NPI_BATCH_SIZE,
+    )
+    checkpoint_ref = _provider_directory_profile_checkpoint_ref(build.schema)
+    build_id = _provider_directory_profile_build_id(build)
+    async with db.transaction():
+        checkpoint_row = await db.first(
+            f"SELECT * FROM {checkpoint_ref} "
+            "WHERE build_id = :build_id FOR UPDATE;",
+            build_id=build_id,
+        )
+        checkpoint_map = (
+            _pagination_checkpoint_row_mapping(checkpoint_row)
+            if checkpoint_row is not None
+            else {}
+        )
+        reusable = bool(checkpoint_map) and (
+            await _is_profile_build_checkpoint_reusable(
+                build,
+                checkpoint_map,
+                has_existing_artifacts=has_existing_artifacts,
+                evidence_build_fence=evidence_build_fence,
+                profile_build_fence=profile_build_fence,
+                evidence_total_batches=len(evidence_batches),
+                profile_total_batches=len(profile_batches),
+            )
+        )
+        if not reusable:
+            await _drop_profile_stages_for_reinitialize(
+                build,
+                checkpoint_map,
+            )
+            await db.status(
+                f"DELETE FROM {checkpoint_ref} WHERE build_id = :build_id;",
+                build_id=build_id,
+            )
+            await db.status(
+                profile_artifact.profile_evidence_table_sql(
+                    build.schema,
+                    build.evidence_stage,
+                    logged=True,
+                )
+            )
+            await db.status(
+                profile_artifact.profile_table_sql(
+                    build.schema,
+                    build.profile_stage,
+                    logged=True,
+                )
+            )
+            evidence_stage_oid = (
+                await _require_provider_directory_profile_stage_oid(
+                    build.schema,
+                    build.evidence_stage,
+                )
+            )
+            profile_stage_oid = (
+                await _require_provider_directory_profile_stage_oid(
+                    build.schema,
+                    build.profile_stage,
+                )
+            )
+            await db.status(
+                f"""
+                INSERT INTO {checkpoint_ref} (
+                    build_id, strategy_version, schema_version,
+                    resume_lineage_hash, owner_run_id, state, profile_as_of,
+                    source_ids, retained_source_ids, dataset_ids,
+                    evidence_stage, profile_stage, evidence_stage_oid,
+                    profile_stage_oid, evidence_target_oid, profile_target_oid,
+                    has_existing_artifacts, evidence_next_batch,
+                    evidence_total_batches, profile_next_batch,
+                    profile_total_batches, created_at, updated_at
+                ) VALUES (
+                    :build_id, :strategy_version, :schema_version,
+                    :resume_lineage_hash, :owner_run_id,
+                    'building_evidence', :profile_as_of,
+                    CAST(:source_ids AS jsonb),
+                    CAST(:retained_source_ids AS jsonb),
+                    CAST(:dataset_ids AS jsonb), :evidence_stage,
+                    :profile_stage, :evidence_stage_oid, :profile_stage_oid,
+                    :evidence_target_oid, :profile_target_oid,
+                    :has_existing_artifacts, 0,
+                    :evidence_total_batches, 0, :profile_total_batches,
+                    now(), now()
+                );
+                """,
+                build_id=build_id,
+                strategy_version=(
+                    profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+                ),
+                schema_version=profile_artifact.PROFILE_SCHEMA_VERSION,
+                resume_lineage_hash=build.resume_lineage_hash,
+                owner_run_id=build.owner_run_id,
+                profile_as_of=build.profile_as_of,
+                source_ids=json.dumps(list(build.source_ids)),
+                retained_source_ids=json.dumps(
+                    list(build.retained_source_ids)
+                ),
+                dataset_ids=json.dumps(list(build.dataset_ids)),
+                evidence_stage=build.evidence_stage,
+                profile_stage=build.profile_stage,
+                evidence_stage_oid=evidence_stage_oid,
+                profile_stage_oid=profile_stage_oid,
+                evidence_target_oid=evidence_build_fence.target_oid,
+                profile_target_oid=profile_build_fence.target_oid,
+                has_existing_artifacts=has_existing_artifacts,
+                evidence_total_batches=len(evidence_batches),
+                profile_total_batches=len(profile_batches),
+            )
+            return _ProviderDirectoryProfileBuildCheckpointState(
+                evidence_next_batch=0,
+                evidence_total_batches=len(evidence_batches),
+                profile_next_batch=0,
+                profile_total_batches=len(profile_batches),
+                state="building_evidence",
+            )
+
+        checkpoint_state = _provider_directory_profile_checkpoint_state(
+            checkpoint_map
+        )
+        claimed_state = (
+            "ready"
+            if checkpoint_state.profile_next_batch
+            == checkpoint_state.profile_total_batches
+            else (
+                "building_profile"
+                if checkpoint_state.evidence_next_batch
+                == checkpoint_state.evidence_total_batches
+                else "building_evidence"
+            )
+        )
+        claimed_count = await db.status(
+            f"""
+            UPDATE {checkpoint_ref}
+               SET owner_run_id = :owner_run_id,
+                   state = :state,
+                   last_error = NULL,
+                   updated_at = now()
+             WHERE build_id = :build_id
+               AND to_regclass(:evidence_stage_relation)::oid::bigint
+                   = evidence_stage_oid
+               AND to_regclass(:profile_stage_relation)::oid::bigint
+                   = profile_stage_oid;
+            """,
+            owner_run_id=build.owner_run_id,
+            state=claimed_state,
+            build_id=build_id,
+            evidence_stage_relation=_provider_directory_profile_build_ref(
+                build,
+                build.evidence_stage,
+            ),
+            profile_stage_relation=_provider_directory_profile_build_ref(
+                build,
+                build.profile_stage,
+            ),
+        )
+        if _coerce_rowcount(claimed_count) != 1:
+            raise RuntimeError(
+                "provider_directory_profile_build_checkpoint_claim_lost"
+            )
+        return replace(checkpoint_state, state=claimed_state)
+
+
+async def _advance_provider_directory_profile_build_checkpoint(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    phase: str,
+    expected_batch: int,
+    total_batches: int,
+) -> None:
+    if phase not in {"evidence", "profile"}:
+        raise ValueError(f"unsupported profile checkpoint phase: {phase}")
+    next_column = f"{phase}_next_batch"
+    total_column = f"{phase}_total_batches"
+    state = "building_evidence" if phase == "evidence" else "building_profile"
+    updated_count = await db.status(
+        f"""
+        UPDATE {_provider_directory_profile_checkpoint_ref(build.schema)}
+           SET {next_column} = :next_batch,
+               state = :state,
+               last_error = NULL,
+               updated_at = now()
+         WHERE build_id = :build_id
+           AND owner_run_id IS NOT DISTINCT FROM :owner_run_id
+           AND {next_column} = :expected_batch
+           AND {total_column} = :total_batches
+           AND to_regclass(:evidence_stage_relation)::oid::bigint
+               = evidence_stage_oid
+           AND to_regclass(:profile_stage_relation)::oid::bigint
+               = profile_stage_oid;
+        """,
+        next_batch=expected_batch + 1,
+        state=state,
+        build_id=_provider_directory_profile_build_id(build),
+        owner_run_id=build.owner_run_id,
+        expected_batch=expected_batch,
+        total_batches=total_batches,
+        evidence_stage_relation=_provider_directory_profile_build_ref(
+            build,
+            build.evidence_stage,
+        ),
+        profile_stage_relation=_provider_directory_profile_build_ref(
+            build,
+            build.profile_stage,
+        ),
+    )
+    if _coerce_rowcount(updated_count) != 1:
+        raise RuntimeError(
+            "provider_directory_profile_build_checkpoint_ownership_lost"
+        )
+
+
+async def _mark_profile_build_checkpoint_state(
+    build: _ProviderDirectoryProfileBuild,
+    state: str,
+) -> None:
+    updated_count = await db.status(
+        f"""
+        UPDATE {_provider_directory_profile_checkpoint_ref(build.schema)}
+           SET state = CAST(:state AS varchar),
+               completed_at = CASE
+                   WHEN CAST(:state AS varchar) = 'ready' THEN now()
+                   ELSE NULL
+               END,
+               updated_at = now()
+         WHERE build_id = :build_id
+           AND owner_run_id IS NOT DISTINCT FROM :owner_run_id
+           AND to_regclass(:evidence_stage_relation)::oid::bigint
+               = evidence_stage_oid
+           AND to_regclass(:profile_stage_relation)::oid::bigint
+               = profile_stage_oid;
+        """,
+        state=state,
+        build_id=_provider_directory_profile_build_id(build),
+        owner_run_id=build.owner_run_id,
+        evidence_stage_relation=_provider_directory_profile_build_ref(
+            build,
+            build.evidence_stage,
+        ),
+        profile_stage_relation=_provider_directory_profile_build_ref(
+            build,
+            build.profile_stage,
+        ),
+    )
+    if _coerce_rowcount(updated_count) != 1:
+        raise RuntimeError(
+            "provider_directory_profile_build_checkpoint_ownership_lost"
+        )
+
+
+async def _mark_profile_build_checkpoint_failed(
+    build: _ProviderDirectoryProfileBuild,
+    exc: BaseException,
+) -> None:
+    try:
+        await db.status(
+            f"""
+            UPDATE {_provider_directory_profile_checkpoint_ref(build.schema)}
+               SET state = 'failed',
+                   last_error = :last_error,
+                   updated_at = now()
+             WHERE build_id = :build_id
+               AND owner_run_id IS NOT DISTINCT FROM :owner_run_id;
+            """,
+            last_error=f"{type(exc).__name__}: {exc}"[:2000],
+            build_id=_provider_directory_profile_build_id(build),
+            owner_run_id=build.owner_run_id,
+        )
+    except Exception:
+        LOGGER.warning(
+            "Failed to mark Provider Directory Profile checkpoint failed",
+            exc_info=True,
+        )
+
+
+async def _delete_provider_directory_profile_build_checkpoint(
+    schema: str,
+    build_id: str,
+) -> None:
+    try:
+        await db.status(
+            f"DELETE FROM {_provider_directory_profile_checkpoint_ref(schema)} "
+            "WHERE build_id = :build_id;",
+            build_id=build_id,
+        )
+    except Exception:
+        LOGGER.warning(
+            "Failed to delete completed Provider Directory Profile checkpoint",
+            exc_info=True,
+        )
+
+
+async def _provider_directory_profile_stage_relation_identity(
+    schema: str,
+    stage_table: str,
+) -> tuple[int, str, str] | None:
+    row = await db.first(
+        """
+        SELECT cls.oid::bigint AS relation_oid,
+               cls.relkind::text AS relation_kind,
+               cls.relpersistence::text AS relation_persistence
+          FROM pg_class cls
+          JOIN pg_namespace ns ON ns.oid = cls.relnamespace
+         WHERE ns.nspname = :schema_name
+           AND cls.relname = :relation_name;
+        """,
+        schema_name=schema,
+        relation_name=stage_table,
+    )
+    if row is None:
+        return None
+    row_map = _pagination_checkpoint_row_mapping(row)
+    return (
+        int(row_map["relation_oid"]),
+        str(row_map["relation_kind"]),
+        str(row_map["relation_persistence"]),
+    )
+
+
+async def _require_provider_directory_profile_stage_oid(
+    schema: str,
+    stage_table: str,
+) -> int:
+    identity = await _provider_directory_profile_stage_relation_identity(
+        schema,
+        stage_table,
+    )
+    if (
+        identity is None
+        or identity[0] <= 0
+        or identity[1:] != ("r", "p")
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_stage_identity_invalid:"
+            + stage_table
+        )
+    return identity[0]
+
+
+async def _drop_profile_stages_for_reinitialize(
+    build: _ProviderDirectoryProfileBuild,
+    checkpoint_map: dict[str, Any],
+) -> None:
+    """Drop only stage OIDs owned by the checkpoint being reinitialized."""
+    if checkpoint_map and (
+        _clean_text(checkpoint_map.get("evidence_stage"))
+        != build.evidence_stage
+        or _clean_text(checkpoint_map.get("profile_stage"))
+        != build.profile_stage
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_reinitialize_stage_name_mismatch"
+        )
+    locked_stages: list[str] = []
+    for stage_table, oid_field in (
+        (build.profile_stage, "profile_stage_oid"),
+        (build.evidence_stage, "evidence_stage_oid"),
+    ):
+        identity = await _provider_directory_profile_stage_relation_identity(
+            build.schema,
+            stage_table,
+        )
+        if identity is None:
+            continue
+        if not checkpoint_map:
+            raise RuntimeError(
+                "provider_directory_profile_unowned_stage_exists:"
+                + stage_table
+            )
+        expected_oid = _provider_directory_profile_checkpoint_oid(
+            checkpoint_map.get(oid_field)
+        )
+        if identity != (expected_oid, "r", "p"):
+            raise RuntimeError(
+                "provider_directory_profile_reinitialize_stage_oid_mismatch:"
+                + stage_table
+            )
+        await db.status(
+            f"LOCK TABLE {_unscoped_qt(build.schema, stage_table)} "
+            "IN ACCESS EXCLUSIVE MODE;"
+        )
+        if (
+            await _provider_directory_profile_stage_relation_identity(
+                build.schema,
+                stage_table,
+            )
+            != identity
+        ):
+            raise RuntimeError(
+                "provider_directory_profile_reinitialize_stage_identity_changed:"
+                + stage_table
+            )
+        locked_stages.append(stage_table)
+    for stage_table in locked_stages:
+        await db.status(
+            f"DROP TABLE {_unscoped_qt(build.schema, stage_table)};"
+        )
+
+
+def _validated_profile_checkpoint_stage_names(
+    checkpoint_map: dict[str, Any],
+) -> tuple[str, str]:
+    build_id = _clean_text(checkpoint_map.get("build_id"))
+    if not build_id or re.fullmatch(r"pdpb_[0-9a-f]{32}", build_id) is None:
+        raise RuntimeError(
+            "provider_directory_profile_stale_checkpoint_identity_invalid"
+        )
+    evidence_stage = _clean_text(checkpoint_map.get("evidence_stage"))
+    profile_stage = _clean_text(checkpoint_map.get("profile_stage"))
+    expected_evidence_stage = (
+        profile_artifact.profile_evidence_stage_table_name(build_id)
+    )
+    expected_profile_stage = profile_artifact.profile_stage_table_name(
+        build_id
+    )
+    if (
+        evidence_stage != expected_evidence_stage
+        or profile_stage != expected_profile_stage
+        or not evidence_stage.startswith(
+            f"{profile_artifact.PROFILE_EVIDENCE_STAGE_PREFIX}_"
+        )
+        or not profile_stage.startswith(
+            f"{profile_artifact.PROFILE_STAGE_PREFIX}_"
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_stale_checkpoint_stage_invalid"
+        )
+    return evidence_stage, profile_stage
+
+
+async def _reap_stale_provider_directory_profile_builds(
+    schema: str,
+    *,
+    current_build_id: str,
+) -> int:
+    """Remove exact logged stages for superseded Profile build lineages."""
+    checkpoint_ref = _provider_directory_profile_checkpoint_ref(schema)
+    checkpoint_rows = await db.all(
+        f"SELECT build_id FROM {checkpoint_ref} "
+        "WHERE build_id <> :current_build_id ORDER BY created_at, build_id;",
+        current_build_id=current_build_id,
+    )
+    reaped_count = 0
+    for checkpoint_summary in checkpoint_rows:
+        stale_build_id = _clean_text(
+            _pagination_checkpoint_row_mapping(checkpoint_summary).get(
+                "build_id"
+            )
+        )
+        if not stale_build_id or stale_build_id == current_build_id:
+            continue
+        async with db.transaction():
+            checkpoint_row = await db.first(
+                f"SELECT * FROM {checkpoint_ref} "
+                "WHERE build_id = :build_id FOR UPDATE;",
+                build_id=stale_build_id,
+            )
+            if checkpoint_row is None:
+                continue
+            checkpoint_map = _pagination_checkpoint_row_mapping(
+                checkpoint_row
+            )
+            evidence_stage, profile_stage = (
+                _validated_profile_checkpoint_stage_names(
+                    checkpoint_map
+                )
+            )
+            stage_oid_by_name = {
+                evidence_stage: _provider_directory_profile_checkpoint_oid(
+                    checkpoint_map.get("evidence_stage_oid")
+                ),
+                profile_stage: _provider_directory_profile_checkpoint_oid(
+                    checkpoint_map.get("profile_stage_oid")
+                ),
+            }
+            if any(
+                stage_oid is None
+                for stage_oid in stage_oid_by_name.values()
+            ):
+                raise RuntimeError(
+                    "provider_directory_profile_stale_checkpoint_oid_invalid"
+                )
+            locked_stages: list[str] = []
+            for stage_table in (profile_stage, evidence_stage):
+                initial_identity = (
+                    await _provider_directory_profile_stage_relation_identity(
+                        schema,
+                        stage_table,
+                    )
+                )
+                if initial_identity is None:
+                    continue
+                expected_identity = (
+                    stage_oid_by_name[stage_table],
+                    "r",
+                    "p",
+                )
+                if initial_identity != expected_identity:
+                    raise RuntimeError(
+                        "provider_directory_profile_stale_stage_oid_mismatch"
+                    )
+                await db.status(
+                    f"LOCK TABLE {_unscoped_qt(schema, stage_table)} "
+                    "IN ACCESS EXCLUSIVE MODE;"
+                )
+                locked_identity = (
+                    await _provider_directory_profile_stage_relation_identity(
+                        schema,
+                        stage_table,
+                    )
+                )
+                if locked_identity != initial_identity:
+                    raise RuntimeError(
+                        "provider_directory_profile_stale_stage_identity_changed"
+                    )
+                locked_stages.append(stage_table)
+            for stage_table in locked_stages:
+                await db.status(
+                    f"DROP TABLE {_unscoped_qt(schema, stage_table)};"
+                )
+            deleted_count = await db.status(
+                f"DELETE FROM {checkpoint_ref} "
+                "WHERE build_id = :build_id "
+                "AND evidence_stage = :evidence_stage "
+                "AND profile_stage = :profile_stage "
+                "AND evidence_stage_oid = :evidence_stage_oid "
+                "AND profile_stage_oid = :profile_stage_oid;",
+                build_id=stale_build_id,
+                evidence_stage=evidence_stage,
+                profile_stage=profile_stage,
+                evidence_stage_oid=stage_oid_by_name[evidence_stage],
+                profile_stage_oid=stage_oid_by_name[profile_stage],
+            )
+            if _coerce_rowcount(deleted_count) != 1:
+                raise RuntimeError(
+                    "provider_directory_profile_stale_checkpoint_delete_lost"
+                )
+            reaped_count += 1
+    return reaped_count
+
+
+async def _populate_provider_directory_profile_evidence_stage(
     build: _ProviderDirectoryProfileBuild,
     *,
     has_evidence_target: bool,
+    bounded: bool = False,
+    start_batch: int = 0,
+    checkpointed: bool = False,
 ) -> None:
-    """Build the logged evidence replacement table and its serving indexes."""
+    """Populate one registered evidence stage and build serving indexes."""
     evidence_stage_ref = _provider_directory_profile_build_ref(
         build, build.evidence_stage
     )
-    await db.status(
-        profile_artifact.profile_evidence_table_sql(
-            build.schema,
-            build.evidence_stage,
-            logged=True,
-        )
+    copy_evidence_sql = profile_artifact.copy_existing_evidence_sql(
+        source_ref=_provider_directory_profile_build_ref(
+            build,
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+        ),
+        target_ref=evidence_stage_ref,
     )
-    if has_evidence_target:
+    evidence_sql_refs_by_name = {
+        "target_ref": evidence_stage_ref,
+        "source_ref": _qt(
+            build.schema,
+            ProviderDirectorySource.__tablename__,
+        ),
+        "practitioner_ref": _qt(
+            build.schema,
+            ProviderDirectoryPractitioner.__tablename__,
+        ),
+        "role_ref": _qt(
+            build.schema,
+            ProviderDirectoryPractitionerRole.__tablename__,
+        ),
+        "organization_ref": _qt(
+            build.schema,
+            ProviderDirectoryOrganization.__tablename__,
+        ),
+        "service_ref": _qt(
+            build.schema,
+            ProviderDirectoryHealthcareService.__tablename__,
+        ),
+        "endpoint_ref": _qt(
+            build.schema,
+            ProviderDirectoryEndpoint.__tablename__,
+        ),
+    }
+    if not bounded:
+        if has_evidence_target:
+            await db.status(
+                copy_evidence_sql,
+                source_ids=list(build.source_ids),
+                retained_source_ids=list(build.retained_source_ids),
+                profile_as_of=build.profile_as_of,
+            )
         await db.status(
-            profile_artifact.copy_existing_evidence_sql(
-                source_ref=_provider_directory_profile_build_ref(
-                    build,
-                    profile_artifact.PROFILE_EVIDENCE_TABLE,
-                ),
-                target_ref=evidence_stage_ref,
+            profile_artifact.profile_evidence_insert_sql(
+                **evidence_sql_refs_by_name
             ),
             source_ids=list(build.source_ids),
-            retained_source_ids=list(build.retained_source_ids),
+            dataset_ids=list(build.dataset_ids),
             profile_as_of=build.profile_as_of,
         )
-    await db.status(
-        profile_artifact.profile_evidence_insert_sql(
-            target_ref=evidence_stage_ref,
-            source_ref=_qt(
-                build.schema,
-                ProviderDirectorySource.__tablename__,
-            ),
-            practitioner_ref=_qt(
-                build.schema,
-                ProviderDirectoryPractitioner.__tablename__,
-            ),
-            role_ref=_qt(
-                build.schema,
-                ProviderDirectoryPractitionerRole.__tablename__,
-            ),
-            organization_ref=_qt(
-                build.schema,
-                ProviderDirectoryOrganization.__tablename__,
-            ),
-            service_ref=_qt(
-                build.schema,
-                ProviderDirectoryHealthcareService.__tablename__,
-            ),
-            endpoint_ref=_qt(
-                build.schema,
-                ProviderDirectoryEndpoint.__tablename__,
-            ),
-        ),
-        source_ids=list(build.source_ids),
-        dataset_ids=list(build.dataset_ids),
-        profile_as_of=build.profile_as_of,
+    else:
+        batches = _provider_directory_profile_evidence_batches(
+            build,
+            has_existing_artifacts=has_evidence_target,
+        )
+        if start_batch < 0 or start_batch > len(batches):
+            raise RuntimeError(
+                "provider_directory_profile_evidence_checkpoint_invalid"
+            )
+        for batch_number, batch in enumerate(batches):
+            if batch_number < start_batch:
+                continue
+            batch_started_at = time.monotonic()
+            LOGGER.info(
+                "Starting Provider Directory Profile evidence batch "
+                "%d/%d kind=%s source_id=%s fact_type=%s role_bucket=%d/%d",
+                batch_number + 1,
+                len(batches),
+                batch.kind,
+                batch.source_id or "-",
+                batch.fact_type or "-",
+                batch.role_bucket + 1,
+                batch.role_bucket_count,
+            )
+            if batch.kind == "copy":
+                affected_rows = _coerce_rowcount(
+                    await db.status(
+                        copy_evidence_sql,
+                        source_ids=list(build.source_ids),
+                        retained_source_ids=list(build.retained_source_ids),
+                        profile_as_of=build.profile_as_of,
+                    )
+                )
+            else:
+                if not batch.source_id or not batch.dataset_id or not batch.fact_type:
+                    raise RuntimeError(
+                        "provider_directory_profile_evidence_batch_invalid"
+                    )
+                insert_params_by_name = {
+                    "source_ids": [batch.source_id],
+                    "dataset_ids": [batch.dataset_id],
+                    "profile_as_of": build.profile_as_of,
+                }
+                if batch.role_bucket_count > 1:
+                    insert_params_by_name.update(
+                        {
+                            "profile_role_bucket_count": (
+                                batch.role_bucket_count
+                            ),
+                            "profile_role_bucket": batch.role_bucket,
+                        }
+                    )
+                affected_rows = _coerce_rowcount(
+                    await db.status(
+                        profile_artifact.profile_evidence_insert_sql(
+                            **evidence_sql_refs_by_name,
+                            fact_type=batch.fact_type,
+                            role_bucket_count=batch.role_bucket_count,
+                            role_bucket=batch.role_bucket,
+                        ),
+                        **insert_params_by_name,
+                    )
+                )
+            if checkpointed:
+                await _advance_provider_directory_profile_build_checkpoint(
+                    build,
+                    phase="evidence",
+                    expected_batch=batch_number,
+                    total_batches=len(batches),
+                )
+            LOGGER.info(
+                "Completed Provider Directory Profile evidence batch "
+                "%d/%d rows=%d elapsed_seconds=%.3f",
+                batch_number + 1,
+                len(batches),
+                affected_rows,
+                time.monotonic() - batch_started_at,
+            )
+    index_started_at = time.monotonic()
+    LOGGER.info(
+        "Starting Provider Directory Profile evidence indexes stage=%s",
+        build.evidence_stage,
     )
     await _create_provider_directory_profile_indexes(
         build.schema,
@@ -13284,14 +14489,30 @@ async def _create_provider_directory_profile_evidence_stage(
         evidence=True,
     )
     await db.status(f"ANALYZE {evidence_stage_ref};")
+    LOGGER.info(
+        "Completed Provider Directory Profile evidence indexes stage=%s "
+        "elapsed_seconds=%.3f",
+        build.evidence_stage,
+        time.monotonic() - index_started_at,
+    )
+    if checkpointed:
+        await _mark_profile_build_checkpoint_state(
+            build,
+            "evidence_complete",
+        )
 
 
-async def _create_provider_directory_profile_compact_stage(
+async def _populate_provider_directory_profile_compact_stage(
     build: _ProviderDirectoryProfileBuild,
     *,
     has_existing_artifacts: bool,
+    npi_batch_size: int | None = None,
+    start_batch: int = 0,
+    checkpointed: bool = False,
 ) -> None:
-    """Build the compact profile stage while preserving unaffected NPIs."""
+    """Populate compact profiles while preserving unaffected NPIs."""
+    if npi_batch_size is not None and npi_batch_size < 1:
+        raise ValueError("profile NPI batch size must be positive")
     evidence_stage_ref = _provider_directory_profile_build_ref(
         build, build.evidence_stage
     )
@@ -13303,42 +14524,109 @@ async def _create_provider_directory_profile_compact_stage(
         build,
         profile_artifact.PROFILE_EVIDENCE_TABLE,
     )
-    await db.status(
-        profile_artifact.profile_table_sql(
-            build.schema,
-            build.profile_stage,
-            logged=True,
-        )
-    )
     should_rebuild_all_profiles = not has_existing_artifacts
-    if has_existing_artifacts:
-        await db.status(
-            profile_artifact.copy_unaffected_profiles_sql(
-                profile_source_ref=_provider_directory_profile_build_ref(
-                    build,
-                    profile_artifact.PROFILE_TABLE,
-                ),
-                evidence_source_ref=evidence_target_ref,
-                evidence_stage_ref=evidence_stage_ref,
-                profile_stage_ref=profile_stage_ref,
-            ),
-            source_ids=list(build.source_ids),
-            retained_source_ids=list(build.retained_source_ids),
-            profile_as_of=build.profile_as_of,
-        )
-    await db.status(
-        profile_artifact.profile_insert_sql(
-            evidence_ref=evidence_stage_ref,
-            target_ref=profile_stage_ref,
-            old_evidence_ref=(
-                evidence_target_ref if has_existing_artifacts else None
-            ),
-            rebuild_all=should_rebuild_all_profiles,
+    copy_profiles_sql = profile_artifact.copy_unaffected_profiles_sql(
+        profile_source_ref=_provider_directory_profile_build_ref(
+            build,
+            profile_artifact.PROFILE_TABLE,
         ),
-        source_ids=list(build.source_ids),
-        retained_source_ids=list(build.retained_source_ids),
-        profile_as_of=build.profile_as_of,
-        generation_id=build.generation_id,
+        evidence_source_ref=evidence_target_ref,
+        evidence_stage_ref=evidence_stage_ref,
+        profile_stage_ref=profile_stage_ref,
+    )
+    profile_sql_args_by_name = {
+        "evidence_ref": evidence_stage_ref,
+        "target_ref": profile_stage_ref,
+        "old_evidence_ref": (
+            evidence_target_ref if has_existing_artifacts else None
+        ),
+        "rebuild_all": should_rebuild_all_profiles,
+    }
+    profile_params_by_name = {
+        "source_ids": list(build.source_ids),
+        "retained_source_ids": list(build.retained_source_ids),
+        "profile_as_of": build.profile_as_of,
+        "generation_id": build.generation_id,
+    }
+    if npi_batch_size is None:
+        if has_existing_artifacts:
+            await db.status(
+                copy_profiles_sql,
+                source_ids=list(build.source_ids),
+                retained_source_ids=list(build.retained_source_ids),
+                profile_as_of=build.profile_as_of,
+            )
+        await db.status(
+            profile_artifact.profile_insert_sql(**profile_sql_args_by_name),
+            **profile_params_by_name,
+        )
+    else:
+        batches = _provider_directory_profile_compact_batches(
+            has_existing_artifacts=has_existing_artifacts,
+            npi_batch_size=npi_batch_size,
+        )
+        if start_batch < 0 or start_batch > len(batches):
+            raise RuntimeError(
+                "provider_directory_profile_compact_checkpoint_invalid"
+            )
+        for batch_number, batch in enumerate(batches):
+            if batch_number < start_batch:
+                continue
+            batch_started_at = time.monotonic()
+            LOGGER.info(
+                "Starting Provider Directory Profile compact batch "
+                "%d/%d kind=%s npi_start=%s npi_end=%s",
+                batch_number + 1,
+                len(batches),
+                batch.kind,
+                batch.npi_start if batch.npi_start is not None else "-",
+                batch.npi_end if batch.npi_end is not None else "-",
+            )
+            if batch.kind == "copy":
+                affected_rows = _coerce_rowcount(
+                    await db.status(
+                        copy_profiles_sql,
+                        source_ids=list(build.source_ids),
+                        retained_source_ids=list(build.retained_source_ids),
+                        profile_as_of=build.profile_as_of,
+                    )
+                )
+            else:
+                if batch.npi_start is None or batch.npi_end is None:
+                    raise RuntimeError(
+                        "provider_directory_profile_compact_batch_invalid"
+                    )
+                affected_rows = _coerce_rowcount(
+                    await db.status(
+                        profile_artifact.profile_insert_sql(
+                            **profile_sql_args_by_name,
+                            npi_start=batch.npi_start,
+                            npi_end=batch.npi_end,
+                        ),
+                        **profile_params_by_name,
+                        profile_npi_start=batch.npi_start,
+                        profile_npi_end=batch.npi_end,
+                    )
+                )
+            if checkpointed:
+                await _advance_provider_directory_profile_build_checkpoint(
+                    build,
+                    phase="profile",
+                    expected_batch=batch_number,
+                    total_batches=len(batches),
+                )
+            LOGGER.info(
+                "Completed Provider Directory Profile compact batch "
+                "%d/%d rows=%d elapsed_seconds=%.3f",
+                batch_number + 1,
+                len(batches),
+                affected_rows,
+                time.monotonic() - batch_started_at,
+            )
+    index_started_at = time.monotonic()
+    LOGGER.info(
+        "Starting Provider Directory Profile compact indexes stage=%s",
+        build.profile_stage,
     )
     await _create_provider_directory_profile_indexes(
         build.schema,
@@ -13346,6 +14634,17 @@ async def _create_provider_directory_profile_compact_stage(
         evidence=False,
     )
     await db.status(f"ANALYZE {profile_stage_ref};")
+    LOGGER.info(
+        "Completed Provider Directory Profile compact indexes stage=%s "
+        "elapsed_seconds=%.3f",
+        build.profile_stage,
+        time.monotonic() - index_started_at,
+    )
+    if checkpointed:
+        await _mark_profile_build_checkpoint_state(
+            build,
+            "ready",
+        )
 
 
 async def _prepare_provider_directory_profile_stages(
@@ -13356,6 +14655,11 @@ async def _prepare_provider_directory_profile_stages(
     ProviderDirectoryPreparedArtifactStage,
     ProviderDirectoryPreparedArtifactStage,
 ]:
+    await _assert_provider_directory_profile_checkpoint_ready(
+        build,
+        evidence_build_fence,
+        profile_build_fence,
+    )
     await _assert_provider_directory_logged_relation(
         build.schema,
         build.evidence_stage,
@@ -13373,6 +14677,11 @@ async def _prepare_provider_directory_profile_stages(
                 _rename_provider_directory_profile_evidence_indexes
             ),
             build_fence=evidence_build_fence,
+            retain_on_failed_bundle=True,
+            resume_checkpoint=(
+                build.schema,
+                _provider_directory_profile_build_id(build),
+            ),
         ),
         ProviderDirectoryPreparedArtifactStage(
             schema=build.schema,
@@ -13382,6 +14691,11 @@ async def _prepare_provider_directory_profile_stages(
                 _rename_provider_directory_profile_table_indexes
             ),
             build_fence=profile_build_fence,
+            retain_on_failed_bundle=True,
+            resume_checkpoint=(
+                build.schema,
+                _provider_directory_profile_build_id(build),
+            ),
         ),
     )
 
@@ -13424,11 +14738,25 @@ async def _finalize_provider_directory_profile_stages(
 ]:
     if defer_cutover:
         return metrics, stages
+    is_promoted = False
     try:
         await _retry_provider_directory_artifact_bundle_promotion(stages)
+        is_promoted = True
+        for schema, build_id in sorted(
+            {
+                    stage.resume_checkpoint
+                    for stage in stages
+                    if getattr(stage, "resume_checkpoint", None) is not None
+            }
+        ):
+            await _delete_provider_directory_profile_build_checkpoint(
+                schema,
+                build_id,
+            )
     finally:
-        for stage in reversed(stages):
-            await _remove_provider_directory_artifact_stage(stage)
+        if is_promoted:
+            for stage in reversed(stages):
+                await _remove_provider_directory_artifact_stage(stage)
     return metrics
 
 
@@ -13460,19 +14788,31 @@ async def _build_provider_directory_profile_stages(
     has_existing_artifacts = await _has_provider_directory_profile_artifacts(
         build.schema
     )
-    created_stage_tables: list[str] = []
-    try:
-        await _create_provider_directory_profile_evidence_stage(
-            build,
-            has_evidence_target=has_existing_artifacts,
-        )
-        created_stage_tables.append(build.evidence_stage)
-        should_rebuild_all_profiles = not has_existing_artifacts
-        await _create_provider_directory_profile_compact_stage(
+    checkpoint_state = (
+        await _claim_provider_directory_profile_build_checkpoint(
             build,
             has_existing_artifacts=has_existing_artifacts,
+            evidence_build_fence=evidence_build_fence,
+            profile_build_fence=profile_build_fence,
         )
-        created_stage_tables.append(build.profile_stage)
+    )
+    try:
+        if checkpoint_state.profile_next_batch == 0:
+            await _populate_provider_directory_profile_evidence_stage(
+                build,
+                has_evidence_target=has_existing_artifacts,
+                bounded=True,
+                start_batch=checkpoint_state.evidence_next_batch,
+                checkpointed=True,
+            )
+        should_rebuild_all_profiles = not has_existing_artifacts
+        await _populate_provider_directory_profile_compact_stage(
+            build,
+            has_existing_artifacts=has_existing_artifacts,
+            npi_batch_size=profile_artifact.PROFILE_NPI_BATCH_SIZE,
+            start_batch=checkpoint_state.profile_next_batch,
+            checkpointed=True,
+        )
         metrics = await _provider_directory_profile_metrics(
             build,
             should_rebuild_all_profiles=should_rebuild_all_profiles,
@@ -13483,11 +14823,13 @@ async def _build_provider_directory_profile_stages(
             profile_build_fence,
         )
         return metrics, stages
-    except BaseException:
-        for stage_table in reversed(created_stage_tables):
-            await _remove_provider_directory_profile_stage_table(
-                build.schema,
-                stage_table,
+    except BaseException as exc:
+        with contextlib.suppress(BaseException):
+            await asyncio.shield(
+                _mark_profile_build_checkpoint_failed(
+                    build,
+                    exc,
+                )
             )
         raise
 
@@ -13509,11 +14851,6 @@ async def publish_provider_directory_profile(
     dataset_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
     if dataset_fence is None:
         return {"skipped": True, "reason": "immutable_dataset_scope_required"}
-    build = await _resolve_provider_directory_profile_build(
-        schema,
-        run_id,
-        dataset_fence,
-    )
     async with contextlib.AsyncExitStack() as build_guards:
         evidence_build_fence = await build_guards.enter_async_context(
             _provider_directory_artifact_build_guard(
@@ -13526,6 +14863,17 @@ async def publish_provider_directory_profile(
                 schema,
                 profile_artifact.PROFILE_TABLE,
             )
+        )
+        build = await _resolve_provider_directory_profile_build(
+            schema,
+            run_id,
+            dataset_fence,
+            evidence_build_fence,
+            profile_build_fence,
+        )
+        await _reap_stale_provider_directory_profile_builds(
+            schema,
+            current_build_id=_provider_directory_profile_build_id(build),
         )
         metrics, stages = await _build_provider_directory_profile_stages(
             build,
@@ -14029,7 +15377,7 @@ async def publish_provider_directory_location_archive(
 ) -> dict[str, Any]:
     """Publish provider directory location archive for provider-directory serving."""
     schema = db_schema or _schema()
-    if not await _address_canon_functions_available(schema):
+    if not await _has_address_canon_functions(schema):
         return {"skipped": True, "reason": "canonical_functions_unavailable"}
     if not await _table_exists(schema, "address_archive_v2"):
         return {"skipped": True, "reason": "address_archive_v2_unavailable"}
@@ -14144,7 +15492,7 @@ async def _ensure_provider_directory_network_catalog_table(schema: str) -> None:
     )
 
 
-async def _provider_directory_network_catalog_has_rows(schema: str) -> bool:
+async def _has_provider_directory_network_catalog_rows(schema: str) -> bool:
     return bool(
         await db.scalar(
             f"""
@@ -14168,7 +15516,7 @@ async def _ensure_provider_directory_network_catalog_populated(schema: str) -> d
             "reason": missing_reason,
             "relation": relation,
         }
-    if await _provider_directory_network_catalog_has_rows(schema):
+    if await _has_provider_directory_network_catalog_rows(schema):
         return {
             "published": False,
             "reason": "already_populated",
@@ -14799,7 +16147,7 @@ def _max_rows_per_statement(column_count: int) -> int:
     return max(1, min(500, 30000 // max(column_count, 1)))
 
 
-def _copy_upsert_enabled() -> bool:
+def _is_copy_upsert_enabled() -> bool:
     return os.getenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT", "1").lower() not in {
         "0",
         "false",
@@ -14808,7 +16156,7 @@ def _copy_upsert_enabled() -> bool:
     }
 
 
-def _seen_stage_enabled() -> bool:
+def _is_seen_stage_enabled() -> bool:
     return os.getenv("HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE", "1").lower() not in {
         "0",
         "false",
@@ -14886,12 +16234,12 @@ def _provider_directory_import_seen_stage_table_name(run_id: str) -> str:
 
 
 def _json_columns(table) -> set[str]:
-    result: set[str] = set()
+    json_column_names: set[str] = set()
     for column in table.columns:
         type_name = column.type.__class__.__name__.upper()
         if "JSON" in type_name:
-            result.add(column.name)
-    return result
+            json_column_names.add(column.name)
+    return json_column_names
 
 
 def _json_default(value: Any) -> Any:
@@ -14946,7 +16294,7 @@ PROVIDER_DIRECTORY_LOCATION_ADDRESS_KEY_INPUT_COLUMNS = (
 )
 
 
-def _preserve_null_location_address_key(table) -> bool:
+def _should_preserve_null_location_address_key(table) -> bool:
     return table.name == ProviderDirectoryLocation.__tablename__
 
 
@@ -15039,7 +16387,7 @@ def _effective_update_expression(table, statement, column: str):
             (statement.excluded.last_probe_status.is_(None), getattr(table.c, column)),
             else_=excluded_value,
         )
-    if column == "address_key" and _preserve_null_location_address_key(table):
+    if column == "address_key" and _should_preserve_null_location_address_key(table):
         return _location_address_key_update_expression(table, statement.excluded)
     return excluded_value
 
@@ -15097,7 +16445,7 @@ def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_pr
             f"ELSE {incoming_prefix}.{quoted} "
             f"END"
         )
-    if column == "address_key" and _preserve_null_location_address_key(table):
+    if column == "address_key" and _should_preserve_null_location_address_key(table):
         return _location_address_key_update_sql(
             target_prefix=target_prefix,
             incoming_prefix=incoming_prefix,
@@ -15125,7 +16473,7 @@ async def _mark_resource_rows_seen(
     if not seen_pairs_by_key:
         return 0
     seen_pairs = list(seen_pairs_by_key.values())
-    if _copy_upsert_enabled() and len(seen_pairs) >= _copy_upsert_min_rows():
+    if _is_copy_upsert_enabled() and len(seen_pairs) >= _copy_upsert_min_rows():
         try:
             return await _copy_mark_resource_rows_seen(
                 resource_type,
@@ -15149,17 +16497,17 @@ async def _mark_resource_rows_seen(
             "run_id": run_id,
             "resource_type": resource_type,
         }
-        value_rows_sql: list[str] = []
+        value_rows_statements: list[str] = []
         for idx, (source_id, resource_id) in enumerate(batch):
             query_params_by_name[f"source_id_{idx}"] = source_id
             query_params_by_name[f"resource_id_{idx}"] = resource_id
-            value_rows_sql.append(
+            value_rows_statements.append(
                 f"(:run_id, :resource_type, :source_id_{idx}, :resource_id_{idx})"
             )
         await db.status(
             f"""
             INSERT INTO {seen_ref} (run_id, resource_type, source_id, resource_id)
-            VALUES {", ".join(value_rows_sql)}
+            VALUES {", ".join(value_rows_statements)}
             {conflict_sql};
             """,
             **query_params_by_name,
@@ -15481,7 +16829,7 @@ async def _upsert_rows_values(
         return total
     table = model.__table__
     statement = pg_insert(table).values(normalized)
-    update_columns = {
+    updates_by_column = {
         column.name: _effective_update_expression(table, statement, column.name)
         for column in table.columns
         if column.name not in primary_keys
@@ -15489,7 +16837,7 @@ async def _upsert_rows_values(
     update_where = _upsert_changed_row_predicate(table, statement, columns, primary_keys) if skip_unchanged else None
     statement = statement.on_conflict_do_update(
         index_elements=primary_keys,
-        set_=update_columns,
+        set_=updates_by_column,
         where=update_where,
     )
     if transaction_session is not None:
@@ -15608,9 +16956,7 @@ async def _upsert_rows(
 ) -> int:
     if not resource_rows:
         return 0
-    if model is ProviderDirectoryLocation and _location_contact_fields_missing(
-        resource_rows
-    ):
+    if model is ProviderDirectoryLocation and _has_missing_location_contact_fields(resource_rows):
         resource_rows = _attach_location_contact_fields(resource_rows)
     table = model.__table__
     columns = [column.name for column in table.columns]
@@ -15623,7 +16969,7 @@ async def _upsert_rows(
         for resource_row in resource_rows
     ]
     transaction_options = _transaction_session_options(_bound_upsert_session())
-    if _copy_upsert_enabled() and len(normalized_rows) >= _copy_upsert_min_rows():
+    if _is_copy_upsert_enabled() and len(normalized_rows) >= _copy_upsert_min_rows():
         try:
             return await _copy_upsert_rows(
                 model,
@@ -15695,9 +17041,12 @@ async def backfill_provider_directory_location_contacts() -> dict[str, Any]:
     """Backfill provider directory location contacts for existing provider-directory rows."""
     await _ensure_provider_directory_tables()
     updated = _status_row_count(await db.status(provider_directory_location_contact_backfill_sql(_schema())))
-    summary = {"location_contact_rows_updated": updated}
-    print("PROVIDER_DIRECTORY_CONTACT_BACKFILL_DONE\t" + json.dumps(summary, sort_keys=True, default=str))
-    return summary
+    summary_by_name = {"location_contact_rows_updated": updated}
+    print(
+        "PROVIDER_DIRECTORY_CONTACT_BACKFILL_DONE\t"
+        + json.dumps(summary_by_name, sort_keys=True, default=str)
+    )
+    return summary_by_name
 
 
 def _canonical_backfill_resource_sql(resource_type: str, table_name: str) -> tuple[str, str]:
@@ -15829,7 +17178,7 @@ async def backfill_provider_directory_canonical_resources(
     """Backfill provider directory canonical resources for existing provider-directory rows."""
     await _ensure_provider_directory_tables()
     selected = _selected_resources(resources)
-    summary: dict[str, Any] = {
+    summary_by_name: dict[str, Any] = {
         "resources": {},
         "canonical_rows": 0,
         "source_edge_rows": 0,
@@ -15841,14 +17190,17 @@ async def backfill_provider_directory_canonical_resources(
         canonical_sql, edge_sql = _canonical_backfill_resource_sql(resource_type, model.__tablename__)
         canonical_rows = _status_row_count(await db.status(canonical_sql))
         source_edge_rows = _status_row_count(await db.status(edge_sql))
-        summary["resources"][resource_type] = {
+        summary_by_name["resources"][resource_type] = {
             "canonical_rows": canonical_rows,
             "source_edge_rows": source_edge_rows,
         }
-        summary["canonical_rows"] += canonical_rows
-        summary["source_edge_rows"] += source_edge_rows
-    print("PROVIDER_DIRECTORY_CANONICAL_BACKFILL_DONE\t" + json.dumps(summary, sort_keys=True, default=str))
-    return summary
+        summary_by_name["canonical_rows"] += canonical_rows
+        summary_by_name["source_edge_rows"] += source_edge_rows
+    print(
+        "PROVIDER_DIRECTORY_CANONICAL_BACKFILL_DONE\t"
+        + json.dumps(summary_by_name, sort_keys=True, default=str)
+    )
+    return summary_by_name
 
 
 def _seed_rows_from_sqlite(path: Path, *, limit: int | None = None, source_query: str | None = None) -> list[dict[str, Any]]:
@@ -15870,7 +17222,7 @@ def _seed_rows_from_sqlite(path: Path, *, limit: int | None = None, source_query
         conn.close()
 
 
-def _seed_row_matches_query(row: dict[str, Any], source_query: str | None) -> bool:
+def _is_seed_row_query_match(row: dict[str, Any], source_query: str | None) -> bool:
     query = _clean_text(source_query)
     if not query:
         return True
@@ -15881,7 +17233,7 @@ def _seed_row_matches_query(row: dict[str, Any], source_query: str | None) -> bo
     )
 
 
-def _seed_row_has_importable_provider_directory_override(row: dict[str, Any]) -> bool:
+def _has_seed_row_importable_provider_directory_override(row: dict[str, Any]) -> bool:
     source_row = _source_row_from_seed(row)
     metadata = source_row.get("metadata_json") or {}
     if not metadata.get("provider_directory_override"):
@@ -15890,8 +17242,8 @@ def _seed_row_has_importable_provider_directory_override(row: dict[str, Any]) ->
     return validation in {"", "valid", "auth_required"}
 
 
-def _seed_row_has_recoverable_provider_directory_base(row: dict[str, Any]) -> bool:
-    if _seed_row_has_importable_provider_directory_override(row):
+def _has_seed_row_recoverable_provider_directory_base(row: dict[str, Any]) -> bool:
+    if _has_seed_row_importable_provider_directory_override(row):
         return True
     source_row = _source_row_from_seed(row)
     metadata = source_row.get("metadata_json") or {}
@@ -16023,7 +17375,7 @@ def _base_path(value: str | None) -> str:
     return parsed.path.rstrip("/").lower()
 
 
-def _cms_sma_bases_are_related(left: str | None, right: str | None) -> bool:
+def _is_cms_sma_base_pair_related(left: str | None, right: str | None) -> bool:
     left_base = _canonical_base(left)
     right_base = _canonical_base(right)
     if not left_base or not right_base:
@@ -16045,7 +17397,7 @@ def _cms_sma_bases_are_related(left: str | None, right: str | None) -> bool:
 
 def _cms_sma_selected_api_base(production_base: str, capability_bases: list[str]) -> str:
     for capability_base in capability_bases:
-        if _cms_sma_bases_are_related(production_base, capability_base):
+        if _is_cms_sma_base_pair_related(production_base, capability_base):
             return capability_base
     return production_base
 
@@ -16150,7 +17502,7 @@ def _cms_sma_endpoint_directory_seed_rows_from_csv(
                 },
             )
             for capability_base, capability_url in capability_url_by_base.items():
-                if _cms_sma_bases_are_related(api_base, capability_base):
+                if _is_cms_sma_base_pair_related(api_base, capability_base):
                     group["metadata_url"] = group["metadata_url"] or capability_url
                     _append_unique(group["equivalent_api_bases"], capability_base)
             return group
@@ -16211,7 +17563,7 @@ def _cms_sma_endpoint_directory_seed_rows_from_csv(
             }
             if refresh:
                 seed_row_by_field["data_quality_checked"] = refresh
-            if _seed_row_matches_query(seed_row_by_field, source_query):
+            if _is_seed_row_query_match(seed_row_by_field, source_query):
                 seed_rows.append(seed_row_by_field)
     return seed_rows
 
@@ -16283,7 +17635,7 @@ def _amerihealth_caritas_seed_rows_from_catalog_html(
                 ),
             },
         }
-        if _seed_row_matches_query(seed_row_by_field, source_query):
+        if _is_seed_row_query_match(seed_row_by_field, source_query):
             seed_rows.append(seed_row_by_field)
     return seed_rows
 
@@ -16376,7 +17728,7 @@ def _contra_costa_seed_rows_from_developer_html(
             continue
         seen_plan_keys.add(provider_base)
         row = _contra_costa_seed_row(provider_base, source_url=source_url, source_date=source_date)
-        if _seed_row_matches_query(row, source_query):
+        if _is_seed_row_query_match(row, source_query):
             rows.append(row)
     return rows
 
@@ -16394,7 +17746,7 @@ def _contra_costa_fallback_seed_rows(
             "confirmed public metadata base as a fallback."
         ),
     )
-    return [row] if _seed_row_matches_query(row, source_query) else []
+    return [row] if _is_seed_row_query_match(row, source_query) else []
 
 
 def _seed_rows_from_contra_costa_catalog(
@@ -16517,12 +17869,12 @@ def _provider_directory_blocker_seed_rows(*, source_query: str | None = None) ->
     return [
         blocker_record
         for blocker_record in blocker_rows
-        if _seed_row_matches_query(blocker_record, source_query)
+        if _is_seed_row_query_match(blocker_record, source_query)
     ]
 
 
 def _health_partners_plans_seed_rows(*, source_query: str | None = None) -> list[dict[str, Any]]:
-    row = {
+    seed_row_by_field = {
         "id": "health-partners-plans-provider-directory",
         "org_name": "Health Partners Plans",
         "plan_name": "Health Partners Plans Provider Directory",
@@ -16535,7 +17887,11 @@ def _health_partners_plans_seed_rows(*, source_query: str | None = None) -> list
         "source_url": HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE,
         "note": "Supplemental Provider Directory source from the Health Partners Plans public FHIR server.",
     }
-    return [row] if _seed_row_matches_query(row, source_query) else []
+    return (
+        [seed_row_by_field]
+        if _is_seed_row_query_match(seed_row_by_field, source_query)
+        else []
+    )
 
 
 def _reviewed_provider_directory_candidate_seed_rows(
@@ -16750,7 +18106,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
     return [
         candidate_record
         for candidate_record in reviewed_rows
-        if _seed_row_matches_query(candidate_record, source_query)
+        if _is_seed_row_query_match(candidate_record, source_query)
     ]
 
 
@@ -16766,13 +18122,13 @@ def _seed_rows_from_supplemental_catalogs(
     cms_sma_endpoint_directory_url: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Build rows from supplemental catalogs used to seed provider-directory discovery."""
-    rows: list[dict[str, Any]] = []
-    metrics: dict[str, Any] = {"catalogs": {}}
+    supplemental_rows: list[dict[str, Any]] = []
+    metrics_by_name: dict[str, Any] = {"catalogs": {}}
     candidate_rows = _reviewed_provider_directory_candidate_seed_rows(
         source_query=source_query
     )
-    rows.extend(candidate_rows)
-    metrics["catalogs"]["reviewed_provider_directory_candidates"] = {
+    supplemental_rows.extend(candidate_rows)
+    metrics_by_name["catalogs"]["reviewed_provider_directory_candidates"] = {
         "source": REVIEWED_PROVIDER_DIRECTORY_CANDIDATE_SOURCE,
         "rows": len(candidate_rows),
     }
@@ -16783,10 +18139,10 @@ def _seed_rows_from_supplemental_catalogs(
             catalog_path=amerihealth_caritas_catalog_path,
             catalog_url=amerihealth_caritas_catalog_url,
         )
-        rows.extend(catalog_rows)
-        metrics["catalogs"]["amerihealth_caritas"] = catalog_metrics
+        supplemental_rows.extend(catalog_rows)
+        metrics_by_name["catalogs"]["amerihealth_caritas"] = catalog_metrics
     except Exception as exc:
-        metrics["catalogs"]["amerihealth_caritas"] = {
+        metrics_by_name["catalogs"]["amerihealth_caritas"] = {
             "rows": 0,
             "error": _short_error(exc),
         }
@@ -16797,10 +18153,10 @@ def _seed_rows_from_supplemental_catalogs(
             catalog_path=contra_costa_catalog_path,
             catalog_url=contra_costa_catalog_url,
         )
-        rows.extend(catalog_rows)
-        metrics["catalogs"]["contra_costa"] = catalog_metrics
+        supplemental_rows.extend(catalog_rows)
+        metrics_by_name["catalogs"]["contra_costa"] = catalog_metrics
     except Exception as exc:
-        metrics["catalogs"]["contra_costa"] = {
+        metrics_by_name["catalogs"]["contra_costa"] = {
             "rows": 0,
             "error": _short_error(exc),
         }
@@ -16811,33 +18167,33 @@ def _seed_rows_from_supplemental_catalogs(
             catalog_path=cms_sma_endpoint_directory_path,
             catalog_url=cms_sma_endpoint_directory_url,
         )
-        rows.extend(catalog_rows)
-        metrics["catalogs"]["cms_sma_endpoint_directory"] = catalog_metrics
+        supplemental_rows.extend(catalog_rows)
+        metrics_by_name["catalogs"]["cms_sma_endpoint_directory"] = catalog_metrics
     except Exception as exc:
-        metrics["catalogs"]["cms_sma_endpoint_directory"] = {
+        metrics_by_name["catalogs"]["cms_sma_endpoint_directory"] = {
             "rows": 0,
             "error": _short_error(exc),
         }
     catalog_rows = _health_partners_plans_seed_rows(source_query=source_query)
-    rows.extend(catalog_rows)
-    metrics["catalogs"]["health_partners_plans"] = {
+    supplemental_rows.extend(catalog_rows)
+    metrics_by_name["catalogs"]["health_partners_plans"] = {
         "source": HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE,
         "rows": len(catalog_rows),
     }
     catalog_rows = _aetna_provider_directory_data_seed_rows(source_query=source_query)
-    rows.extend(catalog_rows)
-    metrics["catalogs"]["aetna_provider_directorydata"] = {
+    supplemental_rows.extend(catalog_rows)
+    metrics_by_name["catalogs"]["aetna_provider_directorydata"] = {
         "source": AETNA_PROVIDER_DIRECTORY_DATA_BASE,
         "rows": len(catalog_rows),
     }
     catalog_rows = _provider_directory_blocker_seed_rows(source_query=source_query)
-    rows.extend(catalog_rows)
-    metrics["catalogs"]["provider_directory_blockers"] = {
+    supplemental_rows.extend(catalog_rows)
+    metrics_by_name["catalogs"]["provider_directory_blockers"] = {
         "source": PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
         "rows": len(catalog_rows),
     }
-    metrics["rows"] = len(rows)
-    return rows, metrics
+    metrics_by_name["rows"] = len(supplemental_rows)
+    return supplemental_rows, metrics_by_name
 
 
 def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = None) -> list[dict[str, Any]]:
@@ -16866,7 +18222,7 @@ def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = Non
         if not api_base or not org_name:
             continue
         is_auth_required = classification == "auth_required"
-        seed_record = {
+        seed_by_field = {
             "id": _clean_text(result_record.get("payer_id")) or f"retest-{index}",
             "org_name": org_name,
             "plan_name": _clean_text(result_record.get("plan_name"))
@@ -16897,11 +18253,13 @@ def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = Non
         }
         if (
             classification not in allowed_classifications
-            and not _seed_row_has_recoverable_provider_directory_base(seed_record)
+            and not _has_seed_row_recoverable_provider_directory_base(
+                seed_by_field
+            )
         ):
             continue
-        if _seed_row_matches_query(seed_record, source_query):
-            seed_rows.append(seed_record)
+        if _is_seed_row_query_match(seed_by_field, source_query):
+            seed_rows.append(seed_by_field)
     return seed_rows
 
 
@@ -16918,10 +18276,10 @@ def _append_unique_metadata_value(metadata: dict[str, Any], key: str, value: str
 
 
 def _merge_skipped_source_row_metadata(target: dict[str, Any], skipped: dict[str, Any]) -> None:
-    target_metadata = target.setdefault("metadata_json", {})
-    if not isinstance(target_metadata, dict):
-        target_metadata = {}
-        target["metadata_json"] = target_metadata
+    target_metadata_by_name = target.setdefault("metadata_json", {})
+    if not isinstance(target_metadata_by_name, dict):
+        target_metadata_by_name = {}
+        target["metadata_json"] = target_metadata_by_name
     skipped_metadata = skipped.get("metadata_json") if isinstance(skipped.get("metadata_json"), dict) else {}
     target_base = _canonical_base(target.get("canonical_api_base") or target.get("api_base"))
     for raw_base in (
@@ -16932,10 +18290,10 @@ def _merge_skipped_source_row_metadata(target: dict[str, Any], skipped: dict[str
     ):
         base = _canonical_base(raw_base)
         if base and base != target_base:
-            _append_unique_metadata_value(target_metadata, "provider_directory_equivalent_api_bases", base)
+            _append_unique_metadata_value(target_metadata_by_name, "provider_directory_equivalent_api_bases", base)
     skipped_override = _clean_text(skipped_metadata.get("provider_directory_override"))
     if skipped_override:
-        _append_unique_metadata_value(target_metadata, "provider_directory_merged_overrides", skipped_override)
+        _append_unique_metadata_value(target_metadata_by_name, "provider_directory_merged_overrides", skipped_override)
 
 
 def _dedupe_source_rows(source_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -17021,9 +18379,9 @@ def _resolve_retest_results(
 
 
 def _ssl_context() -> ssl.SSLContext:
-    verify = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_TLS_VERIFY", "true").lower() not in {"0", "false", "no"}
+    is_tls_verified = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_TLS_VERIFY", "true").lower() not in {"0", "false", "no"}
     context = ssl.create_default_context()
-    if not verify:
+    if not is_tls_verified:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
     return context
@@ -18016,7 +19374,7 @@ async def _probe_resource_access(
     *,
     timeout: int,
 ) -> dict[str, Any] | None:
-    if _alohr_source_uses_graphql_connector(source_record):
+    if _uses_alohr_graphql_connector(source_record):
         return None
     supported_resource_types = _capability_resource_types(capability_payload)
     resource_type = next(
@@ -18077,15 +19435,15 @@ async def _probe_metadata_candidate(
     )
     status = _classify_http(status_code, error, capability_payload, source_record)
     credential = _credential_request_options_for_source(source_record, metadata_url)
-    is_credential_missing = not credential["descriptor"] and not _alohr_source_uses_graphql_connector(
+    is_credential_missing = not credential["descriptor"] and not _uses_alohr_graphql_connector(
         source_record
     )
-    if status == "valid" and _source_declares_credentialed_access(source_record) and is_credential_missing:
+    if status == "valid" and _has_source_declared_credentialed_access(source_record) and is_credential_missing:
         status = "auth_required"
         error = error or "source requires credentialed Provider Directory resource access but no matching credentials are configured"
     if status == "valid_non_fhir" and is_credential_missing and (
-        _source_declares_credentialed_access(source_record)
-        or _source_uses_known_onboarding_gateway(source_record)
+        _has_source_declared_credentialed_access(source_record)
+        or _uses_source_known_onboarding_gateway(source_record)
     ):
         status = "auth_required"
         error = error or "source requires credentialed Provider Directory access but no matching credentials are configured"
@@ -18163,15 +19521,15 @@ def _missing_credential_probe_result(
     run_id: str | None,
 ) -> tuple[dict[str, Any], None] | None:
     """Return an auth-required result without calling a credential-gated source."""
-    requires_credentials = (
-        _source_declares_credentialed_access(source_record)
-        or _source_uses_known_onboarding_gateway(source_record)
+    are_credentials_required = (
+        _has_source_declared_credentialed_access(source_record)
+        or _uses_source_known_onboarding_gateway(source_record)
     )
     has_credentials = any(
         _credential_request_options_for_source(source_record, metadata_url)["descriptor"]
         for _candidate_base, metadata_url in metadata_urls
     )
-    if not requires_credentials or has_credentials:
+    if not are_credentials_required or has_credentials:
         return None
     candidate_base, metadata_url = metadata_urls[0]
     return (
@@ -18194,7 +19552,7 @@ def _missing_credential_probe_result(
 
 async def _probe_source(source_record: dict[str, Any], *, timeout: int, run_id: str | None) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Probe the source's actual acquisition transport and return normalized status."""
-    if _alohr_source_uses_graphql_connector(source_record):
+    if _uses_alohr_graphql_connector(source_record):
         return await _probe_alohr_graphql_connector(source_record, timeout=timeout, run_id=run_id)
     metadata_urls = _candidate_metadata_urls(source_record)
     if not metadata_urls:
@@ -18382,7 +19740,7 @@ async def _run_source_probe_batch(
                         "run_id": run_id,
                     }
                 )
-                if probe["status"] == "valid" and _alohr_source_uses_graphql_connector(source):
+                if probe["status"] == "valid" and _uses_alohr_graphql_connector(source):
                     probe_counts_by_name["valid"] += 1
                     valid_source_ids.add(source["source_id"])
             source_updates.append(update)
@@ -19280,10 +20638,10 @@ def _bulk_export_start_url(source: dict[str, Any], resource_type: str) -> str | 
     return f"{api_base}/$export?{query}"
 
 
-def _bulk_export_enabled(value: Any) -> bool:
+def _is_bulk_export_enabled(value: Any) -> bool:
     if value is None:
         value = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT")
-    return _bool_or_default(value, False)
+    return _is_bool_or_default(value, False)
 
 
 def _is_source_bulk_export_requested(
@@ -19730,7 +21088,7 @@ def _bulk_export_manifest_from_payload(
     expected_request_url: str | None = None,
 ) -> BulkExportManifest:
     """Normalize and hash the immutable fields of one ready export manifest."""
-    if not _bulk_export_status_payload(status_payload):
+    if not _is_bulk_export_status_payload(status_payload):
         raise ValueError("bulk_export_status_non_bulk_payload")
     assert isinstance(status_payload, dict)
     requires_access_token = status_payload.get("requiresAccessToken")
@@ -19902,7 +21260,7 @@ def _bulk_export_output_urls(payload: dict[str, Any] | None, resource_type: str)
     return urls
 
 
-def _bulk_export_status_payload(payload: dict[str, Any] | None) -> bool:
+def _is_bulk_export_status_payload(payload: dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
     return any(key in payload for key in ("transactionTime", "request", "requiresAccessToken", "output", "error"))
@@ -19926,7 +21284,7 @@ def _bulk_export_payload_error(payload: dict[str, Any] | None) -> str | None:
     return "bulk_export_error_output"
 
 
-def _bulk_export_pre_stream_should_fallback(status_code: int | None, error: str | None) -> bool:
+def _should_bulk_export_pre_stream_fallback(status_code: int | None, error: str | None) -> bool:
     if error:
         return True
     return status_code not in {200, 202}
@@ -20379,7 +21737,7 @@ def _bulk_export_finished_poll_result(
         )
         return None, request_error, poll
     if status_code == 200:
-        if not _bulk_export_status_payload(status_payload):
+        if not _is_bulk_export_status_payload(status_payload):
             return None, "bulk_export_status_non_bulk_payload", poll
         return status_payload, _bulk_export_payload_error(status_payload), poll
     _bulk_export_log_poll_http_error(
@@ -20520,7 +21878,7 @@ def _bulk_export_poll_ready_result(
     poll: int,
     payload: dict[str, Any] | None,
 ) -> tuple[list[str] | None, str | None]:
-    if not _bulk_export_status_payload(payload):
+    if not _is_bulk_export_status_payload(payload):
         _bulk_export_log(
             "poll_invalid_payload",
             source_id=source.get("source_id"),
@@ -22111,7 +23469,7 @@ async def _stream_bulk_export_output_rows(
             rows.append(row)
         if row_batch_handler:
             pending_rows.append(row)
-        if not _limit_allows_more(stream_counts_by_name["rows_fetched"], per_resource_limit):
+        if not _can_limit_accept_more(stream_counts_by_name["rows_fetched"], per_resource_limit):
             row_limit_by_name["reached"] = True
         return None
 
@@ -22347,7 +23705,7 @@ async def _start_checkpointed_bulk_export(
     if status_code not in {200, 202}:
         await _release_bulk_export_reservation(identity)
         return None, None, None
-    if status_code == 200 and not _bulk_export_status_payload(status_payload):
+    if status_code == 200 and not _is_bulk_export_status_payload(status_payload):
         await _release_bulk_export_reservation(identity)
         return None, None, None
     return await _accept_checkpointed_bulk_start(
@@ -23477,13 +24835,13 @@ async def _fetch_bulk_export_resource_rows(
             start_url=_bulk_export_log_url(url),
             status_url=_bulk_capability_log_identity(status_location),
         )
-        if _bulk_export_pre_stream_should_fallback(status_code, error):
+        if _should_bulk_export_pre_stream_fallback(status_code, error):
             return None
 
         polls = 0
         requires_access_token: bool | None = None
         if status_code == 200:
-            if not _bulk_export_status_payload(_payload):
+            if not _is_bulk_export_status_payload(_payload):
                 return None
             output_urls = _bulk_export_output_urls(_payload, resource_type)
             if isinstance(_payload.get("requiresAccessToken"), bool):
@@ -27172,7 +28530,7 @@ async def _fetch_resource_rows(
         )
         if bulk_fetch_result is not None:
             return bulk_fetch_result
-    if _scan_practitioner_role_requires_reverse_lookup(source_record, resource_type):
+    if _needs_practitioner_role_reverse_lookup(source_record, resource_type):
         return ResourceFetchResult(
             model=model,
             rows=[],
@@ -27374,7 +28732,7 @@ async def _fetch_resource_rows(
     while pending_start_urls:
         start_url = pending_start_urls.pop(0)
         url = start_url
-        while url and _limit_allows_more(rows_fetched, per_resource_limit):
+        while url and _can_limit_accept_more(rows_fetched, per_resource_limit):
             if cancel_ctx is not None:
                 await raise_if_cancelled(cancel_ctx, cancel_task)
             if deadline_at is not None and time.monotonic() >= deadline_at:
@@ -27581,7 +28939,7 @@ async def _fetch_resource_rows(
                     pending_rows.append(parsed_resource_row)
                     if len(pending_rows) >= max(1, row_batch_size):
                         await flush_pending_rows()
-                if not _limit_allows_more(rows_fetched, per_resource_limit):
+                if not _can_limit_accept_more(rows_fetched, per_resource_limit):
                     has_reached_row_limit = entry_index < len(entries) - 1
                     break
                 if (
@@ -27652,7 +29010,7 @@ async def _fetch_resource_rows(
                     ),
                 )
             url = resolved_next_url
-            if not _limit_allows_more(rows_fetched, per_resource_limit) and url:
+            if not _can_limit_accept_more(rows_fetched, per_resource_limit) and url:
                 has_reached_row_limit = True
                 has_next_url = True
                 break
@@ -27662,7 +29020,7 @@ async def _fetch_resource_rows(
             or has_reached_hard_page_limit
             or is_deadline_reached
             or (error_message and not is_partitioned_fetch)
-            or not _limit_allows_more(rows_fetched, per_resource_limit)
+            or not _can_limit_accept_more(rows_fetched, per_resource_limit)
         ):
             break
     await flush_pending_rows()
@@ -27812,7 +29170,7 @@ async def _fetch_scan_practitioner_role_rows(
         seed_count += 1
         if options.cancel_ctx is not None:
             await raise_if_cancelled(options.cancel_ctx, options.cancel_task)
-        if not _limit_allows_more(rows_fetched, options.per_resource_limit):
+        if not _can_limit_accept_more(rows_fetched, options.per_resource_limit):
             break
         if deadline_at is not None and time.monotonic() >= deadline_at:
             is_deadline_reached = True
@@ -27825,7 +29183,7 @@ async def _fetch_scan_practitioner_role_rows(
             seed_resource_id,
             page_count=options.page_count,
         )
-        while url and _limit_allows_more(rows_fetched, options.per_resource_limit):
+        while url and _can_limit_accept_more(rows_fetched, options.per_resource_limit):
             if options.cancel_ctx is not None:
                 await raise_if_cancelled(options.cancel_ctx, options.cancel_task)
             if deadline_at is not None and time.monotonic() >= deadline_at:
@@ -27880,7 +29238,7 @@ async def _fetch_scan_practitioner_role_rows(
                     retained_role_rows.append(practitioner_role_row)
                 await stream_buffer.add(practitioner_role_row)
                 rows_fetched += 1
-                if not _limit_allows_more(rows_fetched, options.per_resource_limit):
+                if not _can_limit_accept_more(rows_fetched, options.per_resource_limit):
                     has_reached_row_limit = entry_index < len(entries) - 1
                     break
             next_url = _next_link(response_payload)
@@ -27894,7 +29252,7 @@ async def _fetch_scan_practitioner_role_rows(
                 has_next_url = True
                 url = None
                 break
-            if not _limit_allows_more(rows_fetched, options.per_resource_limit) and url:
+            if not _can_limit_accept_more(rows_fetched, options.per_resource_limit) and url:
                 has_reached_row_limit = True
                 has_next_url = True
                 break
@@ -28241,7 +29599,7 @@ def _row_reference_values(row: dict[str, Any], fields: tuple[str, ...]) -> list[
 
 def _linked_resource_refs(rows_by_resource: dict[str, list[dict[str, Any]]]) -> list[tuple[str, str, str, str]]:
     refs: list[tuple[str, str, str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen_resource_keys: set[tuple[str, str]] = set()
     for source_resource_type, fields_by_target in LINKED_REFERENCE_FIELDS.items():
         for row in rows_by_resource.get(source_resource_type, []):
             for target_resource_type, fields in fields_by_target.items():
@@ -28249,9 +29607,9 @@ def _linked_resource_refs(rows_by_resource: dict[str, list[dict[str, Any]]]) -> 
                     references = _row_reference_values(row, (field,))
                     for reference in references:
                         key = _reference_resource_key(reference, target_resource_type)
-                        if not key or key in seen:
+                        if not key or key in seen_resource_keys:
                             continue
-                        seen.add(key)
+                        seen_resource_keys.add(key)
                         refs.append((target_resource_type, key[1], reference, field))
     return refs
 
@@ -29564,7 +30922,7 @@ async def _update_source_resource_import_metadata(
 
 async def _upsert_resource_rows(
     model: type,
-    rows: list[dict[str, Any]],
+    resource_rows: list[dict[str, Any]],
     *,
     run_id: str | None,
     track_seen: bool,
@@ -29573,13 +30931,15 @@ async def _upsert_resource_rows(
     source_ids: list[str] | None = None,
     dataset_id: str | None = None,
 ) -> int:
-    if not rows:
+    if not resource_rows:
         return 0
-    if model is ProviderDirectoryLocation and _location_contact_fields_missing(rows):
-        rows = _attach_location_contact_fields(rows)
+    if model is ProviderDirectoryLocation and _has_missing_location_contact_fields(
+        resource_rows
+    ):
+        resource_rows = _attach_location_contact_fields(resource_rows)
     dataset_rows = _endpoint_dataset_resource_rows(
         model,
-        rows,
+        resource_rows,
         dataset_id=dataset_id,
     )
     if dataset_rows:
@@ -29587,7 +30947,7 @@ async def _upsert_resource_rows(
     if canonical_api_base and source_ids:
         canonical_rows = _canonical_resource_rows(
             model,
-            rows,
+            resource_rows,
             canonical_api_base=canonical_api_base,
             run_id=run_id,
             store_payload=not bool(dataset_id),
@@ -29600,7 +30960,7 @@ async def _upsert_resource_rows(
             )
         edge_rows = _source_resource_edge_rows(
             model,
-            rows,
+            resource_rows,
             canonical_api_base=canonical_api_base,
             source_ids=source_ids,
             run_id=run_id,
@@ -29612,10 +30972,10 @@ async def _upsert_resource_rows(
                 skip_unchanged=track_seen and bool(run_id),
             )
     if track_seen:
-        await _mark_resource_rows_seen(model, rows, run_id, seen_table=seen_table)
+        await _mark_resource_rows_seen(model, resource_rows, run_id, seen_table=seen_table)
     return await _upsert_rows(
         model,
-        rows,
+        resource_rows,
         skip_unchanged=track_seen and bool(run_id),
     )
 
@@ -29707,7 +31067,7 @@ SOURCE_CATALOG_STALE_TABLE_MODELS = (
 )
 
 
-def _source_catalog_stale_cleanup_enabled(
+def _is_source_catalog_stale_cleanup_enabled(
     *,
     stale_cleanup: bool,
     full_refresh: bool,
@@ -29854,7 +31214,7 @@ def _selected_resources(resources_input: Any) -> list[str]:
                 raise ValueError(
                     "Provider Directory FHIR resources JSON value must be an array"
                 )
-    selected = []
+    selected_resources = []
     if isinstance(resources_input, (list, tuple)):
         for index, resource_name in enumerate(resources_input):
             if not isinstance(resource_name, str):
@@ -29867,22 +31227,22 @@ def _selected_resources(resources_input: Any) -> list[str]:
                 raise ValueError(
                     f"Provider Directory FHIR resource at index {index} must not be empty"
                 )
-            selected.append(resource_name)
+            selected_resources.append(resource_name)
     elif isinstance(resources_input, str):
         for resource_name in resources_input.split(","):
             resource_name = resource_name.strip()
             if resource_name:
-                selected.append(resource_name)
+                selected_resources.append(resource_name)
     else:
         raise ValueError(
             "Provider Directory FHIR resources must be a list, tuple, JSON array, "
             f"or comma-separated string, got {type(resources_input).__name__}"
         )
-    allowed = set(DEFAULT_RESOURCES)
-    unknown = sorted(set(selected) - allowed)
+    allowed_resource_names = set(DEFAULT_RESOURCES)
+    unknown = sorted(set(selected_resources) - allowed_resource_names)
     if unknown:
         raise ValueError(f"Unsupported Provider Directory FHIR resources: {', '.join(unknown)}")
-    return selected
+    return selected_resources
 
 
 def _source_resource_fetch_order(
@@ -29908,7 +31268,7 @@ def _source_resource_fetch_order(
     return foundational_resources + practitioner_role_resources
 
 
-def _bool_or_default(value: Any, default: bool) -> bool:
+def _is_bool_or_default(value: Any, default: bool) -> bool:
     if value is None or value == "":
         return default
     if isinstance(value, bool):
@@ -29921,10 +31281,10 @@ def _bool_or_default(value: Any, default: bool) -> bool:
     return bool(value)
 
 
-def _publish_corroboration_enabled(value: Any) -> bool:
-    return _bool_or_default(
+def _is_publish_corroboration_enabled(value: Any) -> bool:
+    return _is_bool_or_default(
         value,
-        _bool_or_default(os.getenv(PUBLISH_CORROBORATION_ENV), False),
+        _is_bool_or_default(os.getenv(PUBLISH_CORROBORATION_ENV), False),
     )
 
 
@@ -30026,7 +31386,7 @@ async def _mark_provider_directory_progress(
         return
     total = max(total, 1)
     done = max(0, min(done, total))
-    progress = {
+    progress_by_name = {
         "unit": "steps",
         "done": done,
         "total": total,
@@ -30035,21 +31395,21 @@ async def _mark_provider_directory_progress(
         "message": message,
     }
     if isinstance(details, dict) and details:
-        progress["detail"] = details
+        progress_by_name["detail"] = details
     try:
         await mark_control_run(
             run_id,
             status="running",
             phase_detail=phase,
             progress_message=message,
-            progress=progress,
+            progress=progress_by_name,
             metrics=metrics,
         )
     except Exception as exc:
         print(f"Provider Directory progress update failed: {type(exc).__name__}: {exc}")
 
 
-def _limit_allows_more(current: int, limit: int) -> bool:
+def _can_limit_accept_more(current: int, limit: int) -> bool:
     return limit <= 0 or current < limit
 
 
@@ -30065,7 +31425,7 @@ def _stable_identity_json(value: Any) -> str:
 def _alohr_graphql_acquisition_contract(
     source: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if not _alohr_source_uses_graphql_connector(source):
+    if not _uses_alohr_graphql_connector(source):
         return None
     return {
         "transport": "graphql",
@@ -30216,14 +31576,17 @@ def _group_resource_import_sources(
     *,
     linked_resource_limit: int,
 ) -> list[list[dict[str, Any]]]:
-    groups: dict[tuple[str, str, tuple[tuple[str, str], ...]], list[dict[str, Any]]] = {}
+    groups_by_key: dict[
+        tuple[str, str, tuple[tuple[str, str], ...]],
+        list[dict[str, Any]],
+    ] = {}
     ordered_groups: list[list[dict[str, Any]]] = []
     for source in sources:
         key = _resource_import_group_key(source)
-        if key not in groups:
-            groups[key] = []
-            ordered_groups.append(groups[key])
-        groups[key].append(source)
+        if key not in groups_by_key:
+            groups_by_key[key] = []
+            ordered_groups.append(groups_by_key[key])
+        groups_by_key[key].append(source)
     return [
         sorted(
             source_group,
@@ -32184,7 +33547,7 @@ def _endpoint_dataset_selected_resources(
     fully_enumerable_resources = _source_fully_enumerable_resource_types(
         source_record
     )
-    if _alohr_source_uses_graphql_connector(source_record):
+    if _uses_alohr_graphql_connector(source_record):
         supported_resources = set(ALOHR_GRAPHQL_RESOURCE_TYPES)
     unique_requested_resources = list(dict.fromkeys(requested_resources))
     eligible_resources = supported_resources
@@ -32961,14 +34324,14 @@ async def _fetch_alohr_graphql_page(
     next_token: str | None,
     timeout: int,
 ) -> tuple[list[dict[str, Any]], str | None, str | None]:
-    request_payload = {
+    request_by_field = {
         "query": query,
         "variables": {"criteria": {}, "nextToken": next_token},
     }
     status_code, response_payload, error, _elapsed = await asyncio.to_thread(
         _post_json_sync,
         ALOHR_GRAPHQL_URL,
-        request_payload,
+        request_by_field,
         timeout=timeout,
         extra_headers={"tenantId": ALOHR_TENANT_ID},
     )
@@ -35922,7 +37285,7 @@ async def _import_resources(
         rows_by_resource: dict[str, list[dict[str, Any]]] = {}
         deferred_zero_role_cleanup: ResourceFetchResult | None = None
         is_scan_role_reverse_lookup_planned = (
-            _scan_practitioner_role_reverse_lookup_planned(source, resources)
+            _is_practitioner_role_reverse_lookup_planned(source, resources)
         )
 
         async def mark_resource_stale_cleanup_ready(resource_type: str, result: ResourceFetchResult) -> None:
@@ -35957,7 +37320,7 @@ async def _import_resources(
                 and source_counts.get("Practitioner", 0) > 0
                 and source_counts.get("Location", 0) > 0
             )
-        if _alohr_source_uses_graphql_connector(source):
+        if _uses_alohr_graphql_connector(source):
             async with progress_lock:
                 active_group_details[group_key]["current_resource"] = "ALOHR GraphQL"
                 active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
@@ -36021,7 +37384,7 @@ async def _import_resources(
                 await raise_if_cancelled(cancel_ctx, cancel_task)
             if (
                 resource_type == "PractitionerRole"
-                and _scan_practitioner_role_requires_reverse_lookup(source, "PractitionerRole")
+                and _needs_practitioner_role_reverse_lookup(source, "PractitionerRole")
             ):
                 continue
             async with progress_lock:
@@ -36262,7 +37625,7 @@ async def _import_resources(
             await mark_resource_stale_cleanup_ready("PractitionerRole", deferred_zero_role_cleanup)
         if (
             "PractitionerRole" in resources
-            and _scan_practitioner_role_requires_reverse_lookup(source, "PractitionerRole")
+            and _needs_practitioner_role_reverse_lookup(source, "PractitionerRole")
             and "PractitionerRole" not in source_resource_diagnostics
         ):
             async with progress_lock:
@@ -36408,7 +37771,7 @@ async def _import_resources(
 
     seen_stage_table = (
         await _ensure_provider_directory_import_seen_stage_table(run_id)
-        if stale_cleanup and run_id and _seen_stage_enabled()
+        if stale_cleanup and run_id and _is_seen_stage_enabled()
         else None
     )
     stale_ready_source_ids_by_resource: dict[str, set[str]] = {}
@@ -36691,7 +38054,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     canonical_backfill_only = bool(task.get("canonical_backfill_only", False))
     contact_backfill_only = bool(task.get("contact_backfill_only", False))
     publish_artifacts_only = bool(task.get("publish_artifacts_only", False))
-    should_publish_corroboration = _publish_corroboration_enabled(
+    should_publish_corroboration = _is_publish_corroboration_enabled(
         task.get("publish_corroboration")
     )
     publish_artifacts_targets = _provider_directory_publish_artifact_targets(
@@ -36701,7 +38064,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     )
     open_only = bool(task.get("open_only", True))
     include_auth_required = bool(task.get("include_auth_required", False))
-    include_supplemental_catalogs = _bool_or_default(task.get("include_supplemental_catalogs"), False)
+    include_supplemental_catalogs = _is_bool_or_default(task.get("include_supplemental_catalogs"), False)
     credential_config_file = _clean_text(task.get("credential_config_file"))
     _PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.set(credential_config_file)
     full_refresh = bool(task.get("full_refresh", False))
@@ -36727,7 +38090,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         task.get("stream_batch_size"),
         0 if test_mode else _env_int("HLTHPRT_PROVIDER_DIRECTORY_STREAM_BATCH_SIZE", DEFAULT_STREAM_BATCH_SIZE),
     )
-    use_bulk_export = _bulk_export_enabled(task.get("bulk_export"))
+    use_bulk_export = _is_bulk_export_enabled(task.get("bulk_export"))
     bulk_export_max_pending_seconds = max(
         1,
         _int_or_default(
@@ -36743,12 +38106,12 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         1 if test_mode else _env_int("HLTHPRT_PROVIDER_DIRECTORY_SOURCE_CONCURRENCY", 1),
     )
     stale_cleanup_raw = task.get("stale_cleanup")
-    should_cleanup_stale_rows = _bool_or_default(
+    should_cleanup_stale_rows = _is_bool_or_default(
         stale_cleanup_raw,
         not test_mode and import_resources,
     )
     resources = _selected_resources(task.get("resources"))
-    should_publish_artifacts = _bool_or_default(
+    should_publish_artifacts = _is_bool_or_default(
         task.get("publish_artifacts"),
         import_resources and set(resources) == set(DEFAULT_RESOURCES),
     )
@@ -36767,7 +38130,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         if should_publish_artifacts
         and should_cleanup_stale_rows
         and run_id
-        and _seen_stage_enabled()
+        and _is_seen_stage_enabled()
         else None
     )
     if canonical_backfill_only:
@@ -36870,7 +38233,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         stale_source_rows_deleted = {}
         protected_source_ids: list[str] = []
         missing_protected_source_ids: list[str] = []
-        if _source_catalog_stale_cleanup_enabled(
+        if _is_source_catalog_stale_cleanup_enabled(
             stale_cleanup=should_cleanup_stale_rows,
             full_refresh=full_refresh,
             source_query=source_query,
@@ -38786,7 +40149,7 @@ PROVIDER_DIRECTORY_ADDRESS_OVERLAY_REQUIRED_TABLES = (
 
 
 async def _address_overlay_missing_requirement(schema: str) -> str | None:
-    if not await _address_canon_functions_available(schema):
+    if not await _has_address_canon_functions(schema):
         return "canonical_functions_unavailable"
     for table_name in PROVIDER_DIRECTORY_ADDRESS_OVERLAY_REQUIRED_TABLES:
         if not await _table_exists(schema, table_name):

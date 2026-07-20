@@ -104,7 +104,7 @@ def test_bulk_checkpoint_keyring_and_ciphertext_fail_closed(monkeypatch):
 def test_bulk_configuration_helpers_cover_absent_values(monkeypatch):
     assert importer._bulk_export_start_url({}, "Practitioner") is None
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT", "true")
-    assert importer._bulk_export_enabled(None) is True
+    assert importer._is_bulk_export_enabled(None) is True
     assert importer._is_bulk_domain_hostname(None) is False
     assert importer._is_safe_bulk_https_url("") is False
     assert importer._is_same_bulk_url_origin(

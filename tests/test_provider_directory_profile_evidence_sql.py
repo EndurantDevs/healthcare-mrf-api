@@ -80,3 +80,50 @@ def test_profile_evidence_sql_filters_current_normalized_references():
     ):
         assert f"{resource_type}/([A-Za-z0-9.-]{{1,64}})" in sql
     assert "(?:/_history/[A-Za-z0-9.-]{1,64})?" in sql
+
+
+def test_profile_evidence_sql_supports_bounded_fact_and_role_scopes():
+    sql = profile.profile_evidence_insert_sql(
+        target_ref='"fixture"."evidence"',
+        source_ref='"fixture"."source"',
+        practitioner_ref='"fixture"."practitioner"',
+        role_ref='"fixture"."role"',
+        organization_ref='"fixture"."organization"',
+        service_ref='"fixture"."service"',
+        endpoint_ref='"fixture"."endpoint"',
+        fact_type="affiliation",
+        role_bucket_count=32,
+        role_bucket=7,
+    )
+
+    assert "fact_type = 'affiliation'" in sql
+    assert ":profile_fact_type" not in sql
+    assert "hashtextextended(role.resource_id, 0)" in sql
+    assert "CAST(:profile_role_bucket_count AS bigint)" in sql
+    assert "CAST(:profile_role_bucket AS bigint)" in sql
+
+
+def test_profile_evidence_sql_rejects_invalid_bounded_scopes():
+    sql_refs_by_name = {
+        "target_ref": '"fixture"."evidence"',
+        "source_ref": '"fixture"."source"',
+        "practitioner_ref": '"fixture"."practitioner"',
+        "role_ref": '"fixture"."role"',
+        "organization_ref": '"fixture"."organization"',
+        "service_ref": '"fixture"."service"',
+    }
+
+    for invalid_args in (
+        {"fact_type": "unknown"},
+        {"role_bucket_count": 0},
+        {"role_bucket_count": 4, "role_bucket": 4},
+        {"role_bucket_count": 4, "role_bucket": -1},
+    ):
+        try:
+            profile.profile_evidence_insert_sql(
+                **sql_refs_by_name,
+                **invalid_args,
+            )
+        except ValueError:
+            continue
+        raise AssertionError(f"scope accepted unexpectedly: {invalid_args}")

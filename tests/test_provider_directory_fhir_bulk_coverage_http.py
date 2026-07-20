@@ -42,7 +42,7 @@ def test_bulk_payload_helpers_cover_malformed_and_typed_errors():
         {"output": [None, {"type": "Practitioner"}]},
         "Practitioner",
     ) == []
-    assert importer._bulk_export_status_payload(None) is False
+    assert importer._is_bulk_export_status_payload(None) is False
     assert importer._bulk_export_payload_error(None) == (
         "bulk_export_invalid_status_payload"
     )

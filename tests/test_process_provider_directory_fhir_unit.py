@@ -3666,7 +3666,7 @@ async def test_publish_provider_directory_location_address_keys_batches_without_
         def __init__(self, **values):
             self._mapping = values
 
-    monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
     monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
     first = AsyncMock(
         side_effect=[
@@ -3698,7 +3698,7 @@ async def test_publish_provider_directory_location_address_keys_batches_with_see
         def __init__(self, **values):
             self._mapping = values
 
-    monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
     monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
     first = AsyncMock(
         side_effect=[
@@ -4057,38 +4057,38 @@ async def test_ensure_provider_directory_source_column_types_skips_current_text_
 
 
 def test_source_catalog_stale_cleanup_only_runs_for_unfiltered_full_refresh():
-    assert importer._source_catalog_stale_cleanup_enabled(
+    assert importer._is_source_catalog_stale_cleanup_enabled(
         stale_cleanup=True,
         full_refresh=True,
         source_query=None,
         limit=None,
     )
-    assert not importer._source_catalog_stale_cleanup_enabled(
+    assert not importer._is_source_catalog_stale_cleanup_enabled(
         stale_cleanup=True,
         full_refresh=False,
         source_query=None,
         limit=None,
     )
-    assert not importer._source_catalog_stale_cleanup_enabled(
+    assert not importer._is_source_catalog_stale_cleanup_enabled(
         stale_cleanup=True,
         full_refresh=True,
         source_query="cigna",
         limit=None,
     )
-    assert not importer._source_catalog_stale_cleanup_enabled(
+    assert not importer._is_source_catalog_stale_cleanup_enabled(
         stale_cleanup=True,
         full_refresh=True,
         source_query=None,
         limit=10,
     )
-    assert not importer._source_catalog_stale_cleanup_enabled(
+    assert not importer._is_source_catalog_stale_cleanup_enabled(
         stale_cleanup=True,
         full_refresh=True,
         source_query=None,
         limit=None,
         requested_source_ids=["source_a"],
     )
-    assert not importer._source_catalog_stale_cleanup_enabled(
+    assert not importer._is_source_catalog_stale_cleanup_enabled(
         stale_cleanup=True,
         full_refresh=True,
         source_query=None,
@@ -7655,7 +7655,7 @@ async def test_ensure_provider_directory_network_catalog_populated_publishes_emp
     publish_catalog = AsyncMock(return_value={"published": True, "rows": 3})
     monkeypatch.setattr(importer, "_ensure_provider_directory_network_catalog_table", ensure_catalog)
     monkeypatch.setattr(importer, "_network_catalog_missing_requirement", AsyncMock(return_value=None))
-    monkeypatch.setattr(importer, "_provider_directory_network_catalog_has_rows", AsyncMock(return_value=False))
+    monkeypatch.setattr(importer, "_has_provider_directory_network_catalog_rows", AsyncMock(return_value=False))
     monkeypatch.setattr(importer, "publish_provider_directory_network_catalog", publish_catalog)
 
     result = await importer._ensure_provider_directory_network_catalog_populated("mrf")
@@ -7671,7 +7671,7 @@ async def test_ensure_provider_directory_network_catalog_populated_skips_existin
     publish_catalog = AsyncMock()
     monkeypatch.setattr(importer, "_ensure_provider_directory_network_catalog_table", ensure_catalog)
     monkeypatch.setattr(importer, "_network_catalog_missing_requirement", AsyncMock(return_value=None))
-    monkeypatch.setattr(importer, "_provider_directory_network_catalog_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_has_provider_directory_network_catalog_rows", AsyncMock(return_value=True))
     monkeypatch.setattr(importer, "publish_provider_directory_network_catalog", publish_catalog)
 
     result = await importer._ensure_provider_directory_network_catalog_populated("mrf")
@@ -7683,6 +7683,28 @@ async def test_ensure_provider_directory_network_catalog_populated_skips_existin
     }
     ensure_catalog.assert_awaited_once_with("mrf")
     publish_catalog.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_network_catalog_scope_sources_resolves_run_owned_evidence(
+    monkeypatch,
+):
+    all_rows = AsyncMock(
+        return_value=[("source-a",), ("source-a",), ("source-b",)]
+    )
+    monkeypatch.setattr(importer.db, "all", all_rows)
+
+    assert await importer._network_catalog_scope_sources(
+        "mrf",
+        run_id="run-a",
+        source_ids=None,
+    ) == ["source-a", "source-b"]
+
+    sql = all_rows.await_args.args[0]
+    assert 'FROM "mrf"."provider_directory_insurance_plan"' in sql
+    assert 'FROM "mrf"."provider_directory_practitioner_role"' in sql
+    assert 'FROM "mrf"."provider_directory_organization_affiliation"' in sql
+    assert all_rows.await_args.kwargs == {"run_id": "run-a"}
 
 
 def test_provider_directory_location_address_key_sql_uses_shared_canonical_functions():
@@ -7891,7 +7913,7 @@ class _AliasImportCapture:
         monkeypatch.setattr(importer, "_delete_stale_resource_rows", self.delete_stale)
         monkeypatch.setattr(importer, "_prepare_endpoint_dataset_candidate", self.prepare_candidate)
         monkeypatch.setattr(importer, "_finalize_endpoint_dataset_candidate", self.finalize_candidate)
-        monkeypatch.setattr(importer, "_seen_stage_enabled", lambda: False)
+        monkeypatch.setattr(importer, "_is_seen_stage_enabled", lambda: False)
         monkeypatch.setattr(importer.db, "status", self.update_metadata)
 
 
@@ -11091,7 +11113,7 @@ async def test_import_resources_does_not_stale_cleanup_suspicious_zero_role_afte
 
 @pytest.mark.asyncio
 async def test_publish_provider_directory_location_address_keys_skips_without_canonical_functions(monkeypatch):
-    monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=False))
+    monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=False))
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
 
@@ -11107,7 +11129,7 @@ async def test_publish_provider_directory_location_address_keys_runs_canonical_u
         def __init__(self, **values):
             self._mapping = values
 
-    monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
     table_exists = AsyncMock(return_value=True)
     monkeypatch.setattr(importer, "_table_exists", table_exists)
     first = AsyncMock(
@@ -11224,7 +11246,7 @@ async def test_provider_directory_openaddresses_archive_backfill_skips_without_s
 
 @pytest.mark.asyncio
 async def test_publish_provider_directory_location_archive_resolves_and_cleans_stage(monkeypatch):
-    monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
     monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
     status = AsyncMock(return_value=0)
     monkeypatch.setattr(importer.db, "status", status)
@@ -11279,7 +11301,7 @@ async def test_location_archive_holds_active_dataset_fence_through_resolve(monke
     fence_lock = AsyncMock(side_effect=lambda *_args: events.append("fence_lock"))
     resolve = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("resolve") or Stats())
     backfill = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("backfill") or 2)
-    monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
     monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
     monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=0))
     monkeypatch.setattr(importer.db, "transaction", lambda: _recording_transaction(events))
@@ -11312,7 +11334,7 @@ async def test_location_archive_holds_active_dataset_fence_through_resolve(monke
 
 @pytest.mark.asyncio
 async def test_publish_provider_directory_location_archive_skips_without_archive(monkeypatch):
-    monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
 
     async def is_table_existing(_schema, table_name):
         return table_name != "address_archive_v2"
@@ -15137,11 +15159,11 @@ async def test_scan_candidate_dispatches_practitioner_role_to_last_updated(monke
         partition_fetch,
     )
 
-    assert importer._scan_practitioner_role_requires_reverse_lookup(
+    assert importer._needs_practitioner_role_reverse_lookup(
         source_row,
         "PractitionerRole",
     ) is False
-    assert importer._scan_practitioner_role_reverse_lookup_planned(
+    assert importer._is_practitioner_role_reverse_lookup_planned(
         source_row,
         list(importer.DEFAULT_RESOURCES),
     ) is False
@@ -16419,11 +16441,11 @@ def test_bulk_export_start_url_omits_output_format_for_aetna_providerdirectoryda
 
 
 def test_bulk_export_pre_stream_failures_fall_back_to_paged_reads():
-    assert importer._bulk_export_pre_stream_should_fallback(500, None) is True
-    assert importer._bulk_export_pre_stream_should_fallback(401, None) is True
-    assert importer._bulk_export_pre_stream_should_fallback(None, "timeout") is True
-    assert importer._bulk_export_pre_stream_should_fallback(202, None) is False
-    assert importer._bulk_export_pre_stream_should_fallback(200, None) is False
+    assert importer._should_bulk_export_pre_stream_fallback(500, None) is True
+    assert importer._should_bulk_export_pre_stream_fallback(401, None) is True
+    assert importer._should_bulk_export_pre_stream_fallback(None, "timeout") is True
+    assert importer._should_bulk_export_pre_stream_fallback(202, None) is False
+    assert importer._should_bulk_export_pre_stream_fallback(200, None) is False
 
 
 def test_bulk_export_output_urls_filters_requested_resource_type():
@@ -16441,11 +16463,11 @@ def test_bulk_export_output_urls_filters_requested_resource_type():
     assert urls == ["https://bulk.example/location.ndjson"]
 
 
-def test_bulk_export_status_payload_and_error_detection():
-    assert importer._bulk_export_status_payload(
+def test_is_bulk_export_status_payload_and_error_detection():
+    assert importer._is_bulk_export_status_payload(
         {"transactionTime": "2026-06-30T00:00:00Z", "output": []}
     )
-    assert not importer._bulk_export_status_payload(
+    assert not importer._is_bulk_export_status_payload(
         {"resourceType": "Bundle", "entry": []}
     )
     assert (
@@ -20640,8 +20662,8 @@ def test_primary_gateway_host():
         "canonical_api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/payer/r4",
     }
 
-    assert importer._source_uses_known_onboarding_gateway(public_cigna_dict) is False
-    assert importer._source_uses_known_onboarding_gateway(availity_primary_dict) is True
+    assert importer._uses_source_known_onboarding_gateway(public_cigna_dict) is False
+    assert importer._uses_source_known_onboarding_gateway(availity_primary_dict) is True
 
 
 def test_location_archive_source_scope():
