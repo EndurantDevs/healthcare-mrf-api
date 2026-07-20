@@ -7233,6 +7233,30 @@ def test_mymedicalshopper_sockjs_frame_and_publication_helpers():
     ]
 
 
+@pytest.mark.asyncio
+async def test_mymedicalshopper_ddp_receive_normalizes_frame_timeout(
+    monkeypatch,
+):
+    websocket = types.SimpleNamespace(receive=AsyncMock())
+
+    async def timeout_wait_for(receive_awaitable, *, timeout):
+        receive_awaitable.close()
+        assert timeout == 0.25
+        raise TimeoutError
+
+    monkeypatch.setattr(discovery.asyncio, "wait_for", timeout_wait_for)
+
+    with pytest.raises(
+        TimeoutError,
+        match="MyMedicalShopper DDP handshake timed out after 0.25s",
+    ):
+        await discovery._mymedicalshopper_ddp_recv(
+            websocket,
+            timeout_seconds=0.25,
+            operation="handshake",
+        )
+
+
 def test_mymedicalshopper_targets_keep_latest_generated_toc_per_plan():
     """Verify this source-discovery regression contract."""
     catalog_source_dict = {"source_id": "source_varipro", "payer_id": "payer_varipro"}

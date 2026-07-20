@@ -16656,6 +16656,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
             expected_nonempty_resources=tuple(
                 sorted(IOWA_MEDICAID_EXPECTED_NONEMPTY_RESOURCES)
             ),
+            candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
         ),
         candidate_row(
             row_id="cms-sma-pennsylvania-reviewed-candidate",
