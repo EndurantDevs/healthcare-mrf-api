@@ -212,9 +212,6 @@ def _passing_batch_report(
             "batch_api_failed_http_requests": 0,
             "retry_count": 0,
             "max_concurrency": 1,
-            "request_start_rate_limit_per_second": 2.0,
-            "request_start_rate_actual_per_second": 0.0,
-            "request_start_span_seconds": 0.0,
         },
         "batch": {"endpoint_duration_ms": 12_000.0},
         "source": {
@@ -799,18 +796,11 @@ def test_audit_summary_timing_edges():
             "duration_seconds": True,
             "latency": {"request_p50_ms": True},
             "batch": {"endpoint_duration_ms": 1.0},
-            "http": {
-                "request_start_rate_limit_per_second": 2,
-                "request_start_rate_actual_per_second": 1.75,
-                "request_start_span_seconds": True,
-            },
         },
         "d" * 64,
     )
     assert batch_summary_by_field["audit_timings"] == {
-        "endpoint_duration_ms": 1.0,
-        "request_start_rate_limit_per_second": 2.0,
-        "request_start_rate_actual_per_second": 1.75,
+        "endpoint_duration_ms": 1.0
     }
 
 
@@ -837,9 +827,6 @@ def test_audit_summary_projects_partition_request_accounting():
     assert summary_by_field["audit_timings"] == {
         "duration_seconds": 12.5,
         "endpoint_duration_ms": 12_000.0,
-        "request_start_rate_limit_per_second": 2.0,
-        "request_start_rate_actual_per_second": 0.0,
-        "request_start_span_seconds": 0.0,
     }
 
 
