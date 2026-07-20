@@ -1088,6 +1088,10 @@ def test_decode_shared_block_payload_rejects_limit_before_zlib_allocation(monkey
             "exceeds uint64",
         ),
         (
+            lambda: shared_readers.read_strict_uvarint(b"\x80" * 10, 0),
+            "exceeds uint64",
+        ),
+        (
             lambda: shared_readers.read_strict_uvarint(b"\x80\0", 0),
             "non-canonical",
         ),

@@ -25,7 +25,6 @@ from process.ptg_parts.ptg2_fast_candidate_audit import (
 from process.ptg_parts.ptg2_batch_candidate_audit import (
     BatchCandidateAuditContractError,
     BatchCandidateAuditTransportError,
-    run_batch_candidate_audit,
 )
 from process.ptg_parts.ptg2_batch_candidate_audit_report import (
     BatchAuditReportTarget,
@@ -42,6 +41,15 @@ from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_evidence,
     validate_provider_identifier_quarantine_evidence,
     validate_provider_identifier_quarantine,
+)
+from process.ptg_parts.ptg2_candidate_audit_plan_store import (
+    load_persisted_audit_sample,
+)
+from process.ptg_parts.ptg2_partitioned_candidate_audit import (
+    run_partitioned_candidate_audit,
+)
+from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_IN_FLIGHT,
 )
 from process.ptg_parts.ptg2_source_witness import (
     PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
@@ -158,7 +166,7 @@ class CandidateAuditReleaseGateError(RuntimeError):
 
 
 class CandidateAuditTransportError(RuntimeError):
-    """A one-request transport failure that requires an explicit retry."""
+    """An audit transport failure that requires an explicit retry."""
 
     control_error_code = "ptg_candidate_audit_transport_failed"
     retryable = False
@@ -560,14 +568,18 @@ def _audit_configuration(
             ptg2_v3_source_api_audit.CANDIDATE_AUDIT_HEADER: snapshot_id,
             "Accept": "application/json",
             "User-Agent": (
-                "ptg2-v3-batch-candidate-audit/4.0"
+                "ptg2-v3-partitioned-candidate-audit/4.1"
                 if batch_writer
                 else "ptg2-v3-fast-candidate-audit/1.0"
             ),
         },
         verify_tls=should_verify_tls,
         transport_contract=transport_contract,
-        concurrency=1 if batch_writer else 32,
+        concurrency=(
+            PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_IN_FLIGHT
+            if batch_writer
+            else 32
+        ),
     )
 
 
@@ -686,10 +698,23 @@ async def run_batch_release_audit(
     *,
     http_config: FastAuditHttpConfig | None = None,
 ) -> dict[str, Any]:
-    """Run one server-derived batch audit without decoding witnesses locally."""
+    """Load sealed evidence once, then run bounded API partitions."""
 
     try:
-        audit_report = await run_batch_candidate_audit(
+        witness = await load_shared_source_witness(
+            schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            snapshot_key=candidate_target.snapshot_key,
+            expected_raw_source_sha256=(
+                candidate_target.raw_container_sha256
+            ),
+            expected_metadata=candidate_target.source_witness,
+        )
+        persisted_sample = await load_persisted_audit_sample(
+            schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            snapshot_key=candidate_target.snapshot_key,
+            expected_metadata=candidate_target.audit_sample,
+        )
+        audit_report = await run_partitioned_candidate_audit(
             audit_target=BatchAuditReportTarget(
                 snapshot_id=candidate_target.snapshot_id,
                 source_key=candidate_target.source_key,
@@ -702,6 +727,8 @@ async def run_batch_release_audit(
                     candidate_target.provider_identifier_quarantine
                 ),
             ),
+            witness=witness,
+            persisted_sample=persisted_sample,
             http_config=(
                 http_config
                 if http_config is not None
@@ -900,7 +927,7 @@ async def _execute_release_audit(
             snapshot_id=candidate_target.snapshot_id,
             phase="candidate release audit",
             message=(
-                "submitting one authenticated server-derived batch request for "
+                "submitting authenticated 100-result API partitions for "
                 f"{int(candidate_target.source_witness['occurrence_witness_count']):,} "
                 "sealed source occurrences"
             ),

@@ -33,6 +33,10 @@ from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
 from process.ptg_parts.ptg2_candidate_audit_contract import (
     PTG2_FAST_AUDIT_DEADLINE_SECONDS,
 )
+from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT,
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_RESULT_CONTRACT,
+)
 from process.ptg_parts.ptg2_provider_quarantine import (
     validate_provider_identifier_quarantine_evidence,
 )
@@ -78,12 +82,29 @@ def validate_report_timing(
         field_name="completed_at",
     )
     duration_seconds = report_by_field.get("duration_seconds")
+    batch_by_field = report_by_field.get("batch")
+    checks_by_field = report_by_field.get("checks")
+    partitioned = (
+        isinstance(batch_by_field, Mapping)
+        and batch_by_field.get("request_contract")
+        == PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
+    )
+    request_count = (
+        checks_by_field.get("batch_requests_executed")
+        if isinstance(checks_by_field, Mapping)
+        else None
+    )
+    maximum_duration_seconds = PTG2_FAST_AUDIT_DEADLINE_SECONDS
+    if partitioned:
+        if type(request_count) is not int or request_count < 1:
+            raise ValueError("batch audit report timing is invalid")
+        maximum_duration_seconds += max(request_count - 1, 0) / 2.0 + 5.0
     if (
         isinstance(duration_seconds, bool)
         or not isinstance(duration_seconds, (int, float))
         or not math.isfinite(float(duration_seconds))
         or float(duration_seconds) < 0
-        or float(duration_seconds) > PTG2_FAST_AUDIT_DEADLINE_SECONDS
+        or float(duration_seconds) > maximum_duration_seconds
         or started_at > completed_at
         or abs(
             (completed_at - started_at).total_seconds()
@@ -143,6 +164,12 @@ def validate_report_target(
         field_name="target",
         expected_fields=TARGET_FIELDS,
     )
+    batch_by_field = report_by_field.get("batch")
+    partitioned = (
+        isinstance(batch_by_field, Mapping)
+        and batch_by_field.get("request_contract")
+        == PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
+    )
     expected_by_field = {
         "expected_architecture": "postgres_binary_v3",
         "expected_storage_generation": "shared_blocks_v3",
@@ -150,7 +177,11 @@ def validate_report_target(
         "expected_snapshot_lifecycle": "validated",
         "architecture_assertion": "required_postgresql_session_evidence",
         "api_path_sha256": sha256_text(PTG2_AUDIT_BATCH_API_PATH),
-        "endpoint_contract": PTG2_AUDIT_BATCH_RESPONSE_CONTRACT,
+        "endpoint_contract": (
+            PTG2_PARTITIONED_CANDIDATE_AUDIT_RESULT_CONTRACT
+            if partitioned
+            else PTG2_AUDIT_BATCH_RESPONSE_CONTRACT
+        ),
         "snapshot_id_sha256": sha256_text(coordinates.snapshot_id),
         "source_key_sha256": sha256_text(coordinates.source_key),
         "plan_id_sha256": sha256_text(coordinates.plan_id),

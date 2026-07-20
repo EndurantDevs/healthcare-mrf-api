@@ -15,6 +15,7 @@ from api import (
     ptg2_candidate_audit_integrity as candidate_integrity,
     ptg2_serving,
 )
+from api import ptg2_candidate_audit_partition as candidate_partition
 from api.ptg2_candidate_audit import (
     PTG2CandidateAuditAccess,
 )
@@ -27,10 +28,28 @@ from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
     AuditBatchWitnessBinding,
     build_audit_batch_request,
 )
+from process.ptg_parts.ptg2_batch_candidate_audit_report import (
+    BatchAuditReportTarget,
+)
+from process.ptg_parts.ptg2_candidate_audit_plan_store import (
+    load_persisted_audit_sample,
+)
+from process.ptg_parts.ptg2_partitioned_candidate_audit import (
+    build_candidate_audit_partition_plan,
+)
+from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_ITEMS,
+    build_partitioned_candidate_audit_result,
+    validate_partitioned_candidate_audit_results,
+)
+from process.ptg_parts.ptg2_source_witness_store import (
+    load_shared_source_witness,
+)
 from process.ptg_parts import ptg2_serving_binary_v3
 from tests.ptg2_candidate_audit_batch_postgres_fixture import (
     PLAN_ID,
     SNAPSHOT_ID,
+    SNAPSHOT_KEY,
     SOURCE_DIGEST,
     SOURCE_KEY,
     audit_rows,
@@ -55,10 +74,10 @@ class _CandidateBatchCase:
     access: PTG2CandidateAuditAccess
 
 
-def _candidate_batch_case() -> _CandidateBatchCase:
+def _candidate_batch_case(*, persisted_count: int = 2) -> _CandidateBatchCase:
     schema_name = f"ptg2_audit_batch_{uuid.uuid4().hex[:16]}"
     witness_payload, witness_metadata = source_witness()
-    persisted_audit_rows = audit_rows()
+    persisted_audit_rows = audit_rows(persisted_count)
     candidate_tables = serving_tables(witness_metadata, persisted_audit_rows)
     audit_request = build_audit_batch_request(
         snapshot_id=SNAPSHOT_ID,
@@ -223,3 +242,151 @@ async def test_real_postgres_candidate_batch_reads_and_processes_each_block_once
         SNAPSHOT_ID,
         candidate_audit_access=candidate_case.access,
     )
+
+
+async def _load_postgres_partition_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_case: _CandidateBatchCase,
+):
+    original_first = db.first
+    original_all = db.all
+    witness_query = AsyncMock(wraps=original_first)
+    sample_query = AsyncMock(wraps=original_all)
+    monkeypatch.setattr(db, "first", witness_query)
+    monkeypatch.setattr(db, "all", sample_query)
+    try:
+        witness = await load_shared_source_witness(
+            schema_name=candidate_case.schema_name,
+            snapshot_key=SNAPSHOT_KEY,
+            expected_raw_source_sha256=(SOURCE_DIGEST,),
+            expected_metadata=candidate_case.witness_metadata,
+        )
+        persisted_sample = await load_persisted_audit_sample(
+            schema_name=candidate_case.schema_name,
+            snapshot_key=SNAPSHOT_KEY,
+            expected_metadata=candidate_case.serving_tables.audit_sample,
+        )
+    finally:
+        monkeypatch.setattr(db, "first", original_first)
+        monkeypatch.setattr(db, "all", original_all)
+    witness_query.assert_awaited_once()
+    sample_query.assert_awaited_once()
+    return build_candidate_audit_partition_plan(
+        audit_target=BatchAuditReportTarget(
+            snapshot_id=SNAPSHOT_ID,
+            source_key=SOURCE_KEY,
+            plan_id=PLAN_ID,
+            plan_market_type="group",
+            raw_container_sha256=(SOURCE_DIGEST,),
+            source_witness=candidate_case.witness_metadata,
+            audit_sample=candidate_case.serving_tables.audit_sample,
+            provider_identifier_quarantine={},
+        ),
+        witness=witness,
+        persisted_sample=persisted_sample,
+    )
+
+
+def _assert_exact_partition_dispatch(plan) -> None:
+    assert plan.request_count == 2
+    assert all(
+        request.item_count <= PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_ITEMS
+        for request in plan.requests
+    )
+    dispatched_ordinals = tuple(
+        audit_item.ordinal
+        for request in plan.requests
+        for audit_item in (
+            *request.source_challenges,
+            *request.persisted_occurrences,
+        )
+    )
+    assert sorted(dispatched_ordinals) == list(range(103))
+    assert len(dispatched_ordinals) == len(set(dispatched_ordinals))
+
+
+async def _execute_postgres_partition_plan(
+    candidate_case: _CandidateBatchCase,
+    plan,
+):
+    partition_results = []
+    for request in plan.requests:
+        async with db.session() as session:
+            with shared_block_read_once_scope(
+                max_retained_raw_bytes=1024 * 1024,
+            ) as read_once_scope:
+                audit_result = await candidate_partition.audit_candidate_partition(
+                    session,
+                    request,
+                    candidate_case.access,
+                )
+                read_once_scope.assert_processed_once()
+                block_io = read_once_scope.ledger
+        partition_results.append(
+            build_partitioned_candidate_audit_result(
+                request=request,
+                matched_source_occurrence_count=(
+                    audit_result.matched_challenge_count
+                ),
+                validated_persisted_occurrence_count=(
+                    audit_result.validated_persisted_audit_occurrence_count
+                ),
+                duration_ms=1,
+                block_io=block_io,
+                candidate_processing_io=audit_result.candidate_processing_io,
+            )
+        )
+    return validate_partitioned_candidate_audit_results(
+        plan,
+        partition_results,
+    )
+
+
+def _assert_partition_aggregate(aggregate) -> None:
+    assert aggregate.request_count == 2
+    assert aggregate.source_occurrence_count == 2
+    assert aggregate.persisted_occurrence_count == 101
+    assert aggregate.block_io["repeated_physical_reads"] == 0
+    assert aggregate.block_io["repeated_physical_decodes"] == 0
+    assert (
+        aggregate.candidate_processing_io[
+            "repeated_candidate_projection_builds"
+        ]
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_partition_plan_dispatches_every_item_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prove two bounded V2 requests over one worker-side PostgreSQL load."""
+
+    if os.getenv("HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST=1")
+    candidate_case = _candidate_batch_case(persisted_count=101)
+    snapshot_descriptor = _patch_candidate_modules(monkeypatch, candidate_case)
+    schema = quote_identifier(candidate_case.schema_name)
+    await db.disconnect()
+    await db.connect()
+    try:
+        await create_candidate_schema(candidate_case.schema_name)
+        await seed_candidate(
+            candidate_case.schema_name,
+            candidate_case.witness_payload,
+            candidate_case.witness_metadata,
+            candidate_case.persisted_audit_rows,
+        )
+        plan = await _load_postgres_partition_plan(monkeypatch, candidate_case)
+        _assert_exact_partition_dispatch(plan)
+        aggregate = await _execute_postgres_partition_plan(
+            candidate_case,
+            plan,
+        )
+        _assert_partition_aggregate(aggregate)
+        assert snapshot_descriptor.await_count == 2
+    finally:
+        try:
+            await db.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        finally:
+            await db.disconnect()

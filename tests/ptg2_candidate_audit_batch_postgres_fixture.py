@@ -199,7 +199,21 @@ def source_witness() -> tuple[bytes, dict[str, Any]]:
     )
 
 
-def audit_rows() -> list[dict[str, Any]]:
+def audit_rows(count: int = 2) -> list[dict[str, Any]]:
+    if count < 1:
+        raise ValueError("candidate audit row count must be positive")
+    row_coordinates = (
+        (7, 0, ATOM_KEY),
+        (8, 1, ALIASED_ATOM_KEY),
+    )
+    occurrence_ids = (
+        (b"a" * 32, b"b" * 32)
+        if count == 2
+        else tuple(
+            hashlib.sha256(f"candidate-audit:{index}".encode()).digest()
+            for index in range(count)
+        )
+    )
     return [
         {
             "occurrence_id": occurrence_id,
@@ -211,9 +225,9 @@ def audit_rows() -> list[dict[str, Any]]:
             "atom_ordinal": atom_ordinal,
             "atom_key": atom_key,
         }
-        for occurrence_id, code_key, atom_ordinal, atom_key in (
-            (b"a" * 32, 7, 0, ATOM_KEY),
-            (b"b" * 32, 8, 1, ALIASED_ATOM_KEY),
+        for index, occurrence_id in enumerate(occurrence_ids)
+        for code_key, atom_ordinal, atom_key in (
+            row_coordinates[index % len(row_coordinates)],
         )
     ]
 
@@ -471,6 +485,7 @@ def serving_tables(
         audit_sample={
             "sample_count": len(persisted_audit_rows),
             "sample_digest": persisted_audit_sample_digest(persisted_audit_rows),
+            "source_count": 1,
         },
         source_witness=witness_metadata,
         source_set=shared_source_set_metadata((SOURCE_DIGEST,)),

@@ -31,7 +31,10 @@ from api.ptg2_candidate_audit import (
     candidate_audit_access_from_args,
     candidate_audit_access_from_verified_request,
 )
-from api.ptg2_candidate_audit_batch import audit_candidate_source_witness_batch
+from api.ptg2_candidate_audit_batch import (
+    audit_candidate_source_witness_batch,
+)
+from api.ptg2_candidate_audit_partition import audit_candidate_partition
 from api.ptg2_shared_blocks import (
     PTG2SharedBlockError,
     shared_block_read_once_scope,
@@ -88,6 +91,11 @@ from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProcedurePeerStats, TerminologySynonym)
 from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT,
+    build_partitioned_candidate_audit_result,
+    parse_partitioned_candidate_audit_request,
+)
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
     PTG2_AUDIT_BATCH_RESPONSE_CONTRACT,
     matched_audit_batch_digest,
@@ -10061,19 +10069,73 @@ def _candidate_audit_batch_response_map(
     }
 
 
+async def _partitioned_candidate_audit_response(
+    request,
+    raw_request: Mapping[str, Any],
+    candidate_access,
+) -> dict[str, Any]:
+    """Evaluate one explicit max-100 partition and return its bound proof."""
+
+    try:
+        audit_request = parse_partitioned_candidate_audit_request(raw_request)
+    except ValueError as exc:
+        raise InvalidUsage(str(exc)) from exc
+    started_at = time.perf_counter()
+    try:
+        with shared_block_read_once_scope(
+            max_retained_raw_bytes=_candidate_audit_batch_raw_limit(),
+        ) as read_once_scope:
+            batch_result = await audit_candidate_partition(
+                _get_session(request),
+                audit_request,
+                candidate_access,
+            )
+            block_io_map = _read_once_block_io_map(read_once_scope)
+    except (PTG2ManifestArtifactError, PTG2SharedBlockError) as exc:
+        raise InvalidUsage(str(exc)) from exc
+    partition_result = build_partitioned_candidate_audit_result(
+        request=audit_request,
+        matched_source_occurrence_count=(
+            batch_result.matched_challenge_count
+        ),
+        validated_persisted_occurrence_count=(
+            batch_result.validated_persisted_audit_occurrence_count
+        ),
+        duration_ms=round((time.perf_counter() - started_at) * 1_000, 3),
+        block_io=block_io_map,
+        candidate_processing_io=batch_result.candidate_processing_io,
+    )
+    return partition_result.payload
+
+
 @blueprint.post(
     "/providers/audit-source-witness-batch",
     name="pricing.providers.audit_source_witness_batch",
 )
 async def audit_ptg2_source_witness_batch(request):
-    """Verify one exhaustive candidate witness through one read-only request."""
+    """Verify one legacy witness or one explicit bounded partition."""
 
-    maximum_body_bytes = 64 * 1024
-    if len(request.body or b"") > maximum_body_bytes:
+    request_body_bytes = len(request.body or b"")
+    if request_body_bytes > 2 * 1024 * 1024:
         raise InvalidUsage("candidate audit batch request is too large")
     _require_candidate_audit_batch_auth(request)
     raw_request = request.json
+    is_partitioned = (
+        isinstance(raw_request, Mapping)
+        and raw_request.get("contract")
+        == PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
+    )
+    if not is_partitioned and request_body_bytes > 64 * 1024:
+        raise InvalidUsage("candidate audit batch request is too large")
     candidate_access = _candidate_audit_batch_access(request, raw_request)
+    if is_partitioned:
+        return _json_response(
+            await _partitioned_candidate_audit_response(
+                request,
+                raw_request,
+                candidate_access,
+            )
+        )
     try:
         audit_request = parse_audit_batch_request(raw_request)
     except ValueError as exc:

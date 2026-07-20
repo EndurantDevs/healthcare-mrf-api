@@ -151,9 +151,9 @@ total is not yet known; a false `total_is_exact` marks `total` and
 | Source and dictionary completeness | Implemented in repository | Per-source run and dictionary contracts bind exact file descriptors to canonical physical identities; Python/Rust parity and coherent-omission tests fail closed. |
 | Exact multiplicity | Implemented in repository | Duplicate source candidates and duplicate atom ordinals survive publication and audit. |
 | Persisted audit sample | Implemented in repository | Publish-time sample metadata, digest, row bound, and API readback tests. |
-| Bounded candidate release audit | Implemented in repository | Import-time exact source witnesses are sealed in PostgreSQL; one authenticated V4 POST derives and reparses independent cohorts of up to 10,000 pricing occurrences and 1,000 provider records plus the served sample within a 55-second deadline. The response proves zero repeated block, witness, and candidate work. |
+| Bounded candidate release audit | Implemented in repository | Import-time exact source witnesses are sealed in PostgreSQL; deterministic authenticated partitions contain at most 100 unique source conditions or persisted sample coordinates and start at no more than two requests per second. They collectively reparse independent cohorts of up to 10,000 pricing occurrences and 1,000 provider records plus the served sample. Each response proves zero request-local repeated block and candidate work. |
 | Candidate attestation and atomic activation | Implemented in repository | Fresh report and sealed-sample binding, immutable validated row, exact predecessor CAS, wall-clock expiry, single-use receipt, V3-reader/V4-writer rolling compatibility, downgrade rejection, and transaction rollback tests. |
-| Automatic candidate audit orchestration | V4 writer cutover implemented | The automatic `ptg-candidate-audit` worker submits exactly one non-auto-retrying `aiohttp` V4 request on `uvloop`, validates the redacted report, records the attestation, and atomically promotes the exact predecessor. Readers retain V3 compatibility for existing history, while new V3 writes fail closed. Request-local preparation is discarded and no application cache is warmed. |
+| Automatic candidate audit orchestration | V4 writer cutover implemented | The automatic `ptg-candidate-audit` worker loads the sealed witness and sample once, submits every exact max-100 partition once through non-auto-retrying `aiohttp` on `uvloop`, validates one redacted V4 report, records the attestation, and atomically promotes the exact predecessor. Readers retain V3 compatibility for existing history, while new V3 writes fail closed. Request-local preparation is discarded and no application cache is warmed. |
 | Class-specific cold first-page p95 <= 40 ms | Pending release measurement | Fresh API processes, distinct keys, and complete first-page observations measured separately for matched-positive, negative, and deterministic-random requests. |
 | Unique large import in 10-15 minutes | Pending dev measurement | Complete fresh build, logged PostgreSQL publication, audit, seal, and resource report. |
 | 2,000 imports/month | Authenticated schema-v7 gate implemented; measurement pending | `ptg2_v3_capacity_gate.py` requires a fresh Ed25519 collector receipt, committed per-import end-to-end timings, 30 qualifying large builds and reuse samples, reconciled retry and audit HTTP cost, signed raw import and audit arrivals behind gap-free seven-day peaks, independently server-signed fully contended cold API samples, zero errors, and raw contention-bound resource telemetry. |
@@ -174,6 +174,10 @@ python -m pytest -q \
   tests/test_ptg2_source_witness.py \
   tests/test_ptg2_fast_candidate_audit.py \
   tests/test_ptg2_batch_candidate_audit.py \
+  tests/test_ptg2_partitioned_candidate_audit_contract.py \
+  tests/test_ptg2_partitioned_candidate_audit.py \
+  tests/test_ptg2_partitioned_candidate_audit_api.py \
+  tests/test_ptg2_partitioned_candidate_audit_report.py \
   tests/test_ptg_candidate_audit_importer.py \
   tests/test_ptg2_shared_gc.py \
   tests/test_ptg2_candidate_attestation.py \
@@ -214,8 +218,10 @@ The bounded activation gate requires all of these floors:
 | Provider-reference witnesses | independently selected; at most 1,000 |
 | Persisted served-sample validation | every sealed sample coordinate, inside the batch |
 | Source occurrence challenges | every selected witness, evaluated server-side |
-| Automated audit HTTP requests | exactly 1 authenticated V4 POST |
-| Complete audit wall time | at most 55 seconds |
+| Automated audit HTTP requests | exactly `ceil((unique source conditions + persisted sample coordinates) / 100)` authenticated POSTs |
+| Request start rate | at most 2 per second; exact starts and start span recorded |
+| Per-request endpoint time | at most 55 seconds |
+| Complete audit wall time | paced request span plus the 55-second per-request ceiling and 5-second accounting allowance |
 | Redirects and in-attempt retries | exactly 0 |
 | Async runtime | `aiohttp` on `uvloop` |
 | Resolved-rate fraction | exactly 1.0 |
@@ -235,15 +241,19 @@ repeated linked-provider JSON into one compressed, SHA-256-keyed dictionary.
 Records retain the linked digest, and decoding rejects missing, corrupt,
 duplicate, out-of-order, or unused dictionary entries. This removes repeated
 audit evidence without weakening exact source-token verification. Activation
-never rereads or decompresses a source file. The V4 endpoint validates the
-complete persisted sample and grouped source conditions in one repeatable-read
-request. It reads, decodes, and prepares each unique physical block once;
-processes each logical payload once; and prepares each evidence entry and
-candidate projection once. Alias reuse is request-local, every repeated-work
-counter must be zero, and the request-local state is discarded with the
-response rather than warming an application cache.
+never rereads or decompresses a source file. The worker decodes the sealed
+witness and loads the complete persisted sample once, then assigns every grouped
+source condition and sample coordinate to exactly one authenticated partition.
+Each partition uses its own repeatable-read request. Within that request it reads,
+decodes, and prepares each unique physical block once; processes each logical
+payload once; and prepares each candidate projection once. Alias reuse is
+request-local, every repeated-work counter must be zero, and the request-local
+state is discarded with the response rather than warming an application cache.
 
-The candidate audit retains its independent 55-second whole-request deadline.
+Each candidate-audit partition retains an independent 55-second endpoint
+deadline. The complete report also validates its paced request-start span and
+allows only that span plus the endpoint ceiling and a five-second accounting
+allowance.
 Standard cold pricing endpoints retain their independent 40 ms p95 ceiling;
 the batch-audit deadline does not relax that serving gate.
 
@@ -302,9 +312,10 @@ Convert to stable 128-bit IDs only where the response contract requires them;
 retain the broader traversal only when geographic or taxonomy validation is
 also requested.
 
-The batch report records the server endpoint duration and complete worker wall
-time separately. Both measurements belong to the same single POST, while queue
-age remains an orchestration metric outside that audit attempt.
+The batch report records the maximum server endpoint duration and complete worker
+wall time separately, together with planned, started, completed, and failed
+request counts and the measured start span. Queue age remains an orchestration
+metric outside that audit attempt.
 
 For plans backed by multiple published network snapshots, measure both every
 pinned snapshot and the unpinned merged-plan API. The merged path reads
@@ -335,9 +346,10 @@ A qualifying dev measurement must:
 6. Persist and validate the publish-time audit sample.
 7. Run the bounded candidate audit over independently selected source cohorts
    of 10,000 occurrences and 1,000 provider witnesses for a large population,
-   plus the served sample. Require exactly one authenticated no-retry V4 POST
-   using `aiohttp` on `uvloop`, a 55-second hard deadline, and zero repeated
-   block, witness, and candidate-processing ledger counters.
+   plus the served sample. Require exact max-100 authenticated partitions,
+   started at no more than two per second with zero automatic retries, using
+   `aiohttp` on `uvloop`. Require a 55-second per-request deadline and zero
+   request-local repeated block and candidate-processing ledger counters.
 8. Collect at least 30 successful candidate audits with zero errors. Record
    audit lane count and availability, duration, queue age, actual HTTP and retry
    counts per activation, attestation, and exact-predecessor activation.
@@ -458,10 +470,12 @@ Schema-v7 release evidence uses these fixed representativeness policies:
   least 30 minutes with at least 3,000 normal requests and 1 request/second.
   Candidate-audit request totals, duration, and derived rate reconcile both in
   the sample population and contention interval, covering the observed
-  occurrence-witness and served-sample work. The normal dense baseline is one
-  V4 HTTP request per audit and 2,000 requests per 2,000 activations, with up to
-  10,000 occurrence challenges evaluated server-side per audit. Record all
-  transport failures and explicit operator retries.
+  occurrence-witness and served-sample work. For every audit, the request count
+  is exactly the ceiling of unique source conditions plus persisted sample
+  coordinates divided by 100. Record planned, started, completed, failed, and
+  retried requests, peak concurrency, actual start rate, start span, endpoint
+  maximum, and complete wall time. Record all transport failures and explicit
+  operator retries.
   The signed raw timestamps cover at least 99 percent of the contention interval
   with no import, audit, or HTTP observation gap above five seconds.
 - Fresh-process cold first-page p95 is at most 40 ms independently for at

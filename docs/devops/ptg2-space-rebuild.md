@@ -66,8 +66,9 @@ activation verifier and cannot create or substitute for a V4 attestation.
 Automatic activation is solely the bounded PostgreSQL-witness gate. During the
 completed reader-first release it kept writing V3 attestations while all
 replicas learned to read V4. The current writer release switches each executed
-audit to one authenticated V4 POST while retaining V3 reader compatibility for
-existing history.
+audit to one authenticated V4 report assembled from exact max-100 request
+partitions started at no more than two per second, while retaining V3 reader
+compatibility for existing history.
 The attestation persistence path, including its authenticated control endpoint,
 rejects every non-current writer contract, so new V3 writes fail closed after
 the cutover.

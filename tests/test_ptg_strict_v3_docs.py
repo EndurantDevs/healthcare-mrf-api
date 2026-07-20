@@ -47,7 +47,8 @@ def test_strict_ptg_docs_define_bounded_candidate_audit_contract():
         assert "10,000" in text
         assert "1,000" in text
         assert "10,001" not in text
-        assert re.search(r"one (?:authenticated )?V4 POST", text)
+        assert re.search(r"(?:at most 100|max-100)", text, re.IGNORECASE)
+        assert re.search(r"two (?:request starts|requests) per second", text, re.I)
         assert re.search(r"(?:zero redirects|redirects[^.]*exactly 0)", text, re.I)
         assert re.search(
             r"(?:zero in-attempt retries|in-attempt retries[^.]*exactly 0)",
@@ -96,4 +97,4 @@ def test_source_file_audit_is_documented_as_standalone_diagnostic_only():
             text,
             re.IGNORECASE,
         )
-        assert "one authenticated V4 POST" in text
+        assert "one authenticated V4 report" in text

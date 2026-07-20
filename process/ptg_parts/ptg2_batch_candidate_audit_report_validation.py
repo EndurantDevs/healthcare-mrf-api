@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import datetime
 import hashlib
-import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -41,8 +40,15 @@ from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
     parse_audit_batch_request,
     validate_audit_batch_once_ledgers,
 )
+from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT,
+)
+from process.ptg_parts.ptg2_partitioned_candidate_audit_report_validation import (
+    validate_endpoint_duration,
+    validate_partitioned_batch_binding,
+    validate_partitioned_http_metrics,
+)
 from process.ptg_parts.ptg2_candidate_audit_contract import (
-    PTG2_FAST_AUDIT_DEADLINE_SECONDS,
     validated_public_audit_sample_projection,
 )
 from process.ptg_parts.ptg2_source_witness_contract import (
@@ -80,12 +86,49 @@ def _validated_coverage_checks(
     witness: Mapping[str, Any],
     audit_sample: Mapping[str, Any],
 ) -> dict[str, int]:
+    """Validate coverage and execution counters against sealed evidence."""
+
     coverage_by_field = strict_report_mapping(
         report_by_field.get("coverage"),
         field_name="coverage",
         expected_fields=COVERAGE_FIELDS,
     )
-    expected_coverage_by_field = {
+    batch_by_field = strict_report_mapping(
+        report_by_field.get("batch"),
+        field_name="batch",
+        expected_fields=BATCH_FIELDS,
+    )
+    is_partitioned = (
+        batch_by_field.get("request_contract")
+        == PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
+    )
+    expected_coverage_by_field = _expected_coverage(
+        coverage_by_field,
+        witness=witness,
+        audit_sample=audit_sample,
+        partitioned=is_partitioned,
+    )
+    if coverage_by_field != expected_coverage_by_field:
+        raise ValueError("batch audit report bounded coverage is invalid")
+    return _validated_checks(
+        report_by_field,
+        witness=witness,
+        audit_sample=audit_sample,
+        coverage=coverage_by_field,
+        partitioned=is_partitioned,
+    )
+
+
+def _expected_coverage(
+    coverage: Mapping[str, Any],
+    *,
+    witness: Mapping[str, Any],
+    audit_sample: Mapping[str, Any],
+    partitioned: bool,
+) -> dict[str, Any]:
+    """Return the only coverage section accepted for the supplied evidence."""
+
+    return {
         "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
         "queryable_occurrence_population_count": witness[
             "queryable_occurrence_population_count"
@@ -96,18 +139,36 @@ def _validated_coverage_checks(
         "occurrence_sample_count": witness["occurrence_witness_count"],
         "provider_sample_count": witness["provider_witness_count"],
         "unique_source_condition_count": strict_nonnegative_report_int(
-            coverage_by_field.get("unique_source_condition_count"),
+            coverage.get("unique_source_condition_count"),
             field_name="coverage.unique_source_condition_count",
         ),
         "persisted_audit_sample_count": audit_sample["sample_count"],
-        "execution_mode": "server_derived_one_request_batch",
+        "execution_mode": (
+            "worker_validated_partitioned_batch_v1"
+            if partitioned
+            else "server_derived_one_request_batch"
+        ),
     }
-    if coverage_by_field != expected_coverage_by_field:
-        raise ValueError("batch audit report bounded coverage is invalid")
+
+
+def _validated_checks(
+    report_by_field: Mapping[str, Any],
+    *,
+    witness: Mapping[str, Any],
+    audit_sample: Mapping[str, Any],
+    coverage: Mapping[str, Any],
+    partitioned: bool,
+) -> dict[str, int]:
+    """Validate exact executed-item and request counters."""
+
     checks_by_name = strict_report_mapping(
         report_by_field.get("checks"),
         field_name="checks",
         expected_fields=CHECK_FIELDS,
+    )
+    batch_request_count = strict_nonnegative_report_int(
+        checks_by_name.get("batch_requests_executed"),
+        field_name="checks.batch_requests_executed",
     )
     expected_checks_by_name = {
         "source_witnesses": int(witness["record_count"]),
@@ -115,13 +176,18 @@ def _validated_coverage_checks(
             witness["occurrence_witness_count"]
         ),
         "unique_source_conditions_executed": int(
-            coverage_by_field["unique_source_condition_count"]
+            coverage["unique_source_condition_count"]
         ),
         "provider_witnesses_validated": int(witness["provider_witness_count"]),
         "persisted_audit_occurrences_validated": int(audit_sample["sample_count"]),
-        "batch_requests_executed": 1,
+        "batch_requests_executed": (
+            batch_request_count if partitioned else 1
+        ),
     }
-    if checks_by_name != expected_checks_by_name:
+    if (
+        checks_by_name != expected_checks_by_name
+        or (partitioned and batch_request_count < 1)
+    ):
         raise ValueError("batch audit report checks are invalid")
     return {
         field_name: int(counter_value)
@@ -195,19 +261,6 @@ def _validate_batch_response_binding(
         raise ValueError("batch audit report response binding is invalid")
 
 
-def _validate_endpoint_duration(batch_by_field: Mapping[str, Any]) -> None:
-    endpoint_duration_ms = batch_by_field.get("endpoint_duration_ms")
-    if (
-        isinstance(endpoint_duration_ms, bool)
-        or not isinstance(endpoint_duration_ms, (int, float))
-        or not math.isfinite(float(endpoint_duration_ms))
-        or float(endpoint_duration_ms) < 0
-        or float(endpoint_duration_ms)
-        > PTG2_FAST_AUDIT_DEADLINE_SECONDS * 1_000
-    ):
-        raise ValueError("batch audit report endpoint timing is invalid")
-
-
 def _validated_batch_ordinal_digest(
     report_by_field: Mapping[str, Any],
     context: BatchBindingContext,
@@ -219,29 +272,58 @@ def _validated_batch_ordinal_digest(
         field_name="batch",
         expected_fields=BATCH_FIELDS,
     )
-    request = _parsed_batch_request(batch_by_field, context)
-    _validate_batch_response_binding(batch_by_field, request, context)
-    _validate_endpoint_duration(batch_by_field)
-    return request.ordered_source_ordinal_digest
+    if (
+        batch_by_field.get("request_contract")
+        == PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
+    ):
+        validate_partitioned_batch_binding(
+            batch_by_field,
+            occurrence_count=context.occurrence_count,
+            persisted_audit_sample_count=(
+                context.persisted_audit_sample_count
+            ),
+            unique_source_condition_count=(
+                context.unique_source_condition_count
+            ),
+        )
+        ordinal_digest = report_digest_hex(
+            batch_by_field.get("ordered_source_ordinal_digest"),
+            field_name="batch.ordered_source_ordinal_digest",
+        )
+    else:
+        request = _parsed_batch_request(batch_by_field, context)
+        _validate_batch_response_binding(batch_by_field, request, context)
+        ordinal_digest = request.ordered_source_ordinal_digest
+    validate_endpoint_duration(batch_by_field)
+    return ordinal_digest
 
 
 def _validate_http_and_io(
     report_by_field: Mapping[str, Any],
     *,
     witness: Mapping[str, Any],
+    checks: Mapping[str, int],
+    partitioned: bool,
 ) -> None:
+    """Validate request accounting and read/process-once ledgers."""
+
     http_metrics_by_name = strict_report_mapping(
         report_by_field.get("http"),
         field_name="http",
     )
-    expected_http_metrics_by_name = {
-        "batch_api_actual_http_requests": 1,
+    expected_request_count = checks["batch_requests_executed"]
+    if partitioned:
+        validate_partitioned_http_metrics(
+            http_metrics_by_name,
+            expected_request_count=expected_request_count,
+        )
+    elif http_metrics_by_name != {
+        "batch_api_actual_http_requests": expected_request_count,
         "retry_count": 0,
         "max_concurrency": 1,
         "method": "POST",
         "redirect_count": 0,
-    }
-    if http_metrics_by_name != expected_http_metrics_by_name:
+    }:
         raise ValueError("batch audit report HTTP accounting is invalid")
     io_ledgers_by_kind = strict_report_mapping(
         report_by_field.get("io"),
@@ -294,11 +376,10 @@ def _validated_report_parts(
     coordinates: CandidateReportCoordinates,
     evaluation_time: datetime.datetime,
 ) -> ValidatedReportParts:
+    """Validate and collect all report sections needed for attestation."""
+
     tool_version = validate_report_header(report_by_field)
-    completed_at = validate_report_timing(
-        report_by_field,
-        evaluated_at=evaluation_time,
-    )
+    completed_at = validate_report_timing(report_by_field, evaluated_at=evaluation_time)
     validate_report_target(report_by_field, coordinates)
     validate_report_redaction(report_by_field)
     source_evidence = validated_report_source(report_by_field)
@@ -323,11 +404,21 @@ def _validated_report_parts(
         ),
         persisted_audit_sample_count=int(audit_sample["sample_count"]),
     )
-    ordinal_digest = _validated_batch_ordinal_digest(
-        report_by_field,
-        batch_context,
+    ordinal_digest = _validated_batch_ordinal_digest(report_by_field, batch_context)
+    batch_by_field = strict_report_mapping(
+        report_by_field.get("batch"),
+        field_name="batch",
+        expected_fields=BATCH_FIELDS,
     )
-    _validate_http_and_io(report_by_field, witness=source_evidence.witness)
+    _validate_http_and_io(
+        report_by_field,
+        witness=source_evidence.witness,
+        checks=checks,
+        partitioned=(
+            batch_by_field.get("request_contract")
+            == PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
+        ),
+    )
     return ValidatedReportParts(
         completed_at=completed_at,
         tool_version=tool_version,
@@ -361,11 +452,11 @@ def _attestation_evidence(
         "provider_identifier_quarantine_evidence": (
             parts.source.quarantine_evidence
         ),
-        "ordered_source_ordinal_digest": (
-            parts.ordered_source_ordinal_digest
-        ),
+        "ordered_source_ordinal_digest": parts.ordered_source_ordinal_digest,
         "checks": dict(parts.checks),
-        "batch_api_actual_http_requests": 1,
+        "batch_api_actual_http_requests": parts.checks[
+            "batch_requests_executed"
+        ],
     }
 
 
@@ -378,14 +469,12 @@ def validate_batch_candidate_release_audit_report(
     plan_market_type: str,
     evaluated_at: datetime.datetime | None = None,
 ) -> dict[str, Any]:
-    """Validate and digest one strict V4 one-request release report."""
+    """Validate and digest one strict V4 bounded release report."""
 
     report_by_field = dict(report)
     if set(report_by_field) != REPORT_FIELDS:
         raise ValueError("batch audit report fields are invalid")
-    evaluation_time = evaluated_at or datetime.datetime.now(
-        datetime.timezone.utc
-    )
+    evaluation_time = evaluated_at or datetime.datetime.now(datetime.timezone.utc)
     if evaluation_time.tzinfo is None or evaluation_time.utcoffset() is None:
         evaluation_time = evaluation_time.replace(tzinfo=datetime.timezone.utc)
     coordinates = CandidateReportCoordinates(
@@ -394,11 +483,7 @@ def validate_batch_candidate_release_audit_report(
         plan_id=plan_id,
         plan_market_type=plan_market_type,
     )
-    parts = _validated_report_parts(
-        report_by_field,
-        coordinates,
-        evaluation_time,
-    )
+    parts = _validated_report_parts(report_by_field, coordinates, evaluation_time)
     return _attestation_evidence(report_by_field, parts)
 
 

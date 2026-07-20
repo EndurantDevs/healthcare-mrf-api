@@ -583,31 +583,34 @@ records the sample count, maximum, digest, method, format, and
 sample through their independent binding.
 
 This served sample is publication evidence. The V4 batch endpoint validates
-every persisted sample coordinate as part of the aggregate release gate. A
+every persisted sample coordinate as part of the partitioned aggregate release gate. A
 completed import is first stored as a `validated` candidate;
 public pricing resolution remains `published`-only. The auditor may read
 exactly one candidate through the control-authenticated audit aliases only when
 snapshot, source, plan, and market selectors all match.
 
-The activation audit sends one authenticated V4 POST containing only the
-candidate coordinates and sealed digests. The server derives the witness and
-persisted sample from PostgreSQL, checks all framing and manifest digests,
-reparses every selected raw token, validates up to 1,000 independently selected
-provider records, and evaluates every selected occurrence witness. A dense
-import still covers 10,000 pricing occurrences and the served sample. The
-worker performs exactly one authenticated V4 POST per executed audit attempt,
-with zero redirects and zero in-attempt retries.
+The activation worker loads the sealed witness and persisted sample once from
+PostgreSQL, checks their framing and manifest digests, and builds one deterministic
+plan. It sends authenticated partitions containing at most 100 unique source
+conditions or persisted sample coordinates. Every coordinate occurs in exactly
+one request; a dense import still covers 10,000 pricing occurrences and the
+served sample. Request starts are spaced at no more than two per second with at
+most eight in flight, zero redirects, and zero in-attempt retries.
 
-The server returns once-only block, witness, and candidate-processing ledgers.
-They require each physical block read, decode, and preparation once; each
-logical payload process once; the witness payload read and decode once; and
-each unique evidence entry and candidate projection prepared once. Every
-repeated-work counter must be zero. Prepared values are request-local and are
-discarded after the response; the release path does not warm or depend on an
-application cache.
+Each server response returns request-local block and candidate-processing
+ledgers. They require each physical block read, decode, and preparation once and
+each logical payload and candidate projection processed once within that
+partition. The worker separately proves that it read and decoded the witness
+payload once, loaded the persisted sample once, and dispatched every coordinate
+once. Every repeated-work counter must be zero. Prepared values are request-local
+and are discarded after the response; the release path does not warm or depend
+on an application cache.
 
-One `aiohttp.ClientSession` performs the single POST with no redirect or retry.
-The complete audit has a fail-closed 55-second deadline. The candidate-audit
+One `aiohttp.ClientSession` performs all exact partitions with a new transport
+connection per request so service routing can use multiple API replicas. Each
+POST has a fail-closed 55-second deadline. The complete audit report validates
+the measured pacing span plus that endpoint ceiling and a five-second accounting
+allowance. The candidate-audit
 ARQ worker requires `uvloop`; the canonical attestation accepts only runtime
 evidence declaring `aiohttp` on `uvloop`. A timeout, cancellation, source
 mismatch, API mismatch, or unsupported runtime leaves the prior snapshot
@@ -625,9 +628,10 @@ a failed network read fails the whole request rather than returning a partial
 union.
 
 The exact tuple includes the source artifact's raw container SHA, so a correct
-price attributed to the wrong input file still fails. The V4 report records one
-endpoint duration, complete worker wall time, one actual HTTP request, zero
-redirects, and zero in-attempt retries. It does not claim the separate
+price attributed to the wrong input file still fails. The V4 report records
+planned, actual, completed, and failed request counts; peak concurrency; start
+rate and span; maximum endpoint duration; complete worker wall time; zero
+redirects; and zero in-attempt retries. It does not claim the separate
 cold-process 40 ms capacity gate. Run the 40 ms standard-API gate from fresh API
 processes with distinct keys under representative concurrent import and API
 load; it does not imply database or operating-system cache eviction.
@@ -728,7 +732,8 @@ missing attestation, or non-activated current snapshot fails closed.
 The bounded PostgreSQL witness audit is the sole automated release verifier.
 The reader-first release has deployed readers that accept V3 and V4. The
 current writer release switches the automatic worker to one V4 report per
-candidate. Persistence is centrally limited to that current writer contract,
+candidate assembled from exact max-100 request partitions. Persistence is
+centrally limited to that current writer contract,
 so the control attestation endpoint rejects new V3 writes while readers retain
 V3 compatibility for existing history.
 An unactivated identity-equal V3 row may upgrade to V4, while V4-to-V3
@@ -779,8 +784,9 @@ For 2,000 logical imports per 30-day month:
   near that bound even though its theoretical steady-state capacity is 2,880
   builds per 30-day month. Candidate audits use separately measured lanes and
   availability. A full activation evaluates up to 10,000 occurrence challenges
-  plus the served sample inside one V4 request, or 2,000 candidate-audit HTTP
-  requests at the monthly objective. Capacity evidence must still measure the
+  plus the served sample through exact max-100 partitions. Monthly HTTP demand
+  is the sum of the measured per-audit partition counts, including explicit
+  operator retries. Capacity evidence must still measure the
   server-side block, witness, candidate, PostgreSQL, CPU, and memory work rather
   than treating the lower HTTP count as free work. Transport failures and
   explicit operator retries must be reported rather than projected away.
@@ -801,7 +807,8 @@ capacity.
 
 The contention run lasts at least 30 minutes with every configured build and
 audit lane active. It includes at least 3,000 requests and 1 request/second of
-normal API traffic plus exactly one V4 POST for each executed candidate audit.
+normal API traffic plus every exact V4 audit partition, paced at no more than
+two request starts per second per audit.
 Audit evidence separately reconciles the server-side occurrence, persisted
 sample, unique block, witness-entry, logical-payload, and candidate-projection
 counts, with zero repeated-work counters. It must use
@@ -870,12 +877,15 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
 - The persisted audit sample exists, validates, and contains no more than 2,560
   rows.
 - The bounded candidate audit reparsed every sealed source witness, passed all
-  selected occurrence challenges and its served-sample validation, ran one V4
-  POST on `aiohttp`/`uvloop`, completed within 55 seconds, and recorded one
-  actual HTTP request, zero retries, and zero repeated-work ledger counters.
+  selected occurrence challenges and its served-sample validation, ran every
+  exact max-100 partition once on `aiohttp`/`uvloop`, and recorded matching
+  planned, actual, and completed request counts, zero failed requests, zero
+  retries, at most two starts per second, and zero request-local repeated-work
+  ledger counters.
 - Cold first-page p95 is at or below 40 ms separately for matched-positive,
   negative, and deterministic-random requests.
-- The one-request candidate audit completes within its 55-second deadline.
+- Every candidate-audit endpoint request completes within its 55-second
+  deadline, and total wall time reconciles with the paced request-start span.
   That deadline does not relax the 40 ms cold ceiling for standard pricing
   endpoints.
 - Price-key publication casts negotiated rates once into a temporary numeric

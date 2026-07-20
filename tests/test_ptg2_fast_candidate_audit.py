@@ -896,3 +896,210 @@ async def test_fast_audit_cancels_requests_when_parent_worker_is_cancelled(monke
         await audit_task
 
     assert challenge_count_by_state["cancelled"] == 4
+
+
+class _ImmediateSemaphore:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+class _FakeResponse:
+    def __init__(self, status, body):
+        self.status = status
+        self.body = body
+
+
+class _FakeRequestContext:
+    def __init__(self, response_or_error):
+        self.response_or_error = response_or_error
+
+    async def __aenter__(self):
+        if isinstance(self.response_or_error, BaseException):
+            raise self.response_or_error
+        return self.response_or_error
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+class _FakeClient:
+    def __init__(self, *responses_or_errors):
+        self.responses_or_errors = list(responses_or_errors)
+
+    def get(self, *_args, **_kwargs):
+        return _FakeRequestContext(self.responses_or_errors.pop(0))
+
+
+@pytest.mark.asyncio
+async def test_fast_response_body_rejects_oversized_payload(monkeypatch):
+    class Content:
+        async def iter_chunked(self, _chunk_size):
+            yield b"12345"
+
+    monkeypatch.setattr(audit, "FAST_AUDIT_MAX_RESPONSE_BYTES", 4)
+
+    with pytest.raises(audit.FastCandidateAuditError, match="too_large"):
+        await audit._bounded_response_body(type("Response", (), {"content": Content()})())
+
+
+@pytest.mark.asyncio
+async def test_request_json_retries_retryable_status_once(monkeypatch):
+    async def response_body(response):
+        return response.body
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(audit, "_bounded_response_body", response_body)
+    monkeypatch.setattr(audit.asyncio, "sleep", no_sleep)
+    metrics = audit.FastAuditHttpMetrics()
+
+    response = await audit._request_json(
+        _FakeClient(_FakeResponse(503, b"{}"), _FakeResponse(200, b"{}")),
+        _ImmediateSemaphore(),
+        metrics,
+        "/test",
+        {},
+    )
+
+    assert response == {}
+    assert metrics.request_count == 2
+    assert metrics.retry_count == 1
+
+
+@pytest.mark.parametrize(
+    ("responses_or_errors", "message"),
+    [
+        ((_FakeResponse(400, b"{}"),), "non_success_status"),
+        ((_FakeResponse(200, b"["),), "json_invalid"),
+        ((_FakeResponse(200, b"[]"),), "not_object"),
+        ((asyncio.TimeoutError(), asyncio.TimeoutError()), "request_timeout"),
+        (
+            (aiohttp.ClientConnectionError(), aiohttp.ClientConnectionError()),
+            "transport_failure",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_request_json_fails_closed_after_protocol_or_transport_error(
+    monkeypatch,
+    responses_or_errors,
+    message,
+):
+    async def response_body(response):
+        return response.body
+
+    monkeypatch.setattr(audit, "_bounded_response_body", response_body)
+    metrics = audit.FastAuditHttpMetrics()
+
+    with pytest.raises(audit.FastCandidateAuditError, match=message):
+        await audit._request_json(
+            _FakeClient(*responses_or_errors),
+            _ImmediateSemaphore(),
+            metrics,
+            "/test",
+            {},
+        )
+
+
+def test_contract_errors_report_malformed_database_and_result_state():
+    assert audit._contract_errors({}, _target(), positive=True)
+    payload = _api_contract_payload(_target(), response_items=[])
+    payload["result_state"] = "no_matching_rates"
+    payload["provenance"]["database_evidence"]["database_selected"] = False
+
+    errors = audit._contract_errors(payload, _target(), positive=True)
+
+    assert "database_evidence_mismatch" in errors
+    assert "positive_result_state_mismatch" in errors
+
+
+def test_challenge_params_include_optional_service_code_and_modifiers():
+    challenge = replace(
+        source_challenge(_occurrence_record()),
+        service_codes=("11",),
+        modifiers=("25", "59"),
+    )
+
+    params = audit._challenge_params(_target(), challenge, offset=100)
+
+    assert params["service_code"] == "11"
+    assert params["billing_code_modifier"] == "25,59"
+    assert params["offset"] == 100
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.update(items=[None]),
+        lambda payload: payload["pagination"].update(offset=1),
+        lambda payload: payload["pagination"].update(limit=1),
+        lambda payload: payload["pagination"].update(total=0),
+    ],
+)
+def test_candidate_page_rejects_item_or_pagination_drift(mutation):
+    payload = _api_contract_payload(_target(), response_items=[])
+    mutation(payload)
+
+    with pytest.raises(audit.FastCandidateAuditError):
+        audit._validated_candidate_page(
+            payload,
+            _target(),
+            requested_offset=0,
+            declared_total=1,
+        )
+
+
+def _preflight_payload():
+    payload = _api_contract_payload(
+        _target(),
+        response_items=[_api_occurrence(_occurrence_record())],
+    )
+    payload["source_set"] = {
+        "contract": audit.source_audit.SOURCE_SET_CONTRACT,
+        "source_count": 1,
+        "raw_container_sha256_digest": SOURCE_SET_DIGEST,
+    }
+    payload["audit_sample"] = audit.public_audit_sample_projection(
+        _target().audit_sample
+    )
+    payload["pagination"] = {"offset": 0, "limit": 1, "total": 1}
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda payload: payload["source_set"].update(source_count=2), "source_set"),
+        (lambda payload: payload.update(audit_sample={}), "audit_sample"),
+        (
+            lambda payload: payload["audit_sample"].update(sample_digest="0" * 64),
+            "audit_sample",
+        ),
+        (lambda payload: payload.update(items=[]), "item_missing"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_preflight_rejects_source_sample_or_item_drift(
+    monkeypatch,
+    mutation,
+    message,
+):
+    payload = _preflight_payload()
+    mutation(payload)
+
+    async def request_json(*_args, **_kwargs):
+        return payload
+
+    monkeypatch.setattr(audit, "_request_json", request_json)
+
+    with pytest.raises(audit.FastCandidateAuditError, match=message):
+        await audit._validate_audit_sample_preflight(
+            object(),
+            _ImmediateSemaphore(),
+            audit.FastAuditHttpMetrics(),
+            _target(),
+        )
