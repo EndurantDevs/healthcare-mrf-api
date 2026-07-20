@@ -9,6 +9,7 @@ from sqlalchemy import (
     TIMESTAMP,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     Computed,
     DateTime,
@@ -1506,6 +1507,46 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("build_id"),
+        CheckConstraint(
+            "resume_lineage_hash ~ '^[0-9a-f]{64}$'",
+            name="pd_profile_build_checkpoint_lineage_hash_check",
+        ),
+        CheckConstraint(
+            "evidence_stage_oid > 0 AND profile_stage_oid > 0 "
+            "AND (evidence_target_oid IS NULL OR evidence_target_oid > 0) "
+            "AND (profile_target_oid IS NULL OR profile_target_oid > 0)",
+            name="pd_profile_build_checkpoint_oid_check",
+        ),
+        CheckConstraint(
+            "state IN ('building_evidence', 'evidence_complete', "
+            "'building_profile', 'ready', 'failed')",
+            name="pd_profile_build_checkpoint_state_check",
+        ),
+        CheckConstraint(
+            "evidence_total_batches >= 0 "
+            "AND evidence_next_batch BETWEEN 0 AND evidence_total_batches "
+            "AND profile_total_batches >= 0 "
+            "AND profile_next_batch BETWEEN 0 AND profile_total_batches",
+            name="pd_profile_build_checkpoint_batch_bounds_check",
+        ),
+        CheckConstraint(
+            "profile_next_batch = 0 "
+            "OR evidence_next_batch = evidence_total_batches",
+            name="pd_profile_build_checkpoint_phase_order_check",
+        ),
+        CheckConstraint(
+            "state = 'failed' "
+            "OR (state = 'building_evidence' AND profile_next_batch = 0) "
+            "OR (state = 'evidence_complete' "
+            "AND evidence_next_batch = evidence_total_batches "
+            "AND profile_next_batch = 0) "
+            "OR (state = 'building_profile' "
+            "AND evidence_next_batch = evidence_total_batches) "
+            "OR (state = 'ready' "
+            "AND evidence_next_batch = evidence_total_batches "
+            "AND profile_next_batch = profile_total_batches)",
+            name="pd_profile_build_checkpoint_state_progress_check",
+        ),
         {
             "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
             "extend_existing": True,
@@ -1526,6 +1567,7 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
     build_id = Column(String(64), nullable=False)
     strategy_version = Column(String(64), nullable=False)
     schema_version = Column(Integer, nullable=False)
+    resume_lineage_hash = Column(String(64), nullable=False)
     owner_run_id = Column(String(64))
     state = Column(String(32), nullable=False)
     profile_as_of = Column(String(10), nullable=False)
@@ -1534,6 +1576,8 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
     dataset_ids = Column(JSON, nullable=False)
     evidence_stage = Column(String(63), nullable=False)
     profile_stage = Column(String(63), nullable=False)
+    evidence_stage_oid = Column(BigInteger, nullable=False)
+    profile_stage_oid = Column(BigInteger, nullable=False)
     evidence_target_oid = Column(BigInteger)
     profile_target_oid = Column(BigInteger)
     has_existing_artifacts = Column(Boolean, nullable=False)

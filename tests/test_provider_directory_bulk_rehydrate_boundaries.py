@@ -166,7 +166,7 @@ def test_boolean_normalization_covers_explicit_and_fallback_values(
     expected,
 ):
     """Respect booleans, common tokens, and legacy truthy fallback values."""
-    assert importer._bool_or_default(raw_value, default) is expected
+    assert importer._is_bool_or_default(raw_value, default) is expected
 
 
 @pytest.mark.parametrize(
@@ -243,7 +243,7 @@ async def test_address_overlay_prerequisites_cover_function_and_table_gates(
     """Fail closed on missing canonical functions or source tables."""
     monkeypatch.setattr(
         importer,
-        "_address_canon_functions_available",
+        "_has_address_canon_functions",
         AsyncMock(return_value=False),
     )
     assert await importer._address_overlay_missing_requirement("mrf") == (
@@ -252,7 +252,7 @@ async def test_address_overlay_prerequisites_cover_function_and_table_gates(
 
     monkeypatch.setattr(
         importer,
-        "_address_canon_functions_available",
+        "_has_address_canon_functions",
         AsyncMock(return_value=True),
     )
     table_exists = AsyncMock(side_effect=[False])

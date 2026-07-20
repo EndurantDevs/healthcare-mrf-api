@@ -1,7 +1,7 @@
 """Add resumable Provider Directory Profile build checkpoints.
 
 Revision ID: 20260720120000_provider_directory_profile_build_checkpoint
-Revises: 20260720100000_provider_directory_bulk_output_resume
+Revises: 20260720110000_uhc_provider_file_catalog
 """
 
 from __future__ import annotations
@@ -12,12 +12,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-from db.migration_adoption import create_table_or_validate
-from db.migration_index_adoption import create_index_if_missing
-
-
 revision = "20260720120000_provider_directory_profile_build_checkpoint"
-down_revision = "20260720100000_provider_directory_bulk_output_resume"
+down_revision = "20260720110000_uhc_provider_file_catalog"
 branch_labels = None
 depends_on = None
 
@@ -29,12 +25,12 @@ def _schema() -> str:
 def upgrade() -> None:
     schema = _schema()
     table = "provider_directory_profile_build_checkpoint"
-    create_table_or_validate(
-        op,
+    op.create_table(
         table,
         sa.Column("build_id", sa.String(64), nullable=False),
         sa.Column("strategy_version", sa.String(64), nullable=False),
         sa.Column("schema_version", sa.Integer(), nullable=False),
+        sa.Column("resume_lineage_hash", sa.String(64), nullable=False),
         sa.Column("owner_run_id", sa.String(64)),
         sa.Column("state", sa.String(32), nullable=False),
         sa.Column("profile_as_of", sa.String(10), nullable=False),
@@ -43,6 +39,8 @@ def upgrade() -> None:
         sa.Column("dataset_ids", postgresql.JSONB(), nullable=False),
         sa.Column("evidence_stage", sa.String(63), nullable=False),
         sa.Column("profile_stage", sa.String(63), nullable=False),
+        sa.Column("evidence_stage_oid", sa.BigInteger(), nullable=False),
+        sa.Column("profile_stage_oid", sa.BigInteger(), nullable=False),
         sa.Column("evidence_target_oid", sa.BigInteger()),
         sa.Column("profile_target_oid", sa.BigInteger()),
         sa.Column("has_existing_artifacts", sa.Boolean(), nullable=False),
@@ -75,17 +73,55 @@ def upgrade() -> None:
         ),
         sa.Column("completed_at", sa.DateTime()),
         sa.PrimaryKeyConstraint("build_id"),
+        sa.CheckConstraint(
+            "resume_lineage_hash ~ '^[0-9a-f]{64}$'",
+            name="pd_profile_build_checkpoint_lineage_hash_check",
+        ),
+        sa.CheckConstraint(
+            "evidence_stage_oid > 0 AND profile_stage_oid > 0 "
+            "AND (evidence_target_oid IS NULL OR evidence_target_oid > 0) "
+            "AND (profile_target_oid IS NULL OR profile_target_oid > 0)",
+            name="pd_profile_build_checkpoint_oid_check",
+        ),
+        sa.CheckConstraint(
+            "state IN ('building_evidence', 'evidence_complete', "
+            "'building_profile', 'ready', 'failed')",
+            name="pd_profile_build_checkpoint_state_check",
+        ),
+        sa.CheckConstraint(
+            "evidence_total_batches >= 0 "
+            "AND evidence_next_batch BETWEEN 0 AND evidence_total_batches "
+            "AND profile_total_batches >= 0 "
+            "AND profile_next_batch BETWEEN 0 AND profile_total_batches",
+            name="pd_profile_build_checkpoint_batch_bounds_check",
+        ),
+        sa.CheckConstraint(
+            "profile_next_batch = 0 "
+            "OR evidence_next_batch = evidence_total_batches",
+            name="pd_profile_build_checkpoint_phase_order_check",
+        ),
+        sa.CheckConstraint(
+            "state = 'failed' "
+            "OR (state = 'building_evidence' AND profile_next_batch = 0) "
+            "OR (state = 'evidence_complete' "
+            "AND evidence_next_batch = evidence_total_batches "
+            "AND profile_next_batch = 0) "
+            "OR (state = 'building_profile' "
+            "AND evidence_next_batch = evidence_total_batches) "
+            "OR (state = 'ready' "
+            "AND evidence_next_batch = evidence_total_batches "
+            "AND profile_next_batch = profile_total_batches)",
+            name="pd_profile_build_checkpoint_state_progress_check",
+        ),
         schema=schema,
     )
-    create_index_if_missing(
-        op,
+    op.create_index(
         "pd_profile_build_checkpoint_state_idx",
         table,
         ["state", "updated_at"],
         schema=schema,
     )
-    create_index_if_missing(
-        op,
+    op.create_index(
         "pd_profile_build_checkpoint_owner_idx",
         table,
         ["owner_run_id"],

@@ -178,7 +178,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260720110000_uhc_provider_file_catalog"
+        "20260720120000_provider_directory_profile_build_checkpoint"
     ]
 
 

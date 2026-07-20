@@ -104,7 +104,7 @@ def test_profile_evidence_sql_supports_bounded_fact_and_role_scopes():
 
 
 def test_profile_evidence_sql_rejects_invalid_bounded_scopes():
-    sql_refs = {
+    sql_refs_by_name = {
         "target_ref": '"fixture"."evidence"',
         "source_ref": '"fixture"."source"',
         "practitioner_ref": '"fixture"."practitioner"',
@@ -121,7 +121,7 @@ def test_profile_evidence_sql_rejects_invalid_bounded_scopes():
     ):
         try:
             profile.profile_evidence_insert_sql(
-                **sql_refs,
+                **sql_refs_by_name,
                 **invalid_args,
             )
         except ValueError:

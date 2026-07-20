@@ -72,7 +72,7 @@ async def test_upsert_rows_empty_location_and_copy_paths(monkeypatch):
     attach_contacts = Mock(return_value=attached_rows)
     monkeypatch.setattr(
         importer,
-        "_location_contact_fields_missing",
+        "_has_missing_location_contact_fields",
         lambda _resource_rows: True,
     )
     monkeypatch.setattr(importer, "_attach_location_contact_fields", attach_contacts)
@@ -99,7 +99,7 @@ async def test_upsert_rows_empty_location_and_copy_paths(monkeypatch):
         "_transaction_session_options",
         lambda _session: {},
     )
-    monkeypatch.setattr(importer, "_copy_upsert_enabled", lambda: True)
+    monkeypatch.setattr(importer, "_is_copy_upsert_enabled", lambda: True)
     monkeypatch.setattr(importer, "_copy_upsert_min_rows", lambda: 1)
     copy_upsert = AsyncMock(return_value=1)
     monkeypatch.setattr(importer, "_copy_upsert_rows", copy_upsert)

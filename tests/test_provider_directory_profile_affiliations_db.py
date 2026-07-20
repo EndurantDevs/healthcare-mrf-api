@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import MetaData
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from db.connection import Database
 from process import provider_directory_profile as profile
@@ -282,7 +282,7 @@ async def _build_bounded_profile_artifacts(
     await database.status(
         profile.profile_table_sql(schema, profile_table, logged=True)
     )
-    evidence_sql_refs = {
+    evidence_sql_refs_by_name = {
         "target_ref": evidence_ref,
         "source_ref": table_ref("provider_directory_source"),
         "practitioner_ref": table_ref("provider_directory_practitioner"),
@@ -298,13 +298,13 @@ async def _build_bounded_profile_artifacts(
         for fact_type in profile.PROFILE_EVIDENCE_FACT_TYPES:
             role_bucket_count = 2 if fact_type == "affiliation" else 1
             for role_bucket in range(role_bucket_count):
-                params = {
+                params_by_name = {
                     "source_ids": [source_id],
                     "dataset_ids": [dataset_id],
                     "profile_as_of": "2026-07-19",
                 }
                 if role_bucket_count > 1:
-                    params.update(
+                    params_by_name.update(
                         {
                             "profile_role_bucket_count": role_bucket_count,
                             "profile_role_bucket": role_bucket,
@@ -312,12 +312,12 @@ async def _build_bounded_profile_artifacts(
                     )
                 await database.status(
                     profile.profile_evidence_insert_sql(
-                        **evidence_sql_refs,
+                        **evidence_sql_refs_by_name,
                         fact_type=fact_type,
                         role_bucket_count=role_bucket_count,
                         role_bucket=role_bucket,
                     ),
-                    **params,
+                    **params_by_name,
                 )
     for npi_start in (1_000_000_000, 2_000_000_000):
         await database.status(
@@ -485,6 +485,118 @@ async def test_bounded_profile_build_matches_monolithic_sql_exactly(monkeypatch)
                             independent_source_count, fact_count, generation_id
                        FROM {baseline_profile_ref})
               ) AS difference;
+            """
+        )
+
+    assert evidence_difference == 0
+    assert profile_difference == 0
+
+
+@pytest.mark.asyncio
+async def test_bounded_build_populates_an_initial_empty_serving_pair(
+    monkeypatch,
+):
+    """Treat an existing empty table pair as a valid incremental baseline."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        monkeypatch.setattr(importer, "db", database)
+        await database.status(
+            profile.profile_evidence_table_sql(
+                schema,
+                profile.PROFILE_EVIDENCE_TABLE,
+                logged=True,
+            )
+        )
+        await database.status(
+            profile.profile_table_sql(
+                schema,
+                profile.PROFILE_TABLE,
+                logged=True,
+            )
+        )
+        build = importer._ProviderDirectoryProfileBuild(
+            schema=schema,
+            generation_id="profile-affiliation-test",
+            source_ids=("profile-source-a", "profile-source-b"),
+            retained_source_ids=("profile-source-a", "profile-source-b"),
+            dataset_ids=("profile-dataset-a", "profile-dataset-b"),
+            profile_as_of="2026-07-19",
+            evidence_stage="profile_evidence_empty_target_stage",
+            profile_stage="profile_empty_target_stage",
+            build_id="profile-empty-target-build",
+            owner_run_id="profile-empty-target-run",
+        )
+        fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+
+        metrics, _stages = (
+            await importer._build_provider_directory_profile_stages(
+                build,
+                fence,
+                fence,
+            )
+        )
+
+        checkpoint_ref = profile.qualified_table(
+            schema,
+            "provider_directory_profile_build_checkpoint",
+        )
+        checkpoint_record = await database.first(
+            f"SELECT has_existing_artifacts, state FROM {checkpoint_ref} "
+            "WHERE build_id = :build_id;",
+            build_id=build.build_id,
+        )
+        assert checkpoint_record is not None
+        assert checkpoint_record.has_existing_artifacts is True
+        assert checkpoint_record.state == "ready"
+        assert metrics["incremental"] is True
+
+        await _build_profile_artifacts(database, schema)
+        baseline_evidence_ref = profile.qualified_table(
+            schema,
+            "profile_evidence",
+        )
+        bounded_evidence_ref = profile.qualified_table(
+            schema,
+            build.evidence_stage,
+        )
+        baseline_profile_ref = profile.qualified_table(schema, "profile")
+        bounded_profile_ref = profile.qualified_table(
+            schema,
+            build.profile_stage,
+        )
+        evidence_difference = await database.scalar(
+            f"""
+            SELECT count(*) FROM (
+                (SELECT * FROM {baseline_evidence_ref}
+                 EXCEPT ALL SELECT * FROM {bounded_evidence_ref})
+                UNION ALL
+                (SELECT * FROM {bounded_evidence_ref}
+                 EXCEPT ALL SELECT * FROM {baseline_evidence_ref})
+            ) AS difference;
+            """
+        )
+        profile_difference = await database.scalar(
+            f"""
+            SELECT count(*) FROM (
+                (SELECT npi, profile_json, evidence_json, source_ids,
+                        endpoint_ids, dataset_ids, source_count,
+                        independent_source_count, fact_count, generation_id
+                   FROM {baseline_profile_ref}
+                 EXCEPT ALL
+                 SELECT npi, profile_json, evidence_json, source_ids,
+                        endpoint_ids, dataset_ids, source_count,
+                        independent_source_count, fact_count, generation_id
+                   FROM {bounded_profile_ref})
+                UNION ALL
+                (SELECT npi, profile_json, evidence_json, source_ids,
+                        endpoint_ids, dataset_ids, source_count,
+                        independent_source_count, fact_count, generation_id
+                   FROM {bounded_profile_ref}
+                 EXCEPT ALL
+                 SELECT npi, profile_json, evidence_json, source_ids,
+                        endpoint_ids, dataset_ids, source_count,
+                        independent_source_count, fact_count, generation_id
+                   FROM {baseline_profile_ref})
+            ) AS difference;
             """
         )
 
@@ -721,6 +833,165 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
             compact_checkpoint.evidence_total_batches - 6
         )
 
+        evidence_population = (
+            importer._populate_provider_directory_profile_evidence_stage
+        )
+        compact_population = (
+            importer._populate_provider_directory_profile_compact_stage
+        )
+        mark_checkpoint_failed = (
+            importer._mark_profile_build_checkpoint_failed
+        )
+
+        async def stage_oids() -> tuple[int, int]:
+            relation_oids: list[int] = []
+            for stage_table in (
+                build.evidence_stage,
+                build.profile_stage,
+            ):
+                relation_oids.append(
+                    int(
+                        await database.scalar(
+                            "SELECT to_regclass(:relation_name)::oid;",
+                            relation_name=f"{schema}.{stage_table}",
+                        )
+                        or 0
+                    )
+                )
+            return relation_oids[0], relation_oids[1]
+
+        stage_oids_before_interrupt = await stage_oids()
+        evidence_reopen_attempts: list[None] = []
+
+        async def reject_evidence_reopen(*_args: Any, **_params: Any):
+            evidence_reopen_attempts.append(None)
+            raise AssertionError("completed evidence phase was reopened")
+
+        async def interrupt_before_next_compact_batch(
+            *_args: Any,
+            **_params: Any,
+        ):
+            raise RuntimeError("hard stop before next compact batch")
+
+        async def preserve_hard_stop_state(
+            *_args: Any,
+            **_params: Any,
+        ) -> None:
+            return None
+
+        monkeypatch.setattr(
+            importer,
+            "_populate_provider_directory_profile_evidence_stage",
+            reject_evidence_reopen,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_populate_provider_directory_profile_compact_stage",
+            interrupt_before_next_compact_batch,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_mark_profile_build_checkpoint_failed",
+            preserve_hard_stop_state,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="hard stop before next compact batch",
+        ):
+            await importer._build_provider_directory_profile_stages(
+                replace(
+                    resumed_build,
+                    owner_run_id="profile-run-boundary-stop",
+                ),
+                fence,
+                fence,
+            )
+        assert evidence_reopen_attempts == []
+        boundary_checkpoint = await database.first(
+            f"SELECT state, evidence_next_batch, evidence_total_batches, "
+            f"profile_next_batch FROM {checkpoint_ref} "
+            f"WHERE build_id = :build_id;",
+            build_id=build.build_id,
+        )
+        assert boundary_checkpoint is not None
+        assert boundary_checkpoint.state == "building_profile"
+        assert (
+            boundary_checkpoint.evidence_next_batch
+            == boundary_checkpoint.evidence_total_batches
+        )
+        assert boundary_checkpoint.profile_next_batch == 120
+        assert await stage_oids() == stage_oids_before_interrupt
+        monkeypatch.setattr(
+            importer,
+            "_populate_provider_directory_profile_evidence_stage",
+            evidence_population,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_populate_provider_directory_profile_compact_stage",
+            compact_population,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_mark_profile_build_checkpoint_failed",
+            mark_checkpoint_failed,
+        )
+
+        last_batch_evidence_statements: list[str] = []
+        last_batch_profile_statements: list[str] = []
+        profile_index_interruptions: list[None] = []
+
+        async def last_batch_status(sql: Any, **params: Any):
+            if (
+                f'INSERT INTO "{schema}"."{build.evidence_stage}"' in str(sql)
+                and "ON CONFLICT (evidence_key) DO NOTHING" in str(sql)
+            ):
+                last_batch_evidence_statements.append(str(sql))
+            if (
+                f'INSERT INTO "{schema}"."{build.profile_stage}"' in str(sql)
+                and "ON CONFLICT (npi) DO NOTHING" in str(sql)
+            ):
+                last_batch_profile_statements.append(str(sql))
+            if (
+                "CREATE INDEX IF NOT EXISTS" in str(sql)
+                and f'"{build.profile_stage}_generation_idx"' in str(sql)
+                and not profile_index_interruptions
+            ):
+                profile_index_interruptions.append(None)
+                raise RuntimeError("forced profile index interruption")
+            return await original_status(sql, **params)
+
+        monkeypatch.setattr(database, "status", last_batch_status)
+        with pytest.raises(
+            RuntimeError,
+            match="forced profile index interruption",
+        ):
+            await importer._build_provider_directory_profile_stages(
+                replace(
+                    resumed_build,
+                    owner_run_id="profile-run-last-batch",
+                ),
+                fence,
+                fence,
+            )
+        last_batch_checkpoint = await database.first(
+            f"SELECT state, evidence_next_batch, evidence_total_batches, "
+            f"profile_next_batch, profile_total_batches "
+            f"FROM {checkpoint_ref} WHERE build_id = :build_id;",
+            build_id=build.build_id,
+        )
+        assert last_batch_checkpoint is not None
+        assert last_batch_evidence_statements == []
+        assert len(last_batch_profile_statements) == (
+            last_batch_checkpoint.profile_total_batches - 120
+        )
+        assert last_batch_checkpoint.state == "failed"
+        assert (
+            last_batch_checkpoint.profile_next_batch
+            == last_batch_checkpoint.profile_total_batches
+        )
+        assert await stage_oids() == stage_oids_before_interrupt
+
         final_evidence_statements: list[str] = []
         final_profile_statements: list[str] = []
 
@@ -751,9 +1022,7 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
         )
         assert completed_checkpoint is not None
         assert final_evidence_statements == []
-        assert len(final_profile_statements) == (
-            completed_checkpoint.profile_total_batches - 120
-        )
+        assert final_profile_statements == []
         assert completed_checkpoint.state == "ready"
         assert (
             completed_checkpoint.evidence_next_batch
@@ -873,7 +1142,7 @@ async def test_profile_build_reaps_failed_stages_after_lineage_changes(
             evidence_build_fence=fence,
             profile_build_fence=fence,
         )
-        await importer._mark_provider_directory_profile_build_checkpoint_failed(
+        await importer._mark_profile_build_checkpoint_failed(
             stale_build,
             RuntimeError("forced stale failure"),
         )
@@ -883,19 +1152,39 @@ async def test_profile_build_reaps_failed_stages_after_lineage_changes(
             evidence_build_fence=fence,
             profile_build_fence=fence,
         )
+        checkpoint_ref = profile.qualified_table(
+            schema,
+            "provider_directory_profile_build_checkpoint",
+        )
+        with pytest.raises(
+            IntegrityError,
+            match="pd_profile_build_checkpoint_phase_order_check",
+        ):
+            await database.status(
+                f"UPDATE {checkpoint_ref} SET profile_next_batch = 1 "
+                "WHERE build_id = :build_id;",
+                build_id=current_build_id,
+            )
+        with pytest.raises(
+            IntegrityError,
+            match="pd_profile_build_checkpoint_state_progress_check",
+        ):
+            await database.status(
+                f"UPDATE {checkpoint_ref} "
+                "SET evidence_next_batch = evidence_total_batches, "
+                "profile_next_batch = 1, state = 'evidence_complete' "
+                "WHERE build_id = :build_id;",
+                build_id=current_build_id,
+            )
 
         assert await importer._reap_stale_provider_directory_profile_builds(
             schema,
             current_build_id=current_build_id,
         ) == 1
 
-        checkpoint_ref = profile.qualified_table(
-            schema,
-            "provider_directory_profile_build_checkpoint",
-        )
         remaining_build_ids = {
-            row.build_id
-            for row in await database.all(
+            checkpoint_record.build_id
+            for checkpoint_record in await database.all(
                 f"SELECT build_id FROM {checkpoint_ref};"
             )
         }

@@ -29,6 +29,41 @@ PROFILE_SOURCE_CLASSIFICATIONS = {
 }
 
 
+def _profile_source_scope(
+    *,
+    plan_name: str | None = "Example Plan",
+):
+    """Return one exact source scope for Profile build-resolution tests."""
+    return (
+        ["source_a"],
+        ["source_a"],
+        (
+            importer._ProviderDirectoryProfileSourceContext(
+                source_id="source_a",
+                canonical_api_base="https://example.test/fhir",
+                org_name="Example",
+                plan_name=plan_name,
+            ),
+        ),
+    )
+
+
+def _patch_fresh_profile_stage_identity(monkeypatch) -> None:
+    """Install deterministic physical identities for a mocked fresh build."""
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_relation_identity",
+        AsyncMock(
+            side_effect=[None, None, (21, "r", "p"), (22, "r", "p")]
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_assert_provider_directory_profile_checkpoint_ready",
+        AsyncMock(),
+    )
+
+
 @pytest.mark.asyncio
 async def test_profile_build_identity_resumes_original_as_of_across_days(
     monkeypatch,
@@ -50,7 +85,7 @@ async def test_profile_build_identity_resumes_original_as_of_across_days(
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_scope_source_ids",
-        AsyncMock(return_value=(["source_a"], ["source_a"])),
+        AsyncMock(return_value=_profile_source_scope()),
     )
     checkpoint = AsyncMock(return_value=None)
     monkeypatch.setattr(importer.db, "first", checkpoint)
@@ -71,20 +106,25 @@ async def test_profile_build_identity_resumes_original_as_of_across_days(
         "build_id": initial_build.build_id,
         "strategy_version": profile.PROFILE_BUILD_STRATEGY_VERSION,
         "schema_version": profile.PROFILE_SCHEMA_VERSION,
+        "resume_lineage_hash": initial_build.resume_lineage_hash,
         "profile_as_of": "2026-07-19",
         "source_ids": ["source_a"],
         "retained_source_ids": ["source_a"],
         "dataset_ids": ["dataset_a"],
         "evidence_stage": initial_build.evidence_stage,
         "profile_stage": initial_build.profile_stage,
+        "evidence_stage_oid": 21,
+        "profile_stage_oid": 22,
         "evidence_target_oid": 11,
         "profile_target_oid": 12,
     }
-    relation_attribute = AsyncMock(side_effect=["p", "p"])
+    stage_identity = AsyncMock(
+        side_effect=[(21, "r", "p"), (22, "r", "p")]
+    )
     monkeypatch.setattr(
         importer,
-        "_provider_directory_relation_attribute",
-        relation_attribute,
+        "_provider_directory_profile_stage_relation_identity",
+        stage_identity,
     )
     monkeypatch.setattr(
         importer,
@@ -103,7 +143,7 @@ async def test_profile_build_identity_resumes_original_as_of_across_days(
     assert resumed_build.build_id == initial_build.build_id
     assert resumed_build.profile_as_of == "2026-07-19"
     assert resumed_build.owner_run_id == "run-retry"
-    assert relation_attribute.await_count == 2
+    assert stage_identity.await_count == 2
 
 
 def test_profile_source_spec_matches_all_reviewed_acquisition_entries():
@@ -345,8 +385,18 @@ async def test_profile_scope_filters_to_current_immutable_dataset_fence(
         captured_by_name["sql"] = sql
         captured_by_name["params"] = params
         return [
-            {"source_id": "source_allowed"},
-            {"source_id": "source_outside_fence"},
+            {
+                "source_id": "source_allowed",
+                "canonical_api_base": "https://allowed.test/fhir",
+                "org_name": "Allowed",
+                "plan_name": "Allowed Plan",
+            },
+            {
+                "source_id": "source_outside_fence",
+                "canonical_api_base": "https://outside.test/fhir",
+                "org_name": "Outside",
+                "plan_name": None,
+            },
         ]
 
     monkeypatch.setattr(
@@ -356,7 +406,7 @@ async def test_profile_scope_filters_to_current_immutable_dataset_fence(
     )
     monkeypatch.setattr(importer.db, "all", fake_all)
 
-    source_ids, retained_source_ids = (
+    source_ids, retained_source_ids, source_contexts = (
         await importer._provider_directory_profile_scope_source_ids(
             "mrf",
             {"source_allowed"},
@@ -368,6 +418,14 @@ async def test_profile_scope_filters_to_current_immutable_dataset_fence(
         "source_allowed",
         "source_outside_fence",
     ]
+    assert source_contexts == (
+        importer._ProviderDirectoryProfileSourceContext(
+            source_id="source_allowed",
+            canonical_api_base="https://allowed.test/fhir",
+            org_name="Allowed",
+            plan_name="Allowed Plan",
+        ),
+    )
     assert captured_by_name["params"]["configured_source_ids"] == [
         "source_allowed",
         "source_outside_fence",
@@ -379,6 +437,7 @@ async def test_profile_scope_filters_to_current_immutable_dataset_fence(
 async def test_profile_stage_build_creates_logged_tables_without_rewrite(
     monkeypatch,
 ):
+    """Create logged stages directly and never rewrite their persistence."""
     status = AsyncMock(return_value=1)
     scalar_queries = []
 
@@ -394,6 +453,7 @@ async def test_profile_stage_build_creates_logged_tables_without_rewrite(
     monkeypatch.setattr(importer.db, "scalar", scalar)
     monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
     monkeypatch.setattr(importer.db, "transaction", transaction)
+    _patch_fresh_profile_stage_identity(monkeypatch)
     monkeypatch.setattr(
         importer,
         "_table_exists",
@@ -468,6 +528,7 @@ def test_artifact_bundle_collects_profile_and_evidence_stages_together():
 async def test_profile_stages_are_logged_at_creation_without_set_logged(
     monkeypatch,
 ):
+    """Create durable stages directly instead of rewriting them after hours."""
     build = importer._ProviderDirectoryProfileBuild(
         schema="mrf",
         generation_id="generation_1",
@@ -492,6 +553,7 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
     monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=0))
     monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
     monkeypatch.setattr(importer.db, "transaction", transaction)
+    _patch_fresh_profile_stage_identity(monkeypatch)
     monkeypatch.setattr(
         importer,
         "_has_provider_directory_profile_artifacts",
@@ -533,6 +595,7 @@ async def test_profile_evidence_population_batches_source_fact_and_affiliation(
     monkeypatch,
     caplog,
 ):
+    """Expose source, fact, bucket, row, and elapsed progress per batch."""
     status = AsyncMock(return_value=1)
     create_indexes = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
@@ -585,7 +648,7 @@ async def test_profile_evidence_population_batches_source_fact_and_affiliation(
         for call in affiliation_calls
         if call.kwargs["source_ids"] == ["source_a"]
     } == set(range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS))
-    log_messages = [record.getMessage() for record in caplog.records]
+    log_messages = [log_record.getMessage() for log_record in caplog.records]
     assert any(
         "source_id=source_a fact_type=name role_bucket=1/1" in message
         for message in log_messages
@@ -650,7 +713,7 @@ async def test_profile_compact_population_batches_npi_ranges(
         (2_000_000_000, 2_500_000_000),
         (2_500_000_000, 3_000_000_000),
     ]
-    log_messages = [record.getMessage() for record in caplog.records]
+    log_messages = [log_record.getMessage() for log_record in caplog.records]
     assert any(
         "npi_start=1000000000 npi_end=1500000000" in message
         for message in log_messages
@@ -697,7 +760,7 @@ async def test_profile_population_failure_is_retained_in_checkpoint(
     )
     monkeypatch.setattr(
         importer,
-        "_mark_provider_directory_profile_build_checkpoint_failed",
+        "_mark_profile_build_checkpoint_failed",
         mark_failed,
     )
     build = importer._ProviderDirectoryProfileBuild(
@@ -724,7 +787,79 @@ async def test_profile_population_failure_is_retained_in_checkpoint(
 
 
 @pytest.mark.asyncio
+async def test_profile_resume_does_not_reopen_completed_evidence_phase(
+    monkeypatch,
+):
+    """Start the next compact batch without rewriting phase state first."""
+    build = importer._ProviderDirectoryProfileBuild(
+        schema="mrf",
+        generation_id="generation",
+        source_ids=("source_a",),
+        retained_source_ids=("source_a",),
+        dataset_ids=("dataset_a",),
+        profile_as_of="2026-07-19",
+        evidence_stage="evidence_stage",
+        profile_stage="profile_stage",
+    )
+    checkpoint_state = importer._ProviderDirectoryProfileBuildCheckpointState(
+        evidence_next_batch=52,
+        evidence_total_batches=52,
+        profile_next_batch=120,
+        profile_total_batches=400,
+        state="building_profile",
+    )
+    evidence_population = AsyncMock(
+        side_effect=AssertionError("completed evidence phase was reopened")
+    )
+    compact_population = AsyncMock(
+        side_effect=RuntimeError("hard stop before next compact batch")
+    )
+    mark_failed = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_has_provider_directory_profile_artifacts",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_claim_provider_directory_profile_build_checkpoint",
+        AsyncMock(return_value=checkpoint_state),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_populate_provider_directory_profile_evidence_stage",
+        evidence_population,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_populate_provider_directory_profile_compact_stage",
+        compact_population,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_mark_profile_build_checkpoint_failed",
+        mark_failed,
+    )
+    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+
+    with pytest.raises(
+        RuntimeError,
+        match="hard stop before next compact batch",
+    ):
+        await importer._build_provider_directory_profile_stages(
+            build,
+            fence,
+            fence,
+        )
+
+    evidence_population.assert_not_awaited()
+    assert compact_population.await_args.kwargs["start_batch"] == 120
+    mark_failed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_profile_publish_refuses_a_partial_artifact_pair(monkeypatch):
+    """Reject publication when only one serving relation exists."""
     dataset = importer.ProviderDirectoryArtifactDataset(
         source_id="source_a",
         endpoint_id="endpoint_a",
@@ -742,7 +877,7 @@ async def test_profile_publish_refuses_a_partial_artifact_pair(monkeypatch):
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_scope_source_ids",
-        AsyncMock(return_value=(["source_a"], ["source_a"])),
+        AsyncMock(return_value=_profile_source_scope(plan_name=None)),
     )
     monkeypatch.setattr(
         importer,
