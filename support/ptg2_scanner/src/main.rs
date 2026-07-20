@@ -54,6 +54,7 @@ use ptg2_scanner::shared_graph::{
     convert_shared_provider_graph, MembershipArtifactDescriptor, MembershipMetadata,
     SharedGraphShardDescriptor,
 };
+use ptg2_scanner::uhc_retained::run_uhc_retain_cli;
 use ptg2_scanner::v3_dense::{DenseIdentityMap, DenseIdentityValue};
 use ptg2_scanner::v3_runs::{
     external_sort_provider_code_pairs, external_sort_provider_identities, parse_coverage_scope_id,
@@ -31447,6 +31448,9 @@ fn main() -> io::Result<()> {
             )
         })?;
         return scan_compact(Path::new(&compact_path));
+    }
+    if first_arg == "--uhc-retain" {
+        return run_uhc_retain_cli(&args.collect::<Vec<_>>());
     }
     if first_arg == "--finalize-v3-runs" {
         return run_v3_finalizer(&args.collect::<Vec<_>>());

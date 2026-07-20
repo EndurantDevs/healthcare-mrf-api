@@ -250,6 +250,7 @@ dependencies = [
  "crossbeam-channel",
  "flate2",
  "itoa",
+ "libc",
  "memchr",
  "memmap2",
  "pyo3",

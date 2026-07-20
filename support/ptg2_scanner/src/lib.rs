@@ -12,6 +12,7 @@ pub mod normalize;
 pub mod output;
 pub mod progress;
 pub mod shared_graph;
+pub mod uhc_retained;
 pub mod v3_dense;
 pub mod v3_runs;
 
