@@ -806,6 +806,43 @@ async def test_real_postgres_selective_copy_stages_each_new_hash_once(
 
 
 @pytest.mark.asyncio
+async def test_real_postgres_shared_block_existence_lateral_batches_are_exact(
+    monkeypatch,
+):
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        stored_count = ptg2_shared_publish._SHARED_BLOCK_EXISTENCE_BATCH_ROWS
+        requested_hashes = {
+            index.to_bytes(32, "big") for index in range(stored_count + 1)
+        }
+        await db.status(
+            f"""
+            INSERT INTO {quoted_schema}.ptg2_v3_block
+                (block_hash, format_version, object_kind, codec, entry_count,
+                 raw_byte_count, stored_byte_count, payload, created_at)
+            SELECT decode(lpad(to_hex(value), 64, '0'), 'hex'),
+                   2, 'serving', 'none', 0, 0, 0, ''::bytea, now()
+              FROM generate_series(0, :maximum_value) AS value
+            """,
+            maximum_value=stored_count - 1,
+        )
+
+        existing_hashes = await ptg2_shared_publish._existing_shared_block_hashes(
+            schema_name=schema_name,
+            requested_hashes=requested_hashes,
+        )
+
+        assert existing_hashes == {
+            index.to_bytes(32, "big") for index in range(stored_count)
+        }
+
+
+@pytest.mark.asyncio
 async def test_real_postgres_selective_copy_rejects_same_copy_metadata_conflict(
     tmp_path,
     monkeypatch,

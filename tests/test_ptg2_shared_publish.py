@@ -587,6 +587,40 @@ async def test_shared_block_existence_query_rejects_unrequested_hash(monkeypatch
         )
 
 
+@pytest.mark.asyncio
+async def test_shared_block_existence_query_uses_exact_lateral_batches(monkeypatch):
+    batch_rows = ptg2_shared_publish._SHARED_BLOCK_EXISTENCE_BATCH_ROWS
+    requested_hashes = {
+        index.to_bytes(32, "big") for index in range(batch_rows + 1)
+    }
+    observed_batches = []
+    observed_statements = []
+
+    async def return_requested_hashes(statement, *, block_hashes):
+        observed_statements.append(str(statement))
+        observed_batches.append(tuple(block_hashes))
+        return [(block_hash,) for block_hash in block_hashes]
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "all", return_requested_hashes)
+
+    existing_hashes = await ptg2_shared_publish._existing_shared_block_hashes(
+        schema_name="mrf",
+        requested_hashes=requested_hashes,
+    )
+
+    assert existing_hashes == requested_hashes
+    assert list(map(len, observed_batches)) == [batch_rows, 1]
+    assert len(set().union(*map(set, observed_batches))) == sum(
+        map(len, observed_batches)
+    )
+    assert all("CROSS JOIN LATERAL" in statement for statement in observed_statements)
+    assert all(
+        "candidate.block_hash = requested.block_hash" in statement
+        for statement in observed_statements
+    )
+    assert all("LIMIT 1" in statement for statement in observed_statements)
+
+
 def _copy_connection(copy_to_table=None):
     driver = object() if copy_to_table is None else SimpleNamespace(
         copy_to_table=copy_to_table
