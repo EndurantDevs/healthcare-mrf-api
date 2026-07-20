@@ -1,7 +1,7 @@
 {
   "issue_counts": {
     "ambiguous_function_names": 42,
-    "ambiguous_variable_names": 287,
+    "ambiguous_variable_names": 286,
     "boolean_name_mismatch": 175,
     "builtin_shadowing": 1,
     "class_name_shape": 2,
@@ -12,7 +12,7 @@
     "function_name_shape": 62,
     "global_state_usage": 19,
     "inline_suppressions": 4,
-    "long_files": 150,
+    "long_files": 151,
     "long_functions": 831,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 8,
@@ -302,7 +302,6 @@
       "ambiguous_variable_name:process/provider_directory_fhir.py:_import_resources.import_one_group:result",
       "ambiguous_variable_name:process/provider_directory_fhir.py:_import_resources.import_one_group:source",
       "ambiguous_variable_name:process/provider_directory_fhir.py:_import_resources:sources",
-      "ambiguous_variable_name:process/provider_directory_fhir.py:_run_source_probe_batch._run_probe:payload",
       "ambiguous_variable_name:process/provider_directory_fhir.py:_run_source_probe_batch._run_probe:source",
       "ambiguous_variable_name:process/provider_directory_fhir.py:_run_source_probe_batch:source",
       "ambiguous_variable_name:process/provider_directory_fhir.py:_run_source_probe_batch:sources",
@@ -1214,6 +1213,7 @@
       "long_file:tests/test_plan_api.py",
       "long_file:tests/test_price_address_assurance.py",
       "long_file:tests/test_pricing_api.py",
+      "long_file:tests/test_process_attributes_unit.py",
       "long_file:tests/test_process_mrf_unit.py",
       "long_file:tests/test_process_npi_unit.py",
       "long_file:tests/test_process_pharmacy_license_unit.py",

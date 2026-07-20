@@ -20058,7 +20058,7 @@ async def _run_source_probe_batch(
             started = time.monotonic()
             hard_timeout = _source_probe_hard_timeout_seconds(source, timeout=timeout)
             try:
-                probe, payload = await asyncio.wait_for(
+                probe, capability_payload = await asyncio.wait_for(
                     _probe_source(source, timeout=timeout, run_id=run_id),
                     timeout=hard_timeout,
                 )
@@ -20073,7 +20073,7 @@ async def _run_source_probe_batch(
                     "run_id": run_id,
                     "credential": None,
                 }
-                payload = None
+                capability_payload = None
             now = _now()
             update = {
                 "source_id": source["source_id"],
@@ -20116,9 +20116,17 @@ async def _run_source_probe_batch(
                 source["endpoint_id"] = endpoint_row["endpoint_id"]
                 update["endpoint_id"] = endpoint_row["endpoint_id"]
                 endpoint_rows.append(endpoint_row)
-            if payload and payload.get("resourceType") == "CapabilityStatement":
-                capability_rows.append(parse_capability(source, payload, probe))
-                update["fhir_version"] = _clean_text(payload.get("fhirVersion")) or update.get("fhir_version")
+            if (
+                capability_payload
+                and capability_payload.get("resourceType")
+                == "CapabilityStatement"
+            ):
+                capability_rows.append(
+                    parse_capability(source, capability_payload, probe)
+                )
+                update["fhir_version"] = _clean_text(
+                    capability_payload.get("fhirVersion")
+                ) or update.get("fhir_version")
                 if probe["status"] == "valid":
                     probe_counts_by_name["valid"] += 1
                     valid_source_ids.add(source["source_id"])
