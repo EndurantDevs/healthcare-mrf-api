@@ -5057,7 +5057,7 @@ _ALLOWED_AMOUNT_CURRENT_SNAPSHOT_SQL = f"""
             OR COALESCE(plan_coverage.plan_market_type, '') = :market_type
        )
      WHERE snapshot.status = 'published'
-       AND jsonb_typeof(allowed_index) = 'object'
+       AND json_typeof(allowed_index) = 'object'
        AND allowed_index->>'contract' = :allowed_contract
        AND allowed_index->>'arch_version' = 'postgres_binary_v3'
        AND allowed_index->>'storage' = 'postgresql'
