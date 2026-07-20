@@ -54,11 +54,17 @@ async def main():
     async with db.engine.begin() as connection:
         def seed(sync_connection):
             models_by_table = _model_by_table_fullname()
+            future_strict_tables = {
+                "provider_directory_profile_build_checkpoint",
+            }
             target_tables = [
                 table
                 for table in Base.metadata.sorted_tables
-                if table.name == "import_run"
-                or table.name.startswith("provider_directory_")
+                if (
+                    table.name == "import_run"
+                    or table.name.startswith("provider_directory_")
+                )
+                and table.name not in future_strict_tables
             ]
             for table in target_tables:
                 inspector = inspect(sync_connection)
