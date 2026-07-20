@@ -31,6 +31,7 @@ from api.ptg2_candidate_audit_projection import (
     candidate_availability_index,
 )
 from api.ptg2_candidate_audit_selection import (
+    load_candidate_provider_indexes as _load_candidate_provider_indexes,
     required_candidate_occurrence_keys as _required_candidate_occurrence_keys,
 )
 from api.ptg2_serving import (
@@ -95,7 +96,7 @@ class _CandidateScopeIndexes:
     """Code, provider, and network indexes shared by both audit populations."""
 
     code_index: CandidateCodeIndex
-    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]]
+    provider_sets_by_npi_code: Mapping[tuple[int, int], tuple[int, ...]]
     provider_filters_by_code_key: Mapping[int, tuple[int, ...]]
     network_digests_by_key: Mapping[int, frozenset[str]]
 
@@ -156,32 +157,6 @@ async def _provider_set_keys_by_npi(
             )
         )
         for npi in npis
-    }
-
-
-def _provider_filters_by_code_key(
-    challenges: Sequence[AuditBatchChallenge],
-    code_index: CandidateCodeIndex,
-    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
-    persisted_audit_occurrences: Sequence[PersistedAuditOccurrence] = (),
-) -> dict[int, tuple[int, ...]]:
-    provider_keys_by_code_key: dict[int, set[int]] = {}
-    for challenge in challenges:
-        code_pair = (challenge.code_system, challenge.code)
-        provider_set_keys = provider_set_keys_by_npi.get(challenge.npi, ())
-        for code_record in code_index.by_pair[code_pair]:
-            code_key = int(code_record["code_key"])
-            provider_keys_by_code_key.setdefault(code_key, set()).update(
-                provider_set_keys
-            )
-    for occurrence in persisted_audit_occurrences:
-        provider_keys_by_code_key.setdefault(occurrence.code_key, set()).add(
-            occurrence.provider_set_key
-        )
-    return {
-        code_key: tuple(sorted(provider_set_keys))
-        for code_key, provider_set_keys in provider_keys_by_code_key.items()
-        if provider_set_keys
     }
 
 
@@ -272,7 +247,7 @@ async def _candidate_audit_data(
         serving_tables,
         challenges,
         scope_indexes.code_index.by_pair,
-        scope_indexes.provider_set_keys_by_npi,
+        scope_indexes.provider_sets_by_npi_code,
         scope_indexes.provider_filters_by_code_key,
         persisted_audit_occurrences,
     )
@@ -283,7 +258,7 @@ async def _candidate_audit_data(
     availability_index, processing_ledger = candidate_availability_index(
         challenges,
         scope_indexes.code_index.by_pair,
-        scope_indexes.provider_set_keys_by_npi,
+        scope_indexes.provider_sets_by_npi_code,
         scope_indexes.network_digests_by_key,
         price_load.data,
     )
@@ -326,11 +301,16 @@ async def _candidate_scope_indexes(
         code_index,
         provider_set_keys_by_npi,
     )
-    provider_filters = _provider_filters_by_code_key(
-        challenges,
-        code_index,
-        provider_set_keys_by_npi,
-        persisted_audit_occurrences,
+    provider_sets_by_npi_code, provider_filters = (
+        await _load_candidate_provider_indexes(
+            session,
+            _required_shared_snapshot_key(serving_tables),
+            challenges,
+            code_index,
+            provider_set_keys_by_npi,
+            persisted_audit_occurrences,
+            schema_name=PTG2_SCHEMA,
+        )
     )
     network_digests_by_key = await _provider_network_digests_by_key(
         session,
@@ -339,12 +319,10 @@ async def _candidate_scope_indexes(
     )
     return _CandidateScopeIndexes(
         code_index=code_index,
-        provider_set_keys_by_npi=provider_set_keys_by_npi,
+        provider_sets_by_npi_code=provider_sets_by_npi_code,
         provider_filters_by_code_key=provider_filters,
         network_digests_by_key=network_digests_by_key,
     )
-
-
 async def _provider_network_digests_by_key(
     session: Any,
     serving_tables: PTG2ServingTables,
@@ -371,7 +349,7 @@ async def _load_candidate_price_data(
     serving_tables: PTG2ServingTables,
     challenges: Sequence[AuditBatchChallenge],
     code_records_by_pair: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]],
-    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
+    provider_sets_by_npi_code: Mapping[tuple[int, int], tuple[int, ...]],
     provider_filters_by_code_key: Mapping[int, tuple[int, ...]],
     persisted_audit_occurrences: Sequence[PersistedAuditOccurrence] = (),
 ) -> _CandidatePriceLoad:
@@ -380,7 +358,7 @@ async def _load_candidate_price_data(
     required_occurrence_keys = _required_candidate_occurrence_keys(
         challenges,
         code_records_by_pair,
-        provider_set_keys_by_npi,
+        provider_sets_by_npi_code,
         persisted_audit_occurrences,
     )
     price_keys_by_occurrence = await _candidate_forward_price_keys(

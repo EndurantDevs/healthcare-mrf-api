@@ -141,7 +141,7 @@ def _record_coordinate_availability(
     state: _CandidateAvailabilityState,
     coordinate: _CandidateCoordinate,
     code_records_by_pair: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]],
-    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
+    provider_sets_by_npi_code: Mapping[tuple[int, int], tuple[int, ...]],
     network_digests_by_provider_set_key: Mapping[int, frozenset[str]],
     price_data: CandidatePriceData,
 ) -> None:
@@ -149,12 +149,18 @@ def _record_coordinate_availability(
     query = source_audit.QueryKey(code_system, code, npi)
     for code_record in code_records_by_pair[(code_system, code)]:
         code_key = int(code_record["code_key"])
-        for provider_set_key in provider_set_keys_by_npi.get(npi, ()):
+        for provider_set_key in provider_sets_by_npi_code.get(
+            (npi, code_key),
+            (),
+        ):
             occurrence_key = (code_key, provider_set_key, source_artifact_key)
+            price_keys = price_data.price_keys_by_occurrence.get(occurrence_key, ())
+            if not price_keys:
+                continue
             provider_network_digests = network_digests_by_provider_set_key[
                 provider_set_key
             ]
-            for price_key in price_data.price_keys_by_occurrence.get(occurrence_key, ()):
+            for price_key in price_keys:
                 for price_payload in price_data.prices_by_key.get(price_key, ()):
                     state.add_projection(
                         query=query,
@@ -169,7 +175,7 @@ def _record_coordinate_availability(
 def candidate_availability_index(
     challenges: Sequence[AuditBatchChallenge],
     code_records_by_pair: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]],
-    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
+    provider_sets_by_npi_code: Mapping[tuple[int, int], tuple[int, ...]],
     network_digests_by_provider_set_key: Mapping[int, frozenset[str]],
     price_data: CandidatePriceData,
 ) -> tuple[dict[_CandidateConditionKey, tuple[frozenset[str], ...]], dict[str, int]]:
@@ -181,7 +187,7 @@ def candidate_availability_index(
             state,
             coordinate,
             code_records_by_pair,
-            provider_set_keys_by_npi,
+            provider_sets_by_npi_code,
             network_digests_by_provider_set_key,
             price_data,
         )

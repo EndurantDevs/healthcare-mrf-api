@@ -7,6 +7,7 @@ import pytest
 
 from api import ptg2_candidate_audit_batch as batch
 from api import ptg2_candidate_audit_codes as codes
+from api import ptg2_candidate_audit_selection as selection
 from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
 from api.ptg2_candidate_audit_integrity import (
     CandidateWitnessScope,
@@ -148,16 +149,26 @@ async def test_candidate_scope_indexes_resolve_each_coordinate_family_once(
         by_key={7: {"code_key": 7}, 8: {"code_key": 8}},
     )
     code_lookup = AsyncMock(return_value=code_index)
-    provider_lookup = AsyncMock(return_value={challenge.npi: (5,), persisted.npi: (7,)})
-    graph_validator = Mock()
-    provider_filter = Mock(return_value={7: (5,), 8: (7,)})
-    network_lookup = AsyncMock(
-        return_value={5: frozenset({"a"}), 7: frozenset({"b"})}
+    provider_lookup = AsyncMock(
+        return_value={challenge.npi: (5, 6), persisted.npi: (7, 8, 9)}
     )
+    graph_validator = Mock()
+    provider_code_lookup = AsyncMock(
+        return_value={
+            5: frozenset((7,)),
+            6: frozenset((9,)),
+            7: frozenset((8,)),
+        }
+    )
+    network_lookup = AsyncMock(return_value={5: frozenset({"a"}), 7: frozenset({"b"})})
     monkeypatch.setattr(batch, "candidate_code_records_by_pair", code_lookup)
     monkeypatch.setattr(batch, "_provider_set_keys_by_npi", provider_lookup)
     monkeypatch.setattr(batch, "validate_persisted_audit_graph_scope", graph_validator)
-    monkeypatch.setattr(batch, "_provider_filters_by_code_key", provider_filter)
+    monkeypatch.setattr(
+        selection,
+        "load_candidate_provider_code_sets",
+        provider_code_lookup,
+    )
     monkeypatch.setattr(batch, "_provider_network_digests_by_key", network_lookup)
 
     indexes = await batch._candidate_scope_indexes(
@@ -169,9 +180,16 @@ async def test_candidate_scope_indexes_resolve_each_coordinate_family_once(
     )
 
     assert indexes.code_index is code_index
+    assert indexes.provider_sets_by_npi_code == {
+        (challenge.npi, 7): (5,),
+        (persisted.npi, 8): (7,),
+    }
     assert indexes.provider_filters_by_code_key == {7: (5,), 8: (7,)}
     graph_validator.assert_called_once()
+    provider_code_lookup.assert_awaited_once()
+    assert provider_code_lookup.await_args.args[2] == {5, 6, 7}
     network_lookup.assert_awaited_once()
+    assert network_lookup.await_args.args[2] == {7: (5,), 8: (7,)}
 
 
 @pytest.mark.asyncio
@@ -206,7 +224,7 @@ async def test_candidate_price_data_hydrates_retained_prices_once(monkeypatch):
         _serving_tables(),
         (_challenge(),),
         {("CPT", "99213"): ({"code_key": 7},)},
-        {1234567890: (5,)},
+        {(1234567890, 7): (5,)},
         {7: (5,)},
     )
 
@@ -242,7 +260,7 @@ async def test_candidate_audit_data_runs_each_bounded_index_once(monkeypatch):
     )
     scope_indexes = batch._CandidateScopeIndexes(
         code_index=code_index,
-        provider_set_keys_by_npi={challenge.npi: (5,)},
+        provider_sets_by_npi_code={(challenge.npi, 7): (5,)},
         provider_filters_by_code_key={7: (5,)},
         network_digests_by_key={5: frozenset({"network"})},
     )

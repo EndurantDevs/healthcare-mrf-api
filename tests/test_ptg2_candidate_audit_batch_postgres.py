@@ -124,10 +124,12 @@ async def _run_candidate_batch(
             with shared_block_read_once_scope(
                 max_retained_raw_bytes=1024 * 1024,
             ) as read_once_scope:
-                audit_result = await candidate_batch.audit_candidate_source_witness_batch(
-                    session,
-                    candidate_case.audit_request,
-                    candidate_case.access,
+                audit_result = (
+                    await candidate_batch.audit_candidate_source_witness_batch(
+                        session,
+                        candidate_case.audit_request,
+                        candidate_case.access,
+                    )
                 )
                 read_once_scope.assert_processed_once()
                 block_io = read_once_scope.ledger
@@ -157,23 +159,24 @@ def _assert_witness_ledger(audit_result: CandidateAuditBatchResult) -> None:
         "repeated_evidence_sha256_hashes": 0,
         "repeated_evidence_json_parses": 0,
     }
-    assert audit_result.candidate_processing_io[
-        "repeated_candidate_projection_builds"
-    ] == 0
+    assert (
+        audit_result.candidate_processing_io["repeated_candidate_projection_builds"]
+        == 0
+    )
 
 
 def _assert_block_ledger(block_io: Mapping[str, int]) -> None:
     assert block_io == {
-        "logical_block_deliveries": 7,
-        "physical_mapping_references": 7,
+        "logical_block_deliveries": 9,
+        "physical_mapping_references": 9,
         "physical_mapping_aliases": 2,
-        "unique_physical_blocks": 5,
-        "physical_block_reads": 5,
-        "physical_block_decodes": 5,
-        "physical_payload_preparations": 5,
-        "expected_logical_payload_processes": 5,
-        "logical_payload_processes": 5,
-        "logical_payload_fragment_references": 5,
+        "unique_physical_blocks": 7,
+        "physical_block_reads": 7,
+        "physical_block_decodes": 7,
+        "physical_payload_preparations": 7,
+        "expected_logical_payload_processes": 7,
+        "logical_payload_processes": 7,
+        "logical_payload_fragment_references": 7,
         "logical_payload_fragment_aliases": 0,
         "repeated_physical_reads": 0,
         "repeated_physical_decodes": 0,
@@ -195,10 +198,18 @@ async def test_real_postgres_candidate_batch_reads_and_processes_each_block_once
     candidate_case = _candidate_batch_case()
     snapshot_descriptor = _patch_candidate_modules(monkeypatch, candidate_case)
     atom_header_spy = Mock(wraps=ptg2_serving_binary_v3._price_atom_header)
+    provider_scope_spy = AsyncMock(
+        wraps=candidate_batch._provider_network_digests_by_key
+    )
     monkeypatch.setattr(
         ptg2_serving_binary_v3,
         "_price_atom_header",
         atom_header_spy,
+    )
+    monkeypatch.setattr(
+        candidate_batch,
+        "_provider_network_digests_by_key",
+        provider_scope_spy,
     )
 
     audit_result, block_io = await _run_candidate_batch(candidate_case)
@@ -206,6 +217,7 @@ async def test_real_postgres_candidate_batch_reads_and_processes_each_block_once
     _assert_witness_ledger(audit_result)
     _assert_block_ledger(block_io)
     assert atom_header_spy.call_count == 1
+    assert provider_scope_spy.await_args.args[2] == {7: (5,), 8: (5,)}
     snapshot_descriptor.assert_awaited_once_with(
         ANY,
         SNAPSHOT_ID,

@@ -27,8 +27,10 @@ from process.ptg_parts.ptg2_source_witness_persisted_encode import (
 )
 from process.ptg_parts.ptg2_source_witness_selection import source_set_digest
 from process.ptg_parts.ptg2_serving_binary_v3 import (
+    append_uvarint,
     encode_price_atoms,
     encode_price_memberships,
+    encode_provider_code_set,
 )
 from process.ptg_parts.ptg2_serving_binary_v3_types import (
     PTG2V3PriceAtomRecord,
@@ -47,10 +49,12 @@ NPI = 1_234_567_890
 SNAPSHOT_KEY = 1
 GROUP_KEY = 3
 PROVIDER_SET_KEY = 5
+IRRELEVANT_PROVIDER_SET_KEY = 1_029
 PRICE_KEY = 8
 ATOM_KEY = 0
 ALIASED_ATOM_KEY = 512
 _U32 = struct.Struct(">I")
+_PROVIDER_SET_BLOCK_SPAN = 1_024
 
 
 def _source_price_json() -> bytes:
@@ -68,6 +72,16 @@ def _linked_provider_json() -> bytes:
         b'{"provider_group_id":1,"network_name":["Alpha Network"],'
         b'"provider_groups":[{"npi":[1234567890]}]}'
     )
+
+
+def _provider_code_block(provider_set_key: int, code_keys: tuple[int, ...]) -> bytes:
+    encoded_codes, _stats = encode_provider_code_set(code_keys)
+    payload = bytearray()
+    append_uvarint(payload, 1)
+    append_uvarint(payload, provider_set_key % _PROVIDER_SET_BLOCK_SPAN)
+    append_uvarint(payload, len(encoded_codes))
+    payload.extend(encoded_codes)
+    return bytes(payload)
 
 
 def _occurrence_metadata_by_field(
@@ -246,6 +260,7 @@ async def _seed_codes_and_provider(schema: str, coverage_scope_id: bytes) -> Non
     for code_key, code_system, code, global_id in (
         (7, "CPT", "99213", b"7" * 16),
         (8, "REVENUE_CODE", "450", b"8" * 16),
+        (9, "CPT", "00000", b"9" * 16),
     ):
         await db.status(
             f"""
@@ -266,38 +281,44 @@ async def _seed_codes_and_provider(schema: str, coverage_scope_id: bytes) -> Non
             code_system=code_system,
             code=code,
         )
-    await db.status(
-        f"""
-        INSERT INTO {schema}.ptg2_v3_provider_set
-            (snapshot_key, provider_set_key, provider_set_global_id_128,
-             provider_count, network_names)
-        VALUES (:snapshot_key, :provider_set_key, :global_id, 1,
-                ARRAY['Alpha Network', 'Extra Network'])
-        """,
-        snapshot_key=SNAPSHOT_KEY,
-        provider_set_key=PROVIDER_SET_KEY,
-        global_id=b"p" * 16,
-    )
+    for provider_set_key, global_id, network_name in (
+        (PROVIDER_SET_KEY, b"p" * 16, "Alpha Network"),
+        (IRRELEVANT_PROVIDER_SET_KEY, b"q" * 16, "Unused Network"),
+    ):
+        await db.status(
+            f"""
+            INSERT INTO {schema}.ptg2_v3_provider_set
+                (snapshot_key, provider_set_key, provider_set_global_id_128,
+                 provider_count, network_names)
+            VALUES (:snapshot_key, :provider_set_key, :global_id, 1,
+                    ARRAY[:network_name, 'Extra Network'])
+            """,
+            snapshot_key=SNAPSHOT_KEY,
+            provider_set_key=provider_set_key,
+            global_id=global_id,
+            network_name=network_name,
+        )
 
 
 async def _seed_graph_and_audit_rows(
     schema: str,
     persisted_audit_rows: list[dict[str, Any]],
 ) -> None:
-    for direction, owner_key in (
-        (PTG2_V3_GRAPH_NPI_TO_GROUP, NPI),
-        (PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET, GROUP_KEY),
+    for direction, owner_key, member_count in (
+        (PTG2_V3_GRAPH_NPI_TO_GROUP, NPI, 1),
+        (PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET, GROUP_KEY, 2),
     ):
         await db.status(
             f"""
             INSERT INTO {schema}.ptg2_v3_graph_owner
                 (snapshot_key, direction, owner_key, first_chunk,
                  member_offset, member_count)
-            VALUES (:snapshot_key, :direction, :owner_key, 0, 0, 1)
+            VALUES (:snapshot_key, :direction, :owner_key, 0, 0, :member_count)
             """,
             snapshot_key=SNAPSHOT_KEY,
             direction=direction,
             owner_key=owner_key,
+            member_count=member_count,
         )
     for audit_row in persisted_audit_rows:
         await db.status(
@@ -338,9 +359,7 @@ async def _seed_witness(
         selection_method=witness_metadata["selection_method"],
         source_set_digest=witness_metadata["source_set_digest"],
         sample_digest=witness_metadata["sample_digest"],
-        occurrence_population=witness_metadata[
-            "queryable_occurrence_population_count"
-        ],
+        occurrence_population=witness_metadata["queryable_occurrence_population_count"],
         provider_population=witness_metadata["provider_population_count"],
         occurrence_count=witness_metadata["occurrence_witness_count"],
         provider_count=witness_metadata["provider_witness_count"],
@@ -354,8 +373,24 @@ async def _seed_shared_blocks(schema_name: str) -> None:
         ("graph_npi_groups_v1", GROUP_KEY.to_bytes(4, "little"), ((0, 0),)),
         (
             "graph_group_provider_sets_v1",
-            PROVIDER_SET_KEY.to_bytes(4, "little"),
+            b"".join(
+                provider_set_key.to_bytes(4, "little")
+                for provider_set_key in (
+                    PROVIDER_SET_KEY,
+                    IRRELEVANT_PROVIDER_SET_KEY,
+                )
+            ),
             ((0, 0),),
+        ),
+        (
+            "provider_set_codes_v3",
+            _provider_code_block(PROVIDER_SET_KEY, (7, 8)),
+            ((0, 0),),
+        ),
+        (
+            "provider_set_codes_v3",
+            _provider_code_block(IRRELEVANT_PROVIDER_SET_KEY, (9,)),
+            ((1, 0),),
         ),
         (
             "by_code_provider_shard_v1",
@@ -383,7 +418,7 @@ async def _seed_shared_blocks(schema_name: str) -> None:
             object_kind=object_kind,
             raw_payload=raw_payload,
             coordinates=coordinates,
-            entry_count=1,
+            entry_count=(2 if object_kind == "graph_group_provider_sets_v1" else 1),
         )
 
 
