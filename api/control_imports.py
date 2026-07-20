@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime as dt
+import hashlib
 import json
 import os
 import shutil
@@ -218,6 +219,18 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
 }
 
 _PTG_CONTROL_QUEUES = frozenset({"arq:PTG", "arq:PTGSmall", "arq:PTGNormal", "arq:PTGLarge", "arq:PTGHuge"})
+_PTG_FULL_REBUILD_TOKEN_PARAM = "_full_rebuild_token"
+_PTG_FULL_REBUILD_SCOPE_PARAM = "_full_rebuild_scope_digest"
+_PTG_FULL_REBUILD_MARKER_PARAM = "full_rebuild_requested"
+_PTG_FULL_REBUILD_SCOPE_DIGEST_DOMAIN = b"PTG2V3FULLREBUILDSCOPE\x01"
+_EPHEMERAL_PARAM_NAMES_BY_IMPORTER = {
+    "ptg": frozenset(
+        {
+            _PTG_FULL_REBUILD_TOKEN_PARAM,
+            _PTG_FULL_REBUILD_SCOPE_PARAM,
+        }
+    ),
+}
 
 _CANCELABLE_IMPORTERS = {
     "ptg",
@@ -651,7 +664,122 @@ def normalize_run(row: Any) -> dict[str, Any]:
         data = dict(row)
     else:
         data = {name: getattr(row, name) for name in ImportRun.__table__.columns.keys() if hasattr(row, name)}
+    if isinstance(data.get("params"), dict):
+        data["params"] = _params_for_import_run_storage(
+            str(data.get("importer") or ""),
+            data["params"],
+        )
     return _overlay_live_progress(_serialize_run_timestamps(data))
+
+
+def _params_for_import_run_storage(
+    importer: str,
+    params_by_name: dict[str, Any],
+) -> dict[str, Any]:
+    """Remove importer-specific ephemeral values from persisted API state."""
+
+    ephemeral_param_names = _EPHEMERAL_PARAM_NAMES_BY_IMPORTER.get(
+        importer,
+        frozenset(),
+    )
+    return {
+        name: param_value
+        for name, param_value in params_by_name.items()
+        if name not in ephemeral_param_names
+    }
+
+
+@dataclass(frozen=True)
+class _ImportParamViews:
+    persisted_by_name: dict[str, Any]
+    enqueue_by_name: dict[str, Any]
+
+
+def _import_param_views(
+    importer: str,
+    params_by_name: dict[str, Any],
+    *,
+    run_id: str,
+) -> _ImportParamViews:
+    """Build separate persisted and one-shot enqueue parameter mappings."""
+
+    if importer != "ptg":
+        return _ImportParamViews(
+            persisted_by_name=dict(params_by_name),
+            enqueue_by_name=dict(params_by_name),
+        )
+    if _PTG_FULL_REBUILD_SCOPE_PARAM in params_by_name:
+        raise ValueError(
+            "PTG full rebuild scope is internal and cannot be supplied"
+        )
+    if _PTG_FULL_REBUILD_MARKER_PARAM in params_by_name:
+        raise ValueError(
+            "PTG full rebuild marker is internal and cannot be supplied"
+        )
+    ordinary_params_by_name = {
+        name: param_value
+        for name, param_value in params_by_name.items()
+        if name != _PTG_FULL_REBUILD_TOKEN_PARAM
+    }
+    if _PTG_FULL_REBUILD_TOKEN_PARAM not in params_by_name:
+        return _ImportParamViews(
+            persisted_by_name=ordinary_params_by_name,
+            enqueue_by_name=dict(ordinary_params_by_name),
+        )
+    scope_digest = _ptg_full_rebuild_scope_digest(
+        params_by_name[_PTG_FULL_REBUILD_TOKEN_PARAM],
+        run_id=run_id,
+    )
+    return _ImportParamViews(
+        persisted_by_name={
+            **ordinary_params_by_name,
+            _PTG_FULL_REBUILD_MARKER_PARAM: True,
+        },
+        enqueue_by_name={
+            **ordinary_params_by_name,
+            _PTG_FULL_REBUILD_SCOPE_PARAM: scope_digest,
+        },
+    )
+
+
+def _assert_ptg_rebuild_request_params(
+    importer: str,
+    params_by_name: dict[str, Any],
+) -> None:
+    """Reject internal rebuild fields at the authenticated request boundary."""
+
+    if importer != "ptg":
+        return
+    if _PTG_FULL_REBUILD_SCOPE_PARAM in params_by_name:
+        raise ValueError(
+            "PTG full rebuild scope is internal and cannot be supplied"
+        )
+    if _PTG_FULL_REBUILD_MARKER_PARAM in params_by_name:
+        raise ValueError(
+            "PTG full rebuild marker is internal and cannot be supplied"
+        )
+
+
+def _ptg_full_rebuild_scope_digest(raw_token: Any, *, run_id: str) -> str:
+    """Derive a domain-separated scope from one canonical token and run id."""
+
+    if not isinstance(raw_token, str):
+        raise ValueError("private PTG full rebuild token must be a valid UUID")
+    try:
+        normalized_token = uuid.UUID(raw_token)
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("private PTG full rebuild token must be a valid UUID") from exc
+    if raw_token != str(normalized_token):
+        raise ValueError("private PTG full rebuild token must be a valid UUID")
+    if not run_id:
+        raise ValueError("private PTG full rebuild request requires a control run id")
+    run_id_bytes = run_id.encode("utf-8")
+    return hashlib.sha256(
+        _PTG_FULL_REBUILD_SCOPE_DIGEST_DOMAIN
+        + normalized_token.bytes
+        + len(run_id_bytes).to_bytes(4, byteorder="big")
+        + run_id_bytes
+    ).hexdigest()
 
 
 def _overlay_live_progress(data: dict[str, Any]) -> dict[str, Any]:
@@ -1283,6 +1411,12 @@ async def create_import_run(
     importer = str(request_payload_map.get("importer") or "").strip()
     if importer not in importer_names():
         raise ValueError(f"unknown importer: {importer}")
+    _assert_ptg_rebuild_request_params(
+        importer,
+        request_payload_map.get("params")
+        if isinstance(request_payload_map.get("params"), dict)
+        else {},
+    )
 
     idempotency_key = (
         str(request_payload_map.get("idempotency_key") or "").strip() or None
@@ -1305,6 +1439,13 @@ async def create_import_run(
     retry_of_run_id = (
         str(request_payload_map.get("retry_of_run_id") or "").strip() or None
     )
+    param_views = _import_param_views(
+        importer,
+        request_payload_map.get("params")
+        if isinstance(request_payload_map.get("params"), dict)
+        else {},
+        run_id=run_id,
+    )
     import_run_values_by_name = {
         "run_id": run_id,
         "engine": ENGINE_NAME,
@@ -1313,11 +1454,7 @@ async def create_import_run(
         "family": _importer_family(importer),
         "status": "queued",
         "phase_detail": "created",
-        "params": (
-            request_payload_map.get("params")
-            if isinstance(request_payload_map.get("params"), dict)
-            else {}
-        ),
+        "params": param_views.persisted_by_name,
         "idempotency_key": idempotency_key,
         "triggered_by": _normalize_triggered_by(
             request_payload_map.get("triggered_by")
@@ -1353,7 +1490,12 @@ async def create_import_run(
             if active:
                 return active, False
         raise
-    enqueue_result = await _enqueue_import_start(import_run_values_by_name)
+    enqueue_result = await _enqueue_import_start(
+        {
+            **import_run_values_by_name,
+            "params": param_views.enqueue_by_name,
+        }
+    )
     import_run_values_by_name.update(enqueue_result)
     await db.execute(
         update(ImportRun)
@@ -1441,9 +1583,21 @@ async def _enqueue_import_start(
                 "function": adapter["function"],
                 **_ptg_lane_metrics(params),
             },
-            "error": {"code": "enqueue_failed", "message": str(exc)},
+            "error": {
+                "code": "enqueue_failed",
+                "message": _safe_enqueue_error_message(
+                    importer,
+                    params,
+                    exc,
+                ),
+            },
         }
-    job_id = getattr(job, "job_id", None) or str(job or "")
+    job_id = _safe_enqueued_job_id(
+        importer,
+        params,
+        job,
+        requested_job_id=enqueue_options_by_name.get("_job_id"),
+    )
     return {
         "status": "queued",
         "phase_detail": "enqueued",
@@ -1487,6 +1641,43 @@ def _ptg_lane_metrics(params: dict[str, Any]) -> dict[str, Any]:
         }.items()
         if value
     }
+
+
+def _safe_enqueue_error_message(
+    importer: str,
+    params_by_name: dict[str, Any],
+    exc: Exception,
+) -> str:
+    """Keep ephemeral importer parameters out of persisted enqueue errors."""
+
+    ephemeral_param_names = _EPHEMERAL_PARAM_NAMES_BY_IMPORTER.get(
+        importer,
+        frozenset(),
+    )
+    if any(name in params_by_name for name in ephemeral_param_names):
+        return "import job enqueue failed"
+    return str(exc)
+
+
+def _safe_enqueued_job_id(
+    importer: str,
+    params_by_name: dict[str, Any],
+    job: Any,
+    *,
+    requested_job_id: Any,
+) -> str:
+    """Avoid reflecting an ephemeral payload through a job representation."""
+
+    ephemeral_param_names = _EPHEMERAL_PARAM_NAMES_BY_IMPORTER.get(
+        importer,
+        frozenset(),
+    )
+    if any(name in params_by_name for name in ephemeral_param_names):
+        return str(requested_job_id or "")
+    explicit_job_id = getattr(job, "job_id", None)
+    if explicit_job_id:
+        return str(explicit_job_id)
+    return str(job or "")
 
 
 _TASK_LINEAGE_FIELDS_BY_IMPORTER = {
@@ -1883,7 +2074,18 @@ def _retry_child_params(
         if isinstance(current_run_map.get("params"), dict)
         else {}
     )
-    child_params_by_name = {**current_params_by_name, **retry_params_by_name}
+    if current_run_map.get("importer") == "ptg" and (
+        _has_ptg_full_rebuild_control(current_params_by_name)
+        or _has_ptg_full_rebuild_control(retry_params_by_name)
+    ):
+        raise ValueError(
+            "full rebuild runs cannot be retried; create a new controlled "
+            "rebuild attempt"
+        )
+    child_params_by_name = {
+        **current_params_by_name,
+        **retry_params_by_name,
+    }
     if current_run_map.get("importer") == "mrf-source-discovery":
         root_run_id = str(
             current_params_by_name.get("mrf_discovery_root_run_id")
@@ -1894,7 +2096,10 @@ def _retry_child_params(
         child_params_by_name["mrf_discovery_root_run_id"] = root_run_id
         return child_params_by_name
     if current_run_map.get("importer") != "provider-directory-fhir":
-        return child_params_by_name
+        return _params_for_import_run_storage(
+            str(current_run_map.get("importer") or ""),
+            child_params_by_name,
+        )
     root_run_id = str(
         current_params_by_name.get("provider_directory_pagination_root_run_id")
         or retry_params_by_name.get("provider_directory_pagination_root_run_id")
@@ -1903,6 +2108,17 @@ def _retry_child_params(
     child_params_by_name["retry_of_run_id"] = run_id
     child_params_by_name["provider_directory_pagination_root_run_id"] = root_run_id
     return child_params_by_name
+
+
+def _has_ptg_full_rebuild_control(params_by_name: dict[str, Any]) -> bool:
+    return any(
+        name in params_by_name
+        for name in (
+            _PTG_FULL_REBUILD_TOKEN_PARAM,
+            _PTG_FULL_REBUILD_SCOPE_PARAM,
+            _PTG_FULL_REBUILD_MARKER_PARAM,
+        )
+    )
 
 
 async def retry_import_run(run_id: str, payload: dict[str, Any]) -> tuple[dict[str, Any], bool] | None:

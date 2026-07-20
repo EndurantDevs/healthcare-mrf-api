@@ -183,6 +183,7 @@ from process.ptg_parts.ptg2_shared_finalize import (
 from process.ptg_parts.ptg2_shared_reuse import (
     SharedPhysicalArtifactIdentity,
     logical_plan_fields_for_job,
+    normalized_full_rebuild_scope_digest,
     normalized_physical_artifact_identity,
     is_same_downloaded_physical_input,
     shared_logical_artifact_metadata,
@@ -221,6 +222,10 @@ from process.ptg_parts.snapshot_tables import (_normalize_source_key,
                                                _ptg2_snapshot_table_name,
                                                _ptg2_snapshot_table_token)
 from process.ptg_parts.source_download import (PTG2_DEFAULT_MAX_BYTES,
+                                               PTG2ArtifactStageCounts,
+                                               PTG2ArtifactStageFreshnessError,
+                                               PTG2ArtifactStageObserver,
+                                               PTG2FreshArtifactStageTracker,
                                                _download_ptg_job_artifact,
                                                _download_ptg_job_artifact_sync,
                                                _download_raw_artifact_ranges,
@@ -389,6 +394,94 @@ async def _enqueue_ptg2_auto_address_refresh_after_import(
 
 class PTG2SnapshotInProgressConflict(RuntimeError):
     """Raised when another delivery owns a deterministic snapshot build."""
+
+
+_SAFE_FULL_REBUILD_METRIC_KEYS = frozenset(
+    {
+        "full_rebuild",
+        "artifacts_observed",
+        "raw_artifacts_total",
+        "raw_artifacts_reused",
+        "raw_artifacts_unique",
+        "raw_artifacts_duplicate_identities",
+        "logical_artifacts_total",
+        "logical_artifacts_reused",
+        "logical_artifacts_unique",
+        "logical_artifacts_duplicate_identities",
+        "logical_artifacts_deferred_hashes",
+        "shared_layout_reused",
+        "shared_layout_reused_at_seal",
+        "existing_snapshot_reused",
+    }
+)
+_BOOLEAN_FULL_REBUILD_METRIC_KEYS = frozenset(
+    {
+        "full_rebuild",
+        "shared_layout_reused",
+        "shared_layout_reused_at_seal",
+        "existing_snapshot_reused",
+    }
+)
+_COUNT_FULL_REBUILD_METRIC_KEYS = (
+    _SAFE_FULL_REBUILD_METRIC_KEYS - _BOOLEAN_FULL_REBUILD_METRIC_KEYS
+)
+
+
+class PTG2FullRebuildFreshnessError(RuntimeError):
+    """Raised when a controlled rebuild encounters previously completed work."""
+
+    def __init__(self, message: str, metrics_by_name: Mapping[str, Any]):
+        super().__init__(message)
+        self.metrics_by_name = _safe_full_rebuild_metrics(metrics_by_name)
+
+
+def _safe_full_rebuild_metrics(
+    metrics_by_name: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Allowlist and type-check proof before it crosses the PTG boundary."""
+
+    safe_metrics_by_name: dict[str, Any] = {}
+    for metric_name, metric_value in metrics_by_name.items():
+        if (
+            metric_name in _BOOLEAN_FULL_REBUILD_METRIC_KEYS
+            and type(metric_value) is bool
+        ):
+            safe_metrics_by_name[metric_name] = metric_value
+        elif (
+            metric_name in _COUNT_FULL_REBUILD_METRIC_KEYS
+            and type(metric_value) is int
+            and metric_value >= 0
+        ):
+            safe_metrics_by_name[metric_name] = metric_value
+    return safe_metrics_by_name
+
+
+def _attach_full_rebuild_failure_metrics(
+    error: BaseException,
+    metrics_by_name: Mapping[str, Any],
+) -> None:
+    """Attach safe runtime proof to an exception crossing the control boundary."""
+
+    safe_metrics_by_name = _safe_full_rebuild_metrics(metrics_by_name)
+    if safe_metrics_by_name:
+        setattr(
+            error,
+            "ptg_full_rebuild_metrics_by_name",
+            safe_metrics_by_name,
+        )
+
+
+def full_rebuild_failure_metrics(error: BaseException) -> dict[str, Any]:
+    """Read safe runtime proof from a failed or canceled controlled rebuild."""
+
+    metrics_by_name = getattr(
+        error,
+        "ptg_full_rebuild_metrics_by_name",
+        {},
+    )
+    if not isinstance(metrics_by_name, Mapping):
+        return {}
+    return _safe_full_rebuild_metrics(metrics_by_name)
 
 
 def _ptg2_snapshot_conflict_update_values(
@@ -1718,6 +1811,7 @@ async def _process_table_of_contents(
     max_bytes: int | None = None,
     keep_partial_artifacts: bool | None = None,
     raise_on_error: bool = False,
+    artifact_stage_observer: PTG2ArtifactStageObserver | None = None,
 ) -> list[dict[str, Any]]:
     """Download and filter one table of contents, persist files, and return jobs."""
     file_cls = classes["PTGFile"]
@@ -1742,7 +1836,17 @@ async def _process_table_of_contents(
                 reuse_raw_artifacts=reuse_raw_artifacts,
                 max_bytes=max_bytes,
                 keep_partial_artifacts=keep_partial_artifacts,
+                **(
+                    {"artifact_stage_observer": artifact_stage_observer}
+                    if artifact_stage_observer is not None
+                    else {}
+                ),
             )
+        except (
+            PTG2ArtifactStageFreshnessError,
+            PTG2FullRebuildFreshnessError,
+        ):
+            raise
         except Exception as exc:
             logger.warning("Failed to download table-of-contents from %s: %s", toc_url, exc)
             if raise_on_error:
@@ -2656,6 +2760,13 @@ def _ptg2_snapshot_content_options(option_by_name: dict[str, Any]) -> dict[str, 
         key: option_by_name.get(key)
         for key in _PTG2_SNAPSHOT_CONTENT_OPTION_KEYS
     }
+    rebuild_scope_digest = normalized_full_rebuild_scope_digest(
+        option_by_name.get("full_rebuild_scope_digest")
+    )
+    if rebuild_scope_digest is not None:
+        content_option_by_name["full_rebuild_scope_digest"] = (
+            rebuild_scope_digest
+        )
     content_option_by_name["toc_urls"] = _dedupe_preserve(
         [
             str(value).strip()
@@ -2691,6 +2802,24 @@ def _ptg2_deterministic_snapshot_id(
     ).encode("utf-8")
     identity_hash = hash_prefix(sha256_bytes(identity_bytes), 12)
     return f"ptg2:{import_month.strftime('%Y%m')}:{identity_hash}"
+
+
+def _ptg2_import_run_id(
+    import_id: str,
+    *,
+    full_rebuild_scope_digest: str | None = None,
+) -> str:
+    """Keep legacy run identity unless one controlled rebuild needs isolation."""
+
+    legacy_run_id = f"ptg2:{import_id}"
+    rebuild_scope_digest = normalized_full_rebuild_scope_digest(
+        full_rebuild_scope_digest
+    )
+    if rebuild_scope_digest is None:
+        return legacy_run_id
+    rebuild_suffix = f":rebuild-{rebuild_scope_digest[:24]}"
+    prefix_length = 96 - len(rebuild_suffix)
+    return f"{legacy_run_id[:prefix_length]}{rebuild_suffix}"
 
 
 def _published_snapshot_manifest(snapshot_attributes: dict[str, Any]) -> dict[str, Any]:
@@ -3515,6 +3644,68 @@ def _is_shared_v3_preflight_eligible(
 _shared_v3_preflight_eligible = _is_shared_v3_preflight_eligible
 
 
+def _full_rebuild_proof_metrics(
+    stage_counts: PTG2ArtifactStageCounts,
+    *,
+    full_rebuild_scope_digest: str | None,
+    shared_layout_reused: bool,
+    shared_layout_reused_at_seal: bool,
+) -> dict[str, Any]:
+    """Describe whether a controlled rebuild reused physical input work."""
+
+    if full_rebuild_scope_digest is None:
+        return {}
+    return {
+        "full_rebuild": True,
+        "artifacts_observed": stage_counts.artifacts_observed,
+        "raw_artifacts_total": stage_counts.raw_artifacts_total,
+        "raw_artifacts_reused": stage_counts.raw_artifacts_reused,
+        "raw_artifacts_unique": stage_counts.raw_artifacts_unique,
+        "raw_artifacts_duplicate_identities": (
+            stage_counts.raw_artifacts_duplicate_identities
+        ),
+        "logical_artifacts_total": stage_counts.logical_artifacts_total,
+        "logical_artifacts_reused": stage_counts.logical_artifacts_reused,
+        "logical_artifacts_unique": stage_counts.logical_artifacts_unique,
+        "logical_artifacts_duplicate_identities": (
+            stage_counts.logical_artifacts_duplicate_identities
+        ),
+        "logical_artifacts_deferred_hashes": (
+            stage_counts.logical_artifacts_deferred_hashes
+        ),
+        "shared_layout_reused": bool(shared_layout_reused),
+        "shared_layout_reused_at_seal": bool(shared_layout_reused_at_seal),
+    }
+
+
+def _assert_full_rebuild_is_fresh(
+    metrics_by_name: Mapping[str, Any],
+) -> None:
+    """Fail a controlled rebuild if any physical input work was reused."""
+
+    if not metrics_by_name:
+        return
+    if (
+        int(metrics_by_name.get("raw_artifacts_reused") or 0) > 0
+        or int(metrics_by_name.get("logical_artifacts_reused") or 0) > 0
+        or int(
+            metrics_by_name.get("raw_artifacts_duplicate_identities") or 0
+        )
+        > 0
+        or int(
+            metrics_by_name.get("logical_artifacts_duplicate_identities") or 0
+        )
+        > 0
+        or bool(metrics_by_name.get("shared_layout_reused"))
+        or bool(metrics_by_name.get("shared_layout_reused_at_seal"))
+    ):
+        raise PTG2FullRebuildFreshnessError(
+            "controlled full rebuild selected retained or duplicate work; "
+            "create a new attempt after clearing the reuse path",
+            metrics_by_name,
+        )
+
+
 @dataclass(frozen=True)
 class _ReusedSharedV3AllowedContext:
     successful_files: Sequence[Mapping[str, Any]]
@@ -4011,6 +4202,7 @@ async def _process_allowed_snapshot_files(
     selected_jobs: Sequence[dict[str, Any]],
     context: _AllowedFileProcessingContext,
     failure_report_by_field: dict[str, Any],
+    artifact_stage_observer: PTG2ArtifactStageObserver | None = None,
 ) -> list[dict[str, Any]]:
     """Download and parse the full allowed-only strict-V3 file set."""
 
@@ -4031,6 +4223,11 @@ async def _process_allowed_snapshot_files(
         reuse_raw_artifacts=context.reuse_raw_artifacts,
         max_bytes=context.max_bytes,
         keep_partial_artifacts=context.keep_partial_artifacts,
+        **(
+            {"artifact_stage_observer": artifact_stage_observer}
+            if artifact_stage_observer is not None
+            else {}
+        ),
     ):
         file_result = await _load_allowed_file_result(downloaded, context)
         file_by_field = asdict(file_result)
@@ -4179,6 +4376,7 @@ def _allowed_snapshot_result(
     context: _AllowedSnapshotPublishContext,
     report_by_field: Mapping[str, Any],
     timing_by_metric: Mapping[str, Any],
+    full_rebuild_metrics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "status": "succeeded",
@@ -4202,6 +4400,7 @@ def _allowed_snapshot_result(
             metric_name: report_by_field[metric_name]
             for metric_name in (*_ALLOWED_AMOUNT_METRIC_KEYS, "allowed_amount_evidence")
         },
+        **dict(full_rebuild_metrics or {}),
         "timings": timing_by_metric,
     }
 
@@ -4209,6 +4408,7 @@ def _allowed_snapshot_result(
 def _prepare_allowed_snapshot_publish(
     successful_files: list[dict[str, Any]],
     context: _AllowedSnapshotPublishContext,
+    full_rebuild_metrics: Mapping[str, Any] | None = None,
 ) -> _AllowedSnapshotPublishPreparation:
     allowed_metrics_by_name = _allowed_amount_metrics_from_results(
         successful_files
@@ -4239,6 +4439,8 @@ def _prepare_allowed_snapshot_publish(
         source_file_versions,
         timing_by_metric,
     )
+    if full_rebuild_metrics:
+        report_by_field.update(full_rebuild_metrics)
     return _AllowedSnapshotPublishPreparation(
         allowed_metrics_by_name=allowed_metrics_by_name,
         report_by_field=report_by_field,
@@ -4252,12 +4454,14 @@ async def _publish_allowed_snapshot(
     successful_files: list[dict[str, Any]],
     context: _AllowedSnapshotPublishContext,
     allowed_snapshot_state_by_name: dict[str, bool],
+    full_rebuild_metrics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Publish durable allowed evidence without creating serving pointers."""
 
     preparation = _prepare_allowed_snapshot_publish(
         successful_files,
         context,
+        full_rebuild_metrics,
     )
     write_live_progress(
         phase="publishing",
@@ -4270,6 +4474,26 @@ async def _publish_allowed_snapshot(
         preparation.published_at,
     )
     allowed_snapshot_state_by_name["published"] = True
+    await _finish_allowed_snapshot_publish(
+        successful_files,
+        context,
+        preparation,
+    )
+    return _allowed_snapshot_result(
+        context,
+        preparation.report_by_field,
+        preparation.timing_by_metric,
+        full_rebuild_metrics,
+    )
+
+
+async def _finish_allowed_snapshot_publish(
+    successful_files: list[dict[str, Any]],
+    context: _AllowedSnapshotPublishContext,
+    preparation: _AllowedSnapshotPublishPreparation,
+) -> None:
+    """Finish pointer publication, completion state, and progress reporting."""
+
     pointer_result = await _publish_allowed_current_pointer(
         source_key=context.source_key,
         snapshot_id=context.snapshot_id,
@@ -4301,11 +4525,6 @@ async def _publish_allowed_snapshot(
         pct=100,
         eta_seconds=0,
         message="PTG allowed-amount import succeeded",
-    )
-    return _allowed_snapshot_result(
-        context,
-        preparation.report_by_field,
-        preparation.timing_by_metric,
     )
 
 
@@ -4361,6 +4580,7 @@ async def _main_with_artifact_lease(
     reuse_raw_artifacts: bool = True,
     keep_partial_artifacts: bool | None = None,
     control_run_id: str | None = None,
+    full_rebuild_scope_digest: str | None = None,
 ) -> dict[str, Any]:
     """
     PTG2 entry point for the Transparency in Coverage importer.
@@ -4369,6 +4589,15 @@ async def _main_with_artifact_lease(
     import_month_value = normalize_import_month(import_month)
     source_key_val = _normalize_source_key(source_key or os.getenv("HLTHPRT_PTG2_SOURCE_KEY"))
     snapshot_arch_version = _ptg2_snapshot_arch_from_env()
+    rebuild_scope_digest = normalized_full_rebuild_scope_digest(
+        full_rebuild_scope_digest
+    )
+    should_reuse_raw_artifacts = (
+        reuse_raw_artifacts if rebuild_scope_digest is None else False
+    )
+    should_keep_partial_artifacts = (
+        keep_partial_artifacts if rebuild_scope_digest is None else False
+    )
     if provider_ref_url:
         raise ValueError(
             "provider_ref_url is not supported by strict V3; provider references "
@@ -4387,7 +4616,10 @@ async def _main_with_artifact_lease(
             arch_variant=PTG2_V3_SHARED_GENERATION,
         )
     )
-    import_run_id = f"ptg2:{import_id_val}"
+    import_run_id = _ptg2_import_run_id(
+        import_id_val,
+        full_rebuild_scope_digest=rebuild_scope_digest,
+    )
     if source_key_val is None:
         if test_mode:
             source_key_val = _normalize_source_key(import_id_val)
@@ -4411,9 +4643,10 @@ async def _main_with_artifact_lease(
         "file_url_contains": file_url_contains or [],
         "source_network_names": source_network_name_values,
         "max_files": max_files,
-        "reuse_raw_artifacts": reuse_raw_artifacts,
+        "reuse_raw_artifacts": should_reuse_raw_artifacts,
         "keep_partial_artifacts": _env_bool(PTG2_KEEP_PARTIAL_ENV, True)
-        if keep_partial_artifacts is None else keep_partial_artifacts,
+        if should_keep_partial_artifacts is None
+        else should_keep_partial_artifacts,
         "snapshot_arch": snapshot_arch_version,
         "storage_generation": PTG2_V3_SHARED_GENERATION,
         "test_mode": test_mode,
@@ -4438,6 +4671,8 @@ async def _main_with_artifact_lease(
         ),
         "auto_activate_candidates": should_auto_activate_candidates,
     }
+    if rebuild_scope_digest is not None:
+        options_by_name["full_rebuild_scope_digest"] = rebuild_scope_digest
     snapshot_id = _ptg2_deterministic_snapshot_id(
         import_month=import_month_value,
         import_id=import_id_val,
@@ -4453,6 +4688,7 @@ async def _main_with_artifact_lease(
     setup_seconds_by_stage: dict[str, float] = {}
     setup_stage_timer = _StageTimer(setup_seconds_by_stage, import_started_monotonic)
     pending_strict_v3 = _PendingStrictV3State({}, {})
+    full_rebuild_stage_tracker = PTG2FreshArtifactStageTracker()
 
     # Enforce a streaming size cap on every caller-supplied URL (never None for
     # control-triggered runs) so a malicious/huge target cannot OOM or fill the node.
@@ -4510,6 +4746,22 @@ async def _main_with_artifact_lease(
         raise
     if snapshot_state and snapshot_state.get("status") == PTG2_STATUS_PUBLISHED:
         try:
+            if rebuild_scope_digest is not None:
+                raise PTG2FullRebuildFreshnessError(
+                    "controlled full rebuild scope already completed; "
+                    "create a new attempt",
+                    {
+                        **_full_rebuild_proof_metrics(
+                            full_rebuild_stage_tracker.snapshot(),
+                            full_rebuild_scope_digest=(
+                                rebuild_scope_digest
+                            ),
+                            shared_layout_reused=False,
+                            shared_layout_reused_at_seal=False,
+                        ),
+                        "existing_snapshot_reused": True,
+                    },
+                )
             pointer_reconciliation = await _reconcile_already_published_snapshot(
                 snapshot_attributes=snapshot_state,
                 snapshot_id=snapshot_id,
@@ -4537,6 +4789,22 @@ async def _main_with_artifact_lease(
             reset_live_progress_context(live_token)
     if snapshot_state and snapshot_state.get("status") == PTG2_STATUS_VALIDATED:
         try:
+            if rebuild_scope_digest is not None:
+                raise PTG2FullRebuildFreshnessError(
+                    "controlled full rebuild scope already completed; "
+                    "create a new attempt",
+                    {
+                        **_full_rebuild_proof_metrics(
+                            full_rebuild_stage_tracker.snapshot(),
+                            full_rebuild_scope_digest=(
+                                rebuild_scope_digest
+                            ),
+                            shared_layout_reused=False,
+                            shared_layout_reused_at_seal=False,
+                        ),
+                        "existing_snapshot_reused": True,
+                    },
+                )
             candidate_result = await _resume_validated_candidate(
                 snapshot_attributes=snapshot_state,
                 snapshot_id=snapshot_id,
@@ -4616,6 +4884,20 @@ async def _main_with_artifact_lease(
         """Persist import failure state and drop unpublished source-scoped staging tables."""
         failure_handling_started_monotonic = _ptg2_monotonic()
         error_text = str(error) or "worker task was cancelled"
+        failure_report_by_field.update(
+            _full_rebuild_proof_metrics(
+                full_rebuild_stage_tracker.snapshot(),
+                full_rebuild_scope_digest=rebuild_scope_digest,
+                shared_layout_reused=bool(
+                    failure_report_by_field.get("shared_layout_reused")
+                ),
+                shared_layout_reused_at_seal=bool(
+                    failure_report_by_field.get(
+                        "shared_layout_reused_at_seal"
+                    )
+                ),
+            )
+        )
         write_live_progress(
             phase="failing",
             pct=99,
@@ -4745,11 +5027,25 @@ async def _main_with_artifact_lease(
                     file_url_contains=file_url_contains,
                     max_files=max_files,
                     import_run_id=import_run_id,
-                    reuse_raw_artifacts=reuse_raw_artifacts,
+                    reuse_raw_artifacts=should_reuse_raw_artifacts,
                     max_bytes=max_bytes,
-                    keep_partial_artifacts=keep_partial_artifacts,
+                    keep_partial_artifacts=should_keep_partial_artifacts,
                     raise_on_error=True,
+                    **(
+                        {
+                            "artifact_stage_observer": (
+                                full_rebuild_stage_tracker.observe
+                            )
+                        }
+                        if rebuild_scope_digest is not None
+                        else {}
+                    ),
                 )
+            except (
+                PTG2ArtifactStageFreshnessError,
+                PTG2FullRebuildFreshnessError,
+            ):
+                raise
             except Exception as exc:
                 toc_failures.append({"url": toc_url, "error": str(exc)})
                 continue
@@ -4875,17 +5171,26 @@ async def _main_with_artifact_lease(
             processing_context = _AllowedFileProcessingContext(
                 classes=classes,
                 test_mode=test_mode,
-                reuse_raw_artifacts=reuse_raw_artifacts,
+                reuse_raw_artifacts=should_reuse_raw_artifacts,
                 max_bytes=max_bytes,
                 max_items=max_items,
                 import_run_id=import_run_id,
                 snapshot_id=snapshot_id,
-                keep_partial_artifacts=keep_partial_artifacts,
+                keep_partial_artifacts=should_keep_partial_artifacts,
             )
             successful_allowed_files = await _process_allowed_snapshot_files(
                 allowed_jobs,
                 processing_context,
                 allowed_lane_report_by_field,
+                **(
+                    {
+                        "artifact_stage_observer": (
+                            full_rebuild_stage_tracker.observe
+                        )
+                    }
+                    if rebuild_scope_digest is not None
+                    else {}
+                ),
             )
             allowed_metrics_by_name = _allowed_amount_metrics_from_results(
                 successful_allowed_files
@@ -4896,6 +5201,13 @@ async def _main_with_artifact_lease(
                 raise RuntimeError(
                     "PTG2 allowed-amount import produced no payment evidence"
                 )
+        pre_rate_rebuild_metrics = _full_rebuild_proof_metrics(
+            full_rebuild_stage_tracker.snapshot(),
+            full_rebuild_scope_digest=rebuild_scope_digest,
+            shared_layout_reused=False,
+            shared_layout_reused_at_seal=False,
+        )
+        _assert_full_rebuild_is_fresh(pre_rate_rebuild_metrics)
         if not selected_jobs:
             publish_context = _AllowedSnapshotPublishContext(
                 snapshot_id=snapshot_id,
@@ -4912,6 +5224,7 @@ async def _main_with_artifact_lease(
                 successful_allowed_files,
                 publish_context,
                 allowed_snapshot_state_by_name,
+                full_rebuild_metrics=pre_rate_rebuild_metrics,
             )
         ptg2_manifest_stage_table = _ptg2_manifest_stage_table_name(
             stage_token
@@ -5015,11 +5328,11 @@ async def _main_with_artifact_lease(
                         job,
                         classes,
                         test_mode,
-                        reuse_raw_artifacts=reuse_raw_artifacts,
+                        reuse_raw_artifacts=should_reuse_raw_artifacts,
                         max_bytes=max_bytes,
                         max_items=max_items,
                         import_run_id=import_run_id,
-                        keep_partial_artifacts=keep_partial_artifacts,
+                        keep_partial_artifacts=should_keep_partial_artifacts,
                         snapshot_id=snapshot_id,
                         coverage_scope_id=shared_input_identity.coverage_scope_hex,
                         import_month=import_month_value,
@@ -5043,11 +5356,29 @@ async def _main_with_artifact_lease(
             buffered_downloads: list[PTG2DownloadedJob] = []
             async for downloaded in _iter_downloaded_ptg_jobs(
                 selected_jobs,
-                reuse_raw_artifacts=reuse_raw_artifacts,
+                reuse_raw_artifacts=should_reuse_raw_artifacts,
                 max_bytes=max_bytes,
-                keep_partial_artifacts=keep_partial_artifacts,
+                keep_partial_artifacts=should_keep_partial_artifacts,
+                **(
+                    {
+                        "artifact_stage_observer": (
+                            full_rebuild_stage_tracker.observe
+                        )
+                    }
+                    if rebuild_scope_digest is not None
+                    else {}
+                ),
             ):
                 buffered_downloads.append(downloaded)
+            download_rebuild_metrics = _full_rebuild_proof_metrics(
+                full_rebuild_stage_tracker.snapshot(),
+                full_rebuild_scope_digest=rebuild_scope_digest,
+                shared_layout_reused=False,
+                shared_layout_reused_at_seal=False,
+            )
+            _assert_full_rebuild_is_fresh(
+                download_rebuild_metrics
+            )
             download_failures: list[PTG2FileProcessResult] = []
             for downloaded in buffered_downloads:
                 if downloaded.error:
@@ -5143,6 +5474,15 @@ async def _main_with_artifact_lease(
                 }
             )
             if shared_layout_reservation.reused:
+                if rebuild_scope_digest is not None:
+                    _assert_full_rebuild_is_fresh(
+                        _full_rebuild_proof_metrics(
+                            full_rebuild_stage_tracker.snapshot(),
+                            full_rebuild_scope_digest=rebuild_scope_digest,
+                            shared_layout_reused=True,
+                            shared_layout_reused_at_seal=False,
+                        )
+                    )
                 return await _publish_reused_shared_v3_snapshot(
                     downloaded_jobs=buffered_downloads,
                     shared_input_identity=shared_input_identity,
@@ -5447,12 +5787,30 @@ async def _main_with_artifact_lease(
                     graph_artifact_entries=list(manifest_artifacts.get("sidecars") or []),
                     provider_identifier_quarantine=provider_identifier_quarantine,
                     scratch_parent=ptg2_temp_parent(),
+                    **(
+                        {"full_rebuild_scope_digest": rebuild_scope_digest}
+                        if rebuild_scope_digest is not None
+                        else {}
+                    ),
                 )
             finally:
                 _cleanup_manifest_copy_entries(strict_v3_copy_entries)
                 _cleanup_strict_v3_graph_artifacts(manifest_artifacts)
                 pending_strict_v3.copy_entries_by_kind = {}
                 pending_strict_v3.graph_artifacts_map = {}
+            if (
+                rebuild_scope_digest is not None
+                and shared_publication.layout_reused_at_seal
+            ):
+                failure_report_by_field["shared_layout_reused_at_seal"] = True
+                _assert_full_rebuild_is_fresh(
+                    _full_rebuild_proof_metrics(
+                        full_rebuild_stage_tracker.snapshot(),
+                        full_rebuild_scope_digest=rebuild_scope_digest,
+                        shared_layout_reused=False,
+                        shared_layout_reused_at_seal=True,
+                    )
+                )
             serving_index = {
                 **dict(shared_publication.serving_index),
                 "source_key": source_key_val,
@@ -5476,6 +5834,15 @@ async def _main_with_artifact_lease(
                     "shared_stored_byte_count": shared_publication.stored_byte_count,
                 }
             )
+            full_rebuild_metrics = _full_rebuild_proof_metrics(
+                full_rebuild_stage_tracker.snapshot(),
+                full_rebuild_scope_digest=rebuild_scope_digest,
+                shared_layout_reused=shared_layout_reservation.reused,
+                shared_layout_reused_at_seal=(
+                    shared_publication.layout_reused_at_seal
+                ),
+            )
+            failure_report_by_field.update(full_rebuild_metrics)
             await _drop_ptg2_snapshot_table_names(
                 _ptg2_manifest_stage_table_names(ptg2_manifest_stage_table)
             )
@@ -5739,16 +6106,42 @@ async def _main_with_artifact_lease(
             "source_file_versions": _ptg2_source_file_versions_from_results(successful_files + skipped_files),
             "address_refresh": address_refresh_result,
             **allowed_metrics_by_name,
+            **full_rebuild_metrics,
             "timings": timing_by_metric,
         }
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as exc:
         await mark_import_failed(
             "worker task was cancelled",
             progress_message="PTG import interrupted: worker task was cancelled",
         )
+        _attach_full_rebuild_failure_metrics(exc, failure_report_by_field)
         raise
+    except PTG2ArtifactStageFreshnessError as exc:
+        freshness_error = PTG2FullRebuildFreshnessError(
+            "controlled full rebuild repeated an artifact stage; "
+            "create a new attempt after correcting the dataflow",
+            _full_rebuild_proof_metrics(
+                full_rebuild_stage_tracker.snapshot(),
+                full_rebuild_scope_digest=rebuild_scope_digest,
+                shared_layout_reused=bool(
+                    failure_report_by_field.get("shared_layout_reused")
+                ),
+                shared_layout_reused_at_seal=bool(
+                    failure_report_by_field.get(
+                        "shared_layout_reused_at_seal"
+                    )
+                ),
+            ),
+        )
+        await mark_import_failed(freshness_error)
+        _attach_full_rebuild_failure_metrics(
+            freshness_error,
+            failure_report_by_field,
+        )
+        raise freshness_error from exc
     except Exception as exc:
         await mark_import_failed(exc)
+        _attach_full_rebuild_failure_metrics(exc, failure_report_by_field)
         raise
     finally:
         await _stop_ptg2_import_heartbeat(ptg2_import_heartbeat_task)
@@ -5781,6 +6174,7 @@ async def main(
     reuse_raw_artifacts: bool = True,
     keep_partial_artifacts: bool | None = None,
     control_run_id: str | None = None,
+    full_rebuild_scope_digest: str | None = None,
 ) -> dict[str, Any]:
     """Run one PTG import while retaining shared inputs through a live lease."""
 
@@ -5813,6 +6207,11 @@ async def main(
                 reuse_raw_artifacts=reuse_raw_artifacts,
                 keep_partial_artifacts=keep_partial_artifacts,
                 control_run_id=control_run_id,
+                **(
+                    {"full_rebuild_scope_digest": full_rebuild_scope_digest}
+                    if full_rebuild_scope_digest is not None
+                    else {}
+                ),
             ),
         )
 

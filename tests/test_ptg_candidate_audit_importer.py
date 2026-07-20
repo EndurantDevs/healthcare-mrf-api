@@ -20,6 +20,7 @@ from process.ptg_parts.ptg2_source_witness import source_set_digest
 
 
 ptg_candidate_audit = importlib.import_module("process.ptg_candidate_audit")
+process_ptg = importlib.import_module("process.ptg")
 
 
 RAW_DIGEST = "ab" * 32
@@ -347,6 +348,68 @@ async def test_candidate_scope_is_derived_and_corroboration_cannot_spoof(monkeyp
             candidate_run_id="ptg2:derived-import",
             import_id="caller-spoofed-import",
         )
+
+
+@pytest.mark.asyncio
+async def test_controlled_rebuild_run_identity_keeps_audit_targets_unambiguous(
+    monkeypatch,
+):
+    """Resolve the legacy and rebuilt snapshots through distinct audit runs."""
+
+    legacy_run_id = process_ptg._ptg2_import_run_id("test-import")
+    rebuild_run_id = process_ptg._ptg2_import_run_id(
+        "test-import",
+        full_rebuild_scope_digest="1" * 64,
+    )
+    candidate_by_run_id = {}
+    for candidate_run_id, snapshot_id in (
+        (legacy_run_id, "legacy-snapshot"),
+        (rebuild_run_id, "rebuild-snapshot"),
+    ):
+        candidate_by_run_id[candidate_run_id] = {
+            **_candidate_row(),
+            "snapshot_id": snapshot_id,
+            "import_run_id": candidate_run_id,
+        }
+
+    async def candidate_rows(candidate_run_id):
+        return [candidate_by_run_id[candidate_run_id]]
+
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_rows",
+        candidate_rows,
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        AsyncMock(return_value=(RAW_DIGEST,)),
+    )
+
+    legacy_target = await ptg_candidate_audit.load_candidate_audit_target(
+        candidate_run_id=legacy_run_id,
+        import_id="test-import",
+    )
+    rebuild_target = await ptg_candidate_audit.load_candidate_audit_target(
+        candidate_run_id=rebuild_run_id,
+        import_id="test-import",
+    )
+
+    assert legacy_target.snapshot_id == "legacy-snapshot"
+    assert rebuild_target.snapshot_id == "rebuild-snapshot"
+    assert legacy_target.candidate_run_id != rebuild_target.candidate_run_id
+
+
+def test_candidate_import_id_only_strips_exact_rebuild_suffix():
+    assert ptg_candidate_audit._candidate_import_id(
+        "ptg2:test:rebuild-label"
+    ) == "test:rebuild-label"
+    assert ptg_candidate_audit._candidate_import_id(
+        "ptg2:test:rebuild-" + "a" * 23
+    ) == "test:rebuild-" + "a" * 23
+    assert ptg_candidate_audit._candidate_import_id(
+        "ptg2:test:rebuild-" + "a" * 24
+    ) == "test"
 
 
 @pytest.mark.asyncio

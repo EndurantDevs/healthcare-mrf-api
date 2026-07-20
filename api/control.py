@@ -342,7 +342,10 @@ async def control_retry_import(request, run_id: str):
 
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
-    result = await retry_import_run(run_id, payload)
+    try:
+        result = await retry_import_run(run_id, payload)
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
     if result is None:
         raise NotFound("import run not found")
     run, created = result

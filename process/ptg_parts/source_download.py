@@ -14,13 +14,14 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 import zlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qsl, urljoin, urlsplit
 
 import aiohttp
@@ -54,7 +55,9 @@ from process.ptg_parts.config import (
     _range_download_tasks,
 )
 from process.ptg_parts.domain import (
+    PTG2_ARTIFACT_LOGICAL_JSON,
     PTG2_ARTIFACT_RAW,
+    PTG2ArtifactStageObservation,
     PTG2DownloadedJob,
     PTG2HeadMetadata,
     PTG2LogicalArtifact,
@@ -67,13 +70,16 @@ from process.ptg_parts.live_progress import (
     write_live_progress,
 )
 from process.ptg_parts.input_artifact_retention import (
+    PTG2VerifiedArtifactStage,
     async_named_artifact_lock,
     bind_artifact_lease,
+    _capture_streamed_artifact_stage,
     current_artifact_lease_id,
     protect_artifact_path,
     protect_artifact_prefix,
     protect_existing_artifact,
     publish_artifact_file,
+    publish_verified_artifact_stage,
 )
 from process.ptg_parts.progress import _scale_stage_progress_pct
 from process.ptg_parts.screen import _emit_screen_line
@@ -107,6 +113,138 @@ class _UnsafeRangeResponseError(RuntimeError):
 
 class _UnexpectedArtifactContainerError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class PTG2ArtifactStageCounts:
+    """Identity-only counters for completed raw and logical artifact stages."""
+
+    artifacts_observed: int
+    raw_artifacts_total: int
+    raw_artifacts_reused: int
+    raw_artifacts_unique: int
+    raw_artifacts_duplicate_identities: int
+    logical_artifacts_total: int
+    logical_artifacts_reused: int
+    logical_artifacts_unique: int
+    logical_artifacts_duplicate_identities: int
+    logical_artifacts_deferred_hashes: int
+
+    @property
+    def is_reuse_detected(self) -> bool:
+        """Return whether any completed stage selected retained work."""
+
+        return bool(self.raw_artifacts_reused or self.logical_artifacts_reused)
+
+
+class PTG2ArtifactStageFreshnessError(RuntimeError):
+    """Raised when a fresh artifact tracker observes repeated stage work."""
+
+    def __init__(
+        self,
+        counts: PTG2ArtifactStageCounts,
+        artifact_kind: str,
+        reason: str,
+    ):
+        super().__init__(
+            f"fresh PTG artifact stage repeated {artifact_kind} work: {reason}"
+        )
+        self.counts = counts
+        self.artifact_kind = artifact_kind
+        self.reason = reason
+
+
+class PTG2FreshArtifactStageTracker:
+    """Collect safe stage proof with constant-time thread-safe updates."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._raw_total = 0
+        self._raw_reused = 0
+        self._raw_identities: set[str] = set()
+        self._logical_total = 0
+        self._logical_reused = 0
+        self._logical_identities: set[str] = set()
+        self._logical_deferred = 0
+
+    def observe(self, observation: PTG2ArtifactStageObservation) -> None:
+        """Record one completed stage and fail immediately on retained work."""
+
+        self._validate_observation(observation)
+        with self._lock:
+            if observation.artifact_kind == PTG2_ARTIFACT_RAW:
+                is_duplicate_identity = (
+                    observation.identity_sha256 in self._raw_identities
+                )
+                self._raw_total += 1
+                self._raw_reused += int(observation.reused)
+                self._raw_identities.add(observation.identity_sha256)
+            else:
+                is_duplicate_identity = (
+                    observation.identity_sha256 in self._logical_identities
+                )
+                self._logical_total += 1
+                self._logical_reused += int(observation.reused)
+                self._logical_identities.add(observation.identity_sha256)
+                self._logical_deferred += int(
+                    observation.logical_hash_deferred
+                )
+            counts = self._snapshot_locked()
+        if observation.reused or is_duplicate_identity:
+            raise PTG2ArtifactStageFreshnessError(
+                counts,
+                observation.artifact_kind,
+                "reused" if observation.reused else "duplicate_identity",
+            )
+
+    def snapshot(self) -> PTG2ArtifactStageCounts:
+        """Return typed aggregate proof without exposing artifact identities."""
+
+        with self._lock:
+            return self._snapshot_locked()
+
+    @staticmethod
+    def _validate_observation(observation: PTG2ArtifactStageObservation) -> None:
+        if observation.artifact_kind not in {
+            PTG2_ARTIFACT_RAW,
+            PTG2_ARTIFACT_LOGICAL_JSON,
+        }:
+            raise ValueError("PTG artifact stage kind is invalid")
+        identity = observation.identity_sha256
+        if (
+            not isinstance(identity, str)
+            or len(identity) != 64
+            or any(character not in "0123456789abcdef" for character in identity)
+        ):
+            raise ValueError("PTG artifact stage identity must be canonical SHA-256")
+        if type(observation.byte_count) is not int or observation.byte_count < 0:
+            raise ValueError("PTG artifact stage byte count must be non-negative")
+        if type(observation.reused) is not bool:
+            raise ValueError("PTG artifact stage reused flag must be boolean")
+        if type(observation.logical_hash_deferred) is not bool:
+            raise ValueError("PTG artifact deferred-hash flag must be boolean")
+
+    def _snapshot_locked(self) -> PTG2ArtifactStageCounts:
+        raw_unique = len(self._raw_identities)
+        logical_unique = len(self._logical_identities)
+        return PTG2ArtifactStageCounts(
+            artifacts_observed=self._raw_total,
+            raw_artifacts_total=self._raw_total,
+            raw_artifacts_reused=self._raw_reused,
+            raw_artifacts_unique=raw_unique,
+            raw_artifacts_duplicate_identities=max(self._raw_total - raw_unique, 0),
+            logical_artifacts_total=self._logical_total,
+            logical_artifacts_reused=self._logical_reused,
+            logical_artifacts_unique=logical_unique,
+            logical_artifacts_duplicate_identities=max(
+                self._logical_total - logical_unique,
+                0,
+            ),
+            logical_artifacts_deferred_hashes=self._logical_deferred,
+        )
+
+
+PTG2ArtifactStageObserver = Callable[[PTG2ArtifactStageObservation], None]
 
 
 def _validate_content_range(
@@ -907,6 +1045,37 @@ async def download_raw_artifact(
         )
 
 
+def _publish_downloaded_raw_artifact(
+    store: PTG2ArtifactStore,
+    temporary_path: Path,
+    *,
+    raw_sha256: str,
+    byte_count: int,
+    reuse_raw_artifacts: bool,
+    verified_stage: PTG2VerifiedArtifactStage | None = None,
+) -> tuple[Path, str, int]:
+    """Publish one raw stage, retaining exact legacy verification by default."""
+
+    final_path = store.artifact_path(raw_sha256, kind=PTG2_ARTIFACT_RAW)
+    if verified_stage is not None:
+        final_path = publish_verified_artifact_stage(
+            store,
+            verified_stage,
+            artifact_kind=PTG2_ARTIFACT_RAW,
+        )
+        return final_path, raw_sha256, byte_count
+    publish_artifact_file(
+        store,
+        temporary_path,
+        final_path,
+        expected_sha256=raw_sha256,
+    )
+    actual_sha256, actual_size = sha256_file(final_path)
+    if actual_sha256 != raw_sha256:
+        raise RuntimeError(f"Checksum verification failed for {final_path}")
+    return final_path, actual_sha256, actual_size
+
+
 async def _download_raw_artifact_locked(
     url: str,
     *,
@@ -1007,7 +1176,20 @@ async def _download_raw_artifact_locked(
                 )
 
     partial_path = store.partial_path(canonical_url, suffix=_safe_url_suffix(url))
-    tmp_path = partial_path if keep_partials else store.tmp_dir / f"ptg2-{os.getpid()}-{datetime.datetime.utcnow().timestamp()}.part"
+    private_stage_directory = None
+    if keep_partials:
+        tmp_path = partial_path
+    elif not reuse_raw_artifacts:
+        private_stage_directory = tempfile.TemporaryDirectory(
+            prefix="ptg2-fresh-",
+            dir=store.tmp_dir,
+        )
+        tmp_path = Path(private_stage_directory.name) / "artifact.part"
+    else:
+        tmp_path = (
+            store.tmp_dir
+            / f"ptg2-{os.getpid()}-{datetime.datetime.utcnow().timestamp()}.part"
+        )
     if keep_partials:
         protect_artifact_path(store, partial_path)
         protect_artifact_path(store, _range_sidecar_path(partial_path))
@@ -1110,16 +1292,29 @@ async def _download_raw_artifact_locked(
         # The digest is the complete physical identity. Omitting URL-derived
         # suffixes lets different source URLs with identical bytes share one
         # retained raw container.
-        final_path = store.artifact_path(raw_sha, kind=PTG2_ARTIFACT_RAW)
-        publish_artifact_file(
-            store,
-            tmp_path,
-            final_path,
-            expected_sha256=raw_sha,
-        )
-        actual_sha, actual_size = sha256_file(final_path)
-        if actual_sha != raw_sha:
-            raise RuntimeError(f"Checksum verification failed for {final_path}")
+        if private_stage_directory is None:
+            final_path, actual_sha, actual_size = _publish_downloaded_raw_artifact(
+                store,
+                tmp_path,
+                raw_sha256=raw_sha,
+                byte_count=byte_count,
+                reuse_raw_artifacts=reuse_raw_artifacts,
+            )
+        else:
+            with _capture_streamed_artifact_stage(
+                store,
+                tmp_path,
+                streamed_sha256=raw_sha,
+                streamed_byte_count=byte_count,
+            ) as verified_stage:
+                final_path, actual_sha, actual_size = _publish_downloaded_raw_artifact(
+                    store,
+                    tmp_path,
+                    raw_sha256=raw_sha,
+                    byte_count=byte_count,
+                    reuse_raw_artifacts=reuse_raw_artifacts,
+                    verified_stage=verified_stage,
+                )
         _emit_download_progress(
             url=url,
             bytes_read=actual_size,
@@ -1183,6 +1378,9 @@ async def _download_raw_artifact_locked(
         elif tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
         raise
+    finally:
+        if private_stage_directory is not None:
+            private_stage_directory.cleanup()
 
 
 async def materialize_json_source(
@@ -1192,6 +1390,7 @@ async def materialize_json_source(
     max_bytes: int | None = None,
     materialize_logical: bool = True,
     keep_partial_artifacts: bool | None = None,
+    artifact_stage_observer: PTG2ArtifactStageObserver | None = None,
 ) -> tuple[PTG2RawArtifact, PTG2LogicalArtifact]:
     """Download a source and return its raw and logical artifact identities."""
     raw_artifact = await download_raw_artifact(
@@ -1200,6 +1399,7 @@ async def materialize_json_source(
         max_bytes=max_bytes,
         keep_partial_artifacts=keep_partial_artifacts,
     )
+    _observe_raw_artifact_stage(artifact_stage_observer, raw_artifact)
     logical_artifact = (
         stream_logical_artifact(raw_artifact.raw_path, output_dir=output_dir)
         if materialize_logical or _should_materialize_logical_artifact(raw_artifact.raw_path)
@@ -1209,6 +1409,10 @@ async def materialize_json_source(
             raw_byte_count=raw_artifact.byte_count,
             allow_deferred=True,
         )
+    )
+    _observe_logical_artifact_stage(
+        artifact_stage_observer,
+        logical_artifact,
     )
     return raw_artifact, logical_artifact
 
@@ -1230,6 +1434,8 @@ def _retained_logical_artifact_dir(store: PTG2ArtifactStore, raw_artifact: PTG2R
 async def _retained_logical_artifact(
     store: PTG2ArtifactStore,
     raw_artifact: PTG2RawArtifact,
+    *,
+    reuse_retained_logical_artifacts: bool = True,
 ) -> PTG2LogicalArtifact:
     """Expand or reuse the retained logical artifact for raw input."""
     logical_dir = _retained_logical_artifact_dir(store, raw_artifact)
@@ -1239,7 +1445,12 @@ async def _retained_logical_artifact(
         "logical",
         raw_artifact.raw_sha256,
     ):
-        for candidate in reversed(store.find_logical_candidates(raw_artifact.raw_sha256)):
+        logical_candidates = (
+            reversed(store.find_logical_candidates(raw_artifact.raw_sha256))
+            if reuse_retained_logical_artifacts
+            else ()
+        )
+        for candidate in logical_candidates:
             logical_uri = candidate.get("logical_storage_uri") or candidate.get("storage_uri")
             logical_sha256 = str(candidate.get("logical_sha256") or "")
             if not logical_uri or re.fullmatch(r"[0-9a-f]{64}", logical_sha256) is None:
@@ -1278,6 +1489,7 @@ async def _retained_logical_artifact(
                     byte_count=expected_size,
                     compression=candidate.get("compression"),
                     member_name=candidate.get("member_name"),
+                    reused=True,
                 )
 
         with tempfile.TemporaryDirectory(
@@ -1289,13 +1501,32 @@ async def _retained_logical_artifact(
                 output_dir=temporary_dir,
             )
             final_path = logical_dir / f"{staged.logical_sha256}.json"
-            publish_artifact_file(
-                store,
-                staged.logical_path,
-                final_path,
-                expected_sha256=staged.logical_sha256,
-            )
-        retained = replace(staged, logical_path=str(final_path))
+            if reuse_retained_logical_artifacts:
+                publish_artifact_file(
+                    store,
+                    staged.logical_path,
+                    final_path,
+                    expected_sha256=staged.logical_sha256,
+                )
+            else:
+                with _capture_streamed_artifact_stage(
+                    store,
+                    staged.logical_path,
+                    streamed_sha256=staged.logical_sha256,
+                    streamed_byte_count=staged.byte_count,
+                ) as verified_stage:
+                    final_path = publish_verified_artifact_stage(
+                        store,
+                        verified_stage,
+                        artifact_kind="logical",
+                        suffix=".json",
+                        namespace_sha256=raw_artifact.raw_sha256,
+                    )
+        retained = replace(
+            staged,
+            logical_path=str(final_path),
+            reused=False,
+        )
         store.record_manifest(
             {
                 "artifact_kind": "logical_json",
@@ -1314,6 +1545,39 @@ async def _retained_logical_artifact(
 def _materialize_json_source_from_facade():
     ptg_module = sys.modules.get("process.ptg")
     return getattr(ptg_module, "materialize_json_source", materialize_json_source)
+
+
+def _observe_raw_artifact_stage(
+    observer: PTG2ArtifactStageObserver | None,
+    artifact: PTG2RawArtifact,
+) -> None:
+    if observer is None:
+        return
+    observer(
+        PTG2ArtifactStageObservation(
+            artifact_kind=PTG2_ARTIFACT_RAW,
+            identity_sha256=artifact.raw_sha256,
+            byte_count=artifact.byte_count,
+            reused=artifact.reused,
+        )
+    )
+
+
+def _observe_logical_artifact_stage(
+    observer: PTG2ArtifactStageObserver | None,
+    artifact: PTG2LogicalArtifact,
+) -> None:
+    if observer is None:
+        return
+    observer(
+        PTG2ArtifactStageObservation(
+            artifact_kind=PTG2_ARTIFACT_LOGICAL_JSON,
+            identity_sha256=artifact.logical_sha256,
+            byte_count=artifact.byte_count,
+            reused=artifact.reused,
+            logical_hash_deferred=artifact.logical_hash_deferred,
+        )
+    )
 
 
 def _download_ptg_job_artifact_sync_from_facade(job: dict[str, object], **kwargs) -> PTG2DownloadedJob:
@@ -1337,6 +1601,7 @@ async def _download_ptg_job_artifact(
     reuse_raw_artifacts: bool,
     max_bytes: int | None,
     keep_partial_artifacts: bool | None,
+    artifact_stage_observer: PTG2ArtifactStageObserver | None = None,
 ) -> PTG2DownloadedJob:
     try:
         store = PTG2ArtifactStore()
@@ -1347,8 +1612,13 @@ async def _download_ptg_job_artifact(
             max_bytes=max_bytes,
             keep_partial_artifacts=keep_partial_artifacts,
         )
+        _observe_raw_artifact_stage(artifact_stage_observer, raw_artifact)
         logical_artifact = (
-            await _retained_logical_artifact(store, raw_artifact)
+            await _retained_logical_artifact(
+                store,
+                raw_artifact,
+                reuse_retained_logical_artifacts=reuse_raw_artifacts,
+            )
             if _should_materialize_logical_artifact(raw_artifact.raw_path)
             else logical_artifact_identity(
                 raw_artifact.raw_path,
@@ -1357,7 +1627,13 @@ async def _download_ptg_job_artifact(
                 allow_deferred=True,
             )
         )
+        _observe_logical_artifact_stage(
+            artifact_stage_observer,
+            logical_artifact,
+        )
         return PTG2DownloadedJob(job=job, raw_artifact=raw_artifact, logical_artifact=logical_artifact)
+    except PTG2ArtifactStageFreshnessError:
+        raise
     except Exception as exc:
         return PTG2DownloadedJob(job=job, error=str(exc))
 
@@ -1368,6 +1644,7 @@ def _download_ptg_job_artifact_sync(
     reuse_raw_artifacts: bool,
     max_bytes: int | None,
     keep_partial_artifacts: bool | None,
+    artifact_stage_observer: PTG2ArtifactStageObserver | None = None,
 ) -> PTG2DownloadedJob:
     return asyncio.run(
         _download_ptg_job_artifact(
@@ -1375,6 +1652,7 @@ def _download_ptg_job_artifact_sync(
             reuse_raw_artifacts=reuse_raw_artifacts,
             max_bytes=max_bytes,
             keep_partial_artifacts=keep_partial_artifacts,
+            artifact_stage_observer=artifact_stage_observer,
         )
     )
 
@@ -1385,6 +1663,7 @@ async def _iter_downloaded_ptg_jobs(
     reuse_raw_artifacts: bool,
     max_bytes: int | None,
     keep_partial_artifacts: bool | None,
+    artifact_stage_observer: PTG2ArtifactStageObserver | None = None,
 ):
     """Yield PTG jobs after acquiring their retained artifacts."""
     download_tasks = max(_env_int(PTG2_DOWNLOAD_TASKS_ENV, PTG2_DEFAULT_DOWNLOAD_TASKS), 1)
@@ -1414,16 +1693,23 @@ async def _iter_downloaded_ptg_jobs(
                 "overall_progress_start_pct": progress_start,
                 "overall_progress_end_pct": progress_end,
             }
+            download_options_by_name = {
+                "reuse_raw_artifacts": reuse_raw_artifacts,
+                "max_bytes": max_bytes,
+                "keep_partial_artifacts": keep_partial_artifacts,
+                "live_progress_context": job_live_progress_context_map,
+                "artifact_lease_id": artifact_lease_id,
+            }
+            if artifact_stage_observer is not None:
+                download_options_by_name["artifact_stage_observer"] = (
+                    artifact_stage_observer
+                )
             pending_tasks.add(
                 asyncio.wrap_future(
                     executor.submit(
                         _download_ptg_job_artifact_sync_from_facade,
                         job,
-                        reuse_raw_artifacts=reuse_raw_artifacts,
-                        max_bytes=max_bytes,
-                        keep_partial_artifacts=keep_partial_artifacts,
-                        live_progress_context=job_live_progress_context_map,
-                        artifact_lease_id=artifact_lease_id,
+                        **download_options_by_name,
                     )
                 )
             )
@@ -1435,9 +1721,10 @@ async def _iter_downloaded_ptg_jobs(
                 pending_tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            completed_downloads = [task.result() for task in done_tasks]
             schedule_more()
-            for task in done_tasks:
-                yield task.result()
+            for downloaded in completed_downloads:
+                yield downloaded
     finally:
         for task in pending_tasks:
             task.cancel()

@@ -989,6 +989,11 @@ def npi(test: bool):
     is_flag=True,
     help="Alias for --keep-partial-artifacts to explicitly retain failed-download artifacts for reruns.",
 )
+@click.option(
+    "--_full-rebuild-token",
+    "_full_rebuild_token",
+    hidden=True,
+)
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def ptg(
     toc_url: tuple[str, ...],
@@ -1008,9 +1013,14 @@ def ptg(
     reuse_raw_artifacts: bool = True,
     keep_partial_artifacts: bool | None = None,
     keep_artifacts_on_failure: bool = False,
+    _full_rebuild_token: str | None = None,
     test: bool = False,
 ):
     """Run a filtered Transparency in Coverage import."""
+    if _full_rebuild_token is not None:
+        raise click.UsageError(
+            "controlled PTG rebuilds must be requested through import control"
+        )
     if keep_artifacts_on_failure:
         keep_partial_artifacts = True
     _run(

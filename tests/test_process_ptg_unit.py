@@ -6846,6 +6846,117 @@ def _strict_v3_downloaded_job(job):
     )
 
 
+def test_full_rebuild_proof_metrics_are_opt_in_and_count_raw_reuse():
+    stage_counts = process_ptg.PTG2ArtifactStageCounts(
+        artifacts_observed=2,
+        raw_artifacts_total=2,
+        raw_artifacts_reused=1,
+        raw_artifacts_unique=2,
+        raw_artifacts_duplicate_identities=0,
+        logical_artifacts_total=2,
+        logical_artifacts_reused=1,
+        logical_artifacts_unique=2,
+        logical_artifacts_duplicate_identities=0,
+        logical_artifacts_deferred_hashes=0,
+    )
+
+    assert process_ptg._full_rebuild_proof_metrics(
+        stage_counts,
+        full_rebuild_scope_digest=None,
+        shared_layout_reused=False,
+        shared_layout_reused_at_seal=False,
+    ) == {}
+    reused_metrics_by_name = process_ptg._full_rebuild_proof_metrics(
+        stage_counts,
+        full_rebuild_scope_digest="1" * 64,
+        shared_layout_reused=True,
+        shared_layout_reused_at_seal=True,
+    )
+    assert reused_metrics_by_name == {
+        "full_rebuild": True,
+        "artifacts_observed": 2,
+        "raw_artifacts_total": 2,
+        "raw_artifacts_reused": 1,
+        "raw_artifacts_unique": 2,
+        "raw_artifacts_duplicate_identities": 0,
+        "logical_artifacts_total": 2,
+        "logical_artifacts_reused": 1,
+        "logical_artifacts_unique": 2,
+        "logical_artifacts_duplicate_identities": 0,
+        "logical_artifacts_deferred_hashes": 0,
+        "shared_layout_reused": True,
+        "shared_layout_reused_at_seal": True,
+    }
+    with pytest.raises(RuntimeError, match="retained or duplicate work"):
+        process_ptg._assert_full_rebuild_is_fresh(
+            reused_metrics_by_name
+        )
+
+
+def test_full_rebuild_failure_metrics_reject_hostile_allowed_key_values():
+    failure = RuntimeError("scanner failed")
+    failure.ptg_full_rebuild_metrics_by_name = {
+        "full_rebuild": True,
+        "raw_artifacts_total": "private payload",
+        "raw_artifacts_reused": -1,
+        "logical_artifacts_total": 2,
+        "shared_layout_reused": "false",
+        "unknown_metric": "private payload",
+    }
+
+    assert process_ptg.full_rebuild_failure_metrics(failure) == {
+        "full_rebuild": True,
+        "logical_artifacts_total": 2,
+    }
+
+
+def test_full_rebuild_scope_isolates_snapshot_and_audit_run_identity():
+    """Keep old identities stable while every controlled attempt stays unique."""
+
+    import_month = datetime.date(2026, 7, 1)
+    import_id = "test-import"
+    default_snapshot_id = process_ptg._ptg2_deterministic_snapshot_id(
+        import_month=import_month,
+        import_id=import_id,
+        option_by_name={},
+    )
+    explicit_default_snapshot_id = process_ptg._ptg2_deterministic_snapshot_id(
+        import_month=import_month,
+        import_id=import_id,
+        option_by_name={"full_rebuild_scope_digest": None},
+    )
+    first_scoped_snapshot_id = process_ptg._ptg2_deterministic_snapshot_id(
+        import_month=import_month,
+        import_id=import_id,
+        option_by_name={"full_rebuild_scope_digest": "1" * 64},
+    )
+    second_scoped_snapshot_id = process_ptg._ptg2_deterministic_snapshot_id(
+        import_month=import_month,
+        import_id=import_id,
+        option_by_name={"full_rebuild_scope_digest": "2" * 64},
+    )
+
+    assert default_snapshot_id == explicit_default_snapshot_id
+    assert len(
+        {
+            default_snapshot_id,
+            first_scoped_snapshot_id,
+            second_scoped_snapshot_id,
+        }
+    ) == 3
+    assert process_ptg._ptg2_import_run_id(import_id) == "ptg2:test-import"
+    first_run_id = process_ptg._ptg2_import_run_id(
+        "x" * 96,
+        full_rebuild_scope_digest="1" * 64,
+    )
+    second_run_id = process_ptg._ptg2_import_run_id(
+        "x" * 96,
+        full_rebuild_scope_digest="2" * 64,
+    )
+    assert first_run_id != second_run_id
+    assert len(first_run_id) == len(second_run_id) == 96
+
+
 def _reused_mixed_allowed_context():
     allowed_result = vars(
         _build_allowed_amount_file_result(
@@ -7711,17 +7822,42 @@ def test_failed_shared_layout_abandonment_retries_transient_database_errors(monk
     }
 
 
-def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
-    """Verify ptg2 test mode uses manifest source scoped import."""
-    pushed_list = []
-
+def _manifest_push_mock(pushed_list):
     async def fake_push(rows, cls, **_kwargs):
         pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
 
-    async def fake_downloaded_jobs(jobs, **_kwargs):
-        for job in jobs:
-            yield _strict_v3_downloaded_job(job)
+    return fake_push
 
+
+def _manifest_download_mock(download_options_by_name):
+    async def fake_downloaded_jobs(jobs, **kwargs):
+        download_options_by_name.update(kwargs)
+        for job in jobs:
+            downloaded_job = _strict_v3_downloaded_job(job)
+            stage_observer = kwargs.get("artifact_stage_observer")
+            if stage_observer is not None:
+                stage_observer(
+                    ptg_domain.PTG2ArtifactStageObservation(
+                        artifact_kind=ptg_domain.PTG2_ARTIFACT_RAW,
+                        identity_sha256=downloaded_job.raw_artifact.raw_sha256,
+                        byte_count=1024,
+                    )
+                )
+                stage_observer(
+                    ptg_domain.PTG2ArtifactStageObservation(
+                        artifact_kind=ptg_domain.PTG2_ARTIFACT_LOGICAL_JSON,
+                        identity_sha256=(
+                            downloaded_job.logical_artifact.logical_sha256
+                        ),
+                        byte_count=downloaded_job.logical_artifact.byte_count,
+                    )
+                )
+            yield downloaded_job
+
+    return fake_downloaded_jobs
+
+
+def _manifest_process_mock(create_stage_mock):
     async def fake_process(*_args, **kwargs):
         stage_token = create_stage_mock.await_args.args[0]
         assert kwargs.get("ptg2_manifest_stage_table") == (
@@ -7742,17 +7878,37 @@ def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
             },
         )
 
+    return fake_process
+
+
+def _install_manifest_case_mocks(
+    monkeypatch,
+    pushed_list,
+    download_options_by_name,
+):
     create_stage_mock = AsyncMock(return_value="manifest_stage")
     publish_mock = _install_strict_v3_publish_mocks(monkeypatch, serving_rates=222)
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
-    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
+    monkeypatch.setattr(
+        process_ptg,
+        "_push_ptg2_objects",
+        _manifest_push_mock(pushed_list),
+    )
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
     monkeypatch.setattr(process_ptg, "_create_serving_stage_table", create_stage_mock)
-    monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
-    monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
+    monkeypatch.setattr(
+        process_ptg,
+        "_iter_downloaded_ptg_jobs",
+        _manifest_download_mock(download_options_by_name),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_process_in_network_file",
+        _manifest_process_mock(create_stage_mock),
+    )
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
     monkeypatch.setattr(
         process_ptg,
@@ -7762,24 +7918,175 @@ def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
+    return create_stage_mock, publish_mock
 
-    asyncio.run(
-        process_ptg.main(
-            in_network_url="https://example.test/rates.json.gz",
-            import_month="2026-04",
-            import_id="test_mode_rust_env",
-            source_key="example_dental",
-            test_mode=True,
+
+def _run_manifest_import_case(
+    monkeypatch,
+    *,
+    full_rebuild_scope_digest=None,
+):
+    """Run one isolated manifest-import case and expose its proof calls."""
+
+    pushed_list = []
+    download_options_by_name = {}
+    create_stage_mock, publish_mock = _install_manifest_case_mocks(
+        monkeypatch,
+        pushed_list,
+        download_options_by_name,
+    )
+
+    main_options_by_name = {
+        "in_network_url": "https://example.test/rates.json.gz",
+        "import_month": "2026-04",
+        "import_id": "test_mode_rust_env",
+        "source_key": "example_dental",
+        "test_mode": True,
+    }
+    if full_rebuild_scope_digest is not None:
+        main_options_by_name.update(
+            {
+                "reuse_raw_artifacts": True,
+                "keep_partial_artifacts": True,
+                "full_rebuild_scope_digest": full_rebuild_scope_digest,
+            }
         )
+    import_result = asyncio.run(
+        process_ptg.main(**main_options_by_name)
     )
 
     create_stage_mock.assert_awaited_once()
     publish_mock.assert_awaited_once()
     import_run_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2ImportRun"]
-    assert import_run_rows[-1]["options"]["snapshot_arch"] == "postgres_binary_v3"
-    assert import_run_rows[-1]["options"]["storage_generation"] == "shared_blocks_v3"
-    assert import_run_rows[-1]["options"]["test_mode"] is True
-    assert import_run_rows[-1]["report"]["serving_rates"] == 222
+    return SimpleNamespace(
+        import_result=import_result,
+        import_run=import_run_rows[-1],
+        publish_mock=publish_mock,
+        download_options_by_name=download_options_by_name,
+    )
+
+
+def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
+    """Verify the legacy PTG main path retains its exact default behavior."""
+
+    run = _run_manifest_import_case(monkeypatch)
+
+    assert "full_rebuild_scope_digest" not in run.publish_mock.await_args.kwargs
+    assert "full_rebuild_scope_digest" not in run.import_run["options"]
+    assert run.import_run["options"]["snapshot_arch"] == "postgres_binary_v3"
+    assert run.import_run["options"]["storage_generation"] == "shared_blocks_v3"
+    assert run.import_run["options"]["test_mode"] is True
+    assert run.import_run["report"]["serving_rates"] == 222
+    assert "full_rebuild" not in run.import_result
+
+
+def test_ptg2_full_rebuild_forces_fresh_manifest_source_import(monkeypatch):
+    """Verify a controlled rebuild bypasses every physical reuse boundary."""
+
+    rebuild_scope_digest = "1" * 64
+    run = _run_manifest_import_case(
+        monkeypatch,
+        full_rebuild_scope_digest=rebuild_scope_digest,
+    )
+
+    assert run.download_options_by_name["reuse_raw_artifacts"] is False
+    assert run.download_options_by_name["keep_partial_artifacts"] is False
+    assert run.publish_mock.await_args.kwargs["full_rebuild_scope_digest"] == (
+        rebuild_scope_digest
+    )
+    assert run.import_run["options"]["reuse_raw_artifacts"] is False
+    assert run.import_run["options"]["keep_partial_artifacts"] is False
+    assert run.import_run["options"]["full_rebuild_scope_digest"] == (
+        rebuild_scope_digest
+    )
+    assert run.import_run["import_run_id"].endswith(
+        f":rebuild-{rebuild_scope_digest[:24]}"
+    )
+    expected_rebuild_metrics_by_name = {
+        "full_rebuild": True,
+        "artifacts_observed": 1,
+        "raw_artifacts_total": 1,
+        "raw_artifacts_reused": 0,
+        "raw_artifacts_unique": 1,
+        "raw_artifacts_duplicate_identities": 0,
+        "logical_artifacts_total": 1,
+        "logical_artifacts_reused": 0,
+        "logical_artifacts_unique": 1,
+        "logical_artifacts_duplicate_identities": 0,
+        "logical_artifacts_deferred_hashes": 0,
+        "shared_layout_reused": False,
+        "shared_layout_reused_at_seal": False,
+    }
+    assert {
+        metric_name: run.import_run["report"][metric_name]
+        for metric_name in expected_rebuild_metrics_by_name
+    } == expected_rebuild_metrics_by_name
+    assert {
+        metric_name: run.import_result[metric_name]
+        for metric_name in expected_rebuild_metrics_by_name
+    } == expected_rebuild_metrics_by_name
+
+
+def test_ptg2_full_rebuild_toc_freshness_failure_stops_later_tocs(monkeypatch):
+    """Keep a repeated TOC stage on the specific fail-fast rebuild path."""
+
+    pushed_list = []
+    download_options_by_name = {}
+    _install_manifest_case_mocks(
+        monkeypatch,
+        pushed_list,
+        download_options_by_name,
+    )
+    toc_urls = [
+        "https://example.test/first-index.json",
+        "https://example.test/second-index.json",
+    ]
+    observed_toc_urls = []
+
+    async def repeat_toc_stage(toc_url, *_args, **kwargs):
+        observed_toc_urls.append(toc_url)
+        stage_observer = kwargs["artifact_stage_observer"]
+        observation = ptg_domain.PTG2ArtifactStageObservation(
+            artifact_kind=ptg_domain.PTG2_ARTIFACT_RAW,
+            identity_sha256="a" * 64,
+            byte_count=1024,
+        )
+        stage_observer(observation)
+        stage_observer(observation)
+        raise AssertionError("duplicate stage observation must fail")
+
+    monkeypatch.setattr(
+        process_ptg,
+        "_process_table_of_contents",
+        repeat_toc_stage,
+    )
+
+    with pytest.raises(
+        process_ptg.PTG2FullRebuildFreshnessError,
+        match="repeated an artifact stage",
+    ) as error_info:
+        asyncio.run(
+            process_ptg.main(
+                toc_urls=toc_urls,
+                import_month="2026-04",
+                import_id="toc_freshness_test",
+                source_key="toc_freshness_test",
+                full_rebuild_scope_digest="1" * 64,
+            )
+        )
+
+    assert observed_toc_urls == toc_urls[:1]
+    assert error_info.value.metrics_by_name[
+        "raw_artifacts_duplicate_identities"
+    ] == 1
+    failed_import_runs = [
+        import_row
+        for cls_name, import_row in pushed_list
+        if cls_name == "PTG2ImportRun" and import_row["status"] == "failed"
+    ]
+    assert failed_import_runs[-1]["report"][
+        "raw_artifacts_duplicate_identities"
+    ] == 1
 
 
 

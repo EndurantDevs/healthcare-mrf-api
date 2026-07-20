@@ -34,6 +34,7 @@ _PHYSICAL_IDENTITY_KINDS = frozenset(
     {"logical_json_sha256_v1", "raw_container_sha256_v1"}
 )
 _PHYSICAL_OPTION_KEYS: tuple[str, ...] = ()
+_FULL_REBUILD_SCOPE_DIGEST_OPTION = "full_rebuild_scope_digest"
 
 
 def _normalized_physical_source_type(value: Any) -> str:
@@ -47,6 +48,17 @@ def _normalized_physical_source_type(value: Any) -> str:
             "ASCII token of at most 64 bytes"
         )
     return normalized
+
+
+def normalized_full_rebuild_scope_digest(value: Any) -> str | None:
+    """Return the optional opaque digest that isolates one forced rebuild."""
+
+    if value is None:
+        return None
+    return _normalized_sha256(
+        value,
+        field_name=_FULL_REBUILD_SCOPE_DIGEST_OPTION,
+    )
 
 
 @dataclass(frozen=True, order=True)
@@ -504,6 +516,13 @@ def shared_physical_input_identity(
         key: _canonicalize_for_json(options.get(key))
         for key in _PHYSICAL_OPTION_KEYS
     }
+    full_rebuild_scope_digest = normalized_full_rebuild_scope_digest(
+        options.get(_FULL_REBUILD_SCOPE_DIGEST_OPTION)
+    )
+    if full_rebuild_scope_digest is not None:
+        physical_option_map[_FULL_REBUILD_SCOPE_DIGEST_OPTION] = (
+            full_rebuild_scope_digest
+        )
     identity_payload_map = {
         "identity_version": 6,
         "storage_generation": PTG2_V3_SHARED_GENERATION,
@@ -546,6 +565,7 @@ __all__ = [
     "SharedPhysicalArtifactIdentity",
     "SharedSnapshotSourceAssignment",
     "deterministic_source_key_assignments",
+    "normalized_full_rebuild_scope_digest",
     "normalized_physical_artifact_identity",
     "logical_plan_fields_for_job",
     "is_same_downloaded_physical_input",

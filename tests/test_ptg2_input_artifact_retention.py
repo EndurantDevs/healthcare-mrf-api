@@ -21,12 +21,14 @@ from process.ptg_parts.input_artifact_retention import (
     PTG2ArtifactLease,
     artifact_lease_context,
     bind_artifact_lease,
+    _capture_streamed_artifact_stage,
     collect_ptg2_input_artifacts,
     guard_artifact_lease,
     protect_artifact_path,
     protect_artifact_prefix,
     protect_existing_artifact,
     publish_artifact_file,
+    publish_verified_artifact_stage,
 )
 
 
@@ -1250,6 +1252,296 @@ def test_retention_publish_conflict_edges(tmp_path):
             checksum_target,
             expected_sha256="0" * 64,
         )
+
+
+def test_verified_publish_replaces_old_target_without_hashing_it(
+    tmp_path,
+    monkeypatch,
+):
+    """Publish verified fresh bytes atomically without selecting old content."""
+
+    store = PTG2ArtifactStore(tmp_path / "verified-publish")
+    stage_dir = store.tmp_dir / "private-stage"
+    stage_dir.mkdir(mode=0o700)
+    staged = stage_dir / "fresh-stage"
+    staged_payload = b"fresh verified artifact"
+    staged.write_bytes(staged_payload)
+    verified_sha256 = hashlib.sha256(staged_payload).hexdigest()
+    final = store.artifact_path(verified_sha256)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    final.write_bytes(b"stale retained artifact")
+    old_inode = final.stat().st_ino
+
+    def reject_old_target_hash(*_args, **_kwargs):
+        raise AssertionError("fresh publication must not hash the old target")
+
+    monkeypatch.setattr(retention, "sha256_file", reject_old_target_hash)
+
+    with _capture_streamed_artifact_stage(
+        store,
+        staged,
+        streamed_sha256=verified_sha256,
+        streamed_byte_count=len(staged_payload),
+    ) as verified_stage:
+        published = publish_verified_artifact_stage(
+            store,
+            verified_stage,
+            artifact_kind="raw",
+        )
+
+    assert published == final
+    assert final.read_bytes() == staged_payload
+    assert final.stat().st_ino != old_inode
+    assert not staged.exists()
+
+
+def test_verified_publish_requires_canonical_digest_and_exact_size(tmp_path):
+    """Reject an unverified staging contract before replacing retained bytes."""
+
+    store = PTG2ArtifactStore(tmp_path / "verified-contract")
+    stage_dir = store.tmp_dir / "private-stage"
+    stage_dir.mkdir(mode=0o700)
+    staged = stage_dir / "stage"
+    staged.write_bytes(b"payload")
+
+    with pytest.raises(ValueError, match="canonical SHA-256"):
+        _capture_streamed_artifact_stage(
+            store,
+            staged,
+            streamed_sha256="A" * 64,
+            streamed_byte_count=7,
+        )
+    with pytest.raises(RuntimeError, match="does not match"):
+        _capture_streamed_artifact_stage(
+            store,
+            staged,
+            streamed_sha256="a" * 64,
+            streamed_byte_count=8,
+        )
+
+
+def test_verified_stage_rejects_non_private_directory_and_fifo(tmp_path):
+    """Reject unsafe writer namespaces and non-regular stage nodes promptly."""
+
+    store = PTG2ArtifactStore(tmp_path / "verified-node-contract")
+    unsafe_dir = store.tmp_dir / "shared-stage"
+    unsafe_dir.mkdir(mode=0o755)
+    unsafe_stage = unsafe_dir / "artifact"
+    unsafe_stage.write_bytes(b"payload")
+    with pytest.raises(RuntimeError, match="directory is not private"):
+        _capture_streamed_artifact_stage(
+            store,
+            unsafe_stage,
+            streamed_sha256=hashlib.sha256(b"payload").hexdigest(),
+            streamed_byte_count=7,
+        )
+
+    if not hasattr(os, "mkfifo"):
+        return
+    private_dir = store.tmp_dir / "private-fifo-stage"
+    private_dir.mkdir(mode=0o700)
+    fifo_stage = private_dir / "artifact"
+    os.mkfifo(fifo_stage)
+    with pytest.raises(RuntimeError, match="does not match its stream"):
+        _capture_streamed_artifact_stage(
+            store,
+            fifo_stage,
+            streamed_sha256=hashlib.sha256(b"").hexdigest(),
+            streamed_byte_count=0,
+        )
+
+
+def _private_verified_stage(
+    store: PTG2ArtifactStore,
+    payload: bytes,
+    *,
+    name: str = "artifact.stage",
+):
+    stage_dir = store.tmp_dir / f"private-{name}"
+    stage_dir.mkdir(mode=0o700)
+    staged = stage_dir / name
+    staged.write_bytes(payload)
+    streamed_sha256 = hashlib.sha256(payload).hexdigest()
+    stage = _capture_streamed_artifact_stage(
+        store,
+        staged,
+        streamed_sha256=streamed_sha256,
+        streamed_byte_count=len(payload),
+    )
+    return staged, streamed_sha256, stage
+
+
+def test_verified_publish_rejects_same_size_stage_mutation(tmp_path):
+    """Do not publish a held inode changed after its stream was sealed."""
+
+    store = PTG2ArtifactStore(tmp_path / "mutated-stage")
+    original = b"streamed-original"
+    staged, digest, stage = _private_verified_stage(store, original)
+    final = store.artifact_path(digest)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    final.write_bytes(b"retained-old")
+    old_bytes = final.read_bytes()
+    try:
+        staged.write_bytes(b"mutated--payload!")
+        changed = staged.stat()
+        os.utime(
+            staged,
+            ns=(changed.st_atime_ns, changed.st_mtime_ns + 1_000_000_000),
+        )
+        with pytest.raises(RuntimeError, match="staging identity changed"):
+            publish_verified_artifact_stage(
+                store,
+                stage,
+                artifact_kind="raw",
+            )
+    finally:
+        stage.close()
+
+    assert final.read_bytes() == old_bytes
+
+
+def test_verified_publish_rejects_stage_name_inode_swap(tmp_path):
+    """Keep a replacement staging name from substituting same-size bytes."""
+
+    store = PTG2ArtifactStore(tmp_path / "swapped-stage")
+    streamed_bytes = b"streamed-original"
+    staged, digest, stage = _private_verified_stage(store, streamed_bytes)
+    held_name = staged.with_suffix(".held")
+    try:
+        staged.rename(held_name)
+        staged.write_bytes(b"substitute-bytes-")
+        with pytest.raises(RuntimeError, match="staging identity changed"):
+            publish_verified_artifact_stage(
+                store,
+                stage,
+                artifact_kind="raw",
+            )
+    finally:
+        stage.close()
+
+    assert not store.artifact_path(digest).exists()
+
+
+def test_verified_publish_rejects_source_swap_during_atomic_replace(
+    tmp_path,
+    monkeypatch,
+):
+    """Validate a destination candidate before it can replace retained bytes."""
+
+    store = PTG2ArtifactStore(tmp_path / "replace-race")
+    streamed_bytes = b"streamed-original"
+    staged, digest, stage = _private_verified_stage(store, streamed_bytes)
+    final = store.artifact_path(digest)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    final.write_bytes(b"retained-old")
+    held_name = staged.with_suffix(".held")
+    real_replace = os.replace
+    swap_state_by_name = {"has_swapped_source": False}
+
+    def swap_before_replace(source_name, destination_name, *args, **kwargs):
+        if (
+            not swap_state_by_name["has_swapped_source"]
+            and source_name == staged.name
+            and kwargs.get("src_dir_fd") is not None
+        ):
+            swap_state_by_name["has_swapped_source"] = True
+            staged.rename(held_name)
+            staged.write_bytes(b"substitute-bytes-")
+        return real_replace(source_name, destination_name, *args, **kwargs)
+
+    monkeypatch.setattr(retention.os, "replace", swap_before_replace)
+    try:
+        with pytest.raises(RuntimeError, match="publication changed inode"):
+            publish_verified_artifact_stage(
+                store,
+                stage,
+                artifact_kind="raw",
+            )
+    finally:
+        stage.close()
+
+    assert swap_state_by_name["has_swapped_source"] is True
+    assert final.read_bytes() == b"retained-old"
+    assert not list(final.parent.glob(f".{final.name}.publish-*"))
+
+
+def test_verified_publish_rejects_final_symlink_without_changing_lease(tmp_path):
+    """Reject a managed final symlink before recording or replacing its target."""
+
+    store = PTG2ArtifactStore(tmp_path / "final-symlink")
+    staged, digest, stage = _private_verified_stage(store, b"streamed")
+    final = store.artifact_path(digest)
+    target_file = store.root / "raw" / "safe-target"
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_bytes(b"target")
+    final.parent.mkdir(parents=True, exist_ok=True)
+    final.symlink_to(target_file)
+    lease = PTG2ArtifactLease(
+        store=store,
+        owner="verified-symlink",
+        heartbeat_seconds=0,
+    ).start()
+    try:
+        with bind_artifact_lease(lease.lease_id):
+            with pytest.raises(RuntimeError, match="target is not a regular file"):
+                publish_verified_artifact_stage(
+                    store,
+                    stage,
+                    artifact_kind="raw",
+                )
+        marker = json.loads(lease.marker_path.read_text(encoding="utf-8"))
+        assert marker["paths"] == []
+    finally:
+        stage.close()
+        lease.release()
+
+    assert final.is_symlink()
+    assert target_file.read_bytes() == b"target"
+    assert staged.exists()
+
+
+def test_verified_publish_rejects_symlinked_destination_parent(tmp_path):
+    """Walk managed destination components without following a parent symlink."""
+
+    store = PTG2ArtifactStore(tmp_path / "parent-symlink")
+    _staged, _digest, stage = _private_verified_stage(store, b"streamed")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (store.root / "raw").symlink_to(outside, target_is_directory=True)
+    try:
+        with pytest.raises(RuntimeError, match="unsafe path component"):
+            publish_verified_artifact_stage(
+                store,
+                stage,
+                artifact_kind="raw",
+            )
+    finally:
+        stage.close()
+
+    assert list(outside.iterdir()) == []
+
+
+def test_verified_publish_records_exact_derived_path_in_active_lease(tmp_path):
+    """Protect the exact inode path before a collector can observe publication."""
+
+    store = PTG2ArtifactStore(tmp_path / "verified-lease")
+    _staged, digest, stage = _private_verified_stage(store, b"streamed")
+    try:
+        with artifact_lease_context(
+            store=store,
+            owner="verified-publication",
+            heartbeat_seconds=0,
+        ) as lease:
+            final = publish_verified_artifact_stage(
+                store,
+                stage,
+                artifact_kind="raw",
+            )
+            marker = json.loads(lease.marker_path.read_text(encoding="utf-8"))
+            assert marker["paths"] == [final.relative_to(store.root).as_posix()]
+            assert final == store.artifact_path(digest)
+    finally:
+        stage.close()
 
 
 def test_retention_stale_lease_candidate_edges(tmp_path):

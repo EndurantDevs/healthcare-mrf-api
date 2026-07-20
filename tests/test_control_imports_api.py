@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import importlib
 import importlib.util
 import io
 import json
@@ -2693,6 +2694,46 @@ async def test_finalize_import_run_enqueues_finish_and_marks_finalizing(monkeypa
     assert update_values["status"] == "finalizing"
     assert update_values["import_id"] == "20260603"
     assert update_values["metrics"]["finalize"]["run_id"] == "run_claims"
+
+
+@pytest.mark.parametrize(
+    ("importer", "module_name"),
+    [
+        ("claims-pricing", "process.claims_pricing"),
+        ("claims-procedures", "process.claims_pricing"),
+        ("drug-claims", "process.drug_claims"),
+        ("provider-quality", "process.provider_quality"),
+        ("partd-formulary-network", "process.partd_formulary_network"),
+        ("pharmacy-license", "process.pharmacy_license"),
+        ("mrf", "process.initial"),
+    ],
+)
+def test_finish_function_resolves_each_supported_importer(importer, module_name):
+    assert control_imports._finish_function(importer) is importlib.import_module(
+        module_name
+    ).finish_main
+
+
+def test_finish_function_rejects_unsupported_importer():
+    with pytest.raises(ValueError, match="does not support finalize"):
+        control_imports._finish_function("unsupported")
+
+
+def test_mrf_finish_params_keep_manifest_without_worker_run_id():
+    observed = control_imports._finish_params_for(
+        "mrf",
+        {"run_id": "run_mrf", "params": {}},
+        {
+            "import_id": "test-import",
+            "manifest_path": "/tmp/test-manifest.json",
+        },
+    )
+
+    assert observed == {
+        "import_id": "test-import",
+        "test_mode": False,
+        "manifest_path": "/tmp/test-manifest.json",
+    }
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,7 @@ import struct
 import uuid
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -38,10 +38,14 @@ from process.ptg_parts.ptg2_candidate_attestation import (
     PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
 )
 from process.ptg_parts.ptg2_shared_blocks import (
+    SharedBlock,
     bind_snapshot_to_shared_layout,
+    insert_shared_blocks,
     reserve_shared_layout,
+    seal_shared_layout,
     shared_block_hash,
     shared_semantic_fingerprint,
+    summarize_shared_snapshot_mappings,
 )
 from process.ptg_parts.ptg2_shared_finalize import (
     attach_v3_dictionary_contract,
@@ -66,6 +70,7 @@ from process.ptg_parts.ptg2_shared_publish import (
     publish_shared_block_stage,
 )
 from process.ptg_parts.ptg2_shared_snapshot_publish import (
+    _shared_layout_support_digest,
     publish_shared_v3_snapshot_sources,
     publish_strict_shared_v3_layout,
 )
@@ -137,14 +142,15 @@ def _graph_artifacts(
 
 async def _create_shared_schema(schema_name: str) -> None:
     recorder = _OpRecorder()
-    for migration_index, migration_path in enumerate(MIGRATION_PATHS):
-        migration = _load_module(
-            migration_path,
-            f"ptg2_shared_schema_{migration_index}_{schema_name}",
-        )
-        migration.op = recorder
-        migration._schema = lambda: schema_name
-        migration.upgrade()
+    with patch.dict(os.environ, {"HLTHPRT_DB_SCHEMA": schema_name}):
+        for migration_index, migration_path in enumerate(MIGRATION_PATHS):
+            migration = _load_module(
+                migration_path,
+                f"ptg2_shared_schema_{migration_index}_{schema_name}",
+            )
+            migration.op = recorder
+            migration._schema = lambda: schema_name
+            migration.upgrade()
     quoted_schema = '"' + schema_name.replace('"', '""') + '"'
     await db.execute_ddl(f"CREATE SCHEMA {quoted_schema}")
     for statement in recorder.executed:
@@ -156,6 +162,154 @@ async def _create_shared_schema(schema_name: str) -> None:
         VALUES ('CPT', '99213', 'Office visit', 'Office visit')
         """
     )
+
+
+async def _publish_rebuild_scope_proof_layout(
+    *,
+    schema_name: str,
+    build_token: str,
+    full_rebuild_scope_digest: str | None,
+):
+    identity_by_field = {"fixture": "full-rebuild-scope-proof-v1"}
+    if full_rebuild_scope_digest is not None:
+        identity_by_field["full_rebuild_scope_digest"] = (
+            full_rebuild_scope_digest
+        )
+    semantic_fingerprint = shared_semantic_fingerprint(identity_by_field)
+    async with db.transaction() as session:
+        reservation = await reserve_shared_layout(
+            session,
+            schema_name=schema_name,
+            semantic_fingerprint=semantic_fingerprint,
+            build_token=build_token,
+        )
+        if reservation.reused:
+            return reservation, None
+        block = SharedBlock(
+            object_kind="scope_proof",
+            block_key=1,
+            fragment_no=0,
+            entry_count=1,
+            codec="none",
+            raw_byte_count=15,
+            payload=b"identical-block",
+        )
+        await insert_shared_blocks(
+            session,
+            schema_name=schema_name,
+            snapshot_key=reservation.snapshot_key,
+            blocks=(block,),
+        )
+        summary = await summarize_shared_snapshot_mappings(
+            session,
+            schema_name=schema_name,
+            snapshot_key=reservation.snapshot_key,
+        )
+        sealed = await seal_shared_layout(
+            session,
+            schema_name=schema_name,
+            snapshot_key=reservation.snapshot_key,
+            build_token=build_token,
+            expected_summary=summary,
+            support_digest=_shared_layout_support_digest(
+                core_support={"fixture": "full-rebuild-scope-proof-v1"},
+                audit_sample={},
+                source_witness={},
+                full_rebuild_scope_digest=full_rebuild_scope_digest,
+            ),
+            layout_manifest={"fixture": "full-rebuild-scope-proof-v1"},
+        )
+    return reservation, sealed
+
+
+async def _publish_scope_proof_layout_set(schema_name: str):
+    legacy_reservation, legacy_seal = await _publish_rebuild_scope_proof_layout(
+        schema_name=schema_name,
+        build_token="legacy-build",
+        full_rebuild_scope_digest=None,
+    )
+    legacy_retry, legacy_retry_seal = await _publish_rebuild_scope_proof_layout(
+        schema_name=schema_name,
+        build_token="legacy-retry",
+        full_rebuild_scope_digest=None,
+    )
+    scoped_layout_pairs = tuple(
+        [
+            await _publish_rebuild_scope_proof_layout(
+                schema_name=schema_name,
+                build_token=f"scoped-build-{scope_number}",
+                full_rebuild_scope_digest=str(scope_number) * 64,
+            )
+            for scope_number in (1, 2)
+        ]
+    )
+    return (
+        legacy_reservation,
+        legacy_seal,
+        legacy_retry,
+        legacy_retry_seal,
+        scoped_layout_pairs,
+    )
+
+
+async def _assert_scope_proof_layout_set(schema_name: str, layout_set) -> None:
+    (
+        legacy_reservation,
+        legacy_seal,
+        legacy_retry,
+        legacy_retry_seal,
+        scoped_layout_pairs,
+    ) = layout_set
+    scoped_snapshot_keys = [
+        reservation.snapshot_key
+        for reservation, _sealed_layout in scoped_layout_pairs
+    ]
+    assert legacy_seal is not None and legacy_seal.reused is False
+    assert legacy_retry.reused is True and legacy_retry_seal is None
+    assert all(
+        reservation.reused is False
+        for reservation, _sealed_layout in scoped_layout_pairs
+    )
+    assert all(
+        sealed_layout is not None and sealed_layout.reused is False
+        for _reservation, sealed_layout in scoped_layout_pairs
+    )
+    assert len({legacy_reservation.snapshot_key, *scoped_snapshot_keys}) == 3
+    quoted_schema = f'"{schema_name}"'
+    stored_block_count = await db.scalar(
+        f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_block"
+    )
+    assert int(stored_block_count or 0) == 1
+    scoped_mapping_count = await db.scalar(
+        f"""
+        SELECT COUNT(*)
+          FROM {quoted_schema}.ptg2_v3_snapshot_block
+         WHERE snapshot_key = ANY(CAST(:snapshot_keys AS bigint[]))
+        """,
+        snapshot_keys=scoped_snapshot_keys,
+    )
+    assert int(scoped_mapping_count or 0) == 2
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_full_rebuild_scopes_keep_global_block_dedup():
+    """Isolate rebuild layouts while retaining content-addressed block storage."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip(
+            "set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1 for PostgreSQL proof"
+        )
+    schema_name = f"ptg2_rebuild_scope_{uuid.uuid4().hex[:16]}"
+    quoted_schema = f'"{schema_name}"'
+    await db.disconnect()
+    await db.connect()
+    try:
+        await _create_shared_schema(schema_name)
+        layout_set = await _publish_scope_proof_layout_set(schema_name)
+        await _assert_scope_proof_layout_set(schema_name, layout_set)
+    finally:
+        await db.status(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
+        await db.disconnect()
 
 
 @pytest.mark.asyncio
