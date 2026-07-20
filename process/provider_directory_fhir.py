@@ -25004,6 +25004,20 @@ async def _fetch_partition_window_for_pass(
     return request_url, window_fetch
 
 
+def _is_partition_window_fetch_retryable(
+    window_fetch: LastUpdatedWindowFetch,
+) -> bool:
+    return bool(
+        window_fetch.transient
+        or window_fetch.deadline_reached
+        or (
+            not window_fetch.complete
+            and not window_fetch.bounded
+            and window_fetch.error == "pagination_loop_detected"
+        )
+    )
+
+
 async def _fetch_partition_pass(
     source_record: dict[str, Any],
     resource_type: str,
@@ -25025,7 +25039,7 @@ async def _fetch_partition_pass(
         fetch_options,
         window,
     )
-    if window_fetch.transient or window_fetch.deadline_reached:
+    if _is_partition_window_fetch_retryable(window_fetch):
         state.pages_fetched += window_fetch.pages_fetched
         state.rows_fetched += len(window_fetch.resources)
         return await _saved_partition_retry_result(

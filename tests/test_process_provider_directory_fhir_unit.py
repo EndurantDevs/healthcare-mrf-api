@@ -22136,6 +22136,382 @@ class _CensusResumeRecorder:
         )
 
 
+class _RepeatedPartitionNextResponder:
+    """Return one partial page whose next link never advances."""
+
+    def __init__(self):
+        self.requested_urls = []
+
+    async def _fetch_source_json(self, _source, request_url, *, timeout):
+        self.requested_urls.append(request_url)
+        if "_summary=count" in request_url:
+            return (
+                200,
+                _last_updated_partition_test_bundle([], total=2),
+                None,
+                1,
+            )
+        payload = _last_updated_partition_test_bundle(
+            [_last_updated_partition_test_resource("prac-1")]
+        )
+        payload["link"] = [{"relation": "next", "url": request_url}]
+        return 200, payload, None, 1
+
+
+class _CleanPartitionRetryResponder:
+    """Complete both partition passes and their post-acquisition census."""
+
+    def __init__(self):
+        self.requested_urls = []
+
+    async def _fetch_source_json(self, _source, request_url, *, timeout):
+        self.requested_urls.append(request_url)
+        if "_summary=count" in request_url:
+            return (
+                200,
+                _last_updated_partition_test_bundle([], total=2),
+                None,
+                1,
+            )
+        return (
+            200,
+            _last_updated_partition_test_bundle(
+                [
+                    _last_updated_partition_test_resource("prac-1"),
+                    _last_updated_partition_test_resource("prac-2"),
+                ]
+            ),
+            None,
+            1,
+        )
+
+
+async def _run_repeated_next_partition_retry(
+    monkeypatch,
+    fingerprints_by_window_and_pass,
+):
+    directory_source = _last_updated_partition_test_source()
+    responder = _RepeatedPartitionNextResponder()
+    resume_recorder = _CensusResumeRecorder()
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            responder._fetch_source_json,
+            save_plan_callback=resume_recorder._save,
+            fingerprints_by_window_and_pass=fingerprints_by_window_and_pass,
+        )
+    )
+    return (
+        directory_source,
+        responder,
+        resume_recorder,
+        fetch_outcome,
+        staged_resources_by_id,
+        written_resource_ids,
+    )
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_repeated_next_url_remains_retryable(
+    monkeypatch,
+):
+    fingerprints_by_window_and_pass = {}
+    (
+        _directory_source,
+        responder,
+        resume_recorder,
+        fetch_outcome,
+        staged_resources_by_id,
+        written_resource_ids,
+    ) = await _run_repeated_next_partition_retry(
+        monkeypatch,
+        fingerprints_by_window_and_pass,
+    )
+
+    assert fetch_outcome.complete is False
+    assert fetch_outcome.next_url_remaining is True
+    assert fetch_outcome.hard_page_limit_reached is False
+    assert fetch_outcome.error == (
+        f"{importer.LAST_UPDATED_PARTITION_RETRYABLE_ERROR}:"
+        "pagination_loop_detected"
+    )
+    assert fetch_outcome.pages_fetched == 3
+    assert fetch_outcome.rows_fetched == 1
+    assert len(responder.requested_urls) == 3
+    assert resume_recorder.persisted_resume is not None
+    assert resume_recorder.persisted_resume.plan.status is importer.PlanStatus.ACQUIRING
+    assert resume_recorder.persisted_resume.plan.failure is None
+    assert resume_recorder.persisted_resume.plan.windows["root"].passes == {}
+    assert resume_recorder.persisted_resume.pages_processed == 3
+    assert resume_recorder.persisted_resume.rows_processed == 1
+    assert fingerprints_by_window_and_pass == {}
+    assert staged_resources_by_id == {}
+    assert written_resource_ids == []
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_repeated_next_retry_resumes_cleanly(
+    monkeypatch,
+):
+    fingerprints_by_window_and_pass = {}
+    (
+        directory_source,
+        _responder,
+        resume_recorder,
+        first_outcome,
+        _staged,
+        _written,
+    ) = await _run_repeated_next_partition_retry(
+        monkeypatch,
+        fingerprints_by_window_and_pass,
+    )
+    assert importer.LAST_UPDATED_PARTITION_RETRYABLE_ERROR in first_outcome.error
+    assert resume_recorder.persisted_resume is not None
+
+    clean_responder = _CleanPartitionRetryResponder()
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            clean_responder._fetch_source_json,
+            partition_resume=resume_recorder.persisted_resume,
+            fingerprints_by_window_and_pass=fingerprints_by_window_and_pass,
+        )
+    )
+
+    assert fetch_outcome.complete is True
+    assert fetch_outcome.fetch_diagnostic == (
+        _last_updated_partition_expected_proof(
+            2,
+            "2024-01-03T00:00:00.000000Z",
+        )
+    )
+    assert set(staged_resources_by_id) == {"prac-1", "prac-2"}
+    assert written_resource_ids == ["prac-1", "prac-2"]
+    assert set(fingerprints_by_window_and_pass) == {
+        ("root", 1),
+        ("root", 2),
+    }
+    assert len(clean_responder.requested_urls) == 4
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_bounded_ceiling_remains_terminal(
+    monkeypatch,
+):
+    directory_source = _last_updated_partition_test_source()
+    resume_recorder = _CensusResumeRecorder()
+
+    async def fetch_beyond_ceiling(_source, request_url, *, timeout):
+        if "_summary=count" in request_url:
+            return (
+                200,
+                _last_updated_partition_test_bundle([], total=1),
+                None,
+                1,
+            )
+        return (
+            200,
+            _last_updated_partition_test_bundle(
+                [
+                    _last_updated_partition_test_resource("prac-1"),
+                    _last_updated_partition_test_resource("prac-2"),
+                ]
+            ),
+            None,
+            1,
+        )
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            fetch_beyond_ceiling,
+            save_plan_callback=resume_recorder._save,
+        )
+    )
+
+    assert fetch_outcome.complete is False
+    assert fetch_outcome.next_url_remaining is False
+    assert fetch_outcome.hard_page_limit_reached is True
+    assert "bounded_window" in fetch_outcome.error
+    assert resume_recorder.persisted_resume is not None
+    assert resume_recorder.persisted_resume.plan.status is importer.PlanStatus.FAILED
+    assert resume_recorder.persisted_resume.plan.failure is not None
+    assert resume_recorder.persisted_resume.plan.failure.code == "bounded_window"
+    assert staged_resources_by_id == {}
+    assert written_resource_ids == []
+
+
+class _PartitionCheckpointPayloadRecorder:
+    def __init__(self):
+        self.payloads = []
+
+    async def _save(
+        self,
+        _context,
+        _resource_type,
+        partition_config,
+        partition_plan,
+        **checkpoint_fields,
+    ):
+        checkpoint_payload = importer._last_updated_partition_checkpoint_payload(
+            partition_config,
+            partition_plan,
+            checkpoint_fields["census"],
+        )
+        self.payloads.append(json.loads(checkpoint_payload))
+
+
+def _partition_retry_state_with_completed_window():
+    directory_source = _last_updated_partition_test_source(
+        ceiling=1,
+        page_count=1,
+    )
+    partition_config, config_error = importer._last_updated_partition_config(
+        directory_source,
+        "Practitioner",
+    )
+    assert config_error is None and partition_config is not None
+    partition_plan = _new_last_updated_partition_resume(partition_config).plan
+    partition_plan.observe_count("root", importer.CountObservation.exact(2))
+    partition_plan.observe_count("root.0", importer.CountObservation.exact(1))
+    partition_plan.observe_count("root.1", importer.CountObservation.exact(1))
+    completed_resource = _last_updated_partition_test_resource("prac-left")
+    partition_plan.record_pass("root.0", 1, [completed_resource], complete=True)
+    partition_plan.record_pass("root.0", 2, [completed_resource], complete=True)
+    state = importer.LastUpdatedPartitionState(
+        context=_last_updated_partition_test_context(),
+        plan=partition_plan,
+        census=importer.LastUpdatedCompletenessCensus(
+            unfiltered_pre=2,
+            ranged_root_pre=2,
+        ),
+        start_url=f"{importer.SCAN_PROVIDER_DIRECTORY_BASE}/Practitioner",
+        pages_fetched=0,
+        rows_fetched=0,
+        deadline_at=None,
+    )
+    fetch_options = importer.LastUpdatedPartitionFetchOptions(
+        per_resource_limit=0,
+        page_limit=0,
+        timeout=3,
+        run_id="run_partition",
+        row_batch_handler=AsyncMock(return_value=0),
+        row_batch_size=2,
+        retain_rows=False,
+        cancel_ctx=None,
+        cancel_task=None,
+        deadline_seconds=0,
+        pagination_checkpoint=_last_updated_partition_test_context(),
+    )
+    return directory_source, partition_config, partition_plan, state, fetch_options
+
+
+@pytest.mark.asyncio
+async def test_partition_retry_preserves_prior_completed_window_markers(
+    monkeypatch,
+):
+    (
+        directory_source,
+        partition_config,
+        partition_plan,
+        state,
+        fetch_options,
+    ) = _partition_retry_state_with_completed_window()
+    retry_fetch = importer.LastUpdatedWindowFetch(
+        resources=(
+            _last_updated_partition_test_resource(
+                "prac-right",
+                last_updated="2024-01-02T01:00:00Z",
+            ),
+        ),
+        pages_fetched=1,
+        complete=False,
+        error="pagination_loop_detected",
+    )
+    monkeypatch.setattr(
+        importer,
+        "_fetch_partition_window_for_pass",
+        AsyncMock(return_value=("https://example.test/repeated", retry_fetch)),
+    )
+    checkpoint_recorder = _PartitionCheckpointPayloadRecorder()
+    monkeypatch.setattr(
+        importer,
+        "_save_last_updated_partition_plan",
+        checkpoint_recorder._save,
+    )
+    persist_pass = AsyncMock()
+    monkeypatch.setattr(importer, "_persist_partition_pass", persist_pass)
+
+    fetch_outcome = await importer._fetch_partition_plan_passes(
+        directory_source,
+        "Practitioner",
+        ProviderDirectoryPractitioner,
+        partition_config,
+        state,
+        fetch_options,
+    )
+
+    assert fetch_outcome is not None
+    assert fetch_outcome.error.endswith(":pagination_loop_detected")
+    assert partition_plan.status is importer.PlanStatus.ACQUIRING
+    assert partition_plan.failure is None
+    assert set(partition_plan.windows["root.0"].passes) == {1, 2}
+    assert partition_plan.windows["root.1"].passes == {}
+    completed_passes_by_window = {
+        window_fields["window_id"]: window_fields["completed_passes"]
+        for window_fields in checkpoint_recorder.payloads[-1]["control"]["windows"]
+    }
+    assert completed_passes_by_window["root.0"] == [1, 2]
+    assert completed_passes_by_window["root.1"] == []
+    persist_pass.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_partition_permanent_unbounded_failure_remains_terminal(
+    monkeypatch,
+):
+    (
+        directory_source,
+        partition_config,
+        partition_plan,
+        state,
+        fetch_options,
+    ) = _partition_retry_state_with_completed_window()
+    permanent_fetch = importer.LastUpdatedWindowFetch(
+        resources=(),
+        pages_fetched=1,
+        complete=False,
+        error="non_searchset_bundle",
+    )
+    monkeypatch.setattr(
+        importer,
+        "_fetch_partition_window_for_pass",
+        AsyncMock(return_value=("https://example.test/invalid", permanent_fetch)),
+    )
+    persist_pass = AsyncMock()
+    monkeypatch.setattr(importer, "_persist_partition_pass", persist_pass)
+
+    fetch_outcome = await importer._fetch_partition_plan_passes(
+        directory_source,
+        "Practitioner",
+        ProviderDirectoryPractitioner,
+        partition_config,
+        state,
+        fetch_options,
+    )
+
+    assert fetch_outcome is not None
+    assert "incomplete_window" in fetch_outcome.error
+    assert fetch_outcome.next_url_remaining is False
+    assert partition_plan.status is importer.PlanStatus.FAILED
+    assert partition_plan.failure is not None
+    assert partition_plan.failure.code == "incomplete_window"
+    persist_pass.assert_awaited_once()
+
+
 class _TransientCensusResponder:
     def __init__(self):
         self.first_requested_urls = []
