@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [main]
   workflow_dispatch:
@@ -66,23 +67,24 @@ jobs:
       - name: Readability budget
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          READABILITY_ZERO_GROWTH_APPROVED: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'readability-zero-growth-approved') }}
         run: |
           if [ -n "$BASE_SHA" ]; then
             git show "$BASE_SHA:readability-baseline.json" > "$RUNNER_TEMP/readability-base.json"
+            required_reduction_percent=1
             if git diff --quiet "$BASE_SHA" HEAD -- \
               main.py \
               ':(glob)api/**/*.py' \
               ':(glob)db/**/*.py' \
               ':(glob)process/**/*.py' \
               ':(glob)service/**/*.py'; then
-              python scripts/readability_budget.py \
-                --ratchet-baseline "$RUNNER_TEMP/readability-base.json" \
-                --required-reduction-percent 0
-            else
-              python scripts/readability_budget.py \
-                --ratchet-baseline "$RUNNER_TEMP/readability-base.json" \
-                --required-reduction-percent 1
+              required_reduction_percent=0
+            elif [ "$READABILITY_ZERO_GROWTH_APPROVED" = "true" ]; then
+              required_reduction_percent=0
             fi
+            python scripts/readability_budget.py \
+              --ratchet-baseline "$RUNNER_TEMP/readability-base.json" \
+              --required-reduction-percent "$required_reduction_percent"
           else
             python scripts/readability_budget.py
           fi

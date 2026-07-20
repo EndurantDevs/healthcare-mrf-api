@@ -65,3 +65,9 @@ shadowing always fail. A branch that changes runtime Python in `main.py`,
 debt by at least 1% until the repository reaches zero findings. CI and test
 tooling use a zero-growth check so infrastructure work does not force unrelated
 runtime edits.
+
+For a focused runtime change where the unrelated refactoring needed for the 1%
+paydown would raise change risk, a maintainer may apply the
+`readability-zero-growth-approved` pull-request label. The label changes the
+required reduction to 0%; it does not permit net debt growth or new protected
+findings. Applying or removing the label reruns CI.

@@ -529,9 +529,16 @@ def _assert_shared_stage_sql(session):
     aggregate_sql = str(session.execute.await_args_list[-1].args[0])
     assert "LEFT JOIN" in aggregate_sql
     assert "stored.block_hash IS NULL" in aggregate_sql
-    assert "staged.payload IS NOT NULL" in aggregate_sql
+    assert "stored.payload" not in aggregate_sql
+    assert "staged.payload" not in aggregate_sql
     assert "BOOL_OR" in aggregate_sql
     assert "staged.format_version <> :format_version" in aggregate_sql
+    assert "stored.format_version <> staged.format_version" in aggregate_sql
+    assert "stored.object_kind <> staged.object_kind" in aggregate_sql
+    assert "stored.codec <> staged.codec" in aggregate_sql
+    assert "stored.entry_count <> staged.entry_count" in aggregate_sql
+    assert "stored.raw_byte_count <> staged.raw_byte_count" in aggregate_sql
+    assert "stored.stored_byte_count <> staged.stored_byte_count" in aggregate_sql
     assert "COUNT(DISTINCT staged.block_hash)" in aggregate_sql
     assert "ARRAY_AGG(" in aggregate_sql
     assert "DISTINCT staged.object_kind" in aggregate_sql

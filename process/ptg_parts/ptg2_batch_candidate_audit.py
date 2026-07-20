@@ -101,6 +101,20 @@ def _validated_http_deadline(http_config: FastAuditHttpConfig) -> float:
     return deadline_seconds
 
 
+def _transport_failure_reason(exc: BaseException) -> str:
+    """Return a stable, non-sensitive reason for an HTTP client failure."""
+
+    if isinstance(exc, TimeoutError):
+        return "batch_deadline_exceeded"
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        return "batch_endpoint_connect_failed"
+    if isinstance(exc, aiohttp.ServerDisconnectedError):
+        return "batch_endpoint_server_disconnected"
+    if isinstance(exc, aiohttp.ClientPayloadError):
+        return "batch_response_incomplete"
+    return "batch_endpoint_transport_failed"
+
+
 async def _post_batch_request(
     *,
     request_payload_by_field: Mapping[str, Any],
@@ -137,7 +151,7 @@ async def _post_batch_request(
         raise
     except (TimeoutError, aiohttp.ClientError) as exc:
         raise BatchCandidateAuditTransportError(
-            "batch_endpoint_transport_failed"
+            _transport_failure_reason(exc)
         ) from exc
 
 

@@ -22,11 +22,18 @@ def test_ci_readability_ratchet_requires_python_debt_reduction():
         Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
     ).read_text(encoding="utf-8")
 
+    assert "types: [opened, synchronize, reopened, labeled, unlabeled]" in workflow_text
     assert 'git diff --quiet "$BASE_SHA" HEAD -- \\' in workflow_text
     for source_root in ("api", "db", "process", "service"):
         assert f"':(glob){source_root}/**/*.py'" in workflow_text
-    assert "--required-reduction-percent 0" in workflow_text
-    assert "--required-reduction-percent 1" in workflow_text
+    assert "required_reduction_percent=1" in workflow_text
+    assert (
+        "contains(github.event.pull_request.labels.*.name, "
+        "'readability-zero-growth-approved')"
+    ) in workflow_text
+    assert 'elif [ "$READABILITY_ZERO_GROWTH_APPROVED" = "true" ]; then' in workflow_text
+    assert workflow_text.count("required_reduction_percent=0") == 2
+    assert '--required-reduction-percent "$required_reduction_percent"' in workflow_text
 
 
 def _write_config(repo_root: Path) -> None:
