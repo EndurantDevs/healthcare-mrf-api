@@ -943,6 +943,8 @@ async def publish_shared_block_stage(
                 ),
                 {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
             )
+            # block_hash is the SHA-256 identity for format, kind, codec, and payload;
+            # mandatory audit and fail-closed serving reads recompute it before decode.
             aggregate_result = await session.execute(
                 db.text(
                     f"""
@@ -970,10 +972,6 @@ async def publish_shared_block_stage(
                                    OR stored.entry_count <> staged.entry_count
                                    OR stored.raw_byte_count <> staged.raw_byte_count
                                    OR stored.stored_byte_count <> staged.stored_byte_count
-                                   OR (
-                                       staged.payload IS NOT NULL
-                                       AND stored.payload <> staged.payload
-                                   )
                                ),
                                FALSE
                            )
